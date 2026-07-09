@@ -1,11 +1,21 @@
 # Copy to spar.toml in a project, or ~/.config/spar/config.toml
 
 max_agents = 4
-default_backend = "auto" # auto | headless | tmux
+default_backend = "auto" # auto | headless | tmux (native-cli spawn mode)
 isolation = "worktree"   # none | worktree | worktree+db | worktree+bwrap
+# autonomy: manual | semi | high | full  (lean dogfood: semi or high)
+autonomy = "semi"
+message_budget = "normal" # none | lean | normal | chatty
+auto_cleanup = false
 
 [providers]
+# Mix CLI + API: "claude", "cli:grok", "api:openai", "api:xai", ...
 order = ["claude", "grok", "agy"]
+
+[gates]
+plan = true
+winner = true
+ship = true
 
 [ship]
 auto_confirm = false

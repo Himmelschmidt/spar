@@ -1,3 +1,4 @@
+use crate::bus::MessageBudget;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -17,6 +18,14 @@ pub struct Config {
     pub ship: ShipConfig,
     #[serde(default)]
     pub timeouts: TimeoutConfig,
+    #[serde(default)]
+    pub gates: GatesConfig,
+    #[serde(default)]
+    pub autonomy: AutonomyLevel,
+    #[serde(default)]
+    pub message_budget: MessageBudget,
+    #[serde(default)]
+    pub auto_cleanup: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +38,46 @@ pub enum IsolationMode {
     WorktreeDb,
     #[serde(rename = "worktree+bwrap")]
     WorktreeBwrap,
+}
+
+/// How aggressively spar auto-passes human gates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutonomyLevel {
+    /// Require human at plan / winner / ship (safe default).
+    #[default]
+    Manual,
+    /// Auto-approve plan; still gate winner + ship.
+    Semi,
+    /// Auto plan + winner; ship still requires confirm unless ship.auto_confirm.
+    High,
+    /// Auto plan + winner + ship.
+    Full,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatesConfig {
+    /// Require plan approval gate (can be skipped by autonomy).
+    #[serde(default = "default_true")]
+    pub plan: bool,
+    #[serde(default = "default_true")]
+    pub winner: bool,
+    #[serde(default = "default_true")]
+    pub ship: bool,
+}
+
+impl Default for GatesConfig {
+    fn default() -> Self {
+        Self {
+            plan: true,
+            winner: true,
+            ship: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -87,11 +136,35 @@ impl Default for Config {
             },
             ship: ShipConfig::default(),
             timeouts: TimeoutConfig::default(),
+            gates: GatesConfig::default(),
+            autonomy: AutonomyLevel::default(),
+            message_budget: MessageBudget::default(),
+            auto_cleanup: false,
         }
     }
 }
 
-/// Partial file shape so project/user files overlay only set keys.
+impl Config {
+    /// Whether plan approval can be auto-applied.
+    pub fn auto_plan(&self) -> bool {
+        !self.gates.plan
+            || matches!(
+                self.autonomy,
+                AutonomyLevel::Semi | AutonomyLevel::High | AutonomyLevel::Full
+            )
+    }
+
+    pub fn auto_winner(&self) -> bool {
+        !self.gates.winner || matches!(self.autonomy, AutonomyLevel::High | AutonomyLevel::Full)
+    }
+
+    pub fn auto_ship(&self) -> bool {
+        !self.gates.ship
+            || self.ship.auto_confirm
+            || matches!(self.autonomy, AutonomyLevel::Full)
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ConfigFile {
     max_agents: Option<u32>,
@@ -100,6 +173,10 @@ struct ConfigFile {
     providers: Option<ProviderConfigFile>,
     ship: Option<ShipConfigFile>,
     timeouts: Option<TimeoutConfigFile>,
+    gates: Option<GatesConfigFile>,
+    autonomy: Option<AutonomyLevel>,
+    message_budget: Option<MessageBudget>,
+    auto_cleanup: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -116,6 +193,13 @@ struct ShipConfigFile {
 struct TimeoutConfigFile {
     slot_secs: Option<u64>,
     wait: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct GatesConfigFile {
+    plan: Option<bool>,
+    winner: Option<bool>,
+    ship: Option<bool>,
 }
 
 impl Config {
@@ -161,6 +245,26 @@ impl Config {
                 self.timeouts.wait = v.clone();
             }
         }
+        if let Some(g) = &file.gates {
+            if let Some(v) = g.plan {
+                self.gates.plan = v;
+            }
+            if let Some(v) = g.winner {
+                self.gates.winner = v;
+            }
+            if let Some(v) = g.ship {
+                self.gates.ship = v;
+            }
+        }
+        if let Some(v) = file.autonomy {
+            self.autonomy = v;
+        }
+        if let Some(v) = file.message_budget {
+            self.message_budget = v;
+        }
+        if let Some(v) = file.auto_cleanup {
+            self.auto_cleanup = v;
+        }
         Ok(())
     }
 }
@@ -187,10 +291,17 @@ mod tests {
     fn partial_project_overlays_user() {
         let tmp = tempdir().unwrap();
         let project = tmp.path();
-        std::fs::write(project.join("spar.toml"), "max_agents = 2\n").unwrap();
+        std::fs::write(
+            project.join("spar.toml"),
+            "max_agents = 2\nautonomy = \"high\"\n",
+        )
+        .unwrap();
         let cfg = Config::load(project).unwrap();
         assert_eq!(cfg.max_agents, 2);
         assert_eq!(cfg.providers.order, default_provider_order());
         assert!(!cfg.ship.auto_confirm);
+        assert_eq!(cfg.autonomy, AutonomyLevel::High);
+        assert!(cfg.auto_plan());
+        assert!(cfg.auto_winner());
     }
 }

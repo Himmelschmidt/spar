@@ -220,7 +220,16 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
 
     let winner = parse_winner(paths, &state.id, &implementers);
     state.winner_slot = winner;
-    state.set_phase(Phase::AwaitingWinnerConfirm);
+    if cfg.auto_winner() {
+        if let Some(w) = state.winner_slot.clone() {
+            state.gates.winner_confirmed = Some(w);
+            state.set_phase(Phase::AwaitingShipConfirm);
+        } else {
+            state.set_phase(Phase::AwaitingWinnerConfirm);
+        }
+    } else {
+        state.set_phase(Phase::AwaitingWinnerConfirm);
+    }
     state.save(paths)?;
     Ok(())
 }
@@ -250,15 +259,16 @@ pub fn confirm_winner(
     json: bool,
 ) -> Result<ExitCode> {
     let mut state = RunState::load(paths, run_id)?;
-    if state.phase != Phase::AwaitingWinnerConfirm {
+    if state.phase != Phase::AwaitingWinnerConfirm && state.phase != Phase::AwaitingReconcile {
         anyhow::bail!(
-            "run {run_id} not awaiting winner confirm (phase={:?})",
+            "run {run_id} not awaiting winner/reconcile (phase={:?})",
             state.phase
         );
     }
     let winner = slot
         .or_else(|| state.winner_slot.clone())
         .ok_or_else(|| anyhow::anyhow!("no winner to confirm"))?;
+    state.arena_finish = Some(crate::state::ArenaFinish::Winner);
     state.gates.winner_confirmed = Some(winner.clone());
     state.winner_slot = Some(winner.clone());
     state.set_phase(Phase::AwaitingShipConfirm);
@@ -269,6 +279,127 @@ pub fn confirm_winner(
         println!("confirmed winner {winner} for run {run_id}");
     }
     Ok(ExitCode::Success)
+}
+
+/// Merge-good-parts agent then multi-review, then ship gate.
+pub fn reconcile(
+    paths: &SparPaths,
+    cfg: &Config,
+    run_id: &str,
+    json: bool,
+) -> Result<ExitCode> {
+    let mut state = RunState::load(paths, run_id)?;
+    if state.workflow != crate::cli::WorkflowKind::Arena {
+        anyhow::bail!("reconcile only applies to arena runs");
+    }
+    if !matches!(
+        state.phase,
+        Phase::AwaitingWinnerConfirm | Phase::AwaitingReconcile | Phase::Rank
+    ) {
+        anyhow::bail!(
+            "run {run_id} not ready for reconcile (phase={:?})",
+            state.phase
+        );
+    }
+    state.arena_finish = Some(crate::state::ArenaFinish::Reconcile);
+    state.set_phase(Phase::AwaitingReconcile);
+    state.save(paths)?;
+
+    let implementers: Vec<_> = state
+        .slots
+        .iter()
+        .filter(|s| s.role == SlotRole::Implementer)
+        .cloned()
+        .collect();
+    let mut candidates = String::new();
+    for slot in &implementers {
+        let sum = paths.artifact(&state.id, &format!("summary-{}.md", slot.id));
+        let body = std::fs::read_to_string(sum).unwrap_or_else(|_| "(missing)".into());
+        let wt = state
+            .worktrees
+            .iter()
+            .find(|w| w.slot_id == slot.id)
+            .map(|w| w.path.display().to_string())
+            .unwrap_or_else(|| "(no worktree)".into());
+        candidates.push_str(&format!(
+            "### {} ({})\nworktree: {wt}\n{body}\n\n",
+            slot.id, slot.provider
+        ));
+    }
+
+    let recon_prov = state
+        .providers
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "claude".into());
+    let recon_id = format!("reconcile-{recon_prov}");
+    if state.slots.iter().all(|s| s.id != recon_id) {
+        state
+            .slots
+            .push(executor::init_slot(&recon_id, &recon_prov, SlotRole::Reconciler));
+    }
+    worktree::prepare_isolation(&mut state, paths, std::slice::from_ref(&recon_id))?;
+
+    let mut extra = HashMap::new();
+    extra.insert("candidates".into(), candidates);
+    let job = SlotJob {
+        slot_id: recon_id.clone(),
+        provider: recon_prov,
+        role: SlotRole::Reconciler,
+        template: "reconciler".into(),
+        extra_vars: extra,
+        expected_artifact: Some("summary-reconcile.md".into()),
+    };
+    if let Err(e) = executor::run_slot(&mut state, paths, cfg, &job) {
+        state.set_phase(Phase::Failed);
+        state.error = Some(e.to_string());
+        state.save(paths)?;
+        return Ok(ExitCode::Failure);
+    }
+
+    // dual review on reconcile result
+    let recon_cwd = state
+        .slots
+        .iter()
+        .find(|s| s.id == recon_id)
+        .and_then(|s| s.cwd.clone())
+        .unwrap_or_else(|| state.project_root.clone());
+    let rev_providers: Vec<String> = state
+        .providers
+        .iter()
+        .take(2)
+        .cloned()
+        .collect();
+    for (i, prov) in rev_providers.iter().enumerate() {
+        let id = format!("reconcile-review-{i}-{prov}");
+        if state.slots.iter().all(|s| s.id != id) {
+            let mut slot = executor::init_slot(&id, prov, SlotRole::Reviewer);
+            slot.cwd = Some(recon_cwd.clone());
+            state.slots.push(slot);
+        }
+        let mut extra = HashMap::new();
+        extra.insert("review_cwd".into(), recon_cwd.display().to_string());
+        let job = SlotJob {
+            slot_id: id,
+            provider: prov.clone(),
+            role: SlotRole::Reviewer,
+            template: "reviewer".into(),
+            extra_vars: extra,
+            expected_artifact: Some(format!("review-reconcile-{i}.md")),
+        };
+        let _ = executor::run_slot(&mut state, paths, cfg, &job);
+    }
+
+    state.winner_slot = Some(recon_id.clone());
+    state.gates.winner_confirmed = Some(recon_id);
+    state.set_phase(Phase::AwaitingShipConfirm);
+    state.save(paths)?;
+    if json {
+        executor::emit_run_json(&state)?;
+    } else {
+        println!("reconcile complete for {run_id}; confirm ship when ready");
+    }
+    Ok(state.exit_code())
 }
 
 fn detach(state: &RunState, json: bool) -> Result<ExitCode> {

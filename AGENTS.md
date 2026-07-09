@@ -6,15 +6,19 @@ Multi-agent coding product. Humans open `spar` (TUI). You drive it via CLI.
 spar skills list
 spar skills get core          # full operator skill (read this)
 spar doctor --json
-spar plan -t "..." --json [--dry-run]
+spar plan -t "..." --json [--dry-run] [--big]
 spar approve <run_id> --json  # exit 2 = human gate until approve
-spar implement --run <id> --json
+spar implement --run <id> --json   # SAME run id as plan
 spar status [run_id] --json
 spar wait <run_id> --follow --json
 spar logs <run_id> [slot] -f
+spar bus send <run_id> -m "..."
+spar reconcile <run_id>       # arena merge path
 ```
+
+**Providers:** `claude` / `cli:grok` / `api:openai` / `api:xai` (mixable).
 
 **Exit codes:** `0` ok · `1` fail · `2` human gate · `3` stuck · `4` quota  
 
-State: `.spar/runs/<id>/` (`state.json`, `events.jsonl`, `logs/`).  
+State: `.spar/runs/<id>/` (`state.json`, `events.jsonl`, `bus/`, `logs/`).  
 Ship is draft PR only — never merge. Worktrees only for coding slots.

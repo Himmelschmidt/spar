@@ -1,7 +1,9 @@
+use crate::bus::MessageBudget;
 use crate::cli::{Backend, WorkflowKind};
-use crate::config::IsolationMode;
+use crate::config::{AutonomyLevel, IsolationMode};
 use crate::exit_codes::ExitCode;
 use crate::paths::SparPaths;
+use crate::provider_ref::ExecBackend;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -22,6 +24,7 @@ pub struct RunState {
     pub error: Option<String>,
     #[serde(default)]
     pub project_root: PathBuf,
+    /// Spawn mode for native-cli: auto|headless|tmux
     #[serde(default)]
     pub backend: Backend,
     #[serde(default)]
@@ -30,7 +33,7 @@ pub struct RunState {
     pub dry_run: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_run: Option<String>,
-    /// When this run spawned a child (e.g. plan → implement), the child run id.
+    /// Deprecated: plan→implement now stays on one run id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_run: Option<String>,
     #[serde(default)]
@@ -49,11 +52,37 @@ pub struct RunState {
     pub tmux_session: Option<String>,
     #[serde(default)]
     pub providers: Vec<String>,
-    /// Stuck-policy progress flags (persisted for detach/resume).
     #[serde(default)]
     pub rotated_implementer: bool,
     #[serde(default)]
     pub widened_reviewers: bool,
+    #[serde(default)]
+    pub autonomy: AutonomyLevel,
+    #[serde(default)]
+    pub message_budget: MessageBudget,
+    #[serde(default)]
+    pub big: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arena_finish: Option<ArenaFinish>,
+    #[serde(default)]
+    pub usage: Vec<SlotUsage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArenaFinish {
+    Winner,
+    Reconcile,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlotUsage {
+    pub slot_id: String,
+    pub provider: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -92,6 +121,7 @@ pub enum Phase {
     Fix,
     PeerRelay,
     AwaitingWinnerConfirm,
+    AwaitingReconcile,
     AwaitingShipConfirm,
     Shipping,
     Done,
@@ -119,7 +149,10 @@ impl Phase {
     pub fn is_gate(&self) -> bool {
         matches!(
             self,
-            Phase::AwaitingPlanApproval | Phase::AwaitingWinnerConfirm | Phase::AwaitingShipConfirm
+            Phase::AwaitingPlanApproval
+                | Phase::AwaitingWinnerConfirm
+                | Phase::AwaitingReconcile
+                | Phase::AwaitingShipConfirm
         )
     }
 
@@ -134,8 +167,11 @@ pub struct SlotState {
     pub provider: String,
     pub role: SlotRole,
     pub status: SlotStatus,
+    /// native-cli | api-sdk | dry-run | headless | tmux
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_backend: Option<ExecBackend>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -148,6 +184,8 @@ pub struct SlotState {
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<SlotUsage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +197,7 @@ pub enum SlotRole {
     Reviewer,
     Ranker,
     Peer,
+    Reconciler,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +246,11 @@ impl RunState {
             providers: Vec::new(),
             rotated_implementer: false,
             widened_reviewers: false,
+            autonomy: AutonomyLevel::default(),
+            message_budget: MessageBudget::default(),
+            big: false,
+            arena_finish: None,
+            usage: Vec::new(),
         }
     }
 
@@ -263,6 +307,7 @@ impl RunState {
             Phase::Done | Phase::PlanApproved => ExitCode::Success,
             Phase::AwaitingPlanApproval
             | Phase::AwaitingWinnerConfirm
+            | Phase::AwaitingReconcile
             | Phase::AwaitingShipConfirm => ExitCode::HumanGate,
             Phase::Stuck | Phase::Escalated => ExitCode::Stuck,
             Phase::Quota => ExitCode::Quota,

@@ -1,3 +1,5 @@
+mod api;
+mod bus;
 mod cli;
 mod config;
 mod doctor;
@@ -8,12 +10,14 @@ mod mailbox;
 mod markers;
 mod paths;
 mod process;
+mod provider_ref;
 mod providers;
 mod quota;
 mod sandbox;
 mod ship;
 mod skills;
 mod state;
+mod tasks;
 mod templates;
 mod tmux;
 mod tui;
@@ -23,7 +27,7 @@ mod worktree;
 
 use anyhow::Result;
 use clap::Parser;
-use cli::{Cli, Command, SkillsCmd};
+use cli::{BusCmd, Cli, Command, SkillsCmd};
 use config::Config;
 use exit_codes::ExitCode;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -66,6 +70,7 @@ fn run() -> Result<ExitCode> {
             json,
             backend,
             dry_run,
+            big,
         } => {
             let (paths, cfg) = project_ctx()?;
             let opts = CommonOpts {
@@ -75,6 +80,7 @@ fn run() -> Result<ExitCode> {
                 json,
                 backend,
                 dry_run,
+                big,
             };
             workflow::plan::run(task, opts, &paths, &cfg)
         }
@@ -99,6 +105,7 @@ fn run() -> Result<ExitCode> {
             backend,
             dry_run,
             providers,
+            big,
         } => {
             let (paths, cfg) = project_ctx()?;
             let opts = CommonOpts {
@@ -108,6 +115,7 @@ fn run() -> Result<ExitCode> {
                 json,
                 backend,
                 dry_run,
+                big,
             };
             workflow::implement::run_from_cli(run_id, plan, task, opts, &paths, &cfg)
         }
@@ -119,6 +127,7 @@ fn run() -> Result<ExitCode> {
             backend,
             dry_run,
             providers,
+            big,
         } => {
             let (paths, cfg) = project_ctx()?;
             let opts = CommonOpts {
@@ -128,6 +137,7 @@ fn run() -> Result<ExitCode> {
                 json,
                 backend,
                 dry_run,
+                big,
             };
             workflow::run_named(workflow, opts, &paths, &cfg)
         }
@@ -176,6 +186,11 @@ fn run() -> Result<ExitCode> {
             let (paths, _) = project_ctx()?;
             workflow::arena::confirm_winner(&paths, &run_id, winner, json)
         }
+        Command::Reconcile { run_id, json } => {
+            let (paths, cfg) = project_ctx()?;
+            workflow::arena::reconcile(&paths, &cfg, &run_id, json)
+        }
+        Command::Bus { action } => bus_cmd(action),
         Command::Cleanup {
             run_id,
             json,
@@ -188,6 +203,81 @@ fn run() -> Result<ExitCode> {
         Command::InternalContinue { run_id } => {
             let (paths, cfg) = project_ctx()?;
             workflow::implement::continue_run(&paths, &cfg, &run_id)
+        }
+    }
+}
+
+fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
+    let (paths, _) = project_ctx()?;
+    match action {
+        BusCmd::Send {
+            run_id,
+            from,
+            to,
+            message,
+            json,
+        } => {
+            let msg = bus::chat(
+                &paths,
+                &run_id,
+                &from,
+                &to,
+                message,
+                bus::MessageBudget::Normal,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&msg)?);
+            } else {
+                println!("sent {} → {}", msg.from, msg.to);
+            }
+            Ok(ExitCode::Success)
+        }
+        BusCmd::Log { run_id, json } => {
+            let events = bus::list_events(&paths, &run_id)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&events)?);
+            } else {
+                for e in events {
+                    println!(
+                        "{} {} → {} ({:?}) {}",
+                        e.ts.format("%H:%M:%S"),
+                        e.from,
+                        e.to,
+                        e.kind,
+                        e.body.chars().take(100).collect::<String>()
+                    );
+                }
+            }
+            Ok(ExitCode::Success)
+        }
+        BusCmd::Presence { run_id, json } => {
+            let p = bus::list_presence(&paths, &run_id)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&p)?);
+            } else {
+                for a in p {
+                    println!("{:<20} {:<12} {:?}", a.agent, a.status, a.provider);
+                }
+            }
+            Ok(ExitCode::Success)
+        }
+        BusCmd::Reserve {
+            run_id,
+            path,
+            holder,
+        } => {
+            bus::reserve(&paths, &run_id, &path, &holder)?;
+            println!("reserved {path} by {holder}");
+            Ok(ExitCode::Success)
+        }
+        BusCmd::Release {
+            run_id,
+            path,
+            holder,
+        } => {
+            bus::release(&paths, &run_id, &path, &holder)?;
+            println!("released {path}");
+            Ok(ExitCode::Success)
         }
     }
 }

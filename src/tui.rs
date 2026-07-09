@@ -442,12 +442,23 @@ fn draw(
     );
     f.render_widget(fleet, mid[0]);
 
-    let mut bus_lines = vec![
-        "swarm bus (M2 stub)".into(),
-        "presence / inbox / reserves".into(),
-        String::new(),
-    ];
-    for line in app.event_lines.iter().rev().take(8).rev() {
+    let mut bus_lines = vec!["swarm bus".into()];
+    if let Some(id) = full.map(|s| s.id.as_str()) {
+        if let Ok(presence) = crate::bus::list_presence(swarm, id) {
+            for p in presence.iter().take(4) {
+                bus_lines.push(format!("· {} {}", p.agent, p.status));
+            }
+        }
+        if let Ok(evs) = crate::bus::list_events(swarm, id) {
+            for e in evs.iter().rev().take(6).rev() {
+                bus_lines.push(truncate(
+                    &format!("{}→{}: {}", e.from, e.to, e.body),
+                    42,
+                ));
+            }
+        }
+    }
+    for line in app.event_lines.iter().rev().take(3).rev() {
         bus_lines.push(truncate(line, 40));
     }
     if quota.providers.is_empty() {

@@ -16,6 +16,7 @@ pub struct Message {
 }
 
 impl Message {
+    #[allow(dead_code)]
     pub fn new(
         from: impl Into<String>,
         to: impl Into<String>,
@@ -50,6 +51,7 @@ pub fn send(paths: &SparPaths, run_id: &str, msg: &Message) -> Result<PathBuf> {
     Ok(path)
 }
 
+#[allow(dead_code)]
 pub fn list(paths: &SparPaths, run_id: &str) -> Result<Vec<Message>> {
     let dir = paths.mailbox_dir(run_id);
     if !dir.is_dir() {

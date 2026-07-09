@@ -6,13 +6,14 @@ Not a plugin for Pi or any other harness. Outer agents drive it headlessly (`--j
 
 ## Status
 
-**On `main`:** orchestrator skeleton (dry-run workflows, worktrees, ship helpers, provider detect). Product direction: **TUI-first**, swarm bus, dual-backend — see docs.
+**Product v1 (M0–M5):** fleet TUI, swarm bus, one-run plan→implement→ship, arena reconcile, dual backend (`cli:*` + `api:*`), autonomy gates, skills discovery. Dry-run suites green; live CLI/API depend on installed providers / API keys.
 
 - [docs/PRODUCT.md](docs/PRODUCT.md) — product vision  
 - [docs/architecture-dual-backend.md](docs/architecture-dual-backend.md) — CLI + API backends  
 - [docs/architecture-a2a.md](docs/architecture-a2a.md) — swarm bus  
 - [roadmap/ROADMAP.md](roadmap/ROADMAP.md) — milestones  
-- [DECISIONS.md](DECISIONS.md) — locked decisions
+- [DECISIONS.md](DECISIONS.md) — locked decisions  
+- [AGENTS.md](AGENTS.md) / `spar skills get core` — outer agents
 
 ## Install
 

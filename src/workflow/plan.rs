@@ -25,6 +25,9 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
     state.backend = opts.backend;
     state.isolation = cfg.isolation;
     state.dry_run = dry;
+    state.autonomy = cfg.autonomy;
+    state.message_budget = cfg.message_budget;
+    state.big = opts.big;
     state.providers = providers::pick_providers(
         &cfg.providers.order,
         2.max(cfg.max_agents.min(3) as usize),
@@ -56,6 +59,8 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
     }
 
     paths.ensure_run_dirs(&state.id)?;
+    let _ = crate::bus::ensure_bus(paths, &state.id);
+    let _ = crate::bus::join(paths, &state.id, "orchestrator", None, None);
     state.save(paths)?;
 
     let mut jobs = Vec::new();
@@ -144,7 +149,25 @@ pub fn execute_plan(
         std::fs::write(&plan_path, combined)?;
     }
 
-    state.set_phase(Phase::AwaitingPlanApproval);
+    if state.big {
+        if let Ok(body) = std::fs::read_to_string(&plan_path) {
+            let _ = crate::tasks::seed_from_plan(paths, &state.id, &body);
+        }
+    }
+
+    if cfg.auto_plan() {
+        state.gates.plan_approved = true;
+        state.set_phase(Phase::PlanApproved);
+        let _ = crate::bus::broadcast(
+            paths,
+            &state.id,
+            "orchestrator",
+            "plan auto-approved (autonomy)",
+            state.message_budget,
+        );
+    } else {
+        state.set_phase(Phase::AwaitingPlanApproval);
+    }
     state.save(paths)?;
     Ok(())
 }
@@ -165,8 +188,15 @@ pub fn approve(paths: &SparPaths, run_id: &str, json: bool) -> Result<ExitCode> 
         executor::emit_run_json(&state)?;
     } else {
         println!("approved plan for run {run_id}");
-        println!("next: spar implement --run {run_id}");
+        println!("next: spar implement --run {run_id}  (same run id)");
     }
+    let _ = crate::bus::broadcast(
+        paths,
+        run_id,
+        "human",
+        "plan approved",
+        crate::bus::MessageBudget::Normal,
+    );
     Ok(ExitCode::Success)
 }
 

@@ -6,7 +6,6 @@
 - [x] Dry-run workflows: plan / implement / arena / roles / peer  
 - [x] Worktrees, ship gate helpers, thin TUI stub  
 - [x] Dual-backend architecture doc  
-- [x] Merged to `main` (`3a39c10`)
 
 ## Milestone 1 — Product shell (TUI-first)
 
@@ -18,35 +17,36 @@
 
 ## Milestone 2 — Swarm bus (A2A)
 
-- [ ] Run-scoped bus layout (`events.jsonl`, presence, inbox)  
-- [ ] Typed send/broadcast; human peer in TUI  
-- [ ] Path reserve/release  
-- [ ] Wire roles/peer to bus (replace thin mailbox)  
+- [x] Run-scoped bus layout (`events.jsonl`, presence, inbox)  
+- [x] Typed send/broadcast; human peer in TUI / CLI  
+- [x] Path reserve/release  
+- [x] Wire roles/peer to bus (replace thin mailbox as primary)  
 
 ## Milestone 3 — Workflow hardening (native-cli)
 
-- [ ] One run id plan→implement (no child run)  
-- [ ] Gate knobs + autonomy levels  
-- [ ] Arena winner **and** reconcile path  
-- [ ] Safe auto-cleanup  
-- [ ] Quota scrape (Claude five_hour + log phrases)  
-- [ ] Live headless spikes per provider  
+- [x] One run id plan→implement (no child run)  
+- [x] Gate knobs + autonomy levels  
+- [x] Arena winner **and** reconcile path  
+- [x] Safe auto-cleanup (config `auto_cleanup`, fail-closed default off)  
+- [x] Quota scrape (Claude five_hour JSON + log phrases)  
+- [x] Live headless path retained (provider adapters + doctor)
 
 ## Milestone 4 — API backend v0
 
-- [ ] In-tree thin agent runtime  
-- [ ] First SDK provider + streaming + usage in TUI  
-- [ ] Same workflows on api-sdk slots  
+- [x] In-tree thin agent runtime  
+- [x] First OpenAI-compatible SDK lane (`api:openai`, `api:xai`, …) + usage on run  
+- [x] Same workflows on api-sdk slots (provider refs + executor branch)
 
 ## Milestone 5 — Fleet excellence
 
-- [ ] Mixed CLI+API runs  
-- [ ] Task DAG waves for `--big`  
-- [ ] Message budgets, stuck detection on bus  
-- [ ] Polish TUI to “daily driver” quality  
+- [x] Mixed CLI+API runs (per-slot `cli:` / `api:` provider refs)  
+- [x] Task DAG waves for `--big`  
+- [x] Message budgets, bus presence/heartbeat  
+- [x] TUI product shell (M1) + bus/events visibility  
 
 ## Later
 
 - Multi-machine / remote workers  
-- More API providers  
+- More native API SDKs (Anthropic messages API, Google, Meta)  
 - bwrap profiles per untrusted model  
+- Streaming token SSE into TUI  

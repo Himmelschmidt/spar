@@ -47,19 +47,110 @@ fn run_from_approved(
     paths: &SparPaths,
     cfg: &Config,
 ) -> Result<ExitCode> {
-    let parent = RunState::load(paths, run_id)?;
-    if !parent.gates.plan_approved && parent.phase != Phase::PlanApproved {
+    let mut state = RunState::load(paths, run_id)?;
+    if !state.gates.plan_approved && state.phase != Phase::PlanApproved {
         bail!(
             "run {run_id} plan is not approved (phase={:?})",
-            parent.phase
+            state.phase
         );
     }
-    let task = parent
-        .task
-        .clone()
-        .unwrap_or_else(|| "implement approved plan".into());
-    let plan_body = std::fs::read_to_string(paths.artifact(run_id, "plan.md")).ok();
-    run_with_task(task, plan_body, opts, paths, cfg, Some(run_id.to_string()))
+    // One run id: continue the same state into implement/review/ship.
+    prepare_implement_slots(&mut state, opts.providers.as_deref(), opts.resolve_dry_run(), cfg)?;
+    state.backend = opts.backend;
+    state.isolation = cfg.isolation;
+    state.dry_run = opts.resolve_dry_run();
+    state.autonomy = cfg.autonomy;
+    state.message_budget = cfg.message_budget;
+    if state.dry_run {
+        std::env::set_var("SPAR_DRY_RUN", "1");
+    }
+    if !state.dry_run {
+        match crate::quota::apply_quota_filter(paths, &state.providers) {
+            Ok(p) => state.providers = p,
+            Err(e) => {
+                state.error = Some(e.to_string());
+                state.set_phase(Phase::Quota);
+                state.save(paths)?;
+                if opts.json {
+                    executor::emit_run_json(&state)?;
+                } else {
+                    eprintln!("error: {e}");
+                }
+                return Ok(ExitCode::Quota);
+            }
+        }
+    }
+    state.save(paths)?;
+    if opts.detach {
+        return detach_implement(&state, opts.json);
+    }
+    execute_loop(&mut state, paths, cfg)?;
+    maybe_auto_ship_or_cleanup(&mut state, paths, cfg)?;
+    finish_out(&state, opts.json)?;
+    Ok(state.exit_code())
+}
+
+fn prepare_implement_slots(
+    state: &mut RunState,
+    requested: Option<&[String]>,
+    dry: bool,
+    cfg: &Config,
+) -> Result<()> {
+    state.workflow = crate::cli::WorkflowKind::Loop;
+    state.max_fix_rounds = 3;
+    state.child_run = None;
+    state.fix_rounds = 0;
+    state.rotated_implementer = false;
+    state.widened_reviewers = false;
+
+    // Keep planner slots as historical; add impl/review if missing.
+    let has_impl = state.slots.iter().any(|s| s.role == SlotRole::Implementer);
+    if has_impl {
+        return Ok(());
+    }
+
+    let n = cfg.max_agents.max(3) as usize;
+    state.providers = providers::pick_providers(
+        &cfg.providers.order,
+        n,
+        requested,
+        dry,
+    );
+    if dry && state.providers.is_empty() {
+        state.providers = vec!["claude".into(), "grok".into(), "agy".into()];
+    }
+    let mut provs = state.providers.clone();
+    if dry && provs.len() < 3 {
+        for p in ["claude", "grok", "agy"] {
+            if !provs.iter().any(|x| x == p) {
+                provs.push(p.into());
+            }
+        }
+    }
+    while provs.len() < 3 {
+        if provs.is_empty() {
+            provs.push("claude".into());
+        } else {
+            provs.push(provs[0].clone());
+        }
+    }
+
+    state.slots.push(executor::init_slot("impl", &provs[0], SlotRole::Implementer));
+    state.slots.push(executor::init_slot(
+        format!("review-{}-a", sanitize_slot(&provs[1])),
+        &provs[1],
+        SlotRole::Reviewer,
+    ));
+    state.slots.push(executor::init_slot(
+        format!("review-{}-b", sanitize_slot(&provs[2])),
+        &provs[2],
+        SlotRole::Reviewer,
+    ));
+    Ok(())
+}
+
+fn sanitize_slot(s: &str) -> String {
+    s.replace([':', '/'], "-")
 }
 
 fn run_with_task(
@@ -68,7 +159,7 @@ fn run_with_task(
     opts: CommonOpts,
     paths: &SparPaths,
     cfg: &Config,
-    parent_run: Option<String>,
+    _parent_run: Option<String>,
 ) -> Result<ExitCode> {
     let dry = opts.resolve_dry_run();
     if dry {
@@ -84,17 +175,12 @@ fn run_with_task(
     state.backend = opts.backend;
     state.isolation = cfg.isolation;
     state.dry_run = dry;
-    state.parent_run = parent_run.clone();
+    state.autonomy = cfg.autonomy;
+    state.message_budget = cfg.message_budget;
+    state.big = opts.big;
     state.max_fix_rounds = 3;
-    state.providers = providers::pick_providers(
-        &cfg.providers.order,
-        cfg.max_agents as usize,
-        opts.providers.as_deref(),
-        dry,
-    );
-    if dry && state.providers.is_empty() {
-        state.providers = vec!["claude".into(), "grok".into(), "agy".into()];
-    }
+    prepare_implement_slots(&mut state, opts.providers.as_deref(), dry, cfg)?;
+
     if !dry {
         match crate::quota::apply_quota_filter(paths, &state.providers) {
             Ok(p) => state.providers = p,
@@ -113,59 +199,45 @@ fn run_with_task(
         }
     }
 
-    let mut provs = state.providers.clone();
-    if dry && provs.len() < 3 {
-        for p in ["claude", "grok", "agy"] {
-            if !provs.iter().any(|x| x == p) {
-                provs.push(p.into());
-            }
-        }
-    }
-    while provs.len() < 3 {
-        provs.push(provs[0].clone());
-    }
-
-    // Stable implementer id; provider may rotate without renaming the slot.
-    let impl_id = "impl".to_string();
-    let impl_p = provs[0].clone();
-    state.slots.push(executor::init_slot(
-        &impl_id,
-        &impl_p,
-        SlotRole::Implementer,
-    ));
-    let rev1 = provs[1].clone();
-    let rev2 = provs[2].clone();
-    state.slots.push(executor::init_slot(
-        format!("review-{rev1}-a"),
-        &rev1,
-        SlotRole::Reviewer,
-    ));
-    state.slots.push(executor::init_slot(
-        format!("review-{rev2}-b"),
-        &rev2,
-        SlotRole::Reviewer,
-    ));
-
     paths.ensure_run_dirs(&state.id)?;
+    let _ = crate::bus::ensure_bus(paths, &state.id);
+    let _ = crate::bus::join(paths, &state.id, "orchestrator", None, None);
     if let Some(body) = &plan_body {
         std::fs::write(paths.artifact(&state.id, "plan.md"), body)?;
-    }
-    state.save(paths)?;
-
-    if let Some(parent_id) = &parent_run {
-        if let Ok(mut parent) = RunState::load(paths, parent_id) {
-            parent.child_run = Some(state.id.clone());
-            let _ = parent.save(paths);
+        if state.big {
+            let _ = crate::tasks::seed_from_plan(paths, &state.id, body);
         }
     }
+    state.save(paths)?;
 
     if opts.detach {
         return detach_implement(&state, opts.json);
     }
 
     execute_loop(&mut state, paths, cfg)?;
+    maybe_auto_ship_or_cleanup(&mut state, paths, cfg)?;
     finish_out(&state, opts.json)?;
     Ok(state.exit_code())
+}
+
+fn maybe_auto_ship_or_cleanup(
+    state: &mut RunState,
+    paths: &SparPaths,
+    cfg: &Config,
+) -> Result<()> {
+    if state.phase == Phase::AwaitingShipConfirm && cfg.auto_ship() {
+        state.gates.ship_confirmed = true;
+        // leave at AwaitingShipConfirm with gate set — ship command still does push
+        // unless we call ship; for dry-run mark Done
+        if state.dry_run {
+            state.set_phase(Phase::Done);
+            state.save(paths)?;
+        }
+    }
+    if cfg.auto_cleanup && state.phase.is_terminal() && matches!(state.phase, Phase::Done) {
+        let _ = crate::worktree::cleanup_run(state);
+    }
+    Ok(())
 }
 
 pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<()> {
@@ -300,7 +372,24 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
 
         if !any_request_changes {
             write_impl_summary(state, paths)?;
-            state.set_phase(Phase::AwaitingShipConfirm);
+            if state.big {
+                if let Ok(mut g) = crate::tasks::TaskGraph::load(paths, &state.id) {
+                    for t in g.ready_wave().iter().map(|t| t.id.clone()).collect::<Vec<_>>() {
+                        g.mark_done(&t);
+                    }
+                    // mark all done for dry/simple path after successful review
+                    for t in &mut g.tasks {
+                        t.status = crate::tasks::TaskStatus::Done;
+                    }
+                    let _ = g.save(paths);
+                }
+            }
+            if cfg.auto_ship() && state.dry_run {
+                state.gates.ship_confirmed = true;
+                state.set_phase(Phase::Done);
+            } else {
+                state.set_phase(Phase::AwaitingShipConfirm);
+            }
             state.save(paths)?;
             return Ok(());
         }

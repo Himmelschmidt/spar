@@ -46,6 +46,9 @@ pub enum Command {
         backend: Backend,
         #[arg(long)]
         dry_run: bool,
+        /// Structured plan-big task DAG under bus/tasks
+        #[arg(long)]
+        big: bool,
     },
 
     /// Approve a plan run so implement can proceed
@@ -82,6 +85,8 @@ pub enum Command {
         dry_run: bool,
         #[arg(long, value_delimiter = ',')]
         providers: Option<Vec<String>>,
+        #[arg(long)]
+        big: bool,
     },
 
     /// Run a named workflow
@@ -100,6 +105,8 @@ pub enum Command {
         dry_run: bool,
         #[arg(long, value_delimiter = ',')]
         providers: Option<Vec<String>>,
+        #[arg(long)]
+        big: bool,
     },
 
     /// Show run status (or list runs)
@@ -164,6 +171,19 @@ pub enum Command {
         json: bool,
     },
 
+    /// Arena finish: merge-good-parts + multi-review → ship gate
+    Reconcile {
+        run_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Swarm bus: send / list / presence / reserve
+    Bus {
+        #[command(subcommand)]
+        action: BusCmd,
+    },
+
     /// Remove worktrees and optional run data
     Cleanup {
         run_id: String,
@@ -195,6 +215,48 @@ pub enum SkillsCmd {
     /// Print a skill document
     Get {
         name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BusCmd {
+    /// Send a chat message
+    Send {
+        run_id: String,
+        #[arg(long, default_value = "human")]
+        from: String,
+        #[arg(long, default_value = "broadcast")]
+        to: String,
+        #[arg(long, short = 'm')]
+        message: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List bus events
+    Log {
+        run_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Presence snapshot
+    Presence {
+        run_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reserve a path
+    Reserve {
+        run_id: String,
+        path: String,
+        #[arg(long, default_value = "human")]
+        holder: String,
+    },
+    /// Release a path reserve
+    Release {
+        run_id: String,
+        path: String,
+        #[arg(long, default_value = "human")]
+        holder: String,
     },
 }
 

@@ -18,26 +18,54 @@ spar provider list [--json]
 | Human | `spar` (no subcommand) → product TUI in current git repo |
 | Outer agent | subcommands + `--json` + exit codes |
 
+## Dual backend
+
+Providers are `cli:name` (subscription CLIs) or `api:name` (OpenAI-compatible SDKs):
+
+```bash
+# native CLIs (default bare names = cli)
+spar plan -t "..." --providers claude,grok --dry-run
+
+# mix CLI + API slots
+spar implement -t "..." --providers claude,api:openai --dry-run
+spar run --workflow arena -t "..." --providers api:xai,claude,grok
+```
+
+API keys: `OPENAI_API_KEY`, `XAI_API_KEY`, optional `OPENAI_BASE_URL` / `XAI_BASE_URL` / `*_MODEL`.
+
 ## Workflows
 
 ```bash
-# Plan (ends HumanGate / awaiting_plan_approval)
-spar plan -t "describe the work" [--providers claude,grok] [--dry-run] [--json] [--detach]
+# Plan (ends HumanGate / awaiting_plan_approval unless autonomy auto-approves)
+spar plan -t "describe the work" [--providers …] [--big] [--dry-run] [--json] [--detach]
 
 spar approve <run_id> [--json]
 spar reject <run_id> [--reason "..."] [--json]
 
-# Implement from approved plan run, plan file, or direct task
+# Implement continues THE SAME run id (plan → implement → ship)
 spar implement --run <run_id> [--dry-run] [--json] [--detach]
 spar implement -t "small task" [--dry-run]
 
 # Named workflows
-spar run --workflow loop|arena|roles|peer -t "..." [--dry-run]
+spar run --workflow loop|arena|roles|peer -t "..." [--dry-run] [--big]
 
 spar confirm <run_id> [--winner <slot>]   # arena winner
-spar ship <run_id> --confirm             # record + draft PR (never merges)
+spar reconcile <run_id>                  # arena merge-good-parts + review
+spar ship <run_id> --confirm             # draft PR (never merges)
 spar cleanup <run_id> [--purge]
 ```
+
+## Swarm bus
+
+```bash
+spar bus send <run_id> -m "hello" [--from human] [--to broadcast|slot]
+spar bus log <run_id> [--json]
+spar bus presence <run_id>
+spar bus reserve <run_id> path/to/file --holder <slot>
+spar bus release <run_id> path/to/file --holder <slot>
+```
+
+Layout: `.spar/runs/<id>/bus/{events.jsonl,agents.jsonl,inbox/,reserves.json,tasks/}`
 
 ## Observe
 
@@ -48,7 +76,7 @@ spar logs <run_id> [slot] [-f|--follow]
 ```
 
 - Run state: `.spar/runs/<id>/state.json`
-- Events: `.spar/runs/<id>/events.jsonl`
+- Events (orchestrator): `.spar/runs/<id>/events.jsonl`
 - Logs: `.spar/runs/<id>/logs/<slot>.log`
 
 ## Exit codes (stable)
@@ -61,28 +89,21 @@ spar logs <run_id> [slot] [-f|--follow]
 | 3 | Stuck / escalated / wait timeout |
 | 4 | No usable providers (quota/pause) |
 
-Always branch on exit code; use `--json` for machine-readable state.
+## Config knobs (`spar.toml`)
 
-## Providers
-
-```bash
-spar provider list [--json]
-spar provider pause <name> [--until 1h|RFC3339]
-spar provider resume <name>
+```toml
+autonomy = "manual" | "semi" | "high" | "full"
+message_budget = "none" | "lean" | "normal" | "chatty"
+auto_cleanup = false
+[gates]
+plan = true
+winner = true
+ship = true
 ```
-
-Workers: subscription CLIs (`claude`, `grok`, `agy`) via native-cli backend. Prefer headless; tmux only as namespaced `spar-<run_id>` opt-in.
 
 ## Rules of the road
 
-- One run id plan → implement → ship (product goal; avoid inventing parallel orchestration).
+- One run id plan → implement → ship.
 - Coding slots always use git worktrees; never check out feature branches on the primary tree.
 - Ship is draft PR only — never merge.
 - State lives under `.spar/` in the project root.
-
-## Prefer dry-run while learning
-
-```bash
-spar plan -t "..." --dry-run --json
-spar implement --run <id> --dry-run --json
-```

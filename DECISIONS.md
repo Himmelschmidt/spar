@@ -11,7 +11,7 @@ Project-level product and architecture decisions. Status: `OPEN` | `LEANING` | `
 | P2 | Default human surface is a **nice fleet TUI** (Claude/Grok/agy class); CLI/JSON for outer agents | DECIDED |
 | P3 | Discovery via **built-in skills + AGENTS.md** (agent-browser pattern) | DECIDED |
 | P4 | Dual execution: **native-cli** + **api-sdk**, one orchestrator | DECIDED |
-| P5 | First-class **swarm bus** (A2A), not dumb mailbox only | LEANING → promote with bus design |
+| P5 | First-class **swarm bus** (A2A), not dumb mailbox only | DECIDED |
 
 ## Orchestration
 
@@ -35,7 +35,7 @@ Project-level product and architecture decisions. Status: `OPEN` | `LEANING` | `
 
 | ID | Topic | Status |
 |----|-------|--------|
-| X1 | First API provider to spike (xAI / Anthropic / OpenAI) | OPEN |
-| X2 | TUI keymap / layout (mimic which product most?) | OPEN |
+| X1 | First API provider to spike (xAI / Anthropic / OpenAI) | DECIDED — OpenAI-compatible (`api:openai`, `api:xai`) via ureq |
+| X2 | TUI keymap / layout (mimic which product most?) | LEANING — j/k Tab a/r/s /commands (M1 shell) |
 | X3 | Project template overrides day one vs later | OPEN |
-| X4 | Bus steer reliability for native-cli headless | OPEN |
+| X4 | Bus steer reliability for native-cli headless | OPEN — inbox + best-effort; full inject later |
