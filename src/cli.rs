@@ -2,12 +2,12 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "agent-swarm",
+    name = "spar",
     version,
     about = "Orchestrate native subscription AI CLIs for multi-provider swarms",
     long_about = "Agent-operable control plane for claude/grok/agy (and future providers).\n\
          Prefer headless execution when capable; tmux is an optional backend.\n\
-         State lives in .swarm/ under the project root."
+         State lives in .spar/ under the project root."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -153,7 +153,7 @@ pub enum Command {
         run_id: String,
         #[arg(long)]
         json: bool,
-        /// Also delete `.swarm/runs/<id>`
+        /// Also delete `.spar/runs/<id>`
         #[arg(long)]
         purge: bool,
     },

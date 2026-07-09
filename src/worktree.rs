@@ -1,11 +1,11 @@
 use crate::config::IsolationMode;
-use crate::paths::SwarmPaths;
+use crate::paths::SparPaths;
 use crate::state::{RunState, WorktreeRecord};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Sibling path: `../<repo>-swarm-<run>-<slot>`
+/// Sibling path: `../<repo>-spar-<run>-<slot>`
 pub fn worktree_path(project_root: &Path, run_id: &str, slot_id: &str) -> Result<PathBuf> {
     let repo_name = project_root
         .file_name()
@@ -15,12 +15,12 @@ pub fn worktree_path(project_root: &Path, run_id: &str, slot_id: &str) -> Result
         .parent()
         .ok_or_else(|| anyhow::anyhow!("project root has no parent"))?;
     let slot_safe = slot_id.replace('/', "-");
-    Ok(parent.join(format!("{repo_name}-swarm-{run_id}-{slot_safe}")))
+    Ok(parent.join(format!("{repo_name}-spar-{run_id}-{slot_safe}")))
 }
 
 pub fn branch_name(run_id: &str, slot_id: &str) -> String {
     let slot_safe = slot_id.replace('/', "-");
-    format!("swarm/{run_id}/{slot_safe}")
+    format!("spar/{run_id}/{slot_safe}")
 }
 
 pub fn create_worktree(project_root: &Path, run_id: &str, slot_id: &str) -> Result<WorktreeRecord> {
@@ -115,7 +115,7 @@ pub fn maybe_dbiso(project_root: &Path, worktree: &Path) -> Result<()> {
 
 pub fn prepare_isolation(
     state: &mut RunState,
-    paths: &SwarmPaths,
+    paths: &SparPaths,
     slot_ids: &[String],
 ) -> Result<()> {
     state.set_phase(crate::state::Phase::PrepareIsolation);
@@ -185,11 +185,11 @@ mod tests {
             worktree_path(Path::new("/home/u/projects/foo"), "abcd1234", "impl-claude").unwrap();
         assert_eq!(
             p,
-            PathBuf::from("/home/u/projects/foo-swarm-abcd1234-impl-claude")
+            PathBuf::from("/home/u/projects/foo-spar-abcd1234-impl-claude")
         );
         assert_eq!(
             branch_name("abcd1234", "impl-claude"),
-            "swarm/abcd1234/impl-claude"
+            "spar/abcd1234/impl-claude"
         );
     }
 

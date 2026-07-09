@@ -2,7 +2,7 @@ use super::CommonOpts;
 use crate::config::Config;
 use crate::executor::{self, SlotJob};
 use crate::exit_codes::ExitCode;
-use crate::paths::SwarmPaths;
+use crate::paths::SparPaths;
 use crate::providers;
 use crate::state::{Phase, RunState, SlotRole, SlotStatus};
 use crate::util;
@@ -16,7 +16,7 @@ pub fn run_from_cli(
     plan: Option<PathBuf>,
     task: Option<String>,
     opts: CommonOpts,
-    paths: &SwarmPaths,
+    paths: &SparPaths,
     cfg: &Config,
 ) -> Result<ExitCode> {
     if let Some(id) = run_id {
@@ -33,7 +33,7 @@ pub fn run_from_cli(
     run_with_task(task, None, opts, paths, cfg, None)
 }
 
-pub fn run_loop(opts: CommonOpts, paths: &SwarmPaths, cfg: &Config) -> Result<ExitCode> {
+pub fn run_loop(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode> {
     let task = opts
         .task
         .clone()
@@ -44,7 +44,7 @@ pub fn run_loop(opts: CommonOpts, paths: &SwarmPaths, cfg: &Config) -> Result<Ex
 fn run_from_approved(
     run_id: &str,
     opts: CommonOpts,
-    paths: &SwarmPaths,
+    paths: &SparPaths,
     cfg: &Config,
 ) -> Result<ExitCode> {
     let parent = RunState::load(paths, run_id)?;
@@ -66,13 +66,13 @@ fn run_with_task(
     task: String,
     plan_body: Option<String>,
     opts: CommonOpts,
-    paths: &SwarmPaths,
+    paths: &SparPaths,
     cfg: &Config,
     parent_run: Option<String>,
 ) -> Result<ExitCode> {
     let dry = opts.resolve_dry_run();
     if dry {
-        std::env::set_var("AGENT_SWARM_DRY_RUN", "1");
+        std::env::set_var("SPAR_DRY_RUN", "1");
     }
     let run_id = util::short_run_id();
     let mut state = RunState::new(
@@ -168,7 +168,7 @@ fn run_with_task(
     Ok(state.exit_code())
 }
 
-pub fn execute_loop(state: &mut RunState, paths: &SwarmPaths, cfg: &Config) -> Result<()> {
+pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<()> {
     // Only isolate the implementer; reviewers share its cwd.
     let impl_ids: Vec<String> = state
         .slots
@@ -332,7 +332,7 @@ pub fn execute_loop(state: &mut RunState, paths: &SwarmPaths, cfg: &Config) -> R
 }
 
 /// Change implementer **provider** only; keep stable slot id and worktree.
-fn try_rotate_implementer(state: &mut RunState, paths: &SwarmPaths) -> Result<bool> {
+fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths) -> Result<bool> {
     let current = state
         .slots
         .iter()
@@ -376,7 +376,7 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SwarmPaths) -> Result<bo
 /// Add an extra adversarial reviewer from a provider not already reviewing.
 fn try_widen_reviewers(
     state: &mut RunState,
-    paths: &SwarmPaths,
+    paths: &SparPaths,
     review_cwd: &std::path::Path,
 ) -> Result<bool> {
     let existing: Vec<String> = state
@@ -414,7 +414,7 @@ fn try_widen_reviewers(
 /// Returns true if provider was changed.
 fn try_rotate_reviewer_provider(
     state: &mut RunState,
-    paths: &SwarmPaths,
+    paths: &SparPaths,
     rev_id: &str,
     review_cwd: &std::path::Path,
     cfg: &Config,
@@ -446,14 +446,14 @@ fn try_rotate_reviewer_provider(
     Ok(true)
 }
 
-fn fail(state: &mut RunState, paths: &SwarmPaths, e: anyhow::Error) -> Result<()> {
+fn fail(state: &mut RunState, paths: &SparPaths, e: anyhow::Error) -> Result<()> {
     state.set_phase(Phase::Failed);
     state.error = Some(e.to_string());
     state.save(paths)?;
     Err(e)
 }
 
-fn write_impl_summary(state: &RunState, paths: &SwarmPaths) -> Result<()> {
+fn write_impl_summary(state: &RunState, paths: &SparPaths) -> Result<()> {
     let mut body = format!(
         "# Implementation summary\n\nRun: {}\nTask: {}\nFix rounds: {}\n\n",
         state.id,
@@ -463,14 +463,14 @@ fn write_impl_summary(state: &RunState, paths: &SwarmPaths) -> Result<()> {
     for s in &state.slots {
         body.push_str(&format!("- {} ({}) {:?}\n", s.id, s.provider, s.status));
     }
-    body.push_str("\nShip when ready: `agent-swarm ship ");
+    body.push_str("\nShip when ready: `spar ship ");
     body.push_str(&state.id);
     body.push_str("` (requires confirm).\n");
     std::fs::write(paths.artifact(&state.id, "summary.md"), body)?;
     Ok(())
 }
 
-fn write_stuck(paths: &SwarmPaths, run_id: &str) -> Result<()> {
+fn write_stuck(paths: &SparPaths, run_id: &str) -> Result<()> {
     std::fs::write(
         paths.artifact(run_id, "escalation.md"),
         "# Escalation\n\nStuck policy exhausted. Human intervention required.\n",
@@ -494,7 +494,7 @@ fn detach_implement(state: &RunState, json: bool) -> Result<ExitCode> {
         child_cmd
             .arg("__internal_continue")
             .arg(&state.id)
-            .env("AGENT_SWARM_INTERNAL", "1")
+            .env("SPAR_INTERNAL", "1")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
@@ -504,12 +504,12 @@ fn detach_implement(state: &RunState, json: bool) -> Result<ExitCode> {
         executor::emit_run_json(state)?;
     } else {
         executor::print_run_human(state);
-        println!("detached; wait with: agent-swarm wait {}", state.id);
+        println!("detached; wait with: spar wait {}", state.id);
     }
     Ok(ExitCode::Success)
 }
 
-pub fn continue_run(paths: &SwarmPaths, cfg: &Config, run_id: &str) -> Result<ExitCode> {
+pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<ExitCode> {
     let mut state = RunState::load(paths, run_id)?;
     match state.workflow {
         crate::cli::WorkflowKind::Loop => {

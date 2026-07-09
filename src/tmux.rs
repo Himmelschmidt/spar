@@ -7,7 +7,7 @@ pub fn available() -> bool {
 }
 
 pub fn session_name(run_id: &str) -> String {
-    format!("swarm-{run_id}")
+    format!("spar-{run_id}")
 }
 
 pub fn has_session(name: &str) -> bool {

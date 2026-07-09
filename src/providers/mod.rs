@@ -151,7 +151,7 @@ pub fn available_providers(order: &[String]) -> Vec<String> {
 
 /// Prefer multi-provider when possible; fall back to repeating available ones.
 ///
-/// When `allow_missing` is true (CLI `--dry-run` or `AGENT_SWARM_DRY_RUN`), names
+/// When `allow_missing` is true (CLI `--dry-run` or `SPAR_DRY_RUN`), names
 /// need not be on PATH.
 pub fn pick_providers(
     order: &[String],
@@ -159,7 +159,7 @@ pub fn pick_providers(
     requested: Option<&[String]>,
     allow_missing: bool,
 ) -> Vec<String> {
-    let allow_missing = allow_missing || crate::util::env_truthy("AGENT_SWARM_DRY_RUN");
+    let allow_missing = allow_missing || crate::util::env_truthy("SPAR_DRY_RUN");
     let base = if let Some(req) = requested {
         let detected = detect_all();
         req.iter()

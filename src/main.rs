@@ -162,16 +162,16 @@ fn run() -> Result<ExitCode> {
     }
 }
 
-fn project_ctx() -> Result<(paths::SwarmPaths, Config)> {
+fn project_ctx() -> Result<(paths::SparPaths, Config)> {
     let root = paths::find_project_root()?;
-    let paths = paths::SwarmPaths::new(&root);
+    let paths = paths::SparPaths::new(&root);
     let cfg = Config::load(&root)?;
     Ok((paths, cfg))
 }
 
 fn status_cmd(run_id: Option<String>, json: bool) -> Result<ExitCode> {
     let root = paths::find_project_root()?;
-    let swarm = paths::SwarmPaths::new(&root);
+    let swarm = paths::SparPaths::new(&root);
 
     if let Some(id) = run_id {
         let state = state::RunState::load(&swarm, &id)?;
@@ -310,7 +310,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
             let quota = paths::find_project_root()
                 .ok()
                 .and_then(|r| {
-                    let p = paths::SwarmPaths::new(r);
+                    let p = paths::SparPaths::new(r);
                     quota::QuotaStore::load(&p).ok()
                 })
                 .unwrap_or_default();

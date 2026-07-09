@@ -7,7 +7,7 @@ pub mod roles;
 use crate::cli::{Backend, WorkflowKind};
 use crate::config::Config;
 use crate::exit_codes::ExitCode;
-use crate::paths::SwarmPaths;
+use crate::paths::SparPaths;
 use crate::util;
 use anyhow::Result;
 
@@ -23,14 +23,14 @@ pub struct CommonOpts {
 
 impl CommonOpts {
     pub fn resolve_dry_run(&self) -> bool {
-        self.dry_run || util::env_truthy("AGENT_SWARM_DRY_RUN")
+        self.dry_run || util::env_truthy("SPAR_DRY_RUN")
     }
 }
 
 pub fn run_named(
     kind: WorkflowKind,
     opts: CommonOpts,
-    paths: &SwarmPaths,
+    paths: &SparPaths,
     cfg: &Config,
 ) -> Result<ExitCode> {
     match kind {

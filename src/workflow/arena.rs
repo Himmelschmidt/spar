@@ -2,7 +2,7 @@ use super::CommonOpts;
 use crate::config::Config;
 use crate::executor::{self, SlotJob};
 use crate::exit_codes::ExitCode;
-use crate::paths::SwarmPaths;
+use crate::paths::SparPaths;
 use crate::providers;
 use crate::state::{Phase, RunState, SlotRole, SlotStatus};
 use crate::util;
@@ -10,14 +10,14 @@ use crate::worktree;
 use anyhow::Result;
 use std::collections::HashMap;
 
-pub fn run(opts: CommonOpts, paths: &SwarmPaths, cfg: &Config) -> Result<ExitCode> {
+pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode> {
     let task = opts
         .task
         .clone()
         .ok_or_else(|| anyhow::anyhow!("--task required for arena"))?;
     let dry = opts.resolve_dry_run();
     if dry {
-        std::env::set_var("AGENT_SWARM_DRY_RUN", "1");
+        std::env::set_var("SPAR_DRY_RUN", "1");
     }
     let n = cfg.max_agents.max(2) as usize;
     let run_id = util::short_run_id();
@@ -91,7 +91,7 @@ pub fn run(opts: CommonOpts, paths: &SwarmPaths, cfg: &Config) -> Result<ExitCod
     Ok(state.exit_code())
 }
 
-pub fn execute(state: &mut RunState, paths: &SwarmPaths, cfg: &Config) -> Result<()> {
+pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<()> {
     let impl_ids: Vec<String> = state
         .slots
         .iter()
@@ -136,7 +136,7 @@ pub fn execute(state: &mut RunState, paths: &SwarmPaths, cfg: &Config) -> Result
                         .unwrap_or_else(|| paths_c.project_root.clone());
                     scope.spawn(move || {
                         let _ = std::fs::write(
-                            cwd.join(".swarm-dry-implement"),
+                            cwd.join(".spar-dry-implement"),
                             format!("arena dry-run {} : {task}\n", slot.id),
                         );
                         let _ = std::fs::write(
@@ -226,7 +226,7 @@ pub fn execute(state: &mut RunState, paths: &SwarmPaths, cfg: &Config) -> Result
 }
 
 fn parse_winner(
-    paths: &SwarmPaths,
+    paths: &SparPaths,
     run_id: &str,
     implementers: &[crate::state::SlotState],
 ) -> Option<String> {
@@ -244,7 +244,7 @@ fn parse_winner(
 }
 
 pub fn confirm_winner(
-    paths: &SwarmPaths,
+    paths: &SparPaths,
     run_id: &str,
     slot: Option<String>,
     json: bool,
@@ -278,7 +278,7 @@ fn detach(state: &RunState, json: bool) -> Result<ExitCode> {
         child_cmd
             .arg("__internal_continue")
             .arg(&state.id)
-            .env("AGENT_SWARM_INTERNAL", "1")
+            .env("SPAR_INTERNAL", "1")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());

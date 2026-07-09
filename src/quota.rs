@@ -1,4 +1,4 @@
-use crate::paths::SwarmPaths;
+use crate::paths::SparPaths;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -32,7 +32,7 @@ pub struct QuotaStore {
 }
 
 impl QuotaStore {
-    pub fn load(paths: &SwarmPaths) -> Result<Self> {
+    pub fn load(paths: &SparPaths) -> Result<Self> {
         paths.ensure_swarm_root()?;
         let file = paths.quota_file();
         if !file.is_file() {
@@ -43,7 +43,7 @@ impl QuotaStore {
         Ok(serde_json::from_str(&text)?)
     }
 
-    pub fn save(&self, paths: &SwarmPaths) -> Result<()> {
+    pub fn save(&self, paths: &SparPaths) -> Result<()> {
         paths.ensure_swarm_root()?;
         let file = paths.quota_file();
         let text = serde_json::to_string_pretty(self)?;
@@ -152,7 +152,7 @@ pub fn filter_usable(names: &[String], store: &QuotaStore) -> Vec<String> {
 
 /// Drop paused providers. Returns empty when every named provider is unusable
 /// (caller should exit with `ExitCode::Quota` rather than re-enabling them).
-pub fn apply_quota_filter(paths: &SwarmPaths, names: &[String]) -> Result<Vec<String>> {
+pub fn apply_quota_filter(paths: &SparPaths, names: &[String]) -> Result<Vec<String>> {
     if names.is_empty() {
         return Ok(Vec::new());
     }
@@ -172,7 +172,7 @@ mod tests {
     #[test]
     fn pause_resume() {
         let tmp = tempdir().unwrap();
-        let paths = SwarmPaths::new(tmp.path());
+        let paths = SparPaths::new(tmp.path());
         let mut store = QuotaStore::default();
         store.pause_manual("claude", None);
         store.save(&paths).unwrap();
@@ -186,7 +186,7 @@ mod tests {
     #[test]
     fn filter_empty_errors() {
         let tmp = tempdir().unwrap();
-        let paths = SwarmPaths::new(tmp.path());
+        let paths = SparPaths::new(tmp.path());
         let mut store = QuotaStore::default();
         store.pause_manual("claude", None);
         store.pause_manual("grok", None);

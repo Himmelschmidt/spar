@@ -1,4 +1,4 @@
-# agent-swarm — Product vision
+# spar — Product vision
 
 **Not a Pi extension. Not a thin orchestrator wrapper.**  
 A **first-class coding-agent product** in the same class as Claude Code, Grok Build, and Antigravity (`agy`) — with multi-agent, multi-provider, dual-backend, and a real control-room TUI as the default surface.
@@ -7,13 +7,13 @@ A **first-class coding-agent product** in the same class as Claude Code, Grok Bu
 
 ## One-liner
 
-**agent-swarm** is the terminal product you open to get hard software work done with a *fleet* of agents — subscription CLIs and/or API models — that plan, build, review, compete, reconcile, and coordinate, under your gates and in isolated worktrees.
+**spar** is the terminal product you open to get hard software work done with a *fleet* of agents — subscription CLIs and/or API models — that plan, build, review, compete, reconcile, and coordinate, under your gates and in isolated worktrees.
 
 ---
 
 ## Positioning
 
-| | Claude / Grok / agy | Pi + messenger | **agent-swarm** |
+| | Claude / Grok / agy | Pi + messenger | **spar** |
 |--|---------------------|----------------|-----------------|
 | Primary UX | Single-agent TUI | Single-agent + optional multi ext | **Fleet-native TUI** |
 | Providers | One vendor | Multi-model, one harness | **Multi-vendor + dual backend** (CLI sub + API SDK) |
@@ -22,7 +22,7 @@ A **first-class coding-agent product** in the same class as Claude Code, Grok Bu
 | Human | Chat with one agent | Peer in mesh overlay | **Operator in control room** + optional chat peer |
 | Ship | You drive git/PR | You drive | **Gated draft PR** built-in |
 
-You still use Claude/Grok/agy as **workers** (native-cli backend). agent-swarm is the **product you live in** when the job needs more than one brain.
+You still use Claude/Grok/agy as **workers** (native-cli backend). spar is the **product you live in** when the job needs more than one brain.
 
 ---
 
@@ -31,9 +31,9 @@ You still use Claude/Grok/agy as **workers** (native-cli backend). agent-swarm i
 Launch:
 
 ```bash
-agent-swarm                 # open product TUI in current repo
-agent-swarm .               # explicit cwd
-agent-swarm --task "..."    # start with a task
+spar                 # open product TUI in current repo
+spar .               # explicit cwd
+spar --task "..."    # start with a task
 ```
 
 The TUI is not `dashboard` as an afterthought. It **is** the app (like `claude` / `grok` / `agy`).
@@ -72,7 +72,7 @@ See [architecture-dual-backend.md](./architecture-dual-backend.md).
 
 - **native-cli** — claude / grok / agy (subscription, TOS-safe)  
 - **api-sdk** — OpenAI, Anthropic, xAI, Google, Meta, … (metered, full control)  
-- Mixable per slot when ready; same workflows and `.swarm/` layout  
+- Mixable per slot when ready; same workflows and `.spar/` layout  
 
 ### Workflows (orchestrator-owned)
 
@@ -111,7 +111,7 @@ Configurable knobs: plan / winner / ship / full-auto levels. Default lean autono
 
 ### Discovery (agent-browser style)
 
-- `agent-swarm skills list|get core|...`  
+- `spar skills list|get core|...`  
 - Short AGENTS.md blurb for outer agents  
 - Product teaches itself; no “read 40 pages of markdown first”  
 
@@ -125,10 +125,10 @@ Configurable knobs: plan / winner / ship / full-auto levels. Default lean autono
 
 ## What “done product” feels like (north star demos)
 
-1. **You open `agent-swarm` in a repo**, type a goal, watch plan multi-provider stream in TUI, approve with one key, implement+dual-review runs, draft PR opens.  
+1. **You open `spar` in a repo**, type a goal, watch plan multi-provider stream in TUI, approve with one key, implement+dual-review runs, draft PR opens.  
 2. **Arena + reconcile:** three providers implement; you choose reconcile; merge agent + review; ship one branch.  
 3. **Peer FE/BE:** two worktrees, bus contract messages, dashboard shows blocked/unblocked, joint review, PR.  
-4. **Outer agent:** Claude in another pane runs `agent-swarm plan --json` via skill, never needs the TUI.  
+4. **Outer agent:** Claude in another pane runs `spar plan --json` via skill, never needs the TUI.  
 5. **API day:** same TUI, slots on `api:anthropic` + `cli:grok`, usage meters visible.  
 
 ---
@@ -156,13 +156,13 @@ The product pivot:
 | native-cli only story | **Dual backend** (API track planned) |
 | “tool to manage sessions” | **Agent product that owns the fleet** |
 
-Evolution, not rewrite: keep `.swarm/`, workflows, adapters; promote TUI and bus to the center.
+Evolution, not rewrite: keep `.spar/`, workflows, adapters; promote TUI and bus to the center.
 
 ---
 
 ## Success metrics (qualitative)
 
-- You open agent-swarm instead of three tmux panes of claude/grok/agy for multi-agent jobs  
+- You open spar instead of three tmux panes of claude/grok/agy for multi-agent jobs  
 - Outer agents reliably drive it via skills + exit codes  
 - Arena/reconcile and peer bus feel *better* than pi-messenger crew for your repos  
 - When API prices are right, flipping a slot to API needs no second tool  

@@ -1,4 +1,4 @@
-# Copy to agent-swarm.toml in a project, or ~/.config/agent-swarm/config.toml
+# Copy to spar.toml in a project, or ~/.config/spar/config.toml
 
 max_agents = 4
 default_backend = "auto" # auto | headless | tmux

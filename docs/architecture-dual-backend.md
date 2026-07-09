@@ -1,7 +1,7 @@
 # Dual-backend architecture
 
 **Status:** DECIDED (product discussion, 2026-07-09)  
-**Binary:** `agent-swarm`  
+**Binary:** `spar`  
 **Principle:** One orchestrator; two (or more) execution backends. Workflows do not fork.
 
 ---
@@ -20,7 +20,7 @@ Spawning CLI sessions is “hacky” only at the **adapter** layer. The product 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │  Outer agent / human                                            │
-│  agent-swarm skills (agent-browser style) + AGENTS.md blurb     │
+│  spar skills (agent-browser style) + AGENTS.md blurb     │
 │  CLI (--json, wait --follow) · nice TUI dashboard               │
 └────────────────────────────┬────────────────────────────────────┘
                              │
@@ -48,7 +48,7 @@ Spawning CLI sessions is “hacky” only at the **adapter** layer. The product 
              │                               │
              └───────────┬───────────────────┘
                          ▼
-              .swarm/runs/<id>/  (same layout either way)
+              .spar/runs/<id>/  (same layout either way)
 ```
 
 ### Non-negotiable split
@@ -68,13 +68,13 @@ Spawning CLI sessions is “hacky” only at the **adapter** layer. The product 
 | Concern | Decision |
 |---------|----------|
 | Default execution | **Headless** process spawn |
-| Tmux | Opt-in only; **dedicated session per run** (`agent-swarm-<run_id>`); never touch the user’s personal sessions |
+| Tmux | Opt-in only; **dedicated session per run** (`spar-<run_id>`); never touch the user’s personal sessions |
 | Completion | Process exit + expected artifacts/markers; never success-on-timeout-alone |
 | Trust | Configurable; default strong auto-approve flags the human UI allows |
 | Quota | Best-effort parse of provider signals (e.g. Claude `rate_limits.five_hour.*` as in statusline JSON) + log/error scrape + manual pause |
 | Providers (v1) | `claude`, `grok`, `agy` |
 
-Dry-run remains a test backend: real `.swarm/` layout, no provider spawn.
+Dry-run remains a test backend: real `.spar/` layout, no provider spawn.
 
 ---
 
@@ -138,11 +138,11 @@ These must not depend on backend:
 1. **One run id** for plan → approve → implement → ship (phases on one record).
 2. **Always worktrees** for coding slots; primary checkout never switches feature branches.
 3. **Cleanup fail-closed** — auto-remove worktrees only when the run is fully terminal and nothing still needs the tree; branches outlive worktree dirs when possible.
-4. **Artifacts / mailbox / markers / logs / events** under `.swarm/runs/<id>/`.
+4. **Artifacts / mailbox / markers / logs / events** under `.spar/runs/<id>/`.
 5. **Gates** configurable (`plan`, `winner`, `ship`, autonomy levels).
 6. **Exit codes:** 0 ok, 1 fail, 2 human gate, 3 stuck, 4 quota.
 7. **Stream everything** — process or API tokens → followable logs + dashboard.
-8. **Ship:** draft PR default, never merge; force-with-lease only on swarm-owned branches.
+8. **Ship:** draft PR default, never merge; force-with-lease only on spar-owned branches.
 
 ---
 
@@ -162,8 +162,8 @@ Two implementers in the *default* loop is overkill; multi-implementer lives in *
 
 ## Discovery (agent-browser pattern)
 
-- `agent-swarm skills list` / `skills get core` (and workflow skills)
-- Short **AGENTS.md** blurb: use agent-swarm for multi-provider orchestration; load core skill first; don’t invent API harnesses for subscription CLIs
+- `spar skills list` / `skills get core` (and workflow skills)
+- Short **AGENTS.md** blurb: use spar for multi-provider orchestration; load core skill first; don’t invent API harnesses for subscription CLIs
 - Dashboard and CLI both first-class for humans; outer agents prefer CLI + JSON + stream
 
 ---

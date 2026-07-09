@@ -1,4 +1,4 @@
-use crate::paths::{self, SwarmPaths};
+use crate::paths::{self, SparPaths};
 use crate::quota::QuotaStore;
 use crate::state::{self, Phase};
 use anyhow::Result;
@@ -14,7 +14,7 @@ use std::time::Duration;
 
 pub fn run() -> Result<crate::exit_codes::ExitCode> {
     let root = paths::find_project_root()?;
-    let swarm = SwarmPaths::new(&root);
+    let swarm = SparPaths::new(&root);
 
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
@@ -29,7 +29,7 @@ pub fn run() -> Result<crate::exit_codes::ExitCode> {
 
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    swarm: &SwarmPaths,
+    swarm: &SparPaths,
 ) -> Result<crate::exit_codes::ExitCode> {
     let mut selected = 0usize;
     loop {
@@ -49,7 +49,7 @@ fn run_loop(
                 .split(area);
 
             let header = Paragraph::new(format!(
-                "agent-swarm dashboard  project={}",
+                "spar dashboard  project={}",
                 swarm.project_root.display()
             ))
             .block(Block::default().borders(Borders::ALL).title("swarm"));

@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::exit_codes::ExitCode;
-use crate::paths::{self, SwarmPaths};
+use crate::paths::{self, SparPaths};
 use crate::providers;
 use anyhow::Result;
 use serde::Serialize;
@@ -10,7 +10,7 @@ use std::path::PathBuf;
 struct DoctorReport {
     ok: bool,
     project_root: Option<PathBuf>,
-    swarm_dir: Option<PathBuf>,
+    spar_dir: Option<PathBuf>,
     max_agents: u32,
     default_backend: String,
     git: ToolCheck,
@@ -40,7 +40,7 @@ pub fn run(json: bool) -> Result<ExitCode> {
             None
         }
     };
-    let swarm_dir = project_root.as_ref().map(|p| SwarmPaths::new(p).root);
+    let spar_dir = project_root.as_ref().map(|p| SparPaths::new(p).root);
 
     let git = check_tool("git", &["git"], true, &["--version"]);
     let tmux = check_tool("tmux", &["tmux"], false, &["-V"]);
@@ -68,7 +68,7 @@ pub fn run(json: bool) -> Result<ExitCode> {
     let report = DoctorReport {
         ok,
         project_root,
-        swarm_dir,
+        spar_dir,
         max_agents: cfg.max_agents,
         default_backend: format!("{:?}", cfg.default_backend).to_ascii_lowercase(),
         git,
@@ -124,7 +124,7 @@ fn check_tool(name: &str, bins: &[&str], required: bool, version_args: &[&str]) 
 }
 
 fn print_human(r: &DoctorReport) {
-    println!("agent-swarm doctor");
+    println!("spar doctor");
     println!(
         "  status:        {}",
         if r.ok { "ok" } else { "problems found" }
@@ -133,10 +133,10 @@ fn print_human(r: &DoctorReport) {
         Some(p) => println!("  project_root:  {}", p.display()),
         None => println!("  project_root:  (not found)"),
     }
-    if let Some(p) = &r.swarm_dir {
+    if let Some(p) = &r.spar_dir {
         let exists = p.is_dir();
         println!(
-            "  swarm_dir:     {}{}",
+            "  spar_dir:     {}{}",
             p.display(),
             if exists { "" } else { " (not created yet)" }
         );

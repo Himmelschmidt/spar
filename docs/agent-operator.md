@@ -1,15 +1,15 @@
 # Agent operator contract
 
-How an **outer agent** (Claude, Grok, agy, etc.) should call `agent-swarm`.
+How an **outer agent** (Claude, Grok, agy, etc.) should call `spar`.
 
 ## Principles
 
 1. Prefer `--json` and parse stdout.
 2. Prefer `--detach` + `wait` / `status` over long blocking calls when you need to stay responsive.
-3. Read artifacts from disk under `.swarm/runs/<run-id>/` — do not rely on chat alone.
+3. Read artifacts from disk under `.spar/runs/<run-id>/` — do not rely on chat alone.
 4. Branch on exit codes, not only stderr text.
 5. Never merge to the default branch; shipping is gated.
-6. Use `--dry-run` (or `AGENT_SWARM_DRY_RUN=1`) to exercise workflows without live provider CLIs.
+6. Use `--dry-run` (or `SPAR_DRY_RUN=1`) to exercise workflows without live provider CLIs.
 
 ## Exit codes
 
@@ -24,29 +24,29 @@ How an **outer agent** (Claude, Grok, agy, etc.) should call `agent-swarm`.
 ## Typical Path A (plan → approve → implement)
 
 ```bash
-agent-swarm plan --task "$TASK" --detach --json
+spar plan --task "$TASK" --detach --json
 # → { "run_id": "...", "phase": "...", ... }
 
-agent-swarm wait "$RUN_ID" --json
+spar wait "$RUN_ID" --json
 # exit 2 + phase awaiting_plan_approval
 
 # Read plan for the human:
-#   .swarm/runs/$RUN_ID/artifacts/plan.md
+#   .spar/runs/$RUN_ID/artifacts/plan.md
 
-agent-swarm approve "$RUN_ID" --json
+spar approve "$RUN_ID" --json
 
 # implement creates a *new* run id (parent plan stays plan_approved).
 # Always take run_id from implement's JSON — do not wait on the plan id.
-agent-swarm implement --run "$RUN_ID" --detach --json
+spar implement --run "$RUN_ID" --detach --json
 # → { "run_id": "<IMPL_ID>", "parent_run": "<PLAN_ID>", ... }
 # Plan state also records child_run for discovery:
-#   agent-swarm status "$RUN_ID" --json  →  .child_run
+#   spar status "$RUN_ID" --json  →  .child_run
 
 IMPL_ID=...   # from implement JSON run_id
-agent-swarm wait "$IMPL_ID" --json
+spar wait "$IMPL_ID" --json
 # exit 2 + awaiting_ship_confirm when ready
 
-agent-swarm ship "$IMPL_ID" --confirm --json
+spar ship "$IMPL_ID" --confirm --json
 ```
 
 **Note:** `exit_code` in JSON is only set when the phase is terminal or a human gate (`null` while in-flight). Prefer `phase` + polling `wait`.
@@ -54,32 +54,32 @@ agent-swarm ship "$IMPL_ID" --confirm --json
 ## Typical Path B (autonomous task)
 
 ```bash
-agent-swarm implement --task "$TASK" --detach --json
-# or: agent-swarm run --workflow loop --task "$TASK" --detach --json
+spar implement --task "$TASK" --detach --json
+# or: spar run --workflow loop --task "$TASK" --detach --json
 # Use the run_id from that command's JSON response:
-agent-swarm wait "$RUN_ID" --timeout 2h --json
+spar wait "$RUN_ID" --timeout 2h --json
 ```
 
 ## Arena
 
 ```bash
-agent-swarm run --workflow arena --task "$TASK" --json
+spar run --workflow arena --task "$TASK" --json
 # exit 2 awaiting_winner_confirm
-agent-swarm confirm "$RUN_ID" [--winner slot-id] --json
-agent-swarm ship "$RUN_ID" --confirm --json
+spar confirm "$RUN_ID" [--winner slot-id] --json
+spar ship "$RUN_ID" --confirm --json
 ```
 
 ## Roles / peer
 
 ```bash
-agent-swarm run --workflow roles --task "$TASK" --json
-agent-swarm run --workflow peer --task "$TASK" --json
-# mailbox under .swarm/runs/$RUN_ID/mailbox/
+spar run --workflow roles --task "$TASK" --json
+spar run --workflow peer --task "$TASK" --json
+# mailbox under .spar/runs/$RUN_ID/mailbox/
 ```
 
 ## Status JSON (shape)
 
-`agent-swarm status <run-id> --json` returns `RunState`:
+`spar status <run-id> --json` returns `RunState`:
 
 ```json
 {
@@ -118,16 +118,16 @@ Machine-oriented start responses (`plan`/`implement`/`run --json`) use:
 ## Wait / logs / attach
 
 ```bash
-agent-swarm wait "$RUN_ID" --timeout 30m --json
-agent-swarm logs "$RUN_ID"
-agent-swarm logs "$RUN_ID" impl-claude
-agent-swarm attach "$RUN_ID"   # tmux backend only
+spar wait "$RUN_ID" --timeout 30m --json
+spar logs "$RUN_ID"
+spar logs "$RUN_ID" impl-claude
+spar attach "$RUN_ID"   # tmux backend only
 ```
 
 ## Doctor
 
 ```bash
-agent-swarm doctor --json
+spar doctor --json
 ```
 
 Use before a swarm if you are unsure providers are installed. `ok: false` means git missing or no providers on PATH (dry-run still works for workflow testing).
@@ -135,9 +135,9 @@ Use before a swarm if you are unsure providers are installed. `ok: false` means 
 ## Providers / quota
 
 ```bash
-agent-swarm provider list --json
-agent-swarm provider pause claude [--until 1h]
-agent-swarm provider resume claude
+spar provider list --json
+spar provider pause claude [--until 1h]
+spar provider resume claude
 ```
 
 First-class v1 names: `claude`, `grok`, `agy`.
@@ -147,8 +147,8 @@ Paused providers are skipped by the scheduler. If **every** selected provider is
 ## Cleanup
 
 ```bash
-agent-swarm cleanup "$RUN_ID"           # remove worktrees
-agent-swarm cleanup "$RUN_ID" --purge   # also delete .swarm/runs/<id>
+spar cleanup "$RUN_ID"           # remove worktrees
+spar cleanup "$RUN_ID" --purge   # also delete .spar/runs/<id>
 ```
 
 ## What not to do

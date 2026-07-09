@@ -1,7 +1,7 @@
 # Swarm bus — agent-to-agent communication
 
 **Status:** LEANING (product planning)  
-**Not:** a Pi extension. First-class subsystem of agent-swarm.  
+**Not:** a Pi extension. First-class subsystem of spar.  
 **Inspiration:** pi-messenger (file bus, presence, steer, reserves, crew waves) — improved for dual-backend + orchestrator ownership.
 
 ---
@@ -19,7 +19,7 @@
 ## Layout
 
 ```text
-.swarm/runs/<run_id>/
+.spar/runs/<run_id>/
   bus/
     agents.jsonl       # join / leave / heartbeat / status
     events.jsonl       # append-only: messages + activity (tail = live stream)
@@ -76,7 +76,7 @@
 
 | | pi-messenger | swarm bus |
 |--|--------------|-----------|
-| Host | Pi extension | agent-swarm product |
+| Host | Pi extension | spar product |
 | Scope | Often global + folder | **Run-scoped** default |
 | Fleet | Pi subprocesses | **Heterogeneous** CLI + API |
 | Orchestration | Optional crew self-mesh | **Strong orchestrator** + peer talk |

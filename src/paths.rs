@@ -1,17 +1,17 @@
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
-/// Layout under `<project>/.swarm/`.
+/// Layout under `<project>/.spar/`.
 #[derive(Debug, Clone)]
-pub struct SwarmPaths {
+pub struct SparPaths {
     pub project_root: PathBuf,
     pub root: PathBuf,
 }
 
-impl SwarmPaths {
+impl SparPaths {
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
         let project_root = project_root.into();
-        let root = project_root.join(".swarm");
+        let root = project_root.join(".spar");
         Self { project_root, root }
     }
 
@@ -79,7 +79,7 @@ impl SwarmPaths {
     }
 }
 
-/// Walk up from cwd looking for `.git` or existing `.swarm`.
+/// Walk up from cwd looking for `.git` or existing `.spar`.
 pub fn find_project_root() -> Result<PathBuf> {
     find_project_root_from(std::env::current_dir()?)
 }
@@ -87,12 +87,12 @@ pub fn find_project_root() -> Result<PathBuf> {
 pub fn find_project_root_from(start: impl AsRef<Path>) -> Result<PathBuf> {
     let mut dir = start.as_ref().to_path_buf();
     loop {
-        if dir.join(".git").exists() || dir.join(".swarm").exists() {
+        if dir.join(".git").exists() || dir.join(".spar").exists() {
             return Ok(dir);
         }
         if !dir.pop() {
             bail!(
-                "not inside a project (no .git or .swarm above {})",
+                "not inside a project (no .git or .spar above {})",
                 start.as_ref().display()
             );
         }
@@ -117,7 +117,7 @@ mod tests {
     #[test]
     fn run_layout() {
         let tmp = tempdir().unwrap();
-        let paths = SwarmPaths::new(tmp.path());
+        let paths = SparPaths::new(tmp.path());
         paths.ensure_run_dirs("abc").unwrap();
         assert!(paths.artifacts_dir("abc").is_dir());
         assert!(paths.markers_dir("abc").is_dir());

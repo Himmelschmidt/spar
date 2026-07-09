@@ -1,7 +1,7 @@
 use crate::cli::{Backend, WorkflowKind};
 use crate::config::IsolationMode;
 use crate::exit_codes::ExitCode;
-use crate::paths::SwarmPaths;
+use crate::paths::SparPaths;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -219,7 +219,7 @@ impl RunState {
         self.touch();
     }
 
-    pub fn load(paths: &SwarmPaths, run_id: &str) -> Result<Self> {
+    pub fn load(paths: &SparPaths, run_id: &str) -> Result<Self> {
         let file = paths.state_file(run_id);
         let text = std::fs::read_to_string(&file)
             .with_context(|| format!("read run state {}", file.display()))?;
@@ -228,7 +228,7 @@ impl RunState {
         Ok(state)
     }
 
-    pub fn save(&self, paths: &SwarmPaths) -> Result<()> {
+    pub fn save(&self, paths: &SparPaths) -> Result<()> {
         paths.ensure_run_dirs(&self.id)?;
         let file = paths.state_file(&self.id);
         let text = serde_json::to_string_pretty(self)?;
@@ -266,7 +266,7 @@ impl RunState {
     }
 }
 
-pub fn list_runs(paths: &SwarmPaths) -> Result<Vec<RunSummary>> {
+pub fn list_runs(paths: &SparPaths) -> Result<Vec<RunSummary>> {
     let runs_dir = paths.runs_dir();
     if !runs_dir.is_dir() {
         return Ok(Vec::new());
@@ -297,13 +297,13 @@ pub fn list_runs(paths: &SwarmPaths) -> Result<Vec<RunSummary>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::paths::SwarmPaths;
+    use crate::paths::SparPaths;
     use tempfile::tempdir;
 
     #[test]
     fn roundtrip_state() {
         let tmp = tempdir().unwrap();
-        let paths = SwarmPaths::new(tmp.path());
+        let paths = SparPaths::new(tmp.path());
         let mut state = RunState::new("run1", WorkflowKind::Plan, tmp.path().to_path_buf());
         state.phase = Phase::AwaitingPlanApproval;
         state.task = Some("do the thing".into());

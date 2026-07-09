@@ -10,7 +10,7 @@
 
 ## Milestone 1 — Product shell (TUI-first)
 
-- [ ] `agent-swarm` with no subcommand opens full TUI in repo  
+- [ ] `spar` with no subcommand opens full TUI in repo  
 - [ ] Fleet panel, phase/gates, live log pane, basic actions  
 - [ ] Event stream file + follow  
 - [ ] Skills: `skills list` / `skills get core`  

@@ -1,4 +1,4 @@
-use crate::paths::SwarmPaths;
+use crate::paths::SparPaths;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -33,7 +33,7 @@ impl Message {
     }
 }
 
-fn message_path(paths: &SwarmPaths, run_id: &str, msg: &Message) -> PathBuf {
+fn message_path(paths: &SparPaths, run_id: &str, msg: &Message) -> PathBuf {
     paths.mailbox_dir(run_id).join(format!(
         "{}-{}-{}.json",
         msg.created_at.timestamp_millis(),
@@ -42,7 +42,7 @@ fn message_path(paths: &SwarmPaths, run_id: &str, msg: &Message) -> PathBuf {
     ))
 }
 
-pub fn send(paths: &SwarmPaths, run_id: &str, msg: &Message) -> Result<PathBuf> {
+pub fn send(paths: &SparPaths, run_id: &str, msg: &Message) -> Result<PathBuf> {
     paths.ensure_run_dirs(run_id)?;
     let path = message_path(paths, run_id, msg);
     let text = serde_json::to_string_pretty(msg)?;
@@ -50,7 +50,7 @@ pub fn send(paths: &SwarmPaths, run_id: &str, msg: &Message) -> Result<PathBuf> 
     Ok(path)
 }
 
-pub fn list(paths: &SwarmPaths, run_id: &str) -> Result<Vec<Message>> {
+pub fn list(paths: &SparPaths, run_id: &str) -> Result<Vec<Message>> {
     let dir = paths.mailbox_dir(run_id);
     if !dir.is_dir() {
         return Ok(Vec::new());
@@ -78,7 +78,7 @@ mod tests {
     #[test]
     fn send_and_list() {
         let tmp = tempdir().unwrap();
-        let paths = SwarmPaths::new(tmp.path());
+        let paths = SparPaths::new(tmp.path());
         let msg = Message::new("peer-a", "peer-b", "hello", "world");
         send(&paths, "r1", &msg).unwrap();
         let all = list(&paths, "r1").unwrap();

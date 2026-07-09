@@ -1,15 +1,15 @@
 [package]
-name = "agent-swarm"
+name = "spar"
 version = "0.1.0"
 edition = "2021"
-description = "Orchestrate native subscription AI CLIs for multi-provider planning, implementation, and review"
+description = "Multi-agent coding product: fleet TUI, dual backends, plan/review/arena/ship"
 license = "MIT"
 readme = "README.md"
-keywords = ["agents", "orchestration", "cli", "swarm"]
+keywords = ["agents", "orchestration", "cli", "tui"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
-name = "agent-swarm"
+name = "spar"
 path = "src/main.rs"
 
 [dependencies]

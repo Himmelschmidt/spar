@@ -48,7 +48,7 @@ fn plan_approve_implement_dry_run() {
     init_git_repo(tmp.path());
     let branch_before = primary_branch(tmp.path());
 
-    let plan = cargo_bin_cmd!("agent-swarm")
+    let plan = cargo_bin_cmd!("spar")
         .current_dir(tmp.path())
         .args([
             "plan",
@@ -67,18 +67,18 @@ fn plan_approve_implement_dry_run() {
 
     let plan_path = tmp
         .path()
-        .join(".swarm/runs")
+        .join(".spar/runs")
         .join(run_id)
         .join("artifacts/plan.md");
     assert!(plan_path.is_file(), "plan.md should exist");
     let done_marker = tmp
         .path()
-        .join(".swarm/runs")
+        .join(".spar/runs")
         .join(run_id)
         .join("markers")
         .join("planner-claude.done");
     // planner id may be planner-{provider}; at least one done marker
-    let markers = tmp.path().join(".swarm/runs").join(run_id).join("markers");
+    let markers = tmp.path().join(".spar/runs").join(run_id).join("markers");
     let has_done = std::fs::read_dir(&markers)
         .unwrap()
         .flatten()
@@ -92,14 +92,14 @@ fn plan_approve_implement_dry_run() {
 
     assert_eq!(primary_branch(tmp.path()), branch_before);
 
-    cargo_bin_cmd!("agent-swarm")
+    cargo_bin_cmd!("spar")
         .current_dir(tmp.path())
         .args(["approve", run_id, "--json"])
         .assert()
         .success()
         .stdout(predicate::str::contains("plan_approved"));
 
-    let impl_out = cargo_bin_cmd!("agent-swarm")
+    let impl_out = cargo_bin_cmd!("spar")
         .current_dir(tmp.path())
         .args(["implement", "--run", run_id, "--dry-run", "--json"])
         .assert()
@@ -113,7 +113,7 @@ fn plan_approve_implement_dry_run() {
     assert_eq!(impl_v["parent_run"].as_str(), Some(run_id));
 
     // parent records child_run
-    let parent = cargo_bin_cmd!("agent-swarm")
+    let parent = cargo_bin_cmd!("spar")
         .current_dir(tmp.path())
         .args(["status", run_id, "--json"])
         .assert()
@@ -125,7 +125,7 @@ fn plan_approve_implement_dry_run() {
     // worktree sibling naming for implementer
     let state_path = tmp
         .path()
-        .join(".swarm/runs")
+        .join(".spar/runs")
         .join(impl_id)
         .join("state.json");
     let state: serde_json::Value =
@@ -134,38 +134,38 @@ fn plan_approve_implement_dry_run() {
     assert!(!wts.is_empty());
     let wt_path = wts[0]["path"].as_str().unwrap();
     assert!(
-        wt_path.contains("-swarm-") && wt_path.contains(impl_id),
+        wt_path.contains("-spar-") && wt_path.contains(impl_id),
         "unexpected worktree path {wt_path}"
     );
 
     assert_eq!(primary_branch(tmp.path()), branch_before);
 
     // ship without confirm → gate 2
-    cargo_bin_cmd!("agent-swarm")
+    cargo_bin_cmd!("spar")
         .current_dir(tmp.path())
         .args(["ship", impl_id, "--json"])
         .assert()
         .code(2);
 
     // dry-run ship with confirm writes ship.md, no real push
-    cargo_bin_cmd!("agent-swarm")
+    cargo_bin_cmd!("spar")
         .current_dir(tmp.path())
         .args(["ship", impl_id, "--confirm", "--json"])
         .assert()
         .success();
     assert!(tmp
         .path()
-        .join(".swarm/runs")
+        .join(".spar/runs")
         .join(impl_id)
         .join("artifacts/ship.md")
         .is_file());
 
-    cargo_bin_cmd!("agent-swarm")
+    cargo_bin_cmd!("spar")
         .current_dir(tmp.path())
         .args(["cleanup", run_id, "--purge", "--json"])
         .assert()
         .success();
-    cargo_bin_cmd!("agent-swarm")
+    cargo_bin_cmd!("spar")
         .current_dir(tmp.path())
         .args(["cleanup", impl_id, "--purge", "--json"])
         .assert()
@@ -178,9 +178,9 @@ fn stuck_policy_dry_run_request_changes() {
     init_git_repo(tmp.path());
 
     // Force request_changes every review → fix rounds → rotate → widen → stuck
-    let out = cargo_bin_cmd!("agent-swarm")
+    let out = cargo_bin_cmd!("spar")
         .current_dir(tmp.path())
-        .env("AGENT_SWARM_FORCE_REQUEST_CHANGES", "1")
+        .env("SPAR_FORCE_REQUEST_CHANGES", "1")
         .args([
             "implement",
             "--task",
@@ -197,7 +197,7 @@ fn stuck_policy_dry_run_request_changes() {
     let run_id = v["run_id"].as_str().unwrap();
     let esc = tmp
         .path()
-        .join(".swarm/runs")
+        .join(".spar/runs")
         .join(run_id)
         .join("artifacts/escalation.md");
     assert!(esc.is_file());
@@ -220,7 +220,7 @@ fn quota_exit_when_all_paused() {
     init_git_repo(tmp.path());
 
     for p in ["claude", "grok", "agy"] {
-        cargo_bin_cmd!("agent-swarm")
+        cargo_bin_cmd!("spar")
             .current_dir(tmp.path())
             .args(["provider", "pause", p])
             .assert()
@@ -228,7 +228,7 @@ fn quota_exit_when_all_paused() {
     }
 
     // Force provider names so we hit quota filter even if some are missing on PATH.
-    let r = cargo_bin_cmd!("agent-swarm")
+    let r = cargo_bin_cmd!("spar")
         .current_dir(tmp.path())
         .args([
             "plan",
@@ -248,7 +248,7 @@ fn quota_exit_when_all_paused() {
         assert_eq!(v["exit_code"], 4, "JSON exit_code must match process 4");
         assert_eq!(v["phase"], "quota");
         let run_id = v["run_id"].as_str().unwrap();
-        cargo_bin_cmd!("agent-swarm")
+        cargo_bin_cmd!("spar")
             .current_dir(tmp.path())
             .args(["status", run_id, "--json"])
             .assert()
@@ -270,7 +270,7 @@ fn arena_dry_run() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
 
-    cargo_bin_cmd!("agent-swarm")
+    cargo_bin_cmd!("spar")
         .current_dir(tmp.path())
         .args([
             "run",
@@ -291,7 +291,7 @@ fn peer_and_roles_dry_run() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
 
-    cargo_bin_cmd!("agent-swarm")
+    cargo_bin_cmd!("spar")
         .current_dir(tmp.path())
         .args([
             "run",
@@ -306,7 +306,7 @@ fn peer_and_roles_dry_run() {
         .success()
         .stdout(predicate::str::contains("\"phase\": \"done\""));
 
-    cargo_bin_cmd!("agent-swarm")
+    cargo_bin_cmd!("spar")
         .current_dir(tmp.path())
         .args([
             "run",
@@ -326,14 +326,14 @@ fn provider_pause_resume() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
 
-    cargo_bin_cmd!("agent-swarm")
+    cargo_bin_cmd!("spar")
         .current_dir(tmp.path())
         .args(["provider", "pause", "claude", "--json"])
         .assert()
         .success()
         .stdout(predicate::str::contains("paused_manual"));
 
-    cargo_bin_cmd!("agent-swarm")
+    cargo_bin_cmd!("spar")
         .current_dir(tmp.path())
         .args(["provider", "resume", "claude", "--json"])
         .assert()
@@ -346,7 +346,7 @@ fn path_b_implement_task() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
 
-    cargo_bin_cmd!("agent-swarm")
+    cargo_bin_cmd!("spar")
         .current_dir(tmp.path())
         .args([
             "implement",

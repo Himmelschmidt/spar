@@ -1,7 +1,7 @@
 use crate::cli::Backend;
 use crate::config::Config;
 use crate::markers;
-use crate::paths::SwarmPaths;
+use crate::paths::SparPaths;
 use crate::process::{self, SpawnRequest};
 use crate::providers::{self, SpawnOpts, TrustPolicy};
 use crate::sandbox;
@@ -46,7 +46,7 @@ pub struct SlotJob {
 
 pub fn run_slot(
     state: &mut RunState,
-    paths: &SwarmPaths,
+    paths: &SparPaths,
     cfg: &Config,
     job: &SlotJob,
 ) -> Result<()> {
@@ -68,7 +68,7 @@ pub fn run_slot(
         .iter()
         .find(|w| w.slot_id == job.slot_id)
         .map(|w| w.branch.clone())
-        .unwrap_or_else(|| format!("swarm/{}/{}", state.id, job.slot_id));
+        .unwrap_or_else(|| format!("spar/{}/{}", state.id, job.slot_id));
 
     let project_root_s = state.project_root.display().to_string();
     let cwd_s = cwd.display().to_string();
@@ -173,7 +173,7 @@ struct SlotOutcome {
 
 fn run_dry(
     state: &mut RunState,
-    paths: &SwarmPaths,
+    paths: &SparPaths,
     job: &SlotJob,
     cwd: &Path,
     log_path: &Path,
@@ -208,7 +208,7 @@ fn run_dry(
 
 fn write_dry_artifacts(
     state: &RunState,
-    paths: &SwarmPaths,
+    paths: &SparPaths,
     job: &SlotJob,
     cwd: &Path,
     _prompt: &str,
@@ -234,7 +234,7 @@ fn write_dry_artifacts(
             }
         }
         SlotRole::Implementer => {
-            let stamp = cwd.join(".swarm-dry-implement");
+            let stamp = cwd.join(".spar-dry-implement");
             std::fs::write(
                 &stamp,
                 format!("implemented (dry-run) by {} for: {task}\n", job.slot_id),
@@ -249,7 +249,7 @@ fn write_dry_artifacts(
             )?;
         }
         SlotRole::Reviewer => {
-            let force_rc = crate::util::env_truthy("AGENT_SWARM_FORCE_REQUEST_CHANGES")
+            let force_rc = crate::util::env_truthy("SPAR_FORCE_REQUEST_CHANGES")
                 || job.slot_id.contains("harsh")
                 || job.extra_vars.contains_key("request_changes");
             let verdict = if force_rc {
@@ -314,7 +314,7 @@ fn write_dry_artifacts(
 #[allow(clippy::too_many_arguments)]
 fn run_headless(
     state: &RunState,
-    paths: &SwarmPaths,
+    paths: &SparPaths,
     job: &SlotJob,
     cwd: &Path,
     log_path: &Path,
@@ -388,7 +388,7 @@ fn run_headless(
 #[allow(clippy::too_many_arguments)]
 fn run_tmux(
     state: &mut RunState,
-    paths: &SwarmPaths,
+    paths: &SparPaths,
     job: &SlotJob,
     cwd: &Path,
     log_path: &Path,
@@ -504,7 +504,7 @@ pub fn print_run_human(state: &RunState) {
 }
 
 pub fn wait_run(
-    paths: &SwarmPaths,
+    paths: &SparPaths,
     run_id: &str,
     timeout: Duration,
     json: bool,

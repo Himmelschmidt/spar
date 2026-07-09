@@ -1,5 +1,5 @@
 /target/
-.swarm/
+.spar/
 **/*.rs.bk
 .DS_Store
 .env

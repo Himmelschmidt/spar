@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// User/project config. Project `agent-swarm.toml` field-overlays user config.
+/// User/project config. Project `spar.toml` field-overlays user config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_max_agents")]
@@ -126,7 +126,7 @@ impl Config {
                 cfg.apply_file(&load_file(&user_path)?)?;
             }
         }
-        let project_path = project_root.join("agent-swarm.toml");
+        let project_path = project_root.join("spar.toml");
         if project_path.is_file() {
             cfg.apply_file(&load_file(&project_path)?)?;
         }
@@ -166,7 +166,7 @@ impl Config {
 }
 
 fn user_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("agent-swarm").join("config.toml"))
+    dirs::config_dir().map(|d| d.join("spar").join("config.toml"))
 }
 
 fn load_file(path: &Path) -> Result<ConfigFile> {
@@ -187,7 +187,7 @@ mod tests {
     fn partial_project_overlays_user() {
         let tmp = tempdir().unwrap();
         let project = tmp.path();
-        std::fs::write(project.join("agent-swarm.toml"), "max_agents = 2\n").unwrap();
+        std::fs::write(project.join("spar.toml"), "max_agents = 2\n").unwrap();
         let cfg = Config::load(project).unwrap();
         assert_eq!(cfg.max_agents, 2);
         assert_eq!(cfg.providers.order, default_provider_order());

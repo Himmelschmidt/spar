@@ -1,12 +1,12 @@
 use crate::config::Config;
 use crate::executor;
 use crate::exit_codes::ExitCode;
-use crate::paths::SwarmPaths;
+use crate::paths::SparPaths;
 use crate::state::{Phase, RunState};
 use anyhow::{bail, Result};
 use std::process::Command;
 
-pub fn confirm_ship(paths: &SwarmPaths, run_id: &str, json: bool) -> Result<ExitCode> {
+pub fn confirm_ship(paths: &SparPaths, run_id: &str, json: bool) -> Result<ExitCode> {
     let mut state = RunState::load(paths, run_id)?;
     state.gates.ship_confirmed = true;
     if state.phase == Phase::AwaitingShipConfirm || state.phase == Phase::AwaitingWinnerConfirm {
@@ -23,12 +23,12 @@ pub fn confirm_ship(paths: &SwarmPaths, run_id: &str, json: bool) -> Result<Exit
     if json {
         executor::emit_run_json(&state)?;
     } else {
-        println!("ship confirmed for {run_id}; run: agent-swarm ship {run_id}");
+        println!("ship confirmed for {run_id}; run: spar ship {run_id}");
     }
     Ok(ExitCode::Success)
 }
 
-pub fn ship(paths: &SwarmPaths, cfg: &Config, run_id: &str, json: bool) -> Result<ExitCode> {
+pub fn ship(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> Result<ExitCode> {
     let mut state = RunState::load(paths, run_id)?;
     if !state.gates.ship_confirmed && !cfg.ship.auto_confirm {
         if state.phase == Phase::AwaitingShipConfirm || state.phase == Phase::AwaitingWinnerConfirm
@@ -39,7 +39,7 @@ pub fn ship(paths: &SwarmPaths, cfg: &Config, run_id: &str, json: bool) -> Resul
             if json {
                 executor::emit_run_json(&state)?;
             } else {
-                eprintln!("ship requires confirm: agent-swarm ship {run_id} --confirm");
+                eprintln!("ship requires confirm: spar ship {run_id} --confirm");
             }
             return Ok(ExitCode::HumanGate);
         }
@@ -82,7 +82,7 @@ pub fn ship(paths: &SwarmPaths, cfg: &Config, run_id: &str, json: bool) -> Resul
     let title = state
         .task
         .as_deref()
-        .unwrap_or("agent-swarm change")
+        .unwrap_or("spar change")
         .chars()
         .take(72)
         .collect::<String>();
@@ -95,7 +95,7 @@ pub fn ship(paths: &SwarmPaths, cfg: &Config, run_id: &str, json: bool) -> Resul
         "cd {} && gh pr create --head {branch} --title {} --body {}",
         cwd.display(),
         shell_single_quote(&title),
-        shell_single_quote(&format!("agent-swarm run `{}`", state.id))
+        shell_single_quote(&format!("spar run `{}`", state.id))
     );
 
     let commands = vec![push_cmd, pr_cmd];
@@ -134,7 +134,7 @@ pub fn ship(paths: &SwarmPaths, cfg: &Config, run_id: &str, json: bool) -> Resul
                 "--title",
                 &title,
                 "--body",
-                &format!("Shipped by agent-swarm run {}", state.id),
+                &format!("Shipped by spar run {}", state.id),
             ])
             .current_dir(&cwd)
             .output();
@@ -218,7 +218,7 @@ fn select_branch_cwd(state: &RunState) -> Result<(String, std::path::PathBuf)> {
                 .iter()
                 .find(|w| w.slot_id == imp.id)
                 .map(|w| w.branch.clone())
-                .unwrap_or_else(|| format!("swarm/{}/{}", state.id, imp.id));
+                .unwrap_or_else(|| format!("spar/{}/{}", state.id, imp.id));
             return Ok((branch, cwd.clone()));
         }
     }

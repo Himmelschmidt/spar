@@ -2,7 +2,7 @@ use super::CommonOpts;
 use crate::config::Config;
 use crate::executor::{self, SlotJob};
 use crate::exit_codes::ExitCode;
-use crate::paths::SwarmPaths;
+use crate::paths::SparPaths;
 use crate::providers;
 use crate::state::{Phase, RunState, SlotRole};
 use crate::util;
@@ -10,10 +10,10 @@ use crate::worktree;
 use anyhow::Result;
 use std::collections::HashMap;
 
-pub fn run(task: String, opts: CommonOpts, paths: &SwarmPaths, cfg: &Config) -> Result<ExitCode> {
+pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode> {
     let dry = opts.resolve_dry_run();
     if dry {
-        std::env::set_var("AGENT_SWARM_DRY_RUN", "1");
+        std::env::set_var("SPAR_DRY_RUN", "1");
     }
     let run_id = util::short_run_id();
     let mut state = RunState::new(
@@ -94,7 +94,7 @@ pub fn run(task: String, opts: CommonOpts, paths: &SwarmPaths, cfg: &Config) -> 
 
 pub fn execute_plan(
     state: &mut RunState,
-    paths: &SwarmPaths,
+    paths: &SparPaths,
     cfg: &Config,
     jobs: &[SlotJob],
 ) -> Result<()> {
@@ -149,7 +149,7 @@ pub fn execute_plan(
     Ok(())
 }
 
-pub fn approve(paths: &SwarmPaths, run_id: &str, json: bool) -> Result<ExitCode> {
+pub fn approve(paths: &SparPaths, run_id: &str, json: bool) -> Result<ExitCode> {
     let mut state = RunState::load(paths, run_id)?;
     if state.phase != Phase::AwaitingPlanApproval && state.phase != Phase::PlanRejected {
         anyhow::bail!(
@@ -165,13 +165,13 @@ pub fn approve(paths: &SwarmPaths, run_id: &str, json: bool) -> Result<ExitCode>
         executor::emit_run_json(&state)?;
     } else {
         println!("approved plan for run {run_id}");
-        println!("next: agent-swarm implement --run {run_id}");
+        println!("next: spar implement --run {run_id}");
     }
     Ok(ExitCode::Success)
 }
 
 pub fn reject(
-    paths: &SwarmPaths,
+    paths: &SparPaths,
     run_id: &str,
     reason: Option<String>,
     json: bool,
@@ -203,7 +203,7 @@ fn detach_self(state: &RunState, json: bool) -> Result<ExitCode> {
         child_cmd
             .arg("__internal_continue")
             .arg(&state.id)
-            .env("AGENT_SWARM_INTERNAL", "1")
+            .env("SPAR_INTERNAL", "1")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
@@ -218,12 +218,12 @@ fn detach_self(state: &RunState, json: bool) -> Result<ExitCode> {
         executor::emit_run_json(state)?;
     } else {
         executor::print_run_human(state);
-        println!("detached; poll with: agent-swarm wait {}", state.id);
+        println!("detached; poll with: spar wait {}", state.id);
     }
     Ok(ExitCode::Success)
 }
 
-pub fn continue_run(paths: &SwarmPaths, cfg: &Config, run_id: &str) -> Result<ExitCode> {
+pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<ExitCode> {
     let mut state = RunState::load(paths, run_id)?;
     let mut jobs = Vec::new();
     for slot in &state.slots {
