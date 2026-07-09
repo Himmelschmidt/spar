@@ -1,13 +1,15 @@
-//! Product shell — fleet control room styled like a first-class coding agent.
+//! Product shell — clear fleet dashboard for multi-agent runs.
+use crate::cli::WorkflowKind;
 use crate::config::Config;
 use crate::events;
 use crate::liveness::SlotActivity;
 use crate::paths::{self, SparPaths};
-use crate::process::{self, StreamStats};
+use crate::process;
 use crate::quota::QuotaStore;
 use crate::state::{self, Phase, RunState, SlotState, SlotStatus};
 use crate::workflow;
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
     MouseButton, MouseEventKind,
@@ -25,7 +27,7 @@ use std::io::stdout;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-// ── palette (dark agent-cli aesthetic) ──────────────────────────────────────
+// ── palette ─────────────────────────────────────────────────────────────────
 
 const BG: Color = Color::Rgb(12, 14, 18);
 const BG_PANEL: Color = Color::Rgb(18, 21, 28);
@@ -44,31 +46,42 @@ const MAGENTA: Color = Color::Rgb(188, 120, 240);
 const CYAN: Color = Color::Rgb(57, 190, 200);
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const PULSE: &[&str] = &["●", "◉", "○", "◉"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
-    Fleet,
-    Stream,
-    Bus,
+    Runs,
+    Agents,
+    Log,
+    Messages,
     Composer,
 }
 
 impl Focus {
     fn next(self) -> Self {
         match self {
-            Focus::Fleet => Focus::Stream,
-            Focus::Stream => Focus::Bus,
-            Focus::Bus => Focus::Composer,
-            Focus::Composer => Focus::Fleet,
+            Focus::Runs => Focus::Agents,
+            Focus::Agents => Focus::Log,
+            Focus::Log => Focus::Messages,
+            Focus::Messages => Focus::Composer,
+            Focus::Composer => Focus::Runs,
         }
     }
     fn prev(self) -> Self {
         match self {
-            Focus::Fleet => Focus::Composer,
-            Focus::Stream => Focus::Fleet,
-            Focus::Bus => Focus::Stream,
-            Focus::Composer => Focus::Bus,
+            Focus::Runs => Focus::Composer,
+            Focus::Agents => Focus::Runs,
+            Focus::Log => Focus::Agents,
+            Focus::Messages => Focus::Log,
+            Focus::Composer => Focus::Messages,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Focus::Runs => "Runs",
+            Focus::Agents => "Agents",
+            Focus::Log => "Live log",
+            Focus::Messages => "Messages",
+            Focus::Composer => "Command",
         }
     }
 }
@@ -113,13 +126,12 @@ struct App {
     stream_scroll: u16,
     bus_scroll: u16,
     tick: u64,
-    started: Instant,
     flash: Option<(Instant, String, Color)>,
-    mouse_hint_shown: bool,
-    last_click: Option<(u16, u16, Instant)>,
     stall_warn_secs: u64,
-    /// Layout rects for hit-testing mouse clicks
+    last_click: Option<(u16, u16, Instant)>,
+    show_help: bool,
     rect_header: Rect,
+    rect_action: Rect,
     rect_fleet: Rect,
     rect_stream: Rect,
     rect_bus: Rect,
@@ -132,18 +144,18 @@ impl App {
         Self {
             selected_run: 0,
             selected_slot: 0,
-            focus: Focus::Composer,
+            focus: Focus::Runs,
             composer: task_seed.unwrap_or_default(),
             status_line: String::new(),
             stream_scroll: 0,
             bus_scroll: 0,
             tick: 0,
-            started: Instant::now(),
             flash: None,
-            mouse_hint_shown: false,
             stall_warn_secs,
             last_click: None,
+            show_help: false,
             rect_header: Rect::default(),
+            rect_action: Rect::default(),
             rect_fleet: Rect::default(),
             rect_stream: Rect::default(),
             rect_bus: Rect::default(),
@@ -155,14 +167,29 @@ impl App {
     fn flash(&mut self, msg: impl Into<String>, color: Color) {
         self.flash = Some((Instant::now(), msg.into(), color));
         self.status_line.clear();
+        self.show_help = false;
     }
 
     fn spinner(&self) -> &'static str {
         SPINNER[(self.tick as usize) % SPINNER.len()]
     }
 
-    fn pulse(&self) -> &'static str {
-        PULSE[(self.tick as usize / 4) % PULSE.len()]
+    fn select_run(&mut self, idx: usize, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.selected_run = idx.min(n - 1);
+        self.selected_slot = 0;
+        self.stream_scroll = 0;
+        self.bus_scroll = 0;
+    }
+
+    fn select_slot(&mut self, idx: usize, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.selected_slot = idx.min(n - 1);
+        self.stream_scroll = 0;
     }
 }
 
@@ -214,20 +241,26 @@ fn run_loop(
         let stream_text = stream_content(swarm, full.as_ref(), app.selected_slot);
         let bus_lines = bus_lines(swarm, full.as_ref(), &quota);
 
-        // expire flash
         if let Some((t, _, _)) = &app.flash {
-            if t.elapsed() > Duration::from_secs(3) {
+            if t.elapsed() > Duration::from_secs(4) {
                 app.flash = None;
             }
         }
 
         terminal.draw(|f| {
-            draw(f, swarm, &runs, full.as_ref(), &stream_text, &bus_lines, &app, &mut fleet_state, &mut runs_state);
-            // store rects from last layout — recompute in draw via app mut isn't possible easily;
-            // we recompute hit rects in draw by writing through a side channel
+            draw(
+                f,
+                swarm,
+                &runs,
+                full.as_ref(),
+                &stream_text,
+                &bus_lines,
+                &app,
+                &mut fleet_state,
+                &mut runs_state,
+            );
         })?;
 
-        // recompute rects for mouse (same layout as draw)
         let area = terminal.size()?;
         let layout = layout_rects(Rect {
             x: 0,
@@ -236,6 +269,7 @@ fn run_loop(
             height: area.height,
         });
         app.rect_header = layout.header;
+        app.rect_action = layout.action;
         app.rect_runs = layout.runs;
         app.rect_fleet = layout.fleet;
         app.rect_stream = layout.stream;
@@ -276,12 +310,21 @@ fn handle_key(
     full: Option<&RunState>,
 ) -> Result<bool> {
     let selected_id = runs.get(app.selected_run).map(|r| r.id.as_str());
+    let n_slots = full.map(|s| s.slots.len()).unwrap_or(0);
+
+    if app.show_help {
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter => {
+                app.show_help = false;
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
 
     if app.focus == Focus::Composer {
         match code {
-            KeyCode::Esc => {
-                app.focus = Focus::Fleet;
-            }
+            KeyCode::Esc => app.focus = Focus::Runs,
             KeyCode::Enter => {
                 let line = app.composer.trim().to_string();
                 if !line.is_empty() {
@@ -311,7 +354,14 @@ fn handle_key(
     }
 
     match code {
-        KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+        KeyCode::Char('q') => return Ok(true),
+        KeyCode::Esc => {
+            if app.focus != Focus::Runs {
+                app.focus = Focus::Runs;
+            } else {
+                return Ok(true);
+            }
+        }
         KeyCode::Tab => app.focus = app.focus.next(),
         KeyCode::BackTab => app.focus = app.focus.prev(),
         KeyCode::Char('/') => {
@@ -320,101 +370,103 @@ fn handle_key(
                 app.composer = "/".into();
             }
         }
-        KeyCode::Char('i') => {
-            app.focus = Focus::Composer;
-        }
+        KeyCode::Char('i') => app.focus = Focus::Composer,
         KeyCode::Char('j') | KeyCode::Down => match app.focus {
-            Focus::Fleet => {
-                if let Some(st) = full {
-                    if !st.slots.is_empty() {
-                        app.selected_slot = (app.selected_slot + 1).min(st.slots.len() - 1);
-                        app.stream_scroll = 0;
-                    }
+            Focus::Runs => {
+                if !runs.is_empty() {
+                    app.select_run(app.selected_run + 1, runs.len());
                 }
             }
-            Focus::Stream => app.stream_scroll = app.stream_scroll.saturating_add(2),
-            Focus::Bus => app.bus_scroll = app.bus_scroll.saturating_add(1),
+            Focus::Agents => {
+                if n_slots > 0 {
+                    app.select_slot(app.selected_slot + 1, n_slots);
+                }
+            }
+            Focus::Log => app.stream_scroll = app.stream_scroll.saturating_add(3),
+            Focus::Messages => app.bus_scroll = app.bus_scroll.saturating_add(1),
             Focus::Composer => {}
         },
         KeyCode::Char('k') | KeyCode::Up => match app.focus {
-            Focus::Fleet => {
-                app.selected_slot = app.selected_slot.saturating_sub(1);
-                app.stream_scroll = 0;
+            Focus::Runs => {
+                app.select_run(app.selected_run.saturating_sub(1), runs.len().max(1));
             }
-            Focus::Stream => app.stream_scroll = app.stream_scroll.saturating_sub(2),
-            Focus::Bus => app.bus_scroll = app.bus_scroll.saturating_sub(1),
+            Focus::Agents => {
+                app.select_slot(app.selected_slot.saturating_sub(1), n_slots.max(1));
+            }
+            Focus::Log => app.stream_scroll = app.stream_scroll.saturating_sub(3),
+            Focus::Messages => app.bus_scroll = app.bus_scroll.saturating_sub(1),
             Focus::Composer => {}
         },
-        KeyCode::Char('J') => {
+        KeyCode::PageDown => match app.focus {
+            Focus::Log => app.stream_scroll = app.stream_scroll.saturating_add(12),
+            Focus::Messages => app.bus_scroll = app.bus_scroll.saturating_add(6),
+            Focus::Runs if !runs.is_empty() => app.select_run(app.selected_run + 5, runs.len()),
+            Focus::Agents if n_slots > 0 => app.select_slot(app.selected_slot + 5, n_slots),
+            _ => {}
+        },
+        KeyCode::PageUp => match app.focus {
+            Focus::Log => app.stream_scroll = app.stream_scroll.saturating_sub(12),
+            Focus::Messages => app.bus_scroll = app.bus_scroll.saturating_sub(6),
+            Focus::Runs => {
+                app.select_run(app.selected_run.saturating_sub(5), runs.len().max(1));
+            }
+            Focus::Agents => {
+                app.select_slot(app.selected_slot.saturating_sub(5), n_slots.max(1));
+            }
+            _ => {}
+        },
+        KeyCode::Char('J') | KeyCode::Char(']') => {
             if !runs.is_empty() {
-                app.selected_run = (app.selected_run + 1).min(runs.len() - 1);
-                app.selected_slot = 0;
-                app.stream_scroll = 0;
+                app.select_run(app.selected_run + 1, runs.len());
+                app.focus = Focus::Runs;
             }
         }
-        KeyCode::Char('K') => {
-            app.selected_run = app.selected_run.saturating_sub(1);
-            app.selected_slot = 0;
-            app.stream_scroll = 0;
-        }
-        KeyCode::Char('[') => {
+        KeyCode::Char('K') | KeyCode::Char('[') => {
             if !runs.is_empty() {
-                app.selected_run = app.selected_run.saturating_sub(1);
-                app.selected_slot = 0;
-            }
-        }
-        KeyCode::Char(']') => {
-            if !runs.is_empty() {
-                app.selected_run = (app.selected_run + 1).min(runs.len() - 1);
-                app.selected_slot = 0;
+                app.select_run(app.selected_run.saturating_sub(1), runs.len());
+                app.focus = Focus::Runs;
             }
         }
         KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
             let idx = (c as u8 - b'1') as usize;
-            if let Some(st) = full {
-                if idx < st.slots.len() {
-                    app.selected_slot = idx;
-                    app.focus = Focus::Fleet;
-                    app.stream_scroll = 0;
-                }
+            if n_slots > 0 && idx < n_slots {
+                app.select_slot(idx, n_slots);
+                app.focus = Focus::Agents;
             }
         }
         KeyCode::Char('a') => {
             if let Some(id) = selected_id {
                 match workflow::plan::approve(swarm, id, false) {
-                    Ok(_) => app.flash(format!("approved {id}"), GREEN),
-                    Err(e) => app.flash(format!("approve: {e:#}"), RED),
+                    Ok(_) => app.flash(format!("Approved plan {id}"), GREEN),
+                    Err(e) => app.flash(format!("Approve failed: {e:#}"), RED),
                 }
             }
         }
         KeyCode::Char('r') => {
             if let Some(id) = selected_id {
                 match workflow::plan::reject(swarm, id, None, false) {
-                    Ok(_) => app.flash(format!("rejected {id}"), YELLOW),
-                    Err(e) => app.flash(format!("reject: {e:#}"), RED),
+                    Ok(_) => app.flash(format!("Rejected plan {id}"), YELLOW),
+                    Err(e) => app.flash(format!("Reject failed: {e:#}"), RED),
                 }
             }
         }
         KeyCode::Char('s') => {
             if let Some(id) = selected_id {
                 match crate::ship::confirm_ship(swarm, id, false) {
-                    Ok(_) => app.flash(format!("ship confirmed {id}"), GREEN),
-                    Err(e) => app.flash(format!("ship: {e:#}"), RED),
+                    Ok(_) => app.flash(format!("Ship confirmed {id}"), GREEN),
+                    Err(e) => app.flash(format!("Ship failed: {e:#}"), RED),
                 }
             }
         }
-        KeyCode::Char('g') => {
+        KeyCode::Char('g') | KeyCode::Home => {
             app.stream_scroll = 0;
             app.bus_scroll = 0;
         }
-        KeyCode::Char('G') => {
+        KeyCode::Char('G') | KeyCode::End => {
             app.stream_scroll = 9999;
         }
         KeyCode::Char('?') => {
-            app.flash(
-                "Tab panes · j/k slots · J/K or [] runs · a approve · r reject · s ship · i// composer · q quit · click panes",
-                ACCENT,
-            );
+            app.show_help = true;
         }
         _ => {}
     }
@@ -428,73 +480,92 @@ fn handle_mouse(
     full: Option<&RunState>,
 ) {
     let (x, y) = (m.column, m.row);
+    let n_slots = full.map(|s| s.slots.len()).unwrap_or(0);
+
     match m.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            // double-click detect
             let now = Instant::now();
-            let dbl = app
-                .last_click
-                .map(|(lx, ly, t)| lx == x && ly == y && t.elapsed() < Duration::from_millis(350))
-                .unwrap_or(false);
             app.last_click = Some((x, y, now));
 
             if contains(app.rect_composer, x, y) {
                 app.focus = Focus::Composer;
             } else if contains(app.rect_stream, x, y) {
-                app.focus = Focus::Stream;
+                app.focus = Focus::Log;
             } else if contains(app.rect_bus, x, y) {
-                app.focus = Focus::Bus;
+                app.focus = Focus::Messages;
             } else if contains(app.rect_fleet, x, y) {
-                app.focus = Focus::Fleet;
-                // row within fleet list (account for border + header)
+                app.focus = Focus::Agents;
                 if let Some(st) = full {
-                    let row = y.saturating_sub(app.rect_fleet.y.saturating_add(1)) as usize;
-                    if row < st.slots.len() {
-                        app.selected_slot = row;
-                        app.stream_scroll = 0;
+                    if let Some(row) = list_row_at(app.rect_fleet, y, st.slots.len()) {
+                        app.select_slot(row, st.slots.len());
                     }
                 }
             } else if contains(app.rect_runs, x, y) {
-                app.focus = Focus::Fleet;
-                let row = y.saturating_sub(app.rect_runs.y.saturating_add(1)) as usize;
-                if row < runs.len() {
-                    app.selected_run = row;
-                    app.selected_slot = 0;
-                    app.stream_scroll = 0;
+                app.focus = Focus::Runs;
+                if let Some(row) = list_row_at(app.rect_runs, y, runs.len()) {
+                    app.select_run(row, runs.len());
                 }
-            }
-
-            if !app.mouse_hint_shown {
-                app.mouse_hint_shown = true;
-                app.flash("mouse on · click panes/rows · scroll stream", ACCENT_SOFT);
-            }
-            if dbl && app.focus == Focus::Composer {
-                // ignore
+            } else if contains(app.rect_action, x, y) {
+                // Action bar: focus runs so a/r/s context is clear
+                app.focus = Focus::Runs;
             }
         }
         MouseEventKind::ScrollDown => {
             if contains(app.rect_stream, x, y) {
+                app.focus = Focus::Log;
                 app.stream_scroll = app.stream_scroll.saturating_add(3);
             } else if contains(app.rect_bus, x, y) {
-                app.bus_scroll = app.bus_scroll.saturating_add(1);
+                app.focus = Focus::Messages;
+                app.bus_scroll = app.bus_scroll.saturating_add(2);
             } else if contains(app.rect_fleet, x, y) {
-                if let Some(st) = full {
-                    if !st.slots.is_empty() {
-                        app.selected_slot = (app.selected_slot + 1).min(st.slots.len() - 1);
-                    }
+                app.focus = Focus::Agents;
+                if n_slots > 0 {
+                    app.select_slot(app.selected_slot + 1, n_slots);
                 }
+            } else if contains(app.rect_runs, x, y) {
+                app.focus = Focus::Runs;
+                if !runs.is_empty() {
+                    app.select_run(app.selected_run + 1, runs.len());
+                }
+            } else if contains(app.rect_stream, x, y) || app.focus == Focus::Log {
+                app.stream_scroll = app.stream_scroll.saturating_add(3);
             }
         }
         MouseEventKind::ScrollUp => {
             if contains(app.rect_stream, x, y) {
+                app.focus = Focus::Log;
                 app.stream_scroll = app.stream_scroll.saturating_sub(3);
             } else if contains(app.rect_bus, x, y) {
-                app.bus_scroll = app.bus_scroll.saturating_sub(1);
+                app.focus = Focus::Messages;
+                app.bus_scroll = app.bus_scroll.saturating_sub(2);
             } else if contains(app.rect_fleet, x, y) {
-                app.selected_slot = app.selected_slot.saturating_sub(1);
+                app.focus = Focus::Agents;
+                if n_slots > 0 {
+                    app.select_slot(app.selected_slot.saturating_sub(1), n_slots);
+                }
+            } else if contains(app.rect_runs, x, y) {
+                app.focus = Focus::Runs;
+                if !runs.is_empty() {
+                    app.select_run(app.selected_run.saturating_sub(1), runs.len());
+                }
             }
         }
         _ => {}
+    }
+}
+
+/// Map a mouse Y to a list row inside a bordered panel (title row skipped).
+fn list_row_at(panel: Rect, y: u16, n_items: usize) -> Option<usize> {
+    if n_items == 0 || panel.height < 3 {
+        return None;
+    }
+    // border top + title uses y = panel.y; first item at panel.y + 1
+    let inner_y = y.saturating_sub(panel.y.saturating_add(1));
+    let row = inner_y as usize;
+    if row < n_items {
+        Some(row)
+    } else {
+        None
     }
 }
 
@@ -504,6 +575,7 @@ fn contains(r: Rect, x: u16, y: u16) -> bool {
 
 struct LayoutRects {
     header: Rect,
+    action: Rect,
     runs: Rect,
     fleet: Rect,
     stream: Rect,
@@ -516,35 +588,37 @@ fn layout_rects(area: Rect) -> LayoutRects {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Min(8),
-            Constraint::Length(4),
-            Constraint::Length(1),
+            Constraint::Length(3), // header
+            Constraint::Length(2), // action / context
+            Constraint::Min(8),    // main
+            Constraint::Length(4), // command
+            Constraint::Length(1), // footer
         ])
         .split(area);
 
     let mid = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(28),
-            Constraint::Percentage(47),
+            Constraint::Percentage(30),
+            Constraint::Percentage(45),
             Constraint::Percentage(25),
         ])
-        .split(root[1]);
+        .split(root[2]);
 
     let left = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(mid[0]);
 
     LayoutRects {
         header: root[0],
+        action: root[1],
         runs: left[0],
         fleet: left[1],
         stream: mid[1],
         bus: mid[2],
-        composer: root[2],
-        footer: root[3],
+        composer: root[3],
+        footer: root[4],
     }
 }
 
@@ -561,18 +635,24 @@ fn draw(
     runs_state: &mut ListState,
 ) {
     let area = f.area();
-    // solid bg
     f.render_widget(Block::default().style(Style::default().bg(BG)), area);
 
     let lay = layout_rects(area);
 
     draw_header(f, lay.header, swarm, full, app);
+    draw_action(f, lay.action, runs, full, app);
     draw_runs(f, lay.runs, runs, app, runs_state);
-    draw_fleet(f, lay.fleet, full, app, fleet_state);
+    draw_agents(f, lay.fleet, full, app, fleet_state);
     draw_stream(f, lay.stream, full, stream_text, app);
-    draw_bus(f, lay.bus, bus_lines, app);
+    draw_messages(f, lay.bus, bus_lines, app);
     draw_composer(f, lay.composer, app);
     draw_footer(f, lay.footer, app, full);
+
+    if app.show_help {
+        draw_help_overlay(f, area);
+    }
+
+    let _ = Clear;
 }
 
 fn draw_header(f: &mut Frame, area: Rect, swarm: &SparPaths, full: Option<&RunState>, app: &App) {
@@ -581,44 +661,51 @@ fn draw_header(f: &mut Frame, area: Rect, swarm: &SparPaths, full: Option<&RunSt
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(".");
-    let (run, phase, task) = match full {
+    let (run, phase_label, task) = match full {
         Some(st) => (
             st.id.clone(),
-            format!("{:?}", st.phase),
+            phase_label(st.phase),
             st.task
                 .as_deref()
-                .map(|t| truncate(t, 40))
+                .map(|t| truncate(t, 36))
                 .unwrap_or_default(),
         ),
-        None => ("—".into(), "idle".into(), String::new()),
+        None => ("—".into(), "No run selected".into(), String::new()),
     };
 
     let phase_color = full
         .map(|s| phase_color(s.phase))
         .unwrap_or(FG_DIM);
-    let anim = if full.map(|s| is_active_phase(s.phase)).unwrap_or(false) {
-        format!("{} ", app.spinner())
-    } else {
-        format!("{} ", app.pulse())
-    };
-
-    let elapsed = app.started.elapsed().as_secs();
-    let clock = format!("{:02}:{:02}", elapsed / 60, elapsed % 60);
+    let dry = full
+        .filter(|s| s.dry_run)
+        .map(|_| " dry-run ")
+        .unwrap_or("");
 
     let left = Line::from(vec![
         Span::styled(" spar ", Style::default().fg(BG).bg(ACCENT).bold()),
         Span::raw(" "),
         Span::styled(project, Style::default().fg(FG).bold()),
-        Span::styled(" · ", Style::default().fg(FG_MUTED)),
+        Span::styled("  ·  ", Style::default().fg(FG_MUTED)),
         Span::styled(run, Style::default().fg(CYAN)),
+        Span::styled(dry, Style::default().fg(BG).bg(YELLOW).bold()),
         Span::raw("  "),
-        Span::styled(anim, Style::default().fg(phase_color)),
-        Span::styled(phase, Style::default().fg(phase_color).bold()),
+        Span::styled(
+            if full.map(|s| is_active_phase(s.phase)).unwrap_or(false) {
+                format!("{} ", app.spinner())
+            } else {
+                String::new()
+            },
+            Style::default().fg(phase_color),
+        ),
+        Span::styled(phase_label, Style::default().fg(phase_color).bold()),
     ]);
     let right = Line::from(vec![
         Span::styled(task, Style::default().fg(FG_DIM)),
         Span::raw("  "),
-        Span::styled(clock, Style::default().fg(FG_MUTED)),
+        Span::styled(
+            format!("focus: {}  ", app.focus.label()),
+            Style::default().fg(ACCENT_SOFT),
+        ),
     ]);
 
     let block = Block::default()
@@ -630,10 +717,96 @@ fn draw_header(f: &mut Frame, area: Rect, swarm: &SparPaths, full: Option<&RunSt
 
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(20), Constraint::Length(48)])
+        .constraints([Constraint::Min(20), Constraint::Length(42)])
         .split(inner);
     f.render_widget(Paragraph::new(left), chunks[0]);
     f.render_widget(Paragraph::new(right).alignment(Alignment::Right), chunks[1]);
+}
+
+fn draw_action(
+    f: &mut Frame,
+    area: Rect,
+    runs: &[state::RunSummary],
+    full: Option<&RunState>,
+    app: &App,
+) {
+    let (text, fg, bg) = if let Some(st) = full {
+        match st.phase {
+            Phase::AwaitingPlanApproval => (
+                "  Plan ready — press  a  to approve ·  r  to reject · or click Agents / Live log to inspect  ".into(),
+                BG,
+                YELLOW,
+            ),
+            Phase::AwaitingWinnerConfirm => (
+                "  Arena winner ready — confirm with spar confirm, or inspect candidates  ".into(),
+                BG,
+                YELLOW,
+            ),
+            Phase::AwaitingShipConfirm => (
+                "  Ready to ship — press  s  to confirm draft PR (never merges)  ".into(),
+                BG,
+                YELLOW,
+            ),
+            Phase::AwaitingReconcile => (
+                "  Arena reconcile ready — run spar reconcile  ".into(),
+                BG,
+                YELLOW,
+            ),
+            Phase::Quota => (
+                "  All providers paused (quota) — spar provider resume  ".into(),
+                BG,
+                RED,
+            ),
+            Phase::Failed | Phase::Stuck | Phase::Escalated => (
+                format!(
+                    "  {} — check Live log · spar cleanup {}  ",
+                    phase_label(st.phase),
+                    st.id
+                ),
+                FG,
+                Color::Rgb(48, 24, 24),
+            ),
+            _ if st.dry_run => (
+                "  Dry-run — synthetic agents only · no real code changes  ".into(),
+                FG_DIM,
+                BG_RAISED,
+            ),
+            _ if is_active_phase(st.phase) => (
+                format!(
+                    "  Working…  click a run · click an agent · scroll Live log  ·  Tab = next pane ({})  ",
+                    app.focus.label()
+                ),
+                FG_DIM,
+                BG_RAISED,
+            ),
+            _ => (
+                format!(
+                    "  {}  ·  Tab cycles panes · j/k move · mouse click & scroll · ? help  ",
+                    phase_label(st.phase)
+                ),
+                FG_MUTED,
+                BG_RAISED,
+            ),
+        }
+    } else if runs.is_empty() {
+        (
+            "  No runs yet — try:  spar plan -t \"…\" --providers cli:claude --dry-run  ".into(),
+            FG_DIM,
+            BG_RAISED,
+        )
+    } else {
+        (
+            "  Select a run (click or j/k in Runs) · Tab to Agents / Live log · ? help  ".into(),
+            FG_MUTED,
+            BG_RAISED,
+        )
+    };
+
+    f.render_widget(
+        Paragraph::new(Span::styled(text, Style::default().fg(fg).bg(bg).bold()))
+            .style(Style::default().bg(bg)),
+        area,
+    );
 }
 
 fn draw_runs(
@@ -643,10 +816,10 @@ fn draw_runs(
     app: &App,
     state: &mut ListState,
 ) {
-    let focused = app.focus == Focus::Fleet;
+    let focused = app.focus == Focus::Runs;
     let items: Vec<ListItem> = if runs.is_empty() {
         vec![ListItem::new(Span::styled(
-            "  no runs yet",
+            "  (empty)",
             Style::default().fg(FG_MUTED).italic(),
         ))]
     } else {
@@ -655,20 +828,32 @@ fn draw_runs(
             .map(|(i, r)| {
                 let sel = i == app.selected_run;
                 let mark = if sel { "›" } else { " " };
+                let dry = if r.dry_run { "dry " } else { "" };
+                let task = r
+                    .task
+                    .as_deref()
+                    .map(|t| truncate(t, 18))
+                    .unwrap_or_else(|| workflow_label(r.workflow).into());
+                let age = relative_age(r.updated_at);
                 let line = Line::from(vec![
-                    Span::styled(format!("{mark} "), Style::default().fg(ACCENT)),
+                    Span::styled(format!("{mark}"), Style::default().fg(ACCENT)),
                     Span::styled(
-                        format!("{:<8}", truncate(&r.id, 8)),
-                        Style::default().fg(if sel { FG } else { FG_DIM }).bold(),
+                        format!(" {:<8}", truncate(&r.id, 8)),
+                        Style::default()
+                            .fg(if sel { FG } else { FG_DIM })
+                            .add_modifier(if sel {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
                     ),
                     Span::styled(
-                        format!(" {}", format!("{:?}", r.workflow).to_lowercase()),
-                        Style::default().fg(FG_MUTED),
-                    ),
-                    Span::styled(
-                        format!(" {}", format!("{:?}", r.phase).to_lowercase()),
+                        format!(" {:<14}", truncate(&phase_label(r.phase), 14)),
                         Style::default().fg(phase_color(r.phase)),
                     ),
+                    Span::styled(format!(" {dry}"), Style::default().fg(YELLOW)),
+                    Span::styled(format!("{task} "), Style::default().fg(FG_MUTED)),
+                    Span::styled(age, Style::default().fg(FG_MUTED)),
                 ]);
                 ListItem::new(line).style(if sel {
                     Style::default().bg(BG_RAISED)
@@ -679,25 +864,30 @@ fn draw_runs(
             .collect()
     };
 
-    let list = List::new(items).block(panel("runs  [ ]", focused)).highlight_symbol("");
+    let title = if focused {
+        format!(" Runs  · j/k or click  ({}) ", runs.len())
+    } else {
+        format!(" Runs  ({}) ", runs.len())
+    };
+    let list = List::new(items).block(panel(&title, focused));
     f.render_stateful_widget(list, area, state);
 }
 
-fn draw_fleet(
+fn draw_agents(
     f: &mut Frame,
     area: Rect,
     full: Option<&RunState>,
     app: &App,
     state: &mut ListState,
 ) {
-    let focused = app.focus == Focus::Fleet;
+    let focused = app.focus == Focus::Agents;
     let items: Vec<ListItem> = match full {
         None => vec![ListItem::new(Span::styled(
-            "  select a run",
+            "  select a run first",
             Style::default().fg(FG_MUTED).italic(),
         ))],
         Some(st) if st.slots.is_empty() => vec![ListItem::new(Span::styled(
-            "  no slots",
+            "  no agents yet",
             Style::default().fg(FG_MUTED).italic(),
         ))],
         Some(st) => st
@@ -707,37 +897,42 @@ fn draw_fleet(
             .map(|(i, s)| {
                 let sel = i == app.selected_slot;
                 let icon = slot_icon(s, app);
-                let stats = s.log_path.as_ref().and_then(|p| StreamStats::load(p));
-                let badge = stats
-                    .as_ref()
-                    .filter(|st| st.tools > 0 || st.input_tokens > 0)
-                    .map(|st| format!(" {}t {}", st.tools, compact_u64(st.context_tokens)))
-                    .unwrap_or_default();
+                let role = role_label(s.role);
+                let status = slot_status_label(s.status);
                 let act = SlotActivity::observe(s, app.stall_warn_secs);
-                let (age, age_color) = if s.status == SlotStatus::Running {
+                let (tail, tail_c) = if s.status == SlotStatus::Running {
                     if act.stalled {
                         (format!(" STALL {}", act.human_silent()), RED)
                     } else {
-                        (format!(" {}", act.human_silent()), FG_MUTED)
+                        (format!(" quiet {}", act.human_silent()), FG_MUTED)
                     }
                 } else {
                     (String::new(), FG_MUTED)
                 };
+                let color = if act.stalled {
+                    RED
+                } else {
+                    slot_color(s)
+                };
                 let line = Line::from(vec![
-                    Span::styled(format!(" {icon} "), Style::default().fg(if act.stalled {
-                        RED
-                    } else {
-                        slot_color(s)
-                    })),
+                    Span::styled(format!(" {icon} "), Style::default().fg(color)),
                     Span::styled(
-                        format!("{:<12}", truncate(&s.id, 12)),
+                        format!("{:<10}", truncate(&s.id, 10)),
                         Style::default()
                             .fg(if sel { FG } else { FG_DIM })
-                            .add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() }),
+                            .add_modifier(if sel {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
                     ),
-                    Span::styled(truncate(&s.provider, 11), Style::default().fg(ACCENT_SOFT)),
-                    Span::styled(badge, Style::default().fg(YELLOW)),
-                    Span::styled(age, Style::default().fg(age_color)),
+                    Span::styled(format!(" {role:<8}"), Style::default().fg(ACCENT_SOFT)),
+                    Span::styled(format!(" {status}"), Style::default().fg(color)),
+                    Span::styled(
+                        format!(" {}", truncate(&s.provider, 10)),
+                        Style::default().fg(FG_MUTED),
+                    ),
+                    Span::styled(tail, Style::default().fg(tail_c)),
                 ]);
                 ListItem::new(line).style(if sel {
                     Style::default().bg(BG_RAISED)
@@ -760,19 +955,26 @@ fn draw_fleet(
             .iter()
             .filter(|s| SlotActivity::observe(s, app.stall_warn_secs).stalled)
             .count();
-        if stalled > 0 {
-            format!("fleet  {running}/{n} live  {stalled} stall")
+        if focused {
+            if stalled > 0 {
+                format!(" Agents  {running}/{n} live · {stalled} quiet too long  · j/k ")
+            } else {
+                format!(" Agents  {running}/{n} live  · j/k or click ")
+            }
+        } else if stalled > 0 {
+            format!(" Agents  {running}/{n} live · {stalled} stall ")
         } else {
-            format!("fleet  {running}/{n} live")
+            format!(" Agents  {running}/{n} live ")
         }
+    } else if focused {
+        " Agents  · select a run first ".into()
     } else {
-        "fleet".into()
+        " Agents ".into()
     };
 
     let list = List::new(items).block(panel(&title, focused));
     f.render_stateful_widget(list, area, state);
 
-    // activity gauge under fleet if active
     if let Some(st) = full {
         if !st.slots.is_empty() && area.height > 6 {
             let done = st
@@ -790,7 +992,7 @@ fn draw_fleet(
             let g = Gauge::default()
                 .gauge_style(Style::default().fg(ACCENT).bg(BG_PANEL))
                 .ratio(ratio)
-                .label(format!("{:.0}%", ratio * 100.0));
+                .label(format!("{:.0}% done", ratio * 100.0));
             f.render_widget(g, gauge_area);
         }
     }
@@ -803,28 +1005,31 @@ fn draw_stream(
     stream_text: &str,
     app: &App,
 ) {
-    let focused = app.focus == Focus::Stream;
+    let focused = app.focus == Focus::Log;
     let slot = full.and_then(|st| st.slots.get(app.selected_slot));
     let slot_id = slot.map(|s| s.id.as_str()).unwrap_or("—");
     let silent_hint = slot
         .map(|s| {
             let act = SlotActivity::observe(s, app.stall_warn_secs);
             if act.stalled {
-                format!("  STALL {}", act.human_silent())
+                format!(" · STALL {}", act.human_silent())
             } else if s.status == SlotStatus::Running {
-                format!("  silent {}", act.human_silent())
+                format!(" · quiet {}", act.human_silent())
             } else {
                 String::new()
             }
         })
         .unwrap_or_default();
-    let title = format!("stream  {slot_id}{silent_hint}");
+    let title = if focused {
+        format!(" Live log  · {slot_id}{silent_hint}  · scroll wheel / j k ")
+    } else {
+        format!(" Live log  · {slot_id}{silent_hint} ")
+    };
 
     let block = panel(&title, focused);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // stats strip
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
@@ -879,7 +1084,7 @@ fn draw_stream_stats(
     let Some(s) = stats else {
         f.render_widget(
             Paragraph::new(Span::styled(
-                "  no live stats yet",
+                "  waiting for agent output…",
                 Style::default().fg(FG_MUTED).bg(BG_RAISED),
             )),
             area,
@@ -904,16 +1109,22 @@ fn draw_stream_stats(
         FG_MUTED
     };
     let status_span = match status {
-        Some(SlotStatus::Running) => Span::styled(" LIVE ", Style::default().fg(BG).bg(CYAN).bold()),
-        Some(SlotStatus::Done) => Span::styled(" DONE ", Style::default().fg(BG).bg(GREEN).bold()),
-        Some(SlotStatus::Failed) => Span::styled(" FAIL ", Style::default().fg(BG).bg(RED).bold()),
+        Some(SlotStatus::Running) => {
+            Span::styled(" LIVE ", Style::default().fg(BG).bg(CYAN).bold())
+        }
+        Some(SlotStatus::Done) => {
+            Span::styled(" DONE ", Style::default().fg(BG).bg(GREEN).bold())
+        }
+        Some(SlotStatus::Failed) => {
+            Span::styled(" FAIL ", Style::default().fg(BG).bg(RED).bold())
+        }
         _ => Span::styled(" … ", Style::default().fg(FG_MUTED).bg(BG_RAISED)),
     };
     let line = Line::from(vec![
         status_span,
         Span::raw(" "),
         Span::styled(
-            format!(" co {} ", compact_u64(ctx)),
+            format!(" context {} ", compact_u64(ctx)),
             Style::default().fg(ctx_color).bg(BG_RAISED).bold(),
         ),
         Span::raw(" "),
@@ -961,9 +1172,7 @@ fn stream_lines_styled(text: &str) -> Vec<Line<'static>> {
                 } else {
                     Style::default().fg(GREEN)
                 }
-            } else if line.starts_with('·') {
-                Style::default().fg(FG_MUTED)
-            } else if line.starts_with('…') {
+            } else if line.starts_with('·') || line.starts_with('…') {
                 Style::default().fg(FG_MUTED).italic()
             } else if line.starts_with('!') {
                 Style::default().fg(RED).bold()
@@ -987,18 +1196,23 @@ fn compact_u64(n: u64) -> String {
     }
 }
 
-fn draw_bus(f: &mut Frame, area: Rect, bus_lines: &[String], app: &App) {
-    let focused = app.focus == Focus::Bus;
+fn draw_messages(f: &mut Frame, area: Rect, bus_lines: &[String], app: &App) {
+    let focused = app.focus == Focus::Messages;
     let text = if bus_lines.is_empty() {
-        "  bus quiet · peer messages land here".into()
+        "  No messages yet.\n  Agent chatter and events show up here.".into()
     } else {
         bus_lines.join("\n")
+    };
+    let title = if focused {
+        " Messages  · scroll wheel / j k "
+    } else {
+        " Messages "
     };
     let p = Paragraph::new(text)
         .style(Style::default().fg(FG_DIM).bg(BG_PANEL))
         .wrap(Wrap { trim: true })
         .scroll((app.bus_scroll, 0))
-        .block(panel("bus", focused));
+        .block(panel(title, focused));
     f.render_widget(p, area);
 }
 
@@ -1021,23 +1235,21 @@ fn draw_composer(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(&app.composer, Style::default().fg(FG)),
         Span::styled(cursor_blink, Style::default().fg(ACCENT)),
     ]);
-    let hint = if app.composer.is_empty() && focused {
-        "  /approve  /reject  /ship  /help  ·  plain text is a stub for now"
+    let hint = if app.composer.is_empty() {
+        "  Type a command:  /approve  /reject  /ship  /help   ·  click here or press i /"
     } else {
         ""
+    };
+    let title = if focused {
+        " Command  · Enter run · Esc leave "
+    } else {
+        " Command  · i or / to type "
     };
     let p = Paragraph::new(vec![
         line,
         Line::from(Span::styled(hint, Style::default().fg(FG_MUTED).italic())),
     ])
-    .block(panel(
-        if focused {
-            "composer  enter send · esc blur"
-        } else {
-            "composer  i or / to type"
-        },
-        focused,
-    ));
+    .block(panel(title, focused));
     f.render_widget(p, area);
 }
 
@@ -1048,12 +1260,11 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, full: Option<&RunState>) {
         (app.status_line.as_str(), YELLOW)
     } else {
         (
-            "tab panes · j/k slots · J/K runs · a/r/s gates · i compose · ? help · q quit",
+            situational_footer(full, app.focus),
             FG_MUTED,
         )
     };
 
-    // gate urgency bar
     let gate = full.map(|s| s.phase.is_gate()).unwrap_or(false);
     let bg = if gate {
         Color::Rgb(40, 30, 12)
@@ -1064,23 +1275,93 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, full: Option<&RunState>) {
     let left = Span::styled(format!(" {msg} "), Style::default().fg(color).bg(bg));
     let right = if gate {
         Span::styled(
-            "  GATE  press a/r/s  ",
+            "  YOUR MOVE  ",
             Style::default().fg(BG).bg(YELLOW).bold(),
         )
     } else {
         Span::styled(
-            format!(" {} ", app.spinner()),
+            format!(" {}  ? help  q quit  ", app.spinner()),
             Style::default().fg(FG_MUTED).bg(bg),
         )
     };
-    let line = Line::from(vec![left, Span::styled(
-        " ".repeat(area.width.saturating_sub(msg.len() as u16 + 20) as usize),
-        Style::default().bg(bg),
-    ), right]);
+    let pad = area
+        .width
+        .saturating_sub(msg.len() as u16 + 24)
+        .max(1) as usize;
+    let line = Line::from(vec![
+        left,
+        Span::styled(" ".repeat(pad), Style::default().bg(bg)),
+        right,
+    ]);
     f.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), area);
+}
 
-    // silence unused Clear
-    let _ = Clear;
+fn situational_footer(full: Option<&RunState>, focus: Focus) -> &'static str {
+    if let Some(st) = full {
+        if st.phase == Phase::AwaitingPlanApproval {
+            return "a approve plan · r reject · Tab panes · click Live log to inspect";
+        }
+        if st.phase == Phase::AwaitingShipConfirm {
+            return "s confirm ship (draft PR) · Tab panes · ? help";
+        }
+        if st.phase.is_gate() {
+            return "gate waiting · see yellow bar above · ? help";
+        }
+    }
+    match focus {
+        Focus::Runs => "j/k or click: pick run · ] next · Tab → Agents · ? help",
+        Focus::Agents => "j/k or click: pick agent · log follows selection · Tab → Live log",
+        Focus::Log => "scroll wheel / j k / PgUp PgDn · g top · Tab → Messages",
+        Focus::Messages => "scroll wheel / j k · Tab → Command",
+        Focus::Composer => "type /approve /reject /ship /help · Enter · Esc",
+    }
+}
+
+fn draw_help_overlay(f: &mut Frame, area: Rect) {
+    let w = area.width.min(72).max(40);
+    let h = area.height.min(22).max(14);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let body = "\
+ spar — keyboard & mouse\n\
+ \n\
+  Mouse\n\
+    click panel          focus it (border lights up)\n\
+    click a run/agent    select that row\n\
+    scroll wheel         scroll log/messages · step runs/agents\n\
+ \n\
+  Keyboard\n\
+    Tab / Shift-Tab      next / previous panel\n\
+    j k  or  ↑ ↓         move in focused panel\n\
+    [ ]  or  J K         previous / next run\n\
+    1-9                  jump to agent slot\n\
+    a / r / s            approve · reject · ship (when gated)\n\
+    i  or  /             command bar\n\
+    g / G                log top / bottom\n\
+    ?                    this help · Esc closes\n\
+    q                    quit\n\
+ \n\
+  Esc or ? to close";
+    let p = Paragraph::new(body)
+        .style(Style::default().fg(FG).bg(BG_RAISED))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(BORDER_FOCUS))
+                .title(Span::styled(
+                    " Help ",
+                    Style::default().fg(ACCENT).bold(),
+                ))
+                .style(Style::default().bg(BG_RAISED)),
+        );
+    f.render_widget(p, rect);
 }
 
 fn panel(title: &str, focused: bool) -> Block<'_> {
@@ -1093,7 +1374,7 @@ fn panel(title: &str, focused: bool) -> Block<'_> {
     Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
-        .title(Span::styled(format!(" {title} "), title_style))
+        .title(Span::styled(title.to_string(), title_style))
         .style(Style::default().bg(BG_PANEL))
 }
 
@@ -1112,35 +1393,38 @@ fn handle_composer(
         return match head.as_str() {
             "q" | "quit" => Ok("__quit__".into()),
             "help" | "h" | "?" => Ok(
-                "/approve /reject [reason] /ship /quit · click panes · scroll stream".into(),
+                "Commands: /approve /reject [reason] /ship /quit · press ? for full help".into(),
             ),
             "approve" => {
-                let id = arg.or(run_id).ok_or_else(|| anyhow::anyhow!("no run"))?;
+                let id = arg.or(run_id).ok_or_else(|| anyhow::anyhow!("no run selected"))?;
                 workflow::plan::approve(swarm, id, false)?;
-                Ok(format!("approved {id}"))
+                Ok(format!("Approved plan {id}"))
             }
             "reject" => {
-                let id = run_id.ok_or_else(|| anyhow::anyhow!("no run"))?;
+                let id = run_id.ok_or_else(|| anyhow::anyhow!("no run selected"))?;
                 workflow::plan::reject(swarm, id, arg.map(|s| s.to_string()), false)?;
-                Ok(format!("rejected {id}"))
+                Ok(format!("Rejected plan {id}"))
             }
             "ship" => {
-                let id = arg.or(run_id).ok_or_else(|| anyhow::anyhow!("no run"))?;
+                let id = arg.or(run_id).ok_or_else(|| anyhow::anyhow!("no run selected"))?;
                 crate::ship::confirm_ship(swarm, id, false)?;
-                Ok(format!("ship confirmed {id}"))
+                Ok(format!("Ship confirmed {id}"))
             }
-            other => Ok(format!("unknown /{other} — try /help")),
+            other => Ok(format!("Unknown /{other} — try /help")),
         };
     }
-    Ok(format!("noted (orchestrator chat later): {}", truncate(cmd, 48)))
+    Ok(format!(
+        "Noted (chat later): {}",
+        truncate(cmd, 48)
+    ))
 }
 
 fn stream_content(swarm: &SparPaths, full: Option<&RunState>, slot_idx: usize) -> String {
     let Some(st) = full else {
-        return "\n  open a run to stream agent output\n\n  tip: spar plan -t \"…\" --providers cli:claude --dry-run".into();
+        return "\n  Select a run on the left.\n\n  New work:\n    spar plan -t \"describe the change\" --providers cli:claude --dry-run\n".into();
     };
     if st.slots.is_empty() {
-        return "\n  no slots in this run".into();
+        return "\n  This run has no agents yet.".into();
     }
     let slot = &st.slots[slot_idx.min(st.slots.len() - 1)];
     let path = slot
@@ -1149,19 +1433,24 @@ fn stream_content(swarm: &SparPaths, full: Option<&RunState>, slot_idx: usize) -
         .unwrap_or_else(|| swarm.log_file(&st.id, &slot.id));
     if path.is_file() {
         let raw = process::tail_log(&path, 64_000);
-        // drop spawn header noise for display when body exists
         let body = raw
             .lines()
             .skip_while(|l| l.starts_with('#') || *l == "---" || l.is_empty())
             .collect::<Vec<_>>()
             .join("\n");
         if body.trim().is_empty() {
-            format!("\n  {} waiting for output…", slot.id)
+            format!(
+                "\n  {} is running but hasn't written the log yet…\n  (quiet time is shown in Agents)",
+                slot.id
+            )
         } else {
             body
         }
     } else {
-        format!("\n  no log yet for {}\n  {}", slot.id, slot.provider)
+        format!(
+            "\n  No log file yet for {}\n  provider: {}\n  status: {:?}",
+            slot.id, slot.provider, slot.status
+        )
     }
 }
 
@@ -1177,21 +1466,104 @@ fn bus_lines(swarm: &SparPaths, full: Option<&RunState>, quota: &QuotaStore) -> 
             for e in evs.iter().rev().take(12).rev() {
                 lines.push(truncate(
                     &format!("{}→{}  {}", e.from, e.to, e.body),
-                    42,
+                    48,
                 ));
             }
         }
         if lines.is_empty() {
-            for e in events::read_all(swarm, &st.id).unwrap_or_default().iter().rev().take(10).rev()
+            for e in events::read_all(swarm, &st.id)
+                .unwrap_or_default()
+                .iter()
+                .rev()
+                .take(10)
+                .rev()
             {
-                lines.push(truncate(&e.display_line(), 42));
+                lines.push(truncate(&e.display_line(), 48));
             }
         }
     }
     for (name, q) in &quota.providers {
-        lines.push(format!("q {name}: {:?}", q.status));
+        lines.push(format!("quota {name}: {:?}", q.status));
     }
     lines
+}
+
+// ── human labels ────────────────────────────────────────────────────────────
+
+fn phase_label(phase: Phase) -> String {
+    match phase {
+        Phase::Init => "Starting".into(),
+        Phase::PrepareIsolation => "Preparing worktrees".into(),
+        Phase::SpawnSlots => "Spawning agents".into(),
+        Phase::Dispatch => "Dispatching".into(),
+        Phase::WaitCompletion => "Waiting on agents".into(),
+        Phase::PlanReady => "Plan ready".into(),
+        Phase::AwaitingPlanApproval => "Needs plan approval".into(),
+        Phase::PlanApproved => "Plan approved".into(),
+        Phase::PlanRejected => "Plan rejected".into(),
+        Phase::Review => "Under review".into(),
+        Phase::Suite => "Running tests".into(),
+        Phase::Rank => "Ranking candidates".into(),
+        Phase::Fix => "Fixing issues".into(),
+        Phase::PeerRelay => "Peer collaboration".into(),
+        Phase::AwaitingWinnerConfirm => "Needs winner pick".into(),
+        Phase::AwaitingReconcile => "Needs reconcile".into(),
+        Phase::AwaitingShipConfirm => "Ready to ship".into(),
+        Phase::Shipping => "Shipping".into(),
+        Phase::Done => "Done".into(),
+        Phase::Escalated => "Escalated".into(),
+        Phase::Failed => "Failed".into(),
+        Phase::Stuck => "Stuck".into(),
+        Phase::Quota => "Quota blocked".into(),
+    }
+}
+
+fn workflow_label(w: WorkflowKind) -> &'static str {
+    match w {
+        WorkflowKind::Plan => "plan",
+        WorkflowKind::Loop => "build",
+        WorkflowKind::Arena => "arena",
+        WorkflowKind::Roles => "roles",
+        WorkflowKind::Peer => "peer",
+        WorkflowKind::Review => "review",
+    }
+}
+
+fn role_label(r: crate::state::SlotRole) -> &'static str {
+    use crate::state::SlotRole::*;
+    match r {
+        Planner => "planner",
+        PlanCritic => "critic",
+        Implementer => "builder",
+        Tester => "tests",
+        Reviewer => "review",
+        Ranker => "ranker",
+        Peer => "peer",
+        Reconciler => "merge",
+    }
+}
+
+fn slot_status_label(s: SlotStatus) -> &'static str {
+    match s {
+        SlotStatus::Pending => "wait",
+        SlotStatus::Running => "run",
+        SlotStatus::Done => "done",
+        SlotStatus::Failed => "fail",
+        SlotStatus::Stuck => "stuck",
+    }
+}
+
+fn relative_age(ts: DateTime<Utc>) -> String {
+    let secs = (Utc::now() - ts).num_seconds().max(0) as u64;
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86400)
+    }
 }
 
 fn slot_icon(s: &SlotState, app: &App) -> String {
@@ -1236,5 +1608,30 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let t: String = s.chars().take(max.saturating_sub(1)).collect();
         format!("{t}…")
+    }
+}
+
+#[cfg(test)]
+mod labels {
+    use super::*;
+
+    #[test]
+    fn phase_labels_are_human() {
+        assert_eq!(phase_label(Phase::AwaitingPlanApproval), "Needs plan approval");
+        assert_eq!(phase_label(Phase::AwaitingShipConfirm), "Ready to ship");
+        assert!(!phase_label(Phase::Suite).contains('_'));
+    }
+
+    #[test]
+    fn list_row_hit() {
+        let r = Rect {
+            x: 0,
+            y: 10,
+            width: 20,
+            height: 8,
+        };
+        assert_eq!(list_row_at(r, 11, 3), Some(0));
+        assert_eq!(list_row_at(r, 12, 3), Some(1));
+        assert_eq!(list_row_at(r, 20, 3), None);
     }
 }

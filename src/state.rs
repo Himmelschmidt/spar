@@ -226,6 +226,10 @@ pub struct RunSummary {
     pub workflow: WorkflowKind,
     pub phase: Phase,
     pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 impl RunState {
@@ -361,6 +365,8 @@ pub fn list_runs(paths: &SparPaths) -> Result<Vec<RunSummary>> {
                 workflow: state.workflow,
                 phase: state.phase,
                 updated_at: state.updated_at,
+                task: state.task,
+                dry_run: state.dry_run,
             }),
             Err(_) => continue,
         }
