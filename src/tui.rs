@@ -155,6 +155,8 @@ struct App {
     stall_warn_secs: u64,
     /// When false (default), long log lines truncate with …; `w` toggles wrap.
     log_expand: bool,
+    /// First Ctrl+C timestamp; second within 2s exits (Esc/q never quit).
+    last_ctrl_c: Option<Instant>,
     last_click: Option<(u16, u16, Instant)>,
     show_help: bool,
     rect_header: Rect,
@@ -187,6 +189,7 @@ impl App {
             flash: None,
             stall_warn_secs,
             log_expand: false,
+            last_ctrl_c: None,
             last_click: None,
             show_help: false,
             rect_header: Rect::default(),
@@ -457,9 +460,25 @@ fn handle_key(
     let selected_id = runs.get(app.selected_run).map(|r| r.id.as_str());
     let n_slots = full.map(|s| s.slots.len()).unwrap_or(0);
 
+    // Ctrl+C twice (within 2s) is the only quit path — never Esc or q.
+    if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
+        if let Some(t) = app.last_ctrl_c {
+            if t.elapsed() < Duration::from_secs(2) {
+                return Ok(true);
+            }
+        }
+        app.last_ctrl_c = Some(Instant::now());
+        app.flash("Ctrl+C again to exit", YELLOW);
+        return Ok(false);
+    }
+    // Any other key clears the first Ctrl+C arm.
+    if !mods.contains(KeyModifiers::CONTROL) {
+        app.last_ctrl_c = None;
+    }
+
     if app.show_help {
         match code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter => {
+            KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter => {
                 app.show_help = false;
             }
             _ => {}
@@ -475,9 +494,6 @@ fn handle_key(
                 if !line.is_empty() {
                     match handle_composer(swarm, runs, app.selected_run, &line) {
                         Ok(msg) => {
-                            if msg == "__quit__" {
-                                return Ok(true);
-                            }
                             app.flash(msg, GREEN);
                             app.composer.clear();
                         }
@@ -499,17 +515,14 @@ fn handle_key(
     }
 
     match code {
-        KeyCode::Char('q') => return Ok(true),
         KeyCode::Esc => {
             if app.focus != Focus::Runs {
                 app.focus = Focus::Runs;
             } else if app.browse == BrowseLevel::Runs {
-                // Back to general project list (unless only ever local and user wants quit)
                 app.open_projects_view();
                 app.flash("Projects — Enter to open · p always returns here", ACCENT);
-            } else {
-                return Ok(true);
             }
+            // Never exit on Esc (including Projects view).
         }
         KeyCode::Tab => app.focus = app.focus.next(),
         KeyCode::BackTab => app.focus = app.focus.prev(),
@@ -1833,7 +1846,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, full: Option<&RunState>) {
         )
     } else {
         Span::styled(
-            format!(" {}  ? help  q quit  ", app.spinner()),
+            format!(" {}  ? help  ·  Ctrl+C×2 exit  ", app.spinner()),
             Style::default().fg(FG_MUTED).bg(bg),
         )
     };
@@ -1904,14 +1917,14 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
     i  or  /             command bar\n\
     w                    log wrap ↔ truncate long lines\n\
     g / G                log top / bottom\n\
-    ?                    this help · Esc closes\n\
-    q                    quit\n\
+    ?                    this help · Esc closes help\n\
+    Ctrl+C twice         exit (only quit path)\n\
  \n\
   Default: this project's runs (or Projects if outside a repo).\n\
   Activity: phase timeline + agent status (not chat).\n\
   Runs: <project>/.spar/runs/ · Index: ~/.spar/registry.json\n\
  \n\
-  Esc or ? to close";
+  Esc or ? to close help";
     let p = Paragraph::new(body)
         .style(Style::default().fg(FG).bg(BG_RAISED))
         .block(
@@ -1954,9 +1967,10 @@ fn handle_composer(
         let head = parts.next().unwrap_or("").to_ascii_lowercase();
         let arg = parts.next().map(str::trim).filter(|s| !s.is_empty());
         return match head.as_str() {
-            "q" | "quit" => Ok("__quit__".into()),
+            "q" | "quit" => Ok("Use Ctrl+C twice to exit (q does not quit)".into()),
             "help" | "h" | "?" => Ok(
-                "Commands: /approve /reject [reason] /ship /quit · press ? for full help".into(),
+                "Commands: /approve /reject [reason] /ship · press ? for full help · Ctrl+C×2 exit"
+                    .into(),
             ),
             "approve" => {
                 let id = arg.or(run_id).ok_or_else(|| anyhow::anyhow!("no run selected"))?;
