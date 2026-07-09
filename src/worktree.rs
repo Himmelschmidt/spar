@@ -159,18 +159,17 @@ pub fn prepare_isolation(
                     }
                     continue;
                 }
+                // dry-run: never create real git worktrees / sibling dirs — only
+                // ephemeral cwd under .spar/runs/<id>/ so agents are stubbed without
+                // mutating the repo's worktree list.
                 let rec = if state.dry_run {
-                    match create_worktree(&state.project_root, &state.id, sid) {
-                        Ok(r) => r,
-                        Err(_) => {
-                            let path = paths.run_dir(&state.id).join(format!("cwd-{sid}"));
-                            std::fs::create_dir_all(&path)?;
-                            WorktreeRecord {
-                                slot_id: sid.clone(),
-                                path,
-                                branch: branch_name(&state.id, sid),
-                            }
-                        }
+                    let safe = sid.replace(['/', ':'], "-");
+                    let path = paths.run_dir(&state.id).join(format!("cwd-{safe}"));
+                    std::fs::create_dir_all(&path)?;
+                    WorktreeRecord {
+                        slot_id: sid.clone(),
+                        path,
+                        branch: branch_name(&state.id, sid),
                     }
                 } else {
                     create_worktree(&state.project_root, &state.id, sid)?
@@ -199,7 +198,24 @@ pub fn prepare_isolation(
 
 pub fn cleanup_run(state: &RunState) -> Result<()> {
     for rec in &state.worktrees {
-        let _ = remove_worktree(&state.project_root, rec);
+        if state.dry_run || rec.path.starts_with(state.project_root.join(".spar")) {
+            // dry-run cwd dirs live under .spar — just rm
+            let _ = std::fs::remove_dir_all(&rec.path);
+        } else {
+            let _ = remove_worktree(&state.project_root, rec);
+        }
+    }
+    Ok(())
+}
+
+/// After purging a run dir, drop empty parent dirs (runs/, .spar/ if empty).
+pub fn prune_empty_spar_parents(paths: &SparPaths) -> Result<()> {
+    let runs = paths.runs_dir();
+    if runs.is_dir() && std::fs::read_dir(&runs)?.next().is_none() {
+        let _ = std::fs::remove_dir(&runs);
+    }
+    if paths.root.is_dir() && std::fs::read_dir(&paths.root)?.next().is_none() {
+        let _ = std::fs::remove_dir(&paths.root);
     }
     Ok(())
 }

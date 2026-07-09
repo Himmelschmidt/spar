@@ -123,7 +123,7 @@ fn plan_approve_implement_dry_run() {
     // One run id plan → implement (O1)
     assert_eq!(impl_id, run_id);
 
-    // worktree sibling naming for implementer
+    // dry-run: cwd under .spar/runs/<id>/cwd-* (no real git worktrees)
     let state_path = tmp
         .path()
         .join(".spar/runs")
@@ -135,8 +135,8 @@ fn plan_approve_implement_dry_run() {
     assert!(!wts.is_empty());
     let wt_path = wts[0]["path"].as_str().unwrap();
     assert!(
-        wt_path.contains("-spar-") && wt_path.contains(impl_id),
-        "unexpected worktree path {wt_path}"
+        wt_path.contains(".spar") && wt_path.contains("cwd-") && wt_path.contains(impl_id),
+        "unexpected dry-run cwd path {wt_path}"
     );
 
     assert_eq!(primary_branch(tmp.path()), branch_before);
@@ -166,6 +166,99 @@ fn plan_approve_implement_dry_run() {
         .args(["cleanup", run_id, "--purge", "--json"])
         .assert()
         .success();
+    // purge should not leave an empty runs/ shell behind
+    let runs = tmp.path().join(".spar/runs");
+    assert!(
+        !runs.is_dir() || std::fs::read_dir(&runs).unwrap().next().is_some(),
+        "empty .spar/runs should be removed"
+    );
+}
+
+#[test]
+fn dry_run_does_not_create_git_worktrees() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let parent = tmp.path().parent().unwrap();
+    let before: std::collections::HashSet<_> = std::fs::read_dir(parent)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+
+    cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args([
+            "implement",
+            "--task",
+            "no real worktrees",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2);
+
+    let after: Vec<_> = std::fs::read_dir(parent)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .filter(|n| !before.contains(n))
+        .collect();
+    // only the temp project itself might appear as "new" if something else; no *-spar-* siblings
+    for name in &after {
+        let s = name.to_string_lossy();
+        assert!(
+            !s.contains("-spar-"),
+            "dry-run must not create sibling worktree dirs, found {s}"
+        );
+    }
+    // cwd lives under .spar
+    let spar = tmp.path().join(".spar/runs");
+    assert!(spar.is_dir());
+    let has_cwd = walkdir_has_cwd(&spar);
+    assert!(has_cwd, "expected .spar/runs/*/cwd-* dirs");
+}
+
+fn walkdir_has_cwd(dir: &std::path::Path) -> bool {
+    fn rec(d: &std::path::Path) -> bool {
+        let Ok(rd) = std::fs::read_dir(d) else {
+            return false;
+        };
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n.starts_with("cwd-") {
+                return true;
+            }
+            if e.path().is_dir() && rec(&e.path()) {
+                return true;
+            }
+        }
+        false
+    }
+    rec(dir)
+}
+
+#[test]
+fn status_exit_zero_when_gated() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let plan = cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args(["plan", "--task", "gate", "--dry-run", "--json"])
+        .assert()
+        .code(2);
+    let stdout = String::from_utf8_lossy(plan.get_output().stdout.as_slice());
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let run_id = v["run_id"].as_str().unwrap();
+
+    let st = cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args(["status", run_id, "--json"])
+        .assert()
+        .code(0); // observe always succeeds
+    let s = String::from_utf8_lossy(st.get_output().stdout.as_slice());
+    let sv: serde_json::Value = serde_json::from_str(&s).unwrap();
+    assert_eq!(sv["exit_code"], 2);
+    assert_eq!(sv["phase"], "awaiting_plan_approval");
 }
 
 #[test]
@@ -400,8 +493,9 @@ fn quota_exit_when_all_paused() {
             .current_dir(tmp.path())
             .args(["status", run_id, "--json"])
             .assert()
-            .code(4)
-            .stdout(predicate::str::contains("\"phase\": \"quota\""));
+            .code(0) // status is observe-only
+            .stdout(predicate::str::contains("\"phase\": \"quota\""))
+            .stdout(predicate::str::contains("\"exit_code\": 4"));
     } else {
         // Offline / no binaries: still accept 1 only when JSON is not a quota run
         assert_eq!(

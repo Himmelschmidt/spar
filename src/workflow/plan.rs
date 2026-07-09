@@ -70,6 +70,17 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
         }
         return Ok(ExitCode::Failure);
     }
+    if !opts.json {
+        eprintln!(
+            "providers: {}{}",
+            state.providers.join(", "),
+            if dry {
+                " (dry-run: no git worktrees; agents stubbed)"
+            } else {
+                ""
+            }
+        );
+    }
 
     paths.ensure_run_dirs(&state.id)?;
     let _ = crate::bus::ensure_bus(paths, &state.id);
@@ -78,13 +89,16 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
 
     let mut jobs = Vec::new();
     for (i, prov) in state.providers.iter().take(2).enumerate() {
-        let id = format!("planner-{prov}");
-        let role = if i == 0 {
-            SlotRole::Planner
+        let safe = prov.replace(['/', ':'], "-");
+        let (id, role, template) = if i == 0 {
+            (format!("planner-{safe}"), SlotRole::Planner, "planner")
         } else {
-            SlotRole::PlanCritic
+            (
+                format!("critic-{safe}"),
+                SlotRole::PlanCritic,
+                "plan_critic",
+            )
         };
-        let template = if i == 0 { "planner" } else { "plan_critic" };
         state.slots.push(executor::init_slot(&id, prov, role));
         jobs.push(SlotJob {
             slot_id: id,
@@ -286,13 +300,16 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
     }
     if jobs.is_empty() {
         for (i, prov) in state.providers.iter().take(2).enumerate() {
-            let id = format!("planner-{prov}");
-            let role = if i == 0 {
-                SlotRole::Planner
+            let safe = prov.replace(['/', ':'], "-");
+            let (id, role, template) = if i == 0 {
+                (format!("planner-{safe}"), SlotRole::Planner, "planner")
             } else {
-                SlotRole::PlanCritic
+                (
+                    format!("critic-{safe}"),
+                    SlotRole::PlanCritic,
+                    "plan_critic",
+                )
             };
-            let template = if i == 0 { "planner" } else { "plan_critic" };
             if state.slots.iter().all(|s| s.id != id) {
                 state.slots.push(executor::init_slot(&id, prov, role));
             }

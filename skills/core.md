@@ -89,6 +89,12 @@ spar logs <run_id> [slot] [-f|--follow]
 | 3 | Stuck / escalated / wait timeout |
 | 4 | No usable providers (quota/pause) |
 
+**`status` is observe-only:** process exit is always `0` if the run loads. Read JSON `exit_code` / `phase` for run state. Use `wait` when you want the process exit coded by gate/stuck/quota.
+
+**`--dry-run`:** stubs agent processes only; writes `.spar/runs/<id>/`. Does **not** create real git worktrees (cwd under `.spar/…/cwd-*`). Live runs create sibling worktrees.
+
+**Default providers:** with no `--providers`, order is config default (often all of claude,grok,agy). Live runs can spawn multiple agents — pass an explicit list when you care.
+
 ## Config knobs (`spar.toml`)
 
 ```toml
