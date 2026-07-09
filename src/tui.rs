@@ -1552,7 +1552,7 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
     q                    quit\n\
  \n\
   Runs live under each project’s .spar/runs/.\n\
-  Global index: ~/.local/share/spar (SPAR_HOME).\n\
+  Global index: ~/.spar/registry.json (SPAR_HOME overrides).\n\
  \n\
   Esc or ? to close";
     let p = Paragraph::new(body)

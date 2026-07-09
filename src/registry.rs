@@ -1,10 +1,11 @@
 //! Global project registry so `spar` can list runs from anywhere.
 //!
 //! Layout (override with `SPAR_HOME`):
-//!   ~/.local/share/spar/registry.json
+//!   ~/.spar/registry.json
 //!
 //! Runs still live under each project’s `.spar/runs/` (worktrees, isolation).
-//! The registry only tracks project roots we’ve seen.
+//! The registry only tracks project roots we’ve seen — no hardcoded scan paths.
+//! Projects appear when you run spar there or a run is saved.
 use crate::paths::SparPaths;
 use crate::state::{self, RunSummary};
 use anyhow::{Context, Result};
@@ -45,7 +46,7 @@ pub struct ProjectEntry {
     pub last_run_id: Option<String>,
 }
 
-/// Base directory for global spar state (`SPAR_HOME` or platform data dir).
+/// Global spar home: `$SPAR_HOME` or `~/.spar`.
 pub fn spar_home() -> PathBuf {
     if let Ok(p) = std::env::var("SPAR_HOME") {
         let p = PathBuf::from(p);
@@ -53,17 +54,37 @@ pub fn spar_home() -> PathBuf {
             return p;
         }
     }
-    dirs::data_local_dir()
+    dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("spar")
+        .join(".spar")
 }
 
 pub fn registry_path() -> PathBuf {
     spar_home().join("registry.json")
 }
 
+/// One-time copy from the short-lived XDG path if `~/.spar/registry.json` is missing.
+fn maybe_migrate_from_xdg() {
+    let dest = registry_path();
+    if dest.is_file() {
+        return;
+    }
+    let Some(data) = dirs::data_local_dir() else {
+        return;
+    };
+    let legacy = data.join("spar").join("registry.json");
+    if !legacy.is_file() {
+        return;
+    }
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::copy(&legacy, &dest);
+}
+
 impl Registry {
     pub fn load() -> Result<Self> {
+        maybe_migrate_from_xdg();
         let path = registry_path();
         if !path.is_file() {
             return Ok(Self::default());
@@ -88,11 +109,7 @@ impl Registry {
     }
 
     /// Remember a project root (idempotent).
-    pub fn touch_project(
-        &mut self,
-        root: &Path,
-        last_run_id: Option<&str>,
-    ) -> Result<()> {
+    pub fn touch_project(&mut self, root: &Path, last_run_id: Option<&str>) -> Result<()> {
         let root = canonicalize_best_effort(root);
         let name = root
             .file_name()
@@ -149,42 +166,17 @@ fn project_name(root: &Path) -> String {
         .to_string()
 }
 
-/// Soft-discover projects under `~/projects/*` that already have `.spar`.
-pub fn discover_home_projects() -> Vec<PathBuf> {
-    let Some(home) = dirs::home_dir() else {
-        return Vec::new();
-    };
-    let projects = home.join("projects");
-    let Ok(rd) = std::fs::read_dir(&projects) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for e in rd.flatten() {
-        let p = e.path();
-        if p.is_dir() && p.join(".spar").is_dir() {
-            out.push(canonicalize_best_effort(&p));
-        }
-    }
-    out
-}
-
-/// Ensure registry knows about current root + soft-discovered projects.
+/// Load registry; optionally register the cwd project. No filesystem path scans.
 pub fn ensure_known(current: Option<&Path>) -> Registry {
     let mut reg = Registry::load().unwrap_or_default();
     let _ = reg.prune_missing();
     if let Some(root) = current {
         let _ = reg.touch_project(root, None);
     }
-    for p in discover_home_projects() {
-        if !reg.projects.iter().any(|e| e.root == p) {
-            let _ = reg.touch_project(&p, None);
-        }
-    }
-    // reload after touches
     Registry::load().unwrap_or(reg)
 }
 
-/// All runs across registered projects, newest first. Each summary carries project fields.
+/// All runs across registered projects, newest first.
 pub fn list_all_runs() -> Result<Vec<RunSummary>> {
     let reg = ensure_known(None);
     let mut out = Vec::new();
@@ -237,18 +229,25 @@ mod tests {
         std::fs::create_dir_all(proj.join(".spar/runs")).unwrap();
         let paths = SparPaths::new(&proj);
         paths.ensure_run_dirs("abcd1234").unwrap();
-        // minimal state
         let state = state::RunState::new("abcd1234", crate::cli::WorkflowKind::Plan, proj.clone());
         state.save(&paths).unwrap();
 
         let mut reg = Registry::default();
         reg.touch_project(&proj, Some("abcd1234")).unwrap();
         assert_eq!(reg.projects.len(), 1);
+        assert!(registry_path().starts_with(&home));
 
         let all = list_all_runs().unwrap();
         assert!(all.iter().any(|r| r.id == "abcd1234"));
         assert_eq!(all[0].project_name.as_deref(), Some("myproj"));
 
         std::env::remove_var("SPAR_HOME");
+    }
+
+    #[test]
+    fn default_home_is_dot_spar_under_home() {
+        std::env::remove_var("SPAR_HOME");
+        let h = spar_home();
+        assert!(h.ends_with(".spar"), "expected ~/.spar, got {}", h.display());
     }
 }
