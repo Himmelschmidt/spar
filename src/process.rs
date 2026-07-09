@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -740,20 +740,76 @@ fn append_log(path: &Path, text: &str) -> Result<()> {
     Ok(())
 }
 
+pub struct TailLog {
+    pub text: String,
+    pub truncated: bool,
+    /// True when open/read failed (caller should not cache as a successful empty).
+    pub io_error: bool,
+}
+
 pub fn tail_log(path: &Path, max_bytes: usize) -> String {
+    tail_log_info(path, max_bytes).text
+}
+
+/// Read only the last `max_bytes` of a log (seek from end). Avoids loading multi-MB logs.
+pub fn tail_log_info(path: &Path, max_bytes: usize) -> TailLog {
     let Ok(mut f) = File::open(path) else {
-        return String::new();
+        return TailLog {
+            text: String::new(),
+            truncated: false,
+            io_error: true,
+        };
     };
+    let Ok(len) = f.seek(SeekFrom::End(0)) else {
+        return TailLog {
+            text: String::new(),
+            truncated: false,
+            io_error: true,
+        };
+    };
+    let truncated = len > max_bytes as u64;
+    if truncated {
+        let back = max_bytes as u64;
+        if f.seek(SeekFrom::End(-(back as i64))).is_err() {
+            return TailLog {
+                text: String::new(),
+                truncated: false,
+                io_error: true,
+            };
+        }
+    } else if f.seek(SeekFrom::Start(0)).is_err() {
+        return TailLog {
+            text: String::new(),
+            truncated: false,
+            io_error: true,
+        };
+    }
     let mut buf = Vec::new();
     if f.read_to_end(&mut buf).is_err() {
-        return String::new();
+        return TailLog {
+            text: String::new(),
+            truncated: false,
+            io_error: true,
+        };
     }
-    if buf.len() > max_bytes {
-        let start = buf.len() - max_bytes;
-        String::from_utf8_lossy(&buf[start..]).into_owned()
-    } else {
-        String::from_utf8_lossy(&buf).into_owned()
+    if truncated {
+        let start = next_char_boundary(&buf, 0);
+        if start > 0 {
+            buf = buf[start..].to_vec();
+        }
     }
+    TailLog {
+        text: String::from_utf8_lossy(&buf).into_owned(),
+        truncated,
+        io_error: false,
+    }
+}
+
+fn next_char_boundary(buf: &[u8], mut i: usize) -> usize {
+    while i < buf.len() && (buf[i] & 0b1100_0000) == 0b1000_0000 {
+        i += 1;
+    }
+    i
 }
 
 pub fn run_mock(req: &SpawnRequest, mock_output: &str) -> Result<SpawnResult> {
@@ -870,5 +926,54 @@ mod tests {
         let chunk = c.feed(line).unwrap();
         assert!(chunk.contains("←"));
         assert!(chunk.contains("a.rs"));
+    }
+
+    #[test]
+    fn tail_log_seeks_window() {
+        let tmp = tempdir().unwrap();
+        let log = tmp.path().join("big.log");
+        let mut body = String::new();
+        body.push_str("PREFIX_SHOULD_DROP\n");
+        body.push_str(&"x".repeat(200));
+        body.push_str("\nTAIL_MARKER\n");
+        std::fs::write(&log, &body).unwrap();
+        let t = tail_log_info(&log, 50);
+        assert!(t.truncated);
+        assert!(!t.io_error);
+        assert!(t.text.contains("TAIL_MARKER"));
+        assert!(!t.text.contains("PREFIX_SHOULD_DROP"));
+        assert!(t.text.len() <= 50 + 4); // boundary may drop a few lead bytes
+    }
+
+    #[test]
+    fn tail_log_small_file_not_truncated() {
+        let tmp = tempdir().unwrap();
+        let log = tmp.path().join("small.log");
+        std::fs::write(&log, "hello\nworld\n").unwrap();
+        let t = tail_log_info(&log, 10_000);
+        assert!(!t.truncated);
+        assert!(!t.io_error);
+        assert_eq!(t.text, "hello\nworld\n");
+    }
+
+    #[test]
+    fn tail_log_utf8_boundary() {
+        let tmp = tempdir().unwrap();
+        let log = tmp.path().join("utf8.log");
+        // 2-byte UTF-8 chars so a naive mid-window start can land on a continuation.
+        let mut bytes = Vec::new();
+        bytes.extend(std::iter::repeat_n(0xC3u8, 1)); // incomplete alone; we'll write full chars
+        // Write many "é" (C3 A9) then ASCII marker.
+        for _ in 0..40 {
+            bytes.extend_from_slice("é".as_bytes());
+        }
+        bytes.extend_from_slice(b"\nEND\n");
+        std::fs::write(&log, &bytes).unwrap();
+        let t = tail_log_info(&log, 25);
+        assert!(t.truncated);
+        assert!(!t.io_error);
+        // Must be valid UTF-8 view (lossless for our content after boundary).
+        assert!(t.text.contains("END"));
+        assert!(!t.text.chars().any(|c| c == '\u{FFFD}'));
     }
 }

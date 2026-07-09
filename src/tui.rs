@@ -26,8 +26,8 @@ use ratatui::widgets::{
     ScrollbarOrientation, ScrollbarState, Widget,
 };
 use std::io::stdout;
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 
 // ── palette ─────────────────────────────────────────────────────────────────
 
@@ -111,25 +111,36 @@ pub fn run_with(opts: TuiOpts) -> Result<crate::exit_codes::ExitCode> {
         .unwrap_or(300);
 
     enable_raw_mode()?;
+    // Install immediately so partial setup / panic still restores the terminal.
+    let _guard = TerminalGuard;
     let mut out = stdout();
     out.execute(EnterAlternateScreen)?;
     out.execute(EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
     terminal.clear()?;
 
-    let result = run_loop(
+    run_loop(
         &mut terminal,
         local_root,
         opts.task_seed,
         stall_warn_secs,
-    );
-
-    disable_raw_mode()?;
-    let mut out = stdout();
-    out.execute(DisableMouseCapture)?;
-    out.execute(LeaveAlternateScreen)?;
-    result
+    )
 }
+
+/// Best-effort teardown of raw mode / mouse / alt-screen (safe if only partially entered).
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let mut out = stdout();
+        let _ = out.execute(DisableMouseCapture);
+        let _ = out.execute(LeaveAlternateScreen);
+    }
+}
+
+/// Bytes of slot log kept in the live-log viewport (tail window).
+const LOG_TAIL_BYTES: usize = 256_000;
 
 /// Left-rail navigation: projects first (general), then runs for one project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +161,15 @@ struct App {
     status_line: String,
     stream_scroll: u16,
     bus_scroll: u16,
+    /// When true, keep the live log pinned to the newest line as content grows.
+    stream_follow: bool,
+    bus_follow: bool,
+    /// Last known max scroll offsets (from the most recent paint).
+    stream_max: u16,
+    bus_max: u16,
+    /// Log viewport height in rows (for PageUp/PageDown).
+    stream_view_h: u16,
+    bus_view_h: u16,
     tick: u64,
     /// (started, message, color, how long to show)
     flash: Option<(Instant, String, Color, Duration)>,
@@ -160,6 +180,7 @@ struct App {
     last_ctrl_c: Option<Instant>,
     last_click: Option<(u16, u16, Instant)>,
     show_help: bool,
+    log_cache: LogCache,
     rect_header: Rect,
     rect_action: Rect,
     rect_fleet: Rect,
@@ -167,6 +188,57 @@ struct App {
     rect_bus: Rect,
     rect_composer: Rect,
     rect_runs: Rect,
+}
+
+/// Avoid re-reading the slot log on every frame when the file is unchanged.
+struct LogCache {
+    path: Option<PathBuf>,
+    len: u64,
+    mtime: Option<SystemTime>,
+    text: String,
+    truncated: bool,
+}
+
+impl LogCache {
+    fn empty() -> Self {
+        Self {
+            path: None,
+            len: 0,
+            mtime: None,
+            text: String::new(),
+            truncated: false,
+        }
+    }
+
+    fn load(&mut self, path: &Path, max_bytes: usize) -> (&str, bool) {
+        let meta = std::fs::metadata(path).ok();
+        let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let mtime = meta.and_then(|m| m.modified().ok());
+        let same = self.path.as_deref() == Some(path)
+            && self.len == len
+            && self.mtime == mtime;
+        if !same {
+            let tail = process::tail_log_info(path, max_bytes);
+            if tail.io_error {
+                // Do not cache a failed read as an empty successful snapshot.
+                return ("", false);
+            }
+            self.path = Some(path.to_path_buf());
+            self.len = len;
+            self.mtime = mtime;
+            self.text = tail.text;
+            self.truncated = tail.truncated;
+        }
+        (&self.text, self.truncated)
+    }
+
+    fn clear(&mut self) {
+        self.path = None;
+        self.len = 0;
+        self.mtime = None;
+        self.text.clear();
+        self.truncated = false;
+    }
 }
 
 impl App {
@@ -186,6 +258,13 @@ impl App {
             status_line: String::new(),
             stream_scroll: 0,
             bus_scroll: 0,
+            // Default: follow live output (newest lines).
+            stream_follow: true,
+            bus_follow: true,
+            stream_max: 0,
+            bus_max: 0,
+            stream_view_h: 12,
+            bus_view_h: 12,
             tick: 0,
             flash: None,
             stall_warn_secs,
@@ -193,6 +272,7 @@ impl App {
             last_ctrl_c: None,
             last_click: None,
             show_help: false,
+            log_cache: LogCache::empty(),
             rect_header: Rect::default(),
             rect_action: Rect::default(),
             rect_fleet: Rect::default(),
@@ -217,14 +297,25 @@ impl App {
         SPINNER[(self.tick as usize) % SPINNER.len()]
     }
 
+    fn reset_stream_view(&mut self) {
+        self.stream_scroll = 0;
+        self.stream_follow = true;
+        self.log_cache.clear();
+    }
+
+    fn reset_bus_view(&mut self) {
+        self.bus_scroll = 0;
+        self.bus_follow = true;
+    }
+
     fn select_run(&mut self, idx: usize, n: usize) {
         if n == 0 {
             return;
         }
         self.selected_run = idx.min(n - 1);
         self.selected_slot = 0;
-        self.stream_scroll = 0;
-        self.bus_scroll = 0;
+        self.reset_stream_view();
+        self.reset_bus_view();
     }
 
     fn select_project(&mut self, idx: usize, n: usize) {
@@ -234,8 +325,8 @@ impl App {
         self.selected_project = idx.min(n - 1);
         self.selected_run = 0;
         self.selected_slot = 0;
-        self.stream_scroll = 0;
-        self.bus_scroll = 0;
+        self.reset_stream_view();
+        self.reset_bus_view();
     }
 
     fn select_slot(&mut self, idx: usize, n: usize) {
@@ -243,14 +334,15 @@ impl App {
             return;
         }
         self.selected_slot = idx.min(n - 1);
-        self.stream_scroll = 0;
+        self.reset_stream_view();
     }
 
     fn open_project_runs(&mut self) {
         self.browse = BrowseLevel::Runs;
         self.selected_run = 0;
         self.selected_slot = 0;
-        self.stream_scroll = 0;
+        self.reset_stream_view();
+        self.reset_bus_view();
         self.focus = Focus::Runs;
     }
 
@@ -258,8 +350,90 @@ impl App {
         self.browse = BrowseLevel::Projects;
         self.selected_run = 0;
         self.selected_slot = 0;
-        self.stream_scroll = 0;
+        self.reset_stream_view();
+        self.reset_bus_view();
         self.focus = Focus::Runs;
+    }
+
+    fn stream_page(&self) -> u16 {
+        self.stream_view_h.saturating_sub(1).max(3)
+    }
+
+    fn bus_page(&self) -> u16 {
+        self.bus_view_h.saturating_sub(1).max(3)
+    }
+
+    fn scroll_stream_by(&mut self, delta: i32) {
+        apply_scroll_delta(
+            &mut self.stream_scroll,
+            &mut self.stream_follow,
+            self.stream_max,
+            delta,
+        );
+    }
+
+    fn scroll_bus_by(&mut self, delta: i32) {
+        apply_scroll_delta(
+            &mut self.bus_scroll,
+            &mut self.bus_follow,
+            self.bus_max,
+            delta,
+        );
+    }
+
+    fn home_for_focus(&mut self) {
+        match self.focus {
+            Focus::Activity => {
+                self.bus_follow = false;
+                self.bus_scroll = 0;
+            }
+            _ => {
+                self.stream_follow = false;
+                self.stream_scroll = 0;
+            }
+        }
+    }
+
+    fn end_for_focus(&mut self) {
+        match self.focus {
+            Focus::Activity => {
+                self.bus_follow = true;
+                self.bus_scroll = self.bus_max;
+            }
+            _ => {
+                self.stream_follow = true;
+                self.stream_scroll = self.stream_max;
+            }
+        }
+    }
+}
+
+/// Apply a scroll delta and update follow-tail. Positive = toward newer lines.
+fn apply_scroll_delta(scroll: &mut u16, follow: &mut bool, max: u16, delta: i32) {
+    if delta == 0 {
+        return;
+    }
+    if delta > 0 {
+        let next = (*scroll as u32).saturating_add(delta as u32);
+        *scroll = next.min(u32::from(max)) as u16;
+    } else {
+        let sub = (-delta) as u32;
+        *scroll = (*scroll as u32).saturating_sub(sub) as u16;
+    }
+    // When content fits (max==0) or we remain at the end, keep follow so growth
+    // does not leave the viewport stuck at the top of a short log.
+    *follow = *scroll >= max;
+}
+
+/// Clamp scroll into `[0, max]`; when `follow`, pin to max.
+fn clamp_scroll(scroll: &mut u16, follow: &mut bool, max: u16) {
+    if *follow {
+        *scroll = max;
+    } else {
+        *scroll = (*scroll).min(max);
+        if *scroll >= max {
+            *follow = true;
+        }
     }
 }
 
@@ -349,8 +523,13 @@ fn run_loop(
 
         let quota = QuotaStore::load(&swarm).unwrap_or_default();
         let stream_text = match app.browse {
-            BrowseLevel::Projects => project_overview(&projects, app.selected_project),
-            BrowseLevel::Runs => stream_content(&swarm, full.as_ref(), app.selected_slot),
+            BrowseLevel::Projects => {
+                app.log_cache.clear();
+                project_overview(&projects, app.selected_project)
+            }
+            BrowseLevel::Runs => {
+                stream_content(&swarm, full.as_ref(), app.selected_slot, &mut app.log_cache)
+            }
         };
         let activity = activity_feed(&swarm, full.as_ref(), &quota);
 
@@ -369,60 +548,54 @@ fn run_loop(
                 full.as_ref(),
                 &stream_text,
                 &activity,
-                &app,
+                &mut app,
                 &mut fleet_state,
                 &mut rail_state,
             );
         })?;
 
-        let area = terminal.size()?;
-        let layout = layout_rects(Rect {
-            x: 0,
-            y: 0,
-            width: area.width,
-            height: area.height,
-        });
-        app.rect_header = layout.header;
-        app.rect_action = layout.action;
-        app.rect_runs = layout.runs;
-        app.rect_fleet = layout.fleet;
-        app.rect_stream = layout.stream;
-        app.rect_bus = layout.bus;
-        app.rect_composer = layout.composer;
-
+        // Wait up to 50ms for the first event, then drain a bounded batch so
+        // wheel/key spam cannot leave deltas stuck or starve redraw.
+        const MAX_EVENTS_PER_TICK: usize = 48;
         if event::poll(Duration::from_millis(50))? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if handle_key(
-                        &mut app,
-                        key.code,
-                        key.modifiers,
-                        &swarm,
-                        &projects,
-                        &runs,
-                        full.as_ref(),
-                        &mut active_root,
-                        local_root.as_deref(),
-                    )? {
-                        break;
+            for _ in 0..MAX_EVENTS_PER_TICK {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        if handle_key(
+                            &mut app,
+                            key.code,
+                            key.modifiers,
+                            &swarm,
+                            &projects,
+                            &runs,
+                            full.as_ref(),
+                            &mut active_root,
+                            local_root.as_deref(),
+                        )? {
+                            return Ok(crate::exit_codes::ExitCode::Success);
+                        }
                     }
+                    Event::Mouse(m) => {
+                        handle_mouse(
+                            &mut app,
+                            m,
+                            &projects,
+                            &runs,
+                            full.as_ref(),
+                            &mut active_root,
+                            rail_state.offset(),
+                            fleet_state.offset(),
+                        );
+                    }
+                    Event::Resize(_, _) => {}
+                    _ => {}
                 }
-                Event::Mouse(m) => {
-                    handle_mouse(
-                        &mut app,
-                        m,
-                        &projects,
-                        &runs,
-                        full.as_ref(),
-                        &mut active_root,
-                    );
+                if !event::poll(Duration::from_millis(0))? {
+                    break;
                 }
-                Event::Resize(_, _) => {}
-                _ => {}
             }
         }
     }
-    Ok(crate::exit_codes::ExitCode::Success)
 }
 
 fn load_projects(local_root: Option<&std::path::Path>) -> Vec<registry::ProjectEntry> {
@@ -582,8 +755,8 @@ fn handle_key(
                     app.select_slot(app.selected_slot + 1, n_slots);
                 }
             }
-            Focus::Log => app.stream_scroll = app.stream_scroll.saturating_add(3),
-            Focus::Activity => app.bus_scroll = app.bus_scroll.saturating_add(1),
+            Focus::Log => app.scroll_stream_by(3),
+            Focus::Activity => app.scroll_bus_by(1),
             Focus::Composer => {}
         },
         KeyCode::Char('k') | KeyCode::Up => match app.focus {
@@ -601,13 +774,13 @@ fn handle_key(
             Focus::Agents => {
                 app.select_slot(app.selected_slot.saturating_sub(1), n_slots.max(1));
             }
-            Focus::Log => app.stream_scroll = app.stream_scroll.saturating_sub(3),
-            Focus::Activity => app.bus_scroll = app.bus_scroll.saturating_sub(1),
+            Focus::Log => app.scroll_stream_by(-3),
+            Focus::Activity => app.scroll_bus_by(-1),
             Focus::Composer => {}
         },
         KeyCode::PageDown => match app.focus {
-            Focus::Log => app.stream_scroll = app.stream_scroll.saturating_add(12),
-            Focus::Activity => app.bus_scroll = app.bus_scroll.saturating_add(6),
+            Focus::Log => app.scroll_stream_by(i32::from(app.stream_page())),
+            Focus::Activity => app.scroll_bus_by(i32::from(app.bus_page())),
             Focus::Runs => match app.browse {
                 BrowseLevel::Projects if !projects.is_empty() => {
                     app.select_project(app.selected_project + 5, projects.len());
@@ -621,8 +794,8 @@ fn handle_key(
             _ => {}
         },
         KeyCode::PageUp => match app.focus {
-            Focus::Log => app.stream_scroll = app.stream_scroll.saturating_sub(12),
-            Focus::Activity => app.bus_scroll = app.bus_scroll.saturating_sub(6),
+            Focus::Log => app.scroll_stream_by(-i32::from(app.stream_page())),
+            Focus::Activity => app.scroll_bus_by(-i32::from(app.bus_page())),
             Focus::Runs => match app.browse {
                 BrowseLevel::Projects => {
                     app.select_project(
@@ -697,17 +870,17 @@ fn handle_key(
             }
         }
         KeyCode::Char('g') | KeyCode::Home => {
-            app.stream_scroll = 0;
-            app.bus_scroll = 0;
+            app.home_for_focus();
         }
         KeyCode::Char('G') | KeyCode::End => {
-            app.stream_scroll = 9999;
+            app.end_for_focus();
         }
         KeyCode::Char('?') => {
             app.show_help = true;
         }
         KeyCode::Char('w') => {
             app.log_expand = !app.log_expand;
+            // Row count changes with wrap; keep follow semantics, clamp on next paint.
             app.flash(
                 if app.log_expand {
                     "Log: wrap long lines"
@@ -722,6 +895,7 @@ fn handle_key(
     Ok(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_mouse(
     app: &mut App,
     m: crossterm::event::MouseEvent,
@@ -729,6 +903,8 @@ fn handle_mouse(
     runs: &[state::RunSummary],
     full: Option<&RunState>,
     active_root: &mut PathBuf,
+    rail_offset: usize,
+    fleet_offset: usize,
 ) {
     let (x, y) = (m.column, m.row);
     let n_slots = full.map(|s| s.slots.len()).unwrap_or(0);
@@ -751,7 +927,9 @@ fn handle_mouse(
             } else if contains(app.rect_fleet, x, y) {
                 app.focus = Focus::Agents;
                 if let Some(st) = full {
-                    if let Some(row) = list_row_at(app.rect_fleet, y, st.slots.len()) {
+                    if let Some(row) =
+                        list_row_at(app.rect_fleet, y, st.slots.len(), fleet_offset)
+                    {
                         app.select_slot(row, st.slots.len());
                     }
                 }
@@ -759,7 +937,9 @@ fn handle_mouse(
                 app.focus = Focus::Runs;
                 match app.browse {
                     BrowseLevel::Projects => {
-                        if let Some(row) = list_row_at(app.rect_runs, y, projects.len()) {
+                        if let Some(row) =
+                            list_row_at(app.rect_runs, y, projects.len(), rail_offset)
+                        {
                             app.select_project(row, projects.len());
                             if dbl {
                                 if let Some(p) = projects.get(row) {
@@ -770,7 +950,8 @@ fn handle_mouse(
                         }
                     }
                     BrowseLevel::Runs => {
-                        if let Some(row) = list_row_at(app.rect_runs, y, runs.len()) {
+                        if let Some(row) = list_row_at(app.rect_runs, y, runs.len(), rail_offset)
+                        {
                             app.select_run(row, runs.len());
                         }
                     }
@@ -782,10 +963,10 @@ fn handle_mouse(
         MouseEventKind::ScrollDown => {
             if contains(app.rect_stream, x, y) {
                 app.focus = Focus::Log;
-                app.stream_scroll = app.stream_scroll.saturating_add(3);
+                app.scroll_stream_by(3);
             } else if contains(app.rect_bus, x, y) {
                 app.focus = Focus::Activity;
-                app.bus_scroll = app.bus_scroll.saturating_add(2);
+                app.scroll_bus_by(2);
             } else if contains(app.rect_fleet, x, y) {
                 app.focus = Focus::Agents;
                 if n_slots > 0 {
@@ -807,10 +988,10 @@ fn handle_mouse(
         MouseEventKind::ScrollUp => {
             if contains(app.rect_stream, x, y) {
                 app.focus = Focus::Log;
-                app.stream_scroll = app.stream_scroll.saturating_sub(3);
+                app.scroll_stream_by(-3);
             } else if contains(app.rect_bus, x, y) {
                 app.focus = Focus::Activity;
-                app.bus_scroll = app.bus_scroll.saturating_sub(2);
+                app.scroll_bus_by(-2);
             } else if contains(app.rect_fleet, x, y) {
                 app.focus = Focus::Agents;
                 if n_slots > 0 {
@@ -836,13 +1017,18 @@ fn handle_mouse(
 }
 
 /// Map a mouse Y to a list row inside a bordered panel (title row skipped).
-fn list_row_at(panel: Rect, y: u16, n_items: usize) -> Option<usize> {
+/// `offset` is the ListState scroll offset so clicks track the visible window.
+fn list_row_at(panel: Rect, y: u16, n_items: usize, offset: usize) -> Option<usize> {
     if n_items == 0 || panel.height < 3 {
         return None;
     }
-    // border top + title uses y = panel.y; first item at panel.y + 1
+    // border top + title uses y = panel.y; first visible item at panel.y + 1
     let inner_y = y.saturating_sub(panel.y.saturating_add(1));
-    let row = inner_y as usize;
+    let visible = panel.height.saturating_sub(2) as usize;
+    if inner_y as usize >= visible {
+        return None;
+    }
+    let row = offset.saturating_add(inner_y as usize);
     if row < n_items {
         Some(row)
     } else {
@@ -913,7 +1099,7 @@ fn draw(
     full: Option<&RunState>,
     stream_text: &str,
     activity: &[String],
-    app: &App,
+    app: &mut App,
     fleet_state: &mut ListState,
     rail_state: &mut ListState,
 ) {
@@ -923,6 +1109,14 @@ fn draw(
     f.render_widget(Block::default().style(Style::default().bg(BG)), area);
 
     let lay = layout_rects(area);
+    // Keep mouse hit regions aligned with the frame actually painted.
+    app.rect_header = lay.header;
+    app.rect_action = lay.action;
+    app.rect_runs = lay.runs;
+    app.rect_fleet = lay.fleet;
+    app.rect_stream = lay.stream;
+    app.rect_bus = lay.bus;
+    app.rect_composer = lay.composer;
 
     draw_header(f, lay.header, swarm, full, app);
     draw_action(f, lay.action, projects, runs, full, app);
@@ -936,8 +1130,6 @@ fn draw(
     if app.show_help {
         draw_help_overlay(f, area);
     }
-
-    let _ = Clear;
 }
 
 fn draw_header(f: &mut Frame, area: Rect, swarm: &SparPaths, full: Option<&RunState>, app: &App) {
@@ -1370,7 +1562,7 @@ fn draw_stream(
     area: Rect,
     full: Option<&RunState>,
     stream_text: &str,
-    app: &App,
+    app: &mut App,
 ) {
     let focused = app.focus == Focus::Log;
     let slot = full.and_then(|st| st.slots.get(app.selected_slot));
@@ -1388,10 +1580,11 @@ fn draw_stream(
         })
         .unwrap_or_default();
     let mode = if app.log_expand { "wrap" } else { "trim" };
+    let follow = if app.stream_follow { " · live" } else { "" };
     let title = if focused {
-        format!(" Live log  · {slot_id}{silent_hint}  · {mode} · w toggle · scroll ")
+        format!(" Live log  · {slot_id}{silent_hint}  · {mode}{follow} · w · scroll ")
     } else {
-        format!(" Live log  · {slot_id}{silent_hint} ")
+        format!(" Live log  · {slot_id}{silent_hint}{follow} ")
     };
 
     let block = panel(&title, focused);
@@ -1425,11 +1618,13 @@ fn draw_stream(
     });
     draw_stream_stats(f, chunks[0], stats.as_ref(), slot.map(|s| s.status));
 
-    render_scrollable_log(
+    app.stream_view_h = chunks[1].height;
+    app.stream_max = render_scrollable_log(
         f,
         chunks[1],
         stream_text,
-        app.stream_scroll,
+        &mut app.stream_scroll,
+        &mut app.stream_follow,
         true,
         app.log_expand,
     );
@@ -1522,16 +1717,20 @@ fn draw_stream_stats(
 }
 
 /// Paint a log viewport by writing cells directly (no Paragraph wrap/scroll).
+/// Clamps `scroll` into range and pins to bottom when `follow` is set.
+/// Returns the max valid scroll offset for this paint.
 fn render_scrollable_log(
     f: &mut Frame,
     area: Rect,
     text: &str,
-    scroll: u16,
+    scroll: &mut u16,
+    follow: &mut bool,
     colorize: bool,
     expand: bool,
-) {
+) -> u16 {
     if area.width == 0 || area.height == 0 {
-        return;
+        clamp_scroll(scroll, follow, 0);
+        return 0;
     }
 
     let sb_w = 1u16;
@@ -1539,8 +1738,10 @@ fn render_scrollable_log(
     let height = area.height as usize;
     let rows = layout_log_rows(text, text_w, colorize, expand);
     let total = rows.len().max(1);
-    let max_scroll = total.saturating_sub(height);
-    let start = (scroll as usize).min(max_scroll);
+    // Cap at u16::MAX so dense tails cannot wrap the scroll type.
+    let max_scroll = total.saturating_sub(height).min(u16::MAX as usize) as u16;
+    clamp_scroll(scroll, follow, max_scroll);
+    let start = *scroll as usize;
     let visible: Vec<(String, Style)> = rows.into_iter().skip(start).take(height).collect();
 
     let text_area = Rect {
@@ -1566,6 +1767,7 @@ fn render_scrollable_log(
         area,
         &mut sb,
     );
+    max_scroll
 }
 
 /// Fills every cell, then paints plain strings — no span leftovers across frames.
@@ -1770,7 +1972,7 @@ fn compact_u64(n: u64) -> String {
     }
 }
 
-fn draw_activity(f: &mut Frame, area: Rect, activity: &[String], app: &App) {
+fn draw_activity(f: &mut Frame, area: Rect, activity: &[String], app: &mut App) {
     let focused = app.focus == Focus::Activity;
     let text = if activity.is_empty() {
         "No activity yet.\n\nRun timeline: phases,\nagents, gates, bus.".into()
@@ -1785,7 +1987,16 @@ fn draw_activity(f: &mut Frame, area: Rect, activity: &[String], app: &App) {
     let block = panel(title, focused);
     let inner = block.inner(area);
     f.render_widget(block, area);
-    render_scrollable_log(f, inner, &text, app.bus_scroll, false, true);
+    app.bus_view_h = inner.height;
+    app.bus_max = render_scrollable_log(
+        f,
+        inner,
+        &text,
+        &mut app.bus_scroll,
+        &mut app.bus_follow,
+        false,
+        true,
+    );
 }
 
 fn draw_composer(f: &mut Frame, area: Rect, app: &App) {
@@ -1844,22 +2055,23 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, full: Option<&RunState>) {
         BG_RAISED
     };
 
-    let left = Span::styled(format!(" {msg} "), Style::default().fg(color).bg(bg));
-    let right = if gate {
-        Span::styled(
-            "  YOUR MOVE  ",
-            Style::default().fg(BG).bg(YELLOW).bold(),
-        )
+    let left_text = format!(" {msg} ");
+    let right_text = if gate {
+        "  YOUR MOVE  ".to_string()
     } else {
-        Span::styled(
-            format!(" {}  ? help  ·  Ctrl+C×2 exit  ", app.spinner()),
-            Style::default().fg(FG_MUTED).bg(bg),
-        )
+        format!(" {}  ? help  ·  Ctrl+C×2 exit  ", app.spinner())
     };
-    let pad = area
-        .width
-        .saturating_sub(msg.len() as u16 + 24)
-        .max(1) as usize;
+    let left = Span::styled(
+        left_text.clone(),
+        Style::default().fg(color).bg(bg),
+    );
+    let right = if gate {
+        Span::styled(right_text.clone(), Style::default().fg(BG).bg(YELLOW).bold())
+    } else {
+        Span::styled(right_text.clone(), Style::default().fg(FG_MUTED).bg(bg))
+    };
+    let used = (left_text.chars().count() + right_text.chars().count()) as u16;
+    let pad = area.width.saturating_sub(used).max(1) as usize;
     let line = Line::from(vec![
         left,
         Span::styled(" ".repeat(pad), Style::default().bg(bg)),
@@ -1886,7 +2098,7 @@ fn situational_footer(full: Option<&RunState>, focus: Focus, browse: BrowseLevel
     match focus {
         Focus::Runs => "j/k runs · Esc/p projects · Tab → Agents · ? help",
         Focus::Agents => "j/k agent · log follows · Tab → Live log",
-        Focus::Log => "scroll / j k · w wrap/trim · g top · Tab → Activity",
+        Focus::Log => "scroll · w wrap · g/G top/end · up unfollows live · Tab",
         Focus::Activity => "run timeline · scroll · Tab → Command",
         Focus::Composer => "type /approve /reject /ship /help · Enter · Esc",
     }
@@ -2002,11 +2214,18 @@ fn handle_composer(
     ))
 }
 
-fn stream_content(swarm: &SparPaths, full: Option<&RunState>, slot_idx: usize) -> String {
+fn stream_content(
+    swarm: &SparPaths,
+    full: Option<&RunState>,
+    slot_idx: usize,
+    cache: &mut LogCache,
+) -> String {
     let Some(st) = full else {
+        cache.clear();
         return "\n  Select a run on the left.\n\n  New work:\n    spar plan -t \"describe the change\" --providers cli:claude\n".into();
     };
     if st.slots.is_empty() {
+        cache.clear();
         return "\n  This run has no agents yet.".into();
     }
     let slot = &st.slots[slot_idx.min(st.slots.len() - 1)];
@@ -2015,7 +2234,7 @@ fn stream_content(swarm: &SparPaths, full: Option<&RunState>, slot_idx: usize) -
         .clone()
         .unwrap_or_else(|| swarm.log_file(&st.id, &slot.id));
     if path.is_file() {
-        let raw = process::tail_log(&path, 80_000);
+        let (raw, truncated) = cache.load(&path, LOG_TAIL_BYTES);
         let body: Vec<&str> = raw
             .lines()
             .skip_while(|l| {
@@ -2047,10 +2266,13 @@ fn stream_content(swarm: &SparPaths, full: Option<&RunState>, slot_idx: usize) -
                 "\n  {} is running — waiting for stream…\n  Quiet time is on Agents; Activity shows phase timeline.",
                 slot.id
             )
+        } else if truncated {
+            format!("… earlier log truncated (showing last ~{} KB)\n{body}", LOG_TAIL_BYTES / 1024)
         } else {
             body
         }
     } else {
+        cache.clear();
         format!(
             "\n  No log yet for {}\n  {} · {}",
             slot.id,
@@ -2334,9 +2556,12 @@ mod labels {
             width: 20,
             height: 8,
         };
-        assert_eq!(list_row_at(r, 11, 3), Some(0));
-        assert_eq!(list_row_at(r, 12, 3), Some(1));
-        assert_eq!(list_row_at(r, 20, 3), None);
+        assert_eq!(list_row_at(r, 11, 3, 0), Some(0));
+        assert_eq!(list_row_at(r, 12, 3, 0), Some(1));
+        assert_eq!(list_row_at(r, 20, 3, 0), None);
+        // Scrolled list: first visible row is index 2
+        assert_eq!(list_row_at(r, 11, 10, 2), Some(2));
+        assert_eq!(list_row_at(r, 12, 10, 2), Some(3));
     }
 
     #[test]
@@ -2354,5 +2579,74 @@ mod labels {
         let rows = layout_log_rows(&long, 20, true, true);
         assert!(rows.len() > 1);
         assert!(rows.iter().all(|(s, _)| s.chars().count() <= 20));
+    }
+
+    #[test]
+    fn scroll_delta_clamps_and_sets_follow() {
+        let mut scroll = 0u16;
+        let mut follow = false;
+        let max = 100u16;
+        apply_scroll_delta(&mut scroll, &mut follow, max, 3);
+        assert_eq!(scroll, 3);
+        assert!(!follow);
+        apply_scroll_delta(&mut scroll, &mut follow, max, 1000);
+        assert_eq!(scroll, 100);
+        assert!(follow);
+        apply_scroll_delta(&mut scroll, &mut follow, max, -5);
+        assert_eq!(scroll, 95);
+        assert!(!follow);
+    }
+
+    #[test]
+    fn scroll_up_when_content_fits_keeps_follow() {
+        let mut scroll = 0u16;
+        let mut follow = true;
+        apply_scroll_delta(&mut scroll, &mut follow, 0, -3);
+        assert_eq!(scroll, 0);
+        assert!(follow, "short log must stay following so growth stays visible");
+    }
+
+    #[test]
+    fn clamp_scroll_pins_when_following() {
+        let mut scroll = 9999u16;
+        let mut follow = true;
+        clamp_scroll(&mut scroll, &mut follow, 40);
+        assert_eq!(scroll, 40);
+        assert!(follow);
+
+        scroll = 9999;
+        follow = false;
+        clamp_scroll(&mut scroll, &mut follow, 40);
+        assert_eq!(scroll, 40);
+        assert!(follow);
+
+        scroll = 10;
+        follow = false;
+        clamp_scroll(&mut scroll, &mut follow, 40);
+        assert_eq!(scroll, 10);
+        assert!(!follow);
+    }
+
+    #[test]
+    fn overscroll_then_up_moves_immediately() {
+        let mut scroll = 9999u16;
+        let mut follow = false;
+        let max = 50u16;
+        clamp_scroll(&mut scroll, &mut follow, max);
+        assert_eq!(scroll, 50);
+        apply_scroll_delta(&mut scroll, &mut follow, max, -3);
+        assert_eq!(scroll, 47);
+        assert!(!follow);
+    }
+
+    #[test]
+    fn follow_pins_when_max_grows() {
+        let mut scroll = 10u16;
+        let mut follow = true;
+        clamp_scroll(&mut scroll, &mut follow, 10);
+        assert_eq!(scroll, 10);
+        clamp_scroll(&mut scroll, &mut follow, 40);
+        assert_eq!(scroll, 40);
+        assert!(follow);
     }
 }
