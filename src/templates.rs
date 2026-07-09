@@ -69,7 +69,13 @@ pub fn base_vars(ctx: &TemplateCtx<'_>) -> HashMap<String, String> {
     m.insert("review_cwd".into(), ctx.cwd.into());
     m.insert(
         "suite_body".into(),
-        "(no suite report yet — suite channel may still be running or was skipped)".into(),
+        "(no suite report)".into(),
+    );
+    // Default: independent review may run tests. Implement overrides when suite channel ran.
+    m.insert(
+        "suite_guidance".into(),
+        "## Tests\nYou may run targeted or full suites as needed for confidence. Prefer evidence over claims.\n"
+            .into(),
     );
     m.insert("candidates".into(), String::new());
     m.insert("peer_role".into(), String::new());
@@ -106,17 +112,20 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_gets_suite_body() {
+    fn reviewer_gets_suite_guidance() {
         let mut v = HashMap::new();
         v.insert("task".into(), "x".into());
         v.insert("review_cwd".into(), "/tmp".into());
         v.insert("artifacts_dir".into(), "/tmp/a".into());
         v.insert("markers_dir".into(), "/tmp/m".into());
         v.insert("slot_id".into(), "rev".into());
-        v.insert("suite_body".into(), "## Result\npass\n".into());
+        v.insert(
+            "suite_guidance".into(),
+            "## Suite channel\nDo **not** kick off full suites.\n## Result\npass\n".into(),
+        );
         let s = render("reviewer", &v).unwrap();
         assert!(s.contains("## Result\npass"));
         assert!(s.contains("Do **not** kick off full"));
-        assert!(!s.contains("{{suite_body}}"));
+        assert!(!s.contains("{{suite_guidance}}"));
     }
 }

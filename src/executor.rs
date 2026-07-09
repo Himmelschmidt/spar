@@ -491,7 +491,16 @@ pub fn run_slot(
     } else {
         match backend {
             Backend::Tmux => {
-                match run_tmux(state, paths, job, &cwd, &log_path, &prompt_path, &prompt) {
+                match run_tmux(
+                    state,
+                    paths,
+                    job,
+                    &cwd,
+                    &log_path,
+                    &prompt_path,
+                    &prompt,
+                    timeout,
+                ) {
                     Ok(r) => r,
                     Err(e) => {
                         salvage_expected_artifact(paths, &state.id, job, &log_path, &e.to_string());
@@ -944,7 +953,7 @@ fn run_tmux(
     log_path: &Path,
     prompt_path: &Path,
     prompt: &str,
-    // timeout not used for full wait here — workflow waits on markers
+    timeout: Duration,
 ) -> Result<SlotOutcome> {
     if !tmux::available() {
         bail!("tmux not available");
@@ -979,8 +988,7 @@ fn run_tmux(
     let shell = tmux::shell_wrap(&program, &args, log_path);
     tmux::spawn_window(&session, &job.slot_id, cwd, &shell)?;
 
-    // Wait for marker with timeout
-    let timeout = Duration::from_secs(30); // short for marker; real runs use wait command
+    // Wait for marker using role timeout (suite needs long budget).
     let done = format!("{}.done", job.slot_id);
     let failed = format!("{}.failed", job.slot_id);
     let start = std::time::Instant::now();

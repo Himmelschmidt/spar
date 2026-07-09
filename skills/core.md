@@ -127,4 +127,4 @@ timeout_secs = 7200
 - Coding slots always use git worktrees; never check out feature branches on the primary tree.
 - Ship is draft PR only — never merge.
 - State lives under `.spar/` in the project root.
-- **Suite channel:** a dedicated `tester` slot runs full test suites; impl/review must not. Artifact: `artifacts/suite.md`.
+- **Suite channel (implement/loop):** a dedicated `tester` slot runs full test suites; impl/review stay smoke/diff-only when it runs. Artifact: `artifacts/suite.md`. Independent `review` workflow does not spawn a tester by default.
