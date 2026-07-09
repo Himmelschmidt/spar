@@ -6,7 +6,7 @@ Project-level product and architecture decisions. Status: `OPEN` | `LEANING` | `
 
 | ID | Decision | Status |
 |----|----------|--------|
-| P0 | Product name is **spar** (binary `spar`); former working name agent-swarm | DECIDED |
+| P0 | Product name is **spar** (binary `spar`) | DECIDED |
 | P1 | spar is a **first-class agent product** (TUI-first), not a Pi/Claude plugin | DECIDED |
 | P2 | Default human surface is a **nice fleet TUI** (Claude/Grok/agy class); CLI/JSON for outer agents | DECIDED |
 | P3 | Discovery via **built-in skills + AGENTS.md** (agent-browser pattern) | DECIDED |

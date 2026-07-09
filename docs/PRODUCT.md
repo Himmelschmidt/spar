@@ -60,7 +60,7 @@ Headless/CLI remains first-class for **outer agents** (`--json`, `wait --follow`
 - Split panes that survive resize  
 - Unread badges on bus; stuck/quota callouts  
 
-Implementation stack: **Rust + ratatui** (already in tree), evolve from stub `tui.rs` into the main binary mode.
+Implementation stack: **Rust + ratatui** (product TUI is the default binary mode).
 
 ---
 

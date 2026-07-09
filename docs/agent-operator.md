@@ -69,7 +69,7 @@ spar wait "$RUN_ID" --timeout 2h --json
 --providers cli:claude,cli:grok
 
 # explicit
---providers cli:cli:claude,api:openai,api:xai
+--providers cli:claude,api:openai,api:xai
 ```
 
 API keys: `OPENAI_API_KEY`, `XAI_API_KEY`, optional `*_BASE_URL` / `*_MODEL`.

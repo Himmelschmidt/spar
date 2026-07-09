@@ -1,12 +1,17 @@
 [package]
 name = "spar"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 description = "Multi-agent coding product: fleet TUI, dual backends, plan/review/arena/ship"
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/Himmelschmidt/spar"
+homepage = "https://github.com/Himmelschmidt/spar"
+documentation = "https://github.com/Himmelschmidt/spar#readme"
 keywords = ["agents", "orchestration", "cli", "tui"]
 categories = ["command-line-utilities", "development-tools"]
+# Note: the crates.io name `spar` is taken by an unrelated project.
+# Install from this git repository (see README).
 
 [[bin]]
 name = "spar"

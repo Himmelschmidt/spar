@@ -3,14 +3,14 @@
 max_agents = 4
 default_backend = "auto" # auto | headless | tmux (native-cli spawn mode)
 isolation = "worktree"   # none | worktree | worktree+db | worktree+bwrap
-# autonomy: manual | semi | high | full  (lean dogfood: semi or high)
+# autonomy: manual | semi | high | full  (recommended: semi or high)
 autonomy = "semi"
 message_budget = "normal" # none | lean | normal | chatty
 auto_cleanup = false
 
 [providers]
 # Mix CLI + API: "cli:claude", "cli:grok", "api:openai", "api:xai", ...
-order = ["cli:claude", "grok", "agy"]
+order = ["cli:claude", "cli:grok", "cli:agy"]
 
 [gates]
 plan = true
