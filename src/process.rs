@@ -740,20 +740,50 @@ fn append_log(path: &Path, text: &str) -> Result<()> {
     Ok(())
 }
 
+pub struct TailLog {
+    pub text: String,
+    pub truncated: bool,
+}
+
 pub fn tail_log(path: &Path, max_bytes: usize) -> String {
+    tail_log_info(path, max_bytes).text
+}
+
+pub fn tail_log_info(path: &Path, max_bytes: usize) -> TailLog {
     let Ok(mut f) = File::open(path) else {
-        return String::new();
+        return TailLog {
+            text: String::new(),
+            truncated: false,
+        };
     };
     let mut buf = Vec::new();
     if f.read_to_end(&mut buf).is_err() {
-        return String::new();
+        return TailLog {
+            text: String::new(),
+            truncated: false,
+        };
     }
     if buf.len() > max_bytes {
         let start = buf.len() - max_bytes;
-        String::from_utf8_lossy(&buf[start..]).into_owned()
+        // Avoid starting mid-UTF-8 sequence.
+        let start = next_char_boundary(&buf, start);
+        TailLog {
+            text: String::from_utf8_lossy(&buf[start..]).into_owned(),
+            truncated: true,
+        }
     } else {
-        String::from_utf8_lossy(&buf).into_owned()
+        TailLog {
+            text: String::from_utf8_lossy(&buf).into_owned(),
+            truncated: false,
+        }
     }
+}
+
+fn next_char_boundary(buf: &[u8], mut i: usize) -> usize {
+    while i < buf.len() && (buf[i] & 0b1100_0000) == 0b1000_0000 {
+        i += 1;
+    }
+    i
 }
 
 pub fn run_mock(req: &SpawnRequest, mock_output: &str) -> Result<SpawnResult> {
