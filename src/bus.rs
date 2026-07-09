@@ -393,8 +393,8 @@ mod tests {
     fn send_inbox_reserve() {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
-        join(&paths, "r1", "a", Some("claude"), Some("native-cli")).unwrap();
-        join(&paths, "r1", "b", Some("grok"), Some("native-cli")).unwrap();
+        join(&paths, "r1", "a", Some("cli:claude"), Some("native-cli")).unwrap();
+        join(&paths, "r1", "b", Some("cli:grok"), Some("native-cli")).unwrap();
         chat(&paths, "r1", "a", "b", "hello", MessageBudget::Normal).unwrap();
         let inbox_b = inbox(&paths, "r1", "b").unwrap();
         assert!(!inbox_b.is_empty());

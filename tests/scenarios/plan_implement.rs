@@ -55,7 +55,7 @@ fn plan_approve_implement_dry_run() {
             "--task",
             "add a hello world module",
             "--providers",
-            "claude,grok",
+            "cli:claude,cli:grok",
             "--dry-run",
             "--json",
         ])
@@ -119,7 +119,7 @@ fn plan_approve_implement_dry_run() {
             "--run",
             run_id,
             "--providers",
-            "claude,grok,agy",
+            "cli:claude,cli:grok,cli:agy",
             "--dry-run",
             "--json",
         ])
@@ -202,7 +202,7 @@ fn dry_run_does_not_create_git_worktrees() {
             "--task",
             "no real worktrees",
             "--providers",
-            "claude,grok,agy",
+            "cli:claude,cli:grok,cli:agy",
             "--dry-run",
             "--json",
         ])
@@ -260,7 +260,7 @@ fn status_exit_zero_when_gated() {
             "--task",
             "gate",
             "--providers",
-            "claude,grok",
+            "cli:claude,cli:grok",
             "--dry-run",
             "--json",
         ])
@@ -290,7 +290,7 @@ fn arena_reconcile_dry_run() {
         .args([
             "run",
             "--providers",
-            "claude,grok,agy",
+            "cli:claude,cli:grok,cli:agy",
             "--workflow",
             "arena",
             "--task",
@@ -349,7 +349,7 @@ fn dual_backend_dry_run_providers() {
         .collect::<Vec<_>>()
         .join(",");
     assert!(
-        joined.contains("openai") || joined.contains("grok"),
+        joined.contains("openai") || joined.contains("cli:grok"),
         "providers={joined}"
     );
 }
@@ -366,7 +366,7 @@ fn empty_fake_providers_fail_closed() {
             "--task",
             "x",
             "--providers",
-            "notreal1,notreal2",
+            "cli:notreal1,cli:notreal2",
             "--json",
         ])
         .output()
@@ -398,7 +398,7 @@ fn skills_and_bus_commands() {
 
     let plan = cargo_bin_cmd!("spar")
         .current_dir(tmp.path())
-        .args(["plan", "--task", "bus seed", "--providers", "claude,grok", "--dry-run", "--json", "--big"])
+        .args(["plan", "--task", "bus seed", "--providers", "cli:claude,cli:grok", "--dry-run", "--json", "--big"])
         .assert()
         .code(2);
     let stdout = String::from_utf8_lossy(plan.get_output().stdout.as_slice());
@@ -449,7 +449,7 @@ fn stuck_policy_dry_run_request_changes() {
             "--task",
             "force stuck path",
             "--providers",
-            "claude,grok,agy",
+            "cli:claude,cli:grok,cli:agy",
             "--dry-run",
             "--json",
         ])
@@ -484,7 +484,7 @@ fn quota_exit_when_all_paused() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
 
-    for p in ["claude", "grok", "agy"] {
+    for p in ["cli:claude", "cli:grok", "cli:agy"] {
         cargo_bin_cmd!("spar")
             .current_dir(tmp.path())
             .args(["provider", "pause", p])
@@ -500,7 +500,7 @@ fn quota_exit_when_all_paused() {
             "--task",
             "x",
             "--providers",
-            "claude,grok,agy",
+            "cli:claude,cli:grok,cli:agy",
             "--json",
         ])
         .output()
@@ -541,7 +541,7 @@ fn arena_dry_run() {
         .args([
             "run",
             "--providers",
-            "claude,grok,agy",
+            "cli:claude,cli:grok,cli:agy",
             "--workflow",
             "arena",
             "--task",
@@ -564,7 +564,7 @@ fn peer_and_roles_dry_run() {
         .args([
             "run",
             "--providers",
-            "claude,grok",
+            "cli:claude,cli:grok",
             "--workflow",
             "peer",
             "--task",
@@ -581,7 +581,7 @@ fn peer_and_roles_dry_run() {
         .args([
             "run",
             "--providers",
-            "claude,grok",
+            "cli:claude,cli:grok",
             "--workflow",
             "roles",
             "--task",
@@ -600,14 +600,14 @@ fn provider_pause_resume() {
 
     cargo_bin_cmd!("spar")
         .current_dir(tmp.path())
-        .args(["provider", "pause", "claude", "--json"])
+        .args(["provider", "pause", "cli:claude", "--json"])
         .assert()
         .success()
         .stdout(predicate::str::contains("paused_manual"));
 
     cargo_bin_cmd!("spar")
         .current_dir(tmp.path())
-        .args(["provider", "resume", "claude", "--json"])
+        .args(["provider", "resume", "cli:claude", "--json"])
         .assert()
         .success()
         .stdout(predicate::str::contains("available"));
@@ -635,7 +635,7 @@ fn path_b_implement_task() {
         .args([
             "implement",
             "--providers",
-            "claude,grok,agy",
+            "cli:claude,cli:grok,cli:agy",
             "--task",
             "fix the flaky test",
             "--dry-run",

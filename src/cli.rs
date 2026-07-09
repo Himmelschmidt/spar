@@ -36,7 +36,7 @@ pub enum Command {
     Plan {
         #[arg(long, short = 't')]
         task: String,
-        /// Required: comma-separated providers (e.g. claude,grok or api:openai)
+        /// Required: comma-separated `cli:…` or `api:…` (e.g. cli:cli:claude,api:openai)
         #[arg(long, value_delimiter = ',', required = true)]
         providers: Vec<String>,
         #[arg(long)]
@@ -86,7 +86,7 @@ pub enum Command {
         /// Stub agents only; still writes `.spar/` state. Does **not** create real git worktrees.
         #[arg(long)]
         dry_run: bool,
-        /// Required: comma-separated providers (e.g. claude or claude,grok)
+        /// Required: comma-separated `cli:…` or `api:…`
         #[arg(long, value_delimiter = ',', required = true)]
         providers: Vec<String>,
         #[arg(long)]
@@ -107,7 +107,7 @@ pub enum Command {
         backend: Backend,
         #[arg(long)]
         dry_run: bool,
-        /// Required: comma-separated providers
+        /// Required: comma-separated `cli:…` or `api:…`
         #[arg(long, value_delimiter = ',', required = true)]
         providers: Vec<String>,
         #[arg(long)]

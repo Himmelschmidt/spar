@@ -101,7 +101,7 @@ pub fn run_slot(
     std::fs::write(&prompt_path, &prompt)
         .with_context(|| format!("write {}", prompt_path.display()))?;
 
-    let pref = ProviderRef::parse(&job.provider);
+    let pref = ProviderRef::parse(&job.provider)?;
     if let Some(s) = state.slot_mut(&job.slot_id) {
         s.status = SlotStatus::Running;
         s.exec_backend = Some(pref.backend);
@@ -495,7 +495,7 @@ fn run_headless(
     prompt: &str,
     timeout: Duration,
 ) -> Result<SlotOutcome> {
-    let pref = ProviderRef::parse(&job.provider);
+    let pref = ProviderRef::parse(&job.provider)?;
     let cli_name = pref.cli_name().unwrap_or(job.provider.as_str());
     let adapter = providers::adapter_named(cli_name)
         .ok_or_else(|| anyhow::anyhow!("unknown provider {}", job.provider))?;
@@ -578,7 +578,7 @@ fn run_tmux(
         state.save(paths)?;
     }
 
-    let pref = ProviderRef::parse(&job.provider);
+    let pref = ProviderRef::parse(&job.provider)?;
     let cli_name = pref.cli_name().unwrap_or(job.provider.as_str());
     let adapter = providers::adapter_named(cli_name)
         .ok_or_else(|| anyhow::anyhow!("unknown provider {}", job.provider))?;
@@ -623,7 +623,7 @@ fn run_tmux(
 
 pub fn init_slot(id: impl Into<String>, provider: impl Into<String>, role: SlotRole) -> SlotState {
     let provider = provider.into();
-    let pref = ProviderRef::parse(&provider);
+    let pref = ProviderRef::parse(&provider).expect("slot provider must be cli:… or api:…");
     SlotState {
         id: id.into(),
         provider,

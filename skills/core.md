@@ -24,11 +24,11 @@ Providers are `cli:name` (subscription CLIs) or `api:name` (OpenAI-compatible SD
 
 ```bash
 # native CLIs (default bare names = cli)
-spar plan -t "..." --providers claude,grok --dry-run
+spar plan -t "..." --providers cli:claude,cli:grok --dry-run
 
 # mix CLI + API slots
-spar implement -t "..." --providers claude,api:openai --dry-run
-spar run --workflow arena -t "..." --providers api:xai,claude,grok
+spar implement -t "..." --providers cli:cli:claude,api:openai --dry-run
+spar run --workflow arena -t "..." --providers api:xai,cli:claude,cli:grok
 ```
 
 API keys: `OPENAI_API_KEY`, `XAI_API_KEY`, optional `OPENAI_BASE_URL` / `XAI_BASE_URL` / `*_MODEL`.
@@ -39,17 +39,17 @@ API keys: `OPENAI_API_KEY`, `XAI_API_KEY`, optional `OPENAI_BASE_URL` / `XAI_BAS
 
 ```bash
 # Plan (ends HumanGate / awaiting_plan_approval unless autonomy auto-approves)
-spar plan -t "describe the work" --providers claude,grok [--big] [--dry-run] [--json] [--detach]
+spar plan -t "describe the work" --providers cli:claude,cli:grok [--big] [--dry-run] [--json] [--detach]
 
 spar approve <run_id> [--json]
 spar reject <run_id> [--reason "..."] [--json]
 
 # Implement continues THE SAME run id (plan → implement → ship)
-spar implement --run <run_id> --providers claude,grok,agy [--dry-run] [--json] [--detach]
-spar implement -t "small task" --providers claude [--dry-run]
+spar implement --run <run_id> --providers cli:claude,cli:grok,cli:agy [--dry-run] [--json] [--detach]
+spar implement -t "small task" --providers cli:claude [--dry-run]
 
 # Named workflows
-spar run --workflow loop|arena|roles|peer -t "..." --providers claude,grok [--dry-run] [--big]
+spar run --workflow loop|arena|roles|peer -t "..." --providers cli:claude,cli:grok [--dry-run] [--big]
 
 spar confirm <run_id> [--winner <slot>]   # arena winner
 spar reconcile <run_id>                  # arena merge-good-parts + review
@@ -95,7 +95,7 @@ spar logs <run_id> [slot] [-f|--follow]
 
 **`--dry-run`:** stubs agent processes only; writes `.spar/runs/<id>/`. Does **not** create real git worktrees (cwd under `.spar/…/cwd-*`). Live runs create sibling worktrees.
 
-**Providers:** always pass `--providers` explicitly. A single name is fine (`--providers claude`); multiple names cycle across slots.
+**Providers:** always pass `--providers` explicitly. A single name is fine (`--providers cli:claude`); multiple names cycle across slots.
 
 ## Config knobs (`spar.toml`)
 

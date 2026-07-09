@@ -216,7 +216,7 @@ fn parse_rate_limits_value(v: &serde_json::Value) -> Option<(String, Option<Date
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|d| d.with_timezone(&Utc));
     Some((
-        "claude".into(),
+        "cli:claude".into(),
         until,
         format!("claude five_hour used_percentage={used}"),
     ))
@@ -254,13 +254,13 @@ mod tests {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         let mut store = QuotaStore::default();
-        store.pause_manual("claude", None);
+        store.pause_manual("cli:claude", None);
         store.save(&paths).unwrap();
         let loaded = QuotaStore::load(&paths).unwrap();
-        assert!(!loaded.is_usable("claude"));
+        assert!(!loaded.is_usable("cli:claude"));
         let mut loaded = loaded;
-        loaded.resume("claude");
-        assert!(loaded.is_usable("claude"));
+        loaded.resume("cli:claude");
+        assert!(loaded.is_usable("cli:claude"));
     }
 
     #[test]
@@ -268,10 +268,10 @@ mod tests {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         let mut store = QuotaStore::default();
-        store.pause_manual("claude", None);
-        store.pause_manual("grok", None);
+        store.pause_manual("cli:claude", None);
+        store.pause_manual("cli:grok", None);
         store.save(&paths).unwrap();
-        let err = apply_quota_filter(&paths, &["claude".into(), "grok".into()]).unwrap_err();
+        let err = apply_quota_filter(&paths, &["cli:claude".into(), "cli:grok".into()]).unwrap_err();
         assert!(err.to_string().contains("no usable providers"));
     }
 }

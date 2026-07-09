@@ -9,8 +9,8 @@ message_budget = "normal" # none | lean | normal | chatty
 auto_cleanup = false
 
 [providers]
-# Mix CLI + API: "claude", "cli:grok", "api:openai", "api:xai", ...
-order = ["claude", "grok", "agy"]
+# Mix CLI + API: "cli:claude", "cli:grok", "api:openai", "api:xai", ...
+order = ["cli:claude", "grok", "agy"]
 
 [gates]
 plan = true

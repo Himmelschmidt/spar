@@ -40,20 +40,20 @@ spar status
 # --providers is required (no silent multi-agent default)
 
 # Path A
-spar plan --task "add retry to the payment client" --providers claude,grok --dry-run --json
+spar plan --task "add retry to the payment client" --providers cli:claude,cli:grok --dry-run --json
 # exit 2 = awaiting approval; note run_id
 spar approve <run-id>
-spar implement --run <run-id> --providers claude,grok,agy --dry-run --json
+spar implement --run <run-id> --providers cli:claude,cli:grok,cli:agy --dry-run --json
 # same run_id through plan → implement → ship
 spar status <run-id> --json
 
 # Path B
-spar implement --task "fix the flaky test" --providers claude --dry-run --json
+spar implement --task "fix the flaky test" --providers cli:claude --dry-run --json
 
 # Arena / peer / roles
-spar run --workflow arena --task "feature X" --providers claude,grok,agy --dry-run --json
-spar run --workflow peer --task "split stack" --providers claude,grok --dry-run --json
-spar run --workflow roles --task "fe/be feature" --providers claude,grok --dry-run --json
+spar run --workflow arena --task "feature X" --providers cli:claude,cli:grok,cli:agy --dry-run --json
+spar run --workflow peer --task "split stack" --providers cli:claude,cli:grok --dry-run --json
+spar run --workflow roles --task "fe/be feature" --providers cli:claude,cli:grok --dry-run --json
 
 # Or: SPAR_DRY_RUN=1
 ```
@@ -61,11 +61,11 @@ spar run --workflow roles --task "fe/be feature" --providers claude,grok --dry-r
 ## Live Path A — plan then implement
 
 ```bash
-spar plan --task "add retry to the payment client" --providers claude,grok --detach --json
+spar plan --task "add retry to the payment client" --providers cli:claude,cli:grok --detach --json
 spar wait <run-id> --json          # exit 2 = awaiting your approval
 # review .spar/runs/<id>/artifacts/plan.md
 spar approve <run-id>
-spar implement --run <run-id> --providers claude,grok,agy --detach
+spar implement --run <run-id> --providers cli:claude,cli:grok,cli:agy --detach
 spar wait <run-id>
 # after human confirm:
 spar ship <run-id> --confirm
@@ -74,7 +74,7 @@ spar ship <run-id> --confirm
 ## Path B — just do it
 
 ```bash
-spar implement --task "fix the flaky test in foo_test.rs" --providers claude --detach
+spar implement --task "fix the flaky test in foo_test.rs" --providers cli:claude --detach
 spar wait <run-id>
 ```
 

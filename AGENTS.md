@@ -6,9 +6,9 @@ Multi-agent coding product. Humans open `spar` (TUI). You drive it via CLI.
 spar skills list
 spar skills get core          # full operator skill (read this)
 spar doctor --json
-spar plan -t "..." --providers claude,grok --json [--dry-run] [--big]
+spar plan -t "..." --providers cli:claude,cli:grok --json [--dry-run] [--big]
 spar approve <run_id> --json  # exit 2 = human gate until approve
-spar implement --run <id> --providers claude,grok,agy --json   # SAME run id
+spar implement --run <id> --providers cli:claude,cli:grok,cli:agy --json   # SAME run id
 spar status [run_id] --json
 spar wait <run_id> --follow --json
 spar logs <run_id> [slot] -f

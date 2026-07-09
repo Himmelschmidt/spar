@@ -44,7 +44,12 @@ impl CommonOpts {
 
     pub fn require_providers(&self) -> Result<&[String]> {
         if self.providers.is_empty() {
-            anyhow::bail!("--providers is required (e.g. --providers claude or --providers claude,grok)");
+            anyhow::bail!(
+                "--providers is required (e.g. --providers cli:claude or --providers cli:cli:claude,api:openai)"
+            );
+        }
+        for p in &self.providers {
+            crate::provider_ref::ProviderRef::parse(p)?;
         }
         Ok(&self.providers)
     }
