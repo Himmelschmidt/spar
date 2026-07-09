@@ -1,27 +1,74 @@
+//! Product shell — fleet control room styled like a first-class coding agent.
 use crate::events;
 use crate::paths::{self, SparPaths};
 use crate::process;
 use crate::quota::QuotaStore;
-use crate::state::{self, Phase, RunState, SlotState};
+use crate::state::{self, Phase, RunState, SlotState, SlotStatus};
 use crate::workflow;
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEventKind,
+};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Wrap,
+};
 use std::io::stdout;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+// ── palette (dark agent-cli aesthetic) ──────────────────────────────────────
+
+const BG: Color = Color::Rgb(12, 14, 18);
+const BG_PANEL: Color = Color::Rgb(18, 21, 28);
+const BG_RAISED: Color = Color::Rgb(24, 28, 36);
+const BORDER: Color = Color::Rgb(42, 48, 60);
+const BORDER_FOCUS: Color = Color::Rgb(88, 166, 255);
+const FG: Color = Color::Rgb(220, 224, 232);
+const FG_DIM: Color = Color::Rgb(110, 118, 132);
+const FG_MUTED: Color = Color::Rgb(72, 80, 96);
+const ACCENT: Color = Color::Rgb(88, 166, 255);
+const ACCENT_SOFT: Color = Color::Rgb(56, 110, 180);
+const GREEN: Color = Color::Rgb(63, 185, 80);
+const YELLOW: Color = Color::Rgb(210, 168, 70);
+const RED: Color = Color::Rgb(248, 81, 73);
+const MAGENTA: Color = Color::Rgb(188, 120, 240);
+const CYAN: Color = Color::Rgb(57, 190, 200);
+
+const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const PULSE: &[&str] = &["●", "◉", "○", "◉"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
-    Runs,
     Fleet,
     Stream,
+    Bus,
     Composer,
+}
+
+impl Focus {
+    fn next(self) -> Self {
+        match self {
+            Focus::Fleet => Focus::Stream,
+            Focus::Stream => Focus::Bus,
+            Focus::Bus => Focus::Composer,
+            Focus::Composer => Focus::Fleet,
+        }
+    }
+    fn prev(self) -> Self {
+        match self {
+            Focus::Fleet => Focus::Composer,
+            Focus::Stream => Focus::Fleet,
+            Focus::Bus => Focus::Stream,
+            Focus::Composer => Focus::Bus,
+        }
+    }
 }
 
 pub struct TuiOpts {
@@ -37,13 +84,18 @@ pub fn run_with(opts: TuiOpts) -> Result<crate::exit_codes::ExitCode> {
     let swarm = SparPaths::new(&root);
 
     enable_raw_mode()?;
-    stdout().execute(EnterAlternateScreen)?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+    let mut out = stdout();
+    out.execute(EnterAlternateScreen)?;
+    out.execute(EnableMouseCapture)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
+    terminal.clear()?;
 
     let result = run_loop(&mut terminal, &swarm, opts.task_seed);
 
     disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
+    let mut out = stdout();
+    out.execute(DisableMouseCapture)?;
+    out.execute(LeaveAlternateScreen)?;
     result
 }
 
@@ -54,7 +106,19 @@ struct App {
     composer: String,
     status_line: String,
     stream_scroll: u16,
-    event_lines: Vec<String>,
+    bus_scroll: u16,
+    tick: u64,
+    started: Instant,
+    flash: Option<(Instant, String, Color)>,
+    mouse_hint_shown: bool,
+    last_click: Option<(u16, u16, Instant)>,
+    /// Layout rects for hit-testing mouse clicks
+    rect_header: Rect,
+    rect_fleet: Rect,
+    rect_stream: Rect,
+    rect_bus: Rect,
+    rect_composer: Rect,
+    rect_runs: Rect,
 }
 
 impl App {
@@ -62,13 +126,36 @@ impl App {
         Self {
             selected_run: 0,
             selected_slot: 0,
-            focus: Focus::Runs,
+            focus: Focus::Composer,
             composer: task_seed.unwrap_or_default(),
-            status_line: "Tab focus  j/k select  a approve  r reject  q quit  / for commands"
-                .into(),
+            status_line: String::new(),
             stream_scroll: 0,
-            event_lines: Vec::new(),
+            bus_scroll: 0,
+            tick: 0,
+            started: Instant::now(),
+            flash: None,
+            mouse_hint_shown: false,
+            last_click: None,
+            rect_header: Rect::default(),
+            rect_fleet: Rect::default(),
+            rect_stream: Rect::default(),
+            rect_bus: Rect::default(),
+            rect_composer: Rect::default(),
+            rect_runs: Rect::default(),
         }
+    }
+
+    fn flash(&mut self, msg: impl Into<String>, color: Color) {
+        self.flash = Some((Instant::now(), msg.into(), color));
+        self.status_line.clear();
+    }
+
+    fn spinner(&self) -> &'static str {
+        SPINNER[(self.tick as usize) % SPINNER.len()]
+    }
+
+    fn pulse(&self) -> &'static str {
+        PULSE[(self.tick as usize / 4) % PULSE.len()]
     }
 }
 
@@ -78,175 +165,750 @@ fn run_loop(
     task_seed: Option<String>,
 ) -> Result<crate::exit_codes::ExitCode> {
     let mut app = App::new(task_seed);
+    let mut fleet_state = ListState::default();
+    let mut runs_state = ListState::default();
 
     loop {
+        app.tick = app.tick.wrapping_add(1);
+
         let runs = state::list_runs(swarm).unwrap_or_default();
         if !runs.is_empty() {
             app.selected_run = app.selected_run.min(runs.len() - 1);
         } else {
             app.selected_run = 0;
         }
+        runs_state.select(if runs.is_empty() {
+            None
+        } else {
+            Some(app.selected_run)
+        });
 
         let selected_id = runs.get(app.selected_run).map(|r| r.id.clone());
         let full = selected_id
             .as_ref()
             .and_then(|id| RunState::load(swarm, id).ok());
         if let Some(ref st) = full {
-            app.selected_slot = app.selected_slot.min(st.slots.len().saturating_sub(1));
+            if !st.slots.is_empty() {
+                app.selected_slot = app.selected_slot.min(st.slots.len() - 1);
+            } else {
+                app.selected_slot = 0;
+            }
         } else {
             app.selected_slot = 0;
         }
+        fleet_state.select(if full.as_ref().map(|s| s.slots.is_empty()).unwrap_or(true) {
+            None
+        } else {
+            Some(app.selected_slot)
+        });
 
         let quota = QuotaStore::load(swarm).unwrap_or_default();
         let stream_text = stream_content(swarm, full.as_ref(), app.selected_slot);
-        if let Some(id) = &selected_id {
-            app.event_lines = events::read_all(swarm, id)
-                .unwrap_or_default()
-                .into_iter()
-                .rev()
-                .take(40)
-                .map(|e| e.display_line())
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
-        } else {
-            app.event_lines.clear();
+        let bus_lines = bus_lines(swarm, full.as_ref(), &quota);
+
+        // expire flash
+        if let Some((t, _, _)) = &app.flash {
+            if t.elapsed() > Duration::from_secs(3) {
+                app.flash = None;
+            }
         }
 
         terminal.draw(|f| {
-            draw(f, swarm, &runs, full.as_ref(), &quota, &stream_text, &app);
+            draw(f, swarm, &runs, full.as_ref(), &stream_text, &bus_lines, &app, &mut fleet_state, &mut runs_state);
+            // store rects from last layout — recompute in draw via app mut isn't possible easily;
+            // we recompute hit rects in draw by writing through a side channel
         })?;
 
-        if event::poll(Duration::from_millis(300))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                if app.focus == Focus::Composer {
-                    match key.code {
-                        KeyCode::Esc => {
-                            app.focus = Focus::Runs;
-                        }
-                        KeyCode::Enter => {
-                            let line = app.composer.trim().to_string();
-                            app.composer.clear();
-                            if !line.is_empty() {
-                                match handle_composer(swarm, &runs, app.selected_run, &line) {
-                                    Ok(msg) => {
-                                        if msg == "__quit__" {
-                                            break;
-                                        }
-                                        app.status_line = msg;
-                                    }
-                                    Err(e) => app.status_line = format!("error: {e:#}"),
-                                }
-                            }
-                        }
-                        KeyCode::Backspace => {
-                            app.composer.pop();
-                        }
-                        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            app.composer.push(c);
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
+        // recompute rects for mouse (same layout as draw)
+        let area = terminal.size()?;
+        let layout = layout_rects(Rect {
+            x: 0,
+            y: 0,
+            width: area.width,
+            height: area.height,
+        });
+        app.rect_header = layout.header;
+        app.rect_runs = layout.runs;
+        app.rect_fleet = layout.fleet;
+        app.rect_stream = layout.stream;
+        app.rect_bus = layout.bus;
+        app.rect_composer = layout.composer;
 
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Tab => {
-                        app.focus = match app.focus {
-                            Focus::Runs => Focus::Fleet,
-                            Focus::Fleet => Focus::Stream,
-                            Focus::Stream => Focus::Composer,
-                            Focus::Composer => Focus::Runs,
-                        };
+        if event::poll(Duration::from_millis(50))? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if handle_key(
+                        &mut app,
+                        key.code,
+                        key.modifiers,
+                        swarm,
+                        &runs,
+                        full.as_ref(),
+                    )? {
+                        break;
                     }
-                    KeyCode::Char('/') => {
-                        app.focus = Focus::Composer;
-                        if !app.composer.starts_with('/') {
-                            app.composer = "/".into();
-                        }
-                    }
-                    KeyCode::Char('j') | KeyCode::Down => match app.focus {
-                        Focus::Runs if !runs.is_empty() => {
-                            app.selected_run = (app.selected_run + 1).min(runs.len() - 1);
-                            app.selected_slot = 0;
-                            app.stream_scroll = 0;
-                        }
-                        Focus::Fleet => {
-                            if let Some(ref st) = full {
-                                if !st.slots.is_empty() {
-                                    app.selected_slot =
-                                        (app.selected_slot + 1).min(st.slots.len() - 1);
-                                    app.stream_scroll = 0;
-                                }
-                            }
-                        }
-                        Focus::Stream => {
-                            app.stream_scroll = app.stream_scroll.saturating_add(3);
-                        }
-                        _ => {}
-                    },
-                    KeyCode::Char('k') | KeyCode::Up => match app.focus {
-                        Focus::Runs => {
-                            app.selected_run = app.selected_run.saturating_sub(1);
-                            app.selected_slot = 0;
-                            app.stream_scroll = 0;
-                        }
-                        Focus::Fleet => {
-                            app.selected_slot = app.selected_slot.saturating_sub(1);
-                            app.stream_scroll = 0;
-                        }
-                        Focus::Stream => {
-                            app.stream_scroll = app.stream_scroll.saturating_sub(3);
-                        }
-                        _ => {}
-                    },
-                    KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
-                        let idx = (c as u8 - b'1') as usize;
-                        if let Some(ref st) = full {
-                            if idx < st.slots.len() {
-                                app.selected_slot = idx;
-                                app.focus = Focus::Fleet;
-                                app.stream_scroll = 0;
-                            }
-                        }
-                    }
-                    KeyCode::Char('a') => {
-                        if let Some(id) = &selected_id {
-                            match workflow::plan::approve(swarm, id, false) {
-                                Ok(_) => app.status_line = format!("approved {id}"),
-                                Err(e) => app.status_line = format!("approve failed: {e:#}"),
-                            }
-                        }
-                    }
-                    KeyCode::Char('r') => {
-                        if let Some(id) = &selected_id {
-                            match workflow::plan::reject(swarm, id, None, false) {
-                                Ok(_) => app.status_line = format!("rejected {id}"),
-                                Err(e) => app.status_line = format!("reject failed: {e:#}"),
-                            }
-                        }
-                    }
-                    KeyCode::Char('s') => {
-                        if let Some(id) = &selected_id {
-                            match crate::ship::confirm_ship(swarm, id, false) {
-                                Ok(_) => {
-                                    app.status_line = format!("ship confirmed for {id}")
-                                }
-                                Err(e) => app.status_line = format!("ship confirm: {e:#}"),
-                            }
-                        }
-                    }
-                    _ => {}
                 }
+                Event::Mouse(m) => {
+                    handle_mouse(&mut app, m, &runs, full.as_ref());
+                }
+                Event::Resize(_, _) => {}
+                _ => {}
             }
         }
     }
     Ok(crate::exit_codes::ExitCode::Success)
+}
+
+fn handle_key(
+    app: &mut App,
+    code: KeyCode,
+    mods: KeyModifiers,
+    swarm: &SparPaths,
+    runs: &[state::RunSummary],
+    full: Option<&RunState>,
+) -> Result<bool> {
+    let selected_id = runs.get(app.selected_run).map(|r| r.id.as_str());
+
+    if app.focus == Focus::Composer {
+        match code {
+            KeyCode::Esc => {
+                app.focus = Focus::Fleet;
+            }
+            KeyCode::Enter => {
+                let line = app.composer.trim().to_string();
+                if !line.is_empty() {
+                    match handle_composer(swarm, runs, app.selected_run, &line) {
+                        Ok(msg) => {
+                            if msg == "__quit__" {
+                                return Ok(true);
+                            }
+                            app.flash(msg, GREEN);
+                            app.composer.clear();
+                        }
+                        Err(e) => app.flash(format!("{e:#}"), RED),
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                app.composer.pop();
+            }
+            KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
+                app.composer.push(c);
+            }
+            KeyCode::Tab => app.focus = app.focus.next(),
+            KeyCode::BackTab => app.focus = app.focus.prev(),
+            _ => {}
+        }
+        return Ok(false);
+    }
+
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+        KeyCode::Tab => app.focus = app.focus.next(),
+        KeyCode::BackTab => app.focus = app.focus.prev(),
+        KeyCode::Char('/') => {
+            app.focus = Focus::Composer;
+            if !app.composer.starts_with('/') {
+                app.composer = "/".into();
+            }
+        }
+        KeyCode::Char('i') => {
+            app.focus = Focus::Composer;
+        }
+        KeyCode::Char('j') | KeyCode::Down => match app.focus {
+            Focus::Fleet => {
+                if let Some(st) = full {
+                    if !st.slots.is_empty() {
+                        app.selected_slot = (app.selected_slot + 1).min(st.slots.len() - 1);
+                        app.stream_scroll = 0;
+                    }
+                }
+            }
+            Focus::Stream => app.stream_scroll = app.stream_scroll.saturating_add(2),
+            Focus::Bus => app.bus_scroll = app.bus_scroll.saturating_add(1),
+            Focus::Composer => {}
+        },
+        KeyCode::Char('k') | KeyCode::Up => match app.focus {
+            Focus::Fleet => {
+                app.selected_slot = app.selected_slot.saturating_sub(1);
+                app.stream_scroll = 0;
+            }
+            Focus::Stream => app.stream_scroll = app.stream_scroll.saturating_sub(2),
+            Focus::Bus => app.bus_scroll = app.bus_scroll.saturating_sub(1),
+            Focus::Composer => {}
+        },
+        KeyCode::Char('J') => {
+            if !runs.is_empty() {
+                app.selected_run = (app.selected_run + 1).min(runs.len() - 1);
+                app.selected_slot = 0;
+                app.stream_scroll = 0;
+            }
+        }
+        KeyCode::Char('K') => {
+            app.selected_run = app.selected_run.saturating_sub(1);
+            app.selected_slot = 0;
+            app.stream_scroll = 0;
+        }
+        KeyCode::Char('[') => {
+            if !runs.is_empty() {
+                app.selected_run = app.selected_run.saturating_sub(1);
+                app.selected_slot = 0;
+            }
+        }
+        KeyCode::Char(']') => {
+            if !runs.is_empty() {
+                app.selected_run = (app.selected_run + 1).min(runs.len() - 1);
+                app.selected_slot = 0;
+            }
+        }
+        KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+            let idx = (c as u8 - b'1') as usize;
+            if let Some(st) = full {
+                if idx < st.slots.len() {
+                    app.selected_slot = idx;
+                    app.focus = Focus::Fleet;
+                    app.stream_scroll = 0;
+                }
+            }
+        }
+        KeyCode::Char('a') => {
+            if let Some(id) = selected_id {
+                match workflow::plan::approve(swarm, id, false) {
+                    Ok(_) => app.flash(format!("approved {id}"), GREEN),
+                    Err(e) => app.flash(format!("approve: {e:#}"), RED),
+                }
+            }
+        }
+        KeyCode::Char('r') => {
+            if let Some(id) = selected_id {
+                match workflow::plan::reject(swarm, id, None, false) {
+                    Ok(_) => app.flash(format!("rejected {id}"), YELLOW),
+                    Err(e) => app.flash(format!("reject: {e:#}"), RED),
+                }
+            }
+        }
+        KeyCode::Char('s') => {
+            if let Some(id) = selected_id {
+                match crate::ship::confirm_ship(swarm, id, false) {
+                    Ok(_) => app.flash(format!("ship confirmed {id}"), GREEN),
+                    Err(e) => app.flash(format!("ship: {e:#}"), RED),
+                }
+            }
+        }
+        KeyCode::Char('g') => {
+            app.stream_scroll = 0;
+            app.bus_scroll = 0;
+        }
+        KeyCode::Char('G') => {
+            app.stream_scroll = 9999;
+        }
+        KeyCode::Char('?') => {
+            app.flash(
+                "Tab panes · j/k slots · J/K or [] runs · a approve · r reject · s ship · i// composer · q quit · click panes",
+                ACCENT,
+            );
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn handle_mouse(
+    app: &mut App,
+    m: crossterm::event::MouseEvent,
+    runs: &[state::RunSummary],
+    full: Option<&RunState>,
+) {
+    let (x, y) = (m.column, m.row);
+    match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            // double-click detect
+            let now = Instant::now();
+            let dbl = app
+                .last_click
+                .map(|(lx, ly, t)| lx == x && ly == y && t.elapsed() < Duration::from_millis(350))
+                .unwrap_or(false);
+            app.last_click = Some((x, y, now));
+
+            if contains(app.rect_composer, x, y) {
+                app.focus = Focus::Composer;
+            } else if contains(app.rect_stream, x, y) {
+                app.focus = Focus::Stream;
+            } else if contains(app.rect_bus, x, y) {
+                app.focus = Focus::Bus;
+            } else if contains(app.rect_fleet, x, y) {
+                app.focus = Focus::Fleet;
+                // row within fleet list (account for border + header)
+                if let Some(st) = full {
+                    let row = y.saturating_sub(app.rect_fleet.y.saturating_add(1)) as usize;
+                    if row < st.slots.len() {
+                        app.selected_slot = row;
+                        app.stream_scroll = 0;
+                    }
+                }
+            } else if contains(app.rect_runs, x, y) {
+                app.focus = Focus::Fleet;
+                let row = y.saturating_sub(app.rect_runs.y.saturating_add(1)) as usize;
+                if row < runs.len() {
+                    app.selected_run = row;
+                    app.selected_slot = 0;
+                    app.stream_scroll = 0;
+                }
+            }
+
+            if !app.mouse_hint_shown {
+                app.mouse_hint_shown = true;
+                app.flash("mouse on · click panes/rows · scroll stream", ACCENT_SOFT);
+            }
+            if dbl && app.focus == Focus::Composer {
+                // ignore
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if contains(app.rect_stream, x, y) {
+                app.stream_scroll = app.stream_scroll.saturating_add(3);
+            } else if contains(app.rect_bus, x, y) {
+                app.bus_scroll = app.bus_scroll.saturating_add(1);
+            } else if contains(app.rect_fleet, x, y) {
+                if let Some(st) = full {
+                    if !st.slots.is_empty() {
+                        app.selected_slot = (app.selected_slot + 1).min(st.slots.len() - 1);
+                    }
+                }
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            if contains(app.rect_stream, x, y) {
+                app.stream_scroll = app.stream_scroll.saturating_sub(3);
+            } else if contains(app.rect_bus, x, y) {
+                app.bus_scroll = app.bus_scroll.saturating_sub(1);
+            } else if contains(app.rect_fleet, x, y) {
+                app.selected_slot = app.selected_slot.saturating_sub(1);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn contains(r: Rect, x: u16, y: u16) -> bool {
+    x >= r.x && x < r.x.saturating_add(r.width) && y >= r.y && y < r.y.saturating_add(r.height)
+}
+
+struct LayoutRects {
+    header: Rect,
+    runs: Rect,
+    fleet: Rect,
+    stream: Rect,
+    bus: Rect,
+    composer: Rect,
+    footer: Rect,
+}
+
+fn layout_rects(area: Rect) -> LayoutRects {
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(4),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    let mid = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(28),
+            Constraint::Percentage(47),
+            Constraint::Percentage(25),
+        ])
+        .split(root[1]);
+
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(mid[0]);
+
+    LayoutRects {
+        header: root[0],
+        runs: left[0],
+        fleet: left[1],
+        stream: mid[1],
+        bus: mid[2],
+        composer: root[2],
+        footer: root[3],
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw(
+    f: &mut Frame,
+    swarm: &SparPaths,
+    runs: &[state::RunSummary],
+    full: Option<&RunState>,
+    stream_text: &str,
+    bus_lines: &[String],
+    app: &App,
+    fleet_state: &mut ListState,
+    runs_state: &mut ListState,
+) {
+    let area = f.area();
+    // solid bg
+    f.render_widget(Block::default().style(Style::default().bg(BG)), area);
+
+    let lay = layout_rects(area);
+
+    draw_header(f, lay.header, swarm, full, app);
+    draw_runs(f, lay.runs, runs, app, runs_state);
+    draw_fleet(f, lay.fleet, full, app, fleet_state);
+    draw_stream(f, lay.stream, full, stream_text, app);
+    draw_bus(f, lay.bus, bus_lines, app);
+    draw_composer(f, lay.composer, app);
+    draw_footer(f, lay.footer, app, full);
+}
+
+fn draw_header(f: &mut Frame, area: Rect, swarm: &SparPaths, full: Option<&RunState>, app: &App) {
+    let project = swarm
+        .project_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(".");
+    let (run, phase, task) = match full {
+        Some(st) => (
+            st.id.clone(),
+            format!("{:?}", st.phase),
+            st.task
+                .as_deref()
+                .map(|t| truncate(t, 40))
+                .unwrap_or_default(),
+        ),
+        None => ("—".into(), "idle".into(), String::new()),
+    };
+
+    let phase_color = full
+        .map(|s| phase_color(s.phase))
+        .unwrap_or(FG_DIM);
+    let anim = if full.map(|s| is_active_phase(s.phase)).unwrap_or(false) {
+        format!("{} ", app.spinner())
+    } else {
+        format!("{} ", app.pulse())
+    };
+
+    let elapsed = app.started.elapsed().as_secs();
+    let clock = format!("{:02}:{:02}", elapsed / 60, elapsed % 60);
+
+    let left = Line::from(vec![
+        Span::styled(" spar ", Style::default().fg(BG).bg(ACCENT).bold()),
+        Span::raw(" "),
+        Span::styled(project, Style::default().fg(FG).bold()),
+        Span::styled(" · ", Style::default().fg(FG_MUTED)),
+        Span::styled(run, Style::default().fg(CYAN)),
+        Span::raw("  "),
+        Span::styled(anim, Style::default().fg(phase_color)),
+        Span::styled(phase, Style::default().fg(phase_color).bold()),
+    ]);
+    let right = Line::from(vec![
+        Span::styled(task, Style::default().fg(FG_DIM)),
+        Span::raw("  "),
+        Span::styled(clock, Style::default().fg(FG_MUTED)),
+    ]);
+
+    let block = Block::default()
+        .borders(Borders::BOTTOM)
+        .border_style(Style::default().fg(BORDER))
+        .style(Style::default().bg(BG_RAISED));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(20), Constraint::Length(48)])
+        .split(inner);
+    f.render_widget(Paragraph::new(left), chunks[0]);
+    f.render_widget(Paragraph::new(right).alignment(Alignment::Right), chunks[1]);
+}
+
+fn draw_runs(
+    f: &mut Frame,
+    area: Rect,
+    runs: &[state::RunSummary],
+    app: &App,
+    state: &mut ListState,
+) {
+    let focused = app.focus == Focus::Fleet;
+    let items: Vec<ListItem> = if runs.is_empty() {
+        vec![ListItem::new(Span::styled(
+            "  no runs yet",
+            Style::default().fg(FG_MUTED).italic(),
+        ))]
+    } else {
+        runs.iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let sel = i == app.selected_run;
+                let mark = if sel { "›" } else { " " };
+                let line = Line::from(vec![
+                    Span::styled(format!("{mark} "), Style::default().fg(ACCENT)),
+                    Span::styled(
+                        format!("{:<8}", truncate(&r.id, 8)),
+                        Style::default().fg(if sel { FG } else { FG_DIM }).bold(),
+                    ),
+                    Span::styled(
+                        format!(" {}", format!("{:?}", r.workflow).to_lowercase()),
+                        Style::default().fg(FG_MUTED),
+                    ),
+                    Span::styled(
+                        format!(" {}", format!("{:?}", r.phase).to_lowercase()),
+                        Style::default().fg(phase_color(r.phase)),
+                    ),
+                ]);
+                ListItem::new(line).style(if sel {
+                    Style::default().bg(BG_RAISED)
+                } else {
+                    Style::default()
+                })
+            })
+            .collect()
+    };
+
+    let list = List::new(items).block(panel("runs  [ ]", focused)).highlight_symbol("");
+    f.render_stateful_widget(list, area, state);
+}
+
+fn draw_fleet(
+    f: &mut Frame,
+    area: Rect,
+    full: Option<&RunState>,
+    app: &App,
+    state: &mut ListState,
+) {
+    let focused = app.focus == Focus::Fleet;
+    let items: Vec<ListItem> = match full {
+        None => vec![ListItem::new(Span::styled(
+            "  select a run",
+            Style::default().fg(FG_MUTED).italic(),
+        ))],
+        Some(st) if st.slots.is_empty() => vec![ListItem::new(Span::styled(
+            "  no slots",
+            Style::default().fg(FG_MUTED).italic(),
+        ))],
+        Some(st) => st
+            .slots
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let sel = i == app.selected_slot;
+                let icon = slot_icon(s, app);
+                let line = Line::from(vec![
+                    Span::styled(format!(" {icon} "), Style::default().fg(slot_color(s))),
+                    Span::styled(
+                        format!("{:<14}", truncate(&s.id, 14)),
+                        Style::default()
+                            .fg(if sel { FG } else { FG_DIM })
+                            .add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() }),
+                    ),
+                    Span::styled(
+                        format!("{:<10}", truncate(&format!("{:?}", s.role).to_lowercase(), 10)),
+                        Style::default().fg(FG_MUTED),
+                    ),
+                    Span::styled(
+                        truncate(&s.provider, 14),
+                        Style::default().fg(ACCENT_SOFT),
+                    ),
+                ]);
+                ListItem::new(line).style(if sel {
+                    Style::default().bg(BG_RAISED)
+                } else {
+                    Style::default()
+                })
+            })
+            .collect(),
+    };
+
+    let title = if let Some(st) = full {
+        let n = st.slots.len();
+        let running = st
+            .slots
+            .iter()
+            .filter(|s| s.status == SlotStatus::Running)
+            .count();
+        format!("fleet  {running}/{n} live")
+    } else {
+        "fleet".into()
+    };
+
+    let list = List::new(items).block(panel(&title, focused));
+    f.render_stateful_widget(list, area, state);
+
+    // activity gauge under fleet if active
+    if let Some(st) = full {
+        if !st.slots.is_empty() && area.height > 6 {
+            let done = st
+                .slots
+                .iter()
+                .filter(|s| s.status == SlotStatus::Done)
+                .count() as f64;
+            let ratio = done / st.slots.len() as f64;
+            let gauge_area = Rect {
+                x: area.x + 1,
+                y: area.y + area.height.saturating_sub(2),
+                width: area.width.saturating_sub(2),
+                height: 1,
+            };
+            let g = Gauge::default()
+                .gauge_style(Style::default().fg(ACCENT).bg(BG_PANEL))
+                .ratio(ratio)
+                .label(format!("{:.0}%", ratio * 100.0));
+            f.render_widget(g, gauge_area);
+        }
+    }
+}
+
+fn draw_stream(
+    f: &mut Frame,
+    area: Rect,
+    full: Option<&RunState>,
+    stream_text: &str,
+    app: &App,
+) {
+    let focused = app.focus == Focus::Stream;
+    let slot = full
+        .and_then(|st| st.slots.get(app.selected_slot))
+        .map(|s| s.id.as_str())
+        .unwrap_or("—");
+    let title = format!("stream  {slot}");
+
+    // subtle scanline shimmer on active stream
+    let style = Style::default().fg(FG).bg(BG_PANEL);
+    let p = Paragraph::new(stream_text)
+        .style(style)
+        .wrap(Wrap { trim: false })
+        .scroll((app.stream_scroll, 0))
+        .block(panel(&title, focused));
+    f.render_widget(p, area);
+
+    let lines = stream_text.lines().count().max(1) as u16;
+    let mut sb = ScrollbarState::new(lines as usize).position(app.stream_scroll as usize);
+    f.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .style(Style::default().fg(FG_MUTED))
+            .thumb_style(Style::default().fg(ACCENT_SOFT)),
+        area.inner(Margin {
+            vertical: 1,
+            horizontal: 0,
+        }),
+        &mut sb,
+    );
+}
+
+fn draw_bus(f: &mut Frame, area: Rect, bus_lines: &[String], app: &App) {
+    let focused = app.focus == Focus::Bus;
+    let text = if bus_lines.is_empty() {
+        "  bus quiet · peer messages land here".into()
+    } else {
+        bus_lines.join("\n")
+    };
+    let p = Paragraph::new(text)
+        .style(Style::default().fg(FG_DIM).bg(BG_PANEL))
+        .wrap(Wrap { trim: true })
+        .scroll((app.bus_scroll, 0))
+        .block(panel("bus", focused));
+    f.render_widget(p, area);
+}
+
+fn draw_composer(f: &mut Frame, area: Rect, app: &App) {
+    let focused = app.focus == Focus::Composer;
+    let cursor_blink = if focused && (app.tick / 6).is_multiple_of(2) {
+        "▌"
+    } else if focused {
+        " "
+    } else {
+        ""
+    };
+    let prompt = if focused {
+        Span::styled(" › ", Style::default().fg(ACCENT).bold())
+    } else {
+        Span::styled("   ", Style::default().fg(FG_MUTED))
+    };
+    let line = Line::from(vec![
+        prompt,
+        Span::styled(&app.composer, Style::default().fg(FG)),
+        Span::styled(cursor_blink, Style::default().fg(ACCENT)),
+    ]);
+    let hint = if app.composer.is_empty() && focused {
+        "  /approve  /reject  /ship  /help  ·  plain text is a stub for now"
+    } else {
+        ""
+    };
+    let p = Paragraph::new(vec![
+        line,
+        Line::from(Span::styled(hint, Style::default().fg(FG_MUTED).italic())),
+    ])
+    .block(panel(
+        if focused {
+            "composer  enter send · esc blur"
+        } else {
+            "composer  i or / to type"
+        },
+        focused,
+    ));
+    f.render_widget(p, area);
+}
+
+fn draw_footer(f: &mut Frame, area: Rect, app: &App, full: Option<&RunState>) {
+    let (msg, color) = if let Some((_, m, c)) = &app.flash {
+        (m.as_str(), *c)
+    } else if !app.status_line.is_empty() {
+        (app.status_line.as_str(), YELLOW)
+    } else {
+        (
+            "tab panes · j/k slots · J/K runs · a/r/s gates · i compose · ? help · q quit",
+            FG_MUTED,
+        )
+    };
+
+    // gate urgency bar
+    let gate = full.map(|s| s.phase.is_gate()).unwrap_or(false);
+    let bg = if gate {
+        Color::Rgb(40, 30, 12)
+    } else {
+        BG_RAISED
+    };
+
+    let left = Span::styled(format!(" {msg} "), Style::default().fg(color).bg(bg));
+    let right = if gate {
+        Span::styled(
+            "  GATE  press a/r/s  ",
+            Style::default().fg(BG).bg(YELLOW).bold(),
+        )
+    } else {
+        Span::styled(
+            format!(" {} ", app.spinner()),
+            Style::default().fg(FG_MUTED).bg(bg),
+        )
+    };
+    let line = Line::from(vec![left, Span::styled(
+        " ".repeat(area.width.saturating_sub(msg.len() as u16 + 20) as usize),
+        Style::default().bg(bg),
+    ), right]);
+    f.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), area);
+
+    // silence unused Clear
+    let _ = Clear;
+}
+
+fn panel(title: &str, focused: bool) -> Block<'_> {
+    let border = if focused { BORDER_FOCUS } else { BORDER };
+    let title_style = if focused {
+        Style::default().fg(ACCENT).bold()
+    } else {
+        Style::default().fg(FG_DIM)
+    };
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .title(Span::styled(format!(" {title} "), title_style))
+        .style(Style::default().bg(BG_PANEL))
 }
 
 fn handle_composer(
@@ -264,8 +926,7 @@ fn handle_composer(
         return match head.as_str() {
             "q" | "quit" => Ok("__quit__".into()),
             "help" | "h" | "?" => Ok(
-                "commands: /approve /reject [reason] /ship /quit /help — or plain text (stub)"
-                    .into(),
+                "/approve /reject [reason] /ship /quit · click panes · scroll stream".into(),
             ),
             "approve" => {
                 let id = arg.or(run_id).ok_or_else(|| anyhow::anyhow!("no run"))?;
@@ -280,23 +941,20 @@ fn handle_composer(
             "ship" => {
                 let id = arg.or(run_id).ok_or_else(|| anyhow::anyhow!("no run"))?;
                 crate::ship::confirm_ship(swarm, id, false)?;
-                Ok(format!("ship confirmed for {id}"))
+                Ok(format!("ship confirmed {id}"))
             }
-            other => Ok(format!("unknown command /{other} — try /help")),
+            other => Ok(format!("unknown /{other} — try /help")),
         };
     }
-    Ok(format!(
-        "composer stub (orchestrator chat later): {}",
-        truncate(cmd, 60)
-    ))
+    Ok(format!("noted (orchestrator chat later): {}", truncate(cmd, 48)))
 }
 
 fn stream_content(swarm: &SparPaths, full: Option<&RunState>, slot_idx: usize) -> String {
     let Some(st) = full else {
-        return "no run selected".into();
+        return "\n  open a run to stream agent output\n\n  tip: spar plan -t \"…\" --providers cli:claude --dry-run".into();
     };
     if st.slots.is_empty() {
-        return "no slots".into();
+        return "\n  no slots in this run".into();
     }
     let slot = &st.slots[slot_idx.min(st.slots.len() - 1)];
     let path = slot
@@ -304,307 +962,80 @@ fn stream_content(swarm: &SparPaths, full: Option<&RunState>, slot_idx: usize) -
         .clone()
         .unwrap_or_else(|| swarm.log_file(&st.id, &slot.id));
     if path.is_file() {
-        process::tail_log(&path, 24_000)
+        let raw = process::tail_log(&path, 48_000);
+        if raw.trim().is_empty() {
+            format!("\n  {} waiting for output…", slot.id)
+        } else {
+            raw
+        }
     } else {
-        format!("(no log yet for slot {})", slot.id)
+        format!("\n  no log yet for {}\n  {}", slot.id, slot.provider)
     }
 }
 
-fn draw(
-    f: &mut Frame,
-    swarm: &SparPaths,
-    runs: &[state::RunSummary],
-    full: Option<&RunState>,
-    quota: &QuotaStore,
-    stream_text: &str,
-    app: &App,
-) {
-    let area = f.area();
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(7),
-            Constraint::Percentage(35),
-            Constraint::Min(6),
-            Constraint::Length(4),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
-        .split(area);
-
-    // Header
-    let (run_s, phase_s, gates_s, task_s) = if let Some(st) = full {
-        let gates = format!(
-            "plan={} winner={} ship={}",
-            st.gates.plan_approved,
-            st.gates
-                .winner_confirmed
-                .as_deref()
-                .unwrap_or("-"),
-            st.gates.ship_confirmed
-        );
-        (
-            st.id.clone(),
-            format!("{:?}", st.phase),
-            gates,
-            st.task
-                .as_deref()
-                .map(|t| truncate(t, 48))
-                .unwrap_or_default(),
-        )
-    } else {
-        ("—".into(), "—".into(), "—".into(), String::new())
-    };
-    let header = Paragraph::new(format!(
-        "spar  {}  run={}  phase={}  gates[{}]  {}",
-        swarm.project_root.display(),
-        run_s,
-        phase_s,
-        gates_s,
-        task_s
-    ))
-    .style(Style::default().fg(Color::Cyan))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("spar")
-            .border_style(focus_border(app.focus == Focus::Runs)),
-    );
-    f.render_widget(header, chunks[0]);
-
-    // Runs list
-    let run_rows: Vec<Row> = runs
-        .iter()
-        .enumerate()
-        .map(|(i, r)| {
-            let style = if i == app.selected_run {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else {
-                phase_style(r.phase)
-            };
-            Row::new(vec![
-                Cell::from(r.id.clone()),
-                Cell::from(format!("{:?}", r.workflow)),
-                Cell::from(format!("{:?}", r.phase)),
-                Cell::from(r.updated_at.format("%H:%M:%S").to_string()),
-            ])
-            .style(style)
-        })
-        .collect();
-    let runs_table = Table::new(
-        run_rows,
-        [
-            Constraint::Length(12),
-            Constraint::Length(10),
-            Constraint::Length(24),
-            Constraint::Length(10),
-        ],
-    )
-    .header(
-        Row::new(vec!["run", "workflow", "phase", "updated"])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
-    )
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(focus_title("runs", app.focus == Focus::Runs))
-            .border_style(focus_border(app.focus == Focus::Runs)),
-    );
-    f.render_widget(runs_table, chunks[1]);
-
-    // Fleet + bus split
-    let mid = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
-        .split(chunks[2]);
-
-    let fleet_rows = fleet_rows(full, app.selected_slot);
-    let fleet = Table::new(
-        fleet_rows,
-        [
-            Constraint::Length(14),
-            Constraint::Length(12),
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Min(12),
-        ],
-    )
-    .header(
-        Row::new(vec!["slot", "role", "provider", "status", "worktree"])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
-    )
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(focus_title("fleet", app.focus == Focus::Fleet))
-            .border_style(focus_border(app.focus == Focus::Fleet)),
-    );
-    f.render_widget(fleet, mid[0]);
-
-    let mut bus_lines = vec!["swarm bus".into()];
-    if let Some(id) = full.map(|s| s.id.as_str()) {
-        if let Ok(presence) = crate::bus::list_presence(swarm, id) {
-            for p in presence.iter().take(4) {
-                bus_lines.push(format!("· {} {}", p.agent, p.status));
+fn bus_lines(swarm: &SparPaths, full: Option<&RunState>, quota: &QuotaStore) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(st) = full {
+        if let Ok(presence) = crate::bus::list_presence(swarm, &st.id) {
+            for p in presence.iter().take(6) {
+                lines.push(format!("· {:<12} {}", p.agent, p.status));
             }
         }
-        if let Ok(evs) = crate::bus::list_events(swarm, id) {
-            for e in evs.iter().rev().take(6).rev() {
-                bus_lines.push(truncate(
-                    &format!("{}→{}: {}", e.from, e.to, e.body),
+        if let Ok(evs) = crate::bus::list_events(swarm, &st.id) {
+            for e in evs.iter().rev().take(12).rev() {
+                lines.push(truncate(
+                    &format!("{}→{}  {}", e.from, e.to, e.body),
                     42,
                 ));
             }
         }
-    }
-    for line in app.event_lines.iter().rev().take(3).rev() {
-        bus_lines.push(truncate(line, 40));
-    }
-    if quota.providers.is_empty() {
-        bus_lines.push("quota: (none)".into());
-    } else {
-        for (name, q) in &quota.providers {
-            bus_lines.push(format!("q {name}: {:?}", q.status));
+        if lines.is_empty() {
+            for e in events::read_all(swarm, &st.id).unwrap_or_default().iter().rev().take(10).rev()
+            {
+                lines.push(truncate(&e.display_line(), 42));
+            }
         }
     }
-    let bus = Paragraph::new(bus_lines.join("\n"))
-        .block(Block::default().borders(Borders::ALL).title("bus / events"))
-        .wrap(Wrap { trim: true });
-    f.render_widget(bus, mid[1]);
-
-    // Stream
-    let slot_label = full
-        .and_then(|st| st.slots.get(app.selected_slot))
-        .map(|s| s.id.as_str())
-        .unwrap_or("-");
-    let stream = Paragraph::new(stream_text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(focus_title(
-                    &format!("stream [{slot_label}]"),
-                    app.focus == Focus::Stream,
-                ))
-                .border_style(focus_border(app.focus == Focus::Stream)),
-        )
-        .scroll((app.stream_scroll, 0))
-        .wrap(Wrap { trim: false });
-    f.render_widget(stream, chunks[3]);
-
-    // Composer
-    let comp_title = if app.focus == Focus::Composer {
-        "composer [editing]"
-    } else {
-        "composer  (/help)"
-    };
-    let composer = Paragraph::new(format!("> {}", app.composer))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(comp_title)
-                .border_style(focus_border(app.focus == Focus::Composer)),
-        );
-    f.render_widget(composer, chunks[4]);
-
-    // Help strip
-    let help = Paragraph::new(
-        "Tab panes  j/k move  1-9 slot  a approve  r reject  s ship-confirm  / commands  q quit",
-    )
-    .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(help, chunks[5]);
-
-    let status = Paragraph::new(app.status_line.as_str()).style(Style::default().fg(Color::Yellow));
-    f.render_widget(status, chunks[6]);
-}
-
-fn fleet_rows(full: Option<&RunState>, selected_slot: usize) -> Vec<Row<'static>> {
-    let Some(st) = full else {
-        return vec![Row::new(vec![
-            Cell::from("(no run)"),
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from(""),
-        ])];
-    };
-    if st.slots.is_empty() {
-        return vec![Row::new(vec![
-            Cell::from("(no slots)"),
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from(""),
-        ])];
+    for (name, q) in &quota.providers {
+        lines.push(format!("q {name}: {:?}", q.status));
     }
-    st.slots
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let style = if i == selected_slot {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else {
-                slot_style(s)
-            };
-            let wt = st
-                .worktrees
-                .iter()
-                .find(|w| w.slot_id == s.id)
-                .map(|w| truncate(&w.branch, 28))
-                .or_else(|| {
-                    s.cwd
-                        .as_ref()
-                        .map(|p| truncate(&p.display().to_string(), 28))
-                })
-                .unwrap_or_else(|| "-".into());
-            Row::new(vec![
-                Cell::from(s.id.clone()),
-                Cell::from(format!("{:?}", s.role)),
-                Cell::from(s.provider.clone()),
-                Cell::from(format!("{:?}", s.status)),
-                Cell::from(wt),
-            ])
-            .style(style)
-        })
-        .collect()
+    lines
 }
 
-fn slot_style(s: &SlotState) -> Style {
+fn slot_icon(s: &SlotState, app: &App) -> String {
     match s.status {
-        state::SlotStatus::Done => Style::default().fg(Color::Green),
-        state::SlotStatus::Failed | state::SlotStatus::Stuck => Style::default().fg(Color::Red),
-        state::SlotStatus::Running => Style::default().fg(Color::Cyan),
-        state::SlotStatus::Pending => Style::default().fg(Color::DarkGray),
+        SlotStatus::Running => app.spinner().to_string(),
+        SlotStatus::Done => "✓".into(),
+        SlotStatus::Failed => "✗".into(),
+        SlotStatus::Stuck => "!".into(),
+        SlotStatus::Pending => "·".into(),
     }
 }
 
-fn focus_title(name: &str, focused: bool) -> String {
-    if focused {
-        format!("▶ {name}")
-    } else {
-        name.to_string()
+fn slot_color(s: &SlotState) -> Color {
+    match s.status {
+        SlotStatus::Done => GREEN,
+        SlotStatus::Failed | SlotStatus::Stuck => RED,
+        SlotStatus::Running => CYAN,
+        SlotStatus::Pending => FG_MUTED,
     }
 }
 
-fn focus_border(focused: bool) -> Style {
-    if focused {
-        Style::default().fg(Color::Yellow)
-    } else {
-        Style::default()
-    }
-}
-
-fn phase_style(phase: Phase) -> Style {
+fn phase_color(phase: Phase) -> Color {
     match phase {
-        Phase::Done | Phase::PlanApproved => Style::default().fg(Color::Green),
-        Phase::Failed | Phase::PlanRejected => Style::default().fg(Color::Red),
-        Phase::Quota => Style::default().fg(Color::Red),
-        Phase::Stuck | Phase::Escalated => Style::default().fg(Color::Magenta),
-        Phase::AwaitingPlanApproval | Phase::AwaitingWinnerConfirm | Phase::AwaitingShipConfirm => {
-            Style::default().fg(Color::Yellow)
-        }
-        _ => Style::default(),
+        Phase::Done | Phase::PlanApproved => GREEN,
+        Phase::Failed | Phase::PlanRejected | Phase::Quota => RED,
+        Phase::Stuck | Phase::Escalated => MAGENTA,
+        Phase::AwaitingPlanApproval
+        | Phase::AwaitingWinnerConfirm
+        | Phase::AwaitingShipConfirm
+        | Phase::AwaitingReconcile => YELLOW,
+        _ => ACCENT,
     }
+}
+
+fn is_active_phase(phase: Phase) -> bool {
+    !phase.is_terminal() && !phase.is_gate()
 }
 
 fn truncate(s: &str, max: usize) -> String {
