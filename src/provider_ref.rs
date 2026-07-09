@@ -1,4 +1,5 @@
-//! Provider identity: `cli:claude`, `api:openai`, or bare `claude` (native-cli).
+//! Provider identity: always `cli:name` or `api:name` (no bare names).
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -32,42 +33,46 @@ pub struct ProviderRef {
 }
 
 impl ProviderRef {
-    pub fn parse(raw: &str) -> Self {
+    /// Parse a provider ref. **Requires** `cli:` or `api:` prefix.
+    pub fn parse(raw: &str) -> Result<Self> {
         let raw = raw.trim();
+        if raw.is_empty() {
+            bail!("empty provider name");
+        }
         if let Some(rest) = raw.strip_prefix("api:") {
-            return Self {
+            let name = rest.trim();
+            if name.is_empty() {
+                bail!("api: requires a provider name (e.g. api:openai)");
+            }
+            if name.contains(':') {
+                bail!("invalid provider '{raw}' (use api:name)");
+            }
+            return Ok(Self {
                 backend: ExecBackend::ApiSdk,
-                name: rest.to_string(),
-            };
+                name: name.to_string(),
+            });
         }
         if let Some(rest) = raw.strip_prefix("cli:") {
-            return Self {
+            let name = rest.trim();
+            if name.is_empty() {
+                bail!("cli: requires a provider name (e.g. cli:claude)");
+            }
+            if name.contains(':') {
+                bail!("invalid provider '{raw}' (use cli:name)");
+            }
+            return Ok(Self {
                 backend: ExecBackend::NativeCli,
-                name: rest.to_string(),
-            };
+                name: name.to_string(),
+            });
         }
-        // bare api provider names
-        match raw {
-            "openai" | "anthropic" | "xai" | "google" | "meta" => Self {
-                backend: ExecBackend::ApiSdk,
-                name: raw.into(),
-            },
-            _ => Self {
-                backend: ExecBackend::NativeCli,
-                name: raw.into(),
-            },
-        }
+        bail!(
+            "provider '{raw}' must be 'cli:…' or 'api:…' (e.g. cli:claude, api:openai)"
+        );
     }
 
     pub fn display(&self) -> String {
         match self.backend {
-            ExecBackend::NativeCli => {
-                if self.name.contains(':') {
-                    self.name.clone()
-                } else {
-                    format!("cli:{}", self.name)
-                }
-            }
+            ExecBackend::NativeCli => format!("cli:{}", self.name),
             ExecBackend::ApiSdk => format!("api:{}", self.name),
         }
     }
@@ -94,10 +99,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_forms() {
-        assert_eq!(ProviderRef::parse("claude").backend, ExecBackend::NativeCli);
-        assert_eq!(ProviderRef::parse("cli:grok").name, "grok");
-        assert!(ProviderRef::parse("api:openai").is_api());
-        assert!(ProviderRef::parse("xai").is_api());
+    fn requires_prefix() {
+        assert!(ProviderRef::parse("claude").is_err());
+        assert!(ProviderRef::parse("openai").is_err());
+        assert!(ProviderRef::parse("xai").is_err());
+        let g = ProviderRef::parse("cli:grok").unwrap();
+        assert_eq!(g.name, "grok");
+        assert_eq!(g.backend, ExecBackend::NativeCli);
+        assert_eq!(g.storage_key(), "cli:grok");
+        assert!(ProviderRef::parse("api:openai").unwrap().is_api());
     }
 }

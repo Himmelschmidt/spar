@@ -61,7 +61,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         .iter()
         .next_back()
         .cloned()
-        .unwrap_or_else(|| "claude".into());
+        .unwrap_or_else(|| "cli:claude".into());
     state.slots.push(executor::init_slot(
         format!("ranker-{rank_p}"),
         rank_p,
@@ -327,7 +327,7 @@ pub fn reconcile(
         .providers
         .first()
         .cloned()
-        .unwrap_or_else(|| "claude".into());
+        .unwrap_or_else(|| "cli:claude".into());
     let recon_id = format!("reconcile-{recon_prov}");
     if state.slots.iter().all(|s| s.id != recon_id) {
         state

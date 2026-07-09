@@ -30,7 +30,7 @@ Also: `spar skills get core` (preferred; always current).
 ## Path A (plan → approve → implement) — **one run id**
 
 ```bash
-spar plan --task "$TASK" --providers claude,grok --detach --json
+spar plan --task "$TASK" --providers cli:claude,cli:grok --detach --json
 # → { "run_id": "...", "id": "...", "phase": "...", ... }
 
 spar wait "$RUN_ID" --json
@@ -42,7 +42,7 @@ spar wait "$RUN_ID" --json
 spar approve "$RUN_ID" --json   # only if still awaiting_plan_approval
 
 # SAME run id continues into implement (workflow becomes loop).
-spar implement --run "$RUN_ID" --providers claude,grok,agy --detach --json
+spar implement --run "$RUN_ID" --providers cli:claude,cli:grok,cli:agy --detach --json
 # → { "run_id": "$RUN_ID", ... }   # not a child run
 
 spar wait "$RUN_ID" --json
@@ -58,7 +58,7 @@ spar ship "$RUN_ID" --confirm --json
 ## Path B (autonomous task)
 
 ```bash
-spar implement --task "$TASK" --providers claude --detach --json
+spar implement --task "$TASK" --providers cli:claude --detach --json
 spar wait "$RUN_ID" --timeout 2h --json
 ```
 
@@ -66,10 +66,10 @@ spar wait "$RUN_ID" --timeout 2h --json
 
 ```bash
 # bare names = native-cli
---providers claude,grok
+--providers cli:claude,cli:grok
 
 # explicit
---providers cli:claude,api:openai,api:xai
+--providers cli:cli:claude,api:openai,api:xai
 ```
 
 API keys: `OPENAI_API_KEY`, `XAI_API_KEY`, optional `*_BASE_URL` / `*_MODEL`.
@@ -77,7 +77,7 @@ API keys: `OPENAI_API_KEY`, `XAI_API_KEY`, optional `*_BASE_URL` / `*_MODEL`.
 ## Arena
 
 ```bash
-spar run --workflow arena --task "$TASK" --providers claude,grok,agy --json
+spar run --workflow arena --task "$TASK" --providers cli:claude,cli:grok,cli:agy --json
 spar confirm "$RUN_ID" [--winner slot-id] --json
 # or: spar reconcile "$RUN_ID" --json
 spar ship "$RUN_ID" --confirm --json
@@ -88,7 +88,7 @@ spar ship "$RUN_ID" --confirm --json
 ```bash
 spar bus send "$RUN_ID" -m "hello" --to broadcast
 spar bus log "$RUN_ID"
-spar run --workflow peer --task "$TASK" --providers claude,grok --json
+spar run --workflow peer --task "$TASK" --providers cli:claude,cli:grok --json
 ```
 
 ## Status JSON

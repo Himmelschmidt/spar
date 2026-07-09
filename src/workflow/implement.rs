@@ -434,7 +434,7 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths) -> Result<boo
         .filter(|s| s.role == SlotRole::Implementer)
         .map(|s| s.provider.clone())
         .collect();
-    let defaults = ["claude", "grok", "agy"];
+    let defaults = ["cli:claude", "cli:grok", "cli:agy"];
     let next = state
         .providers
         .iter()
@@ -472,14 +472,14 @@ fn try_widen_reviewers(
         .filter(|s| s.role == SlotRole::Reviewer)
         .map(|s| s.provider.clone())
         .collect();
-    let candidate = ["claude", "grok", "agy", "claude", "grok"]
+    let candidate = ["cli:claude", "cli:grok", "cli:agy", "cli:claude", "cli:grok"]
         .iter()
         .map(|s| (*s).to_string())
         .chain(state.providers.iter().cloned())
         .find(|p| !existing.contains(p));
     let Some(prov) = candidate else {
         // still widen with a synthetic extra reviewer on a repeated provider
-        let prov = existing.first().cloned().unwrap_or_else(|| "claude".into());
+        let prov = existing.first().cloned().unwrap_or_else(|| "cli:claude".into());
         let id = format!("review-{}-wide", state.slots.len());
         let mut slot = executor::init_slot(&id, &prov, SlotRole::Reviewer);
         slot.cwd = Some(review_cwd.to_path_buf());

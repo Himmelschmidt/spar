@@ -114,7 +114,11 @@ fn default_max_agents() -> u32 {
 }
 
 fn default_provider_order() -> Vec<String> {
-    vec!["claude".into(), "grok".into(), "agy".into()]
+    vec![
+        "cli:claude".into(),
+        "cli:grok".into(),
+        "cli:agy".into(),
+    ]
 }
 
 fn default_slot_timeout_secs() -> u64 {
