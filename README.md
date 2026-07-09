@@ -1,21 +1,18 @@
 # agent-swarm
 
-Orchestrate **native subscription AI CLIs** (Claude Code, Grok Build, Antigravity/`agy`) for multi-provider planning, implementation, and review — without provider API billing or third-party API harnesses.
+A **first-class multi-agent coding product** for the terminal — fleet-native TUI (Claude / Grok / agy class), multi-provider orchestration, dual backends (subscription CLIs **and** API SDKs), and a real agent-to-agent bus.
 
-Designed so **another AI agent** can drive it: stable subcommands, `--json`, detach/wait, exit codes, artifacts under `.swarm/`.
+Not a plugin for Pi or any other harness. Outer agents drive it headlessly (`--json`, skills).
 
 ## Status
 
-M0–M6 implemented:
+**On `main`:** orchestrator skeleton (dry-run workflows, worktrees, ship helpers, provider detect). Product direction: **TUI-first**, swarm bus, dual-backend — see docs.
 
-- Headless process runner + provider spawn adapters (`claude` / `grok` / `agy`)
-- Tmux backend (`--backend tmux`), attach
-- Git worktree isolation + optional dbiso seed + optional bwrap
-- Plan → approve → implement, arena, loop, roles, peer
-- Ship gate (confirm + push `--force-with-lease` + `gh pr create`, never merge)
-- Provider pause/resume + quota hints
-- Minimal ratatui dashboard
-- **Dry-run mode** for CI / demos without live LLM sessions
+- [docs/PRODUCT.md](docs/PRODUCT.md) — product vision  
+- [docs/architecture-dual-backend.md](docs/architecture-dual-backend.md) — CLI + API backends  
+- [docs/architecture-a2a.md](docs/architecture-a2a.md) — swarm bus  
+- [roadmap/ROADMAP.md](roadmap/ROADMAP.md) — milestones  
+- [DECISIONS.md](DECISIONS.md) — locked decisions
 
 ## Install
 
