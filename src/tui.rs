@@ -155,7 +155,7 @@ struct App {
     stall_warn_secs: u64,
     /// When false (default), long log lines truncate with …; `w` toggles wrap.
     log_expand: bool,
-    /// First Ctrl+C timestamp; second within 2s exits (Esc/q never quit).
+    /// First Ctrl+C timestamp; second within 1s exits (Esc/q never quit).
     last_ctrl_c: Option<Instant>,
     last_click: Option<(u16, u16, Instant)>,
     show_help: bool,
