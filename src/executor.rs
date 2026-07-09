@@ -222,6 +222,9 @@ fn execute_prepared(
             provider: prep.pref.storage_key(),
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
+            cache_read_tokens: 0,
+            context_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
+            tools: 0,
             model: usage.model,
         };
         return Ok(if ok {
@@ -242,7 +245,6 @@ fn execute_prepared(
     }
 
     let backend = resolve_backend(backend_policy, &prep.job.provider);
-    // headless only for parallel (tmux is session-shared)
     let _ = backend;
     let adapter = providers::adapter_named(&prep.job.provider)
         .ok_or_else(|| anyhow::anyhow!("unknown provider {}", prep.job.provider))?;
@@ -268,18 +270,42 @@ fn execute_prepared(
         timeout,
     };
     let res = process::run_captured(&req)?;
+    let usage = usage_from_stream(&prep.job.slot_id, &prep.job.provider, &res.stats);
     if res.timed_out {
-        return Ok(SlotOutcome::err("timeout"));
+        return Ok(SlotOutcome {
+            ok: false,
+            exit_code: res.exit_code,
+            error: Some("timeout".into()),
+            usage: Some(usage),
+        });
     }
     if res.exit_code != Some(0) {
         return Ok(SlotOutcome {
             ok: false,
             exit_code: res.exit_code,
             error: Some(format!("exit {:?}", res.exit_code)),
-            usage: None,
+            usage: Some(usage),
         });
     }
-    Ok(SlotOutcome::ok())
+    Ok(SlotOutcome {
+        ok: true,
+        exit_code: Some(0),
+        error: None,
+        usage: Some(usage),
+    })
+}
+
+fn usage_from_stream(slot_id: &str, provider: &str, s: &process::StreamStats) -> SlotUsage {
+    SlotUsage {
+        slot_id: slot_id.into(),
+        provider: provider.into(),
+        input_tokens: s.input_tokens,
+        output_tokens: s.output_tokens,
+        cache_read_tokens: s.cache_read_tokens,
+        context_tokens: s.context_tokens,
+        tools: s.tools,
+        model: s.model.clone(),
+    }
 }
 
 fn apply_parallel_outcome(
@@ -746,6 +772,9 @@ fn run_api(
         provider: pref.storage_key(),
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
+        cache_read_tokens: 0,
+        context_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
+        tools: 0,
         model: usage.model,
     };
     if ok {
@@ -804,8 +833,14 @@ fn run_headless(
         timeout,
     };
     let res = process::run_captured(&req)?;
+    let usage = usage_from_stream(&job.slot_id, &job.provider, &res.stats);
     if res.timed_out {
-        return Ok(SlotOutcome::err("timeout"));
+        return Ok(SlotOutcome {
+            ok: false,
+            exit_code: res.exit_code,
+            error: Some("timeout".into()),
+            usage: Some(usage),
+        });
     }
     let code = res.exit_code;
     if code != Some(0) {
@@ -813,7 +848,7 @@ fn run_headless(
             ok: false,
             exit_code: code,
             error: Some(format!("exit {:?}", code)),
-            usage: None,
+            usage: Some(usage),
         });
     }
     if let Some(name) = &job.expected_artifact {
@@ -827,12 +862,17 @@ fn run_headless(
                     ok: false,
                     exit_code: Some(0),
                     error: Some(format!("missing expected artifact {name}")),
-                    usage: None,
+                    usage: Some(usage),
                 });
             }
         }
     }
-    Ok(SlotOutcome::ok())
+    Ok(SlotOutcome {
+        ok: true,
+        exit_code: Some(0),
+        error: None,
+        usage: Some(usage),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
