@@ -23,6 +23,10 @@ Also: `spar skills get core` (preferred; always current).
 | 3 | Stuck | Policy chain exhausted; needs human |
 | 4 | Quota | No usable provider / quota pause (`phase: quota`) |
 
+**`status` is observe-only:** process exit is always `0` when the run loads. Read `phase` / JSON `exit_code` for run state. Use `wait` when you want process exit coded by gate/stuck.
+
+**`--dry-run`:** no real git worktrees; only `.spar/` state + stubbed agents. Live runs provision sibling worktrees.
+
 ## Path A (plan → approve → implement) — **one run id**
 
 ```bash

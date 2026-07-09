@@ -674,8 +674,11 @@ pub fn print_run_human(state: &RunState) {
     if let Some(t) = &state.task {
         println!("task:    {t}");
     }
+    if !state.providers.is_empty() {
+        println!("providers: {}", state.providers.join(", "));
+    }
     if state.dry_run {
-        println!("dry_run: true");
+        println!("dry_run: true  (no git worktrees; agent processes stubbed only)");
     }
 }
 

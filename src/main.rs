@@ -293,10 +293,27 @@ fn status_cmd(run_id: Option<String>, json: bool) -> Result<ExitCode> {
     let root = paths::find_project_root()?;
     let swarm = paths::SparPaths::new(&root);
 
+    // Observe-only: process exit is always 0 when the command succeeds.
+    // Run-phase gate/stuck/quota lives in JSON `exit_code` / `phase` (use `wait` to
+    // block and get gate-coded process exit).
     if let Some(id) = run_id {
         let state = state::RunState::load(&swarm, &id)?;
         if json {
-            println!("{}", serde_json::to_string_pretty(&state)?);
+            let mut v = serde_json::to_value(&state)?;
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "run_id".into(),
+                    serde_json::Value::String(state.id.clone()),
+                );
+                obj.insert(
+                    "exit_code".into(),
+                    match state.status_exit_code() {
+                        Some(c) => serde_json::json!(c),
+                        None => serde_json::Value::Null,
+                    },
+                );
+            }
+            println!("{}", serde_json::to_string_pretty(&v)?);
         } else {
             println!("run: {}", state.id);
             println!("phase: {:?}", state.phase);
@@ -306,6 +323,9 @@ fn status_cmd(run_id: Option<String>, json: bool) -> Result<ExitCode> {
             }
             if state.dry_run {
                 println!("dry_run: true");
+            }
+            if let Some(c) = state.status_exit_code() {
+                println!("run_exit_code: {c}  (process exit always 0 for status)");
             }
             println!("slots: {}", state.slots.len());
             for slot in &state.slots {
@@ -321,7 +341,7 @@ fn status_cmd(run_id: Option<String>, json: bool) -> Result<ExitCode> {
                 println!("error: {err}");
             }
         }
-        return Ok(state.exit_code());
+        return Ok(ExitCode::Success);
     }
 
     let runs = state::list_runs(&swarm)?;
@@ -500,6 +520,7 @@ fn cleanup_cmd(run_id: &str, json: bool, purge: bool) -> Result<ExitCode> {
         if dir.is_dir() {
             std::fs::remove_dir_all(&dir)?;
         }
+        worktree::prune_empty_spar_parents(&paths)?;
     }
     if json {
         println!(
@@ -514,6 +535,12 @@ fn cleanup_cmd(run_id: &str, json: bool, purge: bool) -> Result<ExitCode> {
         println!("cleaned worktrees for {run_id}");
         if purge {
             println!("purged run dir");
+            if !paths.runs_dir().is_dir() {
+                println!("removed empty .spar/runs");
+            }
+            if !paths.root.is_dir() {
+                println!("removed empty .spar");
+            }
         }
     }
     Ok(ExitCode::Success)

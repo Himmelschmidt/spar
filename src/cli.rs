@@ -44,6 +44,7 @@ pub enum Command {
         json: bool,
         #[arg(long, value_enum, default_value_t = Backend::Auto)]
         backend: Backend,
+        /// Stub agents only; still writes `.spar/` state. Does **not** create real git worktrees.
         #[arg(long)]
         dry_run: bool,
         /// Structured plan-big task DAG under bus/tasks
@@ -81,6 +82,7 @@ pub enum Command {
         json: bool,
         #[arg(long, value_enum, default_value_t = Backend::Auto)]
         backend: Backend,
+        /// Stub agents only; still writes `.spar/` state. Does **not** create real git worktrees.
         #[arg(long)]
         dry_run: bool,
         #[arg(long, value_delimiter = ',')]
