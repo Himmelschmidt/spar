@@ -131,10 +131,21 @@ pub fn run_with(opts: TuiOpts) -> Result<crate::exit_codes::ExitCode> {
     result
 }
 
+/// Left-rail navigation: projects first (general), then runs for one project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowseLevel {
+    /// General view — registered projects only (not a wall of runs).
+    Projects,
+    /// Per-project view — runs for `active_root` only.
+    Runs,
+}
+
 struct App {
     selected_run: usize,
+    selected_project: usize,
     selected_slot: usize,
     focus: Focus,
+    browse: BrowseLevel,
     composer: String,
     status_line: String,
     stream_scroll: u16,
@@ -142,8 +153,6 @@ struct App {
     tick: u64,
     flash: Option<(Instant, String, Color)>,
     stall_warn_secs: u64,
-    /// When true, Runs list includes every registered project.
-    show_all_projects: bool,
     last_click: Option<(u16, u16, Instant)>,
     show_help: bool,
     rect_header: Rect,
@@ -156,11 +165,18 @@ struct App {
 }
 
 impl App {
-    fn new(task_seed: Option<String>, stall_warn_secs: u64) -> Self {
+    fn new(task_seed: Option<String>, stall_warn_secs: u64, start_in_project: bool) -> Self {
         Self {
             selected_run: 0,
+            selected_project: 0,
             selected_slot: 0,
             focus: Focus::Runs,
+            // Inside a project → that project's runs. Outside → project picker.
+            browse: if start_in_project {
+                BrowseLevel::Runs
+            } else {
+                BrowseLevel::Projects
+            },
             composer: task_seed.unwrap_or_default(),
             status_line: String::new(),
             stream_scroll: 0,
@@ -168,7 +184,6 @@ impl App {
             tick: 0,
             flash: None,
             stall_warn_secs,
-            show_all_projects: true, // global home by default
             last_click: None,
             show_help: false,
             rect_header: Rect::default(),
@@ -201,12 +216,39 @@ impl App {
         self.bus_scroll = 0;
     }
 
+    fn select_project(&mut self, idx: usize, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.selected_project = idx.min(n - 1);
+        self.selected_run = 0;
+        self.selected_slot = 0;
+        self.stream_scroll = 0;
+        self.bus_scroll = 0;
+    }
+
     fn select_slot(&mut self, idx: usize, n: usize) {
         if n == 0 {
             return;
         }
         self.selected_slot = idx.min(n - 1);
         self.stream_scroll = 0;
+    }
+
+    fn open_project_runs(&mut self) {
+        self.browse = BrowseLevel::Runs;
+        self.selected_run = 0;
+        self.selected_slot = 0;
+        self.stream_scroll = 0;
+        self.focus = Focus::Runs;
+    }
+
+    fn open_projects_view(&mut self) {
+        self.browse = BrowseLevel::Projects;
+        self.selected_run = 0;
+        self.selected_slot = 0;
+        self.stream_scroll = 0;
+        self.focus = Focus::Runs;
     }
 }
 
@@ -216,50 +258,69 @@ fn run_loop(
     task_seed: Option<String>,
     stall_warn_secs: u64,
 ) -> Result<crate::exit_codes::ExitCode> {
-    let mut app = App::new(task_seed, stall_warn_secs);
-    // Outside a project, always show the global registry.
-    if local_root.is_none() {
-        app.show_all_projects = true;
-    }
+    let mut app = App::new(task_seed, stall_warn_secs, local_root.is_some());
     let mut fleet_state = ListState::default();
-    let mut runs_state = ListState::default();
+    let mut rail_state = ListState::default();
     let mut active_root: PathBuf = local_root.clone().unwrap_or_else(|| {
-        registry::list_all_runs()
+        registry::Registry::load()
             .ok()
-            .and_then(|r| r.into_iter().next())
-            .and_then(|s| s.project_root)
+            .and_then(|r| r.projects.into_iter().next())
+            .map(|p| p.root)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
     });
 
     loop {
         app.tick = app.tick.wrapping_add(1);
 
-        let runs = load_run_list(local_root.as_deref(), app.show_all_projects);
+        let projects = load_projects(local_root.as_deref());
+        if !projects.is_empty() {
+            app.selected_project = app.selected_project.min(projects.len() - 1);
+            // When browsing projects, active_root tracks the highlighted project.
+            if app.browse == BrowseLevel::Projects {
+                active_root = projects[app.selected_project].root.clone();
+            }
+        } else {
+            app.selected_project = 0;
+        }
+
+        let runs = if app.browse == BrowseLevel::Runs {
+            registry::list_project_runs(&active_root).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         if !runs.is_empty() {
             app.selected_run = app.selected_run.min(runs.len() - 1);
         } else {
             app.selected_run = 0;
         }
-        runs_state.select(if runs.is_empty() {
-            None
-        } else {
-            Some(app.selected_run)
-        });
 
-        // Active project follows the selected run (multi-project home).
-        if let Some(r) = runs.get(app.selected_run) {
-            if let Some(root) = &r.project_root {
-                active_root = root.clone();
+        let rail_sel = match app.browse {
+            BrowseLevel::Projects => {
+                if projects.is_empty() {
+                    None
+                } else {
+                    Some(app.selected_project)
+                }
             }
-        } else if let Some(root) = &local_root {
-            active_root = root.clone();
-        }
-        let swarm = SparPaths::new(&active_root);
+            BrowseLevel::Runs => {
+                if runs.is_empty() {
+                    None
+                } else {
+                    Some(app.selected_run)
+                }
+            }
+        };
+        rail_state.select(rail_sel);
 
+        let swarm = SparPaths::new(&active_root);
         let selected_id = runs.get(app.selected_run).map(|r| r.id.clone());
-        let full = selected_id
-            .as_ref()
-            .and_then(|id| RunState::load(&swarm, id).ok());
+        let full = if app.browse == BrowseLevel::Runs {
+            selected_id
+                .as_ref()
+                .and_then(|id| RunState::load(&swarm, id).ok())
+        } else {
+            None
+        };
         if let Some(ref st) = full {
             if !st.slots.is_empty() {
                 app.selected_slot = app.selected_slot.min(st.slots.len() - 1);
@@ -276,7 +337,10 @@ fn run_loop(
         });
 
         let quota = QuotaStore::load(&swarm).unwrap_or_default();
-        let stream_text = stream_content(&swarm, full.as_ref(), app.selected_slot);
+        let stream_text = match app.browse {
+            BrowseLevel::Projects => project_overview(&projects, app.selected_project),
+            BrowseLevel::Runs => stream_content(&swarm, full.as_ref(), app.selected_slot),
+        };
         let bus_lines = bus_lines(&swarm, full.as_ref(), &quota);
 
         if let Some((t, _, _)) = &app.flash {
@@ -289,13 +353,14 @@ fn run_loop(
             draw(
                 f,
                 &swarm,
+                &projects,
                 &runs,
                 full.as_ref(),
                 &stream_text,
                 &bus_lines,
                 &app,
                 &mut fleet_state,
-                &mut runs_state,
+                &mut rail_state,
             );
         })?;
 
@@ -322,14 +387,24 @@ fn run_loop(
                         key.code,
                         key.modifiers,
                         &swarm,
+                        &projects,
                         &runs,
                         full.as_ref(),
+                        &mut active_root,
+                        local_root.as_deref(),
                     )? {
                         break;
                     }
                 }
                 Event::Mouse(m) => {
-                    handle_mouse(&mut app, m, &runs, full.as_ref());
+                    handle_mouse(
+                        &mut app,
+                        m,
+                        &projects,
+                        &runs,
+                        full.as_ref(),
+                        &mut active_root,
+                    );
                 }
                 Event::Resize(_, _) => {}
                 _ => {}
@@ -339,24 +414,42 @@ fn run_loop(
     Ok(crate::exit_codes::ExitCode::Success)
 }
 
-fn load_run_list(local_root: Option<&std::path::Path>, all: bool) -> Vec<RunSummary> {
-    if all || local_root.is_none() {
-        registry::list_all_runs().unwrap_or_default()
-    } else if let Some(root) = local_root {
-        let _ = registry::ensure_known(Some(root));
-        registry::list_project_runs(root).unwrap_or_default()
-    } else {
-        Vec::new()
-    }
+fn load_projects(local_root: Option<&std::path::Path>) -> Vec<registry::ProjectEntry> {
+    let reg = registry::ensure_known(local_root);
+    reg.projects
 }
 
+fn project_overview(projects: &[registry::ProjectEntry], idx: usize) -> String {
+    if projects.is_empty() {
+        return format!(
+            "\n  No projects registered yet.\n\n  cd into a repo and run spar (or start a plan).\n  Registry: {}\n",
+            registry::spar_home().display()
+        );
+    }
+    let p = &projects[idx.min(projects.len() - 1)];
+    let n_runs = registry::list_project_runs(&p.root)
+        .map(|r| r.len())
+        .unwrap_or(0);
+    format!(
+        "\n  Project: {}\n  Path:    {}\n  Runs:    {}\n  Last:    {}\n\n  Enter / click  → open this project's runs\n  p              → stay on projects list\n",
+        p.name.as_deref().unwrap_or("·"),
+        p.root.display(),
+        n_runs,
+        relative_age(p.last_seen),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_key(
     app: &mut App,
     code: KeyCode,
     mods: KeyModifiers,
     swarm: &SparPaths,
+    projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
+    active_root: &mut PathBuf,
+    local_root: Option<&std::path::Path>,
 ) -> Result<bool> {
     let selected_id = runs.get(app.selected_run).map(|r| r.id.as_str());
     let n_slots = full.map(|s| s.slots.len()).unwrap_or(0);
@@ -407,6 +500,10 @@ fn handle_key(
         KeyCode::Esc => {
             if app.focus != Focus::Runs {
                 app.focus = Focus::Runs;
+            } else if app.browse == BrowseLevel::Runs {
+                // Back to general project list (unless only ever local and user wants quit)
+                app.open_projects_view();
+                app.flash("Projects — Enter to open · p always returns here", ACCENT);
             } else {
                 return Ok(true);
             }
@@ -420,12 +517,44 @@ fn handle_key(
             }
         }
         KeyCode::Char('i') => app.focus = Focus::Composer,
-        KeyCode::Char('j') | KeyCode::Down => match app.focus {
-            Focus::Runs => {
-                if !runs.is_empty() {
-                    app.select_run(app.selected_run + 1, runs.len());
+        KeyCode::Enter => {
+            if app.focus == Focus::Runs && app.browse == BrowseLevel::Projects {
+                if let Some(p) = projects.get(app.selected_project) {
+                    *active_root = p.root.clone();
+                    app.open_project_runs();
+                    app.flash(
+                        format!(
+                            "Opened {}",
+                            p.name.as_deref().unwrap_or("project")
+                        ),
+                        GREEN,
+                    );
                 }
             }
+        }
+        KeyCode::Char('p') => {
+            app.open_projects_view();
+            // Highlight local project if present
+            if let Some(root) = local_root {
+                if let Some(i) = projects.iter().position(|p| p.root == root) {
+                    app.selected_project = i;
+                }
+            }
+            app.flash("Projects (general view)", ACCENT);
+        }
+        KeyCode::Char('j') | KeyCode::Down => match app.focus {
+            Focus::Runs => match app.browse {
+                BrowseLevel::Projects => {
+                    if !projects.is_empty() {
+                        app.select_project(app.selected_project + 1, projects.len());
+                    }
+                }
+                BrowseLevel::Runs => {
+                    if !runs.is_empty() {
+                        app.select_run(app.selected_run + 1, runs.len());
+                    }
+                }
+            },
             Focus::Agents => {
                 if n_slots > 0 {
                     app.select_slot(app.selected_slot + 1, n_slots);
@@ -436,9 +565,17 @@ fn handle_key(
             Focus::Composer => {}
         },
         KeyCode::Char('k') | KeyCode::Up => match app.focus {
-            Focus::Runs => {
-                app.select_run(app.selected_run.saturating_sub(1), runs.len().max(1));
-            }
+            Focus::Runs => match app.browse {
+                BrowseLevel::Projects => {
+                    app.select_project(
+                        app.selected_project.saturating_sub(1),
+                        projects.len().max(1),
+                    );
+                }
+                BrowseLevel::Runs => {
+                    app.select_run(app.selected_run.saturating_sub(1), runs.len().max(1));
+                }
+            },
             Focus::Agents => {
                 app.select_slot(app.selected_slot.saturating_sub(1), n_slots.max(1));
             }
@@ -449,31 +586,61 @@ fn handle_key(
         KeyCode::PageDown => match app.focus {
             Focus::Log => app.stream_scroll = app.stream_scroll.saturating_add(12),
             Focus::Messages => app.bus_scroll = app.bus_scroll.saturating_add(6),
-            Focus::Runs if !runs.is_empty() => app.select_run(app.selected_run + 5, runs.len()),
+            Focus::Runs => match app.browse {
+                BrowseLevel::Projects if !projects.is_empty() => {
+                    app.select_project(app.selected_project + 5, projects.len());
+                }
+                BrowseLevel::Runs if !runs.is_empty() => {
+                    app.select_run(app.selected_run + 5, runs.len());
+                }
+                _ => {}
+            },
             Focus::Agents if n_slots > 0 => app.select_slot(app.selected_slot + 5, n_slots),
             _ => {}
         },
         KeyCode::PageUp => match app.focus {
             Focus::Log => app.stream_scroll = app.stream_scroll.saturating_sub(12),
             Focus::Messages => app.bus_scroll = app.bus_scroll.saturating_sub(6),
-            Focus::Runs => {
-                app.select_run(app.selected_run.saturating_sub(5), runs.len().max(1));
-            }
+            Focus::Runs => match app.browse {
+                BrowseLevel::Projects => {
+                    app.select_project(
+                        app.selected_project.saturating_sub(5),
+                        projects.len().max(1),
+                    );
+                }
+                BrowseLevel::Runs => {
+                    app.select_run(app.selected_run.saturating_sub(5), runs.len().max(1));
+                }
+            },
             Focus::Agents => {
                 app.select_slot(app.selected_slot.saturating_sub(5), n_slots.max(1));
             }
             _ => {}
         },
         KeyCode::Char('J') | KeyCode::Char(']') => {
-            if !runs.is_empty() {
-                app.select_run(app.selected_run + 1, runs.len());
-                app.focus = Focus::Runs;
+            app.focus = Focus::Runs;
+            match app.browse {
+                BrowseLevel::Projects if !projects.is_empty() => {
+                    app.select_project(app.selected_project + 1, projects.len());
+                }
+                BrowseLevel::Runs if !runs.is_empty() => {
+                    app.select_run(app.selected_run + 1, runs.len());
+                }
+                _ => {}
             }
         }
         KeyCode::Char('K') | KeyCode::Char('[') => {
-            if !runs.is_empty() {
-                app.select_run(app.selected_run.saturating_sub(1), runs.len());
-                app.focus = Focus::Runs;
+            app.focus = Focus::Runs;
+            match app.browse {
+                BrowseLevel::Projects => {
+                    app.select_project(
+                        app.selected_project.saturating_sub(1),
+                        projects.len().max(1),
+                    );
+                }
+                BrowseLevel::Runs => {
+                    app.select_run(app.selected_run.saturating_sub(1), runs.len().max(1));
+                }
             }
         }
         KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
@@ -517,19 +684,6 @@ fn handle_key(
         KeyCode::Char('?') => {
             app.show_help = true;
         }
-        KeyCode::Char('A') => {
-            app.show_all_projects = !app.show_all_projects;
-            app.selected_run = 0;
-            app.selected_slot = 0;
-            app.flash(
-                if app.show_all_projects {
-                    "Showing runs from all registered projects"
-                } else {
-                    "Showing runs from this project only"
-                },
-                ACCENT,
-            );
-        }
         _ => {}
     }
     Ok(false)
@@ -538,8 +692,10 @@ fn handle_key(
 fn handle_mouse(
     app: &mut App,
     m: crossterm::event::MouseEvent,
+    projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
+    active_root: &mut PathBuf,
 ) {
     let (x, y) = (m.column, m.row);
     let n_slots = full.map(|s| s.slots.len()).unwrap_or(0);
@@ -547,6 +703,10 @@ fn handle_mouse(
     match m.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             let now = Instant::now();
+            let dbl = app
+                .last_click
+                .map(|(lx, ly, t)| lx == x && ly == y && t.elapsed() < Duration::from_millis(400))
+                .unwrap_or(false);
             app.last_click = Some((x, y, now));
 
             if contains(app.rect_composer, x, y) {
@@ -564,11 +724,25 @@ fn handle_mouse(
                 }
             } else if contains(app.rect_runs, x, y) {
                 app.focus = Focus::Runs;
-                if let Some(row) = list_row_at(app.rect_runs, y, runs.len()) {
-                    app.select_run(row, runs.len());
+                match app.browse {
+                    BrowseLevel::Projects => {
+                        if let Some(row) = list_row_at(app.rect_runs, y, projects.len()) {
+                            app.select_project(row, projects.len());
+                            if dbl {
+                                if let Some(p) = projects.get(row) {
+                                    *active_root = p.root.clone();
+                                    app.open_project_runs();
+                                }
+                            }
+                        }
+                    }
+                    BrowseLevel::Runs => {
+                        if let Some(row) = list_row_at(app.rect_runs, y, runs.len()) {
+                            app.select_run(row, runs.len());
+                        }
+                    }
                 }
             } else if contains(app.rect_action, x, y) {
-                // Action bar: focus runs so a/r/s context is clear
                 app.focus = Focus::Runs;
             }
         }
@@ -586,11 +760,15 @@ fn handle_mouse(
                 }
             } else if contains(app.rect_runs, x, y) {
                 app.focus = Focus::Runs;
-                if !runs.is_empty() {
-                    app.select_run(app.selected_run + 1, runs.len());
+                match app.browse {
+                    BrowseLevel::Projects if !projects.is_empty() => {
+                        app.select_project(app.selected_project + 1, projects.len());
+                    }
+                    BrowseLevel::Runs if !runs.is_empty() => {
+                        app.select_run(app.selected_run + 1, runs.len());
+                    }
+                    _ => {}
                 }
-            } else if contains(app.rect_stream, x, y) || app.focus == Focus::Log {
-                app.stream_scroll = app.stream_scroll.saturating_add(3);
             }
         }
         MouseEventKind::ScrollUp => {
@@ -607,8 +785,16 @@ fn handle_mouse(
                 }
             } else if contains(app.rect_runs, x, y) {
                 app.focus = Focus::Runs;
-                if !runs.is_empty() {
-                    app.select_run(app.selected_run.saturating_sub(1), runs.len());
+                match app.browse {
+                    BrowseLevel::Projects => {
+                        app.select_project(
+                            app.selected_project.saturating_sub(1),
+                            projects.len().max(1),
+                        );
+                    }
+                    BrowseLevel::Runs => {
+                        app.select_run(app.selected_run.saturating_sub(1), runs.len().max(1));
+                    }
                 }
             }
         }
@@ -688,13 +874,14 @@ fn layout_rects(area: Rect) -> LayoutRects {
 fn draw(
     f: &mut Frame,
     swarm: &SparPaths,
+    projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
     stream_text: &str,
     bus_lines: &[String],
     app: &App,
     fleet_state: &mut ListState,
-    runs_state: &mut ListState,
+    rail_state: &mut ListState,
 ) {
     let area = f.area();
     // Full clear each frame — prevents styled-cell ghosting across the whole UI.
@@ -704,8 +891,8 @@ fn draw(
     let lay = layout_rects(area);
 
     draw_header(f, lay.header, swarm, full, app);
-    draw_action(f, lay.action, runs, full, app);
-    draw_runs(f, lay.runs, runs, app, runs_state);
+    draw_action(f, lay.action, projects, runs, full, app);
+    draw_rail(f, lay.runs, projects, runs, app, rail_state);
     draw_agents(f, lay.fleet, full, app, fleet_state);
     draw_stream(f, lay.stream, full, stream_text, app);
     draw_messages(f, lay.bus, bus_lines, app);
@@ -745,10 +932,9 @@ fn draw_header(f: &mut Frame, area: Rect, swarm: &SparPaths, full: Option<&RunSt
         .map(|_| " dry-run ")
         .unwrap_or("");
 
-    let scope = if app.show_all_projects {
-        " all projects "
-    } else {
-        " this project "
+    let scope = match app.browse {
+        BrowseLevel::Projects => " projects ",
+        BrowseLevel::Runs => " runs ",
     };
     let left = Line::from(vec![
         Span::styled(" spar ", Style::default().fg(BG).bg(ACCENT).bold()),
@@ -796,29 +982,48 @@ fn draw_header(f: &mut Frame, area: Rect, swarm: &SparPaths, full: Option<&RunSt
 fn draw_action(
     f: &mut Frame,
     area: Rect,
+    projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
     app: &App,
 ) {
-    let (text, fg, bg) = if let Some(st) = full {
+    let (text, fg, bg) = if app.browse == BrowseLevel::Projects {
+        if projects.is_empty() {
+            (
+                format!(
+                    "  No projects yet — cd into a repo and run spar · index {}  ",
+                    registry::spar_home().display()
+                ),
+                FG_DIM,
+                BG_RAISED,
+            )
+        } else {
+            (
+                "  Projects (general) — j/k select · Enter / double-click open runs · p stays here  "
+                    .into(),
+                FG_MUTED,
+                BG_RAISED,
+            )
+        }
+    } else if let Some(st) = full {
         match st.phase {
             Phase::AwaitingPlanApproval => (
-                "  Plan ready — press  a  to approve ·  r  to reject · or click Agents / Live log to inspect  ".into(),
+                "  Plan ready — press  a  to approve ·  r  to reject · p = all projects  ".into(),
                 BG,
                 YELLOW,
             ),
             Phase::AwaitingWinnerConfirm => (
-                "  Arena winner ready — confirm with spar confirm, or inspect candidates  ".into(),
+                "  Arena winner ready — confirm with spar confirm · p = projects  ".into(),
                 BG,
                 YELLOW,
             ),
             Phase::AwaitingShipConfirm => (
-                "  Ready to ship — press  s  to confirm draft PR (never merges)  ".into(),
+                "  Ready to ship — press  s  (draft PR) · p = projects  ".into(),
                 BG,
                 YELLOW,
             ),
             Phase::AwaitingReconcile => (
-                "  Arena reconcile ready — run spar reconcile  ".into(),
+                "  Arena reconcile ready — spar reconcile · p = projects  ".into(),
                 BG,
                 YELLOW,
             ),
@@ -829,7 +1034,7 @@ fn draw_action(
             ),
             Phase::Failed | Phase::Stuck | Phase::Escalated => (
                 format!(
-                    "  {} — check Live log · spar cleanup {}  ",
+                    "  {} — check Live log · spar cleanup {} · p = projects  ",
                     phase_label(st.phase),
                     st.id
                 ),
@@ -837,13 +1042,13 @@ fn draw_action(
                 Color::Rgb(48, 24, 24),
             ),
             _ if st.dry_run => (
-                "  Dry-run — synthetic agents only · no real code changes  ".into(),
+                "  Dry-run — synthetic agents only · p = projects  ".into(),
                 FG_DIM,
                 BG_RAISED,
             ),
             _ if is_active_phase(st.phase) => (
                 format!(
-                    "  Working…  click a run · click an agent · scroll Live log  ·  Tab = next pane ({})  ",
+                    "  Working…  j/k runs · scroll Live log · p = projects · Tab = {}  ",
                     app.focus.label()
                 ),
                 FG_DIM,
@@ -851,7 +1056,7 @@ fn draw_action(
             ),
             _ => (
                 format!(
-                    "  {}  ·  Tab cycles panes · j/k move · mouse click & scroll · ? help  ",
+                    "  {}  ·  p projects · Tab panes · j/k · ? help  ",
                     phase_label(st.phase)
                 ),
                 FG_MUTED,
@@ -860,16 +1065,13 @@ fn draw_action(
         }
     } else if runs.is_empty() {
         (
-            format!(
-                "  No runs yet — open a project and:  spar plan -t \"…\" --providers cli:claude  ·  registry {}  ",
-                registry::spar_home().display()
-            ),
+            "  No runs in this project — spar plan -t \"…\" --providers cli:claude  ·  Esc/p = projects  ".into(),
             FG_DIM,
             BG_RAISED,
         )
     } else {
         (
-            "  Select a run (click / j k) · A toggles all projects · Tab panes · ? help  ".into(),
+            "  This project's runs — j/k select · Esc or p = all projects · Tab panes  ".into(),
             FG_MUTED,
             BG_RAISED,
         )
@@ -882,87 +1084,126 @@ fn draw_action(
     );
 }
 
-fn draw_runs(
+fn draw_rail(
     f: &mut Frame,
     area: Rect,
+    projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     app: &App,
     state: &mut ListState,
 ) {
     let focused = app.focus == Focus::Runs;
-    let items: Vec<ListItem> = if runs.is_empty() {
-        vec![ListItem::new(Span::styled(
-            "  (empty)",
-            Style::default().fg(FG_MUTED).italic(),
-        ))]
-    } else {
-        runs.iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let sel = i == app.selected_run;
-                let mark = if sel { "›" } else { " " };
-                let dry = if r.dry_run { "dry " } else { "" };
-                let proj = r
-                    .project_name
-                    .as_deref()
-                    .unwrap_or("·");
-                let task = r
-                    .task
-                    .as_deref()
-                    .map(|t| truncate(t, 14))
-                    .unwrap_or_else(|| workflow_label(r.workflow).into());
-                let age = relative_age(r.updated_at);
-                let show_proj = app.show_all_projects;
-                let line = Line::from(vec![
-                    Span::styled(format!("{mark}"), Style::default().fg(ACCENT)),
-                    if show_proj {
-                        Span::styled(
-                            format!(" {:<10}", truncate(proj, 10)),
-                            Style::default().fg(CYAN),
-                        )
-                    } else {
-                        Span::raw("")
-                    },
-                    Span::styled(
-                        format!(" {:<8}", truncate(&r.id, 8)),
-                        Style::default()
-                            .fg(if sel { FG } else { FG_DIM })
-                            .add_modifier(if sel {
-                                Modifier::BOLD
-                            } else {
-                                Modifier::empty()
-                            }),
-                    ),
-                    Span::styled(
-                        format!(" {:<12}", truncate(&phase_label(r.phase), 12)),
-                        Style::default().fg(phase_color(r.phase)),
-                    ),
-                    Span::styled(format!(" {dry}"), Style::default().fg(YELLOW)),
-                    Span::styled(format!("{task} "), Style::default().fg(FG_MUTED)),
-                    Span::styled(age, Style::default().fg(FG_MUTED)),
-                ]);
-                ListItem::new(line).style(if sel {
-                    Style::default().bg(BG_RAISED)
-                } else {
-                    Style::default()
-                })
-            })
-            .collect()
-    };
-
-    let title = if focused {
-        if app.show_all_projects {
-            format!(" Runs · all projects ({}) · A local · j/k ", runs.len())
-        } else {
-            format!(" Runs · this project ({}) · A all · j/k ", runs.len())
+    match app.browse {
+        BrowseLevel::Projects => {
+            let items: Vec<ListItem> = if projects.is_empty() {
+                vec![ListItem::new(Span::styled(
+                    "  (no projects)",
+                    Style::default().fg(FG_MUTED).italic(),
+                ))]
+            } else {
+                projects
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        let sel = i == app.selected_project;
+                        let mark = if sel { "›" } else { " " };
+                        let name = p.name.as_deref().unwrap_or("·");
+                        let n = registry::list_project_runs(&p.root)
+                            .map(|r| r.len())
+                            .unwrap_or(0);
+                        let line = Line::from(vec![
+                            Span::styled(format!("{mark}"), Style::default().fg(ACCENT)),
+                            Span::styled(
+                                format!(" {:<14}", truncate(name, 14)),
+                                Style::default()
+                                    .fg(if sel { FG } else { CYAN })
+                                    .add_modifier(if sel {
+                                        Modifier::BOLD
+                                    } else {
+                                        Modifier::empty()
+                                    }),
+                            ),
+                            Span::styled(
+                                format!(" {n} runs "),
+                                Style::default().fg(FG_MUTED),
+                            ),
+                            Span::styled(
+                                relative_age(p.last_seen),
+                                Style::default().fg(FG_MUTED),
+                            ),
+                        ]);
+                        ListItem::new(line).style(if sel {
+                            Style::default().bg(BG_RAISED)
+                        } else {
+                            Style::default()
+                        })
+                    })
+                    .collect()
+            };
+            let title = if focused {
+                format!(" Projects  ({}) · Enter open · j/k ", projects.len())
+            } else {
+                format!(" Projects  ({}) ", projects.len())
+            };
+            let list = List::new(items).block(panel(&title, focused));
+            f.render_stateful_widget(list, area, state);
         }
-    } else if app.show_all_projects {
-        format!(" Runs · all ({}) ", runs.len())
-    } else {
-        format!(" Runs ({}) ", runs.len())
-    };
-    let list = List::new(items).block(panel(&title, focused));
-    f.render_stateful_widget(list, area, state);
+        BrowseLevel::Runs => {
+            let items: Vec<ListItem> = if runs.is_empty() {
+                vec![ListItem::new(Span::styled(
+                    "  (no runs)",
+                    Style::default().fg(FG_MUTED).italic(),
+                ))]
+            } else {
+                runs.iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        let sel = i == app.selected_run;
+                        let mark = if sel { "›" } else { " " };
+                        let dry = if r.dry_run { "dry " } else { "" };
+                        let task = r
+                            .task
+                            .as_deref()
+                            .map(|t| truncate(t, 16))
+                            .unwrap_or_else(|| workflow_label(r.workflow).into());
+                        let age = relative_age(r.updated_at);
+                        let line = Line::from(vec![
+                            Span::styled(format!("{mark}"), Style::default().fg(ACCENT)),
+                            Span::styled(
+                                format!(" {:<8}", truncate(&r.id, 8)),
+                                Style::default()
+                                    .fg(if sel { FG } else { FG_DIM })
+                                    .add_modifier(if sel {
+                                        Modifier::BOLD
+                                    } else {
+                                        Modifier::empty()
+                                    }),
+                            ),
+                            Span::styled(
+                                format!(" {:<12}", truncate(&phase_label(r.phase), 12)),
+                                Style::default().fg(phase_color(r.phase)),
+                            ),
+                            Span::styled(format!(" {dry}"), Style::default().fg(YELLOW)),
+                            Span::styled(format!("{task} "), Style::default().fg(FG_MUTED)),
+                            Span::styled(age, Style::default().fg(FG_MUTED)),
+                        ]);
+                        ListItem::new(line).style(if sel {
+                            Style::default().bg(BG_RAISED)
+                        } else {
+                            Style::default()
+                        })
+                    })
+                    .collect()
+            };
+            let title = if focused {
+                format!(" Runs  ({}) · Esc/p projects · j/k ", runs.len())
+            } else {
+                format!(" Runs  ({}) ", runs.len())
+            };
+            let list = List::new(items).block(panel(&title, focused));
+            f.render_stateful_widget(list, area, state);
+        }
+    }
 }
 
 fn draw_agents(
@@ -1462,7 +1703,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, full: Option<&RunState>) {
         (app.status_line.as_str(), YELLOW)
     } else {
         (
-            situational_footer(full, app.focus),
+            situational_footer(full, app.focus, app.browse),
             FG_MUTED,
         )
     };
@@ -1498,22 +1739,25 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, full: Option<&RunState>) {
     f.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), area);
 }
 
-fn situational_footer(full: Option<&RunState>, focus: Focus) -> &'static str {
+fn situational_footer(full: Option<&RunState>, focus: Focus, browse: BrowseLevel) -> &'static str {
+    if browse == BrowseLevel::Projects {
+        return "j/k projects · Enter open · double-click open · ? help";
+    }
     if let Some(st) = full {
         if st.phase == Phase::AwaitingPlanApproval {
-            return "a approve plan · r reject · Tab panes · click Live log to inspect";
+            return "a approve · r reject · p projects · Tab panes";
         }
         if st.phase == Phase::AwaitingShipConfirm {
-            return "s confirm ship (draft PR) · Tab panes · ? help";
+            return "s confirm ship · p projects · ? help";
         }
         if st.phase.is_gate() {
-            return "gate waiting · see yellow bar above · ? help";
+            return "gate waiting · yellow bar above · p projects";
         }
     }
     match focus {
-        Focus::Runs => "j/k click: pick run · A all/local projects · Tab → Agents · ? help",
-        Focus::Agents => "j/k or click: pick agent · log follows selection · Tab → Live log",
-        Focus::Log => "scroll wheel / j k / PgUp PgDn · g top · Tab → Messages",
+        Focus::Runs => "j/k runs · Esc/p projects · Tab → Agents · ? help",
+        Focus::Agents => "j/k agent · log follows · Tab → Live log",
+        Focus::Log => "scroll wheel / j k · g top · Tab → Messages",
         Focus::Messages => "scroll wheel / j k · Tab → Command",
         Focus::Composer => "type /approve /reject /ship /help · Enter · Esc",
     }
@@ -1542,8 +1786,9 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
   Keyboard\n\
     Tab / Shift-Tab      next / previous panel\n\
     j k  or  ↑ ↓         move in focused panel\n\
-    [ ]  or  J K         previous / next run\n\
-    A                    toggle all projects vs this project\n\
+    Enter                open project (from Projects list)\n\
+    p  or  Esc           back to Projects (general view)\n\
+    [ ]  or  J K         previous / next item\n\
     1-9                  jump to agent slot\n\
     a / r / s            approve · reject · ship (when gated)\n\
     i  or  /             command bar\n\
@@ -1551,8 +1796,8 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
     ?                    this help · Esc closes\n\
     q                    quit\n\
  \n\
-  Runs live under each project’s .spar/runs/.\n\
-  Global index: ~/.spar/registry.json (SPAR_HOME overrides).\n\
+  Default: this project's runs (or Projects if outside a repo).\n\
+  Runs: <project>/.spar/runs/ · Index: ~/.spar/registry.json\n\
  \n\
   Esc or ? to close";
     let p = Paragraph::new(body)

@@ -82,7 +82,8 @@ spar logs <run_id> [slot] [-f|--follow]
 # Global home: open `spar` from anywhere. Runs stay under each project’s
 # `.spar/runs/`; project list is ~/.spar/registry.json (or $SPAR_HOME).
 # Projects appear when you use spar there — no hardcoded scan paths.
-# TUI key **A** toggles all-projects vs current-project only.
+# TUI: default = this project's runs; **p** / Esc = Projects (general view);
+# Enter opens a project.
 ```
 
 - Run state: `.spar/runs/<id>/state.json`
