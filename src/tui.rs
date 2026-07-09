@@ -111,11 +111,11 @@ pub fn run_with(opts: TuiOpts) -> Result<crate::exit_codes::ExitCode> {
         .unwrap_or(300);
 
     enable_raw_mode()?;
+    // Install immediately so partial setup / panic still restores the terminal.
+    let _guard = TerminalGuard;
     let mut out = stdout();
     out.execute(EnterAlternateScreen)?;
     out.execute(EnableMouseCapture)?;
-    // Restore terminal on any exit path (including panic unwind).
-    let _guard = TerminalGuard;
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
     terminal.clear()?;
 
@@ -127,7 +127,7 @@ pub fn run_with(opts: TuiOpts) -> Result<crate::exit_codes::ExitCode> {
     )
 }
 
-/// Ensures raw mode / mouse / alt-screen are torn down even if the TUI panics.
+/// Best-effort teardown of raw mode / mouse / alt-screen (safe if only partially entered).
 struct TerminalGuard;
 
 impl Drop for TerminalGuard {
@@ -219,6 +219,10 @@ impl LogCache {
             && self.mtime == mtime;
         if !same {
             let tail = process::tail_log_info(path, max_bytes);
+            if tail.io_error {
+                // Do not cache a failed read as an empty successful snapshot.
+                return ("", false);
+            }
             self.path = Some(path.to_path_buf());
             self.len = len;
             self.mtime = mtime;
@@ -377,18 +381,30 @@ impl App {
         );
     }
 
-    fn stream_home(&mut self) {
-        self.stream_follow = false;
-        self.stream_scroll = 0;
-        self.bus_follow = false;
-        self.bus_scroll = 0;
+    fn home_for_focus(&mut self) {
+        match self.focus {
+            Focus::Activity => {
+                self.bus_follow = false;
+                self.bus_scroll = 0;
+            }
+            _ => {
+                self.stream_follow = false;
+                self.stream_scroll = 0;
+            }
+        }
     }
 
-    fn stream_end(&mut self) {
-        self.stream_follow = true;
-        self.stream_scroll = self.stream_max;
-        self.bus_follow = true;
-        self.bus_scroll = self.bus_max;
+    fn end_for_focus(&mut self) {
+        match self.focus {
+            Focus::Activity => {
+                self.bus_follow = true;
+                self.bus_scroll = self.bus_max;
+            }
+            _ => {
+                self.stream_follow = true;
+                self.stream_scroll = self.stream_max;
+            }
+        }
     }
 }
 
@@ -400,12 +416,13 @@ fn apply_scroll_delta(scroll: &mut u16, follow: &mut bool, max: u16, delta: i32)
     if delta > 0 {
         let next = (*scroll as u32).saturating_add(delta as u32);
         *scroll = next.min(u32::from(max)) as u16;
-        *follow = *scroll >= max;
     } else {
-        *follow = false;
         let sub = (-delta) as u32;
         *scroll = (*scroll as u32).saturating_sub(sub) as u16;
     }
+    // When content fits (max==0) or we remain at the end, keep follow so growth
+    // does not leave the viewport stuck at the top of a short log.
+    *follow = *scroll >= max;
 }
 
 /// Clamp scroll into `[0, max]`; when `follow`, pin to max.
@@ -522,22 +539,6 @@ fn run_loop(
             }
         }
 
-        // Hit-test rects match the frame we are about to paint.
-        let area = terminal.size()?;
-        let layout = layout_rects(Rect {
-            x: 0,
-            y: 0,
-            width: area.width,
-            height: area.height,
-        });
-        app.rect_header = layout.header;
-        app.rect_action = layout.action;
-        app.rect_runs = layout.runs;
-        app.rect_fleet = layout.fleet;
-        app.rect_stream = layout.stream;
-        app.rect_bus = layout.bus;
-        app.rect_composer = layout.composer;
-
         terminal.draw(|f| {
             draw(
                 f,
@@ -553,10 +554,11 @@ fn run_loop(
             );
         })?;
 
-        // Wait up to 50ms for the first event, then drain the rest so wheel/key
-        // spam cannot leave scroll deltas stuck in the queue.
+        // Wait up to 50ms for the first event, then drain a bounded batch so
+        // wheel/key spam cannot leave deltas stuck or starve redraw.
+        const MAX_EVENTS_PER_TICK: usize = 48;
         if event::poll(Duration::from_millis(50))? {
-            loop {
+            for _ in 0..MAX_EVENTS_PER_TICK {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         if handle_key(
@@ -868,10 +870,10 @@ fn handle_key(
             }
         }
         KeyCode::Char('g') | KeyCode::Home => {
-            app.stream_home();
+            app.home_for_focus();
         }
         KeyCode::Char('G') | KeyCode::End => {
-            app.stream_end();
+            app.end_for_focus();
         }
         KeyCode::Char('?') => {
             app.show_help = true;
@@ -1736,7 +1738,8 @@ fn render_scrollable_log(
     let height = area.height as usize;
     let rows = layout_log_rows(text, text_w, colorize, expand);
     let total = rows.len().max(1);
-    let max_scroll = total.saturating_sub(height) as u16;
+    // Cap at u16::MAX so dense tails cannot wrap the scroll type.
+    let max_scroll = total.saturating_sub(height).min(u16::MAX as usize) as u16;
     clamp_scroll(scroll, follow, max_scroll);
     let start = *scroll as usize;
     let visible: Vec<(String, Style)> = rows.into_iter().skip(start).take(height).collect();
@@ -2095,7 +2098,7 @@ fn situational_footer(full: Option<&RunState>, focus: Focus, browse: BrowseLevel
     match focus {
         Focus::Runs => "j/k runs · Esc/p projects · Tab → Agents · ? help",
         Focus::Agents => "j/k agent · log follows · Tab → Live log",
-        Focus::Log => "scroll / j k · w wrap/trim · g top · Tab → Activity",
+        Focus::Log => "scroll · w wrap · g/G top/end · up unfollows live · Tab",
         Focus::Activity => "run timeline · scroll · Tab → Command",
         Focus::Composer => "type /approve /reject /ship /help · Enter · Esc",
     }
@@ -2595,6 +2598,15 @@ mod labels {
     }
 
     #[test]
+    fn scroll_up_when_content_fits_keeps_follow() {
+        let mut scroll = 0u16;
+        let mut follow = true;
+        apply_scroll_delta(&mut scroll, &mut follow, 0, -3);
+        assert_eq!(scroll, 0);
+        assert!(follow, "short log must stay following so growth stays visible");
+    }
+
+    #[test]
     fn clamp_scroll_pins_when_following() {
         let mut scroll = 9999u16;
         let mut follow = true;
@@ -2617,7 +2629,6 @@ mod labels {
 
     #[test]
     fn overscroll_then_up_moves_immediately() {
-        // Regression: unclamped scroll made up-scroll appear frozen.
         let mut scroll = 9999u16;
         let mut follow = false;
         let max = 50u16;
@@ -2626,5 +2637,16 @@ mod labels {
         apply_scroll_delta(&mut scroll, &mut follow, max, -3);
         assert_eq!(scroll, 47);
         assert!(!follow);
+    }
+
+    #[test]
+    fn follow_pins_when_max_grows() {
+        let mut scroll = 10u16;
+        let mut follow = true;
+        clamp_scroll(&mut scroll, &mut follow, 10);
+        assert_eq!(scroll, 10);
+        clamp_scroll(&mut scroll, &mut follow, 40);
+        assert_eq!(scroll, 40);
+        assert!(follow);
     }
 }
