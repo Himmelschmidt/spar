@@ -21,7 +21,7 @@ use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Scrollbar,
-    ScrollbarOrientation, ScrollbarState, Wrap,
+    ScrollbarOrientation, ScrollbarState,
 };
 use std::io::stdout;
 use std::path::PathBuf;
@@ -1057,22 +1057,9 @@ fn draw_stream(
     });
     draw_stream_stats(f, chunks[0], stats.as_ref(), slot.map(|s| s.status));
 
-    let styled = stream_lines_styled(stream_text);
-    let p = Paragraph::new(styled)
-        .style(Style::default().bg(BG_PANEL))
-        .wrap(Wrap { trim: false })
-        .scroll((app.stream_scroll, 0));
-    f.render_widget(p, chunks[1]);
-
-    let lines = stream_text.lines().count().max(1);
-    let mut sb = ScrollbarState::new(lines).position(app.stream_scroll as usize);
-    f.render_stateful_widget(
-        Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .style(Style::default().fg(FG_MUTED))
-            .thumb_style(Style::default().fg(ACCENT_SOFT)),
-        chunks[1],
-        &mut sb,
-    );
+    // Live log: never use Paragraph wrap+scroll together — wrapped styled lines
+    // leave ghost glyphs (duplicated colored words) on scroll. Pre-wrap, pad, slice.
+    render_scrollable_log(f, chunks[1], stream_text, app.stream_scroll, true);
 }
 
 fn draw_stream_stats(
@@ -1161,29 +1148,119 @@ fn draw_stream_stats(
     );
 }
 
-fn stream_lines_styled(text: &str) -> Vec<Line<'static>> {
-    text.lines()
-        .map(|line| {
-            let style = if line.starts_with('→') {
-                Style::default().fg(CYAN)
-            } else if line.starts_with('←') {
-                if line.contains('✗') {
-                    Style::default().fg(RED)
-                } else {
-                    Style::default().fg(GREEN)
-                }
-            } else if line.starts_with('·') || line.starts_with('…') {
-                Style::default().fg(FG_MUTED).italic()
-            } else if line.starts_with('!') {
-                Style::default().fg(RED).bold()
-            } else if line.starts_with('#') {
-                Style::default().fg(FG_MUTED)
-            } else {
-                Style::default().fg(FG)
-            };
-            Line::from(Span::styled(line.to_string(), style))
-        })
-        .collect()
+/// Paint a log viewport without Paragraph wrap+scroll (avoids color ghosting).
+fn render_scrollable_log(
+    f: &mut Frame,
+    area: Rect,
+    text: &str,
+    scroll: u16,
+    colorize: bool,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    // Full clear of the content region so previous frames cannot leave cells behind.
+    f.render_widget(
+        Block::default().style(Style::default().bg(BG_PANEL).fg(FG)),
+        area,
+    );
+
+    let sb_w = 1u16;
+    let text_w = area.width.saturating_sub(sb_w).max(1) as usize;
+    let height = area.height as usize;
+    let wrapped = wrap_log_lines(text, text_w, colorize);
+    let total = wrapped.len().max(1);
+    let max_scroll = total.saturating_sub(height);
+    let start = (scroll as usize).min(max_scroll);
+    let visible: Vec<Line> = wrapped
+        .into_iter()
+        .skip(start)
+        .take(height)
+        .map(|line| pad_line_bg(line, text_w))
+        .collect();
+
+    let text_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width.saturating_sub(sb_w).max(1),
+        height: area.height,
+    };
+    let p = Paragraph::new(visible).style(Style::default().bg(BG_PANEL).fg(FG));
+    f.render_widget(p, text_area);
+
+    let mut sb = ScrollbarState::new(total).position(start);
+    f.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .style(Style::default().fg(FG_MUTED).bg(BG_PANEL))
+            .thumb_style(Style::default().fg(ACCENT_SOFT).bg(BG_PANEL)),
+        area,
+        &mut sb,
+    );
+}
+
+fn log_line_style(line: &str, colorize: bool) -> Style {
+    let base = Style::default().bg(BG_PANEL);
+    if !colorize {
+        return base.fg(FG_DIM);
+    }
+    if line.starts_with('→') {
+        base.fg(CYAN)
+    } else if line.starts_with('←') {
+        if line.contains('✗') {
+            base.fg(RED)
+        } else {
+            base.fg(GREEN)
+        }
+    } else if line.starts_with('·') || line.starts_with('…') {
+        base.fg(FG_MUTED).italic()
+    } else if line.starts_with('!') {
+        base.fg(RED).bold()
+    } else if line.starts_with('#') {
+        base.fg(FG_MUTED)
+    } else {
+        base.fg(FG)
+    }
+}
+
+/// Hard-wrap source lines to `width` display columns (char-based; agent logs are ASCII-heavy).
+fn wrap_log_lines(text: &str, width: usize, colorize: bool) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let style = log_line_style(raw, colorize);
+        if raw.is_empty() {
+            out.push(Line::from(Span::styled(String::new(), style)));
+            continue;
+        }
+        let chars: Vec<char> = raw.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let end = (i + width).min(chars.len());
+            let chunk: String = chars[i..end].iter().collect();
+            out.push(Line::from(Span::styled(chunk, style)));
+            i = end;
+        }
+    }
+    if out.is_empty() {
+        out.push(Line::from(Span::styled(String::new(), log_line_style("", colorize))));
+    }
+    out
+}
+
+fn pad_line_bg(mut line: Line<'static>, width: usize) -> Line<'static> {
+    let w = line.width();
+    if w < width {
+        line.spans.push(Span::styled(
+            " ".repeat(width - w),
+            Style::default().bg(BG_PANEL).fg(FG),
+        ));
+    }
+    // Ensure every span carries the panel background so scroll cannot leave
+    // previous-frame foreground cells in the padding.
+    for span in &mut line.spans {
+        span.style.bg = Some(BG_PANEL);
+    }
+    line
 }
 
 fn compact_u64(n: u64) -> String {
@@ -1208,12 +1285,10 @@ fn draw_messages(f: &mut Frame, area: Rect, bus_lines: &[String], app: &App) {
     } else {
         " Messages "
     };
-    let p = Paragraph::new(text)
-        .style(Style::default().fg(FG_DIM).bg(BG_PANEL))
-        .wrap(Wrap { trim: true })
-        .scroll((app.bus_scroll, 0))
-        .block(panel(title, focused));
-    f.render_widget(p, area);
+    let block = panel(title, focused);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    render_scrollable_log(f, inner, &text, app.bus_scroll, false);
 }
 
 fn draw_composer(f: &mut Frame, area: Rect, app: &App) {
@@ -1633,5 +1708,16 @@ mod labels {
         assert_eq!(list_row_at(r, 11, 3), Some(0));
         assert_eq!(list_row_at(r, 12, 3), Some(1));
         assert_eq!(list_row_at(r, 20, 3), None);
+    }
+
+    #[test]
+    fn wrap_log_splits_long_colored_lines() {
+        let long = format!("→ {}", "abcdefghij".repeat(5)); // 2 + 50
+        let lines = wrap_log_lines(&long, 20, true);
+        assert!(lines.len() >= 3, "expected wrap, got {}", lines.len());
+        assert!(lines.iter().all(|l| l.width() <= 20));
+        let padded = pad_line_bg(lines[0].clone(), 20);
+        assert_eq!(padded.width(), 20);
+        assert!(padded.spans.iter().all(|s| s.style.bg == Some(BG_PANEL)));
     }
 }
