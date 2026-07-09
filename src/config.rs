@@ -101,6 +101,10 @@ pub struct TimeoutConfig {
     /// Reviewer wall clock (diff-focused). Defaults to `slot_secs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_secs: Option<u64>,
+    /// Running slot with no log output for this long ⇒ `stalled` in status/TUI.
+    /// `0` disables the stall flag (last_log_at still reported).
+    #[serde(default = "default_stall_warn_secs")]
+    pub stall_warn_secs: u64,
     #[serde(default = "default_wait_timeout")]
     pub wait: String,
 }
@@ -110,9 +114,14 @@ impl Default for TimeoutConfig {
         Self {
             slot_secs: default_slot_timeout_secs(),
             review_secs: None,
+            stall_warn_secs: default_stall_warn_secs(),
             wait: default_wait_timeout(),
         }
     }
+}
+
+fn default_stall_warn_secs() -> u64 {
+    300
 }
 
 impl TimeoutConfig {
@@ -237,6 +246,7 @@ struct ShipConfigFile {
 struct TimeoutConfigFile {
     slot_secs: Option<u64>,
     review_secs: Option<u64>,
+    stall_warn_secs: Option<u64>,
     wait: Option<String>,
 }
 
@@ -295,6 +305,9 @@ impl Config {
             }
             if let Some(v) = t.review_secs {
                 self.timeouts.review_secs = Some(v);
+            }
+            if let Some(v) = t.stall_warn_secs {
+                self.timeouts.stall_warn_secs = v;
             }
             if let Some(v) = &t.wait {
                 self.timeouts.wait = v.clone();

@@ -30,6 +30,9 @@ pub struct StreamStats {
     pub model: Option<String>,
     pub lines_in: u64,
     pub chars_out: u64,
+    /// RFC3339 of last successful log append (for stall detection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_log_at: Option<String>,
 }
 
 impl StreamStats {
@@ -38,6 +41,12 @@ impl StreamStats {
             .input_tokens
             .saturating_add(self.cache_read_tokens)
             .saturating_add(self.output_tokens);
+    }
+
+    pub fn touch_log(&mut self) {
+        self.last_log_at = Some(
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        );
     }
 
     pub fn stats_path(log_path: &Path) -> PathBuf {
@@ -96,7 +105,9 @@ pub fn run_captured(req: &SpawnRequest) -> Result<SpawnResult> {
         f.write_all(header.as_bytes())?;
         f.flush()?;
     }
-    let _ = StreamStats::default().save(&req.log_path);
+    let mut initial = StreamStats::default();
+    initial.touch_log();
+    let _ = initial.save(&req.log_path);
 
     let mut cmd = Command::new(&req.program);
     cmd.args(&req.args)
@@ -232,47 +243,52 @@ fn stream_to_log(
 ) {
     let reader = BufReader::new(pipe);
     let mut c = StreamCoalescer::new(is_err);
-    let mut n = 0u32;
     for line in reader.lines() {
         let Ok(line) = line else { break };
         if let Ok(mut s) = stats.lock() {
             s.lines_in += 1;
         }
         if let Some(chunk) = c.feed(&line) {
+            if append_log(log_path, &chunk).is_ok() {
+                if let Ok(mut s) = stats.lock() {
+                    s.chars_out += chunk.len() as u64;
+                    s.tools = c.tools;
+                    s.tool_errors = c.tool_errors;
+                    s.input_tokens = c.input_tokens;
+                    s.output_tokens = c.output_tokens.max(c.est_output_tokens);
+                    s.cache_read_tokens = c.cache_read;
+                    s.cache_write_tokens = c.cache_write;
+                    if c.model.is_some() {
+                        s.model = c.model.clone();
+                    }
+                    s.touch_context();
+                    s.touch_log();
+                    // Persist last_log_at every append so status/TUI never read a stale stamp.
+                    let _ = s.save(log_path);
+                }
+            }
+        }
+    }
+    if let Some(chunk) = c.finish() {
+        if append_log(log_path, &chunk).is_ok() {
             if let Ok(mut s) = stats.lock() {
                 s.chars_out += chunk.len() as u64;
                 s.tools = c.tools;
-                s.tool_errors = c.tool_errors;
                 s.input_tokens = c.input_tokens;
                 s.output_tokens = c.output_tokens.max(c.est_output_tokens);
                 s.cache_read_tokens = c.cache_read;
                 s.cache_write_tokens = c.cache_write;
-                if c.model.is_some() {
-                    s.model = c.model.clone();
-                }
+                s.model = c.model.clone();
                 s.touch_context();
-                n += 1;
-                if n.is_multiple_of(8) {
-                    let _ = s.save(log_path);
-                }
+                s.touch_log();
+                let _ = s.save(log_path);
             }
-            let _ = append_log(log_path, &chunk);
         }
-    }
-    if let Some(chunk) = c.finish() {
-        if let Ok(mut s) = stats.lock() {
-            s.chars_out += chunk.len() as u64;
-            s.tools = c.tools;
-            s.input_tokens = c.input_tokens;
-            s.output_tokens = c.output_tokens.max(c.est_output_tokens);
-            s.cache_read_tokens = c.cache_read;
-            s.cache_write_tokens = c.cache_write;
-            s.model = c.model.clone();
-            s.touch_context();
-            let _ = s.save(log_path);
+    } else if let Ok(mut s) = stats.lock() {
+        // Keep any prior last_log_at (e.g. spawn header); do not wipe with defaults.
+        if s.last_log_at.is_none() {
+            s.touch_log();
         }
-        let _ = append_log(log_path, &chunk);
-    } else if let Ok(s) = stats.lock() {
         let _ = s.save(log_path);
     }
 }

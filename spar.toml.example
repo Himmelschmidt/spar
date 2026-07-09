@@ -23,6 +23,7 @@ auto_confirm = false
 [timeouts]
 slot_secs = 1800
 # review_secs = 1800   # optional; defaults to slot_secs (diff-focused, no full suites)
+stall_warn_secs = 300  # running + no log output for this long ⇒ stalled in status/TUI (0 = off)
 wait = "2h"
 
 # Full test suite channel (cheap/dumb model). Implementers/reviewers must not run multi-hour suites.

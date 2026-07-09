@@ -6,6 +6,7 @@ mod doctor;
 mod events;
 mod executor;
 mod exit_codes;
+mod liveness;
 mod mailbox;
 mod markers;
 mod paths;
@@ -292,6 +293,7 @@ fn project_ctx() -> Result<(paths::SparPaths, Config)> {
 fn status_cmd(run_id: Option<String>, json: bool) -> Result<ExitCode> {
     let root = paths::find_project_root()?;
     let swarm = paths::SparPaths::new(&root);
+    let cfg = Config::load(&root).unwrap_or_default();
 
     // Observe-only: process exit is always 0 when the command succeeds.
     // Run-phase gate/stuck/quota lives in JSON `exit_code` / `phase` (use `wait` to
@@ -313,6 +315,7 @@ fn status_cmd(run_id: Option<String>, json: bool) -> Result<ExitCode> {
                     },
                 );
             }
+            liveness::enrich_status_json(&mut v, &state.slots, &cfg);
             println!("{}", serde_json::to_string_pretty(&v)?);
         } else {
             println!("run: {}", state.id);
@@ -329,8 +332,12 @@ fn status_cmd(run_id: Option<String>, json: bool) -> Result<ExitCode> {
             }
             println!("slots: {}", state.slots.len());
             for slot in &state.slots {
+                let act =
+                    liveness::SlotActivity::observe(slot, cfg.timeouts.stall_warn_secs);
+                let silent = act.human_silent();
+                let stall = if act.stalled { " STALL" } else { "" };
                 println!(
-                    "  - {} provider={} role={:?} status={:?}",
+                    "  - {} provider={} role={:?} status={:?} silent={silent}{stall}",
                     slot.id, slot.provider, slot.role, slot.status
                 );
             }
