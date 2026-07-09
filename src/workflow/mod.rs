@@ -14,7 +14,8 @@ use anyhow::Result;
 #[derive(Debug, Clone)]
 pub struct CommonOpts {
     pub task: Option<String>,
-    pub providers: Option<Vec<String>>,
+    /// Explicit provider list (required by CLI for spawn workflows).
+    pub providers: Vec<String>,
     pub detach: bool,
     pub json: bool,
     pub backend: Backend,
@@ -26,7 +27,7 @@ impl Default for CommonOpts {
     fn default() -> Self {
         Self {
             task: None,
-            providers: None,
+            providers: Vec::new(),
             detach: false,
             json: false,
             backend: Backend::Auto,
@@ -39,6 +40,13 @@ impl Default for CommonOpts {
 impl CommonOpts {
     pub fn resolve_dry_run(&self) -> bool {
         self.dry_run || util::env_truthy("SPAR_DRY_RUN")
+    }
+
+    pub fn require_providers(&self) -> Result<&[String]> {
+        if self.providers.is_empty() {
+            anyhow::bail!("--providers is required (e.g. --providers claude or --providers claude,grok)");
+        }
+        Ok(&self.providers)
     }
 }
 

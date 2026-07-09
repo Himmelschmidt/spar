@@ -28,18 +28,13 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
     state.autonomy = cfg.autonomy;
     state.message_budget = cfg.message_budget;
     state.big = opts.big;
+    let requested = opts.require_providers()?;
     state.providers = providers::pick_providers(
-        &cfg.providers.order,
+        requested,
         2.max(cfg.max_agents.min(3) as usize),
-        opts.providers.as_deref(),
+        Some(requested),
         dry,
     );
-    if dry && state.providers.is_empty() {
-        state.providers = cfg.providers.order.clone();
-        if state.providers.is_empty() {
-            state.providers = vec!["claude".into(), "grok".into()];
-        }
-    }
     if !dry {
         match crate::quota::apply_quota_filter(paths, &state.providers) {
             Ok(p) => state.providers = p,

@@ -30,7 +30,7 @@ Also: `spar skills get core` (preferred; always current).
 ## Path A (plan → approve → implement) — **one run id**
 
 ```bash
-spar plan --task "$TASK" --detach --json
+spar plan --task "$TASK" --providers claude,grok --detach --json
 # → { "run_id": "...", "id": "...", "phase": "...", ... }
 
 spar wait "$RUN_ID" --json
@@ -42,7 +42,7 @@ spar wait "$RUN_ID" --json
 spar approve "$RUN_ID" --json   # only if still awaiting_plan_approval
 
 # SAME run id continues into implement (workflow becomes loop).
-spar implement --run "$RUN_ID" --detach --json
+spar implement --run "$RUN_ID" --providers claude,grok,agy --detach --json
 # → { "run_id": "$RUN_ID", ... }   # not a child run
 
 spar wait "$RUN_ID" --json
@@ -51,12 +51,14 @@ spar wait "$RUN_ID" --json
 spar ship "$RUN_ID" --confirm --json
 ```
 
+`--providers` is **required** for plan / implement / run (no implicit fleet).
+
 **Note:** `exit_code` in JSON is only set when the phase is terminal or a human gate (`null` while in-flight). Prefer `phase` + polling `wait`.
 
 ## Path B (autonomous task)
 
 ```bash
-spar implement --task "$TASK" --detach --json
+spar implement --task "$TASK" --providers claude --detach --json
 spar wait "$RUN_ID" --timeout 2h --json
 ```
 
@@ -75,7 +77,7 @@ API keys: `OPENAI_API_KEY`, `XAI_API_KEY`, optional `*_BASE_URL` / `*_MODEL`.
 ## Arena
 
 ```bash
-spar run --workflow arena --task "$TASK" --json
+spar run --workflow arena --task "$TASK" --providers claude,grok,agy --json
 spar confirm "$RUN_ID" [--winner slot-id] --json
 # or: spar reconcile "$RUN_ID" --json
 spar ship "$RUN_ID" --confirm --json
@@ -86,7 +88,7 @@ spar ship "$RUN_ID" --confirm --json
 ```bash
 spar bus send "$RUN_ID" -m "hello" --to broadcast
 spar bus log "$RUN_ID"
-spar run --workflow peer --task "$TASK" --json
+spar run --workflow peer --task "$TASK" --providers claude,grok --json
 ```
 
 ## Status JSON

@@ -35,19 +35,21 @@ API keys: `OPENAI_API_KEY`, `XAI_API_KEY`, optional `OPENAI_BASE_URL` / `XAI_BAS
 
 ## Workflows
 
+**`--providers` is required** for `plan`, `implement`, and `run` (no silent default fleet).
+
 ```bash
 # Plan (ends HumanGate / awaiting_plan_approval unless autonomy auto-approves)
-spar plan -t "describe the work" [--providers …] [--big] [--dry-run] [--json] [--detach]
+spar plan -t "describe the work" --providers claude,grok [--big] [--dry-run] [--json] [--detach]
 
 spar approve <run_id> [--json]
 spar reject <run_id> [--reason "..."] [--json]
 
 # Implement continues THE SAME run id (plan → implement → ship)
-spar implement --run <run_id> [--dry-run] [--json] [--detach]
-spar implement -t "small task" [--dry-run]
+spar implement --run <run_id> --providers claude,grok,agy [--dry-run] [--json] [--detach]
+spar implement -t "small task" --providers claude [--dry-run]
 
 # Named workflows
-spar run --workflow loop|arena|roles|peer -t "..." [--dry-run] [--big]
+spar run --workflow loop|arena|roles|peer -t "..." --providers claude,grok [--dry-run] [--big]
 
 spar confirm <run_id> [--winner <slot>]   # arena winner
 spar reconcile <run_id>                  # arena merge-good-parts + review
@@ -93,7 +95,7 @@ spar logs <run_id> [slot] [-f|--follow]
 
 **`--dry-run`:** stubs agent processes only; writes `.spar/runs/<id>/`. Does **not** create real git worktrees (cwd under `.spar/…/cwd-*`). Live runs create sibling worktrees.
 
-**Default providers:** with no `--providers`, order is config default (often all of claude,grok,agy). Live runs can spawn multiple agents — pass an explicit list when you care.
+**Providers:** always pass `--providers` explicitly. A single name is fine (`--providers claude`); multiple names cycle across slots.
 
 ## Config knobs (`spar.toml`)
 
