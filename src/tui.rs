@@ -156,7 +156,7 @@ struct App {
     stall_warn_secs: u64,
     /// When false (default), long log lines truncate with …; `w` toggles wrap.
     log_expand: bool,
-    /// First Ctrl+C timestamp; second within 1s exits (Esc/q never quit).
+    /// First Ctrl+C timestamp; second within 2s exits (Esc/q never quit).
     last_ctrl_c: Option<Instant>,
     last_click: Option<(u16, u16, Instant)>,
     show_help: bool,
@@ -465,16 +465,16 @@ fn handle_key(
     let selected_id = runs.get(app.selected_run).map(|r| r.id.as_str());
     let n_slots = full.map(|s| s.slots.len()).unwrap_or(0);
 
-    // Ctrl+C twice (within 1s) is the only quit path — never Esc or q.
+    // Ctrl+C twice (within 2s) is the only quit path — never Esc or q.
     if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
         if let Some(t) = app.last_ctrl_c {
-            if t.elapsed() < Duration::from_millis(1000) {
+            if t.elapsed() < Duration::from_secs(2) {
                 return Ok(true);
             }
         }
         app.last_ctrl_c = Some(Instant::now());
-        // Match the 1s double-press window so the hint doesn't linger.
-        app.flash_for("Ctrl+C again to exit", YELLOW, Duration::from_millis(900));
+        // Match the 2s double-press window so the hint doesn't outlive the arm.
+        app.flash_for("Ctrl+C again to exit", YELLOW, Duration::from_secs(2));
         return Ok(false);
     }
     // Any other key clears the first Ctrl+C arm.
