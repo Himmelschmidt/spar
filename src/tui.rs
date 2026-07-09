@@ -6,7 +6,8 @@ use crate::liveness::SlotActivity;
 use crate::paths::{self, SparPaths};
 use crate::process;
 use crate::quota::QuotaStore;
-use crate::state::{self, Phase, RunState, SlotState, SlotStatus};
+use crate::registry;
+use crate::state::{self, Phase, RunState, RunSummary, SlotState, SlotStatus};
 use crate::workflow;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -18,10 +19,11 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::ExecutableCommand;
+use ratatui::buffer::Buffer;
 use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Scrollbar,
-    ScrollbarOrientation, ScrollbarState,
+    ScrollbarOrientation, ScrollbarState, Widget,
 };
 use std::io::stdout;
 use std::path::PathBuf;
@@ -95,9 +97,16 @@ pub fn run_with(opts: TuiOpts) -> Result<crate::exit_codes::ExitCode> {
     if let Some(cwd) = &opts.cwd {
         std::env::set_current_dir(cwd)?;
     }
-    let root = paths::find_project_root()?;
-    let swarm = SparPaths::new(&root);
-    let stall_warn_secs = Config::load(&root)
+    // Optional: cwd may not be a git project — global home still works.
+    let local_root = paths::find_project_root().ok();
+    if let Some(root) = &local_root {
+        let _ = registry::ensure_known(Some(root));
+    } else {
+        let _ = registry::ensure_known(None);
+    }
+    let stall_warn_secs = local_root
+        .as_ref()
+        .and_then(|r| Config::load(r).ok())
         .map(|c| c.timeouts.stall_warn_secs)
         .unwrap_or(300);
 
@@ -108,7 +117,12 @@ pub fn run_with(opts: TuiOpts) -> Result<crate::exit_codes::ExitCode> {
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
     terminal.clear()?;
 
-    let result = run_loop(&mut terminal, &swarm, opts.task_seed, stall_warn_secs);
+    let result = run_loop(
+        &mut terminal,
+        local_root,
+        opts.task_seed,
+        stall_warn_secs,
+    );
 
     disable_raw_mode()?;
     let mut out = stdout();
@@ -128,6 +142,8 @@ struct App {
     tick: u64,
     flash: Option<(Instant, String, Color)>,
     stall_warn_secs: u64,
+    /// When true, Runs list includes every registered project.
+    show_all_projects: bool,
     last_click: Option<(u16, u16, Instant)>,
     show_help: bool,
     rect_header: Rect,
@@ -152,6 +168,7 @@ impl App {
             tick: 0,
             flash: None,
             stall_warn_secs,
+            show_all_projects: true, // global home by default
             last_click: None,
             show_help: false,
             rect_header: Rect::default(),
@@ -195,18 +212,29 @@ impl App {
 
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    swarm: &SparPaths,
+    local_root: Option<PathBuf>,
     task_seed: Option<String>,
     stall_warn_secs: u64,
 ) -> Result<crate::exit_codes::ExitCode> {
     let mut app = App::new(task_seed, stall_warn_secs);
+    // Outside a project, always show the global registry.
+    if local_root.is_none() {
+        app.show_all_projects = true;
+    }
     let mut fleet_state = ListState::default();
     let mut runs_state = ListState::default();
+    let mut active_root: PathBuf = local_root.clone().unwrap_or_else(|| {
+        registry::list_all_runs()
+            .ok()
+            .and_then(|r| r.into_iter().next())
+            .and_then(|s| s.project_root)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    });
 
     loop {
         app.tick = app.tick.wrapping_add(1);
 
-        let runs = state::list_runs(swarm).unwrap_or_default();
+        let runs = load_run_list(local_root.as_deref(), app.show_all_projects);
         if !runs.is_empty() {
             app.selected_run = app.selected_run.min(runs.len() - 1);
         } else {
@@ -218,10 +246,20 @@ fn run_loop(
             Some(app.selected_run)
         });
 
+        // Active project follows the selected run (multi-project home).
+        if let Some(r) = runs.get(app.selected_run) {
+            if let Some(root) = &r.project_root {
+                active_root = root.clone();
+            }
+        } else if let Some(root) = &local_root {
+            active_root = root.clone();
+        }
+        let swarm = SparPaths::new(&active_root);
+
         let selected_id = runs.get(app.selected_run).map(|r| r.id.clone());
         let full = selected_id
             .as_ref()
-            .and_then(|id| RunState::load(swarm, id).ok());
+            .and_then(|id| RunState::load(&swarm, id).ok());
         if let Some(ref st) = full {
             if !st.slots.is_empty() {
                 app.selected_slot = app.selected_slot.min(st.slots.len() - 1);
@@ -237,9 +275,9 @@ fn run_loop(
             Some(app.selected_slot)
         });
 
-        let quota = QuotaStore::load(swarm).unwrap_or_default();
-        let stream_text = stream_content(swarm, full.as_ref(), app.selected_slot);
-        let bus_lines = bus_lines(swarm, full.as_ref(), &quota);
+        let quota = QuotaStore::load(&swarm).unwrap_or_default();
+        let stream_text = stream_content(&swarm, full.as_ref(), app.selected_slot);
+        let bus_lines = bus_lines(&swarm, full.as_ref(), &quota);
 
         if let Some((t, _, _)) = &app.flash {
             if t.elapsed() > Duration::from_secs(4) {
@@ -250,7 +288,7 @@ fn run_loop(
         terminal.draw(|f| {
             draw(
                 f,
-                swarm,
+                &swarm,
                 &runs,
                 full.as_ref(),
                 &stream_text,
@@ -283,7 +321,7 @@ fn run_loop(
                         &mut app,
                         key.code,
                         key.modifiers,
-                        swarm,
+                        &swarm,
                         &runs,
                         full.as_ref(),
                     )? {
@@ -299,6 +337,17 @@ fn run_loop(
         }
     }
     Ok(crate::exit_codes::ExitCode::Success)
+}
+
+fn load_run_list(local_root: Option<&std::path::Path>, all: bool) -> Vec<RunSummary> {
+    if all || local_root.is_none() {
+        registry::list_all_runs().unwrap_or_default()
+    } else if let Some(root) = local_root {
+        let _ = registry::ensure_known(Some(root));
+        registry::list_project_runs(root).unwrap_or_default()
+    } else {
+        Vec::new()
+    }
 }
 
 fn handle_key(
@@ -468,6 +517,19 @@ fn handle_key(
         KeyCode::Char('?') => {
             app.show_help = true;
         }
+        KeyCode::Char('A') => {
+            app.show_all_projects = !app.show_all_projects;
+            app.selected_run = 0;
+            app.selected_slot = 0;
+            app.flash(
+                if app.show_all_projects {
+                    "Showing runs from all registered projects"
+                } else {
+                    "Showing runs from this project only"
+                },
+                ACCENT,
+            );
+        }
         _ => {}
     }
     Ok(false)
@@ -635,6 +697,8 @@ fn draw(
     runs_state: &mut ListState,
 ) {
     let area = f.area();
+    // Full clear each frame — prevents styled-cell ghosting across the whole UI.
+    f.render_widget(Clear, area);
     f.render_widget(Block::default().style(Style::default().bg(BG)), area);
 
     let lay = layout_rects(area);
@@ -681,10 +745,16 @@ fn draw_header(f: &mut Frame, area: Rect, swarm: &SparPaths, full: Option<&RunSt
         .map(|_| " dry-run ")
         .unwrap_or("");
 
+    let scope = if app.show_all_projects {
+        " all projects "
+    } else {
+        " this project "
+    };
     let left = Line::from(vec![
         Span::styled(" spar ", Style::default().fg(BG).bg(ACCENT).bold()),
         Span::raw(" "),
         Span::styled(project, Style::default().fg(FG).bold()),
+        Span::styled(scope, Style::default().fg(BG).bg(ACCENT_SOFT)),
         Span::styled("  ·  ", Style::default().fg(FG_MUTED)),
         Span::styled(run, Style::default().fg(CYAN)),
         Span::styled(dry, Style::default().fg(BG).bg(YELLOW).bold()),
@@ -790,13 +860,16 @@ fn draw_action(
         }
     } else if runs.is_empty() {
         (
-            "  No runs yet — try:  spar plan -t \"…\" --providers cli:claude --dry-run  ".into(),
+            format!(
+                "  No runs yet — open a project and:  spar plan -t \"…\" --providers cli:claude  ·  registry {}  ",
+                registry::spar_home().display()
+            ),
             FG_DIM,
             BG_RAISED,
         )
     } else {
         (
-            "  Select a run (click or j/k in Runs) · Tab to Agents / Live log · ? help  ".into(),
+            "  Select a run (click / j k) · A toggles all projects · Tab panes · ? help  ".into(),
             FG_MUTED,
             BG_RAISED,
         )
@@ -829,14 +902,27 @@ fn draw_runs(
                 let sel = i == app.selected_run;
                 let mark = if sel { "›" } else { " " };
                 let dry = if r.dry_run { "dry " } else { "" };
+                let proj = r
+                    .project_name
+                    .as_deref()
+                    .unwrap_or("·");
                 let task = r
                     .task
                     .as_deref()
-                    .map(|t| truncate(t, 18))
+                    .map(|t| truncate(t, 14))
                     .unwrap_or_else(|| workflow_label(r.workflow).into());
                 let age = relative_age(r.updated_at);
+                let show_proj = app.show_all_projects;
                 let line = Line::from(vec![
                     Span::styled(format!("{mark}"), Style::default().fg(ACCENT)),
+                    if show_proj {
+                        Span::styled(
+                            format!(" {:<10}", truncate(proj, 10)),
+                            Style::default().fg(CYAN),
+                        )
+                    } else {
+                        Span::raw("")
+                    },
                     Span::styled(
                         format!(" {:<8}", truncate(&r.id, 8)),
                         Style::default()
@@ -848,7 +934,7 @@ fn draw_runs(
                             }),
                     ),
                     Span::styled(
-                        format!(" {:<14}", truncate(&phase_label(r.phase), 14)),
+                        format!(" {:<12}", truncate(&phase_label(r.phase), 12)),
                         Style::default().fg(phase_color(r.phase)),
                     ),
                     Span::styled(format!(" {dry}"), Style::default().fg(YELLOW)),
@@ -865,9 +951,15 @@ fn draw_runs(
     };
 
     let title = if focused {
-        format!(" Runs  · j/k or click  ({}) ", runs.len())
+        if app.show_all_projects {
+            format!(" Runs · all projects ({}) · A local · j/k ", runs.len())
+        } else {
+            format!(" Runs · this project ({}) · A all · j/k ", runs.len())
+        }
+    } else if app.show_all_projects {
+        format!(" Runs · all ({}) ", runs.len())
     } else {
-        format!(" Runs  ({}) ", runs.len())
+        format!(" Runs ({}) ", runs.len())
     };
     let list = List::new(items).block(panel(&title, focused));
     f.render_stateful_widget(list, area, state);
@@ -1148,7 +1240,8 @@ fn draw_stream_stats(
     );
 }
 
-/// Paint a log viewport without Paragraph wrap+scroll (avoids color ghosting).
+/// Paint a log viewport by writing cells directly (no Paragraph wrap/scroll).
+/// This is the reliable fix for colored-text smear/ghosting on scroll.
 fn render_scrollable_log(
     f: &mut Frame,
     area: Rect,
@@ -1159,11 +1252,6 @@ fn render_scrollable_log(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    // Full clear of the content region so previous frames cannot leave cells behind.
-    f.render_widget(
-        Block::default().style(Style::default().bg(BG_PANEL).fg(FG)),
-        area,
-    );
 
     let sb_w = 1u16;
     let text_w = area.width.saturating_sub(sb_w).max(1) as usize;
@@ -1172,11 +1260,19 @@ fn render_scrollable_log(
     let total = wrapped.len().max(1);
     let max_scroll = total.saturating_sub(height);
     let start = (scroll as usize).min(max_scroll);
-    let visible: Vec<Line> = wrapped
+    let visible: Vec<(String, Style)> = wrapped
         .into_iter()
         .skip(start)
         .take(height)
-        .map(|line| pad_line_bg(line, text_w))
+        .map(|line| {
+            let style = line
+                .spans
+                .first()
+                .map(|s| s.style)
+                .unwrap_or_else(|| Style::default().fg(FG).bg(BG_PANEL));
+            let s: String = line.spans.iter().map(|sp| sp.content.as_ref()).collect();
+            (s, style.bg(BG_PANEL))
+        })
         .collect();
 
     let text_area = Rect {
@@ -1185,8 +1281,14 @@ fn render_scrollable_log(
         width: area.width.saturating_sub(sb_w).max(1),
         height: area.height,
     };
-    let p = Paragraph::new(visible).style(Style::default().bg(BG_PANEL).fg(FG));
-    f.render_widget(p, text_area);
+    f.render_widget(Clear, text_area);
+    f.render_widget(
+        CellLog {
+            lines: visible,
+            fill: Style::default().bg(BG_PANEL).fg(FG),
+        },
+        text_area,
+    );
 
     let mut sb = ScrollbarState::new(total).position(start);
     f.render_stateful_widget(
@@ -1196,6 +1298,45 @@ fn render_scrollable_log(
         area,
         &mut sb,
     );
+}
+
+/// Fills every cell, then paints plain strings — no span leftovers across frames.
+struct CellLog {
+    lines: Vec<(String, Style)>,
+    fill: Style,
+}
+
+impl Widget for CellLog {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_symbol(" ");
+                    cell.set_style(self.fill);
+                    cell.set_skip(false);
+                }
+            }
+        }
+        for (i, (text, style)) in self.lines.iter().enumerate() {
+            if i as u16 >= area.height {
+                break;
+            }
+            let y = area.top() + i as u16;
+            let mut col = 0u16;
+            for ch in text.chars() {
+                if col >= area.width {
+                    break;
+                }
+                let x = area.left() + col;
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_symbol(&ch.to_string());
+                    cell.set_style(*style);
+                    cell.set_skip(false);
+                }
+                col = col.saturating_add(1);
+            }
+        }
+    }
 }
 
 fn log_line_style(line: &str, colorize: bool) -> Style {
@@ -1247,21 +1388,7 @@ fn wrap_log_lines(text: &str, width: usize, colorize: bool) -> Vec<Line<'static>
     out
 }
 
-fn pad_line_bg(mut line: Line<'static>, width: usize) -> Line<'static> {
-    let w = line.width();
-    if w < width {
-        line.spans.push(Span::styled(
-            " ".repeat(width - w),
-            Style::default().bg(BG_PANEL).fg(FG),
-        ));
-    }
-    // Ensure every span carries the panel background so scroll cannot leave
-    // previous-frame foreground cells in the padding.
-    for span in &mut line.spans {
-        span.style.bg = Some(BG_PANEL);
-    }
-    line
-}
+
 
 fn compact_u64(n: u64) -> String {
     if n >= 1_000_000 {
@@ -1384,7 +1511,7 @@ fn situational_footer(full: Option<&RunState>, focus: Focus) -> &'static str {
         }
     }
     match focus {
-        Focus::Runs => "j/k or click: pick run · ] next · Tab → Agents · ? help",
+        Focus::Runs => "j/k click: pick run · A all/local projects · Tab → Agents · ? help",
         Focus::Agents => "j/k or click: pick agent · log follows selection · Tab → Live log",
         Focus::Log => "scroll wheel / j k / PgUp PgDn · g top · Tab → Messages",
         Focus::Messages => "scroll wheel / j k · Tab → Command",
@@ -1416,12 +1543,16 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
     Tab / Shift-Tab      next / previous panel\n\
     j k  or  ↑ ↓         move in focused panel\n\
     [ ]  or  J K         previous / next run\n\
+    A                    toggle all projects vs this project\n\
     1-9                  jump to agent slot\n\
     a / r / s            approve · reject · ship (when gated)\n\
     i  or  /             command bar\n\
     g / G                log top / bottom\n\
     ?                    this help · Esc closes\n\
     q                    quit\n\
+ \n\
+  Runs live under each project’s .spar/runs/.\n\
+  Global index: ~/.local/share/spar (SPAR_HOME).\n\
  \n\
   Esc or ? to close";
     let p = Paragraph::new(body)
@@ -1716,8 +1847,5 @@ mod labels {
         let lines = wrap_log_lines(&long, 20, true);
         assert!(lines.len() >= 3, "expected wrap, got {}", lines.len());
         assert!(lines.iter().all(|l| l.width() <= 20));
-        let padded = pad_line_bg(lines[0].clone(), 20);
-        assert_eq!(padded.width(), 20);
-        assert!(padded.spans.iter().all(|s| s.style.bg == Some(BG_PANEL)));
     }
 }
