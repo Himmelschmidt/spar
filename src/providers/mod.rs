@@ -127,10 +127,16 @@ pub fn detect_all() -> Vec<ProviderReport> {
     all_adapters().iter().map(|a| a.detect()).collect()
 }
 
+/// Resolve a CLI adapter by `cli:name` **or** bare adapter name (`claude`).
+/// API refs (`api:…`) return `None` here — they use the api-sdk path.
 pub fn adapter_named(name: &str) -> Option<Box<dyn ProviderAdapter>> {
-    let pref = ProviderRef::parse(name).ok()?;
-    let cli = pref.cli_name()?;
-    all_adapters().into_iter().find(|a| a.name() == cli)
+    let bare = if let Ok(pref) = ProviderRef::parse(name) {
+        pref.cli_name()?.to_string()
+    } else {
+        // Internal call sites pass bare adapter ids (e.g. "claude").
+        name.trim().to_string()
+    };
+    all_adapters().into_iter().find(|a| a.name() == bare)
 }
 
 /// Whether a provider ref can be used for a live slot.
