@@ -30,12 +30,8 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     state.backend = opts.backend;
     state.isolation = cfg.isolation;
     state.dry_run = dry;
-    state.providers =
-        providers::pick_providers(&cfg.providers.order, n, opts.providers.as_deref(), dry);
-    if dry && state.providers.len() < n {
-        let base: Vec<String> = vec!["claude".into(), "grok".into(), "agy".into()];
-        state.providers = (0..n).map(|i| base[i % base.len()].clone()).collect();
-    }
+    let requested = opts.require_providers()?;
+    state.providers = providers::pick_providers(requested, n, Some(requested), dry);
     if !dry {
         match crate::quota::apply_quota_filter(paths, &state.providers) {
             Ok(p) => state.providers = p,

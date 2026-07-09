@@ -33,11 +33,8 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     if dry {
         std::env::set_var("SPAR_DRY_RUN", "1");
     }
-    state.providers =
-        providers::pick_providers(&cfg.providers.order, 2, opts.providers.as_deref(), dry);
-    if dry && state.providers.len() < 2 {
-        state.providers = vec!["claude".into(), "grok".into()];
-    }
+    let requested = opts.require_providers()?;
+    state.providers = providers::pick_providers(requested, 2, Some(requested), dry);
     if state.providers.is_empty() {
         state.error = Some("no usable providers".into());
         state.set_phase(Phase::Failed);

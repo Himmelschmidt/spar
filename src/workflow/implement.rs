@@ -62,16 +62,10 @@ fn run_from_approved(
     if state.dry_run {
         std::env::set_var("SPAR_DRY_RUN", "1");
     }
+    let requested = opts.require_providers()?.to_vec();
     // Quota filter before slot assignment so paused providers never get slots.
     if !state.dry_run {
-        let candidate = if let Some(req) = opts.providers.as_deref() {
-            req.to_vec()
-        } else if !state.providers.is_empty() {
-            state.providers.clone()
-        } else {
-            cfg.providers.order.clone()
-        };
-        match crate::quota::apply_quota_filter(paths, &candidate) {
+        match crate::quota::apply_quota_filter(paths, &requested) {
             Ok(p) => state.providers = p,
             Err(e) => {
                 state.error = Some(e.to_string());
@@ -85,9 +79,11 @@ fn run_from_approved(
                 return Ok(ExitCode::Quota);
             }
         }
+    } else {
+        state.providers = requested.clone();
     }
     let dry = state.dry_run;
-    prepare_implement_slots(&mut state, opts.providers.as_deref(), dry, cfg)?;
+    prepare_implement_slots(&mut state, Some(&requested), dry, cfg)?;
     if state.slots.iter().all(|s| s.role != SlotRole::Implementer) {
         bail!("no implementer slot after provider pick");
     }
@@ -120,35 +116,18 @@ fn prepare_implement_slots(
         return Ok(());
     }
 
+    let Some(req) = requested.filter(|r| !r.is_empty()) else {
+        bail!("--providers is required");
+    };
     let n = cfg.max_agents.max(3) as usize;
-    if state.providers.is_empty() || requested.is_some() {
-        state.providers = providers::pick_providers(
-            &cfg.providers.order,
-            n,
-            requested,
-            dry,
-        );
-    }
-    if dry && state.providers.is_empty() {
-        state.providers = vec!["claude".into(), "grok".into(), "agy".into()];
-    }
+    state.providers = providers::pick_providers(req, n, Some(req), dry);
     if state.providers.is_empty() {
-        return Ok(());
+        bail!("no usable providers from --providers {:?}", req);
     }
+    // Cycle the explicit list to fill impl + reviewers (same provider may repeat).
     let mut provs = state.providers.clone();
-    if dry && provs.len() < 3 {
-        for p in ["claude", "grok", "agy"] {
-            if !provs.iter().any(|x| x == p) {
-                provs.push(p.into());
-            }
-        }
-    }
     while provs.len() < 3 {
-        if provs.is_empty() {
-            provs.push("claude".into());
-        } else {
-            provs.push(provs[0].clone());
-        }
+        provs.push(provs[0].clone());
     }
 
     state.slots.push(executor::init_slot("impl", &provs[0], SlotRole::Implementer));
@@ -195,13 +174,10 @@ fn run_with_task(
     state.message_budget = cfg.message_budget;
     state.big = opts.big;
     state.max_fix_rounds = 3;
+    let requested = opts.require_providers()?.to_vec();
 
     if !dry {
-        let candidate = opts
-            .providers
-            .clone()
-            .unwrap_or_else(|| cfg.providers.order.clone());
-        match crate::quota::apply_quota_filter(paths, &candidate) {
+        match crate::quota::apply_quota_filter(paths, &requested) {
             Ok(p) => state.providers = p,
             Err(e) => {
                 state.error = Some(e.to_string());
@@ -216,8 +192,10 @@ fn run_with_task(
                 return Ok(ExitCode::Quota);
             }
         }
+    } else {
+        state.providers = requested.clone();
     }
-    prepare_implement_slots(&mut state, opts.providers.as_deref(), dry, cfg)?;
+    prepare_implement_slots(&mut state, Some(&requested), dry, cfg)?;
 
     paths.ensure_run_dirs(&state.id)?;
     let _ = crate::bus::ensure_bus(paths, &state.id);
