@@ -39,11 +39,11 @@ spar status
 ```bash
 # Path A
 spar plan --task "add retry to the payment client" --dry-run --json
-# exit 2 = awaiting approval; note plan run_id
-spar approve <plan-run-id>
-spar implement --run <plan-run-id> --dry-run --json
-# implement returns a *new* run_id — wait/status that one (or read plan.child_run)
-spar status <impl-run-id> --json
+# exit 2 = awaiting approval; note run_id
+spar approve <run-id>
+spar implement --run <run-id> --dry-run --json
+# same run_id through plan → implement → ship
+spar status <run-id> --json
 
 # Path B
 spar implement --task "fix the flaky test" --dry-run --json
