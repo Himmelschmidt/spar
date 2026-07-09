@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::events;
 use crate::liveness::SlotActivity;
 use crate::paths::{self, SparPaths};
-use crate::process::{self, StreamStats};
+use crate::process;
 use crate::quota::QuotaStore;
 use crate::state::{self, Phase, RunState, SlotState, SlotStatus};
 use crate::workflow;
@@ -126,7 +126,6 @@ struct App {
     stream_scroll: u16,
     bus_scroll: u16,
     tick: u64,
-    started: Instant,
     flash: Option<(Instant, String, Color)>,
     stall_warn_secs: u64,
     last_click: Option<(u16, u16, Instant)>,
@@ -151,7 +150,6 @@ impl App {
             stream_scroll: 0,
             bus_scroll: 0,
             tick: 0,
-            started: Instant::now(),
             flash: None,
             stall_warn_secs,
             last_click: None,
