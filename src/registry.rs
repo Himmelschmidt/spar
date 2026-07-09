@@ -223,7 +223,10 @@ mod tests {
     fn touch_and_list_roundtrip() {
         let tmp = tempdir().unwrap();
         let home = tmp.path().join("spar-home");
+        // Serialize env mutation across tests in this process.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SPAR_HOME", &home);
+        assert_eq!(spar_home(), home);
 
         let proj = tmp.path().join("myproj");
         std::fs::create_dir_all(proj.join(".spar/runs")).unwrap();
@@ -235,19 +238,29 @@ mod tests {
         let mut reg = Registry::default();
         reg.touch_project(&proj, Some("abcd1234")).unwrap();
         assert_eq!(reg.projects.len(), 1);
-        assert!(registry_path().starts_with(&home));
+        assert_eq!(registry_path(), home.join("registry.json"));
 
         let all = list_all_runs().unwrap();
         assert!(all.iter().any(|r| r.id == "abcd1234"));
-        assert_eq!(all[0].project_name.as_deref(), Some("myproj"));
+        assert_eq!(
+            all.iter().find(|r| r.id == "abcd1234").unwrap().project_name.as_deref(),
+            Some("myproj")
+        );
 
         std::env::remove_var("SPAR_HOME");
     }
 
     #[test]
     fn default_home_is_dot_spar_under_home() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("SPAR_HOME");
         let h = spar_home();
-        assert!(h.ends_with(".spar"), "expected ~/.spar, got {}", h.display());
+        assert!(
+            h.ends_with(".spar"),
+            "expected ~/.spar, got {}",
+            h.display()
+        );
     }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
