@@ -49,7 +49,10 @@ spar implement --run <run_id> --providers cli:claude,cli:grok,cli:agy [--dry-run
 spar implement -t "small task" --providers cli:claude [--dry-run]
 
 # Named workflows
-spar run --workflow loop|arena|roles|peer -t "..." --providers cli:claude,cli:grok [--dry-run] [--big]
+spar run --workflow loop|arena|roles|peer|review -t "..." --providers cli:claude,cli:grok [--dry-run] [--big]
+
+# Independent concurrent multi-review (not peer/split-stack):
+spar run --workflow review -t "Review PR #12 for auth bugs" --providers cli:claude,cli:grok
 
 spar confirm <run_id> [--winner <slot>]   # arena winner
 spar reconcile <run_id>                  # arena merge-good-parts + review

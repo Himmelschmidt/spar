@@ -2,6 +2,7 @@ pub mod arena;
 pub mod implement;
 pub mod peer;
 pub mod plan;
+pub mod review;
 pub mod roles;
 
 use crate::cli::{Backend, WorkflowKind};
@@ -45,7 +46,7 @@ impl CommonOpts {
     pub fn require_providers(&self) -> Result<&[String]> {
         if self.providers.is_empty() {
             anyhow::bail!(
-                "--providers is required (e.g. --providers cli:claude or --providers cli:cli:claude,api:openai)"
+                "--providers is required (e.g. --providers cli:claude or --providers cli:claude,api:openai)"
             );
         }
         for p in &self.providers {
@@ -73,5 +74,6 @@ pub fn run_named(
         WorkflowKind::Arena => arena::run(opts, paths, cfg),
         WorkflowKind::Roles => roles::run(opts, paths, cfg),
         WorkflowKind::Peer => peer::run(opts, paths, cfg),
+        WorkflowKind::Review => review::run(opts, paths, cfg),
     }
 }

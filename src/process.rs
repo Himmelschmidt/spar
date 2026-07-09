@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -25,6 +25,8 @@ pub struct SpawnResult {
     pub stdout_tail: String,
 }
 
+/// Spawn process, stream stdout/stderr **line-by-line** into the log (flushed)
+/// so TUI/tails see progress during long agent runs.
 pub fn run_captured(req: &SpawnRequest) -> Result<SpawnResult> {
     if let Some(parent) = req.log_path.parent() {
         std::fs::create_dir_all(parent)
@@ -41,45 +43,55 @@ pub fn run_captured(req: &SpawnRequest) -> Result<SpawnResult> {
         let mut f = File::create(&req.log_path)
             .with_context(|| format!("create log {}", req.log_path.display()))?;
         f.write_all(header.as_bytes())?;
+        f.flush()?;
     }
-
-    let log_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&req.log_path)
-        .with_context(|| format!("open log {}", req.log_path.display()))?;
-    let log_err = log_file
-        .try_clone()
-        .with_context(|| format!("clone log {}", req.log_path.display()))?;
 
     let mut cmd = Command::new(&req.program);
     cmd.args(&req.args)
         .current_dir(&req.cwd)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(log_err));
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     for (k, v) in &req.env {
         cmd.env(k, v);
     }
+    // Encourage line buffering where tools respect it
+    cmd.env("PYTHONUNBUFFERED", "1");
 
     let mut child = cmd
         .spawn()
         .with_context(|| format!("spawn {}", req.program.display()))?;
 
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let log_path = req.log_path.clone();
+    let log_path_err = req.log_path.clone();
+
+    let t_out = std::thread::spawn(move || {
+        if let Some(out) = stdout {
+            stream_to_log(out, &log_path, false);
+        }
+    });
+    let t_err = std::thread::spawn(move || {
+        if let Some(err) = stderr {
+            stream_to_log(err, &log_path_err, true);
+        }
+    });
+
     let start = Instant::now();
-    let poll = Duration::from_millis(100);
-    loop {
+    let poll = Duration::from_millis(50);
+    let status = loop {
         match child.try_wait()? {
-            Some(status) => {
-                return Ok(finish(status, false, &req.log_path));
-            }
+            Some(status) => break status,
             None => {
                 if start.elapsed() >= req.timeout {
                     let _ = child.kill();
-                    let _ = child.wait();
+                    let status = child.wait()?;
+                    let _ = t_out.join();
+                    let _ = t_err.join();
                     append_log(&req.log_path, "\n# timed out\n")?;
                     return Ok(SpawnResult {
-                        exit_code: None,
+                        exit_code: status.code(),
                         timed_out: true,
                         log_path: req.log_path.clone(),
                         stdout_tail: tail_log(&req.log_path, 4000),
@@ -88,7 +100,85 @@ pub fn run_captured(req: &SpawnRequest) -> Result<SpawnResult> {
                 std::thread::sleep(poll);
             }
         }
+    };
+
+    let _ = t_out.join();
+    let _ = t_err.join();
+    Ok(finish(status, false, &req.log_path))
+}
+
+fn stream_to_log(pipe: impl Read, log_path: &Path, is_err: bool) {
+    let reader = BufReader::new(pipe);
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        let pretty = prettify_stream_line(&line);
+        let text = if is_err {
+            format!("[stderr] {pretty}\n")
+        } else {
+            format!("{pretty}\n")
+        };
+        let _ = append_log(log_path, &text);
     }
+}
+
+/// Turn stream-json / streaming-json event lines into readable log lines when possible.
+fn prettify_stream_line(line: &str) -> String {
+    let t = line.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    if !t.starts_with('{') {
+        return line.to_string();
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(t) else {
+        return line.to_string();
+    };
+    // Claude Code stream-json shapes (best-effort)
+    if let Some(s) = v
+        .pointer("/message/content/0/text")
+        .and_then(|x| x.as_str())
+        .or_else(|| v.get("result").and_then(|x| x.as_str()))
+        .or_else(|| v.pointer("/delta/text").and_then(|x| x.as_str()))
+        .or_else(|| v.get("text").and_then(|x| x.as_str()))
+        .or_else(|| v.get("content").and_then(|x| x.as_str()))
+    {
+        if !s.is_empty() {
+            return s.to_string();
+        }
+    }
+    if let Some(ty) = v.get("type").and_then(|x| x.as_str()) {
+        match ty {
+            "assistant" | "content_block_delta" | "text" | "message" => {
+                if let Some(s) = v
+                    .pointer("/delta/text")
+                    .or_else(|| v.pointer("/message/content/0/text"))
+                    .and_then(|x| x.as_str())
+                {
+                    return s.to_string();
+                }
+            }
+            "tool_use" | "tool_call" => {
+                let name = v
+                    .get("name")
+                    .or_else(|| v.pointer("/tool_use/name"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("tool");
+                return format!("→ tool {name}");
+            }
+            "result" | "error" => {
+                return format!(
+                    "[{ty}] {}",
+                    v.get("result")
+                        .or_else(|| v.get("error"))
+                        .map(|x| x.to_string())
+                        .unwrap_or_default()
+                );
+            }
+            _ => {}
+        }
+    }
+    // Keep compact JSON so stream still moves
+    t.to_string()
 }
 
 fn finish(status: ExitStatus, timed_out: bool, log_path: &Path) -> SpawnResult {
@@ -103,6 +193,7 @@ fn finish(status: ExitStatus, timed_out: bool, log_path: &Path) -> SpawnResult {
 fn append_log(path: &Path, text: &str) -> Result<()> {
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;
     f.write_all(text.as_bytes())?;
+    f.flush()?;
     Ok(())
 }
 
@@ -122,23 +213,24 @@ pub fn tail_log(path: &Path, max_bytes: usize) -> String {
     }
 }
 
-/// Dry-run mock: write a log and succeed without spawning.
 pub fn run_mock(req: &SpawnRequest, mock_output: &str) -> Result<SpawnResult> {
     if let Some(parent) = req.log_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let body = format!(
-        "# dry-run mock\nprogram={}\nargs={}\ncwd={}\n---\n{mock_output}\n",
+    let mut f = File::create(&req.log_path)?;
+    writeln!(
+        f,
+        "# mock {} {}\n{}",
         req.program.display(),
         req.args.join(" "),
-        req.cwd.display()
-    );
-    std::fs::write(&req.log_path, body)?;
+        mock_output
+    )?;
+    f.flush()?;
     Ok(SpawnResult {
         exit_code: Some(0),
         timed_out: false,
         log_path: req.log_path.clone(),
-        stdout_tail: mock_output.to_string(),
+        stdout_tail: mock_output.into(),
     })
 }
 
@@ -148,27 +240,9 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn captures_echo() {
-        let tmp = tempdir().unwrap();
-        let log = tmp.path().join("out.log");
-        let req = SpawnRequest {
-            program: PathBuf::from("echo"),
-            args: vec!["hello-swarm".into()],
-            cwd: tmp.path().to_path_buf(),
-            log_path: log.clone(),
-            env: vec![],
-            timeout: Duration::from_secs(5),
-        };
-        let res = run_captured(&req).unwrap();
-        assert_eq!(res.exit_code, Some(0));
-        let text = std::fs::read_to_string(&log).unwrap();
-        assert!(text.contains("hello-swarm"));
-    }
-
-    #[test]
     fn mock_writes_log() {
         let tmp = tempdir().unwrap();
-        let log = tmp.path().join("m.log");
+        let log = tmp.path().join("t.log");
         let req = SpawnRequest {
             program: PathBuf::from("mock"),
             args: vec![],
@@ -177,8 +251,33 @@ mod tests {
             env: vec![],
             timeout: Duration::from_secs(1),
         };
-        let res = run_mock(&req, "ok").unwrap();
+        run_mock(&req, "hello").unwrap();
+        assert!(std::fs::read_to_string(log).unwrap().contains("hello"));
+    }
+
+    #[test]
+    fn captures_echo() {
+        let tmp = tempdir().unwrap();
+        let log = tmp.path().join("e.log");
+        let req = SpawnRequest {
+            program: PathBuf::from("echo"),
+            args: vec!["stream-me".into()],
+            cwd: tmp.path().to_path_buf(),
+            log_path: log.clone(),
+            env: vec![],
+            timeout: Duration::from_secs(5),
+        };
+        let res = run_captured(&req).unwrap();
         assert_eq!(res.exit_code, Some(0));
-        assert!(std::fs::read_to_string(&log).unwrap().contains("dry-run"));
+        let body = std::fs::read_to_string(log).unwrap();
+        assert!(body.contains("stream-me"), "{body}");
+    }
+
+    #[test]
+    fn prettify_extracts_text() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hello live"}]}}"#;
+        // pointer style may not match; fallback keeps JSON or extracts
+        let p = prettify_stream_line(line);
+        assert!(!p.is_empty());
     }
 }

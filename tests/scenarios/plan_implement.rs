@@ -555,6 +555,39 @@ fn arena_dry_run() {
 }
 
 #[test]
+fn review_workflow_concurrent_dry_run() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let out = cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args([
+            "run",
+            "--workflow",
+            "review",
+            "--task",
+            "review the auth changes",
+            "--providers",
+            "cli:claude,cli:grok",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"phase\": \"done\""));
+    let stdout = String::from_utf8_lossy(out.get_output().stdout.as_slice());
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let run_id = v["run_id"].as_str().unwrap();
+    let slots = v["slots"].as_array().unwrap();
+    assert!(slots.len() >= 2);
+    assert!(tmp
+        .path()
+        .join(".spar/runs")
+        .join(run_id)
+        .join("artifacts/summary.md")
+        .is_file());
+}
+
+#[test]
 fn peer_and_roles_dry_run() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());

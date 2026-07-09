@@ -304,4 +304,6 @@ pub enum WorkflowKind {
     Arena,
     Roles,
     Peer,
+    /// Concurrent independent multi-provider review (not split-stack peer)
+    Review,
 }

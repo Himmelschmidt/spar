@@ -124,39 +124,51 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
     state.set_phase(Phase::PeerRelay);
     state.save(paths)?;
 
+    // Concurrent halves (not A-then-B serial). Split-stack collaboration still
+    // uses peer_half templates; for independent multi-review use --workflow review.
     let slots: Vec<_> = state.slots.clone();
+    let jobs: Vec<SlotJob> = slots
+        .iter()
+        .map(|slot| {
+            let partner = slots
+                .iter()
+                .find(|s| s.id != slot.id)
+                .map(|s| s.id.clone())
+                .unwrap_or_default();
+            let mut extra = HashMap::new();
+            extra.insert(
+                "peer_role".into(),
+                if slot.id.contains("peer-a") {
+                    "peer-a"
+                } else {
+                    "peer-b"
+                }
+                .into(),
+            );
+            extra.insert("partner_slot".into(), partner);
+            SlotJob {
+                slot_id: slot.id.clone(),
+                provider: slot.provider.clone(),
+                role: SlotRole::Peer,
+                template: "peer_half".into(),
+                extra_vars: extra,
+                expected_artifact: Some(format!("summary-{}.md", slot.id)),
+            }
+        })
+        .collect();
+    executor::run_slots_parallel(state, paths, cfg, &jobs)?;
     for slot in &slots {
         let partner = slots
             .iter()
             .find(|s| s.id != slot.id)
-            .map(|s| s.id.clone())
-            .unwrap_or_default();
-        let mut extra = HashMap::new();
-        extra.insert(
-            "peer_role".into(),
-            if slot.id.contains("peer-a") {
-                "peer-a"
-            } else {
-                "peer-b"
-            }
-            .into(),
-        );
-        extra.insert("partner_slot".into(), partner.clone());
-        let job = SlotJob {
-            slot_id: slot.id.clone(),
-            provider: slot.provider.clone(),
-            role: SlotRole::Peer,
-            template: "peer_half".into(),
-            extra_vars: extra,
-            expected_artifact: Some(format!("summary-{}.md", slot.id)),
-        };
-        let _ = executor::run_slot(state, paths, cfg, &job);
+            .map(|s| s.id.as_str())
+            .unwrap_or("broadcast");
         let _ = bus::chat(
             paths,
             &state.id,
             &slot.id,
-            &partner,
-            format!("peer {} finished dry/live work", slot.id),
+            partner,
+            format!("peer {} finished", slot.id),
             state.message_budget,
         );
     }
