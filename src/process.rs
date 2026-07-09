@@ -243,7 +243,6 @@ fn stream_to_log(
 ) {
     let reader = BufReader::new(pipe);
     let mut c = StreamCoalescer::new(is_err);
-    let mut n = 0u32;
     for line in reader.lines() {
         let Ok(line) = line else { break };
         if let Ok(mut s) = stats.lock() {
@@ -264,11 +263,8 @@ fn stream_to_log(
                     }
                     s.touch_context();
                     s.touch_log();
-                    n += 1;
-                    // Save often so status/TUI see fresh last_log_at (stall surface).
-                    if n.is_multiple_of(2) {
-                        let _ = s.save(log_path);
-                    }
+                    // Persist last_log_at every append so status/TUI never read a stale stamp.
+                    let _ = s.save(log_path);
                 }
             }
         }
@@ -288,7 +284,11 @@ fn stream_to_log(
                 let _ = s.save(log_path);
             }
         }
-    } else if let Ok(s) = stats.lock() {
+    } else if let Ok(mut s) = stats.lock() {
+        // Keep any prior last_log_at (e.g. spawn header); do not wipe with defaults.
+        if s.last_log_at.is_none() {
+            s.touch_log();
+        }
         let _ = s.save(log_path);
     }
 }

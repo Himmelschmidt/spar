@@ -50,19 +50,27 @@ impl SlotActivity {
     }
 }
 
-/// Best-effort last log write: StreamStats field, else log file mtime, else stats mtime.
+/// Best-effort last log write: freshest among stats field, log mtime, stats file mtime.
+/// Prefer max so a stale stats snapshot never masks a fresher log write (false STALL).
 pub fn last_log_time(log_path: &Path) -> Option<DateTime<Utc>> {
+    let mut best: Option<DateTime<Utc>> = None;
     if let Some(stats) = StreamStats::load(log_path) {
         if let Some(s) = stats.last_log_at.as_deref() {
             if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-                return Some(dt.with_timezone(&Utc));
+                best = Some(dt.with_timezone(&Utc));
             }
         }
     }
-    if let Some(t) = file_mtime(log_path) {
-        return Some(t);
+    for t in [file_mtime(log_path), file_mtime(&StreamStats::stats_path(log_path))]
+        .into_iter()
+        .flatten()
+    {
+        best = Some(match best {
+            Some(b) if b >= t => b,
+            _ => t,
+        });
     }
-    file_mtime(&StreamStats::stats_path(log_path))
+    best
 }
 
 fn file_mtime(path: &Path) -> Option<DateTime<Utc>> {
@@ -179,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn stats_last_log_at_preferred() {
+    fn fresher_log_mtime_beats_stale_stats() {
         use chrono::Datelike;
         let tmp = tempdir().unwrap();
         let log = tmp.path().join("s.log");
@@ -187,8 +195,23 @@ mod tests {
         let mut stats = StreamStats::default();
         stats.last_log_at = Some("2020-01-01T00:00:00Z".into());
         stats.save(&log).unwrap();
+        // Fresh log write after stale stats stamp.
+        std::fs::write(&log, "fresh\n").unwrap();
         let t = last_log_time(&log).unwrap();
-        assert_eq!(t.year(), 2020);
+        assert!(t.year() >= 2025, "must prefer fresher log mtime over stale stats, got {t}");
+    }
+
+    #[test]
+    fn stall_warn_zero_disables_flag() {
+        let tmp = tempdir().unwrap();
+        let log = tmp.path().join("s.log");
+        std::fs::write(&log, "x\n").unwrap();
+        let past = SystemTime::now() - std::time::Duration::from_secs(600);
+        filetime_set(&log, past);
+        let slot = slot_with_log(&log, SlotStatus::Running);
+        let act = SlotActivity::observe(&slot, 0);
+        assert!(act.silent_for_secs.unwrap() >= 500);
+        assert!(!act.stalled);
     }
 
     fn filetime_set(path: &Path, t: SystemTime) {
