@@ -81,6 +81,12 @@ pub struct SlotUsage {
     pub provider: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub context_tokens: u64,
+    #[serde(default)]
+    pub tools: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 }

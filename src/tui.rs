@@ -1,7 +1,7 @@
 //! Product shell — fleet control room styled like a first-class coding agent.
 use crate::events;
 use crate::paths::{self, SparPaths};
-use crate::process;
+use crate::process::{self, StreamStats};
 use crate::quota::QuotaStore;
 use crate::state::{self, Phase, RunState, SlotState, SlotStatus};
 use crate::workflow;
@@ -699,22 +699,22 @@ fn draw_fleet(
             .map(|(i, s)| {
                 let sel = i == app.selected_slot;
                 let icon = slot_icon(s, app);
+                let stats = s.log_path.as_ref().and_then(|p| StreamStats::load(p));
+                let badge = stats
+                    .as_ref()
+                    .filter(|st| st.tools > 0 || st.input_tokens > 0)
+                    .map(|st| format!(" {}t {}", st.tools, compact_u64(st.context_tokens)))
+                    .unwrap_or_default();
                 let line = Line::from(vec![
                     Span::styled(format!(" {icon} "), Style::default().fg(slot_color(s))),
                     Span::styled(
-                        format!("{:<14}", truncate(&s.id, 14)),
+                        format!("{:<12}", truncate(&s.id, 12)),
                         Style::default()
                             .fg(if sel { FG } else { FG_DIM })
                             .add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() }),
                     ),
-                    Span::styled(
-                        format!("{:<10}", truncate(&format!("{:?}", s.role).to_lowercase(), 10)),
-                        Style::default().fg(FG_MUTED),
-                    ),
-                    Span::styled(
-                        truncate(&s.provider, 14),
-                        Style::default().fg(ACCENT_SOFT),
-                    ),
+                    Span::styled(truncate(&s.provider, 11), Style::default().fg(ACCENT_SOFT)),
+                    Span::styled(badge, Style::default().fg(YELLOW)),
                 ]);
                 ListItem::new(line).style(if sel {
                     Style::default().bg(BG_RAISED)
@@ -772,33 +772,174 @@ fn draw_stream(
     app: &App,
 ) {
     let focused = app.focus == Focus::Stream;
-    let slot = full
-        .and_then(|st| st.slots.get(app.selected_slot))
-        .map(|s| s.id.as_str())
-        .unwrap_or("—");
-    let title = format!("stream  {slot}");
+    let slot = full.and_then(|st| st.slots.get(app.selected_slot));
+    let slot_id = slot.map(|s| s.id.as_str()).unwrap_or("—");
+    let title = format!("stream  {slot_id}");
 
-    // subtle scanline shimmer on active stream
-    let style = Style::default().fg(FG).bg(BG_PANEL);
-    let p = Paragraph::new(stream_text)
-        .style(style)
+    let block = panel(&title, focused);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // stats strip
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(inner);
+
+    let stats = slot.and_then(|s| {
+        s.log_path
+            .as_ref()
+            .and_then(|p| process::StreamStats::load(p))
+            .or_else(|| {
+                s.usage.as_ref().map(|u| process::StreamStats {
+                    tools: u.tools,
+                    tool_errors: 0,
+                    input_tokens: u.input_tokens,
+                    output_tokens: u.output_tokens,
+                    cache_read_tokens: u.cache_read_tokens,
+                    cache_write_tokens: 0,
+                    context_tokens: u.context_tokens,
+                    model: u.model.clone(),
+                    lines_in: 0,
+                    chars_out: 0,
+                })
+            })
+    });
+    draw_stream_stats(f, chunks[0], stats.as_ref(), slot.map(|s| s.status));
+
+    let styled = stream_lines_styled(stream_text);
+    let p = Paragraph::new(styled)
+        .style(Style::default().bg(BG_PANEL))
         .wrap(Wrap { trim: false })
-        .scroll((app.stream_scroll, 0))
-        .block(panel(&title, focused));
-    f.render_widget(p, area);
+        .scroll((app.stream_scroll, 0));
+    f.render_widget(p, chunks[1]);
 
-    let lines = stream_text.lines().count().max(1) as u16;
-    let mut sb = ScrollbarState::new(lines as usize).position(app.stream_scroll as usize);
+    let lines = stream_text.lines().count().max(1);
+    let mut sb = ScrollbarState::new(lines).position(app.stream_scroll as usize);
     f.render_stateful_widget(
         Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .style(Style::default().fg(FG_MUTED))
             .thumb_style(Style::default().fg(ACCENT_SOFT)),
-        area.inner(Margin {
-            vertical: 1,
-            horizontal: 0,
-        }),
+        chunks[1],
         &mut sb,
     );
+}
+
+fn draw_stream_stats(
+    f: &mut Frame,
+    area: Rect,
+    stats: Option<&process::StreamStats>,
+    status: Option<SlotStatus>,
+) {
+    let Some(s) = stats else {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "  no live stats yet",
+                Style::default().fg(FG_MUTED).bg(BG_RAISED),
+            )),
+            area,
+        );
+        return;
+    };
+    let ctx = s.context_tokens;
+    let ctx_color = if ctx > 150_000 {
+        RED
+    } else if ctx > 80_000 {
+        YELLOW
+    } else if ctx > 0 {
+        GREEN
+    } else {
+        FG_MUTED
+    };
+    let tools_color = if s.tool_errors > 0 {
+        RED
+    } else if s.tools > 0 {
+        CYAN
+    } else {
+        FG_MUTED
+    };
+    let status_span = match status {
+        Some(SlotStatus::Running) => Span::styled(" LIVE ", Style::default().fg(BG).bg(CYAN).bold()),
+        Some(SlotStatus::Done) => Span::styled(" DONE ", Style::default().fg(BG).bg(GREEN).bold()),
+        Some(SlotStatus::Failed) => Span::styled(" FAIL ", Style::default().fg(BG).bg(RED).bold()),
+        _ => Span::styled(" … ", Style::default().fg(FG_MUTED).bg(BG_RAISED)),
+    };
+    let line = Line::from(vec![
+        status_span,
+        Span::raw(" "),
+        Span::styled(
+            format!(" co {} ", compact_u64(ctx)),
+            Style::default().fg(ctx_color).bg(BG_RAISED).bold(),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!(" {} tools ", s.tools),
+            Style::default().fg(tools_color).bg(BG_RAISED),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!(" in {} ", compact_u64(s.input_tokens)),
+            Style::default().fg(ACCENT).bg(BG_RAISED),
+        ),
+        Span::styled(
+            format!(" out {} ", compact_u64(s.output_tokens)),
+            Style::default().fg(MAGENTA).bg(BG_RAISED),
+        ),
+        if s.cache_read_tokens > 0 {
+            Span::styled(
+                format!(" cache {} ", compact_u64(s.cache_read_tokens)),
+                Style::default().fg(YELLOW).bg(BG_RAISED),
+            )
+        } else {
+            Span::raw("")
+        },
+        Span::raw(" "),
+        Span::styled(
+            s.model.as_deref().unwrap_or(""),
+            Style::default().fg(FG_MUTED).bg(BG_RAISED),
+        ),
+    ]);
+    f.render_widget(
+        Paragraph::new(line).style(Style::default().bg(BG_RAISED)),
+        area,
+    );
+}
+
+fn stream_lines_styled(text: &str) -> Vec<Line<'static>> {
+    text.lines()
+        .map(|line| {
+            let style = if line.starts_with('→') {
+                Style::default().fg(CYAN)
+            } else if line.starts_with('←') {
+                if line.contains('✗') {
+                    Style::default().fg(RED)
+                } else {
+                    Style::default().fg(GREEN)
+                }
+            } else if line.starts_with('·') {
+                Style::default().fg(FG_MUTED)
+            } else if line.starts_with('…') {
+                Style::default().fg(FG_MUTED).italic()
+            } else if line.starts_with('!') {
+                Style::default().fg(RED).bold()
+            } else if line.starts_with('#') {
+                Style::default().fg(FG_MUTED)
+            } else {
+                Style::default().fg(FG)
+            };
+            Line::from(Span::styled(line.to_string(), style))
+        })
+        .collect()
+}
+
+fn compact_u64(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
 }
 
 fn draw_bus(f: &mut Frame, area: Rect, bus_lines: &[String], app: &App) {
@@ -962,11 +1103,17 @@ fn stream_content(swarm: &SparPaths, full: Option<&RunState>, slot_idx: usize) -
         .clone()
         .unwrap_or_else(|| swarm.log_file(&st.id, &slot.id));
     if path.is_file() {
-        let raw = process::tail_log(&path, 48_000);
-        if raw.trim().is_empty() {
+        let raw = process::tail_log(&path, 64_000);
+        // drop spawn header noise for display when body exists
+        let body = raw
+            .lines()
+            .skip_while(|l| l.starts_with('#') || *l == "---" || l.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if body.trim().is_empty() {
             format!("\n  {} waiting for output…", slot.id)
         } else {
-            raw
+            body
         }
     } else {
         format!("\n  no log yet for {}\n  {}", slot.id, slot.provider)
