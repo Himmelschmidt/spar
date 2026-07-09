@@ -7,7 +7,7 @@ use crate::paths::{self, SparPaths};
 use crate::process;
 use crate::quota::QuotaStore;
 use crate::registry;
-use crate::state::{self, Phase, RunState, RunSummary, SlotState, SlotStatus};
+use crate::state::{self, Phase, RunState, SlotState, SlotStatus};
 use crate::workflow;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
