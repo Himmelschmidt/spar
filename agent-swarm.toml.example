@@ -1,0 +1,15 @@
+# Copy to agent-swarm.toml in a project, or ~/.config/agent-swarm/config.toml
+
+max_agents = 4
+default_backend = "auto" # auto | headless | tmux
+isolation = "worktree"   # none | worktree | worktree+db | worktree+bwrap
+
+[providers]
+order = ["claude", "grok", "agy"]
+
+[ship]
+auto_confirm = false
+
+[timeouts]
+slot_secs = 1800
+wait = "2h"

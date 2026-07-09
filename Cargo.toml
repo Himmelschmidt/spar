@@ -1,0 +1,37 @@
+[package]
+name = "agent-swarm"
+version = "0.1.0"
+edition = "2021"
+description = "Orchestrate native subscription AI CLIs for multi-provider planning, implementation, and review"
+license = "MIT"
+readme = "README.md"
+keywords = ["agents", "orchestration", "cli", "swarm"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "agent-swarm"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+crossterm = "0.28"
+dirs = "6"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+toml = "0.8"
+uuid = { version = "1", features = ["v4", "serde"] }
+which = "7"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+serde_json = "1"
+
+[[test]]
+name = "plan_implement"
+path = "tests/scenarios/plan_implement.rs"

@@ -1,0 +1,205 @@
+use clap::{Parser, Subcommand, ValueEnum};
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "agent-swarm",
+    version,
+    about = "Orchestrate native subscription AI CLIs for multi-provider swarms",
+    long_about = "Agent-operable control plane for claude/grok/agy (and future providers).\n\
+         Prefer headless execution when capable; tmux is an optional backend.\n\
+         State lives in .swarm/ under the project root."
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Check providers, tmux, git, and project layout
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Multi-provider planning; ends in awaiting_plan_approval
+    Plan {
+        #[arg(long, short = 't')]
+        task: String,
+        #[arg(long, value_delimiter = ',')]
+        providers: Option<Vec<String>>,
+        #[arg(long)]
+        detach: bool,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, value_enum, default_value_t = Backend::Auto)]
+        backend: Backend,
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Approve a plan run so implement can proceed
+    Approve {
+        run_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Reject a plan and optionally record a reason
+    Reject {
+        run_id: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Implement from an approved run, plan file, or direct task
+    Implement {
+        #[arg(long = "run")]
+        run_id: Option<String>,
+        #[arg(long)]
+        plan: Option<std::path::PathBuf>,
+        #[arg(long, short = 't')]
+        task: Option<String>,
+        #[arg(long)]
+        detach: bool,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, value_enum, default_value_t = Backend::Auto)]
+        backend: Backend,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, value_delimiter = ',')]
+        providers: Option<Vec<String>>,
+    },
+
+    /// Run a named workflow
+    Run {
+        #[arg(long, value_enum)]
+        workflow: WorkflowKind,
+        #[arg(long, short = 't')]
+        task: Option<String>,
+        #[arg(long)]
+        detach: bool,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, value_enum, default_value_t = Backend::Auto)]
+        backend: Backend,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, value_delimiter = ',')]
+        providers: Option<Vec<String>>,
+    },
+
+    /// Show run status (or list runs)
+    Status {
+        run_id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Block until a run reaches a terminal or gate phase
+    Wait {
+        run_id: String,
+        #[arg(long, default_value = "2h")]
+        timeout: String,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show logs for a run or slot
+    Logs {
+        run_id: String,
+        slot: Option<String>,
+    },
+
+    /// Attach to tmux session for a run (tmux backend)
+    Attach { run_id: String },
+
+    /// Live TUI dashboard
+    Dashboard,
+
+    /// Provider inventory and quota controls
+    Provider {
+        #[command(subcommand)]
+        action: ProviderAction,
+    },
+
+    /// Ship (push/PR) after human confirm
+    Ship {
+        run_id: String,
+        #[arg(long)]
+        json: bool,
+        /// Record ship confirmation (and optionally execute)
+        #[arg(long)]
+        confirm: bool,
+        /// Only record confirmation without pushing
+        #[arg(long)]
+        confirm_only: bool,
+    },
+
+    /// Confirm arena winner (or use ranked default)
+    Confirm {
+        run_id: String,
+        #[arg(long)]
+        winner: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Remove worktrees and optional run data
+    Cleanup {
+        run_id: String,
+        #[arg(long)]
+        json: bool,
+        /// Also delete `.swarm/runs/<id>`
+        #[arg(long)]
+        purge: bool,
+    },
+
+    /// Internal: continue a detached run (not for humans)
+    #[command(name = "__internal_continue", hide = true)]
+    InternalContinue { run_id: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProviderAction {
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    Pause {
+        name: String,
+        #[arg(long)]
+        until: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    Resume {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(
+    Debug, Clone, Copy, ValueEnum, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Backend {
+    #[default]
+    Auto,
+    Headless,
+    Tmux,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowKind {
+    Plan,
+    Loop,
+    Arena,
+    Roles,
+    Peer,
+}
