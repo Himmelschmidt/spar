@@ -76,12 +76,12 @@ pub fn run_slots_parallel(
     }
     state.save(paths)?;
 
-    let timeout = Duration::from_secs(cfg.timeouts.slot_secs);
     let isolation = state.isolation;
     let backend_policy = state.backend;
 
     let mut handles = Vec::new();
     for prep in prepared {
+        let timeout = timeout_for_role(cfg, prep.job.role);
         handles.push(std::thread::spawn(move || {
             let outcome = execute_prepared(&prep, isolation, backend_policy, timeout);
             (prep.job.slot_id.clone(), outcome, prep)
@@ -343,14 +343,59 @@ fn apply_parallel_outcome(
         }
         Ok(result) => {
             let err = result.error.unwrap_or_else(|| "failed".into());
+            salvage_expected_artifact(paths, &state.id, &prep.job, &prep.log_path, &err);
+            if let Some(u) = result.usage {
+                if let Some(s) = state.slot_mut(slot_id) {
+                    s.usage = Some(u.clone());
+                }
+                state.usage.push(u);
+            }
             mark_slot_failed(state, paths, slot_id, &err)?;
         }
         Err(e) => {
+            salvage_expected_artifact(paths, &state.id, &prep.job, &prep.log_path, &e.to_string());
             mark_slot_failed(state, paths, slot_id, &e.to_string())?;
         }
     }
     let _ = crate::bus::heartbeat(paths, &state.id, slot_id, "done");
     Ok(())
+}
+
+pub fn timeout_for_role(cfg: &Config, role: SlotRole) -> Duration {
+    let secs = match role {
+        SlotRole::Tester => cfg.suite.timeout_secs,
+        SlotRole::Reviewer => cfg.timeouts.review_secs(),
+        _ => cfg.timeouts.slot_secs,
+    };
+    Duration::from_secs(secs)
+}
+
+/// On timeout/fail, keep any non-empty expected artifact; else salvage from the slot log.
+pub fn salvage_expected_artifact(
+    paths: &SparPaths,
+    run_id: &str,
+    job: &SlotJob,
+    log_path: &Path,
+    reason: &str,
+) {
+    let Some(name) = &job.expected_artifact else {
+        return;
+    };
+    let path = paths.artifact(run_id, name);
+    if path.is_file() && std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 0 {
+        return;
+    }
+    let tail = process::tail_log(log_path, 6000);
+    let body = match job.role {
+        SlotRole::Reviewer => format!(
+            "## Verdict\nrequest_changes\n\n## Findings\n- severity: major — review slot interrupted ({reason}); partial transcript salvaged below\n\n## Tests\nsee partial transcript\n\n## Partial transcript\n\n```\n{tail}\n```\n"
+        ),
+        SlotRole::Tester => format!(
+            "## Result\nfail\n\n## Commands\n- (interrupted: {reason})\n\n## Summary\nSuite channel timed out or failed before a clean report.\n\n## Failures\n```\n{tail}\n```\n"
+        ),
+        _ => format!("# Salvaged artifact ({reason})\n\n```\n{tail}\n```\n"),
+    };
+    let _ = std::fs::write(path, body);
 }
 
 pub fn run_slot(
@@ -428,7 +473,7 @@ pub fn run_slot(
     let _ = crate::bus::heartbeat(paths, &state.id, &job.slot_id, "running");
     state.save(paths)?;
 
-    let timeout = Duration::from_secs(cfg.timeouts.slot_secs);
+    let timeout = timeout_for_role(cfg, job.role);
 
     if state.dry_run {
         return run_dry(state, paths, job, &cwd, &log_path, &prompt);
@@ -438,6 +483,7 @@ pub fn run_slot(
         match run_api(state, paths, job, &pref, &cwd, &log_path, &prompt, timeout) {
             Ok(r) => r,
             Err(e) => {
+                salvage_expected_artifact(paths, &state.id, job, &log_path, &e.to_string());
                 mark_slot_failed(state, paths, &job.slot_id, &e.to_string())?;
                 return Err(e);
             }
@@ -448,6 +494,7 @@ pub fn run_slot(
                 match run_tmux(state, paths, job, &cwd, &log_path, &prompt_path, &prompt) {
                     Ok(r) => r,
                     Err(e) => {
+                        salvage_expected_artifact(paths, &state.id, job, &log_path, &e.to_string());
                         mark_slot_failed(state, paths, &job.slot_id, &e.to_string())?;
                         return Err(e);
                     }
@@ -466,6 +513,7 @@ pub fn run_slot(
                 ) {
                     Ok(r) => r,
                     Err(e) => {
+                        salvage_expected_artifact(paths, &state.id, job, &log_path, &e.to_string());
                         mark_slot_failed(state, paths, &job.slot_id, &e.to_string())?;
                         return Err(e);
                     }
@@ -492,16 +540,19 @@ pub fn run_slot(
             &crate::events::Event::slot(&job.slot_id, SlotStatus::Done),
         );
     } else {
-        markers::write_failed(
-            paths,
-            &state.id,
-            &job.slot_id,
-            result.error.as_deref().unwrap_or("failed"),
-        )?;
+        let err = result.error.as_deref().unwrap_or("failed");
+        salvage_expected_artifact(paths, &state.id, job, &log_path, err);
+        markers::write_failed(paths, &state.id, &job.slot_id, err)?;
         if let Some(s) = state.slot_mut(&job.slot_id) {
             s.status = SlotStatus::Failed;
             s.error = result.error.clone();
             s.exit_code = result.exit_code;
+            if let Some(u) = &result.usage {
+                s.usage = Some(u.clone());
+            }
+        }
+        if let Some(u) = result.usage {
+            state.usage.push(u);
         }
         let _ = crate::events::append(
             paths,
@@ -665,6 +716,15 @@ fn write_dry_artifacts(
                 ),
             )?;
         }
+        SlotRole::Tester => {
+            std::fs::write(
+                paths.artifact(&state.id, "suite.md"),
+                format!(
+                    "## Result\npass\n\n## Commands\n- `dry-run suite` → exit 0\n\n## Summary\nDry-run suite channel ({}) for: {task}\n\n## Failures\nnone\n",
+                    job.provider
+                ),
+            )?;
+        }
         SlotRole::Reviewer => {
             let force_rc = crate::util::env_truthy("SPAR_FORCE_REQUEST_CHANGES")
                 || job.slot_id.contains("harsh")
@@ -677,7 +737,7 @@ fn write_dry_artifacts(
             std::fs::write(
                 paths.artifact(&state.id, &format!("review-{}.md", job.slot_id)),
                 format!(
-                    "## Verdict\n{verdict}\n\n## Findings\n- severity: minor — dry-run synthetic review from {}\n\n## Tests\nnot run (dry-run)\n",
+                    "## Verdict\n{verdict}\n\n## Findings\n- severity: minor — dry-run synthetic review from {}\n\n## Tests\nsuite channel (dry-run); no full suite here\n",
                     job.provider
                 ),
             )?;

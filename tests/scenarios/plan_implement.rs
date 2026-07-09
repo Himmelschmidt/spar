@@ -185,6 +185,55 @@ fn plan_approve_implement_dry_run() {
 }
 
 #[test]
+fn implement_dry_run_writes_suite_artifact() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+
+    let out = cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args([
+            "implement",
+            "--task",
+            "suite channel check",
+            "--providers",
+            "cli:claude,cli:grok",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let run_id = v["run_id"].as_str().unwrap();
+    let suite = tmp
+        .path()
+        .join(".spar/runs")
+        .join(run_id)
+        .join("artifacts/suite.md");
+    assert!(suite.is_file(), "suite.md missing");
+    let body = std::fs::read_to_string(&suite).unwrap();
+    assert!(body.contains("## Result"), "suite report shape: {body}");
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            tmp.path()
+                .join(".spar/runs")
+                .join(run_id)
+                .join("state.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let has_tester = state["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["role"] == "tester");
+    assert!(has_tester, "expected tester slot in state");
+}
+
+#[test]
 fn dry_run_does_not_create_git_worktrees() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());

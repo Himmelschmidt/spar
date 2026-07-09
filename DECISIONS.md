@@ -30,6 +30,7 @@ Project-level product and architecture decisions. Status: `OPEN` | `LEANING` | `
 | O11 | Stream **everything** (logs/events) | DECIDED |
 | O12 | Headless default; tmux **namespaced opt-in only** | DECIDED |
 | O13 | Quota: **best-effort auto** + manual; Claude rate_limits-shaped signals | DECIDED |
+| O14 | **Suite channel**: dedicated cheap `tester` slot runs full suites; impl/review are smoke/diff-only; long `suite.timeout_secs`; salvage partial review/suite artifacts on timeout | DECIDED |
 
 ## Open
 

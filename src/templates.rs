@@ -3,6 +3,7 @@ use std::collections::HashMap;
 const PLANNER: &str = include_str!("../templates/planner.md");
 const PLAN_CRITIC: &str = include_str!("../templates/plan_critic.md");
 const IMPLEMENTER: &str = include_str!("../templates/implementer.md");
+const TESTER: &str = include_str!("../templates/tester.md");
 const REVIEWER: &str = include_str!("../templates/reviewer_adversarial.md");
 const RANKER: &str = include_str!("../templates/ranker.md");
 const PEER_HALF: &str = include_str!("../templates/peer_half.md");
@@ -15,6 +16,7 @@ pub fn get(name: &str) -> Option<&'static str> {
         "planner" | "planner.md" => Some(PLANNER),
         "plan_critic" | "plan_critic.md" => Some(PLAN_CRITIC),
         "implementer" | "implementer.md" => Some(IMPLEMENTER),
+        "tester" | "tester.md" => Some(TESTER),
         "reviewer" | "reviewer_adversarial" | "reviewer_adversarial.md" => Some(REVIEWER),
         "ranker" | "ranker.md" => Some(RANKER),
         "peer_half" | "peer_half.md" => Some(PEER_HALF),
@@ -65,6 +67,10 @@ pub fn base_vars(ctx: &TemplateCtx<'_>) -> HashMap<String, String> {
     m.insert("branch".into(), ctx.branch.into());
     m.insert("plan_body".into(), String::new());
     m.insert("review_cwd".into(), ctx.cwd.into());
+    m.insert(
+        "suite_body".into(),
+        "(no suite report yet — suite channel may still be running or was skipped)".into(),
+    );
     m.insert("candidates".into(), String::new());
     m.insert("peer_role".into(), String::new());
     m.insert("partner_slot".into(), String::new());
@@ -82,5 +88,35 @@ mod tests {
         let s = render("planner", &v).unwrap();
         assert!(s.contains("fix login"));
         assert!(!s.contains("{{task}}"));
+    }
+
+    #[test]
+    fn tester_template_renders() {
+        let mut v = HashMap::new();
+        v.insert("task".into(), "ship auth".into());
+        v.insert("cwd".into(), "/tmp/wt".into());
+        v.insert("artifacts_dir".into(), "/tmp/a".into());
+        v.insert("markers_dir".into(), "/tmp/m".into());
+        v.insert("slot_id".into(), "suite-cli-claude".into());
+        v.insert("provider".into(), "cli:claude".into());
+        let s = render("tester", &v).unwrap();
+        assert!(s.contains("ship auth"));
+        assert!(s.contains("suite.md"));
+        assert!(!s.contains("{{task}}"));
+    }
+
+    #[test]
+    fn reviewer_gets_suite_body() {
+        let mut v = HashMap::new();
+        v.insert("task".into(), "x".into());
+        v.insert("review_cwd".into(), "/tmp".into());
+        v.insert("artifacts_dir".into(), "/tmp/a".into());
+        v.insert("markers_dir".into(), "/tmp/m".into());
+        v.insert("slot_id".into(), "rev".into());
+        v.insert("suite_body".into(), "## Result\npass\n".into());
+        let s = render("reviewer", &v).unwrap();
+        assert!(s.contains("## Result\npass"));
+        assert!(s.contains("Do **not** kick off full"));
+        assert!(!s.contains("{{suite_body}}"));
     }
 }

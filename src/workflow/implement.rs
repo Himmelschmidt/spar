@@ -131,6 +131,15 @@ fn prepare_implement_slots(
     }
 
     state.slots.push(executor::init_slot("impl", &provs[0], SlotRole::Implementer));
+    if cfg.suite.enabled {
+        if let Some(suite_prov) = resolve_suite_provider(cfg, dry) {
+            state.slots.push(executor::init_slot(
+                format!("suite-{}", sanitize_slot(&suite_prov)),
+                &suite_prov,
+                SlotRole::Tester,
+            ));
+        }
+    }
     state.slots.push(executor::init_slot(
         format!("review-{}-a", sanitize_slot(&provs[1])),
         &provs[1],
@@ -142,6 +151,46 @@ fn prepare_implement_slots(
         SlotRole::Reviewer,
     ));
     Ok(())
+}
+
+/// Cheap suite-channel provider: config override, else first usable preference.
+fn resolve_suite_provider(cfg: &Config, dry: bool) -> Option<String> {
+    if !cfg.suite.enabled {
+        return None;
+    }
+    if let Some(p) = &cfg.suite.provider {
+        return Some(p.clone());
+    }
+    const PREFS: &[&str] = &[
+        "cli:claude",
+        "cli:grok",
+        "cli:agy",
+        "api:xai",
+        "api:openai",
+    ];
+    if dry {
+        return Some(PREFS[0].into());
+    }
+    PREFS
+        .iter()
+        .find(|p| providers::is_provider_usable(p, false))
+        .map(|s| (*s).to_string())
+}
+
+fn suite_report_is_red(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    // Prefer structured Result line; fail closed on fail/timeout salvage.
+    if let Some(idx) = lower.find("## result") {
+        let after = &lower[idx..];
+        let line = after.lines().nth(1).unwrap_or("").trim();
+        if line.starts_with("fail") {
+            return true;
+        }
+        if line.starts_with("pass") || line.starts_with("skipped") {
+            return false;
+        }
+    }
+    lower.contains("## result\nfail") || lower.contains("result: fail")
 }
 
 fn sanitize_slot(s: &str) -> String {
@@ -301,6 +350,57 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
             })
             .unwrap_or_else(|| state.project_root.clone());
 
+        // Suite channel: cheap model runs full suites; reviewers must not.
+        let mut suite_body =
+            "(suite channel disabled or skipped — do not run full multi-hour suites yourself)"
+                .to_string();
+        let mut suite_red = false;
+        if cfg.suite.enabled {
+            let tester = state
+                .slots
+                .iter()
+                .find(|s| s.role == SlotRole::Tester)
+                .cloned();
+            if let Some(tester) = tester {
+                state.set_phase(Phase::Suite);
+                state.save(paths)?;
+                if let Some(s) = state.slot_mut(&tester.id) {
+                    s.status = SlotStatus::Pending;
+                    s.cwd = Some(review_cwd.clone());
+                    s.error = None;
+                }
+                let suite_job = SlotJob {
+                    slot_id: tester.id.clone(),
+                    provider: tester.provider.clone(),
+                    role: SlotRole::Tester,
+                    template: "tester".into(),
+                    extra_vars: HashMap::new(),
+                    expected_artifact: Some("suite.md".into()),
+                };
+                // Soft: suite failure/timeout still leaves suite.md (salvage) for reviewers.
+                let suite_ok = executor::run_slot(state, paths, cfg, &suite_job).is_ok();
+                let suite_path = paths.artifact(&state.id, "suite.md");
+                suite_body = std::fs::read_to_string(&suite_path).unwrap_or_else(|_| {
+                    format!(
+                        "(missing suite.md after suite slot `{}` — treat as fail)",
+                        tester.id
+                    )
+                });
+                suite_red = !suite_ok || suite_report_is_red(&suite_body);
+                let _ = crate::bus::broadcast(
+                    paths,
+                    &state.id,
+                    "orchestrator",
+                    if suite_red {
+                        format!("suite channel red (slot {})", tester.id)
+                    } else {
+                        format!("suite channel green (slot {})", tester.id)
+                    },
+                    state.message_budget,
+                );
+            }
+        }
+
         state.set_phase(Phase::Review);
         state.save(paths)?;
 
@@ -311,7 +411,7 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
             .cloned()
             .collect();
 
-        let mut any_request_changes = false;
+        let mut any_request_changes = suite_red;
         for rev in &reviewers {
             if let Some(s) = state.slot_mut(&rev.id) {
                 s.status = SlotStatus::Pending;
@@ -319,6 +419,7 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
             }
             let mut extra = HashMap::new();
             extra.insert("review_cwd".into(), review_cwd.display().to_string());
+            extra.insert("suite_body".into(), suite_body.clone());
             let mut job = SlotJob {
                 slot_id: rev.id.clone(),
                 provider: rev.provider.clone(),
@@ -350,6 +451,7 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
                 .unwrap_or(true);
 
             // Fail closed: failed slot or missing review artifact ⇒ treat as request_changes.
+            // Timeout salvage may have already written a partial review-*.md.
             if !review_ok || missing_or_empty {
                 any_request_changes = true;
                 if missing_or_empty {
@@ -366,6 +468,9 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
                     any_request_changes = true;
                 }
             }
+        }
+        if suite_red {
+            any_request_changes = true;
         }
 
         if !any_request_changes {

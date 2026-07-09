@@ -108,6 +108,12 @@ pub fn run_captured(req: &SpawnRequest) -> Result<SpawnResult> {
         cmd.env(k, v);
     }
     cmd.env("PYTHONUNBUFFERED", "1");
+    // Own process group so timeout can kill nested suites (cargo test, etc.).
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     let mut child = cmd
         .spawn()
@@ -139,7 +145,7 @@ pub fn run_captured(req: &SpawnRequest) -> Result<SpawnResult> {
             Some(status) => break status,
             None => {
                 if start.elapsed() >= req.timeout {
-                    let _ = child.kill();
+                    kill_process_group(&mut child);
                     let status = child.wait()?;
                     let _ = t_out.join();
                     let _ = t_err.join();
@@ -170,6 +176,34 @@ pub fn run_captured(req: &SpawnRequest) -> Result<SpawnResult> {
         stdout_tail: tail_log(&req.log_path, 4000),
         stats,
     })
+}
+
+/// SIGTERM the process group, brief grace, then SIGKILL group + child.
+fn kill_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as i32;
+        // Negative pid = process group (child is group leader via process_group(0)).
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &format!("-{pid}")])
+            .status();
+        let grace = Instant::now();
+        while grace.elapsed() < Duration::from_secs(2) {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(_) => break,
+            }
+        }
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &format!("-{pid}")])
+            .status();
+        let _ = child.kill();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
 }
 
 fn stream_to_log(
