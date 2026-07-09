@@ -230,6 +230,11 @@ pub struct RunSummary {
     pub task: Option<String>,
     #[serde(default)]
     pub dry_run: bool,
+    /// Filled when listing across projects (global home).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
 }
 
 impl RunState {
@@ -311,6 +316,8 @@ impl RunState {
                 );
             }
         }
+        // Global index so `spar` from anywhere can find this project’s runs.
+        crate::registry::note_run(&self.project_root, &self.id);
         Ok(())
     }
 
@@ -367,6 +374,8 @@ pub fn list_runs(paths: &SparPaths) -> Result<Vec<RunSummary>> {
                 updated_at: state.updated_at,
                 task: state.task,
                 dry_run: state.dry_run,
+                project_root: None,
+                project_name: None,
             }),
             Err(_) => continue,
         }

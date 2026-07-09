@@ -14,6 +14,7 @@ mod process;
 mod provider_ref;
 mod providers;
 mod quota;
+mod registry;
 mod sandbox;
 mod ship;
 mod skills;
@@ -142,7 +143,11 @@ fn run() -> Result<ExitCode> {
             };
             workflow::run_named(workflow, opts, &paths, &cfg)
         }
-        Command::Status { run_id, json } => status_cmd(run_id, json),
+        Command::Status {
+            run_id,
+            json,
+            all,
+        } => status_cmd(run_id, json, all),
         Command::Wait {
             run_id,
             timeout,
@@ -290,22 +295,22 @@ fn project_ctx() -> Result<(paths::SparPaths, Config)> {
     Ok((paths, cfg))
 }
 
-fn status_cmd(run_id: Option<String>, json: bool) -> Result<ExitCode> {
-    let root = paths::find_project_root()?;
-    let swarm = paths::SparPaths::new(&root);
-    let cfg = Config::load(&root).unwrap_or_default();
+fn status_cmd(run_id: Option<String>, json: bool, all: bool) -> Result<ExitCode> {
+    let local_root = paths::find_project_root().ok();
 
     // Observe-only: process exit is always 0 when the command succeeds.
-    // Run-phase gate/stuck/quota lives in JSON `exit_code` / `phase` (use `wait` to
-    // block and get gate-coded process exit).
     if let Some(id) = run_id {
-        let state = state::RunState::load(&swarm, &id)?;
+        let (swarm, cfg, state) = load_run_anywhere(&id, local_root.as_deref())?;
         if json {
             let mut v = serde_json::to_value(&state)?;
             if let Some(obj) = v.as_object_mut() {
                 obj.insert(
                     "run_id".into(),
                     serde_json::Value::String(state.id.clone()),
+                );
+                obj.insert(
+                    "project_root".into(),
+                    serde_json::Value::String(swarm.project_root.display().to_string()),
                 );
                 obj.insert(
                     "exit_code".into(),
@@ -319,6 +324,7 @@ fn status_cmd(run_id: Option<String>, json: bool) -> Result<ExitCode> {
             println!("{}", serde_json::to_string_pretty(&v)?);
         } else {
             println!("run: {}", state.id);
+            println!("project: {}", swarm.project_root.display());
             println!("phase: {:?}", state.phase);
             println!("workflow: {:?}", state.workflow);
             if let Some(task) = &state.task {
@@ -351,21 +357,95 @@ fn status_cmd(run_id: Option<String>, json: bool) -> Result<ExitCode> {
         return Ok(ExitCode::Success);
     }
 
-    let runs = state::list_runs(&swarm)?;
+    let use_all = all || local_root.is_none();
+    let runs = if use_all {
+        registry::list_all_runs()?
+    } else {
+        let root = local_root.as_ref().unwrap();
+        let _ = registry::ensure_known(Some(root));
+        registry::list_project_runs(root)?
+    };
+
     if json {
         println!("{}", serde_json::to_string_pretty(&runs)?);
     } else if runs.is_empty() {
-        println!("no runs in {}", swarm.root.display());
-    } else {
-        println!("runs in {}:", swarm.root.display());
-        for summary in runs {
+        if use_all {
             println!(
-                "  {}  {:?}/{:?}",
-                summary.id, summary.workflow, summary.phase
+                "no runs in global registry ({})",
+                registry::spar_home().display()
+            );
+            println!("hint: run spar inside a project once, or spar status --all after work starts");
+        } else {
+            println!(
+                "no runs in {}",
+                local_root.as_ref().unwrap().join(".spar").display()
+            );
+        }
+    } else {
+        if use_all {
+            println!("all projects (registry {}):", registry::spar_home().display());
+        } else {
+            println!("runs in {}:", local_root.as_ref().unwrap().display());
+        }
+        let mut last_proj = String::new();
+        for summary in runs {
+            let proj = summary
+                .project_name
+                .clone()
+                .unwrap_or_else(|| "·".into());
+            if use_all && proj != last_proj {
+                println!("  [{proj}]");
+                last_proj = proj;
+            }
+            let dry = if summary.dry_run { " dry" } else { "" };
+            let task = summary
+                .task
+                .as_deref()
+                .map(|t| format!("  {}", truncate_cli(t, 40)))
+                .unwrap_or_default();
+            println!(
+                "    {}  {:?}{}{task}",
+                summary.id, summary.phase, dry
             );
         }
     }
     Ok(ExitCode::Success)
+}
+
+fn load_run_anywhere(
+    run_id: &str,
+    local_root: Option<&std::path::Path>,
+) -> Result<(paths::SparPaths, Config, state::RunState)> {
+    if let Some(root) = local_root {
+        let swarm = paths::SparPaths::new(root);
+        if let Ok(state) = state::RunState::load(&swarm, run_id) {
+            let cfg = Config::load(root).unwrap_or_default();
+            return Ok((swarm, cfg, state));
+        }
+    }
+    for summary in registry::list_all_runs()? {
+        if summary.id != run_id {
+            continue;
+        }
+        let Some(root) = summary.project_root else {
+            continue;
+        };
+        let swarm = paths::SparPaths::new(&root);
+        if let Ok(state) = state::RunState::load(&swarm, run_id) {
+            let cfg = Config::load(&root).unwrap_or_default();
+            return Ok((swarm, cfg, state));
+        }
+    }
+    anyhow::bail!("run {run_id} not found in current project or global registry");
+}
+
+fn truncate_cli(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let t: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{t}…")
+    }
 }
 
 fn logs_cmd(run_id: &str, slot: Option<&str>, follow: bool) -> Result<ExitCode> {

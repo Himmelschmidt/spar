@@ -75,9 +75,15 @@ Layout: `.spar/runs/<id>/bus/{events.jsonl,agents.jsonl,inbox/,reserves.json,tas
 ## Observe
 
 ```bash
-spar status [run_id] [--json]
+spar status [run_id] [--json] [--all]   # --all = every registered project
 spar wait <run_id> [--timeout 2h] [--follow] [--json]
 spar logs <run_id> [slot] [-f|--follow]
+
+# Global home: open `spar` from anywhere. Runs stay under each project’s
+# `.spar/runs/`; project list is ~/.spar/registry.json (or $SPAR_HOME).
+# Projects appear when you use spar there — no hardcoded scan paths.
+# TUI: default = this project's runs; **p** / Esc = Projects (general view);
+# Enter opens a project.
 ```
 
 - Run state: `.spar/runs/<id>/state.json`

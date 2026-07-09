@@ -119,6 +119,9 @@ pub enum Command {
         run_id: Option<String>,
         #[arg(long)]
         json: bool,
+        /// List runs across all registered projects (global home)
+        #[arg(long)]
+        all: bool,
     },
 
     /// Block until a run reaches a terminal or gate phase

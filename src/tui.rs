@@ -6,6 +6,7 @@ use crate::liveness::SlotActivity;
 use crate::paths::{self, SparPaths};
 use crate::process;
 use crate::quota::QuotaStore;
+use crate::registry;
 use crate::state::{self, Phase, RunState, SlotState, SlotStatus};
 use crate::workflow;
 use anyhow::Result;
@@ -18,10 +19,11 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::ExecutableCommand;
+use ratatui::buffer::Buffer;
 use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Scrollbar,
-    ScrollbarOrientation, ScrollbarState,
+    ScrollbarOrientation, ScrollbarState, Widget,
 };
 use std::io::stdout;
 use std::path::PathBuf;
@@ -52,7 +54,7 @@ enum Focus {
     Runs,
     Agents,
     Log,
-    Messages,
+    Activity,
     Composer,
 }
 
@@ -61,8 +63,8 @@ impl Focus {
         match self {
             Focus::Runs => Focus::Agents,
             Focus::Agents => Focus::Log,
-            Focus::Log => Focus::Messages,
-            Focus::Messages => Focus::Composer,
+            Focus::Log => Focus::Activity,
+            Focus::Activity => Focus::Composer,
             Focus::Composer => Focus::Runs,
         }
     }
@@ -71,8 +73,8 @@ impl Focus {
             Focus::Runs => Focus::Composer,
             Focus::Agents => Focus::Runs,
             Focus::Log => Focus::Agents,
-            Focus::Messages => Focus::Log,
-            Focus::Composer => Focus::Messages,
+            Focus::Activity => Focus::Log,
+            Focus::Composer => Focus::Activity,
         }
     }
     fn label(self) -> &'static str {
@@ -80,7 +82,7 @@ impl Focus {
             Focus::Runs => "Runs",
             Focus::Agents => "Agents",
             Focus::Log => "Live log",
-            Focus::Messages => "Messages",
+            Focus::Activity => "Activity",
             Focus::Composer => "Command",
         }
     }
@@ -95,9 +97,16 @@ pub fn run_with(opts: TuiOpts) -> Result<crate::exit_codes::ExitCode> {
     if let Some(cwd) = &opts.cwd {
         std::env::set_current_dir(cwd)?;
     }
-    let root = paths::find_project_root()?;
-    let swarm = SparPaths::new(&root);
-    let stall_warn_secs = Config::load(&root)
+    // Optional: cwd may not be a git project — global home still works.
+    let local_root = paths::find_project_root().ok();
+    if let Some(root) = &local_root {
+        let _ = registry::ensure_known(Some(root));
+    } else {
+        let _ = registry::ensure_known(None);
+    }
+    let stall_warn_secs = local_root
+        .as_ref()
+        .and_then(|r| Config::load(r).ok())
         .map(|c| c.timeouts.stall_warn_secs)
         .unwrap_or(300);
 
@@ -108,7 +117,12 @@ pub fn run_with(opts: TuiOpts) -> Result<crate::exit_codes::ExitCode> {
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
     terminal.clear()?;
 
-    let result = run_loop(&mut terminal, &swarm, opts.task_seed, stall_warn_secs);
+    let result = run_loop(
+        &mut terminal,
+        local_root,
+        opts.task_seed,
+        stall_warn_secs,
+    );
 
     disable_raw_mode()?;
     let mut out = stdout();
@@ -117,17 +131,33 @@ pub fn run_with(opts: TuiOpts) -> Result<crate::exit_codes::ExitCode> {
     result
 }
 
+/// Left-rail navigation: projects first (general), then runs for one project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowseLevel {
+    /// General view — registered projects only (not a wall of runs).
+    Projects,
+    /// Per-project view — runs for `active_root` only.
+    Runs,
+}
+
 struct App {
     selected_run: usize,
+    selected_project: usize,
     selected_slot: usize,
     focus: Focus,
+    browse: BrowseLevel,
     composer: String,
     status_line: String,
     stream_scroll: u16,
     bus_scroll: u16,
     tick: u64,
-    flash: Option<(Instant, String, Color)>,
+    /// (started, message, color, how long to show)
+    flash: Option<(Instant, String, Color, Duration)>,
     stall_warn_secs: u64,
+    /// When false (default), long log lines truncate with …; `w` toggles wrap.
+    log_expand: bool,
+    /// First Ctrl+C timestamp; second within 2s exits (Esc/q never quit).
+    last_ctrl_c: Option<Instant>,
     last_click: Option<(u16, u16, Instant)>,
     show_help: bool,
     rect_header: Rect,
@@ -140,11 +170,18 @@ struct App {
 }
 
 impl App {
-    fn new(task_seed: Option<String>, stall_warn_secs: u64) -> Self {
+    fn new(task_seed: Option<String>, stall_warn_secs: u64, start_in_project: bool) -> Self {
         Self {
             selected_run: 0,
+            selected_project: 0,
             selected_slot: 0,
             focus: Focus::Runs,
+            // Inside a project → that project's runs. Outside → project picker.
+            browse: if start_in_project {
+                BrowseLevel::Runs
+            } else {
+                BrowseLevel::Projects
+            },
             composer: task_seed.unwrap_or_default(),
             status_line: String::new(),
             stream_scroll: 0,
@@ -152,6 +189,8 @@ impl App {
             tick: 0,
             flash: None,
             stall_warn_secs,
+            log_expand: false,
+            last_ctrl_c: None,
             last_click: None,
             show_help: false,
             rect_header: Rect::default(),
@@ -165,7 +204,11 @@ impl App {
     }
 
     fn flash(&mut self, msg: impl Into<String>, color: Color) {
-        self.flash = Some((Instant::now(), msg.into(), color));
+        self.flash_for(msg, color, Duration::from_secs(3));
+    }
+
+    fn flash_for(&mut self, msg: impl Into<String>, color: Color, for_ms: Duration) {
+        self.flash = Some((Instant::now(), msg.into(), color, for_ms));
         self.status_line.clear();
         self.show_help = false;
     }
@@ -184,6 +227,17 @@ impl App {
         self.bus_scroll = 0;
     }
 
+    fn select_project(&mut self, idx: usize, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.selected_project = idx.min(n - 1);
+        self.selected_run = 0;
+        self.selected_slot = 0;
+        self.stream_scroll = 0;
+        self.bus_scroll = 0;
+    }
+
     fn select_slot(&mut self, idx: usize, n: usize) {
         if n == 0 {
             return;
@@ -191,37 +245,93 @@ impl App {
         self.selected_slot = idx.min(n - 1);
         self.stream_scroll = 0;
     }
+
+    fn open_project_runs(&mut self) {
+        self.browse = BrowseLevel::Runs;
+        self.selected_run = 0;
+        self.selected_slot = 0;
+        self.stream_scroll = 0;
+        self.focus = Focus::Runs;
+    }
+
+    fn open_projects_view(&mut self) {
+        self.browse = BrowseLevel::Projects;
+        self.selected_run = 0;
+        self.selected_slot = 0;
+        self.stream_scroll = 0;
+        self.focus = Focus::Runs;
+    }
 }
 
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    swarm: &SparPaths,
+    local_root: Option<PathBuf>,
     task_seed: Option<String>,
     stall_warn_secs: u64,
 ) -> Result<crate::exit_codes::ExitCode> {
-    let mut app = App::new(task_seed, stall_warn_secs);
+    let mut app = App::new(task_seed, stall_warn_secs, local_root.is_some());
     let mut fleet_state = ListState::default();
-    let mut runs_state = ListState::default();
+    let mut rail_state = ListState::default();
+    let mut active_root: PathBuf = local_root.clone().unwrap_or_else(|| {
+        registry::Registry::load()
+            .ok()
+            .and_then(|r| r.projects.into_iter().next())
+            .map(|p| p.root)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    });
 
     loop {
         app.tick = app.tick.wrapping_add(1);
 
-        let runs = state::list_runs(swarm).unwrap_or_default();
+        let projects = load_projects(local_root.as_deref());
+        if !projects.is_empty() {
+            app.selected_project = app.selected_project.min(projects.len() - 1);
+            // When browsing projects, active_root tracks the highlighted project.
+            if app.browse == BrowseLevel::Projects {
+                active_root = projects[app.selected_project].root.clone();
+            }
+        } else {
+            app.selected_project = 0;
+        }
+
+        let runs = if app.browse == BrowseLevel::Runs {
+            registry::list_project_runs(&active_root).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         if !runs.is_empty() {
             app.selected_run = app.selected_run.min(runs.len() - 1);
         } else {
             app.selected_run = 0;
         }
-        runs_state.select(if runs.is_empty() {
-            None
-        } else {
-            Some(app.selected_run)
-        });
 
+        let rail_sel = match app.browse {
+            BrowseLevel::Projects => {
+                if projects.is_empty() {
+                    None
+                } else {
+                    Some(app.selected_project)
+                }
+            }
+            BrowseLevel::Runs => {
+                if runs.is_empty() {
+                    None
+                } else {
+                    Some(app.selected_run)
+                }
+            }
+        };
+        rail_state.select(rail_sel);
+
+        let swarm = SparPaths::new(&active_root);
         let selected_id = runs.get(app.selected_run).map(|r| r.id.clone());
-        let full = selected_id
-            .as_ref()
-            .and_then(|id| RunState::load(swarm, id).ok());
+        let full = if app.browse == BrowseLevel::Runs {
+            selected_id
+                .as_ref()
+                .and_then(|id| RunState::load(&swarm, id).ok())
+        } else {
+            None
+        };
         if let Some(ref st) = full {
             if !st.slots.is_empty() {
                 app.selected_slot = app.selected_slot.min(st.slots.len() - 1);
@@ -237,12 +347,15 @@ fn run_loop(
             Some(app.selected_slot)
         });
 
-        let quota = QuotaStore::load(swarm).unwrap_or_default();
-        let stream_text = stream_content(swarm, full.as_ref(), app.selected_slot);
-        let bus_lines = bus_lines(swarm, full.as_ref(), &quota);
+        let quota = QuotaStore::load(&swarm).unwrap_or_default();
+        let stream_text = match app.browse {
+            BrowseLevel::Projects => project_overview(&projects, app.selected_project),
+            BrowseLevel::Runs => stream_content(&swarm, full.as_ref(), app.selected_slot),
+        };
+        let activity = activity_feed(&swarm, full.as_ref(), &quota);
 
-        if let Some((t, _, _)) = &app.flash {
-            if t.elapsed() > Duration::from_secs(4) {
+        if let Some((t, _, _, dur)) = &app.flash {
+            if t.elapsed() > *dur {
                 app.flash = None;
             }
         }
@@ -250,14 +363,15 @@ fn run_loop(
         terminal.draw(|f| {
             draw(
                 f,
-                swarm,
+                &swarm,
+                &projects,
                 &runs,
                 full.as_ref(),
                 &stream_text,
-                &bus_lines,
+                &activity,
                 &app,
                 &mut fleet_state,
-                &mut runs_state,
+                &mut rail_state,
             );
         })?;
 
@@ -283,15 +397,25 @@ fn run_loop(
                         &mut app,
                         key.code,
                         key.modifiers,
-                        swarm,
+                        &swarm,
+                        &projects,
                         &runs,
                         full.as_ref(),
+                        &mut active_root,
+                        local_root.as_deref(),
                     )? {
                         break;
                     }
                 }
                 Event::Mouse(m) => {
-                    handle_mouse(&mut app, m, &runs, full.as_ref());
+                    handle_mouse(
+                        &mut app,
+                        m,
+                        &projects,
+                        &runs,
+                        full.as_ref(),
+                        &mut active_root,
+                    );
                 }
                 Event::Resize(_, _) => {}
                 _ => {}
@@ -301,20 +425,66 @@ fn run_loop(
     Ok(crate::exit_codes::ExitCode::Success)
 }
 
+fn load_projects(local_root: Option<&std::path::Path>) -> Vec<registry::ProjectEntry> {
+    let reg = registry::ensure_known(local_root);
+    reg.projects
+}
+
+fn project_overview(projects: &[registry::ProjectEntry], idx: usize) -> String {
+    if projects.is_empty() {
+        return format!(
+            "\n  No projects registered yet.\n\n  cd into a repo and run spar (or start a plan).\n  Registry: {}\n",
+            registry::spar_home().display()
+        );
+    }
+    let p = &projects[idx.min(projects.len() - 1)];
+    let n_runs = registry::list_project_runs(&p.root)
+        .map(|r| r.len())
+        .unwrap_or(0);
+    format!(
+        "\n  Project: {}\n  Path:    {}\n  Runs:    {}\n  Last:    {}\n\n  Enter / click  → open this project's runs\n  p              → stay on projects list\n",
+        p.name.as_deref().unwrap_or("·"),
+        p.root.display(),
+        n_runs,
+        relative_age(p.last_seen),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_key(
     app: &mut App,
     code: KeyCode,
     mods: KeyModifiers,
     swarm: &SparPaths,
+    projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
+    active_root: &mut PathBuf,
+    local_root: Option<&std::path::Path>,
 ) -> Result<bool> {
     let selected_id = runs.get(app.selected_run).map(|r| r.id.as_str());
     let n_slots = full.map(|s| s.slots.len()).unwrap_or(0);
 
+    // Ctrl+C twice (within 2s) is the only quit path — never Esc or q.
+    if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
+        if let Some(t) = app.last_ctrl_c {
+            if t.elapsed() < Duration::from_secs(2) {
+                return Ok(true);
+            }
+        }
+        app.last_ctrl_c = Some(Instant::now());
+        // Match the 2s double-press window so the hint doesn't outlive the arm.
+        app.flash_for("Ctrl+C again to exit", YELLOW, Duration::from_secs(2));
+        return Ok(false);
+    }
+    // Any other key clears the first Ctrl+C arm.
+    if !mods.contains(KeyModifiers::CONTROL) {
+        app.last_ctrl_c = None;
+    }
+
     if app.show_help {
         match code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter => {
+            KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter => {
                 app.show_help = false;
             }
             _ => {}
@@ -330,9 +500,6 @@ fn handle_key(
                 if !line.is_empty() {
                     match handle_composer(swarm, runs, app.selected_run, &line) {
                         Ok(msg) => {
-                            if msg == "__quit__" {
-                                return Ok(true);
-                            }
                             app.flash(msg, GREEN);
                             app.composer.clear();
                         }
@@ -354,13 +521,14 @@ fn handle_key(
     }
 
     match code {
-        KeyCode::Char('q') => return Ok(true),
         KeyCode::Esc => {
             if app.focus != Focus::Runs {
                 app.focus = Focus::Runs;
-            } else {
-                return Ok(true);
+            } else if app.browse == BrowseLevel::Runs {
+                app.open_projects_view();
+                app.flash("Projects — Enter to open · p always returns here", ACCENT);
             }
+            // Never exit on Esc (including Projects view).
         }
         KeyCode::Tab => app.focus = app.focus.next(),
         KeyCode::BackTab => app.focus = app.focus.prev(),
@@ -371,60 +539,130 @@ fn handle_key(
             }
         }
         KeyCode::Char('i') => app.focus = Focus::Composer,
-        KeyCode::Char('j') | KeyCode::Down => match app.focus {
-            Focus::Runs => {
-                if !runs.is_empty() {
-                    app.select_run(app.selected_run + 1, runs.len());
+        KeyCode::Enter => {
+            if app.focus == Focus::Runs && app.browse == BrowseLevel::Projects {
+                if let Some(p) = projects.get(app.selected_project) {
+                    *active_root = p.root.clone();
+                    app.open_project_runs();
+                    app.flash(
+                        format!(
+                            "Opened {}",
+                            p.name.as_deref().unwrap_or("project")
+                        ),
+                        GREEN,
+                    );
                 }
             }
+        }
+        KeyCode::Char('p') => {
+            app.open_projects_view();
+            // Highlight local project if present
+            if let Some(root) = local_root {
+                if let Some(i) = projects.iter().position(|p| p.root == root) {
+                    app.selected_project = i;
+                }
+            }
+            app.flash("Projects (general view)", ACCENT);
+        }
+        KeyCode::Char('j') | KeyCode::Down => match app.focus {
+            Focus::Runs => match app.browse {
+                BrowseLevel::Projects => {
+                    if !projects.is_empty() {
+                        app.select_project(app.selected_project + 1, projects.len());
+                    }
+                }
+                BrowseLevel::Runs => {
+                    if !runs.is_empty() {
+                        app.select_run(app.selected_run + 1, runs.len());
+                    }
+                }
+            },
             Focus::Agents => {
                 if n_slots > 0 {
                     app.select_slot(app.selected_slot + 1, n_slots);
                 }
             }
             Focus::Log => app.stream_scroll = app.stream_scroll.saturating_add(3),
-            Focus::Messages => app.bus_scroll = app.bus_scroll.saturating_add(1),
+            Focus::Activity => app.bus_scroll = app.bus_scroll.saturating_add(1),
             Focus::Composer => {}
         },
         KeyCode::Char('k') | KeyCode::Up => match app.focus {
-            Focus::Runs => {
-                app.select_run(app.selected_run.saturating_sub(1), runs.len().max(1));
-            }
+            Focus::Runs => match app.browse {
+                BrowseLevel::Projects => {
+                    app.select_project(
+                        app.selected_project.saturating_sub(1),
+                        projects.len().max(1),
+                    );
+                }
+                BrowseLevel::Runs => {
+                    app.select_run(app.selected_run.saturating_sub(1), runs.len().max(1));
+                }
+            },
             Focus::Agents => {
                 app.select_slot(app.selected_slot.saturating_sub(1), n_slots.max(1));
             }
             Focus::Log => app.stream_scroll = app.stream_scroll.saturating_sub(3),
-            Focus::Messages => app.bus_scroll = app.bus_scroll.saturating_sub(1),
+            Focus::Activity => app.bus_scroll = app.bus_scroll.saturating_sub(1),
             Focus::Composer => {}
         },
         KeyCode::PageDown => match app.focus {
             Focus::Log => app.stream_scroll = app.stream_scroll.saturating_add(12),
-            Focus::Messages => app.bus_scroll = app.bus_scroll.saturating_add(6),
-            Focus::Runs if !runs.is_empty() => app.select_run(app.selected_run + 5, runs.len()),
+            Focus::Activity => app.bus_scroll = app.bus_scroll.saturating_add(6),
+            Focus::Runs => match app.browse {
+                BrowseLevel::Projects if !projects.is_empty() => {
+                    app.select_project(app.selected_project + 5, projects.len());
+                }
+                BrowseLevel::Runs if !runs.is_empty() => {
+                    app.select_run(app.selected_run + 5, runs.len());
+                }
+                _ => {}
+            },
             Focus::Agents if n_slots > 0 => app.select_slot(app.selected_slot + 5, n_slots),
             _ => {}
         },
         KeyCode::PageUp => match app.focus {
             Focus::Log => app.stream_scroll = app.stream_scroll.saturating_sub(12),
-            Focus::Messages => app.bus_scroll = app.bus_scroll.saturating_sub(6),
-            Focus::Runs => {
-                app.select_run(app.selected_run.saturating_sub(5), runs.len().max(1));
-            }
+            Focus::Activity => app.bus_scroll = app.bus_scroll.saturating_sub(6),
+            Focus::Runs => match app.browse {
+                BrowseLevel::Projects => {
+                    app.select_project(
+                        app.selected_project.saturating_sub(5),
+                        projects.len().max(1),
+                    );
+                }
+                BrowseLevel::Runs => {
+                    app.select_run(app.selected_run.saturating_sub(5), runs.len().max(1));
+                }
+            },
             Focus::Agents => {
                 app.select_slot(app.selected_slot.saturating_sub(5), n_slots.max(1));
             }
             _ => {}
         },
         KeyCode::Char('J') | KeyCode::Char(']') => {
-            if !runs.is_empty() {
-                app.select_run(app.selected_run + 1, runs.len());
-                app.focus = Focus::Runs;
+            app.focus = Focus::Runs;
+            match app.browse {
+                BrowseLevel::Projects if !projects.is_empty() => {
+                    app.select_project(app.selected_project + 1, projects.len());
+                }
+                BrowseLevel::Runs if !runs.is_empty() => {
+                    app.select_run(app.selected_run + 1, runs.len());
+                }
+                _ => {}
             }
         }
         KeyCode::Char('K') | KeyCode::Char('[') => {
-            if !runs.is_empty() {
-                app.select_run(app.selected_run.saturating_sub(1), runs.len());
-                app.focus = Focus::Runs;
+            app.focus = Focus::Runs;
+            match app.browse {
+                BrowseLevel::Projects => {
+                    app.select_project(
+                        app.selected_project.saturating_sub(1),
+                        projects.len().max(1),
+                    );
+                }
+                BrowseLevel::Runs => {
+                    app.select_run(app.selected_run.saturating_sub(1), runs.len().max(1));
+                }
             }
         }
         KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
@@ -468,6 +706,17 @@ fn handle_key(
         KeyCode::Char('?') => {
             app.show_help = true;
         }
+        KeyCode::Char('w') => {
+            app.log_expand = !app.log_expand;
+            app.flash(
+                if app.log_expand {
+                    "Log: wrap long lines"
+                } else {
+                    "Log: truncate long lines (w toggles)"
+                },
+                ACCENT,
+            );
+        }
         _ => {}
     }
     Ok(false)
@@ -476,8 +725,10 @@ fn handle_key(
 fn handle_mouse(
     app: &mut App,
     m: crossterm::event::MouseEvent,
+    projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
+    active_root: &mut PathBuf,
 ) {
     let (x, y) = (m.column, m.row);
     let n_slots = full.map(|s| s.slots.len()).unwrap_or(0);
@@ -485,6 +736,10 @@ fn handle_mouse(
     match m.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             let now = Instant::now();
+            let dbl = app
+                .last_click
+                .map(|(lx, ly, t)| lx == x && ly == y && t.elapsed() < Duration::from_millis(400))
+                .unwrap_or(false);
             app.last_click = Some((x, y, now));
 
             if contains(app.rect_composer, x, y) {
@@ -492,7 +747,7 @@ fn handle_mouse(
             } else if contains(app.rect_stream, x, y) {
                 app.focus = Focus::Log;
             } else if contains(app.rect_bus, x, y) {
-                app.focus = Focus::Messages;
+                app.focus = Focus::Activity;
             } else if contains(app.rect_fleet, x, y) {
                 app.focus = Focus::Agents;
                 if let Some(st) = full {
@@ -502,11 +757,25 @@ fn handle_mouse(
                 }
             } else if contains(app.rect_runs, x, y) {
                 app.focus = Focus::Runs;
-                if let Some(row) = list_row_at(app.rect_runs, y, runs.len()) {
-                    app.select_run(row, runs.len());
+                match app.browse {
+                    BrowseLevel::Projects => {
+                        if let Some(row) = list_row_at(app.rect_runs, y, projects.len()) {
+                            app.select_project(row, projects.len());
+                            if dbl {
+                                if let Some(p) = projects.get(row) {
+                                    *active_root = p.root.clone();
+                                    app.open_project_runs();
+                                }
+                            }
+                        }
+                    }
+                    BrowseLevel::Runs => {
+                        if let Some(row) = list_row_at(app.rect_runs, y, runs.len()) {
+                            app.select_run(row, runs.len());
+                        }
+                    }
                 }
             } else if contains(app.rect_action, x, y) {
-                // Action bar: focus runs so a/r/s context is clear
                 app.focus = Focus::Runs;
             }
         }
@@ -515,7 +784,7 @@ fn handle_mouse(
                 app.focus = Focus::Log;
                 app.stream_scroll = app.stream_scroll.saturating_add(3);
             } else if contains(app.rect_bus, x, y) {
-                app.focus = Focus::Messages;
+                app.focus = Focus::Activity;
                 app.bus_scroll = app.bus_scroll.saturating_add(2);
             } else if contains(app.rect_fleet, x, y) {
                 app.focus = Focus::Agents;
@@ -524,11 +793,15 @@ fn handle_mouse(
                 }
             } else if contains(app.rect_runs, x, y) {
                 app.focus = Focus::Runs;
-                if !runs.is_empty() {
-                    app.select_run(app.selected_run + 1, runs.len());
+                match app.browse {
+                    BrowseLevel::Projects if !projects.is_empty() => {
+                        app.select_project(app.selected_project + 1, projects.len());
+                    }
+                    BrowseLevel::Runs if !runs.is_empty() => {
+                        app.select_run(app.selected_run + 1, runs.len());
+                    }
+                    _ => {}
                 }
-            } else if contains(app.rect_stream, x, y) || app.focus == Focus::Log {
-                app.stream_scroll = app.stream_scroll.saturating_add(3);
             }
         }
         MouseEventKind::ScrollUp => {
@@ -536,7 +809,7 @@ fn handle_mouse(
                 app.focus = Focus::Log;
                 app.stream_scroll = app.stream_scroll.saturating_sub(3);
             } else if contains(app.rect_bus, x, y) {
-                app.focus = Focus::Messages;
+                app.focus = Focus::Activity;
                 app.bus_scroll = app.bus_scroll.saturating_sub(2);
             } else if contains(app.rect_fleet, x, y) {
                 app.focus = Focus::Agents;
@@ -545,8 +818,16 @@ fn handle_mouse(
                 }
             } else if contains(app.rect_runs, x, y) {
                 app.focus = Focus::Runs;
-                if !runs.is_empty() {
-                    app.select_run(app.selected_run.saturating_sub(1), runs.len());
+                match app.browse {
+                    BrowseLevel::Projects => {
+                        app.select_project(
+                            app.selected_project.saturating_sub(1),
+                            projects.len().max(1),
+                        );
+                    }
+                    BrowseLevel::Runs => {
+                        app.select_run(app.selected_run.saturating_sub(1), runs.len().max(1));
+                    }
                 }
             }
         }
@@ -596,12 +877,13 @@ fn layout_rects(area: Rect) -> LayoutRects {
         ])
         .split(area);
 
+    // Wide live log is the main stage; rail + activity are supporting columns.
     let mid = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(30),
-            Constraint::Percentage(45),
-            Constraint::Percentage(25),
+            Constraint::Percentage(22),
+            Constraint::Percentage(58),
+            Constraint::Percentage(20),
         ])
         .split(root[2]);
 
@@ -626,25 +908,28 @@ fn layout_rects(area: Rect) -> LayoutRects {
 fn draw(
     f: &mut Frame,
     swarm: &SparPaths,
+    projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
     stream_text: &str,
-    bus_lines: &[String],
+    activity: &[String],
     app: &App,
     fleet_state: &mut ListState,
-    runs_state: &mut ListState,
+    rail_state: &mut ListState,
 ) {
     let area = f.area();
+    // Full clear each frame — prevents styled-cell ghosting across the whole UI.
+    f.render_widget(Clear, area);
     f.render_widget(Block::default().style(Style::default().bg(BG)), area);
 
     let lay = layout_rects(area);
 
     draw_header(f, lay.header, swarm, full, app);
-    draw_action(f, lay.action, runs, full, app);
-    draw_runs(f, lay.runs, runs, app, runs_state);
+    draw_action(f, lay.action, projects, runs, full, app);
+    draw_rail(f, lay.runs, projects, runs, app, rail_state);
     draw_agents(f, lay.fleet, full, app, fleet_state);
     draw_stream(f, lay.stream, full, stream_text, app);
-    draw_messages(f, lay.bus, bus_lines, app);
+    draw_activity(f, lay.bus, activity, app);
     draw_composer(f, lay.composer, app);
     draw_footer(f, lay.footer, app, full);
 
@@ -681,10 +966,15 @@ fn draw_header(f: &mut Frame, area: Rect, swarm: &SparPaths, full: Option<&RunSt
         .map(|_| " dry-run ")
         .unwrap_or("");
 
+    let scope = match app.browse {
+        BrowseLevel::Projects => " projects ",
+        BrowseLevel::Runs => " runs ",
+    };
     let left = Line::from(vec![
         Span::styled(" spar ", Style::default().fg(BG).bg(ACCENT).bold()),
         Span::raw(" "),
         Span::styled(project, Style::default().fg(FG).bold()),
+        Span::styled(scope, Style::default().fg(BG).bg(ACCENT_SOFT)),
         Span::styled("  ·  ", Style::default().fg(FG_MUTED)),
         Span::styled(run, Style::default().fg(CYAN)),
         Span::styled(dry, Style::default().fg(BG).bg(YELLOW).bold()),
@@ -726,29 +1016,48 @@ fn draw_header(f: &mut Frame, area: Rect, swarm: &SparPaths, full: Option<&RunSt
 fn draw_action(
     f: &mut Frame,
     area: Rect,
+    projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
     app: &App,
 ) {
-    let (text, fg, bg) = if let Some(st) = full {
+    let (text, fg, bg) = if app.browse == BrowseLevel::Projects {
+        if projects.is_empty() {
+            (
+                format!(
+                    "  No projects yet — cd into a repo and run spar · index {}  ",
+                    registry::spar_home().display()
+                ),
+                FG_DIM,
+                BG_RAISED,
+            )
+        } else {
+            (
+                "  Projects (general) — j/k select · Enter / double-click open runs · p stays here  "
+                    .into(),
+                FG_MUTED,
+                BG_RAISED,
+            )
+        }
+    } else if let Some(st) = full {
         match st.phase {
             Phase::AwaitingPlanApproval => (
-                "  Plan ready — press  a  to approve ·  r  to reject · or click Agents / Live log to inspect  ".into(),
+                "  Plan ready — press  a  to approve ·  r  to reject · p = all projects  ".into(),
                 BG,
                 YELLOW,
             ),
             Phase::AwaitingWinnerConfirm => (
-                "  Arena winner ready — confirm with spar confirm, or inspect candidates  ".into(),
+                "  Arena winner ready — confirm with spar confirm · p = projects  ".into(),
                 BG,
                 YELLOW,
             ),
             Phase::AwaitingShipConfirm => (
-                "  Ready to ship — press  s  to confirm draft PR (never merges)  ".into(),
+                "  Ready to ship — press  s  (draft PR) · p = projects  ".into(),
                 BG,
                 YELLOW,
             ),
             Phase::AwaitingReconcile => (
-                "  Arena reconcile ready — run spar reconcile  ".into(),
+                "  Arena reconcile ready — spar reconcile · p = projects  ".into(),
                 BG,
                 YELLOW,
             ),
@@ -759,7 +1068,7 @@ fn draw_action(
             ),
             Phase::Failed | Phase::Stuck | Phase::Escalated => (
                 format!(
-                    "  {} — check Live log · spar cleanup {}  ",
+                    "  {} — check Live log · spar cleanup {} · p = projects  ",
                     phase_label(st.phase),
                     st.id
                 ),
@@ -767,13 +1076,13 @@ fn draw_action(
                 Color::Rgb(48, 24, 24),
             ),
             _ if st.dry_run => (
-                "  Dry-run — synthetic agents only · no real code changes  ".into(),
+                "  Dry-run — synthetic agents only · p = projects  ".into(),
                 FG_DIM,
                 BG_RAISED,
             ),
             _ if is_active_phase(st.phase) => (
                 format!(
-                    "  Working…  click a run · click an agent · scroll Live log  ·  Tab = next pane ({})  ",
+                    "  Working…  j/k runs · scroll Live log · p = projects · Tab = {}  ",
                     app.focus.label()
                 ),
                 FG_DIM,
@@ -781,7 +1090,7 @@ fn draw_action(
             ),
             _ => (
                 format!(
-                    "  {}  ·  Tab cycles panes · j/k move · mouse click & scroll · ? help  ",
+                    "  {}  ·  p projects · Tab panes · j/k · ? help  ",
                     phase_label(st.phase)
                 ),
                 FG_MUTED,
@@ -790,13 +1099,13 @@ fn draw_action(
         }
     } else if runs.is_empty() {
         (
-            "  No runs yet — try:  spar plan -t \"…\" --providers cli:claude --dry-run  ".into(),
+            "  No runs in this project — spar plan -t \"…\" --providers cli:claude  ·  Esc/p = projects  ".into(),
             FG_DIM,
             BG_RAISED,
         )
     } else {
         (
-            "  Select a run (click or j/k in Runs) · Tab to Agents / Live log · ? help  ".into(),
+            "  This project's runs — j/k select · Esc or p = all projects · Tab panes  ".into(),
             FG_MUTED,
             BG_RAISED,
         )
@@ -809,68 +1118,126 @@ fn draw_action(
     );
 }
 
-fn draw_runs(
+fn draw_rail(
     f: &mut Frame,
     area: Rect,
+    projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     app: &App,
     state: &mut ListState,
 ) {
     let focused = app.focus == Focus::Runs;
-    let items: Vec<ListItem> = if runs.is_empty() {
-        vec![ListItem::new(Span::styled(
-            "  (empty)",
-            Style::default().fg(FG_MUTED).italic(),
-        ))]
-    } else {
-        runs.iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let sel = i == app.selected_run;
-                let mark = if sel { "›" } else { " " };
-                let dry = if r.dry_run { "dry " } else { "" };
-                let task = r
-                    .task
-                    .as_deref()
-                    .map(|t| truncate(t, 18))
-                    .unwrap_or_else(|| workflow_label(r.workflow).into());
-                let age = relative_age(r.updated_at);
-                let line = Line::from(vec![
-                    Span::styled(format!("{mark}"), Style::default().fg(ACCENT)),
-                    Span::styled(
-                        format!(" {:<8}", truncate(&r.id, 8)),
-                        Style::default()
-                            .fg(if sel { FG } else { FG_DIM })
-                            .add_modifier(if sel {
-                                Modifier::BOLD
-                            } else {
-                                Modifier::empty()
-                            }),
-                    ),
-                    Span::styled(
-                        format!(" {:<14}", truncate(&phase_label(r.phase), 14)),
-                        Style::default().fg(phase_color(r.phase)),
-                    ),
-                    Span::styled(format!(" {dry}"), Style::default().fg(YELLOW)),
-                    Span::styled(format!("{task} "), Style::default().fg(FG_MUTED)),
-                    Span::styled(age, Style::default().fg(FG_MUTED)),
-                ]);
-                ListItem::new(line).style(if sel {
-                    Style::default().bg(BG_RAISED)
-                } else {
-                    Style::default()
-                })
-            })
-            .collect()
-    };
-
-    let title = if focused {
-        format!(" Runs  · j/k or click  ({}) ", runs.len())
-    } else {
-        format!(" Runs  ({}) ", runs.len())
-    };
-    let list = List::new(items).block(panel(&title, focused));
-    f.render_stateful_widget(list, area, state);
+    match app.browse {
+        BrowseLevel::Projects => {
+            let items: Vec<ListItem> = if projects.is_empty() {
+                vec![ListItem::new(Span::styled(
+                    "  (no projects)",
+                    Style::default().fg(FG_MUTED).italic(),
+                ))]
+            } else {
+                projects
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        let sel = i == app.selected_project;
+                        let mark = if sel { "›" } else { " " };
+                        let name = p.name.as_deref().unwrap_or("·");
+                        let n = registry::list_project_runs(&p.root)
+                            .map(|r| r.len())
+                            .unwrap_or(0);
+                        let line = Line::from(vec![
+                            Span::styled(format!("{mark}"), Style::default().fg(ACCENT)),
+                            Span::styled(
+                                format!(" {:<14}", truncate(name, 14)),
+                                Style::default()
+                                    .fg(if sel { FG } else { CYAN })
+                                    .add_modifier(if sel {
+                                        Modifier::BOLD
+                                    } else {
+                                        Modifier::empty()
+                                    }),
+                            ),
+                            Span::styled(
+                                format!(" {n} runs "),
+                                Style::default().fg(FG_MUTED),
+                            ),
+                            Span::styled(
+                                relative_age(p.last_seen),
+                                Style::default().fg(FG_MUTED),
+                            ),
+                        ]);
+                        ListItem::new(line).style(if sel {
+                            Style::default().bg(BG_RAISED)
+                        } else {
+                            Style::default()
+                        })
+                    })
+                    .collect()
+            };
+            let title = if focused {
+                format!(" Projects  ({}) · Enter open · j/k ", projects.len())
+            } else {
+                format!(" Projects  ({}) ", projects.len())
+            };
+            let list = List::new(items).block(panel(&title, focused));
+            f.render_stateful_widget(list, area, state);
+        }
+        BrowseLevel::Runs => {
+            let items: Vec<ListItem> = if runs.is_empty() {
+                vec![ListItem::new(Span::styled(
+                    "  (no runs)",
+                    Style::default().fg(FG_MUTED).italic(),
+                ))]
+            } else {
+                runs.iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        let sel = i == app.selected_run;
+                        let mark = if sel { "›" } else { " " };
+                        let dry = if r.dry_run { "dry " } else { "" };
+                        let task = r
+                            .task
+                            .as_deref()
+                            .map(|t| truncate(t, 16))
+                            .unwrap_or_else(|| workflow_label(r.workflow).into());
+                        let age = relative_age(r.updated_at);
+                        let line = Line::from(vec![
+                            Span::styled(format!("{mark}"), Style::default().fg(ACCENT)),
+                            Span::styled(
+                                format!(" {:<8}", truncate(&r.id, 8)),
+                                Style::default()
+                                    .fg(if sel { FG } else { FG_DIM })
+                                    .add_modifier(if sel {
+                                        Modifier::BOLD
+                                    } else {
+                                        Modifier::empty()
+                                    }),
+                            ),
+                            Span::styled(
+                                format!(" {:<12}", truncate(&phase_label(r.phase), 12)),
+                                Style::default().fg(phase_color(r.phase)),
+                            ),
+                            Span::styled(format!(" {dry}"), Style::default().fg(YELLOW)),
+                            Span::styled(format!("{task} "), Style::default().fg(FG_MUTED)),
+                            Span::styled(age, Style::default().fg(FG_MUTED)),
+                        ]);
+                        ListItem::new(line).style(if sel {
+                            Style::default().bg(BG_RAISED)
+                        } else {
+                            Style::default()
+                        })
+                    })
+                    .collect()
+            };
+            let title = if focused {
+                format!(" Runs  ({}) · Esc/p projects · j/k ", runs.len())
+            } else {
+                format!(" Runs  ({}) ", runs.len())
+            };
+            let list = List::new(items).block(panel(&title, focused));
+            f.render_stateful_widget(list, area, state);
+        }
+    }
 }
 
 fn draw_agents(
@@ -1020,8 +1387,9 @@ fn draw_stream(
             }
         })
         .unwrap_or_default();
+    let mode = if app.log_expand { "wrap" } else { "trim" };
     let title = if focused {
-        format!(" Live log  · {slot_id}{silent_hint}  · scroll wheel / j k ")
+        format!(" Live log  · {slot_id}{silent_hint}  · {mode} · w toggle · scroll ")
     } else {
         format!(" Live log  · {slot_id}{silent_hint} ")
     };
@@ -1057,9 +1425,14 @@ fn draw_stream(
     });
     draw_stream_stats(f, chunks[0], stats.as_ref(), slot.map(|s| s.status));
 
-    // Live log: never use Paragraph wrap+scroll together — wrapped styled lines
-    // leave ghost glyphs (duplicated colored words) on scroll. Pre-wrap, pad, slice.
-    render_scrollable_log(f, chunks[1], stream_text, app.stream_scroll, true);
+    render_scrollable_log(
+        f,
+        chunks[1],
+        stream_text,
+        app.stream_scroll,
+        true,
+        app.log_expand,
+    );
 }
 
 fn draw_stream_stats(
@@ -1148,36 +1521,27 @@ fn draw_stream_stats(
     );
 }
 
-/// Paint a log viewport without Paragraph wrap+scroll (avoids color ghosting).
+/// Paint a log viewport by writing cells directly (no Paragraph wrap/scroll).
 fn render_scrollable_log(
     f: &mut Frame,
     area: Rect,
     text: &str,
     scroll: u16,
     colorize: bool,
+    expand: bool,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    // Full clear of the content region so previous frames cannot leave cells behind.
-    f.render_widget(
-        Block::default().style(Style::default().bg(BG_PANEL).fg(FG)),
-        area,
-    );
 
     let sb_w = 1u16;
     let text_w = area.width.saturating_sub(sb_w).max(1) as usize;
     let height = area.height as usize;
-    let wrapped = wrap_log_lines(text, text_w, colorize);
-    let total = wrapped.len().max(1);
+    let rows = layout_log_rows(text, text_w, colorize, expand);
+    let total = rows.len().max(1);
     let max_scroll = total.saturating_sub(height);
     let start = (scroll as usize).min(max_scroll);
-    let visible: Vec<Line> = wrapped
-        .into_iter()
-        .skip(start)
-        .take(height)
-        .map(|line| pad_line_bg(line, text_w))
-        .collect();
+    let visible: Vec<(String, Style)> = rows.into_iter().skip(start).take(height).collect();
 
     let text_area = Rect {
         x: area.x,
@@ -1185,8 +1549,14 @@ fn render_scrollable_log(
         width: area.width.saturating_sub(sb_w).max(1),
         height: area.height,
     };
-    let p = Paragraph::new(visible).style(Style::default().bg(BG_PANEL).fg(FG));
-    f.render_widget(p, text_area);
+    f.render_widget(Clear, text_area);
+    f.render_widget(
+        CellLog {
+            lines: visible,
+            fill: Style::default().bg(BG_PANEL).fg(FG),
+        },
+        text_area,
+    );
 
     let mut sb = ScrollbarState::new(total).position(start);
     f.render_stateful_widget(
@@ -1198,70 +1568,197 @@ fn render_scrollable_log(
     );
 }
 
+/// Fills every cell, then paints plain strings — no span leftovers across frames.
+struct CellLog {
+    lines: Vec<(String, Style)>,
+    fill: Style,
+}
+
+impl Widget for CellLog {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_symbol(" ");
+                    cell.set_style(self.fill);
+                    cell.set_skip(false);
+                }
+            }
+        }
+        for (i, (text, style)) in self.lines.iter().enumerate() {
+            if i as u16 >= area.height {
+                break;
+            }
+            let y = area.top() + i as u16;
+            let mut col = 0u16;
+            for ch in text.chars() {
+                if col >= area.width {
+                    break;
+                }
+                let x = area.left() + col;
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_symbol(&ch.to_string());
+                    cell.set_style(*style);
+                    cell.set_skip(false);
+                }
+                col = col.saturating_add(1);
+            }
+        }
+    }
+}
+
 fn log_line_style(line: &str, colorize: bool) -> Style {
     let base = Style::default().bg(BG_PANEL);
     if !colorize {
         return base.fg(FG_DIM);
     }
-    if line.starts_with('→') {
+    let t = line.trim_start();
+    if t.starts_with('▸') || t.starts_with('→') {
         base.fg(CYAN)
-    } else if line.starts_with('←') {
-        if line.contains('✗') {
+    } else if t.starts_with('◂') || t.starts_with('←') {
+        if t.contains('✗') || t.contains("err") {
             base.fg(RED)
         } else {
             base.fg(GREEN)
         }
-    } else if line.starts_with('·') || line.starts_with('…') {
+    } else if t.starts_with('·') || t.starts_with('…') || t.starts_with('│') {
         base.fg(FG_MUTED).italic()
-    } else if line.starts_with('!') {
+    } else if t.starts_with('!') {
         base.fg(RED).bold()
-    } else if line.starts_with('#') {
+    } else if t.starts_with('#') {
         base.fg(FG_MUTED)
     } else {
         base.fg(FG)
     }
 }
 
-/// Hard-wrap source lines to `width` display columns (char-based; agent logs are ASCII-heavy).
-fn wrap_log_lines(text: &str, width: usize, colorize: bool) -> Vec<Line<'static>> {
+/// Compact stream lines (grok-cli style density), then truncate or wrap to width.
+fn layout_log_rows(
+    text: &str,
+    width: usize,
+    colorize: bool,
+    expand: bool,
+) -> Vec<(String, Style)> {
     let width = width.max(1);
     let mut out = Vec::new();
     for raw in text.lines() {
-        let style = log_line_style(raw, colorize);
-        if raw.is_empty() {
-            out.push(Line::from(Span::styled(String::new(), style)));
+        let line = compact_log_line(raw);
+        let style = log_line_style(&line, colorize);
+        if line.is_empty() {
+            out.push((String::new(), style));
             continue;
         }
-        let chars: Vec<char> = raw.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            let end = (i + width).min(chars.len());
-            let chunk: String = chars[i..end].iter().collect();
-            out.push(Line::from(Span::styled(chunk, style)));
-            i = end;
+        if expand {
+            // Soft-wrap at word boundaries when possible.
+            for chunk in soft_wrap(&line, width) {
+                out.push((chunk, style));
+            }
+        } else {
+            out.push((truncate_display(&line, width), style));
         }
     }
     if out.is_empty() {
-        out.push(Line::from(Span::styled(String::new(), log_line_style("", colorize))));
+        out.push((String::new(), log_line_style("", colorize)));
     }
     out
 }
 
-fn pad_line_bg(mut line: Line<'static>, width: usize) -> Line<'static> {
-    let w = line.width();
-    if w < width {
-        line.spans.push(Span::styled(
-            " ".repeat(width - w),
-            Style::default().bg(BG_PANEL).fg(FG),
-        ));
+fn compact_log_line(raw: &str) -> String {
+    let s = raw.trim_end();
+    if s.is_empty() {
+        return String::new();
     }
-    // Ensure every span carries the panel background so scroll cannot leave
-    // previous-frame foreground cells in the padding.
-    for span in &mut line.spans {
-        span.style.bg = Some(BG_PANEL);
+    // Tool call / result markers from stream coalescer
+    if let Some(rest) = s.strip_prefix('→') {
+        let rest = rest.trim();
+        // "Bash  Fetch PR diff" → keep short tool + summary
+        return format!("▸ {}", collapse_ws(rest));
     }
-    line
+    if let Some(rest) = s.strip_prefix('←') {
+        let rest = rest.trim();
+        return format!("◂ {}", collapse_ws(rest));
+    }
+    if let Some(rest) = s.strip_prefix('·') {
+        return format!("  {}", collapse_ws(rest.trim()));
+    }
+    if s.starts_with('…') {
+        return format!("  {}", collapse_ws(s.trim_start_matches('…').trim()));
+    }
+    collapse_ws(s)
 }
+
+fn collapse_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    out
+}
+
+fn truncate_display(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let n = s.chars().count();
+    if n <= width {
+        return s.to_string();
+    }
+    if width == 1 {
+        return "…".into();
+    }
+    let keep: String = s.chars().take(width - 1).collect();
+    format!("{keep}…")
+}
+
+fn soft_wrap(s: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    let mut rows = Vec::new();
+    let mut cur = String::new();
+    for word in s.split_whitespace() {
+        if word.chars().count() > width {
+            if !cur.is_empty() {
+                rows.push(std::mem::take(&mut cur));
+            }
+            let chars: Vec<char> = word.chars().collect();
+            let mut i = 0;
+            while i < chars.len() {
+                let end = (i + width).min(chars.len());
+                rows.push(chars[i..end].iter().collect());
+                i = end;
+            }
+            continue;
+        }
+        let next_len = if cur.is_empty() {
+            word.chars().count()
+        } else {
+            cur.chars().count() + 1 + word.chars().count()
+        };
+        if next_len > width && !cur.is_empty() {
+            rows.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() || rows.is_empty() {
+        rows.push(cur);
+    }
+    rows
+}
+
+
 
 fn compact_u64(n: u64) -> String {
     if n >= 1_000_000 {
@@ -1273,22 +1770,22 @@ fn compact_u64(n: u64) -> String {
     }
 }
 
-fn draw_messages(f: &mut Frame, area: Rect, bus_lines: &[String], app: &App) {
-    let focused = app.focus == Focus::Messages;
-    let text = if bus_lines.is_empty() {
-        "  No messages yet.\n  Agent chatter and events show up here.".into()
+fn draw_activity(f: &mut Frame, area: Rect, activity: &[String], app: &App) {
+    let focused = app.focus == Focus::Activity;
+    let text = if activity.is_empty() {
+        "No activity yet.\n\nRun timeline: phases,\nagents, gates, bus.".into()
     } else {
-        bus_lines.join("\n")
+        activity.join("\n")
     };
     let title = if focused {
-        " Messages  · scroll wheel / j k "
+        " Activity  · timeline · j/k "
     } else {
-        " Messages "
+        " Activity "
     };
     let block = panel(title, focused);
     let inner = block.inner(area);
     f.render_widget(block, area);
-    render_scrollable_log(f, inner, &text, app.bus_scroll, false);
+    render_scrollable_log(f, inner, &text, app.bus_scroll, false, true);
 }
 
 fn draw_composer(f: &mut Frame, area: Rect, app: &App) {
@@ -1329,13 +1826,13 @@ fn draw_composer(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App, full: Option<&RunState>) {
-    let (msg, color) = if let Some((_, m, c)) = &app.flash {
+    let (msg, color) = if let Some((_, m, c, _)) = &app.flash {
         (m.as_str(), *c)
     } else if !app.status_line.is_empty() {
         (app.status_line.as_str(), YELLOW)
     } else {
         (
-            situational_footer(full, app.focus),
+            situational_footer(full, app.focus, app.browse),
             FG_MUTED,
         )
     };
@@ -1355,7 +1852,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, full: Option<&RunState>) {
         )
     } else {
         Span::styled(
-            format!(" {}  ? help  q quit  ", app.spinner()),
+            format!(" {}  ? help  ·  Ctrl+C×2 exit  ", app.spinner()),
             Style::default().fg(FG_MUTED).bg(bg),
         )
     };
@@ -1371,23 +1868,26 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, full: Option<&RunState>) {
     f.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), area);
 }
 
-fn situational_footer(full: Option<&RunState>, focus: Focus) -> &'static str {
+fn situational_footer(full: Option<&RunState>, focus: Focus, browse: BrowseLevel) -> &'static str {
+    if browse == BrowseLevel::Projects {
+        return "j/k projects · Enter open · double-click open · ? help";
+    }
     if let Some(st) = full {
         if st.phase == Phase::AwaitingPlanApproval {
-            return "a approve plan · r reject · Tab panes · click Live log to inspect";
+            return "a approve · r reject · p projects · Tab panes";
         }
         if st.phase == Phase::AwaitingShipConfirm {
-            return "s confirm ship (draft PR) · Tab panes · ? help";
+            return "s confirm ship · p projects · ? help";
         }
         if st.phase.is_gate() {
-            return "gate waiting · see yellow bar above · ? help";
+            return "gate waiting · yellow bar above · p projects";
         }
     }
     match focus {
-        Focus::Runs => "j/k or click: pick run · ] next · Tab → Agents · ? help",
-        Focus::Agents => "j/k or click: pick agent · log follows selection · Tab → Live log",
-        Focus::Log => "scroll wheel / j k / PgUp PgDn · g top · Tab → Messages",
-        Focus::Messages => "scroll wheel / j k · Tab → Command",
+        Focus::Runs => "j/k runs · Esc/p projects · Tab → Agents · ? help",
+        Focus::Agents => "j/k agent · log follows · Tab → Live log",
+        Focus::Log => "scroll / j k · w wrap/trim · g top · Tab → Activity",
+        Focus::Activity => "run timeline · scroll · Tab → Command",
         Focus::Composer => "type /approve /reject /ship /help · Enter · Esc",
     }
 }
@@ -1415,15 +1915,22 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
   Keyboard\n\
     Tab / Shift-Tab      next / previous panel\n\
     j k  or  ↑ ↓         move in focused panel\n\
-    [ ]  or  J K         previous / next run\n\
+    Enter                open project (from Projects list)\n\
+    p  or  Esc           back to Projects (general view)\n\
+    [ ]  or  J K         previous / next item\n\
     1-9                  jump to agent slot\n\
     a / r / s            approve · reject · ship (when gated)\n\
     i  or  /             command bar\n\
+    w                    log wrap ↔ truncate long lines\n\
     g / G                log top / bottom\n\
-    ?                    this help · Esc closes\n\
-    q                    quit\n\
+    ?                    this help · Esc closes help\n\
+    Ctrl+C twice         exit (only quit path)\n\
  \n\
-  Esc or ? to close";
+  Default: this project's runs (or Projects if outside a repo).\n\
+  Activity: phase timeline + agent status (not chat).\n\
+  Runs: <project>/.spar/runs/ · Index: ~/.spar/registry.json\n\
+ \n\
+  Esc or ? to close help";
     let p = Paragraph::new(body)
         .style(Style::default().fg(FG).bg(BG_RAISED))
         .block(
@@ -1466,9 +1973,10 @@ fn handle_composer(
         let head = parts.next().unwrap_or("").to_ascii_lowercase();
         let arg = parts.next().map(str::trim).filter(|s| !s.is_empty());
         return match head.as_str() {
-            "q" | "quit" => Ok("__quit__".into()),
+            "q" | "quit" => Ok("Use Ctrl+C twice to exit (q does not quit)".into()),
             "help" | "h" | "?" => Ok(
-                "Commands: /approve /reject [reason] /ship /quit · press ? for full help".into(),
+                "Commands: /approve /reject [reason] /ship · press ? for full help · Ctrl+C×2 exit"
+                    .into(),
             ),
             "approve" => {
                 let id = arg.or(run_id).ok_or_else(|| anyhow::anyhow!("no run selected"))?;
@@ -1496,7 +2004,7 @@ fn handle_composer(
 
 fn stream_content(swarm: &SparPaths, full: Option<&RunState>, slot_idx: usize) -> String {
     let Some(st) = full else {
-        return "\n  Select a run on the left.\n\n  New work:\n    spar plan -t \"describe the change\" --providers cli:claude --dry-run\n".into();
+        return "\n  Select a run on the left.\n\n  New work:\n    spar plan -t \"describe the change\" --providers cli:claude\n".into();
     };
     if st.slots.is_empty() {
         return "\n  This run has no agents yet.".into();
@@ -1507,15 +2015,36 @@ fn stream_content(swarm: &SparPaths, full: Option<&RunState>, slot_idx: usize) -
         .clone()
         .unwrap_or_else(|| swarm.log_file(&st.id, &slot.id));
     if path.is_file() {
-        let raw = process::tail_log(&path, 64_000);
-        let body = raw
+        let raw = process::tail_log(&path, 80_000);
+        let body: Vec<&str> = raw
             .lines()
-            .skip_while(|l| l.starts_with('#') || *l == "---" || l.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
+            .skip_while(|l| {
+                l.starts_with('#')
+                    || *l == "---"
+                    || l.starts_with("cwd=")
+                    || l.is_empty()
+                    || l.starts_with("# Role:")
+            })
+            // Drop the huge prompt dump often pasted as first "user" blob in headless spawn
+            .filter(|l| !l.starts_with("# Role:") && !l.starts_with("## Task"))
+            .collect();
+        // Skip until first real stream marker if present
+        let start = body
+            .iter()
+            .position(|l| {
+                l.starts_with('→')
+                    || l.starts_with('←')
+                    || l.starts_with('·')
+                    || l.starts_with('…')
+                    || l.starts_with('!')
+                    || l.starts_with("I'll ")
+                    || l.starts_with("I ")
+            })
+            .unwrap_or(0);
+        let body = body[start..].join("\n");
         if body.trim().is_empty() {
             format!(
-                "\n  {} is running but hasn't written the log yet…\n  (quiet time is shown in Agents)",
+                "\n  {} is running — waiting for stream…\n  Quiet time is on Agents; Activity shows phase timeline.",
                 slot.id
             )
         } else {
@@ -1523,44 +2052,144 @@ fn stream_content(swarm: &SparPaths, full: Option<&RunState>, slot_idx: usize) -
         }
     } else {
         format!(
-            "\n  No log file yet for {}\n  provider: {}\n  status: {:?}",
-            slot.id, slot.provider, slot.status
+            "\n  No log yet for {}\n  {} · {}",
+            slot.id,
+            slot.provider,
+            slot_status_label(slot.status)
         )
     }
 }
 
-fn bus_lines(swarm: &SparPaths, full: Option<&RunState>, quota: &QuotaStore) -> Vec<String> {
+/// Right-rail feed: human run timeline (not a raw bus dump).
+fn activity_feed(
+    swarm: &SparPaths,
+    full: Option<&RunState>,
+    quota: &QuotaStore,
+) -> Vec<String> {
     let mut lines = Vec::new();
-    if let Some(st) = full {
-        if let Ok(presence) = crate::bus::list_presence(swarm, &st.id) {
-            for p in presence.iter().take(6) {
-                lines.push(format!("· {:<12} {}", p.agent, p.status));
-            }
+    let Some(st) = full else {
+        lines.push("No run selected.".into());
+        lines.push(String::new());
+        lines.push("Open a project, pick a run.".into());
+        return lines;
+    };
+
+    lines.push(format!("Run  {}", st.id));
+    lines.push(format!("  {}", phase_label(st.phase)));
+    if st.dry_run {
+        lines.push("  dry-run".into());
+    }
+    if let Some(t) = st.task.as_deref() {
+        lines.push(format!("  {}", truncate(t, 36)));
+    }
+    lines.push(String::new());
+
+    // Compact agent status
+    lines.push("Agents".into());
+    for s in &st.slots {
+        let act = SlotActivity::observe(s, 300);
+        let mark = match s.status {
+            SlotStatus::Running if act.stalled => "!",
+            SlotStatus::Running => "●",
+            SlotStatus::Done => "✓",
+            SlotStatus::Failed => "✗",
+            SlotStatus::Stuck => "!",
+            SlotStatus::Pending => "·",
+        };
+        let quiet = if s.status == SlotStatus::Running {
+            format!(" {}", act.human_silent())
+        } else {
+            String::new()
+        };
+        lines.push(format!(
+            " {mark} {} {}{quiet}",
+            role_label(s.role),
+            slot_status_label(s.status),
+        ));
+    }
+
+    // Orchestrator event timeline (human)
+    let evs = events::read_all(swarm, &st.id).unwrap_or_default();
+    if !evs.is_empty() {
+        lines.push(String::new());
+        lines.push("Timeline".into());
+        for e in evs.iter().rev().take(14).rev() {
+            lines.push(format!(" {}", activity_event_line(e)));
         }
-        if let Ok(evs) = crate::bus::list_events(swarm, &st.id) {
-            for e in evs.iter().rev().take(12).rev() {
-                lines.push(truncate(
-                    &format!("{}→{}  {}", e.from, e.to, e.body),
-                    48,
+    }
+
+    // Bus chat only if real agent chat exists
+    if let Ok(bus) = crate::bus::list_events(swarm, &st.id) {
+        let chat: Vec<_> = bus
+            .iter()
+            .filter(|m| {
+                !matches!(
+                    m.kind,
+                    crate::bus::MsgKind::Hello | crate::bus::MsgKind::System
+                )
+            })
+            .collect();
+        if !chat.is_empty() {
+            lines.push(String::new());
+            lines.push("Bus".into());
+            for m in chat.iter().rev().take(8).rev() {
+                lines.push(format!(
+                    " {}→{} {}",
+                    short_agent(&m.from),
+                    short_agent(&m.to),
+                    truncate(&m.body, 28)
                 ));
             }
         }
-        if lines.is_empty() {
-            for e in events::read_all(swarm, &st.id)
-                .unwrap_or_default()
-                .iter()
-                .rev()
-                .take(10)
-                .rev()
-            {
-                lines.push(truncate(&e.display_line(), 48));
-            }
+    }
+
+    let paused: Vec<_> = quota
+        .providers
+        .iter()
+        .filter(|(_, q)| format!("{:?}", q.status).to_ascii_lowercase().contains("pause"))
+        .collect();
+    if !paused.is_empty() {
+        lines.push(String::new());
+        lines.push("Quota".into());
+        for (name, q) in paused {
+            lines.push(format!(" {} {:?}", name, q.status));
         }
     }
-    for (name, q) in &quota.providers {
-        lines.push(format!("quota {name}: {:?}", q.status));
-    }
+
     lines
+}
+
+fn short_agent(s: &str) -> &str {
+    s.rsplit(['-', '/']).next().unwrap_or(s)
+}
+
+fn activity_event_line(e: &events::Event) -> String {
+    let t = e.ts.format("%H:%M");
+    match e.kind {
+        events::EventKind::Phase => {
+            let phase = e
+                .phase
+                .map(phase_label)
+                .unwrap_or_else(|| "?".into());
+            format!("{t} → {phase}")
+        }
+        events::EventKind::Slot => {
+            let slot = e.slot.as_deref().unwrap_or("agent");
+            let st = e
+                .status
+                .map(slot_status_label)
+                .unwrap_or("?");
+            format!("{t} {slot} {st}")
+        }
+        events::EventKind::Gate => {
+            let msg = e.message.as_deref().unwrap_or("waiting on you");
+            format!("{t} gate · {msg}")
+        }
+        events::EventKind::Info => {
+            let msg = e.message.as_deref().unwrap_or("");
+            format!("{t} {msg}")
+        }
+    }
 }
 
 // ── human labels ────────────────────────────────────────────────────────────
@@ -1711,13 +2340,19 @@ mod labels {
     }
 
     #[test]
-    fn wrap_log_splits_long_colored_lines() {
-        let long = format!("→ {}", "abcdefghij".repeat(5)); // 2 + 50
-        let lines = wrap_log_lines(&long, 20, true);
-        assert!(lines.len() >= 3, "expected wrap, got {}", lines.len());
-        assert!(lines.iter().all(|l| l.width() <= 20));
-        let padded = pad_line_bg(lines[0].clone(), 20);
-        assert_eq!(padded.width(), 20);
-        assert!(padded.spans.iter().all(|s| s.style.bg == Some(BG_PANEL)));
+    fn truncate_log_default_one_row() {
+        let long = format!("→ {}", "abcdefghij".repeat(8));
+        let rows = layout_log_rows(&long, 24, true, false);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].0.ends_with('…'));
+        assert!(rows[0].0.chars().count() <= 24);
+    }
+
+    #[test]
+    fn expand_log_soft_wraps() {
+        let long = format!("→ tool {}", "word ".repeat(20));
+        let rows = layout_log_rows(&long, 20, true, true);
+        assert!(rows.len() > 1);
+        assert!(rows.iter().all(|(s, _)| s.chars().count() <= 20));
     }
 }
