@@ -71,6 +71,17 @@ fn plan_approve_implement_dry_run() {
         .join(run_id)
         .join("artifacts/plan.md");
     assert!(plan_path.is_file(), "plan.md should exist");
+    let events_path = tmp
+        .path()
+        .join(".spar/runs")
+        .join(run_id)
+        .join("events.jsonl");
+    assert!(events_path.is_file(), "events.jsonl should exist");
+    let events_text = std::fs::read_to_string(&events_path).unwrap();
+    assert!(
+        events_text.contains("awaiting_plan_approval") || events_text.contains("\"phase\""),
+        "events should record phases"
+    );
     let done_marker = tmp
         .path()
         .join(".spar/runs")
@@ -109,18 +120,8 @@ fn plan_approve_implement_dry_run() {
     let impl_stdout = String::from_utf8_lossy(impl_out.get_output().stdout.as_slice());
     let impl_v: serde_json::Value = serde_json::from_str(&impl_stdout).expect("implement json");
     let impl_id = impl_v["run_id"].as_str().expect("implement run_id");
-    assert_ne!(impl_id, run_id);
-    assert_eq!(impl_v["parent_run"].as_str(), Some(run_id));
-
-    // parent records child_run
-    let parent = cargo_bin_cmd!("spar")
-        .current_dir(tmp.path())
-        .args(["status", run_id, "--json"])
-        .assert()
-        .success();
-    let parent_s = String::from_utf8_lossy(parent.get_output().stdout.as_slice());
-    let parent_v: serde_json::Value = serde_json::from_str(&parent_s).unwrap();
-    assert_eq!(parent_v["child_run"].as_str(), Some(impl_id));
+    // One run id plan → implement (O1)
+    assert_eq!(impl_id, run_id);
 
     // worktree sibling naming for implementer
     let state_path = tmp
@@ -165,11 +166,158 @@ fn plan_approve_implement_dry_run() {
         .args(["cleanup", run_id, "--purge", "--json"])
         .assert()
         .success();
+}
+
+#[test]
+fn arena_reconcile_dry_run() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let out = cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args([
+            "run",
+            "--workflow",
+            "arena",
+            "--task",
+            "feature X",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("awaiting_winner_confirm"));
+    let stdout = String::from_utf8_lossy(out.get_output().stdout.as_slice());
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let run_id = v["run_id"].as_str().unwrap();
+
     cargo_bin_cmd!("spar")
         .current_dir(tmp.path())
-        .args(["cleanup", impl_id, "--purge", "--json"])
+        .args(["reconcile", run_id, "--json"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("awaiting_ship_confirm"));
+    assert!(tmp
+        .path()
+        .join(".spar/runs")
+        .join(run_id)
+        .join("artifacts/summary-reconcile.md")
+        .is_file());
+}
+
+#[test]
+fn dual_backend_dry_run_providers() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let out = cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args([
+            "plan",
+            "--task",
+            "dual backend",
+            "--providers",
+            "api:openai,cli:grok",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2);
+    let stdout = String::from_utf8_lossy(out.get_output().stdout.as_slice());
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(v.get("run_id").is_some());
+    assert_eq!(v.get("id"), v.get("run_id"));
+    let slots = v["slots"].as_array().unwrap();
+    assert!(!slots.is_empty(), "expected planner slots for api/cli providers");
+    let providers = v["providers"].as_array().unwrap();
+    let joined = providers
+        .iter()
+        .filter_map(|p| p.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    assert!(
+        joined.contains("openai") || joined.contains("grok"),
+        "providers={joined}"
+    );
+}
+
+#[test]
+fn empty_fake_providers_fail_closed() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    // Live (no dry-run): unknown names must not become a fake plan gate.
+    let r = cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args([
+            "plan",
+            "--task",
+            "x",
+            "--providers",
+            "notreal1,notreal2",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let code = r.status.code().unwrap_or(1);
+    assert_ne!(code, 2, "must not return human gate with zero providers");
+    assert!(
+        code == 1 || code == 4,
+        "expected failure/quota, got {code}"
+    );
+}
+
+#[test]
+fn skills_and_bus_commands() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args(["skills", "list", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("core"));
+    cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args(["skills", "get", "core"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Exit codes"));
+
+    let plan = cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args(["plan", "--task", "bus seed", "--dry-run", "--json", "--big"])
+        .assert()
+        .code(2);
+    let stdout = String::from_utf8_lossy(plan.get_output().stdout.as_slice());
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let run_id = v["run_id"].as_str().unwrap();
+    assert!(tmp
+        .path()
+        .join(".spar/runs")
+        .join(run_id)
+        .join("bus/tasks/graph.json")
+        .is_file());
+
+    cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args([
+            "bus",
+            "send",
+            run_id,
+            "--from",
+            "human",
+            "--to",
+            "broadcast",
+            "-m",
+            "hello fleet",
+            "--json",
+        ])
         .assert()
         .success();
+    cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args(["bus", "log", run_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello fleet"));
 }
 
 #[test]

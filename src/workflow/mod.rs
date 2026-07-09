@@ -19,6 +19,21 @@ pub struct CommonOpts {
     pub json: bool,
     pub backend: Backend,
     pub dry_run: bool,
+    pub big: bool,
+}
+
+impl Default for CommonOpts {
+    fn default() -> Self {
+        Self {
+            task: None,
+            providers: None,
+            detach: false,
+            json: false,
+            backend: Backend::Auto,
+            dry_run: false,
+            big: false,
+        }
+    }
 }
 
 impl CommonOpts {

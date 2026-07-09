@@ -1,17 +1,27 @@
 use clap::{Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "spar",
     version,
-    about = "Orchestrate native subscription AI CLIs for multi-provider swarms",
-    long_about = "Agent-operable control plane for claude/grok/agy (and future providers).\n\
-         Prefer headless execution when capable; tmux is an optional backend.\n\
+    about = "Multi-agent coding product: fleet TUI, dual backends, plan/review/arena/ship",
+    long_about = "First-class multi-agent coding product.\n\
+         Humans: `spar` opens the fleet TUI in the current git repo.\n\
+         Outer agents: subcommands + --json + `spar skills get core`.\n\
          State lives in .spar/ under the project root."
 )]
 pub struct Cli {
+    /// Project directory for TUI (default: cwd). Only when no subcommand.
+    #[arg(long, global = true)]
+    pub cwd: Option<PathBuf>,
+
+    /// Seed the TUI composer with a task (TUI mode only)
+    #[arg(long = "task", global = true)]
+    pub task: Option<String>,
+
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -36,6 +46,9 @@ pub enum Command {
         backend: Backend,
         #[arg(long)]
         dry_run: bool,
+        /// Structured plan-big task DAG under bus/tasks
+        #[arg(long)]
+        big: bool,
     },
 
     /// Approve a plan run so implement can proceed
@@ -72,6 +85,8 @@ pub enum Command {
         dry_run: bool,
         #[arg(long, value_delimiter = ',')]
         providers: Option<Vec<String>>,
+        #[arg(long)]
+        big: bool,
     },
 
     /// Run a named workflow
@@ -90,6 +105,8 @@ pub enum Command {
         dry_run: bool,
         #[arg(long, value_delimiter = ',')]
         providers: Option<Vec<String>>,
+        #[arg(long)]
+        big: bool,
     },
 
     /// Show run status (or list runs)
@@ -106,18 +123,24 @@ pub enum Command {
         timeout: String,
         #[arg(long)]
         json: bool,
+        /// Stream events until stop
+        #[arg(long)]
+        follow: bool,
     },
 
     /// Show logs for a run or slot
     Logs {
         run_id: String,
         slot: Option<String>,
+        /// Follow log growth
+        #[arg(short = 'f', long)]
+        follow: bool,
     },
 
     /// Attach to tmux session for a run (tmux backend)
     Attach { run_id: String },
 
-    /// Live TUI dashboard
+    /// Live TUI dashboard (same as bare `spar`)
     Dashboard,
 
     /// Provider inventory and quota controls
@@ -148,6 +171,19 @@ pub enum Command {
         json: bool,
     },
 
+    /// Arena finish: merge-good-parts + multi-review → ship gate
+    Reconcile {
+        run_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Swarm bus: send / list / presence / reserve
+    Bus {
+        #[command(subcommand)]
+        action: BusCmd,
+    },
+
     /// Remove worktrees and optional run data
     Cleanup {
         run_id: String,
@@ -158,9 +194,70 @@ pub enum Command {
         purge: bool,
     },
 
+    /// Built-in skills for outer agents (agent-browser style)
+    Skills {
+        #[command(subcommand)]
+        action: SkillsCmd,
+    },
+
     /// Internal: continue a detached run (not for humans)
     #[command(name = "__internal_continue", hide = true)]
     InternalContinue { run_id: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SkillsCmd {
+    /// List available skills
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a skill document
+    Get {
+        name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BusCmd {
+    /// Send a chat message
+    Send {
+        run_id: String,
+        #[arg(long, default_value = "human")]
+        from: String,
+        #[arg(long, default_value = "broadcast")]
+        to: String,
+        #[arg(long, short = 'm')]
+        message: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List bus events
+    Log {
+        run_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Presence snapshot
+    Presence {
+        run_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reserve a path
+    Reserve {
+        run_id: String,
+        path: String,
+        #[arg(long, default_value = "human")]
+        holder: String,
+    },
+    /// Release a path reserve
+    Release {
+        run_id: String,
+        path: String,
+        #[arg(long, default_value = "human")]
+        holder: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]

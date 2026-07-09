@@ -130,8 +130,36 @@ pub fn prepare_isolation(
         }
         IsolationMode::Worktree | IsolationMode::WorktreeDb | IsolationMode::WorktreeBwrap => {
             for sid in slot_ids {
+                // Idempotent: reuse existing worktree for same slot (one-run re-entry).
+                let existing_path = state
+                    .worktrees
+                    .iter()
+                    .find(|w| w.slot_id == *sid)
+                    .map(|w| w.path.clone());
+                if let Some(path) = existing_path {
+                    if path.is_dir() {
+                        if let Some(slot) = state.slot_mut(sid) {
+                            slot.cwd = Some(path);
+                        }
+                        continue;
+                    }
+                }
+                let expected = worktree_path(&state.project_root, &state.id, sid)?;
+                if expected.is_dir() {
+                    let rec = WorktreeRecord {
+                        slot_id: sid.clone(),
+                        path: expected.clone(),
+                        branch: branch_name(&state.id, sid),
+                    };
+                    if let Some(slot) = state.slot_mut(sid) {
+                        slot.cwd = Some(rec.path.clone());
+                    }
+                    if state.worktrees.iter().all(|w| w.slot_id != *sid) {
+                        state.worktrees.push(rec);
+                    }
+                    continue;
+                }
                 let rec = if state.dry_run {
-                    // still create real worktrees when git available; fall back to temp dir
                     match create_worktree(&state.project_root, &state.id, sid) {
                         Ok(r) => r,
                         Err(_) => {
@@ -159,7 +187,9 @@ pub fn prepare_isolation(
                 if let Some(slot) = state.slot_mut(sid) {
                     slot.cwd = Some(rec.path.clone());
                 }
-                state.worktrees.push(rec);
+                if state.worktrees.iter().all(|w| w.slot_id != *sid) {
+                    state.worktrees.push(rec);
+                }
             }
         }
     }

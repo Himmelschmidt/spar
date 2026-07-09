@@ -2,6 +2,7 @@ mod agy;
 mod claude;
 mod grok;
 
+use crate::provider_ref::{ExecBackend, ProviderRef};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -127,7 +128,34 @@ pub fn detect_all() -> Vec<ProviderReport> {
 }
 
 pub fn adapter_named(name: &str) -> Option<Box<dyn ProviderAdapter>> {
-    all_adapters().into_iter().find(|a| a.name() == name)
+    let pref = ProviderRef::parse(name);
+    let cli = pref.cli_name().unwrap_or(name);
+    all_adapters().into_iter().find(|a| a.name() == cli)
+}
+
+/// Whether a provider ref can be used for a live slot.
+pub fn is_provider_usable(raw: &str, allow_missing: bool) -> bool {
+    let pref = ProviderRef::parse(raw);
+    match pref.backend {
+        ExecBackend::NativeCli => {
+            if allow_missing {
+                return true;
+            }
+            adapter_named(&pref.name)
+                .map(|a| a.resolve_binary().is_some())
+                .unwrap_or(false)
+        }
+        ExecBackend::ApiSdk => {
+            if allow_missing {
+                return true;
+            }
+            // Live: accept named API providers; slot fails later if keys missing.
+            matches!(
+                pref.name.as_str(),
+                "openai" | "xai" | "anthropic" | "google" | "meta"
+            )
+        }
+    }
 }
 
 /// Providers that are on PATH, optionally filtered/ordered by `order`.
@@ -142,7 +170,7 @@ pub fn available_providers(order: &[String]) -> Vec<String> {
     } else {
         order
             .iter()
-            .filter(|n| detected.iter().any(|d| d.name == **n && d.available))
+            .filter(|n| is_provider_usable(n, false))
             .cloned()
             .collect()
     };
@@ -152,7 +180,7 @@ pub fn available_providers(order: &[String]) -> Vec<String> {
 /// Prefer multi-provider when possible; fall back to repeating available ones.
 ///
 /// When `allow_missing` is true (CLI `--dry-run` or `SPAR_DRY_RUN`), names
-/// need not be on PATH.
+/// need not be on PATH / have API keys.
 pub fn pick_providers(
     order: &[String],
     n: usize,
@@ -161,16 +189,34 @@ pub fn pick_providers(
 ) -> Vec<String> {
     let allow_missing = allow_missing || crate::util::env_truthy("SPAR_DRY_RUN");
     let base = if let Some(req) = requested {
-        let detected = detect_all();
         req.iter()
-            .filter(|n| detected.iter().any(|d| d.name == **n && d.available) || allow_missing)
-            .cloned()
+            .filter(|n| is_provider_usable(n, allow_missing))
+            .map(|n| {
+                // Normalize bare names; keep api:/cli: storage keys for API
+                let pref = ProviderRef::parse(n);
+                if pref.is_api() {
+                    pref.storage_key()
+                } else {
+                    // Prefer bare CLI name for adapters
+                    pref.name
+                }
+            })
             .collect::<Vec<_>>()
     } else if allow_missing {
         if order.is_empty() {
             vec!["claude".into(), "grok".into(), "agy".into()]
         } else {
-            order.to_vec()
+            order
+                .iter()
+                .map(|n| {
+                    let pref = ProviderRef::parse(n);
+                    if pref.is_api() {
+                        pref.storage_key()
+                    } else {
+                        pref.name
+                    }
+                })
+                .collect()
         }
     } else {
         available_providers(order)
@@ -204,4 +250,29 @@ pub fn command_to_parts(cmd: &Command) -> (PathBuf, Vec<String>) {
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
     (program, args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dry_run_keeps_api_and_cli_prefix() {
+        let picked = pick_providers(
+            &[],
+            2,
+            Some(&["api:openai".into(), "cli:grok".into()]),
+            true,
+        );
+        assert_eq!(picked.len(), 2);
+        assert!(picked[0].contains("openai") || picked[0].starts_with("api:"));
+        assert_eq!(picked[1], "grok");
+    }
+
+    #[test]
+    fn live_accepts_api_names() {
+        assert!(is_provider_usable("api:openai", false));
+        assert!(is_provider_usable("xai", false));
+        assert!(!is_provider_usable("api:notreal", false));
+    }
 }

@@ -1,11 +1,13 @@
+use crate::api;
 use crate::cli::Backend;
 use crate::config::Config;
 use crate::markers;
 use crate::paths::SparPaths;
 use crate::process::{self, SpawnRequest};
+use crate::provider_ref::ProviderRef;
 use crate::providers::{self, SpawnOpts, TrustPolicy};
 use crate::sandbox;
-use crate::state::{RunState, SlotRole, SlotState, SlotStatus};
+use crate::state::{RunState, SlotRole, SlotState, SlotStatus, SlotUsage};
 use crate::templates;
 use crate::tmux;
 use anyhow::{bail, Context, Result};
@@ -99,12 +101,24 @@ pub fn run_slot(
     std::fs::write(&prompt_path, &prompt)
         .with_context(|| format!("write {}", prompt_path.display()))?;
 
+    let pref = ProviderRef::parse(&job.provider);
     if let Some(s) = state.slot_mut(&job.slot_id) {
         s.status = SlotStatus::Running;
-        s.backend = Some(format!("{backend:?}").to_ascii_lowercase());
+        s.exec_backend = Some(pref.backend);
+        s.backend = Some(if pref.is_api() {
+            "api-sdk".into()
+        } else {
+            format!("{backend:?}").to_ascii_lowercase()
+        });
         s.log_path = Some(log_path.clone());
         s.artifact = job.expected_artifact.clone();
     }
+    let _ = crate::events::append(
+        paths,
+        &state.id,
+        &crate::events::Event::slot(&job.slot_id, SlotStatus::Running),
+    );
+    let _ = crate::bus::heartbeat(paths, &state.id, &job.slot_id, "running");
     state.save(paths)?;
 
     let timeout = Duration::from_secs(cfg.timeouts.slot_secs);
@@ -113,18 +127,44 @@ pub fn run_slot(
         return run_dry(state, paths, job, &cwd, &log_path, &prompt);
     }
 
-    let result = match backend {
-        Backend::Tmux => run_tmux(state, paths, job, &cwd, &log_path, &prompt_path, &prompt)?,
-        Backend::Headless | Backend::Auto => run_headless(
-            state,
-            paths,
-            job,
-            &cwd,
-            &log_path,
-            &prompt_path,
-            &prompt,
-            timeout,
-        )?,
+    let result = if pref.is_api() {
+        match run_api(state, paths, job, &pref, &cwd, &log_path, &prompt, timeout) {
+            Ok(r) => r,
+            Err(e) => {
+                mark_slot_failed(state, paths, &job.slot_id, &e.to_string())?;
+                return Err(e);
+            }
+        }
+    } else {
+        match backend {
+            Backend::Tmux => {
+                match run_tmux(state, paths, job, &cwd, &log_path, &prompt_path, &prompt) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        mark_slot_failed(state, paths, &job.slot_id, &e.to_string())?;
+                        return Err(e);
+                    }
+                }
+            }
+            Backend::Headless | Backend::Auto => {
+                match run_headless(
+                    state,
+                    paths,
+                    job,
+                    &cwd,
+                    &log_path,
+                    &prompt_path,
+                    &prompt,
+                    timeout,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        mark_slot_failed(state, paths, &job.slot_id, &e.to_string())?;
+                        return Err(e);
+                    }
+                }
+            }
+        }
     };
 
     if result.ok {
@@ -132,7 +172,18 @@ pub fn run_slot(
         if let Some(s) = state.slot_mut(&job.slot_id) {
             s.status = SlotStatus::Done;
             s.exit_code = Some(0);
+            if let Some(u) = &result.usage {
+                s.usage = Some(u.clone());
+            }
         }
+        if let Some(u) = result.usage {
+            state.usage.push(u);
+        }
+        let _ = crate::events::append(
+            paths,
+            &state.id,
+            &crate::events::Event::slot(&job.slot_id, SlotStatus::Done),
+        );
     } else {
         markers::write_failed(
             paths,
@@ -145,15 +196,29 @@ pub fn run_slot(
             s.error = result.error.clone();
             s.exit_code = result.exit_code;
         }
-        // quota scrape
-        if let Some(hint) =
-            crate::quota::QuotaStore::scrape_log_hint(&process::tail_log(&log_path, 8000))
-        {
+        let _ = crate::events::append(
+            paths,
+            &state.id,
+            &crate::events::Event::slot(&job.slot_id, SlotStatus::Failed),
+        );
+        let log_text = process::tail_log(&log_path, 8000);
+        if let Some(hint) = crate::quota::QuotaStore::scrape_log_hint(&log_text) {
             let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
             store.pause_quota(&job.provider, hint);
             let _ = store.save(paths);
         }
+        if let Some((name, until, hint)) = crate::quota::scrape_claude_rate_limits(&log_text) {
+            let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+            store.pause_quota_until(&name, until, hint);
+            let _ = store.save(paths);
+        }
     }
+    let _ = crate::bus::heartbeat(
+        paths,
+        &state.id,
+        &job.slot_id,
+        if result.ok { "done" } else { "failed" },
+    );
     state.save(paths)?;
     if !result.ok {
         bail!(
@@ -169,6 +234,46 @@ struct SlotOutcome {
     ok: bool,
     exit_code: Option<i32>,
     error: Option<String>,
+    usage: Option<SlotUsage>,
+}
+
+impl SlotOutcome {
+    fn ok() -> Self {
+        Self {
+            ok: true,
+            exit_code: Some(0),
+            error: None,
+            usage: None,
+        }
+    }
+    fn err(msg: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            exit_code: None,
+            error: Some(msg.into()),
+            usage: None,
+        }
+    }
+}
+
+fn mark_slot_failed(
+    state: &mut RunState,
+    paths: &SparPaths,
+    slot_id: &str,
+    err: &str,
+) -> Result<()> {
+    let _ = markers::write_failed(paths, &state.id, slot_id, err);
+    if let Some(s) = state.slot_mut(slot_id) {
+        s.status = SlotStatus::Failed;
+        s.error = Some(err.into());
+    }
+    let _ = crate::events::append(
+        paths,
+        &state.id,
+        &crate::events::Event::slot(slot_id, SlotStatus::Failed),
+    );
+    state.save(paths)?;
+    Ok(())
 }
 
 fn run_dry(
@@ -202,6 +307,11 @@ fn run_dry(
         s.exit_code = Some(0);
         s.backend = Some("dry-run".into());
     }
+    let _ = crate::events::append(
+        paths,
+        &state.id,
+        &crate::events::Event::slot(&job.slot_id, SlotStatus::Done),
+    );
     state.save(paths)?;
     Ok(())
 }
@@ -303,12 +413,75 @@ fn write_dry_artifacts(
                     job.slot_id
                 ),
             )?;
-            let msg =
-                crate::mailbox::Message::new(&job.slot_id, "*", "status", "dry-run peer ready");
-            crate::mailbox::send(paths, &state.id, &msg)?;
+            let _ = crate::bus::chat(
+                paths,
+                &state.id,
+                &job.slot_id,
+                "broadcast",
+                "dry-run peer ready",
+                state.message_budget,
+            );
+        }
+        SlotRole::Reconciler => {
+            std::fs::write(
+                paths.artifact(&state.id, "summary-reconcile.md"),
+                format!("# Reconcile (dry-run)\n\nMerged best parts for: {task}\n"),
+            )?;
+            std::fs::write(
+                paths.artifact(&state.id, &format!("summary-{}.md", job.slot_id)),
+                format!("# Reconcile ({})\n\n{task}\n", job.slot_id),
+            )?;
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_api(
+    state: &RunState,
+    paths: &SparPaths,
+    job: &SlotJob,
+    pref: &ProviderRef,
+    cwd: &Path,
+    log_path: &Path,
+    prompt: &str,
+    timeout: Duration,
+) -> Result<SlotOutcome> {
+    let expected = job
+        .expected_artifact
+        .as_ref()
+        .map(|n| paths.artifact(&state.id, n));
+    let (ok, err, usage) = api::run_api_slot(&api::runtime::ApiSlotRequest {
+        provider_name: &pref.name,
+        prompt,
+        cwd,
+        log_path,
+        expected_artifact: expected.as_deref(),
+        timeout,
+        dry_run: false,
+    })?;
+    let slot_usage = SlotUsage {
+        slot_id: job.slot_id.clone(),
+        provider: pref.storage_key(),
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        model: usage.model,
+    };
+    if ok {
+        Ok(SlotOutcome {
+            ok: true,
+            exit_code: Some(0),
+            error: None,
+            usage: Some(slot_usage),
+        })
+    } else {
+        Ok(SlotOutcome {
+            ok: false,
+            exit_code: Some(1),
+            error: err,
+            usage: Some(slot_usage),
+        })
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -322,7 +495,9 @@ fn run_headless(
     prompt: &str,
     timeout: Duration,
 ) -> Result<SlotOutcome> {
-    let adapter = providers::adapter_named(&job.provider)
+    let pref = ProviderRef::parse(&job.provider);
+    let cli_name = pref.cli_name().unwrap_or(job.provider.as_str());
+    let adapter = providers::adapter_named(cli_name)
         .ok_or_else(|| anyhow::anyhow!("unknown provider {}", job.provider))?;
     let bin = adapter
         .resolve_binary()
@@ -349,11 +524,7 @@ fn run_headless(
     };
     let res = process::run_captured(&req)?;
     if res.timed_out {
-        return Ok(SlotOutcome {
-            ok: false,
-            exit_code: None,
-            error: Some("timeout".into()),
-        });
+        return Ok(SlotOutcome::err("timeout"));
     }
     let code = res.exit_code;
     if code != Some(0) {
@@ -361,6 +532,7 @@ fn run_headless(
             ok: false,
             exit_code: code,
             error: Some(format!("exit {:?}", code)),
+            usage: None,
         });
     }
     if let Some(name) = &job.expected_artifact {
@@ -374,15 +546,12 @@ fn run_headless(
                     ok: false,
                     exit_code: Some(0),
                     error: Some(format!("missing expected artifact {name}")),
+                    usage: None,
                 });
             }
         }
     }
-    Ok(SlotOutcome {
-        ok: true,
-        exit_code: Some(0),
-        error: None,
-    })
+    Ok(SlotOutcome::ok())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -409,7 +578,9 @@ fn run_tmux(
         state.save(paths)?;
     }
 
-    let adapter = providers::adapter_named(&job.provider)
+    let pref = ProviderRef::parse(&job.provider);
+    let cli_name = pref.cli_name().unwrap_or(job.provider.as_str());
+    let adapter = providers::adapter_named(cli_name)
         .ok_or_else(|| anyhow::anyhow!("unknown provider {}", job.provider))?;
     let bin = adapter
         .resolve_binary()
@@ -434,56 +605,61 @@ fn run_tmux(
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
         if markers::marker_exists(paths, &state.id, &done) {
-            return Ok(SlotOutcome {
-                ok: true,
-                exit_code: Some(0),
-                error: None,
-            });
+            return Ok(SlotOutcome::ok());
         }
         if markers::marker_exists(paths, &state.id, &failed) {
             return Ok(SlotOutcome {
                 ok: false,
                 exit_code: Some(1),
                 error: Some("marker failed".into()),
+                usage: None,
             });
         }
         std::thread::sleep(Duration::from_millis(200));
     }
     // Never success-on-timeout-alone (plan completion contract).
-    Ok(SlotOutcome {
-        ok: false,
-        exit_code: None,
-        error: Some("tmux marker wait timed out".into()),
-    })
+    Ok(SlotOutcome::err("tmux marker wait timed out"))
 }
 
 pub fn init_slot(id: impl Into<String>, provider: impl Into<String>, role: SlotRole) -> SlotState {
+    let provider = provider.into();
+    let pref = ProviderRef::parse(&provider);
     SlotState {
         id: id.into(),
-        provider: provider.into(),
+        provider,
         role,
         status: SlotStatus::Pending,
         backend: None,
+        exec_backend: Some(pref.backend),
         cwd: None,
         log_path: None,
         error: None,
         pid: None,
         exit_code: None,
         artifact: None,
+        usage: None,
     }
 }
 
 pub fn emit_run_json(state: &RunState) -> Result<()> {
     let v = serde_json::json!({
+        // Both keys for outer agents (status uses `id`; emit historically used `run_id`).
         "run_id": state.id,
+        "id": state.id,
         "workflow": state.workflow,
         "phase": state.phase,
         "task": state.task,
         "dry_run": state.dry_run,
         "slots": state.slots,
+        "providers": state.providers,
+        "gates": state.gates,
+        "error": state.error,
         "project_root": state.project_root,
         "parent_run": state.parent_run,
         "child_run": state.child_run,
+        "usage": state.usage,
+        "big": state.big,
+        "autonomy": state.autonomy,
         // null while in-flight; only set at terminal/gate phases
         "exit_code": state.status_exit_code(),
     });
@@ -508,11 +684,27 @@ pub fn wait_run(
     run_id: &str,
     timeout: Duration,
     json: bool,
+    follow: bool,
 ) -> Result<crate::exit_codes::ExitCode> {
     let start = std::time::Instant::now();
     let poll = Duration::from_millis(250);
+    let mut event_off = 0u64;
+    let mut last_phase = None;
     loop {
         let state = RunState::load(paths, run_id)?;
+        if follow && !json {
+            let (off, evs) = crate::events::read_from_offset(paths, run_id, event_off)?;
+            event_off = off;
+            for ev in evs {
+                println!("{}", ev.display_line());
+            }
+            if last_phase != Some(state.phase) {
+                if last_phase.is_some() {
+                    eprintln!("phase: {:?}", state.phase);
+                }
+                last_phase = Some(state.phase);
+            }
+        }
         if state.phase.is_waitable_stop() {
             if json {
                 println!("{}", serde_json::to_string_pretty(&state)?);

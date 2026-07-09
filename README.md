@@ -6,13 +6,14 @@ Not a plugin for Pi or any other harness. Outer agents drive it headlessly (`--j
 
 ## Status
 
-**On `main`:** orchestrator skeleton (dry-run workflows, worktrees, ship helpers, provider detect). Product direction: **TUI-first**, swarm bus, dual-backend — see docs.
+**Product v1 (M0–M5):** fleet TUI, swarm bus, one-run plan→implement→ship, arena reconcile, dual backend (`cli:*` + `api:*`), autonomy gates, skills discovery. Dry-run suites green; live CLI/API depend on installed providers / API keys.
 
 - [docs/PRODUCT.md](docs/PRODUCT.md) — product vision  
 - [docs/architecture-dual-backend.md](docs/architecture-dual-backend.md) — CLI + API backends  
 - [docs/architecture-a2a.md](docs/architecture-a2a.md) — swarm bus  
 - [roadmap/ROADMAP.md](roadmap/ROADMAP.md) — milestones  
-- [DECISIONS.md](DECISIONS.md) — locked decisions
+- [DECISIONS.md](DECISIONS.md) — locked decisions  
+- [AGENTS.md](AGENTS.md) / `spar skills get core` — outer agents
 
 ## Install
 
@@ -25,9 +26,11 @@ cargo build --release
 ## Quick start
 
 ```bash
+spar                         # product TUI in current git repo
 spar doctor
 spar doctor --json
 spar provider list
+spar skills get core         # outer-agent skill
 spar status
 ```
 
@@ -36,11 +39,11 @@ spar status
 ```bash
 # Path A
 spar plan --task "add retry to the payment client" --dry-run --json
-# exit 2 = awaiting approval; note plan run_id
-spar approve <plan-run-id>
-spar implement --run <plan-run-id> --dry-run --json
-# implement returns a *new* run_id — wait/status that one (or read plan.child_run)
-spar status <impl-run-id> --json
+# exit 2 = awaiting approval; note run_id
+spar approve <run-id>
+spar implement --run <run-id> --dry-run --json
+# same run_id through plan → implement → ship
+spar status <run-id> --json
 
 # Path B
 spar implement --task "fix the flaky test" --dry-run --json

@@ -107,6 +107,28 @@ impl QuotaStore {
         );
     }
 
+    pub fn pause_quota_until(
+        &mut self,
+        name: &str,
+        until: Option<DateTime<Utc>>,
+        hint: impl Into<String>,
+    ) {
+        self.providers.insert(
+            name.into(),
+            ProviderQuota {
+                name: name.into(),
+                status: if until.is_some() {
+                    ProviderStatus::Cooldown
+                } else {
+                    ProviderStatus::PausedQuota
+                },
+                cooldown_until: until,
+                hint: Some(hint.into()),
+                updated_at: Some(Utc::now()),
+            },
+        );
+    }
+
     pub fn resume(&mut self, name: &str) {
         self.providers.insert(
             name.into(),
@@ -132,6 +154,8 @@ impl QuotaStore {
             "out of credits",
             "billing",
             "capacity",
+            "five_hour",
+            "rate_limits",
         ];
         for n in needles {
             if lower.contains(n) {
@@ -140,6 +164,62 @@ impl QuotaStore {
         }
         None
     }
+}
+
+/// Parse Claude-style `rate_limits.five_hour` JSON fragments from logs/statusline.
+/// Returns (provider_name, cooldown_until, hint).
+pub fn scrape_claude_rate_limits(log: &str) -> Option<(String, Option<DateTime<Utc>>, String)> {
+    // Look for embedded JSON objects containing rate_limits
+    for line in log.lines() {
+        let t = line.trim();
+        if !(t.contains("rate_limits") || t.contains("five_hour")) {
+            continue;
+        }
+        // try whole line as JSON
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
+            if let Some(hit) = parse_rate_limits_value(&v) {
+                return Some(hit);
+            }
+        }
+        // scan for JSON object substrings
+        if let Some(start) = t.find('{') {
+            if let Some(end) = t.rfind('}') {
+                if end > start {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t[start..=end]) {
+                        if let Some(hit) = parse_rate_limits_value(&v) {
+                            return Some(hit);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_rate_limits_value(v: &serde_json::Value) -> Option<(String, Option<DateTime<Utc>>, String)> {
+    let rl = v.get("rate_limits").or_else(|| {
+        v.get("status")
+            .and_then(|s| s.get("rate_limits"))
+    })?;
+    let five = rl.get("five_hour")?;
+    let used = five
+        .get("used_percentage")
+        .and_then(|x| x.as_f64())
+        .or_else(|| five.get("used_percent").and_then(|x| x.as_f64()))?;
+    if used < 95.0 {
+        return None;
+    }
+    let until = five
+        .get("resets_at")
+        .and_then(|x| x.as_str())
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&Utc));
+    Some((
+        "claude".into(),
+        until,
+        format!("claude five_hour used_percentage={used}"),
+    ))
 }
 
 pub fn filter_usable(names: &[String], store: &QuotaStore) -> Vec<String> {

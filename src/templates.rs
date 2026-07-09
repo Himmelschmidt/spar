@@ -8,6 +8,7 @@ const RANKER: &str = include_str!("../templates/ranker.md");
 const PEER_HALF: &str = include_str!("../templates/peer_half.md");
 const ROLE_FRONTEND: &str = include_str!("../templates/role_frontend.md");
 const ROLE_BACKEND: &str = include_str!("../templates/role_backend.md");
+const RECONCILER: &str = include_str!("../templates/reconciler.md");
 
 pub fn get(name: &str) -> Option<&'static str> {
     match name {
@@ -19,6 +20,7 @@ pub fn get(name: &str) -> Option<&'static str> {
         "peer_half" | "peer_half.md" => Some(PEER_HALF),
         "role_frontend" | "role_frontend.md" => Some(ROLE_FRONTEND),
         "role_backend" | "role_backend.md" => Some(ROLE_BACKEND),
+        "reconciler" | "reconciler.md" => Some(RECONCILER),
         _ => None,
     }
 }
