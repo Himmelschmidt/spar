@@ -17,7 +17,7 @@ Implement the task in your isolated worktree. Do not modify the primary checkout
 
 ## Required
 1. Implement the change in `{{cwd}}` only.
-2. Run relevant tests/builds if available.
+2. Smoke-check only: compile, typecheck, or 1–2 targeted tests for **your** change. Do **not** run the full multi-minute/hour suite — a dedicated cheap `tester` slot runs that after you finish.
 3. Write a summary to `{{artifacts_dir}}/summary-{{slot_id}}.md`
 4. Write done marker `{{markers_dir}}/{{slot_id}}.done` or `.failed`
 

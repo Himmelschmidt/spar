@@ -10,7 +10,11 @@ You did NOT write this code. Find real bugs, missing tests, and regressions.
 - Write review to: {{artifacts_dir}}/review-{{slot_id}}.md
 - Markers: {{markers_dir}}/{{slot_id}}.done or .failed
 
+{{suite_guidance}}
+
 ## Review format
+Write the artifact early and iteratively — partial findings are better than nothing if you run out of time.
+
 ```
 ## Verdict
 approve | request_changes
@@ -19,7 +23,7 @@ approve | request_changes
 - severity: critical|major|minor — description
 
 ## Tests
-what was / should be run
+what was checked; be explicit about suite evidence vs targeted checks
 ```
 
 Be strict. Prefer false positives over silent bugs. No praise padding.

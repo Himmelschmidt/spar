@@ -22,4 +22,11 @@ auto_confirm = false
 
 [timeouts]
 slot_secs = 1800
+# review_secs = 1800   # optional; defaults to slot_secs (diff-focused, no full suites)
 wait = "2h"
+
+# Full test suite channel (cheap/dumb model). Implementers/reviewers must not run multi-hour suites.
+[suite]
+enabled = true
+# provider = "cli:claude"   # optional; else first usable of claude/grok/agy/api:xai/openai
+timeout_secs = 7200

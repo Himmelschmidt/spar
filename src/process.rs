@@ -108,6 +108,12 @@ pub fn run_captured(req: &SpawnRequest) -> Result<SpawnResult> {
         cmd.env(k, v);
     }
     cmd.env("PYTHONUNBUFFERED", "1");
+    // Own process group so timeout can kill nested suites (cargo test, etc.).
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     let mut child = cmd
         .spawn()
@@ -139,8 +145,7 @@ pub fn run_captured(req: &SpawnRequest) -> Result<SpawnResult> {
             Some(status) => break status,
             None => {
                 if start.elapsed() >= req.timeout {
-                    let _ = child.kill();
-                    let status = child.wait()?;
+                    let status = kill_process_group(&mut child)?;
                     let _ = t_out.join();
                     let _ = t_err.join();
                     append_log(&req.log_path, "\n! timed out\n")?;
@@ -170,6 +175,53 @@ pub fn run_captured(req: &SpawnRequest) -> Result<SpawnResult> {
         stdout_tail: tail_log(&req.log_path, 4000),
         stats,
     })
+}
+
+/// SIGTERM the process group, brief grace, then always SIGKILL the group
+/// (even if the leader already reaped — grandchildren may still be alive).
+/// Returns the reaped exit status; sole owner of `wait`.
+fn kill_process_group(
+    child: &mut std::process::Child,
+) -> Result<std::process::ExitStatus> {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as i32;
+        // Negative pid = process group (child is group leader via process_group(0)).
+        signal_process_group(pid, SIGTERM);
+        let grace = Instant::now();
+        while grace.elapsed() < Duration::from_secs(2) {
+            if let Ok(Some(st)) = child.try_wait() {
+                // Leader gone; still SIGKILL group for nested suite orphans.
+                signal_process_group(pid, SIGKILL);
+                return Ok(st);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        signal_process_group(pid, SIGKILL);
+        let _ = child.kill();
+        return child.wait().context("wait after process-group kill");
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+        child.wait().context("wait after kill")
+    }
+}
+
+#[cfg(unix)]
+const SIGTERM: i32 = 15;
+#[cfg(unix)]
+const SIGKILL: i32 = 9;
+
+#[cfg(unix)]
+fn signal_process_group(pid: i32, sig: i32) {
+    // libc kill(-pgid) — no dependency on `kill` binary / PATH.
+    unsafe {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        let _ = kill(-pid, sig);
+    }
 }
 
 fn stream_to_log(
@@ -731,6 +783,23 @@ mod tests {
         };
         run_mock(&req, "hello").unwrap();
         assert!(std::fs::read_to_string(log).unwrap().contains("hello"));
+    }
+
+    #[test]
+    fn timeout_sets_timed_out_and_kills_group() {
+        let tmp = tempdir().unwrap();
+        let log = tmp.path().join("to.log");
+        // Leader sleeps; grandchild would be in same process group.
+        let req = SpawnRequest {
+            program: PathBuf::from("sh"),
+            args: vec!["-c".into(), "sleep 30".into()],
+            cwd: tmp.path().to_path_buf(),
+            log_path: log,
+            env: vec![],
+            timeout: Duration::from_millis(200),
+        };
+        let res = run_captured(&req).expect("timeout path must not error");
+        assert!(res.timed_out, "expected timed_out");
     }
 
     #[test]

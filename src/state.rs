@@ -123,6 +123,8 @@ pub enum Phase {
     PlanApproved,
     PlanRejected,
     Review,
+    /// Full test suite channel (cheap model).
+    Suite,
     Rank,
     Fix,
     PeerRelay,
@@ -200,6 +202,8 @@ pub enum SlotRole {
     Planner,
     PlanCritic,
     Implementer,
+    /// Cheap suite runner — full test suites only; not review/impl judgment.
+    Tester,
     Reviewer,
     Ranker,
     Peer,

@@ -19,6 +19,8 @@ pub struct Config {
     #[serde(default)]
     pub timeouts: TimeoutConfig,
     #[serde(default)]
+    pub suite: SuiteConfig,
+    #[serde(default)]
     pub gates: GatesConfig,
     #[serde(default)]
     pub autonomy: AutonomyLevel,
@@ -96,6 +98,9 @@ pub struct ShipConfig {
 pub struct TimeoutConfig {
     #[serde(default = "default_slot_timeout_secs")]
     pub slot_secs: u64,
+    /// Reviewer wall clock (diff-focused). Defaults to `slot_secs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_secs: Option<u64>,
     #[serde(default = "default_wait_timeout")]
     pub wait: String,
 }
@@ -104,9 +109,42 @@ impl Default for TimeoutConfig {
     fn default() -> Self {
         Self {
             slot_secs: default_slot_timeout_secs(),
+            review_secs: None,
             wait: default_wait_timeout(),
         }
     }
+}
+
+impl TimeoutConfig {
+    pub fn review_secs(&self) -> u64 {
+        self.review_secs.unwrap_or(self.slot_secs)
+    }
+}
+
+/// Dedicated full-suite channel (cheap/dumb model). Separate from smart review/impl.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuiteConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Prefer a cheap provider (`cli:claude`, `cli:grok`, `api:xai`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default = "default_suite_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl Default for SuiteConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            provider: None,
+            timeout_secs: default_suite_timeout_secs(),
+        }
+    }
+}
+
+fn default_suite_timeout_secs() -> u64 {
+    7200
 }
 
 fn default_max_agents() -> u32 {
@@ -140,6 +178,7 @@ impl Default for Config {
             },
             ship: ShipConfig::default(),
             timeouts: TimeoutConfig::default(),
+            suite: SuiteConfig::default(),
             gates: GatesConfig::default(),
             autonomy: AutonomyLevel::default(),
             message_budget: MessageBudget::default(),
@@ -177,6 +216,7 @@ struct ConfigFile {
     providers: Option<ProviderConfigFile>,
     ship: Option<ShipConfigFile>,
     timeouts: Option<TimeoutConfigFile>,
+    suite: Option<SuiteConfigFile>,
     gates: Option<GatesConfigFile>,
     autonomy: Option<AutonomyLevel>,
     message_budget: Option<MessageBudget>,
@@ -196,7 +236,15 @@ struct ShipConfigFile {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct TimeoutConfigFile {
     slot_secs: Option<u64>,
+    review_secs: Option<u64>,
     wait: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct SuiteConfigFile {
+    enabled: Option<bool>,
+    provider: Option<String>,
+    timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -245,8 +293,22 @@ impl Config {
             if let Some(v) = t.slot_secs {
                 self.timeouts.slot_secs = v;
             }
+            if let Some(v) = t.review_secs {
+                self.timeouts.review_secs = Some(v);
+            }
             if let Some(v) = &t.wait {
                 self.timeouts.wait = v.clone();
+            }
+        }
+        if let Some(s) = &file.suite {
+            if let Some(v) = s.enabled {
+                self.suite.enabled = v;
+            }
+            if let Some(v) = &s.provider {
+                self.suite.provider = Some(v.clone());
+            }
+            if let Some(v) = s.timeout_secs {
+                self.suite.timeout_secs = v;
             }
         }
         if let Some(g) = &file.gates {
@@ -307,5 +369,33 @@ mod tests {
         assert_eq!(cfg.autonomy, AutonomyLevel::High);
         assert!(cfg.auto_plan());
         assert!(cfg.auto_winner());
+        assert!(cfg.suite.enabled);
+        assert_eq!(cfg.suite.timeout_secs, 7200);
+    }
+
+    #[test]
+    fn suite_and_review_timeout_overlay() {
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+        std::fs::write(
+            project.join("spar.toml"),
+            r#"
+[timeouts]
+slot_secs = 100
+review_secs = 200
+
+[suite]
+enabled = false
+provider = "cli:grok"
+timeout_secs = 3600
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(project).unwrap();
+        assert_eq!(cfg.timeouts.slot_secs, 100);
+        assert_eq!(cfg.timeouts.review_secs(), 200);
+        assert!(!cfg.suite.enabled);
+        assert_eq!(cfg.suite.provider.as_deref(), Some("cli:grok"));
+        assert_eq!(cfg.suite.timeout_secs, 3600);
     }
 }

@@ -110,6 +110,15 @@ auto_cleanup = false
 plan = true
 winner = true
 ship = true
+[timeouts]
+slot_secs = 1800
+# review_secs = 1800   # optional; defaults to slot_secs
+wait = "2h"
+# Full suite channel (cheap/dumb model). Implementers/reviewers: smoke/diff only.
+[suite]
+enabled = true
+# provider = "cli:claude"   # else first usable of claude/grok/agy/api:xai/openai
+timeout_secs = 7200
 ```
 
 ## Rules of the road
@@ -118,3 +127,4 @@ ship = true
 - Coding slots always use git worktrees; never check out feature branches on the primary tree.
 - Ship is draft PR only — never merge.
 - State lives under `.spar/` in the project root.
+- **Suite channel (implement/loop):** a dedicated `tester` slot runs full test suites; impl/review stay smoke/diff-only when it runs. Artifact: `artifacts/suite.md`. Independent `review` workflow does not spawn a tester by default.
