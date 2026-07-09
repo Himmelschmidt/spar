@@ -151,7 +151,8 @@ struct App {
     stream_scroll: u16,
     bus_scroll: u16,
     tick: u64,
-    flash: Option<(Instant, String, Color)>,
+    /// (started, message, color, how long to show)
+    flash: Option<(Instant, String, Color, Duration)>,
     stall_warn_secs: u64,
     /// When false (default), long log lines truncate with …; `w` toggles wrap.
     log_expand: bool,
@@ -203,7 +204,11 @@ impl App {
     }
 
     fn flash(&mut self, msg: impl Into<String>, color: Color) {
-        self.flash = Some((Instant::now(), msg.into(), color));
+        self.flash_for(msg, color, Duration::from_secs(3));
+    }
+
+    fn flash_for(&mut self, msg: impl Into<String>, color: Color, for_ms: Duration) {
+        self.flash = Some((Instant::now(), msg.into(), color, for_ms));
         self.status_line.clear();
         self.show_help = false;
     }
@@ -349,8 +354,8 @@ fn run_loop(
         };
         let activity = activity_feed(&swarm, full.as_ref(), &quota);
 
-        if let Some((t, _, _)) = &app.flash {
-            if t.elapsed() > Duration::from_secs(4) {
+        if let Some((t, _, _, dur)) = &app.flash {
+            if t.elapsed() > *dur {
                 app.flash = None;
             }
         }
@@ -460,15 +465,16 @@ fn handle_key(
     let selected_id = runs.get(app.selected_run).map(|r| r.id.as_str());
     let n_slots = full.map(|s| s.slots.len()).unwrap_or(0);
 
-    // Ctrl+C twice (within 2s) is the only quit path — never Esc or q.
+    // Ctrl+C twice (within 1s) is the only quit path — never Esc or q.
     if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
         if let Some(t) = app.last_ctrl_c {
-            if t.elapsed() < Duration::from_secs(2) {
+            if t.elapsed() < Duration::from_millis(1000) {
                 return Ok(true);
             }
         }
         app.last_ctrl_c = Some(Instant::now());
-        app.flash("Ctrl+C again to exit", YELLOW);
+        // Match the 1s double-press window so the hint doesn't linger.
+        app.flash_for("Ctrl+C again to exit", YELLOW, Duration::from_millis(900));
         return Ok(false);
     }
     // Any other key clears the first Ctrl+C arm.
@@ -1820,7 +1826,7 @@ fn draw_composer(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App, full: Option<&RunState>) {
-    let (msg, color) = if let Some((_, m, c)) = &app.flash {
+    let (msg, color) = if let Some((_, m, c, _)) = &app.flash {
         (m.as_str(), *c)
     } else if !app.status_line.is_empty() {
         (app.status_line.as_str(), YELLOW)
