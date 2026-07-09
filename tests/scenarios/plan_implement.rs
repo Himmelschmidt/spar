@@ -205,6 +205,66 @@ fn arena_reconcile_dry_run() {
 }
 
 #[test]
+fn dual_backend_dry_run_providers() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let out = cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args([
+            "plan",
+            "--task",
+            "dual backend",
+            "--providers",
+            "api:openai,cli:grok",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2);
+    let stdout = String::from_utf8_lossy(out.get_output().stdout.as_slice());
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(v.get("run_id").is_some());
+    assert_eq!(v.get("id"), v.get("run_id"));
+    let slots = v["slots"].as_array().unwrap();
+    assert!(!slots.is_empty(), "expected planner slots for api/cli providers");
+    let providers = v["providers"].as_array().unwrap();
+    let joined = providers
+        .iter()
+        .filter_map(|p| p.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    assert!(
+        joined.contains("openai") || joined.contains("grok"),
+        "providers={joined}"
+    );
+}
+
+#[test]
+fn empty_fake_providers_fail_closed() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    // Live (no dry-run): unknown names must not become a fake plan gate.
+    let r = cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args([
+            "plan",
+            "--task",
+            "x",
+            "--providers",
+            "notreal1,notreal2",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let code = r.status.code().unwrap_or(1);
+    assert_ne!(code, 2, "must not return human gate with zero providers");
+    assert!(
+        code == 1 || code == 4,
+        "expected failure/quota, got {code}"
+    );
+}
+
+#[test]
 fn skills_and_bus_commands() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());

@@ -139,8 +139,13 @@ pub fn chat_completion(cfg: &ApiProviderConfig, messages: &[ChatMessage]) -> Res
 
 fn truncate(s: &str, n: usize) -> String {
     if s.len() <= n {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..n])
+        return s.to_string();
     }
+    let end = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|&i| i < n)
+        .last()
+        .unwrap_or(0);
+    format!("{}…", &s[..end])
 }

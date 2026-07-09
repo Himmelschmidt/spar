@@ -58,6 +58,19 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
         }
     }
 
+    if state.providers.is_empty() {
+        state.error = Some("no usable providers".into());
+        state.set_phase(Phase::Failed);
+        paths.ensure_run_dirs(&state.id)?;
+        state.save(paths)?;
+        if opts.json {
+            executor::emit_run_json(&state)?;
+        } else {
+            eprintln!("error: no usable providers");
+        }
+        return Ok(ExitCode::Failure);
+    }
+
     paths.ensure_run_dirs(&state.id)?;
     let _ = crate::bus::ensure_bus(paths, &state.id);
     let _ = crate::bus::join(paths, &state.id, "orchestrator", None, None);

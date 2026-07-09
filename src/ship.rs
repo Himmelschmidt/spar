@@ -8,17 +8,23 @@ use std::process::Command;
 
 pub fn confirm_ship(paths: &SparPaths, run_id: &str, json: bool) -> Result<ExitCode> {
     let mut state = RunState::load(paths, run_id)?;
-    state.gates.ship_confirmed = true;
-    if state.phase == Phase::AwaitingShipConfirm || state.phase == Phase::AwaitingWinnerConfirm {
-        // allow confirm from winner gate only if winner already set
-        if state.phase == Phase::AwaitingWinnerConfirm {
-            if state.winner_slot.is_none() {
-                bail!("confirm a winner first");
-            }
-            state.gates.winner_confirmed = state.winner_slot.clone();
-        }
-        state.set_phase(Phase::AwaitingShipConfirm);
+    if !matches!(
+        state.phase,
+        Phase::AwaitingShipConfirm | Phase::AwaitingWinnerConfirm
+    ) {
+        bail!(
+            "run {run_id} not ready for ship confirm (phase={:?})",
+            state.phase
+        );
     }
+    if state.phase == Phase::AwaitingWinnerConfirm {
+        if state.winner_slot.is_none() {
+            bail!("confirm a winner first");
+        }
+        state.gates.winner_confirmed = state.winner_slot.clone();
+    }
+    state.gates.ship_confirmed = true;
+    state.set_phase(Phase::AwaitingShipConfirm);
     state.save(paths)?;
     if json {
         executor::emit_run_json(&state)?;
@@ -30,11 +36,18 @@ pub fn confirm_ship(paths: &SparPaths, run_id: &str, json: bool) -> Result<ExitC
 
 pub fn ship(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> Result<ExitCode> {
     let mut state = RunState::load(paths, run_id)?;
-    if !state.gates.ship_confirmed && !cfg.ship.auto_confirm {
-        if state.phase == Phase::AwaitingShipConfirm || state.phase == Phase::AwaitingWinnerConfirm
-        {
-            // set gate and refuse to ship
-            state.set_phase(Phase::AwaitingShipConfirm);
+    if !matches!(
+        state.phase,
+        Phase::AwaitingShipConfirm | Phase::Shipping | Phase::Done
+    ) && !state.gates.ship_confirmed
+    {
+        bail!(
+            "run {run_id} is not ready to ship (phase={:?})",
+            state.phase
+        );
+    }
+    if !state.gates.ship_confirmed && !cfg.ship.auto_confirm && !cfg.auto_ship() {
+        if state.phase == Phase::AwaitingShipConfirm {
             state.save(paths)?;
             if json {
                 executor::emit_run_json(&state)?;
@@ -47,6 +60,9 @@ pub fn ship(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> Result
             "run {run_id} is not ready to ship (phase={:?}); approve/confirm first",
             state.phase
         );
+    }
+    if cfg.auto_ship() || cfg.ship.auto_confirm {
+        state.gates.ship_confirmed = true;
     }
 
     // Determine branch/worktree to push

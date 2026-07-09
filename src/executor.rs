@@ -128,20 +128,42 @@ pub fn run_slot(
     }
 
     let result = if pref.is_api() {
-        run_api(state, paths, job, &pref, &cwd, &log_path, &prompt, timeout)?
+        match run_api(state, paths, job, &pref, &cwd, &log_path, &prompt, timeout) {
+            Ok(r) => r,
+            Err(e) => {
+                mark_slot_failed(state, paths, &job.slot_id, &e.to_string())?;
+                return Err(e);
+            }
+        }
     } else {
         match backend {
-            Backend::Tmux => run_tmux(state, paths, job, &cwd, &log_path, &prompt_path, &prompt)?,
-            Backend::Headless | Backend::Auto => run_headless(
-                state,
-                paths,
-                job,
-                &cwd,
-                &log_path,
-                &prompt_path,
-                &prompt,
-                timeout,
-            )?,
+            Backend::Tmux => {
+                match run_tmux(state, paths, job, &cwd, &log_path, &prompt_path, &prompt) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        mark_slot_failed(state, paths, &job.slot_id, &e.to_string())?;
+                        return Err(e);
+                    }
+                }
+            }
+            Backend::Headless | Backend::Auto => {
+                match run_headless(
+                    state,
+                    paths,
+                    job,
+                    &cwd,
+                    &log_path,
+                    &prompt_path,
+                    &prompt,
+                    timeout,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        mark_slot_failed(state, paths, &job.slot_id, &e.to_string())?;
+                        return Err(e);
+                    }
+                }
+            }
         }
     };
 
@@ -232,6 +254,26 @@ impl SlotOutcome {
             usage: None,
         }
     }
+}
+
+fn mark_slot_failed(
+    state: &mut RunState,
+    paths: &SparPaths,
+    slot_id: &str,
+    err: &str,
+) -> Result<()> {
+    let _ = markers::write_failed(paths, &state.id, slot_id, err);
+    if let Some(s) = state.slot_mut(slot_id) {
+        s.status = SlotStatus::Failed;
+        s.error = Some(err.into());
+    }
+    let _ = crate::events::append(
+        paths,
+        &state.id,
+        &crate::events::Event::slot(slot_id, SlotStatus::Failed),
+    );
+    state.save(paths)?;
+    Ok(())
 }
 
 fn run_dry(
@@ -601,12 +643,17 @@ pub fn init_slot(id: impl Into<String>, provider: impl Into<String>, role: SlotR
 
 pub fn emit_run_json(state: &RunState) -> Result<()> {
     let v = serde_json::json!({
+        // Both keys for outer agents (status uses `id`; emit historically used `run_id`).
         "run_id": state.id,
+        "id": state.id,
         "workflow": state.workflow,
         "phase": state.phase,
         "task": state.task,
         "dry_run": state.dry_run,
         "slots": state.slots,
+        "providers": state.providers,
+        "gates": state.gates,
+        "error": state.error,
         "project_root": state.project_root,
         "parent_run": state.parent_run,
         "child_run": state.child_run,

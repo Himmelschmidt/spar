@@ -38,6 +38,18 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     if dry && state.providers.len() < 2 {
         state.providers = vec!["claude".into(), "grok".into()];
     }
+    if state.providers.is_empty() {
+        state.error = Some("no usable providers".into());
+        state.set_phase(Phase::Failed);
+        paths.ensure_run_dirs(&state.id)?;
+        state.save(paths)?;
+        if opts.json {
+            executor::emit_run_json(&state)?;
+        } else {
+            eprintln!("error: no usable providers");
+        }
+        return Ok(ExitCode::Failure);
+    }
     while state.providers.len() < 2 {
         state.providers.push(state.providers[0].clone());
     }

@@ -387,7 +387,30 @@ pub fn reconcile(
             extra_vars: extra,
             expected_artifact: Some(format!("review-reconcile-{i}.md")),
         };
-        let _ = executor::run_slot(&mut state, paths, cfg, &job);
+        if let Err(e) = executor::run_slot(&mut state, paths, cfg, &job) {
+            state.set_phase(Phase::Failed);
+            state.error = Some(format!("reconcile review failed: {e:#}"));
+            state.save(paths)?;
+            return Ok(ExitCode::Failure);
+        }
+        let review_path = paths.artifact(&state.id, &format!("review-reconcile-{i}.md"));
+        let text = std::fs::read_to_string(&review_path).unwrap_or_default();
+        if text.trim().is_empty()
+            || text
+                .lines()
+                .any(|l| l.trim().eq_ignore_ascii_case("request_changes"))
+            || text.to_ascii_lowercase().contains("## verdict\nrequest_changes")
+        {
+            // fail-closed only on explicit verdict line when present
+            if text.to_ascii_lowercase().contains("request_changes")
+                && text.to_ascii_lowercase().contains("verdict")
+            {
+                state.set_phase(Phase::Failed);
+                state.error = Some("reconcile review requested changes".into());
+                state.save(paths)?;
+                return Ok(ExitCode::Failure);
+            }
+        }
     }
 
     state.winner_slot = Some(recon_id.clone());

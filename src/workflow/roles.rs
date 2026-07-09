@@ -6,6 +6,7 @@ use crate::exit_codes::ExitCode;
 use crate::paths::SparPaths;
 use crate::providers;
 use crate::state::{Phase, RunState, SlotRole};
+// ExitCode used for empty-provider fail path
 use crate::templates;
 use crate::util;
 use crate::worktree;
@@ -36,6 +37,18 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         providers::pick_providers(&cfg.providers.order, 2, opts.providers.as_deref(), dry);
     if dry && state.providers.len() < 2 {
         state.providers = vec!["claude".into(), "grok".into()];
+    }
+    if state.providers.is_empty() {
+        state.error = Some("no usable providers".into());
+        state.set_phase(Phase::Failed);
+        paths.ensure_run_dirs(&state.id)?;
+        state.save(paths)?;
+        if opts.json {
+            executor::emit_run_json(&state)?;
+        } else {
+            eprintln!("error: no usable providers");
+        }
+        return Ok(ExitCode::Failure);
     }
     while state.providers.len() < 2 {
         state.providers.push(state.providers[0].clone());

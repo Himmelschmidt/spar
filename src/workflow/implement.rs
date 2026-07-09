@@ -54,8 +54,6 @@ fn run_from_approved(
             state.phase
         );
     }
-    // One run id: continue the same state into implement/review/ship.
-    prepare_implement_slots(&mut state, opts.providers.as_deref(), opts.resolve_dry_run(), cfg)?;
     state.backend = opts.backend;
     state.isolation = cfg.isolation;
     state.dry_run = opts.resolve_dry_run();
@@ -64,8 +62,16 @@ fn run_from_approved(
     if state.dry_run {
         std::env::set_var("SPAR_DRY_RUN", "1");
     }
+    // Quota filter before slot assignment so paused providers never get slots.
     if !state.dry_run {
-        match crate::quota::apply_quota_filter(paths, &state.providers) {
+        let candidate = if let Some(req) = opts.providers.as_deref() {
+            req.to_vec()
+        } else if !state.providers.is_empty() {
+            state.providers.clone()
+        } else {
+            cfg.providers.order.clone()
+        };
+        match crate::quota::apply_quota_filter(paths, &candidate) {
             Ok(p) => state.providers = p,
             Err(e) => {
                 state.error = Some(e.to_string());
@@ -79,6 +85,11 @@ fn run_from_approved(
                 return Ok(ExitCode::Quota);
             }
         }
+    }
+    let dry = state.dry_run;
+    prepare_implement_slots(&mut state, opts.providers.as_deref(), dry, cfg)?;
+    if state.slots.iter().all(|s| s.role != SlotRole::Implementer) {
+        bail!("no implementer slot after provider pick");
     }
     state.save(paths)?;
     if opts.detach {
@@ -110,14 +121,19 @@ fn prepare_implement_slots(
     }
 
     let n = cfg.max_agents.max(3) as usize;
-    state.providers = providers::pick_providers(
-        &cfg.providers.order,
-        n,
-        requested,
-        dry,
-    );
+    if state.providers.is_empty() || requested.is_some() {
+        state.providers = providers::pick_providers(
+            &cfg.providers.order,
+            n,
+            requested,
+            dry,
+        );
+    }
     if dry && state.providers.is_empty() {
         state.providers = vec!["claude".into(), "grok".into(), "agy".into()];
+    }
+    if state.providers.is_empty() {
+        return Ok(());
     }
     let mut provs = state.providers.clone();
     if dry && provs.len() < 3 {
@@ -179,10 +195,13 @@ fn run_with_task(
     state.message_budget = cfg.message_budget;
     state.big = opts.big;
     state.max_fix_rounds = 3;
-    prepare_implement_slots(&mut state, opts.providers.as_deref(), dry, cfg)?;
 
     if !dry {
-        match crate::quota::apply_quota_filter(paths, &state.providers) {
+        let candidate = opts
+            .providers
+            .clone()
+            .unwrap_or_else(|| cfg.providers.order.clone());
+        match crate::quota::apply_quota_filter(paths, &candidate) {
             Ok(p) => state.providers = p,
             Err(e) => {
                 state.error = Some(e.to_string());
@@ -198,6 +217,7 @@ fn run_with_task(
             }
         }
     }
+    prepare_implement_slots(&mut state, opts.providers.as_deref(), dry, cfg)?;
 
     paths.ensure_run_dirs(&state.id)?;
     let _ = crate::bus::ensure_bus(paths, &state.id);
