@@ -151,7 +151,7 @@ impl App {
     }
 
     fn spinner(&self) -> &'static str {
-        SPINNER[(self.tick as usize / 1) % SPINNER.len()]
+        SPINNER[(self.tick as usize) % SPINNER.len()]
     }
 
     fn pulse(&self) -> &'static str {
@@ -818,7 +818,7 @@ fn draw_bus(f: &mut Frame, area: Rect, bus_lines: &[String], app: &App) {
 
 fn draw_composer(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.focus == Focus::Composer;
-    let cursor_blink = if focused && (app.tick / 6) % 2 == 0 {
+    let cursor_blink = if focused && (app.tick / 6).is_multiple_of(2) {
         "▌"
     } else if focused {
         " "
