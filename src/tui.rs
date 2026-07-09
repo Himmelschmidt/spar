@@ -1,5 +1,7 @@
 //! Product shell — fleet control room styled like a first-class coding agent.
+use crate::config::Config;
 use crate::events;
+use crate::liveness::SlotActivity;
 use crate::paths::{self, SparPaths};
 use crate::process::{self, StreamStats};
 use crate::quota::QuotaStore;
@@ -82,6 +84,9 @@ pub fn run_with(opts: TuiOpts) -> Result<crate::exit_codes::ExitCode> {
     }
     let root = paths::find_project_root()?;
     let swarm = SparPaths::new(&root);
+    let stall_warn_secs = Config::load(&root)
+        .map(|c| c.timeouts.stall_warn_secs)
+        .unwrap_or(300);
 
     enable_raw_mode()?;
     let mut out = stdout();
@@ -90,7 +95,7 @@ pub fn run_with(opts: TuiOpts) -> Result<crate::exit_codes::ExitCode> {
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
     terminal.clear()?;
 
-    let result = run_loop(&mut terminal, &swarm, opts.task_seed);
+    let result = run_loop(&mut terminal, &swarm, opts.task_seed, stall_warn_secs);
 
     disable_raw_mode()?;
     let mut out = stdout();
@@ -112,6 +117,7 @@ struct App {
     flash: Option<(Instant, String, Color)>,
     mouse_hint_shown: bool,
     last_click: Option<(u16, u16, Instant)>,
+    stall_warn_secs: u64,
     /// Layout rects for hit-testing mouse clicks
     rect_header: Rect,
     rect_fleet: Rect,
@@ -122,7 +128,7 @@ struct App {
 }
 
 impl App {
-    fn new(task_seed: Option<String>) -> Self {
+    fn new(task_seed: Option<String>, stall_warn_secs: u64) -> Self {
         Self {
             selected_run: 0,
             selected_slot: 0,
@@ -135,6 +141,7 @@ impl App {
             started: Instant::now(),
             flash: None,
             mouse_hint_shown: false,
+            stall_warn_secs,
             last_click: None,
             rect_header: Rect::default(),
             rect_fleet: Rect::default(),
@@ -163,8 +170,9 @@ fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     swarm: &SparPaths,
     task_seed: Option<String>,
+    stall_warn_secs: u64,
 ) -> Result<crate::exit_codes::ExitCode> {
-    let mut app = App::new(task_seed);
+    let mut app = App::new(task_seed, stall_warn_secs);
     let mut fleet_state = ListState::default();
     let mut runs_state = ListState::default();
 
@@ -705,8 +713,22 @@ fn draw_fleet(
                     .filter(|st| st.tools > 0 || st.input_tokens > 0)
                     .map(|st| format!(" {}t {}", st.tools, compact_u64(st.context_tokens)))
                     .unwrap_or_default();
+                let act = SlotActivity::observe(s, app.stall_warn_secs);
+                let (age, age_color) = if s.status == SlotStatus::Running {
+                    if act.stalled {
+                        (format!(" STALL {}", act.human_silent()), RED)
+                    } else {
+                        (format!(" {}", act.human_silent()), FG_MUTED)
+                    }
+                } else {
+                    (String::new(), FG_MUTED)
+                };
                 let line = Line::from(vec![
-                    Span::styled(format!(" {icon} "), Style::default().fg(slot_color(s))),
+                    Span::styled(format!(" {icon} "), Style::default().fg(if act.stalled {
+                        RED
+                    } else {
+                        slot_color(s)
+                    })),
                     Span::styled(
                         format!("{:<12}", truncate(&s.id, 12)),
                         Style::default()
@@ -715,6 +737,7 @@ fn draw_fleet(
                     ),
                     Span::styled(truncate(&s.provider, 11), Style::default().fg(ACCENT_SOFT)),
                     Span::styled(badge, Style::default().fg(YELLOW)),
+                    Span::styled(age, Style::default().fg(age_color)),
                 ]);
                 ListItem::new(line).style(if sel {
                     Style::default().bg(BG_RAISED)
@@ -732,7 +755,16 @@ fn draw_fleet(
             .iter()
             .filter(|s| s.status == SlotStatus::Running)
             .count();
-        format!("fleet  {running}/{n} live")
+        let stalled = st
+            .slots
+            .iter()
+            .filter(|s| SlotActivity::observe(s, app.stall_warn_secs).stalled)
+            .count();
+        if stalled > 0 {
+            format!("fleet  {running}/{n} live  {stalled} stall")
+        } else {
+            format!("fleet  {running}/{n} live")
+        }
     } else {
         "fleet".into()
     };
@@ -774,7 +806,19 @@ fn draw_stream(
     let focused = app.focus == Focus::Stream;
     let slot = full.and_then(|st| st.slots.get(app.selected_slot));
     let slot_id = slot.map(|s| s.id.as_str()).unwrap_or("—");
-    let title = format!("stream  {slot_id}");
+    let silent_hint = slot
+        .map(|s| {
+            let act = SlotActivity::observe(s, app.stall_warn_secs);
+            if act.stalled {
+                format!("  STALL {}", act.human_silent())
+            } else if s.status == SlotStatus::Running {
+                format!("  silent {}", act.human_silent())
+            } else {
+                String::new()
+            }
+        })
+        .unwrap_or_default();
+    let title = format!("stream  {slot_id}{silent_hint}");
 
     let block = panel(&title, focused);
     let inner = block.inner(area);
@@ -802,6 +846,7 @@ fn draw_stream(
                     model: u.model.clone(),
                     lines_in: 0,
                     chars_out: 0,
+                    last_log_at: None,
                 })
             })
     });

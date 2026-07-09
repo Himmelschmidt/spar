@@ -83,6 +83,7 @@ spar logs <run_id> [slot] [-f|--follow]
 - Run state: `.spar/runs/<id>/state.json`
 - Events (orchestrator): `.spar/runs/<id>/events.jsonl`
 - Logs: `.spar/runs/<id>/logs/<slot>.log`
+- `status --json` enriches each slot with `last_log_at`, `silent_for_secs`, `stalled` (log quiet longer than `timeouts.stall_warn_secs` while running)
 
 ## Exit codes (stable)
 
@@ -113,6 +114,7 @@ ship = true
 [timeouts]
 slot_secs = 1800
 # review_secs = 1800   # optional; defaults to slot_secs
+stall_warn_secs = 300  # running slot silent this long ⇒ stalled in status/TUI (0 = off)
 wait = "2h"
 # Full suite channel (cheap/dumb model). Implementers/reviewers: smoke/diff only.
 [suite]
