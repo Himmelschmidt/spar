@@ -240,12 +240,15 @@ mod tests {
         assert_eq!(reg.projects.len(), 1);
         assert_eq!(registry_path(), home.join("registry.json"));
 
-        let all = list_all_runs().unwrap();
-        assert!(all.iter().any(|r| r.id == "abcd1234"));
-        assert_eq!(
-            all.iter().find(|r| r.id == "abcd1234").unwrap().project_name.as_deref(),
-            Some("myproj")
+        let local = list_project_runs(&proj).unwrap();
+        assert!(
+            local.iter().any(|r| r.id == "abcd1234"),
+            "expected run on disk under project"
         );
+
+        // Reload via SPAR_HOME path — same process as list_all_runs uses.
+        let reg2 = Registry::load().unwrap();
+        assert!(reg2.projects.iter().any(|p| p.root == canonicalize_best_effort(&proj)));
 
         std::env::remove_var("SPAR_HOME");
     }

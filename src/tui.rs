@@ -54,7 +54,7 @@ enum Focus {
     Runs,
     Agents,
     Log,
-    Messages,
+    Activity,
     Composer,
 }
 
@@ -63,8 +63,8 @@ impl Focus {
         match self {
             Focus::Runs => Focus::Agents,
             Focus::Agents => Focus::Log,
-            Focus::Log => Focus::Messages,
-            Focus::Messages => Focus::Composer,
+            Focus::Log => Focus::Activity,
+            Focus::Activity => Focus::Composer,
             Focus::Composer => Focus::Runs,
         }
     }
@@ -73,8 +73,8 @@ impl Focus {
             Focus::Runs => Focus::Composer,
             Focus::Agents => Focus::Runs,
             Focus::Log => Focus::Agents,
-            Focus::Messages => Focus::Log,
-            Focus::Composer => Focus::Messages,
+            Focus::Activity => Focus::Log,
+            Focus::Composer => Focus::Activity,
         }
     }
     fn label(self) -> &'static str {
@@ -82,7 +82,7 @@ impl Focus {
             Focus::Runs => "Runs",
             Focus::Agents => "Agents",
             Focus::Log => "Live log",
-            Focus::Messages => "Messages",
+            Focus::Activity => "Activity",
             Focus::Composer => "Command",
         }
     }
@@ -153,6 +153,8 @@ struct App {
     tick: u64,
     flash: Option<(Instant, String, Color)>,
     stall_warn_secs: u64,
+    /// When false (default), long log lines truncate with …; `w` toggles wrap.
+    log_expand: bool,
     last_click: Option<(u16, u16, Instant)>,
     show_help: bool,
     rect_header: Rect,
@@ -184,6 +186,7 @@ impl App {
             tick: 0,
             flash: None,
             stall_warn_secs,
+            log_expand: false,
             last_click: None,
             show_help: false,
             rect_header: Rect::default(),
@@ -341,7 +344,7 @@ fn run_loop(
             BrowseLevel::Projects => project_overview(&projects, app.selected_project),
             BrowseLevel::Runs => stream_content(&swarm, full.as_ref(), app.selected_slot),
         };
-        let bus_lines = bus_lines(&swarm, full.as_ref(), &quota);
+        let activity = activity_feed(&swarm, full.as_ref(), &quota);
 
         if let Some((t, _, _)) = &app.flash {
             if t.elapsed() > Duration::from_secs(4) {
@@ -357,7 +360,7 @@ fn run_loop(
                 &runs,
                 full.as_ref(),
                 &stream_text,
-                &bus_lines,
+                &activity,
                 &app,
                 &mut fleet_state,
                 &mut rail_state,
@@ -561,7 +564,7 @@ fn handle_key(
                 }
             }
             Focus::Log => app.stream_scroll = app.stream_scroll.saturating_add(3),
-            Focus::Messages => app.bus_scroll = app.bus_scroll.saturating_add(1),
+            Focus::Activity => app.bus_scroll = app.bus_scroll.saturating_add(1),
             Focus::Composer => {}
         },
         KeyCode::Char('k') | KeyCode::Up => match app.focus {
@@ -580,12 +583,12 @@ fn handle_key(
                 app.select_slot(app.selected_slot.saturating_sub(1), n_slots.max(1));
             }
             Focus::Log => app.stream_scroll = app.stream_scroll.saturating_sub(3),
-            Focus::Messages => app.bus_scroll = app.bus_scroll.saturating_sub(1),
+            Focus::Activity => app.bus_scroll = app.bus_scroll.saturating_sub(1),
             Focus::Composer => {}
         },
         KeyCode::PageDown => match app.focus {
             Focus::Log => app.stream_scroll = app.stream_scroll.saturating_add(12),
-            Focus::Messages => app.bus_scroll = app.bus_scroll.saturating_add(6),
+            Focus::Activity => app.bus_scroll = app.bus_scroll.saturating_add(6),
             Focus::Runs => match app.browse {
                 BrowseLevel::Projects if !projects.is_empty() => {
                     app.select_project(app.selected_project + 5, projects.len());
@@ -600,7 +603,7 @@ fn handle_key(
         },
         KeyCode::PageUp => match app.focus {
             Focus::Log => app.stream_scroll = app.stream_scroll.saturating_sub(12),
-            Focus::Messages => app.bus_scroll = app.bus_scroll.saturating_sub(6),
+            Focus::Activity => app.bus_scroll = app.bus_scroll.saturating_sub(6),
             Focus::Runs => match app.browse {
                 BrowseLevel::Projects => {
                     app.select_project(
@@ -684,6 +687,17 @@ fn handle_key(
         KeyCode::Char('?') => {
             app.show_help = true;
         }
+        KeyCode::Char('w') => {
+            app.log_expand = !app.log_expand;
+            app.flash(
+                if app.log_expand {
+                    "Log: wrap long lines"
+                } else {
+                    "Log: truncate long lines (w toggles)"
+                },
+                ACCENT,
+            );
+        }
         _ => {}
     }
     Ok(false)
@@ -714,7 +728,7 @@ fn handle_mouse(
             } else if contains(app.rect_stream, x, y) {
                 app.focus = Focus::Log;
             } else if contains(app.rect_bus, x, y) {
-                app.focus = Focus::Messages;
+                app.focus = Focus::Activity;
             } else if contains(app.rect_fleet, x, y) {
                 app.focus = Focus::Agents;
                 if let Some(st) = full {
@@ -751,7 +765,7 @@ fn handle_mouse(
                 app.focus = Focus::Log;
                 app.stream_scroll = app.stream_scroll.saturating_add(3);
             } else if contains(app.rect_bus, x, y) {
-                app.focus = Focus::Messages;
+                app.focus = Focus::Activity;
                 app.bus_scroll = app.bus_scroll.saturating_add(2);
             } else if contains(app.rect_fleet, x, y) {
                 app.focus = Focus::Agents;
@@ -776,7 +790,7 @@ fn handle_mouse(
                 app.focus = Focus::Log;
                 app.stream_scroll = app.stream_scroll.saturating_sub(3);
             } else if contains(app.rect_bus, x, y) {
-                app.focus = Focus::Messages;
+                app.focus = Focus::Activity;
                 app.bus_scroll = app.bus_scroll.saturating_sub(2);
             } else if contains(app.rect_fleet, x, y) {
                 app.focus = Focus::Agents;
@@ -844,12 +858,13 @@ fn layout_rects(area: Rect) -> LayoutRects {
         ])
         .split(area);
 
+    // Wide live log is the main stage; rail + activity are supporting columns.
     let mid = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(30),
-            Constraint::Percentage(45),
-            Constraint::Percentage(25),
+            Constraint::Percentage(22),
+            Constraint::Percentage(58),
+            Constraint::Percentage(20),
         ])
         .split(root[2]);
 
@@ -878,7 +893,7 @@ fn draw(
     runs: &[state::RunSummary],
     full: Option<&RunState>,
     stream_text: &str,
-    bus_lines: &[String],
+    activity: &[String],
     app: &App,
     fleet_state: &mut ListState,
     rail_state: &mut ListState,
@@ -895,7 +910,7 @@ fn draw(
     draw_rail(f, lay.runs, projects, runs, app, rail_state);
     draw_agents(f, lay.fleet, full, app, fleet_state);
     draw_stream(f, lay.stream, full, stream_text, app);
-    draw_messages(f, lay.bus, bus_lines, app);
+    draw_activity(f, lay.bus, activity, app);
     draw_composer(f, lay.composer, app);
     draw_footer(f, lay.footer, app, full);
 
@@ -1353,8 +1368,9 @@ fn draw_stream(
             }
         })
         .unwrap_or_default();
+    let mode = if app.log_expand { "wrap" } else { "trim" };
     let title = if focused {
-        format!(" Live log  · {slot_id}{silent_hint}  · scroll wheel / j k ")
+        format!(" Live log  · {slot_id}{silent_hint}  · {mode} · w toggle · scroll ")
     } else {
         format!(" Live log  · {slot_id}{silent_hint} ")
     };
@@ -1390,9 +1406,14 @@ fn draw_stream(
     });
     draw_stream_stats(f, chunks[0], stats.as_ref(), slot.map(|s| s.status));
 
-    // Live log: never use Paragraph wrap+scroll together — wrapped styled lines
-    // leave ghost glyphs (duplicated colored words) on scroll. Pre-wrap, pad, slice.
-    render_scrollable_log(f, chunks[1], stream_text, app.stream_scroll, true);
+    render_scrollable_log(
+        f,
+        chunks[1],
+        stream_text,
+        app.stream_scroll,
+        true,
+        app.log_expand,
+    );
 }
 
 fn draw_stream_stats(
@@ -1482,13 +1503,13 @@ fn draw_stream_stats(
 }
 
 /// Paint a log viewport by writing cells directly (no Paragraph wrap/scroll).
-/// This is the reliable fix for colored-text smear/ghosting on scroll.
 fn render_scrollable_log(
     f: &mut Frame,
     area: Rect,
     text: &str,
     scroll: u16,
     colorize: bool,
+    expand: bool,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -1497,24 +1518,11 @@ fn render_scrollable_log(
     let sb_w = 1u16;
     let text_w = area.width.saturating_sub(sb_w).max(1) as usize;
     let height = area.height as usize;
-    let wrapped = wrap_log_lines(text, text_w, colorize);
-    let total = wrapped.len().max(1);
+    let rows = layout_log_rows(text, text_w, colorize, expand);
+    let total = rows.len().max(1);
     let max_scroll = total.saturating_sub(height);
     let start = (scroll as usize).min(max_scroll);
-    let visible: Vec<(String, Style)> = wrapped
-        .into_iter()
-        .skip(start)
-        .take(height)
-        .map(|line| {
-            let style = line
-                .spans
-                .first()
-                .map(|s| s.style)
-                .unwrap_or_else(|| Style::default().fg(FG).bg(BG_PANEL));
-            let s: String = line.spans.iter().map(|sp| sp.content.as_ref()).collect();
-            (s, style.bg(BG_PANEL))
-        })
-        .collect();
+    let visible: Vec<(String, Style)> = rows.into_iter().skip(start).take(height).collect();
 
     let text_area = Rect {
         x: area.x,
@@ -1585,48 +1593,150 @@ fn log_line_style(line: &str, colorize: bool) -> Style {
     if !colorize {
         return base.fg(FG_DIM);
     }
-    if line.starts_with('→') {
+    let t = line.trim_start();
+    if t.starts_with('▸') || t.starts_with('→') {
         base.fg(CYAN)
-    } else if line.starts_with('←') {
-        if line.contains('✗') {
+    } else if t.starts_with('◂') || t.starts_with('←') {
+        if t.contains('✗') || t.contains("err") {
             base.fg(RED)
         } else {
             base.fg(GREEN)
         }
-    } else if line.starts_with('·') || line.starts_with('…') {
+    } else if t.starts_with('·') || t.starts_with('…') || t.starts_with('│') {
         base.fg(FG_MUTED).italic()
-    } else if line.starts_with('!') {
+    } else if t.starts_with('!') {
         base.fg(RED).bold()
-    } else if line.starts_with('#') {
+    } else if t.starts_with('#') {
         base.fg(FG_MUTED)
     } else {
         base.fg(FG)
     }
 }
 
-/// Hard-wrap source lines to `width` display columns (char-based; agent logs are ASCII-heavy).
-fn wrap_log_lines(text: &str, width: usize, colorize: bool) -> Vec<Line<'static>> {
+/// Compact stream lines (grok-cli style density), then truncate or wrap to width.
+fn layout_log_rows(
+    text: &str,
+    width: usize,
+    colorize: bool,
+    expand: bool,
+) -> Vec<(String, Style)> {
     let width = width.max(1);
     let mut out = Vec::new();
     for raw in text.lines() {
-        let style = log_line_style(raw, colorize);
-        if raw.is_empty() {
-            out.push(Line::from(Span::styled(String::new(), style)));
+        let line = compact_log_line(raw);
+        let style = log_line_style(&line, colorize);
+        if line.is_empty() {
+            out.push((String::new(), style));
             continue;
         }
-        let chars: Vec<char> = raw.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            let end = (i + width).min(chars.len());
-            let chunk: String = chars[i..end].iter().collect();
-            out.push(Line::from(Span::styled(chunk, style)));
-            i = end;
+        if expand {
+            // Soft-wrap at word boundaries when possible.
+            for chunk in soft_wrap(&line, width) {
+                out.push((chunk, style));
+            }
+        } else {
+            out.push((truncate_display(&line, width), style));
         }
     }
     if out.is_empty() {
-        out.push(Line::from(Span::styled(String::new(), log_line_style("", colorize))));
+        out.push((String::new(), log_line_style("", colorize)));
     }
     out
+}
+
+fn compact_log_line(raw: &str) -> String {
+    let s = raw.trim_end();
+    if s.is_empty() {
+        return String::new();
+    }
+    // Tool call / result markers from stream coalescer
+    if let Some(rest) = s.strip_prefix('→') {
+        let rest = rest.trim();
+        // "Bash  Fetch PR diff" → keep short tool + summary
+        return format!("▸ {}", collapse_ws(rest));
+    }
+    if let Some(rest) = s.strip_prefix('←') {
+        let rest = rest.trim();
+        return format!("◂ {}", collapse_ws(rest));
+    }
+    if let Some(rest) = s.strip_prefix('·') {
+        return format!("  {}", collapse_ws(rest.trim()));
+    }
+    if s.starts_with('…') {
+        return format!("  {}", collapse_ws(s.trim_start_matches('…').trim()));
+    }
+    collapse_ws(s)
+}
+
+fn collapse_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    out
+}
+
+fn truncate_display(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let n = s.chars().count();
+    if n <= width {
+        return s.to_string();
+    }
+    if width == 1 {
+        return "…".into();
+    }
+    let keep: String = s.chars().take(width - 1).collect();
+    format!("{keep}…")
+}
+
+fn soft_wrap(s: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    let mut rows = Vec::new();
+    let mut cur = String::new();
+    for word in s.split_whitespace() {
+        if word.chars().count() > width {
+            if !cur.is_empty() {
+                rows.push(std::mem::take(&mut cur));
+            }
+            let chars: Vec<char> = word.chars().collect();
+            let mut i = 0;
+            while i < chars.len() {
+                let end = (i + width).min(chars.len());
+                rows.push(chars[i..end].iter().collect());
+                i = end;
+            }
+            continue;
+        }
+        let next_len = if cur.is_empty() {
+            word.chars().count()
+        } else {
+            cur.chars().count() + 1 + word.chars().count()
+        };
+        if next_len > width && !cur.is_empty() {
+            rows.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() || rows.is_empty() {
+        rows.push(cur);
+    }
+    rows
 }
 
 
@@ -1641,22 +1751,22 @@ fn compact_u64(n: u64) -> String {
     }
 }
 
-fn draw_messages(f: &mut Frame, area: Rect, bus_lines: &[String], app: &App) {
-    let focused = app.focus == Focus::Messages;
-    let text = if bus_lines.is_empty() {
-        "  No messages yet.\n  Agent chatter and events show up here.".into()
+fn draw_activity(f: &mut Frame, area: Rect, activity: &[String], app: &App) {
+    let focused = app.focus == Focus::Activity;
+    let text = if activity.is_empty() {
+        "No activity yet.\n\nRun timeline: phases,\nagents, gates, bus.".into()
     } else {
-        bus_lines.join("\n")
+        activity.join("\n")
     };
     let title = if focused {
-        " Messages  · scroll wheel / j k "
+        " Activity  · timeline · j/k "
     } else {
-        " Messages "
+        " Activity "
     };
     let block = panel(title, focused);
     let inner = block.inner(area);
     f.render_widget(block, area);
-    render_scrollable_log(f, inner, &text, app.bus_scroll, false);
+    render_scrollable_log(f, inner, &text, app.bus_scroll, false, true);
 }
 
 fn draw_composer(f: &mut Frame, area: Rect, app: &App) {
@@ -1757,8 +1867,8 @@ fn situational_footer(full: Option<&RunState>, focus: Focus, browse: BrowseLevel
     match focus {
         Focus::Runs => "j/k runs · Esc/p projects · Tab → Agents · ? help",
         Focus::Agents => "j/k agent · log follows · Tab → Live log",
-        Focus::Log => "scroll wheel / j k · g top · Tab → Messages",
-        Focus::Messages => "scroll wheel / j k · Tab → Command",
+        Focus::Log => "scroll / j k · w wrap/trim · g top · Tab → Activity",
+        Focus::Activity => "run timeline · scroll · Tab → Command",
         Focus::Composer => "type /approve /reject /ship /help · Enter · Esc",
     }
 }
@@ -1792,11 +1902,13 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
     1-9                  jump to agent slot\n\
     a / r / s            approve · reject · ship (when gated)\n\
     i  or  /             command bar\n\
+    w                    log wrap ↔ truncate long lines\n\
     g / G                log top / bottom\n\
     ?                    this help · Esc closes\n\
     q                    quit\n\
  \n\
   Default: this project's runs (or Projects if outside a repo).\n\
+  Activity: phase timeline + agent status (not chat).\n\
   Runs: <project>/.spar/runs/ · Index: ~/.spar/registry.json\n\
  \n\
   Esc or ? to close";
@@ -1872,7 +1984,7 @@ fn handle_composer(
 
 fn stream_content(swarm: &SparPaths, full: Option<&RunState>, slot_idx: usize) -> String {
     let Some(st) = full else {
-        return "\n  Select a run on the left.\n\n  New work:\n    spar plan -t \"describe the change\" --providers cli:claude --dry-run\n".into();
+        return "\n  Select a run on the left.\n\n  New work:\n    spar plan -t \"describe the change\" --providers cli:claude\n".into();
     };
     if st.slots.is_empty() {
         return "\n  This run has no agents yet.".into();
@@ -1883,15 +1995,36 @@ fn stream_content(swarm: &SparPaths, full: Option<&RunState>, slot_idx: usize) -
         .clone()
         .unwrap_or_else(|| swarm.log_file(&st.id, &slot.id));
     if path.is_file() {
-        let raw = process::tail_log(&path, 64_000);
-        let body = raw
+        let raw = process::tail_log(&path, 80_000);
+        let body: Vec<&str> = raw
             .lines()
-            .skip_while(|l| l.starts_with('#') || *l == "---" || l.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
+            .skip_while(|l| {
+                l.starts_with('#')
+                    || *l == "---"
+                    || l.starts_with("cwd=")
+                    || l.is_empty()
+                    || l.starts_with("# Role:")
+            })
+            // Drop the huge prompt dump often pasted as first "user" blob in headless spawn
+            .filter(|l| !l.starts_with("# Role:") && !l.starts_with("## Task"))
+            .collect();
+        // Skip until first real stream marker if present
+        let start = body
+            .iter()
+            .position(|l| {
+                l.starts_with('→')
+                    || l.starts_with('←')
+                    || l.starts_with('·')
+                    || l.starts_with('…')
+                    || l.starts_with('!')
+                    || l.starts_with("I'll ")
+                    || l.starts_with("I ")
+            })
+            .unwrap_or(0);
+        let body = body[start..].join("\n");
         if body.trim().is_empty() {
             format!(
-                "\n  {} is running but hasn't written the log yet…\n  (quiet time is shown in Agents)",
+                "\n  {} is running — waiting for stream…\n  Quiet time is on Agents; Activity shows phase timeline.",
                 slot.id
             )
         } else {
@@ -1899,44 +2032,144 @@ fn stream_content(swarm: &SparPaths, full: Option<&RunState>, slot_idx: usize) -
         }
     } else {
         format!(
-            "\n  No log file yet for {}\n  provider: {}\n  status: {:?}",
-            slot.id, slot.provider, slot.status
+            "\n  No log yet for {}\n  {} · {}",
+            slot.id,
+            slot.provider,
+            slot_status_label(slot.status)
         )
     }
 }
 
-fn bus_lines(swarm: &SparPaths, full: Option<&RunState>, quota: &QuotaStore) -> Vec<String> {
+/// Right-rail feed: human run timeline (not a raw bus dump).
+fn activity_feed(
+    swarm: &SparPaths,
+    full: Option<&RunState>,
+    quota: &QuotaStore,
+) -> Vec<String> {
     let mut lines = Vec::new();
-    if let Some(st) = full {
-        if let Ok(presence) = crate::bus::list_presence(swarm, &st.id) {
-            for p in presence.iter().take(6) {
-                lines.push(format!("· {:<12} {}", p.agent, p.status));
-            }
+    let Some(st) = full else {
+        lines.push("No run selected.".into());
+        lines.push(String::new());
+        lines.push("Open a project, pick a run.".into());
+        return lines;
+    };
+
+    lines.push(format!("Run  {}", st.id));
+    lines.push(format!("  {}", phase_label(st.phase)));
+    if st.dry_run {
+        lines.push("  dry-run".into());
+    }
+    if let Some(t) = st.task.as_deref() {
+        lines.push(format!("  {}", truncate(t, 36)));
+    }
+    lines.push(String::new());
+
+    // Compact agent status
+    lines.push("Agents".into());
+    for s in &st.slots {
+        let act = SlotActivity::observe(s, 300);
+        let mark = match s.status {
+            SlotStatus::Running if act.stalled => "!",
+            SlotStatus::Running => "●",
+            SlotStatus::Done => "✓",
+            SlotStatus::Failed => "✗",
+            SlotStatus::Stuck => "!",
+            SlotStatus::Pending => "·",
+        };
+        let quiet = if s.status == SlotStatus::Running {
+            format!(" {}", act.human_silent())
+        } else {
+            String::new()
+        };
+        lines.push(format!(
+            " {mark} {} {}{quiet}",
+            role_label(s.role),
+            slot_status_label(s.status),
+        ));
+    }
+
+    // Orchestrator event timeline (human)
+    let evs = events::read_all(swarm, &st.id).unwrap_or_default();
+    if !evs.is_empty() {
+        lines.push(String::new());
+        lines.push("Timeline".into());
+        for e in evs.iter().rev().take(14).rev() {
+            lines.push(format!(" {}", activity_event_line(e)));
         }
-        if let Ok(evs) = crate::bus::list_events(swarm, &st.id) {
-            for e in evs.iter().rev().take(12).rev() {
-                lines.push(truncate(
-                    &format!("{}→{}  {}", e.from, e.to, e.body),
-                    48,
+    }
+
+    // Bus chat only if real agent chat exists
+    if let Ok(bus) = crate::bus::list_events(swarm, &st.id) {
+        let chat: Vec<_> = bus
+            .iter()
+            .filter(|m| {
+                !matches!(
+                    m.kind,
+                    crate::bus::MsgKind::Hello | crate::bus::MsgKind::System
+                )
+            })
+            .collect();
+        if !chat.is_empty() {
+            lines.push(String::new());
+            lines.push("Bus".into());
+            for m in chat.iter().rev().take(8).rev() {
+                lines.push(format!(
+                    " {}→{} {}",
+                    short_agent(&m.from),
+                    short_agent(&m.to),
+                    truncate(&m.body, 28)
                 ));
             }
         }
-        if lines.is_empty() {
-            for e in events::read_all(swarm, &st.id)
-                .unwrap_or_default()
-                .iter()
-                .rev()
-                .take(10)
-                .rev()
-            {
-                lines.push(truncate(&e.display_line(), 48));
-            }
+    }
+
+    let paused: Vec<_> = quota
+        .providers
+        .iter()
+        .filter(|(_, q)| format!("{:?}", q.status).to_ascii_lowercase().contains("pause"))
+        .collect();
+    if !paused.is_empty() {
+        lines.push(String::new());
+        lines.push("Quota".into());
+        for (name, q) in paused {
+            lines.push(format!(" {} {:?}", name, q.status));
         }
     }
-    for (name, q) in &quota.providers {
-        lines.push(format!("quota {name}: {:?}", q.status));
-    }
+
     lines
+}
+
+fn short_agent(s: &str) -> &str {
+    s.rsplit(['-', '/']).next().unwrap_or(s)
+}
+
+fn activity_event_line(e: &events::Event) -> String {
+    let t = e.ts.format("%H:%M");
+    match e.kind {
+        events::EventKind::Phase => {
+            let phase = e
+                .phase
+                .map(phase_label)
+                .unwrap_or_else(|| "?".into());
+            format!("{t} → {phase}")
+        }
+        events::EventKind::Slot => {
+            let slot = e.slot.as_deref().unwrap_or("agent");
+            let st = e
+                .status
+                .map(slot_status_label)
+                .unwrap_or("?");
+            format!("{t} {slot} {st}")
+        }
+        events::EventKind::Gate => {
+            let msg = e.message.as_deref().unwrap_or("waiting on you");
+            format!("{t} gate · {msg}")
+        }
+        events::EventKind::Info => {
+            let msg = e.message.as_deref().unwrap_or("");
+            format!("{t} {msg}")
+        }
+    }
 }
 
 // ── human labels ────────────────────────────────────────────────────────────
@@ -2087,10 +2320,19 @@ mod labels {
     }
 
     #[test]
-    fn wrap_log_splits_long_colored_lines() {
-        let long = format!("→ {}", "abcdefghij".repeat(5)); // 2 + 50
-        let lines = wrap_log_lines(&long, 20, true);
-        assert!(lines.len() >= 3, "expected wrap, got {}", lines.len());
-        assert!(lines.iter().all(|l| l.width() <= 20));
+    fn truncate_log_default_one_row() {
+        let long = format!("→ {}", "abcdefghij".repeat(8));
+        let rows = layout_log_rows(&long, 24, true, false);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].0.ends_with('…'));
+        assert!(rows[0].0.chars().count() <= 24);
+    }
+
+    #[test]
+    fn expand_log_soft_wraps() {
+        let long = format!("→ tool {}", "word ".repeat(20));
+        let rows = layout_log_rows(&long, 20, true, true);
+        assert!(rows.len() > 1);
+        assert!(rows.iter().all(|(s, _)| s.chars().count() <= 20));
     }
 }
