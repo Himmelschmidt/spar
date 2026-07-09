@@ -36,6 +36,7 @@ pub fn resolve_backend(policy: Backend, provider: &str) -> Backend {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct SlotJob {
     pub slot_id: String,
     pub provider: String,
@@ -44,6 +45,286 @@ pub struct SlotJob {
     pub extra_vars: HashMap<String, String>,
     /// Expected primary artifact name under artifacts/
     pub expected_artifact: Option<String>,
+}
+
+/// Run multiple slots **concurrently** (live). Dry-run stays sequential for simpler state.
+pub fn run_slots_parallel(
+    state: &mut RunState,
+    paths: &SparPaths,
+    cfg: &Config,
+    jobs: &[SlotJob],
+) -> Result<()> {
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    if state.dry_run || jobs.len() == 1 {
+        for job in jobs {
+            let _ = run_slot(state, paths, cfg, job);
+        }
+        return Ok(());
+    }
+
+    // Prepare prompts + mark running sequentially, then spawn processes in parallel.
+    let mut prepared = Vec::new();
+    for job in jobs {
+        match prepare_slot_execution(state, paths, cfg, job) {
+            Ok(p) => prepared.push(p),
+            Err(e) => {
+                let _ = mark_slot_failed(state, paths, &job.slot_id, &e.to_string());
+            }
+        }
+    }
+    state.save(paths)?;
+
+    let timeout = Duration::from_secs(cfg.timeouts.slot_secs);
+    let isolation = state.isolation;
+    let backend_policy = state.backend;
+
+    let mut handles = Vec::new();
+    for prep in prepared {
+        handles.push(std::thread::spawn(move || {
+            let outcome = execute_prepared(&prep, isolation, backend_policy, timeout);
+            (prep.job.slot_id.clone(), outcome, prep)
+        }));
+    }
+
+    for h in handles {
+        match h.join() {
+            Ok((slot_id, outcome, prep)) => {
+                apply_parallel_outcome(state, paths, &slot_id, outcome, &prep)?;
+            }
+            Err(_) => bail!("slot thread panicked"),
+        }
+    }
+    state.save(paths)?;
+    Ok(())
+}
+
+struct PreparedSlot {
+    job: SlotJob,
+    cwd: PathBuf,
+    log_path: PathBuf,
+    prompt_path: PathBuf,
+    prompt: String,
+    pref: ProviderRef,
+}
+
+fn prepare_slot_execution(
+    state: &mut RunState,
+    paths: &SparPaths,
+    _cfg: &Config,
+    job: &SlotJob,
+) -> Result<PreparedSlot> {
+    let slot = state
+        .slots
+        .iter()
+        .find(|s| s.id == job.slot_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("unknown slot {}", job.slot_id))?;
+    let cwd = slot
+        .cwd
+        .clone()
+        .unwrap_or_else(|| state.project_root.clone());
+    let backend = resolve_backend(state.backend, &job.provider);
+    let log_path = paths.log_file(&state.id, &job.slot_id);
+    let branch = state
+        .worktrees
+        .iter()
+        .find(|w| w.slot_id == job.slot_id)
+        .map(|w| w.branch.clone())
+        .unwrap_or_else(|| format!("spar/{}/{}", state.id, job.slot_id));
+
+    let project_root_s = state.project_root.display().to_string();
+    let cwd_s = cwd.display().to_string();
+    let artifacts_s = paths.artifacts_dir(&state.id).display().to_string();
+    let markers_s = paths.markers_dir(&state.id).display().to_string();
+    let mailbox_s = paths.mailbox_dir(&state.id).display().to_string();
+    let mut vars = templates::base_vars(&templates::TemplateCtx {
+        task: state.task.as_deref().unwrap_or(""),
+        project_root: &project_root_s,
+        cwd: &cwd_s,
+        run_id: &state.id,
+        artifacts_dir: &artifacts_s,
+        markers_dir: &markers_s,
+        mailbox_dir: &mailbox_s,
+        slot_id: &job.slot_id,
+        provider: &job.provider,
+        branch: &branch,
+    });
+    for (k, v) in &job.extra_vars {
+        vars.insert(k.clone(), v.clone());
+    }
+    let prompt = templates::render(&job.template, &vars)?;
+    let prompt_path = paths
+        .run_dir(&state.id)
+        .join(format!("prompt-{}.md", job.slot_id));
+    std::fs::write(&prompt_path, &prompt)?;
+
+    let pref = ProviderRef::parse(&job.provider)?;
+    if let Some(s) = state.slot_mut(&job.slot_id) {
+        s.status = SlotStatus::Running;
+        s.exec_backend = Some(pref.backend);
+        s.backend = Some(if pref.is_api() {
+            "api-sdk".into()
+        } else {
+            format!("{backend:?}").to_ascii_lowercase()
+        });
+        s.log_path = Some(log_path.clone());
+        s.artifact = job.expected_artifact.clone();
+    }
+    let _ = crate::events::append(
+        paths,
+        &state.id,
+        &crate::events::Event::slot(&job.slot_id, SlotStatus::Running),
+    );
+    let _ = crate::bus::heartbeat(paths, &state.id, &job.slot_id, "running");
+
+    Ok(PreparedSlot {
+        job: job.clone(),
+        cwd,
+        log_path,
+        prompt_path,
+        prompt,
+        pref,
+    })
+}
+
+fn execute_prepared(
+    prep: &PreparedSlot,
+    isolation: crate::config::IsolationMode,
+    backend_policy: Backend,
+    timeout: Duration,
+) -> Result<SlotOutcome> {
+    if prep.pref.is_api() {
+        let expected = prep
+            .job
+            .expected_artifact
+            .as_ref()
+            .map(|n| {
+                // artifact path reconstructed from log path parent layout
+                prep.log_path
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .map(|run| run.join("artifacts").join(n))
+                    .unwrap_or_else(|| PathBuf::from(n))
+            });
+        let (ok, err, usage) = crate::api::run_api_slot(&crate::api::runtime::ApiSlotRequest {
+            provider_name: &prep.pref.name,
+            prompt: &prep.prompt,
+            cwd: &prep.cwd,
+            log_path: &prep.log_path,
+            expected_artifact: expected.as_deref(),
+            timeout,
+            dry_run: false,
+        })?;
+        let slot_usage = SlotUsage {
+            slot_id: prep.job.slot_id.clone(),
+            provider: prep.pref.storage_key(),
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            model: usage.model,
+        };
+        return Ok(if ok {
+            SlotOutcome {
+                ok: true,
+                exit_code: Some(0),
+                error: None,
+                usage: Some(slot_usage),
+            }
+        } else {
+            SlotOutcome {
+                ok: false,
+                exit_code: Some(1),
+                error: err,
+                usage: Some(slot_usage),
+            }
+        });
+    }
+
+    let backend = resolve_backend(backend_policy, &prep.job.provider);
+    // headless only for parallel (tmux is session-shared)
+    let _ = backend;
+    let adapter = providers::adapter_named(&prep.job.provider)
+        .ok_or_else(|| anyhow::anyhow!("unknown provider {}", prep.job.provider))?;
+    let bin = adapter
+        .resolve_binary()
+        .ok_or_else(|| anyhow::anyhow!("provider {} not on PATH", prep.job.provider))?;
+    let opts = SpawnOpts {
+        prompt: prep.prompt.clone(),
+        prompt_file: Some(prep.prompt_path.clone()),
+        cwd: prep.cwd.clone(),
+        trust: TrustPolicy::FullAuto,
+        extra_args: vec![],
+    };
+    let cmd = adapter.build_headless(&bin, &opts);
+    let (program, args) = providers::command_to_parts(&cmd);
+    let (program, args) = sandbox::maybe_wrap(isolation, &prep.cwd, &program, &args);
+    let req = SpawnRequest {
+        program,
+        args,
+        cwd: prep.cwd.clone(),
+        log_path: prep.log_path.clone(),
+        env: vec![],
+        timeout,
+    };
+    let res = process::run_captured(&req)?;
+    if res.timed_out {
+        return Ok(SlotOutcome::err("timeout"));
+    }
+    if res.exit_code != Some(0) {
+        return Ok(SlotOutcome {
+            ok: false,
+            exit_code: res.exit_code,
+            error: Some(format!("exit {:?}", res.exit_code)),
+            usage: None,
+        });
+    }
+    Ok(SlotOutcome::ok())
+}
+
+fn apply_parallel_outcome(
+    state: &mut RunState,
+    paths: &SparPaths,
+    slot_id: &str,
+    outcome: Result<SlotOutcome>,
+    prep: &PreparedSlot,
+) -> Result<()> {
+    match outcome {
+        Ok(result) if result.ok => {
+            markers::write_done(paths, &state.id, slot_id)?;
+            if let Some(s) = state.slot_mut(slot_id) {
+                s.status = SlotStatus::Done;
+                s.exit_code = Some(0);
+                if let Some(u) = &result.usage {
+                    s.usage = Some(u.clone());
+                }
+            }
+            if let Some(u) = result.usage {
+                state.usage.push(u);
+            }
+            // expected artifact check
+            if let Some(name) = &prep.job.expected_artifact {
+                let path = paths.artifact(&state.id, name);
+                if !path.is_file() {
+                    // soft: leave done; reviewer may still have written log
+                }
+            }
+            let _ = crate::events::append(
+                paths,
+                &state.id,
+                &crate::events::Event::slot(slot_id, SlotStatus::Done),
+            );
+        }
+        Ok(result) => {
+            let err = result.error.unwrap_or_else(|| "failed".into());
+            mark_slot_failed(state, paths, slot_id, &err)?;
+        }
+        Err(e) => {
+            mark_slot_failed(state, paths, slot_id, &e.to_string())?;
+        }
+    }
+    let _ = crate::bus::heartbeat(paths, &state.id, slot_id, "done");
+    Ok(())
 }
 
 pub fn run_slot(

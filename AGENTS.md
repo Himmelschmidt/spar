@@ -14,9 +14,10 @@ spar wait <run_id> --follow --json
 spar logs <run_id> [slot] -f
 spar bus send <run_id> -m "..."
 spar reconcile <run_id>       # arena merge path
+spar run --workflow review -t "…" --providers cli:claude,cli:grok  # concurrent independent review
 ```
 
-**`--providers` is required** on plan/implement/run. Examples: `claude`, `cli:grok`, `api:openai` (mixable).
+**`--providers` is required** on plan/implement/run (`cli:name` or `api:name` only).
 
 **Exit codes:** `0` ok · `1` fail · `2` human gate · `3` stuck · `4` quota  
 

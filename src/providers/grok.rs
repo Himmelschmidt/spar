@@ -33,7 +33,8 @@ impl ProviderAdapter for GrokAdapter {
     fn build_headless(&self, bin: &Path, opts: &SpawnOpts) -> Command {
         // -p / --single is one flag that takes the prompt value; do not pass both.
         let mut cmd = Command::new(bin);
-        cmd.arg("--output-format").arg("plain");
+        // streaming-json so slot logs update while the agent runs
+        cmd.arg("--output-format").arg("streaming-json");
         if let Some(pf) = &opts.prompt_file {
             cmd.arg("--prompt-file").arg(pf);
         } else {

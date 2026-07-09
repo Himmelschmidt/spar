@@ -611,6 +611,9 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
         crate::cli::WorkflowKind::Peer => {
             crate::workflow::peer::execute(&mut state, paths, cfg)?;
         }
+        crate::cli::WorkflowKind::Review => {
+            crate::workflow::review::execute(&mut state, paths, cfg)?;
+        }
         crate::cli::WorkflowKind::Plan => {
             return crate::workflow::plan::continue_run(paths, cfg, run_id);
         }

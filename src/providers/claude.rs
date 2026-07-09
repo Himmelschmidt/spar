@@ -47,6 +47,9 @@ impl ProviderAdapter for ClaudeAdapter {
             String::new()
         };
         cmd.arg(prompt);
+        // stream-json emits events as they happen so spar can tail the slot log live
+        cmd.arg("--output-format").arg("stream-json");
+        cmd.arg("--verbose");
         for a in self.permission_args(opts.trust) {
             cmd.arg(a);
         }
@@ -92,6 +95,7 @@ mod tests {
         let (_, args) = command_to_parts(&cmd);
         assert_eq!(args.first().map(String::as_str), Some("-p"));
         assert_eq!(args.get(1).map(String::as_str), Some("implement feature"));
+        assert!(args.iter().any(|a| a == "stream-json"));
         assert!(!args.iter().any(|a| a.starts_with('@')));
     }
 }
