@@ -180,6 +180,7 @@ mod tests {
 
     #[test]
     fn stats_last_log_at_preferred() {
+        use chrono::Datelike;
         let tmp = tempdir().unwrap();
         let log = tmp.path().join("s.log");
         std::fs::write(&log, "x\n").unwrap();
