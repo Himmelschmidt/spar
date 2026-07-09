@@ -7,7 +7,7 @@ You keep using Claude Code, Grok Build, Antigravity (`agy`), and/or API models a
 Humans: open `spar` (TUI).  
 Outer agents (Claude, Grok, …): drive it with CLI + `--json` after reading the built-in skill.
 
-> Early project, shared with friends. Dry-run workflows are solid. Live runs need real provider CLIs and/or API keys.
+> **v0.0.1 — early release.** Dry-run workflows are solid for learning the flow. Live runs need real provider CLIs and/or API keys. APIs and UX may still change.
 
 ---
 
@@ -28,18 +28,28 @@ Supported native CLIs on `PATH` today: `claude`, `grok`, `agy`.
 
 ## Install
 
+From source (recommended):
+
+```bash
+cargo install --git https://github.com/Himmelschmidt/spar.git --locked
+```
+
+Or clone and install locally:
+
 ```bash
 git clone https://github.com/Himmelschmidt/spar.git
 cd spar
-cargo install --path .
+cargo install --path . --locked
 ```
 
-Or build without installing:
+Build without installing:
 
 ```bash
 cargo build --release
 # binary: ./target/release/spar
 ```
+
+> The crates.io package name `spar` is taken by an unrelated project. Install from this repository.
 
 Check the install:
 
@@ -114,7 +124,7 @@ spar                 # fleet TUI
 Safe way to learn the flow:
 
 ```bash
-spar plan -t "add retry to the payment client" \
+spar plan -t "add retry logic to the HTTP client" \
   --providers cli:claude,cli:grok --dry-run --json
 # note run_id; exit 2 often means "awaiting plan approval"
 
@@ -169,7 +179,7 @@ spar --task "…"      # open TUI with a seeded task
 ### Path A — plan, then implement (one run id)
 
 ```bash
-spar plan -t "add retry to the payment client" \
+spar plan -t "add retry logic to the HTTP client" \
   --providers cli:claude,cli:grok --detach --json
 
 spar wait <run_id> --json

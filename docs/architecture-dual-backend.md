@@ -212,7 +212,7 @@ Outer agents need not use it; humans should want to.
 | **B — api-sdk lane** | Runtime + first provider + usage; then multi-SDK; then mixed fleets |
 | **C — Polish** | Skills + AGENTS.md discovery, quota scrapers per provider, cost UX |
 
-Track A remains the dogfood path; Track B is planned first-class, not a hacked afterthought.
+Track A (native-cli) is the default day-to-day path; Track B (api-sdk) is first-class, not an afterthought.
 
 ---
 

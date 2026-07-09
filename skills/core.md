@@ -27,7 +27,7 @@ Providers are `cli:name` (subscription CLIs) or `api:name` (OpenAI-compatible SD
 spar plan -t "..." --providers cli:claude,cli:grok --dry-run
 
 # mix CLI + API slots
-spar implement -t "..." --providers cli:cli:claude,api:openai --dry-run
+spar implement -t "..." --providers cli:claude,api:openai --dry-run
 spar run --workflow arena -t "..." --providers api:xai,cli:claude,cli:grok
 ```
 

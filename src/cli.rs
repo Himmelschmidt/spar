@@ -36,7 +36,7 @@ pub enum Command {
     Plan {
         #[arg(long, short = 't')]
         task: String,
-        /// Required: comma-separated `cli:…` or `api:…` (e.g. cli:cli:claude,api:openai)
+        /// Required: comma-separated `cli:…` or `api:…` (e.g. cli:claude,api:openai)
         #[arg(long, value_delimiter = ',', required = true)]
         providers: Vec<String>,
         #[arg(long)]
