@@ -71,6 +71,17 @@ fn plan_approve_implement_dry_run() {
         .join(run_id)
         .join("artifacts/plan.md");
     assert!(plan_path.is_file(), "plan.md should exist");
+    let events_path = tmp
+        .path()
+        .join(".spar/runs")
+        .join(run_id)
+        .join("events.jsonl");
+    assert!(events_path.is_file(), "events.jsonl should exist");
+    let events_text = std::fs::read_to_string(&events_path).unwrap();
+    assert!(
+        events_text.contains("awaiting_plan_approval") || events_text.contains("\"phase\""),
+        "events should record phases"
+    );
     let done_marker = tmp
         .path()
         .join(".spar/runs")

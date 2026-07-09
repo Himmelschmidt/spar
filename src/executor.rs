@@ -105,6 +105,11 @@ pub fn run_slot(
         s.log_path = Some(log_path.clone());
         s.artifact = job.expected_artifact.clone();
     }
+    let _ = crate::events::append(
+        paths,
+        &state.id,
+        &crate::events::Event::slot(&job.slot_id, SlotStatus::Running),
+    );
     state.save(paths)?;
 
     let timeout = Duration::from_secs(cfg.timeouts.slot_secs);
@@ -133,6 +138,11 @@ pub fn run_slot(
             s.status = SlotStatus::Done;
             s.exit_code = Some(0);
         }
+        let _ = crate::events::append(
+            paths,
+            &state.id,
+            &crate::events::Event::slot(&job.slot_id, SlotStatus::Done),
+        );
     } else {
         markers::write_failed(
             paths,
@@ -145,6 +155,11 @@ pub fn run_slot(
             s.error = result.error.clone();
             s.exit_code = result.exit_code;
         }
+        let _ = crate::events::append(
+            paths,
+            &state.id,
+            &crate::events::Event::slot(&job.slot_id, SlotStatus::Failed),
+        );
         // quota scrape
         if let Some(hint) =
             crate::quota::QuotaStore::scrape_log_hint(&process::tail_log(&log_path, 8000))
@@ -202,6 +217,11 @@ fn run_dry(
         s.exit_code = Some(0);
         s.backend = Some("dry-run".into());
     }
+    let _ = crate::events::append(
+        paths,
+        &state.id,
+        &crate::events::Event::slot(&job.slot_id, SlotStatus::Done),
+    );
     state.save(paths)?;
     Ok(())
 }
@@ -508,11 +528,27 @@ pub fn wait_run(
     run_id: &str,
     timeout: Duration,
     json: bool,
+    follow: bool,
 ) -> Result<crate::exit_codes::ExitCode> {
     let start = std::time::Instant::now();
     let poll = Duration::from_millis(250);
+    let mut event_off = 0u64;
+    let mut last_phase = None;
     loop {
         let state = RunState::load(paths, run_id)?;
+        if follow && !json {
+            let (off, evs) = crate::events::read_from_offset(paths, run_id, event_off)?;
+            event_off = off;
+            for ev in evs {
+                println!("{}", ev.display_line());
+            }
+            if last_phase != Some(state.phase) {
+                if last_phase.is_some() {
+                    eprintln!("phase: {:?}", state.phase);
+                }
+                last_phase = Some(state.phase);
+            }
+        }
         if state.phase.is_waitable_stop() {
             if json {
                 println!("{}", serde_json::to_string_pretty(&state)?);

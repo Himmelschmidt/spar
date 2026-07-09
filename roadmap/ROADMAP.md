@@ -10,11 +10,11 @@
 
 ## Milestone 1 — Product shell (TUI-first)
 
-- [ ] `spar` with no subcommand opens full TUI in repo  
-- [ ] Fleet panel, phase/gates, live log pane, basic actions  
-- [ ] Event stream file + follow  
-- [ ] Skills: `skills list` / `skills get core`  
-- [ ] AGENTS.md blurb for outer agents  
+- [x] `spar` with no subcommand opens full TUI in repo  
+- [x] Fleet panel, phase/gates, live log pane, basic actions  
+- [x] Event stream file + follow  
+- [x] Skills: `skills list` / `skills get core`  
+- [x] AGENTS.md blurb for outer agents  
 
 ## Milestone 2 — Swarm bus (A2A)
 

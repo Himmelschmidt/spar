@@ -230,9 +230,29 @@ impl RunState {
 
     pub fn save(&self, paths: &SparPaths) -> Result<()> {
         paths.ensure_run_dirs(&self.id)?;
+        let prev_phase = if paths.state_file(&self.id).is_file() {
+            RunState::load(paths, &self.id).ok().map(|s| s.phase)
+        } else {
+            None
+        };
         let file = paths.state_file(&self.id);
         let text = serde_json::to_string_pretty(self)?;
         std::fs::write(&file, text).with_context(|| format!("write {}", file.display()))?;
+
+        if prev_phase != Some(self.phase) {
+            let _ = crate::events::append(
+                paths,
+                &self.id,
+                &crate::events::Event::phase(self.phase, prev_phase),
+            );
+            if self.phase.is_gate() {
+                let _ = crate::events::append(
+                    paths,
+                    &self.id,
+                    &crate::events::Event::gate(format!("{:?}", self.phase), self.phase),
+                );
+            }
+        }
         Ok(())
     }
 

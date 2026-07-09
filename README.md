@@ -25,9 +25,11 @@ cargo build --release
 ## Quick start
 
 ```bash
+spar                         # product TUI in current git repo
 spar doctor
 spar doctor --json
 spar provider list
+spar skills get core         # outer-agent skill
 spar status
 ```
 

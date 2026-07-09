@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 mod doctor;
+mod events;
 mod executor;
 mod exit_codes;
 mod mailbox;
@@ -11,6 +12,7 @@ mod providers;
 mod quota;
 mod sandbox;
 mod ship;
+mod skills;
 mod state;
 mod templates;
 mod tmux;
@@ -21,10 +23,12 @@ mod worktree;
 
 use anyhow::Result;
 use clap::Parser;
-use cli::{Cli, Command};
+use cli::{Cli, Command, SkillsCmd};
 use config::Config;
 use exit_codes::ExitCode;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::process::ExitCode as StdExitCode;
+use std::time::Duration;
 use workflow::CommonOpts;
 
 fn main() -> StdExitCode {
@@ -39,7 +43,21 @@ fn main() -> StdExitCode {
 
 fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
-    match cli.command {
+
+    if let Some(cwd) = &cli.cwd {
+        if cli.command.is_some() {
+            std::env::set_current_dir(cwd)?;
+        }
+    }
+
+    let Some(command) = cli.command else {
+        return tui::run_with(tui::TuiOpts {
+            task_seed: cli.task.clone(),
+            cwd: cli.cwd.clone(),
+        });
+    };
+
+    match command {
         Command::Doctor { json } => doctor::run(json),
         Command::Plan {
             task,
@@ -118,14 +136,22 @@ fn run() -> Result<ExitCode> {
             run_id,
             timeout,
             json,
+            follow,
         } => {
             let (paths, _) = project_ctx()?;
             let dur = util::parse_duration(&timeout)?;
-            executor::wait_run(&paths, &run_id, dur, json)
+            executor::wait_run(&paths, &run_id, dur, json, follow)
         }
-        Command::Logs { run_id, slot } => logs_cmd(&run_id, slot.as_deref()),
+        Command::Logs {
+            run_id,
+            slot,
+            follow,
+        } => logs_cmd(&run_id, slot.as_deref(), follow),
         Command::Attach { run_id } => attach_cmd(&run_id),
-        Command::Dashboard => tui::run(),
+        Command::Dashboard => tui::run_with(tui::TuiOpts {
+            task_seed: cli.task.clone(),
+            cwd: cli.cwd.clone(),
+        }),
         Command::Provider { action } => provider_cmd(action),
         Command::Ship {
             run_id,
@@ -155,6 +181,10 @@ fn run() -> Result<ExitCode> {
             json,
             purge,
         } => cleanup_cmd(&run_id, json, purge),
+        Command::Skills { action } => match action {
+            SkillsCmd::List { json } => skills::run(skills::SkillsAction::List { json }),
+            SkillsCmd::Get { name } => skills::run(skills::SkillsAction::Get { name }),
+        },
         Command::InternalContinue { run_id } => {
             let (paths, cfg) = project_ctx()?;
             workflow::implement::continue_run(&paths, &cfg, &run_id)
@@ -221,34 +251,20 @@ fn status_cmd(run_id: Option<String>, json: bool) -> Result<ExitCode> {
     Ok(ExitCode::Success)
 }
 
-fn logs_cmd(run_id: &str, slot: Option<&str>) -> Result<ExitCode> {
+fn logs_cmd(run_id: &str, slot: Option<&str>, follow: bool) -> Result<ExitCode> {
     let (paths, _) = project_ctx()?;
     let logs_dir = paths.logs_dir(run_id);
     if !logs_dir.is_dir() {
         anyhow::bail!("no logs for run {run_id}");
     }
+
+    if follow {
+        return logs_follow(&paths, run_id, slot);
+    }
+
     if let Some(slot) = slot {
-        let p = paths.log_file(run_id, slot);
-        if !p.is_file() {
-            // try prefix match
-            let mut found = None;
-            for e in std::fs::read_dir(&logs_dir)? {
-                let e = e?;
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name.starts_with(slot) {
-                    found = Some(e.path());
-                    break;
-                }
-            }
-            match found {
-                Some(p) => {
-                    print!("{}", std::fs::read_to_string(p)?);
-                }
-                None => anyhow::bail!("no log for slot {slot}"),
-            }
-        } else {
-            print!("{}", std::fs::read_to_string(p)?);
-        }
+        let p = resolve_log_path(&paths, run_id, slot)?;
+        print!("{}", std::fs::read_to_string(p)?);
         return Ok(ExitCode::Success);
     }
     for e in std::fs::read_dir(&logs_dir)? {
@@ -260,6 +276,116 @@ fn logs_cmd(run_id: &str, slot: Option<&str>) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::Success)
+}
+
+fn resolve_log_path(
+    paths: &paths::SparPaths,
+    run_id: &str,
+    slot: &str,
+) -> Result<std::path::PathBuf> {
+    let p = paths.log_file(run_id, slot);
+    if p.is_file() {
+        return Ok(p);
+    }
+    let logs_dir = paths.logs_dir(run_id);
+    for e in std::fs::read_dir(&logs_dir)? {
+        let e = e?;
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with(slot) {
+            return Ok(e.path());
+        }
+    }
+    anyhow::bail!("no log for slot {slot}")
+}
+
+fn logs_follow(
+    paths: &paths::SparPaths,
+    run_id: &str,
+    slot: Option<&str>,
+) -> Result<ExitCode> {
+    let targets: Vec<std::path::PathBuf> = if let Some(slot) = slot {
+        vec![resolve_log_path(paths, run_id, slot)?]
+    } else {
+        let logs_dir = paths.logs_dir(run_id);
+        let mut files = Vec::new();
+        for e in std::fs::read_dir(&logs_dir)? {
+            let e = e?;
+            if e.path().extension().and_then(|x| x.to_str()) == Some("log") {
+                files.push(e.path());
+            }
+        }
+        files.sort();
+        if files.is_empty() {
+            anyhow::bail!("no log files for run {run_id}");
+        }
+        files
+    };
+
+    let multi = targets.len() > 1;
+    let mut offsets: Vec<u64> = vec![0; targets.len()];
+
+    // First dump existing
+    for (i, path) in targets.iter().enumerate() {
+        if path.is_file() {
+            let data = std::fs::read(path)?;
+            if multi {
+                println!("===== {} =====", path.file_name().unwrap().to_string_lossy());
+            }
+            let _ = std::io::stdout().write_all(&data);
+            offsets[i] = data.len() as u64;
+        }
+    }
+    let _ = std::io::stdout().flush();
+
+    loop {
+        // stop if run reached terminal-ish? keep following until ctrl-c; check phase
+        if let Ok(st) = state::RunState::load(paths, run_id) {
+            if st.phase.is_waitable_stop() {
+                // one more read then exit
+                for (i, path) in targets.iter().enumerate() {
+                    if let Ok(mut f) = std::fs::File::open(path) {
+                        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+                        if len > offsets[i] {
+                            f.seek(SeekFrom::Start(offsets[i]))?;
+                            let mut buf = Vec::new();
+                            f.read_to_end(&mut buf)?;
+                            if multi && !buf.is_empty() {
+                                println!(
+                                    "===== {} =====",
+                                    path.file_name().unwrap().to_string_lossy()
+                                );
+                            }
+                            let _ = std::io::stdout().write_all(&buf);
+                            offsets[i] = len;
+                        }
+                    }
+                }
+                let _ = std::io::stdout().flush();
+                return Ok(st.exit_code());
+            }
+        }
+
+        for (i, path) in targets.iter().enumerate() {
+            if let Ok(mut f) = std::fs::File::open(path) {
+                let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+                if len > offsets[i] {
+                    f.seek(SeekFrom::Start(offsets[i]))?;
+                    let mut buf = Vec::new();
+                    f.read_to_end(&mut buf)?;
+                    if multi && !buf.is_empty() {
+                        println!(
+                            "===== {} =====",
+                            path.file_name().unwrap().to_string_lossy()
+                        );
+                    }
+                    let _ = std::io::stdout().write_all(&buf);
+                    offsets[i] = len;
+                }
+            }
+        }
+        let _ = std::io::stdout().flush();
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 fn attach_cmd(run_id: &str) -> Result<ExitCode> {
@@ -357,7 +483,6 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
             let (paths, _) = project_ctx()?;
             let mut store = quota::QuotaStore::load(&paths)?;
             let until_dt = if let Some(u) = until {
-                // accept RFC3339 or duration from now
                 if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&u) {
                     Some(dt.with_timezone(&chrono::Utc))
                 } else {
