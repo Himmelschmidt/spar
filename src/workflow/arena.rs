@@ -301,6 +301,9 @@ pub fn reconcile(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> R
             state.phase
         );
     }
+    // Single-flight: a second `spar reconcile` (e.g. a re-tapped TUI button) fails
+    // fast with OrchestratorBusy instead of racing state/worktrees of the first.
+    let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
     state.arena_finish = Some(crate::state::ArenaFinish::Reconcile);
     state.set_phase(Phase::AwaitingReconcile);
     state.save(paths)?;

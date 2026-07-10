@@ -1104,7 +1104,14 @@ fn spawn_reconcile(app: &mut App, swarm: &SparPaths, id: &str) {
             return;
         }
     }
-    let spawned = std::process::Command::new(std::env::current_exe().unwrap_or_default())
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            app.flash(format!("Reconcile failed to start: {e}"), RED);
+            return;
+        }
+    };
+    let spawned = std::process::Command::new(exe)
         .arg("reconcile")
         .arg(id)
         .arg("--json")
@@ -1117,7 +1124,10 @@ fn spawn_reconcile(app: &mut App, swarm: &SparPaths, id: &str) {
     match spawned {
         Ok(_) => {
             app.reconcile_spawn = Some((id.to_string(), Instant::now()));
-            app.flash(format!("Reconcile started for {id} — watch Live log"), ACCENT);
+            app.flash(
+                format!("Reconcile started for {id} — watch Live log"),
+                ACCENT,
+            );
         }
         Err(e) => app.flash(format!("Reconcile failed to start: {e}"), RED),
     }
@@ -1183,8 +1193,10 @@ fn handle_mouse(
                 return;
             }
             // Tappable gate buttons take priority — they sit on the status/action bar.
+            // Target the run the buttons were painted from (`full`), not the rail
+            // selection, which can lag by a snapshot cycle.
             if let Some(&(_, action)) = app.gate_buttons.iter().find(|(r, _)| contains(*r, x, y)) {
-                if let Some(id) = runs.get(app.selected_run).map(|r| r.id.as_str()) {
+                if let Some(id) = full.map(|s| s.id.as_str()) {
                     run_gate_action(app, swarm, id, action);
                 }
                 return;
@@ -1756,7 +1768,10 @@ fn draw_action(
     let text = if buttons.is_empty() {
         text
     } else {
-        format!("  {}  ", full.map(|s| phase_label(s.phase)).unwrap_or_default())
+        format!(
+            "  {}  ",
+            full.map(|s| phase_label(s.phase)).unwrap_or_default()
+        )
     };
     f.render_widget(
         Paragraph::new(Span::styled(text, Style::default().fg(fg).bg(bg).bold()))
@@ -2722,7 +2737,10 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &mut App, full: Option<&RunState>
     let proj = " Projects ";
     let help = " Help ";
     let tail = " Ctrl+C×2 exit ";
-    let right_w = (sp.chars().count() + proj.len() + help.len() + tail.len()) as u16;
+    // Display columns, not bytes — the × in `tail` is 2 bytes but 1 column.
+    let right_w =
+        (sp.chars().count() + proj.chars().count() + help.chars().count() + tail.chars().count())
+            as u16;
 
     // Keep the tokens on screen by truncating the left hint to what's left.
     let avail_left = area.width.saturating_sub(right_w + 1).max(1) as usize;
@@ -2732,17 +2750,17 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &mut App, full: Option<&RunState>
 
     let tok_x = area.x + area.width.saturating_sub(right_w);
     let proj_x = tok_x + sp.chars().count() as u16;
-    let help_x = proj_x + proj.len() as u16;
+    let help_x = proj_x + proj.chars().count() as u16;
     app.rect_projects = Rect {
         x: proj_x,
         y: area.y,
-        width: proj.len() as u16,
+        width: proj.chars().count() as u16,
         height: 1,
     };
     app.rect_help = Rect {
         x: help_x,
         y: area.y,
-        width: help.len() as u16,
+        width: help.chars().count() as u16,
         height: 1,
     };
 
@@ -3320,7 +3338,10 @@ mod labels {
             .unwrap();
         assert_eq!(app.gate_buttons.len(), 2);
         // Both buttons sit on the top row, in order, inside the area, right-aligned.
-        assert!(app.gate_buttons.iter().all(|(r, _)| r.y == 0 && r.right() <= 90));
+        assert!(app
+            .gate_buttons
+            .iter()
+            .all(|(r, _)| r.y == 0 && r.right() <= 90));
         assert!(app.gate_buttons[0].0.x < app.gate_buttons[1].0.x);
         assert_eq!(app.gate_buttons[1].1, GateAction::Reject);
     }
