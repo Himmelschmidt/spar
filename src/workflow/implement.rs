@@ -1182,6 +1182,35 @@ mod suite_parse_tests {
     }
 
     #[test]
+    fn tester_template_never_routes_budget_exhaustion_to_green() {
+        let tester = include_str!("../../templates/tester.md");
+        let lower = tester.to_lowercase();
+        let budget_rule = lower
+            .lines()
+            .find(|l| l.contains("cannot complete within the budget"))
+            .expect("budget-exhaustion rule must exist");
+        assert!(
+            budget_rule.contains("inconclusive"),
+            "budget-exhaustion must be reported as inconclusive, got: {budget_rule}"
+        );
+        assert!(
+            !budget_rule.contains("= `skipped`"),
+            "budget-exhaustion must not be assigned `skipped` (skipped maps to a green Pass): {budget_rule}"
+        );
+        // `skipped -> Pass` stays reserved strictly for a repo with no test suite.
+        assert!(
+            lower.contains("skipped` only when no suite could be found")
+                || lower.contains("skipped only when no suite could be found"),
+            "skipped must remain reserved for 'no suite could be found'"
+        );
+        // The verdict the template now mandates for budget exhaustion must gate the ship.
+        assert_eq!(
+            derive_suite_outcome(true, Some(0), Some("## Result\ninconclusive\n")),
+            SuiteOutcome::Inconclusive
+        );
+    }
+
+    #[test]
     fn guidance_distinguishes_inconclusive_from_fail() {
         let inconclusive = suite_guidance(SuiteOutcome::Inconclusive, "body", "").to_lowercase();
         assert!(inconclusive.contains("did not run"));

@@ -18,13 +18,13 @@ You only run the project's test suite and report results. You are **not** a revi
 4. Do **not** change product code, refactor, review style, or "fix" bugs yourself.
 5. Do **not** skip the suite to save time unless there is truly no test command (then document that).
 6. Write `suite.md` **before** exiting, even if the suite is still partial after a long run.
-7. If the suite cannot complete within the budget, write `suite.md` with `## Result` = `skipped` and explain why in `## Summary`. Never guess `pass` or `fail`.
+7. If the suite cannot complete within the budget, write `suite.md` with `## Result` = `inconclusive` and explain why in `## Summary`. Never guess `pass` or `fail`, and never report `skipped` for a suite that started but could not finish — `skipped` is a green pass and would let a half-run suite ship.
 8. Do **not** use `pkill -f`, `pgrep -f`, or `killall` on any token from the task or a test name: your own process's argv contains the full task text, so those match and kill YOU. Kill by pid instead.
 
 ## Report format (`suite.md`)
 ```
 ## Result
-pass | fail | skipped
+pass | fail | skipped | inconclusive
 
 ## Commands
 - `<command>` → exit N
@@ -39,4 +39,5 @@ one short paragraph
 - Result `pass` only if the suite exited 0.
 - Result `fail` if any required suite command failed.
 - Result `skipped` only when no suite could be found.
-- Write done marker on pass/skipped; failed marker on fail.
+- Result `inconclusive` when a suite exists but could not run to a clean verdict within the budget. This blocks the ship (fail closed); it is not a pass.
+- Write done marker on pass/skipped; failed marker on fail/inconclusive.
