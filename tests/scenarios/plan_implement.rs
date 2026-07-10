@@ -551,6 +551,67 @@ fn stop_preserves_gate_phase() {
 }
 
 #[test]
+fn stop_preserves_terminal_done_phase() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let run = cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args([
+            "run",
+            "--workflow",
+            "review",
+            "--task",
+            "review then stop",
+            "--providers",
+            "cli:claude,cli:grok",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(run.get_output().stdout.as_slice());
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["phase"], "done");
+    let run_id = v["run_id"].as_str().unwrap();
+
+    let stop = cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args(["stop", run_id, "--json"])
+        .assert()
+        .success();
+    let sout = String::from_utf8_lossy(stop.get_output().stdout.as_slice());
+    let sv: serde_json::Value = serde_json::from_str(&sout).unwrap();
+    assert_eq!(
+        sv["phase"], "done",
+        "stop must not clobber a finished run's terminal phase"
+    );
+
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            tmp.path()
+                .join(".spar/runs")
+                .join(run_id)
+                .join("state.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        state["phase"], "done",
+        "state.json phase must stay done after stop"
+    );
+    let stopped_marker = tmp
+        .path()
+        .join(".spar/runs")
+        .join(run_id)
+        .join("markers/stopped");
+    assert!(
+        !stopped_marker.is_file(),
+        "stop must not drop a resumable stopped marker on a finished run"
+    );
+}
+
+#[test]
 fn arena_reconcile_dry_run() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
