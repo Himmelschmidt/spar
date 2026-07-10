@@ -70,6 +70,18 @@ pub struct RunState {
     pub arena_finish: Option<ArenaFinish>,
     #[serde(default)]
     pub usage: Vec<SlotUsage>,
+    /// Last suite-channel result. `Inconclusive` means the runner fell over and the
+    /// tests never produced a clean verdict — distinct from a real `Fail`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suite_outcome: Option<SuiteOutcome>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SuiteOutcome {
+    Pass,
+    Fail,
+    Inconclusive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,6 +299,7 @@ impl RunState {
             big: false,
             arena_finish: None,
             usage: Vec::new(),
+            suite_outcome: None,
         }
     }
 

@@ -444,13 +444,15 @@ pub fn salvage_expected_artifact(
     if path.is_file() && std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 0 {
         return;
     }
+    // Never synthesize a suite report: an absent suite.md is meaningful (Inconclusive),
+    // whereas a fabricated `## Result: fail` blocks the ship on a runner problem.
+    if job.role == SlotRole::Tester {
+        return;
+    }
     let tail = process::tail_log(log_path, 6000);
     let body = match job.role {
         SlotRole::Reviewer => format!(
             "## Verdict\nrequest_changes\n\n## Findings\n- severity: major — review slot interrupted ({reason}); partial transcript salvaged below\n\n## Tests\nsee partial transcript\n\n## Partial transcript\n\n```\n{tail}\n```\n"
-        ),
-        SlotRole::Tester => format!(
-            "## Result\nfail\n\n## Commands\n- (interrupted: {reason})\n\n## Summary\nSuite channel timed out or failed before a clean report.\n\n## Failures\n```\n{tail}\n```\n"
         ),
         SlotRole::TestAuthor => format!(
             "## Scenarios\n- (interrupted: {reason})\n\n## Non-goals\n- n/a\n\n## How to run\n- unknown\n\n## Expected before implement\nskipped-reason\n\n## Notes\nPartial transcript:\n```\n{tail}\n```\n"
@@ -1316,6 +1318,7 @@ pub fn emit_run_json(state: &RunState) -> Result<()> {
         "usage": state.usage,
         "big": state.big,
         "autonomy": state.autonomy,
+        "suite_outcome": state.suite_outcome,
         // null while in-flight; only set at terminal/gate phases
         "exit_code": state.status_exit_code(),
     });
@@ -1435,5 +1438,34 @@ mod tests {
         assert_eq!(describe_exit(None, Some(9)), "killed by signal 9 (SIGKILL)");
         assert_eq!(describe_exit(Some(137), None), "exit 137 (OOM-killed)");
         assert_eq!(describe_exit(Some(2), None), "exit 2");
+    }
+
+    #[test]
+    fn tester_salvage_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("r1").unwrap();
+        let log_path = paths.log_file("r1", "suite-x");
+        std::fs::write(
+            &log_path,
+            "## Rules\n1. run the suite\n## Report format\n## Paths\n(prompt echo, not test output)\n",
+        )
+        .unwrap();
+        let job = SlotJob {
+            slot_id: "suite-x".into(),
+            provider: "cli:claude".into(),
+            role: SlotRole::Tester,
+            template: "tester".into(),
+            extra_vars: HashMap::new(),
+            expected_artifact: Some("suite.md".into()),
+            model: None,
+        };
+        salvage_expected_artifact(&paths, "r1", &job, &log_path, "interrupted: timeout");
+        let suite = paths.artifact("r1", "suite.md");
+        assert!(
+            !suite.exists(),
+            "tester salvage must leave suite.md absent, found {}",
+            suite.display()
+        );
     }
 }

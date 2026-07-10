@@ -346,6 +346,56 @@ fn implement_dry_run_writes_suite_artifact() {
 }
 
 #[test]
+fn implement_dry_run_surfaces_suite_outcome() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+
+    let out = cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args([
+            "implement",
+            "--task",
+            "suite outcome surfaced",
+            "--providers",
+            "cli:claude,cli:grok",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let run_id = v["run_id"].as_str().unwrap();
+
+    // state.json carries the tri-state suite outcome (dry-run tester writes pass).
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            tmp.path()
+                .join(".spar/runs")
+                .join(run_id)
+                .join("state.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["suite_outcome"], "pass", "state.json suite_outcome");
+
+    // status --json surfaces it too.
+    let st = cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args(["status", run_id, "--json"])
+        .assert()
+        .code(0)
+        .get_output()
+        .stdout
+        .clone();
+    let sv: serde_json::Value = serde_json::from_slice(&st).unwrap();
+    assert_eq!(sv["suite_outcome"], "pass", "status --json suite_outcome");
+}
+
+#[test]
 fn dry_run_does_not_create_git_worktrees() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
