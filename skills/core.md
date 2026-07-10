@@ -127,6 +127,11 @@ wait = "2h"
 enabled = true
 # provider = "cli:claude"   # else first usable of claude/grok/agy/api:xai/openai
 timeout_secs = 7200
+# Pre-coding acceptance tests (plan). Separate test-author agent; not planner/critic.
+[spec]
+enabled = true
+# provider = "cli:agy"      # prefer third provider ≠ planner/critic
+timeout_secs = 1800
 ```
 
 ## Rules of the road
@@ -135,4 +140,5 @@ timeout_secs = 7200
 - Coding slots always use git worktrees; never check out feature branches on the primary tree.
 - Ship is draft PR only — never merge.
 - State lives under `.spar/` in the project root.
+- **Spec channel (plan):** after planner+critic, a `test-author` freezes acceptance tests (`artifacts/test-contract.md` + worktree tests) from plan/critique (bus is audit trail), **before** the plan approval gate. Implement overlays those tests into the impl worktree (fail closed if author ran). Disable with `[spec] enabled = false`.
 - **Suite channel (implement/loop):** a dedicated `tester` slot runs full test suites; impl/review stay smoke/diff-only when it runs. Artifact: `artifacts/suite.md`. Independent `review` workflow does not spawn a tester by default.

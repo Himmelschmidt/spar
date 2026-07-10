@@ -208,6 +208,118 @@ pub fn cleanup_run(state: &RunState) -> Result<()> {
     Ok(())
 }
 
+/// Bring pre-coding acceptance tests from the test-author worktree into the implementer cwd.
+///
+/// Fail closed when the author worktree is missing. Always overlays the author working tree
+/// (agents often leave tests uncommitted). Live runs also try `git merge` of the author branch
+/// first for committed history; failed merges are aborted before overlay.
+pub fn apply_spec_tests_to_impl(
+    state: &RunState,
+    author_slot: &str,
+    impl_cwd: &Path,
+) -> Result<()> {
+    let spec = state
+        .worktrees
+        .iter()
+        .find(|w| w.slot_id == author_slot)
+        .ok_or_else(|| {
+            anyhow::anyhow!("test-author worktree missing for slot {author_slot}")
+        })?;
+    if !spec.path.is_dir() {
+        anyhow::bail!(
+            "test-author worktree path missing: {}",
+            spec.path.display()
+        );
+    }
+    if !impl_cwd.is_dir() {
+        anyhow::bail!("implementer cwd missing: {}", impl_cwd.display());
+    }
+
+    let dry_or_spar = state.dry_run || impl_cwd.starts_with(state.project_root.join(".spar"));
+    if !dry_or_spar {
+        try_merge_spec_branch(impl_cwd, &spec.branch)?;
+    }
+    // Always overlay: uncommitted author files never appear in a merge.
+    copy_tree_overlay(&spec.path, impl_cwd)?;
+    Ok(())
+}
+
+/// Attempt merge; on failure abort so the tree is never left in MERGING.
+fn try_merge_spec_branch(impl_cwd: &Path, branch: &str) -> Result<()> {
+    let status = Command::new("git")
+        .args([
+            "merge",
+            "--no-edit",
+            "-m",
+            "spar: acceptance tests from test-author",
+            branch,
+        ])
+        .current_dir(impl_cwd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .with_context(|| format!("git merge {branch} into {}", impl_cwd.display()))?;
+    if status.success() {
+        return Ok(());
+    }
+    let _ = Command::new("git")
+        .args(["merge", "--abort"])
+        .current_dir(impl_cwd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    Ok(())
+}
+
+fn copy_tree_overlay(src: &Path, dst: &Path) -> Result<()> {
+    if !src.is_dir() {
+        return Ok(());
+    }
+    for entry in walkdir_regular_files(src)? {
+        let rel = entry.strip_prefix(src).unwrap_or(&entry);
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        if rel.components().any(|c| c.as_os_str() == ".git") {
+            continue;
+        }
+        let target = dst.join(rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("mkdir {}", parent.display()))?;
+        }
+        std::fs::copy(&entry, &target).with_context(|| {
+            format!("copy {} -> {}", entry.display(), target.display())
+        })?;
+    }
+    Ok(())
+}
+
+/// Regular files only — never follow or copy symlinks (agent could link secrets).
+fn walkdir_regular_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    fn rec(d: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+        let rd =
+            std::fs::read_dir(d).with_context(|| format!("read_dir {}", d.display()))?;
+        for e in rd.flatten() {
+            let p = e.path();
+            let meta = std::fs::symlink_metadata(&p)
+                .with_context(|| format!("stat {}", p.display()))?;
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                rec(&p, out)?;
+            } else if meta.is_file() {
+                out.push(p);
+            }
+        }
+        Ok(())
+    }
+    rec(root, &mut out)?;
+    Ok(out)
+}
+
 /// After purging a run dir, drop empty parent dirs (runs/, .spar/ if empty).
 pub fn prune_empty_spar_parents(paths: &SparPaths) -> Result<()> {
     let runs = paths.runs_dir();
@@ -224,6 +336,57 @@ pub fn prune_empty_spar_parents(paths: &SparPaths) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn overlay_copies_files_skips_symlinks() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(src.join("tests")).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("tests/a.rs"), "fn t() {}\n").unwrap();
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink("/etc/passwd", src.join("evil"));
+        }
+        copy_tree_overlay(&src, &dst).unwrap();
+        assert!(dst.join("tests/a.rs").is_file());
+        #[cfg(unix)]
+        {
+            assert!(!dst.join("evil").exists());
+        }
+    }
+
+    #[test]
+    fn apply_spec_missing_worktree_errors() {
+        let tmp = tempdir().unwrap();
+        let mut state =
+            RunState::new("r1", crate::cli::WorkflowKind::Plan, tmp.path().to_path_buf());
+        state.dry_run = true;
+        let err = apply_spec_tests_to_impl(&state, "test-author-x", tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("missing"), "err={err}");
+    }
+
+    #[test]
+    fn apply_spec_overlays_author_files() {
+        let tmp = tempdir().unwrap();
+        let project = tmp.path().join("proj");
+        let author = tmp.path().join("author");
+        let impl_cwd = tmp.path().join("impl");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&author).unwrap();
+        std::fs::create_dir_all(&impl_cwd).unwrap();
+        std::fs::write(author.join(".spar-dry-acceptance-tests"), "tests\n").unwrap();
+        let mut state = RunState::new("r1", crate::cli::WorkflowKind::Plan, project);
+        state.dry_run = true;
+        state.worktrees.push(WorktreeRecord {
+            slot_id: "test-author-x".into(),
+            path: author,
+            branch: "spar/r1/test-author-x".into(),
+        });
+        apply_spec_tests_to_impl(&state, "test-author-x", &impl_cwd).unwrap();
+        assert!(impl_cwd.join(".spar-dry-acceptance-tests").is_file());
+    }
 
     #[test]
     fn path_shape() {

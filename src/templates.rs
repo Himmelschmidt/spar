@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 const PLANNER: &str = include_str!("../templates/planner.md");
 const PLAN_CRITIC: &str = include_str!("../templates/plan_critic.md");
+const TEST_AUTHOR: &str = include_str!("../templates/test_author.md");
 const IMPLEMENTER: &str = include_str!("../templates/implementer.md");
 const TESTER: &str = include_str!("../templates/tester.md");
 const REVIEWER: &str = include_str!("../templates/reviewer_adversarial.md");
@@ -15,6 +16,7 @@ pub fn get(name: &str) -> Option<&'static str> {
     match name {
         "planner" | "planner.md" => Some(PLANNER),
         "plan_critic" | "plan_critic.md" => Some(PLAN_CRITIC),
+        "test_author" | "test_author.md" => Some(TEST_AUTHOR),
         "implementer" | "implementer.md" => Some(IMPLEMENTER),
         "tester" | "tester.md" => Some(TESTER),
         "reviewer" | "reviewer_adversarial" | "reviewer_adversarial.md" => Some(REVIEWER),
@@ -66,6 +68,12 @@ pub fn base_vars(ctx: &TemplateCtx<'_>) -> HashMap<String, String> {
     m.insert("provider".into(), ctx.provider.into());
     m.insert("branch".into(), ctx.branch.into());
     m.insert("plan_body".into(), String::new());
+    m.insert(
+        "test_contract_body".into(),
+        "(no pre-written acceptance contract)".into(),
+    );
+    m.insert("planner_slot".into(), String::new());
+    m.insert("critic_slot".into(), String::new());
     m.insert("review_cwd".into(), ctx.cwd.into());
     m.insert(
         "suite_body".into(),
@@ -109,6 +117,28 @@ mod tests {
         assert!(s.contains("ship auth"));
         assert!(s.contains("suite.md"));
         assert!(!s.contains("{{task}}"));
+    }
+
+    #[test]
+    fn test_author_template_renders() {
+        let mut v = HashMap::new();
+        v.insert("task".into(), "add login".into());
+        v.insert("cwd".into(), "/tmp/wt".into());
+        v.insert("project_root".into(), "/tmp/proj".into());
+        v.insert("artifacts_dir".into(), "/tmp/a".into());
+        v.insert("markers_dir".into(), "/tmp/m".into());
+        v.insert("slot_id".into(), "test-author-cli-agy".into());
+        v.insert("provider".into(), "cli:agy".into());
+        v.insert("run_id".into(), "abc".into());
+        v.insert("branch".into(), "spar/abc/test-author".into());
+        v.insert("planner_slot".into(), "planner-cli-claude".into());
+        v.insert("critic_slot".into(), "critic-cli-grok".into());
+        let s = render("test_author", &v).unwrap();
+        assert!(s.contains("test-contract.md"));
+        assert!(s.contains("planner-cli-claude"));
+        assert!(s.contains("add login"));
+        assert!(!s.contains("{{task}}"));
+        assert!(!s.contains("{{planner_slot}}"));
     }
 
     #[test]
