@@ -222,8 +222,10 @@ mod tests {
         let tmp = tempdir().unwrap();
         let log = tmp.path().join("s.log");
         std::fs::write(&log, "x\n").unwrap();
-        let mut stats = StreamStats::default();
-        stats.last_log_at = Some("2020-01-01T00:00:00Z".into());
+        let stats = StreamStats {
+            last_log_at: Some("2020-01-01T00:00:00Z".into()),
+            ..Default::default()
+        };
         stats.save(&log).unwrap();
         // Fresh log write after stale stats stamp.
         std::fs::write(&log, "fresh\n").unwrap();

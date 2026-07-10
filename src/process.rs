@@ -246,7 +246,7 @@ fn kill_process_group(
         }
         signal_process_group(pid, SIGKILL);
         let _ = child.kill();
-        return child.wait().context("wait after process-group kill");
+        child.wait().context("wait after process-group kill")
     }
     #[cfg(not(unix))]
     {

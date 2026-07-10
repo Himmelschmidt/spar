@@ -58,6 +58,18 @@ impl Event {
         }
     }
 
+    pub fn info(message: impl Into<String>) -> Self {
+        Self {
+            ts: Utc::now(),
+            kind: EventKind::Info,
+            phase: None,
+            prev_phase: None,
+            slot: None,
+            status: None,
+            message: Some(message.into()),
+        }
+    }
+
     pub fn gate(message: impl Into<String>, phase: Phase) -> Self {
         Self {
             ts: Utc::now(),

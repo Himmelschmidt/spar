@@ -16,6 +16,7 @@ mod provider_ref;
 mod providers;
 mod quota;
 mod registry;
+mod runlock;
 mod sandbox;
 mod ship;
 mod skills;
@@ -339,6 +340,18 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool) -> Result<ExitCode>
                         None => serde_json::Value::Null,
                     },
                 );
+                let orch_pid = runlock::RunLock::owner(&swarm, &state.id);
+                obj.insert(
+                    "orchestrator_pid".into(),
+                    match orch_pid {
+                        Some(p) => serde_json::json!(p),
+                        None => serde_json::Value::Null,
+                    },
+                );
+                obj.insert(
+                    "orchestrator_alive".into(),
+                    serde_json::Value::Bool(orch_pid.map(process::pid_alive).unwrap_or(false)),
+                );
             }
             liveness::enrich_status_json(&mut v, &state.slots, &cfg, &swarm, &state.id);
             println!("{}", serde_json::to_string_pretty(&v)?);
@@ -355,6 +368,13 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool) -> Result<ExitCode>
             }
             if let Some(c) = state.status_exit_code() {
                 println!("run_exit_code: {c}  (process exit always 0 for status)");
+            }
+            match runlock::RunLock::owner(&swarm, &state.id) {
+                Some(p) => {
+                    let alive = process::pid_alive(p);
+                    println!("orchestrator: pid={p} alive={alive}");
+                }
+                None => println!("orchestrator: none"),
             }
             println!("slots: {}", state.slots.len());
             for slot in &state.slots {

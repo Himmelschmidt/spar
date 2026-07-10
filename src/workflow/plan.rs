@@ -494,6 +494,7 @@ fn detach_self(state: &RunState, json: bool) -> Result<ExitCode> {
 }
 
 pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<ExitCode> {
+    let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
     let mut state = RunState::load(paths, run_id)?;
     let mut jobs = Vec::new();
     for slot in &state.slots {

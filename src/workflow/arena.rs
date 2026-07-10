@@ -76,6 +76,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         return detach(&state, opts.json);
     }
 
+    let _lock = crate::runlock::RunLock::acquire(paths, &state.id)?;
     execute(&mut state, paths, cfg)?;
     if opts.json {
         executor::emit_run_json(&state)?;

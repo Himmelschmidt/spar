@@ -1338,7 +1338,7 @@ fn draw_rail(
                             .map(|r| r.len())
                             .unwrap_or(0);
                         let line = Line::from(vec![
-                            Span::styled(format!("{mark}"), Style::default().fg(ACCENT)),
+                            Span::styled(mark.to_string(), Style::default().fg(ACCENT)),
                             Span::styled(
                                 format!(" {:<14}", truncate(name, 14)),
                                 Style::default()
@@ -1394,7 +1394,7 @@ fn draw_rail(
                             .unwrap_or_else(|| workflow_label(r.workflow).into());
                         let age = relative_age(r.updated_at);
                         let line = Line::from(vec![
-                            Span::styled(format!("{mark}"), Style::default().fg(ACCENT)),
+                            Span::styled(mark.to_string(), Style::default().fg(ACCENT)),
                             Span::styled(
                                 format!(" {:<8}", truncate(&r.id, 8)),
                                 Style::default()
@@ -2105,8 +2105,8 @@ fn situational_footer(full: Option<&RunState>, focus: Focus, browse: BrowseLevel
 }
 
 fn draw_help_overlay(f: &mut Frame, area: Rect) {
-    let w = area.width.min(72).max(40);
-    let h = area.height.min(22).max(14);
+    let w = area.width.clamp(40, 72);
+    let h = area.height.clamp(14, 22);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let rect = Rect {

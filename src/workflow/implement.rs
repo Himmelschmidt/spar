@@ -94,8 +94,9 @@ fn run_from_approved(
     }
     state.save(paths)?;
     if opts.detach {
-        return detach_implement(&state, opts.json);
+        return detach_implement(&state, paths, opts.json);
     }
+    let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
     execute_loop(&mut state, paths, cfg)?;
     maybe_auto_ship_or_cleanup(&mut state, paths, cfg)?;
     finish_out(&state, opts.json)?;
@@ -273,26 +274,6 @@ fn suite_report_is_red(body: &str) -> bool {
     true
 }
 
-#[cfg(test)]
-mod suite_parse_tests {
-    use super::suite_report_is_red;
-
-    #[test]
-    fn pass_and_skipped_green() {
-        assert!(!suite_report_is_red("## Result\npass\n"));
-        assert!(!suite_report_is_red("## Result\nskipped\n"));
-    }
-
-    #[test]
-    fn fail_and_malformed_red() {
-        assert!(suite_report_is_red("## Result\nfail\n"));
-        assert!(suite_report_is_red("## Result\nfailed\n"));
-        assert!(suite_report_is_red("## Result\n\n"));
-        assert!(suite_report_is_red("no result header"));
-        assert!(suite_report_is_red("## Result\n**fail**\n") || suite_report_is_red("## Result\nfail\n"));
-    }
-}
-
 fn sanitize_slot(s: &str) -> String {
     s.replace([':', '/'], "-")
 }
@@ -363,9 +344,10 @@ fn run_with_task(
     state.save(paths)?;
 
     if opts.detach {
-        return detach_implement(&state, opts.json);
+        return detach_implement(&state, paths, opts.json);
     }
 
+    let _lock = crate::runlock::RunLock::acquire(paths, &state.id)?;
     execute_loop(&mut state, paths, cfg)?;
     maybe_auto_ship_or_cleanup(&mut state, paths, cfg)?;
     finish_out(&state, opts.json)?;
@@ -849,7 +831,16 @@ fn finish_out(state: &RunState, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn detach_implement(state: &RunState, json: bool) -> Result<ExitCode> {
+fn detach_implement(state: &RunState, paths: &SparPaths, json: bool) -> Result<ExitCode> {
+    if let Some(owner) = crate::runlock::RunLock::owner(paths, &state.id) {
+        if crate::process::pid_alive(owner) {
+            return Err(crate::runlock::OrchestratorBusy {
+                run_id: state.id.clone(),
+                owner_pid: owner,
+            }
+            .into());
+        }
+    }
     #[cfg(unix)]
     {
         let mut child_cmd = std::process::Command::new(std::env::current_exe()?);
@@ -873,6 +864,10 @@ fn detach_implement(state: &RunState, json: bool) -> Result<ExitCode> {
 
 pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<ExitCode> {
     let mut state = RunState::load(paths, run_id)?;
+    if state.workflow == crate::cli::WorkflowKind::Plan {
+        return crate::workflow::plan::continue_run(paths, cfg, run_id);
+    }
+    let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
     match state.workflow {
         crate::cli::WorkflowKind::Loop => {
             execute_loop(&mut state, paths, cfg)?;
@@ -889,9 +884,27 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
         crate::cli::WorkflowKind::Review => {
             crate::workflow::review::execute(&mut state, paths, cfg)?;
         }
-        crate::cli::WorkflowKind::Plan => {
-            return crate::workflow::plan::continue_run(paths, cfg, run_id);
-        }
+        crate::cli::WorkflowKind::Plan => unreachable!("plan handled above"),
     }
     Ok(state.exit_code())
+}
+
+#[cfg(test)]
+mod suite_parse_tests {
+    use super::suite_report_is_red;
+
+    #[test]
+    fn pass_and_skipped_green() {
+        assert!(!suite_report_is_red("## Result\npass\n"));
+        assert!(!suite_report_is_red("## Result\nskipped\n"));
+    }
+
+    #[test]
+    fn fail_and_malformed_red() {
+        assert!(suite_report_is_red("## Result\nfail\n"));
+        assert!(suite_report_is_red("## Result\nfailed\n"));
+        assert!(suite_report_is_red("## Result\n\n"));
+        assert!(suite_report_is_red("no result header"));
+        assert!(suite_report_is_red("## Result\n**fail**\n") || suite_report_is_red("## Result\nfail\n"));
+    }
 }

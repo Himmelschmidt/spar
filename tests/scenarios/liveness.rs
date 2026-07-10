@@ -1,5 +1,6 @@
 //! Slot liveness surfaced through `spar status --json`.
 use assert_cmd::cargo::cargo_bin_cmd;
+use predicates::prelude::*;
 use serde_json::Value;
 use std::process::Command;
 use tempfile::tempdir;
@@ -81,5 +82,204 @@ fn dry_run_status_reports_pid_liveness() {
     assert!(
         slots.iter().any(|s| s["status"] == "done"),
         "expected at least one done slot"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn foreground_workflows_acquire_orchestrator_lock() {
+    for workflow in ["review", "arena", "roles", "peer"] {
+        assert_foreground_lock(workflow);
+    }
+}
+
+#[cfg(unix)]
+fn assert_foreground_lock(workflow: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    init_git_repo(&proj);
+    // No worktrees: slots run in the project root so the blocking fake CLI is
+    // reached regardless of per-workflow slot-id shapes.
+    std::fs::write(proj.join("spar.toml"), "isolation = \"none\"\n").unwrap();
+
+    // Fake provider CLIs that block, so the foreground orchestrator stays inside
+    // execute() (holding its lock) long enough to observe it.
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for name in ["claude", "grok", "agy"] {
+        let p = bin.join(name);
+        std::fs::write(&p, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path_env = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let exe = assert_cmd::cargo::cargo_bin("spar");
+    let mut child = Command::new(&exe)
+        .current_dir(&proj)
+        .env("PATH", &path_env)
+        .args([
+            "run",
+            "--workflow",
+            workflow,
+            "--task",
+            "lock guard regression",
+            "--providers",
+            "cli:claude,cli:grok",
+            "--json",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let runs = proj.join(".spar/runs");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut lock_pid: Option<u64> = None;
+    let mut run_id: Option<String> = None;
+    while Instant::now() < deadline {
+        if let Ok(entries) = std::fs::read_dir(&runs) {
+            for e in entries.flatten() {
+                let lock = e.path().join("orchestrator.lock");
+                if let Ok(s) = std::fs::read_to_string(&lock) {
+                    if let Ok(pid) = s.trim().parse::<u64>() {
+                        lock_pid = Some(pid);
+                        run_id = e.file_name().to_str().map(str::to_string);
+                    }
+                }
+            }
+        }
+        if lock_pid.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let observed = lock_pid.zip(run_id.clone());
+    let (pid, run_id) = match observed {
+        Some(v) => v,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "foreground `spar run --workflow {workflow}` created no orchestrator.lock -- \
+                 a concurrent orchestrator on the same run would not be refused"
+            );
+        }
+    };
+    assert_eq!(
+        pid,
+        child.id() as u64,
+        "orchestrator.lock for {workflow} must name the live orchestrator process"
+    );
+
+    // While the orchestrator holds its lock, status must expose it as alive.
+    let st = cargo_bin_cmd!("spar")
+        .current_dir(&proj)
+        .args(["status", &run_id, "--json"])
+        .assert()
+        .code(0)
+        .get_output()
+        .stdout
+        .clone();
+    let sv: Value = serde_json::from_slice(&st).unwrap();
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(
+        sv["orchestrator_pid"].as_u64(),
+        Some(pid),
+        "status must expose the {workflow} orchestrator pid: {sv}"
+    );
+    assert_eq!(
+        sv["orchestrator_alive"],
+        Value::Bool(true),
+        "status must report the {workflow} orchestrator as alive: {sv}"
+    );
+}
+
+#[test]
+fn implement_refuses_second_orchestrator() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+
+    let plan = cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args([
+            "plan",
+            "--task",
+            "lock check",
+            "--providers",
+            "cli:claude,cli:grok",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&plan).unwrap();
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+
+    cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+
+    // A live orchestrator (this test process) already owns the run.
+    let lock = tmp
+        .path()
+        .join(".spar/runs")
+        .join(&run_id)
+        .join("orchestrator.lock");
+    std::fs::write(&lock, std::process::id().to_string()).unwrap();
+
+    cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--providers",
+            "cli:claude,cli:grok,cli:agy",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(1)
+        .stderr(
+            predicate::str::contains("already has a running orchestrator")
+                .and(predicate::str::contains(std::process::id().to_string())),
+        );
+
+    // status must let an operator see who is driving the run.
+    let st = cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args(["status", &run_id, "--json"])
+        .assert()
+        .code(0)
+        .get_output()
+        .stdout
+        .clone();
+    let sv: Value = serde_json::from_slice(&st).unwrap();
+    assert_eq!(
+        sv["orchestrator_pid"].as_u64(),
+        Some(std::process::id() as u64),
+        "status must expose the owning orchestrator pid: {sv}"
+    );
+    assert_eq!(
+        sv["orchestrator_alive"],
+        Value::Bool(true),
+        "status must report the orchestrator as alive: {sv}"
     );
 }

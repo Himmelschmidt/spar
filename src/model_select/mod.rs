@@ -501,8 +501,8 @@ pub fn run_cmd(action: crate::cli::ModelAction, cfg: &Config) -> Result<crate::e
                     ranked.len()
                 );
                 println!(
-                    "{:<36} {:>8} {:>10} {:>10} {:>8}  {}",
-                    "ID", "ACC", "LAT(s)", "COST", "SCORE", "PROVIDER"
+                    "{:<36} {:>8} {:>10} {:>10} {:>8}  PROVIDER",
+                    "ID", "ACC", "LAT(s)", "COST", "SCORE"
                 );
                 for r in ranked.iter().take(30) {
                     let mapped = map_usable_allowed(&r.model.id, false, &ms)
