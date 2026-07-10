@@ -1304,6 +1304,7 @@ pub fn emit_run_json(state: &RunState) -> Result<()> {
         "workflow": state.workflow,
         "phase": state.phase,
         "task": state.task,
+        "amendment": state.amendment,
         "dry_run": state.dry_run,
         "slots": state.slots,
         "providers": state.providers,
@@ -1328,6 +1329,9 @@ pub fn print_run_human(state: &RunState) {
     println!("workflow:{:?}", state.workflow);
     if let Some(t) = &state.task {
         println!("task:    {t}");
+    }
+    if let Some(a) = &state.amendment {
+        println!("amendment: {a}");
     }
     if !state.providers.is_empty() {
         println!("providers: {}", state.providers.join(", "));

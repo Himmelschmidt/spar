@@ -20,7 +20,7 @@ pub fn run_from_cli(
     cfg: &Config,
 ) -> Result<ExitCode> {
     if let Some(id) = run_id {
-        return run_from_approved(&id, opts, paths, cfg);
+        return run_from_approved(&id, task, opts, paths, cfg);
     }
     if let Some(plan_path) = plan {
         let body = std::fs::read_to_string(&plan_path)?;
@@ -43,6 +43,7 @@ pub fn run_loop(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<Exi
 
 fn run_from_approved(
     run_id: &str,
+    amendment: Option<String>,
     opts: CommonOpts,
     paths: &SparPaths,
     cfg: &Config,
@@ -61,6 +62,16 @@ fn run_from_approved(
     // of halting again at its first boundary.
     if state.phase == Phase::Stopped {
         let _ = std::fs::remove_file(paths.marker(run_id, "stopped"));
+    }
+    // `-t` on an approved run is a directive for THIS round only. It never rewrites
+    // the run's task; absent `-t`, any prior amendment is cleared so it never silently
+    // re-applies to a later round.
+    state.amendment = amendment;
+    if !opts.json {
+        match &state.amendment {
+            Some(a) => println!("amendment applied for this round: {a}"),
+            None => println!("no amendment (running the original task)"),
+        }
     }
     state.backend = opts.backend;
     state.isolation = cfg.isolation;
@@ -406,6 +417,15 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
 
     let plan_body =
         std::fs::read_to_string(paths.artifact(&state.id, "plan.md")).unwrap_or_default();
+    let amendment_section = state
+        .amendment
+        .as_deref()
+        .map(|a| {
+            format!(
+                "## Amendment (this round)\nThe operator supplied a directive for THIS round. It takes precedence over the original task where they conflict. The original task below is context; the amendment is the work.\n\n{a}\n"
+            )
+        })
+        .unwrap_or_default();
     let test_contract_body = {
         let p = paths.artifact(&state.id, "test-contract.md");
         std::fs::read_to_string(&p).unwrap_or_else(|_| {
@@ -461,6 +481,7 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
         let mut extra = HashMap::new();
         extra.insert("plan_body".into(), plan_body.clone());
         extra.insert("test_contract_body".into(), test_contract_body.clone());
+        extra.insert("amendment_section".into(), amendment_section.clone());
         let impl_model = impl_slot.model.clone();
         let impl_job = SlotJob {
             slot_id: impl_slot.id.clone(),

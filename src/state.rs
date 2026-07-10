@@ -16,6 +16,10 @@ pub struct RunState {
     pub phase: Phase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
+    /// Operator directive for the current implement round (`implement --run -t`).
+    /// Never replaces `task` (the run's identity); cleared when a round runs without `-t`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amendment: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
@@ -257,6 +261,7 @@ impl RunState {
             workflow,
             phase: Phase::Init,
             task: None,
+            amendment: None,
             created_at: now,
             updated_at: now,
             slots: Vec::new(),

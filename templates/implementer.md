@@ -5,6 +5,7 @@ Implement the task in your isolated worktree. Do not modify the primary checkout
 ## Task
 {{task}}
 
+{{amendment_section}}
 ## Plan (if any)
 {{plan_body}}
 
