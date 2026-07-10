@@ -471,10 +471,7 @@ fn stop_cmd(run_id: &str, json: bool) -> Result<ExitCode> {
 
     // A finished or gated run is already at rest: never downgrade it to Stopped or
     // drop a resumable marker that would make a later `implement --run` redo work.
-    // PlanApproved is `is_terminal` only for the plan sub-workflow; it is the normal
-    // resumable plan→implement handoff, so stop still applies there.
-    let finished = state.phase.is_terminal() && state.phase != state::Phase::PlanApproved;
-    if finished || state.phase.is_gate() {
+    if phase_at_rest(state.phase) {
         if json {
             let v = run_status_json(&paths, &cfg, &state)?;
             println!("{}", serde_json::to_string_pretty(&v)?);
@@ -516,10 +513,24 @@ fn stop_cmd(run_id: &str, json: bool) -> Result<ExitCode> {
         }
     }
 
-    // 4. The kill window above spans seconds; the orchestrator may have persisted
-    //    slot exit/usage while dying. Reload so that is not clobbered, then write
-    //    the phase ourselves in case the orchestrator died before recording it.
+    // 4. The kill window above spans seconds; the orchestrator may have finished
+    //    naturally and persisted a terminal/gate phase while dying. Reload and
+    //    re-check: never downgrade a run that reached rest on its own, and drop the
+    //    stopped marker so a later `implement --run` does not redo finished work.
     let mut state = state::RunState::load(&paths, run_id)?;
+    if phase_at_rest(state.phase) {
+        let _ = std::fs::remove_file(paths.marker(run_id, "stopped"));
+        if json {
+            let v = run_status_json(&paths, &cfg, &state)?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        } else {
+            println!(
+                "run {run_id} finished at {:?} before stop took effect; left as-is",
+                state.phase
+            );
+        }
+        return Ok(ExitCode::Success);
+    }
     state.set_phase(state::Phase::Stopped);
     state.save(&paths)?;
 
@@ -531,6 +542,14 @@ fn stop_cmd(run_id: &str, json: bool) -> Result<ExitCode> {
         println!("resume: spar implement --run {run_id} --providers <…>");
     }
     Ok(ExitCode::Success)
+}
+
+/// A run at a terminal (non-`PlanApproved`) or gate phase is already at rest and must
+/// not be downgraded to `Stopped`. `PlanApproved` is `is_terminal` only for the plan
+/// sub-workflow; it is the normal resumable plan→implement handoff, so stop applies there.
+fn phase_at_rest(phase: state::Phase) -> bool {
+    let finished = phase.is_terminal() && phase != state::Phase::PlanApproved;
+    finished || phase.is_gate()
 }
 
 fn load_run_anywhere(

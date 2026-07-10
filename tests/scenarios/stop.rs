@@ -175,6 +175,63 @@ fn stop_preserves_state_written_during_kill_window() {
     );
 }
 
+/// If the orchestrator finishes naturally during the kill window and persists a
+/// gate/terminal phase, `stop` must leave it there — not stamp `Stopped` over it,
+/// which would make a later `implement --run` redo finished work. Encoded: a phase
+/// that reaches a gate during the kill window survives. Pre-fix step 4 overwrote it.
+#[test]
+fn stop_does_not_downgrade_a_run_that_finished_during_the_kill_window() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let run_id = plan_and_approve(tmp.path());
+
+    let mut state = load_state(tmp.path(), &run_id);
+    let slot_id = state["slots"][0]["id"].as_str().unwrap().to_string();
+    state["slots"][0]["status"] = Value::from("running");
+    save_state(tmp.path(), &run_id, &state);
+
+    let mut child = Command::new("sh")
+        .args(["-c", "trap '' TERM; while true; do sleep 1; done"])
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let markers = tmp.path().join(".spar/runs").join(&run_id).join("markers");
+    std::fs::create_dir_all(&markers).unwrap();
+    std::fs::write(markers.join(format!("{slot_id}.pid")), child.id().to_string()).unwrap();
+
+    let dir = tmp.path().to_path_buf();
+    let rid = run_id.clone();
+    let writer = std::thread::spawn(move || {
+        let stopped = dir.join(".spar/runs").join(&rid).join("markers/stopped");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !stopped.is_file() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut s = load_state(&dir, &rid);
+        s["phase"] = Value::from("awaiting_ship_confirm");
+        save_state(&dir, &rid, &s);
+    });
+
+    cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args(["stop", &run_id, "--json"])
+        .assert()
+        .code(0);
+    writer.join().unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let state = load_state(tmp.path(), &run_id);
+    assert_eq!(
+        state["phase"], "awaiting_ship_confirm",
+        "stop must not downgrade a run that reached a gate during the kill window: {state}"
+    );
+    assert!(
+        !markers.join("stopped").is_file(),
+        "stop must drop its marker when it declines to stop a finished run"
+    );
+}
+
 /// The encoded bug: with the `stopped` marker present, `execute_loop` must
 /// dispatch NOTHING. Pre-fix the marker is meaningless and the implementer runs.
 #[test]
