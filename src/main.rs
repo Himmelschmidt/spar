@@ -469,6 +469,21 @@ fn stop_cmd(run_id: &str, json: bool) -> Result<ExitCode> {
     let (paths, cfg) = project_ctx()?;
     let mut state = state::RunState::load(&paths, run_id)?;
 
+    // A finished or gated run is already at rest: never downgrade it to Stopped or
+    // drop a resumable marker that would make a later `implement --run` redo work.
+    // PlanApproved is `is_terminal` only for the plan sub-workflow; it is the normal
+    // resumable plan→implement handoff, so stop still applies there.
+    let finished = state.phase.is_terminal() && state.phase != state::Phase::PlanApproved;
+    if finished || state.phase.is_gate() {
+        if json {
+            let v = run_status_json(&paths, &cfg, &state)?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        } else {
+            println!("run {run_id} already at {:?}; nothing to stop", state.phase);
+        }
+        return Ok(ExitCode::Success);
+    }
+
     // 1. Marker first: an orchestrator that survives the signal stops at its next
     //    dispatch boundary instead of resurrecting a killed slot.
     markers::write_marker(&paths, run_id, "stopped", "stopped by operator\n")?;

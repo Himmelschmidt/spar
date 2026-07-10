@@ -493,6 +493,64 @@ fn status_exit_zero_when_gated() {
 }
 
 #[test]
+fn stop_preserves_gate_phase() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let plan = cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args([
+            "plan",
+            "--task",
+            "gate then stop",
+            "--providers",
+            "cli:claude,cli:grok",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2);
+    let stdout = String::from_utf8_lossy(plan.get_output().stdout.as_slice());
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let run_id = v["run_id"].as_str().unwrap();
+
+    let stop = cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args(["stop", run_id, "--json"])
+        .assert()
+        .success();
+    let sout = String::from_utf8_lossy(stop.get_output().stdout.as_slice());
+    let sv: serde_json::Value = serde_json::from_str(&sout).unwrap();
+    assert_eq!(
+        sv["phase"], "awaiting_plan_approval",
+        "stop must not clobber the gate phase"
+    );
+
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            tmp.path()
+                .join(".spar/runs")
+                .join(run_id)
+                .join("state.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        state["phase"], "awaiting_plan_approval",
+        "state.json phase must stay at the gate after stop"
+    );
+    let stopped_marker = tmp
+        .path()
+        .join(".spar/runs")
+        .join(run_id)
+        .join("markers/stopped");
+    assert!(
+        !stopped_marker.is_file(),
+        "stop must not drop a resumable stopped marker on a gated run"
+    );
+}
+
+#[test]
 fn arena_reconcile_dry_run() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
