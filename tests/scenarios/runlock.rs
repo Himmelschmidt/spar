@@ -9,6 +9,25 @@ use std::io::Write;
 use std::process::Command;
 use tempfile::tempdir;
 
+/// Per-test-process SPAR_HOME so the suite never writes the developer's real
+/// ~/.spar/registry.json. Shared across spawns in this binary.
+fn spar_home_dir() -> std::path::PathBuf {
+    use std::sync::OnceLock;
+    static HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
+    HOME.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!("spar-test-home-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    })
+    .clone()
+}
+
+fn spar_cmd() -> assert_cmd::Command {
+    let mut c = cargo_bin_cmd!("spar");
+    c.env("SPAR_HOME", spar_home_dir());
+    c
+}
+
 fn init_git_repo(dir: &std::path::Path) {
     for args in [
         vec!["init"],
@@ -35,7 +54,7 @@ fn init_git_repo(dir: &std::path::Path) {
 }
 
 fn plan_and_approve(dir: &std::path::Path) -> String {
-    let plan = cargo_bin_cmd!("spar")
+    let plan = spar_cmd()
         .current_dir(dir)
         .args([
             "plan",
@@ -53,7 +72,7 @@ fn plan_and_approve(dir: &std::path::Path) -> String {
         .clone();
     let v: Value = serde_json::from_slice(&plan).unwrap();
     let run_id = v["run_id"].as_str().unwrap().to_string();
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(dir)
         .args(["approve", &run_id, "--json"])
         .assert()
@@ -99,7 +118,7 @@ fn busy_lock_leaves_state_untouched() {
         .write_all(std::process::id().to_string().as_bytes())
         .unwrap();
 
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args([
             "implement",

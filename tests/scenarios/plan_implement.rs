@@ -4,6 +4,25 @@ use predicates::prelude::*;
 use std::process::Command;
 use tempfile::tempdir;
 
+/// Per-test-process SPAR_HOME so the suite never writes the developer's real
+/// ~/.spar/registry.json. Shared across spawns in this binary.
+fn spar_home_dir() -> std::path::PathBuf {
+    use std::sync::OnceLock;
+    static HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
+    HOME.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!("spar-test-home-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    })
+    .clone()
+}
+
+fn spar_cmd() -> assert_cmd::Command {
+    let mut c = cargo_bin_cmd!("spar");
+    c.env("SPAR_HOME", spar_home_dir());
+    c
+}
+
 fn init_git_repo(dir: &std::path::Path) {
     Command::new("git")
         .args(["init"])
@@ -48,7 +67,7 @@ fn plan_approve_implement_dry_run() {
     init_git_repo(tmp.path());
     let branch_before = primary_branch(tmp.path());
 
-    let plan = cargo_bin_cmd!("spar")
+    let plan = spar_cmd()
         .current_dir(tmp.path())
         .args([
             "plan",
@@ -130,14 +149,14 @@ fn plan_approve_implement_dry_run() {
 
     assert_eq!(primary_branch(tmp.path()), branch_before);
 
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args(["approve", run_id, "--json"])
         .assert()
         .success()
         .stdout(predicate::str::contains("plan_approved"));
 
-    let impl_out = cargo_bin_cmd!("spar")
+    let impl_out = spar_cmd()
         .current_dir(tmp.path())
         .args([
             "implement",
@@ -191,14 +210,14 @@ fn plan_approve_implement_dry_run() {
     assert_eq!(primary_branch(tmp.path()), branch_before);
 
     // ship without confirm → gate 2
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args(["ship", impl_id, "--json"])
         .assert()
         .code(2);
 
     // dry-run ship with confirm writes ship.md, no real push
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args(["ship", impl_id, "--confirm", "--json"])
         .assert()
@@ -210,7 +229,7 @@ fn plan_approve_implement_dry_run() {
         .join("artifacts/ship.md")
         .is_file());
 
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args(["cleanup", run_id, "--purge", "--json"])
         .assert()
@@ -228,7 +247,7 @@ fn plan_spec_disabled_skips_test_author() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
     std::fs::write(tmp.path().join("spar.toml"), "[spec]\nenabled = false\n").unwrap();
-    let out = cargo_bin_cmd!("spar")
+    let out = spar_cmd()
         .current_dir(tmp.path())
         .args([
             "plan",
@@ -263,7 +282,7 @@ fn plan_spec_disabled_skips_test_author() {
 fn plan_dry_run_writes_test_contract() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
-    let out = cargo_bin_cmd!("spar")
+    let out = spar_cmd()
         .current_dir(tmp.path())
         .args([
             "plan",
@@ -301,7 +320,7 @@ fn implement_dry_run_writes_suite_artifact() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
 
-    let out = cargo_bin_cmd!("spar")
+    let out = spar_cmd()
         .current_dir(tmp.path())
         .args([
             "implement",
@@ -350,7 +369,7 @@ fn implement_dry_run_surfaces_suite_outcome() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
 
-    let out = cargo_bin_cmd!("spar")
+    let out = spar_cmd()
         .current_dir(tmp.path())
         .args([
             "implement",
@@ -383,7 +402,7 @@ fn implement_dry_run_surfaces_suite_outcome() {
     assert_eq!(state["suite_outcome"], "pass", "state.json suite_outcome");
 
     // status --json surfaces it too.
-    let st = cargo_bin_cmd!("spar")
+    let st = spar_cmd()
         .current_dir(tmp.path())
         .args(["status", run_id, "--json"])
         .assert()
@@ -406,7 +425,7 @@ fn dry_run_does_not_create_git_worktrees() {
         .map(|e| e.file_name())
         .collect();
 
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args([
             "implement",
@@ -464,7 +483,7 @@ fn walkdir_has_cwd(dir: &std::path::Path) -> bool {
 fn status_exit_zero_when_gated() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
-    let plan = cargo_bin_cmd!("spar")
+    let plan = spar_cmd()
         .current_dir(tmp.path())
         .args([
             "plan",
@@ -481,7 +500,7 @@ fn status_exit_zero_when_gated() {
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let run_id = v["run_id"].as_str().unwrap();
 
-    let st = cargo_bin_cmd!("spar")
+    let st = spar_cmd()
         .current_dir(tmp.path())
         .args(["status", run_id, "--json"])
         .assert()
@@ -496,7 +515,7 @@ fn status_exit_zero_when_gated() {
 fn stop_preserves_gate_phase() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
-    let plan = cargo_bin_cmd!("spar")
+    let plan = spar_cmd()
         .current_dir(tmp.path())
         .args([
             "plan",
@@ -513,7 +532,7 @@ fn stop_preserves_gate_phase() {
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let run_id = v["run_id"].as_str().unwrap();
 
-    let stop = cargo_bin_cmd!("spar")
+    let stop = spar_cmd()
         .current_dir(tmp.path())
         .args(["stop", run_id, "--json"])
         .assert()
@@ -554,7 +573,7 @@ fn stop_preserves_gate_phase() {
 fn stop_preserves_terminal_done_phase() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
-    let run = cargo_bin_cmd!("spar")
+    let run = spar_cmd()
         .current_dir(tmp.path())
         .args([
             "run",
@@ -574,7 +593,7 @@ fn stop_preserves_terminal_done_phase() {
     assert_eq!(v["phase"], "done");
     let run_id = v["run_id"].as_str().unwrap();
 
-    let stop = cargo_bin_cmd!("spar")
+    let stop = spar_cmd()
         .current_dir(tmp.path())
         .args(["stop", run_id, "--json"])
         .assert()
@@ -615,7 +634,7 @@ fn stop_preserves_terminal_done_phase() {
 fn arena_reconcile_dry_run() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
-    let out = cargo_bin_cmd!("spar")
+    let out = spar_cmd()
         .current_dir(tmp.path())
         .args([
             "run",
@@ -635,7 +654,7 @@ fn arena_reconcile_dry_run() {
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let run_id = v["run_id"].as_str().unwrap();
 
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args(["reconcile", run_id, "--json"])
         .assert()
@@ -653,7 +672,7 @@ fn arena_reconcile_dry_run() {
 fn dual_backend_dry_run_providers() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
-    let out = cargo_bin_cmd!("spar")
+    let out = spar_cmd()
         .current_dir(tmp.path())
         .args([
             "plan",
@@ -692,7 +711,7 @@ fn empty_fake_providers_fail_closed() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
     // Live (no dry-run): unknown names must not become a fake plan gate.
-    let r = cargo_bin_cmd!("spar")
+    let r = spar_cmd()
         .current_dir(tmp.path())
         .args([
             "plan",
@@ -713,20 +732,20 @@ fn empty_fake_providers_fail_closed() {
 fn skills_and_bus_commands() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args(["skills", "list", "--json"])
         .assert()
         .success()
         .stdout(predicate::str::contains("core"));
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args(["skills", "get", "core"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Exit codes"));
 
-    let plan = cargo_bin_cmd!("spar")
+    let plan = spar_cmd()
         .current_dir(tmp.path())
         .args([
             "plan",
@@ -750,7 +769,7 @@ fn skills_and_bus_commands() {
         .join("bus/tasks/graph.json")
         .is_file());
 
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args([
             "bus",
@@ -766,7 +785,7 @@ fn skills_and_bus_commands() {
         ])
         .assert()
         .success();
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args(["bus", "log", run_id])
         .assert()
@@ -780,7 +799,7 @@ fn stuck_policy_dry_run_request_changes() {
     init_git_repo(tmp.path());
 
     // Force request_changes every review → fix rounds → rotate → widen → stuck
-    let out = cargo_bin_cmd!("spar")
+    let out = spar_cmd()
         .current_dir(tmp.path())
         .env("SPAR_FORCE_REQUEST_CHANGES", "1")
         .args([
@@ -824,7 +843,7 @@ fn quota_exit_when_all_paused() {
     init_git_repo(tmp.path());
 
     for p in ["cli:claude", "cli:grok", "cli:agy"] {
-        cargo_bin_cmd!("spar")
+        spar_cmd()
             .current_dir(tmp.path())
             .args(["provider", "pause", p])
             .assert()
@@ -832,7 +851,7 @@ fn quota_exit_when_all_paused() {
     }
 
     // Force provider names so we hit quota filter even if some are missing on PATH.
-    let r = cargo_bin_cmd!("spar")
+    let r = spar_cmd()
         .current_dir(tmp.path())
         .args([
             "plan",
@@ -852,7 +871,7 @@ fn quota_exit_when_all_paused() {
         assert_eq!(v["exit_code"], 4, "JSON exit_code must match process 4");
         assert_eq!(v["phase"], "quota");
         let run_id = v["run_id"].as_str().unwrap();
-        cargo_bin_cmd!("spar")
+        spar_cmd()
             .current_dir(tmp.path())
             .args(["status", run_id, "--json"])
             .assert()
@@ -875,7 +894,7 @@ fn arena_dry_run() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
 
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args([
             "run",
@@ -897,7 +916,7 @@ fn arena_dry_run() {
 fn review_workflow_concurrent_dry_run() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
-    let out = cargo_bin_cmd!("spar")
+    let out = spar_cmd()
         .current_dir(tmp.path())
         .args([
             "run",
@@ -931,7 +950,7 @@ fn peer_and_roles_dry_run() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
 
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args([
             "run",
@@ -948,7 +967,7 @@ fn peer_and_roles_dry_run() {
         .success()
         .stdout(predicate::str::contains("\"phase\": \"done\""));
 
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args([
             "run",
@@ -970,14 +989,14 @@ fn provider_pause_resume() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
 
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args(["provider", "pause", "cli:claude", "--json"])
         .assert()
         .success()
         .stdout(predicate::str::contains("paused_manual"));
 
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args(["provider", "resume", "cli:claude", "--json"])
         .assert()
@@ -989,7 +1008,7 @@ fn provider_pause_resume() {
 fn providers_required_on_plan() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args(["plan", "--task", "x", "--dry-run", "--json"])
         .assert()
@@ -1002,7 +1021,7 @@ fn path_b_implement_task() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
 
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args([
             "implement",

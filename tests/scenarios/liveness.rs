@@ -5,6 +5,25 @@ use serde_json::Value;
 use std::process::Command;
 use tempfile::tempdir;
 
+/// Per-test-process SPAR_HOME so the suite never writes the developer's real
+/// ~/.spar/registry.json. Shared across spawns in this binary.
+fn spar_home_dir() -> std::path::PathBuf {
+    use std::sync::OnceLock;
+    static HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
+    HOME.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!("spar-test-home-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    })
+    .clone()
+}
+
+fn spar_cmd() -> assert_cmd::Command {
+    let mut c = cargo_bin_cmd!("spar");
+    c.env("SPAR_HOME", spar_home_dir());
+    c
+}
+
 fn init_git_repo(dir: &std::path::Path) {
     for args in [
         vec!["init"],
@@ -35,7 +54,7 @@ fn dry_run_status_reports_pid_liveness() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
 
-    let out = cargo_bin_cmd!("spar")
+    let out = spar_cmd()
         .current_dir(tmp.path())
         .args([
             "implement",
@@ -54,7 +73,7 @@ fn dry_run_status_reports_pid_liveness() {
     let v: Value = serde_json::from_slice(&out).unwrap();
     let run_id = v["run_id"].as_str().unwrap();
 
-    let st = cargo_bin_cmd!("spar")
+    let st = spar_cmd()
         .current_dir(tmp.path())
         .args(["status", run_id, "--json"])
         .assert()
@@ -124,6 +143,7 @@ fn assert_foreground_lock(workflow: &str) {
     let exe = assert_cmd::cargo::cargo_bin("spar");
     let mut child = Command::new(&exe)
         .current_dir(&proj)
+        .env("SPAR_HOME", spar_home_dir())
         .env("PATH", &path_env)
         .args([
             "run",
@@ -182,7 +202,7 @@ fn assert_foreground_lock(workflow: &str) {
     );
 
     // While the orchestrator holds its lock, status must expose it as alive.
-    let st = cargo_bin_cmd!("spar")
+    let st = spar_cmd()
         .current_dir(&proj)
         .args(["status", &run_id, "--json"])
         .assert()
@@ -212,7 +232,7 @@ fn implement_refuses_second_orchestrator() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
 
-    let plan = cargo_bin_cmd!("spar")
+    let plan = spar_cmd()
         .current_dir(tmp.path())
         .args([
             "plan",
@@ -231,7 +251,7 @@ fn implement_refuses_second_orchestrator() {
     let v: Value = serde_json::from_slice(&plan).unwrap();
     let run_id = v["run_id"].as_str().unwrap().to_string();
 
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args(["approve", &run_id, "--json"])
         .assert()
@@ -254,7 +274,7 @@ fn implement_refuses_second_orchestrator() {
     held.try_lock().unwrap();
     std::fs::write(&lock, std::process::id().to_string()).unwrap();
 
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args([
             "implement",
@@ -273,7 +293,7 @@ fn implement_refuses_second_orchestrator() {
         );
 
     // status must let an operator see who is driving the run.
-    let st = cargo_bin_cmd!("spar")
+    let st = spar_cmd()
         .current_dir(tmp.path())
         .args(["status", &run_id, "--json"])
         .assert()

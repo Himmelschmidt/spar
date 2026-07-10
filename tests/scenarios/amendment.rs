@@ -4,6 +4,25 @@ use predicates::prelude::*;
 use std::process::Command;
 use tempfile::tempdir;
 
+/// Per-test-process SPAR_HOME so the suite never writes the developer's real
+/// ~/.spar/registry.json. Shared across spawns in this binary.
+fn spar_home_dir() -> std::path::PathBuf {
+    use std::sync::OnceLock;
+    static HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
+    HOME.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!("spar-test-home-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    })
+    .clone()
+}
+
+fn spar_cmd() -> assert_cmd::Command {
+    let mut c = cargo_bin_cmd!("spar");
+    c.env("SPAR_HOME", spar_home_dir());
+    c
+}
+
 const PLAN_TASK: &str = "add a hello world module";
 const SENTINEL: &str = "AMENDMENT-SENTINEL-XYZ";
 
@@ -33,7 +52,7 @@ fn init_git_repo(dir: &std::path::Path) {
 }
 
 fn plan_and_approve(dir: &std::path::Path) -> String {
-    let plan = cargo_bin_cmd!("spar")
+    let plan = spar_cmd()
         .current_dir(dir)
         .args([
             "plan",
@@ -49,7 +68,7 @@ fn plan_and_approve(dir: &std::path::Path) -> String {
     let stdout = String::from_utf8_lossy(plan.get_output().stdout.as_slice());
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let run_id = v["run_id"].as_str().unwrap().to_string();
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(dir)
         .args(["approve", &run_id, "--json"])
         .assert()
@@ -74,7 +93,7 @@ fn implement_run_with_task_applies_amendment() {
     init_git_repo(tmp.path());
     let run_id = plan_and_approve(tmp.path());
 
-    let out = cargo_bin_cmd!("spar")
+    let out = spar_cmd()
         .current_dir(tmp.path())
         .args([
             "implement",
@@ -127,7 +146,7 @@ fn implement_run_without_task_clears_stale_amendment() {
     init_git_repo(tmp.path());
     let run_id = plan_and_approve(tmp.path());
 
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args([
             "implement",
@@ -144,7 +163,7 @@ fn implement_run_without_task_clears_stale_amendment() {
         .code(2);
 
     // Second round, no -t: stale amendment must be cleared.
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args([
             "implement",
@@ -179,7 +198,7 @@ fn implement_run_amendment_notice_human() {
     init_git_repo(tmp.path());
     let run_id = plan_and_approve(tmp.path());
 
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args([
             "implement",
