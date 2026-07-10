@@ -196,6 +196,8 @@ struct App {
     /// Tappable footer tokens.
     rect_help: Rect,
     rect_projects: Rect,
+    /// Debounce for spawning the detached reconcile process (run id + when).
+    reconcile_spawn: Option<(String, Instant)>,
 }
 
 /// A gate action reachable by both a key and a tappable button.
@@ -204,6 +206,8 @@ enum GateAction {
     Approve,
     Reject,
     Ship,
+    ConfirmWinner,
+    Reconcile,
 }
 
 /// Avoid re-reading the slot log on every frame when the file is unchanged.
@@ -299,6 +303,7 @@ impl App {
             gate_buttons: Vec::new(),
             rect_help: Rect::default(),
             rect_projects: Rect::default(),
+            reconcile_spawn: None,
         }
     }
 
@@ -1079,10 +1084,42 @@ fn run_gate_action(app: &mut App, swarm: &SparPaths, id: &str, action: GateActio
             .map(|_| (format!("Rejected plan {id}"), YELLOW)),
         GateAction::Ship => crate::ship::confirm_ship(swarm, id, false)
             .map(|_| (format!("Ship confirmed {id}"), GREEN)),
+        GateAction::ConfirmWinner => workflow::arena::confirm_winner(swarm, id, None, false)
+            .map(|_| (format!("Confirmed winner for {id}"), GREEN)),
+        // Reconcile runs agents (minutes) — never on the render thread.
+        GateAction::Reconcile => return spawn_reconcile(app, swarm, id),
     };
     match res {
         Ok((msg, color)) => app.flash(msg, color),
         Err(e) => app.flash(format!("{} failed: {e:#}", action.verb()), RED),
+    }
+}
+
+/// Kick off arena reconcile as a detached `spar reconcile` process so it survives
+/// the TUI and keeps agent work off the render loop. Progress shows via the log.
+fn spawn_reconcile(app: &mut App, swarm: &SparPaths, id: &str) {
+    if let Some((rid, t)) = &app.reconcile_spawn {
+        if rid == id && t.elapsed() < Duration::from_secs(15) {
+            app.flash("Reconcile already starting…", YELLOW);
+            return;
+        }
+    }
+    let spawned = std::process::Command::new(std::env::current_exe().unwrap_or_default())
+        .arg("reconcile")
+        .arg(id)
+        .arg("--json")
+        .current_dir(&swarm.project_root)
+        .env("SPAR_INTERNAL", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    match spawned {
+        Ok(_) => {
+            app.reconcile_spawn = Some((id.to_string(), Instant::now()));
+            app.flash(format!("Reconcile started for {id} — watch Live log"), ACCENT);
+        }
+        Err(e) => app.flash(format!("Reconcile failed to start: {e}"), RED),
     }
 }
 
@@ -1094,6 +1131,11 @@ fn gate_buttons_for(full: Option<&RunState>) -> Vec<(&'static str, GateAction)> 
             ("Reject", GateAction::Reject),
         ],
         Some(Phase::AwaitingShipConfirm) => vec![("Ship", GateAction::Ship)],
+        Some(Phase::AwaitingWinnerConfirm) => vec![
+            ("Confirm", GateAction::ConfirmWinner),
+            ("Reconcile", GateAction::Reconcile),
+        ],
+        Some(Phase::AwaitingReconcile) => vec![("Reconcile", GateAction::Reconcile)],
         _ => Vec::new(),
     }
 }
@@ -1104,6 +1146,8 @@ impl GateAction {
             GateAction::Approve => "Approve",
             GateAction::Reject => "Reject",
             GateAction::Ship => "Ship",
+            GateAction::ConfirmWinner => "Confirm winner",
+            GateAction::Reconcile => "Reconcile",
         }
     }
 }
@@ -1663,8 +1707,9 @@ fn action_content(
 
 fn button_style(action: GateAction) -> Style {
     let bg = match action {
-        GateAction::Approve | GateAction::Ship => GREEN,
+        GateAction::Approve | GateAction::Ship | GateAction::ConfirmWinner => GREEN,
         GateAction::Reject => RED,
+        GateAction::Reconcile => ACCENT,
     };
     Style::default().fg(BG).bg(bg).bold()
 }
@@ -2724,6 +2769,12 @@ fn situational_footer(full: Option<&RunState>, focus: Focus, browse: BrowseLevel
         if st.phase == Phase::AwaitingShipConfirm {
             return "s confirm ship · p projects · ? help";
         }
+        if st.phase == Phase::AwaitingWinnerConfirm {
+            return "tap Confirm / Reconcile above · p projects";
+        }
+        if st.phase == Phase::AwaitingReconcile {
+            return "tap Reconcile above · watch log · p projects";
+        }
         if st.phase.is_gate() {
             return "gate waiting · yellow bar above · p projects";
         }
@@ -2755,7 +2806,7 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
   Mouse / touch\n\
     tap panel / tab      focus it (border lights up)\n\
     tap a run/agent      select that row\n\
-    tap Approve/Reject/Ship   act on a gate (no keys needed)\n\
+    tap a gate button    Approve/Reject/Ship/Confirm/Reconcile\n\
     tap Projects / Help  footer shortcuts · tap anywhere closes help\n\
     scroll / swipe       scroll log/messages · step runs/agents\n\
  \n\
@@ -3238,6 +3289,15 @@ mod labels {
         let b = gate_buttons_for(Some(&st));
         assert_eq!(b.len(), 1);
         assert_eq!(b[0].1, GateAction::Ship);
+        st.phase = Phase::AwaitingWinnerConfirm;
+        let b = gate_buttons_for(Some(&st));
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[0].1, GateAction::ConfirmWinner);
+        assert_eq!(b[1].1, GateAction::Reconcile);
+        st.phase = Phase::AwaitingReconcile;
+        let b = gate_buttons_for(Some(&st));
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].1, GateAction::Reconcile);
     }
 
     #[test]
@@ -3263,6 +3323,30 @@ mod labels {
         assert!(app.gate_buttons.iter().all(|(r, _)| r.y == 0 && r.right() <= 90));
         assert!(app.gate_buttons[0].0.x < app.gate_buttons[1].0.x);
         assert_eq!(app.gate_buttons[1].1, GateAction::Reject);
+    }
+
+    #[test]
+    fn winner_confirm_bar_paints_both_buttons() {
+        use crate::cli::WorkflowKind;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut st = RunState::new("run1", WorkflowKind::Arena, std::path::PathBuf::from("/x"));
+        st.phase = Phase::AwaitingWinnerConfirm;
+        let swarm = SparPaths::new("/x");
+        let mut term = Terminal::new(TestBackend::new(70, 1)).unwrap();
+        let mut app = App::new(None, 300, true);
+        term.draw(|f| {
+            let area = f.area();
+            draw_status_bar(f, area, &swarm, Some(&st), &mut app, &[], &[]);
+        })
+        .unwrap();
+        let row: String = {
+            let buf = term.backend().buffer();
+            (0..70).map(|x| buf[(x, 0)].symbol()).collect()
+        };
+        assert!(row.contains("Confirm"), "row was: {row:?}");
+        assert!(row.contains("Reconcile"), "row was: {row:?}");
+        assert_eq!(app.gate_buttons.len(), 2);
     }
 
     #[test]
