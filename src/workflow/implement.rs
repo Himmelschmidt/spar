@@ -111,11 +111,12 @@ fn run_from_approved(
     if state.slots.iter().all(|s| s.role != SlotRole::Implementer) {
         bail!("no implementer slot after provider pick");
     }
-    state.save(paths)?;
     if opts.detach {
+        state.save(paths)?;
         return detach_implement(&state, paths, opts.json);
     }
     let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
+    state.save(paths)?;
     execute_loop(&mut state, paths, cfg)?;
     maybe_auto_ship_or_cleanup(&mut state, paths, cfg)?;
     finish_out(&state, opts.json)?;
