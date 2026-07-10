@@ -27,6 +27,8 @@ use ratatui::widgets::{
 };
 use std::io::stdout;
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 // ── palette ─────────────────────────────────────────────────────────────────
@@ -175,7 +177,6 @@ struct App {
     last_ctrl_c: Option<Instant>,
     last_click: Option<(u16, u16, Instant)>,
     show_help: bool,
-    log_cache: LogCache,
     rect_header: Rect,
     rect_action: Rect,
     rect_fleet: Rect,
@@ -265,7 +266,6 @@ impl App {
             last_ctrl_c: None,
             last_click: None,
             show_help: false,
-            log_cache: LogCache::empty(),
             rect_header: Rect::default(),
             rect_action: Rect::default(),
             rect_fleet: Rect::default(),
@@ -293,7 +293,6 @@ impl App {
     fn reset_stream_view(&mut self) {
         self.stream_scroll = 0;
         self.stream_follow = true;
-        self.log_cache.clear();
     }
 
     fn reset_bus_view(&mut self) {
@@ -430,6 +429,116 @@ fn clamp_scroll(scroll: &mut u16, follow: &mut bool, max: u16) {
     }
 }
 
+/// How often the background thread re-reads the run state from disk.
+const REFRESH: Duration = Duration::from_millis(200);
+/// Upper bound on how long the render thread sleeps; also the animation rate.
+const FRAME: Duration = Duration::from_millis(100);
+
+/// What the refresher needs in order to know which run/slot to read.
+#[derive(Clone, PartialEq, Eq)]
+struct Selection {
+    browse: BrowseLevel,
+    root: PathBuf,
+    run_id: Option<String>,
+    slot_idx: usize,
+    project_idx: usize,
+}
+
+/// An immutable view of the world, produced off-thread and rendered as-is.
+struct Snapshot {
+    swarm: SparPaths,
+    projects: Vec<registry::ProjectEntry>,
+    runs: Vec<state::RunSummary>,
+    full: Option<RunState>,
+    stream_text: String,
+    activity: Vec<String>,
+}
+
+enum Msg {
+    Input(Event),
+    Data,
+}
+
+/// Size+mtime of everything a snapshot is derived from. Comparing these is a
+/// handful of `stat` calls, versus re-parsing the event log and every run state.
+type Marks = Vec<Option<(u64, SystemTime)>>;
+
+fn stamp(p: &Path) -> Option<(u64, SystemTime)> {
+    let m = std::fs::metadata(p).ok()?;
+    Some((m.len(), m.modified().ok()?))
+}
+
+fn marks_for(sel: &Selection, prev: Option<&Snapshot>) -> Marks {
+    let mut out = vec![stamp(&registry::registry_path())];
+    if sel.browse == BrowseLevel::Runs {
+        let swarm = SparPaths::new(&sel.root);
+        out.push(stamp(&swarm.runs_dir()));
+        out.push(stamp(&swarm.quota_file()));
+        if let Some(id) = sel.run_id.as_deref() {
+            out.push(stamp(&swarm.state_file(id)));
+            out.push(stamp(&events::events_file(&swarm, id)));
+            out.push(stamp(&crate::bus::events_path(&swarm, id)));
+            // The live log grows without the run state changing.
+            let slot = prev
+                .and_then(|s| s.full.as_ref())
+                .and_then(|st| st.slots.get(sel.slot_idx));
+            if let Some(sl) = slot {
+                let p = sl
+                    .log_path
+                    .clone()
+                    .unwrap_or_else(|| swarm.log_file(id, &sl.id));
+                out.push(stamp(&p));
+            }
+        }
+    }
+    out
+}
+
+/// All blocking filesystem work lives here, never on the render thread.
+fn build_snapshot(sel: &Selection, cache: &mut LogCache) -> Snapshot {
+    let swarm = SparPaths::new(&sel.root);
+    let projects = registry::projects();
+    let runs = if sel.browse == BrowseLevel::Runs {
+        registry::list_project_runs(&sel.root).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let full = if sel.browse == BrowseLevel::Runs {
+        sel.run_id
+            .as_ref()
+            .and_then(|id| RunState::load(&swarm, id).ok())
+    } else {
+        None
+    };
+    let quota = QuotaStore::load(&swarm).unwrap_or_default();
+    let stream_text = match sel.browse {
+        BrowseLevel::Projects => {
+            cache.clear();
+            project_overview(&projects, sel.project_idx)
+        }
+        BrowseLevel::Runs => stream_content(&swarm, full.as_ref(), sel.slot_idx, cache),
+    };
+    let activity = activity_feed(&swarm, full.as_ref(), &quota);
+    Snapshot {
+        swarm,
+        projects,
+        runs,
+        full,
+        stream_text,
+        activity,
+    }
+}
+
+/// Redraw is only worth it while something is moving on screen.
+fn animating(app: &App, snap: &Snapshot) -> bool {
+    app.flash.is_some()
+        || app.focus == Focus::Composer
+        || snap
+            .full
+            .as_ref()
+            .is_some_and(|st| st.slots.iter().any(|s| s.status == SlotStatus::Running))
+}
+
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     local_root: Option<PathBuf>,
@@ -440,162 +549,194 @@ fn run_loop(
     let mut fleet_state = ListState::default();
     let mut rail_state = ListState::default();
     let mut active_root: PathBuf = local_root.clone().unwrap_or_else(|| {
-        registry::Registry::load()
-            .ok()
-            .and_then(|r| r.projects.into_iter().next())
+        registry::projects()
+            .into_iter()
+            .next()
             .map(|p| p.root)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
     });
 
+    let mut sel = Selection {
+        browse: app.browse,
+        root: active_root.clone(),
+        run_id: None,
+        slot_idx: 0,
+        project_idx: 0,
+    };
+
+    // First paint needs data, so build one snapshot synchronously.
+    let mut cache = LogCache::empty();
+    let snapshot = Arc::new(Mutex::new(Arc::new(build_snapshot(&sel, &mut cache))));
+
+    let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
+    let (sel_tx, sel_rx) = mpsc::channel::<Selection>();
+
+    {
+        let tx = msg_tx.clone();
+        thread::spawn(move || {
+            while let Ok(ev) = event::read() {
+                if tx.send(Msg::Input(ev)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    {
+        let tx = msg_tx;
+        let slot = Arc::clone(&snapshot);
+        let mut sel = sel.clone();
+        let mut marks = Marks::new();
+        thread::spawn(move || loop {
+            let mut forced = false;
+            match sel_rx.recv_timeout(REFRESH) {
+                Ok(s) => {
+                    sel = s;
+                    while let Ok(newer) = sel_rx.try_recv() {
+                        sel = newer;
+                    }
+                    forced = true;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+
+            let prev = Arc::clone(&*slot.lock().unwrap());
+            let next_marks = marks_for(&sel, Some(&prev));
+            if !forced && next_marks == marks {
+                continue; // nothing on disk moved; don't rebuild, don't repaint
+            }
+            marks = next_marks;
+
+            let next = Arc::new(build_snapshot(&sel, &mut cache));
+            *slot.lock().unwrap() = next;
+            if tx.send(Msg::Data).is_err() {
+                break;
+            }
+        });
+    }
+
+    let mut dirty = true;
     loop {
-        app.tick = app.tick.wrapping_add(1);
-
-        let projects = load_projects(local_root.as_deref());
-        if !projects.is_empty() {
-            app.selected_project = app.selected_project.min(projects.len() - 1);
-            // When browsing projects, active_root tracks the highlighted project.
-            if app.browse == BrowseLevel::Projects {
-                active_root = projects[app.selected_project].root.clone();
-            }
-        } else {
-            app.selected_project = 0;
-        }
-
-        let runs = if app.browse == BrowseLevel::Runs {
-            registry::list_project_runs(&active_root).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        if !runs.is_empty() {
-            app.selected_run = app.selected_run.min(runs.len() - 1);
-        } else {
-            app.selected_run = 0;
-        }
-
-        let rail_sel = match app.browse {
-            BrowseLevel::Projects => {
-                if projects.is_empty() {
-                    None
-                } else {
-                    Some(app.selected_project)
-                }
-            }
-            BrowseLevel::Runs => {
-                if runs.is_empty() {
-                    None
-                } else {
-                    Some(app.selected_run)
-                }
-            }
-        };
-        rail_state.select(rail_sel);
-
-        let swarm = SparPaths::new(&active_root);
-        let selected_id = runs.get(app.selected_run).map(|r| r.id.clone());
-        let full = if app.browse == BrowseLevel::Runs {
-            selected_id
-                .as_ref()
-                .and_then(|id| RunState::load(&swarm, id).ok())
-        } else {
-            None
-        };
-        if let Some(ref st) = full {
-            if !st.slots.is_empty() {
-                app.selected_slot = app.selected_slot.min(st.slots.len() - 1);
-            } else {
-                app.selected_slot = 0;
-            }
-        } else {
-            app.selected_slot = 0;
-        }
-        fleet_state.select(
-            if full.as_ref().map(|s| s.slots.is_empty()).unwrap_or(true) {
-                None
-            } else {
-                Some(app.selected_slot)
-            },
-        );
-
-        let quota = QuotaStore::load(&swarm).unwrap_or_default();
-        let stream_text = match app.browse {
-            BrowseLevel::Projects => {
-                app.log_cache.clear();
-                project_overview(&projects, app.selected_project)
-            }
-            BrowseLevel::Runs => {
-                stream_content(&swarm, full.as_ref(), app.selected_slot, &mut app.log_cache)
-            }
-        };
-        let activity = activity_feed(&swarm, full.as_ref(), &quota);
+        let snap = Arc::clone(&*snapshot.lock().unwrap());
 
         if let Some((t, _, _, dur)) = &app.flash {
             if t.elapsed() > *dur {
                 app.flash = None;
+                dirty = true;
             }
         }
 
-        terminal.draw(|f| {
-            draw(
-                f,
-                &swarm,
-                &projects,
-                &runs,
-                full.as_ref(),
-                &stream_text,
-                &activity,
-                &mut app,
-                &mut fleet_state,
-                &mut rail_state,
-            );
-        })?;
+        // Clamp selections against the snapshot we are about to paint.
+        if snap.projects.is_empty() {
+            app.selected_project = 0;
+        } else {
+            app.selected_project = app.selected_project.min(snap.projects.len() - 1);
+            if app.browse == BrowseLevel::Projects {
+                active_root = snap.projects[app.selected_project].root.clone();
+            }
+        }
+        if snap.runs.is_empty() {
+            app.selected_run = 0;
+        } else {
+            app.selected_run = app.selected_run.min(snap.runs.len() - 1);
+        }
+        let n_slots = snap.full.as_ref().map(|s| s.slots.len()).unwrap_or(0);
+        app.selected_slot = if n_slots == 0 {
+            0
+        } else {
+            app.selected_slot.min(n_slots - 1)
+        };
 
-        // Wait up to 50ms for the first event, then drain a bounded batch so
-        // wheel/key spam cannot leave deltas stuck or starve redraw.
-        const MAX_EVENTS_PER_TICK: usize = 48;
-        if event::poll(Duration::from_millis(50))? {
-            for _ in 0..MAX_EVENTS_PER_TICK {
-                match event::read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        if handle_key(
-                            &mut app,
-                            key.code,
-                            key.modifiers,
-                            &swarm,
-                            &projects,
-                            &runs,
-                            full.as_ref(),
-                            &mut active_root,
-                            local_root.as_deref(),
-                        )? {
-                            return Ok(crate::exit_codes::ExitCode::Success);
+        rail_state.select(match app.browse {
+            BrowseLevel::Projects if !snap.projects.is_empty() => Some(app.selected_project),
+            BrowseLevel::Runs if !snap.runs.is_empty() => Some(app.selected_run),
+            _ => None,
+        });
+        fleet_state.select((n_slots > 0).then_some(app.selected_slot));
+
+        if dirty {
+            app.tick = app.tick.wrapping_add(1);
+            terminal.draw(|f| {
+                draw(
+                    f,
+                    &snap.swarm,
+                    &snap.projects,
+                    &snap.runs,
+                    snap.full.as_ref(),
+                    &snap.stream_text,
+                    &snap.activity,
+                    &mut app,
+                    &mut fleet_state,
+                    &mut rail_state,
+                );
+            })?;
+            dirty = false;
+        }
+
+        match msg_rx.recv_timeout(FRAME) {
+            Ok(Msg::Data) => dirty = true,
+            Ok(Msg::Input(ev)) => {
+                dirty = true;
+                let mut ev = Some(ev);
+                // Drain the burst so wheel/key spam cannot outpace the redraw.
+                while let Some(e) = ev {
+                    match e {
+                        Event::Key(key) if key.kind == KeyEventKind::Press => {
+                            if handle_key(
+                                &mut app,
+                                key.code,
+                                key.modifiers,
+                                &snap.swarm,
+                                &snap.projects,
+                                &snap.runs,
+                                snap.full.as_ref(),
+                                &mut active_root,
+                                local_root.as_deref(),
+                            )? {
+                                return Ok(crate::exit_codes::ExitCode::Success);
+                            }
                         }
-                    }
-                    Event::Mouse(m) => {
-                        handle_mouse(
+                        Event::Mouse(m) => handle_mouse(
                             &mut app,
                             m,
-                            &projects,
-                            &runs,
-                            full.as_ref(),
+                            &snap.projects,
+                            &snap.runs,
+                            snap.full.as_ref(),
                             &mut active_root,
                             rail_state.offset(),
                             fleet_state.offset(),
-                        );
+                        ),
+                        _ => {}
                     }
-                    Event::Resize(_, _) => {}
-                    _ => {}
-                }
-                if !event::poll(Duration::from_millis(0))? {
-                    break;
+                    ev = match msg_rx.try_recv() {
+                        Ok(Msg::Input(next)) => Some(next),
+                        Ok(Msg::Data) => None,
+                        Err(_) => None,
+                    };
                 }
             }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if animating(&app, &snap) {
+                    dirty = true;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Ok(crate::exit_codes::ExitCode::Success)
+            }
+        }
+
+        let next_sel = Selection {
+            browse: app.browse,
+            root: active_root.clone(),
+            run_id: snap.runs.get(app.selected_run).map(|r| r.id.clone()),
+            slot_idx: app.selected_slot,
+            project_idx: app.selected_project,
+        };
+        if next_sel != sel {
+            sel = next_sel.clone();
+            let _ = sel_tx.send(next_sel);
         }
     }
-}
-
-fn load_projects(local_root: Option<&std::path::Path>) -> Vec<registry::ProjectEntry> {
-    let reg = registry::ensure_known(local_root);
-    reg.projects
 }
 
 fn project_overview(projects: &[registry::ProjectEntry], idx: usize) -> String {
@@ -1711,13 +1852,13 @@ fn render_scrollable_log(
     let sb_w = 1u16;
     let text_w = area.width.saturating_sub(sb_w).max(1) as usize;
     let height = area.height as usize;
-    let rows = layout_log_rows(text, text_w, colorize, expand);
-    let total = rows.len().max(1);
+    let total = log_row_count(text, text_w, expand).max(1);
     // Cap at u16::MAX so dense tails cannot wrap the scroll type.
     let max_scroll = total.saturating_sub(height).min(u16::MAX as usize) as u16;
     clamp_scroll(scroll, follow, max_scroll);
     let start = *scroll as usize;
-    let visible: Vec<(String, Style)> = rows.into_iter().skip(start).take(height).collect();
+    // Materialise only the rows we are about to paint, not the whole tail.
+    let visible = log_rows_window(text, text_w, colorize, expand, start, height);
 
     let text_area = Rect {
         x: area.x,
@@ -1774,7 +1915,7 @@ impl Widget for CellLog {
                 }
                 let x = area.left() + col;
                 if let Some(cell) = buf.cell_mut((x, y)) {
-                    cell.set_symbol(&ch.to_string());
+                    cell.set_char(ch);
                     cell.set_style(*style);
                     cell.set_skip(false);
                 }
@@ -1810,29 +1951,77 @@ fn log_line_style(line: &str, colorize: bool) -> Style {
 }
 
 /// Compact stream lines (grok-cli style density), then truncate or wrap to width.
-fn layout_log_rows(text: &str, width: usize, colorize: bool, expand: bool) -> Vec<(String, Style)> {
+/// Rows the log occupies, without building any of them. In trim mode this is
+/// just the line count; wrapping has to measure each line.
+fn log_row_count(text: &str, width: usize, expand: bool) -> usize {
+    if !expand {
+        return text.lines().count();
+    }
     let width = width.max(1);
+    text.lines()
+        .map(|raw| {
+            let line = compact_log_line(raw);
+            if line.is_empty() {
+                1
+            } else {
+                soft_wrap(&line, width).len()
+            }
+        })
+        .sum()
+}
+
+/// Build only the rows in `[start, start + height)`.
+fn log_rows_window(
+    text: &str,
+    width: usize,
+    colorize: bool,
+    expand: bool,
+    start: usize,
+    height: usize,
+) -> Vec<(String, Style)> {
+    let width = width.max(1);
+    let end = start.saturating_add(height);
     let mut out = Vec::new();
+    let mut row = 0usize;
     for raw in text.lines() {
+        if row >= end {
+            break;
+        }
         let line = compact_log_line(raw);
         let style = log_line_style(&line, colorize);
         if line.is_empty() {
-            out.push((String::new(), style));
+            if row >= start {
+                out.push((String::new(), style));
+            }
+            row += 1;
             continue;
         }
         if expand {
-            // Soft-wrap at word boundaries when possible.
             for chunk in soft_wrap(&line, width) {
-                out.push((chunk, style));
+                if row >= end {
+                    break;
+                }
+                if row >= start {
+                    out.push((chunk, style));
+                }
+                row += 1;
             }
         } else {
-            out.push((truncate_display(&line, width), style));
+            if row >= start {
+                out.push((truncate_display(&line, width), style));
+            }
+            row += 1;
         }
     }
-    if out.is_empty() {
+    if out.is_empty() && start == 0 {
         out.push((String::new(), log_line_style("", colorize)));
     }
     out
+}
+
+#[cfg(test)]
+fn layout_log_rows(text: &str, width: usize, colorize: bool, expand: bool) -> Vec<(String, Style)> {
+    log_rows_window(text, width, colorize, expand, 0, usize::MAX)
 }
 
 fn compact_log_line(raw: &str) -> String {

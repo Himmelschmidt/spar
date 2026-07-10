@@ -6,6 +6,25 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
+/// Per-test-process SPAR_HOME so the suite never writes the developer's real
+/// ~/.spar/registry.json. Shared across spawns in this binary.
+fn spar_home_dir() -> std::path::PathBuf {
+    use std::sync::OnceLock;
+    static HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
+    HOME.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!("spar-test-home-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    })
+    .clone()
+}
+
+fn spar_cmd() -> assert_cmd::Command {
+    let mut c = cargo_bin_cmd!("spar");
+    c.env("SPAR_HOME", spar_home_dir());
+    c
+}
+
 fn init_git_repo(dir: &std::path::Path) {
     for args in [
         vec!["init"],
@@ -41,7 +60,7 @@ fn primary_branch(dir: &std::path::Path) -> String {
 }
 
 fn plan_and_approve(dir: &std::path::Path) -> String {
-    let plan = cargo_bin_cmd!("spar")
+    let plan = spar_cmd()
         .current_dir(dir)
         .args([
             "plan",
@@ -59,7 +78,7 @@ fn plan_and_approve(dir: &std::path::Path) -> String {
         .clone();
     let v: Value = serde_json::from_slice(&plan).unwrap();
     let run_id = v["run_id"].as_str().unwrap().to_string();
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(dir)
         .args(["approve", &run_id, "--json"])
         .assert()
@@ -100,9 +119,13 @@ fn stop_leaves_terminal_slot_pid_untouched() {
         .unwrap();
     let markers = tmp.path().join(".spar/runs").join(&run_id).join("markers");
     std::fs::create_dir_all(&markers).unwrap();
-    std::fs::write(markers.join(format!("{slot_id}.pid")), child.id().to_string()).unwrap();
+    std::fs::write(
+        markers.join(format!("{slot_id}.pid")),
+        child.id().to_string(),
+    )
+    .unwrap();
 
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args(["stop", &run_id, "--json"])
         .assert()
@@ -138,17 +161,18 @@ fn stop_preserves_state_written_during_kill_window() {
         .unwrap();
     let markers = tmp.path().join(".spar/runs").join(&run_id).join("markers");
     std::fs::create_dir_all(&markers).unwrap();
-    std::fs::write(markers.join(format!("{slot_id}.pid")), child.id().to_string()).unwrap();
+    std::fs::write(
+        markers.join(format!("{slot_id}.pid")),
+        child.id().to_string(),
+    )
+    .unwrap();
 
     // Simulate the orchestrator persisting a slot result during the kill window:
     // wait for stop's `stopped` marker (written after it loads state), then write.
     let dir = tmp.path().to_path_buf();
     let rid = run_id.clone();
     let writer = std::thread::spawn(move || {
-        let stopped = dir
-            .join(".spar/runs")
-            .join(&rid)
-            .join("markers/stopped");
+        let stopped = dir.join(".spar/runs").join(&rid).join("markers/stopped");
         let deadline = Instant::now() + Duration::from_secs(5);
         while !stopped.is_file() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
@@ -158,7 +182,7 @@ fn stop_preserves_state_written_during_kill_window() {
         save_state(&dir, &rid, &s);
     });
 
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args(["stop", &run_id, "--json"])
         .assert()
@@ -197,7 +221,11 @@ fn stop_does_not_downgrade_a_run_that_finished_during_the_kill_window() {
         .unwrap();
     let markers = tmp.path().join(".spar/runs").join(&run_id).join("markers");
     std::fs::create_dir_all(&markers).unwrap();
-    std::fs::write(markers.join(format!("{slot_id}.pid")), child.id().to_string()).unwrap();
+    std::fs::write(
+        markers.join(format!("{slot_id}.pid")),
+        child.id().to_string(),
+    )
+    .unwrap();
 
     let dir = tmp.path().to_path_buf();
     let rid = run_id.clone();
@@ -212,7 +240,7 @@ fn stop_does_not_downgrade_a_run_that_finished_during_the_kill_window() {
         save_state(&dir, &rid, &s);
     });
 
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args(["stop", &run_id, "--json"])
         .assert()
@@ -246,7 +274,7 @@ fn stop_marker_halts_dispatch() {
     std::fs::create_dir_all(&markers).unwrap();
     std::fs::write(markers.join("stopped"), "stopped by operator\n").unwrap();
 
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args([
             "implement",
@@ -294,7 +322,7 @@ fn stop_command_keeps_worktrees_and_run_dir() {
     init_git_repo(tmp.path());
     let run_id = plan_and_approve(tmp.path());
 
-    let st = cargo_bin_cmd!("spar")
+    let st = spar_cmd()
         .current_dir(tmp.path())
         .args(["stop", &run_id, "--json"])
         .assert()
@@ -328,7 +356,7 @@ fn stopped_run_resumes_after_stop() {
     init_git_repo(tmp.path());
     let run_id = plan_and_approve(tmp.path());
 
-    cargo_bin_cmd!("spar")
+    spar_cmd()
         .current_dir(tmp.path())
         .args(["stop", &run_id, "--json"])
         .assert()
@@ -336,7 +364,7 @@ fn stopped_run_resumes_after_stop() {
     assert_eq!(load_state(tmp.path(), &run_id)["phase"], "stopped");
 
     // Resume: marker cleared, phase leaves Stopped, dispatch proceeds.
-    let out = cargo_bin_cmd!("spar")
+    let out = spar_cmd()
         .current_dir(tmp.path())
         .args([
             "implement",

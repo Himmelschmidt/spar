@@ -105,6 +105,9 @@ impl Registry {
         serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
     }
 
+    /// Write via temp file + rename. A concurrent reader either sees the old
+    /// file or the new one, never a truncated one — a torn parse would make
+    /// `load()` fall back to an empty registry and drop every known project.
     pub fn save(&self) -> Result<()> {
         let path = registry_path();
         if let Some(parent) = path.parent() {
@@ -112,7 +115,9 @@ impl Registry {
                 .with_context(|| format!("create {}", parent.display()))?;
         }
         let text = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
+        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+        std::fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).with_context(|| format!("replace {}", path.display()))?;
         Ok(())
     }
 
@@ -181,6 +186,12 @@ pub fn ensure_known(current: Option<&Path>) -> Registry {
         let _ = reg.touch_project(root, None);
     }
     Registry::load().unwrap_or(reg)
+}
+
+/// Read-only project list. Unlike `ensure_known` this never writes, so it is
+/// safe to call on a refresh tick.
+pub fn projects() -> Vec<ProjectEntry> {
+    Registry::load().map(|r| r.projects).unwrap_or_default()
 }
 
 /// All runs across registered projects, newest first.
