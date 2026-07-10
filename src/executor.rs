@@ -72,7 +72,8 @@ pub fn run_slots_parallel(
         match prepare_slot_execution(state, paths, cfg, job) {
             Ok(p) => prepared.push(p),
             Err(e) => {
-                let _ = mark_slot_failed(state, paths, &job.slot_id, &e.to_string());
+                let _ =
+                    mark_slot_failed(state, paths, &job.slot_id, &e.to_string(), None, None, None);
             }
         }
     }
@@ -205,18 +206,14 @@ fn execute_prepared(
     timeout: Duration,
 ) -> Result<SlotOutcome> {
     if prep.pref.is_api() {
-        let expected = prep
-            .job
-            .expected_artifact
-            .as_ref()
-            .map(|n| {
-                // artifact path reconstructed from log path parent layout
-                prep.log_path
-                    .parent()
-                    .and_then(|p| p.parent())
-                    .map(|run| run.join("artifacts").join(n))
-                    .unwrap_or_else(|| PathBuf::from(n))
-            });
+        let expected = prep.job.expected_artifact.as_ref().map(|n| {
+            // artifact path reconstructed from log path parent layout
+            prep.log_path
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|run| run.join("artifacts").join(n))
+                .unwrap_or_else(|| PathBuf::from(n))
+        });
         let model = prep.job.model.clone();
         let (ok, err, usage) = crate::api::run_api_slot(&crate::api::runtime::ApiSlotRequest {
             provider_name: &prep.pref.name,
@@ -241,14 +238,18 @@ fn execute_prepared(
         return Ok(if ok {
             SlotOutcome {
                 ok: true,
+                pid: None,
                 exit_code: Some(0),
+                signal: None,
                 error: None,
                 usage: Some(slot_usage),
             }
         } else {
             SlotOutcome {
                 ok: false,
+                pid: None,
                 exit_code: Some(1),
+                signal: None,
                 error: err,
                 usage: Some(slot_usage),
             }
@@ -281,30 +282,65 @@ fn execute_prepared(
         env: vec![],
         timeout,
     };
-    let res = process::run_captured(&req)?;
+    let pid_cell = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let sink_cell = pid_cell.clone();
+    let pid_file = pid_marker_from_log(&prep.log_path, &prep.job.slot_id);
+    let sink = move |pid: u32| {
+        sink_cell.store(pid, std::sync::atomic::Ordering::SeqCst);
+        if let Some(f) = &pid_file {
+            let _ = std::fs::write(f, process::PidToken::capture(pid).encode());
+        }
+    };
+    let res = process::run_captured(&req, Some(&sink))?;
+    let pid = load_pid(&pid_cell);
     let usage = usage_from_stream(&prep.job.slot_id, &prep.job.provider, &res.stats);
     if res.timed_out {
         return Ok(SlotOutcome {
             ok: false,
+            pid,
             exit_code: res.exit_code,
-            error: Some("timeout".into()),
+            signal: res.signal,
+            error: Some(format!(
+                "timeout after {}s ({})",
+                timeout.as_secs(),
+                timeout_label(prep.job.role)
+            )),
             usage: Some(usage),
         });
     }
     if res.exit_code != Some(0) {
         return Ok(SlotOutcome {
             ok: false,
+            pid,
             exit_code: res.exit_code,
-            error: Some(format!("exit {:?}", res.exit_code)),
+            signal: res.signal,
+            error: Some(describe_exit(res.exit_code, res.signal)),
             usage: Some(usage),
         });
     }
     Ok(SlotOutcome {
         ok: true,
+        pid,
         exit_code: Some(0),
+        signal: None,
         error: None,
         usage: Some(usage),
     })
+}
+
+/// Derive `<run_dir>/markers/<slot>.pid` from a slot log path (`<run_dir>/logs/<slot>.log`).
+fn pid_marker_from_log(log_path: &Path, slot_id: &str) -> Option<PathBuf> {
+    log_path
+        .parent()
+        .and_then(|logs| logs.parent())
+        .map(|run| run.join("markers").join(format!("{slot_id}.pid")))
+}
+
+fn load_pid(cell: &std::sync::atomic::AtomicU32) -> Option<u32> {
+    match cell.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => None,
+        p => Some(p),
+    }
 }
 
 fn usage_from_stream(slot_id: &str, provider: &str, s: &process::StreamStats) -> SlotUsage {
@@ -332,7 +368,9 @@ fn apply_parallel_outcome(
             markers::write_done(paths, &state.id, slot_id)?;
             if let Some(s) = state.slot_mut(slot_id) {
                 s.status = SlotStatus::Done;
-                s.exit_code = Some(0);
+                s.pid = result.pid;
+                s.exit_code = result.exit_code.or(Some(0));
+                s.signal = result.signal;
                 if let Some(u) = &result.usage {
                     s.usage = Some(u.clone());
                 }
@@ -362,11 +400,19 @@ fn apply_parallel_outcome(
                 }
                 state.usage.push(u);
             }
-            mark_slot_failed(state, paths, slot_id, &err)?;
+            mark_slot_failed(
+                state,
+                paths,
+                slot_id,
+                &err,
+                result.pid,
+                result.exit_code,
+                result.signal,
+            )?;
         }
         Err(e) => {
             salvage_expected_artifact(paths, &state.id, &prep.job, &prep.log_path, &e.to_string());
-            mark_slot_failed(state, paths, slot_id, &e.to_string())?;
+            mark_slot_failed(state, paths, slot_id, &e.to_string(), None, None, None)?;
         }
     }
     let _ = crate::bus::heartbeat(paths, &state.id, slot_id, "done");
@@ -398,13 +444,15 @@ pub fn salvage_expected_artifact(
     if path.is_file() && std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 0 {
         return;
     }
+    // Never synthesize a suite report: an absent suite.md is meaningful (Inconclusive),
+    // whereas a fabricated `## Result: fail` blocks the ship on a runner problem.
+    if job.role == SlotRole::Tester {
+        return;
+    }
     let tail = process::tail_log(log_path, 6000);
     let body = match job.role {
         SlotRole::Reviewer => format!(
             "## Verdict\nrequest_changes\n\n## Findings\n- severity: major — review slot interrupted ({reason}); partial transcript salvaged below\n\n## Tests\nsee partial transcript\n\n## Partial transcript\n\n```\n{tail}\n```\n"
-        ),
-        SlotRole::Tester => format!(
-            "## Result\nfail\n\n## Commands\n- (interrupted: {reason})\n\n## Summary\nSuite channel timed out or failed before a clean report.\n\n## Failures\n```\n{tail}\n```\n"
         ),
         SlotRole::TestAuthor => format!(
             "## Scenarios\n- (interrupted: {reason})\n\n## Non-goals\n- n/a\n\n## How to run\n- unknown\n\n## Expected before implement\nskipped-reason\n\n## Notes\nPartial transcript:\n```\n{tail}\n```\n"
@@ -500,7 +548,7 @@ pub fn run_slot(
             Ok(r) => r,
             Err(e) => {
                 salvage_expected_artifact(paths, &state.id, job, &log_path, &e.to_string());
-                mark_slot_failed(state, paths, &job.slot_id, &e.to_string())?;
+                mark_slot_failed(state, paths, &job.slot_id, &e.to_string(), None, None, None)?;
                 return Err(e);
             }
         }
@@ -520,7 +568,15 @@ pub fn run_slot(
                     Ok(r) => r,
                     Err(e) => {
                         salvage_expected_artifact(paths, &state.id, job, &log_path, &e.to_string());
-                        mark_slot_failed(state, paths, &job.slot_id, &e.to_string())?;
+                        mark_slot_failed(
+                            state,
+                            paths,
+                            &job.slot_id,
+                            &e.to_string(),
+                            None,
+                            None,
+                            None,
+                        )?;
                         return Err(e);
                     }
                 }
@@ -539,7 +595,15 @@ pub fn run_slot(
                     Ok(r) => r,
                     Err(e) => {
                         salvage_expected_artifact(paths, &state.id, job, &log_path, &e.to_string());
-                        mark_slot_failed(state, paths, &job.slot_id, &e.to_string())?;
+                        mark_slot_failed(
+                            state,
+                            paths,
+                            &job.slot_id,
+                            &e.to_string(),
+                            None,
+                            None,
+                            None,
+                        )?;
                         return Err(e);
                     }
                 }
@@ -551,7 +615,9 @@ pub fn run_slot(
         markers::write_done(paths, &state.id, &job.slot_id)?;
         if let Some(s) = state.slot_mut(&job.slot_id) {
             s.status = SlotStatus::Done;
-            s.exit_code = Some(0);
+            s.pid = result.pid;
+            s.exit_code = result.exit_code.or(Some(0));
+            s.signal = result.signal;
             if let Some(u) = &result.usage {
                 s.usage = Some(u.clone());
             }
@@ -571,7 +637,9 @@ pub fn run_slot(
         if let Some(s) = state.slot_mut(&job.slot_id) {
             s.status = SlotStatus::Failed;
             s.error = result.error.clone();
+            s.pid = result.pid;
             s.exit_code = result.exit_code;
+            s.signal = result.signal;
             if let Some(u) = &result.usage {
                 s.usage = Some(u.clone());
             }
@@ -615,27 +683,56 @@ pub fn run_slot(
 
 struct SlotOutcome {
     ok: bool,
+    pid: Option<u32>,
     exit_code: Option<i32>,
+    signal: Option<i32>,
     error: Option<String>,
     usage: Option<SlotUsage>,
 }
 
 impl SlotOutcome {
-    fn ok() -> Self {
-        Self {
-            ok: true,
-            exit_code: Some(0),
-            error: None,
-            usage: None,
-        }
-    }
     fn err(msg: impl Into<String>) -> Self {
         Self {
             ok: false,
+            pid: None,
             exit_code: None,
+            signal: None,
             error: Some(msg.into()),
             usage: None,
         }
+    }
+}
+
+/// Config-key label for the timeout that governs a role, so a killed slot names its budget.
+fn timeout_label(role: SlotRole) -> &'static str {
+    match role {
+        SlotRole::Tester => "suite.timeout_secs",
+        SlotRole::TestAuthor => "spec.timeout_secs",
+        SlotRole::Reviewer => "timeouts.review_secs",
+        _ => "timeouts.slot_secs",
+    }
+}
+
+fn signal_name(sig: i32) -> &'static str {
+    match sig {
+        2 => "SIGINT",
+        6 => "SIGABRT",
+        9 => "SIGKILL",
+        11 => "SIGSEGV",
+        15 => "SIGTERM",
+        _ => "signal",
+    }
+}
+
+/// Actionable one-liner for a non-zero / signal exit.
+fn describe_exit(code: Option<i32>, signal: Option<i32>) -> String {
+    if let Some(sig) = signal {
+        return format!("killed by signal {sig} ({})", signal_name(sig));
+    }
+    match code {
+        Some(137) => "exit 137 (OOM-killed)".into(),
+        Some(c) => format!("exit {c}"),
+        None => "exited without a status".into(),
     }
 }
 
@@ -644,11 +741,17 @@ fn mark_slot_failed(
     paths: &SparPaths,
     slot_id: &str,
     err: &str,
+    pid: Option<u32>,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
 ) -> Result<()> {
     let _ = markers::write_failed(paths, &state.id, slot_id, err);
     if let Some(s) = state.slot_mut(slot_id) {
         s.status = SlotStatus::Failed;
         s.error = Some(err.into());
+        s.pid = pid;
+        s.exit_code = exit_code;
+        s.signal = signal;
     }
     let _ = crate::events::append(
         paths,
@@ -745,7 +848,10 @@ fn write_dry_artifacts(
             let stamp = cwd.join(".spar-dry-acceptance-tests");
             std::fs::write(
                 &stamp,
-                format!("acceptance tests (dry-run) by {} for: {task}\n", job.slot_id),
+                format!(
+                    "acceptance tests (dry-run) by {} for: {task}\n",
+                    job.slot_id
+                ),
             )?;
             std::fs::write(
                 paths.artifact(&state.id, "test-contract.md"),
@@ -891,14 +997,18 @@ fn run_api(
     if ok {
         Ok(SlotOutcome {
             ok: true,
+            pid: None,
             exit_code: Some(0),
+            signal: None,
             error: None,
             usage: Some(slot_usage),
         })
     } else {
         Ok(SlotOutcome {
             ok: false,
+            pid: None,
             exit_code: Some(1),
+            signal: None,
             error: err,
             usage: Some(slot_usage),
         })
@@ -944,13 +1054,28 @@ fn run_headless(
         env: vec![],
         timeout,
     };
-    let res = process::run_captured(&req)?;
+    let pid_cell = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let sink_cell = pid_cell.clone();
+    let run_id = state.id.clone();
+    let slot_id = job.slot_id.clone();
+    let sink = move |pid: u32| {
+        sink_cell.store(pid, std::sync::atomic::Ordering::SeqCst);
+        let _ = markers::write_pid(paths, &run_id, &slot_id, process::PidToken::capture(pid));
+    };
+    let res = process::run_captured(&req, Some(&sink))?;
+    let pid = load_pid(&pid_cell);
     let usage = usage_from_stream(&job.slot_id, &job.provider, &res.stats);
     if res.timed_out {
         return Ok(SlotOutcome {
             ok: false,
+            pid,
             exit_code: res.exit_code,
-            error: Some("timeout".into()),
+            signal: res.signal,
+            error: Some(format!(
+                "timeout after {}s ({})",
+                timeout.as_secs(),
+                timeout_label(job.role)
+            )),
             usage: Some(usage),
         });
     }
@@ -958,8 +1083,10 @@ fn run_headless(
     if code != Some(0) {
         return Ok(SlotOutcome {
             ok: false,
+            pid,
             exit_code: code,
-            error: Some(format!("exit {:?}", code)),
+            signal: res.signal,
+            error: Some(describe_exit(code, res.signal)),
             usage: Some(usage),
         });
     }
@@ -972,7 +1099,9 @@ fn run_headless(
             if !found {
                 return Ok(SlotOutcome {
                     ok: false,
+                    pid,
                     exit_code: Some(0),
+                    signal: None,
                     error: Some(format!("missing expected artifact {name}")),
                     usage: Some(usage),
                 });
@@ -981,10 +1110,38 @@ fn run_headless(
     }
     Ok(SlotOutcome {
         ok: true,
+        pid,
         exit_code: Some(0),
+        signal: None,
         error: None,
         usage: Some(usage),
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkerState {
+    None,
+    Done,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TmuxDecision {
+    Wait,
+    Ok,
+    DoneButAlive,
+    Failed,
+}
+
+/// A `done` marker only means success once the agent's pane process has exited.
+fn tmux_outcome(marker: MarkerState, pane_alive: bool, budget_left: bool) -> TmuxDecision {
+    match marker {
+        MarkerState::Failed => TmuxDecision::Failed,
+        MarkerState::Done if !pane_alive => TmuxDecision::Ok,
+        MarkerState::Done if budget_left => TmuxDecision::Wait,
+        MarkerState::Done => TmuxDecision::DoneButAlive,
+        MarkerState::None => TmuxDecision::Wait,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1032,26 +1189,75 @@ fn run_tmux(
     let shell = tmux::shell_wrap(&program, &args, log_path);
     tmux::spawn_window(&session, &job.slot_id, cwd, &shell)?;
 
-    // Wait for marker using role timeout (suite needs long budget).
+    // `done` means the agent's own process has exited — not just that it wrote its marker.
     let done = format!("{}.done", job.slot_id);
     let failed = format!("{}.failed", job.slot_id);
     let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        if markers::marker_exists(paths, &state.id, &done) {
-            return Ok(SlotOutcome::ok());
+    let mut pane_pid: Option<u32> = None;
+    loop {
+        let marker = if markers::marker_exists(paths, &state.id, &failed) {
+            MarkerState::Failed
+        } else if markers::marker_exists(paths, &state.id, &done) {
+            MarkerState::Done
+        } else {
+            MarkerState::None
+        };
+        if marker == MarkerState::Done && pane_pid.is_none() {
+            if let Some(p) = tmux::pane_pid(&session, &job.slot_id) {
+                pane_pid = Some(p);
+                let _ = markers::write_pid(
+                    paths,
+                    &state.id,
+                    &job.slot_id,
+                    process::PidToken::capture(p),
+                );
+            }
         }
-        if markers::marker_exists(paths, &state.id, &failed) {
-            return Ok(SlotOutcome {
-                ok: false,
-                exit_code: Some(1),
-                error: Some("marker failed".into()),
-                usage: None,
-            });
+        let pane_alive = match pane_pid {
+            Some(p) => process::pid_alive(p),
+            None => tmux::pane_pid(&session, &job.slot_id).is_some(),
+        };
+        let budget_left = start.elapsed() < timeout;
+        match tmux_outcome(marker, pane_alive, budget_left) {
+            TmuxDecision::Ok => {
+                return Ok(SlotOutcome {
+                    ok: true,
+                    pid: pane_pid,
+                    exit_code: Some(0),
+                    signal: None,
+                    error: None,
+                    usage: None,
+                })
+            }
+            TmuxDecision::Failed => {
+                return Ok(SlotOutcome {
+                    ok: false,
+                    pid: pane_pid,
+                    exit_code: Some(1),
+                    signal: None,
+                    error: Some("marker failed".into()),
+                    usage: None,
+                })
+            }
+            TmuxDecision::DoneButAlive => {
+                return Ok(SlotOutcome {
+                    ok: false,
+                    pid: pane_pid,
+                    exit_code: None,
+                    signal: None,
+                    error: Some("agent reported done but its process is still running".into()),
+                    usage: None,
+                })
+            }
+            TmuxDecision::Wait => {
+                if !budget_left {
+                    // Never success-on-timeout-alone (plan completion contract).
+                    return Ok(SlotOutcome::err("tmux marker wait timed out"));
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
         }
-        std::thread::sleep(Duration::from_millis(200));
     }
-    // Never success-on-timeout-alone (plan completion contract).
-    Ok(SlotOutcome::err("tmux marker wait timed out"))
 }
 
 fn slot_model_for(state: Option<&RunState>, job: &SlotJob) -> Option<String> {
@@ -1090,13 +1296,12 @@ pub fn init_slot_model(
         error: None,
         pid: None,
         exit_code: None,
+        signal: None,
         artifact: None,
         usage: None,
         model,
     }
 }
-
-
 
 pub fn emit_run_json(state: &RunState) -> Result<()> {
     let v = serde_json::json!({
@@ -1106,6 +1311,7 @@ pub fn emit_run_json(state: &RunState) -> Result<()> {
         "workflow": state.workflow,
         "phase": state.phase,
         "task": state.task,
+        "amendment": state.amendment,
         "dry_run": state.dry_run,
         "slots": state.slots,
         "providers": state.providers,
@@ -1117,6 +1323,7 @@ pub fn emit_run_json(state: &RunState) -> Result<()> {
         "usage": state.usage,
         "big": state.big,
         "autonomy": state.autonomy,
+        "suite_outcome": state.suite_outcome,
         // null while in-flight; only set at terminal/gate phases
         "exit_code": state.status_exit_code(),
     });
@@ -1130,6 +1337,9 @@ pub fn print_run_human(state: &RunState) {
     println!("workflow:{:?}", state.workflow);
     if let Some(t) = &state.task {
         println!("task:    {t}");
+    }
+    if let Some(a) = &state.amendment {
+        println!("amendment: {a}");
     }
     if !state.providers.is_empty() {
         println!("providers: {}", state.providers.join(", "));
@@ -1184,5 +1394,83 @@ pub fn wait_run(
             return Ok(crate::exit_codes::ExitCode::Stuck);
         }
         std::thread::sleep(poll);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tmux_done_requires_process_exit() {
+        // marker done + pane dead => success
+        assert_eq!(
+            tmux_outcome(MarkerState::Done, false, true),
+            TmuxDecision::Ok
+        );
+        assert_eq!(
+            tmux_outcome(MarkerState::Done, false, false),
+            TmuxDecision::Ok
+        );
+        // marker done + pane alive + budget left => keep waiting (NOT success)
+        assert_eq!(
+            tmux_outcome(MarkerState::Done, true, true),
+            TmuxDecision::Wait
+        );
+        // marker done + pane alive + budget exhausted => error
+        assert_eq!(
+            tmux_outcome(MarkerState::Done, true, false),
+            TmuxDecision::DoneButAlive
+        );
+        // failed marker is always a failure
+        assert_eq!(
+            tmux_outcome(MarkerState::Failed, true, true),
+            TmuxDecision::Failed
+        );
+        assert_eq!(
+            tmux_outcome(MarkerState::Failed, false, false),
+            TmuxDecision::Failed
+        );
+        // no marker yet => keep waiting while budget remains
+        assert_eq!(
+            tmux_outcome(MarkerState::None, false, true),
+            TmuxDecision::Wait
+        );
+    }
+
+    #[test]
+    fn describe_exit_is_actionable() {
+        assert_eq!(describe_exit(None, Some(9)), "killed by signal 9 (SIGKILL)");
+        assert_eq!(describe_exit(Some(137), None), "exit 137 (OOM-killed)");
+        assert_eq!(describe_exit(Some(2), None), "exit 2");
+    }
+
+    #[test]
+    fn tester_salvage_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("r1").unwrap();
+        let log_path = paths.log_file("r1", "suite-x");
+        std::fs::write(
+            &log_path,
+            "## Rules\n1. run the suite\n## Report format\n## Paths\n(prompt echo, not test output)\n",
+        )
+        .unwrap();
+        let job = SlotJob {
+            slot_id: "suite-x".into(),
+            provider: "cli:claude".into(),
+            role: SlotRole::Tester,
+            template: "tester".into(),
+            extra_vars: HashMap::new(),
+            expected_artifact: Some("suite.md".into()),
+            model: None,
+        };
+        salvage_expected_artifact(&paths, "r1", &job, &log_path, "interrupted: timeout");
+        let suite = paths.artifact("r1", "suite.md");
+        assert!(
+            !suite.exists(),
+            "tester salvage must leave suite.md absent, found {}",
+            suite.display()
+        );
     }
 }

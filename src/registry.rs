@@ -46,8 +46,16 @@ pub struct ProjectEntry {
     pub last_run_id: Option<String>,
 }
 
-/// Global spar home: `$SPAR_HOME` or `~/.spar`.
+thread_local! {
+    static HOME_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Global spar home: a thread-local test override, else `$SPAR_HOME`, else `~/.spar`.
 pub fn spar_home() -> PathBuf {
+    if let Some(p) = HOME_OVERRIDE.with(|h| h.borrow().clone()) {
+        return p;
+    }
     if let Ok(p) = std::env::var("SPAR_HOME") {
         let p = PathBuf::from(p);
         if !p.as_os_str().is_empty() {
@@ -89,8 +97,8 @@ impl Registry {
         if !path.is_file() {
             return Ok(Self::default());
         }
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         if text.trim().is_empty() {
             return Ok(Self::default());
         }
@@ -132,8 +140,7 @@ impl Registry {
                 last_run_id: last_run_id.map(|s| s.to_string()),
             });
         }
-        self.projects
-            .sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+        self.projects.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
         self.save()
     }
 
@@ -219,13 +226,15 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn set_home_override(home: &Path) {
+        HOME_OVERRIDE.with(|h| *h.borrow_mut() = Some(home.to_path_buf()));
+    }
+
     #[test]
     fn touch_and_list_roundtrip() {
         let tmp = tempdir().unwrap();
         let home = tmp.path().join("spar-home");
-        // Serialize env mutation across tests in this process.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("SPAR_HOME", &home);
+        set_home_override(&home);
         assert_eq!(spar_home(), home);
 
         let proj = tmp.path().join("myproj");
@@ -246,17 +255,15 @@ mod tests {
             "expected run on disk under project"
         );
 
-        // Reload via SPAR_HOME path — same process as list_all_runs uses.
         let reg2 = Registry::load().unwrap();
-        assert!(reg2.projects.iter().any(|p| p.root == canonicalize_best_effort(&proj)));
-
-        std::env::remove_var("SPAR_HOME");
+        assert!(reg2
+            .projects
+            .iter()
+            .any(|p| p.root == canonicalize_best_effort(&proj)));
     }
 
     #[test]
     fn default_home_is_dot_spar_under_home() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("SPAR_HOME");
         let h = spar_home();
         assert!(
             h.ends_with(".spar"),
@@ -265,5 +272,31 @@ mod tests {
         );
     }
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[test]
+    fn home_override_is_thread_isolated() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let tmp = tempdir().unwrap();
+        let a = tmp.path().join("home-a");
+        let b = tmp.path().join("home-b");
+        let barrier = Arc::new(Barrier::new(2));
+
+        let ba = Arc::clone(&barrier);
+        let aa = a.clone();
+        let ta = thread::spawn(move || {
+            set_home_override(&aa);
+            ba.wait();
+            assert_eq!(spar_home(), aa);
+        });
+        let bb = Arc::clone(&barrier);
+        let bbp = b.clone();
+        let tb = thread::spawn(move || {
+            set_home_override(&bbp);
+            bb.wait();
+            assert_eq!(spar_home(), bbp);
+        });
+        ta.join().unwrap();
+        tb.join().unwrap();
+    }
 }

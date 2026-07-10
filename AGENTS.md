@@ -15,6 +15,7 @@ spar logs <run_id> [slot] -f
 spar bus send <run_id> -m "..."
 spar reconcile <run_id>       # arena merge path
 spar run --workflow review -t "…" --providers cli:claude,cli:grok  # concurrent independent review
+spar stop <run_id>            # halt dispatch, KEEP branch+worktree (resumable); vs cleanup which removes them
 ```
 
 **`--providers` or `--select`** is required on plan/implement/run (`cli:name` / `api:name`, or vals-backed profiles).

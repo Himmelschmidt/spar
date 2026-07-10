@@ -277,11 +277,7 @@ fn default_max_agents() -> u32 {
 }
 
 fn default_provider_order() -> Vec<String> {
-    vec![
-        "cli:claude".into(),
-        "cli:grok".into(),
-        "cli:agy".into(),
-    ]
+    vec!["cli:claude".into(), "cli:grok".into(), "cli:agy".into()]
 }
 
 fn default_slot_timeout_secs() -> u64 {
@@ -329,9 +325,7 @@ impl Config {
     }
 
     pub fn auto_ship(&self) -> bool {
-        !self.gates.ship
-            || self.ship.auto_confirm
-            || matches!(self.autonomy, AutonomyLevel::Full)
+        !self.gates.ship || self.ship.auto_confirm || matches!(self.autonomy, AutonomyLevel::Full)
     }
 }
 

@@ -109,7 +109,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             trust: TrustPolicy::FullAuto,
             extra_args: vec![],
-        model: None,
+            model: None,
         };
         let cmd = GrokAdapter.build_headless(Path::new("grok"), &opts);
         let (_, args) = command_to_parts(&cmd);

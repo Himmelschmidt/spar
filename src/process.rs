@@ -44,9 +44,8 @@ impl StreamStats {
     }
 
     pub fn touch_log(&mut self) {
-        self.last_log_at = Some(
-            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        );
+        self.last_log_at =
+            Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
     }
 
     pub fn stats_path(log_path: &Path) -> PathBuf {
@@ -78,6 +77,8 @@ impl StreamStats {
 #[derive(Debug)]
 pub struct SpawnResult {
     pub exit_code: Option<i32>,
+    /// Terminating signal number for signal-killed children (Unix); None otherwise.
+    pub signal: Option<i32>,
     pub timed_out: bool,
     #[allow(dead_code)]
     pub log_path: PathBuf,
@@ -86,8 +87,114 @@ pub struct SpawnResult {
     pub stats: StreamStats,
 }
 
+/// True if a process with `pid` is still addressable (`kill(pid, 0) == 0`).
+#[cfg(unix)]
+pub fn pid_alive(pid: u32) -> bool {
+    unsafe {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        kill(pid as i32, 0) == 0
+    }
+}
+
+#[cfg(not(unix))]
+pub fn pid_alive(_pid: u32) -> bool {
+    false
+}
+
+/// Kernel start-time (jiffies since boot, field 22 of `/proc/<pid>/stat`).
+/// Unique per live pid, so it distinguishes a process from a later reuse of its pid.
+#[cfg(target_os = "linux")]
+pub fn pid_starttime(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm (field 2) is parenthesised and may itself contain ')' / spaces; skip past
+    // the last ')', then starttime is the 20th whitespace field (field 22 overall).
+    let after_comm = &stat[stat.rfind(')')? + 1..];
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn pid_starttime(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// A recorded pid tied to the start-time of the process that owned it, so a pid
+/// recycled by the OS onto an unrelated process is never mistaken for the original
+/// and never signalled. Persisted as `pid` or `pid:starttime`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PidToken {
+    pub pid: u32,
+    pub starttime: Option<u64>,
+}
+
+impl PidToken {
+    /// Capture identity for a live pid (call while the process is known to be running).
+    pub fn capture(pid: u32) -> Self {
+        Self {
+            pid,
+            starttime: pid_starttime(pid),
+        }
+    }
+
+    /// A pid with no identity token (legacy record or a platform without `/proc`).
+    pub fn from_pid(pid: u32) -> Self {
+        Self {
+            pid,
+            starttime: None,
+        }
+    }
+
+    /// True only if the pid is live AND still the same process we recorded. When no
+    /// start-time was captured (unknown platform / legacy record) we cannot prove
+    /// identity, so fall back to bare liveness rather than refusing to act.
+    pub fn alive(&self) -> bool {
+        match self.starttime {
+            Some(st) => pid_starttime(self.pid) == Some(st),
+            None => pid_alive(self.pid),
+        }
+    }
+
+    pub fn encode(&self) -> String {
+        match self.starttime {
+            Some(st) => format!("{}:{st}", self.pid),
+            None => self.pid.to_string(),
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if s.is_empty() {
+            return None;
+        }
+        match s.split_once(':') {
+            Some((pid, st)) => Some(Self {
+                pid: pid.trim().parse().ok()?,
+                starttime: st.trim().parse().ok(),
+            }),
+            None => Some(Self {
+                pid: s.parse().ok()?,
+                starttime: None,
+            }),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
 /// Spawn process; stream structured events into a human log + live stats file.
-pub fn run_captured(req: &SpawnRequest) -> Result<SpawnResult> {
+/// `on_spawn` fires with the child pid the moment spawn succeeds, before the wait
+/// loop, so callers can record a live pid.
+pub fn run_captured(req: &SpawnRequest, on_spawn: Option<&dyn Fn(u32)>) -> Result<SpawnResult> {
     if let Some(parent) = req.log_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create log dir {}", parent.display()))?;
@@ -129,6 +236,9 @@ pub fn run_captured(req: &SpawnRequest) -> Result<SpawnResult> {
     let mut child = cmd
         .spawn()
         .with_context(|| format!("spawn {}", req.program.display()))?;
+    if let Some(cb) = on_spawn {
+        cb(child.id());
+    }
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -164,6 +274,7 @@ pub fn run_captured(req: &SpawnRequest) -> Result<SpawnResult> {
                     let _ = stats.save(&req.log_path);
                     return Ok(SpawnResult {
                         exit_code: status.code(),
+                        signal: exit_signal(&status),
                         timed_out: true,
                         log_path: req.log_path.clone(),
                         stdout_tail: tail_log(&req.log_path, 4000),
@@ -181,6 +292,7 @@ pub fn run_captured(req: &SpawnRequest) -> Result<SpawnResult> {
     let _ = stats.save(&req.log_path);
     Ok(SpawnResult {
         exit_code: status.code(),
+        signal: exit_signal(&status),
         timed_out: false,
         log_path: req.log_path.clone(),
         stdout_tail: tail_log(&req.log_path, 4000),
@@ -191,9 +303,7 @@ pub fn run_captured(req: &SpawnRequest) -> Result<SpawnResult> {
 /// SIGTERM the process group, brief grace, then always SIGKILL the group
 /// (even if the leader already reaped — grandchildren may still be alive).
 /// Returns the reaped exit status; sole owner of `wait`.
-fn kill_process_group(
-    child: &mut std::process::Child,
-) -> Result<std::process::ExitStatus> {
+fn kill_process_group(child: &mut std::process::Child) -> Result<std::process::ExitStatus> {
     #[cfg(unix)]
     {
         let pid = child.id() as i32;
@@ -210,7 +320,7 @@ fn kill_process_group(
         }
         signal_process_group(pid, SIGKILL);
         let _ = child.kill();
-        return child.wait().context("wait after process-group kill");
+        child.wait().context("wait after process-group kill")
     }
     #[cfg(not(unix))]
     {
@@ -225,15 +335,42 @@ const SIGTERM: i32 = 15;
 const SIGKILL: i32 = 9;
 
 #[cfg(unix)]
-fn signal_process_group(pid: i32, sig: i32) {
-    // libc kill(-pgid) — no dependency on `kill` binary / PATH.
+fn raw_kill(pid: i32, sig: i32) {
+    // libc kill — no dependency on the `kill` binary / PATH.
     unsafe {
         extern "C" {
             fn kill(pid: i32, sig: i32) -> i32;
         }
-        let _ = kill(-pid, sig);
+        let _ = kill(pid, sig);
     }
 }
+
+#[cfg(unix)]
+fn signal_process_group(pid: i32, sig: i32) {
+    // Negative pid = whole process group (leader via process_group(0)).
+    raw_kill(-pid, sig);
+}
+
+/// SIGTERM a live target, brief grace, then SIGKILL. With `group`, signals the
+/// whole process group (negative pid) so nested suite children are reaped too.
+/// Slots run in their own group (`process_group(0)`); the orchestrator does not,
+/// so it must be signalled by its bare pid.
+#[cfg(unix)]
+pub fn terminate_tree(pid: u32, group: bool) {
+    let target = if group { -(pid as i32) } else { pid as i32 };
+    raw_kill(target, SIGTERM);
+    let grace = Instant::now();
+    while grace.elapsed() < Duration::from_secs(2) {
+        if !pid_alive(pid) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    raw_kill(target, SIGKILL);
+}
+
+#[cfg(not(unix))]
+pub fn terminate_tree(_pid: u32, _group: bool) {}
 
 fn stream_to_log(
     pipe: impl Read,
@@ -400,10 +537,7 @@ impl StreamCoalescer {
                     let sub = v.get("subtype").and_then(|x| x.as_str()).unwrap_or("");
                     if sub == "init" {
                         let mut out = self.flush_buf();
-                        let model = v
-                            .get("model")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("claude");
+                        let model = v.get("model").and_then(|x| x.as_str()).unwrap_or("claude");
                         self.model = Some(model.to_string());
                         out.push_str(&format!("· session  {model}\n"));
                         return Some(out);
@@ -451,7 +585,11 @@ impl StreamCoalescer {
                     out.push_str(&format!(
                         "· done  {sub}  ·  {} tools  ·  {}\n",
                         self.tools,
-                        format_tokens(self.input_tokens, self.output_tokens.max(self.est_output_tokens), self.cache_read)
+                        format_tokens(
+                            self.input_tokens,
+                            self.output_tokens.max(self.est_output_tokens),
+                            self.cache_read
+                        )
                     ));
                     return Some(out);
                 }
@@ -829,6 +967,7 @@ pub fn run_mock(req: &SpawnRequest, mock_output: &str) -> Result<SpawnResult> {
     let _ = stats.save(&req.log_path);
     Ok(SpawnResult {
         exit_code: Some(0),
+        signal: None,
         timed_out: false,
         log_path: req.log_path.clone(),
         stdout_tail: mock_output.into(),
@@ -870,8 +1009,98 @@ mod tests {
             env: vec![],
             timeout: Duration::from_millis(200),
         };
-        let res = run_captured(&req).expect("timeout path must not error");
+        let res = run_captured(&req, None).expect("timeout path must not error");
         assert!(res.timed_out, "expected timed_out");
+    }
+
+    fn sh_req(script: &str, dir: &Path, log: &str) -> SpawnRequest {
+        SpawnRequest {
+            program: PathBuf::from("sh"),
+            args: vec!["-c".into(), script.into()],
+            cwd: dir.to_path_buf(),
+            log_path: dir.join(log),
+            env: vec![],
+            timeout: Duration::from_secs(5),
+        }
+    }
+
+    #[test]
+    fn pid_sink_fires_with_live_pid_before_exit() {
+        let tmp = tempdir().unwrap();
+        let req = sh_req("sleep 0.3", tmp.path(), "sink.log");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sink = move |pid: u32| {
+            let _ = tx.send((pid, pid_alive(pid)));
+        };
+        let res = run_captured(&req, Some(&sink)).expect("run");
+        let (pid, alive) = rx.recv().expect("sink must fire");
+        assert!(pid > 1, "real child pid, got {pid}");
+        assert!(alive, "child must be alive at the moment the sink fires");
+        assert_eq!(res.exit_code, Some(0));
+    }
+
+    #[test]
+    fn signal_kill_reports_signal_not_exit_code() {
+        let tmp = tempdir().unwrap();
+        let req = sh_req("kill -9 $$", tmp.path(), "sig.log");
+        let res = run_captured(&req, None).expect("run");
+        assert_eq!(res.exit_code, None, "signal death has no exit code");
+        assert_eq!(res.signal, Some(9));
+    }
+
+    #[test]
+    fn nonzero_exit_code_captured() {
+        let tmp = tempdir().unwrap();
+        let req = sh_req("exit 137", tmp.path(), "oom.log");
+        let res = run_captured(&req, None).expect("run");
+        assert_eq!(res.exit_code, Some(137));
+        assert_eq!(res.signal, None);
+    }
+
+    #[test]
+    fn pid_alive_true_self_false_reaped() {
+        assert!(pid_alive(std::process::id()));
+        let mut child = Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(!pid_alive(pid), "reaped child pid must be dead");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_starttime_token_is_not_alive_but_fresh_is() {
+        let me = std::process::id();
+        let fresh = PidToken::capture(me);
+        assert_eq!(fresh.pid, me);
+        assert!(fresh.starttime.is_some(), "linux must record a start-time");
+        assert!(
+            fresh.alive(),
+            "our own live pid with matching start-time is alive"
+        );
+
+        // Same live pid, but a start-time that no longer matches models a recycled pid
+        // now owned by an unrelated process: it must never be treated as ours.
+        let recycled = PidToken {
+            pid: me,
+            starttime: Some(fresh.starttime.unwrap() + 1),
+        };
+        assert!(
+            !recycled.alive(),
+            "a live pid whose recorded start-time differs must be treated as dead"
+        );
+    }
+
+    #[test]
+    fn pid_token_roundtrips_through_encode_parse() {
+        let with_st = PidToken {
+            pid: 4242,
+            starttime: Some(987654),
+        };
+        assert_eq!(with_st.encode(), "4242:987654");
+        assert_eq!(PidToken::parse("4242:987654"), Some(with_st));
+        // Legacy bare-pid record parses with no start-time and falls back to liveness.
+        assert_eq!(PidToken::parse("4242"), Some(PidToken::from_pid(4242)));
+        assert_eq!(PidToken::parse("  "), None);
     }
 
     #[test]
@@ -886,7 +1115,7 @@ mod tests {
             env: vec![],
             timeout: Duration::from_secs(5),
         };
-        let res = run_captured(&req).unwrap();
+        let res = run_captured(&req, None).unwrap();
         assert_eq!(res.exit_code, Some(0));
         assert!(std::fs::read_to_string(log).unwrap().contains("stream-me"));
     }
@@ -963,7 +1192,7 @@ mod tests {
         // 2-byte UTF-8 chars so a naive mid-window start can land on a continuation.
         let mut bytes = Vec::new();
         bytes.extend(std::iter::repeat_n(0xC3u8, 1)); // incomplete alone; we'll write full chars
-        // Write many "é" (C3 A9) then ASCII marker.
+                                                      // Write many "é" (C3 A9) then ASCII marker.
         for _ in 0..40 {
             bytes.extend_from_slice("é".as_bytes());
         }

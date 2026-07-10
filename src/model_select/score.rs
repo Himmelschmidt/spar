@@ -130,10 +130,7 @@ pub fn pick_ranked(
 
     let (acc_min, acc_max) = min_max(filtered.iter().map(|m| m.accuracy));
     let (lat_min, lat_max) = min_max(filtered.iter().map(|m| m.latency));
-    let costs: Vec<f64> = filtered
-        .iter()
-        .map(|m| effective_cost(m))
-        .collect();
+    let costs: Vec<f64> = filtered.iter().map(|m| effective_cost(m)).collect();
     let (cost_min, cost_max) = min_max(costs.iter().copied());
 
     let mut ranked: Vec<RankedModel> = filtered

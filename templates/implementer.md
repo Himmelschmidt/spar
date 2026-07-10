@@ -5,6 +5,7 @@ Implement the task in your isolated worktree. Do not modify the primary checkout
 ## Task
 {{task}}
 
+{{amendment_section}}
 ## Plan (if any)
 {{plan_body}}
 
@@ -25,3 +26,5 @@ Implement the task in your isolated worktree. Do not modify the primary checkout
 4. Write done marker `{{markers_dir}}/{{slot_id}}.done` or `.failed`
 
 Do not merge. Do not push unless explicitly told. Prefer small commits on branch `{{branch}}`.
+
+Do **not** use `pkill -f`, `pgrep -f`, or `killall` on any token derived from the task or a test name: your own process's argv contains the full task text, so those patterns match and kill YOU. Kill stray processes by pid instead.

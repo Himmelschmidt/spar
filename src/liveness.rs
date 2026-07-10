@@ -22,10 +22,7 @@ pub struct SlotActivity {
 
 impl SlotActivity {
     pub fn observe(slot: &SlotState, stall_warn_secs: u64) -> Self {
-        let last = slot
-            .log_path
-            .as_ref()
-            .and_then(|p| last_log_time(p));
+        let last = slot.log_path.as_ref().and_then(|p| last_log_time(p));
         let silent_for_secs = last.map(|t| {
             let now = Utc::now();
             (now - t).num_seconds().max(0) as u64
@@ -61,9 +58,12 @@ pub fn last_log_time(log_path: &Path) -> Option<DateTime<Utc>> {
             }
         }
     }
-    for t in [file_mtime(log_path), file_mtime(&StreamStats::stats_path(log_path))]
-        .into_iter()
-        .flatten()
+    for t in [
+        file_mtime(log_path),
+        file_mtime(&StreamStats::stats_path(log_path)),
+    ]
+    .into_iter()
+    .flatten()
     {
         best = Some(match best {
             Some(b) if b >= t => b,
@@ -100,17 +100,33 @@ pub fn format_duration_short(secs: u64) -> String {
     }
 }
 
-/// Enrich a status JSON value's `slots` array with activity fields.
-pub fn enrich_status_json(v: &mut serde_json::Value, state_slots: &[SlotState], cfg: &Config) {
+/// Enrich a status JSON value's `slots` array with activity + liveness fields.
+pub fn enrich_status_json(
+    v: &mut serde_json::Value,
+    state_slots: &[SlotState],
+    cfg: &Config,
+    paths: &crate::paths::SparPaths,
+    run_id: &str,
+) {
     let warn = cfg.timeouts.stall_warn_secs;
+    let by_id: std::collections::HashMap<&str, &SlotState> =
+        state_slots.iter().map(|s| (s.id.as_str(), s)).collect();
     let Some(slots) = v.get_mut("slots").and_then(|s| s.as_array_mut()) else {
         return;
     };
-    for (i, slot_val) in slots.iter_mut().enumerate() {
-        let Some(slot) = state_slots.get(i) else {
-            break;
+    for slot_val in slots.iter_mut() {
+        let id = slot_val
+            .get("id")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string());
+        let Some(slot) = id.as_deref().and_then(|id| by_id.get(id).copied()) else {
+            continue;
         };
         let act = SlotActivity::observe(slot, warn);
+        let token = crate::markers::read_pid(paths, run_id, &slot.id)
+            .or_else(|| slot.pid.map(crate::process::PidToken::from_pid));
+        let pid = token.map(|t| t.pid);
+        let pid_alive = token.map(|t| t.alive()).unwrap_or(false);
         if let Some(obj) = slot_val.as_object_mut() {
             if let Some(t) = &act.last_log_at {
                 obj.insert("last_log_at".into(), serde_json::Value::String(t.clone()));
@@ -119,6 +135,20 @@ pub fn enrich_status_json(v: &mut serde_json::Value, state_slots: &[SlotState], 
                 obj.insert("silent_for_secs".into(), serde_json::json!(s));
             }
             obj.insert("stalled".into(), serde_json::Value::Bool(act.stalled));
+            obj.insert(
+                "pid".into(),
+                match pid {
+                    Some(p) => serde_json::json!(p),
+                    None => serde_json::Value::Null,
+                },
+            );
+            obj.insert("pid_alive".into(), serde_json::Value::Bool(pid_alive));
+            if let Some(c) = slot.exit_code {
+                obj.insert("exit_code".into(), serde_json::json!(c));
+            }
+            if let Some(sig) = slot.signal {
+                obj.insert("signal".into(), serde_json::json!(sig));
+            }
         }
     }
     if let Some(obj) = v.as_object_mut() {
@@ -132,8 +162,8 @@ pub fn enrich_status_json(v: &mut serde_json::Value, state_slots: &[SlotState], 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{SlotRole, SlotState};
     use crate::provider_ref::ProviderRef;
+    use crate::state::{SlotRole, SlotState};
     use std::io::Write;
     use tempfile::tempdir;
 
@@ -151,6 +181,7 @@ mod tests {
             error: None,
             pid: None,
             exit_code: None,
+            signal: None,
             artifact: None,
             usage: None,
             model: None,
@@ -193,13 +224,18 @@ mod tests {
         let tmp = tempdir().unwrap();
         let log = tmp.path().join("s.log");
         std::fs::write(&log, "x\n").unwrap();
-        let mut stats = StreamStats::default();
-        stats.last_log_at = Some("2020-01-01T00:00:00Z".into());
+        let stats = StreamStats {
+            last_log_at: Some("2020-01-01T00:00:00Z".into()),
+            ..Default::default()
+        };
         stats.save(&log).unwrap();
         // Fresh log write after stale stats stamp.
         std::fs::write(&log, "fresh\n").unwrap();
         let t = last_log_time(&log).unwrap();
-        assert!(t.year() >= 2025, "must prefer fresher log mtime over stale stats, got {t}");
+        assert!(
+            t.year() >= 2025,
+            "must prefer fresher log mtime over stale stats, got {t}"
+        );
     }
 
     #[test]
@@ -218,10 +254,7 @@ mod tests {
     fn filetime_set(path: &Path, t: SystemTime) {
         // Use utime via filetime crate? Not a dep — use `touch -d` style via libc or std.
         // On Linux, set with filetime from std is not available; use Command touch.
-        let secs = t
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let secs = t.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
         let _ = std::process::Command::new("touch")
             .args(["-d", &format!("@{secs}"), path.to_str().unwrap()])
             .status();

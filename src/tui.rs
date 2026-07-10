@@ -119,12 +119,7 @@ pub fn run_with(opts: TuiOpts) -> Result<crate::exit_codes::ExitCode> {
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
     terminal.clear()?;
 
-    run_loop(
-        &mut terminal,
-        local_root,
-        opts.task_seed,
-        stall_warn_secs,
-    )
+    run_loop(&mut terminal, local_root, opts.task_seed, stall_warn_secs)
 }
 
 /// Best-effort teardown of raw mode / mouse / alt-screen (safe if only partially entered).
@@ -214,9 +209,7 @@ impl LogCache {
         let meta = std::fs::metadata(path).ok();
         let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
         let mtime = meta.and_then(|m| m.modified().ok());
-        let same = self.path.as_deref() == Some(path)
-            && self.len == len
-            && self.mtime == mtime;
+        let same = self.path.as_deref() == Some(path) && self.len == len && self.mtime == mtime;
         if !same {
             let tail = process::tail_log_info(path, max_bytes);
             if tail.io_error {
@@ -515,11 +508,13 @@ fn run_loop(
         } else {
             app.selected_slot = 0;
         }
-        fleet_state.select(if full.as_ref().map(|s| s.slots.is_empty()).unwrap_or(true) {
-            None
-        } else {
-            Some(app.selected_slot)
-        });
+        fleet_state.select(
+            if full.as_ref().map(|s| s.slots.is_empty()).unwrap_or(true) {
+                None
+            } else {
+                Some(app.selected_slot)
+            },
+        );
 
         let quota = QuotaStore::load(&swarm).unwrap_or_default();
         let stream_text = match app.browse {
@@ -718,10 +713,7 @@ fn handle_key(
                     *active_root = p.root.clone();
                     app.open_project_runs();
                     app.flash(
-                        format!(
-                            "Opened {}",
-                            p.name.as_deref().unwrap_or("project")
-                        ),
+                        format!("Opened {}", p.name.as_deref().unwrap_or("project")),
                         GREEN,
                     );
                 }
@@ -927,8 +919,7 @@ fn handle_mouse(
             } else if contains(app.rect_fleet, x, y) {
                 app.focus = Focus::Agents;
                 if let Some(st) = full {
-                    if let Some(row) =
-                        list_row_at(app.rect_fleet, y, st.slots.len(), fleet_offset)
+                    if let Some(row) = list_row_at(app.rect_fleet, y, st.slots.len(), fleet_offset)
                     {
                         app.select_slot(row, st.slots.len());
                     }
@@ -950,8 +941,7 @@ fn handle_mouse(
                         }
                     }
                     BrowseLevel::Runs => {
-                        if let Some(row) = list_row_at(app.rect_runs, y, runs.len(), rail_offset)
-                        {
+                        if let Some(row) = list_row_at(app.rect_runs, y, runs.len(), rail_offset) {
                             app.select_run(row, runs.len());
                         }
                     }
@@ -1150,9 +1140,7 @@ fn draw_header(f: &mut Frame, area: Rect, swarm: &SparPaths, full: Option<&RunSt
         None => ("—".into(), "No run selected".into(), String::new()),
     };
 
-    let phase_color = full
-        .map(|s| phase_color(s.phase))
-        .unwrap_or(FG_DIM);
+    let phase_color = full.map(|s| phase_color(s.phase)).unwrap_or(FG_DIM);
     let dry = full
         .filter(|s| s.dry_run)
         .map(|_| " dry-run ")
@@ -1234,7 +1222,8 @@ fn draw_action(
     } else if let Some(st) = full {
         match st.phase {
             Phase::AwaitingPlanApproval => (
-                "  Plan + tests ready — press  a  to approve ·  r  to reject · p = all projects  ".into(),
+                "  Plan + tests ready — press  a  to approve ·  r  to reject · p = all projects  "
+                    .into(),
                 BG,
                 YELLOW,
             ),
@@ -1338,7 +1327,7 @@ fn draw_rail(
                             .map(|r| r.len())
                             .unwrap_or(0);
                         let line = Line::from(vec![
-                            Span::styled(format!("{mark}"), Style::default().fg(ACCENT)),
+                            Span::styled(mark.to_string(), Style::default().fg(ACCENT)),
                             Span::styled(
                                 format!(" {:<14}", truncate(name, 14)),
                                 Style::default()
@@ -1349,14 +1338,8 @@ fn draw_rail(
                                         Modifier::empty()
                                     }),
                             ),
-                            Span::styled(
-                                format!(" {n} runs "),
-                                Style::default().fg(FG_MUTED),
-                            ),
-                            Span::styled(
-                                relative_age(p.last_seen),
-                                Style::default().fg(FG_MUTED),
-                            ),
+                            Span::styled(format!(" {n} runs "), Style::default().fg(FG_MUTED)),
+                            Span::styled(relative_age(p.last_seen), Style::default().fg(FG_MUTED)),
                         ]);
                         ListItem::new(line).style(if sel {
                             Style::default().bg(BG_RAISED)
@@ -1394,7 +1377,7 @@ fn draw_rail(
                             .unwrap_or_else(|| workflow_label(r.workflow).into());
                         let age = relative_age(r.updated_at);
                         let line = Line::from(vec![
-                            Span::styled(format!("{mark}"), Style::default().fg(ACCENT)),
+                            Span::styled(mark.to_string(), Style::default().fg(ACCENT)),
                             Span::styled(
                                 format!(" {:<8}", truncate(&r.id, 8)),
                                 Style::default()
@@ -1468,11 +1451,7 @@ fn draw_agents(
                 } else {
                     (String::new(), FG_MUTED)
                 };
-                let color = if act.stalled {
-                    RED
-                } else {
-                    slot_color(s)
-                };
+                let color = if act.stalled { RED } else { slot_color(s) };
                 let line = Line::from(vec![
                     Span::styled(format!(" {icon} "), Style::default().fg(color)),
                     Span::styled(
@@ -1667,12 +1646,8 @@ fn draw_stream_stats(
         Some(SlotStatus::Running) => {
             Span::styled(" LIVE ", Style::default().fg(BG).bg(CYAN).bold())
         }
-        Some(SlotStatus::Done) => {
-            Span::styled(" DONE ", Style::default().fg(BG).bg(GREEN).bold())
-        }
-        Some(SlotStatus::Failed) => {
-            Span::styled(" FAIL ", Style::default().fg(BG).bg(RED).bold())
-        }
+        Some(SlotStatus::Done) => Span::styled(" DONE ", Style::default().fg(BG).bg(GREEN).bold()),
+        Some(SlotStatus::Failed) => Span::styled(" FAIL ", Style::default().fg(BG).bg(RED).bold()),
         _ => Span::styled(" … ", Style::default().fg(FG_MUTED).bg(BG_RAISED)),
     };
     let line = Line::from(vec![
@@ -1835,12 +1810,7 @@ fn log_line_style(line: &str, colorize: bool) -> Style {
 }
 
 /// Compact stream lines (grok-cli style density), then truncate or wrap to width.
-fn layout_log_rows(
-    text: &str,
-    width: usize,
-    colorize: bool,
-    expand: bool,
-) -> Vec<(String, Style)> {
+fn layout_log_rows(text: &str, width: usize, colorize: bool, expand: bool) -> Vec<(String, Style)> {
     let width = width.max(1);
     let mut out = Vec::new();
     for raw in text.lines() {
@@ -1960,8 +1930,6 @@ fn soft_wrap(s: &str, width: usize) -> Vec<String> {
     rows
 }
 
-
-
 fn compact_u64(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
@@ -2042,10 +2010,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, full: Option<&RunState>) {
     } else if !app.status_line.is_empty() {
         (app.status_line.as_str(), YELLOW)
     } else {
-        (
-            situational_footer(full, app.focus, app.browse),
-            FG_MUTED,
-        )
+        (situational_footer(full, app.focus, app.browse), FG_MUTED)
     };
 
     let gate = full.map(|s| s.phase.is_gate()).unwrap_or(false);
@@ -2061,12 +2026,12 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, full: Option<&RunState>) {
     } else {
         format!(" {}  ? help  ·  Ctrl+C×2 exit  ", app.spinner())
     };
-    let left = Span::styled(
-        left_text.clone(),
-        Style::default().fg(color).bg(bg),
-    );
+    let left = Span::styled(left_text.clone(), Style::default().fg(color).bg(bg));
     let right = if gate {
-        Span::styled(right_text.clone(), Style::default().fg(BG).bg(YELLOW).bold())
+        Span::styled(
+            right_text.clone(),
+            Style::default().fg(BG).bg(YELLOW).bold(),
+        )
     } else {
         Span::styled(right_text.clone(), Style::default().fg(FG_MUTED).bg(bg))
     };
@@ -2105,8 +2070,8 @@ fn situational_footer(full: Option<&RunState>, focus: Focus, browse: BrowseLevel
 }
 
 fn draw_help_overlay(f: &mut Frame, area: Rect) {
-    let w = area.width.min(72).max(40);
-    let h = area.height.min(22).max(14);
+    let w = area.width.clamp(40, 72);
+    let h = area.height.clamp(14, 22);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let rect = Rect {
@@ -2149,10 +2114,7 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(BORDER_FOCUS))
-                .title(Span::styled(
-                    " Help ",
-                    Style::default().fg(ACCENT).bold(),
-                ))
+                .title(Span::styled(" Help ", Style::default().fg(ACCENT).bold()))
                 .style(Style::default().bg(BG_RAISED)),
         );
     f.render_widget(p, rect);
@@ -2191,7 +2153,9 @@ fn handle_composer(
                     .into(),
             ),
             "approve" => {
-                let id = arg.or(run_id).ok_or_else(|| anyhow::anyhow!("no run selected"))?;
+                let id = arg
+                    .or(run_id)
+                    .ok_or_else(|| anyhow::anyhow!("no run selected"))?;
                 workflow::plan::approve(swarm, id, false)?;
                 Ok(format!("Approved plan {id}"))
             }
@@ -2201,17 +2165,16 @@ fn handle_composer(
                 Ok(format!("Rejected plan {id}"))
             }
             "ship" => {
-                let id = arg.or(run_id).ok_or_else(|| anyhow::anyhow!("no run selected"))?;
+                let id = arg
+                    .or(run_id)
+                    .ok_or_else(|| anyhow::anyhow!("no run selected"))?;
                 crate::ship::confirm_ship(swarm, id, false)?;
                 Ok(format!("Ship confirmed {id}"))
             }
             other => Ok(format!("Unknown /{other} — try /help")),
         };
     }
-    Ok(format!(
-        "Noted (chat later): {}",
-        truncate(cmd, 48)
-    ))
+    Ok(format!("Noted (chat later): {}", truncate(cmd, 48)))
 }
 
 fn stream_content(
@@ -2267,7 +2230,10 @@ fn stream_content(
                 slot.id
             )
         } else if truncated {
-            format!("… earlier log truncated (showing last ~{} KB)\n{body}", LOG_TAIL_BYTES / 1024)
+            format!(
+                "… earlier log truncated (showing last ~{} KB)\n{body}",
+                LOG_TAIL_BYTES / 1024
+            )
         } else {
             body
         }
@@ -2283,11 +2249,7 @@ fn stream_content(
 }
 
 /// Right-rail feed: human run timeline (not a raw bus dump).
-fn activity_feed(
-    swarm: &SparPaths,
-    full: Option<&RunState>,
-    quota: &QuotaStore,
-) -> Vec<String> {
+fn activity_feed(swarm: &SparPaths, full: Option<&RunState>, quota: &QuotaStore) -> Vec<String> {
     let mut lines = Vec::new();
     let Some(st) = full else {
         lines.push("No run selected.".into());
@@ -2368,7 +2330,11 @@ fn activity_feed(
     let paused: Vec<_> = quota
         .providers
         .iter()
-        .filter(|(_, q)| format!("{:?}", q.status).to_ascii_lowercase().contains("pause"))
+        .filter(|(_, q)| {
+            format!("{:?}", q.status)
+                .to_ascii_lowercase()
+                .contains("pause")
+        })
         .collect();
     if !paused.is_empty() {
         lines.push(String::new());
@@ -2389,18 +2355,12 @@ fn activity_event_line(e: &events::Event) -> String {
     let t = e.ts.format("%H:%M");
     match e.kind {
         events::EventKind::Phase => {
-            let phase = e
-                .phase
-                .map(phase_label)
-                .unwrap_or_else(|| "?".into());
+            let phase = e.phase.map(phase_label).unwrap_or_else(|| "?".into());
             format!("{t} → {phase}")
         }
         events::EventKind::Slot => {
             let slot = e.slot.as_deref().unwrap_or("agent");
-            let st = e
-                .status
-                .map(slot_status_label)
-                .unwrap_or("?");
+            let st = e.status.map(slot_status_label).unwrap_or("?");
             format!("{t} {slot} {st}")
         }
         events::EventKind::Gate => {
@@ -2442,6 +2402,7 @@ fn phase_label(phase: Phase) -> String {
         Phase::Failed => "Failed".into(),
         Phase::Stuck => "Stuck".into(),
         Phase::Quota => "Quota blocked".into(),
+        Phase::Stopped => "Stopped".into(),
     }
 }
 
@@ -2527,7 +2488,7 @@ fn phase_color(phase: Phase) -> Color {
 }
 
 fn is_active_phase(phase: Phase) -> bool {
-    !phase.is_terminal() && !phase.is_gate()
+    !phase.is_waitable_stop()
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -2545,7 +2506,10 @@ mod labels {
 
     #[test]
     fn phase_labels_are_human() {
-        assert_eq!(phase_label(Phase::AwaitingPlanApproval), "Needs plan approval");
+        assert_eq!(
+            phase_label(Phase::AwaitingPlanApproval),
+            "Needs plan approval"
+        );
         assert_eq!(phase_label(Phase::AwaitingShipConfirm), "Ready to ship");
         assert!(!phase_label(Phase::Suite).contains('_'));
     }
@@ -2605,7 +2569,10 @@ mod labels {
         let mut follow = true;
         apply_scroll_delta(&mut scroll, &mut follow, 0, -3);
         assert_eq!(scroll, 0);
-        assert!(follow, "short log must stay following so growth stays visible");
+        assert!(
+            follow,
+            "short log must stay following so growth stays visible"
+        );
     }
 
     #[test]

@@ -106,7 +106,9 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
                 "plan_critic",
             )
         };
-        state.slots.push(executor::init_slot_model(&id, prov, role, model.clone()));
+        state
+            .slots
+            .push(executor::init_slot_model(&id, prov, role, model.clone()));
         jobs.push(SlotJob {
             slot_id: id,
             provider: prov.clone(),
@@ -256,9 +258,12 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
     let id = format!("test-author-{safe}");
 
     if state.slots.iter().all(|s| s.id != id) {
-        state
-            .slots
-            .push(executor::init_slot_model(&id, &provider, SlotRole::TestAuthor, model.clone()));
+        state.slots.push(executor::init_slot_model(
+            &id,
+            &provider,
+            SlotRole::TestAuthor,
+            model.clone(),
+        ));
     }
     worktree::prepare_isolation(state, paths, std::slice::from_ref(&id))?;
     // After isolation so status/TUI show Spec for the author wall-clock, not PrepareIsolation.
@@ -494,6 +499,7 @@ fn detach_self(state: &RunState, json: bool) -> Result<ExitCode> {
 }
 
 pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<ExitCode> {
+    let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
     let mut state = RunState::load(paths, run_id)?;
     let mut jobs = Vec::new();
     for slot in &state.slots {
@@ -511,7 +517,7 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
             template: template.into(),
             extra_vars: HashMap::new(),
             expected_artifact: Some("plan.md".into()),
-        model: None,
+            model: None,
         });
     }
     if jobs.is_empty() {
@@ -536,7 +542,7 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
                 template: template.into(),
                 extra_vars: HashMap::new(),
                 expected_artifact: Some("plan.md".into()),
-            model: None,
+                model: None,
             });
         }
         state.save(paths)?;

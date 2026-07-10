@@ -10,14 +10,14 @@ pub use map::map_model;
 pub use score::{
     apply_urgency, default_profiles, pick_fleet, pick_ranked, ProfileWeights, RankedModel, Urgency,
 };
-pub use vals::{fetch_bench, BenchSnapshot, ModelScore};
 #[cfg(test)]
 pub use vals::parse_overall_rsc;
+pub use vals::{fetch_bench, BenchSnapshot, ModelScore};
 
 use crate::config::{Config, ModelSelectConfig};
 use anyhow::{bail, Context, Result};
-use serde::Serialize;
 use serde::Deserialize;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -44,9 +44,7 @@ pub fn resolve_providers(
         });
     }
     let Some(select) = select else {
-        bail!(
-            "--providers is required (or pass --select <profile>, e.g. --select value)"
-        );
+        bail!("--providers is required (or pass --select <profile>, e.g. --select value)");
     };
     if select.is_empty() {
         bail!("--select requires at least one profile name (or auto)");
@@ -62,9 +60,8 @@ pub fn resolve_providers(
     let mut out_providers = Vec::with_capacity(ranked.len());
     let mut chosen = Vec::with_capacity(ranked.len());
     for (i, r) in ranked.iter().enumerate() {
-        let mapped = map_usable_allowed(&r.model.id, dry, ms).with_context(|| {
-            format!("no usable spar mapping for vals model {}", r.model.id)
-        })?;
+        let mapped = map_usable_allowed(&r.model.id, dry, ms)
+            .with_context(|| format!("no usable spar mapping for vals model {}", r.model.id))?;
         out_providers.push(mapped.provider.clone());
         chosen.push(SelectChoice {
             slot: i,
@@ -354,8 +351,7 @@ fn map_usable_allowed(
     crate::model_select::map::map_candidates(vals_id)
         .into_iter()
         .find(|m| {
-            allow_matches(ms, &m.provider)
-                && crate::providers::is_provider_usable(&m.provider, dry)
+            allow_matches(ms, &m.provider) && crate::providers::is_provider_usable(&m.provider, dry)
         })
 }
 
@@ -369,10 +365,12 @@ pub fn list_ranked(
 ) -> Result<(BenchSnapshot, Vec<RankedModel>)> {
     let snap = ensure_bench_data(ms)?;
     let profiles = ms.resolved_profiles();
-    let weights = profiles
-        .get(profile)
-        .cloned()
-        .with_context(|| format!("unknown profile '{profile}' (have {:?})", profiles.keys().collect::<Vec<_>>()))?;
+    let weights = profiles.get(profile).cloned().with_context(|| {
+        format!(
+            "unknown profile '{profile}' (have {:?})",
+            profiles.keys().collect::<Vec<_>>()
+        )
+    })?;
     let weights = apply_urgency(&weights, urgency);
 
     let candidates: Vec<ModelScore> = snap
@@ -397,7 +395,11 @@ pub fn list_ranked(
     Ok((snap, ranked))
 }
 
-pub fn write_select_artifact(paths: &crate::paths::SparPaths, run_id: &str, art: &SelectArtifact) -> Result<()> {
+pub fn write_select_artifact(
+    paths: &crate::paths::SparPaths,
+    run_id: &str,
+    art: &SelectArtifact,
+) -> Result<()> {
     paths.ensure_run_dirs(run_id)?;
     let path = paths.artifact(run_id, "model-select.json");
     let text = serde_json::to_string_pretty(art)?;
@@ -440,7 +442,10 @@ pub struct SelectChoice {
 }
 
 /// CLI entry for `spar model …`
-pub fn run_cmd(action: crate::cli::ModelAction, cfg: &Config) -> Result<crate::exit_codes::ExitCode> {
+pub fn run_cmd(
+    action: crate::cli::ModelAction,
+    cfg: &Config,
+) -> Result<crate::exit_codes::ExitCode> {
     use crate::cli::ModelAction;
     use crate::exit_codes::ExitCode;
 
@@ -501,16 +506,13 @@ pub fn run_cmd(action: crate::cli::ModelAction, cfg: &Config) -> Result<crate::e
                     ranked.len()
                 );
                 println!(
-                    "{:<36} {:>8} {:>10} {:>10} {:>8}  {}",
-                    "ID", "ACC", "LAT(s)", "COST", "SCORE", "PROVIDER"
+                    "{:<36} {:>8} {:>10} {:>10} {:>8}  PROVIDER",
+                    "ID", "ACC", "LAT(s)", "COST", "SCORE"
                 );
                 for r in ranked.iter().take(30) {
                     let mapped = map_usable_allowed(&r.model.id, false, &ms)
                         .or_else(|| map_model(&r.model.id));
-                    let prov = mapped
-                        .as_ref()
-                        .map(|m| m.provider.as_str())
-                        .unwrap_or("-");
+                    let prov = mapped.as_ref().map(|m| m.provider.as_str()).unwrap_or("-");
                     println!(
                         "{:<36} {:>7.1}% {:>10.1} {:>10.4} {:>8.3}  {}",
                         r.model.id,
@@ -658,8 +660,8 @@ mod tests {
     use crate::config::ModelSelectConfig;
 
     fn fixture_snap() -> BenchSnapshot {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/vals/swebench_overall.json");
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vals/swebench_overall.json");
         let text = std::fs::read_to_string(&path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         let models = v["models"]

@@ -68,6 +68,7 @@ pub fn base_vars(ctx: &TemplateCtx<'_>) -> HashMap<String, String> {
     m.insert("provider".into(), ctx.provider.into());
     m.insert("branch".into(), ctx.branch.into());
     m.insert("plan_body".into(), String::new());
+    m.insert("amendment_section".into(), String::new());
     m.insert(
         "test_contract_body".into(),
         "(no pre-written acceptance contract)".into(),
@@ -75,10 +76,7 @@ pub fn base_vars(ctx: &TemplateCtx<'_>) -> HashMap<String, String> {
     m.insert("planner_slot".into(), String::new());
     m.insert("critic_slot".into(), String::new());
     m.insert("review_cwd".into(), ctx.cwd.into());
-    m.insert(
-        "suite_body".into(),
-        "(no suite report)".into(),
-    );
+    m.insert("suite_body".into(), "(no suite report)".into());
     // Default: independent review may run tests. Implement overrides when suite channel ran.
     m.insert(
         "suite_guidance".into(),
@@ -139,6 +137,54 @@ mod tests {
         assert!(s.contains("add login"));
         assert!(!s.contains("{{task}}"));
         assert!(!s.contains("{{planner_slot}}"));
+    }
+
+    #[test]
+    fn implementer_empty_amendment_renders_clean() {
+        let ctx = TemplateCtx {
+            task: "do X",
+            project_root: "/tmp/p",
+            cwd: "/tmp/wt",
+            run_id: "abc",
+            artifacts_dir: "/tmp/a",
+            markers_dir: "/tmp/m",
+            mailbox_dir: "/tmp/mb",
+            slot_id: "impl",
+            provider: "cli:claude",
+            branch: "spar/abc/impl",
+        };
+        let v = base_vars(&ctx);
+        let s = render("implementer", &v).unwrap();
+        assert!(!s.contains("## Amendment"), "no header when empty:\n{s}");
+        assert!(
+            !s.contains("{{amendment_section}}"),
+            "no literal left:\n{s}"
+        );
+        assert!(s.contains("do X"));
+    }
+
+    #[test]
+    fn implementer_amendment_section_renders() {
+        let ctx = TemplateCtx {
+            task: "do X",
+            project_root: "/tmp/p",
+            cwd: "/tmp/wt",
+            run_id: "abc",
+            artifacts_dir: "/tmp/a",
+            markers_dir: "/tmp/m",
+            mailbox_dir: "/tmp/mb",
+            slot_id: "impl",
+            provider: "cli:claude",
+            branch: "spar/abc/impl",
+        };
+        let mut v = base_vars(&ctx);
+        v.insert(
+            "amendment_section".into(),
+            "## Amendment (this round)\nSENTINEL-ABC\n".into(),
+        );
+        let s = render("implementer", &v).unwrap();
+        assert!(s.contains("## Amendment (this round)"));
+        assert!(s.contains("SENTINEL-ABC"));
     }
 
     #[test]

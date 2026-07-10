@@ -92,6 +92,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     if opts.detach {
         return detach(&state, opts.json);
     }
+    let _lock = crate::runlock::RunLock::acquire(paths, &state.id)?;
     execute(&mut state, paths, cfg)?;
     if opts.json {
         executor::emit_run_json(&state)?;
@@ -102,6 +103,11 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
 }
 
 pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<()> {
+    if crate::workflow::implement::should_stop(paths, &state.id) {
+        state.set_phase(Phase::Stopped);
+        state.save(paths)?;
+        return Ok(());
+    }
     let ids: Vec<String> = state.slots.iter().map(|s| s.id.clone()).collect();
     // Reviewers share the project root view: worktrees still used for write safety,
     // but each gets the same task (independent).
@@ -134,7 +140,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
                 template: "reviewer".into(),
                 extra_vars: extra,
                 expected_artifact: Some(format!("review-{}.md", slot.id)),
-            model: None,
+                model: None,
             }
         })
         .collect();
@@ -175,10 +181,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
     ));
     std::fs::write(paths.artifact(&state.id, "summary.md"), body)?;
 
-    let any_failed = state
-        .slots
-        .iter()
-        .any(|s| s.status == SlotStatus::Failed);
+    let any_failed = state.slots.iter().any(|s| s.status == SlotStatus::Failed);
     if any_failed && approve == 0 && changes == 0 {
         state.set_phase(Phase::Failed);
         state.error = Some("all review slots failed".into());

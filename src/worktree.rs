@@ -222,14 +222,9 @@ pub fn apply_spec_tests_to_impl(
         .worktrees
         .iter()
         .find(|w| w.slot_id == author_slot)
-        .ok_or_else(|| {
-            anyhow::anyhow!("test-author worktree missing for slot {author_slot}")
-        })?;
+        .ok_or_else(|| anyhow::anyhow!("test-author worktree missing for slot {author_slot}"))?;
     if !spec.path.is_dir() {
-        anyhow::bail!(
-            "test-author worktree path missing: {}",
-            spec.path.display()
-        );
+        anyhow::bail!("test-author worktree path missing: {}", spec.path.display());
     }
     if !impl_cwd.is_dir() {
         anyhow::bail!("implementer cwd missing: {}", impl_cwd.display());
@@ -288,9 +283,8 @@ fn copy_tree_overlay(src: &Path, dst: &Path) -> Result<()> {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("mkdir {}", parent.display()))?;
         }
-        std::fs::copy(&entry, &target).with_context(|| {
-            format!("copy {} -> {}", entry.display(), target.display())
-        })?;
+        std::fs::copy(&entry, &target)
+            .with_context(|| format!("copy {} -> {}", entry.display(), target.display()))?;
     }
     Ok(())
 }
@@ -299,12 +293,11 @@ fn copy_tree_overlay(src: &Path, dst: &Path) -> Result<()> {
 fn walkdir_regular_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     fn rec(d: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-        let rd =
-            std::fs::read_dir(d).with_context(|| format!("read_dir {}", d.display()))?;
+        let rd = std::fs::read_dir(d).with_context(|| format!("read_dir {}", d.display()))?;
         for e in rd.flatten() {
             let p = e.path();
-            let meta = std::fs::symlink_metadata(&p)
-                .with_context(|| format!("stat {}", p.display()))?;
+            let meta =
+                std::fs::symlink_metadata(&p).with_context(|| format!("stat {}", p.display()))?;
             if meta.file_type().is_symlink() {
                 continue;
             }
@@ -360,8 +353,11 @@ mod tests {
     #[test]
     fn apply_spec_missing_worktree_errors() {
         let tmp = tempdir().unwrap();
-        let mut state =
-            RunState::new("r1", crate::cli::WorkflowKind::Plan, tmp.path().to_path_buf());
+        let mut state = RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Plan,
+            tmp.path().to_path_buf(),
+        );
         state.dry_run = true;
         let err = apply_spec_tests_to_impl(&state, "test-author-x", tmp.path()).unwrap_err();
         assert!(err.to_string().contains("missing"), "err={err}");

@@ -88,7 +88,8 @@ pub fn run(json: bool) -> Result<ExitCode> {
         }
         Ok(None) => {
             notes.push(
-                "model-select: no vals cache yet (optional; `spar model refresh` or --select)".into(),
+                "model-select: no vals cache yet (optional; `spar model refresh` or --select)"
+                    .into(),
             );
         }
         Err(e) => notes.push(format!("model-select cache read error: {e:#}")),

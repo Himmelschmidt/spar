@@ -16,6 +16,10 @@ pub struct RunState {
     pub phase: Phase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
+    /// Operator directive for the current implement round (`implement --run -t`).
+    /// Never replaces `task` (the run's identity); cleared when a round runs without `-t`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amendment: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
@@ -66,6 +70,18 @@ pub struct RunState {
     pub arena_finish: Option<ArenaFinish>,
     #[serde(default)]
     pub usage: Vec<SlotUsage>,
+    /// Last suite-channel result. `Inconclusive` means the runner fell over and the
+    /// tests never produced a clean verdict — distinct from a real `Fail`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suite_outcome: Option<SuiteOutcome>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SuiteOutcome {
+    Pass,
+    Fail,
+    Inconclusive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +156,8 @@ pub enum Phase {
     Stuck,
     /// No usable providers (maps to exit code 4).
     Quota,
+    /// Halted by operator (`spar stop`). Waitable but resumable; keeps worktrees.
+    Stopped,
 }
 
 impl Phase {
@@ -167,7 +185,8 @@ impl Phase {
     }
 
     pub fn is_waitable_stop(&self) -> bool {
-        self.is_terminal() || self.is_gate()
+        // Stopped is resumable (not terminal, not a gate) but `wait` must return.
+        self.is_terminal() || self.is_gate() || matches!(self, Phase::Stopped)
     }
 }
 
@@ -192,6 +211,8 @@ pub struct SlotState {
     pub pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -252,6 +273,7 @@ impl RunState {
             workflow,
             phase: Phase::Init,
             task: None,
+            amendment: None,
             created_at: now,
             updated_at: now,
             slots: Vec::new(),
@@ -277,6 +299,7 @@ impl RunState {
             big: false,
             arena_finish: None,
             usage: Vec::new(),
+            suite_outcome: None,
         }
     }
 
@@ -339,7 +362,7 @@ impl RunState {
             | Phase::AwaitingShipConfirm => ExitCode::HumanGate,
             Phase::Stuck | Phase::Escalated => ExitCode::Stuck,
             Phase::Quota => ExitCode::Quota,
-            Phase::Failed | Phase::PlanRejected => ExitCode::Failure,
+            Phase::Failed | Phase::PlanRejected | Phase::Stopped => ExitCode::Failure,
             // In-flight: not a terminal success; outer agents should poll until waitable.
             _ => ExitCode::Success,
         }
@@ -408,5 +431,42 @@ mod tests {
         let loaded = RunState::load(&paths, "run1").unwrap();
         assert_eq!(loaded.phase, Phase::AwaitingPlanApproval);
         assert_eq!(loaded.exit_code(), ExitCode::HumanGate);
+    }
+
+    #[test]
+    fn stopped_is_waitable_and_roundtrips() {
+        assert!(Phase::Stopped.is_waitable_stop());
+        assert!(!Phase::Stopped.is_terminal());
+        assert!(!Phase::Stopped.is_gate());
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new("run-stop", WorkflowKind::Loop, tmp.path().to_path_buf());
+        state.phase = Phase::Stopped;
+        state.save(&paths).unwrap();
+        let loaded = RunState::load(&paths, "run-stop").unwrap();
+        assert_eq!(loaded.phase, Phase::Stopped);
+        assert_eq!(loaded.exit_code(), ExitCode::Failure);
+        assert_eq!(loaded.status_exit_code(), Some(1));
+    }
+
+    #[test]
+    fn failed_slot_persists_exit_and_signal() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new("run-sig", WorkflowKind::Loop, tmp.path().to_path_buf());
+        let mut slot = crate::executor::init_slot("impl", "cli:claude", SlotRole::Implementer);
+        slot.status = SlotStatus::Failed;
+        slot.pid = Some(4242);
+        slot.exit_code = None;
+        slot.signal = Some(9);
+        state.slots.push(slot);
+        state.save(&paths).unwrap();
+
+        let loaded = RunState::load(&paths, "run-sig").unwrap();
+        let s = &loaded.slots[0];
+        assert_eq!(s.status, SlotStatus::Failed);
+        assert_eq!(s.pid, Some(4242));
+        assert_eq!(s.exit_code, None);
+        assert_eq!(s.signal, Some(9));
     }
 }
