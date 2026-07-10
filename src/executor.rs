@@ -288,7 +288,7 @@ fn execute_prepared(
     let sink = move |pid: u32| {
         sink_cell.store(pid, std::sync::atomic::Ordering::SeqCst);
         if let Some(f) = &pid_file {
-            let _ = std::fs::write(f, pid.to_string());
+            let _ = std::fs::write(f, process::PidToken::capture(pid).encode());
         }
     };
     let res = process::run_captured(&req, Some(&sink))?;
@@ -1060,7 +1060,7 @@ fn run_headless(
     let slot_id = job.slot_id.clone();
     let sink = move |pid: u32| {
         sink_cell.store(pid, std::sync::atomic::Ordering::SeqCst);
-        let _ = markers::write_pid(paths, &run_id, &slot_id, pid);
+        let _ = markers::write_pid(paths, &run_id, &slot_id, process::PidToken::capture(pid));
     };
     let res = process::run_captured(&req, Some(&sink))?;
     let pid = load_pid(&pid_cell);
@@ -1205,7 +1205,12 @@ fn run_tmux(
         if marker == MarkerState::Done && pane_pid.is_none() {
             if let Some(p) = tmux::pane_pid(&session, &job.slot_id) {
                 pane_pid = Some(p);
-                let _ = markers::write_pid(paths, &state.id, &job.slot_id, p);
+                let _ = markers::write_pid(
+                    paths,
+                    &state.id,
+                    &job.slot_id,
+                    process::PidToken::capture(p),
+                );
             }
         }
         let pane_alive = match pane_pid {

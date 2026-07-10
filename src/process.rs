@@ -103,6 +103,83 @@ pub fn pid_alive(_pid: u32) -> bool {
     false
 }
 
+/// Kernel start-time (jiffies since boot, field 22 of `/proc/<pid>/stat`).
+/// Unique per live pid, so it distinguishes a process from a later reuse of its pid.
+#[cfg(target_os = "linux")]
+pub fn pid_starttime(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm (field 2) is parenthesised and may itself contain ')' / spaces; skip past
+    // the last ')', then starttime is the 20th whitespace field (field 22 overall).
+    let after_comm = &stat[stat.rfind(')')? + 1..];
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn pid_starttime(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// A recorded pid tied to the start-time of the process that owned it, so a pid
+/// recycled by the OS onto an unrelated process is never mistaken for the original
+/// and never signalled. Persisted as `pid` or `pid:starttime`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PidToken {
+    pub pid: u32,
+    pub starttime: Option<u64>,
+}
+
+impl PidToken {
+    /// Capture identity for a live pid (call while the process is known to be running).
+    pub fn capture(pid: u32) -> Self {
+        Self {
+            pid,
+            starttime: pid_starttime(pid),
+        }
+    }
+
+    /// A pid with no identity token (legacy record or a platform without `/proc`).
+    pub fn from_pid(pid: u32) -> Self {
+        Self {
+            pid,
+            starttime: None,
+        }
+    }
+
+    /// True only if the pid is live AND still the same process we recorded. When no
+    /// start-time was captured (unknown platform / legacy record) we cannot prove
+    /// identity, so fall back to bare liveness rather than refusing to act.
+    pub fn alive(&self) -> bool {
+        match self.starttime {
+            Some(st) => pid_starttime(self.pid) == Some(st),
+            None => pid_alive(self.pid),
+        }
+    }
+
+    pub fn encode(&self) -> String {
+        match self.starttime {
+            Some(st) => format!("{}:{st}", self.pid),
+            None => self.pid.to_string(),
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if s.is_empty() {
+            return None;
+        }
+        match s.split_once(':') {
+            Some((pid, st)) => Some(Self {
+                pid: pid.trim().parse().ok()?,
+                starttime: st.trim().parse().ok(),
+            }),
+            None => Some(Self {
+                pid: s.parse().ok()?,
+                starttime: None,
+            }),
+        }
+    }
+}
+
 #[cfg(unix)]
 fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
     use std::os::unix::process::ExitStatusExt;
@@ -987,6 +1064,43 @@ mod tests {
         let pid = child.id();
         child.wait().unwrap();
         assert!(!pid_alive(pid), "reaped child pid must be dead");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_starttime_token_is_not_alive_but_fresh_is() {
+        let me = std::process::id();
+        let fresh = PidToken::capture(me);
+        assert_eq!(fresh.pid, me);
+        assert!(fresh.starttime.is_some(), "linux must record a start-time");
+        assert!(
+            fresh.alive(),
+            "our own live pid with matching start-time is alive"
+        );
+
+        // Same live pid, but a start-time that no longer matches models a recycled pid
+        // now owned by an unrelated process: it must never be treated as ours.
+        let recycled = PidToken {
+            pid: me,
+            starttime: Some(fresh.starttime.unwrap() + 1),
+        };
+        assert!(
+            !recycled.alive(),
+            "a live pid whose recorded start-time differs must be treated as dead"
+        );
+    }
+
+    #[test]
+    fn pid_token_roundtrips_through_encode_parse() {
+        let with_st = PidToken {
+            pid: 4242,
+            starttime: Some(987654),
+        };
+        assert_eq!(with_st.encode(), "4242:987654");
+        assert_eq!(PidToken::parse("4242:987654"), Some(with_st));
+        // Legacy bare-pid record parses with no start-time and falls back to liveness.
+        assert_eq!(PidToken::parse("4242"), Some(PidToken::from_pid(4242)));
+        assert_eq!(PidToken::parse("  "), None);
     }
 
     #[test]

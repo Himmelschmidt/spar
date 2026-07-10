@@ -337,9 +337,9 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool) -> Result<ExitCode>
                 println!("run_exit_code: {c}  (process exit always 0 for status)");
             }
             match runlock::RunLock::owner(&swarm, &state.id) {
-                Some(p) => {
-                    let alive = process::pid_alive(p);
-                    println!("orchestrator: pid={p} alive={alive}");
+                Some(t) => {
+                    let alive = t.alive();
+                    println!("orchestrator: pid={} alive={alive}", t.pid);
                 }
                 None => println!("orchestrator: none"),
             }
@@ -348,10 +348,10 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool) -> Result<ExitCode>
                 let act = liveness::SlotActivity::observe(slot, cfg.timeouts.stall_warn_secs);
                 let silent = act.human_silent();
                 let stall = if act.stalled { " STALL" } else { "" };
-                let pid = slot
-                    .pid
-                    .or_else(|| markers::read_pid(&swarm, &state.id, &slot.id));
-                let alive = pid.map(process::pid_alive).unwrap_or(false);
+                let token = markers::read_pid(&swarm, &state.id, &slot.id)
+                    .or_else(|| slot.pid.map(process::PidToken::from_pid));
+                let pid = token.map(|t| t.pid);
+                let alive = token.map(|t| t.alive()).unwrap_or(false);
                 let pid_s = pid.map(|p| format!(" pid={p}")).unwrap_or_default();
                 let zombie = if slot.status == state::SlotStatus::Done && alive {
                     " DONE-BUT-ALIVE"
@@ -448,17 +448,17 @@ fn run_status_json(
                 None => serde_json::Value::Null,
             },
         );
-        let orch_pid = runlock::RunLock::owner(swarm, &state.id);
+        let orch = runlock::RunLock::owner(swarm, &state.id);
         obj.insert(
             "orchestrator_pid".into(),
-            match orch_pid {
-                Some(p) => serde_json::json!(p),
+            match &orch {
+                Some(t) => serde_json::json!(t.pid),
                 None => serde_json::Value::Null,
             },
         );
         obj.insert(
             "orchestrator_alive".into(),
-            serde_json::Value::Bool(orch_pid.map(process::pid_alive).unwrap_or(false)),
+            serde_json::Value::Bool(orch.map(|t| t.alive()).unwrap_or(false)),
         );
     }
     liveness::enrich_status_json(&mut v, &state.slots, cfg, swarm, &state.id);
@@ -491,19 +491,20 @@ fn stop_cmd(run_id: &str, json: bool) -> Result<ExitCode> {
     // 2. Orchestrator before slots: signalling slots first lets the orchestrator
     //    re-dispatch them. The orchestrator is not a group leader — bare pid.
     if let Some(owner) = runlock::RunLock::owner(&paths, run_id) {
-        if process::pid_alive(owner) {
-            process::terminate_tree(owner, false);
+        if owner.alive() {
+            process::terminate_tree(owner.pid, false);
         }
     }
 
     // 3. Slot process groups: reaps nested cargo test / pnpm build children too.
+    //    Only signal when the recorded start-time still matches, so a recycled pid
+    //    now owned by an unrelated process is never killed.
     for slot in &state.slots {
-        let pid = slot
-            .pid
-            .or_else(|| markers::read_pid(&paths, run_id, &slot.id));
-        if let Some(pid) = pid {
-            if process::pid_alive(pid) {
-                process::terminate_tree(pid, true);
+        let token = markers::read_pid(&paths, run_id, &slot.id)
+            .or_else(|| slot.pid.map(process::PidToken::from_pid));
+        if let Some(token) = token {
+            if token.alive() {
+                process::terminate_tree(token.pid, true);
             }
         }
     }

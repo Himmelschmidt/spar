@@ -1005,10 +1005,10 @@ fn finish_out(state: &RunState, json: bool) -> Result<()> {
 
 fn detach_implement(state: &RunState, paths: &SparPaths, json: bool) -> Result<ExitCode> {
     if let Some(owner) = crate::runlock::RunLock::owner(paths, &state.id) {
-        if crate::process::pid_alive(owner) {
+        if owner.alive() {
             return Err(crate::runlock::OrchestratorBusy {
                 run_id: state.id.clone(),
-                owner_pid: owner,
+                owner_pid: owner.pid,
             }
             .into());
         }

@@ -123,10 +123,10 @@ pub fn enrich_status_json(
             continue;
         };
         let act = SlotActivity::observe(slot, warn);
-        let pid = slot
-            .pid
-            .or_else(|| crate::markers::read_pid(paths, run_id, &slot.id));
-        let pid_alive = pid.map(crate::process::pid_alive).unwrap_or(false);
+        let token = crate::markers::read_pid(paths, run_id, &slot.id)
+            .or_else(|| slot.pid.map(crate::process::PidToken::from_pid));
+        let pid = token.map(|t| t.pid);
+        let pid_alive = token.map(|t| t.alive()).unwrap_or(false);
         if let Some(obj) = slot_val.as_object_mut() {
             if let Some(t) = &act.last_log_at {
                 obj.insert("last_log_at".into(), serde_json::Value::String(t.clone()));

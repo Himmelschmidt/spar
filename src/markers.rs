@@ -21,14 +21,24 @@ pub fn write_failed(paths: &SparPaths, run_id: &str, slot_id: &str, reason: &str
     write_marker(paths, run_id, &format!("{slot_id}.failed"), reason)
 }
 
-/// Record a running slot's pid so an out-of-process `spar status` can observe it mid-run.
-pub fn write_pid(paths: &SparPaths, run_id: &str, slot_id: &str, pid: u32) -> Result<()> {
-    write_marker(paths, run_id, &format!("{slot_id}.pid"), &pid.to_string())
+/// Record a running slot's pid (with its start-time identity) so an out-of-process
+/// `spar status`/`stop` can observe it mid-run without risking a recycled pid.
+pub fn write_pid(
+    paths: &SparPaths,
+    run_id: &str,
+    slot_id: &str,
+    token: crate::process::PidToken,
+) -> Result<()> {
+    write_marker(paths, run_id, &format!("{slot_id}.pid"), &token.encode())
 }
 
-pub fn read_pid(paths: &SparPaths, run_id: &str, slot_id: &str) -> Option<u32> {
+pub fn read_pid(
+    paths: &SparPaths,
+    run_id: &str,
+    slot_id: &str,
+) -> Option<crate::process::PidToken> {
     let p = paths.marker(run_id, &format!("{slot_id}.pid"));
-    std::fs::read_to_string(p).ok()?.trim().parse().ok()
+    crate::process::PidToken::parse(&std::fs::read_to_string(p).ok()?)
 }
 
 /// Wait until an artifact file is non-empty.

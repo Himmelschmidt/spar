@@ -29,8 +29,12 @@ fn lock_path(paths: &SparPaths, run_id: &str) -> PathBuf {
     paths.run_dir(run_id).join("orchestrator.lock")
 }
 
+fn read_owner_token(path: &Path) -> Option<crate::process::PidToken> {
+    crate::process::PidToken::parse(&fs::read_to_string(path).ok()?)
+}
+
 fn read_owner_pid(path: &Path) -> Option<u32> {
-    fs::read_to_string(path).ok()?.trim().parse::<u32>().ok()
+    read_owner_token(path).map(|t| t.pid)
 }
 
 impl RunLock {
@@ -62,7 +66,7 @@ impl RunLock {
         file.set_len(0)
             .with_context(|| format!("truncate {}", path.display()))?;
         (&file)
-            .write_all(me.to_string().as_bytes())
+            .write_all(crate::process::PidToken::capture(me).encode().as_bytes())
             .with_context(|| format!("write {}", path.display()))?;
         if let Some(prev) = reclaimed {
             let _ = crate::events::append(
@@ -80,8 +84,8 @@ impl RunLock {
         })
     }
 
-    pub fn owner(paths: &SparPaths, run_id: &str) -> Option<u32> {
-        read_owner_pid(&lock_path(paths, run_id))
+    pub fn owner(paths: &SparPaths, run_id: &str) -> Option<crate::process::PidToken> {
+        read_owner_token(&lock_path(paths, run_id))
     }
 }
 
@@ -101,13 +105,29 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn owner_pid(paths: &SparPaths, run_id: &str) -> Option<u32> {
+        RunLock::owner(paths, run_id).map(|t| t.pid)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owner_carries_starttime_and_matches_self() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let _held = RunLock::acquire(&paths, "r1").unwrap();
+        let owner = RunLock::owner(&paths, "r1").expect("owner recorded");
+        assert_eq!(owner.pid, std::process::id());
+        assert!(owner.starttime.is_some(), "lock must record a start-time");
+        assert!(owner.alive(), "live self must match its own start-time");
+    }
+
     #[test]
     fn acquire_fresh_succeeds() {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         let lock = RunLock::acquire(&paths, "r1").unwrap();
         assert_eq!(lock.pid, std::process::id());
-        assert_eq!(RunLock::owner(&paths, "r1"), Some(std::process::id()));
+        assert_eq!(owner_pid(&paths, "r1"), Some(std::process::id()));
     }
 
     #[test]
@@ -128,7 +148,7 @@ mod tests {
         let paths = SparPaths::new(tmp.path());
         let first = RunLock::acquire(&paths, "r1").unwrap();
         drop(first);
-        assert_eq!(RunLock::owner(&paths, "r1"), None);
+        assert_eq!(owner_pid(&paths, "r1"), None);
         let _second = RunLock::acquire(&paths, "r1").unwrap();
     }
 
@@ -140,7 +160,7 @@ mod tests {
         fs::write(lock_path(&paths, "r1"), (i32::MAX as u32).to_string()).unwrap();
         let lock = RunLock::acquire(&paths, "r1").unwrap();
         assert_eq!(lock.pid, std::process::id());
-        assert_eq!(RunLock::owner(&paths, "r1"), Some(std::process::id()));
+        assert_eq!(owner_pid(&paths, "r1"), Some(std::process::id()));
     }
 
     #[test]
@@ -169,7 +189,7 @@ mod tests {
                     );
                 }
             }
-            assert_eq!(RunLock::owner(&paths, "r1"), Some(std::process::id()));
+            assert_eq!(owner_pid(&paths, "r1"), Some(std::process::id()));
             drop(results);
             let _ = fs::remove_file(lock_path(&paths, "r1"));
         }
@@ -184,7 +204,7 @@ mod tests {
         fs::write(lock_path(&paths, "r1"), (i32::MAX as u32).to_string()).unwrap();
         drop(lock);
         assert_eq!(
-            RunLock::owner(&paths, "r1"),
+            owner_pid(&paths, "r1"),
             Some(i32::MAX as u32),
             "drop must not delete a lock a takeover handed to someone else"
         );

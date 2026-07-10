@@ -149,7 +149,8 @@ fn assert_foreground_lock(workflow: &str) {
             for e in entries.flatten() {
                 let lock = e.path().join("orchestrator.lock");
                 if let Ok(s) = std::fs::read_to_string(&lock) {
-                    if let Ok(pid) = s.trim().parse::<u64>() {
+                    // Lock body is `pid` or `pid:starttime`; the pid is the identity we assert on.
+                    if let Ok(pid) = s.trim().split(':').next().unwrap_or("").parse::<u64>() {
                         lock_pid = Some(pid);
                         run_id = e.file_name().to_str().map(str::to_string);
                     }
