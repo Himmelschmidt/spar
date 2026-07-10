@@ -100,17 +100,31 @@ pub fn format_duration_short(secs: u64) -> String {
     }
 }
 
-/// Enrich a status JSON value's `slots` array with activity fields.
-pub fn enrich_status_json(v: &mut serde_json::Value, state_slots: &[SlotState], cfg: &Config) {
+/// Enrich a status JSON value's `slots` array with activity + liveness fields.
+pub fn enrich_status_json(
+    v: &mut serde_json::Value,
+    state_slots: &[SlotState],
+    cfg: &Config,
+    paths: &crate::paths::SparPaths,
+    run_id: &str,
+) {
     let warn = cfg.timeouts.stall_warn_secs;
+    let by_id: std::collections::HashMap<&str, &SlotState> =
+        state_slots.iter().map(|s| (s.id.as_str(), s)).collect();
     let Some(slots) = v.get_mut("slots").and_then(|s| s.as_array_mut()) else {
         return;
     };
-    for (i, slot_val) in slots.iter_mut().enumerate() {
-        let Some(slot) = state_slots.get(i) else {
-            break;
+    for slot_val in slots.iter_mut() {
+        let id = slot_val
+            .get("id")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string());
+        let Some(slot) = id.as_deref().and_then(|id| by_id.get(id).copied()) else {
+            continue;
         };
         let act = SlotActivity::observe(slot, warn);
+        let pid = slot.pid.or_else(|| crate::markers::read_pid(paths, run_id, &slot.id));
+        let pid_alive = pid.map(crate::process::pid_alive).unwrap_or(false);
         if let Some(obj) = slot_val.as_object_mut() {
             if let Some(t) = &act.last_log_at {
                 obj.insert("last_log_at".into(), serde_json::Value::String(t.clone()));
@@ -119,6 +133,20 @@ pub fn enrich_status_json(v: &mut serde_json::Value, state_slots: &[SlotState], 
                 obj.insert("silent_for_secs".into(), serde_json::json!(s));
             }
             obj.insert("stalled".into(), serde_json::Value::Bool(act.stalled));
+            obj.insert(
+                "pid".into(),
+                match pid {
+                    Some(p) => serde_json::json!(p),
+                    None => serde_json::Value::Null,
+                },
+            );
+            obj.insert("pid_alive".into(), serde_json::Value::Bool(pid_alive));
+            if let Some(c) = slot.exit_code {
+                obj.insert("exit_code".into(), serde_json::json!(c));
+            }
+            if let Some(sig) = slot.signal {
+                obj.insert("signal".into(), serde_json::json!(sig));
+            }
         }
     }
     if let Some(obj) = v.as_object_mut() {
@@ -151,6 +179,7 @@ mod tests {
             error: None,
             pid: None,
             exit_code: None,
+            signal: None,
             artifact: None,
             usage: None,
             model: None,

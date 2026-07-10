@@ -78,6 +78,8 @@ impl StreamStats {
 #[derive(Debug)]
 pub struct SpawnResult {
     pub exit_code: Option<i32>,
+    /// Terminating signal number for signal-killed children (Unix); None otherwise.
+    pub signal: Option<i32>,
     pub timed_out: bool,
     #[allow(dead_code)]
     pub log_path: PathBuf,
@@ -86,8 +88,37 @@ pub struct SpawnResult {
     pub stats: StreamStats,
 }
 
+/// True if a process with `pid` is still addressable (`kill(pid, 0) == 0`).
+#[cfg(unix)]
+pub fn pid_alive(pid: u32) -> bool {
+    unsafe {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        kill(pid as i32, 0) == 0
+    }
+}
+
+#[cfg(not(unix))]
+pub fn pid_alive(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
 /// Spawn process; stream structured events into a human log + live stats file.
-pub fn run_captured(req: &SpawnRequest) -> Result<SpawnResult> {
+/// `on_spawn` fires with the child pid the moment spawn succeeds, before the wait
+/// loop, so callers can record a live pid.
+pub fn run_captured(req: &SpawnRequest, on_spawn: Option<&dyn Fn(u32)>) -> Result<SpawnResult> {
     if let Some(parent) = req.log_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create log dir {}", parent.display()))?;
@@ -129,6 +160,9 @@ pub fn run_captured(req: &SpawnRequest) -> Result<SpawnResult> {
     let mut child = cmd
         .spawn()
         .with_context(|| format!("spawn {}", req.program.display()))?;
+    if let Some(cb) = on_spawn {
+        cb(child.id());
+    }
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -164,6 +198,7 @@ pub fn run_captured(req: &SpawnRequest) -> Result<SpawnResult> {
                     let _ = stats.save(&req.log_path);
                     return Ok(SpawnResult {
                         exit_code: status.code(),
+                        signal: exit_signal(&status),
                         timed_out: true,
                         log_path: req.log_path.clone(),
                         stdout_tail: tail_log(&req.log_path, 4000),
@@ -181,6 +216,7 @@ pub fn run_captured(req: &SpawnRequest) -> Result<SpawnResult> {
     let _ = stats.save(&req.log_path);
     Ok(SpawnResult {
         exit_code: status.code(),
+        signal: exit_signal(&status),
         timed_out: false,
         log_path: req.log_path.clone(),
         stdout_tail: tail_log(&req.log_path, 4000),
@@ -829,6 +865,7 @@ pub fn run_mock(req: &SpawnRequest, mock_output: &str) -> Result<SpawnResult> {
     let _ = stats.save(&req.log_path);
     Ok(SpawnResult {
         exit_code: Some(0),
+        signal: None,
         timed_out: false,
         log_path: req.log_path.clone(),
         stdout_tail: mock_output.into(),
@@ -870,8 +907,61 @@ mod tests {
             env: vec![],
             timeout: Duration::from_millis(200),
         };
-        let res = run_captured(&req).expect("timeout path must not error");
+        let res = run_captured(&req, None).expect("timeout path must not error");
         assert!(res.timed_out, "expected timed_out");
+    }
+
+    fn sh_req(script: &str, dir: &Path, log: &str) -> SpawnRequest {
+        SpawnRequest {
+            program: PathBuf::from("sh"),
+            args: vec!["-c".into(), script.into()],
+            cwd: dir.to_path_buf(),
+            log_path: dir.join(log),
+            env: vec![],
+            timeout: Duration::from_secs(5),
+        }
+    }
+
+    #[test]
+    fn pid_sink_fires_with_live_pid_before_exit() {
+        let tmp = tempdir().unwrap();
+        let req = sh_req("sleep 0.3", tmp.path(), "sink.log");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sink = move |pid: u32| {
+            let _ = tx.send((pid, pid_alive(pid)));
+        };
+        let res = run_captured(&req, Some(&sink)).expect("run");
+        let (pid, alive) = rx.recv().expect("sink must fire");
+        assert!(pid > 1, "real child pid, got {pid}");
+        assert!(alive, "child must be alive at the moment the sink fires");
+        assert_eq!(res.exit_code, Some(0));
+    }
+
+    #[test]
+    fn signal_kill_reports_signal_not_exit_code() {
+        let tmp = tempdir().unwrap();
+        let req = sh_req("kill -9 $$", tmp.path(), "sig.log");
+        let res = run_captured(&req, None).expect("run");
+        assert_eq!(res.exit_code, None, "signal death has no exit code");
+        assert_eq!(res.signal, Some(9));
+    }
+
+    #[test]
+    fn nonzero_exit_code_captured() {
+        let tmp = tempdir().unwrap();
+        let req = sh_req("exit 137", tmp.path(), "oom.log");
+        let res = run_captured(&req, None).expect("run");
+        assert_eq!(res.exit_code, Some(137));
+        assert_eq!(res.signal, None);
+    }
+
+    #[test]
+    fn pid_alive_true_self_false_reaped() {
+        assert!(pid_alive(std::process::id()));
+        let mut child = Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(!pid_alive(pid), "reaped child pid must be dead");
     }
 
     #[test]
@@ -886,7 +976,7 @@ mod tests {
             env: vec![],
             timeout: Duration::from_secs(5),
         };
-        let res = run_captured(&req).unwrap();
+        let res = run_captured(&req, None).unwrap();
         assert_eq!(res.exit_code, Some(0));
         assert!(std::fs::read_to_string(log).unwrap().contains("stream-me"));
     }

@@ -193,6 +193,8 @@ pub struct SlotState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<SlotUsage>,
@@ -408,5 +410,28 @@ mod tests {
         let loaded = RunState::load(&paths, "run1").unwrap();
         assert_eq!(loaded.phase, Phase::AwaitingPlanApproval);
         assert_eq!(loaded.exit_code(), ExitCode::HumanGate);
+    }
+
+    #[test]
+    fn failed_slot_persists_exit_and_signal() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state =
+            RunState::new("run-sig", WorkflowKind::Loop, tmp.path().to_path_buf());
+        let mut slot =
+            crate::executor::init_slot("impl", "cli:claude", SlotRole::Implementer);
+        slot.status = SlotStatus::Failed;
+        slot.pid = Some(4242);
+        slot.exit_code = None;
+        slot.signal = Some(9);
+        state.slots.push(slot);
+        state.save(&paths).unwrap();
+
+        let loaded = RunState::load(&paths, "run-sig").unwrap();
+        let s = &loaded.slots[0];
+        assert_eq!(s.status, SlotStatus::Failed);
+        assert_eq!(s.pid, Some(4242));
+        assert_eq!(s.exit_code, None);
+        assert_eq!(s.signal, Some(9));
     }
 }

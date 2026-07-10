@@ -84,6 +84,24 @@ pub fn capture_pane(session: &str, window: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Pid of the process running in a slot's window (the pane's shell), if the pane exists.
+pub fn pane_pid(session: &str, window: &str) -> Option<u32> {
+    let target = format!("{session}:{window}");
+    let out = Command::new("tmux")
+        .args(["list-panes", "-t", &target, "-F", "#{pane_pid}"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 pub fn kill_session(name: &str) -> Result<()> {
     if !has_session(name) {
         return Ok(());

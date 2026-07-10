@@ -41,3 +41,7 @@ serde_json = "1"
 [[test]]
 name = "plan_implement"
 path = "tests/scenarios/plan_implement.rs"
+
+[[test]]
+name = "liveness"
+path = "tests/scenarios/liveness.rs"

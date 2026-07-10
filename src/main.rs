@@ -340,7 +340,7 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool) -> Result<ExitCode>
                     },
                 );
             }
-            liveness::enrich_status_json(&mut v, &state.slots, &cfg);
+            liveness::enrich_status_json(&mut v, &state.slots, &cfg, &swarm, &state.id);
             println!("{}", serde_json::to_string_pretty(&v)?);
         } else {
             println!("run: {}", state.id);
@@ -362,8 +362,18 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool) -> Result<ExitCode>
                     liveness::SlotActivity::observe(slot, cfg.timeouts.stall_warn_secs);
                 let silent = act.human_silent();
                 let stall = if act.stalled { " STALL" } else { "" };
+                let pid = slot
+                    .pid
+                    .or_else(|| markers::read_pid(&swarm, &state.id, &slot.id));
+                let alive = pid.map(process::pid_alive).unwrap_or(false);
+                let pid_s = pid.map(|p| format!(" pid={p}")).unwrap_or_default();
+                let zombie = if slot.status == state::SlotStatus::Done && alive {
+                    " DONE-BUT-ALIVE"
+                } else {
+                    ""
+                };
                 println!(
-                    "  - {} provider={} role={:?} status={:?} silent={silent}{stall}",
+                    "  - {} provider={} role={:?} status={:?}{pid_s} silent={silent}{stall}{zombie}",
                     slot.id, slot.provider, slot.role, slot.status
                 );
             }
