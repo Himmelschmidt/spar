@@ -467,7 +467,7 @@ fn run_status_json(
 
 fn stop_cmd(run_id: &str, json: bool) -> Result<ExitCode> {
     let (paths, cfg) = project_ctx()?;
-    let mut state = state::RunState::load(&paths, run_id)?;
+    let state = state::RunState::load(&paths, run_id)?;
 
     // A finished or gated run is already at rest: never downgrade it to Stopped or
     // drop a resumable marker that would make a later `implement --run` redo work.
@@ -497,9 +497,16 @@ fn stop_cmd(run_id: &str, json: bool) -> Result<ExitCode> {
     }
 
     // 3. Slot process groups: reaps nested cargo test / pnpm build children too.
-    //    Only signal when the recorded start-time still matches, so a recycled pid
-    //    now owned by an unrelated process is never killed.
+    //    Terminal slots were already reaped, so their recorded pid may name an
+    //    unrelated recycled process; never signal it. Only signal when the
+    //    recorded start-time still matches, so a recycled pid is never killed.
     for slot in &state.slots {
+        if matches!(
+            slot.status,
+            state::SlotStatus::Done | state::SlotStatus::Failed | state::SlotStatus::Stuck
+        ) {
+            continue;
+        }
         let token = markers::read_pid(&paths, run_id, &slot.id)
             .or_else(|| slot.pid.map(process::PidToken::from_pid));
         if let Some(token) = token {
@@ -509,7 +516,10 @@ fn stop_cmd(run_id: &str, json: bool) -> Result<ExitCode> {
         }
     }
 
-    // 4. The orchestrator may have died before recording it; write phase ourselves.
+    // 4. The kill window above spans seconds; the orchestrator may have persisted
+    //    slot exit/usage while dying. Reload so that is not clobbered, then write
+    //    the phase ourselves in case the orchestrator died before recording it.
+    let mut state = state::RunState::load(&paths, run_id)?;
     state.set_phase(state::Phase::Stopped);
     state.save(&paths)?;
 
