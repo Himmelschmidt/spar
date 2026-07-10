@@ -1902,7 +1902,14 @@ fn render_scrollable_log(
         text_area,
     );
 
-    let mut sb = ScrollbarState::new(total).position(start);
+    // Map our tail-scroll model (position in [0, max_scroll], last screenful
+    // pinned to the bottom) onto ratatui's scrollbar, whose thumb only reaches
+    // the track bottom when position == content_length - 1. content_length is
+    // the number of scroll positions, not content rows, so the thumb lands flush
+    // at the bottom when start == max_scroll and its length stays height/total.
+    let mut sb = ScrollbarState::new(max_scroll as usize + 1)
+        .position(start)
+        .viewport_content_length(height);
     f.render_stateful_widget(
         Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .style(Style::default().fg(FG_MUTED).bg(BG_PANEL))
