@@ -350,6 +350,26 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
 
     let plan_body =
         std::fs::read_to_string(paths.artifact(&state.id, "plan.md")).unwrap_or_default();
+    let test_contract_body = {
+        let p = paths.artifact(&state.id, "test-contract.md");
+        std::fs::read_to_string(&p).unwrap_or_else(|_| {
+            "(no pre-written acceptance contract — implement without frozen tests)".into()
+        })
+    };
+
+    // Merge pre-coding acceptance tests from test-author worktree once at start.
+    if let Some(author) = state
+        .slots
+        .iter()
+        .find(|s| s.role == SlotRole::TestAuthor)
+        .map(|s| s.id.clone())
+    {
+        if let Some(impl_slot) = state.slots.iter().find(|s| s.role == SlotRole::Implementer) {
+            if let Some(cwd) = impl_slot.cwd.clone() {
+                let _ = worktree::apply_spec_tests_to_impl(state, &author, &cwd);
+            }
+        }
+    }
 
     loop {
         state.set_phase(Phase::Dispatch);
@@ -370,6 +390,7 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
 
         let mut extra = HashMap::new();
         extra.insert("plan_body".into(), plan_body.clone());
+        extra.insert("test_contract_body".into(), test_contract_body.clone());
         let impl_job = SlotJob {
             slot_id: impl_slot.id.clone(),
             provider: impl_slot.provider.clone(),
@@ -465,6 +486,11 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
             }
         }
 
+        let contract_note = if paths.artifact(&state.id, "test-contract.md").is_file() {
+            "\n- Check pre-written acceptance contract (`test-contract.md`) is still honored; do not accept deleted/weakened acceptance tests without a finding.\n"
+        } else {
+            ""
+        };
         let suite_guidance = if suite_channel_active {
             format!(
                 "## Suite channel (do not re-run full suites)\n\
@@ -473,11 +499,13 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
                  - Do **not** kick off full multi-minute/hour test suites.\n\
                  - At most: static/diff review, plus optional 1–2 targeted tests on suspect files.\n\
                  - Use the suite report above for pass/fail evidence.\n\
-                 - Orchestrator treats suite **fail** as request_changes even if you approve.\n"
+                 - Orchestrator treats suite **fail** as request_changes even if you approve.\n\
+                 {contract_note}"
             )
         } else {
-            "## Tests\nYou may run targeted or full suites as needed for confidence. Prefer evidence over claims.\n"
-                .into()
+            format!(
+                "## Tests\nYou may run targeted or full suites as needed for confidence. Prefer evidence over claims.\n{contract_note}"
+            )
         };
 
         state.set_phase(Phase::Review);

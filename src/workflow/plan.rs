@@ -1,4 +1,5 @@
 use super::CommonOpts;
+use crate::bus::{self, MessageBudget, MsgKind, MsgRefs};
 use crate::config::Config;
 use crate::executor::{self, SlotJob};
 use crate::exit_codes::ExitCode;
@@ -29,12 +30,8 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
     state.message_budget = cfg.message_budget;
     state.big = opts.big;
     let requested = opts.require_providers()?;
-    state.providers = providers::pick_providers(
-        requested,
-        2.max(cfg.max_agents.min(3) as usize),
-        Some(requested),
-        dry,
-    );
+    let n_slots = if cfg.spec.enabled { 3 } else { 2 };
+    state.providers = providers::pick_providers(requested, n_slots, Some(requested), dry);
     if !dry {
         match crate::quota::apply_quota_filter(paths, &state.providers) {
             Ok(p) => state.providers = p,
@@ -78,8 +75,8 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
     }
 
     paths.ensure_run_dirs(&state.id)?;
-    let _ = crate::bus::ensure_bus(paths, &state.id);
-    let _ = crate::bus::join(paths, &state.id, "orchestrator", None, None);
+    let _ = bus::ensure_bus(paths, &state.id);
+    let _ = bus::join(paths, &state.id, "orchestrator", None, None);
     state.save(paths)?;
 
     let mut jobs = Vec::new();
@@ -115,6 +112,10 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
     } else {
         executor::print_run_human(&state);
         println!("plan: {}", paths.artifact(&state.id, "plan.md").display());
+        let contract = paths.artifact(&state.id, "test-contract.md");
+        if contract.is_file() {
+            println!("tests: {}", contract.display());
+        }
     }
     Ok(state.exit_code())
 }
@@ -177,10 +178,14 @@ pub fn execute_plan(
         }
     }
 
+    if cfg.spec.enabled {
+        run_test_author(state, paths, cfg)?;
+    }
+
     if cfg.auto_plan() {
         state.gates.plan_approved = true;
         state.set_phase(Phase::PlanApproved);
-        let _ = crate::bus::broadcast(
+        let _ = bus::broadcast(
             paths,
             &state.id,
             "orchestrator",
@@ -192,6 +197,183 @@ pub fn execute_plan(
     }
     state.save(paths)?;
     Ok(())
+}
+
+fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<()> {
+    let planner_slot = state
+        .slots
+        .iter()
+        .find(|s| s.role == SlotRole::Planner)
+        .map(|s| s.id.clone())
+        .unwrap_or_else(|| "planner".into());
+    let critic_slot = state
+        .slots
+        .iter()
+        .find(|s| s.role == SlotRole::PlanCritic)
+        .map(|s| s.id.clone())
+        .unwrap_or_else(|| "critic".into());
+
+    let used: Vec<String> = state
+        .slots
+        .iter()
+        .filter(|s| matches!(s.role, SlotRole::Planner | SlotRole::PlanCritic))
+        .map(|s| s.provider.clone())
+        .collect();
+    let provider = resolve_spec_provider(cfg, state.dry_run, &state.providers, &used)?;
+    let safe = provider.replace(['/', ':'], "-");
+    let id = format!("test-author-{safe}");
+
+    if state.slots.iter().all(|s| s.id != id) {
+        state
+            .slots
+            .push(executor::init_slot(&id, &provider, SlotRole::TestAuthor));
+    }
+    state.set_phase(Phase::Spec);
+    state.save(paths)?;
+
+    worktree::prepare_isolation(state, paths, std::slice::from_ref(&id))?;
+
+    let _ = bus::join(paths, &state.id, &id, Some(&provider), None);
+    seed_spec_bus(state, paths, &id, &planner_slot, &critic_slot)?;
+
+    let mut extra = HashMap::new();
+    extra.insert("planner_slot".into(), planner_slot);
+    extra.insert("critic_slot".into(), critic_slot);
+    let job = SlotJob {
+        slot_id: id.clone(),
+        provider,
+        role: SlotRole::TestAuthor,
+        template: "test_author".into(),
+        extra_vars: extra,
+        expected_artifact: Some("test-contract.md".into()),
+    };
+
+    if let Err(e) = executor::run_slot(state, paths, cfg, &job) {
+        state.set_phase(Phase::Failed);
+        state.error = Some(format!("test-author failed: {e}"));
+        state.save(paths)?;
+        return Err(e);
+    }
+
+    let contract = paths.artifact(&state.id, "test-contract.md");
+    if !contract.is_file()
+        || std::fs::metadata(&contract)
+            .map(|m| m.len() == 0)
+            .unwrap_or(true)
+    {
+        let msg = "test-author finished without test-contract.md";
+        state.set_phase(Phase::Failed);
+        state.error = Some(msg.into());
+        state.save(paths)?;
+        anyhow::bail!("{msg}");
+    }
+
+    let _ = bus::broadcast(
+        paths,
+        &state.id,
+        "orchestrator",
+        "test-author finished; acceptance contract ready for plan approval",
+        state.message_budget,
+    );
+    Ok(())
+}
+
+fn seed_spec_bus(
+    state: &RunState,
+    paths: &SparPaths,
+    author_id: &str,
+    planner_slot: &str,
+    critic_slot: &str,
+) -> Result<()> {
+    let budget = state.message_budget;
+    let body = format!(
+        "Spec phase: `{author_id}` will freeze acceptance tests from plan.md. \
+         Planner `{planner_slot}` and critic `{critic_slot}`: reply on bus if still available; \
+         otherwise the author uses plan + critique artifacts."
+    );
+    let _ = bus::broadcast(paths, &state.id, "orchestrator", &body, budget);
+
+    for (to, note) in [
+        (
+            author_id,
+            format!(
+                "You are the test author. Coordinate with `{planner_slot}` and `{critic_slot}` via bus, then write tests + test-contract.md."
+            ),
+        ),
+        (
+            planner_slot,
+            format!("Test author `{author_id}` is writing acceptance tests. Answer bus questions if you can."),
+        ),
+        (
+            critic_slot,
+            format!("Test author `{author_id}` is freezing the test bar. Challenge weak scenarios on the bus if you can."),
+        ),
+    ] {
+        let _ = bus::send(
+            paths,
+            &state.id,
+            bus::BusMessage {
+                id: uuid::Uuid::new_v4().simple().to_string()[..12].to_string(),
+                ts: chrono::Utc::now(),
+                from: "orchestrator".into(),
+                to: to.into(),
+                kind: MsgKind::Hello,
+                body: note,
+                subject: Some("spec".into()),
+                refs: MsgRefs {
+                    artifact: Some("plan.md".into()),
+                    ..Default::default()
+                },
+                requires_ack: false,
+                meta: HashMap::new(),
+            },
+            budget,
+        );
+    }
+    Ok(())
+}
+
+/// Spec provider: config override, then fleet provider not used by planner/critic, then cycle.
+fn resolve_spec_provider(
+    cfg: &Config,
+    dry: bool,
+    fleet: &[String],
+    used: &[String],
+) -> Result<String> {
+    if let Some(p) = &cfg.spec.provider {
+        crate::provider_ref::ProviderRef::parse(p)
+            .map_err(|e| anyhow::anyhow!("invalid spec.provider {p:?}: {e}"))?;
+        return Ok(p.clone());
+    }
+    if dry {
+        if let Some(p) = fleet.iter().find(|p| !used.contains(p)) {
+            return Ok(p.clone());
+        }
+        if let Some(p) = fleet.get(2) {
+            return Ok(p.clone());
+        }
+        if let Some(p) = fleet.last() {
+            return Ok(p.clone());
+        }
+        return Ok("cli:claude".into());
+    }
+    if let Some(p) = fleet
+        .iter()
+        .find(|p| !used.contains(p) && providers::is_provider_usable(p, false))
+        .cloned()
+    {
+        return Ok(p);
+    }
+    if let Some(p) = fleet
+        .iter()
+        .find(|p| providers::is_provider_usable(p, false))
+        .cloned()
+    {
+        return Ok(p);
+    }
+    anyhow::bail!(
+        "spec.enabled but no usable test-author provider (set [spec].provider or pass more --providers)"
+    )
 }
 
 pub fn approve(paths: &SparPaths, run_id: &str, json: bool) -> Result<ExitCode> {
@@ -212,12 +394,12 @@ pub fn approve(paths: &SparPaths, run_id: &str, json: bool) -> Result<ExitCode> 
         println!("approved plan for run {run_id}");
         println!("next: spar implement --run {run_id}  (same run id)");
     }
-    let _ = crate::bus::broadcast(
+    let _ = bus::broadcast(
         paths,
         run_id,
         "human",
         "plan approved",
-        crate::bus::MessageBudget::Normal,
+        MessageBudget::Normal,
     );
     Ok(ExitCode::Success)
 }
@@ -282,6 +464,8 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
         let template = match slot.role {
             SlotRole::Planner => "planner",
             SlotRole::PlanCritic => "plan_critic",
+            // Test author is spawned after plan draft inside execute_plan.
+            SlotRole::TestAuthor => continue,
             _ => continue,
         };
         jobs.push(SlotJob {

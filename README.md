@@ -183,7 +183,7 @@ spar plan -t "add retry logic to the HTTP client" \
   --providers cli:claude,cli:grok --detach --json
 
 spar wait <run_id> --json
-# exit 2 → review .spar/runs/<id>/artifacts/plan.md then:
+# exit 2 → review plan.md + test-contract.md under .spar/runs/<id>/artifacts/ then:
 spar approve <run_id>
 
 # SAME run id continues into implement
@@ -287,7 +287,7 @@ Higher `autonomy` auto-approves more gates; ship still prefers an explicit human
 .spar/runs/<run-id>/
   state.json
   events.jsonl
-  artifacts/          # plan.md, reviews, …
+  artifacts/          # plan.md, test-contract.md, reviews, …
   bus/                # swarm A2A bus
   logs/               # per-slot logs
   mailbox/

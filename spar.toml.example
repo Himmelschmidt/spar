@@ -31,3 +31,9 @@ wait = "2h"
 enabled = true
 # provider = "cli:claude"   # optional; else first usable of claude/grok/agy/api:xai/openai
 timeout_secs = 7200
+
+# Pre-coding acceptance tests (plan flow). Separate agent freezes tests before implement.
+[spec]
+enabled = true
+# provider = "cli:agy"      # optional; prefer a third provider ≠ planner/critic
+timeout_secs = 1800

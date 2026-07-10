@@ -37,7 +37,9 @@ spar wait "$RUN_ID" --json
 # exit 2 + phase awaiting_plan_approval  (manual autonomy)
 # OR exit 0 + plan_approved             (semi/high/full)
 
-# Read plan: .spar/runs/$RUN_ID/artifacts/plan.md
+# Read plan + acceptance contract:
+#   .spar/runs/$RUN_ID/artifacts/plan.md
+#   .spar/runs/$RUN_ID/artifacts/test-contract.md
 
 spar approve "$RUN_ID" --json   # only if still awaiting_plan_approval
 

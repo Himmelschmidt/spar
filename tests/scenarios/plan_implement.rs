@@ -73,6 +73,31 @@ fn plan_approve_implement_dry_run() {
         .join(run_id)
         .join("artifacts/plan.md");
     assert!(plan_path.is_file(), "plan.md should exist");
+    let contract_path = tmp
+        .path()
+        .join(".spar/runs")
+        .join(run_id)
+        .join("artifacts/test-contract.md");
+    assert!(
+        contract_path.is_file(),
+        "test-contract.md should exist after plan (spec channel)"
+    );
+    let state_after_plan: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            tmp.path()
+                .join(".spar/runs")
+                .join(run_id)
+                .join("state.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let has_test_author = state_after_plan["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["role"] == "test_author");
+    assert!(has_test_author, "expected test_author slot after plan");
     let events_path = tmp
         .path()
         .join(".spar/runs")
@@ -181,6 +206,43 @@ fn plan_approve_implement_dry_run() {
     assert!(
         !runs.is_dir() || std::fs::read_dir(&runs).unwrap().next().is_some(),
         "empty .spar/runs should be removed"
+    );
+}
+
+#[test]
+fn plan_dry_run_writes_test_contract() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let out = cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args([
+            "plan",
+            "--task",
+            "spec channel check",
+            "--providers",
+            "cli:claude,cli:grok,cli:agy",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let run_id = v["run_id"].as_str().unwrap();
+    let contract = tmp
+        .path()
+        .join(".spar/runs")
+        .join(run_id)
+        .join("artifacts/test-contract.md");
+    assert!(contract.is_file());
+    let body = std::fs::read_to_string(&contract).unwrap();
+    assert!(body.contains("## Scenarios"), "contract shape: {body}");
+    let slots = v["slots"].as_array().unwrap();
+    assert!(
+        slots.iter().any(|s| s["role"] == "test_author"),
+        "expected test_author in slots: {slots:?}"
     );
 }
 

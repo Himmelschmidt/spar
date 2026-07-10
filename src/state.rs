@@ -119,6 +119,8 @@ pub enum Phase {
     Dispatch,
     WaitCompletion,
     PlanReady,
+    /// Pre-coding acceptance tests (test-author slot).
+    Spec,
     AwaitingPlanApproval,
     PlanApproved,
     PlanRejected,
@@ -201,6 +203,8 @@ pub struct SlotState {
 pub enum SlotRole {
     Planner,
     PlanCritic,
+    /// Writes acceptance tests before implement; coordinates with planner/critic via bus.
+    TestAuthor,
     Implementer,
     /// Cheap suite runner — full test suites only; not review/impl judgment.
     Tester,

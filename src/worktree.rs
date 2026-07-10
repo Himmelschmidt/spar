@@ -208,6 +208,86 @@ pub fn cleanup_run(state: &RunState) -> Result<()> {
     Ok(())
 }
 
+/// Bring pre-coding acceptance tests from the test-author worktree into the implementer cwd.
+pub fn apply_spec_tests_to_impl(
+    state: &RunState,
+    author_slot: &str,
+    impl_cwd: &Path,
+) -> Result<()> {
+    let Some(spec) = state.worktrees.iter().find(|w| w.slot_id == author_slot) else {
+        return Ok(());
+    };
+    if !spec.path.is_dir() {
+        return Ok(());
+    }
+    if state.dry_run || impl_cwd.starts_with(state.project_root.join(".spar")) {
+        copy_tree_overlay(&spec.path, impl_cwd)?;
+        return Ok(());
+    }
+    let branch = &spec.branch;
+    let ok = Command::new("git")
+        .args([
+            "merge",
+            "--no-edit",
+            "-m",
+            "spar: acceptance tests from test-author",
+            branch,
+        ])
+        .current_dir(impl_cwd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .with_context(|| format!("git merge {branch} into {}", impl_cwd.display()))?;
+    if !ok.success() {
+        // Fall back to overlay so implement still sees files even if merge conflicts.
+        copy_tree_overlay(&spec.path, impl_cwd)?;
+    }
+    Ok(())
+}
+
+fn copy_tree_overlay(src: &Path, dst: &Path) -> Result<()> {
+    if !src.is_dir() {
+        return Ok(());
+    }
+    for entry in walkdir_files(src)? {
+        let rel = entry.strip_prefix(src).unwrap_or(&entry);
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        // Skip VCS metadata.
+        if rel.components().any(|c| c.as_os_str() == ".git") {
+            continue;
+        }
+        let target = dst.join(rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if entry.is_file() {
+            let _ = std::fs::copy(&entry, &target);
+        }
+    }
+    Ok(())
+}
+
+fn walkdir_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    fn rec(d: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+        let rd = std::fs::read_dir(d)
+            .with_context(|| format!("read_dir {}", d.display()))?;
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                rec(&p, out)?;
+            } else if p.is_file() {
+                out.push(p);
+            }
+        }
+        Ok(())
+    }
+    rec(root, &mut out)?;
+    Ok(out)
+}
+
 /// After purging a run dir, drop empty parent dirs (runs/, .spar/ if empty).
 pub fn prune_empty_spar_parents(paths: &SparPaths) -> Result<()> {
     let runs = paths.runs_dir();

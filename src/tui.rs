@@ -2424,6 +2424,7 @@ fn phase_label(phase: Phase) -> String {
         Phase::Dispatch => "Dispatching".into(),
         Phase::WaitCompletion => "Waiting on agents".into(),
         Phase::PlanReady => "Plan ready".into(),
+        Phase::Spec => "Writing acceptance tests".into(),
         Phase::AwaitingPlanApproval => "Needs plan approval".into(),
         Phase::PlanApproved => "Plan approved".into(),
         Phase::PlanRejected => "Plan rejected".into(),
@@ -2460,6 +2461,7 @@ fn role_label(r: crate::state::SlotRole) -> &'static str {
     match r {
         Planner => "planner",
         PlanCritic => "critic",
+        TestAuthor => "spec",
         Implementer => "builder",
         Tester => "tests",
         Reviewer => "review",

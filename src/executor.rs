@@ -364,6 +364,7 @@ fn apply_parallel_outcome(
 pub fn timeout_for_role(cfg: &Config, role: SlotRole) -> Duration {
     let secs = match role {
         SlotRole::Tester => cfg.suite.timeout_secs,
+        SlotRole::TestAuthor => cfg.spec.timeout_secs,
         SlotRole::Reviewer => cfg.timeouts.review_secs(),
         _ => cfg.timeouts.slot_secs,
     };
@@ -392,6 +393,9 @@ pub fn salvage_expected_artifact(
         ),
         SlotRole::Tester => format!(
             "## Result\nfail\n\n## Commands\n- (interrupted: {reason})\n\n## Summary\nSuite channel timed out or failed before a clean report.\n\n## Failures\n```\n{tail}\n```\n"
+        ),
+        SlotRole::TestAuthor => format!(
+            "## Scenarios\n- (interrupted: {reason})\n\n## Non-goals\n- n/a\n\n## How to run\n- unknown\n\n## Expected before implement\nskipped-reason\n\n## Notes\nPartial transcript:\n```\n{tail}\n```\n"
         ),
         _ => format!("# Salvaged artifact ({reason})\n\n```\n{tail}\n```\n"),
     };
@@ -724,6 +728,30 @@ fn write_dry_artifacts(
                     stamp.display()
                 ),
             )?;
+        }
+        SlotRole::TestAuthor => {
+            let stamp = cwd.join(".spar-dry-acceptance-tests");
+            std::fs::write(
+                &stamp,
+                format!("acceptance tests (dry-run) by {} for: {task}\n", job.slot_id),
+            )?;
+            std::fs::write(
+                paths.artifact(&state.id, "test-contract.md"),
+                format!(
+                    "## Scenarios\n- [ ] dry-run acceptance for: {task}\n\n## Non-goals\n- live test generation\n\n## How to run\n- `dry-run` (stub)\n\n## Expected before implement\nred\n\n## Notes\nDry-run test-author slot `{}` ({}); wrote `{}`.\n",
+                    job.slot_id,
+                    job.provider,
+                    stamp.display()
+                ),
+            )?;
+            let _ = crate::bus::chat(
+                paths,
+                &state.id,
+                &job.slot_id,
+                "broadcast",
+                "dry-run acceptance contract proposed",
+                state.message_budget,
+            );
         }
         SlotRole::Tester => {
             std::fs::write(

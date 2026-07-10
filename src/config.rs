@@ -20,6 +20,9 @@ pub struct Config {
     pub timeouts: TimeoutConfig,
     #[serde(default)]
     pub suite: SuiteConfig,
+    /// Pre-coding acceptance tests (plan flow). Separate from suite channel.
+    #[serde(default)]
+    pub spec: SpecConfig,
     #[serde(default)]
     pub gates: GatesConfig,
     #[serde(default)]
@@ -156,6 +159,32 @@ fn default_suite_timeout_secs() -> u64 {
     7200
 }
 
+/// Pre-coding test-author channel (plan → before human gate).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Prefer a third provider distinct from planner/critic when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default = "default_spec_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl Default for SpecConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            provider: None,
+            timeout_secs: default_spec_timeout_secs(),
+        }
+    }
+}
+
+fn default_spec_timeout_secs() -> u64 {
+    1800
+}
+
 fn default_max_agents() -> u32 {
     4
 }
@@ -188,6 +217,7 @@ impl Default for Config {
             ship: ShipConfig::default(),
             timeouts: TimeoutConfig::default(),
             suite: SuiteConfig::default(),
+            spec: SpecConfig::default(),
             gates: GatesConfig::default(),
             autonomy: AutonomyLevel::default(),
             message_budget: MessageBudget::default(),
@@ -226,6 +256,7 @@ struct ConfigFile {
     ship: Option<ShipConfigFile>,
     timeouts: Option<TimeoutConfigFile>,
     suite: Option<SuiteConfigFile>,
+    spec: Option<SpecConfigFile>,
     gates: Option<GatesConfigFile>,
     autonomy: Option<AutonomyLevel>,
     message_budget: Option<MessageBudget>,
@@ -252,6 +283,13 @@ struct TimeoutConfigFile {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct SuiteConfigFile {
+    enabled: Option<bool>,
+    provider: Option<String>,
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct SpecConfigFile {
     enabled: Option<bool>,
     provider: Option<String>,
     timeout_secs: Option<u64>,
@@ -324,6 +362,17 @@ impl Config {
                 self.suite.timeout_secs = v;
             }
         }
+        if let Some(s) = &file.spec {
+            if let Some(v) = s.enabled {
+                self.spec.enabled = v;
+            }
+            if let Some(v) = &s.provider {
+                self.spec.provider = Some(v.clone());
+            }
+            if let Some(v) = s.timeout_secs {
+                self.spec.timeout_secs = v;
+            }
+        }
         if let Some(g) = &file.gates {
             if let Some(v) = g.plan {
                 self.gates.plan = v;
@@ -384,6 +433,8 @@ mod tests {
         assert!(cfg.auto_winner());
         assert!(cfg.suite.enabled);
         assert_eq!(cfg.suite.timeout_secs, 7200);
+        assert!(cfg.spec.enabled);
+        assert_eq!(cfg.spec.timeout_secs, 1800);
     }
 
     #[test]
@@ -401,6 +452,11 @@ review_secs = 200
 enabled = false
 provider = "cli:grok"
 timeout_secs = 3600
+
+[spec]
+enabled = false
+provider = "cli:agy"
+timeout_secs = 900
 "#,
         )
         .unwrap();
@@ -410,5 +466,8 @@ timeout_secs = 3600
         assert!(!cfg.suite.enabled);
         assert_eq!(cfg.suite.provider.as_deref(), Some("cli:grok"));
         assert_eq!(cfg.suite.timeout_secs, 3600);
+        assert!(!cfg.spec.enabled);
+        assert_eq!(cfg.spec.provider.as_deref(), Some("cli:agy"));
+        assert_eq!(cfg.spec.timeout_secs, 900);
     }
 }
