@@ -22,8 +22,13 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     if dry {
         std::env::set_var("SPAR_DRY_RUN", "1");
     }
-    let requested = opts.require_providers()?;
-    let n = requested.len().max(1);
+    let n = if !opts.providers.is_empty() {
+        opts.providers.len().max(1)
+    } else if opts.select.len() > 1 {
+        opts.select.len()
+    } else {
+        2
+    };
     let run_id = util::short_run_id();
     let mut state = RunState::new(
         run_id,
@@ -37,7 +42,9 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     state.dry_run = dry;
     state.message_budget = cfg.message_budget;
     state.autonomy = cfg.autonomy;
-    state.providers = providers::pick_providers(requested, n, Some(requested), dry);
+    let roles: Vec<&str> = (0..n).map(|_| "reviewer").collect();
+    let requested = opts.resolve_fleet(n, &roles, paths, cfg, &state.id)?;
+    state.providers = providers::pick_providers(&requested, n, Some(&requested), dry);
     if state.providers.is_empty() {
         state.error = Some("no usable providers".into());
         state.set_phase(Phase::Failed);
@@ -127,6 +134,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
                 template: "reviewer".into(),
                 extra_vars: extra,
                 expected_artifact: Some(format!("review-{}.md", slot.id)),
+            model: None,
             }
         })
         .collect();

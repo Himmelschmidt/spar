@@ -64,6 +64,36 @@ pub fn run(json: bool) -> Result<ExitCode> {
         .and_then(|p| Config::load(p).ok())
         .unwrap_or_default();
 
+    let bench = cfg
+        .model_select
+        .benches
+        .first()
+        .map(|s| s.as_str())
+        .unwrap_or("swebench");
+    let cache_path = crate::model_select::cache_path(bench);
+    match crate::model_select::load_cached(&cache_path) {
+        Ok(Some(meta)) => {
+            let age = crate::model_select::cache_age_secs(&meta);
+            notes.push(format!(
+                "model-select cache {bench}: age={age}s models={} ({})",
+                meta.snapshot.models.len(),
+                cache_path.display()
+            ));
+            if age > cfg.model_select.cache_ttl_secs {
+                notes.push(format!(
+                    "model-select cache older than TTL ({}s); run `spar model refresh`",
+                    cfg.model_select.cache_ttl_secs
+                ));
+            }
+        }
+        Ok(None) => {
+            notes.push(
+                "model-select: no vals cache yet (optional; `spar model refresh` or --select)".into(),
+            );
+        }
+        Err(e) => notes.push(format!("model-select cache read error: {e:#}")),
+    }
+
     let ok = git.available && any_provider;
     let report = DoctorReport {
         ok,

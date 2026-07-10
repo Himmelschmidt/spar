@@ -1,0 +1,208 @@
+{
+  "bench": "swebench",
+  "source": "vals",
+  "url": "https://www.vals.ai/benchmarks/swebench",
+  "fetched_at": "2026-07-10T00:00:00Z",
+  "models": [
+    {
+      "id": "openai/gpt-5.6-sol",
+      "accuracy": 96.2,
+      "latency": 182.365,
+      "stderr": 0.856,
+      "cost_per_test": 1.1513,
+      "provider": "openai"
+    },
+    {
+      "id": "anthropic/claude-fable-5",
+      "accuracy": 95.0,
+      "latency": 356.182,
+      "stderr": 0.976,
+      "cost_per_test": 2.046736,
+      "provider": "anthropic"
+    },
+    {
+      "id": "anthropic/claude-opus-4-8",
+      "accuracy": 88.6,
+      "latency": 566.945,
+      "stderr": 1.423,
+      "cost_per_test": 1.923224,
+      "provider": "anthropic"
+    },
+    {
+      "id": "anthropic/claude-opus-4-8-claude-code",
+      "accuracy": 85.8,
+      "latency": 135.395,
+      "stderr": 1.563,
+      "cost_per_test": 0.672451,
+      "provider": "anthropic"
+    },
+    {
+      "id": "zai/glm-5.2",
+      "accuracy": 82.8,
+      "latency": 669.667,
+      "stderr": 1.689,
+      "cost_per_test": 0.710002,
+      "provider": "zai"
+    },
+    {
+      "id": "openai/gpt-5.5",
+      "accuracy": 82.6,
+      "latency": 426.425,
+      "stderr": 1.695,
+      "cost_per_test": 1.361765,
+      "provider": "openai"
+    },
+    {
+      "id": "meta/muse_spark_1_1",
+      "accuracy": 82.0,
+      "latency": 209.115,
+      "stderr": 1.72,
+      "cost_per_test": 0.352022,
+      "provider": "meta"
+    },
+    {
+      "id": "anthropic/claude-opus-4-7",
+      "accuracy": 82.0,
+      "latency": 441.988,
+      "stderr": 1.72,
+      "cost_per_test": 2.423427,
+      "provider": "anthropic"
+    },
+    {
+      "id": "cursor/composer-2.5",
+      "accuracy": 79.6,
+      "latency": 0.0,
+      "stderr": 1.804,
+      "cost_per_test": null,
+      "provider": "cursor"
+    },
+    {
+      "id": "anthropic/claude-sonnet-5",
+      "accuracy": 79.6,
+      "latency": 962.366,
+      "stderr": 1.804,
+      "cost_per_test": 1.489899,
+      "provider": "anthropic"
+    },
+    {
+      "id": "google/gemini-3.5-flash",
+      "accuracy": 78.8,
+      "latency": 254.129,
+      "stderr": 1.83,
+      "cost_per_test": 0.953882,
+      "provider": "google"
+    },
+    {
+      "id": "google/gemini-3.1-pro-preview",
+      "accuracy": 78.8,
+      "latency": 312.261,
+      "stderr": 1.83,
+      "cost_per_test": 0.783381,
+      "provider": "google"
+    },
+    {
+      "id": "openai/gpt-5.4-2026-03-05",
+      "accuracy": 78.2,
+      "latency": 307.118,
+      "stderr": 1.848,
+      "cost_per_test": 0.801134,
+      "provider": "openai"
+    },
+    {
+      "id": "anthropic/claude-opus-4-6-thinking",
+      "accuracy": 78.2,
+      "latency": 350.76,
+      "stderr": 1.848,
+      "cost_per_test": 1.216469,
+      "provider": "anthropic"
+    },
+    {
+      "id": "openai/gpt-5.3-codex",
+      "accuracy": 78.0,
+      "latency": 246.527,
+      "stderr": 1.854,
+      "cost_per_test": 0.455384,
+      "provider": "openai"
+    },
+    {
+      "id": "anthropic/claude-sonnet-4-6",
+      "accuracy": 77.4,
+      "latency": 511.785,
+      "stderr": 1.872,
+      "cost_per_test": 1.303853,
+      "provider": "anthropic"
+    },
+    {
+      "id": "deepseek/deepseek-v4-pro",
+      "accuracy": 77.4,
+      "latency": 634.611,
+      "stderr": 1.872,
+      "cost_per_test": 0.436763,
+      "provider": "deepseek"
+    },
+    {
+      "id": "openai/gpt-5.5-codex",
+      "accuracy": 76.4,
+      "latency": 108.544,
+      "stderr": 1.901,
+      "cost_per_test": 0.652332,
+      "provider": "openai"
+    },
+    {
+      "id": "anthropic/claude-opus-4-5-20251101-thinking",
+      "accuracy": 76.4,
+      "latency": 320.542,
+      "stderr": 1.901,
+      "cost_per_test": 1.054837,
+      "provider": "anthropic"
+    },
+    {
+      "id": "google/gemini-3-pro-preview",
+      "accuracy": 76.4,
+      "latency": 394.488,
+      "stderr": 1.901,
+      "cost_per_test": 0.771547,
+      "provider": "google"
+    },
+    {
+      "id": "zai/glm-5.1",
+      "accuracy": 76.4,
+      "latency": 527.071,
+      "stderr": 1.901,
+      "cost_per_test": 0.456603,
+      "provider": "zai"
+    },
+    {
+      "id": "openai/gpt-5.5-factory",
+      "accuracy": 76.2,
+      "latency": 410.148,
+      "stderr": 1.906,
+      "cost_per_test": 1.129284,
+      "provider": "openai"
+    },
+    {
+      "id": "openai/gpt-5.2-2025-12-11",
+      "accuracy": 75.8,
+      "latency": 640.472,
+      "stderr": 1.917,
+      "cost_per_test": 1.453372,
+      "provider": "openai"
+    },
+    {
+      "id": "openai/gpt-5.6-terra",
+      "accuracy": 75.2,
+      "latency": 121.857,
+      "stderr": 1.933,
+      "cost_per_test": 0.716007,
+      "provider": "openai"
+    },
+    {
+      "id": "google/gemini-3-flash-preview",
+      "accuracy": 75.0,
+      "latency": 285.223,
+      "stderr": 1.938,
+      "cost_per_test": 0.280231,
+      "provider": "google"
+    }
+  ]
+}

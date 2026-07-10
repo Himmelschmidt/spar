@@ -45,6 +45,8 @@ pub struct SlotJob {
     pub extra_vars: HashMap<String, String>,
     /// Expected primary artifact name under artifacts/
     pub expected_artifact: Option<String>,
+    /// Optional model override for CLI `--model` / API body.
+    pub model: Option<String>,
 }
 
 /// Run multiple slots **concurrently** (live). Dry-run stays sequential for simpler state.
@@ -161,6 +163,10 @@ fn prepare_slot_execution(
     std::fs::write(&prompt_path, &prompt)?;
 
     let pref = ProviderRef::parse(&job.provider)?;
+    let mut job = job.clone();
+    if job.model.is_none() {
+        job.model = slot_model_for(Some(state), &job);
+    }
     if let Some(s) = state.slot_mut(&job.slot_id) {
         s.status = SlotStatus::Running;
         s.exec_backend = Some(pref.backend);
@@ -171,6 +177,9 @@ fn prepare_slot_execution(
         });
         s.log_path = Some(log_path.clone());
         s.artifact = job.expected_artifact.clone();
+        if s.model.is_none() {
+            s.model = job.model.clone();
+        }
     }
     let _ = crate::events::append(
         paths,
@@ -180,7 +189,7 @@ fn prepare_slot_execution(
     let _ = crate::bus::heartbeat(paths, &state.id, &job.slot_id, "running");
 
     Ok(PreparedSlot {
-        job: job.clone(),
+        job,
         cwd,
         log_path,
         prompt_path,
@@ -208,6 +217,7 @@ fn execute_prepared(
                     .map(|run| run.join("artifacts").join(n))
                     .unwrap_or_else(|| PathBuf::from(n))
             });
+        let model = prep.job.model.clone();
         let (ok, err, usage) = crate::api::run_api_slot(&crate::api::runtime::ApiSlotRequest {
             provider_name: &prep.pref.name,
             prompt: &prep.prompt,
@@ -216,6 +226,7 @@ fn execute_prepared(
             expected_artifact: expected.as_deref(),
             timeout,
             dry_run: false,
+            model_override: model.clone(),
         })?;
         let slot_usage = SlotUsage {
             slot_id: prep.job.slot_id.clone(),
@@ -225,7 +236,7 @@ fn execute_prepared(
             cache_read_tokens: 0,
             context_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
             tools: 0,
-            model: usage.model,
+            model: usage.model.or(model),
         };
         return Ok(if ok {
             SlotOutcome {
@@ -257,6 +268,7 @@ fn execute_prepared(
         cwd: prep.cwd.clone(),
         trust: TrustPolicy::FullAuto,
         extra_args: vec![],
+        model: prep.job.model.clone(),
     };
     let cmd = adapter.build_headless(&bin, &opts);
     let (program, args) = providers::command_to_parts(&cmd);
@@ -855,6 +867,7 @@ fn run_api(
         .expected_artifact
         .as_ref()
         .map(|n| paths.artifact(&state.id, n));
+    let model = slot_model_for(Some(state), job);
     let (ok, err, usage) = api::run_api_slot(&api::runtime::ApiSlotRequest {
         provider_name: &pref.name,
         prompt,
@@ -863,6 +876,7 @@ fn run_api(
         expected_artifact: expected.as_deref(),
         timeout,
         dry_run: false,
+        model_override: model.clone(),
     })?;
     let slot_usage = SlotUsage {
         slot_id: job.slot_id.clone(),
@@ -872,7 +886,7 @@ fn run_api(
         cache_read_tokens: 0,
         context_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
         tools: 0,
-        model: usage.model,
+        model: usage.model.or(model),
     };
     if ok {
         Ok(SlotOutcome {
@@ -916,6 +930,7 @@ fn run_headless(
         cwd: cwd.to_path_buf(),
         trust: TrustPolicy::FullAuto,
         extra_args: vec![],
+        model: slot_model_for(Some(state), job),
     };
     let cmd = adapter.build_headless(&bin, &opts);
     let (program, args) = providers::command_to_parts(&cmd);
@@ -1009,6 +1024,7 @@ fn run_tmux(
         cwd: cwd.to_path_buf(),
         trust: TrustPolicy::FullAuto,
         extra_args: vec![],
+        model: slot_model_for(Some(state), job),
     };
     // prefer interactive for tmux
     let cmd = adapter.build_interactive(&bin, &opts);
@@ -1038,7 +1054,28 @@ fn run_tmux(
     Ok(SlotOutcome::err("tmux marker wait timed out"))
 }
 
+fn slot_model_for(state: Option<&RunState>, job: &SlotJob) -> Option<String> {
+    if let Some(m) = job.model.as_ref().filter(|s| !s.is_empty()) {
+        return Some(m.clone());
+    }
+    state.and_then(|st| {
+        st.slots
+            .iter()
+            .find(|s| s.id == job.slot_id)
+            .and_then(|s| s.model.clone())
+    })
+}
+
 pub fn init_slot(id: impl Into<String>, provider: impl Into<String>, role: SlotRole) -> SlotState {
+    init_slot_model(id, provider, role, None)
+}
+
+pub fn init_slot_model(
+    id: impl Into<String>,
+    provider: impl Into<String>,
+    role: SlotRole,
+    model: Option<String>,
+) -> SlotState {
     let provider = provider.into();
     let pref = ProviderRef::parse(&provider).expect("slot provider must be cli:… or api:…");
     SlotState {
@@ -1055,8 +1092,11 @@ pub fn init_slot(id: impl Into<String>, provider: impl Into<String>, role: SlotR
         exit_code: None,
         artifact: None,
         usage: None,
+        model,
     }
 }
+
+
 
 pub fn emit_run_json(state: &RunState) -> Result<()> {
     let v = serde_json::json!({

@@ -31,6 +31,93 @@ pub struct Config {
     pub message_budget: MessageBudget,
     #[serde(default)]
     pub auto_cleanup: bool,
+    #[serde(default)]
+    pub model_select: ModelSelectConfig,
+}
+
+/// vals-backed dynamic model selection (see DECISIONS MS*).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelSelectConfig {
+    #[serde(default = "default_model_select_source")]
+    pub source: String,
+    #[serde(default = "default_model_select_benches")]
+    pub benches: Vec<String>,
+    /// Cache TTL seconds (default 24h).
+    #[serde(default = "default_model_select_ttl")]
+    pub cache_ttl_secs: u64,
+    /// Provider allow patterns (`cli:*`, `api:openai`, `*`). Empty = all mappable.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub profiles: std::collections::HashMap<String, crate::model_select::ProfileWeights>,
+    /// role name → profile name
+    #[serde(default)]
+    pub roles: std::collections::HashMap<String, String>,
+}
+
+impl Default for ModelSelectConfig {
+    fn default() -> Self {
+        Self {
+            source: default_model_select_source(),
+            benches: default_model_select_benches(),
+            cache_ttl_secs: default_model_select_ttl(),
+            allow: Vec::new(),
+            profiles: crate::model_select::default_profiles(),
+            roles: default_model_select_roles(),
+        }
+    }
+}
+
+impl ModelSelectConfig {
+    pub fn resolved_profiles(
+        &self,
+    ) -> std::collections::HashMap<String, crate::model_select::ProfileWeights> {
+        let mut m = crate::model_select::default_profiles();
+        for (k, v) in &self.profiles {
+            m.insert(k.clone(), v.clone());
+        }
+        m
+    }
+
+    pub fn role_profile(&self, role: &str) -> &str {
+        self.roles
+            .get(role)
+            .map(|s| s.as_str())
+            .unwrap_or(match role {
+                "planner" | "critic" => "best",
+                "tester" => "fast",
+                "reviewer" => "value",
+                _ => "value",
+            })
+    }
+
+    pub fn min_accuracy_for(&self, profile: &str) -> Option<f64> {
+        self.resolved_profiles()
+            .get(profile)
+            .and_then(|p| p.min_accuracy)
+    }
+}
+
+fn default_model_select_source() -> String {
+    "vals".into()
+}
+
+fn default_model_select_benches() -> Vec<String> {
+    vec!["swebench".into()]
+}
+
+fn default_model_select_ttl() -> u64 {
+    86400
+}
+
+fn default_model_select_roles() -> std::collections::HashMap<String, String> {
+    let mut m = std::collections::HashMap::new();
+    m.insert("planner".into(), "best".into());
+    m.insert("critic".into(), "best".into());
+    m.insert("implementer".into(), "value".into());
+    m.insert("reviewer".into(), "value".into());
+    m.insert("tester".into(), "fast".into());
+    m
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,6 +309,7 @@ impl Default for Config {
             autonomy: AutonomyLevel::default(),
             message_budget: MessageBudget::default(),
             auto_cleanup: false,
+            model_select: ModelSelectConfig::default(),
         }
     }
 }
@@ -261,6 +349,17 @@ struct ConfigFile {
     autonomy: Option<AutonomyLevel>,
     message_budget: Option<MessageBudget>,
     auto_cleanup: Option<bool>,
+    model_select: Option<ModelSelectConfigFile>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ModelSelectConfigFile {
+    source: Option<String>,
+    benches: Option<Vec<String>>,
+    cache_ttl_secs: Option<u64>,
+    allow: Option<Vec<String>>,
+    profiles: Option<std::collections::HashMap<String, crate::model_select::ProfileWeights>>,
+    roles: Option<std::collections::HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -392,6 +491,30 @@ impl Config {
         }
         if let Some(v) = file.auto_cleanup {
             self.auto_cleanup = v;
+        }
+        if let Some(ms) = &file.model_select {
+            if let Some(v) = &ms.source {
+                self.model_select.source = v.clone();
+            }
+            if let Some(v) = &ms.benches {
+                self.model_select.benches = v.clone();
+            }
+            if let Some(v) = ms.cache_ttl_secs {
+                self.model_select.cache_ttl_secs = v;
+            }
+            if let Some(v) = &ms.allow {
+                self.model_select.allow = v.clone();
+            }
+            if let Some(v) = &ms.profiles {
+                for (k, prof) in v {
+                    self.model_select.profiles.insert(k.clone(), prof.clone());
+                }
+            }
+            if let Some(v) = &ms.roles {
+                for (k, role) in v {
+                    self.model_select.roles.insert(k.clone(), role.clone());
+                }
+            }
         }
         Ok(())
     }

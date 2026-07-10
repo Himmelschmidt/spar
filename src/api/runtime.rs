@@ -27,6 +27,8 @@ pub struct ApiSlotRequest<'a> {
     pub expected_artifact: Option<&'a Path>,
     pub timeout: Duration,
     pub dry_run: bool,
+    /// Override model from env default (model-select).
+    pub model_override: Option<String>,
 }
 
 pub fn run_api_slot(req: &ApiSlotRequest<'_>) -> Result<(bool, Option<String>, Usage)> {
@@ -58,7 +60,12 @@ pub fn run_api_slot(req: &ApiSlotRequest<'_>) -> Result<(bool, Option<String>, U
         return Ok((true, None, usage));
     }
 
-    let cfg = ApiProviderConfig::resolve(req.provider_name)?;
+    let mut cfg = ApiProviderConfig::resolve(req.provider_name)?;
+    if let Some(m) = &req.model_override {
+        if !m.is_empty() {
+            cfg.model = m.clone();
+        }
+    }
     usage.model = Some(cfg.model.clone());
 
     let system = format!(
