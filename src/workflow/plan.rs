@@ -29,9 +29,14 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
     state.autonomy = cfg.autonomy;
     state.message_budget = cfg.message_budget;
     state.big = opts.big;
-    let requested = opts.require_providers()?;
     let n_slots = if cfg.spec.enabled { 3 } else { 2 };
-    state.providers = providers::pick_providers(requested, n_slots, Some(requested), dry);
+    let roles: &[&str] = if cfg.spec.enabled {
+        &["planner", "critic", "tester"]
+    } else {
+        &["planner", "critic"]
+    };
+    let requested = opts.resolve_fleet(n_slots, roles, paths, cfg, &state.id)?;
+    state.providers = providers::pick_providers(&requested, n_slots, Some(&requested), dry);
     if !dry {
         match crate::quota::apply_quota_filter(paths, &state.providers) {
             Ok(p) => state.providers = p,
@@ -79,9 +84,19 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
     let _ = bus::join(paths, &state.id, "orchestrator", None, None);
     state.save(paths)?;
 
+    let art = crate::model_select::load_select_artifact(paths, &state.id)
+        .ok()
+        .flatten();
     let mut jobs = Vec::new();
     for (i, prov) in state.providers.iter().take(2).enumerate() {
         let safe = prov.replace(['/', ':'], "-");
+        let role_name = if i == 0 { "planner" } else { "critic" };
+        let model = art.as_ref().and_then(|a| {
+            a.choices
+                .iter()
+                .find(|c| c.role.as_deref() == Some(role_name) || c.slot == i)
+                .and_then(|c| c.model.clone())
+        });
         let (id, role, template) = if i == 0 {
             (format!("planner-{safe}"), SlotRole::Planner, "planner")
         } else {
@@ -91,7 +106,7 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
                 "plan_critic",
             )
         };
-        state.slots.push(executor::init_slot(&id, prov, role));
+        state.slots.push(executor::init_slot_model(&id, prov, role, model.clone()));
         jobs.push(SlotJob {
             slot_id: id,
             provider: prov.clone(),
@@ -99,6 +114,7 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
             template: template.into(),
             extra_vars: HashMap::new(),
             expected_artifact: Some("plan.md".into()),
+            model,
         });
     }
 
@@ -227,13 +243,22 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
         .map(|s| s.provider.clone())
         .collect();
     let provider = resolve_spec_provider(cfg, state.dry_run, &state.providers, &used)?;
+    let model = crate::model_select::load_select_artifact(paths, &state.id)
+        .ok()
+        .flatten()
+        .and_then(|a| {
+            a.choices
+                .iter()
+                .find(|c| c.role.as_deref() == Some("tester") || c.slot == 2)
+                .and_then(|c| c.model.clone())
+        });
     let safe = provider.replace(['/', ':'], "-");
     let id = format!("test-author-{safe}");
 
     if state.slots.iter().all(|s| s.id != id) {
         state
             .slots
-            .push(executor::init_slot(&id, &provider, SlotRole::TestAuthor));
+            .push(executor::init_slot_model(&id, &provider, SlotRole::TestAuthor, model.clone()));
     }
     worktree::prepare_isolation(state, paths, std::slice::from_ref(&id))?;
     // After isolation so status/TUI show Spec for the author wall-clock, not PrepareIsolation.
@@ -253,6 +278,7 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
         template: "test_author".into(),
         extra_vars: extra,
         expected_artifact: Some("test-contract.md".into()),
+        model,
     };
 
     if let Err(e) = executor::run_slot(state, paths, cfg, &job) {
@@ -485,6 +511,7 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
             template: template.into(),
             extra_vars: HashMap::new(),
             expected_artifact: Some("plan.md".into()),
+        model: None,
         });
     }
     if jobs.is_empty() {
@@ -509,6 +536,7 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
                 template: template.into(),
                 extra_vars: HashMap::new(),
                 expected_artifact: Some("plan.md".into()),
+            model: None,
             });
         }
         state.save(paths)?;

@@ -9,6 +9,7 @@ mod exit_codes;
 mod liveness;
 mod mailbox;
 mod markers;
+mod model_select;
 mod paths;
 mod process;
 mod provider_ref;
@@ -68,6 +69,8 @@ fn run() -> Result<ExitCode> {
         Command::Plan {
             task,
             providers,
+            select,
+            urgency,
             detach,
             json,
             backend,
@@ -78,6 +81,8 @@ fn run() -> Result<ExitCode> {
             let opts = CommonOpts {
                 task: Some(task.clone()),
                 providers,
+                select,
+                urgency,
                 detach,
                 json,
                 backend,
@@ -107,12 +112,16 @@ fn run() -> Result<ExitCode> {
             backend,
             dry_run,
             providers,
+            select,
+            urgency,
             big,
         } => {
             let (paths, cfg) = project_ctx()?;
             let opts = CommonOpts {
                 task: task.clone(),
                 providers,
+                select,
+                urgency,
                 detach,
                 json,
                 backend,
@@ -129,12 +138,16 @@ fn run() -> Result<ExitCode> {
             backend,
             dry_run,
             providers,
+            select,
+            urgency,
             big,
         } => {
             let (paths, cfg) = project_ctx()?;
             let opts = CommonOpts {
                 task,
                 providers,
+                select,
+                urgency,
                 detach,
                 json,
                 backend,
@@ -169,6 +182,13 @@ fn run() -> Result<ExitCode> {
             cwd: cli.cwd.clone(),
         }),
         Command::Provider { action } => provider_cmd(action),
+        Command::Model { action } => {
+            let cfg = match project_ctx() {
+                Ok((_, c)) => c,
+                Err(_) => Config::default(),
+            };
+            model_select::run_cmd(action, &cfg)
+        }
         Command::Ship {
             run_id,
             json,

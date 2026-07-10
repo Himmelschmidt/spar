@@ -50,3 +50,4 @@
 - More native API SDKs (Anthropic messages API, Google, Meta)  
 - bwrap profiles per untrusted model  
 - Streaming token SSE into TUI  
+- **Dynamic model select** (vals-backed) — see `features/001-model-select.md`

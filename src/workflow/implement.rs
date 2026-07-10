@@ -62,7 +62,12 @@ fn run_from_approved(
     if state.dry_run {
         std::env::set_var("SPAR_DRY_RUN", "1");
     }
-    let requested = opts.require_providers()?.to_vec();
+    let n = cfg.max_agents.max(3) as usize;
+    let roles: Vec<&str> = std::iter::once("implementer")
+        .chain(std::iter::repeat("reviewer"))
+        .take(n)
+        .collect();
+    let requested = opts.resolve_fleet(n, &roles, paths, cfg, &state.id)?;
     // Quota filter before slot assignment so paused providers never get slots.
     if !state.dry_run {
         match crate::quota::apply_quota_filter(paths, &requested) {
@@ -83,7 +88,7 @@ fn run_from_approved(
         state.providers = requested.clone();
     }
     let dry = state.dry_run;
-    prepare_implement_slots(&mut state, Some(&requested), dry, cfg)?;
+    prepare_implement_slots(&mut state, Some(&requested), dry, cfg, paths)?;
     if state.slots.iter().all(|s| s.role != SlotRole::Implementer) {
         bail!("no implementer slot after provider pick");
     }
@@ -102,6 +107,7 @@ fn prepare_implement_slots(
     requested: Option<&[String]>,
     dry: bool,
     cfg: &Config,
+    paths: &SparPaths,
 ) -> Result<()> {
     state.workflow = crate::cli::WorkflowKind::Loop;
     state.max_fix_rounds = 3;
@@ -113,7 +119,7 @@ fn prepare_implement_slots(
     // Keep planner slots as historical; add impl/review if missing.
     let has_impl = state.slots.iter().any(|s| s.role == SlotRole::Implementer);
     if has_impl {
-        ensure_suite_slot(state, dry, cfg)?;
+        ensure_suite_slot(state, dry, cfg, paths)?;
         return Ok(());
     }
 
@@ -131,48 +137,91 @@ fn prepare_implement_slots(
         provs.push(provs[0].clone());
     }
 
-    state.slots.push(executor::init_slot("impl", &provs[0], SlotRole::Implementer));
-    ensure_suite_slot(state, dry, cfg)?;
-    state.slots.push(executor::init_slot(
+    // Apply model-select choices onto slots when artifact exists.
+    let art = crate::model_select::load_select_artifact(paths, &state.id).ok().flatten();
+    let model_for = |idx: usize| -> Option<String> {
+        art.as_ref().and_then(|a| {
+            a.choices
+                .iter()
+                .find(|c| c.slot == idx)
+                .and_then(|c| c.model.clone())
+        })
+    };
+
+    state.slots.push(executor::init_slot_model(
+        "impl",
+        &provs[0],
+        SlotRole::Implementer,
+        model_for(0),
+    ));
+    ensure_suite_slot(state, dry, cfg, paths)?;
+    state.slots.push(executor::init_slot_model(
         format!("review-{}-a", sanitize_slot(&provs[1])),
         &provs[1],
         SlotRole::Reviewer,
+        model_for(1),
     ));
-    state.slots.push(executor::init_slot(
+    state.slots.push(executor::init_slot_model(
         format!("review-{}-b", sanitize_slot(&provs[2])),
         &provs[2],
         SlotRole::Reviewer,
+        model_for(2),
     ));
     Ok(())
 }
 
 /// Ensure a tester slot exists when suite is enabled. Fail closed if no provider.
-fn ensure_suite_slot(state: &mut RunState, dry: bool, cfg: &Config) -> Result<()> {
+fn ensure_suite_slot(state: &mut RunState, dry: bool, cfg: &Config, paths: &SparPaths) -> Result<()> {
     if !cfg.suite.enabled {
         return Ok(());
     }
     if state.slots.iter().any(|s| s.role == SlotRole::Tester) {
         return Ok(());
     }
-    let suite_prov = resolve_suite_provider(cfg, dry, &state.providers)?;
-    state.slots.push(executor::init_slot(
+    let (suite_prov, suite_model) =
+        resolve_suite_provider(cfg, dry, &state.providers, Some(paths), Some(&state.id))?;
+    state.slots.push(executor::init_slot_model(
         format!("suite-{}", sanitize_slot(&suite_prov)),
         &suite_prov,
         SlotRole::Tester,
+        suite_model,
     ));
     Ok(())
 }
 
-/// Cheap suite-channel provider: config override, prefs, then fleet providers.
+/// Cheap suite-channel provider: config override, model-select (tester/fast), prefs, fleet.
 fn resolve_suite_provider(
     cfg: &Config,
     dry: bool,
     fleet: &[String],
-) -> Result<String> {
+    paths: Option<&SparPaths>,
+    run_id: Option<&str>,
+) -> Result<(String, Option<String>)> {
     if let Some(p) = &cfg.suite.provider {
         crate::provider_ref::ProviderRef::parse(p)
             .map_err(|e| anyhow::anyhow!("invalid suite.provider {p:?}: {e}"))?;
-        return Ok(p.clone());
+        return Ok((p.clone(), None));
+    }
+    // Prefer model-select artifact / fresh pick with tester role (fast profile).
+    if let (Some(paths), Some(run_id)) = (paths, run_id) {
+        if let Ok(Some(art)) = crate::model_select::load_select_artifact(paths, run_id) {
+            if let Some(c) = art.choices.iter().find(|c| c.role.as_deref() == Some("tester")) {
+                return Ok((c.provider.clone(), c.model.clone()));
+            }
+            let exclude: Vec<String> = art.choices.iter().map(|c| c.vals_id.clone()).collect();
+            let urgency = crate::model_select::Urgency::parse(&art.urgency)
+                .unwrap_or(crate::model_select::Urgency::Normal);
+            if let Ok(c) = crate::model_select::pick_one_for_role("tester", urgency, cfg, dry, &exclude)
+            {
+                // Append to artifact for audit trail.
+                let mut art = art;
+                let mut c = c;
+                c.slot = art.choices.len();
+                art.choices.push(c.clone());
+                let _ = crate::model_select::write_select_artifact(paths, run_id, &art);
+                return Ok((c.provider, c.model));
+            }
+        }
     }
     const PREFS: &[&str] = &[
         "cli:claude",
@@ -182,21 +231,21 @@ fn resolve_suite_provider(
         "api:openai",
     ];
     if dry {
-        return Ok(PREFS[0].into());
+        return Ok((PREFS[0].into(), None));
     }
     if let Some(p) = PREFS
         .iter()
         .find(|p| providers::is_provider_usable(p, false))
         .map(|s| (*s).to_string())
     {
-        return Ok(p);
+        return Ok((p, None));
     }
     if let Some(p) = fleet
         .iter()
         .find(|p| providers::is_provider_usable(p, false))
         .cloned()
     {
-        return Ok(p);
+        return Ok((p, None));
     }
     bail!(
         "suite.enabled but no usable suite provider (set [suite].provider or install a CLI)"
@@ -274,7 +323,12 @@ fn run_with_task(
     state.message_budget = cfg.message_budget;
     state.big = opts.big;
     state.max_fix_rounds = 3;
-    let requested = opts.require_providers()?.to_vec();
+    let n = cfg.max_agents.max(3) as usize;
+    let roles: Vec<&str> = std::iter::once("implementer")
+        .chain(std::iter::repeat("reviewer"))
+        .take(n)
+        .collect();
+    let requested = opts.resolve_fleet(n, &roles, paths, cfg, &state.id)?;
 
     if !dry {
         match crate::quota::apply_quota_filter(paths, &requested) {
@@ -295,7 +349,7 @@ fn run_with_task(
     } else {
         state.providers = requested.clone();
     }
-    prepare_implement_slots(&mut state, Some(&requested), dry, cfg)?;
+    prepare_implement_slots(&mut state, Some(&requested), dry, cfg, paths)?;
 
     paths.ensure_run_dirs(&state.id)?;
     let _ = crate::bus::ensure_bus(paths, &state.id);
@@ -399,6 +453,7 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
         let mut extra = HashMap::new();
         extra.insert("plan_body".into(), plan_body.clone());
         extra.insert("test_contract_body".into(), test_contract_body.clone());
+        let impl_model = impl_slot.model.clone();
         let impl_job = SlotJob {
             slot_id: impl_slot.id.clone(),
             provider: impl_slot.provider.clone(),
@@ -406,6 +461,7 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
             template: "implementer".into(),
             extra_vars: extra,
             expected_artifact: Some(format!("summary-{}.md", impl_slot.id)),
+            model: impl_model,
         };
         if let Err(e) = executor::run_slot(state, paths, cfg, &impl_job) {
             return fail(state, paths, e);
@@ -465,6 +521,7 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
                     template: "tester".into(),
                     extra_vars: HashMap::new(),
                     expected_artifact: Some("suite.md".into()),
+                    model: tester.model.clone(),
                 };
                 let suite_ok = executor::run_slot(state, paths, cfg, &suite_job).is_ok();
                 suite_body = std::fs::read_to_string(&suite_path).unwrap_or_else(|_| {
@@ -543,6 +600,7 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
                 template: "reviewer".into(),
                 extra_vars: extra,
                 expected_artifact: Some(format!("review-{}.md", rev.id)),
+            model: None,
             };
             let mut review_ok = executor::run_slot(state, paths, cfg, &job).is_ok();
             if !review_ok {

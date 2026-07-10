@@ -37,3 +37,21 @@ timeout_secs = 7200
 enabled = true
 # provider = "cli:agy"      # optional; prefer a third provider ≠ planner/critic
 timeout_secs = 1800
+
+# Dynamic model select from vals.ai (opt-in via --select). See `spar model list|pick|refresh`.
+[model_select]
+# source = "vals"
+# Multiple benches → metrics averaged for shared model ids (primary = first).
+# benches = ["swebench", "terminal-bench-2-1"]
+# cache_ttl_secs = 86400
+# allow = ["cli:*", "api:openai", "api:xai"]
+# [model_select.profiles.value]
+# quality = 0.6
+# cost = 0.8
+# speed = 0.3
+# min_accuracy = 70
+# [model_select.roles]
+# planner = "best"
+# implementer = "value"
+# reviewer = "value"
+# tester = "fast"

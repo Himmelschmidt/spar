@@ -30,8 +30,9 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     state.backend = opts.backend;
     state.isolation = cfg.isolation;
     state.dry_run = dry;
-    let requested = opts.require_providers()?;
-    state.providers = providers::pick_providers(requested, n, Some(requested), dry);
+    let roles: Vec<&str> = (0..n).map(|_| "implementer").collect();
+    let requested = opts.resolve_fleet(n, &roles, paths, cfg, &state.id)?;
+    state.providers = providers::pick_providers(&requested, n, Some(&requested), dry);
     if !dry {
         match crate::quota::apply_quota_filter(paths, &state.providers) {
             Ok(p) => state.providers = p,
@@ -172,6 +173,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
                     template: "implementer".into(),
                     extra_vars: HashMap::new(),
                     expected_artifact: Some(format!("summary-{}.md", slot.id)),
+                model: None,
                 };
                 if let Err(e) = executor::run_slot(state, paths, cfg, &job) {
                     if let Some(s) = state.slot_mut(&slot.id) {
@@ -210,6 +212,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
             template: "ranker".into(),
             extra_vars: extra,
             expected_artifact: Some("ranking.md".into()),
+        model: None,
         };
         let _ = executor::run_slot(state, paths, cfg, &job);
     }
@@ -345,6 +348,7 @@ pub fn reconcile(
         template: "reconciler".into(),
         extra_vars: extra,
         expected_artifact: Some("summary-reconcile.md".into()),
+    model: None,
     };
     if let Err(e) = executor::run_slot(&mut state, paths, cfg, &job) {
         state.set_phase(Phase::Failed);
@@ -382,6 +386,7 @@ pub fn reconcile(
             template: "reviewer".into(),
             extra_vars: extra,
             expected_artifact: Some(format!("review-reconcile-{i}.md")),
+        model: None,
         };
         if let Err(e) = executor::run_slot(&mut state, paths, cfg, &job) {
             state.set_phase(Phase::Failed);

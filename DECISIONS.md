@@ -12,6 +12,7 @@ Project-level product and architecture decisions. Status: `OPEN` | `LEANING` | `
 | P3 | Discovery via **built-in skills + AGENTS.md** (agent-browser pattern) | DECIDED |
 | P4 | Dual execution: **native-cli** + **api-sdk**, one orchestrator | DECIDED |
 | P5 | First-class **swarm bus** (A2A), not dumb mailbox only | DECIDED |
+| P6 | **Dynamic model select** (vals benchmarks + prefs/urgency) is a first-class product path alongside explicit `--providers` | DECIDED — see MS* |
 
 ## Orchestration
 
@@ -33,6 +34,28 @@ Project-level product and architecture decisions. Status: `OPEN` | `LEANING` | `
 | O14 | **Suite channel** (implement/loop): dedicated cheap `tester` slot runs full suites; impl/review smoke/diff-only when suite ran; long `suite.timeout_secs`; salvage partial review/suite artifacts on timeout; fail closed if enabled but no tester/provider. Independent `review` workflow may still run its own tests (no suite slot by default) | DECIDED |
 | O15 | **Spec / test-author** (plan flow): after planner+critic write `plan.md`, a separate `TestAuthor` slot freezes acceptance tests **before** coding and before the plan gate. Not planner, not critic, not suite `tester`. **Artifact-first** (plan + critique); bus is audit trail (no live multi-turn with finished planner/critic). Outputs `artifacts/test-contract.md` + tests in worktree; implement **always overlays** author working tree into impl (plus best-effort branch merge; abort on conflict). Fail closed if author fails, contract missing, or apply fails when TestAuthor ran. Config `[spec]` (`enabled` default true, optional `provider`, `timeout_secs`). Human gate is plan + contract | DECIDED |
 
+## Model select (vals-backed)
+
+Opt-in path: resolve fleet slots from benchmark data + user profiles + per-run urgency, instead of only manual `--providers`. Explicit `--providers` remains valid and default-required until select is opted in.
+
+| ID | Decision | Status |
+|----|----------|--------|
+| MS0 | Data source: **vals.ai** coding benches; abstract behind `BenchmarkSource` so an official API can replace HTML scrape later | DECIDED |
+| MS1 | Per-model fields used: **accuracy**, **latency**, **cost_per_test** (from vals payload) | DECIDED |
+| MS2 | Phase A primary bench: **SWE-bench Verified** only; later optional blend (Terminal-Bench, LiveCodeBench, Vibe Code, Vals Index) | DECIDED |
+| MS3 | Selection is **opt-in**: keep `--providers` required unless `--select <profile>` and/or `[model_select]` enables auto | DECIDED |
+| MS4 | Named **profiles** in config (`best` / `value` / `fast` or custom) with weights for quality / cost / speed + optional `min_accuracy` | DECIDED |
+| MS5 | **Urgency** is a per-run multiplier on the chosen profile (high → speed↑ cost↓; low → cost↑), not a separate parallel system | DECIDED |
+| MS6 | Score: normalize metrics in candidate set; `score = w_q·acc − w_c·cost − w_s·latency`; apply floors/allowlists before rank | DECIDED |
+| MS7 | **CLI economics**: treat `cli:*` cost as **0** for scoring (flat sub); do not use vals $ against subscription CLIs | DECIDED |
+| MS8 | Resolve to **assignable slots** (`ProviderRef` + optional model), not abstract model names only; filter by doctor-available backends | DECIDED |
+| MS9 | Multi-slot fleets (plan/arena/review ≥2): prefer **provider-family diversity**, then next-best score | DECIDED |
+| MS10 | Always write **`artifacts/model-select.json`** (candidates, weights, urgency, winners, why) into the run | DECIDED |
+| MS11 | Cache: `~/.spar/cache/vals/…` + TTL; `spar model refresh`; stale cache usable within grace window; fail closed with clear error if no cache and fetch fails | DECIDED |
+| MS12 | Role defaults in config (`planner`/`implementer`/`reviewer`/`tester`/`critic` → profile names); suite `tester` defaults toward **fast/value** | DECIDED |
+| MS13 | CLI surface: `spar model list|pick|refresh`; doctor reports cache age | DECIDED |
+| MS14 | Ship phases: **A** cache+parser+list/pick · **B** `--select` into plan/implement · **C** roles/urgency/diversity · **D** per-adapter CLI model flags + richer vals→spar map | DECIDED |
+
 ## Open
 
 | ID | Topic | Status |
@@ -41,3 +64,5 @@ Project-level product and architecture decisions. Status: `OPEN` | `LEANING` | `
 | X2 | TUI keymap / layout (mimic which product most?) | LEANING — j/k Tab a/r/s /commands (M1 shell) |
 | X3 | Project template overrides day one vs later | OPEN |
 | X4 | Bus steer reliability for native-cli headless | OPEN — inbox + best-effort; full inject later |
+| X5 | vals scrape parser brittleness / grace TTL days / ship in-repo snapshot | OPEN — decide at MS phase A impl |
+| X6 | Exact vals model id → `cli:`/`api:` + model string mapping table | OPEN — phase A/B |

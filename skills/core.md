@@ -9,6 +9,7 @@ spar skills list
 spar skills get core
 spar doctor [--json]
 spar provider list [--json]
+spar model list|pick|refresh|cache [--json]
 ```
 
 ## Default surfaces
@@ -35,11 +36,18 @@ API keys: `OPENAI_API_KEY`, `XAI_API_KEY`, optional `OPENAI_BASE_URL` / `XAI_BAS
 
 ## Workflows
 
-**`--providers` is required** for `plan`, `implement`, and `run` (no silent default fleet).
+**`--providers` or `--select`** is required for `plan`, `implement`, and `run` (no silent default fleet).
 
 ```bash
 # Plan (ends HumanGate / awaiting_plan_approval unless autonomy auto-approves)
 spar plan -t "describe the work" --providers cli:claude,cli:grok [--big] [--dry-run] [--json] [--detach]
+
+# Or resolve fleet from vals.ai benchmarks + prefs (see [model_select] in spar.toml)
+spar model refresh
+spar model list --profile value
+spar model pick --role implementer --urgency high --json
+spar plan -t "…" --select value --urgency low --dry-run
+spar plan -t "…" --select auto --urgency high --dry-run
 
 spar approve <run_id> [--json]
 spar reject <run_id> [--reason "..."] [--json]
@@ -47,11 +55,13 @@ spar reject <run_id> [--reason "..."] [--json]
 # Implement continues THE SAME run id (plan → implement → ship)
 spar implement --run <run_id> --providers cli:claude,cli:grok,cli:agy [--dry-run] [--json] [--detach]
 spar implement -t "small task" --providers cli:claude [--dry-run]
+spar implement -t "small task" --select value --urgency high --dry-run
 
 # Named workflows
 spar run --workflow loop|arena|roles|peer|review -t "..." --providers cli:claude,cli:grok [--dry-run] [--big]
+spar run --workflow arena -t "..." --select best --urgency normal --dry-run
 
-# Independent concurrent multi-review (not peer/split-stack):
+# Independent concurrent multi-provider review (not split-stack peer):
 spar run --workflow review -t "Review PR #12 for auth bugs" --providers cli:claude,cli:grok
 
 spar confirm <run_id> [--winner <slot>]   # arena winner
@@ -132,6 +142,16 @@ timeout_secs = 7200
 enabled = true
 # provider = "cli:agy"      # prefer third provider ≠ planner/critic
 timeout_secs = 1800
+# Dynamic model select (vals). Opt-in with --select; cache under ~/.spar/cache/vals/
+[model_select]
+# benches = ["swebench"]
+# cache_ttl_secs = 86400
+# allow = ["cli:*", "api:openai", "api:xai"]
+# [model_select.profiles.value]
+# quality = 0.6
+# cost = 0.8
+# speed = 0.3
+# min_accuracy = 70
 ```
 
 ## Rules of the road

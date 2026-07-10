@@ -153,6 +153,7 @@ mod tests {
             exit_code: None,
             artifact: None,
             usage: None,
+            model: None,
         }
     }
 

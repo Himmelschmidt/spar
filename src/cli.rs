@@ -36,9 +36,15 @@ pub enum Command {
     Plan {
         #[arg(long, short = 't')]
         task: String,
-        /// Required: comma-separated `cli:…` or `api:…` (e.g. cli:claude,api:openai)
-        #[arg(long, value_delimiter = ',', required = true)]
+        /// Comma-separated `cli:…` or `api:…` (required unless `--select`)
+        #[arg(long, value_delimiter = ',')]
         providers: Vec<String>,
+        /// Resolve fleet from vals benchmarks + profile (`value`, `best`, `fast`, `auto`, or list)
+        #[arg(long, value_delimiter = ',')]
+        select: Vec<String>,
+        /// Urgency for `--select`: low | normal | high | critical
+        #[arg(long, default_value = "normal")]
+        urgency: String,
         #[arg(long)]
         detach: bool,
         #[arg(long)]
@@ -86,9 +92,14 @@ pub enum Command {
         /// Stub agents only; still writes `.spar/` state. Does **not** create real git worktrees.
         #[arg(long)]
         dry_run: bool,
-        /// Required: comma-separated `cli:…` or `api:…`
-        #[arg(long, value_delimiter = ',', required = true)]
+        /// Comma-separated `cli:…` or `api:…` (required unless `--select`)
+        #[arg(long, value_delimiter = ',')]
         providers: Vec<String>,
+        /// Resolve fleet from vals benchmarks + profile
+        #[arg(long, value_delimiter = ',')]
+        select: Vec<String>,
+        #[arg(long, default_value = "normal")]
+        urgency: String,
         #[arg(long)]
         big: bool,
     },
@@ -107,9 +118,14 @@ pub enum Command {
         backend: Backend,
         #[arg(long)]
         dry_run: bool,
-        /// Required: comma-separated `cli:…` or `api:…`
-        #[arg(long, value_delimiter = ',', required = true)]
+        /// Comma-separated `cli:…` or `api:…` (required unless `--select`)
+        #[arg(long, value_delimiter = ',')]
         providers: Vec<String>,
+        /// Resolve fleet from vals benchmarks + profile
+        #[arg(long, value_delimiter = ',')]
+        select: Vec<String>,
+        #[arg(long, default_value = "normal")]
+        urgency: String,
         #[arg(long)]
         big: bool,
     },
@@ -155,6 +171,12 @@ pub enum Command {
     Provider {
         #[command(subcommand)]
         action: ProviderAction,
+    },
+
+    /// Dynamic model select (vals benchmarks + profiles)
+    Model {
+        #[command(subcommand)]
+        action: ModelAction,
     },
 
     /// Ship (push/PR) after human confirm
@@ -283,6 +305,49 @@ pub enum ProviderAction {
     },
     Resume {
         name: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ModelAction {
+    /// List ranked models for a profile
+    List {
+        #[arg(long)]
+        bench: Option<String>,
+        #[arg(long, default_value = "value")]
+        profile: String,
+        #[arg(long, default_value = "normal")]
+        urgency: String,
+        #[arg(long)]
+        json: bool,
+        /// Only models whose mapped provider is usable now
+        #[arg(long)]
+        usable: bool,
+    },
+    /// Pick best model(s) for a role/profile
+    Pick {
+        #[arg(long, default_value = "implementer")]
+        role: String,
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long, default_value = "normal")]
+        urgency: String,
+        #[arg(long, default_value_t = 1)]
+        count: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fetch vals bench data into cache
+    Refresh {
+        #[arg(long)]
+        bench: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show cache status
+    Cache {
         #[arg(long)]
         json: bool,
     },

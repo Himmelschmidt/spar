@@ -60,6 +60,8 @@ pub struct SpawnOpts {
     pub trust: TrustPolicy,
     /// Extra args appended after provider defaults.
     pub extra_args: Vec<String>,
+    /// Preferred model id (`--model` on CLIs that support it).
+    pub model: Option<String>,
 }
 
 pub trait ProviderAdapter: Send + Sync {

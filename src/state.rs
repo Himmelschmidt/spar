@@ -196,6 +196,9 @@ pub struct SlotState {
     pub artifact: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<SlotUsage>,
+    /// Selected model id (from model-select or explicit); passed to CLI/API spawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

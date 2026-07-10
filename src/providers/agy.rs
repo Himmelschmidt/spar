@@ -52,6 +52,9 @@ impl ProviderAdapter for AgyAdapter {
         for a in self.permission_args(opts.trust) {
             cmd.arg(a);
         }
+        if let Some(m) = &opts.model {
+            cmd.arg("--model").arg(m);
+        }
         for a in &opts.extra_args {
             cmd.arg(a);
         }
@@ -63,6 +66,9 @@ impl ProviderAdapter for AgyAdapter {
         let mut cmd = Command::new(bin);
         for a in self.permission_args(opts.trust) {
             cmd.arg(a);
+        }
+        if let Some(m) = &opts.model {
+            cmd.arg("--model").arg(m);
         }
         if !opts.prompt.is_empty() {
             cmd.arg(&opts.prompt);

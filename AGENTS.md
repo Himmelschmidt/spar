@@ -17,7 +17,7 @@ spar reconcile <run_id>       # arena merge path
 spar run --workflow review -t "…" --providers cli:claude,cli:grok  # concurrent independent review
 ```
 
-**`--providers` is required** on plan/implement/run (`cli:name` or `api:name` only).
+**`--providers` or `--select`** is required on plan/implement/run (`cli:name` / `api:name`, or vals-backed profiles).
 
 **Exit codes:** `0` ok · `1` fail · `2` human gate · `3` stuck · `4` quota  
 

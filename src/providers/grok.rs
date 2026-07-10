@@ -43,6 +43,9 @@ impl ProviderAdapter for GrokAdapter {
         for a in self.permission_args(opts.trust) {
             cmd.arg(a);
         }
+        if let Some(m) = &opts.model {
+            cmd.arg("--model").arg(m);
+        }
         for a in &opts.extra_args {
             cmd.arg(a);
         }
@@ -54,6 +57,9 @@ impl ProviderAdapter for GrokAdapter {
         let mut cmd = Command::new(bin);
         for a in self.permission_args(opts.trust) {
             cmd.arg(a);
+        }
+        if let Some(m) = &opts.model {
+            cmd.arg("--model").arg(m);
         }
         if !opts.prompt.is_empty() {
             cmd.arg(&opts.prompt);
@@ -80,6 +86,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             trust: TrustPolicy::FullAuto,
             extra_args: vec![],
+            model: None,
         };
         let cmd = GrokAdapter.build_headless(Path::new("grok"), &opts);
         let (_, args) = command_to_parts(&cmd);
@@ -102,6 +109,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             trust: TrustPolicy::FullAuto,
             extra_args: vec![],
+        model: None,
         };
         let cmd = GrokAdapter.build_headless(Path::new("grok"), &opts);
         let (_, args) = command_to_parts(&cmd);
