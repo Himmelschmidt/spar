@@ -1234,7 +1234,7 @@ fn draw_action(
     } else if let Some(st) = full {
         match st.phase {
             Phase::AwaitingPlanApproval => (
-                "  Plan ready — press  a  to approve ·  r  to reject · p = all projects  ".into(),
+                "  Plan + tests ready — press  a  to approve ·  r  to reject · p = all projects  ".into(),
                 BG,
                 YELLOW,
             ),

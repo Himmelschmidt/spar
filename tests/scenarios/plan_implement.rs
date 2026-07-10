@@ -173,6 +173,20 @@ fn plan_approve_implement_dry_run() {
         wt_path.contains(".spar") && wt_path.contains("cwd-") && wt_path.contains(impl_id),
         "unexpected dry-run cwd path {wt_path}"
     );
+    // Spec channel: dry-run acceptance stamp must land in implementer cwd.
+    let impl_cwd = state["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["role"] == "implementer")
+        .and_then(|s| s["cwd"].as_str())
+        .expect("implementer cwd");
+    assert!(
+        std::path::Path::new(impl_cwd)
+            .join(".spar-dry-acceptance-tests")
+            .is_file(),
+        "acceptance tests should be overlaid into implementer cwd {impl_cwd}"
+    );
 
     assert_eq!(primary_branch(tmp.path()), branch_before);
 
@@ -206,6 +220,47 @@ fn plan_approve_implement_dry_run() {
     assert!(
         !runs.is_dir() || std::fs::read_dir(&runs).unwrap().next().is_some(),
         "empty .spar/runs should be removed"
+    );
+}
+
+#[test]
+fn plan_spec_disabled_skips_test_author() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    std::fs::write(
+        tmp.path().join("spar.toml"),
+        "[spec]\nenabled = false\n",
+    )
+    .unwrap();
+    let out = cargo_bin_cmd!("spar")
+        .current_dir(tmp.path())
+        .args([
+            "plan",
+            "--task",
+            "no spec",
+            "--providers",
+            "cli:claude,cli:grok",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let run_id = v["run_id"].as_str().unwrap();
+    let slots = v["slots"].as_array().unwrap();
+    assert!(
+        slots.iter().all(|s| s["role"] != "test_author"),
+        "no test_author when spec disabled: {slots:?}"
+    );
+    assert!(
+        !tmp.path()
+            .join(".spar/runs")
+            .join(run_id)
+            .join("artifacts/test-contract.md")
+            .is_file()
     );
 }
 

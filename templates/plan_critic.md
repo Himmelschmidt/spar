@@ -17,4 +17,3 @@ Review the draft plan and tighten it.
 - Call out scenarios a later **test-author** must cover (you do not write those tests)
 
 If the plan is weak, rewrite an improved plan.md in place after your critique.
-Watch the swarm bus for test-author questions if you are still active.

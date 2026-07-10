@@ -357,17 +357,25 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
         })
     };
 
-    // Merge pre-coding acceptance tests from test-author worktree once at start.
+    // Bring pre-coding acceptance tests into implementer cwd (fail closed if author ran).
     if let Some(author) = state
         .slots
         .iter()
         .find(|s| s.role == SlotRole::TestAuthor)
         .map(|s| s.id.clone())
     {
-        if let Some(impl_slot) = state.slots.iter().find(|s| s.role == SlotRole::Implementer) {
-            if let Some(cwd) = impl_slot.cwd.clone() {
-                let _ = worktree::apply_spec_tests_to_impl(state, &author, &cwd);
-            }
+        let impl_cwd = state
+            .slots
+            .iter()
+            .find(|s| s.role == SlotRole::Implementer)
+            .and_then(|s| s.cwd.clone())
+            .ok_or_else(|| anyhow::anyhow!("implementer cwd missing; cannot apply acceptance tests"))?;
+        if let Err(e) = worktree::apply_spec_tests_to_impl(state, &author, &impl_cwd) {
+            return fail(
+                state,
+                paths,
+                anyhow::anyhow!("failed to apply acceptance tests from {author}: {e}"),
+            );
         }
     }
 

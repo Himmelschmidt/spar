@@ -179,7 +179,14 @@ pub fn execute_plan(
     }
 
     if cfg.spec.enabled {
-        run_test_author(state, paths, cfg)?;
+        if let Err(e) = run_test_author(state, paths, cfg) {
+            if state.phase != Phase::Failed {
+                state.set_phase(Phase::Failed);
+                state.error = Some(e.to_string());
+                let _ = state.save(paths);
+            }
+            return Err(e);
+        }
     }
 
     if cfg.auto_plan() {
@@ -228,10 +235,10 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
             .slots
             .push(executor::init_slot(&id, &provider, SlotRole::TestAuthor));
     }
+    worktree::prepare_isolation(state, paths, std::slice::from_ref(&id))?;
+    // After isolation so status/TUI show Spec for the author wall-clock, not PrepareIsolation.
     state.set_phase(Phase::Spec);
     state.save(paths)?;
-
-    worktree::prepare_isolation(state, paths, std::slice::from_ref(&id))?;
 
     let _ = bus::join(paths, &state.id, &id, Some(&provider), None);
     seed_spec_bus(state, paths, &id, &planner_slot, &critic_slot)?;
@@ -343,7 +350,10 @@ fn resolve_spec_provider(
     if let Some(p) = &cfg.spec.provider {
         crate::provider_ref::ProviderRef::parse(p)
             .map_err(|e| anyhow::anyhow!("invalid spec.provider {p:?}: {e}"))?;
-        return Ok(p.clone());
+        if dry || providers::is_provider_usable(p, false) {
+            return Ok(p.clone());
+        }
+        // Fall through to fleet if override is unusable (missing CLI / paused).
     }
     if dry {
         if let Some(p) = fleet.iter().find(|p| !used.contains(p)) {
@@ -391,7 +401,7 @@ pub fn approve(paths: &SparPaths, run_id: &str, json: bool) -> Result<ExitCode> 
     if json {
         executor::emit_run_json(&state)?;
     } else {
-        println!("approved plan for run {run_id}");
+        println!("approved plan (+ acceptance contract if present) for run {run_id}");
         println!("next: spar implement --run {run_id}  (same run id)");
     }
     let _ = bus::broadcast(
