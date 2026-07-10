@@ -187,6 +187,23 @@ struct App {
     rect_bus: Rect,
     rect_composer: Rect,
     rect_runs: Rect,
+    /// Narrow-mode tab strip (zero-sized when the wide layout is active).
+    rect_tabs: Rect,
+    /// One-shot: on first narrow render with an active run, jump focus to the log.
+    narrow_autofocus_done: bool,
+    /// Tappable gate buttons painted this frame, for touch/mouse hit-testing.
+    gate_buttons: Vec<(Rect, GateAction)>,
+    /// Tappable footer tokens.
+    rect_help: Rect,
+    rect_projects: Rect,
+}
+
+/// A gate action reachable by both a key and a tappable button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateAction {
+    Approve,
+    Reject,
+    Ship,
 }
 
 /// Avoid re-reading the slot log on every frame when the file is unchanged.
@@ -277,6 +294,11 @@ impl App {
             rect_bus: Rect::default(),
             rect_composer: Rect::default(),
             rect_runs: Rect::default(),
+            rect_tabs: Rect::default(),
+            narrow_autofocus_done: false,
+            gate_buttons: Vec::new(),
+            rect_help: Rect::default(),
+            rect_projects: Rect::default(),
         }
     }
 
@@ -726,10 +748,12 @@ fn run_loop(
                         Event::Mouse(m) => handle_mouse(
                             &mut app,
                             m,
+                            &snap.swarm,
                             &snap.projects,
                             &snap.runs,
                             snap.full.as_ref(),
                             &mut active_root,
+                            local_root.as_deref(),
                             rail_state.offset(),
                             fleet_state.offset(),
                         ),
@@ -1007,26 +1031,17 @@ fn handle_key(
         }
         KeyCode::Char('a') => {
             if let Some(id) = selected_id {
-                match workflow::plan::approve(swarm, id, false) {
-                    Ok(_) => app.flash(format!("Approved plan {id}"), GREEN),
-                    Err(e) => app.flash(format!("Approve failed: {e:#}"), RED),
-                }
+                run_gate_action(app, swarm, id, GateAction::Approve);
             }
         }
         KeyCode::Char('r') => {
             if let Some(id) = selected_id {
-                match workflow::plan::reject(swarm, id, None, false) {
-                    Ok(_) => app.flash(format!("Rejected plan {id}"), YELLOW),
-                    Err(e) => app.flash(format!("Reject failed: {e:#}"), RED),
-                }
+                run_gate_action(app, swarm, id, GateAction::Reject);
             }
         }
         KeyCode::Char('s') => {
             if let Some(id) = selected_id {
-                match crate::ship::confirm_ship(swarm, id, false) {
-                    Ok(_) => app.flash(format!("Ship confirmed {id}"), GREEN),
-                    Err(e) => app.flash(format!("Ship failed: {e:#}"), RED),
-                }
+                run_gate_action(app, swarm, id, GateAction::Ship);
             }
         }
         KeyCode::Char('g') | KeyCode::Home => {
@@ -1055,14 +1070,54 @@ fn handle_key(
     Ok(false)
 }
 
+/// Run a gate action from a key or a tapped button — one path for both.
+fn run_gate_action(app: &mut App, swarm: &SparPaths, id: &str, action: GateAction) {
+    let res = match action {
+        GateAction::Approve => workflow::plan::approve(swarm, id, false)
+            .map(|_| (format!("Approved plan {id}"), GREEN)),
+        GateAction::Reject => workflow::plan::reject(swarm, id, None, false)
+            .map(|_| (format!("Rejected plan {id}"), YELLOW)),
+        GateAction::Ship => crate::ship::confirm_ship(swarm, id, false)
+            .map(|_| (format!("Ship confirmed {id}"), GREEN)),
+    };
+    match res {
+        Ok((msg, color)) => app.flash(msg, color),
+        Err(e) => app.flash(format!("{} failed: {e:#}", action.verb()), RED),
+    }
+}
+
+/// Gate buttons for the current phase, in display order (label, action).
+fn gate_buttons_for(full: Option<&RunState>) -> Vec<(&'static str, GateAction)> {
+    match full.map(|s| s.phase) {
+        Some(Phase::AwaitingPlanApproval) => vec![
+            ("Approve", GateAction::Approve),
+            ("Reject", GateAction::Reject),
+        ],
+        Some(Phase::AwaitingShipConfirm) => vec![("Ship", GateAction::Ship)],
+        _ => Vec::new(),
+    }
+}
+
+impl GateAction {
+    fn verb(self) -> &'static str {
+        match self {
+            GateAction::Approve => "Approve",
+            GateAction::Reject => "Reject",
+            GateAction::Ship => "Ship",
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_mouse(
     app: &mut App,
     m: crossterm::event::MouseEvent,
+    swarm: &SparPaths,
     projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
     active_root: &mut PathBuf,
+    local_root: Option<&Path>,
     rail_offset: usize,
     fleet_offset: usize,
 ) {
@@ -1078,7 +1133,38 @@ fn handle_mouse(
                 .unwrap_or(false);
             app.last_click = Some((x, y, now));
 
-            if contains(app.rect_composer, x, y) {
+            // A tap anywhere dismisses the help overlay first.
+            if app.show_help {
+                app.show_help = false;
+                return;
+            }
+            // Tappable gate buttons take priority — they sit on the status/action bar.
+            if let Some(&(_, action)) = app.gate_buttons.iter().find(|(r, _)| contains(*r, x, y)) {
+                if let Some(id) = runs.get(app.selected_run).map(|r| r.id.as_str()) {
+                    run_gate_action(app, swarm, id, action);
+                }
+                return;
+            }
+            if contains(app.rect_help, x, y) {
+                app.show_help = true;
+                return;
+            }
+            if contains(app.rect_projects, x, y) {
+                app.open_projects_view();
+                if let Some(root) = local_root {
+                    if let Some(i) = projects.iter().position(|p| p.root == root) {
+                        app.selected_project = i;
+                    }
+                }
+                return;
+            }
+
+            if contains(app.rect_tabs, x, y) {
+                let n = NARROW_TABS.len() as u16;
+                let cell = (app.rect_tabs.width / n).max(1);
+                let idx = ((x - app.rect_tabs.x) / cell).min(n - 1) as usize;
+                app.focus = NARROW_TABS[idx].0;
+            } else if contains(app.rect_composer, x, y) {
                 app.focus = Focus::Composer;
             } else if contains(app.rect_stream, x, y) {
                 app.focus = Focus::Log;
@@ -1207,9 +1293,54 @@ struct LayoutRects {
     bus: Rect,
     composer: Rect,
     footer: Rect,
+    /// Narrow-mode tab strip; zero-sized in the wide layout.
+    tabs: Rect,
+    /// True when the single-panel phone layout is active.
+    narrow: bool,
 }
 
-fn layout_rects(area: Rect) -> LayoutRects {
+/// Below this terminal width the 3-column layout collapses to one focused
+/// panel at a time with a tab strip — usable over a phone/Termux SSH session.
+const NARROW_WIDTH: u16 = 90;
+
+fn layout_rects(area: Rect, focus: Focus) -> LayoutRects {
+    if area.width < NARROW_WIDTH {
+        // Header + action collapse into a single status row; one panel fills the
+        // stage, a tab strip picks which. Off-screen panels get zero rects so
+        // both painting and mouse hit-testing skip them.
+        let nroot = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // status bar (header + action merged)
+                Constraint::Length(1), // tab strip
+                Constraint::Min(4),    // focused panel
+                Constraint::Length(4), // command
+                Constraint::Length(1), // footer
+            ])
+            .split(area);
+        let z = Rect::default();
+        let mut lay = LayoutRects {
+            header: nroot[0],
+            action: z,
+            runs: z,
+            fleet: z,
+            stream: z,
+            bus: z,
+            composer: nroot[3],
+            footer: nroot[4],
+            tabs: nroot[1],
+            narrow: true,
+        };
+        // Composer focus keeps the live log on stage so you can watch while typing.
+        match focus {
+            Focus::Runs => lay.runs = nroot[2],
+            Focus::Agents => lay.fleet = nroot[2],
+            Focus::Log | Focus::Composer => lay.stream = nroot[2],
+            Focus::Activity => lay.bus = nroot[2],
+        }
+        return lay;
+    }
+
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1245,8 +1376,18 @@ fn layout_rects(area: Rect) -> LayoutRects {
         bus: mid[2],
         composer: root[3],
         footer: root[4],
+        tabs: Rect::default(),
+        narrow: false,
     }
 }
+
+/// Narrow-mode tabs, in cycle order, each mapped to the focus it selects.
+const NARROW_TABS: [(Focus, &str); 4] = [
+    (Focus::Runs, "Runs"),
+    (Focus::Agents, "Agents"),
+    (Focus::Log, "Log"),
+    (Focus::Activity, "Activity"),
+];
 
 #[allow(clippy::too_many_arguments)]
 fn draw(
@@ -1266,7 +1407,21 @@ fn draw(
     f.render_widget(Clear, area);
     f.render_widget(Block::default().style(Style::default().bg(BG)), area);
 
-    let lay = layout_rects(area);
+    // On the first narrow render with an active run, land on the live log so a
+    // phone glance shows progress — but only once, and never over a manual Tab.
+    if area.width < NARROW_WIDTH && !app.narrow_autofocus_done {
+        let active = full.map(|s| {
+            is_active_phase(s.phase) || s.slots.iter().any(|sl| sl.status == SlotStatus::Running)
+        });
+        if active == Some(true) {
+            if app.focus == Focus::Runs {
+                app.focus = Focus::Log;
+            }
+            app.narrow_autofocus_done = true;
+        }
+    }
+
+    let lay = layout_rects(area, app.focus);
     // Keep mouse hit regions aligned with the frame actually painted.
     app.rect_header = lay.header;
     app.rect_action = lay.action;
@@ -1275,19 +1430,64 @@ fn draw(
     app.rect_stream = lay.stream;
     app.rect_bus = lay.bus;
     app.rect_composer = lay.composer;
+    app.rect_tabs = lay.tabs;
+    // Rebuilt below by whichever bar/footer paints this frame.
+    app.gate_buttons.clear();
 
-    draw_header(f, lay.header, swarm, full, app);
-    draw_action(f, lay.action, projects, runs, full, app);
-    draw_rail(f, lay.runs, projects, runs, app, rail_state);
-    draw_agents(f, lay.fleet, full, app, fleet_state);
-    draw_stream(f, lay.stream, full, stream_text, app);
-    draw_activity(f, lay.bus, activity, app);
+    if lay.narrow {
+        draw_status_bar(f, lay.header, swarm, full, app, projects, runs);
+        draw_tabs(f, lay.tabs, app);
+        // Only the focused panel is on stage; its rect is non-zero, the rest zero.
+        match app.focus {
+            Focus::Runs => draw_rail(f, lay.runs, projects, runs, app, rail_state),
+            Focus::Agents => draw_agents(f, lay.fleet, full, app, fleet_state),
+            Focus::Log | Focus::Composer => draw_stream(f, lay.stream, full, stream_text, app),
+            Focus::Activity => draw_activity(f, lay.bus, activity, app),
+        }
+    } else {
+        draw_header(f, lay.header, swarm, full, app);
+        draw_action(f, lay.action, projects, runs, full, app);
+        draw_rail(f, lay.runs, projects, runs, app, rail_state);
+        draw_agents(f, lay.fleet, full, app, fleet_state);
+        draw_stream(f, lay.stream, full, stream_text, app);
+        draw_activity(f, lay.bus, activity, app);
+    }
     draw_composer(f, lay.composer, app);
     draw_footer(f, lay.footer, app, full);
 
     if app.show_help {
         draw_help_overlay(f, area);
     }
+}
+
+/// One-row tab strip for the narrow layout: four equal cells, focused one lit.
+fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let n = NARROW_TABS.len() as u16;
+    let cell = area.width / n;
+    let mut spans: Vec<Span> = Vec::with_capacity(NARROW_TABS.len());
+    for (i, (focus, label)) in NARROW_TABS.iter().enumerate() {
+        // Composer focus visually maps to the Log tab (that's what's on stage).
+        let on = app.focus == *focus || (app.focus == Focus::Composer && *focus == Focus::Log);
+        let w = if i as u16 == n - 1 {
+            area.width.saturating_sub(cell * (n - 1))
+        } else {
+            cell
+        } as usize;
+        let text = format!("{label:^w$}");
+        let style = if on {
+            Style::default().fg(BG).bg(ACCENT).bold()
+        } else {
+            Style::default().fg(FG_MUTED).bg(BG_RAISED)
+        };
+        spans.push(Span::styled(text, style));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(BG_RAISED)),
+        area,
+    );
 }
 
 fn draw_header(f: &mut Frame, area: Rect, swarm: &SparPaths, full: Option<&RunState>, app: &App) {
@@ -1361,15 +1561,15 @@ fn draw_header(f: &mut Frame, area: Rect, swarm: &SparPaths, full: Option<&RunSt
     f.render_widget(Paragraph::new(right).alignment(Alignment::Right), chunks[1]);
 }
 
-fn draw_action(
-    f: &mut Frame,
-    area: Rect,
+/// The action/context banner text and its colors. `bg != BG_RAISED` means an
+/// alert state (gate, quota, failure) worth surfacing loudly.
+fn action_content(
     projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
     app: &App,
-) {
-    let (text, fg, bg) = if app.browse == BrowseLevel::Projects {
+) -> (String, Color, Color) {
+    if app.browse == BrowseLevel::Projects {
         if projects.is_empty() {
             (
                 format!(
@@ -1458,13 +1658,140 @@ fn draw_action(
             FG_MUTED,
             BG_RAISED,
         )
-    };
+    }
+}
 
+fn button_style(action: GateAction) -> Style {
+    let bg = match action {
+        GateAction::Approve | GateAction::Ship => GREEN,
+        GateAction::Reject => RED,
+    };
+    Style::default().fg(BG).bg(bg).bold()
+}
+
+/// Paint right-aligned tappable gate buttons on the top row of `area` and record
+/// their hit-rects. Buttons overpaint whatever text sits beneath them.
+fn render_gate_buttons(f: &mut Frame, area: Rect, app: &mut App, buttons: &[(&str, GateAction)]) {
+    if buttons.is_empty() || area.width == 0 || area.height == 0 {
+        return;
+    }
+    let labels: Vec<String> = buttons.iter().map(|(l, _)| format!(" {l} ")).collect();
+    let gap: u16 = 1;
+    let widths: Vec<u16> = labels.iter().map(|s| s.chars().count() as u16).collect();
+    let total: u16 = widths.iter().sum::<u16>() + gap * (buttons.len() as u16 - 1);
+    let mut cx = area.x + area.width.saturating_sub(total + 1); // 1-col right margin
+    cx = cx.max(area.x);
+    for (i, ((_, action), w)) in buttons.iter().zip(widths.iter()).enumerate() {
+        let r = Rect {
+            x: cx,
+            y: area.y,
+            width: *w,
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(labels[i].clone(), button_style(*action))),
+            r,
+        );
+        app.gate_buttons.push((r, *action));
+        cx = cx.saturating_add(*w + gap);
+    }
+}
+
+fn draw_action(
+    f: &mut Frame,
+    area: Rect,
+    projects: &[registry::ProjectEntry],
+    runs: &[state::RunSummary],
+    full: Option<&RunState>,
+    app: &mut App,
+) {
+    let (text, fg, bg) = action_content(projects, runs, full, app);
+    let buttons = gate_buttons_for(full);
+    // Buttons carry the action, so keep the prompt short and let them sit on the right.
+    let text = if buttons.is_empty() {
+        text
+    } else {
+        format!("  {}  ", full.map(|s| phase_label(s.phase)).unwrap_or_default())
+    };
     f.render_widget(
         Paragraph::new(Span::styled(text, Style::default().fg(fg).bg(bg).bold()))
             .style(Style::default().bg(bg)),
         area,
     );
+    render_gate_buttons(f, area, app, &buttons);
+}
+
+/// Narrow-mode one-row status bar: header essence (project · run · phase) merged
+/// with the action banner. Turns the whole row into the alert color on a gate.
+fn draw_status_bar(
+    f: &mut Frame,
+    area: Rect,
+    swarm: &SparPaths,
+    full: Option<&RunState>,
+    app: &mut App,
+    projects: &[registry::ProjectEntry],
+    runs: &[state::RunSummary],
+) {
+    let (act_text, act_fg, act_bg) = action_content(projects, runs, full, app);
+    let buttons = gate_buttons_for(full);
+    let alert = act_bg != BG_RAISED;
+    let bg = if alert { act_bg } else { BG_RAISED };
+
+    let project = swarm
+        .project_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(".");
+    let (run, phase, phase_col, active) = match full {
+        Some(st) => (
+            st.id.as_str(),
+            phase_label(st.phase),
+            phase_color(st.phase),
+            is_active_phase(st.phase),
+        ),
+        None => ("—", "No run".into(), FG_DIM, false),
+    };
+
+    let mut spans = Vec::new();
+    if alert {
+        // The whole bar is the alert; lead with the run id, then the cue. When
+        // tappable buttons are shown they carry the action, so keep the cue short.
+        spans.push(Span::styled(
+            format!(" {run}  "),
+            Style::default().fg(BG).bg(bg).bold(),
+        ));
+        let cue = if buttons.is_empty() {
+            act_text.trim().to_string()
+        } else {
+            phase.clone()
+        };
+        spans.push(Span::styled(cue, Style::default().fg(act_fg).bg(bg).bold()));
+    } else {
+        spans.push(Span::styled(
+            format!(" {} ", truncate(project, 12)),
+            Style::default().fg(FG).bg(bg).bold(),
+        ));
+        spans.push(Span::styled(
+            format!("· {run} "),
+            Style::default().fg(CYAN).bg(bg),
+        ));
+        if active {
+            spans.push(Span::styled(
+                format!("{} ", app.spinner()),
+                Style::default().fg(phase_col).bg(bg),
+            ));
+        }
+        spans.push(Span::styled(
+            phase,
+            Style::default().fg(phase_col).bg(bg).bold(),
+        ));
+    }
+
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(bg)),
+        area,
+    );
+    render_gate_buttons(f, area, app, &buttons);
 }
 
 fn draw_rail(
@@ -2309,7 +2636,10 @@ fn draw_composer(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, area);
 }
 
-fn draw_footer(f: &mut Frame, area: Rect, app: &App, full: Option<&RunState>) {
+fn draw_footer(f: &mut Frame, area: Rect, app: &mut App, full: Option<&RunState>) {
+    app.rect_help = Rect::default();
+    app.rect_projects = Rect::default();
+
     let (msg, color) = if let Some((_, m, c, _)) = &app.flash {
         (m.as_str(), *c)
     } else if !app.status_line.is_empty() {
@@ -2325,27 +2655,60 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, full: Option<&RunState>) {
         BG_RAISED
     };
 
-    let left_text = format!(" {msg} ");
-    let right_text = if gate {
-        "  YOUR MOVE  ".to_string()
-    } else {
-        format!(" {}  ? help  ·  Ctrl+C×2 exit  ", app.spinner())
-    };
-    let left = Span::styled(left_text.clone(), Style::default().fg(color).bg(bg));
-    let right = if gate {
-        Span::styled(
-            right_text.clone(),
-            Style::default().fg(BG).bg(YELLOW).bold(),
-        )
-    } else {
-        Span::styled(right_text.clone(), Style::default().fg(FG_MUTED).bg(bg))
-    };
-    let used = (left_text.chars().count() + right_text.chars().count()) as u16;
+    if gate {
+        // At a gate the tappable buttons live on the status/action bar above.
+        let left_text = format!(" {msg} ");
+        let right_text = "  YOUR MOVE  ";
+        let left = Span::styled(left_text.clone(), Style::default().fg(color).bg(bg));
+        let right = Span::styled(right_text, Style::default().fg(BG).bg(YELLOW).bold());
+        let used = (left_text.chars().count() + right_text.chars().count()) as u16;
+        let pad = area.width.saturating_sub(used).max(1) as usize;
+        let line = Line::from(vec![
+            left,
+            Span::styled(" ".repeat(pad), Style::default().bg(bg)),
+            right,
+        ]);
+        f.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), area);
+        return;
+    }
+
+    // Right cluster: spinner + tappable Projects/Help tokens + exit hint.
+    let sp = format!(" {} ", app.spinner());
+    let proj = " Projects ";
+    let help = " Help ";
+    let tail = " Ctrl+C×2 exit ";
+    let right_w = (sp.chars().count() + proj.len() + help.len() + tail.len()) as u16;
+
+    // Keep the tokens on screen by truncating the left hint to what's left.
+    let avail_left = area.width.saturating_sub(right_w + 1).max(1) as usize;
+    let left_text = truncate(&format!(" {msg} "), avail_left);
+    let used = left_text.chars().count() as u16 + right_w;
     let pad = area.width.saturating_sub(used).max(1) as usize;
+
+    let tok_x = area.x + area.width.saturating_sub(right_w);
+    let proj_x = tok_x + sp.chars().count() as u16;
+    let help_x = proj_x + proj.len() as u16;
+    app.rect_projects = Rect {
+        x: proj_x,
+        y: area.y,
+        width: proj.len() as u16,
+        height: 1,
+    };
+    app.rect_help = Rect {
+        x: help_x,
+        y: area.y,
+        width: help.len() as u16,
+        height: 1,
+    };
+
+    let tok = Style::default().fg(BG).bg(ACCENT_SOFT).bold();
     let line = Line::from(vec![
-        left,
+        Span::styled(left_text, Style::default().fg(color).bg(bg)),
         Span::styled(" ".repeat(pad), Style::default().bg(bg)),
-        right,
+        Span::styled(sp, Style::default().fg(FG_MUTED).bg(bg)),
+        Span::styled(proj, tok),
+        Span::styled(help, tok),
+        Span::styled(tail, Style::default().fg(FG_MUTED).bg(bg)),
     ]);
     f.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), area);
 }
@@ -2376,7 +2739,7 @@ fn situational_footer(full: Option<&RunState>, focus: Focus, browse: BrowseLevel
 
 fn draw_help_overlay(f: &mut Frame, area: Rect) {
     let w = area.width.clamp(40, 72);
-    let h = area.height.clamp(14, 22);
+    let h = area.height.clamp(14, 32);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let rect = Rect {
@@ -2389,10 +2752,12 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
     let body = "\
  spar — keyboard & mouse\n\
  \n\
-  Mouse\n\
-    click panel          focus it (border lights up)\n\
-    click a run/agent    select that row\n\
-    scroll wheel         scroll log/messages · step runs/agents\n\
+  Mouse / touch\n\
+    tap panel / tab      focus it (border lights up)\n\
+    tap a run/agent      select that row\n\
+    tap Approve/Reject/Ship   act on a gate (no keys needed)\n\
+    tap Projects / Help  footer shortcuts · tap anywhere closes help\n\
+    scroll / swipe       scroll log/messages · step runs/agents\n\
  \n\
   Keyboard\n\
     Tab / Shift-Tab      next / previous panel\n\
@@ -2412,7 +2777,7 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
   Activity: phase timeline + agent status (not chat).\n\
   Runs: <project>/.spar/runs/ · Index: ~/.spar/registry.json\n\
  \n\
-  Esc or ? to close help";
+  Esc, ?, or tap to close help";
     let p = Paragraph::new(body)
         .style(Style::default().fg(FG).bg(BG_RAISED))
         .block(
@@ -2817,6 +3182,87 @@ mod labels {
         );
         assert_eq!(phase_label(Phase::AwaitingShipConfirm), "Ready to ship");
         assert!(!phase_label(Phase::Suite).contains('_'));
+    }
+
+    #[test]
+    fn wide_layout_shows_all_panels() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 40,
+        };
+        let lay = layout_rects(area, Focus::Log);
+        assert!(!lay.narrow);
+        assert_eq!(lay.tabs, Rect::default());
+        for r in [lay.runs, lay.fleet, lay.stream, lay.bus] {
+            assert!(r.width > 0 && r.height > 0);
+        }
+    }
+
+    #[test]
+    fn narrow_layout_shows_only_focused_panel() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 40,
+        };
+        let lay = layout_rects(area, Focus::Log);
+        assert!(lay.narrow);
+        assert!(lay.tabs.width > 0);
+        assert!(lay.stream.width > 0, "focused log panel is on stage");
+        for hidden in [lay.runs, lay.fleet, lay.bus] {
+            assert_eq!(hidden, Rect::default(), "unfocused panels are zero-sized");
+        }
+        // Composer focus keeps the live log on stage.
+        let composer = layout_rects(area, Focus::Composer);
+        assert!(composer.stream.width > 0);
+        // Runs focus swaps the stage to the rail.
+        let runs = layout_rects(area, Focus::Runs);
+        assert!(runs.runs.width > 0);
+        assert_eq!(runs.stream, Rect::default());
+    }
+
+    #[test]
+    fn gate_phases_map_to_buttons() {
+        use crate::cli::WorkflowKind;
+        let mut st = RunState::new("r1", WorkflowKind::Plan, std::path::PathBuf::from("/x"));
+        assert!(gate_buttons_for(Some(&st)).is_empty());
+        st.phase = Phase::AwaitingPlanApproval;
+        let b = gate_buttons_for(Some(&st));
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[0].1, GateAction::Approve);
+        assert_eq!(b[1].1, GateAction::Reject);
+        st.phase = Phase::AwaitingShipConfirm;
+        let b = gate_buttons_for(Some(&st));
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].1, GateAction::Ship);
+    }
+
+    #[test]
+    fn gate_buttons_render_and_record_hit_rects() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut term = Terminal::new(TestBackend::new(90, 3)).unwrap();
+        let mut app = App::new(None, 300, true);
+        let buttons = vec![
+            ("Approve", GateAction::Approve),
+            ("Reject", GateAction::Reject),
+        ];
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 90,
+            height: 2,
+        };
+        term.draw(|f| render_gate_buttons(f, area, &mut app, &buttons))
+            .unwrap();
+        assert_eq!(app.gate_buttons.len(), 2);
+        // Both buttons sit on the top row, in order, inside the area, right-aligned.
+        assert!(app.gate_buttons.iter().all(|(r, _)| r.y == 0 && r.right() <= 90));
+        assert!(app.gate_buttons[0].0.x < app.gate_buttons[1].0.x);
+        assert_eq!(app.gate_buttons[1].1, GateAction::Reject);
     }
 
     #[test]
