@@ -148,11 +148,7 @@ pub fn read_all(paths: &SparPaths, run_id: &str) -> Result<Vec<Event>> {
 }
 
 /// Follow new events from `offset` byte position. Returns new offset and events.
-pub fn read_from_offset(
-    paths: &SparPaths,
-    run_id: &str,
-    offset: u64,
-) -> Result<(u64, Vec<Event>)> {
+pub fn read_from_offset(paths: &SparPaths, run_id: &str, offset: u64) -> Result<(u64, Vec<Event>)> {
     let path = events_file(paths, run_id);
     if !path.is_file() {
         return Ok((offset, Vec::new()));

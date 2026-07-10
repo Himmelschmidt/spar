@@ -90,6 +90,11 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
 }
 
 pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<()> {
+    if crate::workflow::implement::should_stop(paths, &state.id) {
+        state.set_phase(Phase::Stopped);
+        state.save(paths)?;
+        return Ok(());
+    }
     let impl_ids: Vec<String> = state
         .slots
         .iter()
@@ -174,7 +179,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
                     template: "implementer".into(),
                     extra_vars: HashMap::new(),
                     expected_artifact: Some(format!("summary-{}.md", slot.id)),
-                model: None,
+                    model: None,
                 };
                 if let Err(e) = executor::run_slot(state, paths, cfg, &job) {
                     if let Some(s) = state.slot_mut(&slot.id) {
@@ -213,7 +218,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
             template: "ranker".into(),
             extra_vars: extra,
             expected_artifact: Some("ranking.md".into()),
-        model: None,
+            model: None,
         };
         let _ = executor::run_slot(state, paths, cfg, &job);
     }
@@ -282,12 +287,7 @@ pub fn confirm_winner(
 }
 
 /// Merge-good-parts agent then multi-review, then ship gate.
-pub fn reconcile(
-    paths: &SparPaths,
-    cfg: &Config,
-    run_id: &str,
-    json: bool,
-) -> Result<ExitCode> {
+pub fn reconcile(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> Result<ExitCode> {
     let mut state = RunState::load(paths, run_id)?;
     if state.workflow != crate::cli::WorkflowKind::Arena {
         anyhow::bail!("reconcile only applies to arena runs");
@@ -334,9 +334,11 @@ pub fn reconcile(
         .unwrap_or_else(|| "cli:claude".into());
     let recon_id = format!("reconcile-{recon_prov}");
     if state.slots.iter().all(|s| s.id != recon_id) {
-        state
-            .slots
-            .push(executor::init_slot(&recon_id, &recon_prov, SlotRole::Reconciler));
+        state.slots.push(executor::init_slot(
+            &recon_id,
+            &recon_prov,
+            SlotRole::Reconciler,
+        ));
     }
     worktree::prepare_isolation(&mut state, paths, std::slice::from_ref(&recon_id))?;
 
@@ -349,7 +351,7 @@ pub fn reconcile(
         template: "reconciler".into(),
         extra_vars: extra,
         expected_artifact: Some("summary-reconcile.md".into()),
-    model: None,
+        model: None,
     };
     if let Err(e) = executor::run_slot(&mut state, paths, cfg, &job) {
         state.set_phase(Phase::Failed);
@@ -365,12 +367,7 @@ pub fn reconcile(
         .find(|s| s.id == recon_id)
         .and_then(|s| s.cwd.clone())
         .unwrap_or_else(|| state.project_root.clone());
-    let rev_providers: Vec<String> = state
-        .providers
-        .iter()
-        .take(2)
-        .cloned()
-        .collect();
+    let rev_providers: Vec<String> = state.providers.iter().take(2).cloned().collect();
     for (i, prov) in rev_providers.iter().enumerate() {
         let id = format!("reconcile-review-{i}-{prov}");
         if state.slots.iter().all(|s| s.id != id) {
@@ -387,7 +384,7 @@ pub fn reconcile(
             template: "reviewer".into(),
             extra_vars: extra,
             expected_artifact: Some(format!("review-reconcile-{i}.md")),
-        model: None,
+            model: None,
         };
         if let Err(e) = executor::run_slot(&mut state, paths, cfg, &job) {
             state.set_phase(Phase::Failed);
@@ -401,7 +398,9 @@ pub fn reconcile(
             || text
                 .lines()
                 .any(|l| l.trim().eq_ignore_ascii_case("request_changes"))
-            || text.to_ascii_lowercase().contains("## verdict\nrequest_changes")
+            || text
+                .to_ascii_lowercase()
+                .contains("## verdict\nrequest_changes")
         {
             // fail-closed only on explicit verdict line when present
             if text.to_ascii_lowercase().contains("request_changes")

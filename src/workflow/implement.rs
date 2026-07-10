@@ -48,11 +48,19 @@ fn run_from_approved(
     cfg: &Config,
 ) -> Result<ExitCode> {
     let mut state = RunState::load(paths, run_id)?;
-    if !state.gates.plan_approved && state.phase != Phase::PlanApproved {
+    let resumable = state.gates.plan_approved
+        || state.phase == Phase::PlanApproved
+        || state.phase == Phase::Stopped;
+    if !resumable {
         bail!(
             "run {run_id} plan is not approved (phase={:?})",
             state.phase
         );
+    }
+    // Resuming a stopped run: drop the marker so execute_loop dispatches instead
+    // of halting again at its first boundary.
+    if state.phase == Phase::Stopped {
+        let _ = std::fs::remove_file(paths.marker(run_id, "stopped"));
     }
     state.backend = opts.backend;
     state.isolation = cfg.isolation;
@@ -139,7 +147,9 @@ fn prepare_implement_slots(
     }
 
     // Apply model-select choices onto slots when artifact exists.
-    let art = crate::model_select::load_select_artifact(paths, &state.id).ok().flatten();
+    let art = crate::model_select::load_select_artifact(paths, &state.id)
+        .ok()
+        .flatten();
     let model_for = |idx: usize| -> Option<String> {
         art.as_ref().and_then(|a| {
             a.choices
@@ -172,7 +182,12 @@ fn prepare_implement_slots(
 }
 
 /// Ensure a tester slot exists when suite is enabled. Fail closed if no provider.
-fn ensure_suite_slot(state: &mut RunState, dry: bool, cfg: &Config, paths: &SparPaths) -> Result<()> {
+fn ensure_suite_slot(
+    state: &mut RunState,
+    dry: bool,
+    cfg: &Config,
+    paths: &SparPaths,
+) -> Result<()> {
     if !cfg.suite.enabled {
         return Ok(());
     }
@@ -206,13 +221,18 @@ fn resolve_suite_provider(
     // Prefer model-select artifact / fresh pick with tester role (fast profile).
     if let (Some(paths), Some(run_id)) = (paths, run_id) {
         if let Ok(Some(art)) = crate::model_select::load_select_artifact(paths, run_id) {
-            if let Some(c) = art.choices.iter().find(|c| c.role.as_deref() == Some("tester")) {
+            if let Some(c) = art
+                .choices
+                .iter()
+                .find(|c| c.role.as_deref() == Some("tester"))
+            {
                 return Ok((c.provider.clone(), c.model.clone()));
             }
             let exclude: Vec<String> = art.choices.iter().map(|c| c.vals_id.clone()).collect();
             let urgency = crate::model_select::Urgency::parse(&art.urgency)
                 .unwrap_or(crate::model_select::Urgency::Normal);
-            if let Ok(c) = crate::model_select::pick_one_for_role("tester", urgency, cfg, dry, &exclude)
+            if let Ok(c) =
+                crate::model_select::pick_one_for_role("tester", urgency, cfg, dry, &exclude)
             {
                 // Append to artifact for audit trail.
                 let mut art = art;
@@ -224,13 +244,7 @@ fn resolve_suite_provider(
             }
         }
     }
-    const PREFS: &[&str] = &[
-        "cli:claude",
-        "cli:grok",
-        "cli:agy",
-        "api:xai",
-        "api:openai",
-    ];
+    const PREFS: &[&str] = &["cli:claude", "cli:grok", "cli:agy", "api:xai", "api:openai"];
     if dry {
         return Ok((PREFS[0].into(), None));
     }
@@ -248,9 +262,7 @@ fn resolve_suite_provider(
     {
         return Ok((p, None));
     }
-    bail!(
-        "suite.enabled but no usable suite provider (set [suite].provider or install a CLI)"
-    )
+    bail!("suite.enabled but no usable suite provider (set [suite].provider or install a CLI)")
 }
 
 /// Fail closed: missing/unrecognized Result ⇒ red. Only pass/skipped are green.
@@ -354,11 +366,7 @@ fn run_with_task(
     Ok(state.exit_code())
 }
 
-fn maybe_auto_ship_or_cleanup(
-    state: &mut RunState,
-    paths: &SparPaths,
-    cfg: &Config,
-) -> Result<()> {
+fn maybe_auto_ship_or_cleanup(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<()> {
     if state.phase == Phase::AwaitingShipConfirm && cfg.auto_ship() {
         state.gates.ship_confirmed = true;
         // leave at AwaitingShipConfirm with gate set — ship command still does push
@@ -371,6 +379,18 @@ fn maybe_auto_ship_or_cleanup(
     if cfg.auto_cleanup && state.phase.is_terminal() && matches!(state.phase, Phase::Done) {
         let _ = crate::worktree::cleanup_run(state);
     }
+    Ok(())
+}
+
+/// True once `spar stop` has dropped the `stopped` marker for this run.
+pub fn should_stop(paths: &SparPaths, run_id: &str) -> bool {
+    crate::markers::marker_exists(paths, run_id, "stopped")
+}
+
+/// Halt without dispatching or touching worktrees; the run stays resumable.
+fn stop_now(state: &mut RunState, paths: &SparPaths) -> Result<()> {
+    state.set_phase(Phase::Stopped);
+    state.save(paths)?;
     Ok(())
 }
 
@@ -405,7 +425,9 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
             .iter()
             .find(|s| s.role == SlotRole::Implementer)
             .and_then(|s| s.cwd.clone())
-            .ok_or_else(|| anyhow::anyhow!("implementer cwd missing; cannot apply acceptance tests"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("implementer cwd missing; cannot apply acceptance tests")
+            })?;
         if let Err(e) = worktree::apply_spec_tests_to_impl(state, &author, &impl_cwd) {
             return fail(
                 state,
@@ -416,6 +438,10 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
     }
 
     loop {
+        // Stop boundary: before the implementer (and every fix-round re-dispatch).
+        if should_stop(paths, &state.id) {
+            return stop_now(state, paths);
+        }
         state.set_phase(Phase::Dispatch);
         state.save(paths)?;
 
@@ -468,6 +494,11 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
             })
             .unwrap_or_else(|| state.project_root.clone());
 
+        // Stop boundary: before the suite job.
+        if should_stop(paths, &state.id) {
+            return stop_now(state, paths);
+        }
+
         // Suite channel: cheap model runs full suites; reviewers must not re-run them.
         let mut suite_body = String::new();
         let mut suite_red = false;
@@ -489,7 +520,9 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
                 let suite_path = paths.artifact(&state.id, "suite.md");
                 let _ = std::fs::remove_file(&suite_path);
                 let _ = std::fs::remove_file(
-                    paths.markers_dir(&state.id).join(format!("{}.done", tester.id)),
+                    paths
+                        .markers_dir(&state.id)
+                        .join(format!("{}.done", tester.id)),
                 );
                 let _ = std::fs::remove_file(
                     paths
@@ -567,6 +600,10 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
 
         let mut any_request_changes = suite_red;
         for rev in &reviewers {
+            // Stop boundary: before each reviewer job.
+            if should_stop(paths, &state.id) {
+                return stop_now(state, paths);
+            }
             if let Some(s) = state.slot_mut(&rev.id) {
                 s.status = SlotStatus::Pending;
                 s.cwd = Some(review_cwd.clone());
@@ -582,10 +619,14 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
                 template: "reviewer".into(),
                 extra_vars: extra,
                 expected_artifact: Some(format!("review-{}.md", rev.id)),
-            model: None,
+                model: None,
             };
             let mut review_ok = executor::run_slot(state, paths, cfg, &job).is_ok();
             if !review_ok {
+                // Stop boundary: don't re-dispatch a killed reviewer as a "failure".
+                if should_stop(paths, &state.id) {
+                    return stop_now(state, paths);
+                }
                 // Rotate provider and re-run once before treating as blocking failure.
                 if try_rotate_reviewer_provider(state, paths, &rev.id, &review_cwd, cfg)? {
                     if let Some(s) = state.slots.iter().find(|s| s.id == rev.id) {
@@ -629,7 +670,12 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
             write_impl_summary(state, paths)?;
             if state.big {
                 if let Ok(mut g) = crate::tasks::TaskGraph::load(paths, &state.id) {
-                    for t in g.ready_wave().iter().map(|t| t.id.clone()).collect::<Vec<_>>() {
+                    for t in g
+                        .ready_wave()
+                        .iter()
+                        .map(|t| t.id.clone())
+                        .collect::<Vec<_>>()
+                    {
                         g.mark_done(&t);
                     }
                     // mark all done for dry/simple path after successful review
@@ -729,14 +775,23 @@ fn try_widen_reviewers(
         .filter(|s| s.role == SlotRole::Reviewer)
         .map(|s| s.provider.clone())
         .collect();
-    let candidate = ["cli:claude", "cli:grok", "cli:agy", "cli:claude", "cli:grok"]
-        .iter()
-        .map(|s| (*s).to_string())
-        .chain(state.providers.iter().cloned())
-        .find(|p| !existing.contains(p));
+    let candidate = [
+        "cli:claude",
+        "cli:grok",
+        "cli:agy",
+        "cli:claude",
+        "cli:grok",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .chain(state.providers.iter().cloned())
+    .find(|p| !existing.contains(p));
     let Some(prov) = candidate else {
         // still widen with a synthetic extra reviewer on a repeated provider
-        let prov = existing.first().cloned().unwrap_or_else(|| "cli:claude".into());
+        let prov = existing
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "cli:claude".into());
         let id = format!("review-{}-wide", state.slots.len());
         let mut slot = executor::init_slot(&id, &prov, SlotRole::Reviewer);
         slot.cwd = Some(review_cwd.to_path_buf());
@@ -891,7 +946,18 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
 
 #[cfg(test)]
 mod suite_parse_tests {
-    use super::suite_report_is_red;
+    use super::{should_stop, suite_report_is_red};
+    use crate::paths::SparPaths;
+    use tempfile::tempdir;
+
+    #[test]
+    fn should_stop_tracks_marker() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        assert!(!should_stop(&paths, "r1"));
+        crate::markers::write_marker(&paths, "r1", "stopped", "by operator").unwrap();
+        assert!(should_stop(&paths, "r1"));
+    }
 
     #[test]
     fn pass_and_skipped_green() {
@@ -905,6 +971,9 @@ mod suite_parse_tests {
         assert!(suite_report_is_red("## Result\nfailed\n"));
         assert!(suite_report_is_red("## Result\n\n"));
         assert!(suite_report_is_red("no result header"));
-        assert!(suite_report_is_red("## Result\n**fail**\n") || suite_report_is_red("## Result\nfail\n"));
+        assert!(
+            suite_report_is_red("## Result\n**fail**\n")
+                || suite_report_is_red("## Result\nfail\n")
+        );
     }
 }

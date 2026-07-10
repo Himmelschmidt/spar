@@ -72,15 +72,8 @@ pub fn run_slots_parallel(
         match prepare_slot_execution(state, paths, cfg, job) {
             Ok(p) => prepared.push(p),
             Err(e) => {
-                let _ = mark_slot_failed(
-                    state,
-                    paths,
-                    &job.slot_id,
-                    &e.to_string(),
-                    None,
-                    None,
-                    None,
-                );
+                let _ =
+                    mark_slot_failed(state, paths, &job.slot_id, &e.to_string(), None, None, None);
             }
         }
     }
@@ -213,18 +206,14 @@ fn execute_prepared(
     timeout: Duration,
 ) -> Result<SlotOutcome> {
     if prep.pref.is_api() {
-        let expected = prep
-            .job
-            .expected_artifact
-            .as_ref()
-            .map(|n| {
-                // artifact path reconstructed from log path parent layout
-                prep.log_path
-                    .parent()
-                    .and_then(|p| p.parent())
-                    .map(|run| run.join("artifacts").join(n))
-                    .unwrap_or_else(|| PathBuf::from(n))
-            });
+        let expected = prep.job.expected_artifact.as_ref().map(|n| {
+            // artifact path reconstructed from log path parent layout
+            prep.log_path
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|run| run.join("artifacts").join(n))
+                .unwrap_or_else(|| PathBuf::from(n))
+        });
         let model = prep.job.model.clone();
         let (ok, err, usage) = crate::api::run_api_slot(&crate::api::runtime::ApiSlotRequest {
             provider_name: &prep.pref.name,
@@ -577,7 +566,15 @@ pub fn run_slot(
                     Ok(r) => r,
                     Err(e) => {
                         salvage_expected_artifact(paths, &state.id, job, &log_path, &e.to_string());
-                        mark_slot_failed(state, paths, &job.slot_id, &e.to_string(), None, None, None)?;
+                        mark_slot_failed(
+                            state,
+                            paths,
+                            &job.slot_id,
+                            &e.to_string(),
+                            None,
+                            None,
+                            None,
+                        )?;
                         return Err(e);
                     }
                 }
@@ -596,7 +593,15 @@ pub fn run_slot(
                     Ok(r) => r,
                     Err(e) => {
                         salvage_expected_artifact(paths, &state.id, job, &log_path, &e.to_string());
-                        mark_slot_failed(state, paths, &job.slot_id, &e.to_string(), None, None, None)?;
+                        mark_slot_failed(
+                            state,
+                            paths,
+                            &job.slot_id,
+                            &e.to_string(),
+                            None,
+                            None,
+                            None,
+                        )?;
                         return Err(e);
                     }
                 }
@@ -841,7 +846,10 @@ fn write_dry_artifacts(
             let stamp = cwd.join(".spar-dry-acceptance-tests");
             std::fs::write(
                 &stamp,
-                format!("acceptance tests (dry-run) by {} for: {task}\n", job.slot_id),
+                format!(
+                    "acceptance tests (dry-run) by {} for: {task}\n",
+                    job.slot_id
+                ),
             )?;
             std::fs::write(
                 paths.artifact(&state.id, "test-contract.md"),
@@ -1230,9 +1238,7 @@ fn run_tmux(
                     pid: pane_pid,
                     exit_code: None,
                     signal: None,
-                    error: Some(
-                        "agent reported done but its process is still running".into(),
-                    ),
+                    error: Some("agent reported done but its process is still running".into()),
                     usage: None,
                 })
             }
@@ -1289,8 +1295,6 @@ pub fn init_slot_model(
         model,
     }
 }
-
-
 
 pub fn emit_run_json(state: &RunState) -> Result<()> {
     let v = serde_json::json!({

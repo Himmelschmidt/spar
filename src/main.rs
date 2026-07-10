@@ -157,11 +157,7 @@ fn run() -> Result<ExitCode> {
             };
             workflow::run_named(workflow, opts, &paths, &cfg)
         }
-        Command::Status {
-            run_id,
-            json,
-            all,
-        } => status_cmd(run_id, json, all),
+        Command::Status { run_id, json, all } => status_cmd(run_id, json, all),
         Command::Wait {
             run_id,
             timeout,
@@ -218,6 +214,7 @@ fn run() -> Result<ExitCode> {
             workflow::arena::reconcile(&paths, &cfg, &run_id, json)
         }
         Command::Bus { action } => bus_cmd(action),
+        Command::Stop { run_id, json } => stop_cmd(&run_id, json),
         Command::Cleanup {
             run_id,
             json,
@@ -323,37 +320,7 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool) -> Result<ExitCode>
     if let Some(id) = run_id {
         let (swarm, cfg, state) = load_run_anywhere(&id, local_root.as_deref())?;
         if json {
-            let mut v = serde_json::to_value(&state)?;
-            if let Some(obj) = v.as_object_mut() {
-                obj.insert(
-                    "run_id".into(),
-                    serde_json::Value::String(state.id.clone()),
-                );
-                obj.insert(
-                    "project_root".into(),
-                    serde_json::Value::String(swarm.project_root.display().to_string()),
-                );
-                obj.insert(
-                    "exit_code".into(),
-                    match state.status_exit_code() {
-                        Some(c) => serde_json::json!(c),
-                        None => serde_json::Value::Null,
-                    },
-                );
-                let orch_pid = runlock::RunLock::owner(&swarm, &state.id);
-                obj.insert(
-                    "orchestrator_pid".into(),
-                    match orch_pid {
-                        Some(p) => serde_json::json!(p),
-                        None => serde_json::Value::Null,
-                    },
-                );
-                obj.insert(
-                    "orchestrator_alive".into(),
-                    serde_json::Value::Bool(orch_pid.map(process::pid_alive).unwrap_or(false)),
-                );
-            }
-            liveness::enrich_status_json(&mut v, &state.slots, &cfg, &swarm, &state.id);
+            let v = run_status_json(&swarm, &cfg, &state)?;
             println!("{}", serde_json::to_string_pretty(&v)?);
         } else {
             println!("run: {}", state.id);
@@ -378,8 +345,7 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool) -> Result<ExitCode>
             }
             println!("slots: {}", state.slots.len());
             for slot in &state.slots {
-                let act =
-                    liveness::SlotActivity::observe(slot, cfg.timeouts.stall_warn_secs);
+                let act = liveness::SlotActivity::observe(slot, cfg.timeouts.stall_warn_secs);
                 let silent = act.human_silent();
                 let stall = if act.stalled { " STALL" } else { "" };
                 let pid = slot
@@ -424,7 +390,9 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool) -> Result<ExitCode>
                 "no runs in global registry ({})",
                 registry::spar_home().display()
             );
-            println!("hint: run spar inside a project once, or spar status --all after work starts");
+            println!(
+                "hint: run spar inside a project once, or spar status --all after work starts"
+            );
         } else {
             println!(
                 "no runs in {}",
@@ -433,16 +401,16 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool) -> Result<ExitCode>
         }
     } else {
         if use_all {
-            println!("all projects (registry {}):", registry::spar_home().display());
+            println!(
+                "all projects (registry {}):",
+                registry::spar_home().display()
+            );
         } else {
             println!("runs in {}:", local_root.as_ref().unwrap().display());
         }
         let mut last_proj = String::new();
         for summary in runs {
-            let proj = summary
-                .project_name
-                .clone()
-                .unwrap_or_else(|| "·".into());
+            let proj = summary.project_name.clone().unwrap_or_else(|| "·".into());
             if use_all && proj != last_proj {
                 println!("  [{proj}]");
                 last_proj = proj;
@@ -453,11 +421,88 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool) -> Result<ExitCode>
                 .as_deref()
                 .map(|t| format!("  {}", truncate_cli(t, 40)))
                 .unwrap_or_default();
-            println!(
-                "    {}  {:?}{}{task}",
-                summary.id, summary.phase, dry
-            );
+            println!("    {}  {:?}{}{task}", summary.id, summary.phase, dry);
         }
+    }
+    Ok(ExitCode::Success)
+}
+
+/// Status/stop JSON: the persisted run plus run_id, project_root, exit_code,
+/// orchestrator liveness, and per-slot liveness enrichment.
+fn run_status_json(
+    swarm: &paths::SparPaths,
+    cfg: &Config,
+    state: &state::RunState,
+) -> Result<serde_json::Value> {
+    let mut v = serde_json::to_value(state)?;
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("run_id".into(), serde_json::Value::String(state.id.clone()));
+        obj.insert(
+            "project_root".into(),
+            serde_json::Value::String(swarm.project_root.display().to_string()),
+        );
+        obj.insert(
+            "exit_code".into(),
+            match state.status_exit_code() {
+                Some(c) => serde_json::json!(c),
+                None => serde_json::Value::Null,
+            },
+        );
+        let orch_pid = runlock::RunLock::owner(swarm, &state.id);
+        obj.insert(
+            "orchestrator_pid".into(),
+            match orch_pid {
+                Some(p) => serde_json::json!(p),
+                None => serde_json::Value::Null,
+            },
+        );
+        obj.insert(
+            "orchestrator_alive".into(),
+            serde_json::Value::Bool(orch_pid.map(process::pid_alive).unwrap_or(false)),
+        );
+    }
+    liveness::enrich_status_json(&mut v, &state.slots, cfg, swarm, &state.id);
+    Ok(v)
+}
+
+fn stop_cmd(run_id: &str, json: bool) -> Result<ExitCode> {
+    let (paths, cfg) = project_ctx()?;
+    let mut state = state::RunState::load(&paths, run_id)?;
+
+    // 1. Marker first: an orchestrator that survives the signal stops at its next
+    //    dispatch boundary instead of resurrecting a killed slot.
+    markers::write_marker(&paths, run_id, "stopped", "stopped by operator\n")?;
+
+    // 2. Orchestrator before slots: signalling slots first lets the orchestrator
+    //    re-dispatch them. The orchestrator is not a group leader — bare pid.
+    if let Some(owner) = runlock::RunLock::owner(&paths, run_id) {
+        if process::pid_alive(owner) {
+            process::terminate_tree(owner, false);
+        }
+    }
+
+    // 3. Slot process groups: reaps nested cargo test / pnpm build children too.
+    for slot in &state.slots {
+        let pid = slot
+            .pid
+            .or_else(|| markers::read_pid(&paths, run_id, &slot.id));
+        if let Some(pid) = pid {
+            if process::pid_alive(pid) {
+                process::terminate_tree(pid, true);
+            }
+        }
+    }
+
+    // 4. The orchestrator may have died before recording it; write phase ourselves.
+    state.set_phase(state::Phase::Stopped);
+    state.save(&paths)?;
+
+    if json {
+        let v = run_status_json(&paths, &cfg, &state)?;
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        println!("stopped run {run_id}; branch and worktree kept");
+        println!("resume: spar implement --run {run_id} --providers <…>");
     }
     Ok(ExitCode::Success)
 }
@@ -545,11 +590,7 @@ fn resolve_log_path(
     anyhow::bail!("no log for slot {slot}")
 }
 
-fn logs_follow(
-    paths: &paths::SparPaths,
-    run_id: &str,
-    slot: Option<&str>,
-) -> Result<ExitCode> {
+fn logs_follow(paths: &paths::SparPaths, run_id: &str, slot: Option<&str>) -> Result<ExitCode> {
     let targets: Vec<std::path::PathBuf> = if let Some(slot) = slot {
         vec![resolve_log_path(paths, run_id, slot)?]
     } else {
@@ -576,7 +617,10 @@ fn logs_follow(
         if path.is_file() {
             let data = std::fs::read(path)?;
             if multi {
-                println!("===== {} =====", path.file_name().unwrap().to_string_lossy());
+                println!(
+                    "===== {} =====",
+                    path.file_name().unwrap().to_string_lossy()
+                );
             }
             let _ = std::io::stdout().write_all(&data);
             offsets[i] = data.len() as u64;

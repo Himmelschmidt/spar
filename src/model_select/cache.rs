@@ -25,8 +25,8 @@ pub fn load_cached(path: &Path) -> Result<Option<CacheMeta>> {
     }
     let text =
         std::fs::read_to_string(path).with_context(|| format!("read cache {}", path.display()))?;
-    let snapshot: BenchSnapshot = serde_json::from_str(&text)
-        .with_context(|| format!("parse cache {}", path.display()))?;
+    let snapshot: BenchSnapshot =
+        serde_json::from_str(&text).with_context(|| format!("parse cache {}", path.display()))?;
     let mtime_secs = std::fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()
@@ -41,8 +41,7 @@ pub fn load_cached(path: &Path) -> Result<Option<CacheMeta>> {
 
 pub fn save_cached(path: &Path, snap: &BenchSnapshot) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let text = serde_json::to_string_pretty(snap)?;
     std::fs::write(path, text).with_context(|| format!("write cache {}", path.display()))?;

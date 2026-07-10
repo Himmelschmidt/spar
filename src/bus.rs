@@ -105,11 +105,7 @@ pub fn bus_root(paths: &SparPaths, run_id: &str) -> PathBuf {
 pub fn ensure_bus(paths: &SparPaths, run_id: &str) -> Result<()> {
     paths.ensure_run_dirs(run_id)?;
     let root = bus_root(paths, run_id);
-    for d in [
-        root.clone(),
-        root.join("inbox"),
-        root.join("tasks"),
-    ] {
+    for d in [root.clone(), root.join("inbox"), root.join("tasks")] {
         fs::create_dir_all(&d).with_context(|| format!("create {}", d.display()))?;
     }
     Ok(())
@@ -202,7 +198,10 @@ pub fn send(
             id: msg.id.clone(),
             from: msg.from.clone(),
             to: msg.to.clone(),
-            subject: msg.subject.clone().unwrap_or_else(|| format!("{:?}", msg.kind)),
+            subject: msg
+                .subject
+                .clone()
+                .unwrap_or_else(|| format!("{:?}", msg.kind)),
             body: msg.body.clone(),
             created_at: msg.ts,
         },
@@ -305,7 +304,11 @@ pub fn inbox(paths: &SparPaths, run_id: &str, agent: &str) -> Result<Vec<BusMess
 pub fn reserve(paths: &SparPaths, run_id: &str, path: &str, holder: &str) -> Result<()> {
     ensure_bus(paths, run_id)?;
     let mut file = load_reserves(paths, run_id)?;
-    if let Some(c) = file.claims.iter().find(|c| c.path == path && c.holder != holder) {
+    if let Some(c) = file
+        .claims
+        .iter()
+        .find(|c| c.path == path && c.holder != holder)
+    {
         bail!("path {path} already reserved by {}", c.holder);
     }
     file.claims.retain(|c| c.path != path);
@@ -351,7 +354,10 @@ fn count_events(paths: &SparPaths, run_id: &str) -> Result<usize> {
     if !p.is_file() {
         return Ok(0);
     }
-    Ok(fs::read_to_string(p)?.lines().filter(|l| !l.trim().is_empty()).count())
+    Ok(fs::read_to_string(p)?
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count())
 }
 
 fn append_jsonl<T: Serialize>(path: &PathBuf, value: &T) -> Result<()> {

@@ -44,9 +44,8 @@ impl StreamStats {
     }
 
     pub fn touch_log(&mut self) {
-        self.last_log_at = Some(
-            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        );
+        self.last_log_at =
+            Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
     }
 
     pub fn stats_path(log_path: &Path) -> PathBuf {
@@ -227,9 +226,7 @@ pub fn run_captured(req: &SpawnRequest, on_spawn: Option<&dyn Fn(u32)>) -> Resul
 /// SIGTERM the process group, brief grace, then always SIGKILL the group
 /// (even if the leader already reaped — grandchildren may still be alive).
 /// Returns the reaped exit status; sole owner of `wait`.
-fn kill_process_group(
-    child: &mut std::process::Child,
-) -> Result<std::process::ExitStatus> {
+fn kill_process_group(child: &mut std::process::Child) -> Result<std::process::ExitStatus> {
     #[cfg(unix)]
     {
         let pid = child.id() as i32;
@@ -261,15 +258,42 @@ const SIGTERM: i32 = 15;
 const SIGKILL: i32 = 9;
 
 #[cfg(unix)]
-fn signal_process_group(pid: i32, sig: i32) {
-    // libc kill(-pgid) — no dependency on `kill` binary / PATH.
+fn raw_kill(pid: i32, sig: i32) {
+    // libc kill — no dependency on the `kill` binary / PATH.
     unsafe {
         extern "C" {
             fn kill(pid: i32, sig: i32) -> i32;
         }
-        let _ = kill(-pid, sig);
+        let _ = kill(pid, sig);
     }
 }
+
+#[cfg(unix)]
+fn signal_process_group(pid: i32, sig: i32) {
+    // Negative pid = whole process group (leader via process_group(0)).
+    raw_kill(-pid, sig);
+}
+
+/// SIGTERM a live target, brief grace, then SIGKILL. With `group`, signals the
+/// whole process group (negative pid) so nested suite children are reaped too.
+/// Slots run in their own group (`process_group(0)`); the orchestrator does not,
+/// so it must be signalled by its bare pid.
+#[cfg(unix)]
+pub fn terminate_tree(pid: u32, group: bool) {
+    let target = if group { -(pid as i32) } else { pid as i32 };
+    raw_kill(target, SIGTERM);
+    let grace = Instant::now();
+    while grace.elapsed() < Duration::from_secs(2) {
+        if !pid_alive(pid) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    raw_kill(target, SIGKILL);
+}
+
+#[cfg(not(unix))]
+pub fn terminate_tree(_pid: u32, _group: bool) {}
 
 fn stream_to_log(
     pipe: impl Read,
@@ -436,10 +460,7 @@ impl StreamCoalescer {
                     let sub = v.get("subtype").and_then(|x| x.as_str()).unwrap_or("");
                     if sub == "init" {
                         let mut out = self.flush_buf();
-                        let model = v
-                            .get("model")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("claude");
+                        let model = v.get("model").and_then(|x| x.as_str()).unwrap_or("claude");
                         self.model = Some(model.to_string());
                         out.push_str(&format!("· session  {model}\n"));
                         return Some(out);
@@ -487,7 +508,11 @@ impl StreamCoalescer {
                     out.push_str(&format!(
                         "· done  {sub}  ·  {} tools  ·  {}\n",
                         self.tools,
-                        format_tokens(self.input_tokens, self.output_tokens.max(self.est_output_tokens), self.cache_read)
+                        format_tokens(
+                            self.input_tokens,
+                            self.output_tokens.max(self.est_output_tokens),
+                            self.cache_read
+                        )
                     ));
                     return Some(out);
                 }
@@ -1053,7 +1078,7 @@ mod tests {
         // 2-byte UTF-8 chars so a naive mid-window start can land on a continuation.
         let mut bytes = Vec::new();
         bytes.extend(std::iter::repeat_n(0xC3u8, 1)); // incomplete alone; we'll write full chars
-        // Write many "é" (C3 A9) then ASCII marker.
+                                                      // Write many "é" (C3 A9) then ASCII marker.
         for _ in 0..40 {
             bytes.extend_from_slice("é".as_bytes());
         }

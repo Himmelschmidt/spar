@@ -67,8 +67,17 @@ spar run --workflow review -t "Review PR #12 for auth bugs" --providers cli:clau
 spar confirm <run_id> [--winner <slot>]   # arena winner
 spar reconcile <run_id>                  # arena merge-good-parts + review
 spar ship <run_id> --confirm             # draft PR (never merges)
-spar cleanup <run_id> [--purge]
+spar stop <run_id> [--json]              # halt dispatch, KEEP branch+worktree (resumable)
+spar cleanup <run_id> [--purge]          # remove worktrees (and --purge run data)
 ```
+
+**`spar stop`** halts a run without discarding work: it writes a `stopped` marker,
+signals the orchestrator then the slot process groups (SIGTERM → grace → SIGKILL),
+and sets `phase=stopped` (JSON `exit_code: 1`). It never removes the branch or the
+worktree — that is `spar cleanup`'s job. A stopped run is **resumable**: rerun
+`spar implement --run <id> --providers …` and it clears the marker and continues.
+Use `stop` (not killing pids directly) so the orchestrator can't re-dispatch a slot
+you just killed.
 
 ## Swarm bus
 
@@ -106,7 +115,7 @@ spar logs <run_id> [slot] [-f|--follow]
 | Code | Meaning |
 |------|---------|
 | 0 | Success / terminal ok (e.g. plan approved, done) |
-| 1 | Failure |
+| 1 | Failure / halted by operator (`spar stop`, phase=stopped) |
 | 2 | Human gate (approve plan / winner / ship) |
 | 3 | Stuck / escalated / wait timeout |
 | 4 | No usable providers (quota/pause) |

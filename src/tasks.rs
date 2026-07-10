@@ -44,7 +44,9 @@ pub struct TaskGraph {
 
 impl TaskGraph {
     pub fn path(paths: &SparPaths, run_id: &str) -> PathBuf {
-        bus::bus_root(paths, run_id).join("tasks").join("graph.json")
+        bus::bus_root(paths, run_id)
+            .join("tasks")
+            .join("graph.json")
     }
 
     pub fn load(paths: &SparPaths, run_id: &str) -> Result<Self> {
@@ -157,9 +159,7 @@ impl TaskGraph {
             .map(|t| t.id.clone())
             .collect();
         for t in &mut self.tasks {
-            if t.status == TaskStatus::Pending
-                && t.depends_on.iter().all(|d| done.contains(d))
-            {
+            if t.status == TaskStatus::Pending && t.depends_on.iter().all(|d| done.contains(d)) {
                 t.status = TaskStatus::Ready;
             }
         }
@@ -255,6 +255,9 @@ mod tests {
         let paths = SparPaths::new(tmp.path());
         let g = seed_from_plan(&paths, "r1", "### A\n### B\n").unwrap();
         assert!(TaskGraph::path(&paths, "r1").is_file());
-        assert_eq!(TaskGraph::load(&paths, "r1").unwrap().tasks.len(), g.tasks.len());
+        assert_eq!(
+            TaskGraph::load(&paths, "r1").unwrap().tasks.len(),
+            g.tasks.len()
+        );
     }
 }

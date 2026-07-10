@@ -206,11 +206,7 @@ pub fn pick_providers(
             .collect::<Vec<_>>()
     } else if allow_missing {
         if order.is_empty() {
-            vec![
-                "cli:claude".into(),
-                "cli:grok".into(),
-                "cli:agy".into(),
-            ]
+            vec!["cli:claude".into(), "cli:grok".into(), "cli:agy".into()]
         } else {
             order
                 .iter()

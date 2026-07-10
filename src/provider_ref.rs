@@ -65,9 +65,7 @@ impl ProviderRef {
                 name: name.to_string(),
             });
         }
-        bail!(
-            "provider '{raw}' must be 'cli:…' or 'api:…' (e.g. cli:claude, api:openai)"
-        );
+        bail!("provider '{raw}' must be 'cli:…' or 'api:…' (e.g. cli:claude, api:openai)");
     }
 
     pub fn display(&self) -> String {

@@ -89,8 +89,8 @@ impl Registry {
         if !path.is_file() {
             return Ok(Self::default());
         }
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         if text.trim().is_empty() {
             return Ok(Self::default());
         }
@@ -132,8 +132,7 @@ impl Registry {
                 last_run_id: last_run_id.map(|s| s.to_string()),
             });
         }
-        self.projects
-            .sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+        self.projects.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
         self.save()
     }
 
@@ -248,7 +247,10 @@ mod tests {
 
         // Reload via SPAR_HOME path — same process as list_all_runs uses.
         let reg2 = Registry::load().unwrap();
-        assert!(reg2.projects.iter().any(|p| p.root == canonicalize_best_effort(&proj)));
+        assert!(reg2
+            .projects
+            .iter()
+            .any(|p| p.root == canonicalize_best_effort(&proj)));
 
         std::env::remove_var("SPAR_HOME");
     }

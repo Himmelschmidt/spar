@@ -197,11 +197,12 @@ pub fn scrape_claude_rate_limits(log: &str) -> Option<(String, Option<DateTime<U
     None
 }
 
-fn parse_rate_limits_value(v: &serde_json::Value) -> Option<(String, Option<DateTime<Utc>>, String)> {
-    let rl = v.get("rate_limits").or_else(|| {
-        v.get("status")
-            .and_then(|s| s.get("rate_limits"))
-    })?;
+fn parse_rate_limits_value(
+    v: &serde_json::Value,
+) -> Option<(String, Option<DateTime<Utc>>, String)> {
+    let rl = v
+        .get("rate_limits")
+        .or_else(|| v.get("status").and_then(|s| s.get("rate_limits")))?;
     let five = rl.get("five_hour")?;
     let used = five
         .get("used_percentage")
@@ -271,7 +272,8 @@ mod tests {
         store.pause_manual("cli:claude", None);
         store.pause_manual("cli:grok", None);
         store.save(&paths).unwrap();
-        let err = apply_quota_filter(&paths, &["cli:claude".into(), "cli:grok".into()]).unwrap_err();
+        let err =
+            apply_quota_filter(&paths, &["cli:claude".into(), "cli:grok".into()]).unwrap_err();
         assert!(err.to_string().contains("no usable providers"));
     }
 }

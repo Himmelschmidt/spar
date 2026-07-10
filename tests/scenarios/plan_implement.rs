@@ -227,11 +227,7 @@ fn plan_approve_implement_dry_run() {
 fn plan_spec_disabled_skips_test_author() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
-    std::fs::write(
-        tmp.path().join("spar.toml"),
-        "[spec]\nenabled = false\n",
-    )
-    .unwrap();
+    std::fs::write(tmp.path().join("spar.toml"), "[spec]\nenabled = false\n").unwrap();
     let out = cargo_bin_cmd!("spar")
         .current_dir(tmp.path())
         .args([
@@ -255,13 +251,12 @@ fn plan_spec_disabled_skips_test_author() {
         slots.iter().all(|s| s["role"] != "test_author"),
         "no test_author when spec disabled: {slots:?}"
     );
-    assert!(
-        !tmp.path()
-            .join(".spar/runs")
-            .join(run_id)
-            .join("artifacts/test-contract.md")
-            .is_file()
-    );
+    assert!(!tmp
+        .path()
+        .join(".spar/runs")
+        .join(run_id)
+        .join("artifacts/test-contract.md")
+        .is_file());
 }
 
 #[test]
@@ -507,7 +502,10 @@ fn dual_backend_dry_run_providers() {
     assert!(v.get("run_id").is_some());
     assert_eq!(v.get("id"), v.get("run_id"));
     let slots = v["slots"].as_array().unwrap();
-    assert!(!slots.is_empty(), "expected planner slots for api/cli providers");
+    assert!(
+        !slots.is_empty(),
+        "expected planner slots for api/cli providers"
+    );
     let providers = v["providers"].as_array().unwrap();
     let joined = providers
         .iter()
@@ -539,10 +537,7 @@ fn empty_fake_providers_fail_closed() {
         .unwrap();
     let code = r.status.code().unwrap_or(1);
     assert_ne!(code, 2, "must not return human gate with zero providers");
-    assert!(
-        code == 1 || code == 4,
-        "expected failure/quota, got {code}"
-    );
+    assert!(code == 1 || code == 4, "expected failure/quota, got {code}");
 }
 
 #[test]
@@ -564,7 +559,16 @@ fn skills_and_bus_commands() {
 
     let plan = cargo_bin_cmd!("spar")
         .current_dir(tmp.path())
-        .args(["plan", "--task", "bus seed", "--providers", "cli:claude,cli:grok", "--dry-run", "--json", "--big"])
+        .args([
+            "plan",
+            "--task",
+            "bus seed",
+            "--providers",
+            "cli:claude,cli:grok",
+            "--dry-run",
+            "--json",
+            "--big",
+        ])
         .assert()
         .code(2);
     let stdout = String::from_utf8_lossy(plan.get_output().stdout.as_slice());

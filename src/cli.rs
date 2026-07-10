@@ -214,6 +214,18 @@ pub enum Command {
         action: BusCmd,
     },
 
+    /// Halt a run's dispatch, keeping the branch and worktree (resumable).
+    ///
+    /// Writes a `stopped` marker, signals the orchestrator then the slot process
+    /// groups (SIGTERM, grace, SIGKILL), and sets phase=stopped (exit code 1).
+    /// Unlike `cleanup`, it never removes worktrees or the branch. Resume with
+    /// `spar implement --run <id>`.
+    Stop {
+        run_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Remove worktrees and optional run data
     Cleanup {
         run_id: String,
@@ -243,9 +255,7 @@ pub enum SkillsCmd {
         json: bool,
     },
     /// Print a skill document
-    Get {
-        name: String,
-    },
+    Get { name: String },
 }
 
 #[derive(Debug, Subcommand)]

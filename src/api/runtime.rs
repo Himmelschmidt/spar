@@ -150,8 +150,7 @@ pub fn run_api_slot(req: &ApiSlotRequest<'_>) -> Result<(bool, Option<String>, U
         }
         messages.push(ChatMessage {
             role: "user".into(),
-            content: "Continue. Use a tool JSON line if needed, or end with FINAL: summary."
-                .into(),
+            content: "Continue. Use a tool JSON line if needed, or end with FINAL: summary.".into(),
         });
     }
     if !artifact_ok(req) {
@@ -167,9 +166,7 @@ pub fn run_api_slot(req: &ApiSlotRequest<'_>) -> Result<(bool, Option<String>, U
 fn artifact_ok(req: &ApiSlotRequest<'_>) -> bool {
     match req.expected_artifact {
         None => true,
-        Some(art) => {
-            art.is_file() && fs::metadata(art).map(|m| m.len() > 0).unwrap_or(false)
-        }
+        Some(art) => art.is_file() && fs::metadata(art).map(|m| m.len() > 0).unwrap_or(false),
     }
 }
 

@@ -45,3 +45,7 @@ path = "tests/scenarios/plan_implement.rs"
 [[test]]
 name = "liveness"
 path = "tests/scenarios/liveness.rs"
+
+[[test]]
+name = "stop"
+path = "tests/scenarios/stop.rs"

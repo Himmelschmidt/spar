@@ -140,6 +140,8 @@ pub enum Phase {
     Stuck,
     /// No usable providers (maps to exit code 4).
     Quota,
+    /// Halted by operator (`spar stop`). Waitable but resumable; keeps worktrees.
+    Stopped,
 }
 
 impl Phase {
@@ -167,7 +169,8 @@ impl Phase {
     }
 
     pub fn is_waitable_stop(&self) -> bool {
-        self.is_terminal() || self.is_gate()
+        // Stopped is resumable (not terminal, not a gate) but `wait` must return.
+        self.is_terminal() || self.is_gate() || matches!(self, Phase::Stopped)
     }
 }
 
@@ -341,7 +344,7 @@ impl RunState {
             | Phase::AwaitingShipConfirm => ExitCode::HumanGate,
             Phase::Stuck | Phase::Escalated => ExitCode::Stuck,
             Phase::Quota => ExitCode::Quota,
-            Phase::Failed | Phase::PlanRejected => ExitCode::Failure,
+            Phase::Failed | Phase::PlanRejected | Phase::Stopped => ExitCode::Failure,
             // In-flight: not a terminal success; outer agents should poll until waitable.
             _ => ExitCode::Success,
         }
@@ -413,13 +416,27 @@ mod tests {
     }
 
     #[test]
+    fn stopped_is_waitable_and_roundtrips() {
+        assert!(Phase::Stopped.is_waitable_stop());
+        assert!(!Phase::Stopped.is_terminal());
+        assert!(!Phase::Stopped.is_gate());
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new("run-stop", WorkflowKind::Loop, tmp.path().to_path_buf());
+        state.phase = Phase::Stopped;
+        state.save(&paths).unwrap();
+        let loaded = RunState::load(&paths, "run-stop").unwrap();
+        assert_eq!(loaded.phase, Phase::Stopped);
+        assert_eq!(loaded.exit_code(), ExitCode::Failure);
+        assert_eq!(loaded.status_exit_code(), Some(1));
+    }
+
+    #[test]
     fn failed_slot_persists_exit_and_signal() {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
-        let mut state =
-            RunState::new("run-sig", WorkflowKind::Loop, tmp.path().to_path_buf());
-        let mut slot =
-            crate::executor::init_slot("impl", "cli:claude", SlotRole::Implementer);
+        let mut state = RunState::new("run-sig", WorkflowKind::Loop, tmp.path().to_path_buf());
+        let mut slot = crate::executor::init_slot("impl", "cli:claude", SlotRole::Implementer);
         slot.status = SlotStatus::Failed;
         slot.pid = Some(4242);
         slot.exit_code = None;

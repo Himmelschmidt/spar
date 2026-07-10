@@ -22,10 +22,7 @@ pub struct SlotActivity {
 
 impl SlotActivity {
     pub fn observe(slot: &SlotState, stall_warn_secs: u64) -> Self {
-        let last = slot
-            .log_path
-            .as_ref()
-            .and_then(|p| last_log_time(p));
+        let last = slot.log_path.as_ref().and_then(|p| last_log_time(p));
         let silent_for_secs = last.map(|t| {
             let now = Utc::now();
             (now - t).num_seconds().max(0) as u64
@@ -61,9 +58,12 @@ pub fn last_log_time(log_path: &Path) -> Option<DateTime<Utc>> {
             }
         }
     }
-    for t in [file_mtime(log_path), file_mtime(&StreamStats::stats_path(log_path))]
-        .into_iter()
-        .flatten()
+    for t in [
+        file_mtime(log_path),
+        file_mtime(&StreamStats::stats_path(log_path)),
+    ]
+    .into_iter()
+    .flatten()
     {
         best = Some(match best {
             Some(b) if b >= t => b,
@@ -123,7 +123,9 @@ pub fn enrich_status_json(
             continue;
         };
         let act = SlotActivity::observe(slot, warn);
-        let pid = slot.pid.or_else(|| crate::markers::read_pid(paths, run_id, &slot.id));
+        let pid = slot
+            .pid
+            .or_else(|| crate::markers::read_pid(paths, run_id, &slot.id));
         let pid_alive = pid.map(crate::process::pid_alive).unwrap_or(false);
         if let Some(obj) = slot_val.as_object_mut() {
             if let Some(t) = &act.last_log_at {
@@ -160,8 +162,8 @@ pub fn enrich_status_json(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{SlotRole, SlotState};
     use crate::provider_ref::ProviderRef;
+    use crate::state::{SlotRole, SlotState};
     use std::io::Write;
     use tempfile::tempdir;
 
@@ -230,7 +232,10 @@ mod tests {
         // Fresh log write after stale stats stamp.
         std::fs::write(&log, "fresh\n").unwrap();
         let t = last_log_time(&log).unwrap();
-        assert!(t.year() >= 2025, "must prefer fresher log mtime over stale stats, got {t}");
+        assert!(
+            t.year() >= 2025,
+            "must prefer fresher log mtime over stale stats, got {t}"
+        );
     }
 
     #[test]
@@ -249,10 +254,7 @@ mod tests {
     fn filetime_set(path: &Path, t: SystemTime) {
         // Use utime via filetime crate? Not a dep — use `touch -d` style via libc or std.
         // On Linux, set with filetime from std is not available; use Command touch.
-        let secs = t
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let secs = t.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
         let _ = std::process::Command::new("touch")
             .args(["-d", &format!("@{secs}"), path.to_str().unwrap()])
             .status();

@@ -33,7 +33,8 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     if dry {
         std::env::set_var("SPAR_DRY_RUN", "1");
     }
-    let requested = opts.resolve_fleet(2, &["implementer", "implementer"], paths, cfg, &state.id)?;
+    let requested =
+        opts.resolve_fleet(2, &["implementer", "implementer"], paths, cfg, &state.id)?;
     state.providers = providers::pick_providers(&requested, 2, Some(&requested), dry);
     if state.providers.is_empty() {
         state.error = Some("no usable providers".into());
@@ -120,6 +121,11 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
 }
 
 pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<()> {
+    if crate::workflow::implement::should_stop(paths, &state.id) {
+        state.set_phase(Phase::Stopped);
+        state.save(paths)?;
+        return Ok(());
+    }
     let ids: Vec<String> = state.slots.iter().map(|s| s.id.clone()).collect();
     worktree::prepare_isolation(state, paths, &ids)?;
     state.set_phase(Phase::PeerRelay);
@@ -154,7 +160,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
                 template: "peer_half".into(),
                 extra_vars: extra,
                 expected_artifact: Some(format!("summary-{}.md", slot.id)),
-            model: None,
+                model: None,
             }
         })
         .collect();

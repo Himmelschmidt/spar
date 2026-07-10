@@ -26,8 +26,7 @@ impl ApiProviderConfig {
             }),
             "xai" => Ok(Self {
                 name: "xai".into(),
-                base_url: env::var("XAI_BASE_URL")
-                    .unwrap_or_else(|_| "https://api.x.ai/v1".into()),
+                base_url: env::var("XAI_BASE_URL").unwrap_or_else(|_| "https://api.x.ai/v1".into()),
                 api_key: env::var("XAI_API_KEY").context("XAI_API_KEY required for api:xai")?,
                 model: env::var("XAI_MODEL").unwrap_or_else(|_| "grok-3-mini".into()),
             }),
@@ -98,10 +97,7 @@ struct UsageJson {
 }
 
 pub fn chat_completion(cfg: &ApiProviderConfig, messages: &[ChatMessage]) -> Result<ChatResult> {
-    let url = format!(
-        "{}/chat/completions",
-        cfg.base_url.trim_end_matches('/')
-    );
+    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let body = json!({
         "model": cfg.model,
         "messages": messages,

@@ -300,12 +300,17 @@ Live coding slots use **sibling git worktrees** (not the main checkout), typical
 
 Dry-run does **not** create real worktrees.
 
-Cleanup:
+Stop vs cleanup:
 
 ```bash
+spar stop <run_id>              # halt dispatch, KEEP branch+worktree (resumable)
 spar cleanup <run_id>           # remove worktrees
 spar cleanup <run_id> --purge   # also drop run data under .spar/
 ```
+
+`spar stop` signals the orchestrator then the slot process groups and sets
+`phase=stopped`; resume with `spar implement --run <run_id>`. Use it instead of
+killing pids by hand so the orchestrator can't re-dispatch a slot you just killed.
 
 ---
 

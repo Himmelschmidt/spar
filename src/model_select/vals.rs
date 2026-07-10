@@ -6,7 +6,10 @@ use std::collections::HashMap;
 
 const BENCH_URLS: &[(&str, &str)] = &[
     ("swebench", "https://www.vals.ai/benchmarks/swebench"),
-    ("terminal-bench-2-1", "https://www.vals.ai/benchmarks/terminal-bench-2-1"),
+    (
+        "terminal-bench-2-1",
+        "https://www.vals.ai/benchmarks/terminal-bench-2-1",
+    ),
     ("lcb", "https://www.vals.ai/benchmarks/lcb"),
     ("vibe-code", "https://www.vals.ai/benchmarks/vibe-code"),
 ];
@@ -190,7 +193,9 @@ fn valid_model_id(id: &str) -> bool {
 fn take_number(text: &str, cursor: &mut usize) -> Option<f64> {
     let rest = &text[*cursor..];
     let end = rest
-        .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-' && c != '+' && c != 'e' && c != 'E')
+        .find(|c: char| {
+            !c.is_ascii_digit() && c != '.' && c != '-' && c != '+' && c != 'e' && c != 'E'
+        })
         .unwrap_or(rest.len());
     if end == 0 {
         return None;

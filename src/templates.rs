@@ -75,10 +75,7 @@ pub fn base_vars(ctx: &TemplateCtx<'_>) -> HashMap<String, String> {
     m.insert("planner_slot".into(), String::new());
     m.insert("critic_slot".into(), String::new());
     m.insert("review_cwd".into(), ctx.cwd.into());
-    m.insert(
-        "suite_body".into(),
-        "(no suite report)".into(),
-    );
+    m.insert("suite_body".into(), "(no suite report)".into());
     // Default: independent review may run tests. Implement overrides when suite channel ran.
     m.insert(
         "suite_guidance".into(),
