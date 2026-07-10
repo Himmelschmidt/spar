@@ -236,12 +236,21 @@ fn implement_refuses_second_orchestrator() {
         .assert()
         .success();
 
-    // A live orchestrator (this test process) already owns the run.
+    // A live orchestrator (this test process) already owns the run: hold the
+    // advisory lock and publish our pid, exactly as a real run does.
     let lock = tmp
         .path()
         .join(".spar/runs")
         .join(&run_id)
         .join("orchestrator.lock");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock)
+        .unwrap();
+    held.try_lock().unwrap();
     std::fs::write(&lock, std::process::id().to_string()).unwrap();
 
     cargo_bin_cmd!("spar")

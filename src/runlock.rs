@@ -1,8 +1,7 @@
 use crate::paths::SparPaths;
-use crate::process::pid_alive;
 use anyhow::{Context, Result};
-use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::fs::{self, File, OpenOptions, TryLockError};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
@@ -12,15 +11,18 @@ pub struct OrchestratorBusy {
     pub owner_pid: u32,
 }
 
-/// Single-orchestrator guard for a run id, backed by `orchestrator.lock`.
+/// Single-orchestrator guard for a run id, backed by an advisory (`flock`) lock
+/// on `orchestrator.lock`.
 ///
-/// Acquisition is atomic via `O_EXCL`; a lock left by a dead pid is stale and
-/// gets taken over. `Drop` releases the lock only while it still names us, so a
-/// takeover that handed the file to another pid is never clobbered.
+/// Exclusion is enforced by the kernel per open file description, so acquisition
+/// is race-free even under concurrent takeover and a lock held by a crashed
+/// orchestrator is released automatically when its process dies. The file body
+/// only carries the holder pid for observability (`owner`, `spar status`).
 #[derive(Debug)]
 pub struct RunLock {
     path: PathBuf,
     pid: u32,
+    file: File,
 }
 
 fn lock_path(paths: &SparPaths, run_id: &str) -> PathBuf {
@@ -36,36 +38,46 @@ impl RunLock {
         paths.ensure_run_dirs(run_id)?;
         let path = lock_path(paths, run_id);
         let me = std::process::id();
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut f) => {
-                write!(f, "{me}").with_context(|| format!("write {}", path.display()))?;
-                return Ok(RunLock { path, pid: me });
-            }
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
-            Err(e) => {
-                return Err(e).with_context(|| format!("open {}", path.display()));
-            }
-        }
-
-        if let Some(owner) = read_owner_pid(&path) {
-            if pid_alive(owner) {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
                 return Err(OrchestratorBusy {
                     run_id: run_id.to_string(),
-                    owner_pid: owner,
+                    owner_pid: read_owner_pid(&path).unwrap_or(0),
                 }
                 .into());
             }
+            Err(TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("lock {}", path.display()));
+            }
         }
-
-        // Stale lock (dead or unreadable owner): take it over in place.
-        fs::write(&path, me.to_string())
-            .with_context(|| format!("take over {}", path.display()))?;
-        let _ = crate::events::append(
-            paths,
-            run_id,
-            &crate::events::Event::info(format!("orchestrator lock taken over by pid {me}")),
-        );
-        Ok(RunLock { path, pid: me })
+        let reclaimed = read_owner_pid(&path).filter(|&prev| prev != me);
+        file.set_len(0)
+            .with_context(|| format!("truncate {}", path.display()))?;
+        (&file)
+            .write_all(me.to_string().as_bytes())
+            .with_context(|| format!("write {}", path.display()))?;
+        if let Some(prev) = reclaimed {
+            let _ = crate::events::append(
+                paths,
+                run_id,
+                &crate::events::Event::info(format!(
+                    "orchestrator lock reclaimed by pid {me} from crashed pid {prev}"
+                )),
+            );
+        }
+        Ok(RunLock {
+            path,
+            pid: me,
+            file,
+        })
     }
 
     pub fn owner(paths: &SparPaths, run_id: &str) -> Option<u32> {
@@ -75,9 +87,12 @@ impl RunLock {
 
 impl Drop for RunLock {
     fn drop(&mut self) {
+        // Clear the pid so `owner` reports none once released, but only while the
+        // file still names us; the kernel drops the flock as the file closes.
         if read_owner_pid(&self.path) == Some(self.pid) {
-            let _ = fs::remove_file(&self.path);
+            let _ = self.file.set_len(0);
         }
+        let _ = self.file.unlock();
     }
 }
 
@@ -126,6 +141,38 @@ mod tests {
         let lock = RunLock::acquire(&paths, "r1").unwrap();
         assert_eq!(lock.pid, std::process::id());
         assert_eq!(RunLock::owner(&paths, "r1"), Some(std::process::id()));
+    }
+
+    #[test]
+    fn concurrent_takeover_yields_single_winner() {
+        use std::sync::Arc;
+        use std::thread;
+        let tmp = tempdir().unwrap();
+        let paths = Arc::new(SparPaths::new(tmp.path()));
+        for _ in 0..200 {
+            paths.ensure_run_dirs("r1").unwrap();
+            fs::write(lock_path(&paths, "r1"), (i32::MAX as u32).to_string()).unwrap();
+            let handles: Vec<_> = (0..16)
+                .map(|_| {
+                    let p = Arc::clone(&paths);
+                    thread::spawn(move || RunLock::acquire(&p, "r1"))
+                })
+                .collect();
+            let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let winners = results.iter().filter(|r| r.is_ok()).count();
+            assert_eq!(winners, 1, "exactly one orchestrator must win the takeover");
+            for r in &results {
+                if let Err(e) = r {
+                    assert!(
+                        e.downcast_ref::<OrchestratorBusy>().is_some(),
+                        "losers must report busy, got: {e:#}"
+                    );
+                }
+            }
+            assert_eq!(RunLock::owner(&paths, "r1"), Some(std::process::id()));
+            drop(results);
+            let _ = fs::remove_file(lock_path(&paths, "r1"));
+        }
     }
 
     #[test]
