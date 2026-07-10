@@ -177,6 +177,9 @@ struct App {
     last_ctrl_c: Option<Instant>,
     last_click: Option<(u16, u16, Instant)>,
     show_help: bool,
+    /// Whether the current frame is part of an animation; drives the spinner so
+    /// it shows a static glyph when idle instead of a frame frozen mid-spin.
+    animated: bool,
     rect_header: Rect,
     rect_action: Rect,
     rect_fleet: Rect,
@@ -266,6 +269,7 @@ impl App {
             last_ctrl_c: None,
             last_click: None,
             show_help: false,
+            animated: false,
             rect_header: Rect::default(),
             rect_action: Rect::default(),
             rect_fleet: Rect::default(),
@@ -287,7 +291,11 @@ impl App {
     }
 
     fn spinner(&self) -> &'static str {
-        SPINNER[(self.tick as usize) % SPINNER.len()]
+        if self.animated {
+            SPINNER[(self.tick as usize) % SPINNER.len()]
+        } else {
+            "·"
+        }
     }
 
     fn reset_stream_view(&mut self) {
@@ -472,8 +480,23 @@ fn marks_for(sel: &Selection, prev: Option<&Snapshot>) -> Marks {
     let mut out = vec![stamp(&registry::registry_path())];
     if sel.browse == BrowseLevel::Runs {
         let swarm = SparPaths::new(&sel.root);
-        out.push(stamp(&swarm.runs_dir()));
+        let runs_dir = swarm.runs_dir();
+        out.push(stamp(&runs_dir));
         out.push(stamp(&swarm.quota_file()));
+        // The rail lists every run's phase/age from its state.json, which
+        // RunState::save rewrites in place — so the dir mtime above misses it.
+        // Stamp each state file; sort for a stable order across readdirs.
+        if let Ok(entries) = std::fs::read_dir(&runs_dir) {
+            let mut ids: Vec<String> = entries
+                .flatten()
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            ids.sort();
+            for id in ids {
+                out.push(stamp(&swarm.state_file(&id)));
+            }
+        }
         if let Some(id) = sel.run_id.as_deref() {
             out.push(stamp(&swarm.state_file(id)));
             out.push(stamp(&events::events_file(&swarm, id)));
@@ -529,14 +552,16 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache) -> Snapshot {
     }
 }
 
-/// Redraw is only worth it while something is moving on screen.
+/// Redraw is only worth it while something is moving on screen: a flash timer,
+/// the composer cursor, or a run that is actively working (active phase or a
+/// running slot). An active phase with no running slot — Suite, Review,
+/// Shipping — still animates so the header spinner keeps turning.
 fn animating(app: &App, snap: &Snapshot) -> bool {
     app.flash.is_some()
         || app.focus == Focus::Composer
-        || snap
-            .full
-            .as_ref()
-            .is_some_and(|st| st.slots.iter().any(|s| s.status == SlotStatus::Running))
+        || snap.full.as_ref().is_some_and(|st| {
+            is_active_phase(st.phase) || st.slots.iter().any(|s| s.status == SlotStatus::Running)
+        })
 }
 
 fn run_loop(
@@ -654,6 +679,8 @@ fn run_loop(
         });
         fleet_state.select((n_slots > 0).then_some(app.selected_slot));
 
+        app.animated = animating(&app, &snap);
+
         if dirty {
             app.tick = app.tick.wrapping_add(1);
             terminal.draw(|f| {
@@ -716,7 +743,7 @@ fn run_loop(
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if animating(&app, &snap) {
+                if app.animated {
                     dirty = true;
                 }
             }
@@ -1950,24 +1977,27 @@ fn log_line_style(line: &str, colorize: bool) -> Style {
     }
 }
 
-/// Compact stream lines (grok-cli style density), then truncate or wrap to width.
 /// Rows the log occupies, without building any of them. In trim mode this is
-/// just the line count; wrapping has to measure each line.
+/// just the line count; wrapping has to measure each line. Matches
+/// `log_rows_window`'s empty-output fallback so the two always agree.
 fn log_row_count(text: &str, width: usize, expand: bool) -> usize {
-    if !expand {
-        return text.lines().count();
-    }
     let width = width.max(1);
-    text.lines()
-        .map(|raw| {
-            let line = compact_log_line(raw);
-            if line.is_empty() {
-                1
-            } else {
-                soft_wrap(&line, width).len()
-            }
-        })
-        .sum()
+    let n: usize = if !expand {
+        text.lines().count()
+    } else {
+        text.lines()
+            .map(|raw| {
+                let line = compact_log_line(raw);
+                if line.is_empty() {
+                    1
+                } else {
+                    soft_wrap(&line, width).len()
+                }
+            })
+            .sum()
+    };
+    // Empty text still renders one blank row (see log_rows_window fallback).
+    n.max(1)
 }
 
 /// Build only the rows in `[start, start + height)`.
@@ -2017,6 +2047,85 @@ fn log_rows_window(
         out.push((String::new(), log_line_style("", colorize)));
     }
     out
+}
+
+#[cfg(test)]
+mod window_eq {
+    use super::*;
+    fn old_full(text: &str, width: usize, colorize: bool, expand: bool) -> Vec<(String, Style)> {
+        let width = width.max(1);
+        let mut out = Vec::new();
+        for raw in text.lines() {
+            let line = compact_log_line(raw);
+            let style = log_line_style(&line, colorize);
+            if line.is_empty() {
+                out.push((String::new(), style));
+                continue;
+            }
+            if expand {
+                for chunk in soft_wrap(&line, width) {
+                    out.push((chunk, style));
+                }
+            } else {
+                out.push((truncate_display(&line, width), style));
+            }
+        }
+        if out.is_empty() {
+            out.push((String::new(), log_line_style("", colorize)));
+        }
+        out
+    }
+    #[test]
+    fn windows_match_full_layout() {
+        let cases = [
+            "", "\n", "\n\n\n", "one line",
+            "→ tool call\n← result ok\n· thinking about a very long line that definitely exceeds any reasonable terminal width and must wrap or truncate depending on mode yes indeed\n\n! error here\n# comment",
+            &"word ".repeat(200),
+        ];
+        for text in cases {
+            for &w in &[1usize, 5, 20, 80, 200] {
+                for &exp in &[false, true] {
+                    for &col in &[false, true] {
+                        let full = old_full(text, w, col, exp);
+                        let total_fn = log_row_count(text, w, exp);
+                        assert_eq!(
+                            full.len(),
+                            total_fn,
+                            "row count mismatch text={:?} w={} exp={}",
+                            text,
+                            w,
+                            exp
+                        );
+                        for &(start, height) in &[
+                            (0usize, 1usize),
+                            (0, 3),
+                            (1, 2),
+                            (2, 5),
+                            (5, 10),
+                            (0, 1000),
+                            (full.len(), 3),
+                            (full.len().saturating_sub(1), 2),
+                        ] {
+                            let win = log_rows_window(text, w, col, exp, start, height);
+                            let expected: Vec<_> =
+                                full.iter().skip(start).take(height).cloned().collect();
+                            // old fallback: when full has the single empty row and we skip past it, old yields []
+                            assert_eq!(
+                                win.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>(),
+                                expected.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>(),
+                                "window text mismatch text={:?} w={} exp={} start={} h={}",
+                                text,
+                                w,
+                                exp,
+                                start,
+                                height
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
