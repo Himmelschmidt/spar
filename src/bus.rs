@@ -194,6 +194,103 @@ pub fn heartbeat(paths: &SparPaths, run_id: &str, agent: &str, status: &str) -> 
 /// and every inbox copy. 64 KiB is generous for coordination traffic.
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 
+/// Loop prevention (Stage 7). The message budget caps *total* traffic, but two
+/// agents can auto-reply to each other and ping-pong happily inside that budget,
+/// burning real quota. The loop guard caps a *directed exchange* between one
+/// unordered pair `{A,B}`: once the pair has traded [`LoopGuard::max_per_pair`]
+/// messages **in both directions** inside a [`LoopGuard::window`] sliding window,
+/// [`send`] refuses the next one. Only genuine back-and-forth trips it — a
+/// one-directional blast (covered by the budget) and broadcast/system/ack traffic
+/// are exempt, so ordinary coordination is unaffected.
+pub const LOOP_WINDOW_SECS: i64 = 60;
+pub const LOOP_MAX_PER_PAIR: usize = 12;
+
+#[derive(Debug, Clone, Copy)]
+pub struct LoopGuard {
+    pub window: Duration,
+    pub max_per_pair: usize,
+}
+
+impl Default for LoopGuard {
+    fn default() -> Self {
+        Self {
+            window: Duration::seconds(LOOP_WINDOW_SECS),
+            max_per_pair: LOOP_MAX_PER_PAIR,
+        }
+    }
+}
+
+impl LoopGuard {
+    /// Operator overrides via `SPAR_BUS_LOOP_MAX_PER_PAIR` / `SPAR_BUS_LOOP_WINDOW_SECS`.
+    /// A cap of `0` disables the guard entirely.
+    fn from_env() -> Self {
+        let mut g = Self::default();
+        if let Ok(n) = std::env::var("SPAR_BUS_LOOP_WINDOW_SECS")
+            .ok()
+            .map_or(Ok(g.window.num_seconds()), |v| v.parse::<i64>())
+        {
+            g.window = Duration::seconds(n);
+        }
+        if let Ok(n) = std::env::var("SPAR_BUS_LOOP_MAX_PER_PAIR")
+            .ok()
+            .map_or(Ok(g.max_per_pair), |v| v.parse::<usize>())
+        {
+            g.max_per_pair = n;
+        }
+        g
+    }
+}
+
+/// The unordered pair key `(lo, hi)` for a message the loop guard governs, or
+/// `None` if it is exempt. Broadcasts, `@human` alerts, and `Ack`/`System`/`Hello`
+/// bookkeeping are never part of a reply loop, so they pass unguarded.
+fn guarded_pair(msg: &BusMessage) -> Option<(&str, &str)> {
+    if matches!(msg.kind, MsgKind::Ack | MsgKind::System | MsgKind::Hello) {
+        return None;
+    }
+    let (from, to) = (msg.from.as_str(), msg.to.as_str());
+    if to == "broadcast" || to == "*" || to == HUMAN || from == to {
+        return None;
+    }
+    Some(if from <= to { (from, to) } else { (to, from) })
+}
+
+/// Refuse `msg` if sending it would push the `{from,to}` pair past the loop cap.
+/// Trips only when the recent window already holds `max_per_pair` messages for the
+/// pair *and* both directions are represented (a real ping-pong, not a one-way blast).
+fn check_loop(events: &[BusMessage], msg: &BusMessage, guard: LoopGuard) -> Result<()> {
+    if guard.max_per_pair == 0 {
+        return Ok(());
+    }
+    let Some((lo, hi)) = guarded_pair(msg) else {
+        return Ok(());
+    };
+    let cutoff = msg.ts - guard.window;
+    let mut total = 0usize;
+    let (mut fwd, mut rev) = (false, false);
+    for m in events.iter().filter(|m| m.ts >= cutoff) {
+        if guarded_pair(m) != Some((lo, hi)) {
+            continue;
+        }
+        total += 1;
+        if m.from == lo {
+            fwd = true;
+        } else {
+            rev = true;
+        }
+    }
+    if total >= guard.max_per_pair && fwd && rev {
+        bail!(
+            "loop guard: {lo}<->{hi} exchanged {total} messages in the last {}s (cap {}); \
+             refusing to send — two agents are ping-ponging. Break the loop, or raise \
+             SPAR_BUS_LOOP_MAX_PER_PAIR / widen SPAR_BUS_LOOP_WINDOW_SECS if this is legitimate.",
+            guard.window.num_seconds(),
+            guard.max_per_pair,
+        );
+    }
+    Ok(())
+}
+
 pub fn send(
     paths: &SparPaths,
     run_id: &str,
@@ -207,6 +304,7 @@ pub fn send(
         );
     }
     ensure_bus(paths, run_id)?;
+    check_loop(&list_events(paths, run_id)?, &msg, LoopGuard::from_env())?;
     // Budget check and append happen under one lock so two senders can't both
     // read a below-cap count and both write (TOCTOU across processes).
     append_event_checked(&events_path(paths, run_id), &msg, budget.max_messages())?;
@@ -1026,6 +1124,62 @@ mod tests {
         )
         .unwrap();
         assert!(unresolved_alerts(&paths, "r1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn loop_guard_refuses_pingpong_but_passes_normal() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        join(&paths, "r1", "a", Some("cli:claude"), Some("native-cli")).unwrap();
+        join(&paths, "r1", "b", Some("cli:grok"), Some("native-cli")).unwrap();
+
+        // Rapid A<->B ping-pong: alternate direction so both sides are represented.
+        // Chatty budget removes the volume cap, isolating the loop guard as the limiter.
+        let mut sent = 0usize;
+        let mut refused = false;
+        for i in 0..(LOOP_MAX_PER_PAIR * 2) {
+            let (from, to) = if i % 2 == 0 { ("a", "b") } else { ("b", "a") };
+            match chat(
+                &paths,
+                "r1",
+                from,
+                to,
+                format!("m{i}"),
+                MessageBudget::Chatty,
+            ) {
+                Ok(_) => sent += 1,
+                Err(e) => {
+                    assert!(
+                        e.to_string().contains("loop guard"),
+                        "unexpected error: {e}"
+                    );
+                    refused = true;
+                    break;
+                }
+            }
+        }
+        assert!(refused, "ping-pong past the cap should be refused");
+        assert_eq!(
+            sent, LOOP_MAX_PER_PAIR,
+            "exactly the cap is allowed through"
+        );
+
+        // Ordinary traffic is unaffected: a different pair still passes freely,
+        assert!(chat(&paths, "r1", "a", "c", "hi", MessageBudget::Chatty).is_ok());
+        // a one-directional stream (not a loop) passes past the cap,
+        for i in 0..(LOOP_MAX_PER_PAIR + 4) {
+            chat(
+                &paths,
+                "r1",
+                "d",
+                "e",
+                format!("n{i}"),
+                MessageBudget::Chatty,
+            )
+            .unwrap();
+        }
+        // and broadcasts are exempt.
+        assert!(broadcast(&paths, "r1", "a", "all-hands", MessageBudget::Chatty).is_ok());
     }
 
     #[test]
