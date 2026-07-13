@@ -123,11 +123,13 @@ pub enum SendKey {
 }
 
 impl SendKey {
-    /// The `send-keys` arguments that follow the `-t <target>`, e.g. `["-l", "a"]`
+    /// The `send-keys` arguments that follow the `-t <target>`, e.g. `["-l", "--", "a"]`
     /// or `["Enter"]`. Pure; used both for spawning and for tests.
     pub fn args(&self) -> Vec<String> {
         match self {
-            SendKey::Literal(s) => vec!["-l".to_string(), s.clone()],
+            // `--` terminates option parsing so a literal starting with `-`
+            // (e.g. a prompt like `-x fix this`) is typed verbatim, not read as flags.
+            SendKey::Literal(s) => vec!["-l".to_string(), "--".to_string(), s.clone()],
             SendKey::Named(k) => vec![k.clone()],
         }
     }
@@ -655,7 +657,7 @@ mod tests {
     fn literal_args_use_dash_l() {
         assert_eq!(
             SendKey::Literal("a".to_string()).args(),
-            vec!["-l".to_string(), "a".to_string()]
+            vec!["-l".to_string(), "--".to_string(), "a".to_string()]
         );
         assert_eq!(
             SendKey::Named("Enter".to_string()).args(),
