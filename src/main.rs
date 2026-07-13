@@ -322,6 +322,11 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             bus::heartbeat(&paths, &run_id, &agent, &status)?;
             Ok(ExitCode::Success)
         }
+        BusCmd::Deliver {
+            run_id,
+            agent,
+            json,
+        } => bus_deliver(&paths, &run_id, &agent, json),
         BusCmd::Reserve {
             run_id,
             path,
@@ -341,6 +346,37 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             Ok(ExitCode::Success)
         }
     }
+}
+
+/// Resolve `agent`'s delivery strategy from its run slot's provider adapter. An agent
+/// with no slot or no CLI adapter (bare agent / api slot) has no injection channel.
+fn agent_delivery_strategy(state: &state::RunState, agent: &str) -> providers::DeliveryStrategy {
+    state
+        .slots
+        .iter()
+        .find(|s| s.id == agent)
+        .and_then(|s| providers::adapter_named(&s.provider))
+        .map(|a| a.delivery_strategy())
+        .unwrap_or(providers::DeliveryStrategy::None)
+}
+
+fn bus_deliver(
+    paths: &paths::SparPaths,
+    run_id: &str,
+    agent: &str,
+    json: bool,
+) -> Result<ExitCode> {
+    let state = state::RunState::load(paths, run_id)?;
+    let strategy = agent_delivery_strategy(&state, agent);
+    let dry_run = state.dry_run || util::env_truthy("SPAR_DRY_RUN");
+    let d = providers::delivery::deliver(paths, run_id, agent, strategy, dry_run)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&d)?);
+    } else if let Some(payload) = &d.payload {
+        // Hook mode: stdout carries only the raw injection payload for the hook runner.
+        println!("{payload}");
+    }
+    Ok(ExitCode::Success)
 }
 
 fn project_ctx() -> Result<(paths::SparPaths, Config)> {

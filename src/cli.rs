@@ -306,6 +306,17 @@ pub enum BusCmd {
         #[arg(long, default_value = "working")]
         status: String,
     },
+    /// Drain an agent's inbox and dispatch it to the agent's delivery strategy.
+    ///
+    /// Invoked at a turn boundary (e.g. a Claude Stop hook). Bare mode emits the raw
+    /// injection payload on stdout (the Stop-hook `block` JSON) and nothing else;
+    /// `--json` emits an operator report instead of the hook payload.
+    Deliver {
+        run_id: String,
+        agent: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Reserve a path
     Reserve {
         run_id: String,

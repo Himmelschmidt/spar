@@ -58,3 +58,7 @@ path = "tests/scenarios/amendment.rs"
 [[test]]
 name = "runlock"
 path = "tests/scenarios/runlock.rs"
+
+[[test]]
+name = "bus_deliver"
+path = "tests/scenarios/bus_deliver.rs"

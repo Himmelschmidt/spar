@@ -4,7 +4,7 @@
 //! provider-specific mechanism lives here behind the adapter's `presence_source()` —
 //! the orchestrator never learns which provider it is.
 
-use super::{PresenceSource, ProviderAdapter};
+use super::{DeliveryStrategy, PresenceSource, ProviderAdapter};
 use anyhow::{Context, Result};
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
@@ -43,8 +43,12 @@ pub fn wire(adapter: &dyn ProviderAdapter, id: &SlotIdentity) -> PresenceWiring 
             id.project_root.display().to_string(),
         ),
     ];
+    // Only StopHookInject adapters (Claude) close the delivery loop through the Stop
+    // hook. Grok shares the presence hook file but delivers via its native queue, so it
+    // gets presence hooks without the injecting Stop hook.
+    let inject_on_stop = adapter.delivery_strategy() == DeliveryStrategy::StopHookInject;
     let note = match adapter.presence_source() {
-        PresenceSource::Hooks => install_claude_hooks(id).err().map(|e| {
+        PresenceSource::Hooks => install_claude_hooks(id, inject_on_stop).err().map(|e| {
             format!(
                 "{}: presence hooks not installed ({e}) — degraded presence",
                 id.agent_id
@@ -76,9 +80,12 @@ fn hook_events() -> [(&'static str, Option<&'static str>, &'static str); 4] {
     ]
 }
 
-/// Merge spar heartbeat hooks into `<worktree>/.claude/settings.json`, preserving any
-/// existing keys. Refuses to write into the primary checkout (would dirty the repo).
-fn install_claude_hooks(id: &SlotIdentity) -> Result<()> {
+/// Merge spar presence hooks into `<worktree>/.claude/settings.json`, preserving any
+/// existing keys. When `inject_on_stop` is set, also install a Stop hook that runs
+/// `spar bus deliver` — the pane-free channel that injects claimed bus messages by
+/// blocking the turn (`{"decision":"block",…}`) instead of letting the agent go idle.
+/// Refuses to write into the primary checkout (would dirty the repo).
+fn install_claude_hooks(id: &SlotIdentity, inject_on_stop: bool) -> Result<()> {
     if same_dir(id.worktree, id.project_root) {
         anyhow::bail!("would pollute primary checkout working tree");
     }
@@ -112,9 +119,21 @@ fn install_claude_hooks(id: &SlotIdentity) -> Result<()> {
             .or_insert_with(|| Value::Array(Vec::new()))
             .as_array_mut()
             .with_context(|| format!("hooks.{event} is not an array"))?;
-        // Idempotent across resumes: drop any prior spar heartbeat group before re-adding.
-        arr.retain(|g| !is_spar_heartbeat_group(g));
+        // Idempotent across resumes: drop any prior spar group before re-adding.
+        arr.retain(|g| !is_spar_group(g));
         arr.push(entry);
+    }
+
+    if inject_on_stop {
+        let stop = hooks
+            .entry("Stop")
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .context("hooks.Stop is not an array")?;
+        stop.push(hook_group(
+            None,
+            &spar_deliver_cmd(&exe, id.run_id, id.agent_id),
+        ));
     }
 
     let text = serde_json::to_string_pretty(&root)?;
@@ -129,6 +148,10 @@ fn spar_heartbeat_cmd(exe: &str, run_id: &str, agent: &str, status: &str) -> Str
     )
 }
 
+fn spar_deliver_cmd(exe: &str, run_id: &str, agent: &str) -> String {
+    format!("{} bus deliver {run_id} {agent}", shell_quote(exe))
+}
+
 fn hook_group(matcher: Option<&str>, command: &str) -> Value {
     let hooks = json!([{ "type": "command", "command": command }]);
     match matcher {
@@ -137,8 +160,9 @@ fn hook_group(matcher: Option<&str>, command: &str) -> Value {
     }
 }
 
-/// True if a matcher group is one spar wrote (its command runs `bus heartbeat`).
-fn is_spar_heartbeat_group(group: &Value) -> bool {
+/// True if a matcher group is one spar wrote (its command runs a `bus` subcommand spar
+/// installs — `heartbeat` for presence or `deliver` for turn-boundary injection).
+fn is_spar_group(group: &Value) -> bool {
     group
         .get("hooks")
         .and_then(Value::as_array)
@@ -146,7 +170,7 @@ fn is_spar_heartbeat_group(group: &Value) -> bool {
             hs.iter().any(|h| {
                 h.get("command")
                     .and_then(Value::as_str)
-                    .map(|c| c.contains("bus heartbeat"))
+                    .map(|c| c.contains("bus heartbeat") || c.contains("bus deliver"))
                     .unwrap_or(false)
             })
         })
@@ -217,6 +241,29 @@ mod tests {
         assert!(text.contains("--status blocked"));
         assert!(text.contains("--status idle"));
         assert!(text.contains("abc123 impl-1"));
+        // StopHookInject closes the delivery loop via a Stop `bus deliver` hook.
+        assert!(
+            text.contains("bus deliver abc123 impl-1"),
+            "claude Stop hook must inject via `bus deliver`: {text}"
+        );
+    }
+
+    #[test]
+    fn grok_gets_no_deliver_hook() {
+        let tmp = tempdir().unwrap();
+        let wt = tmp.path().join("wt");
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let exe = PathBuf::from("/usr/bin/spar");
+        wire(&GrokAdapter, &id(&wt, &root, &exe));
+        let text = std::fs::read_to_string(settings_path(&wt)).unwrap();
+        // Grok delivers via its native queue, not the injecting Stop hook.
+        assert!(
+            !text.contains("bus deliver"),
+            "grok must not get a deliver Stop hook: {text}"
+        );
+        assert!(text.contains("--status idle"));
     }
 
     #[test]
@@ -275,10 +322,16 @@ mod tests {
             .unwrap()
             .as_array()
             .unwrap();
-        // user's echo hook preserved + exactly one spar heartbeat group
-        assert!(stop.iter().any(|g| !is_spar_heartbeat_group(g)));
-        let spar_groups = stop.iter().filter(|g| is_spar_heartbeat_group(g)).count();
-        assert_eq!(spar_groups, 1, "heartbeat group must be deduped");
+        // user's echo hook preserved.
+        assert!(stop.iter().any(|g| !is_spar_group(g)));
+        // Exactly one spar heartbeat + one deliver group survive the second wire.
+        let count_with = |needle: &str| {
+            stop.iter()
+                .filter(|g| serde_json::to_string(g).unwrap().contains(needle))
+                .count()
+        };
+        assert_eq!(count_with("bus heartbeat"), 1, "heartbeat must be deduped");
+        assert_eq!(count_with("bus deliver"), 1, "deliver must be deduped");
     }
 
     #[test]
