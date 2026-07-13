@@ -8,6 +8,7 @@ use super::{DeliveryStrategy, PresenceSource, ProviderAdapter};
 use anyhow::{Context, Result};
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 /// Stable identity + locations a slot needs to phone home for presence/delivery.
 pub struct SlotIdentity<'a> {
@@ -138,7 +139,80 @@ fn install_claude_hooks(id: &SlotIdentity, inject_on_stop: bool) -> Result<()> {
 
     let text = serde_json::to_string_pretty(&root)?;
     std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
+    // The hook file embeds the operator's absolute spar path plus the run/agent ids, so
+    // an agent's `git add -A` or `spar ship` must never stage it into the PR. Two cases:
+    // an untracked settings.json is held back by `info/exclude`; a *tracked* one (a repo
+    // that commits `.claude/settings.json`) is unaffected by excludes, so mark it
+    // `--skip-worktree` to make git ignore spar's rewrite. Both are best-effort.
+    exclude_from_index(id.worktree, SETTINGS_REL)?;
+    skip_worktree_if_tracked(id.worktree, SETTINGS_REL);
     Ok(())
+}
+
+/// Worktree-relative path of the settings file spar writes.
+const SETTINGS_REL: &str = ".claude/settings.json";
+
+/// Add `rel_path` to the worktree's git exclude file so an untracked copy is never
+/// staged. Worktrees share the main checkout's `info/exclude` via `$GIT_COMMON_DIR`, so
+/// resolve that first. Idempotent: a line already present is left untouched. A non-git
+/// directory has no index to protect, so it is a safe no-op.
+fn exclude_from_index(worktree: &Path, rel_path: &str) -> Result<()> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(worktree)
+        .output();
+    let out = match out {
+        Ok(o) if o.status.success() => o,
+        // git missing or not a repository: nothing can be staged, so nothing to exclude.
+        _ => return Ok(()),
+    };
+    let common_dir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    // A relative git-common-dir resolves against the worktree.
+    let common_dir = if common_dir.is_absolute() {
+        common_dir
+    } else {
+        worktree.join(common_dir)
+    };
+    let info = common_dir.join("info");
+    std::fs::create_dir_all(&info).with_context(|| format!("create {}", info.display()))?;
+    let exclude = info.join("exclude");
+    let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if existing.lines().any(|l| l.trim() == rel_path) {
+        return Ok(());
+    }
+    let mut text = existing;
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(rel_path);
+    text.push('\n');
+    std::fs::write(&exclude, text).with_context(|| format!("write {}", exclude.display()))?;
+    Ok(())
+}
+
+/// If `rel_path` is tracked in the worktree's index, set its `--skip-worktree` bit so git
+/// ignores spar's local rewrite. `info/exclude` only governs untracked files, so a repo
+/// that *commits* `.claude/settings.json` would otherwise still show spar's edit as a
+/// modification and stage it on `git add -A`, leaking the operator path and run/agent
+/// ids. Best-effort: a non-git dir or an untracked path is a harmless no-op.
+fn skip_worktree_if_tracked(worktree: &Path, rel_path: &str) {
+    let tracked = Command::new("git")
+        .args(["ls-files", "--error-unmatch", "--", rel_path])
+        .current_dir(worktree)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !tracked {
+        return;
+    }
+    let _ = Command::new("git")
+        .args(["update-index", "--skip-worktree", "--", rel_path])
+        .current_dir(worktree)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 fn spar_heartbeat_cmd(exe: &str, run_id: &str, agent: &str, status: &str) -> String {
@@ -332,6 +406,131 @@ mod tests {
         };
         assert_eq!(count_with("bus heartbeat"), 1, "heartbeat must be deduped");
         assert_eq!(count_with("bus deliver"), 1, "deliver must be deduped");
+    }
+
+    /// Shared helper: run a git command in `cwd`, asserting success.
+    fn git_ok(args: &[&str], cwd: &Path) {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    fn git_common_dir(cwd: &Path) -> PathBuf {
+        let out = Command::new("git")
+            .args(["rev-parse", "--git-common-dir"])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        let dir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+        if dir.is_absolute() {
+            dir
+        } else {
+            cwd.join(dir)
+        }
+    }
+
+    #[test]
+    fn untracked_settings_file_is_excluded_from_git_in_a_worktree() {
+        let tmp = tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_ok(&["init", "-q"], &repo);
+        git_ok(&["config", "user.email", "t@t"], &repo);
+        git_ok(&["config", "user.name", "t"], &repo);
+        std::fs::write(repo.join("README"), "x").unwrap();
+        git_ok(&["add", "README"], &repo);
+        git_ok(&["commit", "-qm", "init"], &repo);
+
+        // A real linked worktree so info/exclude resolves via the common gitdir.
+        let wt = tmp.path().join("wt");
+        git_ok(
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "HEAD"],
+            &repo,
+        );
+        let exe = PathBuf::from("/usr/bin/spar");
+
+        let w = wire(&ClaudeAdapter, &id(&wt, &repo, &exe));
+        assert!(w.note.is_none(), "note: {:?}", w.note);
+        assert!(settings_path(&wt).is_file());
+
+        let out = Command::new("git")
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        let status = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !status.contains(".claude/settings.json"),
+            "settings.json must be excluded from git status: {status}"
+        );
+
+        // Idempotent: a second wire must not duplicate the exclude line.
+        wire(&ClaudeAdapter, &id(&wt, &repo, &exe));
+        let exclude =
+            std::fs::read_to_string(git_common_dir(&wt).join("info").join("exclude")).unwrap();
+        assert_eq!(
+            exclude.lines().filter(|l| l.trim() == SETTINGS_REL).count(),
+            1,
+            "exclude line must not be duplicated: {exclude}"
+        );
+    }
+
+    #[test]
+    fn tracked_settings_file_is_not_staged_after_wire() {
+        let tmp = tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".claude")).unwrap();
+        git_ok(&["init", "-q"], &repo);
+        git_ok(&["config", "user.email", "t@t"], &repo);
+        git_ok(&["config", "user.name", "t"], &repo);
+        // The target repo *commits* .claude/settings.json — the case info/exclude misses.
+        std::fs::write(settings_path(&repo), r#"{"model":"opus"}"#).unwrap();
+        git_ok(&["add", ".claude/settings.json"], &repo);
+        git_ok(&["commit", "-qm", "init"], &repo);
+
+        let wt = tmp.path().join("wt");
+        git_ok(
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "HEAD"],
+            &repo,
+        );
+        let exe = PathBuf::from("/usr/bin/spar");
+
+        // spar overwrites the tracked file with its hook config.
+        let w = wire(&ClaudeAdapter, &id(&wt, &repo, &exe));
+        assert!(w.note.is_none(), "note: {:?}", w.note);
+        let written = std::fs::read_to_string(settings_path(&wt)).unwrap();
+        assert!(written.contains("bus heartbeat"), "hooks must be written");
+
+        // git status must not report the rewrite (skip-worktree bit).
+        let out = Command::new("git")
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        let status = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !status.contains(".claude/settings.json"),
+            "tracked settings.json must not appear in git status: {status}"
+        );
+
+        // `git add -A` must not stage the operator path / run ids.
+        git_ok(&["add", "-A"], &wt);
+        let staged = Command::new("git")
+            .args(["diff", "--cached", "--name-only"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        let staged = String::from_utf8_lossy(&staged.stdout);
+        assert!(
+            !staged.contains(".claude/settings.json"),
+            "tracked settings.json must not be staged by `git add -A`: {staged}"
+        );
     }
 
     #[test]
