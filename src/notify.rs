@@ -12,6 +12,12 @@ use crate::paths::SparPaths;
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// Cap on how long a notify command may run before it's killed. It runs on a
+/// detached thread, but an unbounded wait would leak a thread and child process
+/// per alert, so bound it defensively.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Route a human alert to the configured external notifier, if any. Errors are
 /// logged to stderr and swallowed so bus delivery is never blocked by a bad sink.
@@ -53,7 +59,8 @@ fn summary(msg: &BusMessage) -> String {
 }
 
 /// Run the operator command via `sh -c`, with the summary as `$1` and the full
-/// message JSON on stdin. Waits for it so a manual echo-config check is observable.
+/// message JSON on stdin. Waits (bounded by `COMMAND_TIMEOUT`) so a manual
+/// echo-config check is observable without a hung notifier leaking forever.
 fn fire_command(command: &str, msg: &BusMessage) -> Result<()> {
     let json = serde_json::to_string(msg)?;
     let mut child = Command::new("sh")
@@ -67,11 +74,25 @@ fn fire_command(command: &str, msg: &BusMessage) -> Result<()> {
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(json.as_bytes()).ok();
     }
-    let status = child.wait().context("wait on notify command")?;
-    if !status.success() {
-        anyhow::bail!("notify command exited with {status}");
+    let start = Instant::now();
+    loop {
+        match child.try_wait().context("wait on notify command")? {
+            Some(status) => {
+                if !status.success() {
+                    anyhow::bail!("notify command exited with {status}");
+                }
+                return Ok(());
+            }
+            None => {
+                if start.elapsed() >= COMMAND_TIMEOUT {
+                    child.kill().ok();
+                    child.wait().ok();
+                    anyhow::bail!("notify command timed out after {COMMAND_TIMEOUT:?}");
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
-    Ok(())
 }
 
 fn fire_webhook(url: &str, msg: &BusMessage) -> Result<()> {

