@@ -20,6 +20,11 @@ pub struct Cli {
     #[arg(long = "task", global = true)]
     pub task: Option<String>,
 
+    /// Use full mouse capture (motion/drag). Default is a minimal click+wheel mode
+    /// that also works on mobile terminals like Termux, where the full set is dropped.
+    #[arg(long = "full-mouse", global = true)]
+    pub full_mouse: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }

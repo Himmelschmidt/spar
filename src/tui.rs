@@ -25,7 +25,7 @@ use ratatui::widgets::{
     Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Scrollbar,
     ScrollbarOrientation, ScrollbarState, Widget,
 };
-use std::io::stdout;
+use std::io::{stdout, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -93,6 +93,8 @@ impl Focus {
 pub struct TuiOpts {
     pub task_seed: Option<String>,
     pub cwd: Option<PathBuf>,
+    /// Opt into crossterm's full mouse capture; default is the mobile-safe subset.
+    pub full_mouse: bool,
 }
 
 pub fn run_with(opts: TuiOpts) -> Result<crate::exit_codes::ExitCode> {
@@ -117,12 +119,26 @@ pub fn run_with(opts: TuiOpts) -> Result<crate::exit_codes::ExitCode> {
     let _guard = TerminalGuard;
     let mut out = stdout();
     out.execute(EnterAlternateScreen)?;
-    out.execute(EnableMouseCapture)?;
+    // Default to a minimal mouse mode: basic tracking (1000) + SGR encoding (1006).
+    // crossterm's EnableMouseCapture also sets button/any-motion tracking
+    // (1002/1003), which Termux silently drops — leaving the app with no mouse
+    // events at all. 1000 still reports clicks and wheel, all this UI needs.
+    // `--full-mouse` opts into the full capture for desktop terminals that want it.
+    if opts.full_mouse {
+        out.execute(EnableMouseCapture)?;
+    } else {
+        out.write_all(MOUSE_ENABLE)?;
+        out.flush()?;
+    }
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
     terminal.clear()?;
 
     run_loop(&mut terminal, local_root, opts.task_seed, stall_warn_secs)
 }
+
+/// Narrow/mobile SGR mouse: basic tracking + SGR encoding only (Termux-compatible;
+/// see run_with). `DisableMouseCapture` on teardown disables this superset too.
+const MOUSE_ENABLE: &[u8] = b"\x1b[?1000h\x1b[?1006h";
 
 /// Best-effort teardown of raw mode / mouse / alt-screen (safe if only partially entered).
 struct TerminalGuard;
@@ -1726,8 +1742,8 @@ fn button_style(action: GateAction) -> Style {
     Style::default().fg(BG).bg(bg).bold()
 }
 
-/// Paint right-aligned tappable gate buttons on the top row of `area` and record
-/// their hit-rects. Buttons overpaint whatever text sits beneath them.
+/// Paint right-aligned tappable gate buttons filling every row of `area` and
+/// record their hit-rects. Buttons overpaint whatever text sits beneath them.
 fn render_gate_buttons(f: &mut Frame, area: Rect, app: &mut App, buttons: &[(&str, GateAction)]) {
     if buttons.is_empty() || area.width == 0 || area.height == 0 {
         return;
