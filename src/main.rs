@@ -279,11 +279,16 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             }
             Ok(ExitCode::Success)
         }
-        BusCmd::Inbox { agent, claim, json } => {
+        BusCmd::Inbox {
+            agent,
+            claim,
+            run,
+            json,
+        } => {
             let msgs = if claim {
-                bus::inbox_claim(&paths, &agent)?
+                bus::inbox_claim(&paths, run.as_deref(), &agent)?
             } else {
-                bus::inbox(&paths, &agent)?
+                bus::inbox(&paths, run.as_deref(), &agent)?
             };
             if json {
                 println!("{}", serde_json::to_string_pretty(&msgs)?);
@@ -380,7 +385,7 @@ fn bus_deliver(
     // only pulse — the wait loop and TUI refresh also tick acks, so redelivery/escalation
     // advances in runs with no Claude slot (whose Stop hook is the only pulse here).
     bus::tick_acks(paths, &bus::AckPolicy::default(), chrono::Utc::now())?;
-    let d = providers::delivery::deliver(paths, agent, strategy, dry_run)?;
+    let d = providers::delivery::deliver(paths, run_id, agent, strategy, dry_run)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&d)?);
     } else if let Some(payload) = &d.payload {

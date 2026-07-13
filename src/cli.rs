@@ -294,6 +294,11 @@ pub enum BusCmd {
         /// Atomically claim (drain) messages so each is delivered exactly once
         #[arg(long)]
         claim: bool,
+        /// Scope to one run's messages (`$SPAR_RUN_ID` for a run slot). Omit for a bare
+        /// agent — slot ids are not unique across runs, so an unscoped drain would claim
+        /// another run's messages for the same slot id.
+        #[arg(long)]
+        run: Option<String>,
         #[arg(long)]
         json: bool,
     },

@@ -539,7 +539,12 @@ pub fn list_presence(paths: &SparPaths, run: Option<&str>) -> Result<Vec<Presenc
 
 /// Peek an agent's undelivered inbox without consuming it. The `claimed/`
 /// subdir is skipped (it has no `.json` extension at the top level).
-pub fn inbox(paths: &SparPaths, agent: &str) -> Result<Vec<BusMessage>> {
+///
+/// `run` scopes the peek exactly like [`inbox_claim`] drains: `Some(r)` returns only
+/// messages tagged with run `r`, `None` returns only untagged (bare) traffic. Slot ids
+/// are not unique across runs, so an unfiltered peek would surface another run's
+/// messages for the same slot id.
+pub fn inbox(paths: &SparPaths, run: Option<&str>, agent: &str) -> Result<Vec<BusMessage>> {
     let dir = inbox_dir(paths, agent);
     if !dir.is_dir() {
         return Ok(Vec::new());
@@ -550,7 +555,10 @@ pub fn inbox(paths: &SparPaths, agent: &str) -> Result<Vec<BusMessage>> {
         if e.path().extension().and_then(|x| x.to_str()) != Some("json") {
             continue;
         }
-        if let Ok(m) = serde_json::from_str(&fs::read_to_string(e.path())?) {
+        if let Ok(m) = serde_json::from_str::<BusMessage>(&fs::read_to_string(e.path())?) {
+            if m.run.as_deref() != run {
+                continue;
+            }
             out.push(m);
         }
     }
@@ -563,7 +571,16 @@ pub fn inbox(paths: &SparPaths, agent: &str) -> Result<Vec<BusMessage>> {
 /// the same filesystem is atomic, so under concurrent claimers exactly one wins
 /// each file (the loser's source path is already gone → skipped), never a double
 /// delivery. Messages already claimed are not returned again.
-pub fn inbox_claim(paths: &SparPaths, agent: &str) -> Result<Vec<BusMessage>> {
+///
+/// `run` scopes the drain to one run's traffic. W5 keys inboxes by `agent_id` at the
+/// workspace root, but slot ids are deterministic per provider/role (`orchestrator`,
+/// `review-0-cli-claude`, …) and therefore collide across concurrent same-shaped runs
+/// sharing one inbox directory. Without scoping, run A's `deliver` would steal run B's
+/// messages. `Some(r)` claims only messages tagged with run `r`; `None` claims only
+/// untagged (bare) traffic. A message whose tag does not match is left in the inbox for
+/// its owner to claim — the match is checked *before* the atomic rename, so a foreign
+/// message is never removed.
+pub fn inbox_claim(paths: &SparPaths, run: Option<&str>, agent: &str) -> Result<Vec<BusMessage>> {
     let dir = inbox_dir(paths, agent);
     if !dir.is_dir() {
         return Ok(Vec::new());
@@ -584,15 +601,24 @@ pub fn inbox_claim(paths: &SparPaths, agent: &str) -> Result<Vec<BusMessage>> {
         let Some(name) = src.file_name() else {
             continue;
         };
+        // Read + scope-check before claiming: only messages tagged for `run` are ours.
+        // A concurrent claimer may have already moved the file (ENOENT) → skip.
+        let Ok(contents) = fs::read_to_string(&src) else {
+            continue;
+        };
+        let Ok(m) = serde_json::from_str::<BusMessage>(&contents) else {
+            continue;
+        };
+        if m.run.as_deref() != run {
+            continue;
+        }
         let dest = claimed_dir.join(name);
         // Whoever moves the inode owns the message. A concurrent claimer that
         // already moved it gets ENOENT here and is skipped.
         if fs::rename(&src, &dest).is_err() {
             continue;
         }
-        if let Ok(m) = serde_json::from_str(&fs::read_to_string(&dest)?) {
-            out.push(m);
-        }
+        out.push(m);
     }
     out.sort_by(|a, b| a.ts.cmp(&b.ts));
     Ok(out)
@@ -1027,7 +1053,7 @@ mod tests {
         )
         .unwrap();
         chat(&paths, Some("r1"), "a", "b", "hello", MessageBudget::Normal).unwrap();
-        let inbox_b = inbox(&paths, "b").unwrap();
+        let inbox_b = inbox(&paths, Some("r1"), "b").unwrap();
         assert!(!inbox_b.is_empty());
         reserve(&paths, Some("r1"), "src/foo.rs", "a").unwrap();
         assert!(reserve(&paths, Some("r1"), "src/foo.rs", "b").is_err());
@@ -1098,18 +1124,49 @@ mod tests {
         chat(&paths, Some("r1"), "a", "b", "world", MessageBudget::Normal).unwrap();
 
         // Peek does not consume: repeated non-claim reads keep returning all.
-        assert_eq!(inbox(&paths, "b").unwrap().len(), 2);
-        assert_eq!(inbox(&paths, "b").unwrap().len(), 2);
+        assert_eq!(inbox(&paths, Some("r1"), "b").unwrap().len(), 2);
+        assert_eq!(inbox(&paths, Some("r1"), "b").unwrap().len(), 2);
 
         // First claim drains everything; second claim sees nothing.
-        let first = inbox_claim(&paths, "b").unwrap();
+        let first = inbox_claim(&paths, Some("r1"), "b").unwrap();
         assert_eq!(first.len(), 2);
         assert_eq!(first[0].body, "hello");
         assert_eq!(first[1].body, "world");
-        assert!(inbox_claim(&paths, "b").unwrap().is_empty());
+        assert!(inbox_claim(&paths, Some("r1"), "b").unwrap().is_empty());
 
         // Peek after claim is also empty (claimed/ is excluded).
-        assert!(inbox(&paths, "b").unwrap().is_empty());
+        assert!(inbox(&paths, Some("r1"), "b").unwrap().is_empty());
+    }
+
+    #[test]
+    fn inbox_claim_is_run_scoped_across_same_slot_id() {
+        // Two runs share the deterministic slot id "b"; a message tagged for one run must
+        // never be claimable under the other (slot ids are not unique across runs).
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        for run in ["rA", "rB"] {
+            join(
+                &paths,
+                Some(run),
+                "a",
+                Some("cli:claude"),
+                Some("native-cli"),
+            )
+            .unwrap();
+            join(&paths, Some(run), "b", Some("cli:grok"), Some("native-cli")).unwrap();
+        }
+        chat(&paths, Some("rA"), "a", "b", "for A", MessageBudget::Normal).unwrap();
+        chat(&paths, Some("rB"), "a", "b", "for B", MessageBudget::Normal).unwrap();
+
+        // Run B's drain sees only run B's message; run A's stays put.
+        let b = inbox_claim(&paths, Some("rB"), "b").unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].body, "for B");
+
+        // Run A's message survived B's drain and is still claimable under run A.
+        let a = inbox_claim(&paths, Some("rA"), "b").unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].body, "for A");
     }
 
     fn nonempty_event_lines(paths: &SparPaths) -> Vec<String> {
@@ -1231,7 +1288,7 @@ mod tests {
         .unwrap();
         let m = req_ack(&paths, "a", "b", "please confirm");
         // Original delivery landed once.
-        assert_eq!(inbox_claim(&paths, "b").unwrap().len(), 1);
+        assert_eq!(inbox_claim(&paths, Some("r1"), "b").unwrap().len(), 1);
 
         // The original send scheduled the first redelivery a default backoff out, so
         // tick from far enough ahead that it (and every base_backoff-0 retry) is due.
@@ -1242,15 +1299,23 @@ mod tests {
         let now = Utc::now() + Duration::seconds(120);
         let t1 = tick_acks(&paths, &policy, now).unwrap();
         assert_eq!((t1.redelivered, t1.escalated), (1, 0));
-        assert_eq!(inbox_claim(&paths, "b").unwrap().len(), 1, "redeliver 1");
+        assert_eq!(
+            inbox_claim(&paths, Some("r1"), "b").unwrap().len(),
+            1,
+            "redeliver 1"
+        );
         let t2 = tick_acks(&paths, &policy, now).unwrap();
         assert_eq!((t2.redelivered, t2.escalated), (1, 0));
-        assert_eq!(inbox_claim(&paths, "b").unwrap().len(), 1, "redeliver 2");
+        assert_eq!(
+            inbox_claim(&paths, Some("r1"), "b").unwrap().len(),
+            1,
+            "redeliver 2"
+        );
 
         // Third due tick: retries spent → escalate to @human, drop the pending record.
         let t3 = tick_acks(&paths, &policy, now).unwrap();
         assert_eq!((t3.redelivered, t3.escalated), (0, 1));
-        let human = inbox(&paths, HUMAN).unwrap();
+        let human = inbox(&paths, Some("r1"), HUMAN).unwrap();
         assert_eq!(human.len(), 1);
         assert_eq!(human[0].kind, MsgKind::Blocked);
         assert_eq!(human[0].refs.reply_to.as_deref(), Some(m.id.as_str()));
@@ -1291,7 +1356,7 @@ mod tests {
         };
         let t = tick_acks(&paths, &policy, Utc::now()).unwrap();
         assert_eq!((t.redelivered, t.escalated), (0, 0));
-        assert!(inbox(&paths, HUMAN).unwrap().is_empty());
+        assert!(inbox(&paths, Some("r1"), HUMAN).unwrap().is_empty());
     }
 
     #[test]
@@ -1476,8 +1541,13 @@ mod tests {
             MessageBudget::Chatty,
         )
         .unwrap();
-        assert_eq!(inbox(&paths, "slot").unwrap().len(), 1);
-        assert_eq!(inbox(&paths, "bare").unwrap()[0].body, "hi bare");
+        // Each message is scoped by its own run tag: the bare→slot message is untagged
+        // (claimed under `None`), the slot→bare message carries `r1`.
+        assert_eq!(inbox(&paths, None, "slot").unwrap().len(), 1);
+        assert_eq!(
+            inbox(&paths, Some("r1"), "bare").unwrap()[0].body,
+            "hi bare"
+        );
 
         // Run-scoped presence sees only the run slot; the workspace view sees both.
         let run_roster = list_presence(&paths, Some("r1")).unwrap();

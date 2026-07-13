@@ -204,6 +204,55 @@ fn native_queue_drains_once_and_dispatches() {
     assert_eq!(again["delivered"], 0);
 }
 
+/// Two concurrent runs in one project share a deterministic slot id (same provider/role),
+/// hence one workspace inbox directory. A message addressed to the slot in run A must not
+/// be claimable by run B's deliver, and vice versa — deliver is scoped by its `--run` tag.
+#[test]
+fn deliver_is_run_scoped_across_identical_slot_ids() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+
+    let run_a = plan_and_approve(tmp.path());
+    let run_b = plan_and_approve(tmp.path());
+    let agent_a = slot_for_provider(tmp.path(), &run_a, "cli:claude");
+    let agent_b = slot_for_provider(tmp.path(), &run_b, "cli:claude");
+    // Premise: the slot id collides across the two runs (deterministic per provider/role).
+    assert_eq!(agent_a, agent_b, "slot ids must collide for this scenario");
+    let agent = agent_a;
+
+    send(tmp.path(), &run_a, &agent, "message for run A");
+    send(tmp.path(), &run_b, &agent, "message for run B");
+
+    // Run B drains only its own run-tagged traffic; run A's message is left untouched.
+    // (Planning emits run-tagged broadcasts to the slot, so `delivered` is >1 — the point
+    // is that run A's message is never among them.)
+    let db = deliver_json(tmp.path(), &run_b, &agent);
+    let reason_b = block_reason(&db);
+    assert!(reason_b.contains("message for run B"), "{reason_b}");
+    assert!(
+        !reason_b.contains("message for run A"),
+        "run B stole run A's message: {reason_b}"
+    );
+
+    // Run A's message survived B's drain and is still deliverable under run A.
+    let da = deliver_json(tmp.path(), &run_a, &agent);
+    let reason_a = block_reason(&da);
+    assert!(reason_a.contains("message for run A"), "{reason_a}");
+    assert!(
+        !reason_a.contains("message for run B"),
+        "run A drained run B's message: {reason_a}"
+    );
+}
+
+/// Extract the Stop-hook block `reason` string from a `deliver --json` report.
+fn block_reason(deliver: &Value) -> String {
+    deliver["payload"]
+        .as_str()
+        .and_then(|p| serde_json::from_str::<Value>(p).ok())
+        .map(|v| v["reason"].as_str().unwrap_or_default().to_string())
+        .unwrap_or_default()
+}
+
 /// agy: no injection channel, so deliver must NOT consume the inbox — the agent reads
 /// it itself on its next turn. `--claim` afterwards still returns the message.
 #[test]
@@ -221,10 +270,13 @@ fn none_leaves_inbox_for_agent_to_claim() {
     assert_eq!(d["delivered"], 0);
     assert!(d["pending"].as_u64().unwrap() >= 1, "{d}");
 
-    // The agent's own claim still finds the message (deliver did not strand it).
+    // The agent's own claim still finds the message (deliver did not strand it). The
+    // slot scopes the claim to its run (`--run`), matching how a run slot self-drains.
     let claimed = spar_cmd()
         .current_dir(tmp.path())
-        .args(["bus", "inbox", &agent, "--claim", "--json"])
+        .args([
+            "bus", "inbox", &agent, "--claim", "--run", &run_id, "--json",
+        ])
         .assert()
         .success()
         .get_output()
