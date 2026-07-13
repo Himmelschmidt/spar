@@ -68,6 +68,7 @@ Workspace initiative (2026-07-13). See `roadmap/workspace-initiative-plan.md` fo
 | W4 | "Own coding UI over direct API" **deferred** — use opencode as the harness for API-only providers for now | DECIDED (deferred) |
 | W5 | Workspace bus keyed by `agent_id`; `run_id` demoted to an optional message tag; `SPAR_AGENT_ID` gives bare agents identity. Lands last | DECIDED |
 | B1 | `@human` routing = always-on TUI sink (baseline, zero config) + opt-in generic `[notify]` command/webhook; **no hardcoded personal integrations** in source | DECIDED |
+| W6 | **Image paste over SSH = local-companion bridge (option A).** A local `spar clip` reads the OS clipboard image (`arboard` / `wl-paste` / `pbpaste`), ships raw bytes to the remote spar over the existing SSH connection (ControlMaster-exec or a forwarded socket); the remote stages a `0600` temp file and injects its **path** into the agent pane via Track A `send-keys` (agents accept image file paths). Additive; fits the ssh-then-run + `tmux -L spar` model. Thin-client alternative deferred — see X7 | DECIDED — backlog feature 002 |
 
 ## Open
 
@@ -79,3 +80,4 @@ Workspace initiative (2026-07-13). See `roadmap/workspace-initiative-plan.md` fo
 | X4 | Bus steer reliability for native-cli headless | DECIDED — adapter-dispatched turn-boundary delivery (Stop-hook inject / native queue / SDK prompt / inbox-on-next-turn per adapter) |
 | X5 | vals scrape parser brittleness / grace TTL days / ship in-repo snapshot | OPEN — decide at MS phase A impl |
 | X6 | Exact vals model id → `cli:`/`api:` + model string mapping table | OPEN — phase A/B |
+| X7 | **Thin-client split** (`spar --remote`: local TUI ↔ remote orchestrator over spar's own protocol stream) as an alternative to ssh-then-run — would make image paste fall out as one message type (herdr's model) and give attach/persistence without tmux. Reopens the tmux-vs-own-protocol call (W1/W2) | OPEN — backlog; revisit after the workspace initiative lands |
