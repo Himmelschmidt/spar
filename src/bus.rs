@@ -18,7 +18,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 /// Reserved recipient id for messages that need a human's attention. Every such
@@ -361,18 +361,23 @@ pub fn send(paths: &SparPaths, msg: BusMessage, budget: MessageBudget) -> Result
     }
     ensure_bus(paths)?;
     let run = msg.run.as_deref();
-    // Loop guard and budget stay run-scoped: cap traffic within one run's cohort, not
-    // across the whole workspace (a bare pair is its own `None` scope).
-    check_loop(&list_events(paths, run)?, &msg, LoopGuard::from_env())?;
-    // Budget check and append happen under one lock so two senders can't both
-    // read a below-cap count and both write (TOCTOU across processes).
-    append_event_checked(&events_path(paths), &msg, budget.max_messages(), run)?;
     // TODO(W5): remove the run-dir event mirror once no reader watches
-    // `.spar/runs/<id>/bus/events.jsonl`.
+    // `.spar/runs/<id>/bus/events.jsonl`. Until then the mirror is written under the
+    // workspace append lock in `append_event_checked`.
     if let Some(r) = run {
         let _ = ensure_run_bus(paths, r);
-        let _ = append_jsonl(&run_events_path(paths, r), &msg);
     }
+    // Loop guard and budget stay run-scoped: cap traffic within one run's cohort, not
+    // across the whole workspace (a bare pair is its own `None` scope). The guard only
+    // needs the recent window, so read a bounded tail of the workspace log instead of
+    // parsing all of its (unbounded) history on every send.
+    let guard = LoopGuard::from_env();
+    let mut recent = recent_events(&events_path(paths), msg.ts - guard.window)?;
+    recent.retain(|m| m.run.as_deref() == run);
+    check_loop(&recent, &msg, guard)?;
+    // Budget check and both appends happen under one lock so two senders can't both
+    // read a below-cap count and both write (TOCTOU across processes).
+    append_event_checked(paths, &msg, budget.max_messages(), run)?;
     deliver_inbox(paths, &msg)?;
     // also mirror to legacy mailbox for tools that still read it (run-scoped only)
     if let Some(r) = run {
@@ -911,26 +916,89 @@ pub fn unresolved_alerts(paths: &SparPaths, run: Option<&str>) -> Result<Vec<Bus
     Ok(out)
 }
 
-/// Count the events on the workspace log that belong to `run` (the message-budget
-/// unit stays a single run's cohort even though the log is now workspace-wide).
-fn count_run_events(path: &PathBuf, run: Option<&str>) -> Result<usize> {
+/// Count nonempty lines without parsing. The per-run mirror log holds only that run's
+/// events (1:1 with its run-tagged records on the workspace log), so its line count is
+/// the run's budget usage — and it is bounded by run lifetime, not workspace age.
+fn count_lines(path: &PathBuf) -> Result<usize> {
     if !path.is_file() {
         return Ok(0);
     }
+    Ok(fs::read_to_string(path)?
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count())
+}
+
+/// Count bare (untagged) events on the workspace log, streaming and short-circuiting
+/// at `max`. Bare traffic has no per-run mirror, so this still scans the workspace
+/// file, but the early stop caps the parse cost at `max` matches.
+/// TODO(W5): add size/age rotation for `.spar/bus/events.jsonl` so this can't scan
+/// unbounded history when bare events stay below `max`.
+fn count_bare_events(path: &PathBuf, max: usize) -> Result<usize> {
+    if !path.is_file() {
+        return Ok(0);
+    }
+    let reader = std::io::BufReader::new(File::open(path)?);
     let mut n = 0usize;
-    for line in fs::read_to_string(path)?.lines() {
+    for line in reader.lines() {
+        let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        let m: BusMessage = match serde_json::from_str(line) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if m.run.as_deref() == run {
-            n += 1;
+        if let Ok(m) = serde_json::from_str::<BusMessage>(&line) {
+            if m.run.is_none() {
+                n += 1;
+                if n >= max {
+                    break;
+                }
+            }
         }
     }
     Ok(n)
+}
+
+/// Read the tail of the workspace event log back far enough to cover every record at
+/// or after `since`, without parsing the whole (unbounded, workspace-global) file. The
+/// log is append-ordered by time, so grow the read window from the end until the
+/// earliest visible record predates `since` (or we reach the file start), then keep the
+/// in-window records. Bounds each send's parse + IO cost to the recent window rather
+/// than total workspace history.
+fn recent_events(path: &PathBuf, since: DateTime<Utc>) -> Result<Vec<BusMessage>> {
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("open {}", path.display())),
+    };
+    let len = f.metadata()?.len();
+    let mut window: u64 = 64 * 1024;
+    loop {
+        let start = len.saturating_sub(window);
+        f.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::new();
+        f.read_to_end(&mut bytes)?;
+        // A tail read can start mid-line; drop the leading partial line unless we are
+        // reading from the very start of the file.
+        let slice: &[u8] = if start > 0 {
+            match bytes.iter().position(|&b| b == b'\n') {
+                Some(i) => &bytes[i + 1..],
+                None => &[],
+            }
+        } else {
+            &bytes[..]
+        };
+        let text = String::from_utf8_lossy(slice);
+        let msgs: Vec<BusMessage> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        let spanned = start == 0 || window >= len;
+        let covered = spanned || matches!(msgs.first(), Some(m) if m.ts < since);
+        if covered {
+            return Ok(msgs.into_iter().filter(|m| m.ts >= since).collect());
+        }
+        window = window.saturating_mul(2);
+    }
 }
 
 fn open_for_append(path: &PathBuf) -> Result<File> {
@@ -992,23 +1060,34 @@ fn append_jsonl<T: Serialize>(path: &PathBuf, value: &T) -> Result<()> {
     write_record(&mut f, value)
 }
 
-/// Append a bus event while enforcing the message budget under the same lock
-/// that guards the write: the count and the append are atomic with respect to
-/// other senders, closing the check-then-write race.
+/// Append a bus event (plus its per-run back-compat mirror) while enforcing the
+/// message budget, all under the workspace log's exclusive lock: the count and both
+/// appends are atomic with respect to other senders, closing the check-then-write
+/// race. The budget counts the bounded per-run mirror instead of the unbounded
+/// workspace log, so each send is O(run events), not O(total workspace history).
 fn append_event_checked(
-    path: &PathBuf,
+    paths: &SparPaths,
     msg: &BusMessage,
     max: Option<usize>,
     run: Option<&str>,
 ) -> Result<()> {
-    let mut f = open_for_append(path)?;
+    let mut f = open_for_append(&events_path(paths))?;
     lock_exclusive(&f)?;
     if let Some(max) = max {
-        if count_run_events(path, run)? >= max {
+        let count = match run {
+            Some(r) => count_lines(&run_events_path(paths, r))?,
+            None => count_bare_events(&events_path(paths), max)?,
+        };
+        if count >= max {
             bail!("message budget exhausted ({max} messages)");
         }
     }
-    write_record(&mut f, msg)
+    write_record(&mut f, msg)?;
+    if let Some(r) = run {
+        let mut mf = open_for_append(&run_events_path(paths, r))?;
+        write_record(&mut mf, msg)?;
+    }
+    Ok(())
 }
 
 fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &PathBuf) -> Result<Vec<T>> {
@@ -1564,5 +1643,82 @@ mod tests {
 
         // The run-tagged traffic is mirrored into the legacy run bus dir.
         assert!(run_events_path(&paths, "r1").is_file());
+    }
+
+    /// The loop guard reads only a bounded tail of the (workspace-global, unbounded)
+    /// event log: `recent_events` returns records at/after the cutoff and nothing older.
+    #[test]
+    fn recent_events_reads_only_the_recent_window() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let now = Utc::now();
+        let mk = |ts, body: &str| BusMessage {
+            id: new_id(),
+            ts,
+            from: "a".into(),
+            to: "b".into(),
+            kind: MsgKind::Chat,
+            body: body.into(),
+            run: Some("r1".into()),
+            subject: None,
+            refs: MsgRefs::default(),
+            requires_ack: false,
+            meta: HashMap::new(),
+        };
+        // Append an out-of-window record, then a recent one (log stays time-ordered).
+        send(
+            &paths,
+            mk(now - Duration::seconds(3600), "old"),
+            MessageBudget::Chatty,
+        )
+        .unwrap();
+        send(
+            &paths,
+            mk(now - Duration::seconds(5), "new"),
+            MessageBudget::Chatty,
+        )
+        .unwrap();
+        let got = recent_events(&events_path(&paths), now - Duration::seconds(60)).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].body, "new");
+        // A missing log is simply empty, not an error.
+        let missing = paths.bus_dir().join("nope.jsonl");
+        assert!(recent_events(&missing, now).unwrap().is_empty());
+    }
+
+    /// The bare-traffic budget count short-circuits at `max` and never counts
+    /// run-tagged events; run budgets are counted off the bounded per-run mirror.
+    #[test]
+    fn bare_budget_count_short_circuits_and_ignores_run_tagged() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        for i in 0..5 {
+            chat(
+                &paths,
+                None,
+                "a",
+                "b",
+                format!("bare{i}"),
+                MessageBudget::Chatty,
+            )
+            .unwrap();
+        }
+        for i in 0..5 {
+            chat(
+                &paths,
+                Some("r1"),
+                "a",
+                "b",
+                format!("run{i}"),
+                MessageBudget::Chatty,
+            )
+            .unwrap();
+        }
+        // Stops at the cap even though more bare events exist.
+        assert_eq!(count_bare_events(&events_path(&paths), 3).unwrap(), 3);
+        // Counts every bare event under a higher cap, and never the run-tagged ones.
+        assert_eq!(count_bare_events(&events_path(&paths), 100).unwrap(), 5);
+        // The per-run budget unit is the bounded mirror's line count.
+        assert_eq!(count_lines(&run_events_path(&paths, "r1")).unwrap(), 5);
     }
 }
