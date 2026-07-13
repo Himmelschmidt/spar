@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -175,20 +175,27 @@ pub fn heartbeat(paths: &SparPaths, run_id: &str, agent: &str, status: &str) -> 
     append_jsonl(&agents_path(paths, run_id), &p)
 }
 
+/// Cap on a message body. Bodies are inline JSONL records read whole into memory
+/// by every reader; an unbounded body would let one message bloat the event log
+/// and every inbox copy. 64 KiB is generous for coordination traffic.
+pub const MAX_BODY_BYTES: usize = 64 * 1024;
+
 pub fn send(
     paths: &SparPaths,
     run_id: &str,
     msg: BusMessage,
     budget: MessageBudget,
 ) -> Result<BusMessage> {
-    ensure_bus(paths, run_id)?;
-    if let Some(max) = budget.max_messages() {
-        let n = count_events(paths, run_id)?;
-        if n >= max {
-            bail!("message budget exhausted ({max} messages)");
-        }
+    if msg.body.len() > MAX_BODY_BYTES {
+        bail!(
+            "message body too large ({} bytes; max {MAX_BODY_BYTES})",
+            msg.body.len()
+        );
     }
-    append_jsonl(&events_path(paths, run_id), &msg)?;
+    ensure_bus(paths, run_id)?;
+    // Budget check and append happen under one lock so two senders can't both
+    // read a below-cap count and both write (TOCTOU across processes).
+    append_event_checked(&events_path(paths, run_id), &msg, budget.max_messages())?;
     deliver_inbox(paths, run_id, &msg)?;
     // also mirror to legacy mailbox for tools that still read it
     let _ = crate::mailbox::send(
@@ -390,29 +397,63 @@ fn save_reserves(paths: &SparPaths, run_id: &str, file: &ReservesFile) -> Result
     Ok(())
 }
 
-fn count_events(paths: &SparPaths, run_id: &str) -> Result<usize> {
-    let p = events_path(paths, run_id);
-    if !p.is_file() {
+fn count_nonempty_lines(path: &PathBuf) -> Result<usize> {
+    if !path.is_file() {
         return Ok(0);
     }
-    Ok(fs::read_to_string(p)?
+    Ok(fs::read_to_string(path)?
         .lines()
         .filter(|l| !l.trim().is_empty())
         .count())
 }
 
-fn append_jsonl<T: Serialize>(path: &PathBuf, value: &T) -> Result<()> {
+fn open_for_append(path: &PathBuf) -> Result<File> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut f = OpenOptions::new()
+    OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-        .with_context(|| format!("open {}", path.display()))?;
-    serde_json::to_writer(&mut f, value)?;
-    f.write_all(b"\n")?;
+        .with_context(|| format!("open {}", path.display()))
+}
+
+/// Take an exclusive advisory lock on the file's open description. It is held
+/// until `f` is dropped (fd close), serializing writers across threads and
+/// processes so a record and its trailing newline can never interleave with
+/// another writer's bytes.
+fn lock_exclusive(f: &File) -> Result<()> {
+    rustix::fs::flock(f, rustix::fs::FlockOperation::LockExclusive).context("flock exclusive")?;
     Ok(())
+}
+
+/// Serialize `value` and its newline into a single `write_all`, so under
+/// `O_APPEND` the whole record lands at end-of-file in one syscall.
+fn write_record<T: Serialize>(f: &mut File, value: &T) -> Result<()> {
+    let mut line = serde_json::to_vec(value)?;
+    line.push(b'\n');
+    f.write_all(&line)?;
+    Ok(())
+}
+
+fn append_jsonl<T: Serialize>(path: &PathBuf, value: &T) -> Result<()> {
+    let mut f = open_for_append(path)?;
+    lock_exclusive(&f)?;
+    write_record(&mut f, value)
+}
+
+/// Append a bus event while enforcing the message budget under the same lock
+/// that guards the write: the count and the append are atomic with respect to
+/// other senders, closing the check-then-write race.
+fn append_event_checked(path: &PathBuf, msg: &BusMessage, max: Option<usize>) -> Result<()> {
+    let mut f = open_for_append(path)?;
+    lock_exclusive(&f)?;
+    if let Some(max) = max {
+        if count_nonempty_lines(path)? >= max {
+            bail!("message budget exhausted ({max} messages)");
+        }
+    }
+    write_record(&mut f, msg)
 }
 
 fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &PathBuf) -> Result<Vec<T>> {
@@ -473,5 +514,85 @@ mod tests {
 
         // Peek after claim is also empty (claimed/ is excluded).
         assert!(inbox(&paths, "r1", "b").unwrap().is_empty());
+    }
+
+    fn nonempty_event_lines(paths: &SparPaths, run_id: &str) -> Vec<String> {
+        fs::read_to_string(events_path(paths, run_id))
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn concurrent_send_writes_intact_lines() {
+        let tmp = tempdir().unwrap();
+        let paths = std::sync::Arc::new(SparPaths::new(tmp.path()));
+        ensure_bus(&paths, "r1").unwrap();
+        let m = 32;
+        let handles: Vec<_> = (0..m)
+            .map(|i| {
+                let p = paths.clone();
+                std::thread::spawn(move || {
+                    chat(
+                        &p,
+                        "r1",
+                        "a",
+                        "b",
+                        format!("msg {i}"),
+                        MessageBudget::Chatty,
+                    )
+                    .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Exactly M records, each a well-formed (untorn) JSONL line.
+        let lines = nonempty_event_lines(&paths, "r1");
+        assert_eq!(lines.len(), m);
+        for l in &lines {
+            serde_json::from_str::<BusMessage>(l).expect("well-formed JSONL line");
+        }
+    }
+
+    #[test]
+    fn concurrent_send_respects_budget() {
+        let tmp = tempdir().unwrap();
+        let paths = std::sync::Arc::new(SparPaths::new(tmp.path()));
+        ensure_bus(&paths, "r1").unwrap();
+        let max = MessageBudget::Lean.max_messages().unwrap();
+        let threads = max * 3;
+        let handles: Vec<_> = (0..threads)
+            .map(|i| {
+                let p = paths.clone();
+                std::thread::spawn(move || {
+                    // Some senders lose the budget race and error; that's fine.
+                    let _ = chat(&p, "r1", "a", "b", format!("m{i}"), MessageBudget::Lean);
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let lines = nonempty_event_lines(&paths, "r1");
+        // Never past the cap, and every survivor is intact.
+        assert_eq!(lines.len(), max);
+        for l in &lines {
+            serde_json::from_str::<BusMessage>(l).expect("well-formed JSONL line");
+        }
+    }
+
+    #[test]
+    fn send_rejects_oversized_body() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let big = "x".repeat(MAX_BODY_BYTES + 1);
+        assert!(chat(&paths, "r1", "a", "b", big, MessageBudget::Chatty).is_err());
+        // A body at the cap is accepted.
+        let ok = "y".repeat(MAX_BODY_BYTES);
+        assert!(chat(&paths, "r1", "a", "b", ok, MessageBudget::Chatty).is_ok());
     }
 }
