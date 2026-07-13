@@ -8,6 +8,7 @@ use crate::process;
 use crate::quota::QuotaStore;
 use crate::registry;
 use crate::state::{self, Phase, RunState, SlotState, SlotStatus};
+use crate::tmux;
 use crate::workflow;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -23,13 +24,14 @@ use ratatui::buffer::Buffer;
 use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Scrollbar,
-    ScrollbarOrientation, ScrollbarState, Widget,
+    ScrollbarOrientation, ScrollbarState, Widget, Wrap,
 };
 use std::io::{stdout, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
+use tui_term::widget::PseudoTerminal;
 
 // ── palette ─────────────────────────────────────────────────────────────────
 
@@ -57,6 +59,7 @@ enum Focus {
     Agents,
     Log,
     Activity,
+    Terminal,
     Composer,
 }
 
@@ -66,7 +69,8 @@ impl Focus {
             Focus::Runs => Focus::Agents,
             Focus::Agents => Focus::Log,
             Focus::Log => Focus::Activity,
-            Focus::Activity => Focus::Composer,
+            Focus::Activity => Focus::Terminal,
+            Focus::Terminal => Focus::Composer,
             Focus::Composer => Focus::Runs,
         }
     }
@@ -76,7 +80,8 @@ impl Focus {
             Focus::Agents => Focus::Runs,
             Focus::Log => Focus::Agents,
             Focus::Activity => Focus::Log,
-            Focus::Composer => Focus::Activity,
+            Focus::Terminal => Focus::Activity,
+            Focus::Composer => Focus::Terminal,
         }
     }
     fn label(self) -> &'static str {
@@ -85,6 +90,7 @@ impl Focus {
             Focus::Agents => "Agents",
             Focus::Log => "Live log",
             Focus::Activity => "Activity",
+            Focus::Terminal => "Terminal",
             Focus::Composer => "Command",
         }
     }
@@ -201,6 +207,7 @@ struct App {
     rect_fleet: Rect,
     rect_stream: Rect,
     rect_bus: Rect,
+    rect_terminal: Rect,
     rect_composer: Rect,
     rect_runs: Rect,
     /// Narrow-mode tab strip (zero-sized when the wide layout is active).
@@ -217,6 +224,9 @@ struct App {
     /// Count of unresolved `@human`/`Blocked` bus alerts for the selected run; drives
     /// the header badge. Refreshed from the snapshot each frame.
     human_alerts_n: usize,
+    /// Embedded terminal (W3): a live vt100 view of the selected run's tmux pane.
+    /// Lazily attached when the Terminal focus is opened over a live session.
+    terminal_pane: Option<crate::terminal::TerminalPane>,
 }
 
 /// A gate action reachable by both a key and a tappable button.
@@ -315,6 +325,7 @@ impl App {
             rect_fleet: Rect::default(),
             rect_stream: Rect::default(),
             rect_bus: Rect::default(),
+            rect_terminal: Rect::default(),
             rect_composer: Rect::default(),
             rect_runs: Rect::default(),
             rect_tabs: Rect::default(),
@@ -324,6 +335,7 @@ impl App {
             rect_projects: Rect::default(),
             reconcile_spawn: None,
             human_alerts_n: 0,
+            terminal_pane: None,
         }
     }
 
@@ -624,6 +636,8 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache) -> Snapshot {
 fn animating(app: &App, snap: &Snapshot) -> bool {
     app.flash.is_some()
         || app.focus == Focus::Composer
+        // A live terminal streams between disk snapshots; keep repainting it.
+        || (app.focus == Focus::Terminal && app.terminal_pane.is_some())
         || snap.full.as_ref().is_some_and(|st| {
             is_active_phase(st.phase) || st.slots.iter().any(|s| s.status == SlotStatus::Running)
         })
@@ -744,6 +758,7 @@ fn run_loop(
         });
         fleet_state.select((n_slots > 0).then_some(app.selected_slot));
 
+        manage_terminal(&mut app, snap.full.as_ref());
         app.animated = animating(&app, &snap);
         app.human_alerts_n = snap.human_alerts;
 
@@ -985,7 +1000,7 @@ fn handle_key(
             }
             Focus::Log => app.scroll_stream_by(3),
             Focus::Activity => app.scroll_bus_by(1),
-            Focus::Composer => {}
+            Focus::Terminal | Focus::Composer => {}
         },
         KeyCode::Char('k') | KeyCode::Up => match app.focus {
             Focus::Runs => match app.browse {
@@ -1004,7 +1019,7 @@ fn handle_key(
             }
             Focus::Log => app.scroll_stream_by(-3),
             Focus::Activity => app.scroll_bus_by(-1),
-            Focus::Composer => {}
+            Focus::Terminal | Focus::Composer => {}
         },
         KeyCode::PageDown => match app.focus {
             Focus::Log => app.scroll_stream_by(i32::from(app.stream_page())),
@@ -1386,6 +1401,9 @@ struct LayoutRects {
     fleet: Rect,
     stream: Rect,
     bus: Rect,
+    /// Embedded terminal stage; non-zero only when the Terminal focus is active
+    /// (it shares the main stage with the live log).
+    terminal: Rect,
     composer: Rect,
     footer: Rect,
     /// Narrow-mode tab strip; zero-sized in the wide layout.
@@ -1421,6 +1439,7 @@ fn layout_rects(area: Rect, focus: Focus) -> LayoutRects {
             fleet: z,
             stream: z,
             bus: z,
+            terminal: z,
             composer: nroot[3],
             footer: nroot[4],
             tabs: nroot[1],
@@ -1432,6 +1451,7 @@ fn layout_rects(area: Rect, focus: Focus) -> LayoutRects {
             Focus::Agents => lay.fleet = nroot[2],
             Focus::Log | Focus::Composer => lay.stream = nroot[2],
             Focus::Activity => lay.bus = nroot[2],
+            Focus::Terminal => lay.terminal = nroot[2],
         }
         return lay;
     }
@@ -1462,13 +1482,22 @@ fn layout_rects(area: Rect, focus: Focus) -> LayoutRects {
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(mid[0]);
 
+    // The terminal shares the main stage with the live log; only one paints,
+    // chosen by focus, so a zero rect suppresses the other.
+    let (stream, terminal) = if focus == Focus::Terminal {
+        (Rect::default(), mid[1])
+    } else {
+        (mid[1], Rect::default())
+    };
+
     LayoutRects {
         header: root[0],
         action: root[1],
         runs: left[0],
         fleet: left[1],
-        stream: mid[1],
+        stream,
         bus: mid[2],
+        terminal,
         composer: root[3],
         footer: root[4],
         tabs: Rect::default(),
@@ -1477,11 +1506,12 @@ fn layout_rects(area: Rect, focus: Focus) -> LayoutRects {
 }
 
 /// Narrow-mode tabs, in cycle order, each mapped to the focus it selects.
-const NARROW_TABS: [(Focus, &str); 4] = [
+const NARROW_TABS: [(Focus, &str); 5] = [
     (Focus::Runs, "Runs"),
     (Focus::Agents, "Agents"),
     (Focus::Log, "Log"),
     (Focus::Activity, "Activity"),
+    (Focus::Terminal, "Term"),
 ];
 
 #[allow(clippy::too_many_arguments)]
@@ -1524,6 +1554,7 @@ fn draw(
     app.rect_fleet = lay.fleet;
     app.rect_stream = lay.stream;
     app.rect_bus = lay.bus;
+    app.rect_terminal = lay.terminal;
     app.rect_composer = lay.composer;
     app.rect_tabs = lay.tabs;
     // Rebuilt below by whichever bar/footer paints this frame.
@@ -1538,13 +1569,18 @@ fn draw(
             Focus::Agents => draw_agents(f, lay.fleet, full, app, fleet_state),
             Focus::Log | Focus::Composer => draw_stream(f, lay.stream, full, stream_text, app),
             Focus::Activity => draw_activity(f, lay.bus, activity, app),
+            Focus::Terminal => draw_terminal(f, lay.terminal, app),
         }
     } else {
         draw_header(f, lay.header, swarm, full, app);
         draw_action(f, lay.action, projects, runs, full, app);
         draw_rail(f, lay.runs, projects, runs, app, rail_state);
         draw_agents(f, lay.fleet, full, app, fleet_state);
-        draw_stream(f, lay.stream, full, stream_text, app);
+        if app.focus == Focus::Terminal {
+            draw_terminal(f, lay.terminal, app);
+        } else {
+            draw_stream(f, lay.stream, full, stream_text, app);
+        }
         draw_activity(f, lay.bus, activity, app);
     }
     draw_composer(f, lay.composer, app);
@@ -2846,7 +2882,8 @@ fn situational_footer(full: Option<&RunState>, focus: Focus, browse: BrowseLevel
         Focus::Runs => "j/k runs · Esc/p projects · Tab → Agents · ? help",
         Focus::Agents => "j/k agent · log follows · Tab → Live log",
         Focus::Log => "scroll · w wrap · g/G top/end · up unfollows live · Tab",
-        Focus::Activity => "run timeline · scroll · Tab → Command",
+        Focus::Activity => "run timeline · scroll · Tab → Terminal",
+        Focus::Terminal => "live agent pane · Tab → Command",
         Focus::Composer => "type /approve /reject /ship /help · Enter · Esc",
     }
 }
@@ -2902,6 +2939,91 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
                 .style(Style::default().bg(BG_RAISED)),
         );
     f.render_widget(p, rect);
+}
+
+/// Rows/cols available inside the terminal panel's border, falling back to a
+/// standard 80x24 when the panel hasn't been laid out yet.
+fn terminal_dims(rect: Rect) -> (u16, u16) {
+    let rows = rect.height.saturating_sub(2);
+    let cols = rect.width.saturating_sub(2);
+    (
+        if rows == 0 { 24 } else { rows },
+        if cols == 0 { 80 } else { cols },
+    )
+}
+
+/// Lifecycle for the embedded terminal: attach to the selected run's tmux pane on
+/// the spar socket when the Terminal panel is focused, drop a stale attachment,
+/// and pump live output into the vt100 buffer every frame.
+fn manage_terminal(app: &mut App, full: Option<&RunState>) {
+    // Nothing to do until the panel is opened; avoids forking `tmux has-session`
+    // every frame while the operator is on another tab.
+    if app.focus != Focus::Terminal && app.terminal_pane.is_none() {
+        return;
+    }
+    let session = full.and_then(|st| {
+        let name = st
+            .tmux_session
+            .clone()
+            .unwrap_or_else(|| tmux::session_name(&st.id));
+        (tmux::available() && tmux::has_session(&name)).then_some(name)
+    });
+
+    // Selection moved to a different (or no) session — release the old client.
+    if let Some(pane) = app.terminal_pane.as_ref() {
+        if pane.session() != session.as_deref() {
+            app.terminal_pane = None;
+        }
+    }
+
+    // Attach lazily, only while the panel is focused, to avoid spawning a control
+    // client for runs the operator never looks at.
+    if app.focus == Focus::Terminal && app.terminal_pane.is_none() {
+        if let Some(name) = &session {
+            let (rows, cols) = terminal_dims(app.rect_terminal);
+            let mut pane = crate::terminal::TerminalPane::new(rows, cols);
+            if pane.attach(name).is_ok() {
+                app.terminal_pane = Some(pane);
+            }
+        }
+    }
+
+    if let Some(pane) = app.terminal_pane.as_mut() {
+        pane.pump();
+    }
+}
+
+fn draw_terminal(f: &mut Frame, area: Rect, app: &mut App) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let focused = app.focus == Focus::Terminal;
+    let title = match app.terminal_pane.as_ref() {
+        Some(pane) => {
+            let (rows, cols) = pane.dims();
+            format!(" Terminal · live agent pane · {cols}x{rows} ")
+        }
+        None => " Terminal · no live tmux pane ".to_string(),
+    };
+    let block = panel(&title, focused);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let Some(pane) = app.terminal_pane.as_mut() else {
+        let hint = Paragraph::new(
+            "No live tmux session for the selected run.\n\nRuns spawned on the spar socket show their agent pane here — \
+             switch to a run with a live session, or spawn one, to attach.",
+        )
+        .style(Style::default().fg(FG_DIM))
+        .wrap(Wrap { trim: true });
+        f.render_widget(hint, inner);
+        return;
+    };
+
+    // Keep the vt100 buffer (and the tmux pane) matched to the visible area.
+    pane.resize(inner.height, inner.width);
+    let term = PseudoTerminal::new(pane.screen());
+    f.render_widget(term, inner);
 }
 
 fn panel(title: &str, focused: bool) -> Block<'_> {

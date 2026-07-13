@@ -24,6 +24,7 @@ mod skills;
 mod state;
 mod tasks;
 mod templates;
+mod terminal;
 mod tmux;
 mod tui;
 mod util;
