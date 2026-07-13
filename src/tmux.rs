@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use crossterm::event::{KeyCode, KeyModifiers};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -92,6 +93,107 @@ pub fn send_keys(session: &str, window: &str, keys: &str) -> Result<()> {
     let target = format!("{session}:{window}");
     let status = tmux()
         .args(["send-keys", "-t", &target, keys, "Enter"])
+        .status()
+        .context("tmux send-keys")?;
+    if !status.success() {
+        bail!("tmux send-keys failed for {target}");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Key forwarding (Stage 10)
+//
+// When the TUI's Terminal panel is focused, crossterm key events are translated
+// into `tmux send-keys` invocations against the focused pane on the spar socket.
+// The translation is a pure function so it can be unit-tested independently of a
+// live tmux server.
+// ---------------------------------------------------------------------------
+
+/// A crossterm key translated for `tmux send-keys`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendKey {
+    /// Printable text sent verbatim with `send-keys -l` (literal), so a glyph is
+    /// never mistaken for a tmux key name (e.g. the letters in "Enter").
+    Literal(String),
+    /// A named tmux key or modifier combo sent by name — `Enter`, `Tab`, `BSpace`,
+    /// `Up`, `C-c`, `M-b`, `F5`, … These carry semantics (Enter submits a prompt),
+    /// which is why they must stay distinct from [`SendKey::Literal`].
+    Named(String),
+}
+
+impl SendKey {
+    /// The `send-keys` arguments that follow the `-t <target>`, e.g. `["-l", "a"]`
+    /// or `["Enter"]`. Pure; used both for spawning and for tests.
+    pub fn args(&self) -> Vec<String> {
+        match self {
+            SendKey::Literal(s) => vec!["-l".to_string(), s.clone()],
+            SendKey::Named(k) => vec![k.clone()],
+        }
+    }
+}
+
+/// Translate a crossterm key event into a single `tmux send-keys` payload, or
+/// `None` for keys we don't forward.
+///
+/// The write-text-then-separate-Enter convention (a prompt's text is typed, then
+/// Enter is a distinct submit) falls out naturally: each printable key maps to a
+/// [`SendKey::Literal`] and Enter maps to its own [`SendKey::Named`] `Enter`, so a
+/// per-keystroke forwarder never fuses text and the submit into one send.
+pub fn map_key(code: KeyCode, mods: KeyModifiers) -> Option<SendKey> {
+    let ctrl = mods.contains(KeyModifiers::CONTROL);
+    let alt = mods.contains(KeyModifiers::ALT);
+    let named = |k: &str| Some(SendKey::Named(k.to_string()));
+    match code {
+        KeyCode::Char(c) => {
+            if ctrl || alt {
+                // tmux spells modifiers `M-`/`C-`; Ctrl folds case (C-c == C-C).
+                let base = if ctrl { c.to_ascii_lowercase() } else { c };
+                let mut name = String::new();
+                if alt {
+                    name.push_str("M-");
+                }
+                if ctrl {
+                    name.push_str("C-");
+                }
+                name.push(base);
+                Some(SendKey::Named(name))
+            } else {
+                Some(SendKey::Literal(c.to_string()))
+            }
+        }
+        KeyCode::Enter => named("Enter"),
+        KeyCode::Tab => named("Tab"),
+        KeyCode::BackTab => named("BTab"),
+        KeyCode::Backspace => named("BSpace"),
+        KeyCode::Esc => named("Escape"),
+        KeyCode::Left => named("Left"),
+        KeyCode::Right => named("Right"),
+        KeyCode::Up => named("Up"),
+        KeyCode::Down => named("Down"),
+        KeyCode::Home => named("Home"),
+        KeyCode::End => named("End"),
+        KeyCode::PageUp => named("PageUp"),
+        KeyCode::PageDown => named("PageDown"),
+        KeyCode::Delete => named("DC"),
+        KeyCode::Insert => named("IC"),
+        KeyCode::F(n) => Some(SendKey::Named(format!("F{n}"))),
+        _ => None,
+    }
+}
+
+/// Send one translated key to `target` (a pane id `%N` or a session name) on the
+/// spar socket via `tmux -L spar send-keys`. Human keystroke rate makes the per-key
+/// spawn negligible, and targeting the exact pane keeps it off any shared socket.
+pub fn send_key(target: &str, key: &SendKey) -> Result<()> {
+    let mut cmd = tmux();
+    cmd.args(["send-keys", "-t", target]);
+    for a in key.args() {
+        cmd.arg(a);
+    }
+    let status = cmd
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .context("tmux send-keys")?;
     if !status.success() {
@@ -514,6 +616,110 @@ mod tests {
                 lines: vec!["no such session".to_string()],
             }
         );
+    }
+
+    fn map(code: KeyCode, mods: KeyModifiers) -> SendKey {
+        super::map_key(code, mods).expect("key should map")
+    }
+
+    #[test]
+    fn printable_chars_map_to_literal() {
+        assert_eq!(
+            map(KeyCode::Char('a'), KeyModifiers::NONE),
+            SendKey::Literal("a".to_string())
+        );
+        // A shifted char already arrives upper-cased; still literal.
+        assert_eq!(
+            map(KeyCode::Char('A'), KeyModifiers::SHIFT),
+            SendKey::Literal("A".to_string())
+        );
+        assert_eq!(
+            map(KeyCode::Char(' '), KeyModifiers::NONE),
+            SendKey::Literal(" ".to_string())
+        );
+    }
+
+    #[test]
+    fn literal_args_use_dash_l() {
+        assert_eq!(
+            SendKey::Literal("a".to_string()).args(),
+            vec!["-l".to_string(), "a".to_string()]
+        );
+        assert_eq!(
+            SendKey::Named("Enter".to_string()).args(),
+            vec!["Enter".to_string()]
+        );
+    }
+
+    #[test]
+    fn enter_is_its_own_named_key() {
+        // Enter must stay a distinct submit, never fused into typed text.
+        assert_eq!(
+            map(KeyCode::Enter, KeyModifiers::NONE),
+            SendKey::Named("Enter".to_string())
+        );
+    }
+
+    #[test]
+    fn ctrl_combos_fold_case_and_prefix() {
+        assert_eq!(
+            map(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            SendKey::Named("C-c".to_string())
+        );
+        // Ctrl folds case: Ctrl+Shift+D still yields C-d.
+        assert_eq!(
+            map(
+                KeyCode::Char('D'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            ),
+            SendKey::Named("C-d".to_string())
+        );
+    }
+
+    #[test]
+    fn alt_and_ctrl_alt_combos() {
+        assert_eq!(
+            map(KeyCode::Char('b'), KeyModifiers::ALT),
+            SendKey::Named("M-b".to_string())
+        );
+        assert_eq!(
+            map(
+                KeyCode::Char('x'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            ),
+            SendKey::Named("M-C-x".to_string())
+        );
+    }
+
+    #[test]
+    fn editing_and_navigation_keys_map_to_names() {
+        for (code, name) in [
+            (KeyCode::Tab, "Tab"),
+            (KeyCode::BackTab, "BTab"),
+            (KeyCode::Backspace, "BSpace"),
+            (KeyCode::Esc, "Escape"),
+            (KeyCode::Left, "Left"),
+            (KeyCode::Right, "Right"),
+            (KeyCode::Up, "Up"),
+            (KeyCode::Down, "Down"),
+            (KeyCode::Home, "Home"),
+            (KeyCode::End, "End"),
+            (KeyCode::PageUp, "PageUp"),
+            (KeyCode::PageDown, "PageDown"),
+            (KeyCode::Delete, "DC"),
+            (KeyCode::Insert, "IC"),
+            (KeyCode::F(5), "F5"),
+        ] {
+            assert_eq!(
+                map(code, KeyModifiers::NONE),
+                SendKey::Named(name.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn unmapped_keys_return_none() {
+        assert_eq!(super::map_key(KeyCode::Null, KeyModifiers::NONE), None);
     }
 
     #[test]

@@ -8,6 +8,7 @@
 
 use crate::tmux::{ControlClient, ControlEvent};
 use anyhow::Result;
+use crossterm::event::{KeyCode, KeyModifiers};
 
 /// Lines of scrollback the parser retains behind the visible screen.
 const SCROLLBACK: usize = 1000;
@@ -59,6 +60,26 @@ impl TerminalPane {
     /// The session this pane is bound to, if any.
     pub fn session(&self) -> Option<&str> {
         self.session.as_deref()
+    }
+
+    /// The `tmux send-keys` target for this pane: the bound pane id (`%N`) once we
+    /// have seen output, else the session (whose active pane is the single agent
+    /// pane). `None` before any binding exists.
+    fn key_target(&self) -> Option<&str> {
+        self.pane_id.as_deref().or(self.session.as_deref())
+    }
+
+    /// Forward one crossterm key event to the live pane via `tmux -L spar send-keys`.
+    /// Returns `false` (a no-op) when the key isn't forwardable or nothing is
+    /// attached yet — the caller still consumes it so it never leaks into TUI nav.
+    pub fn send_key(&self, code: KeyCode, mods: KeyModifiers) -> bool {
+        let Some(target) = self.key_target() else {
+            return false;
+        };
+        let Some(key) = crate::tmux::map_key(code, mods) else {
+            return false;
+        };
+        crate::tmux::send_key(target, &key).is_ok()
     }
 
     /// Drain all pending control events, feeding matching pane output into the

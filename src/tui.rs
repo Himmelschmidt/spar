@@ -465,6 +465,14 @@ impl App {
             }
         }
     }
+
+    /// Forward a key event to the focused embedded terminal pane, if one is
+    /// attached. No-op otherwise; the caller still consumes the key.
+    fn forward_key_to_terminal(&self, code: KeyCode, mods: KeyModifiers) {
+        if let Some(pane) = self.terminal_pane.as_ref() {
+            pane.send_key(code, mods);
+        }
+    }
 }
 
 /// Apply a scroll delta and update follow-tail. Positive = toward newer lines.
@@ -884,8 +892,13 @@ fn handle_key(
     let selected_id = runs.get(app.selected_run).map(|r| r.id.as_str());
     let n_slots = full.map(|s| s.slots.len()).unwrap_or(0);
 
-    // Ctrl+C twice (within 2s) is the only quit path — never Esc or q.
-    if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
+    // Ctrl+C twice (within 2s) is the only quit path — never Esc or q. While the
+    // Terminal panel is focused, Ctrl+C belongs to the agent pane (SIGINT), so it
+    // falls through to forwarding; Tab out first to reach the quit arm.
+    if code == KeyCode::Char('c')
+        && mods.contains(KeyModifiers::CONTROL)
+        && app.focus != Focus::Terminal
+    {
         if let Some(t) = app.last_ctrl_c {
             if t.elapsed() < Duration::from_secs(2) {
                 return Ok(true);
@@ -907,6 +920,19 @@ fn handle_key(
                 app.show_help = false;
             }
             _ => {}
+        }
+        return Ok(false);
+    }
+
+    // Terminal panel focused: keystrokes drive the live agent pane, not TUI nav.
+    // Tab / BackTab stay the focus-cycle escape hatch so the operator is never
+    // trapped; everything else (printable text, Enter, Ctrl-combos, arrows, Esc,
+    // Backspace, …) is forwarded to the pane and consumed here.
+    if app.focus == Focus::Terminal {
+        match code {
+            KeyCode::Tab => app.focus = app.focus.next(),
+            KeyCode::BackTab => app.focus = app.focus.prev(),
+            _ => app.forward_key_to_terminal(code, mods),
         }
         return Ok(false);
     }
