@@ -408,23 +408,53 @@ pub fn inbox_claim(paths: &SparPaths, run_id: &str, agent: &str) -> Result<Vec<B
     Ok(out)
 }
 
+/// A path claim goes stale this many seconds after its holder's last sign of life
+/// (presence heartbeat, falling back to the claim time). Past it, another agent may
+/// reclaim the path — this is what auto-releases a claim held by a crashed agent, so
+/// `reserves.json` never needs hand-editing. Matches the stall-warn horizon: a holder
+/// spar already considers stalled has also lost its lease.
+pub const RESERVE_LEASE_TTL_SECS: i64 = 300;
+
 pub fn reserve(paths: &SparPaths, run_id: &str, path: &str, holder: &str) -> Result<()> {
+    reserve_at(paths, run_id, path, holder, Utc::now())
+}
+
+/// [`reserve`] with an injectable `now` so lease-expiry can be exercised in tests.
+fn reserve_at(
+    paths: &SparPaths,
+    run_id: &str,
+    path: &str,
+    holder: &str,
+    now: DateTime<Utc>,
+) -> Result<()> {
     ensure_bus(paths, run_id)?;
     let mut file = load_reserves(paths, run_id)?;
+    let presence = list_presence(paths, run_id)?;
+    let ttl = Duration::seconds(RESERVE_LEASE_TTL_SECS);
     if let Some(c) = file
         .claims
         .iter()
         .find(|c| c.path == path && c.holder != holder)
     {
-        bail!("path {path} already reserved by {}", c.holder);
+        // The lease is tied to the holder's last heartbeat (or the claim time, if it
+        // has none yet). A fresh, heartbeating holder blocks; a stale one is reclaimed.
+        let basis = holder_heartbeat(&presence, &c.holder).map_or(c.ts, |hb| hb.max(c.ts));
+        if now - basis <= ttl {
+            bail!("path {path} already reserved by {}", c.holder);
+        }
     }
     file.claims.retain(|c| c.path != path);
     file.claims.push(Reserve {
         path: path.into(),
         holder: holder.into(),
-        ts: Utc::now(),
+        ts: now,
     });
     save_reserves(paths, run_id, &file)
+}
+
+/// Timestamp of a holder's most recent presence record, if any.
+fn holder_heartbeat(presence: &[Presence], holder: &str) -> Option<DateTime<Utc>> {
+    presence.iter().find(|p| p.agent == holder).map(|p| p.ts)
 }
 
 pub fn release(paths: &SparPaths, run_id: &str, path: &str, holder: &str) -> Result<()> {
@@ -741,6 +771,31 @@ mod tests {
         assert!(reserve(&paths, "r1", "src/foo.rs", "b").is_err());
         release(&paths, "r1", "src/foo.rs", "a").unwrap();
         reserve(&paths, "r1", "src/foo.rs", "b").unwrap();
+    }
+
+    #[test]
+    fn reserve_lease_expires_with_holder_heartbeat() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        join(&paths, "r1", "a", Some("cli:claude"), Some("native-cli")).unwrap();
+        join(&paths, "r1", "b", Some("cli:grok"), Some("native-cli")).unwrap();
+        reserve(&paths, "r1", "src/foo.rs", "a").unwrap();
+
+        // Within the lease window a's claim still blocks b (heartbeat is fresh).
+        let fresh = Utc::now() + Duration::seconds(RESERVE_LEASE_TTL_SECS - 1);
+        assert!(reserve_at(&paths, "r1", "src/foo.rs", "b", fresh).is_err());
+
+        // Once a's last heartbeat is older than the TTL (a crashed, stopped beating),
+        // b reclaims the path with no manual release.
+        let expired = Utc::now() + Duration::seconds(RESERVE_LEASE_TTL_SECS + 1);
+        reserve_at(&paths, "r1", "src/foo.rs", "b", expired).unwrap();
+        let claims = list_reserves(&paths, "r1").unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].holder, "b");
+
+        // A heartbeating holder refreshes its lease: b now blocks a while b beats.
+        heartbeat(&paths, "r1", "b", "running").unwrap();
+        assert!(reserve(&paths, "r1", "src/foo.rs", "a").is_err());
     }
 
     #[test]
