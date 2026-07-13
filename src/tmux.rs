@@ -252,6 +252,18 @@ pub fn attach_command(session: &str) -> Result<()> {
     Ok(())
 }
 
+/// Build a shell command string that runs `program` with `args` and no logging
+/// wrapper. Interactive agent panes need a real tty on stdout for their TUI to
+/// render, so the `| tee` of [`shell_wrap`] can't be used for them.
+pub fn shell_command(program: &Path, args: &[String]) -> String {
+    let prog = shell_escape(&program.display().to_string());
+    if args.is_empty() {
+        return prog;
+    }
+    let args_s: Vec<String> = args.iter().map(|a| shell_escape(a)).collect();
+    format!("{prog} {}", args_s.join(" "))
+}
+
 /// Build a shell command string that runs program with args and logs.
 pub fn shell_wrap(program: &Path, args: &[String], log_path: &Path) -> String {
     let prog = shell_escape(&program.display().to_string());

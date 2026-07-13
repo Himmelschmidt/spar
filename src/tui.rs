@@ -3103,10 +3103,52 @@ fn handle_composer(
                 crate::ship::confirm_ship(swarm, id, false)?;
                 Ok(format!("Ship confirmed {id}"))
             }
+            "spawn" => spawn_agent_command(runs, selected, arg),
             other => Ok(format!("Unknown /{other} — try /help")),
         };
     }
     Ok(format!("Noted (chat later): {}", truncate(cmd, 48)))
+}
+
+/// `/spawn <cli:provider> <prompt>` — launch a fresh agent into a pane on the spar
+/// tmux socket, joined to the selected run's bus, and hand it the prompt. The whole
+/// spawn → prompt loop runs without leaving spar (Stage 11 / A4).
+fn spawn_agent_command(
+    runs: &[state::RunSummary],
+    selected: usize,
+    arg: Option<&str>,
+) -> Result<String> {
+    let run = runs
+        .get(selected)
+        .ok_or_else(|| anyhow::anyhow!("select a run first — /spawn joins its bus"))?;
+    let spec = arg.ok_or_else(|| anyhow::anyhow!("usage: /spawn <cli:provider> <prompt>"))?;
+    let mut parts = spec.splitn(2, char::is_whitespace);
+    let provider = parts.next().unwrap_or("").trim();
+    let prompt = parts.next().map(str::trim).unwrap_or("");
+    if provider.is_empty() || prompt.is_empty() {
+        anyhow::bail!("usage: /spawn <cli:provider> <prompt>");
+    }
+    let project_root = run
+        .project_root
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("run has no known project root"))?;
+    let paths = SparPaths::new(&project_root);
+    let uid = uuid::Uuid::new_v4().simple().to_string();
+    let agent_id = format!("poke-{}", &uid[..8]);
+
+    let req = crate::workspace::SpawnRequest {
+        paths: &paths,
+        run_id: &run.id,
+        agent_id: &agent_id,
+        provider,
+        cwd: &project_root,
+        project_root: &project_root,
+    };
+    let (session, window) = crate::workspace::spawn_agent(&req)?;
+    crate::workspace::deliver_prompt(&session, &window, prompt)?;
+    Ok(format!(
+        "Spawned {agent_id} ({provider}) — prompt delivered · Terminal tab to watch"
+    ))
 }
 
 fn stream_content(

@@ -29,6 +29,7 @@ mod tmux;
 mod tui;
 mod util;
 mod workflow;
+mod workspace;
 mod worktree;
 
 use anyhow::Result;
