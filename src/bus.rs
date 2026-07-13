@@ -672,6 +672,13 @@ pub fn tick_acks(
     if !dir.is_dir() {
         return Ok(AckTick::default());
     }
+    // Concurrent `spar bus deliver` processes (one per agent finishing a turn)
+    // all tick the same run. Serialize the whole read-modify-remove/write pass
+    // under one exclusive lock so a record is escalated-and-removed or
+    // redelivered by exactly one process — never double-escalated, and never
+    // resurrected by a redeliver write racing another process's remove.
+    let lock = open_lockfile(&dir.join(".lock"))?;
+    lock_exclusive(&lock)?;
     let mut files: Vec<PathBuf> = fs::read_dir(&dir)?
         .flatten()
         .map(|e| e.path())
@@ -688,7 +695,7 @@ pub fn tick_acks(
         }
         if rec.attempts >= policy.max_retries {
             escalate_unacked(paths, run_id, &rec, now, policy.max_retries)?;
-            fs::remove_file(&f)?;
+            remove_file_if_present(&f)?;
             out.escalated += 1;
         } else {
             deliver_inbox(paths, run_id, &rec.msg)?;
@@ -795,6 +802,30 @@ fn open_for_append(path: &PathBuf) -> Result<File> {
         .append(true)
         .open(path)
         .with_context(|| format!("open {}", path.display()))
+}
+
+/// Open (creating if absent) a lockfile whose only purpose is to hold an
+/// advisory `flock`. The file's contents are never read or written.
+fn open_lockfile(path: &PathBuf) -> Result<File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))
+}
+
+/// Remove a file, treating an already-absent file as success so a lost
+/// double-remove race can never abort the caller.
+fn remove_file_if_present(path: &PathBuf) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("remove {}", path.display())),
+    }
 }
 
 /// Take an exclusive advisory lock on the file's open description. It is held
