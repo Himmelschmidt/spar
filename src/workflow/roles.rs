@@ -66,10 +66,10 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     ));
 
     paths.ensure_run_dirs(&state.id)?;
-    bus::ensure_bus(paths, &state.id)?;
-    bus::join(paths, &state.id, "orchestrator", None, None)?;
+    bus::ensure_bus(paths)?;
+    bus::join(paths, Some(&state.id), "orchestrator", None, None)?;
     for s in &state.slots {
-        let _ = bus::join(paths, &state.id, &s.id, Some(&s.provider), None);
+        let _ = bus::join(paths, Some(&state.id), &s.id, Some(&s.provider), None);
     }
     // seed role notes
     std::fs::write(
@@ -82,7 +82,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     )?;
     let _ = bus::broadcast(
         paths,
-        &state.id,
+        Some(&state.id),
         "orchestrator",
         "roles workflow started — coordinate via bus contracts",
         state.message_budget,

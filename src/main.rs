@@ -240,7 +240,7 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
     let (paths, _) = project_ctx()?;
     match action {
         BusCmd::Send {
-            run_id,
+            run,
             from,
             to,
             message,
@@ -248,7 +248,7 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
         } => {
             let msg = bus::chat(
                 &paths,
-                &run_id,
+                run.as_deref(),
                 &from,
                 &to,
                 message,
@@ -261,8 +261,8 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             }
             Ok(ExitCode::Success)
         }
-        BusCmd::Log { run_id, json } => {
-            let events = bus::list_events(&paths, &run_id)?;
+        BusCmd::Log { run, json } => {
+            let events = bus::list_events(&paths, run.as_deref())?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&events)?);
             } else {
@@ -279,16 +279,11 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             }
             Ok(ExitCode::Success)
         }
-        BusCmd::Inbox {
-            run_id,
-            agent,
-            claim,
-            json,
-        } => {
+        BusCmd::Inbox { agent, claim, json } => {
             let msgs = if claim {
-                bus::inbox_claim(&paths, &run_id, &agent)?
+                bus::inbox_claim(&paths, &agent)?
             } else {
-                bus::inbox(&paths, &run_id, &agent)?
+                bus::inbox(&paths, &agent)?
             };
             if json {
                 println!("{}", serde_json::to_string_pretty(&msgs)?);
@@ -306,8 +301,8 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             }
             Ok(ExitCode::Success)
         }
-        BusCmd::Presence { run_id, json } => {
-            let p = bus::list_presence(&paths, &run_id)?;
+        BusCmd::Presence { run, json } => {
+            let p = bus::list_presence(&paths, run.as_deref())?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&p)?);
             } else {
@@ -317,26 +312,18 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             }
             Ok(ExitCode::Success)
         }
-        BusCmd::Heartbeat {
-            run_id,
-            agent,
-            status,
-        } => {
-            bus::heartbeat(&paths, &run_id, &agent, &status)?;
+        BusCmd::Heartbeat { agent, status, run } => {
+            bus::heartbeat(&paths, run.as_deref(), &agent, &status)?;
             Ok(ExitCode::Success)
         }
-        BusCmd::Deliver {
-            run_id,
-            agent,
-            json,
-        } => bus_deliver(&paths, &run_id, &agent, json),
+        BusCmd::Deliver { agent, run, json } => bus_deliver(&paths, run.as_deref(), &agent, json),
         BusCmd::Ack {
-            run_id,
             msg_id,
             from,
+            run,
             json,
         } => {
-            let msg = bus::ack(&paths, &run_id, &from, &msg_id)?;
+            let msg = bus::ack(&paths, run.as_deref(), &from, &msg_id)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&msg)?);
             } else {
@@ -344,21 +331,13 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             }
             Ok(ExitCode::Success)
         }
-        BusCmd::Reserve {
-            run_id,
-            path,
-            holder,
-        } => {
-            bus::reserve(&paths, &run_id, &path, &holder)?;
+        BusCmd::Reserve { path, holder, run } => {
+            bus::reserve(&paths, run.as_deref(), &path, &holder)?;
             println!("reserved {path} by {holder}");
             Ok(ExitCode::Success)
         }
-        BusCmd::Release {
-            run_id,
-            path,
-            holder,
-        } => {
-            bus::release(&paths, &run_id, &path, &holder)?;
+        BusCmd::Release { path, holder, run } => {
+            bus::release(&paths, run.as_deref(), &path, &holder)?;
             println!("released {path}");
             Ok(ExitCode::Success)
         }
@@ -379,24 +358,29 @@ fn agent_delivery_strategy(state: &state::RunState, agent: &str) -> providers::D
 
 fn bus_deliver(
     paths: &paths::SparPaths,
-    run_id: &str,
+    run_id: Option<&str>,
     agent: &str,
     json: bool,
 ) -> Result<ExitCode> {
-    let state = state::RunState::load(paths, run_id)?;
-    let strategy = agent_delivery_strategy(&state, agent);
-    let dry_run = state.dry_run || util::env_truthy("SPAR_DRY_RUN");
+    // A bare agent has no run slot/state, so it has no injection channel — it drains its
+    // own workspace inbox on its next turn (strategy `None`).
+    let (strategy, dry_run) = match run_id {
+        Some(run) => {
+            let state = state::RunState::load(paths, run)?;
+            let strat = agent_delivery_strategy(&state, agent);
+            (strat, state.dry_run || util::env_truthy("SPAR_DRY_RUN"))
+        }
+        None => (
+            providers::DeliveryStrategy::None,
+            util::env_truthy("SPAR_DRY_RUN"),
+        ),
+    };
     // A turn boundary is one of the swarm's delivery pulses: advance any unacked-message
     // redeliveries first so a due redelivery lands in this same drain. This is not the
     // only pulse — the wait loop and TUI refresh also tick acks, so redelivery/escalation
     // advances in runs with no Claude slot (whose Stop hook is the only pulse here).
-    bus::tick_acks(
-        paths,
-        run_id,
-        &bus::AckPolicy::default(),
-        chrono::Utc::now(),
-    )?;
-    let d = providers::delivery::deliver(paths, run_id, agent, strategy, dry_run)?;
+    bus::tick_acks(paths, &bus::AckPolicy::default(), chrono::Utc::now())?;
+    let d = providers::delivery::deliver(paths, agent, strategy, dry_run)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&d)?);
     } else if let Some(payload) = &d.payload {

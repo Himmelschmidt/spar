@@ -437,8 +437,8 @@ fn run_with_task(
     prepare_implement_slots(&mut state, Some(&requested), dry, cfg, paths)?;
 
     paths.ensure_run_dirs(&state.id)?;
-    let _ = crate::bus::ensure_bus(paths, &state.id);
-    let _ = crate::bus::join(paths, &state.id, "orchestrator", None, None);
+    let _ = crate::bus::ensure_bus(paths);
+    let _ = crate::bus::join(paths, Some(&state.id), "orchestrator", None, None);
     if let Some(body) = &plan_body {
         std::fs::write(paths.artifact(&state.id, "plan.md"), body)?;
         if state.big {
@@ -666,7 +666,7 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
                 };
                 let _ = crate::bus::broadcast(
                     paths,
-                    &state.id,
+                    Some(&state.id),
                     "orchestrator",
                     msg,
                     state.message_budget,
@@ -676,7 +676,7 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
                 suite_body = "## Summary\nsuite.enabled but no tester slot was prepared\n".into();
                 let _ = crate::bus::broadcast(
                     paths,
-                    &state.id,
+                    Some(&state.id),
                     "orchestrator",
                     "suite channel inconclusive: no tester slot prepared".to_string(),
                     state.message_budget,

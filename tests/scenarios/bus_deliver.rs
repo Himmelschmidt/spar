@@ -1,4 +1,4 @@
-//! `spar bus deliver <run> <agent>`: drain the inbox (exactly-once) and dispatch the
+//! `spar bus deliver <agent> --run <run>`: drain the inbox (exactly-once) and dispatch the
 //! claimed messages to the agent adapter's `DeliveryStrategy`.
 //!
 //! One scenario per landed strategy, all under `--dry-run` so the side-effecting
@@ -100,7 +100,7 @@ fn slot_for_provider(dir: &std::path::Path, run_id: &str, provider: &str) -> Str
 fn send(dir: &std::path::Path, run_id: &str, to: &str, body: &str) {
     spar_cmd()
         .current_dir(dir)
-        .args(["bus", "send", run_id, "--to", to, "-m", body])
+        .args(["bus", "send", "--run", run_id, "--to", to, "-m", body])
         .assert()
         .success();
 }
@@ -108,7 +108,7 @@ fn send(dir: &std::path::Path, run_id: &str, to: &str, body: &str) {
 fn deliver_json(dir: &std::path::Path, run_id: &str, agent: &str) -> Value {
     let out = spar_cmd()
         .current_dir(dir)
-        .args(["bus", "deliver", run_id, agent, "--json"])
+        .args(["bus", "deliver", agent, "--run", run_id, "--json"])
         .assert()
         .success()
         .get_output()
@@ -164,7 +164,7 @@ fn stop_hook_inject_hook_mode_emits_only_payload() {
 
     let out = spar_cmd()
         .current_dir(tmp.path())
-        .args(["bus", "deliver", &run_id, &agent])
+        .args(["bus", "deliver", &agent, "--run", &run_id])
         .assert()
         .success()
         .get_output()
@@ -224,7 +224,7 @@ fn none_leaves_inbox_for_agent_to_claim() {
     // The agent's own claim still finds the message (deliver did not strand it).
     let claimed = spar_cmd()
         .current_dir(tmp.path())
-        .args(["bus", "inbox", &run_id, &agent, "--claim", "--json"])
+        .args(["bus", "inbox", &agent, "--claim", "--json"])
         .assert()
         .success()
         .get_output()

@@ -62,13 +62,12 @@ fn is_zero(n: &usize) -> bool {
 /// agent. Building the Stop-hook payload is pure and runs in either mode.
 pub fn deliver(
     paths: &SparPaths,
-    run_id: &str,
     agent: &str,
     strategy: DeliveryStrategy,
     dry_run: bool,
 ) -> Result<Delivery> {
     if strategy == DeliveryStrategy::None {
-        let pending = bus::inbox(paths, run_id, agent)?.len();
+        let pending = bus::inbox(paths, agent)?.len();
         return Ok(Delivery {
             strategy,
             action: DeliveryAction::LeftForInbox,
@@ -78,7 +77,7 @@ pub fn deliver(
         });
     }
 
-    let msgs = bus::inbox_claim(paths, run_id, agent)?;
+    let msgs = bus::inbox_claim(paths, agent)?;
     if msgs.is_empty() {
         return Ok(Delivery {
             strategy,
@@ -95,11 +94,11 @@ pub fn deliver(
             (DeliveryAction::StopHookBlock, Some(block_payload(&msgs)))
         }
         DeliveryStrategy::NativeQueue => {
-            enqueue(paths, run_id, agent, &msgs, dry_run)?;
+            enqueue(paths, agent, &msgs, dry_run)?;
             (DeliveryAction::Queued, None)
         }
         DeliveryStrategy::SdkPrompt => {
-            enqueue(paths, run_id, agent, &msgs, dry_run)?;
+            enqueue(paths, agent, &msgs, dry_run)?;
             (DeliveryAction::Prompted, None)
         }
         DeliveryStrategy::None => unreachable!("None handled above"),
@@ -137,25 +136,19 @@ fn render_reason(msgs: &[BusMessage]) -> String {
 /// session prompt are in-process channels into a *running* slot; until the live push
 /// lands (Track A panes / the opencode adapter) spar persists the claimed prompts here
 /// so nothing is lost between the claim and the flush.
-pub fn queue_path(paths: &SparPaths, run_id: &str, agent: &str) -> std::path::PathBuf {
-    bus::bus_root(paths, run_id)
+pub fn queue_path(paths: &SparPaths, agent: &str) -> std::path::PathBuf {
+    bus::bus_root(paths)
         .join("queue")
         .join(format!("{agent}.jsonl"))
 }
 
 /// Append claimed messages to the durable queue. `dry_run` stubs the write so the test
 /// backend never mutates delivery state.
-fn enqueue(
-    paths: &SparPaths,
-    run_id: &str,
-    agent: &str,
-    msgs: &[BusMessage],
-    dry_run: bool,
-) -> Result<()> {
+fn enqueue(paths: &SparPaths, agent: &str, msgs: &[BusMessage], dry_run: bool) -> Result<()> {
     if dry_run {
         return Ok(());
     }
-    let path = queue_path(paths, run_id, agent);
+    let path = queue_path(paths, agent);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -179,12 +172,19 @@ mod tests {
     use tempfile::tempdir;
 
     fn seed(paths: &SparPaths, n: usize) {
-        join(paths, "r1", "a", Some("cli:claude"), Some("native-cli")).unwrap();
-        join(paths, "r1", "b", Some("cli:grok"), Some("native-cli")).unwrap();
+        join(
+            paths,
+            Some("r1"),
+            "a",
+            Some("cli:claude"),
+            Some("native-cli"),
+        )
+        .unwrap();
+        join(paths, Some("r1"), "b", Some("cli:grok"), Some("native-cli")).unwrap();
         for i in 0..n {
             chat(
                 paths,
-                "r1",
+                Some("r1"),
                 "a",
                 "b",
                 format!("msg {i}"),
@@ -200,7 +200,7 @@ mod tests {
         let paths = SparPaths::new(tmp.path());
         seed(&paths, 2);
 
-        let d = deliver(&paths, "r1", "b", DeliveryStrategy::StopHookInject, false).unwrap();
+        let d = deliver(&paths, "b", DeliveryStrategy::StopHookInject, false).unwrap();
         assert_eq!(d.action, DeliveryAction::StopHookBlock);
         assert_eq!(d.delivered, 2);
         let payload = d.payload.expect("block payload");
@@ -213,7 +213,7 @@ mod tests {
         );
 
         // Exactly-once: a second delivery drains nothing.
-        let again = deliver(&paths, "r1", "b", DeliveryStrategy::StopHookInject, false).unwrap();
+        let again = deliver(&paths, "b", DeliveryStrategy::StopHookInject, false).unwrap();
         assert_eq!(again.action, DeliveryAction::Empty);
         assert_eq!(again.delivered, 0);
     }
@@ -224,11 +224,11 @@ mod tests {
         let paths = SparPaths::new(tmp.path());
         seed(&paths, 3);
 
-        let d = deliver(&paths, "r1", "b", DeliveryStrategy::NativeQueue, false).unwrap();
+        let d = deliver(&paths, "b", DeliveryStrategy::NativeQueue, false).unwrap();
         assert_eq!(d.action, DeliveryAction::Queued);
         assert_eq!(d.delivered, 3);
         assert!(d.payload.is_none());
-        let queued = fs::read_to_string(queue_path(&paths, "r1", "b")).unwrap();
+        let queued = fs::read_to_string(queue_path(&paths, "b")).unwrap();
         assert_eq!(queued.lines().filter(|l| !l.is_empty()).count(), 3);
     }
 
@@ -238,10 +238,10 @@ mod tests {
         let paths = SparPaths::new(tmp.path());
         seed(&paths, 1);
 
-        let d = deliver(&paths, "r1", "b", DeliveryStrategy::SdkPrompt, false).unwrap();
+        let d = deliver(&paths, "b", DeliveryStrategy::SdkPrompt, false).unwrap();
         assert_eq!(d.action, DeliveryAction::Prompted);
         assert_eq!(d.delivered, 1);
-        assert!(queue_path(&paths, "r1", "b").is_file());
+        assert!(queue_path(&paths, "b").is_file());
     }
 
     #[test]
@@ -250,12 +250,12 @@ mod tests {
         let paths = SparPaths::new(tmp.path());
         seed(&paths, 2);
 
-        let d = deliver(&paths, "r1", "b", DeliveryStrategy::None, false).unwrap();
+        let d = deliver(&paths, "b", DeliveryStrategy::None, false).unwrap();
         assert_eq!(d.action, DeliveryAction::LeftForInbox);
         assert_eq!(d.delivered, 0);
         assert_eq!(d.pending, 2);
         // The agent must still be able to claim them itself.
-        assert_eq!(bus::inbox_claim(&paths, "r1", "b").unwrap().len(), 2);
+        assert_eq!(bus::inbox_claim(&paths, "b").unwrap().len(), 2);
     }
 
     #[test]
@@ -264,12 +264,12 @@ mod tests {
         let paths = SparPaths::new(tmp.path());
         seed(&paths, 2);
 
-        let d = deliver(&paths, "r1", "b", DeliveryStrategy::NativeQueue, true).unwrap();
+        let d = deliver(&paths, "b", DeliveryStrategy::NativeQueue, true).unwrap();
         assert_eq!(d.action, DeliveryAction::Queued);
         assert_eq!(d.delivered, 2);
         // Injection call stubbed: no queue file written.
-        assert!(!queue_path(&paths, "r1", "b").exists());
+        assert!(!queue_path(&paths, "b").exists());
         // But the drain is real (exactly-once): nothing remains to claim.
-        assert!(bus::inbox_claim(&paths, "r1", "b").unwrap().is_empty());
+        assert!(bus::inbox_claim(&paths, "b").unwrap().is_empty());
     }
 }

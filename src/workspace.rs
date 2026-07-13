@@ -30,9 +30,10 @@ pub const STATUS_IDLE: &str = "idle";
 /// A request to launch a fresh agent into a pane on spar's private tmux socket.
 pub struct SpawnRequest<'a> {
     pub paths: &'a SparPaths,
-    /// Bus scope the agent joins. Pre-Stage-12 this is a run id; the agent is
-    /// addressable on that run's bus exactly like a slot.
-    pub run_id: &'a str,
+    /// Run this agent is tagged with on the bus, or `None` for a bare Composer agent.
+    /// Either way the agent is addressable on the one workspace bus by its `agent_id`
+    /// (W5) — a run tag only scopes run-filtered views.
+    pub run: Option<&'a str>,
     /// Stable agent id, exported as `SPAR_AGENT_ID`.
     pub agent_id: &'a str,
     /// `cli:name` provider ref. API providers have no pane, so they are rejected.
@@ -72,18 +73,19 @@ pub fn spawn_agent(req: &SpawnRequest) -> Result<(String, String)> {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("spar"));
     let identity = providers::presence::SlotIdentity {
         agent_id: req.agent_id,
-        run_id: req.run_id,
+        run_id: req.run,
         project_root: req.project_root,
         worktree: req.cwd,
         spar_exe: &exe,
     };
     let wiring = providers::presence::wire(adapter.as_ref(), &identity);
 
-    // Register on the bus so the agent is addressable like any run slot.
+    // Register on the workspace bus so the agent is addressable by id like any run slot,
+    // bare or not (W5).
     let storage = pref.storage_key();
     bus::join(
         req.paths,
-        req.run_id,
+        req.run,
         req.agent_id,
         Some(storage.as_str()),
         Some(pref.backend.as_str()),
@@ -91,7 +93,7 @@ pub fn spawn_agent(req: &SpawnRequest) -> Result<(String, String)> {
     if let Some(note) = wiring.note {
         let _ = bus::broadcast(
             req.paths,
-            req.run_id,
+            req.run,
             req.agent_id,
             note,
             bus::MessageBudget::Chatty,
@@ -110,7 +112,8 @@ pub fn spawn_agent(req: &SpawnRequest) -> Result<(String, String)> {
     let (program, args) = providers::command_to_parts(&cmd);
     let shell = tmux::shell_command(&program, &args);
 
-    let session = tmux::session_name(req.run_id);
+    // Bare agents have no run, so key the tmux session on the agent id instead.
+    let session = tmux::session_name(req.run.unwrap_or(req.agent_id));
     tmux::new_session(&session, req.cwd)?;
     tmux::spawn_window(&session, req.agent_id, req.cwd, &shell, &wiring.env)?;
 
@@ -194,7 +197,7 @@ impl WaitWorkingThenIdle {
 #[allow(dead_code)]
 pub fn wait_working_then_idle(
     paths: &SparPaths,
-    run_id: &str,
+    run: Option<&str>,
     agent: &str,
     timeout: Duration,
     poll: Duration,
@@ -202,7 +205,7 @@ pub fn wait_working_then_idle(
     let mut w = WaitWorkingThenIdle::new();
     let start = Instant::now();
     loop {
-        let status = bus::list_presence(paths, run_id)?
+        let status = bus::list_presence(paths, run)?
             .into_iter()
             .find(|p| p.agent == agent)
             .map(|p| p.status);
@@ -261,12 +264,12 @@ mod tests {
     fn live_driver_times_out_on_leading_idle_only() {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
-        bus::ensure_bus(&paths, "r1").unwrap();
-        bus::heartbeat(&paths, "r1", "poke-1", "idle").unwrap();
+        bus::ensure_bus(&paths).unwrap();
+        bus::heartbeat(&paths, Some("r1"), "poke-1", "idle").unwrap();
 
         let done = wait_working_then_idle(
             &paths,
-            "r1",
+            Some("r1"),
             "poke-1",
             Duration::from_millis(120),
             Duration::from_millis(10),
@@ -283,22 +286,23 @@ mod tests {
     fn live_driver_completes_on_working_then_idle() {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
-        bus::ensure_bus(&paths, "r1").unwrap();
-        bus::heartbeat(&paths, "r1", "poke-2", "idle").unwrap(); // stale leading idle
+        bus::ensure_bus(&paths).unwrap();
+        // Bare (run-less) agent: presence tracks it by id on the workspace bus.
+        bus::heartbeat(&paths, None, "poke-2", "idle").unwrap(); // stale leading idle
 
         let feeder = {
             let paths = paths.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(40));
-                bus::heartbeat(&paths, "r1", "poke-2", "working").unwrap();
+                bus::heartbeat(&paths, None, "poke-2", "working").unwrap();
                 std::thread::sleep(Duration::from_millis(60));
-                bus::heartbeat(&paths, "r1", "poke-2", "idle").unwrap();
+                bus::heartbeat(&paths, None, "poke-2", "idle").unwrap();
             })
         };
 
         let done = wait_working_then_idle(
             &paths,
-            "r1",
+            None,
             "poke-2",
             Duration::from_secs(5),
             Duration::from_millis(10),

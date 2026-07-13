@@ -569,7 +569,7 @@ fn marks_for(sel: &Selection, prev: Option<&Snapshot>) -> Marks {
         if let Some(id) = sel.run_id.as_deref() {
             out.push(stamp(&swarm.state_file(id)));
             out.push(stamp(&events::events_file(&swarm, id)));
-            out.push(stamp(&crate::bus::events_path(&swarm, id)));
+            out.push(stamp(&crate::bus::run_events_path(&swarm, id)));
             // The live log grows without the run state changing.
             let slot = prev
                 .and_then(|s| s.full.as_ref())
@@ -613,17 +613,12 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache) -> Snapshot {
     // The TUI refresh is a provider-agnostic delivery pulse for the selected run:
     // advance unacked-message redelivery/escalation before reading alerts, so
     // requires_ack works even when no Claude slot's Stop hook is ticking acks.
-    if let Some(st) = full.as_ref() {
-        let _ = crate::bus::tick_acks(
-            &swarm,
-            &st.id,
-            &crate::bus::AckPolicy::default(),
-            Utc::now(),
-        );
+    if full.is_some() {
+        let _ = crate::bus::tick_acks(&swarm, &crate::bus::AckPolicy::default(), Utc::now());
     }
     let alerts = full
         .as_ref()
-        .map(|st| crate::bus::unresolved_alerts(&swarm, &st.id).unwrap_or_default())
+        .map(|st| crate::bus::unresolved_alerts(&swarm, Some(&st.id)).unwrap_or_default())
         .unwrap_or_default();
     let activity = activity_feed(&swarm, full.as_ref(), &quota, &alerts);
     Snapshot {
@@ -3138,7 +3133,7 @@ fn spawn_agent_command(
 
     let req = crate::workspace::SpawnRequest {
         paths: &paths,
-        run_id: &run.id,
+        run: Some(&run.id),
         agent_id: &agent_id,
         provider,
         cwd: &project_root,
@@ -3295,7 +3290,7 @@ fn activity_feed(
     }
 
     // Bus chat only if real agent chat exists
-    if let Ok(bus) = crate::bus::list_events(swarm, &st.id) {
+    if let Ok(bus) = crate::bus::list_events(swarm, Some(&st.id)) {
         let chat: Vec<_> = bus
             .iter()
             .filter(|m| {

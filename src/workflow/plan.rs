@@ -80,8 +80,8 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
     }
 
     paths.ensure_run_dirs(&state.id)?;
-    let _ = bus::ensure_bus(paths, &state.id);
-    let _ = bus::join(paths, &state.id, "orchestrator", None, None);
+    let _ = bus::ensure_bus(paths);
+    let _ = bus::join(paths, Some(&state.id), "orchestrator", None, None);
     state.save(paths)?;
 
     let art = crate::model_select::load_select_artifact(paths, &state.id)
@@ -212,7 +212,7 @@ pub fn execute_plan(
         state.set_phase(Phase::PlanApproved);
         let _ = bus::broadcast(
             paths,
-            &state.id,
+            Some(&state.id),
             "orchestrator",
             "plan auto-approved (autonomy)",
             state.message_budget,
@@ -270,7 +270,7 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
     state.set_phase(Phase::Spec);
     state.save(paths)?;
 
-    let _ = bus::join(paths, &state.id, &id, Some(&provider), None);
+    let _ = bus::join(paths, Some(&state.id), &id, Some(&provider), None);
     seed_spec_bus(state, paths, &id, &planner_slot, &critic_slot)?;
 
     let mut extra = HashMap::new();
@@ -308,7 +308,7 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
 
     let _ = bus::broadcast(
         paths,
-        &state.id,
+        Some(&state.id),
         "orchestrator",
         "test-author finished; acceptance contract ready for plan approval",
         state.message_budget,
@@ -329,7 +329,7 @@ fn seed_spec_bus(
          Planner `{planner_slot}` and critic `{critic_slot}`: reply on bus if still available; \
          otherwise the author uses plan + critique artifacts."
     );
-    let _ = bus::broadcast(paths, &state.id, "orchestrator", &body, budget);
+    let _ = bus::broadcast(paths, Some(&state.id), "orchestrator", &body, budget);
 
     for (to, note) in [
         (
@@ -349,7 +349,6 @@ fn seed_spec_bus(
     ] {
         let _ = bus::send(
             paths,
-            &state.id,
             bus::BusMessage {
                 id: uuid::Uuid::new_v4().simple().to_string()[..12].to_string(),
                 ts: chrono::Utc::now(),
@@ -357,6 +356,7 @@ fn seed_spec_bus(
                 to: to.into(),
                 kind: MsgKind::Hello,
                 body: note,
+                run: Some(state.id.clone()),
                 subject: Some("spec".into()),
                 refs: MsgRefs {
                     artifact: Some("plan.md".into()),
@@ -437,7 +437,7 @@ pub fn approve(paths: &SparPaths, run_id: &str, json: bool) -> Result<ExitCode> 
     }
     let _ = bus::broadcast(
         paths,
-        run_id,
+        Some(run_id),
         "human",
         "plan approved",
         MessageBudget::Normal,

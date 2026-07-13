@@ -263,11 +263,15 @@ pub enum SkillsCmd {
     Get { name: String },
 }
 
+/// Swarm bus (W5): workspace-scoped, keyed by `agent_id`. `--run <id>` is an optional
+/// grouping tag — pass it to scope a message/view to one run; omit it for bare
+/// (run-less) Composer agents, which are addressable exactly like run slots.
 #[derive(Debug, Subcommand)]
 pub enum BusCmd {
     /// Send a chat message
     Send {
-        run_id: String,
+        #[arg(long)]
+        run: Option<String>,
         #[arg(long, default_value = "human")]
         from: String,
         #[arg(long, default_value = "broadcast")]
@@ -277,15 +281,15 @@ pub enum BusCmd {
         #[arg(long)]
         json: bool,
     },
-    /// List bus events
+    /// List bus events (all runs + bare traffic; `--run` filters to one run)
     Log {
-        run_id: String,
+        #[arg(long)]
+        run: Option<String>,
         #[arg(long)]
         json: bool,
     },
     /// Show an agent's inbox (peek by default; `--claim` drains exactly-once)
     Inbox {
-        run_id: String,
         agent: String,
         /// Atomically claim (drain) messages so each is delivered exactly once
         #[arg(long)]
@@ -293,18 +297,20 @@ pub enum BusCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Presence snapshot
+    /// Presence snapshot (whole workspace; `--run` filters to one run's agents)
     Presence {
-        run_id: String,
+        #[arg(long)]
+        run: Option<String>,
         #[arg(long)]
         json: bool,
     },
     /// Record an agent presence transition (called by provider hooks)
     Heartbeat {
-        run_id: String,
         agent: String,
         #[arg(long, default_value = "working")]
         status: String,
+        #[arg(long)]
+        run: Option<String>,
     },
     /// Drain an agent's inbox and dispatch it to the agent's delivery strategy.
     ///
@@ -312,34 +318,38 @@ pub enum BusCmd {
     /// injection payload on stdout (the Stop-hook `block` JSON) and nothing else;
     /// `--json` emits an operator report instead of the hook payload.
     Deliver {
-        run_id: String,
         agent: String,
+        #[arg(long)]
+        run: Option<String>,
         #[arg(long)]
         json: bool,
     },
     /// Acknowledge a `requires_ack` message, stopping its redelivery
     Ack {
-        run_id: String,
         /// Id of the message being acknowledged
         msg_id: String,
         #[arg(long, default_value = "human")]
         from: String,
         #[arg(long)]
+        run: Option<String>,
+        #[arg(long)]
         json: bool,
     },
     /// Reserve a path
     Reserve {
-        run_id: String,
         path: String,
         #[arg(long, default_value = "human")]
         holder: String,
+        #[arg(long)]
+        run: Option<String>,
     },
     /// Release a path reserve
     Release {
-        run_id: String,
         path: String,
         #[arg(long, default_value = "human")]
         holder: String,
+        #[arg(long)]
+        run: Option<String>,
     },
 }
 

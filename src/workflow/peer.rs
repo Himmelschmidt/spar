@@ -64,13 +64,12 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         .push(executor::init_slot(&id_b, &b, SlotRole::Peer));
 
     paths.ensure_run_dirs(&state.id)?;
-    bus::ensure_bus(paths, &state.id)?;
-    bus::join(paths, &state.id, "orchestrator", None, None)?;
-    bus::join(paths, &state.id, &id_a, Some(&a), Some("native-cli"))?;
-    bus::join(paths, &state.id, &id_b, Some(&b), Some("native-cli"))?;
+    bus::ensure_bus(paths)?;
+    bus::join(paths, Some(&state.id), "orchestrator", None, None)?;
+    bus::join(paths, Some(&state.id), &id_a, Some(&a), Some("native-cli"))?;
+    bus::join(paths, Some(&state.id), &id_b, Some(&b), Some("native-cli"))?;
     bus::send(
         paths,
-        &state.id,
         bus::BusMessage {
             id: uuid::Uuid::new_v4().simple().to_string()[..12].to_string(),
             ts: chrono::Utc::now(),
@@ -78,6 +77,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
             to: id_a.clone(),
             kind: MsgKind::Hello,
             body: "You are peer A. Coordinate with peer B via the swarm bus.".into(),
+            run: Some(state.id.clone()),
             subject: Some("hello".into()),
             refs: bus::MsgRefs::default(),
             requires_ack: false,
@@ -87,7 +87,6 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     )?;
     bus::send(
         paths,
-        &state.id,
         bus::BusMessage {
             id: uuid::Uuid::new_v4().simple().to_string()[..12].to_string(),
             ts: chrono::Utc::now(),
@@ -95,6 +94,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
             to: id_b.clone(),
             kind: MsgKind::Hello,
             body: "You are peer B. Coordinate with peer A via the swarm bus.".into(),
+            run: Some(state.id.clone()),
             subject: Some("hello".into()),
             refs: bus::MsgRefs::default(),
             requires_ack: false,
@@ -102,7 +102,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         },
         MessageBudget::Normal,
     )?;
-    let _ = bus::reserve(paths, &state.id, "contracts/", &id_a);
+    let _ = bus::reserve(paths, Some(&state.id), "contracts/", &id_a);
     state.save(paths)?;
 
     if opts.detach {
@@ -114,7 +114,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         executor::emit_run_json(&state)?;
     } else {
         executor::print_run_human(&state);
-        let msgs = bus::list_events(paths, &state.id)?;
+        let msgs = bus::list_events(paths, Some(&state.id))?;
         println!("bus events: {}", msgs.len());
     }
     Ok(state.exit_code())
@@ -173,7 +173,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
             .unwrap_or("broadcast");
         let _ = bus::chat(
             paths,
-            &state.id,
+            Some(&state.id),
             &slot.id,
             partner,
             format!("peer {} finished", slot.id),
@@ -181,7 +181,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
         );
     }
 
-    let msgs = bus::list_events(paths, &state.id)?;
+    let msgs = bus::list_events(paths, Some(&state.id))?;
     let mut body = format!("# Peer summary\n\nBus events: {}\n\n", msgs.len());
     for m in msgs {
         body.push_str(&format!(

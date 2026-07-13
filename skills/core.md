@@ -81,15 +81,21 @@ you just killed.
 
 ## Swarm bus
 
+The bus is **workspace-scoped and keyed by `agent_id`**. `--run <id>` is an optional
+grouping tag: pass it to scope a send/view to one run; omit it for bare agents.
+
 ```bash
-spar bus send <run_id> -m "hello" [--from human] [--to broadcast|slot]
-spar bus log <run_id> [--json]
-spar bus presence <run_id>
-spar bus reserve <run_id> path/to/file --holder <slot>
-spar bus release <run_id> path/to/file --holder <slot>
+spar bus send -m "hello" [--from human] [--to broadcast|agent] [--run <id>]
+spar bus log [--run <id>] [--json]
+spar bus presence [--run <id>]
+spar bus inbox <agent> [--claim] [--json]
+spar bus reserve path/to/file --holder <agent> [--run <id>]
+spar bus release path/to/file --holder <agent> [--run <id>]
 ```
 
-Layout: `.spar/runs/<id>/bus/{events.jsonl,agents.jsonl,inbox/,reserves.json,tasks/}`
+Layout: `.spar/bus/{events.jsonl,agents.jsonl,inbox/<agent>/,queue/,pending_ack/}`
+(workspace, agent-keyed). Per-run `tasks/` + `reserves.json` and a back-compat
+event/presence mirror live under `.spar/runs/<id>/bus/`.
 
 ## Observe
 
