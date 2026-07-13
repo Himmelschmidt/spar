@@ -1,12 +1,17 @@
 //! Run-scoped swarm bus (A2A). Replaces thin mailbox as the coordination plane.
 use crate::paths::SparPaths;
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+
+/// Reserved recipient id for messages that need a human's attention. Every such
+/// message is surfaced in the TUI alert panel (always on, zero config) and, if the
+/// operator wired one, pushed to an external notifier (`[notify]` in config).
+pub const HUMAN: &str = "@human";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -51,6 +56,10 @@ pub struct MsgRefs {
     pub artifact: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
+    /// Id of the message this one answers. An `Ack` sets it to the id of the
+    /// `requires_ack` message it clears.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,7 +114,12 @@ pub fn bus_root(paths: &SparPaths, run_id: &str) -> PathBuf {
 pub fn ensure_bus(paths: &SparPaths, run_id: &str) -> Result<()> {
     paths.ensure_run_dirs(run_id)?;
     let root = bus_root(paths, run_id);
-    for d in [root.clone(), root.join("inbox"), root.join("tasks")] {
+    for d in [
+        root.clone(),
+        root.join("inbox"),
+        root.join("tasks"),
+        root.join("pending_ack"),
+    ] {
         fs::create_dir_all(&d).with_context(|| format!("create {}", d.display()))?;
     }
     Ok(())
@@ -175,20 +189,125 @@ pub fn heartbeat(paths: &SparPaths, run_id: &str, agent: &str, status: &str) -> 
     append_jsonl(&agents_path(paths, run_id), &p)
 }
 
+/// Cap on a message body. Bodies are inline JSONL records read whole into memory
+/// by every reader; an unbounded body would let one message bloat the event log
+/// and every inbox copy. 64 KiB is generous for coordination traffic.
+pub const MAX_BODY_BYTES: usize = 64 * 1024;
+
+/// Loop prevention (Stage 7). The message budget caps *total* traffic, but two
+/// agents can auto-reply to each other and ping-pong happily inside that budget,
+/// burning real quota. The loop guard caps a *directed exchange* between one
+/// unordered pair `{A,B}`: once the pair has traded [`LoopGuard::max_per_pair`]
+/// messages **in both directions** inside a [`LoopGuard::window`] sliding window,
+/// [`send`] refuses the next one. Only genuine back-and-forth trips it — a
+/// one-directional blast (covered by the budget) and broadcast/system/ack traffic
+/// are exempt, so ordinary coordination is unaffected.
+pub const LOOP_WINDOW_SECS: i64 = 60;
+pub const LOOP_MAX_PER_PAIR: usize = 12;
+
+#[derive(Debug, Clone, Copy)]
+pub struct LoopGuard {
+    pub window: Duration,
+    pub max_per_pair: usize,
+}
+
+impl Default for LoopGuard {
+    fn default() -> Self {
+        Self {
+            window: Duration::seconds(LOOP_WINDOW_SECS),
+            max_per_pair: LOOP_MAX_PER_PAIR,
+        }
+    }
+}
+
+impl LoopGuard {
+    /// Operator overrides via `SPAR_BUS_LOOP_MAX_PER_PAIR` / `SPAR_BUS_LOOP_WINDOW_SECS`.
+    /// A cap of `0` disables the guard entirely.
+    fn from_env() -> Self {
+        let mut g = Self::default();
+        if let Ok(n) = std::env::var("SPAR_BUS_LOOP_WINDOW_SECS")
+            .ok()
+            .map_or(Ok(g.window.num_seconds()), |v| v.parse::<i64>())
+        {
+            g.window = Duration::seconds(n);
+        }
+        if let Ok(n) = std::env::var("SPAR_BUS_LOOP_MAX_PER_PAIR")
+            .ok()
+            .map_or(Ok(g.max_per_pair), |v| v.parse::<usize>())
+        {
+            g.max_per_pair = n;
+        }
+        g
+    }
+}
+
+/// The unordered pair key `(lo, hi)` for a message the loop guard governs, or
+/// `None` if it is exempt. Broadcasts, `@human` alerts, and `Ack`/`System`/`Hello`
+/// bookkeeping are never part of a reply loop, so they pass unguarded.
+fn guarded_pair(msg: &BusMessage) -> Option<(&str, &str)> {
+    if matches!(msg.kind, MsgKind::Ack | MsgKind::System | MsgKind::Hello) {
+        return None;
+    }
+    let (from, to) = (msg.from.as_str(), msg.to.as_str());
+    if to == "broadcast" || to == "*" || to == HUMAN || from == to {
+        return None;
+    }
+    Some(if from <= to { (from, to) } else { (to, from) })
+}
+
+/// Refuse `msg` if sending it would push the `{from,to}` pair past the loop cap.
+/// Trips only when the recent window already holds `max_per_pair` messages for the
+/// pair *and* both directions are represented (a real ping-pong, not a one-way blast).
+fn check_loop(events: &[BusMessage], msg: &BusMessage, guard: LoopGuard) -> Result<()> {
+    if guard.max_per_pair == 0 {
+        return Ok(());
+    }
+    let Some((lo, hi)) = guarded_pair(msg) else {
+        return Ok(());
+    };
+    let cutoff = msg.ts - guard.window;
+    let mut total = 0usize;
+    let (mut fwd, mut rev) = (false, false);
+    for m in events.iter().filter(|m| m.ts >= cutoff) {
+        if guarded_pair(m) != Some((lo, hi)) {
+            continue;
+        }
+        total += 1;
+        if m.from == lo {
+            fwd = true;
+        } else {
+            rev = true;
+        }
+    }
+    if total >= guard.max_per_pair && fwd && rev {
+        bail!(
+            "loop guard: {lo}<->{hi} exchanged {total} messages in the last {}s (cap {}); \
+             refusing to send — two agents are ping-ponging. Break the loop, or raise \
+             SPAR_BUS_LOOP_MAX_PER_PAIR / widen SPAR_BUS_LOOP_WINDOW_SECS if this is legitimate.",
+            guard.window.num_seconds(),
+            guard.max_per_pair,
+        );
+    }
+    Ok(())
+}
+
 pub fn send(
     paths: &SparPaths,
     run_id: &str,
     msg: BusMessage,
     budget: MessageBudget,
 ) -> Result<BusMessage> {
-    ensure_bus(paths, run_id)?;
-    if let Some(max) = budget.max_messages() {
-        let n = count_events(paths, run_id)?;
-        if n >= max {
-            bail!("message budget exhausted ({max} messages)");
-        }
+    if msg.body.len() > MAX_BODY_BYTES {
+        bail!(
+            "message body too large ({} bytes; max {MAX_BODY_BYTES})",
+            msg.body.len()
+        );
     }
-    append_jsonl(&events_path(paths, run_id), &msg)?;
+    ensure_bus(paths, run_id)?;
+    check_loop(&list_events(paths, run_id)?, &msg, LoopGuard::from_env())?;
+    // Budget check and append happen under one lock so two senders can't both
+    // read a below-cap count and both write (TOCTOU across processes).
+    append_event_checked(&events_path(paths, run_id), &msg, budget.max_messages())?;
     deliver_inbox(paths, run_id, &msg)?;
     // also mirror to legacy mailbox for tools that still read it
     let _ = crate::mailbox::send(
@@ -206,7 +325,52 @@ pub fn send(
             created_at: msg.ts,
         },
     );
+
+    // requires_ack lifecycle + @human routing (Stage 5). Handling both at this one
+    // choke point covers every producer (chat, broadcast, workflows, tasks) uniformly.
+    if msg.kind == MsgKind::Ack {
+        if let Some(target) = msg.refs.reply_to.as_deref() {
+            clear_pending_ack(paths, run_id, target)?;
+        }
+    } else if msg.requires_ack {
+        record_pending_ack(paths, run_id, &msg)?;
+    }
+    if is_human_alert(&msg) {
+        // The TUI sink reads the bus directly, so only the external notifier is a push.
+        crate::notify::route_human_alert(paths, &msg);
+    }
     Ok(msg)
+}
+
+/// A message the human needs to see: addressed to [`HUMAN`], or any `Blocked`
+/// report (an agent that stalled is a human-relevant event even when broadcast).
+pub fn is_human_alert(msg: &BusMessage) -> bool {
+    msg.to == HUMAN || msg.kind == MsgKind::Blocked
+}
+
+/// Send an `Ack` clearing the redelivery of `msg_id`. Broadcast so any watcher sees
+/// the acknowledgement; the clear itself keys off `refs.reply_to` in [`send`].
+pub fn ack(paths: &SparPaths, run_id: &str, from: &str, msg_id: &str) -> Result<BusMessage> {
+    send(
+        paths,
+        run_id,
+        BusMessage {
+            id: new_id(),
+            ts: Utc::now(),
+            from: from.into(),
+            to: "broadcast".into(),
+            kind: MsgKind::Ack,
+            body: format!("ack {msg_id}"),
+            subject: Some("ack".into()),
+            refs: MsgRefs {
+                reply_to: Some(msg_id.into()),
+                ..Default::default()
+            },
+            requires_ack: false,
+            meta: HashMap::new(),
+        },
+        MessageBudget::Chatty,
+    )
 }
 
 pub fn chat(
@@ -281,7 +445,8 @@ pub fn list_presence(paths: &SparPaths, run_id: &str) -> Result<Vec<Presence>> {
     Ok(out)
 }
 
-#[allow(dead_code)]
+/// Peek an agent's undelivered inbox without consuming it. The `claimed/`
+/// subdir is skipped (it has no `.json` extension at the top level).
 pub fn inbox(paths: &SparPaths, run_id: &str, agent: &str) -> Result<Vec<BusMessage>> {
     let dir = bus_root(paths, run_id).join("inbox").join(agent);
     if !dir.is_dir() {
@@ -301,23 +466,102 @@ pub fn inbox(paths: &SparPaths, run_id: &str, agent: &str) -> Result<Vec<BusMess
     Ok(out)
 }
 
+/// Drain an agent's inbox with exactly-once semantics: each message file is
+/// atomically `rename`d into `inbox/<agent>/claimed/` and returned. `rename` on
+/// the same filesystem is atomic, so under concurrent claimers exactly one wins
+/// each file (the loser's source path is already gone → skipped), never a double
+/// delivery. Messages already claimed are not returned again.
+pub fn inbox_claim(paths: &SparPaths, run_id: &str, agent: &str) -> Result<Vec<BusMessage>> {
+    let dir = bus_root(paths, run_id).join("inbox").join(agent);
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let claimed_dir = dir.join("claimed");
+    fs::create_dir_all(&claimed_dir)?;
+    let mut sources: Vec<PathBuf> = Vec::new();
+    for e in fs::read_dir(&dir)? {
+        let e = e?;
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        sources.push(p);
+    }
+    let mut out: Vec<BusMessage> = Vec::new();
+    for src in sources {
+        let Some(name) = src.file_name() else {
+            continue;
+        };
+        let dest = claimed_dir.join(name);
+        // Whoever moves the inode owns the message. A concurrent claimer that
+        // already moved it gets ENOENT here and is skipped.
+        if fs::rename(&src, &dest).is_err() {
+            continue;
+        }
+        if let Ok(m) = serde_json::from_str(&fs::read_to_string(&dest)?) {
+            out.push(m);
+        }
+    }
+    out.sort_by(|a, b| a.ts.cmp(&b.ts));
+    Ok(out)
+}
+
+/// A path claim goes stale this many seconds after its holder's last sign of life
+/// (presence heartbeat, falling back to the claim time). Past it, another agent may
+/// reclaim the path — this is what auto-releases a claim held by a crashed agent, so
+/// `reserves.json` never needs hand-editing. Matches the stall-warn horizon: a holder
+/// spar already considers stalled has also lost its lease.
+pub const RESERVE_LEASE_TTL_SECS: i64 = 300;
+
+/// How often the orchestrator's process supervisor refreshes a live slot's presence
+/// (see `executor::run_headless` / `execute_prepared`). Provider presence hooks only
+/// fire on events (tool use, prompt submit) and a whole adapter class
+/// (`PresenceSource::None`, e.g. agy) installs no hooks at all — so lease liveness
+/// cannot depend on them. This supervisor beat keeps any live slot's presence fresh
+/// while its child process runs, independent of provider hooks. Kept well under
+/// [`RESERVE_LEASE_TTL_SECS`] so a missed beat never expires a lease on a live holder.
+pub const LIVENESS_HEARTBEAT_SECS: i64 = 30;
+
 pub fn reserve(paths: &SparPaths, run_id: &str, path: &str, holder: &str) -> Result<()> {
+    reserve_at(paths, run_id, path, holder, Utc::now())
+}
+
+/// [`reserve`] with an injectable `now` so lease-expiry can be exercised in tests.
+fn reserve_at(
+    paths: &SparPaths,
+    run_id: &str,
+    path: &str,
+    holder: &str,
+    now: DateTime<Utc>,
+) -> Result<()> {
     ensure_bus(paths, run_id)?;
     let mut file = load_reserves(paths, run_id)?;
+    let presence = list_presence(paths, run_id)?;
+    let ttl = Duration::seconds(RESERVE_LEASE_TTL_SECS);
     if let Some(c) = file
         .claims
         .iter()
         .find(|c| c.path == path && c.holder != holder)
     {
-        bail!("path {path} already reserved by {}", c.holder);
+        // The lease is tied to the holder's last heartbeat (or the claim time, if it
+        // has none yet). A fresh, heartbeating holder blocks; a stale one is reclaimed.
+        let basis = holder_heartbeat(&presence, &c.holder).map_or(c.ts, |hb| hb.max(c.ts));
+        if now - basis <= ttl {
+            bail!("path {path} already reserved by {}", c.holder);
+        }
     }
     file.claims.retain(|c| c.path != path);
     file.claims.push(Reserve {
         path: path.into(),
         holder: holder.into(),
-        ts: Utc::now(),
+        ts: now,
     });
     save_reserves(paths, run_id, &file)
+}
+
+/// Timestamp of a holder's most recent presence record, if any.
+fn holder_heartbeat(presence: &[Presence], holder: &str) -> Option<DateTime<Utc>> {
+    presence.iter().find(|p| p.agent == holder).map(|p| p.ts)
 }
 
 pub fn release(paths: &SparPaths, run_id: &str, path: &str, holder: &str) -> Result<()> {
@@ -349,29 +593,287 @@ fn save_reserves(paths: &SparPaths, run_id: &str, file: &ReservesFile) -> Result
     Ok(())
 }
 
-fn count_events(paths: &SparPaths, run_id: &str) -> Result<usize> {
-    let p = events_path(paths, run_id);
-    if !p.is_file() {
+// ── requires_ack: redeliver-until-acked, then escalate to @human ──────────────
+
+/// A `requires_ack` message awaiting its `Ack`. Persisted per message under
+/// `bus/pending_ack/<id>.json`; [`tick_acks`] redelivers on backoff and escalates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingAck {
+    msg: BusMessage,
+    /// Redeliveries performed so far (0 = only the original delivery has happened).
+    attempts: u32,
+    /// Earliest instant the next redelivery/escalation may fire.
+    next_at: DateTime<Utc>,
+}
+
+/// Redelivery cadence for unacked messages. `max_retries` redeliveries happen
+/// (exponential backoff off `base_backoff`) before the message escalates to a
+/// `@human` alert.
+#[derive(Debug, Clone)]
+pub struct AckPolicy {
+    pub base_backoff: Duration,
+    pub max_retries: u32,
+}
+
+impl Default for AckPolicy {
+    fn default() -> Self {
+        Self {
+            base_backoff: Duration::seconds(60),
+            max_retries: 3,
+        }
+    }
+}
+
+impl AckPolicy {
+    /// Exponential backoff before the `attempts`-th redelivery, capped at 30 min.
+    fn backoff_for(&self, attempts: u32) -> Duration {
+        let factor = 1i64 << attempts.min(6);
+        let secs = self.base_backoff.num_seconds().max(0) * factor;
+        Duration::seconds(secs.min(1800))
+    }
+}
+
+/// What one [`tick_acks`] pass did.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct AckTick {
+    pub redelivered: usize,
+    pub escalated: usize,
+}
+
+fn pending_ack_dir(paths: &SparPaths, run_id: &str) -> PathBuf {
+    bus_root(paths, run_id).join("pending_ack")
+}
+
+fn record_pending_ack(paths: &SparPaths, run_id: &str, msg: &BusMessage) -> Result<()> {
+    let dir = pending_ack_dir(paths, run_id);
+    fs::create_dir_all(&dir)?;
+    let rec = PendingAck {
+        msg: msg.clone(),
+        attempts: 0,
+        next_at: msg.ts + AckPolicy::default().base_backoff,
+    };
+    fs::write(
+        dir.join(format!("{}.json", msg.id)),
+        serde_json::to_string_pretty(&rec)?,
+    )?;
+    Ok(())
+}
+
+fn clear_pending_ack(paths: &SparPaths, run_id: &str, msg_id: &str) -> Result<()> {
+    let p = pending_ack_dir(paths, run_id).join(format!("{msg_id}.json"));
+    if p.is_file() {
+        fs::remove_file(&p)?;
+    }
+    Ok(())
+}
+
+/// Advance every pending `requires_ack` message whose backoff has elapsed by `now`:
+/// redeliver it to the recipient inbox, or — once `max_retries` redeliveries are
+/// spent — escalate it to a `@human` alert and drop the pending record. An `Ack`
+/// (handled in [`send`]) removes the record, so an acked message never ticks again.
+pub fn tick_acks(
+    paths: &SparPaths,
+    run_id: &str,
+    policy: &AckPolicy,
+    now: DateTime<Utc>,
+) -> Result<AckTick> {
+    let dir = pending_ack_dir(paths, run_id);
+    if !dir.is_dir() {
+        return Ok(AckTick::default());
+    }
+    // Several pulses tick the same run concurrently: `spar bus deliver` (one per
+    // agent finishing a turn), the `spar wait` loop, and the TUI refresh thread.
+    // Serialize the whole read-modify-remove/write pass under one exclusive lock so
+    // a record is escalated-and-removed or redelivered by exactly one process —
+    // never double-escalated, and never resurrected by a redeliver write racing
+    // another process's remove.
+    let lock = open_lockfile(&dir.join(".lock"))?;
+    lock_exclusive(&lock)?;
+    let mut files: Vec<PathBuf> = fs::read_dir(&dir)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
+        .collect();
+    files.sort();
+    let mut out = AckTick::default();
+    for f in files {
+        let Ok(mut rec) = serde_json::from_str::<PendingAck>(&fs::read_to_string(&f)?) else {
+            continue;
+        };
+        if rec.next_at > now {
+            continue;
+        }
+        if rec.attempts >= policy.max_retries {
+            escalate_unacked(paths, run_id, &rec, now, policy.max_retries)?;
+            remove_file_if_present(&f)?;
+            out.escalated += 1;
+        } else {
+            deliver_inbox(paths, run_id, &rec.msg)?;
+            rec.attempts += 1;
+            rec.next_at = now + policy.backoff_for(rec.attempts);
+            fs::write(&f, serde_json::to_string_pretty(&rec)?)?;
+            out.redelivered += 1;
+        }
+    }
+    Ok(out)
+}
+
+fn escalate_unacked(
+    paths: &SparPaths,
+    run_id: &str,
+    rec: &PendingAck,
+    now: DateTime<Utc>,
+    max_retries: u32,
+) -> Result<()> {
+    let mut meta = HashMap::new();
+    meta.insert("escalated_from".into(), rec.msg.id.clone());
+    let esc = BusMessage {
+        id: new_id(),
+        ts: now,
+        from: "spar".into(),
+        to: HUMAN.into(),
+        kind: MsgKind::Blocked,
+        body: format!(
+            "No ack after {max_retries} redeliveries: message {} to {} from {} — {}",
+            rec.msg.id,
+            rec.msg.to,
+            rec.msg.from,
+            rec.msg.body.chars().take(200).collect::<String>()
+        ),
+        subject: Some("unacked".into()),
+        refs: MsgRefs {
+            reply_to: Some(rec.msg.id.clone()),
+            ..Default::default()
+        },
+        requires_ack: false,
+        meta,
+    };
+    send(paths, run_id, esc, MessageBudget::Chatty)?;
+    Ok(())
+}
+
+/// Human-facing alerts still awaiting attention: `@human` messages with no `Ack`,
+/// plus every agent still `Blocked` (no later `Unblocked` from it). Powers the TUI
+/// alert panel/badge.
+pub fn unresolved_alerts(paths: &SparPaths, run_id: &str) -> Result<Vec<BusMessage>> {
+    let evs = list_events(paths, run_id)?;
+    let acked: HashSet<String> = evs
+        .iter()
+        .filter(|m| m.kind == MsgKind::Ack)
+        .filter_map(|m| m.refs.reply_to.clone())
+        .collect();
+    let mut blocked: HashMap<String, BusMessage> = HashMap::new();
+    for m in &evs {
+        match m.kind {
+            MsgKind::Blocked => {
+                blocked.insert(m.from.clone(), m.clone());
+            }
+            MsgKind::Unblocked => {
+                blocked.remove(&m.from);
+            }
+            _ => {}
+        }
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<BusMessage> = Vec::new();
+    for m in evs
+        .iter()
+        .filter(|m| m.to == HUMAN && !acked.contains(&m.id))
+    {
+        if seen.insert(m.id.clone()) {
+            out.push(m.clone());
+        }
+    }
+    for m in blocked.into_values() {
+        if !acked.contains(&m.id) && seen.insert(m.id.clone()) {
+            out.push(m);
+        }
+    }
+    out.sort_by(|a, b| a.ts.cmp(&b.ts));
+    Ok(out)
+}
+
+fn count_nonempty_lines(path: &PathBuf) -> Result<usize> {
+    if !path.is_file() {
         return Ok(0);
     }
-    Ok(fs::read_to_string(p)?
+    Ok(fs::read_to_string(path)?
         .lines()
         .filter(|l| !l.trim().is_empty())
         .count())
 }
 
-fn append_jsonl<T: Serialize>(path: &PathBuf, value: &T) -> Result<()> {
+fn open_for_append(path: &PathBuf) -> Result<File> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut f = OpenOptions::new()
+    OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-        .with_context(|| format!("open {}", path.display()))?;
-    serde_json::to_writer(&mut f, value)?;
-    f.write_all(b"\n")?;
+        .with_context(|| format!("open {}", path.display()))
+}
+
+/// Open (creating if absent) a lockfile whose only purpose is to hold an
+/// advisory `flock`. The file's contents are never read or written.
+fn open_lockfile(path: &PathBuf) -> Result<File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))
+}
+
+/// Remove a file, treating an already-absent file as success so a lost
+/// double-remove race can never abort the caller.
+fn remove_file_if_present(path: &PathBuf) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+/// Take an exclusive advisory lock on the file's open description. It is held
+/// until `f` is dropped (fd close), serializing writers across threads and
+/// processes so a record and its trailing newline can never interleave with
+/// another writer's bytes.
+fn lock_exclusive(f: &File) -> Result<()> {
+    rustix::fs::flock(f, rustix::fs::FlockOperation::LockExclusive).context("flock exclusive")?;
     Ok(())
+}
+
+/// Serialize `value` and its newline into a single `write_all`, so under
+/// `O_APPEND` the whole record lands at end-of-file in one syscall.
+fn write_record<T: Serialize>(f: &mut File, value: &T) -> Result<()> {
+    let mut line = serde_json::to_vec(value)?;
+    line.push(b'\n');
+    f.write_all(&line)?;
+    Ok(())
+}
+
+fn append_jsonl<T: Serialize>(path: &PathBuf, value: &T) -> Result<()> {
+    let mut f = open_for_append(path)?;
+    lock_exclusive(&f)?;
+    write_record(&mut f, value)
+}
+
+/// Append a bus event while enforcing the message budget under the same lock
+/// that guards the write: the count and the append are atomic with respect to
+/// other senders, closing the check-then-write race.
+fn append_event_checked(path: &PathBuf, msg: &BusMessage, max: Option<usize>) -> Result<()> {
+    let mut f = open_for_append(path)?;
+    lock_exclusive(&f)?;
+    if let Some(max) = max {
+        if count_nonempty_lines(path)? >= max {
+            bail!("message budget exhausted ({max} messages)");
+        }
+    }
+    write_record(&mut f, msg)
 }
 
 fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &PathBuf) -> Result<Vec<T>> {
@@ -408,5 +910,327 @@ mod tests {
         assert!(reserve(&paths, "r1", "src/foo.rs", "b").is_err());
         release(&paths, "r1", "src/foo.rs", "a").unwrap();
         reserve(&paths, "r1", "src/foo.rs", "b").unwrap();
+    }
+
+    #[test]
+    fn reserve_lease_expires_with_holder_heartbeat() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        join(&paths, "r1", "a", Some("cli:claude"), Some("native-cli")).unwrap();
+        join(&paths, "r1", "b", Some("cli:grok"), Some("native-cli")).unwrap();
+        reserve(&paths, "r1", "src/foo.rs", "a").unwrap();
+
+        // Within the lease window a's claim still blocks b (heartbeat is fresh).
+        let fresh = Utc::now() + Duration::seconds(RESERVE_LEASE_TTL_SECS - 1);
+        assert!(reserve_at(&paths, "r1", "src/foo.rs", "b", fresh).is_err());
+
+        // Once a's last heartbeat is older than the TTL (a crashed, stopped beating),
+        // b reclaims the path with no manual release.
+        let expired = Utc::now() + Duration::seconds(RESERVE_LEASE_TTL_SECS + 1);
+        reserve_at(&paths, "r1", "src/foo.rs", "b", expired).unwrap();
+        let claims = list_reserves(&paths, "r1").unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].holder, "b");
+
+        // A heartbeating holder refreshes its lease: b now blocks a while b beats.
+        heartbeat(&paths, "r1", "b", "running").unwrap();
+        assert!(reserve(&paths, "r1", "src/foo.rs", "a").is_err());
+    }
+
+    #[test]
+    fn inbox_claim_drains_exactly_once() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        join(&paths, "r1", "a", Some("cli:claude"), Some("native-cli")).unwrap();
+        join(&paths, "r1", "b", Some("cli:grok"), Some("native-cli")).unwrap();
+        chat(&paths, "r1", "a", "b", "hello", MessageBudget::Normal).unwrap();
+        chat(&paths, "r1", "a", "b", "world", MessageBudget::Normal).unwrap();
+
+        // Peek does not consume: repeated non-claim reads keep returning all.
+        assert_eq!(inbox(&paths, "r1", "b").unwrap().len(), 2);
+        assert_eq!(inbox(&paths, "r1", "b").unwrap().len(), 2);
+
+        // First claim drains everything; second claim sees nothing.
+        let first = inbox_claim(&paths, "r1", "b").unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].body, "hello");
+        assert_eq!(first[1].body, "world");
+        assert!(inbox_claim(&paths, "r1", "b").unwrap().is_empty());
+
+        // Peek after claim is also empty (claimed/ is excluded).
+        assert!(inbox(&paths, "r1", "b").unwrap().is_empty());
+    }
+
+    fn nonempty_event_lines(paths: &SparPaths, run_id: &str) -> Vec<String> {
+        fs::read_to_string(events_path(paths, run_id))
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn concurrent_send_writes_intact_lines() {
+        let tmp = tempdir().unwrap();
+        let paths = std::sync::Arc::new(SparPaths::new(tmp.path()));
+        ensure_bus(&paths, "r1").unwrap();
+        let m = 32;
+        let handles: Vec<_> = (0..m)
+            .map(|i| {
+                let p = paths.clone();
+                std::thread::spawn(move || {
+                    chat(
+                        &p,
+                        "r1",
+                        "a",
+                        "b",
+                        format!("msg {i}"),
+                        MessageBudget::Chatty,
+                    )
+                    .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Exactly M records, each a well-formed (untorn) JSONL line.
+        let lines = nonempty_event_lines(&paths, "r1");
+        assert_eq!(lines.len(), m);
+        for l in &lines {
+            serde_json::from_str::<BusMessage>(l).expect("well-formed JSONL line");
+        }
+    }
+
+    #[test]
+    fn concurrent_send_respects_budget() {
+        let tmp = tempdir().unwrap();
+        let paths = std::sync::Arc::new(SparPaths::new(tmp.path()));
+        ensure_bus(&paths, "r1").unwrap();
+        let max = MessageBudget::Lean.max_messages().unwrap();
+        let threads = max * 3;
+        let handles: Vec<_> = (0..threads)
+            .map(|i| {
+                let p = paths.clone();
+                std::thread::spawn(move || {
+                    // Some senders lose the budget race and error; that's fine.
+                    let _ = chat(&p, "r1", "a", "b", format!("m{i}"), MessageBudget::Lean);
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let lines = nonempty_event_lines(&paths, "r1");
+        // Never past the cap, and every survivor is intact.
+        assert_eq!(lines.len(), max);
+        for l in &lines {
+            serde_json::from_str::<BusMessage>(l).expect("well-formed JSONL line");
+        }
+    }
+
+    fn req_ack(paths: &SparPaths, from: &str, to: &str, body: &str) -> BusMessage {
+        send(
+            paths,
+            "r1",
+            BusMessage {
+                id: new_id(),
+                ts: Utc::now(),
+                from: from.into(),
+                to: to.into(),
+                kind: MsgKind::Chat,
+                body: body.into(),
+                subject: None,
+                refs: MsgRefs::default(),
+                requires_ack: true,
+                meta: HashMap::new(),
+            },
+            MessageBudget::Chatty,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn requires_ack_redelivers_then_escalates() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        join(&paths, "r1", "a", Some("cli:claude"), Some("native-cli")).unwrap();
+        join(&paths, "r1", "b", Some("cli:grok"), Some("native-cli")).unwrap();
+        let m = req_ack(&paths, "a", "b", "please confirm");
+        // Original delivery landed once.
+        assert_eq!(inbox_claim(&paths, "r1", "b").unwrap().len(), 1);
+
+        // The original send scheduled the first redelivery a default backoff out, so
+        // tick from far enough ahead that it (and every base_backoff-0 retry) is due.
+        let policy = AckPolicy {
+            base_backoff: Duration::zero(),
+            max_retries: 2,
+        };
+        let now = Utc::now() + Duration::seconds(120);
+        let t1 = tick_acks(&paths, "r1", &policy, now).unwrap();
+        assert_eq!((t1.redelivered, t1.escalated), (1, 0));
+        assert_eq!(
+            inbox_claim(&paths, "r1", "b").unwrap().len(),
+            1,
+            "redeliver 1"
+        );
+        let t2 = tick_acks(&paths, "r1", &policy, now).unwrap();
+        assert_eq!((t2.redelivered, t2.escalated), (1, 0));
+        assert_eq!(
+            inbox_claim(&paths, "r1", "b").unwrap().len(),
+            1,
+            "redeliver 2"
+        );
+
+        // Third due tick: retries spent → escalate to @human, drop the pending record.
+        let t3 = tick_acks(&paths, "r1", &policy, now).unwrap();
+        assert_eq!((t3.redelivered, t3.escalated), (0, 1));
+        let human = inbox(&paths, "r1", HUMAN).unwrap();
+        assert_eq!(human.len(), 1);
+        assert_eq!(human[0].kind, MsgKind::Blocked);
+        assert_eq!(human[0].refs.reply_to.as_deref(), Some(m.id.as_str()));
+        assert!(is_human_alert(&human[0]));
+
+        // Record is gone: further ticks are no-ops.
+        let t4 = tick_acks(&paths, "r1", &policy, now).unwrap();
+        assert_eq!((t4.redelivered, t4.escalated), (0, 0));
+    }
+
+    #[test]
+    fn ack_stops_redelivery() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        join(&paths, "r1", "a", Some("cli:claude"), Some("native-cli")).unwrap();
+        join(&paths, "r1", "b", Some("cli:grok"), Some("native-cli")).unwrap();
+        let m = req_ack(&paths, "a", "b", "please confirm");
+
+        ack(&paths, "r1", "b", &m.id).unwrap();
+        // Pending record cleared → no redelivery, no escalation, ever.
+        let policy = AckPolicy {
+            base_backoff: Duration::zero(),
+            max_retries: 1,
+        };
+        let t = tick_acks(&paths, "r1", &policy, Utc::now()).unwrap();
+        assert_eq!((t.redelivered, t.escalated), (0, 0));
+        assert!(inbox(&paths, "r1", HUMAN).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unresolved_alerts_tracks_blocked_and_human() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        join(&paths, "r1", "a", Some("cli:claude"), Some("native-cli")).unwrap();
+        join(&paths, "r1", "b", Some("cli:grok"), Some("native-cli")).unwrap();
+
+        // A Blocked report surfaces; an Unblocked from the same agent clears it.
+        let blocked = |body: &str| {
+            send(
+                &paths,
+                "r1",
+                BusMessage {
+                    id: new_id(),
+                    ts: Utc::now(),
+                    from: "a".into(),
+                    to: "broadcast".into(),
+                    kind: MsgKind::Blocked,
+                    body: body.into(),
+                    subject: None,
+                    refs: MsgRefs::default(),
+                    requires_ack: false,
+                    meta: HashMap::new(),
+                },
+                MessageBudget::Chatty,
+            )
+            .unwrap()
+        };
+        blocked("stuck on tests");
+        assert_eq!(unresolved_alerts(&paths, "r1").unwrap().len(), 1);
+        send(
+            &paths,
+            "r1",
+            BusMessage {
+                id: new_id(),
+                ts: Utc::now(),
+                from: "a".into(),
+                to: "broadcast".into(),
+                kind: MsgKind::Unblocked,
+                body: "resolved".into(),
+                subject: None,
+                refs: MsgRefs::default(),
+                requires_ack: false,
+                meta: HashMap::new(),
+            },
+            MessageBudget::Chatty,
+        )
+        .unwrap();
+        assert!(unresolved_alerts(&paths, "r1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn loop_guard_refuses_pingpong_but_passes_normal() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        join(&paths, "r1", "a", Some("cli:claude"), Some("native-cli")).unwrap();
+        join(&paths, "r1", "b", Some("cli:grok"), Some("native-cli")).unwrap();
+
+        // Rapid A<->B ping-pong: alternate direction so both sides are represented.
+        // Chatty budget removes the volume cap, isolating the loop guard as the limiter.
+        let mut sent = 0usize;
+        let mut refused = false;
+        for i in 0..(LOOP_MAX_PER_PAIR * 2) {
+            let (from, to) = if i % 2 == 0 { ("a", "b") } else { ("b", "a") };
+            match chat(
+                &paths,
+                "r1",
+                from,
+                to,
+                format!("m{i}"),
+                MessageBudget::Chatty,
+            ) {
+                Ok(_) => sent += 1,
+                Err(e) => {
+                    assert!(
+                        e.to_string().contains("loop guard"),
+                        "unexpected error: {e}"
+                    );
+                    refused = true;
+                    break;
+                }
+            }
+        }
+        assert!(refused, "ping-pong past the cap should be refused");
+        assert_eq!(
+            sent, LOOP_MAX_PER_PAIR,
+            "exactly the cap is allowed through"
+        );
+
+        // Ordinary traffic is unaffected: a different pair still passes freely,
+        assert!(chat(&paths, "r1", "a", "c", "hi", MessageBudget::Chatty).is_ok());
+        // a one-directional stream (not a loop) passes past the cap,
+        for i in 0..(LOOP_MAX_PER_PAIR + 4) {
+            chat(
+                &paths,
+                "r1",
+                "d",
+                "e",
+                format!("n{i}"),
+                MessageBudget::Chatty,
+            )
+            .unwrap();
+        }
+        // and broadcasts are exempt.
+        assert!(broadcast(&paths, "r1", "a", "all-hands", MessageBudget::Chatty).is_ok());
+    }
+
+    #[test]
+    fn send_rejects_oversized_body() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let big = "x".repeat(MAX_BODY_BYTES + 1);
+        assert!(chat(&paths, "r1", "a", "b", big, MessageBudget::Chatty).is_err());
+        // A body at the cap is accepted.
+        let ok = "y".repeat(MAX_BODY_BYTES);
+        assert!(chat(&paths, "r1", "a", "b", ok, MessageBudget::Chatty).is_ok());
     }
 }

@@ -110,6 +110,68 @@ struct PreparedSlot {
     prompt_path: PathBuf,
     prompt: String,
     pref: ProviderRef,
+    /// Identity + presence env attached to the spawned agent (empty for api slots).
+    env: Vec<(String, String)>,
+    /// Owned so the supervisor's liveness beat survives the move into a spawn thread.
+    paths: SparPaths,
+    run_id: String,
+}
+
+/// Refreshes a live slot's presence heartbeat while its child process runs, throttled
+/// to [`crate::bus::LIVENESS_HEARTBEAT_SECS`]. Wired to `run_captured`'s per-poll tick so
+/// lease liveness tracks the actual process, not event-driven provider hooks that a whole
+/// adapter class (`PresenceSource::None`, e.g. agy) never installs. See the finding at
+/// `bus::reserve_at`: without this an alive holder's lease expires and its path is reclaimed.
+struct LivenessBeat<'a> {
+    paths: &'a SparPaths,
+    run_id: &'a str,
+    slot_id: &'a str,
+    last: std::cell::Cell<std::time::Instant>,
+}
+
+impl LivenessBeat<'_> {
+    fn tick(&self) {
+        if self.last.get().elapsed()
+            < Duration::from_secs(crate::bus::LIVENESS_HEARTBEAT_SECS as u64)
+        {
+            return;
+        }
+        self.last.set(std::time::Instant::now());
+        let _ = crate::bus::heartbeat(self.paths, self.run_id, self.slot_id, "running");
+    }
+}
+
+/// Wire the adapter's presence source for a CLI slot: install its hook file into the
+/// worktree, log any degraded-mode note, and return the identity env every agent
+/// carries (`SPAR_AGENT_ID` / `SPAR_RUN_ID` / `SPAR_PROJECT_ROOT`). API slots have no
+/// CLI adapter, so they get an empty env. Best-effort — never fails the spawn.
+fn wire_slot_presence(
+    state: &RunState,
+    paths: &SparPaths,
+    job: &SlotJob,
+    cwd: &Path,
+    pref: &ProviderRef,
+) -> Vec<(String, String)> {
+    if pref.is_api() {
+        return Vec::new();
+    }
+    let cli_name = pref.cli_name().unwrap_or(job.provider.as_str());
+    let Some(adapter) = providers::adapter_named(cli_name) else {
+        return Vec::new();
+    };
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("spar"));
+    let identity = providers::presence::SlotIdentity {
+        agent_id: &job.slot_id,
+        run_id: &state.id,
+        project_root: &state.project_root,
+        worktree: cwd,
+        spar_exe: &exe,
+    };
+    let wiring = providers::presence::wire(adapter.as_ref(), &identity);
+    if let Some(note) = wiring.note {
+        let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(note));
+    }
+    wiring.env
 }
 
 fn prepare_slot_execution(
@@ -188,6 +250,7 @@ fn prepare_slot_execution(
         &crate::events::Event::slot(&job.slot_id, SlotStatus::Running),
     );
     let _ = crate::bus::heartbeat(paths, &state.id, &job.slot_id, "running");
+    let env = wire_slot_presence(state, paths, &job, &cwd, &pref);
 
     Ok(PreparedSlot {
         job,
@@ -196,6 +259,9 @@ fn prepare_slot_execution(
         prompt_path,
         prompt,
         pref,
+        env,
+        paths: paths.clone(),
+        run_id: state.id.clone(),
     })
 }
 
@@ -279,7 +345,7 @@ fn execute_prepared(
         args,
         cwd: prep.cwd.clone(),
         log_path: prep.log_path.clone(),
-        env: vec![],
+        env: prep.env.clone(),
         timeout,
     };
     let pid_cell = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -291,7 +357,14 @@ fn execute_prepared(
             let _ = std::fs::write(f, process::PidToken::capture(pid).encode());
         }
     };
-    let res = process::run_captured(&req, Some(&sink))?;
+    let beat = LivenessBeat {
+        paths: &prep.paths,
+        run_id: &prep.run_id,
+        slot_id: &prep.job.slot_id,
+        last: std::cell::Cell::new(std::time::Instant::now()),
+    };
+    let tick = || beat.tick();
+    let res = process::run_captured(&req, Some(&sink), Some(&tick))?;
     let pid = load_pid(&pid_cell);
     let usage = usage_from_stream(&prep.job.slot_id, &prep.job.provider, &res.stats);
     if res.timed_out {
@@ -543,6 +616,8 @@ pub fn run_slot(
         return run_dry(state, paths, job, &cwd, &log_path, &prompt);
     }
 
+    let presence_env = wire_slot_presence(state, paths, job, &cwd, &pref);
+
     let result = if pref.is_api() {
         match run_api(state, paths, job, &pref, &cwd, &log_path, &prompt, timeout) {
             Ok(r) => r,
@@ -564,6 +639,7 @@ pub fn run_slot(
                     &prompt_path,
                     &prompt,
                     timeout,
+                    &presence_env,
                 ) {
                     Ok(r) => r,
                     Err(e) => {
@@ -591,6 +667,7 @@ pub fn run_slot(
                     &prompt_path,
                     &prompt,
                     timeout,
+                    &presence_env,
                 ) {
                     Ok(r) => r,
                     Err(e) => {
@@ -1025,6 +1102,7 @@ fn run_headless(
     prompt_path: &Path,
     prompt: &str,
     timeout: Duration,
+    env: &[(String, String)],
 ) -> Result<SlotOutcome> {
     let pref = ProviderRef::parse(&job.provider)?;
     let cli_name = pref.cli_name().unwrap_or(job.provider.as_str());
@@ -1051,7 +1129,7 @@ fn run_headless(
         args,
         cwd: cwd.to_path_buf(),
         log_path: log_path.to_path_buf(),
-        env: vec![],
+        env: env.to_vec(),
         timeout,
     };
     let pid_cell = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -1062,7 +1140,14 @@ fn run_headless(
         sink_cell.store(pid, std::sync::atomic::Ordering::SeqCst);
         let _ = markers::write_pid(paths, &run_id, &slot_id, process::PidToken::capture(pid));
     };
-    let res = process::run_captured(&req, Some(&sink))?;
+    let beat = LivenessBeat {
+        paths,
+        run_id: &state.id,
+        slot_id: &job.slot_id,
+        last: std::cell::Cell::new(std::time::Instant::now()),
+    };
+    let tick = || beat.tick();
+    let res = process::run_captured(&req, Some(&sink), Some(&tick))?;
     let pid = load_pid(&pid_cell);
     let usage = usage_from_stream(&job.slot_id, &job.provider, &res.stats);
     if res.timed_out {
@@ -1154,6 +1239,7 @@ fn run_tmux(
     prompt_path: &Path,
     prompt: &str,
     timeout: Duration,
+    env: &[(String, String)],
 ) -> Result<SlotOutcome> {
     if !tmux::available() {
         bail!("tmux not available");
@@ -1187,7 +1273,7 @@ fn run_tmux(
     let cmd = adapter.build_interactive(&bin, &opts);
     let (program, args) = providers::command_to_parts(&cmd);
     let shell = tmux::shell_wrap(&program, &args, log_path);
-    tmux::spawn_window(&session, &job.slot_id, cwd, &shell)?;
+    tmux::spawn_window(&session, &job.slot_id, cwd, &shell, env)?;
 
     // `done` means the agent's own process has exited — not just that it wrote its marker.
     let done = format!("{}.done", job.slot_id);
@@ -1362,6 +1448,15 @@ pub fn wait_run(
     let mut last_phase = None;
     loop {
         let state = RunState::load(paths, run_id)?;
+        // The wait loop is a provider-agnostic delivery pulse: advance unacked-message
+        // redelivery/escalation so requires_ack works even in runs with no Claude slot
+        // (whose Stop hook is the only other thing that ticks acks). Best-effort.
+        let _ = crate::bus::tick_acks(
+            paths,
+            run_id,
+            &crate::bus::AckPolicy::default(),
+            chrono::Utc::now(),
+        );
         if follow && !json {
             let (off, evs) = crate::events::read_from_offset(paths, run_id, event_off)?;
             event_off = off;

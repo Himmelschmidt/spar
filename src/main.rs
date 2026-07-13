@@ -10,6 +10,7 @@ mod liveness;
 mod mailbox;
 mod markers;
 mod model_select;
+mod notify;
 mod paths;
 mod process;
 mod provider_ref;
@@ -276,6 +277,33 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             }
             Ok(ExitCode::Success)
         }
+        BusCmd::Inbox {
+            run_id,
+            agent,
+            claim,
+            json,
+        } => {
+            let msgs = if claim {
+                bus::inbox_claim(&paths, &run_id, &agent)?
+            } else {
+                bus::inbox(&paths, &run_id, &agent)?
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&msgs)?);
+            } else {
+                for m in &msgs {
+                    println!(
+                        "{} {} → {} ({:?}) {}",
+                        m.ts.format("%H:%M:%S"),
+                        m.from,
+                        m.to,
+                        m.kind,
+                        m.body.chars().take(100).collect::<String>()
+                    );
+                }
+            }
+            Ok(ExitCode::Success)
+        }
         BusCmd::Presence { run_id, json } => {
             let p = bus::list_presence(&paths, &run_id)?;
             if json {
@@ -284,6 +312,33 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
                 for a in p {
                     println!("{:<20} {:<12} {:?}", a.agent, a.status, a.provider);
                 }
+            }
+            Ok(ExitCode::Success)
+        }
+        BusCmd::Heartbeat {
+            run_id,
+            agent,
+            status,
+        } => {
+            bus::heartbeat(&paths, &run_id, &agent, &status)?;
+            Ok(ExitCode::Success)
+        }
+        BusCmd::Deliver {
+            run_id,
+            agent,
+            json,
+        } => bus_deliver(&paths, &run_id, &agent, json),
+        BusCmd::Ack {
+            run_id,
+            msg_id,
+            from,
+            json,
+        } => {
+            let msg = bus::ack(&paths, &run_id, &from, &msg_id)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&msg)?);
+            } else {
+                println!("acked {msg_id}");
             }
             Ok(ExitCode::Success)
         }
@@ -306,6 +361,47 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             Ok(ExitCode::Success)
         }
     }
+}
+
+/// Resolve `agent`'s delivery strategy from its run slot's provider adapter. An agent
+/// with no slot or no CLI adapter (bare agent / api slot) has no injection channel.
+fn agent_delivery_strategy(state: &state::RunState, agent: &str) -> providers::DeliveryStrategy {
+    state
+        .slots
+        .iter()
+        .find(|s| s.id == agent)
+        .and_then(|s| providers::adapter_named(&s.provider))
+        .map(|a| a.delivery_strategy())
+        .unwrap_or(providers::DeliveryStrategy::None)
+}
+
+fn bus_deliver(
+    paths: &paths::SparPaths,
+    run_id: &str,
+    agent: &str,
+    json: bool,
+) -> Result<ExitCode> {
+    let state = state::RunState::load(paths, run_id)?;
+    let strategy = agent_delivery_strategy(&state, agent);
+    let dry_run = state.dry_run || util::env_truthy("SPAR_DRY_RUN");
+    // A turn boundary is one of the swarm's delivery pulses: advance any unacked-message
+    // redeliveries first so a due redelivery lands in this same drain. This is not the
+    // only pulse — the wait loop and TUI refresh also tick acks, so redelivery/escalation
+    // advances in runs with no Claude slot (whose Stop hook is the only pulse here).
+    bus::tick_acks(
+        paths,
+        run_id,
+        &bus::AckPolicy::default(),
+        chrono::Utc::now(),
+    )?;
+    let d = providers::delivery::deliver(paths, run_id, agent, strategy, dry_run)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&d)?);
+    } else if let Some(payload) = &d.payload {
+        // Hook mode: stdout carries only the raw injection payload for the hook runner.
+        println!("{payload}");
+    }
+    Ok(ExitCode::Success)
 }
 
 fn project_ctx() -> Result<(paths::SparPaths, Config)> {

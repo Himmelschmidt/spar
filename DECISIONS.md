@@ -56,6 +56,19 @@ Opt-in path: resolve fleet slots from benchmark data + user profiles + per-run u
 | MS13 | CLI surface: `spar model list|pick|refresh`; doctor reports cache age | DECIDED |
 | MS14 | Ship phases: **A** cache+parser+list/pick · **B** `--select` into plan/implement · **C** roles/urgency/diversity · **D** per-adapter CLI model flags + richer vals→spar map | DECIDED |
 
+## Workspace + bus delivery
+
+Workspace initiative (2026-07-13). See `roadmap/workspace-initiative-plan.md` for the staged build.
+
+| ID | Decision | Status |
+|----|----------|--------|
+| W1 | spar owns its **own tmux server socket** (`tmux -L spar`); the user's personal tmux sessions are never touched | DECIDED |
+| W2 | Live pane output via tmux **control mode** (`tmux -C` `%output` stream), not `capture-pane` polling | DECIDED |
+| W3 | Embedded terminal rendering via `vt100::Parser` + `tui-term` as a new TUI focus target | DECIDED |
+| W4 | "Own coding UI over direct API" **deferred** — use opencode as the harness for API-only providers for now | DECIDED (deferred) |
+| W5 | Workspace bus keyed by `agent_id`; `run_id` demoted to an optional message tag; `SPAR_AGENT_ID` gives bare agents identity. Lands last | DECIDED |
+| B1 | `@human` routing = always-on TUI sink (baseline, zero config) + opt-in generic `[notify]` command/webhook; **no hardcoded personal integrations** in source | DECIDED |
+
 ## Open
 
 | ID | Topic | Status |
@@ -63,6 +76,6 @@ Opt-in path: resolve fleet slots from benchmark data + user profiles + per-run u
 | X1 | First API provider to spike (xAI / Anthropic / OpenAI) | DECIDED — OpenAI-compatible (`api:openai`, `api:xai`) via ureq |
 | X2 | TUI keymap / layout (mimic which product most?) | LEANING — j/k Tab a/r/s /commands (M1 shell) |
 | X3 | Project template overrides day one vs later | OPEN |
-| X4 | Bus steer reliability for native-cli headless | OPEN — inbox + best-effort; full inject later |
+| X4 | Bus steer reliability for native-cli headless | DECIDED — adapter-dispatched turn-boundary delivery (Stop-hook inject / native queue / SDK prompt / inbox-on-next-turn per adapter) |
 | X5 | vals scrape parser brittleness / grace TTL days / ship in-repo snapshot | OPEN — decide at MS phase A impl |
 | X6 | Exact vals model id → `cli:`/`api:` + model string mapping table | OPEN — phase A/B |

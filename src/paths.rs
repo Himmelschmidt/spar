@@ -81,6 +81,14 @@ impl SparPaths {
 
 /// Walk up from cwd looking for `.git` or existing `.spar`.
 pub fn find_project_root() -> Result<PathBuf> {
+    // Agents spawned by spar carry `SPAR_PROJECT_ROOT` so bus commands they run from a
+    // worktree (whose own `.spar` is empty) resolve the primary checkout that owns the run.
+    if let Ok(root) = std::env::var("SPAR_PROJECT_ROOT") {
+        let root = PathBuf::from(root);
+        if root.is_dir() {
+            return Ok(root);
+        }
+    }
     find_project_root_from(std::env::current_dir()?)
 }
 

@@ -283,9 +283,47 @@ pub enum BusCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Show an agent's inbox (peek by default; `--claim` drains exactly-once)
+    Inbox {
+        run_id: String,
+        agent: String,
+        /// Atomically claim (drain) messages so each is delivered exactly once
+        #[arg(long)]
+        claim: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Presence snapshot
     Presence {
         run_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Record an agent presence transition (called by provider hooks)
+    Heartbeat {
+        run_id: String,
+        agent: String,
+        #[arg(long, default_value = "working")]
+        status: String,
+    },
+    /// Drain an agent's inbox and dispatch it to the agent's delivery strategy.
+    ///
+    /// Invoked at a turn boundary (e.g. a Claude Stop hook). Bare mode emits the raw
+    /// injection payload on stdout (the Stop-hook `block` JSON) and nothing else;
+    /// `--json` emits an operator report instead of the hook payload.
+    Deliver {
+        run_id: String,
+        agent: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Acknowledge a `requires_ack` message, stopping its redelivery
+    Ack {
+        run_id: String,
+        /// Id of the message being acknowledged
+        msg_id: String,
+        #[arg(long, default_value = "human")]
+        from: String,
         #[arg(long)]
         json: bool,
     },

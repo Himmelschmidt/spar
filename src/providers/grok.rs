@@ -1,4 +1,6 @@
-use super::{Capabilities, ProviderAdapter, SpawnOpts, TrustPolicy};
+use super::{
+    Capabilities, DeliveryStrategy, PresenceSource, ProviderAdapter, SpawnOpts, TrustPolicy,
+};
 use std::path::Path;
 use std::process::Command;
 
@@ -7,6 +9,16 @@ pub struct GrokAdapter;
 impl ProviderAdapter for GrokAdapter {
     fn name(&self) -> &'static str {
         "grok"
+    }
+
+    fn delivery_strategy(&self) -> DeliveryStrategy {
+        DeliveryStrategy::NativeQueue
+    }
+
+    // Grok reads Claude-format `.claude/settings.json` hooks, so presence rides the
+    // same hook file spar installs for Claude.
+    fn presence_source(&self) -> PresenceSource {
+        PresenceSource::Hooks
     }
 
     fn binary_names(&self) -> &[&'static str] {
