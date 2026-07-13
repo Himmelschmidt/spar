@@ -384,8 +384,10 @@ fn bus_deliver(
     let state = state::RunState::load(paths, run_id)?;
     let strategy = agent_delivery_strategy(&state, agent);
     let dry_run = state.dry_run || util::env_truthy("SPAR_DRY_RUN");
-    // A turn boundary is the swarm's delivery pulse: advance any unacked-message
-    // redeliveries first so a due redelivery lands in this same drain.
+    // A turn boundary is one of the swarm's delivery pulses: advance any unacked-message
+    // redeliveries first so a due redelivery lands in this same drain. This is not the
+    // only pulse — the wait loop and TUI refresh also tick acks, so redelivery/escalation
+    // advances in runs with no Claude slot (whose Stop hook is the only pulse here).
     bus::tick_acks(
         paths,
         run_id,

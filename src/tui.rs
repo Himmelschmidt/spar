@@ -590,6 +590,17 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache) -> Snapshot {
         }
         BrowseLevel::Runs => stream_content(&swarm, full.as_ref(), sel.slot_idx, cache),
     };
+    // The TUI refresh is a provider-agnostic delivery pulse for the selected run:
+    // advance unacked-message redelivery/escalation before reading alerts, so
+    // requires_ack works even when no Claude slot's Stop hook is ticking acks.
+    if let Some(st) = full.as_ref() {
+        let _ = crate::bus::tick_acks(
+            &swarm,
+            &st.id,
+            &crate::bus::AckPolicy::default(),
+            Utc::now(),
+        );
+    }
     let alerts = full
         .as_ref()
         .map(|st| crate::bus::unresolved_alerts(&swarm, &st.id).unwrap_or_default())

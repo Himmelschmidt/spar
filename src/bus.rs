@@ -672,11 +672,12 @@ pub fn tick_acks(
     if !dir.is_dir() {
         return Ok(AckTick::default());
     }
-    // Concurrent `spar bus deliver` processes (one per agent finishing a turn)
-    // all tick the same run. Serialize the whole read-modify-remove/write pass
-    // under one exclusive lock so a record is escalated-and-removed or
-    // redelivered by exactly one process — never double-escalated, and never
-    // resurrected by a redeliver write racing another process's remove.
+    // Several pulses tick the same run concurrently: `spar bus deliver` (one per
+    // agent finishing a turn), the `spar wait` loop, and the TUI refresh thread.
+    // Serialize the whole read-modify-remove/write pass under one exclusive lock so
+    // a record is escalated-and-removed or redelivered by exactly one process —
+    // never double-escalated, and never resurrected by a redeliver write racing
+    // another process's remove.
     let lock = open_lockfile(&dir.join(".lock"))?;
     lock_exclusive(&lock)?;
     let mut files: Vec<PathBuf> = fs::read_dir(&dir)?

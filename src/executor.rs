@@ -1405,6 +1405,15 @@ pub fn wait_run(
     let mut last_phase = None;
     loop {
         let state = RunState::load(paths, run_id)?;
+        // The wait loop is a provider-agnostic delivery pulse: advance unacked-message
+        // redelivery/escalation so requires_ack works even in runs with no Claude slot
+        // (whose Stop hook is the only other thing that ticks acks). Best-effort.
+        let _ = crate::bus::tick_acks(
+            paths,
+            run_id,
+            &crate::bus::AckPolicy::default(),
+            chrono::Utc::now(),
+        );
         if follow && !json {
             let (off, evs) = crate::events::read_from_offset(paths, run_id, event_off)?;
             event_off = off;
