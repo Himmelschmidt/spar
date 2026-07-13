@@ -16,16 +16,23 @@ use std::process::{Command, Stdio};
 /// Route a human alert to the configured external notifier, if any. Errors are
 /// logged to stderr and swallowed so bus delivery is never blocked by a bad sink.
 pub fn route_human_alert(paths: &SparPaths, msg: &BusMessage) {
-    let cfg = match Config::load(&paths.project_root) {
-        Ok(c) => c.notify,
-        Err(e) => {
-            eprintln!("notify: config load failed: {e:#}");
-            return;
+    // Detached so neither the command wait nor the webhook can stall the caller.
+    // send() runs on the bus hot path (tick_acks -> bus deliver -> a Claude Stop
+    // hook), so a hung command or black-holed webhook must not block the turn boundary.
+    let root = paths.project_root.clone();
+    let msg = msg.clone();
+    std::thread::spawn(move || {
+        let cfg = match Config::load(&root) {
+            Ok(c) => c.notify,
+            Err(e) => {
+                eprintln!("notify: config load failed: {e:#}");
+                return;
+            }
+        };
+        if let Err(e) = dispatch(&cfg, &msg) {
+            eprintln!("notify: {e:#}");
         }
-    };
-    if let Err(e) = dispatch(&cfg, msg) {
-        eprintln!("notify: {e:#}");
-    }
+    });
 }
 
 /// Fire whichever sinks the operator configured. Public for a direct notifier check.
@@ -68,7 +75,12 @@ fn fire_command(command: &str, msg: &BusMessage) -> Result<()> {
 }
 
 fn fire_webhook(url: &str, msg: &BusMessage) -> Result<()> {
-    let resp = ureq::post(url)
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .build()
+        .into();
+    let resp = agent
+        .post(url)
         .header("Content-Type", "application/json")
         .send_json(msg)
         .with_context(|| format!("POST {url}"))?;
