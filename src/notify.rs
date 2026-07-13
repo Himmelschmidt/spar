@@ -22,6 +22,13 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 /// Route a human alert to the configured external notifier, if any. Errors are
 /// logged to stderr and swallowed so bus delivery is never blocked by a bad sink.
 pub fn route_human_alert(paths: &SparPaths, msg: &BusMessage) {
+    // Hermetic in tests and dry runs. The notify config is user-global (config.rs
+    // reads `dirs::config_dir()`, isolated by neither SPAR_HOME nor project_root), so
+    // on a machine whose global spar config has a `[notify]` sink, every Blocked/@human
+    // send in a unit test would otherwise run that command or POST that webhook.
+    if cfg!(test) || crate::util::env_truthy("SPAR_DRY_RUN") {
+        return;
+    }
     // Detached so neither the command wait nor the webhook can stall the caller.
     // send() runs on the bus hot path (tick_acks -> bus deliver -> a Claude Stop
     // hook), so a hung command or black-holed webhook must not block the turn boundary.
