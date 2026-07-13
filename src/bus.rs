@@ -482,7 +482,7 @@ fn deliver_inbox(paths: &SparPaths, msg: &BusMessage) -> Result<()> {
         // A broadcast reaches the sender's own scope only: agents whose run tag matches
         // the message's exactly (a bare broadcast reaches other bare agents, never run
         // slots). Cross-scope fan-out is only ever explicit, addressed by id.
-        list_presence(paths, None)?
+        list_presence(paths, msg.run.as_deref())?
             .into_iter()
             .filter(|p| p.run.as_deref() == msg.run.as_deref())
             .map(|p| p.agent)
