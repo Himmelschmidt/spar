@@ -193,8 +193,14 @@ fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
 
 /// Spawn process; stream structured events into a human log + live stats file.
 /// `on_spawn` fires with the child pid the moment spawn succeeds, before the wait
-/// loop, so callers can record a live pid.
-pub fn run_captured(req: &SpawnRequest, on_spawn: Option<&dyn Fn(u32)>) -> Result<SpawnResult> {
+/// loop, so callers can record a live pid. `on_tick` fires on every wait-poll
+/// iteration while the child is still alive; the supervisor uses it to refresh the
+/// slot's liveness (the callback self-throttles the actual cadence).
+pub fn run_captured(
+    req: &SpawnRequest,
+    on_spawn: Option<&dyn Fn(u32)>,
+    on_tick: Option<&dyn Fn()>,
+) -> Result<SpawnResult> {
     if let Some(parent) = req.log_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create log dir {}", parent.display()))?;
@@ -280,6 +286,9 @@ pub fn run_captured(req: &SpawnRequest, on_spawn: Option<&dyn Fn(u32)>) -> Resul
                         stdout_tail: tail_log(&req.log_path, 4000),
                         stats,
                     });
+                }
+                if let Some(tick) = on_tick {
+                    tick();
                 }
                 std::thread::sleep(poll);
             }
@@ -1009,7 +1018,7 @@ mod tests {
             env: vec![],
             timeout: Duration::from_millis(200),
         };
-        let res = run_captured(&req, None).expect("timeout path must not error");
+        let res = run_captured(&req, None, None).expect("timeout path must not error");
         assert!(res.timed_out, "expected timed_out");
     }
 
@@ -1032,7 +1041,7 @@ mod tests {
         let sink = move |pid: u32| {
             let _ = tx.send((pid, pid_alive(pid)));
         };
-        let res = run_captured(&req, Some(&sink)).expect("run");
+        let res = run_captured(&req, Some(&sink), None).expect("run");
         let (pid, alive) = rx.recv().expect("sink must fire");
         assert!(pid > 1, "real child pid, got {pid}");
         assert!(alive, "child must be alive at the moment the sink fires");
@@ -1040,10 +1049,24 @@ mod tests {
     }
 
     #[test]
+    fn on_tick_fires_while_child_is_alive() {
+        let tmp = tempdir().unwrap();
+        let req = sh_req("sleep 0.3", tmp.path(), "tick.log");
+        let ticks = std::cell::Cell::new(0u32);
+        let tick = || ticks.set(ticks.get() + 1);
+        let res = run_captured(&req, None, Some(&tick)).expect("run");
+        assert_eq!(res.exit_code, Some(0));
+        assert!(
+            ticks.get() > 0,
+            "on_tick must fire at least once during a live child"
+        );
+    }
+
+    #[test]
     fn signal_kill_reports_signal_not_exit_code() {
         let tmp = tempdir().unwrap();
         let req = sh_req("kill -9 $$", tmp.path(), "sig.log");
-        let res = run_captured(&req, None).expect("run");
+        let res = run_captured(&req, None, None).expect("run");
         assert_eq!(res.exit_code, None, "signal death has no exit code");
         assert_eq!(res.signal, Some(9));
     }
@@ -1052,7 +1075,7 @@ mod tests {
     fn nonzero_exit_code_captured() {
         let tmp = tempdir().unwrap();
         let req = sh_req("exit 137", tmp.path(), "oom.log");
-        let res = run_captured(&req, None).expect("run");
+        let res = run_captured(&req, None, None).expect("run");
         assert_eq!(res.exit_code, Some(137));
         assert_eq!(res.signal, None);
     }
@@ -1115,7 +1138,7 @@ mod tests {
             env: vec![],
             timeout: Duration::from_secs(5),
         };
-        let res = run_captured(&req, None).unwrap();
+        let res = run_captured(&req, None, None).unwrap();
         assert_eq!(res.exit_code, Some(0));
         assert!(std::fs::read_to_string(log).unwrap().contains("stream-me"));
     }

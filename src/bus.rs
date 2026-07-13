@@ -513,6 +513,15 @@ pub fn inbox_claim(paths: &SparPaths, run_id: &str, agent: &str) -> Result<Vec<B
 /// spar already considers stalled has also lost its lease.
 pub const RESERVE_LEASE_TTL_SECS: i64 = 300;
 
+/// How often the orchestrator's process supervisor refreshes a live slot's presence
+/// (see `executor::run_headless` / `execute_prepared`). Provider presence hooks only
+/// fire on events (tool use, prompt submit) and a whole adapter class
+/// (`PresenceSource::None`, e.g. agy) installs no hooks at all — so lease liveness
+/// cannot depend on them. This supervisor beat keeps any live slot's presence fresh
+/// while its child process runs, independent of provider hooks. Kept well under
+/// [`RESERVE_LEASE_TTL_SECS`] so a missed beat never expires a lease on a live holder.
+pub const LIVENESS_HEARTBEAT_SECS: i64 = 30;
+
 pub fn reserve(paths: &SparPaths, run_id: &str, path: &str, holder: &str) -> Result<()> {
     reserve_at(paths, run_id, path, holder, Utc::now())
 }

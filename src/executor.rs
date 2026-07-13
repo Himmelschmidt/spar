@@ -112,6 +112,33 @@ struct PreparedSlot {
     pref: ProviderRef,
     /// Identity + presence env attached to the spawned agent (empty for api slots).
     env: Vec<(String, String)>,
+    /// Owned so the supervisor's liveness beat survives the move into a spawn thread.
+    paths: SparPaths,
+    run_id: String,
+}
+
+/// Refreshes a live slot's presence heartbeat while its child process runs, throttled
+/// to [`crate::bus::LIVENESS_HEARTBEAT_SECS`]. Wired to `run_captured`'s per-poll tick so
+/// lease liveness tracks the actual process, not event-driven provider hooks that a whole
+/// adapter class (`PresenceSource::None`, e.g. agy) never installs. See the finding at
+/// `bus::reserve_at`: without this an alive holder's lease expires and its path is reclaimed.
+struct LivenessBeat<'a> {
+    paths: &'a SparPaths,
+    run_id: &'a str,
+    slot_id: &'a str,
+    last: std::cell::Cell<std::time::Instant>,
+}
+
+impl LivenessBeat<'_> {
+    fn tick(&self) {
+        if self.last.get().elapsed()
+            < Duration::from_secs(crate::bus::LIVENESS_HEARTBEAT_SECS as u64)
+        {
+            return;
+        }
+        self.last.set(std::time::Instant::now());
+        let _ = crate::bus::heartbeat(self.paths, self.run_id, self.slot_id, "running");
+    }
 }
 
 /// Wire the adapter's presence source for a CLI slot: install its hook file into the
@@ -233,6 +260,8 @@ fn prepare_slot_execution(
         prompt,
         pref,
         env,
+        paths: paths.clone(),
+        run_id: state.id.clone(),
     })
 }
 
@@ -328,7 +357,14 @@ fn execute_prepared(
             let _ = std::fs::write(f, process::PidToken::capture(pid).encode());
         }
     };
-    let res = process::run_captured(&req, Some(&sink))?;
+    let beat = LivenessBeat {
+        paths: &prep.paths,
+        run_id: &prep.run_id,
+        slot_id: &prep.job.slot_id,
+        last: std::cell::Cell::new(std::time::Instant::now()),
+    };
+    let tick = || beat.tick();
+    let res = process::run_captured(&req, Some(&sink), Some(&tick))?;
     let pid = load_pid(&pid_cell);
     let usage = usage_from_stream(&prep.job.slot_id, &prep.job.provider, &res.stats);
     if res.timed_out {
@@ -1104,7 +1140,14 @@ fn run_headless(
         sink_cell.store(pid, std::sync::atomic::Ordering::SeqCst);
         let _ = markers::write_pid(paths, &run_id, &slot_id, process::PidToken::capture(pid));
     };
-    let res = process::run_captured(&req, Some(&sink))?;
+    let beat = LivenessBeat {
+        paths,
+        run_id: &state.id,
+        slot_id: &job.slot_id,
+        last: std::cell::Cell::new(std::time::Instant::now()),
+    };
+    let tick = || beat.tick();
+    let res = process::run_captured(&req, Some(&sink), Some(&tick))?;
     let pid = load_pid(&pid_cell);
     let usage = usage_from_stream(&job.slot_id, &job.provider, &res.stats);
     if res.timed_out {
