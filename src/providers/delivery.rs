@@ -99,11 +99,11 @@ pub fn deliver(
             (DeliveryAction::StopHookBlock, Some(block_payload(&msgs)))
         }
         DeliveryStrategy::NativeQueue => {
-            enqueue(paths, agent, &msgs, dry_run)?;
+            enqueue(paths, run, agent, &msgs, dry_run)?;
             (DeliveryAction::Queued, None)
         }
         DeliveryStrategy::SdkPrompt => {
-            enqueue(paths, agent, &msgs, dry_run)?;
+            enqueue(paths, run, agent, &msgs, dry_run)?;
             (DeliveryAction::Prompted, None)
         }
         DeliveryStrategy::None => unreachable!("None handled above"),
@@ -141,19 +141,35 @@ fn render_reason(msgs: &[BusMessage]) -> String {
 /// session prompt are in-process channels into a *running* slot; until the live push
 /// lands (Track A panes / the opencode adapter) spar persists the claimed prompts here
 /// so nothing is lost between the claim and the flush.
-pub fn queue_path(paths: &SparPaths, agent: &str) -> std::path::PathBuf {
-    bus::bus_root(paths)
-        .join("queue")
-        .join(format!("{agent}.jsonl"))
+///
+/// `run` scopes the queue file exactly like the inbox drain: slot ids are deterministic
+/// per provider/role and collide across concurrent same-shaped runs, so a bare
+/// `queue/<agent>.jsonl` would mix two runs' claimed messages into one file (the flush
+/// would then leak run A's prompts into run B's slot). `Some(r)` nests the file under
+/// `queue/<r>/`, keeping each run's queue isolated; `None` (bare agents) stays at the
+/// queue root.
+pub fn queue_path(paths: &SparPaths, run: Option<&str>, agent: &str) -> std::path::PathBuf {
+    let root = bus::bus_root(paths).join("queue");
+    let dir = match run {
+        Some(r) => root.join(r),
+        None => root,
+    };
+    dir.join(format!("{agent}.jsonl"))
 }
 
 /// Append claimed messages to the durable queue. `dry_run` stubs the write so the test
 /// backend never mutates delivery state.
-fn enqueue(paths: &SparPaths, agent: &str, msgs: &[BusMessage], dry_run: bool) -> Result<()> {
+fn enqueue(
+    paths: &SparPaths,
+    run: Option<&str>,
+    agent: &str,
+    msgs: &[BusMessage],
+    dry_run: bool,
+) -> Result<()> {
     if dry_run {
         return Ok(());
     }
-    let path = queue_path(paths, agent);
+    let path = queue_path(paths, run, agent);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -254,7 +270,7 @@ mod tests {
         assert_eq!(d.action, DeliveryAction::Queued);
         assert_eq!(d.delivered, 3);
         assert!(d.payload.is_none());
-        let queued = fs::read_to_string(queue_path(&paths, "b")).unwrap();
+        let queued = fs::read_to_string(queue_path(&paths, Some("r1"), "b")).unwrap();
         assert_eq!(queued.lines().filter(|l| !l.is_empty()).count(), 3);
     }
 
@@ -267,7 +283,7 @@ mod tests {
         let d = deliver(&paths, Some("r1"), "b", DeliveryStrategy::SdkPrompt, false).unwrap();
         assert_eq!(d.action, DeliveryAction::Prompted);
         assert_eq!(d.delivered, 1);
-        assert!(queue_path(&paths, "b").is_file());
+        assert!(queue_path(&paths, Some("r1"), "b").is_file());
     }
 
     #[test]
@@ -294,10 +310,70 @@ mod tests {
         assert_eq!(d.action, DeliveryAction::Queued);
         assert_eq!(d.delivered, 2);
         // Injection call stubbed: no queue file written.
-        assert!(!queue_path(&paths, "b").exists());
+        assert!(!queue_path(&paths, Some("r1"), "b").exists());
         // But the drain is real (exactly-once): nothing remains to claim.
         assert!(bus::inbox_claim(&paths, Some("r1"), "b")
             .unwrap()
             .is_empty());
+    }
+
+    /// Two concurrent runs share a deterministic slot id ("b"), hence one workspace inbox,
+    /// but the durable queue must stay run-isolated: run B's flush must never surface run
+    /// A's claimed prompts. Each run enqueues into its own `queue/<run>/b.jsonl`.
+    #[test]
+    fn native_queue_is_run_scoped_across_identical_slot_ids() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        // Two runs, each with the same slot id "b" fed by its own sender "a".
+        for r in ["rA", "rB"] {
+            join(&paths, Some(r), "a", Some("cli:claude"), Some("native-cli")).unwrap();
+            join(&paths, Some(r), "b", Some("cli:grok"), Some("native-cli")).unwrap();
+        }
+        chat(
+            &paths,
+            Some("rA"),
+            "a",
+            "b",
+            "for run A".to_string(),
+            MessageBudget::Chatty,
+        )
+        .unwrap();
+        chat(
+            &paths,
+            Some("rB"),
+            "a",
+            "b",
+            "for run B".to_string(),
+            MessageBudget::Chatty,
+        )
+        .unwrap();
+
+        deliver(
+            &paths,
+            Some("rB"),
+            "b",
+            DeliveryStrategy::NativeQueue,
+            false,
+        )
+        .unwrap();
+        deliver(
+            &paths,
+            Some("rA"),
+            "b",
+            DeliveryStrategy::NativeQueue,
+            false,
+        )
+        .unwrap();
+
+        let qa = fs::read_to_string(queue_path(&paths, Some("rA"), "b")).unwrap();
+        let qb = fs::read_to_string(queue_path(&paths, Some("rB"), "b")).unwrap();
+        assert!(
+            qa.contains("for run A") && !qa.contains("for run B"),
+            "run A queue: {qa}"
+        );
+        assert!(
+            qb.contains("for run B") && !qb.contains("for run A"),
+            "run B queue: {qb}"
+        );
     }
 }
