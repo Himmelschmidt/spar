@@ -120,6 +120,37 @@ pub fn spawn_agent(req: &SpawnRequest) -> Result<(String, String)> {
     Ok((session, req.agent_id.to_string()))
 }
 
+/// A freshly launched CLI agent needs a beat to paint its input box before a
+/// prompt can be typed. Text sent into an unbooted TUI lands in an uninitialised
+/// buffer and is silently dropped (herdr/thurbox finding: readiness must be gated,
+/// not assumed). Polls the rendered pane until the CLI has drawn something or
+/// `timeout` elapses, returning whether the pane looked ready before giving up.
+pub fn wait_pane_ready(
+    session: &str,
+    window: &str,
+    timeout: Duration,
+    poll: Duration,
+) -> Result<bool> {
+    let start = Instant::now();
+    loop {
+        // A pane that isn't attached yet errors; treat that as "not ready" and retry.
+        let capture = tmux::capture_pane(session, window).unwrap_or_default();
+        if pane_looks_ready(&capture) {
+            return Ok(true);
+        }
+        if start.elapsed() >= timeout {
+            return Ok(false);
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// Pure readiness predicate: the CLI has painted its UI once the pane holds any
+/// non-whitespace content. Factored out so the gate can be unit-tested without tmux.
+pub fn pane_looks_ready(capture: &str) -> bool {
+    capture.chars().any(|c| !c.is_whitespace())
+}
+
 /// Deliver a prompt to a live agent pane as **two** steps: type the text, then a
 /// separate Enter. Fusing them would submit a half-typed line, so the submit key
 /// is always its own send (the write-then-Enter gotcha).
@@ -225,6 +256,29 @@ pub fn wait_working_then_idle(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// A blank pane (CLI still booting) is not ready; any painted glyph makes it ready.
+    #[test]
+    fn pane_readiness_tracks_painted_content() {
+        assert!(!pane_looks_ready(""));
+        assert!(!pane_looks_ready("   \n\t \n  "));
+        assert!(pane_looks_ready("> "));
+        assert!(pane_looks_ready("\n  Claude Code\n"));
+    }
+
+    /// With a pane that never paints, the gate must time out rather than deliver
+    /// into an unbooted TUI.
+    #[test]
+    fn wait_pane_ready_times_out_on_missing_session() {
+        let ready = wait_pane_ready(
+            "spar-no-such-session",
+            "nope",
+            Duration::from_millis(60),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        assert!(!ready, "a pane that never paints must not report ready");
+    }
 
     /// The leading idle (pre-start false positive) must not complete the wait.
     #[test]

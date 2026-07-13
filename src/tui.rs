@@ -227,6 +227,9 @@ struct App {
     /// Embedded terminal (W3): a live vt100 view of the selected run's tmux pane.
     /// Lazily attached when the Terminal focus is opened over a live session.
     terminal_pane: Option<crate::terminal::TerminalPane>,
+    /// Sender for background tasks (e.g. deferred `/spawn`) to flash a result back
+    /// onto the render loop. Set once the message channel exists.
+    bg_tx: Option<mpsc::Sender<Msg>>,
 }
 
 /// A gate action reachable by both a key and a tappable button.
@@ -336,6 +339,7 @@ impl App {
             reconcile_spawn: None,
             human_alerts_n: 0,
             terminal_pane: None,
+            bg_tx: None,
         }
     }
 
@@ -534,6 +538,9 @@ struct Snapshot {
 enum Msg {
     Input(Event),
     Data,
+    /// A status line pushed from a background task (e.g. `/spawn`'s deferred
+    /// spawn+deliver), flashed on the next render tick.
+    Flash(String, Color),
 }
 
 /// Size+mtime of everything a snapshot is derived from. Comparing these is a
@@ -677,6 +684,7 @@ fn run_loop(
 
     let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
     let (sel_tx, sel_rx) = mpsc::channel::<Selection>();
+    app.bg_tx = Some(msg_tx.clone());
 
     {
         let tx = msg_tx.clone();
@@ -786,6 +794,10 @@ fn run_loop(
 
         match msg_rx.recv_timeout(FRAME) {
             Ok(Msg::Data) => dirty = true,
+            Ok(Msg::Flash(msg, color)) => {
+                app.flash(msg, color);
+                dirty = true;
+            }
             Ok(Msg::Input(ev)) => {
                 dirty = true;
                 let mut ev = Some(ev);
@@ -823,6 +835,10 @@ fn run_loop(
                     }
                     ev = match msg_rx.try_recv() {
                         Ok(Msg::Input(next)) => Some(next),
+                        Ok(Msg::Flash(msg, color)) => {
+                            app.flash(msg, color);
+                            None
+                        }
                         Ok(Msg::Data) => None,
                         Err(_) => None,
                     };
@@ -938,7 +954,8 @@ fn handle_key(
             KeyCode::Enter => {
                 let line = app.composer.trim().to_string();
                 if !line.is_empty() {
-                    match handle_composer(swarm, runs, app.selected_run, &line) {
+                    let bg = app.bg_tx.clone();
+                    match handle_composer(swarm, runs, app.selected_run, &line, bg) {
                         Ok(msg) => {
                             app.flash(msg, GREEN);
                             app.composer.clear();
@@ -3066,6 +3083,7 @@ fn handle_composer(
     runs: &[state::RunSummary],
     selected: usize,
     line: &str,
+    bg: Option<mpsc::Sender<Msg>>,
 ) -> Result<String> {
     let run_id = runs.get(selected).map(|r| r.id.as_str());
     let cmd = line.trim();
@@ -3098,20 +3116,35 @@ fn handle_composer(
                 crate::ship::confirm_ship(swarm, id, false)?;
                 Ok(format!("Ship confirmed {id}"))
             }
-            "spawn" => spawn_agent_command(runs, selected, arg),
+            "spawn" => spawn_agent_command(runs, selected, arg, bg),
             other => Ok(format!("Unknown /{other} — try /help")),
         };
     }
     Ok(format!("Noted (chat later): {}", truncate(cmd, 48)))
 }
 
+/// How long to let a freshly launched CLI paint its input box before typing the
+/// prompt. Generous: a cold CLI start can take a few seconds, and delivering early
+/// drops the prompt into an unbooted TUI.
+const SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(12);
+
 /// `/spawn <cli:provider> <prompt>` — launch a fresh agent into a pane on the spar
 /// tmux socket, joined to the selected run's bus, and hand it the prompt. The whole
 /// spawn → prompt loop runs without leaving spar (Stage 11 / A4).
+///
+/// Two correctness guards live here:
+///  - The poke agent gets its **own worktree**, never the primary checkout: a
+///    FullAuto agent must not run in the primary tree, and presence hooks refuse to
+///    install there (`same_dir` guard), so cwd == project_root would leave the agent
+///    with no working/idle signal at all.
+///  - Spawn + delivery run on a **background thread** with a bounded readiness gate,
+///    so the render loop never blocks and the prompt is only typed once the CLI has
+///    painted its input box. The final flash reflects actual delivery, not a guess.
 fn spawn_agent_command(
     runs: &[state::RunSummary],
     selected: usize,
     arg: Option<&str>,
+    bg: Option<mpsc::Sender<Msg>>,
 ) -> Result<String> {
     let run = runs
         .get(selected)
@@ -3127,23 +3160,61 @@ fn spawn_agent_command(
         .project_root
         .clone()
         .ok_or_else(|| anyhow::anyhow!("run has no known project root"))?;
-    let paths = SparPaths::new(&project_root);
     let uid = uuid::Uuid::new_v4().simple().to_string();
     let agent_id = format!("poke-{}", &uid[..8]);
 
-    let req = crate::workspace::SpawnRequest {
-        paths: &paths,
-        run: Some(&run.id),
-        agent_id: &agent_id,
-        provider,
-        cwd: &project_root,
-        project_root: &project_root,
+    // Give the agent its own worktree (never the primary checkout) so presence hooks
+    // install and it can run FullAuto safely. Done on this thread so a git failure
+    // surfaces synchronously as a composer error rather than a silent background drop.
+    let record = crate::worktree::create_worktree(&project_root, &run.id, &agent_id)?;
+
+    let paths = SparPaths::new(&project_root);
+    let run_id = run.id.clone();
+    let provider_s = provider.to_string();
+    let prompt_s = prompt.to_string();
+    let cwd = record.path;
+    let label = format!("{agent_id} ({provider})");
+    let pending = format!("Spawning {label}… delivering prompt when the pane is ready");
+
+    let work = move || -> Result<String> {
+        let req = crate::workspace::SpawnRequest {
+            paths: &paths,
+            run: Some(&run_id),
+            agent_id: &agent_id,
+            provider: &provider_s,
+            cwd: &cwd,
+            project_root: &project_root,
+        };
+        let (session, window) = crate::workspace::spawn_agent(&req)?;
+        let ready = crate::workspace::wait_pane_ready(
+            &session,
+            &window,
+            SPAWN_READY_TIMEOUT,
+            Duration::from_millis(200),
+        )?;
+        crate::workspace::deliver_prompt(&session, &window, &prompt_s)?;
+        Ok(if ready {
+            format!("Spawned {label} — prompt delivered · Terminal tab to watch")
+        } else {
+            format!("Spawned {label} — pane slow to boot; prompt sent, confirm in Terminal")
+        })
     };
-    let (session, window) = crate::workspace::spawn_agent(&req)?;
-    crate::workspace::deliver_prompt(&session, &window, prompt)?;
-    Ok(format!(
-        "Spawned {agent_id} ({provider}) — prompt delivered · Terminal tab to watch"
-    ))
+
+    // Real TUI path: hand the spawn+deliver to a background thread and flash the true
+    // outcome when it lands. No channel (defensive/tests) → run inline.
+    match bg {
+        Some(tx) => {
+            std::thread::spawn(move || {
+                let (msg, color) = match work() {
+                    Ok(m) => (m, GREEN),
+                    Err(e) => (format!("spawn failed: {e:#}"), RED),
+                };
+                let _ = tx.send(Msg::Flash(msg, color));
+            });
+            Ok(pending)
+        }
+        None => work(),
+    }
 }
 
 fn stream_content(
