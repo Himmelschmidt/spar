@@ -10,6 +10,7 @@ mod liveness;
 mod mailbox;
 mod markers;
 mod model_select;
+mod notify;
 mod paths;
 mod process;
 mod provider_ref;
@@ -327,6 +328,20 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             agent,
             json,
         } => bus_deliver(&paths, &run_id, &agent, json),
+        BusCmd::Ack {
+            run_id,
+            msg_id,
+            from,
+            json,
+        } => {
+            let msg = bus::ack(&paths, &run_id, &from, &msg_id)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&msg)?);
+            } else {
+                println!("acked {msg_id}");
+            }
+            Ok(ExitCode::Success)
+        }
         BusCmd::Reserve {
             run_id,
             path,
@@ -369,6 +384,14 @@ fn bus_deliver(
     let state = state::RunState::load(paths, run_id)?;
     let strategy = agent_delivery_strategy(&state, agent);
     let dry_run = state.dry_run || util::env_truthy("SPAR_DRY_RUN");
+    // A turn boundary is the swarm's delivery pulse: advance any unacked-message
+    // redeliveries first so a due redelivery lands in this same drain.
+    bus::tick_acks(
+        paths,
+        run_id,
+        &bus::AckPolicy::default(),
+        chrono::Utc::now(),
+    )?;
     let d = providers::delivery::deliver(paths, run_id, agent, strategy, dry_run)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&d)?);

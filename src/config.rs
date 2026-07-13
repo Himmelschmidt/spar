@@ -33,6 +33,23 @@ pub struct Config {
     pub auto_cleanup: bool,
     #[serde(default)]
     pub model_select: ModelSelectConfig,
+    /// Optional external `@human` notifier. Empty by default — the TUI alert panel
+    /// is the always-on baseline; this is the operator's opt-in push sink.
+    #[serde(default)]
+    pub notify: NotifyConfig,
+}
+
+/// Operator-configured external sink for `@human` / `Blocked` alerts. spar ships no
+/// notifier of its own; set exactly one of these to wire your own (ntfy, Slack, a
+/// script). Neither set ⇒ only the TUI panel fires.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NotifyConfig {
+    /// Shell command spar runs on each alert (summary on `$1`, message JSON on stdin).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// URL spar POSTs the message JSON to on each alert.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook: Option<String>,
 }
 
 /// vals-backed dynamic model selection (see DECISIONS MS*).
@@ -306,6 +323,7 @@ impl Default for Config {
             message_budget: MessageBudget::default(),
             auto_cleanup: false,
             model_select: ModelSelectConfig::default(),
+            notify: NotifyConfig::default(),
         }
     }
 }
@@ -344,6 +362,13 @@ struct ConfigFile {
     message_budget: Option<MessageBudget>,
     auto_cleanup: Option<bool>,
     model_select: Option<ModelSelectConfigFile>,
+    notify: Option<NotifyConfigFile>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct NotifyConfigFile {
+    command: Option<String>,
+    webhook: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -508,6 +533,14 @@ impl Config {
                 for (k, role) in v {
                     self.model_select.roles.insert(k.clone(), role.clone());
                 }
+            }
+        }
+        if let Some(n) = &file.notify {
+            if let Some(v) = &n.command {
+                self.notify.command = Some(v.clone());
+            }
+            if let Some(v) = &n.webhook {
+                self.notify.webhook = Some(v.clone());
             }
         }
         Ok(())

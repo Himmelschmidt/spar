@@ -214,6 +214,9 @@ struct App {
     rect_projects: Rect,
     /// Debounce for spawning the detached reconcile process (run id + when).
     reconcile_spawn: Option<(String, Instant)>,
+    /// Count of unresolved `@human`/`Blocked` bus alerts for the selected run; drives
+    /// the header badge. Refreshed from the snapshot each frame.
+    human_alerts_n: usize,
 }
 
 /// A gate action reachable by both a key and a tappable button.
@@ -320,6 +323,7 @@ impl App {
             rect_help: Rect::default(),
             rect_projects: Rect::default(),
             reconcile_spawn: None,
+            human_alerts_n: 0,
         }
     }
 
@@ -503,6 +507,8 @@ struct Snapshot {
     full: Option<RunState>,
     stream_text: String,
     activity: Vec<String>,
+    /// Unresolved `@human`/`Blocked` alerts for the selected run (header badge count).
+    human_alerts: usize,
 }
 
 enum Msg {
@@ -584,7 +590,11 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache) -> Snapshot {
         }
         BrowseLevel::Runs => stream_content(&swarm, full.as_ref(), sel.slot_idx, cache),
     };
-    let activity = activity_feed(&swarm, full.as_ref(), &quota);
+    let alerts = full
+        .as_ref()
+        .map(|st| crate::bus::unresolved_alerts(&swarm, &st.id).unwrap_or_default())
+        .unwrap_or_default();
+    let activity = activity_feed(&swarm, full.as_ref(), &quota, &alerts);
     Snapshot {
         swarm,
         projects,
@@ -592,6 +602,7 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache) -> Snapshot {
         full,
         stream_text,
         activity,
+        human_alerts: alerts.len(),
     }
 }
 
@@ -723,6 +734,7 @@ fn run_loop(
         fleet_state.select((n_slots > 0).then_some(app.selected_slot));
 
         app.animated = animating(&app, &snap);
+        app.human_alerts_n = snap.human_alerts;
 
         if dirty {
             app.tick = app.tick.wrapping_add(1);
@@ -1590,6 +1602,11 @@ fn draw_header(f: &mut Frame, area: Rect, swarm: &SparPaths, full: Option<&RunSt
         BrowseLevel::Projects => " projects ",
         BrowseLevel::Runs => " runs ",
     };
+    let alert_badge = if app.human_alerts_n > 0 {
+        format!(" ⚠ {} needs you ", app.human_alerts_n)
+    } else {
+        String::new()
+    };
     let left = Line::from(vec![
         Span::styled(" spar ", Style::default().fg(BG).bg(ACCENT).bold()),
         Span::raw(" "),
@@ -1598,6 +1615,7 @@ fn draw_header(f: &mut Frame, area: Rect, swarm: &SparPaths, full: Option<&RunSt
         Span::styled("  ·  ", Style::default().fg(FG_MUTED)),
         Span::styled(run, Style::default().fg(CYAN)),
         Span::styled(dry, Style::default().fg(BG).bg(YELLOW).bold()),
+        Span::styled(alert_badge, Style::default().fg(BG).bg(RED).bold()),
         Span::raw("  "),
         Span::styled(
             if full.map(|s| is_active_phase(s.phase)).unwrap_or(false) {
@@ -3004,7 +3022,12 @@ fn stream_content(
 }
 
 /// Right-rail feed: human run timeline (not a raw bus dump).
-fn activity_feed(swarm: &SparPaths, full: Option<&RunState>, quota: &QuotaStore) -> Vec<String> {
+fn activity_feed(
+    swarm: &SparPaths,
+    full: Option<&RunState>,
+    quota: &QuotaStore,
+    alerts: &[crate::bus::BusMessage],
+) -> Vec<String> {
     let mut lines = Vec::new();
     let Some(st) = full else {
         lines.push("No run selected.".into());
@@ -3012,6 +3035,19 @@ fn activity_feed(swarm: &SparPaths, full: Option<&RunState>, quota: &QuotaStore)
         lines.push("Open a project, pick a run.".into());
         return lines;
     };
+
+    // Loudest first: anything waiting on a human sits at the top of the rail.
+    if !alerts.is_empty() {
+        lines.push(format!("⚠ Needs you ({})", alerts.len()));
+        for m in alerts.iter().rev().take(6).rev() {
+            lines.push(format!(
+                " {} {}",
+                short_agent(&m.from),
+                truncate(&m.body, 30)
+            ));
+        }
+        lines.push(String::new());
+    }
 
     lines.push(format!("Run  {}", st.id));
     lines.push(format!("  {}", phase_label(st.phase)));

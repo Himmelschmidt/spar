@@ -317,6 +317,16 @@ pub enum BusCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Acknowledge a `requires_ack` message, stopping its redelivery
+    Ack {
+        run_id: String,
+        /// Id of the message being acknowledged
+        msg_id: String,
+        #[arg(long, default_value = "human")]
+        from: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Reserve a path
     Reserve {
         run_id: String,

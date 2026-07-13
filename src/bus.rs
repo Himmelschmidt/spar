@@ -1,12 +1,17 @@
 //! Run-scoped swarm bus (A2A). Replaces thin mailbox as the coordination plane.
 use crate::paths::SparPaths;
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+
+/// Reserved recipient id for messages that need a human's attention. Every such
+/// message is surfaced in the TUI alert panel (always on, zero config) and, if the
+/// operator wired one, pushed to an external notifier (`[notify]` in config).
+pub const HUMAN: &str = "@human";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -51,6 +56,10 @@ pub struct MsgRefs {
     pub artifact: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
+    /// Id of the message this one answers. An `Ack` sets it to the id of the
+    /// `requires_ack` message it clears.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,7 +114,12 @@ pub fn bus_root(paths: &SparPaths, run_id: &str) -> PathBuf {
 pub fn ensure_bus(paths: &SparPaths, run_id: &str) -> Result<()> {
     paths.ensure_run_dirs(run_id)?;
     let root = bus_root(paths, run_id);
-    for d in [root.clone(), root.join("inbox"), root.join("tasks")] {
+    for d in [
+        root.clone(),
+        root.join("inbox"),
+        root.join("tasks"),
+        root.join("pending_ack"),
+    ] {
         fs::create_dir_all(&d).with_context(|| format!("create {}", d.display()))?;
     }
     Ok(())
@@ -213,7 +227,52 @@ pub fn send(
             created_at: msg.ts,
         },
     );
+
+    // requires_ack lifecycle + @human routing (Stage 5). Handling both at this one
+    // choke point covers every producer (chat, broadcast, workflows, tasks) uniformly.
+    if msg.kind == MsgKind::Ack {
+        if let Some(target) = msg.refs.reply_to.as_deref() {
+            clear_pending_ack(paths, run_id, target)?;
+        }
+    } else if msg.requires_ack {
+        record_pending_ack(paths, run_id, &msg)?;
+    }
+    if is_human_alert(&msg) {
+        // The TUI sink reads the bus directly, so only the external notifier is a push.
+        crate::notify::route_human_alert(paths, &msg);
+    }
     Ok(msg)
+}
+
+/// A message the human needs to see: addressed to [`HUMAN`], or any `Blocked`
+/// report (an agent that stalled is a human-relevant event even when broadcast).
+pub fn is_human_alert(msg: &BusMessage) -> bool {
+    msg.to == HUMAN || msg.kind == MsgKind::Blocked
+}
+
+/// Send an `Ack` clearing the redelivery of `msg_id`. Broadcast so any watcher sees
+/// the acknowledgement; the clear itself keys off `refs.reply_to` in [`send`].
+pub fn ack(paths: &SparPaths, run_id: &str, from: &str, msg_id: &str) -> Result<BusMessage> {
+    send(
+        paths,
+        run_id,
+        BusMessage {
+            id: new_id(),
+            ts: Utc::now(),
+            from: from.into(),
+            to: "broadcast".into(),
+            kind: MsgKind::Ack,
+            body: format!("ack {msg_id}"),
+            subject: Some("ack".into()),
+            refs: MsgRefs {
+                reply_to: Some(msg_id.into()),
+                ..Default::default()
+            },
+            requires_ack: false,
+            meta: HashMap::new(),
+        },
+        MessageBudget::Chatty,
+    )
 }
 
 pub fn chat(
@@ -395,6 +454,198 @@ fn save_reserves(paths: &SparPaths, run_id: &str, file: &ReservesFile) -> Result
         serde_json::to_string_pretty(file)?,
     )?;
     Ok(())
+}
+
+// ── requires_ack: redeliver-until-acked, then escalate to @human ──────────────
+
+/// A `requires_ack` message awaiting its `Ack`. Persisted per message under
+/// `bus/pending_ack/<id>.json`; [`tick_acks`] redelivers on backoff and escalates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingAck {
+    msg: BusMessage,
+    /// Redeliveries performed so far (0 = only the original delivery has happened).
+    attempts: u32,
+    /// Earliest instant the next redelivery/escalation may fire.
+    next_at: DateTime<Utc>,
+}
+
+/// Redelivery cadence for unacked messages. `max_retries` redeliveries happen
+/// (exponential backoff off `base_backoff`) before the message escalates to a
+/// `@human` alert.
+#[derive(Debug, Clone)]
+pub struct AckPolicy {
+    pub base_backoff: Duration,
+    pub max_retries: u32,
+}
+
+impl Default for AckPolicy {
+    fn default() -> Self {
+        Self {
+            base_backoff: Duration::seconds(60),
+            max_retries: 3,
+        }
+    }
+}
+
+impl AckPolicy {
+    /// Exponential backoff before the `attempts`-th redelivery, capped at 30 min.
+    fn backoff_for(&self, attempts: u32) -> Duration {
+        let factor = 1i64 << attempts.min(6);
+        let secs = self.base_backoff.num_seconds().max(0) * factor;
+        Duration::seconds(secs.min(1800))
+    }
+}
+
+/// What one [`tick_acks`] pass did.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct AckTick {
+    pub redelivered: usize,
+    pub escalated: usize,
+}
+
+fn pending_ack_dir(paths: &SparPaths, run_id: &str) -> PathBuf {
+    bus_root(paths, run_id).join("pending_ack")
+}
+
+fn record_pending_ack(paths: &SparPaths, run_id: &str, msg: &BusMessage) -> Result<()> {
+    let dir = pending_ack_dir(paths, run_id);
+    fs::create_dir_all(&dir)?;
+    let rec = PendingAck {
+        msg: msg.clone(),
+        attempts: 0,
+        next_at: msg.ts + AckPolicy::default().base_backoff,
+    };
+    fs::write(
+        dir.join(format!("{}.json", msg.id)),
+        serde_json::to_string_pretty(&rec)?,
+    )?;
+    Ok(())
+}
+
+fn clear_pending_ack(paths: &SparPaths, run_id: &str, msg_id: &str) -> Result<()> {
+    let p = pending_ack_dir(paths, run_id).join(format!("{msg_id}.json"));
+    if p.is_file() {
+        fs::remove_file(&p)?;
+    }
+    Ok(())
+}
+
+/// Advance every pending `requires_ack` message whose backoff has elapsed by `now`:
+/// redeliver it to the recipient inbox, or — once `max_retries` redeliveries are
+/// spent — escalate it to a `@human` alert and drop the pending record. An `Ack`
+/// (handled in [`send`]) removes the record, so an acked message never ticks again.
+pub fn tick_acks(
+    paths: &SparPaths,
+    run_id: &str,
+    policy: &AckPolicy,
+    now: DateTime<Utc>,
+) -> Result<AckTick> {
+    let dir = pending_ack_dir(paths, run_id);
+    if !dir.is_dir() {
+        return Ok(AckTick::default());
+    }
+    let mut files: Vec<PathBuf> = fs::read_dir(&dir)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
+        .collect();
+    files.sort();
+    let mut out = AckTick::default();
+    for f in files {
+        let Ok(mut rec) = serde_json::from_str::<PendingAck>(&fs::read_to_string(&f)?) else {
+            continue;
+        };
+        if rec.next_at > now {
+            continue;
+        }
+        if rec.attempts >= policy.max_retries {
+            escalate_unacked(paths, run_id, &rec, now, policy.max_retries)?;
+            fs::remove_file(&f)?;
+            out.escalated += 1;
+        } else {
+            deliver_inbox(paths, run_id, &rec.msg)?;
+            rec.attempts += 1;
+            rec.next_at = now + policy.backoff_for(rec.attempts);
+            fs::write(&f, serde_json::to_string_pretty(&rec)?)?;
+            out.redelivered += 1;
+        }
+    }
+    Ok(out)
+}
+
+fn escalate_unacked(
+    paths: &SparPaths,
+    run_id: &str,
+    rec: &PendingAck,
+    now: DateTime<Utc>,
+    max_retries: u32,
+) -> Result<()> {
+    let mut meta = HashMap::new();
+    meta.insert("escalated_from".into(), rec.msg.id.clone());
+    let esc = BusMessage {
+        id: new_id(),
+        ts: now,
+        from: "spar".into(),
+        to: HUMAN.into(),
+        kind: MsgKind::Blocked,
+        body: format!(
+            "No ack after {max_retries} redeliveries: message {} to {} from {} — {}",
+            rec.msg.id,
+            rec.msg.to,
+            rec.msg.from,
+            rec.msg.body.chars().take(200).collect::<String>()
+        ),
+        subject: Some("unacked".into()),
+        refs: MsgRefs {
+            reply_to: Some(rec.msg.id.clone()),
+            ..Default::default()
+        },
+        requires_ack: false,
+        meta,
+    };
+    send(paths, run_id, esc, MessageBudget::Chatty)?;
+    Ok(())
+}
+
+/// Human-facing alerts still awaiting attention: `@human` messages with no `Ack`,
+/// plus every agent still `Blocked` (no later `Unblocked` from it). Powers the TUI
+/// alert panel/badge.
+pub fn unresolved_alerts(paths: &SparPaths, run_id: &str) -> Result<Vec<BusMessage>> {
+    let evs = list_events(paths, run_id)?;
+    let acked: HashSet<String> = evs
+        .iter()
+        .filter(|m| m.kind == MsgKind::Ack)
+        .filter_map(|m| m.refs.reply_to.clone())
+        .collect();
+    let mut blocked: HashMap<String, BusMessage> = HashMap::new();
+    for m in &evs {
+        match m.kind {
+            MsgKind::Blocked => {
+                blocked.insert(m.from.clone(), m.clone());
+            }
+            MsgKind::Unblocked => {
+                blocked.remove(&m.from);
+            }
+            _ => {}
+        }
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<BusMessage> = Vec::new();
+    for m in evs
+        .iter()
+        .filter(|m| m.to == HUMAN && !acked.contains(&m.id))
+    {
+        if seen.insert(m.id.clone()) {
+            out.push(m.clone());
+        }
+    }
+    for m in blocked.into_values() {
+        if !acked.contains(&m.id) && seen.insert(m.id.clone()) {
+            out.push(m);
+        }
+    }
+    out.sort_by(|a, b| a.ts.cmp(&b.ts));
+    Ok(out)
 }
 
 fn count_nonempty_lines(path: &PathBuf) -> Result<usize> {
@@ -583,6 +834,143 @@ mod tests {
         for l in &lines {
             serde_json::from_str::<BusMessage>(l).expect("well-formed JSONL line");
         }
+    }
+
+    fn req_ack(paths: &SparPaths, from: &str, to: &str, body: &str) -> BusMessage {
+        send(
+            paths,
+            "r1",
+            BusMessage {
+                id: new_id(),
+                ts: Utc::now(),
+                from: from.into(),
+                to: to.into(),
+                kind: MsgKind::Chat,
+                body: body.into(),
+                subject: None,
+                refs: MsgRefs::default(),
+                requires_ack: true,
+                meta: HashMap::new(),
+            },
+            MessageBudget::Chatty,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn requires_ack_redelivers_then_escalates() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        join(&paths, "r1", "a", Some("cli:claude"), Some("native-cli")).unwrap();
+        join(&paths, "r1", "b", Some("cli:grok"), Some("native-cli")).unwrap();
+        let m = req_ack(&paths, "a", "b", "please confirm");
+        // Original delivery landed once.
+        assert_eq!(inbox_claim(&paths, "r1", "b").unwrap().len(), 1);
+
+        // The original send scheduled the first redelivery a default backoff out, so
+        // tick from far enough ahead that it (and every base_backoff-0 retry) is due.
+        let policy = AckPolicy {
+            base_backoff: Duration::zero(),
+            max_retries: 2,
+        };
+        let now = Utc::now() + Duration::seconds(120);
+        let t1 = tick_acks(&paths, "r1", &policy, now).unwrap();
+        assert_eq!((t1.redelivered, t1.escalated), (1, 0));
+        assert_eq!(
+            inbox_claim(&paths, "r1", "b").unwrap().len(),
+            1,
+            "redeliver 1"
+        );
+        let t2 = tick_acks(&paths, "r1", &policy, now).unwrap();
+        assert_eq!((t2.redelivered, t2.escalated), (1, 0));
+        assert_eq!(
+            inbox_claim(&paths, "r1", "b").unwrap().len(),
+            1,
+            "redeliver 2"
+        );
+
+        // Third due tick: retries spent → escalate to @human, drop the pending record.
+        let t3 = tick_acks(&paths, "r1", &policy, now).unwrap();
+        assert_eq!((t3.redelivered, t3.escalated), (0, 1));
+        let human = inbox(&paths, "r1", HUMAN).unwrap();
+        assert_eq!(human.len(), 1);
+        assert_eq!(human[0].kind, MsgKind::Blocked);
+        assert_eq!(human[0].refs.reply_to.as_deref(), Some(m.id.as_str()));
+        assert!(is_human_alert(&human[0]));
+
+        // Record is gone: further ticks are no-ops.
+        let t4 = tick_acks(&paths, "r1", &policy, now).unwrap();
+        assert_eq!((t4.redelivered, t4.escalated), (0, 0));
+    }
+
+    #[test]
+    fn ack_stops_redelivery() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        join(&paths, "r1", "a", Some("cli:claude"), Some("native-cli")).unwrap();
+        join(&paths, "r1", "b", Some("cli:grok"), Some("native-cli")).unwrap();
+        let m = req_ack(&paths, "a", "b", "please confirm");
+
+        ack(&paths, "r1", "b", &m.id).unwrap();
+        // Pending record cleared → no redelivery, no escalation, ever.
+        let policy = AckPolicy {
+            base_backoff: Duration::zero(),
+            max_retries: 1,
+        };
+        let t = tick_acks(&paths, "r1", &policy, Utc::now()).unwrap();
+        assert_eq!((t.redelivered, t.escalated), (0, 0));
+        assert!(inbox(&paths, "r1", HUMAN).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unresolved_alerts_tracks_blocked_and_human() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        join(&paths, "r1", "a", Some("cli:claude"), Some("native-cli")).unwrap();
+        join(&paths, "r1", "b", Some("cli:grok"), Some("native-cli")).unwrap();
+
+        // A Blocked report surfaces; an Unblocked from the same agent clears it.
+        let blocked = |body: &str| {
+            send(
+                &paths,
+                "r1",
+                BusMessage {
+                    id: new_id(),
+                    ts: Utc::now(),
+                    from: "a".into(),
+                    to: "broadcast".into(),
+                    kind: MsgKind::Blocked,
+                    body: body.into(),
+                    subject: None,
+                    refs: MsgRefs::default(),
+                    requires_ack: false,
+                    meta: HashMap::new(),
+                },
+                MessageBudget::Chatty,
+            )
+            .unwrap()
+        };
+        blocked("stuck on tests");
+        assert_eq!(unresolved_alerts(&paths, "r1").unwrap().len(), 1);
+        send(
+            &paths,
+            "r1",
+            BusMessage {
+                id: new_id(),
+                ts: Utc::now(),
+                from: "a".into(),
+                to: "broadcast".into(),
+                kind: MsgKind::Unblocked,
+                body: "resolved".into(),
+                subject: None,
+                refs: MsgRefs::default(),
+                requires_ack: false,
+                meta: HashMap::new(),
+            },
+            MessageBudget::Chatty,
+        )
+        .unwrap();
+        assert!(unresolved_alerts(&paths, "r1").unwrap().is_empty());
     }
 
     #[test]
