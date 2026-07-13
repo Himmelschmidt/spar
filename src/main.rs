@@ -314,6 +314,14 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             }
             Ok(ExitCode::Success)
         }
+        BusCmd::Heartbeat {
+            run_id,
+            agent,
+            status,
+        } => {
+            bus::heartbeat(&paths, &run_id, &agent, &status)?;
+            Ok(ExitCode::Success)
+        }
         BusCmd::Reserve {
             run_id,
             path,

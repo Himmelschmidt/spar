@@ -110,6 +110,41 @@ struct PreparedSlot {
     prompt_path: PathBuf,
     prompt: String,
     pref: ProviderRef,
+    /// Identity + presence env attached to the spawned agent (empty for api slots).
+    env: Vec<(String, String)>,
+}
+
+/// Wire the adapter's presence source for a CLI slot: install its hook file into the
+/// worktree, log any degraded-mode note, and return the identity env every agent
+/// carries (`SPAR_AGENT_ID` / `SPAR_RUN_ID` / `SPAR_PROJECT_ROOT`). API slots have no
+/// CLI adapter, so they get an empty env. Best-effort — never fails the spawn.
+fn wire_slot_presence(
+    state: &RunState,
+    paths: &SparPaths,
+    job: &SlotJob,
+    cwd: &Path,
+    pref: &ProviderRef,
+) -> Vec<(String, String)> {
+    if pref.is_api() {
+        return Vec::new();
+    }
+    let cli_name = pref.cli_name().unwrap_or(job.provider.as_str());
+    let Some(adapter) = providers::adapter_named(cli_name) else {
+        return Vec::new();
+    };
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("spar"));
+    let identity = providers::presence::SlotIdentity {
+        agent_id: &job.slot_id,
+        run_id: &state.id,
+        project_root: &state.project_root,
+        worktree: cwd,
+        spar_exe: &exe,
+    };
+    let wiring = providers::presence::wire(adapter.as_ref(), &identity);
+    if let Some(note) = wiring.note {
+        let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(note));
+    }
+    wiring.env
 }
 
 fn prepare_slot_execution(
@@ -188,6 +223,7 @@ fn prepare_slot_execution(
         &crate::events::Event::slot(&job.slot_id, SlotStatus::Running),
     );
     let _ = crate::bus::heartbeat(paths, &state.id, &job.slot_id, "running");
+    let env = wire_slot_presence(state, paths, &job, &cwd, &pref);
 
     Ok(PreparedSlot {
         job,
@@ -196,6 +232,7 @@ fn prepare_slot_execution(
         prompt_path,
         prompt,
         pref,
+        env,
     })
 }
 
@@ -279,7 +316,7 @@ fn execute_prepared(
         args,
         cwd: prep.cwd.clone(),
         log_path: prep.log_path.clone(),
-        env: vec![],
+        env: prep.env.clone(),
         timeout,
     };
     let pid_cell = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -543,6 +580,8 @@ pub fn run_slot(
         return run_dry(state, paths, job, &cwd, &log_path, &prompt);
     }
 
+    let presence_env = wire_slot_presence(state, paths, job, &cwd, &pref);
+
     let result = if pref.is_api() {
         match run_api(state, paths, job, &pref, &cwd, &log_path, &prompt, timeout) {
             Ok(r) => r,
@@ -564,6 +603,7 @@ pub fn run_slot(
                     &prompt_path,
                     &prompt,
                     timeout,
+                    &presence_env,
                 ) {
                     Ok(r) => r,
                     Err(e) => {
@@ -591,6 +631,7 @@ pub fn run_slot(
                     &prompt_path,
                     &prompt,
                     timeout,
+                    &presence_env,
                 ) {
                     Ok(r) => r,
                     Err(e) => {
@@ -1025,6 +1066,7 @@ fn run_headless(
     prompt_path: &Path,
     prompt: &str,
     timeout: Duration,
+    env: &[(String, String)],
 ) -> Result<SlotOutcome> {
     let pref = ProviderRef::parse(&job.provider)?;
     let cli_name = pref.cli_name().unwrap_or(job.provider.as_str());
@@ -1051,7 +1093,7 @@ fn run_headless(
         args,
         cwd: cwd.to_path_buf(),
         log_path: log_path.to_path_buf(),
-        env: vec![],
+        env: env.to_vec(),
         timeout,
     };
     let pid_cell = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -1154,6 +1196,7 @@ fn run_tmux(
     prompt_path: &Path,
     prompt: &str,
     timeout: Duration,
+    env: &[(String, String)],
 ) -> Result<SlotOutcome> {
     if !tmux::available() {
         bail!("tmux not available");
@@ -1187,7 +1230,7 @@ fn run_tmux(
     let cmd = adapter.build_interactive(&bin, &opts);
     let (program, args) = providers::command_to_parts(&cmd);
     let shell = tmux::shell_wrap(&program, &args, log_path);
-    tmux::spawn_window(&session, &job.slot_id, cwd, &shell)?;
+    tmux::spawn_window(&session, &job.slot_id, cwd, &shell, env)?;
 
     // `done` means the agent's own process has exited — not just that it wrote its marker.
     let done = format!("{}.done", job.slot_id);

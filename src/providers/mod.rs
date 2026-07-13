@@ -1,6 +1,7 @@
 mod agy;
 mod claude;
 mod grok;
+pub mod presence;
 
 use crate::provider_ref::{ExecBackend, ProviderRef};
 use serde::Serialize;
@@ -11,6 +12,44 @@ pub use agy::AgyAdapter;
 pub use claude::ClaudeAdapter;
 pub use grok::GrokAdapter;
 
+/// How the orchestrator hands a queued message to a *running* adapter at its next
+/// turn boundary. The orchestrator asks the adapter for this; it never branches on
+/// provider name inline (orchestrator / backend / adapter split).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryStrategy {
+    /// Claude Code: a `Stop` hook injects the claimed messages
+    /// (`{"decision":"block","reason":…}` / `additionalContext`). Headless, no pane.
+    StopHookInject,
+    /// Grok: push to the native `/queue`; applied at the turn boundary even mid-turn.
+    NativeQueue,
+    /// opencode: `client.session.prompt()` / `prompt_async` into the live session.
+    /// Declared for matrix completeness; constructed once the opencode adapter lands.
+    #[allow(dead_code)]
+    SdkPrompt,
+    /// No injection channel — messages wait in the inbox for the agent's next turn.
+    None,
+}
+
+/// Where an adapter's `working` / `blocked` / `idle` presence signal originates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PresenceSource {
+    /// Claude-format `.claude/settings.json` hooks call back into `spar bus heartbeat`.
+    /// Grok reads the same file, so one hook file covers both.
+    Hooks,
+    /// Provider posts lifecycle notifications to an HTTP endpoint (e.g. Grok push hooks).
+    /// Declared for matrix completeness; constructed once that adapter path lands.
+    #[allow(dead_code)]
+    HttpPush,
+    /// Server-sent events bus (opencode `GET /event`: session.idle / tool.execute.* / permission.ask).
+    /// Declared for matrix completeness; constructed once the opencode adapter lands.
+    #[allow(dead_code)]
+    Sse,
+    /// No event stream — presence is degraded to a process/output heuristic.
+    None,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderReport {
     pub name: String,
@@ -20,6 +59,10 @@ pub struct ProviderReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     pub capabilities: Capabilities,
+    /// Turn-boundary delivery channel this adapter exposes.
+    pub delivery: DeliveryStrategy,
+    /// Where this adapter's presence transitions come from.
+    pub presence: PresenceSource,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -91,11 +134,25 @@ pub trait ProviderAdapter: Send + Sync {
             path: path_str,
             version,
             capabilities: self.capabilities(),
+            delivery: self.delivery_strategy(),
+            presence: self.presence_source(),
         }
     }
     fn permission_args(&self, policy: TrustPolicy) -> Vec<String>;
     fn build_headless(&self, bin: &Path, opts: &SpawnOpts) -> Command;
     fn build_interactive(&self, bin: &Path, opts: &SpawnOpts) -> Command;
+
+    /// Turn-boundary delivery channel for this adapter (see `DeliveryStrategy`).
+    /// Defaults to inbox-on-next-turn; adapters with a live channel override.
+    fn delivery_strategy(&self) -> DeliveryStrategy {
+        DeliveryStrategy::None
+    }
+
+    /// Where this adapter's presence transitions come from (see `PresenceSource`).
+    /// Defaults to none (degraded); adapters with an event stream override.
+    fn presence_source(&self) -> PresenceSource {
+        PresenceSource::None
+    }
 }
 
 fn probe_version(bin: &PathBuf, args: &[&str]) -> Option<String> {

@@ -1,4 +1,6 @@
-use super::{Capabilities, ProviderAdapter, SpawnOpts, TrustPolicy};
+use super::{
+    Capabilities, DeliveryStrategy, PresenceSource, ProviderAdapter, SpawnOpts, TrustPolicy,
+};
 use std::path::Path;
 use std::process::Command;
 
@@ -7,6 +9,14 @@ pub struct ClaudeAdapter;
 impl ProviderAdapter for ClaudeAdapter {
     fn name(&self) -> &'static str {
         "claude"
+    }
+
+    fn delivery_strategy(&self) -> DeliveryStrategy {
+        DeliveryStrategy::StopHookInject
+    }
+
+    fn presence_source(&self) -> PresenceSource {
+        PresenceSource::Hooks
     }
 
     fn binary_names(&self) -> &[&'static str] {

@@ -1,4 +1,6 @@
-use super::{Capabilities, ProviderAdapter, SpawnOpts, TrustPolicy};
+use super::{
+    Capabilities, DeliveryStrategy, PresenceSource, ProviderAdapter, SpawnOpts, TrustPolicy,
+};
 use std::path::Path;
 use std::process::Command;
 
@@ -7,6 +9,17 @@ pub struct AgyAdapter;
 impl ProviderAdapter for AgyAdapter {
     fn name(&self) -> &'static str {
         "agy"
+    }
+
+    // No idle-injection and no structured event stream (verified against agy 1.1.1:
+    // no `hooks` subcommand; Stop is notify-only). Messages wait for the next turn and
+    // presence is degraded to the process/output heuristic.
+    fn delivery_strategy(&self) -> DeliveryStrategy {
+        DeliveryStrategy::None
+    }
+
+    fn presence_source(&self) -> PresenceSource {
+        PresenceSource::None
     }
 
     fn binary_names(&self) -> &[&'static str] {

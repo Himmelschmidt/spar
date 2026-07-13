@@ -299,6 +299,13 @@ pub enum BusCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Record an agent presence transition (called by provider hooks)
+    Heartbeat {
+        run_id: String,
+        agent: String,
+        #[arg(long, default_value = "working")]
+        status: String,
+    },
     /// Reserve a path
     Reserve {
         run_id: String,

@@ -40,21 +40,31 @@ pub fn new_session(name: &str, cwd: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Create a window for a slot and run `command` inside it.
-pub fn spawn_window(session: &str, window: &str, cwd: &Path, shell_cmd: &str) -> Result<()> {
-    let status = Command::new("tmux")
-        .args([
-            "new-window",
-            "-t",
-            session,
-            "-n",
-            window,
-            "-c",
-            cwd.to_str().unwrap_or("."),
-            shell_cmd,
-        ])
-        .status()
-        .context("tmux new-window")?;
+/// Create a window for a slot and run `command` inside it. `env` entries are set on
+/// the new pane (`-e KEY=VAL`), so a spawned agent and any hooks it runs inherit
+/// its `SPAR_AGENT_ID` / `SPAR_RUN_ID` / `SPAR_PROJECT_ROOT` identity.
+pub fn spawn_window(
+    session: &str,
+    window: &str,
+    cwd: &Path,
+    shell_cmd: &str,
+    env: &[(String, String)],
+) -> Result<()> {
+    let mut cmd = Command::new("tmux");
+    cmd.args([
+        "new-window",
+        "-t",
+        session,
+        "-n",
+        window,
+        "-c",
+        cwd.to_str().unwrap_or("."),
+    ]);
+    for (k, v) in env {
+        cmd.arg("-e").arg(format!("{k}={v}"));
+    }
+    cmd.arg(shell_cmd);
+    let status = cmd.status().context("tmux new-window")?;
     if !status.success() {
         bail!("tmux new-window failed: {window}");
     }
