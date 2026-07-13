@@ -276,6 +276,33 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             }
             Ok(ExitCode::Success)
         }
+        BusCmd::Inbox {
+            run_id,
+            agent,
+            claim,
+            json,
+        } => {
+            let msgs = if claim {
+                bus::inbox_claim(&paths, &run_id, &agent)?
+            } else {
+                bus::inbox(&paths, &run_id, &agent)?
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&msgs)?);
+            } else {
+                for m in &msgs {
+                    println!(
+                        "{} {} → {} ({:?}) {}",
+                        m.ts.format("%H:%M:%S"),
+                        m.from,
+                        m.to,
+                        m.kind,
+                        m.body.chars().take(100).collect::<String>()
+                    );
+                }
+            }
+            Ok(ExitCode::Success)
+        }
         BusCmd::Presence { run_id, json } => {
             let p = bus::list_presence(&paths, &run_id)?;
             if json {

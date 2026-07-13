@@ -281,7 +281,8 @@ pub fn list_presence(paths: &SparPaths, run_id: &str) -> Result<Vec<Presence>> {
     Ok(out)
 }
 
-#[allow(dead_code)]
+/// Peek an agent's undelivered inbox without consuming it. The `claimed/`
+/// subdir is skipped (it has no `.json` extension at the top level).
 pub fn inbox(paths: &SparPaths, run_id: &str, agent: &str) -> Result<Vec<BusMessage>> {
     let dir = bus_root(paths, run_id).join("inbox").join(agent);
     if !dir.is_dir() {
@@ -294,6 +295,46 @@ pub fn inbox(paths: &SparPaths, run_id: &str, agent: &str) -> Result<Vec<BusMess
             continue;
         }
         if let Ok(m) = serde_json::from_str(&fs::read_to_string(e.path())?) {
+            out.push(m);
+        }
+    }
+    out.sort_by(|a, b| a.ts.cmp(&b.ts));
+    Ok(out)
+}
+
+/// Drain an agent's inbox with exactly-once semantics: each message file is
+/// atomically `rename`d into `inbox/<agent>/claimed/` and returned. `rename` on
+/// the same filesystem is atomic, so under concurrent claimers exactly one wins
+/// each file (the loser's source path is already gone → skipped), never a double
+/// delivery. Messages already claimed are not returned again.
+pub fn inbox_claim(paths: &SparPaths, run_id: &str, agent: &str) -> Result<Vec<BusMessage>> {
+    let dir = bus_root(paths, run_id).join("inbox").join(agent);
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let claimed_dir = dir.join("claimed");
+    fs::create_dir_all(&claimed_dir)?;
+    let mut sources: Vec<PathBuf> = Vec::new();
+    for e in fs::read_dir(&dir)? {
+        let e = e?;
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        sources.push(p);
+    }
+    let mut out: Vec<BusMessage> = Vec::new();
+    for src in sources {
+        let Some(name) = src.file_name() else {
+            continue;
+        };
+        let dest = claimed_dir.join(name);
+        // Whoever moves the inode owns the message. A concurrent claimer that
+        // already moved it gets ENOENT here and is skipped.
+        if fs::rename(&src, &dest).is_err() {
+            continue;
+        }
+        if let Ok(m) = serde_json::from_str(&fs::read_to_string(&dest)?) {
             out.push(m);
         }
     }
@@ -408,5 +449,29 @@ mod tests {
         assert!(reserve(&paths, "r1", "src/foo.rs", "b").is_err());
         release(&paths, "r1", "src/foo.rs", "a").unwrap();
         reserve(&paths, "r1", "src/foo.rs", "b").unwrap();
+    }
+
+    #[test]
+    fn inbox_claim_drains_exactly_once() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        join(&paths, "r1", "a", Some("cli:claude"), Some("native-cli")).unwrap();
+        join(&paths, "r1", "b", Some("cli:grok"), Some("native-cli")).unwrap();
+        chat(&paths, "r1", "a", "b", "hello", MessageBudget::Normal).unwrap();
+        chat(&paths, "r1", "a", "b", "world", MessageBudget::Normal).unwrap();
+
+        // Peek does not consume: repeated non-claim reads keep returning all.
+        assert_eq!(inbox(&paths, "r1", "b").unwrap().len(), 2);
+        assert_eq!(inbox(&paths, "r1", "b").unwrap().len(), 2);
+
+        // First claim drains everything; second claim sees nothing.
+        let first = inbox_claim(&paths, "r1", "b").unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].body, "hello");
+        assert_eq!(first[1].body, "world");
+        assert!(inbox_claim(&paths, "r1", "b").unwrap().is_empty());
+
+        // Peek after claim is also empty (claimed/ is excluded).
+        assert!(inbox(&paths, "r1", "b").unwrap().is_empty());
     }
 }

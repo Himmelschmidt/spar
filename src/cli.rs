@@ -283,6 +283,16 @@ pub enum BusCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Show an agent's inbox (peek by default; `--claim` drains exactly-once)
+    Inbox {
+        run_id: String,
+        agent: String,
+        /// Atomically claim (drain) messages so each is delivered exactly once
+        #[arg(long)]
+        claim: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Presence snapshot
     Presence {
         run_id: String,
