@@ -39,8 +39,8 @@ Spawning CLI sessions is “hacky” only at the **adapter** layer. The product 
 │  Backend: native-cli   │     │  Backend: api-sdk              │
 │  · spawn claude/grok/  │     │  · in-tree thin agent runtime  │
 │    agy (headless)      │     │  · provider SDKs               │
-│  · optional namespaced │     │  · tool loop (read/edit/bash…) │
-│    tmux (never user    │     │  · streaming + token usage     │
+│  · tmux on own socket  │     │  · tool loop (read/edit/bash…) │
+│    -L spar (never user │     │  · streaming + token usage     │
 │    sessions)           │     │  · optional $ estimates        │
 │  · scrape rate limits  │     │  · full control / metered      │
 │    best-effort         │     │                                │
@@ -68,7 +68,7 @@ Spawning CLI sessions is “hacky” only at the **adapter** layer. The product 
 | Concern | Decision |
 |---------|----------|
 | Default execution | **Headless** process spawn |
-| Tmux | Opt-in only; **dedicated session per run** (`spar-<run_id>`); never touch the user’s personal sessions |
+| Tmux | Runs on spar's **own server socket** (`tmux -L spar`) — the user's personal tmux sessions are never touched (W1). Headless slot spawn needs no tmux; the **workspace** path (embedded panes, control-mode output) requires it, so it is no longer strictly opt-in there (W1/W2) |
 | Completion | Process exit + expected artifacts/markers; never success-on-timeout-alone |
 | Trust | Configurable; default strong auto-approve flags the human UI allows |
 | Quota | Best-effort parse of provider signals (e.g. Claude `rate_limits.five_hour.*` as in statusline JSON) + log/error scrape + manual pause |
@@ -221,7 +221,7 @@ Track A (native-cli) is the default day-to-day path; Track B (api-sdk) is first-
 | Topic | Decision |
 |-------|----------|
 | Product shape | Single orchestrator, dual execution backends |
-| Native default | Headless CLI; tmux namespaced opt-in |
+| Native default | Headless CLI; tmux on spar's own socket (`-L spar`), never user sessions — required on the workspace path (W1/W2) |
 | API shape | In-tree runtime + official SDKs; opt-in / mixable |
 | Run identity | One id end-to-end |
 | Isolation | Always worktree; bwrap per-provider later (none on by default yet); fail-closed cleanup |
