@@ -62,6 +62,7 @@ fn run() -> Result<ExitCode> {
         return tui::run_with(tui::TuiOpts {
             task_seed: cli.task.clone(),
             cwd: cli.cwd.clone(),
+            full_mouse: cli.full_mouse,
         });
     };
 
@@ -177,6 +178,7 @@ fn run() -> Result<ExitCode> {
         Command::Dashboard => tui::run_with(tui::TuiOpts {
             task_seed: cli.task.clone(),
             cwd: cli.cwd.clone(),
+            full_mouse: cli.full_mouse,
         }),
         Command::Provider { action } => provider_cmd(action),
         Command::Model { action } => {
