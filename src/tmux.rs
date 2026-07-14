@@ -62,8 +62,33 @@ pub fn ensure_workspace_shell(project_root: &Path) -> Result<String> {
     Ok(name)
 }
 
+/// Server-global config for the spar socket, applied before a client attaches.
+/// Best-effort and idempotent.
+///
+/// - `mouse on` so an attached client interprets the SGR mouse sequences we forward
+///   (wheel scroll into copy-mode, click-to-select).
+/// - **prefix `C-a`, not the default `C-b`.** spar is normally run *inside* the user's
+///   own tmux, whose prefix is `C-b` — that outer tmux swallows `C-b` before spar's
+///   process ever sees the key, so the embedded client could never receive a prefix and
+///   every prefix command was dead. `C-a` passes through the outer tmux untouched.
+///   `C-a C-a` sends a literal `C-a` on to the program inside the pane.
+pub fn ensure_server_config() {
+    for args in [
+        ["set", "-g", "mouse", "on"].as_slice(),
+        ["set", "-g", "prefix", "C-a"].as_slice(),
+        ["bind", "C-a", "send-prefix"].as_slice(),
+    ] {
+        let _ = tmux()
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 /// All session names on the spar socket, one per line. Empty when no server is
 /// running or the query fails.
+#[allow(dead_code)]
 pub fn list_sessions() -> Vec<String> {
     let out = tmux()
         .args(["list-sessions", "-F", "#{session_name}"])
@@ -75,6 +100,7 @@ pub fn list_sessions() -> Vec<String> {
 }
 
 /// Parse `list-sessions` stdout into trimmed, non-empty names. Pure, for testing.
+#[allow(dead_code)]
 fn parse_session_list(stdout: &str) -> Vec<String> {
     stdout
         .lines()
@@ -137,6 +163,22 @@ pub fn spawn_window(
     Ok(())
 }
 
+/// Select a window in a session so an attaching client lands on that slot's pane.
+/// Best-effort: callers ignore failure (the window may have closed already).
+pub fn select_window(session: &str, window: &str) -> Result<()> {
+    let target = format!("{session}:{window}");
+    let status = tmux()
+        .args(["select-window", "-t", &target])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("tmux select-window")?;
+    if !status.success() {
+        bail!("tmux select-window failed for {target}");
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 pub fn send_keys(session: &str, window: &str, keys: &str) -> Result<()> {
     let target = format!("{session}:{window}");
@@ -191,6 +233,10 @@ impl SendKey {
 /// Enter is a distinct submit) falls out naturally: each printable key maps to a
 /// [`SendKey::Literal`] and Enter maps to its own [`SendKey::Named`] `Enter`, so a
 /// per-keystroke forwarder never fuses text and the submit into one send.
+///
+/// Retained for `send-keys`-based delivery (workspace prompts); the embedded
+/// terminal now forwards raw bytes via `terminal::encode_key` instead.
+#[allow(dead_code)]
 pub fn map_key(code: KeyCode, mods: KeyModifiers) -> Option<SendKey> {
     let ctrl = mods.contains(KeyModifiers::CONTROL);
     let alt = mods.contains(KeyModifiers::ALT);

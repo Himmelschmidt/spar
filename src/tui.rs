@@ -13,8 +13,8 @@ use crate::workflow;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -136,6 +136,9 @@ pub fn run_with(opts: TuiOpts) -> Result<crate::exit_codes::ExitCode> {
         out.write_all(MOUSE_ENABLE)?;
         out.flush()?;
     }
+    // Bracketed paste so the embedded tmux client receives pastes as one framed
+    // chunk (Event::Paste) rather than a storm of synthetic keystrokes.
+    out.execute(EnableBracketedPaste)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
     terminal.clear()?;
 
@@ -153,6 +156,7 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let mut out = stdout();
+        let _ = out.execute(DisableBracketedPaste);
         let _ = out.execute(DisableMouseCapture);
         let _ = out.execute(LeaveAlternateScreen);
     }
@@ -224,13 +228,14 @@ struct App {
     /// Count of unresolved `@human`/`Blocked` bus alerts for the selected run; drives
     /// the header badge. Refreshed from the snapshot each frame.
     human_alerts_n: usize,
-    /// Embedded terminal (W3/W7): a live vt100 view of a tmux pane on the spar
-    /// socket. Lazily attached when the Terminal focus is opened.
+    /// Embedded terminal (W3/W7/W8): a real `tmux -L spar attach` client in a PTY,
+    /// rendered from its output bytes with raw keys/mouse/paste forwarded in. Lazily
+    /// attached to the project's workspace shell when the Terminal focus is opened.
     terminal_pane: Option<crate::terminal::TerminalPane>,
-    /// Which session the Terminal panel shows. `None` = the project's persistent
-    /// workspace shell (the default); `Some(name)` = an agent session cycled to via
-    /// Ctrl+PgUp/PgDn.
-    terminal_target: Option<String>,
+    /// Which tmux session the Terminal panel should attach to. `None` = the project
+    /// workspace shell; `Some(spar-<run_id>)` = an agent takeover selected from the
+    /// Agents pane. Cleared back to `None` when the client detaches or the session ends.
+    takeover_target: Option<String>,
     /// Sender for background tasks (e.g. deferred `/spawn`) to flash a result back
     /// onto the render loop. Set once the message channel exists.
     bg_tx: Option<mpsc::Sender<Msg>>,
@@ -340,10 +345,10 @@ impl App {
             gate_buttons: Vec::new(),
             rect_help: Rect::default(),
             rect_projects: Rect::default(),
-            terminal_target: None,
             reconcile_spawn: None,
             human_alerts_n: 0,
             terminal_pane: None,
+            takeover_target: None,
             bg_tx: None,
         }
     }
@@ -474,46 +479,6 @@ impl App {
             }
         }
     }
-
-    /// Forward a key event to the focused embedded terminal pane, if one is
-    /// attached. No-op otherwise; the caller still consumes the key.
-    fn forward_key_to_terminal(&self, code: KeyCode, mods: KeyModifiers) {
-        if let Some(pane) = self.terminal_pane.as_ref() {
-            pane.send_key(code, mods);
-        }
-    }
-
-    /// Cycle the Terminal panel to the next/previous pane (`delta` -1/+1, wrapping).
-    /// The ordered ring is the workspace shell first, then every other live session
-    /// on the spar socket (agent sessions `spar-<run_id>`), so all panes are
-    /// reachable. Dropping the pane forces a rebind on the next `manage_terminal`.
-    fn cycle_terminal_target(&mut self, delta: i32, project_root: &Path) {
-        let shell = tmux::workspace_shell_session(project_root);
-        let mut targets = vec![shell.clone()];
-        for s in tmux::list_sessions() {
-            if s != shell {
-                targets.push(s);
-            }
-        }
-        let current = self
-            .terminal_target
-            .clone()
-            .unwrap_or_else(|| shell.clone());
-        let cur_idx = targets.iter().position(|s| *s == current).unwrap_or(0);
-        let next = &targets[cycle_index(targets.len(), cur_idx, delta)];
-        self.terminal_target = (*next != shell).then(|| next.clone());
-        self.terminal_pane = None;
-    }
-}
-
-/// Wrapping index move within `[0, len)`. Returns 0 for an empty ring.
-fn cycle_index(len: usize, current: usize, delta: i32) -> usize {
-    if len == 0 {
-        return 0;
-    }
-    let len_i = len as i32;
-    let cur = (current as i32).rem_euclid(len_i);
-    (cur + delta).rem_euclid(len_i) as usize
 }
 
 /// Apply a scroll delta and update follow-tail. Positive = toward newer lines.
@@ -868,6 +833,18 @@ fn run_loop(
                             rail_state.offset(),
                             fleet_state.offset(),
                         ),
+                        Event::Paste(text) => {
+                            // Forward a paste to the tmux client as bracketed paste.
+                            if app.focus == Focus::Terminal {
+                                if let Some(pane) = app.terminal_pane.as_ref() {
+                                    let mut buf = Vec::with_capacity(text.len() + 12);
+                                    buf.extend_from_slice(b"\x1b[200~");
+                                    buf.extend_from_slice(text.as_bytes());
+                                    buf.extend_from_slice(b"\x1b[201~");
+                                    pane.write_input(&buf);
+                                }
+                            }
+                        }
                         _ => {}
                     }
                     ev = match msg_rx.try_recv() {
@@ -972,34 +949,21 @@ fn handle_key(
         return Ok(false);
     }
 
-    // Terminal panel focused: keystrokes drive the live pane, not TUI nav. Tab /
-    // BackTab stay the focus-cycle escape hatch; Ctrl+PgUp/PgDn switch which pane is
-    // shown. Everything else is forwarded to the pane ONLY when one is attached —
-    // with no pane we deliberately fall through to the normal handler so an
-    // unattachable Terminal panel can never trap the operator.
+    // Terminal panel focused: the panel IS a real tmux client, so every key is
+    // forwarded raw into its PTY — prefix (C-a), copy-mode, splits, session switch
+    // are all tmux's own. F12 is the ONLY escape back to spar. With no pane attached
+    // we deliberately fall through to the normal handler so an unattachable Terminal
+    // panel can never trap the operator.
     if app.focus == Focus::Terminal {
-        match code {
-            KeyCode::Tab => {
-                app.focus = app.focus.next();
-                return Ok(false);
+        if code == KeyCode::F(12) {
+            app.focus = app.focus.next();
+            return Ok(false);
+        }
+        if let Some(pane) = app.terminal_pane.as_ref() {
+            if let Some(bytes) = crate::terminal::encode_key(code, mods) {
+                pane.write_input(&bytes);
             }
-            KeyCode::BackTab => {
-                app.focus = app.focus.prev();
-                return Ok(false);
-            }
-            KeyCode::PageUp if mods.contains(KeyModifiers::CONTROL) => {
-                app.cycle_terminal_target(-1, active_root.as_path());
-                return Ok(false);
-            }
-            KeyCode::PageDown if mods.contains(KeyModifiers::CONTROL) => {
-                app.cycle_terminal_target(1, active_root.as_path());
-                return Ok(false);
-            }
-            _ if app.terminal_pane.is_some() => {
-                app.forward_key_to_terminal(code, mods);
-                return Ok(false);
-            }
-            _ => {}
+            return Ok(false);
         }
     }
 
@@ -1060,6 +1024,29 @@ fn handle_key(
                         format!("Opened {}", p.name.as_deref().unwrap_or("project")),
                         GREEN,
                     );
+                }
+            } else if app.focus == Focus::Agents {
+                // Enter is unbound in the Agents pane, so it takes over the selected
+                // slot: point the passthrough Terminal at that run's tmux pane and focus
+                // it. Only runs launched with `--backend tmux` have a `spar-<run_id>`
+                // session; headless runs have no pane to attach to.
+                if let Some(slot) = full.and_then(|st| st.slots.get(app.selected_slot)) {
+                    let session = tmux::session_name(&full.unwrap().id);
+                    let slot_id = slot.id.clone();
+                    if tmux::has_session(&session) {
+                        app.takeover_target = Some(session.clone());
+                        let _ = tmux::select_window(&session, &slot_id);
+                        app.focus = Focus::Terminal;
+                        app.flash(
+                            format!("Took over {slot_id} — F12/Ctrl+a d to hand back"),
+                            GREEN,
+                        );
+                    } else {
+                        app.flash(
+                            "headless run — rerun with --backend tmux to take over",
+                            YELLOW,
+                        );
+                    }
                 }
             }
         }
@@ -1324,6 +1311,28 @@ fn handle_mouse(
 ) {
     let (x, y) = (m.column, m.row);
     let n_slots = full.map(|s| s.slots.len()).unwrap_or(0);
+
+    // Terminal focused with a live pane: mouse over the panel is tmux's (wheel
+    // scroll into copy-mode, click-select). Translate to pane-relative coords inside
+    // the border and forward as SGR mouse. Events outside the panel fall through so
+    // clicking another panel still changes focus.
+    if app.focus == Focus::Terminal {
+        if let Some(pane) = app.terminal_pane.as_ref() {
+            let r = app.rect_terminal;
+            if contains(r, x, y) && r.width > 2 && r.height > 2 {
+                let inner_x = r.x + 1;
+                let inner_y = r.y + 1;
+                let max_x = r.x + r.width - 2;
+                let max_y = r.y + r.height - 2;
+                let cx = x.clamp(inner_x, max_x) - inner_x;
+                let cy = y.clamp(inner_y, max_y) - inner_y;
+                if let Some(bytes) = crate::terminal::encode_mouse(m.kind, cx, cy, m.modifiers) {
+                    pane.write_input(&bytes);
+                }
+                return;
+            }
+        }
+    }
 
     match m.kind {
         MouseEventKind::Down(MouseButton::Left) => {
@@ -2973,10 +2982,10 @@ fn situational_footer(full: Option<&RunState>, focus: Focus, browse: BrowseLevel
     }
     match focus {
         Focus::Runs => "j/k runs · Esc/p projects · Tab → Agents · ? help",
-        Focus::Agents => "j/k agent · log follows · Tab → Live log",
+        Focus::Agents => "j/k agent · Enter take over pane · log follows · Tab → Live log",
         Focus::Log => "scroll · w wrap · g/G top/end · up unfollows live · Tab",
         Focus::Activity => "run timeline · scroll · Tab → Terminal",
-        Focus::Terminal => "workspace shell · Ctrl+PgUp/PgDn switch pane · Tab → Command",
+        Focus::Terminal => "tmux passthrough · prefix C-a · Ctrl+a d / F12 → spar",
         Focus::Composer => "type /approve /reject /ship /help · Enter · Esc",
     }
 }
@@ -3060,13 +3069,29 @@ fn manage_terminal(app: &mut App, project_root: &Path) {
         return;
     }
 
-    // An explicit target if it still exists, else the project's workspace shell
-    // (created on demand). The shell is detached and deliberately OUTLIVES the TUI,
-    // so a dev server started in it survives restarts.
-    let desired = match app.terminal_target.as_deref() {
-        Some(s) if tmux::has_session(s) => s.to_string(),
+    // Dead client (Ctrl+a d detach, or the takeover session ended): the `attach`
+    // child exited. Drop the pane, revert to the workspace shell, and hand focus back
+    // to spar so the operator isn't stranded on a dead panel. The tmux SESSION is
+    // untouched — only our transient client went away.
+    if let Some(pane) = app.terminal_pane.as_mut() {
+        if !pane.is_alive() {
+            app.terminal_pane = None;
+            app.takeover_target = None;
+            if app.focus == Focus::Terminal {
+                app.focus = Focus::Runs;
+            }
+            return;
+        }
+    }
+
+    // Resolve the session to attach to: an agent takeover if one is set and its
+    // session still exists, otherwise the project workspace shell. A takeover whose
+    // session has since died silently reverts to the shell. The workspace shell is
+    // detached and deliberately OUTLIVES the TUI, so a dev server in it survives restarts.
+    let desired = match app.takeover_target.as_ref() {
+        Some(s) if tmux::has_session(s) => s.clone(),
         _ => {
-            app.terminal_target = None;
+            app.takeover_target = None;
             match tmux::ensure_workspace_shell(project_root) {
                 Ok(name) => name,
                 Err(_) => {
@@ -3086,6 +3111,8 @@ fn manage_terminal(app: &mut App, project_root: &Path) {
 
     // Attach lazily, only while the panel is focused.
     if app.focus == Focus::Terminal && app.terminal_pane.is_none() {
+        // Enable tmux mouse so our forwarded SGR mouse is interpreted by the client.
+        tmux::ensure_server_config();
         let (rows, cols) = terminal_dims(app.rect_terminal);
         let mut pane = crate::terminal::TerminalPane::new(rows, cols);
         if pane.attach(&desired).is_ok() {
@@ -3103,22 +3130,15 @@ fn draw_terminal(f: &mut Frame, area: Rect, app: &mut App, project_root: &Path) 
         return;
     }
     let focused = app.focus == Focus::Terminal;
-    // `terminal_target == None` means the project's workspace shell; otherwise an
-    // agent session cycled to via Ctrl+PgUp/PgDn.
-    let title = if app.terminal_target.is_none() {
-        let base = project_root
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("project");
-        format!(" Terminal · shell · {base} ")
-    } else {
-        let session = app
-            .terminal_pane
-            .as_ref()
-            .and_then(|p| p.session())
-            .or(app.terminal_target.as_deref())
-            .unwrap_or("?");
-        format!(" Terminal · agent · {session} ")
+    let title = match app.takeover_target.as_ref() {
+        Some(session) => format!(" Terminal · agent · {session} "),
+        None => {
+            let base = project_root
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("project");
+            format!(" Terminal · shell · {base} ")
+        }
     };
     let block = panel(&title, focused);
     let inner = block.inner(area);
@@ -3126,9 +3146,10 @@ fn draw_terminal(f: &mut Frame, area: Rect, app: &mut App, project_root: &Path) 
 
     let Some(pane) = app.terminal_pane.as_mut() else {
         let hint = Paragraph::new(
-            "Focus this panel to open a live workspace shell for the project — run a dev server, \
-             cargo, poke around; it stays alive across TUI restarts.\n\n\
-             Ctrl+PgUp/PgDn switch pane · Tab/Esc leave.",
+            "Focus this panel to open a real tmux client for the project's workspace shell — \
+             run a dev server, cargo, poke around; the session stays alive across TUI restarts.\n\n\
+             Or select an agent in the Agents pane and press Enter to take over its live pane.\n\n\
+             Full tmux: prefix C-a, copy-mode/scroll, splits, session switch. Ctrl+a d / F12 → spar.",
         )
         .style(Style::default().fg(FG_DIM))
         .wrap(Wrap { trim: true });
@@ -3153,8 +3174,10 @@ fn draw_terminal(f: &mut Frame, area: Rect, app: &mut App, project_root: &Path) 
             height: 1,
             ..inner
         };
-        let hint = Paragraph::new("Ctrl+PgUp/PgDn: switch pane · Tab: leave")
-            .style(Style::default().fg(FG_DIM));
+        let hint = Paragraph::new(
+            "Ctrl+a d / F12 / tap a tab → spar · C-a [ scroll/copy · ] paste · % / \" split · s session",
+        )
+        .style(Style::default().fg(FG_DIM));
         f.render_widget(hint, footer);
     }
 }
@@ -3727,38 +3750,6 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let t: String = s.chars().take(max.saturating_sub(1)).collect();
         format!("{t}…")
-    }
-}
-
-#[cfg(test)]
-mod terminal_cycle {
-    use super::cycle_index;
-
-    #[test]
-    fn wraps_forward_and_backward() {
-        assert_eq!(cycle_index(3, 2, 1), 0, "past the end wraps to the start");
-        assert_eq!(
-            cycle_index(3, 0, -1),
-            2,
-            "before the start wraps to the end"
-        );
-        assert_eq!(cycle_index(3, 1, 1), 2);
-    }
-
-    #[test]
-    fn single_element_stays_put() {
-        assert_eq!(cycle_index(1, 0, 1), 0);
-        assert_eq!(cycle_index(1, 0, -1), 0);
-    }
-
-    #[test]
-    fn zero_delta_is_a_no_op() {
-        assert_eq!(cycle_index(4, 2, 0), 2);
-    }
-
-    #[test]
-    fn empty_ring_is_zero() {
-        assert_eq!(cycle_index(0, 0, 1), 0);
     }
 }
 
