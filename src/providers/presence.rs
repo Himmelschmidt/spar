@@ -12,9 +12,12 @@ use std::process::{Command, Stdio};
 
 /// Stable identity + locations a slot needs to phone home for presence/delivery.
 pub struct SlotIdentity<'a> {
-    /// Stable agent id exported as `SPAR_AGENT_ID` (the slot id).
+    /// The slot's short role id. `wire` run-qualifies it to the unique `run:slot` bus id
+    /// for the exported `SPAR_AGENT_ID`; the baked hook commands keep the short id + `--run`.
     pub agent_id: &'a str,
-    pub run_id: &'a str,
+    /// Run this agent belongs to, or `None` for a bare (run-less) Composer agent.
+    /// Threaded onto its `spar bus` hook commands as `--run <id>` when present.
+    pub run_id: Option<&'a str>,
     /// Primary checkout that owns `.spar/runs/<id>`; heartbeats resolve against it.
     pub project_root: &'a Path,
     /// Directory the agent runs in (its worktree). Hook files land here.
@@ -36,14 +39,21 @@ pub struct PresenceWiring {
 /// Best-effort: presence is telemetry, so a failure to install hooks degrades to a
 /// note rather than failing the spawn. Every agent still gets the identity env.
 pub fn wire(adapter: &dyn ProviderAdapter, id: &SlotIdentity) -> PresenceWiring {
-    let env = vec![
-        ("SPAR_AGENT_ID".to_string(), id.agent_id.to_string()),
-        ("SPAR_RUN_ID".to_string(), id.run_id.to_string()),
+    // The agent's own `spar bus inbox/deliver $SPAR_AGENT_ID` must drain its unique
+    // inbox, so export the run-qualified id for a run slot (`run:slot`); a bare agent's
+    // id is already unique. The baked-in hook commands still pass the short id + `--run`
+    // (the CLI re-resolves), so only the env-exported id needs qualifying here.
+    let unique = crate::bus::agent_ref(id.run_id, id.agent_id);
+    let mut env = vec![
+        ("SPAR_AGENT_ID".to_string(), unique),
         (
             "SPAR_PROJECT_ROOT".to_string(),
             id.project_root.display().to_string(),
         ),
     ];
+    if let Some(run) = id.run_id {
+        env.push(("SPAR_RUN_ID".to_string(), run.to_string()));
+    }
     // Only StopHookInject adapters (Claude) close the delivery loop through the Stop
     // hook. Grok shares the presence hook file but delivers via its native queue, so it
     // gets presence hooks without the injecting Stop hook.
@@ -215,15 +225,25 @@ fn skip_worktree_if_tracked(worktree: &Path, rel_path: &str) {
         .status();
 }
 
-fn spar_heartbeat_cmd(exe: &str, run_id: &str, agent: &str, status: &str) -> String {
+/// The `--run <id>` fragment a hook command carries, empty for a bare agent.
+fn run_flag(run_id: Option<&str>) -> String {
+    run_id.map(|r| format!(" --run {r}")).unwrap_or_default()
+}
+
+fn spar_heartbeat_cmd(exe: &str, run_id: Option<&str>, agent: &str, status: &str) -> String {
     format!(
-        "{} bus heartbeat {run_id} {agent} --status {status}",
-        shell_quote(exe)
+        "{} bus heartbeat {agent} --status {status}{}",
+        shell_quote(exe),
+        run_flag(run_id)
     )
 }
 
-fn spar_deliver_cmd(exe: &str, run_id: &str, agent: &str) -> String {
-    format!("{} bus deliver {run_id} {agent}", shell_quote(exe))
+fn spar_deliver_cmd(exe: &str, run_id: Option<&str>, agent: &str) -> String {
+    format!(
+        "{} bus deliver {agent}{}",
+        shell_quote(exe),
+        run_flag(run_id)
+    )
 }
 
 fn hook_group(matcher: Option<&str>, command: &str) -> Value {
@@ -282,11 +302,39 @@ mod tests {
     fn id<'a>(worktree: &'a Path, project_root: &'a Path, exe: &'a Path) -> SlotIdentity<'a> {
         SlotIdentity {
             agent_id: "impl-1",
-            run_id: "abc123",
+            run_id: Some("abc123"),
             project_root,
             worktree,
             spar_exe: exe,
         }
+    }
+
+    /// A bare (run-less) Composer agent wires the same hooks but with no run: the
+    /// `spar bus` commands omit `--run` and no `SPAR_RUN_ID` env is exported (W5).
+    #[test]
+    fn bare_agent_hooks_omit_run() {
+        let tmp = tempdir().unwrap();
+        let wt = tmp.path().join("wt");
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let exe = PathBuf::from("/usr/bin/spar");
+        let bare = SlotIdentity {
+            agent_id: "poke-1",
+            run_id: None,
+            project_root: &root,
+            worktree: &wt,
+            spar_exe: &exe,
+        };
+        let w = wire(&ClaudeAdapter, &bare);
+        assert!(!w.env.iter().any(|(k, _)| k == "SPAR_RUN_ID"));
+        let text = std::fs::read_to_string(settings_path(&wt)).unwrap();
+        assert!(
+            !text.contains("--run"),
+            "bare agent must not carry --run: {text}"
+        );
+        assert!(text.contains("bus deliver poke-1"));
+        assert!(text.contains("bus heartbeat poke-1"));
     }
 
     #[test]
@@ -300,10 +348,12 @@ mod tests {
 
         let w = wire(&ClaudeAdapter, &id(&wt, &root, &exe));
         assert!(w.note.is_none(), "note: {:?}", w.note);
+        // SPAR_AGENT_ID carries the run-qualified unique id so the agent self-drains the
+        // right inbox (`run:slot`).
         assert!(w
             .env
             .iter()
-            .any(|(k, v)| k == "SPAR_AGENT_ID" && v == "impl-1"));
+            .any(|(k, v)| k == "SPAR_AGENT_ID" && v == "abc123:impl-1"));
 
         let text = std::fs::read_to_string(settings_path(&wt)).unwrap();
         let v: Value = serde_json::from_str(&text).unwrap();
@@ -314,10 +364,10 @@ mod tests {
         assert!(text.contains("--status working"));
         assert!(text.contains("--status blocked"));
         assert!(text.contains("--status idle"));
-        assert!(text.contains("abc123 impl-1"));
+        assert!(text.contains("--run abc123"));
         // StopHookInject closes the delivery loop via a Stop `bus deliver` hook.
         assert!(
-            text.contains("bus deliver abc123 impl-1"),
+            text.contains("bus deliver impl-1 --run abc123"),
             "claude Stop hook must inject via `bus deliver`: {text}"
         );
     }

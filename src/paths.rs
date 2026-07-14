@@ -19,6 +19,13 @@ impl SparPaths {
         self.root.join("runs")
     }
 
+    /// Workspace-level swarm bus root (W5). Keyed by `agent_id`, independent of any
+    /// run: `.spar/bus/`. A run is now just an optional `run` tag on each message, so
+    /// bare agents and run slots share one addressable bus.
+    pub fn bus_dir(&self) -> PathBuf {
+        self.root.join("bus")
+    }
+
     pub fn run_dir(&self, run_id: &str) -> PathBuf {
         self.runs_dir().join(run_id)
     }

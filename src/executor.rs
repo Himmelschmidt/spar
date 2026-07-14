@@ -137,7 +137,7 @@ impl LivenessBeat<'_> {
             return;
         }
         self.last.set(std::time::Instant::now());
-        let _ = crate::bus::heartbeat(self.paths, self.run_id, self.slot_id, "running");
+        let _ = crate::bus::heartbeat(self.paths, Some(self.run_id), self.slot_id, "running");
     }
 }
 
@@ -162,7 +162,7 @@ fn wire_slot_presence(
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("spar"));
     let identity = providers::presence::SlotIdentity {
         agent_id: &job.slot_id,
-        run_id: &state.id,
+        run_id: Some(&state.id),
         project_root: &state.project_root,
         worktree: cwd,
         spar_exe: &exe,
@@ -249,7 +249,7 @@ fn prepare_slot_execution(
         &state.id,
         &crate::events::Event::slot(&job.slot_id, SlotStatus::Running),
     );
-    let _ = crate::bus::heartbeat(paths, &state.id, &job.slot_id, "running");
+    let _ = crate::bus::heartbeat(paths, Some(&state.id), &job.slot_id, "running");
     let env = wire_slot_presence(state, paths, &job, &cwd, &pref);
 
     Ok(PreparedSlot {
@@ -488,7 +488,7 @@ fn apply_parallel_outcome(
             mark_slot_failed(state, paths, slot_id, &e.to_string(), None, None, None)?;
         }
     }
-    let _ = crate::bus::heartbeat(paths, &state.id, slot_id, "done");
+    let _ = crate::bus::heartbeat(paths, Some(&state.id), slot_id, "done");
     Ok(())
 }
 
@@ -607,7 +607,7 @@ pub fn run_slot(
         &state.id,
         &crate::events::Event::slot(&job.slot_id, SlotStatus::Running),
     );
-    let _ = crate::bus::heartbeat(paths, &state.id, &job.slot_id, "running");
+    let _ = crate::bus::heartbeat(paths, Some(&state.id), &job.slot_id, "running");
     state.save(paths)?;
 
     let timeout = timeout_for_role(cfg, job.role);
@@ -743,7 +743,7 @@ pub fn run_slot(
     }
     let _ = crate::bus::heartbeat(
         paths,
-        &state.id,
+        Some(&state.id),
         &job.slot_id,
         if result.ok { "done" } else { "failed" },
     );
@@ -941,7 +941,7 @@ fn write_dry_artifacts(
             )?;
             let _ = crate::bus::chat(
                 paths,
-                &state.id,
+                Some(&state.id),
                 &job.slot_id,
                 "broadcast",
                 "dry-run acceptance contract proposed",
@@ -1014,7 +1014,7 @@ fn write_dry_artifacts(
             )?;
             let _ = crate::bus::chat(
                 paths,
-                &state.id,
+                Some(&state.id),
                 &job.slot_id,
                 "broadcast",
                 "dry-run peer ready",
@@ -1451,12 +1451,7 @@ pub fn wait_run(
         // The wait loop is a provider-agnostic delivery pulse: advance unacked-message
         // redelivery/escalation so requires_ack works even in runs with no Claude slot
         // (whose Stop hook is the only other thing that ticks acks). Best-effort.
-        let _ = crate::bus::tick_acks(
-            paths,
-            run_id,
-            &crate::bus::AckPolicy::default(),
-            chrono::Utc::now(),
-        );
+        let _ = crate::bus::tick_acks(paths, &crate::bus::AckPolicy::default(), chrono::Utc::now());
         if follow && !json {
             let (off, evs) = crate::events::read_from_offset(paths, run_id, event_off)?;
             event_off = off;

@@ -73,8 +73,13 @@ either way.
   gate, `3` stuck, `4` quota. Never repurpose them.
 - **Completion means process exit plus expected artifacts/markers.** Never treat a
   timeout alone as success.
-- **`.spar/runs/<id>/`** (`state.json`, `events.jsonl`, `bus/`, `logs/`) has the same
+- **`.spar/runs/<id>/`** (`state.json`, `events.jsonl`, `logs/`, plus a run-scoped
+  `bus/` for tasks/reserves and a back-compat event/presence mirror) has the same
   shape for every backend.
+- **The swarm bus is workspace-scoped and `agent_id`-keyed** (W5): it lives at
+  `.spar/bus/`, not under a run. `run` is an optional message/presence tag; bare
+  Composer agents and run slots share one bus and address each other by id. Run views
+  filter by the tag (`spar bus … --run <id>`).
 
 ## Build & test
 

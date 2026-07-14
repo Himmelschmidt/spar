@@ -87,9 +87,11 @@ spar ship "$RUN_ID" --confirm --json
 
 ## Bus / peer
 
+The bus is workspace-scoped and keyed by `agent_id`; `--run` is an optional grouping tag.
+
 ```bash
-spar bus send "$RUN_ID" -m "hello" --to broadcast
-spar bus log "$RUN_ID"
+spar bus send --run "$RUN_ID" -m "hello" --to broadcast
+spar bus log --run "$RUN_ID"
 spar run --workflow peer --task "$TASK" --providers cli:claude,cli:grok --json
 ```
 

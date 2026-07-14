@@ -8,6 +8,7 @@ use crate::process;
 use crate::quota::QuotaStore;
 use crate::registry;
 use crate::state::{self, Phase, RunState, SlotState, SlotStatus};
+use crate::tmux;
 use crate::workflow;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -23,13 +24,14 @@ use ratatui::buffer::Buffer;
 use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Scrollbar,
-    ScrollbarOrientation, ScrollbarState, Widget,
+    ScrollbarOrientation, ScrollbarState, Widget, Wrap,
 };
 use std::io::{stdout, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
+use tui_term::widget::PseudoTerminal;
 
 // ── palette ─────────────────────────────────────────────────────────────────
 
@@ -57,6 +59,7 @@ enum Focus {
     Agents,
     Log,
     Activity,
+    Terminal,
     Composer,
 }
 
@@ -66,7 +69,8 @@ impl Focus {
             Focus::Runs => Focus::Agents,
             Focus::Agents => Focus::Log,
             Focus::Log => Focus::Activity,
-            Focus::Activity => Focus::Composer,
+            Focus::Activity => Focus::Terminal,
+            Focus::Terminal => Focus::Composer,
             Focus::Composer => Focus::Runs,
         }
     }
@@ -76,7 +80,8 @@ impl Focus {
             Focus::Agents => Focus::Runs,
             Focus::Log => Focus::Agents,
             Focus::Activity => Focus::Log,
-            Focus::Composer => Focus::Activity,
+            Focus::Terminal => Focus::Activity,
+            Focus::Composer => Focus::Terminal,
         }
     }
     fn label(self) -> &'static str {
@@ -85,6 +90,7 @@ impl Focus {
             Focus::Agents => "Agents",
             Focus::Log => "Live log",
             Focus::Activity => "Activity",
+            Focus::Terminal => "Terminal",
             Focus::Composer => "Command",
         }
     }
@@ -201,6 +207,7 @@ struct App {
     rect_fleet: Rect,
     rect_stream: Rect,
     rect_bus: Rect,
+    rect_terminal: Rect,
     rect_composer: Rect,
     rect_runs: Rect,
     /// Narrow-mode tab strip (zero-sized when the wide layout is active).
@@ -217,6 +224,12 @@ struct App {
     /// Count of unresolved `@human`/`Blocked` bus alerts for the selected run; drives
     /// the header badge. Refreshed from the snapshot each frame.
     human_alerts_n: usize,
+    /// Embedded terminal (W3): a live vt100 view of the selected run's tmux pane.
+    /// Lazily attached when the Terminal focus is opened over a live session.
+    terminal_pane: Option<crate::terminal::TerminalPane>,
+    /// Sender for background tasks (e.g. deferred `/spawn`) to flash a result back
+    /// onto the render loop. Set once the message channel exists.
+    bg_tx: Option<mpsc::Sender<Msg>>,
 }
 
 /// A gate action reachable by both a key and a tappable button.
@@ -315,6 +328,7 @@ impl App {
             rect_fleet: Rect::default(),
             rect_stream: Rect::default(),
             rect_bus: Rect::default(),
+            rect_terminal: Rect::default(),
             rect_composer: Rect::default(),
             rect_runs: Rect::default(),
             rect_tabs: Rect::default(),
@@ -324,6 +338,8 @@ impl App {
             rect_projects: Rect::default(),
             reconcile_spawn: None,
             human_alerts_n: 0,
+            terminal_pane: None,
+            bg_tx: None,
         }
     }
 
@@ -453,6 +469,14 @@ impl App {
             }
         }
     }
+
+    /// Forward a key event to the focused embedded terminal pane, if one is
+    /// attached. No-op otherwise; the caller still consumes the key.
+    fn forward_key_to_terminal(&self, code: KeyCode, mods: KeyModifiers) {
+        if let Some(pane) = self.terminal_pane.as_ref() {
+            pane.send_key(code, mods);
+        }
+    }
 }
 
 /// Apply a scroll delta and update follow-tail. Positive = toward newer lines.
@@ -514,6 +538,9 @@ struct Snapshot {
 enum Msg {
     Input(Event),
     Data,
+    /// A status line pushed from a background task (e.g. `/spawn`'s deferred
+    /// spawn+deliver), flashed on the next render tick.
+    Flash(String, Color),
 }
 
 /// Size+mtime of everything a snapshot is derived from. Comparing these is a
@@ -549,7 +576,7 @@ fn marks_for(sel: &Selection, prev: Option<&Snapshot>) -> Marks {
         if let Some(id) = sel.run_id.as_deref() {
             out.push(stamp(&swarm.state_file(id)));
             out.push(stamp(&events::events_file(&swarm, id)));
-            out.push(stamp(&crate::bus::events_path(&swarm, id)));
+            out.push(stamp(&crate::bus::run_events_path(&swarm, id)));
             // The live log grows without the run state changing.
             let slot = prev
                 .and_then(|s| s.full.as_ref())
@@ -593,17 +620,12 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache) -> Snapshot {
     // The TUI refresh is a provider-agnostic delivery pulse for the selected run:
     // advance unacked-message redelivery/escalation before reading alerts, so
     // requires_ack works even when no Claude slot's Stop hook is ticking acks.
-    if let Some(st) = full.as_ref() {
-        let _ = crate::bus::tick_acks(
-            &swarm,
-            &st.id,
-            &crate::bus::AckPolicy::default(),
-            Utc::now(),
-        );
+    if full.is_some() {
+        let _ = crate::bus::tick_acks(&swarm, &crate::bus::AckPolicy::default(), Utc::now());
     }
     let alerts = full
         .as_ref()
-        .map(|st| crate::bus::unresolved_alerts(&swarm, &st.id).unwrap_or_default())
+        .map(|st| crate::bus::unresolved_alerts(&swarm, Some(&st.id)).unwrap_or_default())
         .unwrap_or_default();
     let activity = activity_feed(&swarm, full.as_ref(), &quota, &alerts);
     Snapshot {
@@ -624,6 +646,8 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache) -> Snapshot {
 fn animating(app: &App, snap: &Snapshot) -> bool {
     app.flash.is_some()
         || app.focus == Focus::Composer
+        // A live terminal streams between disk snapshots; keep repainting it.
+        || (app.focus == Focus::Terminal && app.terminal_pane.is_some())
         || snap.full.as_ref().is_some_and(|st| {
             is_active_phase(st.phase) || st.slots.iter().any(|s| s.status == SlotStatus::Running)
         })
@@ -660,6 +684,7 @@ fn run_loop(
 
     let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
     let (sel_tx, sel_rx) = mpsc::channel::<Selection>();
+    app.bg_tx = Some(msg_tx.clone());
 
     {
         let tx = msg_tx.clone();
@@ -744,6 +769,7 @@ fn run_loop(
         });
         fleet_state.select((n_slots > 0).then_some(app.selected_slot));
 
+        manage_terminal(&mut app, snap.full.as_ref());
         app.animated = animating(&app, &snap);
         app.human_alerts_n = snap.human_alerts;
 
@@ -768,6 +794,10 @@ fn run_loop(
 
         match msg_rx.recv_timeout(FRAME) {
             Ok(Msg::Data) => dirty = true,
+            Ok(Msg::Flash(msg, color)) => {
+                app.flash(msg, color);
+                dirty = true;
+            }
             Ok(Msg::Input(ev)) => {
                 dirty = true;
                 let mut ev = Some(ev);
@@ -805,6 +835,10 @@ fn run_loop(
                     }
                     ev = match msg_rx.try_recv() {
                         Ok(Msg::Input(next)) => Some(next),
+                        Ok(Msg::Flash(msg, color)) => {
+                            app.flash(msg, color);
+                            None
+                        }
                         Ok(Msg::Data) => None,
                         Err(_) => None,
                     };
@@ -869,8 +903,13 @@ fn handle_key(
     let selected_id = runs.get(app.selected_run).map(|r| r.id.as_str());
     let n_slots = full.map(|s| s.slots.len()).unwrap_or(0);
 
-    // Ctrl+C twice (within 2s) is the only quit path — never Esc or q.
-    if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
+    // Ctrl+C twice (within 2s) is the only quit path — never Esc or q. While the
+    // Terminal panel is focused, Ctrl+C belongs to the agent pane (SIGINT), so it
+    // falls through to forwarding; Tab out first to reach the quit arm.
+    if code == KeyCode::Char('c')
+        && mods.contains(KeyModifiers::CONTROL)
+        && app.focus != Focus::Terminal
+    {
         if let Some(t) = app.last_ctrl_c {
             if t.elapsed() < Duration::from_secs(2) {
                 return Ok(true);
@@ -896,13 +935,27 @@ fn handle_key(
         return Ok(false);
     }
 
+    // Terminal panel focused: keystrokes drive the live agent pane, not TUI nav.
+    // Tab / BackTab stay the focus-cycle escape hatch so the operator is never
+    // trapped; everything else (printable text, Enter, Ctrl-combos, arrows, Esc,
+    // Backspace, …) is forwarded to the pane and consumed here.
+    if app.focus == Focus::Terminal {
+        match code {
+            KeyCode::Tab => app.focus = app.focus.next(),
+            KeyCode::BackTab => app.focus = app.focus.prev(),
+            _ => app.forward_key_to_terminal(code, mods),
+        }
+        return Ok(false);
+    }
+
     if app.focus == Focus::Composer {
         match code {
             KeyCode::Esc => app.focus = Focus::Runs,
             KeyCode::Enter => {
                 let line = app.composer.trim().to_string();
                 if !line.is_empty() {
-                    match handle_composer(swarm, runs, app.selected_run, &line) {
+                    let bg = app.bg_tx.clone();
+                    match handle_composer(swarm, runs, app.selected_run, &line, bg) {
                         Ok(msg) => {
                             app.flash(msg, GREEN);
                             app.composer.clear();
@@ -985,7 +1038,7 @@ fn handle_key(
             }
             Focus::Log => app.scroll_stream_by(3),
             Focus::Activity => app.scroll_bus_by(1),
-            Focus::Composer => {}
+            Focus::Terminal | Focus::Composer => {}
         },
         KeyCode::Char('k') | KeyCode::Up => match app.focus {
             Focus::Runs => match app.browse {
@@ -1004,7 +1057,7 @@ fn handle_key(
             }
             Focus::Log => app.scroll_stream_by(-3),
             Focus::Activity => app.scroll_bus_by(-1),
-            Focus::Composer => {}
+            Focus::Terminal | Focus::Composer => {}
         },
         KeyCode::PageDown => match app.focus {
             Focus::Log => app.scroll_stream_by(i32::from(app.stream_page())),
@@ -1386,6 +1439,9 @@ struct LayoutRects {
     fleet: Rect,
     stream: Rect,
     bus: Rect,
+    /// Embedded terminal stage; non-zero only when the Terminal focus is active
+    /// (it shares the main stage with the live log).
+    terminal: Rect,
     composer: Rect,
     footer: Rect,
     /// Narrow-mode tab strip; zero-sized in the wide layout.
@@ -1421,6 +1477,7 @@ fn layout_rects(area: Rect, focus: Focus) -> LayoutRects {
             fleet: z,
             stream: z,
             bus: z,
+            terminal: z,
             composer: nroot[3],
             footer: nroot[4],
             tabs: nroot[1],
@@ -1432,6 +1489,7 @@ fn layout_rects(area: Rect, focus: Focus) -> LayoutRects {
             Focus::Agents => lay.fleet = nroot[2],
             Focus::Log | Focus::Composer => lay.stream = nroot[2],
             Focus::Activity => lay.bus = nroot[2],
+            Focus::Terminal => lay.terminal = nroot[2],
         }
         return lay;
     }
@@ -1462,13 +1520,22 @@ fn layout_rects(area: Rect, focus: Focus) -> LayoutRects {
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(mid[0]);
 
+    // The terminal shares the main stage with the live log; only one paints,
+    // chosen by focus, so a zero rect suppresses the other.
+    let (stream, terminal) = if focus == Focus::Terminal {
+        (Rect::default(), mid[1])
+    } else {
+        (mid[1], Rect::default())
+    };
+
     LayoutRects {
         header: root[0],
         action: root[1],
         runs: left[0],
         fleet: left[1],
-        stream: mid[1],
+        stream,
         bus: mid[2],
+        terminal,
         composer: root[3],
         footer: root[4],
         tabs: Rect::default(),
@@ -1477,11 +1544,12 @@ fn layout_rects(area: Rect, focus: Focus) -> LayoutRects {
 }
 
 /// Narrow-mode tabs, in cycle order, each mapped to the focus it selects.
-const NARROW_TABS: [(Focus, &str); 4] = [
+const NARROW_TABS: [(Focus, &str); 5] = [
     (Focus::Runs, "Runs"),
     (Focus::Agents, "Agents"),
     (Focus::Log, "Log"),
     (Focus::Activity, "Activity"),
+    (Focus::Terminal, "Term"),
 ];
 
 #[allow(clippy::too_many_arguments)]
@@ -1524,6 +1592,7 @@ fn draw(
     app.rect_fleet = lay.fleet;
     app.rect_stream = lay.stream;
     app.rect_bus = lay.bus;
+    app.rect_terminal = lay.terminal;
     app.rect_composer = lay.composer;
     app.rect_tabs = lay.tabs;
     // Rebuilt below by whichever bar/footer paints this frame.
@@ -1538,13 +1607,18 @@ fn draw(
             Focus::Agents => draw_agents(f, lay.fleet, full, app, fleet_state),
             Focus::Log | Focus::Composer => draw_stream(f, lay.stream, full, stream_text, app),
             Focus::Activity => draw_activity(f, lay.bus, activity, app),
+            Focus::Terminal => draw_terminal(f, lay.terminal, app),
         }
     } else {
         draw_header(f, lay.header, swarm, full, app);
         draw_action(f, lay.action, projects, runs, full, app);
         draw_rail(f, lay.runs, projects, runs, app, rail_state);
         draw_agents(f, lay.fleet, full, app, fleet_state);
-        draw_stream(f, lay.stream, full, stream_text, app);
+        if app.focus == Focus::Terminal {
+            draw_terminal(f, lay.terminal, app);
+        } else {
+            draw_stream(f, lay.stream, full, stream_text, app);
+        }
         draw_activity(f, lay.bus, activity, app);
     }
     draw_composer(f, lay.composer, app);
@@ -2846,7 +2920,8 @@ fn situational_footer(full: Option<&RunState>, focus: Focus, browse: BrowseLevel
         Focus::Runs => "j/k runs · Esc/p projects · Tab → Agents · ? help",
         Focus::Agents => "j/k agent · log follows · Tab → Live log",
         Focus::Log => "scroll · w wrap · g/G top/end · up unfollows live · Tab",
-        Focus::Activity => "run timeline · scroll · Tab → Command",
+        Focus::Activity => "run timeline · scroll · Tab → Terminal",
+        Focus::Terminal => "live agent pane · Tab → Command",
         Focus::Composer => "type /approve /reject /ship /help · Enter · Esc",
     }
 }
@@ -2904,6 +2979,91 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
     f.render_widget(p, rect);
 }
 
+/// Rows/cols available inside the terminal panel's border, falling back to a
+/// standard 80x24 when the panel hasn't been laid out yet.
+fn terminal_dims(rect: Rect) -> (u16, u16) {
+    let rows = rect.height.saturating_sub(2);
+    let cols = rect.width.saturating_sub(2);
+    (
+        if rows == 0 { 24 } else { rows },
+        if cols == 0 { 80 } else { cols },
+    )
+}
+
+/// Lifecycle for the embedded terminal: attach to the selected run's tmux pane on
+/// the spar socket when the Terminal panel is focused, drop a stale attachment,
+/// and pump live output into the vt100 buffer every frame.
+fn manage_terminal(app: &mut App, full: Option<&RunState>) {
+    // Nothing to do until the panel is opened; avoids forking `tmux has-session`
+    // every frame while the operator is on another tab.
+    if app.focus != Focus::Terminal && app.terminal_pane.is_none() {
+        return;
+    }
+    let session = full.and_then(|st| {
+        let name = st
+            .tmux_session
+            .clone()
+            .unwrap_or_else(|| tmux::session_name(&st.id));
+        (tmux::available() && tmux::has_session(&name)).then_some(name)
+    });
+
+    // Selection moved to a different (or no) session — release the old client.
+    if let Some(pane) = app.terminal_pane.as_ref() {
+        if pane.session() != session.as_deref() {
+            app.terminal_pane = None;
+        }
+    }
+
+    // Attach lazily, only while the panel is focused, to avoid spawning a control
+    // client for runs the operator never looks at.
+    if app.focus == Focus::Terminal && app.terminal_pane.is_none() {
+        if let Some(name) = &session {
+            let (rows, cols) = terminal_dims(app.rect_terminal);
+            let mut pane = crate::terminal::TerminalPane::new(rows, cols);
+            if pane.attach(name).is_ok() {
+                app.terminal_pane = Some(pane);
+            }
+        }
+    }
+
+    if let Some(pane) = app.terminal_pane.as_mut() {
+        pane.pump();
+    }
+}
+
+fn draw_terminal(f: &mut Frame, area: Rect, app: &mut App) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let focused = app.focus == Focus::Terminal;
+    let title = match app.terminal_pane.as_ref() {
+        Some(pane) => {
+            let (rows, cols) = pane.dims();
+            format!(" Terminal · live agent pane · {cols}x{rows} ")
+        }
+        None => " Terminal · no live tmux pane ".to_string(),
+    };
+    let block = panel(&title, focused);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let Some(pane) = app.terminal_pane.as_mut() else {
+        let hint = Paragraph::new(
+            "No live tmux session for the selected run.\n\nRuns spawned on the spar socket show their agent pane here — \
+             switch to a run with a live session, or spawn one, to attach.",
+        )
+        .style(Style::default().fg(FG_DIM))
+        .wrap(Wrap { trim: true });
+        f.render_widget(hint, inner);
+        return;
+    };
+
+    // Keep the vt100 buffer (and the tmux pane) matched to the visible area.
+    pane.resize(inner.height, inner.width);
+    let term = PseudoTerminal::new(pane.screen());
+    f.render_widget(term, inner);
+}
+
 fn panel(title: &str, focused: bool) -> Block<'_> {
     let border = if focused { BORDER_FOCUS } else { BORDER };
     let title_style = if focused {
@@ -2923,6 +3083,7 @@ fn handle_composer(
     runs: &[state::RunSummary],
     selected: usize,
     line: &str,
+    bg: Option<mpsc::Sender<Msg>>,
 ) -> Result<String> {
     let run_id = runs.get(selected).map(|r| r.id.as_str());
     let cmd = line.trim();
@@ -2955,10 +3116,174 @@ fn handle_composer(
                 crate::ship::confirm_ship(swarm, id, false)?;
                 Ok(format!("Ship confirmed {id}"))
             }
+            "spawn" => spawn_agent_command(runs, selected, arg, bg),
             other => Ok(format!("Unknown /{other} — try /help")),
         };
     }
+    if let Some(rest) = cmd.strip_prefix('@') {
+        return send_mention(swarm, run_id, rest);
+    }
     Ok(format!("Noted (chat later): {}", truncate(cmd, 48)))
+}
+
+/// Composer `@<agent> <message>` — send a directed bus chat from the human to a slot or
+/// bare agent, resolving the mention to its unique bus id via [`resolve_mention`].
+fn send_mention(swarm: &SparPaths, run_id: Option<&str>, rest: &str) -> Result<String> {
+    let mut it = rest.splitn(2, char::is_whitespace);
+    let target = it.next().unwrap_or("").trim();
+    let body = it.next().map(str::trim).unwrap_or("");
+    if target.is_empty() || body.is_empty() {
+        anyhow::bail!("usage: @<agent> <message>");
+    }
+    let to = resolve_mention(swarm, run_id, target)?;
+    // Tag the message with the target's run scope (a run slot, or a reserved sink for the
+    // selected run) so it shows in that run's bus view; delivery keys on the unique id,
+    // not the tag.
+    let tag = if crate::bus::is_reserved_sink(&to) {
+        run_id
+    } else {
+        run_id.filter(|r| to.starts_with(&format!("{r}:")))
+    };
+    crate::bus::chat(
+        swarm,
+        tag,
+        "human",
+        &to,
+        body,
+        crate::bus::MessageBudget::Normal,
+    )?;
+    Ok(format!("sent to {to}"))
+}
+
+/// Resolve a composer mention to a unique bus id. An already-qualified id (`run:slot`)
+/// or reserved sink (`broadcast`/`@human`) passes through. A short id resolves against
+/// the workspace roster: the selected run's slot (`run:slot`) and any bare agent of that
+/// id are candidates — exactly one resolves, several error (listing them), and none
+/// falls back to the selected run's slot (or the bare id as typed).
+fn resolve_mention(swarm: &SparPaths, run_id: Option<&str>, target: &str) -> Result<String> {
+    if crate::bus::is_reserved_sink(target) {
+        // Canonicalize a `human` alias to the HUMAN sink (`@human`) so it routes to the
+        // notifier and alert panel (which key on `@human`), not a literal `inbox/human`.
+        return Ok(if target == "human" {
+            crate::bus::HUMAN.to_string()
+        } else {
+            target.to_string()
+        });
+    }
+    if target.contains(':') {
+        return Ok(target.to_string());
+    }
+    let qualified = run_id.map(|r| crate::bus::agent_ref(Some(r), target));
+    let mut candidates: Vec<String> = crate::bus::list_presence(swarm, None)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| p.agent)
+        .filter(|a| Some(a.as_str()) == qualified.as_deref() || a == target)
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+    match candidates.len() {
+        1 => Ok(candidates.remove(0)),
+        0 => Ok(qualified.unwrap_or_else(|| target.to_string())),
+        _ => anyhow::bail!(
+            "ambiguous mention @{target}: candidates {}",
+            candidates.join(", ")
+        ),
+    }
+}
+
+/// How long to let a freshly launched CLI paint its input box before typing the
+/// prompt. Generous: a cold CLI start can take a few seconds, and delivering early
+/// drops the prompt into an unbooted TUI.
+const SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// `/spawn <cli:provider> <prompt>` — launch a fresh agent into a pane on the spar
+/// tmux socket, joined to the selected run's bus, and hand it the prompt. The whole
+/// spawn → prompt loop runs without leaving spar (Stage 11 / A4).
+///
+/// Two correctness guards live here:
+///  - The poke agent gets its **own worktree**, never the primary checkout: a
+///    FullAuto agent must not run in the primary tree, and presence hooks refuse to
+///    install there (`same_dir` guard), so cwd == project_root would leave the agent
+///    with no working/idle signal at all.
+///  - Spawn + delivery run on a **background thread** with a bounded readiness gate,
+///    so the render loop never blocks and the prompt is only typed once the CLI has
+///    painted its input box. The final flash reflects actual delivery, not a guess.
+fn spawn_agent_command(
+    runs: &[state::RunSummary],
+    selected: usize,
+    arg: Option<&str>,
+    bg: Option<mpsc::Sender<Msg>>,
+) -> Result<String> {
+    let run = runs
+        .get(selected)
+        .ok_or_else(|| anyhow::anyhow!("select a run first — /spawn joins its bus"))?;
+    let spec = arg.ok_or_else(|| anyhow::anyhow!("usage: /spawn <cli:provider> <prompt>"))?;
+    let mut parts = spec.splitn(2, char::is_whitespace);
+    let provider = parts.next().unwrap_or("").trim();
+    let prompt = parts.next().map(str::trim).unwrap_or("");
+    if provider.is_empty() || prompt.is_empty() {
+        anyhow::bail!("usage: /spawn <cli:provider> <prompt>");
+    }
+    let project_root = run
+        .project_root
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("run has no known project root"))?;
+    let uid = uuid::Uuid::new_v4().simple().to_string();
+    let agent_id = format!("poke-{}", &uid[..8]);
+
+    // Give the agent its own worktree (never the primary checkout) so presence hooks
+    // install and it can run FullAuto safely. Done on this thread so a git failure
+    // surfaces synchronously as a composer error rather than a silent background drop.
+    let record = crate::worktree::create_worktree(&project_root, &run.id, &agent_id)?;
+
+    let paths = SparPaths::new(&project_root);
+    let run_id = run.id.clone();
+    let provider_s = provider.to_string();
+    let prompt_s = prompt.to_string();
+    let cwd = record.path;
+    let label = format!("{agent_id} ({provider})");
+    let pending = format!("Spawning {label}… delivering prompt when the pane is ready");
+
+    let work = move || -> Result<String> {
+        let req = crate::workspace::SpawnRequest {
+            paths: &paths,
+            run: Some(&run_id),
+            agent_id: &agent_id,
+            provider: &provider_s,
+            cwd: &cwd,
+            project_root: &project_root,
+        };
+        let (session, window) = crate::workspace::spawn_agent(&req)?;
+        let ready = crate::workspace::wait_pane_ready(
+            &session,
+            &window,
+            SPAWN_READY_TIMEOUT,
+            Duration::from_millis(200),
+        )?;
+        crate::workspace::deliver_prompt(&session, &window, &prompt_s)?;
+        Ok(if ready {
+            format!("Spawned {label} — prompt delivered · Terminal tab to watch")
+        } else {
+            format!("Spawned {label} — pane slow to boot; prompt sent, confirm in Terminal")
+        })
+    };
+
+    // Real TUI path: hand the spawn+deliver to a background thread and flash the true
+    // outcome when it lands. No channel (defensive/tests) → run inline.
+    match bg {
+        Some(tx) => {
+            std::thread::spawn(move || {
+                let (msg, color) = match work() {
+                    Ok(m) => (m, GREEN),
+                    Err(e) => (format!("spawn failed: {e:#}"), RED),
+                };
+                let _ = tx.send(Msg::Flash(msg, color));
+            });
+            Ok(pending)
+        }
+        None => work(),
+    }
 }
 
 fn stream_content(
@@ -3053,7 +3378,7 @@ fn activity_feed(
         for m in alerts.iter().rev().take(6).rev() {
             lines.push(format!(
                 " {} {}",
-                short_agent(&m.from),
+                short_agent(short_in_run(&m.from, &st.id)),
                 truncate(&m.body, 30)
             ));
         }
@@ -3105,7 +3430,7 @@ fn activity_feed(
     }
 
     // Bus chat only if real agent chat exists
-    if let Ok(bus) = crate::bus::list_events(swarm, &st.id) {
+    if let Ok(bus) = crate::bus::list_events(swarm, Some(&st.id)) {
         let chat: Vec<_> = bus
             .iter()
             .filter(|m| {
@@ -3121,8 +3446,8 @@ fn activity_feed(
             for m in chat.iter().rev().take(8).rev() {
                 lines.push(format!(
                     " {}→{} {}",
-                    short_agent(&m.from),
-                    short_agent(&m.to),
+                    short_agent(short_in_run(&m.from, &st.id)),
+                    short_agent(short_in_run(&m.to, &st.id)),
                     truncate(&m.body, 28)
                 ));
             }
@@ -3151,6 +3476,14 @@ fn activity_feed(
 
 fn short_agent(s: &str) -> &str {
     s.rsplit(['-', '/']).next().unwrap_or(s)
+}
+
+/// Render a bus agent id inside run `run`'s view: drop a leading `run:` qualifier so a
+/// run slot shows as its short role id. Bare ids (no `run:` prefix) are left intact.
+fn short_in_run<'a>(id: &'a str, run: &str) -> &'a str {
+    id.strip_prefix(run)
+        .and_then(|rest| rest.strip_prefix(':'))
+        .unwrap_or(id)
 }
 
 fn activity_event_line(e: &events::Event) -> String {

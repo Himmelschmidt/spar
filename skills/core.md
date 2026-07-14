@@ -81,15 +81,27 @@ you just killed.
 
 ## Swarm bus
 
+The bus is **workspace-scoped and keyed by a globally-unique `agent_id`**. Run-slot role
+ids repeat across concurrent runs, so a run slot's bus id is run-qualified to `run:slot`;
+`$SPAR_AGENT_ID` already holds this unique id. `--run <id>` is an optional grouping tag for
+sends/views, and also lets `inbox`/`deliver` resolve a short role id to its unique id — so
+`spar bus inbox $SPAR_AGENT_ID --claim` (unique id, no `--run` needed) and
+`spar bus inbox <role> --claim --run $SPAR_RUN_ID` are equivalent. There is **no run-tag
+filter** on the drain: each unique id has its own inbox, so a slot never sees another
+run's messages, and a bare agent and a run slot can directed-message each other by id.
+
 ```bash
-spar bus send <run_id> -m "hello" [--from human] [--to broadcast|slot]
-spar bus log <run_id> [--json]
-spar bus presence <run_id>
-spar bus reserve <run_id> path/to/file --holder <slot>
-spar bus release <run_id> path/to/file --holder <slot>
+spar bus send -m "hello" [--from human] [--to broadcast|agent] [--run <id>]
+spar bus log [--run <id>] [--json]
+spar bus presence [--run <id>]
+spar bus inbox <agent> [--claim] [--run <id>] [--json]
+spar bus reserve path/to/file --holder <agent> [--run <id>]
+spar bus release path/to/file --holder <agent> [--run <id>]
 ```
 
-Layout: `.spar/runs/<id>/bus/{events.jsonl,agents.jsonl,inbox/,reserves.json,tasks/}`
+Layout: `.spar/bus/{events.jsonl,agents.jsonl,inbox/<agent>/,queue/,pending_ack/}`
+(workspace, agent-keyed). Per-run `tasks/` + `reserves.json` and a back-compat
+event/presence mirror live under `.spar/runs/<id>/bus/`.
 
 ## Observe
 

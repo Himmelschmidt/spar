@@ -44,7 +44,9 @@ pub struct TaskGraph {
 
 impl TaskGraph {
     pub fn path(paths: &SparPaths, run_id: &str) -> PathBuf {
-        bus::bus_root(paths, run_id)
+        // Tasks stay run-scoped (a plan DAG belongs to one run), so they live in the
+        // per-run bus dir rather than the workspace bus.
+        bus::run_bus_root(paths, run_id)
             .join("tasks")
             .join("graph.json")
     }
@@ -64,7 +66,7 @@ impl TaskGraph {
     }
 
     pub fn save(&self, paths: &SparPaths) -> Result<()> {
-        bus::ensure_bus(paths, &self.run_id)?;
+        bus::ensure_run_bus(paths, &self.run_id)?;
         let p = Self::path(paths, &self.run_id);
         fs::write(&p, serde_json::to_string_pretty(self)?)?;
         Ok(())
@@ -184,14 +186,14 @@ pub fn seed_from_plan(paths: &SparPaths, run_id: &str, plan_md: &str) -> Result<
     let g = TaskGraph::from_plan_outline(run_id, plan_md);
     g.save(paths)?;
     for t in &g.tasks {
-        let p = bus::bus_root(paths, run_id)
+        let p = bus::run_bus_root(paths, run_id)
             .join("tasks")
             .join(format!("task-{}.json", t.id));
         fs::write(&p, serde_json::to_string_pretty(t)?)?;
     }
     let _ = bus::broadcast(
         paths,
-        run_id,
+        Some(run_id),
         "orchestrator",
         format!("task graph seeded: {} tasks", g.tasks.len()),
         bus::MessageBudget::Normal,
@@ -211,7 +213,6 @@ pub fn claim(paths: &SparPaths, run_id: &str, task_id: &str, agent: &str) -> Res
     meta.insert("task_id".into(), task_id.into());
     bus::send(
         paths,
-        run_id,
         bus::BusMessage {
             id: uuid::Uuid::new_v4().simple().to_string()[..12].to_string(),
             ts: Utc::now(),
@@ -219,6 +220,7 @@ pub fn claim(paths: &SparPaths, run_id: &str, task_id: &str, agent: &str) -> Res
             to: "orchestrator".into(),
             kind: bus::MsgKind::TaskClaim,
             body: format!("claimed {task_id}"),
+            run: Some(run_id.into()),
             subject: Some(task_id.into()),
             refs: bus::MsgRefs {
                 task_id: Some(task_id.into()),

@@ -774,6 +774,7 @@ fn skills_and_bus_commands() {
         .args([
             "bus",
             "send",
+            "--run",
             run_id,
             "--from",
             "human",
@@ -787,7 +788,7 @@ fn skills_and_bus_commands() {
         .success();
     spar_cmd()
         .current_dir(tmp.path())
-        .args(["bus", "log", run_id])
+        .args(["bus", "log", "--run", run_id])
         .assert()
         .success()
         .stdout(predicate::str::contains("hello fleet"));

@@ -1,4 +1,4 @@
-//! `spar bus deliver <run> <agent>`: drain the inbox (exactly-once) and dispatch the
+//! `spar bus deliver <agent> --run <run>`: drain the inbox (exactly-once) and dispatch the
 //! claimed messages to the agent adapter's `DeliveryStrategy`.
 //!
 //! One scenario per landed strategy, all under `--dry-run` so the side-effecting
@@ -100,7 +100,7 @@ fn slot_for_provider(dir: &std::path::Path, run_id: &str, provider: &str) -> Str
 fn send(dir: &std::path::Path, run_id: &str, to: &str, body: &str) {
     spar_cmd()
         .current_dir(dir)
-        .args(["bus", "send", run_id, "--to", to, "-m", body])
+        .args(["bus", "send", "--run", run_id, "--to", to, "-m", body])
         .assert()
         .success();
 }
@@ -108,7 +108,7 @@ fn send(dir: &std::path::Path, run_id: &str, to: &str, body: &str) {
 fn deliver_json(dir: &std::path::Path, run_id: &str, agent: &str) -> Value {
     let out = spar_cmd()
         .current_dir(dir)
-        .args(["bus", "deliver", run_id, agent, "--json"])
+        .args(["bus", "deliver", agent, "--run", run_id, "--json"])
         .assert()
         .success()
         .get_output()
@@ -164,7 +164,7 @@ fn stop_hook_inject_hook_mode_emits_only_payload() {
 
     let out = spar_cmd()
         .current_dir(tmp.path())
-        .args(["bus", "deliver", &run_id, &agent])
+        .args(["bus", "deliver", &agent, "--run", &run_id])
         .assert()
         .success()
         .get_output()
@@ -204,6 +204,64 @@ fn native_queue_drains_once_and_dispatches() {
     assert_eq!(again["delivered"], 0);
 }
 
+/// Two concurrent runs in one project share a deterministic *role* id (same provider/role),
+/// but their unique bus ids differ (`run_a:role` vs `run_b:role`) so a collision is
+/// structurally impossible: each run's deliver drains its own inbox directory, and neither
+/// can reach the other's. `deliver`/`send` accept the short role id + `--run` and resolve
+/// the unique id internally.
+#[test]
+fn deliver_is_run_scoped_across_identical_slot_ids() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+
+    let run_a = plan_and_approve(tmp.path());
+    let run_b = plan_and_approve(tmp.path());
+    let agent_a = slot_for_provider(tmp.path(), &run_a, "cli:claude");
+    let agent_b = slot_for_provider(tmp.path(), &run_b, "cli:claude");
+    // Premise: the role id collides across the two runs (deterministic per provider/role).
+    assert_eq!(agent_a, agent_b, "role ids must collide for this scenario");
+    let agent = agent_a;
+
+    send(tmp.path(), &run_a, &agent, "message for run A");
+    send(tmp.path(), &run_b, &agent, "message for run B");
+
+    // The two runs resolve to distinct unique bus ids, so they land in distinct inbox dirs.
+    let inbox_root = tmp.path().join(".spar/bus/inbox");
+    let ia = inbox_root.join(format!("{run_a}:{agent}"));
+    let ib = inbox_root.join(format!("{run_b}:{agent}"));
+    assert_ne!(ia, ib, "unique ids must differ across runs");
+    assert!(ia.is_dir() && ib.is_dir(), "each run has its own inbox dir");
+
+    // Run B drains only its own run's traffic; run A's message is in a different inbox.
+    // (Planning emits run-tagged broadcasts to the slot, so `delivered` is >1 — the point
+    // is that run A's message is never among them.)
+    let db = deliver_json(tmp.path(), &run_b, &agent);
+    let reason_b = block_reason(&db);
+    assert!(reason_b.contains("message for run B"), "{reason_b}");
+    assert!(
+        !reason_b.contains("message for run A"),
+        "run B stole run A's message: {reason_b}"
+    );
+
+    // Run A's message survived B's drain and is still deliverable under run A.
+    let da = deliver_json(tmp.path(), &run_a, &agent);
+    let reason_a = block_reason(&da);
+    assert!(reason_a.contains("message for run A"), "{reason_a}");
+    assert!(
+        !reason_a.contains("message for run B"),
+        "run A drained run B's message: {reason_a}"
+    );
+}
+
+/// Extract the Stop-hook block `reason` string from a `deliver --json` report.
+fn block_reason(deliver: &Value) -> String {
+    deliver["payload"]
+        .as_str()
+        .and_then(|p| serde_json::from_str::<Value>(p).ok())
+        .map(|v| v["reason"].as_str().unwrap_or_default().to_string())
+        .unwrap_or_default()
+}
+
 /// agy: no injection channel, so deliver must NOT consume the inbox — the agent reads
 /// it itself on its next turn. `--claim` afterwards still returns the message.
 #[test]
@@ -221,10 +279,13 @@ fn none_leaves_inbox_for_agent_to_claim() {
     assert_eq!(d["delivered"], 0);
     assert!(d["pending"].as_u64().unwrap() >= 1, "{d}");
 
-    // The agent's own claim still finds the message (deliver did not strand it).
+    // The agent's own claim still finds the message (deliver did not strand it). The
+    // slot scopes the claim to its run (`--run`), matching how a run slot self-drains.
     let claimed = spar_cmd()
         .current_dir(tmp.path())
-        .args(["bus", "inbox", &run_id, &agent, "--claim", "--json"])
+        .args([
+            "bus", "inbox", &agent, "--claim", "--run", &run_id, "--json",
+        ])
         .assert()
         .success()
         .get_output()
