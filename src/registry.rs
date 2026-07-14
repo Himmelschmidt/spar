@@ -71,28 +71,8 @@ pub fn registry_path() -> PathBuf {
     spar_home().join("registry.json")
 }
 
-/// One-time copy from the short-lived XDG path if `~/.spar/registry.json` is missing.
-fn maybe_migrate_from_xdg() {
-    let dest = registry_path();
-    if dest.is_file() {
-        return;
-    }
-    let Some(data) = dirs::data_local_dir() else {
-        return;
-    };
-    let legacy = data.join("spar").join("registry.json");
-    if !legacy.is_file() {
-        return;
-    }
-    if let Some(parent) = dest.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::copy(&legacy, &dest);
-}
-
 impl Registry {
     pub fn load() -> Result<Self> {
-        maybe_migrate_from_xdg();
         let path = registry_path();
         if !path.is_file() {
             return Ok(Self::default());
