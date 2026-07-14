@@ -1,5 +1,7 @@
 use anyhow::{bail, Context, Result};
 use crossterm::event::{KeyCode, KeyModifiers};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -33,6 +35,53 @@ pub fn has_session(name: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Deterministic per-project session name for the embedded workspace shell.
+///
+/// Hashing the canonicalized root keeps the name stable across TUI runs —
+/// `DefaultHasher::new()` is seeded to a fixed constant (unlike `HashMap`'s
+/// randomized `RandomState`), so the same root always yields the same name while
+/// distinct roots map to distinct names.
+pub fn workspace_shell_session(project_root: &Path) -> String {
+    let canon = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let mut hasher = DefaultHasher::new();
+    canon.hash(&mut hasher);
+    format!("spar-shell-{:x}", hasher.finish())
+}
+
+/// Ensure the project's workspace shell exists (idempotent), returning its session
+/// name. The default window runs the user's `$SHELL` rooted at `project_root`.
+///
+/// This session is intentionally persistent: it is detached and OUTLIVES the TUI,
+/// so a dev server (`vite`, `cargo run`, …) started in it keeps running across TUI
+/// restarts and disconnects. It is never killed on exit.
+pub fn ensure_workspace_shell(project_root: &Path) -> Result<String> {
+    let name = workspace_shell_session(project_root);
+    new_session(&name, project_root)?;
+    Ok(name)
+}
+
+/// All session names on the spar socket, one per line. Empty when no server is
+/// running or the query fails.
+pub fn list_sessions() -> Vec<String> {
+    let out = tmux()
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => parse_session_list(&String::from_utf8_lossy(&o.stdout)),
+        _ => Vec::new(),
+    }
+}
+
+/// Parse `list-sessions` stdout into trimmed, non-empty names. Pure, for testing.
+fn parse_session_list(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Create a detached session with a shell in `cwd`.
@@ -524,6 +573,30 @@ impl Drop for ControlClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_shell_name_is_deterministic_and_root_specific() {
+        let a1 = workspace_shell_session(Path::new("/tmp/does-not-exist/proj-a"));
+        let a2 = workspace_shell_session(Path::new("/tmp/does-not-exist/proj-a"));
+        let b = workspace_shell_session(Path::new("/tmp/does-not-exist/proj-b"));
+        assert_eq!(a1, a2, "same root must yield the same name");
+        assert_ne!(a1, b, "distinct roots must yield distinct names");
+        assert!(a1.starts_with("spar-shell-"));
+    }
+
+    #[test]
+    fn parse_session_list_trims_and_drops_blanks() {
+        assert_eq!(
+            parse_session_list("spar-shell-1\n  spar-abc  \n\nspar-def\n"),
+            vec![
+                "spar-shell-1".to_string(),
+                "spar-abc".to_string(),
+                "spar-def".to_string(),
+            ]
+        );
+        assert!(parse_session_list("").is_empty());
+        assert!(parse_session_list("\n  \n").is_empty());
+    }
 
     #[test]
     fn unescapes_octal_bytes() {

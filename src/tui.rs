@@ -224,9 +224,13 @@ struct App {
     /// Count of unresolved `@human`/`Blocked` bus alerts for the selected run; drives
     /// the header badge. Refreshed from the snapshot each frame.
     human_alerts_n: usize,
-    /// Embedded terminal (W3): a live vt100 view of the selected run's tmux pane.
-    /// Lazily attached when the Terminal focus is opened over a live session.
+    /// Embedded terminal (W3/W7): a live vt100 view of a tmux pane on the spar
+    /// socket. Lazily attached when the Terminal focus is opened.
     terminal_pane: Option<crate::terminal::TerminalPane>,
+    /// Which session the Terminal panel shows. `None` = the project's persistent
+    /// workspace shell (the default); `Some(name)` = an agent session cycled to via
+    /// Ctrl+PgUp/PgDn.
+    terminal_target: Option<String>,
     /// Sender for background tasks (e.g. deferred `/spawn`) to flash a result back
     /// onto the render loop. Set once the message channel exists.
     bg_tx: Option<mpsc::Sender<Msg>>,
@@ -336,6 +340,7 @@ impl App {
             gate_buttons: Vec::new(),
             rect_help: Rect::default(),
             rect_projects: Rect::default(),
+            terminal_target: None,
             reconcile_spawn: None,
             human_alerts_n: 0,
             terminal_pane: None,
@@ -477,6 +482,38 @@ impl App {
             pane.send_key(code, mods);
         }
     }
+
+    /// Cycle the Terminal panel to the next/previous pane (`delta` -1/+1, wrapping).
+    /// The ordered ring is the workspace shell first, then every other live session
+    /// on the spar socket (agent sessions `spar-<run_id>`), so all panes are
+    /// reachable. Dropping the pane forces a rebind on the next `manage_terminal`.
+    fn cycle_terminal_target(&mut self, delta: i32, project_root: &Path) {
+        let shell = tmux::workspace_shell_session(project_root);
+        let mut targets = vec![shell.clone()];
+        for s in tmux::list_sessions() {
+            if s != shell {
+                targets.push(s);
+            }
+        }
+        let current = self
+            .terminal_target
+            .clone()
+            .unwrap_or_else(|| shell.clone());
+        let cur_idx = targets.iter().position(|s| *s == current).unwrap_or(0);
+        let next = &targets[cycle_index(targets.len(), cur_idx, delta)];
+        self.terminal_target = (*next != shell).then(|| next.clone());
+        self.terminal_pane = None;
+    }
+}
+
+/// Wrapping index move within `[0, len)`. Returns 0 for an empty ring.
+fn cycle_index(len: usize, current: usize, delta: i32) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let len_i = len as i32;
+    let cur = (current as i32).rem_euclid(len_i);
+    (cur + delta).rem_euclid(len_i) as usize
 }
 
 /// Apply a scroll delta and update follow-tail. Positive = toward newer lines.
@@ -769,7 +806,7 @@ fn run_loop(
         });
         fleet_state.select((n_slots > 0).then_some(app.selected_slot));
 
-        manage_terminal(&mut app, snap.full.as_ref());
+        manage_terminal(&mut app, &active_root);
         app.animated = animating(&app, &snap);
         app.human_alerts_n = snap.human_alerts;
 
@@ -935,17 +972,35 @@ fn handle_key(
         return Ok(false);
     }
 
-    // Terminal panel focused: keystrokes drive the live agent pane, not TUI nav.
-    // Tab / BackTab stay the focus-cycle escape hatch so the operator is never
-    // trapped; everything else (printable text, Enter, Ctrl-combos, arrows, Esc,
-    // Backspace, …) is forwarded to the pane and consumed here.
+    // Terminal panel focused: keystrokes drive the live pane, not TUI nav. Tab /
+    // BackTab stay the focus-cycle escape hatch; Ctrl+PgUp/PgDn switch which pane is
+    // shown. Everything else is forwarded to the pane ONLY when one is attached —
+    // with no pane we deliberately fall through to the normal handler so an
+    // unattachable Terminal panel can never trap the operator.
     if app.focus == Focus::Terminal {
         match code {
-            KeyCode::Tab => app.focus = app.focus.next(),
-            KeyCode::BackTab => app.focus = app.focus.prev(),
-            _ => app.forward_key_to_terminal(code, mods),
+            KeyCode::Tab => {
+                app.focus = app.focus.next();
+                return Ok(false);
+            }
+            KeyCode::BackTab => {
+                app.focus = app.focus.prev();
+                return Ok(false);
+            }
+            KeyCode::PageUp if mods.contains(KeyModifiers::CONTROL) => {
+                app.cycle_terminal_target(-1, active_root.as_path());
+                return Ok(false);
+            }
+            KeyCode::PageDown if mods.contains(KeyModifiers::CONTROL) => {
+                app.cycle_terminal_target(1, active_root.as_path());
+                return Ok(false);
+            }
+            _ if app.terminal_pane.is_some() => {
+                app.forward_key_to_terminal(code, mods);
+                return Ok(false);
+            }
+            _ => {}
         }
-        return Ok(false);
     }
 
     if app.focus == Focus::Composer {
@@ -1607,7 +1662,7 @@ fn draw(
             Focus::Agents => draw_agents(f, lay.fleet, full, app, fleet_state),
             Focus::Log | Focus::Composer => draw_stream(f, lay.stream, full, stream_text, app),
             Focus::Activity => draw_activity(f, lay.bus, activity, app),
-            Focus::Terminal => draw_terminal(f, lay.terminal, app),
+            Focus::Terminal => draw_terminal(f, lay.terminal, app, swarm.project_root.as_path()),
         }
     } else {
         draw_header(f, lay.header, swarm, full, app);
@@ -1615,7 +1670,7 @@ fn draw(
         draw_rail(f, lay.runs, projects, runs, app, rail_state);
         draw_agents(f, lay.fleet, full, app, fleet_state);
         if app.focus == Focus::Terminal {
-            draw_terminal(f, lay.terminal, app);
+            draw_terminal(f, lay.terminal, app, swarm.project_root.as_path());
         } else {
             draw_stream(f, lay.stream, full, stream_text, app);
         }
@@ -2921,7 +2976,7 @@ fn situational_footer(full: Option<&RunState>, focus: Focus, browse: BrowseLevel
         Focus::Agents => "j/k agent · log follows · Tab → Live log",
         Focus::Log => "scroll · w wrap · g/G top/end · up unfollows live · Tab",
         Focus::Activity => "run timeline · scroll · Tab → Terminal",
-        Focus::Terminal => "live agent pane · Tab → Command",
+        Focus::Terminal => "workspace shell · Ctrl+PgUp/PgDn switch pane · Tab → Command",
         Focus::Composer => "type /approve /reject /ship /help · Enter · Esc",
     }
 }
@@ -2990,39 +3045,51 @@ fn terminal_dims(rect: Rect) -> (u16, u16) {
     )
 }
 
-/// Lifecycle for the embedded terminal: attach to the selected run's tmux pane on
-/// the spar socket when the Terminal panel is focused, drop a stale attachment,
-/// and pump live output into the vt100 buffer every frame.
-fn manage_terminal(app: &mut App, full: Option<&RunState>) {
-    // Nothing to do until the panel is opened; avoids forking `tmux has-session`
-    // every frame while the operator is on another tab.
+/// Lifecycle for the embedded terminal (W7): resolve the desired session on the
+/// spar socket, drop a stale attachment, attach lazily while focused, and pump live
+/// output into the vt100 buffer every frame. The panel is project-scoped, not
+/// run-scoped: by default it shows the project's persistent workspace shell.
+fn manage_terminal(app: &mut App, project_root: &Path) {
+    // Nothing to do until the panel is opened; avoids forking tmux every frame
+    // while the operator is on another tab.
     if app.focus != Focus::Terminal && app.terminal_pane.is_none() {
         return;
     }
-    let session = full.and_then(|st| {
-        let name = st
-            .tmux_session
-            .clone()
-            .unwrap_or_else(|| tmux::session_name(&st.id));
-        (tmux::available() && tmux::has_session(&name)).then_some(name)
-    });
+    if !tmux::available() {
+        app.terminal_pane = None;
+        return;
+    }
 
-    // Selection moved to a different (or no) session — release the old client.
+    // An explicit target if it still exists, else the project's workspace shell
+    // (created on demand). The shell is detached and deliberately OUTLIVES the TUI,
+    // so a dev server started in it survives restarts.
+    let desired = match app.terminal_target.as_deref() {
+        Some(s) if tmux::has_session(s) => s.to_string(),
+        _ => {
+            app.terminal_target = None;
+            match tmux::ensure_workspace_shell(project_root) {
+                Ok(name) => name,
+                Err(_) => {
+                    app.terminal_pane = None;
+                    return;
+                }
+            }
+        }
+    };
+
+    // Bound to a different session — release the old client so we rebind below.
     if let Some(pane) = app.terminal_pane.as_ref() {
-        if pane.session() != session.as_deref() {
+        if pane.session() != Some(desired.as_str()) {
             app.terminal_pane = None;
         }
     }
 
-    // Attach lazily, only while the panel is focused, to avoid spawning a control
-    // client for runs the operator never looks at.
+    // Attach lazily, only while the panel is focused.
     if app.focus == Focus::Terminal && app.terminal_pane.is_none() {
-        if let Some(name) = &session {
-            let (rows, cols) = terminal_dims(app.rect_terminal);
-            let mut pane = crate::terminal::TerminalPane::new(rows, cols);
-            if pane.attach(name).is_ok() {
-                app.terminal_pane = Some(pane);
-            }
+        let (rows, cols) = terminal_dims(app.rect_terminal);
+        let mut pane = crate::terminal::TerminalPane::new(rows, cols);
+        if pane.attach(&desired).is_ok() {
+            app.terminal_pane = Some(pane);
         }
     }
 
@@ -3031,17 +3098,27 @@ fn manage_terminal(app: &mut App, full: Option<&RunState>) {
     }
 }
 
-fn draw_terminal(f: &mut Frame, area: Rect, app: &mut App) {
+fn draw_terminal(f: &mut Frame, area: Rect, app: &mut App, project_root: &Path) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let focused = app.focus == Focus::Terminal;
-    let title = match app.terminal_pane.as_ref() {
-        Some(pane) => {
-            let (rows, cols) = pane.dims();
-            format!(" Terminal · live agent pane · {cols}x{rows} ")
-        }
-        None => " Terminal · no live tmux pane ".to_string(),
+    // `terminal_target == None` means the project's workspace shell; otherwise an
+    // agent session cycled to via Ctrl+PgUp/PgDn.
+    let title = if app.terminal_target.is_none() {
+        let base = project_root
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("project");
+        format!(" Terminal · shell · {base} ")
+    } else {
+        let session = app
+            .terminal_pane
+            .as_ref()
+            .and_then(|p| p.session())
+            .or(app.terminal_target.as_deref())
+            .unwrap_or("?");
+        format!(" Terminal · agent · {session} ")
     };
     let block = panel(&title, focused);
     let inner = block.inner(area);
@@ -3049,8 +3126,9 @@ fn draw_terminal(f: &mut Frame, area: Rect, app: &mut App) {
 
     let Some(pane) = app.terminal_pane.as_mut() else {
         let hint = Paragraph::new(
-            "No live tmux session for the selected run.\n\nRuns spawned on the spar socket show their agent pane here — \
-             switch to a run with a live session, or spawn one, to attach.",
+            "Focus this panel to open a live workspace shell for the project — run a dev server, \
+             cargo, poke around; it stays alive across TUI restarts.\n\n\
+             Ctrl+PgUp/PgDn switch pane · Tab/Esc leave.",
         )
         .style(Style::default().fg(FG_DIM))
         .wrap(Wrap { trim: true });
@@ -3058,10 +3136,27 @@ fn draw_terminal(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     };
 
+    // Reserve a one-line in-panel hint footer when there's room for it.
+    let footer_h: u16 = if inner.height >= 3 { 1 } else { 0 };
+    let term_area = Rect {
+        height: inner.height - footer_h,
+        ..inner
+    };
     // Keep the vt100 buffer (and the tmux pane) matched to the visible area.
-    pane.resize(inner.height, inner.width);
+    pane.resize(term_area.height, term_area.width);
     let term = PseudoTerminal::new(pane.screen());
-    f.render_widget(term, inner);
+    f.render_widget(term, term_area);
+
+    if footer_h == 1 {
+        let footer = Rect {
+            y: inner.y + inner.height - 1,
+            height: 1,
+            ..inner
+        };
+        let hint = Paragraph::new("Ctrl+PgUp/PgDn: switch pane · Tab: leave")
+            .style(Style::default().fg(FG_DIM));
+        f.render_widget(hint, footer);
+    }
 }
 
 fn panel(title: &str, focused: bool) -> Block<'_> {
@@ -3632,6 +3727,38 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let t: String = s.chars().take(max.saturating_sub(1)).collect();
         format!("{t}…")
+    }
+}
+
+#[cfg(test)]
+mod terminal_cycle {
+    use super::cycle_index;
+
+    #[test]
+    fn wraps_forward_and_backward() {
+        assert_eq!(cycle_index(3, 2, 1), 0, "past the end wraps to the start");
+        assert_eq!(
+            cycle_index(3, 0, -1),
+            2,
+            "before the start wraps to the end"
+        );
+        assert_eq!(cycle_index(3, 1, 1), 2);
+    }
+
+    #[test]
+    fn single_element_stays_put() {
+        assert_eq!(cycle_index(1, 0, 1), 0);
+        assert_eq!(cycle_index(1, 0, -1), 0);
+    }
+
+    #[test]
+    fn zero_delta_is_a_no_op() {
+        assert_eq!(cycle_index(4, 2, 0), 2);
+    }
+
+    #[test]
+    fn empty_ring_is_zero() {
+        assert_eq!(cycle_index(0, 0, 1), 0);
     }
 }
 
