@@ -23,6 +23,7 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 crossterm = "0.28"
 dirs = "6"
+portable-pty = "0.9"
 ratatui = "0.29"
 rustix = { version = "1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }

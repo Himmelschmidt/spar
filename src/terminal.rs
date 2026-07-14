@@ -1,31 +1,56 @@
-//! Embedded terminal widget (W3).
+//! Embedded terminal widget (W3/W8).
 //!
-//! A [`TerminalPane`] owns a [`vt100::Parser`] fed by the control-mode `%output`
-//! bytes of one tmux pane (Stage 8). The parsed screen buffer renders through
-//! tui-term's `PseudoTerminal`, so the TUI can show a live agent pane without
-//! polling `capture-pane`. The parser and rendering are pure and unit-tested; the
-//! live attach path drives them from a [`ControlClient`].
+//! A [`TerminalPane`] owns a [`vt100::Parser`] fed by the raw output bytes of a
+//! real `tmux -L spar attach` client running in a pseudo-terminal (PTY). The parsed
+//! screen renders through tui-term's `PseudoTerminal`, and raw input (keys, mouse,
+//! paste) is forwarded straight into the PTY, so the panel is a genuine tmux client:
+//! the prefix key, copy-mode/scroll, splits, search and session switch are all real
+//! because it IS tmux. The parser, rendering, and the input [`encode_key`] /
+//! [`encode_mouse`] encoders are pure and unit-tested; the live path drives them
+//! from the PTY.
 
-use crate::tmux::{ControlClient, ControlEvent};
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyModifiers};
+use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use std::io::{Read, Write};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::Mutex;
+use std::thread;
 
 /// Lines of scrollback the parser retains behind the visible screen.
 const SCROLLBACK: usize = 1000;
 
-/// A vt100 screen buffer fed from a tmux pane's control-mode output, plus the
-/// optional live control client that feeds it.
+/// A live `tmux attach` client hosted in a PTY: the master side (for resize/IO),
+/// the client child (killed on drop), a writer for raw input, and a channel of
+/// output bytes drained by [`TerminalPane::pump`].
+struct Pty {
+    master: Box<dyn MasterPty + Send>,
+    child: Box<dyn Child + Send + Sync>,
+    writer: Mutex<Box<dyn Write + Send>>,
+    rx: Receiver<Vec<u8>>,
+}
+
+impl Drop for Pty {
+    fn drop(&mut self) {
+        // Kill only our tmux CLIENT (this PTY's `attach` child). The tmux SESSION is
+        // persistent and deliberately outlives the TUI, so we never kill it here —
+        // dropping the client just detaches; the session (and any dev server in it)
+        // keeps running.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A vt100 screen buffer fed from a real tmux client's PTY output, plus the live
+/// PTY that produces it. Absent-PTY is the pure (test/offline) path.
 pub struct TerminalPane {
     parser: vt100::Parser,
     rows: u16,
     cols: u16,
-    /// The tmux pane id (`%N`) we render. Bound to the first pane we see output
-    /// from, so a single-pane session "just works" without prior discovery.
-    pane_id: Option<String>,
-    /// Live control client, if attached. Absent for the pure (test/offline) path.
-    client: Option<ControlClient>,
-    /// Session this pane is bound to, for match/rebind decisions by the caller.
+    /// Session this pane is attached to, for match/rebind decisions by the caller.
     session: Option<String>,
+    /// Live PTY client, if attached.
+    pty: Option<Pty>,
 }
 
 impl TerminalPane {
@@ -36,24 +61,55 @@ impl TerminalPane {
             parser: vt100::Parser::new(rows, cols, SCROLLBACK),
             rows,
             cols,
-            pane_id: None,
-            client: None,
             session: None,
+            pty: None,
         }
     }
 
-    /// Attach a control client to a session on the spar socket and set its client
-    /// size so tmux sizes the pane to match this widget. Idempotent for the same
-    /// session; re-binds the tracked pane on (re)attach.
+    /// Attach a real tmux client to `session` on the spar socket inside a PTY sized
+    /// to this widget. Idempotent for the same session.
     pub fn attach(&mut self, session: &str) -> Result<()> {
-        if self.session.as_deref() == Some(session) && self.client.is_some() {
+        if self.session.as_deref() == Some(session) && self.pty.is_some() {
             return Ok(());
         }
-        let mut client = ControlClient::attach(session)?;
-        let _ = client.send_command(&format!("refresh-client -C {}x{}", self.cols, self.rows));
-        self.client = Some(client);
+        let pair = native_pty_system().openpty(PtySize {
+            rows: self.rows,
+            cols: self.cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        let mut cmd = CommandBuilder::new("tmux");
+        cmd.args(["-L", "spar", "attach", "-t", session]);
+        let child = pair.slave.spawn_command(cmd)?;
+        // The child owns the slave; drop our handle so the reader sees EOF when the
+        // client exits.
+        drop(pair.slave);
+
+        let mut reader = pair.master.try_clone_reader()?;
+        let writer = pair.master.take_writer()?;
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        self.pty = Some(Pty {
+            master: pair.master,
+            child,
+            writer: Mutex::new(writer),
+            rx,
+        });
         self.session = Some(session.to_string());
-        self.pane_id = None;
         Ok(())
     }
 
@@ -62,51 +118,40 @@ impl TerminalPane {
         self.session.as_deref()
     }
 
-    /// The `tmux send-keys` target for this pane: the bound pane id (`%N`) once we
-    /// have seen output, else the session (whose active pane is the single agent
-    /// pane). `None` before any binding exists.
-    fn key_target(&self) -> Option<&str> {
-        self.pane_id.as_deref().or(self.session.as_deref())
+    /// Whether the tmux `attach` client child is still running. A `Ctrl+b d`
+    /// detach or the session ending makes the child exit, so this flips to `false`
+    /// and lets the caller hand focus back to spar. With no PTY attached there is no
+    /// client to be dead, so this reports alive.
+    pub fn is_alive(&mut self) -> bool {
+        let Some(pty) = self.pty.as_mut() else {
+            return true;
+        };
+        matches!(pty.child.try_wait(), Ok(None))
     }
 
-    /// Forward one crossterm key event to the live pane via `tmux -L spar send-keys`.
-    /// Returns `false` (a no-op) when the key isn't forwardable or nothing is
-    /// attached yet — the caller still consumes it so it never leaks into TUI nav.
-    pub fn send_key(&self, code: KeyCode, mods: KeyModifiers) -> bool {
-        let Some(target) = self.key_target() else {
-            return false;
-        };
-        let Some(key) = crate::tmux::map_key(code, mods) else {
-            return false;
-        };
-        crate::tmux::send_key(target, &key).is_ok()
-    }
-
-    /// Drain all pending control events, feeding matching pane output into the
-    /// parser. Cheap to call every frame; keeps the event channel from backing up.
+    /// Drain the PTY's output channel into the parser. Cheap to call every frame.
     pub fn pump(&mut self) {
-        let mut drained = Vec::new();
-        if let Some(client) = self.client.as_ref() {
-            while let Ok(ev) = client.events().try_recv() {
-                drained.push(ev);
+        let mut chunks = Vec::new();
+        if let Some(pty) = self.pty.as_ref() {
+            while let Ok(bytes) = pty.rx.try_recv() {
+                chunks.push(bytes);
             }
         }
-        for ev in drained {
-            self.apply(&ev);
+        for bytes in chunks {
+            self.parser.process(&bytes);
         }
     }
 
-    /// Apply one control event: `%output` for the tracked pane advances the parser;
-    /// everything else is ignored here (lifecycle is the caller's concern).
-    pub fn apply(&mut self, ev: &ControlEvent) {
-        if let ControlEvent::PaneOutput { pane_id, bytes } = ev {
-            if self.pane_id.is_none() {
-                self.pane_id = Some(pane_id.clone());
-            }
-            if self.pane_id.as_deref() == Some(pane_id.as_str()) {
-                self.parser.process(bytes);
-            }
-        }
+    /// Write raw bytes to the PTY (keys, mouse, paste). Returns whether the write
+    /// succeeded; a no-op returning `false` when nothing is attached.
+    pub fn write_input(&self, bytes: &[u8]) -> bool {
+        let Some(pty) = self.pty.as_ref() else {
+            return false;
+        };
+        let Ok(mut w) = pty.writer.lock() else {
+            return false;
+        };
+        w.write_all(bytes).and_then(|()| w.flush()).is_ok()
     }
 
     /// Feed raw bytes straight into the parser (pure path; also used by tests).
@@ -115,8 +160,8 @@ impl TerminalPane {
         self.parser.process(bytes);
     }
 
-    /// Resize the screen buffer and, if attached, tell tmux to resize the pane on
-    /// the spar socket so its output matches the widget. No-op when unchanged.
+    /// Resize the screen buffer and, if attached, resize the PTY so tmux reflows the
+    /// client to match the widget. No-op when unchanged.
     pub fn resize(&mut self, rows: u16, cols: u16) {
         let rows = rows.max(1);
         let cols = cols.max(1);
@@ -126,8 +171,13 @@ impl TerminalPane {
         self.rows = rows;
         self.cols = cols;
         self.parser.set_size(rows, cols);
-        if let Some(client) = self.client.as_mut() {
-            let _ = client.send_command(&format!("refresh-client -C {cols}x{rows}"));
+        if let Some(pty) = self.pty.as_ref() {
+            let _ = pty.master.resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
         }
     }
 
@@ -140,6 +190,109 @@ impl TerminalPane {
     pub fn screen(&self) -> &vt100::Screen {
         self.parser.screen()
     }
+}
+
+/// Encode one crossterm key event into the terminal byte sequence to forward into
+/// the PTY, or `None` for keys we don't model. Pure; exhaustively unit-tested.
+pub fn encode_key(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
+    let ctrl = mods.contains(KeyModifiers::CONTROL);
+    let alt = mods.contains(KeyModifiers::ALT);
+    match code {
+        KeyCode::Char(c) => {
+            let mut out = Vec::new();
+            // ALT sends ESC then the key.
+            if alt {
+                out.push(0x1b);
+            }
+            if ctrl {
+                // Control byte: fold to uppercase, mask the low 5 bits. Covers
+                // @(0x00) A-Z(0x01..0x1a) [(0x1b) \(0x1c) ](0x1d) ^(0x1e) _(0x1f);
+                // Space and @ both fold to 0x00.
+                out.push((c.to_ascii_uppercase() as u8) & 0x1f);
+            } else {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+            Some(out)
+        }
+        KeyCode::Enter => Some(vec![0x0d]),
+        KeyCode::Tab => Some(vec![0x09]),
+        KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
+        KeyCode::Backspace => Some(vec![0x7f]),
+        KeyCode::Esc => Some(vec![0x1b]),
+        KeyCode::Up => Some(b"\x1b[A".to_vec()),
+        KeyCode::Down => Some(b"\x1b[B".to_vec()),
+        KeyCode::Right => Some(b"\x1b[C".to_vec()),
+        KeyCode::Left => Some(b"\x1b[D".to_vec()),
+        KeyCode::Home => Some(b"\x1b[H".to_vec()),
+        KeyCode::End => Some(b"\x1b[F".to_vec()),
+        KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
+        KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
+        KeyCode::Insert => Some(b"\x1b[2~".to_vec()),
+        KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
+        KeyCode::F(n) => encode_function_key(n),
+        _ => None,
+    }
+}
+
+/// Encode a function key `F(n)` into its terminal sequence, or `None` past F12.
+fn encode_function_key(n: u8) -> Option<Vec<u8>> {
+    let seq: &[u8] = match n {
+        1 => b"\x1bOP",
+        2 => b"\x1bOQ",
+        3 => b"\x1bOR",
+        4 => b"\x1bOS",
+        5 => b"\x1b[15~",
+        6 => b"\x1b[17~",
+        7 => b"\x1b[18~",
+        8 => b"\x1b[19~",
+        9 => b"\x1b[20~",
+        10 => b"\x1b[21~",
+        11 => b"\x1b[23~",
+        12 => b"\x1b[24~",
+        _ => return None,
+    };
+    Some(seq.to_vec())
+}
+
+/// Encode a mouse event as an SGR mouse sequence `\x1b[<{cb};{x};{y}{M|m}` for the
+/// PTY. `col`/`row` are pane-relative and 0-based (the caller translates); the
+/// emitted coords are 1-based. `None` for kinds we don't model. Pure; unit-tested.
+pub fn encode_mouse(
+    kind: MouseEventKind,
+    col: u16,
+    row: u16,
+    mods: KeyModifiers,
+) -> Option<Vec<u8>> {
+    let mut cb: u16 = match kind {
+        MouseEventKind::ScrollUp => 64,
+        MouseEventKind::ScrollDown => 65,
+        MouseEventKind::Down(MouseButton::Left) => 0,
+        MouseEventKind::Down(MouseButton::Middle) => 1,
+        MouseEventKind::Down(MouseButton::Right) => 2,
+        MouseEventKind::Up(_) => 0,
+        // Left-drag: button 0 plus the 32 motion bit.
+        MouseEventKind::Drag(MouseButton::Left) => 32,
+        _ => return None,
+    };
+    if mods.contains(KeyModifiers::SHIFT) {
+        cb += 4;
+    }
+    if mods.contains(KeyModifiers::ALT) {
+        cb += 8;
+    }
+    if mods.contains(KeyModifiers::CONTROL) {
+        cb += 16;
+    }
+    let x = col + 1;
+    let y = row + 1;
+    // A button release is reported with a trailing `m`; everything else with `M`.
+    let terminator = if matches!(kind, MouseEventKind::Up(_)) {
+        'm'
+    } else {
+        'M'
+    };
+    Some(format!("\x1b[<{cb};{x};{y}{terminator}").into_bytes())
 }
 
 #[cfg(test)]
@@ -185,34 +338,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_binds_first_pane_and_feeds_it() {
-        let mut pane = TerminalPane::new(3, 10);
-        pane.apply(&ControlEvent::PaneOutput {
-            pane_id: "%7".to_string(),
-            bytes: b"hi".to_vec(),
-        });
-        // A second, different pane's output is ignored once bound to %7.
-        pane.apply(&ControlEvent::PaneOutput {
-            pane_id: "%8".to_string(),
-            bytes: b"XX".to_vec(),
-        });
-        pane.apply(&ControlEvent::PaneOutput {
-            pane_id: "%7".to_string(),
-            bytes: b"!".to_vec(),
-        });
-        assert_eq!(pane.screen().contents(), "hi!");
-    }
-
-    #[test]
-    fn non_output_events_are_ignored() {
-        let mut pane = TerminalPane::new(3, 10);
-        pane.apply(&ControlEvent::WindowClose {
-            window_id: "@1".to_string(),
-        });
-        assert_eq!(pane.screen().contents(), "");
-    }
-
-    #[test]
     fn resize_updates_screen_dimensions() {
         let mut pane = TerminalPane::new(4, 20);
         assert_eq!(pane.screen().size(), (4, 20));
@@ -226,5 +351,264 @@ mod tests {
         let mut pane = TerminalPane::new(4, 20);
         pane.resize(0, 0);
         assert_eq!(pane.dims(), (1, 1));
+    }
+
+    // ── encode_key ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn plain_char_is_its_utf8() {
+        assert_eq!(
+            encode_key(KeyCode::Char('a'), KeyModifiers::NONE),
+            Some(vec![b'a'])
+        );
+        // Multibyte passes through verbatim.
+        assert_eq!(
+            encode_key(KeyCode::Char('é'), KeyModifiers::NONE),
+            Some("é".as_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn ctrl_letter_is_control_byte() {
+        assert_eq!(
+            encode_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            Some(vec![0x03])
+        );
+        // Ctrl folds case: Ctrl+Shift+C is still 0x03.
+        assert_eq!(
+            encode_key(
+                KeyCode::Char('C'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            ),
+            Some(vec![0x03])
+        );
+    }
+
+    #[test]
+    fn ctrl_punctuation_and_space() {
+        assert_eq!(
+            encode_key(KeyCode::Char('['), KeyModifiers::CONTROL),
+            Some(vec![0x1b])
+        );
+        assert_eq!(
+            encode_key(KeyCode::Char('\\'), KeyModifiers::CONTROL),
+            Some(vec![0x1c])
+        );
+        assert_eq!(
+            encode_key(KeyCode::Char(']'), KeyModifiers::CONTROL),
+            Some(vec![0x1d])
+        );
+        assert_eq!(
+            encode_key(KeyCode::Char('^'), KeyModifiers::CONTROL),
+            Some(vec![0x1e])
+        );
+        assert_eq!(
+            encode_key(KeyCode::Char('_'), KeyModifiers::CONTROL),
+            Some(vec![0x1f])
+        );
+        // Ctrl+Space and Ctrl+@ both encode NUL.
+        assert_eq!(
+            encode_key(KeyCode::Char(' '), KeyModifiers::CONTROL),
+            Some(vec![0x00])
+        );
+        assert_eq!(
+            encode_key(KeyCode::Char('@'), KeyModifiers::CONTROL),
+            Some(vec![0x00])
+        );
+    }
+
+    #[test]
+    fn alt_char_is_esc_prefixed() {
+        assert_eq!(
+            encode_key(KeyCode::Char('b'), KeyModifiers::ALT),
+            Some(vec![0x1b, b'b'])
+        );
+    }
+
+    #[test]
+    fn ctrl_alt_char_is_esc_then_control_byte() {
+        assert_eq!(
+            encode_key(
+                KeyCode::Char('x'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            ),
+            Some(vec![0x1b, 0x18])
+        );
+    }
+
+    #[test]
+    fn editing_keys() {
+        assert_eq!(
+            encode_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some(vec![0x0d])
+        );
+        assert_eq!(
+            encode_key(KeyCode::Tab, KeyModifiers::NONE),
+            Some(vec![0x09])
+        );
+        assert_eq!(
+            encode_key(KeyCode::BackTab, KeyModifiers::NONE),
+            Some(b"\x1b[Z".to_vec())
+        );
+        assert_eq!(
+            encode_key(KeyCode::Backspace, KeyModifiers::NONE),
+            Some(vec![0x7f])
+        );
+        assert_eq!(
+            encode_key(KeyCode::Esc, KeyModifiers::NONE),
+            Some(vec![0x1b])
+        );
+    }
+
+    #[test]
+    fn arrows_and_navigation() {
+        assert_eq!(
+            encode_key(KeyCode::Up, KeyModifiers::NONE),
+            Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            encode_key(KeyCode::Down, KeyModifiers::NONE),
+            Some(b"\x1b[B".to_vec())
+        );
+        assert_eq!(
+            encode_key(KeyCode::Right, KeyModifiers::NONE),
+            Some(b"\x1b[C".to_vec())
+        );
+        assert_eq!(
+            encode_key(KeyCode::Left, KeyModifiers::NONE),
+            Some(b"\x1b[D".to_vec())
+        );
+        assert_eq!(
+            encode_key(KeyCode::Home, KeyModifiers::NONE),
+            Some(b"\x1b[H".to_vec())
+        );
+        assert_eq!(
+            encode_key(KeyCode::End, KeyModifiers::NONE),
+            Some(b"\x1b[F".to_vec())
+        );
+        assert_eq!(
+            encode_key(KeyCode::PageUp, KeyModifiers::NONE),
+            Some(b"\x1b[5~".to_vec())
+        );
+        assert_eq!(
+            encode_key(KeyCode::PageDown, KeyModifiers::NONE),
+            Some(b"\x1b[6~".to_vec())
+        );
+        assert_eq!(
+            encode_key(KeyCode::Insert, KeyModifiers::NONE),
+            Some(b"\x1b[2~".to_vec())
+        );
+        assert_eq!(
+            encode_key(KeyCode::Delete, KeyModifiers::NONE),
+            Some(b"\x1b[3~".to_vec())
+        );
+    }
+
+    #[test]
+    fn function_keys() {
+        assert_eq!(
+            encode_key(KeyCode::F(1), KeyModifiers::NONE),
+            Some(b"\x1bOP".to_vec())
+        );
+        assert_eq!(
+            encode_key(KeyCode::F(4), KeyModifiers::NONE),
+            Some(b"\x1bOS".to_vec())
+        );
+        assert_eq!(
+            encode_key(KeyCode::F(5), KeyModifiers::NONE),
+            Some(b"\x1b[15~".to_vec())
+        );
+        assert_eq!(
+            encode_key(KeyCode::F(12), KeyModifiers::NONE),
+            Some(b"\x1b[24~".to_vec())
+        );
+        assert_eq!(encode_key(KeyCode::F(13), KeyModifiers::NONE), None);
+    }
+
+    #[test]
+    fn unmapped_key_is_none() {
+        assert_eq!(encode_key(KeyCode::Null, KeyModifiers::NONE), None);
+    }
+
+    // ── encode_mouse ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn mouse_scroll_up_and_down() {
+        assert_eq!(
+            encode_mouse(MouseEventKind::ScrollUp, 0, 0, KeyModifiers::NONE),
+            Some(b"\x1b[<64;1;1M".to_vec())
+        );
+        assert_eq!(
+            encode_mouse(MouseEventKind::ScrollDown, 0, 0, KeyModifiers::NONE),
+            Some(b"\x1b[<65;1;1M".to_vec())
+        );
+    }
+
+    #[test]
+    fn mouse_left_down_and_release() {
+        assert_eq!(
+            encode_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                0,
+                0,
+                KeyModifiers::NONE
+            ),
+            Some(b"\x1b[<0;1;1M".to_vec())
+        );
+        // Release is reported with a lowercase `m` terminator.
+        assert_eq!(
+            encode_mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                0,
+                0,
+                KeyModifiers::NONE
+            ),
+            Some(b"\x1b[<0;1;1m".to_vec())
+        );
+    }
+
+    #[test]
+    fn mouse_coords_are_one_based() {
+        // Pane-relative col=4,row=2 -> SGR x=5,y=3.
+        assert_eq!(
+            encode_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                4,
+                2,
+                KeyModifiers::NONE
+            ),
+            Some(b"\x1b[<0;5;3M".to_vec())
+        );
+    }
+
+    #[test]
+    fn mouse_modifiers_add_to_button_code() {
+        // Left-down 0 + CTRL(16) = 16.
+        assert_eq!(
+            encode_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                0,
+                0,
+                KeyModifiers::CONTROL
+            ),
+            Some(b"\x1b[<16;1;1M".to_vec())
+        );
+    }
+
+    #[test]
+    fn mouse_unmodeled_kind_is_none() {
+        assert_eq!(
+            encode_mouse(MouseEventKind::Moved, 0, 0, KeyModifiers::NONE),
+            None
+        );
+        assert_eq!(
+            encode_mouse(
+                MouseEventKind::Drag(MouseButton::Right),
+                0,
+                0,
+                KeyModifiers::NONE
+            ),
+            None
+        );
     }
 }
