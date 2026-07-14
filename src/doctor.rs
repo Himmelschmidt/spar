@@ -80,8 +80,13 @@ pub fn run(json: bool) -> Result<ExitCode> {
                 cache_path.display()
             ));
             if age > cfg.model_select.cache_ttl_secs {
+                let tail = if cfg.model_select.auto_refresh {
+                    "auto-refreshes on next --select"
+                } else {
+                    "auto_refresh off, run `spar model refresh`"
+                };
                 notes.push(format!(
-                    "model-select cache older than TTL ({}s); run `spar model refresh`",
+                    "model-select cache older than TTL ({}s); {tail}",
                     cfg.model_select.cache_ttl_secs
                 ));
             }

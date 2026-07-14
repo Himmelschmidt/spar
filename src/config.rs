@@ -70,6 +70,11 @@ pub struct ModelSelectConfig {
     /// role name → profile name
     #[serde(default)]
     pub roles: std::collections::HashMap<String, String>,
+    /// Auto-refresh a stale/missing vals cache during `--select` (default true). Set
+    /// false to disable spar's network fetch: a stale cache is used as-is and a missing
+    /// one errors instead of fetching. `spar model refresh` still works either way.
+    #[serde(default = "default_model_select_auto_refresh")]
+    pub auto_refresh: bool,
 }
 
 impl Default for ModelSelectConfig {
@@ -81,6 +86,7 @@ impl Default for ModelSelectConfig {
             allow: Vec::new(),
             profiles: crate::model_select::default_profiles(),
             roles: default_model_select_roles(),
+            auto_refresh: default_model_select_auto_refresh(),
         }
     }
 }
@@ -125,6 +131,10 @@ fn default_model_select_benches() -> Vec<String> {
 
 fn default_model_select_ttl() -> u64 {
     86400
+}
+
+fn default_model_select_auto_refresh() -> bool {
+    true
 }
 
 fn default_model_select_roles() -> std::collections::HashMap<String, String> {
@@ -379,6 +389,7 @@ struct ModelSelectConfigFile {
     allow: Option<Vec<String>>,
     profiles: Option<std::collections::HashMap<String, crate::model_select::ProfileWeights>>,
     roles: Option<std::collections::HashMap<String, String>>,
+    auto_refresh: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -533,6 +544,9 @@ impl Config {
                 for (k, role) in v {
                     self.model_select.roles.insert(k.clone(), role.clone());
                 }
+            }
+            if let Some(v) = ms.auto_refresh {
+                self.model_select.auto_refresh = v;
             }
         }
         // [notify] shells out / makes outbound requests, so an untrusted project
