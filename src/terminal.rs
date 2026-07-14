@@ -131,6 +131,7 @@ impl TerminalPane {
         }
     }
 
+    #[allow(dead_code)]
     pub fn dims(&self) -> (u16, u16) {
         (self.rows, self.cols)
     }
