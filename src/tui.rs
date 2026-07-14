@@ -224,6 +224,9 @@ struct App {
     /// Count of unresolved `@human`/`Blocked` bus alerts for the selected run; drives
     /// the header badge. Refreshed from the snapshot each frame.
     human_alerts_n: usize,
+    /// Selected run is in flight with no live orchestrator. Refreshed from the snapshot
+    /// each frame; a slot that still says `running` under this is not actually working.
+    abandoned: bool,
     /// Embedded terminal (W3/W7): a live vt100 view of a tmux pane on the spar
     /// socket. Lazily attached when the Terminal focus is opened.
     terminal_pane: Option<crate::terminal::TerminalPane>,
@@ -343,6 +346,7 @@ impl App {
             terminal_target: None,
             reconcile_spawn: None,
             human_alerts_n: 0,
+            abandoned: false,
             terminal_pane: None,
             bg_tx: None,
         }
@@ -570,6 +574,8 @@ struct Snapshot {
     activity: Vec<String>,
     /// Unresolved `@human`/`Blocked` alerts for the selected run (header badge count).
     human_alerts: usize,
+    /// Selected run is in flight with no live orchestrator.
+    abandoned: bool,
 }
 
 enum Msg {
@@ -639,13 +645,18 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache) -> Snapshot {
     } else {
         Vec::new()
     };
+    // Display path: markers, not state.json, decide whether a slot is still running.
     let full = if sel.browse == BrowseLevel::Runs {
         sel.run_id
             .as_ref()
-            .and_then(|id| RunState::load(&swarm, id).ok())
+            .and_then(|id| RunState::load_for_display(&swarm, id).ok())
     } else {
         None
     };
+    let abandoned = full
+        .as_ref()
+        .map(|st| st.abandoned(&swarm))
+        .unwrap_or(false);
     let quota = QuotaStore::load(&swarm).unwrap_or_default();
     let stream_text = match sel.browse {
         BrowseLevel::Projects => {
@@ -673,6 +684,7 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache) -> Snapshot {
         stream_text,
         activity,
         human_alerts: alerts.len(),
+        abandoned,
     }
 }
 
@@ -685,9 +697,12 @@ fn animating(app: &App, snap: &Snapshot) -> bool {
         || app.focus == Focus::Composer
         // A live terminal streams between disk snapshots; keep repainting it.
         || (app.focus == Focus::Terminal && app.terminal_pane.is_some())
-        || snap.full.as_ref().is_some_and(|st| {
-            is_active_phase(st.phase) || st.slots.iter().any(|s| s.status == SlotStatus::Running)
-        })
+        // An abandoned run is going nowhere: never spin for it.
+        || (!snap.abandoned
+            && snap.full.as_ref().is_some_and(|st| {
+                is_active_phase(st.phase)
+                    || st.slots.iter().any(|s| s.status == SlotStatus::Running)
+            }))
 }
 
 fn run_loop(
@@ -809,6 +824,7 @@ fn run_loop(
         manage_terminal(&mut app, &active_root);
         app.animated = animating(&app, &snap);
         app.human_alerts_n = snap.human_alerts;
+        app.abandoned = snap.abandoned;
 
         if dirty {
             app.tick = app.tick.wrapping_add(1);
@@ -1747,6 +1763,12 @@ fn draw_header(f: &mut Frame, area: Rect, swarm: &SparPaths, full: Option<&RunSt
     } else {
         String::new()
     };
+    // No live orchestrator: whatever the phase says, nothing is driving this run.
+    let abandoned_badge = if app.abandoned {
+        " ABANDONED · no orchestrator "
+    } else {
+        ""
+    };
     let left = Line::from(vec![
         Span::styled(" spar ", Style::default().fg(BG).bg(ACCENT).bold()),
         Span::raw(" "),
@@ -1756,9 +1778,10 @@ fn draw_header(f: &mut Frame, area: Rect, swarm: &SparPaths, full: Option<&RunSt
         Span::styled(run, Style::default().fg(CYAN)),
         Span::styled(dry, Style::default().fg(BG).bg(YELLOW).bold()),
         Span::styled(alert_badge, Style::default().fg(BG).bg(RED).bold()),
+        Span::styled(abandoned_badge, Style::default().fg(BG).bg(RED).bold()),
         Span::raw("  "),
         Span::styled(
-            if full.map(|s| is_active_phase(s.phase)).unwrap_or(false) {
+            if !app.abandoned && full.map(|s| is_active_phase(s.phase)).unwrap_or(false) {
                 format!("{} ", app.spinner())
             } else {
                 String::new()
@@ -1818,6 +1841,16 @@ fn action_content(
             )
         }
     } else if let Some(st) = full {
+        if app.abandoned {
+            return (
+                format!(
+                    "  Abandoned — no live orchestrator · resume: spar implement --run {} · or spar stop {}  ",
+                    st.id, st.id
+                ),
+                FG,
+                Color::Rgb(48, 24, 24),
+            );
+        }
         match st.phase {
             Phase::AwaitingPlanApproval => (
                 "  Plan + tests ready — press  a  to approve ·  r  to reject · p = all projects  "
@@ -2105,6 +2138,12 @@ fn draw_rail(
                             .map(|t| truncate(t, 16))
                             .unwrap_or_else(|| workflow_label(r.workflow).into());
                         let age = relative_age(r.updated_at);
+                        // Phase reads "review" forever on a run nobody is driving; say so.
+                        let (phase_text, phase_c) = if r.abandoned {
+                            (format!("{} ✗", truncate(&phase_label(r.phase), 10)), RED)
+                        } else {
+                            (truncate(&phase_label(r.phase), 12), phase_color(r.phase))
+                        };
                         let line = Line::from(vec![
                             Span::styled(mark.to_string(), Style::default().fg(ACCENT)),
                             Span::styled(
@@ -2118,8 +2157,8 @@ fn draw_rail(
                                     }),
                             ),
                             Span::styled(
-                                format!(" {:<12}", truncate(&phase_label(r.phase), 12)),
-                                Style::default().fg(phase_color(r.phase)),
+                                format!(" {phase_text:<12}"),
+                                Style::default().fg(phase_c),
                             ),
                             Span::styled(format!(" {dry}"), Style::default().fg(YELLOW)),
                             Span::styled(format!("{task} "), Style::default().fg(FG_MUTED)),
@@ -2172,7 +2211,9 @@ fn draw_agents(
                 let status = slot_status_label(s.status);
                 let act = SlotActivity::observe(s, app.stall_warn_secs);
                 let (tail, tail_c) = if s.status == SlotStatus::Running {
-                    if act.stalled {
+                    if app.abandoned {
+                        (format!(" ABANDONED {}", act.human_silent()), RED)
+                    } else if act.stalled {
                         (format!(" STALL {}", act.human_silent()), RED)
                     } else {
                         (format!(" quiet {}", act.human_silent()), FG_MUTED)
@@ -2180,7 +2221,12 @@ fn draw_agents(
                 } else {
                     (String::new(), FG_MUTED)
                 };
-                let color = if act.stalled { RED } else { slot_color(s) };
+                let orphaned = app.abandoned && s.status == SlotStatus::Running;
+                let color = if act.stalled || orphaned {
+                    RED
+                } else {
+                    slot_color(s)
+                };
                 let line = Line::from(vec![
                     Span::styled(format!(" {icon} "), Style::default().fg(color)),
                     Span::styled(
@@ -2222,7 +2268,9 @@ fn draw_agents(
             .iter()
             .filter(|s| SlotActivity::observe(s, app.stall_warn_secs).stalled)
             .count();
-        if focused {
+        if app.abandoned {
+            format!(" Agents  {running}/{n} orphaned · no orchestrator ")
+        } else if focused {
             if stalled > 0 {
                 format!(" Agents  {running}/{n} live · {stalled} quiet too long  · j/k ")
             } else {

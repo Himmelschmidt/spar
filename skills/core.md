@@ -80,6 +80,12 @@ worktree — that is `spar cleanup`'s job. A stopped run is **resumable**: rerun
 Use `stop` (not killing pids directly) so the orchestrator can't re-dispatch a slot
 you just killed.
 
+**`spar cleanup`** reaps before it removes: for each of the run's own worktrees it kills
+every process whose **cwd is inside that worktree** (SIGTERM → grace → SIGKILL — this is
+how orphaned dev servers get collected), then removes the worktree, falling back to a
+directory delete if git no longer tracks it. It never touches the project root or anything
+outside the run's worktrees. `--json` reports `worktrees[]` with `killed` pids and `removed`.
+
 ## Swarm bus
 
 The bus is **workspace-scoped and keyed by a globally-unique `agent_id`**. Run-slot role
@@ -128,6 +134,8 @@ spar logs <run_id> [slot] [-f|--follow]
 - Events (orchestrator): `.spar/runs/<id>/events.jsonl`
 - Logs: `.spar/runs/<id>/logs/<slot>.log`
 - `status --json` enriches each slot with `last_log_at`, `silent_for_secs`, `stalled` (log quiet longer than `timeouts.stall_warn_secs` while running)
+- Slot status is reconciled against on-disk markers at read time: a slot recorded as `running` that has a `<slot>.done` / `<slot>.failed` marker is reported `done` / `failed`. `status` never rewrites `state.json`.
+- `status --json` also carries **`"abandoned": true|false`** per run: the run is in a non-terminal phase but no live orchestrator owns it (the driving process died). Not an exit code — exit codes are unchanged. Resume with `spar implement --run <id> --providers …`, park it with `spar stop <id>`, or discard with `spar cleanup <id>`.
 
 ## Exit codes (stable)
 
