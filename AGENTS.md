@@ -26,6 +26,9 @@ providers, isolating each coding slot in its own git worktree.
   `ID | Decision | Status` rows, status `OPEN` | `LEANING` | `DECIDED`. Match the
   existing table format. If you make a call a future agent could reasonably reverse,
   write it down.
+- **Keep the skill in sync.** When you add features or change agent-facing behavior
+  (CLI surface, flags, config, exit codes), update the embedded operator skill
+  (`skills/core.md`, served by `spar skills`) in the same change so it never drifts.
 
 ## Architecture — the non-negotiable split
 

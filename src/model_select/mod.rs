@@ -219,6 +219,12 @@ pub fn ensure_bench_data(ms: &ModelSelectConfig) -> Result<BenchSnapshot> {
                 let mut s = meta.snapshot;
                 s.stale = false;
                 s
+            } else if !ms.auto_refresh {
+                any_stale = true;
+                stale_reasons.push(format!("{bench}: stale, auto_refresh off"));
+                let mut s = meta.snapshot;
+                s.stale = true;
+                s
             } else {
                 match fetch_and_cache(bench, &path) {
                     Ok(s) => s,
@@ -231,6 +237,8 @@ pub fn ensure_bench_data(ms: &ModelSelectConfig) -> Result<BenchSnapshot> {
                     }
                 }
             }
+        } else if !ms.auto_refresh {
+            bail!("no vals cache for {bench} and [model_select] auto_refresh is off; run `spar model refresh`");
         } else {
             fetch_and_cache(bench, &path)?
         };
@@ -298,6 +306,19 @@ fn blend_snapshots(
             Some(stale_reasons.join("; "))
         },
     }
+}
+
+/// Pure staleness decision: `None` (missing cache) → refresh; else age > ttl.
+fn needs_refresh(meta: Option<&cache::CacheMeta>, ttl: u64) -> bool {
+    match meta {
+        Some(m) => cache_age_secs(m) > ttl,
+        None => true,
+    }
+}
+
+/// Whether a bench's on-disk cache warrants a refresh (missing/unreadable/stale).
+pub fn cache_is_stale(bench: &str, ttl: u64) -> bool {
+    needs_refresh(load_cached(&cache_path(bench)).ok().flatten().as_ref(), ttl)
 }
 
 pub fn refresh_bench(bench: &str) -> Result<BenchSnapshot> {
@@ -584,29 +605,59 @@ pub fn run_cmd(
             }
             Ok(ExitCode::Success)
         }
-        ModelAction::Refresh { bench, json } => {
-            let snaps = refresh_all(&cfg.model_select, bench.as_deref())?;
+        ModelAction::Refresh {
+            bench,
+            json,
+            if_stale,
+        } => {
+            let ms = &cfg.model_select;
+            let (refreshed, skipped) = if !if_stale {
+                (refresh_all(ms, bench.as_deref())?, Vec::new())
+            } else {
+                let benches: Vec<String> = if let Some(b) = &bench {
+                    vec![b.clone()]
+                } else if ms.benches.is_empty() {
+                    vec!["swebench".into()]
+                } else {
+                    ms.benches.clone()
+                };
+                let mut refreshed = Vec::new();
+                let mut skipped = Vec::new();
+                for b in &benches {
+                    if cache_is_stale(b, ms.cache_ttl_secs) {
+                        refreshed.push(refresh_bench(b)?);
+                    } else {
+                        skipped.push(b.clone());
+                    }
+                }
+                (refreshed, skipped)
+            };
+
             if json {
-                let out: Vec<_> = snaps
-                    .iter()
-                    .map(|snap| {
-                        serde_json::json!({
+                let out = serde_json::json!({
+                    "refreshed": refreshed
+                        .iter()
+                        .map(|snap| serde_json::json!({
                             "bench": snap.bench,
                             "fetched_at": snap.fetched_at,
                             "models": snap.models.len(),
                             "cache": cache_path(&snap.bench).display().to_string(),
-                        })
-                    })
-                    .collect();
+                        }))
+                        .collect::<Vec<_>>(),
+                    "skipped": skipped,
+                });
                 println!("{}", serde_json::to_string_pretty(&out)?);
             } else {
-                for snap in &snaps {
+                for snap in &refreshed {
                     println!(
                         "refreshed {} ({} models) → {}",
                         snap.bench,
                         snap.models.len(),
                         cache_path(&snap.bench).display()
                     );
+                }
+                for b in &skipped {
+                    println!("skipped {b} (fresh)");
                 }
             }
             Ok(ExitCode::Success)
@@ -726,6 +777,26 @@ mod tests {
         {
             assert_ne!(p0, p1, "expected diversity across provider families");
         }
+    }
+
+    #[test]
+    fn needs_refresh_by_age_and_missing() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let fresh = cache::CacheMeta {
+            snapshot: fixture_snap(),
+            mtime_secs: now,
+        };
+        let stale = cache::CacheMeta {
+            snapshot: fixture_snap(),
+            mtime_secs: now - 1000,
+        };
+        assert!(!needs_refresh(Some(&fresh), 500));
+        assert!(needs_refresh(Some(&stale), 500));
+        assert!(needs_refresh(None, 500));
     }
 
     #[test]

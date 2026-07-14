@@ -413,6 +413,9 @@ pub enum ModelAction {
         bench: Option<String>,
         #[arg(long)]
         json: bool,
+        /// Only refresh benches whose cache is missing or older than the TTL
+        #[arg(long)]
+        if_stale: bool,
     },
     /// Show cache status
     Cache {

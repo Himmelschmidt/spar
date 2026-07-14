@@ -44,6 +44,7 @@ spar plan -t "describe the work" --providers cli:claude,cli:grok [--big] [--dry-
 
 # Or resolve fleet from vals.ai benchmarks + prefs (see [model_select] in spar.toml)
 spar model refresh
+spar model refresh --if-stale   # refresh only stale/missing benches (cron-friendly)
 spar model list --profile value
 spar model pick --role implementer --urgency high --json
 spar plan -t "…" --select value --urgency low --dry-run
@@ -97,7 +98,13 @@ spar bus presence [--run <id>]
 spar bus inbox <agent> [--claim] [--run <id>] [--json]
 spar bus reserve path/to/file --holder <agent> [--run <id>]
 spar bus release path/to/file --holder <agent> [--run <id>]
+spar bus deliver <agent> [--run <id>]              # drain inbox + inject at turn boundary (Stop-hook driven)
+spar bus ack <msg_id> --from <agent> [--run <id>]  # stop a requires_ack redelivery
 ```
+
+A message to `@human` (or any `Blocked` agent) surfaces in the TUI alert panel and,
+if `[notify]` is configured, also fires an external notifier. A `requires_ack` message
+redelivers until acked, then escalates to `@human`.
 
 Layout: `.spar/bus/{events.jsonl,agents.jsonl,inbox/<agent>/,queue/,pending_ack/}`
 (workspace, agent-keyed). Per-run `tasks/` + `reserves.json` and a back-compat
@@ -163,10 +170,15 @@ timeout_secs = 7200
 enabled = true
 # provider = "cli:agy"      # prefer third provider ≠ planner/critic
 timeout_secs = 1800
+# External @human notifier (user-level config only; ignored from a repo spar.toml).
+[notify]
+# command = "..."   # shell out; message on argv/stdin
+# webhook = "..."   # POST message json
 # Dynamic model select (vals). Opt-in with --select; cache under ~/.spar/cache/vals/
 [model_select]
 # benches = ["swebench"]
 # cache_ttl_secs = 86400
+# auto_refresh = true   # false = never fetch during --select
 # allow = ["cli:*", "api:openai", "api:xai"]
 # [model_select.profiles.value]
 # quality = 0.6
@@ -183,3 +195,4 @@ timeout_secs = 1800
 - State lives under `.spar/` in the project root.
 - **Spec channel (plan):** after planner+critic, a `test-author` freezes acceptance tests (`artifacts/test-contract.md` + worktree tests) from plan/critique (bus is audit trail), **before** the plan approval gate. Implement overlays those tests into the impl worktree (fail closed if author ran). Disable with `[spec] enabled = false`.
 - **Suite channel (implement/loop):** a dedicated `tester` slot runs full test suites; impl/review stay smoke/diff-only when it runs. Artifact: `artifacts/suite.md`. Independent `review` workflow does not spawn a tester by default.
+- **Human TUI `/spawn`:** `/spawn <cli:provider> <prompt>` launches an agent into a pane on spar's own `tmux -L spar` socket, joined to the selected run's bus — watch and steer it in the embedded terminal focus (Stages 8-11) without leaving spar.
