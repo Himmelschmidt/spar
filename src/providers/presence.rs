@@ -12,7 +12,8 @@ use std::process::{Command, Stdio};
 
 /// Stable identity + locations a slot needs to phone home for presence/delivery.
 pub struct SlotIdentity<'a> {
-    /// Stable agent id exported as `SPAR_AGENT_ID` (the slot id).
+    /// The slot's short role id. `wire` run-qualifies it to the unique `run:slot` bus id
+    /// for the exported `SPAR_AGENT_ID`; the baked hook commands keep the short id + `--run`.
     pub agent_id: &'a str,
     /// Run this agent belongs to, or `None` for a bare (run-less) Composer agent.
     /// Threaded onto its `spar bus` hook commands as `--run <id>` when present.
@@ -38,8 +39,13 @@ pub struct PresenceWiring {
 /// Best-effort: presence is telemetry, so a failure to install hooks degrades to a
 /// note rather than failing the spawn. Every agent still gets the identity env.
 pub fn wire(adapter: &dyn ProviderAdapter, id: &SlotIdentity) -> PresenceWiring {
+    // The agent's own `spar bus inbox/deliver $SPAR_AGENT_ID` must drain its unique
+    // inbox, so export the run-qualified id for a run slot (`run:slot`); a bare agent's
+    // id is already unique. The baked-in hook commands still pass the short id + `--run`
+    // (the CLI re-resolves), so only the env-exported id needs qualifying here.
+    let unique = crate::bus::agent_ref(id.run_id, id.agent_id);
     let mut env = vec![
-        ("SPAR_AGENT_ID".to_string(), id.agent_id.to_string()),
+        ("SPAR_AGENT_ID".to_string(), unique),
         (
             "SPAR_PROJECT_ROOT".to_string(),
             id.project_root.display().to_string(),
@@ -342,10 +348,12 @@ mod tests {
 
         let w = wire(&ClaudeAdapter, &id(&wt, &root, &exe));
         assert!(w.note.is_none(), "note: {:?}", w.note);
+        // SPAR_AGENT_ID carries the run-qualified unique id so the agent self-drains the
+        // right inbox (`run:slot`).
         assert!(w
             .env
             .iter()
-            .any(|(k, v)| k == "SPAR_AGENT_ID" && v == "impl-1"));
+            .any(|(k, v)| k == "SPAR_AGENT_ID" && v == "abc123:impl-1"));
 
         let text = std::fs::read_to_string(settings_path(&wt)).unwrap();
         let v: Value = serde_json::from_str(&text).unwrap();

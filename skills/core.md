@@ -81,11 +81,14 @@ you just killed.
 
 ## Swarm bus
 
-The bus is **workspace-scoped and keyed by `agent_id`**. `--run <id>` is an optional
-grouping tag: pass it to scope a send/view to one run; omit it for bare agents. Because
-slot ids are not unique across runs, `inbox`/`inbox --claim` are run-scoped too — a run
-slot must pass `--run $SPAR_RUN_ID` so it drains only its own run's messages (and never
-another concurrent run's); a bare agent omits it and drains only untagged traffic.
+The bus is **workspace-scoped and keyed by a globally-unique `agent_id`**. Run-slot role
+ids repeat across concurrent runs, so a run slot's bus id is run-qualified to `run:slot`;
+`$SPAR_AGENT_ID` already holds this unique id. `--run <id>` is an optional grouping tag for
+sends/views, and also lets `inbox`/`deliver` resolve a short role id to its unique id — so
+`spar bus inbox $SPAR_AGENT_ID --claim` (unique id, no `--run` needed) and
+`spar bus inbox <role> --claim --run $SPAR_RUN_ID` are equivalent. There is **no run-tag
+filter** on the drain: each unique id has its own inbox, so a slot never sees another
+run's messages, and a bare agent and a run slot can directed-message each other by id.
 
 ```bash
 spar bus send -m "hello" [--from human] [--to broadcast|agent] [--run <id>]

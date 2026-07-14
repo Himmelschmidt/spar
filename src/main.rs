@@ -285,10 +285,13 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             run,
             json,
         } => {
+            // Accept either the short slot id (+ `--run`) or the already-unique id
+            // (`$SPAR_AGENT_ID`); resolve to the unique inbox key either way.
+            let unique = bus::resolve_addr(run.as_deref(), &agent);
             let msgs = if claim {
-                bus::inbox_claim(&paths, run.as_deref(), &agent)?
+                bus::inbox_claim(&paths, &unique)?
             } else {
-                bus::inbox(&paths, run.as_deref(), &agent)?
+                bus::inbox(&paths, &unique)?
             };
             if json {
                 println!("{}", serde_json::to_string_pretty(&msgs)?);
@@ -367,12 +370,19 @@ fn bus_deliver(
     agent: &str,
     json: bool,
 ) -> Result<ExitCode> {
+    // The hook / `$SPAR_AGENT_ID` may hand us the short slot id (+ `--run`) or the
+    // already-unique `run:slot` id. The inbox drain keys on the unique id; the delivery
+    // strategy is looked up by the short slot id (`state.slots[].id`).
+    let unique = bus::resolve_addr(run_id, agent);
+    let short = run_id
+        .and_then(|r| agent.strip_prefix(&format!("{r}:")))
+        .unwrap_or(agent);
     // A bare agent has no run slot/state, so it has no injection channel — it drains its
     // own workspace inbox on its next turn (strategy `None`).
     let (strategy, dry_run) = match run_id {
         Some(run) => {
             let state = state::RunState::load(paths, run)?;
-            let strat = agent_delivery_strategy(&state, agent);
+            let strat = agent_delivery_strategy(&state, short);
             (strat, state.dry_run || util::env_truthy("SPAR_DRY_RUN"))
         }
         None => (
@@ -385,7 +395,7 @@ fn bus_deliver(
     // only pulse — the wait loop and TUI refresh also tick acks, so redelivery/escalation
     // advances in runs with no Claude slot (whose Stop hook is the only pulse here).
     bus::tick_acks(paths, &bus::AckPolicy::default(), chrono::Utc::now())?;
-    let d = providers::delivery::deliver(paths, run_id, agent, strategy, dry_run)?;
+    let d = providers::delivery::deliver(paths, run_id, &unique, strategy, dry_run)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&d)?);
     } else if let Some(payload) = &d.payload {

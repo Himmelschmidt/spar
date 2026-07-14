@@ -1,12 +1,16 @@
 //! Workspace-scoped swarm bus (A2A). Replaces thin mailbox as the coordination plane.
 //!
-//! W5 re-scope: the bus lives at the workspace root (`.spar/bus/`) and is keyed by
-//! `agent_id`, independent of any run. `run` is demoted to an optional tag carried on
-//! each [`BusMessage`]/[`Presence`] record, used only for grouping and run-scoped
-//! views (pass `Some(run)` to filter, `None` for the whole workspace). Bare agents
-//! spawned from the Composer (with a `SPAR_AGENT_ID` but no run) get a first-class
-//! inbox + presence exactly like a run slot, and a bare agent and a run slot can
-//! address each other directly by id.
+//! W5 re-scope: the bus lives at the workspace root (`.spar/bus/`) and is keyed by a
+//! **globally-unique** `agent_id`, independent of any run. Run-slot role ids
+//! (`orchestrator`, `impl-1`, …) are not unique across concurrent runs, so a run slot's
+//! bus id is run-qualified to `run:slot` (see [`agent_ref`]); a bare (run-less) agent
+//! keeps its own already-unique id. Presence rows and inbox directories are keyed by
+//! this unique id, so directed delivery keys purely on it — there is no run-tag filter
+//! on drain. `run` survives only as an optional tag carried on each
+//! [`BusMessage`]/[`Presence`] for grouping and run-scoped views (`Some(run)` filters,
+//! `None` is the whole workspace). Bare agents spawned from the Composer (with a
+//! `SPAR_AGENT_ID` but no run) get a first-class inbox + presence exactly like a run
+//! slot, and a bare agent and a run slot address each other by their unique ids.
 //!
 //! Run-tagged events/presence are also mirrored into the legacy
 //! `.spar/runs/<id>/bus/` layout for back-compat with any reader still watching that
@@ -25,6 +29,36 @@ use std::path::PathBuf;
 /// message is surfaced in the TUI alert panel (always on, zero config) and, if the
 /// operator wired one, pushed to an external notifier (`[notify]` in config).
 pub const HUMAN: &str = "@human";
+
+/// Reserved bus sinks — they address a role, not a per-run slot, so they are never
+/// run-qualified and pass through verbatim on both send and delivery.
+pub fn is_reserved_sink(to: &str) -> bool {
+    matches!(to, "broadcast" | "*" | "human") || to == HUMAN
+}
+
+/// The globally-unique bus id for a slot. Run-slot role ids repeat across concurrent
+/// runs, so a run slot qualifies to `run:slot`; a bare (run-less) agent's id is already
+/// unique and passes through. This is the id under which presence rows and the slot's
+/// inbox directory are keyed.
+pub fn agent_ref(run: Option<&str>, slot: &str) -> String {
+    match run {
+        Some(r) => format!("{r}:{slot}"),
+        None => slot.to_string(),
+    }
+}
+
+/// Resolve a directed address (`to`, or a `from` for self-exclusion) to the unique
+/// inbox/presence id it targets. Reserved sinks and already-qualified (`run:slot`) ids
+/// pass through untouched; a short slot id is qualified with the message's `run`.
+/// Idempotent, so it is safe to hand an id that may already be qualified (e.g. a
+/// `SPAR_AGENT_ID` a slot self-drains with, or a composer-resolved mention).
+pub fn resolve_addr(run: Option<&str>, id: &str) -> String {
+    if is_reserved_sink(id) || id.contains(':') {
+        id.to_string()
+    } else {
+        agent_ref(run, id)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -197,7 +231,7 @@ pub fn join(
     backend: Option<&str>,
 ) -> Result<()> {
     let p = Presence {
-        agent: agent.into(),
+        agent: resolve_addr(run, agent),
         status: "joined".into(),
         ts: Utc::now(),
         run: run.map(str::to_string),
@@ -227,7 +261,7 @@ pub fn join(
 
 pub fn heartbeat(paths: &SparPaths, run: Option<&str>, agent: &str, status: &str) -> Result<()> {
     let p = Presence {
-        agent: agent.into(),
+        agent: resolve_addr(run, agent),
         status: status.into(),
         ts: Utc::now(),
         run: run.map(str::to_string),
@@ -486,15 +520,20 @@ fn deliver_inbox(paths: &SparPaths, msg: &BusMessage) -> Result<()> {
     let targets: Vec<String> = if msg.to == "broadcast" || msg.to == "*" {
         // A broadcast reaches the sender's own scope only: agents whose run tag matches
         // the message's exactly (a bare broadcast reaches other bare agents, never run
-        // slots). Cross-scope fan-out is only ever explicit, addressed by id.
+        // slots). Cross-scope fan-out is only ever explicit, addressed by id. Exclude the
+        // sender by its unique presence id (presence is keyed by the qualified id).
+        let self_id = resolve_addr(msg.run.as_deref(), &msg.from);
         list_presence(paths, msg.run.as_deref())?
             .into_iter()
             .filter(|p| p.run.as_deref() == msg.run.as_deref())
             .map(|p| p.agent)
-            .filter(|a| a != &msg.from)
+            .filter(|a| a != &self_id)
             .collect()
     } else {
-        vec![msg.to.clone()]
+        // Directed: resolve `to` to the unique inbox id. A reserved sink or an
+        // already-qualified id passes through; a short slot id is qualified with the
+        // message's run. No run-tag filter — the unique id alone routes the message.
+        vec![resolve_addr(msg.run.as_deref(), &msg.to)]
     };
     for t in targets {
         let dir = inbox_dir(paths, &t);
@@ -545,11 +584,9 @@ pub fn list_presence(paths: &SparPaths, run: Option<&str>) -> Result<Vec<Presenc
 /// Peek an agent's undelivered inbox without consuming it. The `claimed/`
 /// subdir is skipped (it has no `.json` extension at the top level).
 ///
-/// `run` scopes the peek exactly like [`inbox_claim`] drains: `Some(r)` returns only
-/// messages tagged with run `r`, `None` returns only untagged (bare) traffic. Slot ids
-/// are not unique across runs, so an unfiltered peek would surface another run's
-/// messages for the same slot id.
-pub fn inbox(paths: &SparPaths, run: Option<&str>, agent: &str) -> Result<Vec<BusMessage>> {
+/// `agent` is the unique bus id (run slots: `run:slot`, bare agents: their own id), so
+/// the directory already isolates one agent's traffic — no run filter is applied.
+pub fn inbox(paths: &SparPaths, agent: &str) -> Result<Vec<BusMessage>> {
     let dir = inbox_dir(paths, agent);
     if !dir.is_dir() {
         return Ok(Vec::new());
@@ -561,9 +598,6 @@ pub fn inbox(paths: &SparPaths, run: Option<&str>, agent: &str) -> Result<Vec<Bu
             continue;
         }
         if let Ok(m) = serde_json::from_str::<BusMessage>(&fs::read_to_string(e.path())?) {
-            if m.run.as_deref() != run {
-                continue;
-            }
             out.push(m);
         }
     }
@@ -577,15 +611,11 @@ pub fn inbox(paths: &SparPaths, run: Option<&str>, agent: &str) -> Result<Vec<Bu
 /// each file (the loser's source path is already gone → skipped), never a double
 /// delivery. Messages already claimed are not returned again.
 ///
-/// `run` scopes the drain to one run's traffic. W5 keys inboxes by `agent_id` at the
-/// workspace root, but slot ids are deterministic per provider/role (`orchestrator`,
-/// `review-0-cli-claude`, …) and therefore collide across concurrent same-shaped runs
-/// sharing one inbox directory. Without scoping, run A's `deliver` would steal run B's
-/// messages. `Some(r)` claims only messages tagged with run `r`; `None` claims only
-/// untagged (bare) traffic. A message whose tag does not match is left in the inbox for
-/// its owner to claim — the match is checked *before* the atomic rename, so a foreign
-/// message is never removed.
-pub fn inbox_claim(paths: &SparPaths, run: Option<&str>, agent: &str) -> Result<Vec<BusMessage>> {
+/// `agent` is the unique bus id (run slots: `run:slot`, bare agents: their own id). The
+/// directory already isolates one agent's traffic — two concurrent runs' same-role slots
+/// have distinct ids (`rA:impl` vs `rB:impl`) and therefore distinct inboxes — so the
+/// drain keys purely on the id with no run-tag filter.
+pub fn inbox_claim(paths: &SparPaths, agent: &str) -> Result<Vec<BusMessage>> {
     let dir = inbox_dir(paths, agent);
     if !dir.is_dir() {
         return Ok(Vec::new());
@@ -606,7 +636,6 @@ pub fn inbox_claim(paths: &SparPaths, run: Option<&str>, agent: &str) -> Result<
         let Some(name) = src.file_name() else {
             continue;
         };
-        // Read + scope-check before claiming: only messages tagged for `run` are ours.
         // A concurrent claimer may have already moved the file (ENOENT) → skip.
         let Ok(contents) = fs::read_to_string(&src) else {
             continue;
@@ -614,9 +643,6 @@ pub fn inbox_claim(paths: &SparPaths, run: Option<&str>, agent: &str) -> Result<
         let Ok(m) = serde_json::from_str::<BusMessage>(&contents) else {
             continue;
         };
-        if m.run.as_deref() != run {
-            continue;
-        }
         let dest = claimed_dir.join(name);
         // Whoever moves the inode owns the message. A concurrent claimer that
         // already moved it gets ENOENT here and is skipped.
@@ -1132,7 +1158,8 @@ mod tests {
         )
         .unwrap();
         chat(&paths, Some("r1"), "a", "b", "hello", MessageBudget::Normal).unwrap();
-        let inbox_b = inbox(&paths, Some("r1"), "b").unwrap();
+        // The message routes to the slot's unique inbox id (`r1:b`), not the bare `b`.
+        let inbox_b = inbox(&paths, &agent_ref(Some("r1"), "b")).unwrap();
         assert!(!inbox_b.is_empty());
         reserve(&paths, Some("r1"), "src/foo.rs", "a").unwrap();
         assert!(reserve(&paths, Some("r1"), "src/foo.rs", "b").is_err());
@@ -1160,23 +1187,26 @@ mod tests {
             Some("native-cli"),
         )
         .unwrap();
-        reserve(&paths, Some("r1"), "src/foo.rs", "a").unwrap();
+        // Holders are the agents' unique bus ids (presence is keyed by them), so the
+        // lease can find a holder's heartbeat.
+        let (ua, ub) = (agent_ref(Some("r1"), "a"), agent_ref(Some("r1"), "b"));
+        reserve(&paths, Some("r1"), "src/foo.rs", &ua).unwrap();
 
         // Within the lease window a's claim still blocks b (heartbeat is fresh).
         let fresh = Utc::now() + Duration::seconds(RESERVE_LEASE_TTL_SECS - 1);
-        assert!(reserve_at(&paths, Some("r1"), "src/foo.rs", "b", fresh).is_err());
+        assert!(reserve_at(&paths, Some("r1"), "src/foo.rs", &ub, fresh).is_err());
 
         // Once a's last heartbeat is older than the TTL (a crashed, stopped beating),
         // b reclaims the path with no manual release.
         let expired = Utc::now() + Duration::seconds(RESERVE_LEASE_TTL_SECS + 1);
-        reserve_at(&paths, Some("r1"), "src/foo.rs", "b", expired).unwrap();
+        reserve_at(&paths, Some("r1"), "src/foo.rs", &ub, expired).unwrap();
         let claims = list_reserves(&paths, Some("r1")).unwrap();
         assert_eq!(claims.len(), 1);
-        assert_eq!(claims[0].holder, "b");
+        assert_eq!(claims[0].holder, ub);
 
         // A heartbeating holder refreshes its lease: b now blocks a while b beats.
         heartbeat(&paths, Some("r1"), "b", "running").unwrap();
-        assert!(reserve(&paths, Some("r1"), "src/foo.rs", "a").is_err());
+        assert!(reserve(&paths, Some("r1"), "src/foo.rs", &ua).is_err());
     }
 
     #[test]
@@ -1201,26 +1231,28 @@ mod tests {
         .unwrap();
         chat(&paths, Some("r1"), "a", "b", "hello", MessageBudget::Normal).unwrap();
         chat(&paths, Some("r1"), "a", "b", "world", MessageBudget::Normal).unwrap();
+        let ub = agent_ref(Some("r1"), "b");
 
         // Peek does not consume: repeated non-claim reads keep returning all.
-        assert_eq!(inbox(&paths, Some("r1"), "b").unwrap().len(), 2);
-        assert_eq!(inbox(&paths, Some("r1"), "b").unwrap().len(), 2);
+        assert_eq!(inbox(&paths, &ub).unwrap().len(), 2);
+        assert_eq!(inbox(&paths, &ub).unwrap().len(), 2);
 
         // First claim drains everything; second claim sees nothing.
-        let first = inbox_claim(&paths, Some("r1"), "b").unwrap();
+        let first = inbox_claim(&paths, &ub).unwrap();
         assert_eq!(first.len(), 2);
         assert_eq!(first[0].body, "hello");
         assert_eq!(first[1].body, "world");
-        assert!(inbox_claim(&paths, Some("r1"), "b").unwrap().is_empty());
+        assert!(inbox_claim(&paths, &ub).unwrap().is_empty());
 
         // Peek after claim is also empty (claimed/ is excluded).
-        assert!(inbox(&paths, Some("r1"), "b").unwrap().is_empty());
+        assert!(inbox(&paths, &ub).unwrap().is_empty());
     }
 
     #[test]
-    fn inbox_claim_is_run_scoped_across_same_slot_id() {
-        // Two runs share the deterministic slot id "b"; a message tagged for one run must
-        // never be claimable under the other (slot ids are not unique across runs).
+    fn inbox_claim_keys_on_unique_id_across_same_slot_id() {
+        // Two runs share the deterministic role id "b", but their unique bus ids differ
+        // (`rA:b` vs `rB:b`), so a collision is structurally impossible: each drains only
+        // its own inbox directory.
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         for run in ["rA", "rB"] {
@@ -1234,16 +1266,19 @@ mod tests {
             .unwrap();
             join(&paths, Some(run), "b", Some("cli:grok"), Some("native-cli")).unwrap();
         }
+        let (ua, ub) = (agent_ref(Some("rA"), "b"), agent_ref(Some("rB"), "b"));
+        assert_ne!(
+            ua, ub,
+            "same role id must yield distinct unique ids per run"
+        );
         chat(&paths, Some("rA"), "a", "b", "for A", MessageBudget::Normal).unwrap();
         chat(&paths, Some("rB"), "a", "b", "for B", MessageBudget::Normal).unwrap();
 
-        // Run B's drain sees only run B's message; run A's stays put.
-        let b = inbox_claim(&paths, Some("rB"), "b").unwrap();
+        // Each unique id drains only its own message; neither can reach the other's.
+        let b = inbox_claim(&paths, &ub).unwrap();
         assert_eq!(b.len(), 1);
         assert_eq!(b[0].body, "for B");
-
-        // Run A's message survived B's drain and is still claimable under run A.
-        let a = inbox_claim(&paths, Some("rA"), "b").unwrap();
+        let a = inbox_claim(&paths, &ua).unwrap();
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].body, "for A");
     }
@@ -1366,8 +1401,9 @@ mod tests {
         )
         .unwrap();
         let m = req_ack(&paths, "a", "b", "please confirm");
+        let ub = agent_ref(Some("r1"), "b");
         // Original delivery landed once.
-        assert_eq!(inbox_claim(&paths, Some("r1"), "b").unwrap().len(), 1);
+        assert_eq!(inbox_claim(&paths, &ub).unwrap().len(), 1);
 
         // The original send scheduled the first redelivery a default backoff out, so
         // tick from far enough ahead that it (and every base_backoff-0 retry) is due.
@@ -1378,23 +1414,15 @@ mod tests {
         let now = Utc::now() + Duration::seconds(120);
         let t1 = tick_acks(&paths, &policy, now).unwrap();
         assert_eq!((t1.redelivered, t1.escalated), (1, 0));
-        assert_eq!(
-            inbox_claim(&paths, Some("r1"), "b").unwrap().len(),
-            1,
-            "redeliver 1"
-        );
+        assert_eq!(inbox_claim(&paths, &ub).unwrap().len(), 1, "redeliver 1");
         let t2 = tick_acks(&paths, &policy, now).unwrap();
         assert_eq!((t2.redelivered, t2.escalated), (1, 0));
-        assert_eq!(
-            inbox_claim(&paths, Some("r1"), "b").unwrap().len(),
-            1,
-            "redeliver 2"
-        );
+        assert_eq!(inbox_claim(&paths, &ub).unwrap().len(), 1, "redeliver 2");
 
         // Third due tick: retries spent → escalate to @human, drop the pending record.
         let t3 = tick_acks(&paths, &policy, now).unwrap();
         assert_eq!((t3.redelivered, t3.escalated), (0, 1));
-        let human = inbox(&paths, Some("r1"), HUMAN).unwrap();
+        let human = inbox(&paths, HUMAN).unwrap();
         assert_eq!(human.len(), 1);
         assert_eq!(human[0].kind, MsgKind::Blocked);
         assert_eq!(human[0].refs.reply_to.as_deref(), Some(m.id.as_str()));
@@ -1435,7 +1463,7 @@ mod tests {
         };
         let t = tick_acks(&paths, &policy, Utc::now()).unwrap();
         assert_eq!((t.redelivered, t.escalated), (0, 0));
-        assert!(inbox(&paths, Some("r1"), HUMAN).unwrap().is_empty());
+        assert!(inbox(&paths, HUMAN).unwrap().is_empty());
     }
 
     #[test]
@@ -1584,8 +1612,10 @@ mod tests {
         assert!(chat(&paths, Some("r1"), "a", "b", ok, MessageBudget::Chatty).is_ok());
     }
 
-    /// W5 cross-scope addressing: a bare agent (no run) and a run slot can message
-    /// each other by id, and per-run views stay filtered by the run tag.
+    /// W5 cross-scope addressing: a bare agent (no run) and a run slot directed-message
+    /// each other by their unique bus ids, and each message lands via the *real* drain
+    /// (`inbox_claim` on the recipient's unique id) — the same path the turn boundary
+    /// uses — not a raw read under the sender's scope.
     #[test]
     fn bare_and_run_agents_address_each_other() {
         let tmp = tempdir().unwrap();
@@ -1600,49 +1630,45 @@ mod tests {
         )
         .unwrap();
         join(&paths, None, "bare", Some("cli:grok"), Some("native-cli")).unwrap();
+        let slot_id = agent_ref(Some("r1"), "slot"); // "r1:slot"
 
-        // Bare → run slot and run slot → bare both land, keyed purely by agent id.
+        // Bare → run slot: address the slot by its unique id. A qualified `to` routes
+        // regardless of the message's run tag (no run filter on drain).
         chat(
             &paths,
             None,
             "bare",
-            "slot",
+            &slot_id,
             "hi slot",
             MessageBudget::Chatty,
         )
         .unwrap();
+        // Run slot → bare: address the bare agent by its unique (run-less) id.
         chat(
             &paths,
-            Some("r1"),
-            "slot",
+            None,
+            &slot_id,
             "bare",
             "hi bare",
             MessageBudget::Chatty,
         )
         .unwrap();
-        // Each message is scoped by its own run tag: the bare→slot message is untagged
-        // (claimed under `None`), the slot→bare message carries `r1`.
-        assert_eq!(inbox(&paths, None, "slot").unwrap().len(), 1);
-        assert_eq!(
-            inbox(&paths, Some("r1"), "bare").unwrap()[0].body,
-            "hi bare"
-        );
 
-        // Run-scoped presence sees only the run slot; the workspace view sees both.
+        // Each lands via the recipient's own real drain, keyed purely by unique id.
+        let got_slot = inbox_claim(&paths, &slot_id).unwrap();
+        assert_eq!(got_slot.len(), 1);
+        assert_eq!(got_slot[0].body, "hi slot");
+        let got_bare = inbox_claim(&paths, "bare").unwrap();
+        assert_eq!(got_bare.len(), 1);
+        assert_eq!(got_bare[0].body, "hi bare");
+
+        // Run-scoped presence sees only the run slot (by its unique id); the workspace
+        // view sees both agents.
         let run_roster = list_presence(&paths, Some("r1")).unwrap();
         assert_eq!(run_roster.len(), 1);
-        assert_eq!(run_roster[0].agent, "slot");
+        assert_eq!(run_roster[0].agent, slot_id);
         let all = list_presence(&paths, None).unwrap();
         assert_eq!(all.len(), 2);
-
-        // Events filter by run tag: r1 view excludes the bare traffic.
-        let r1_events = list_events(&paths, Some("r1")).unwrap();
-        assert!(r1_events.iter().all(|m| m.run.as_deref() == Some("r1")));
-        assert!(r1_events.iter().any(|m| m.body == "hi bare"));
-        assert!(!r1_events.iter().any(|m| m.body == "hi slot"));
-
-        // The run-tagged traffic is mirrored into the legacy run bus dir.
-        assert!(run_events_path(&paths, "r1").is_file());
     }
 
     /// The loop guard reads only a bounded tail of the (workspace-global, unbounded)

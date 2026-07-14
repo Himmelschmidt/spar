@@ -204,9 +204,11 @@ fn native_queue_drains_once_and_dispatches() {
     assert_eq!(again["delivered"], 0);
 }
 
-/// Two concurrent runs in one project share a deterministic slot id (same provider/role),
-/// hence one workspace inbox directory. A message addressed to the slot in run A must not
-/// be claimable by run B's deliver, and vice versa — deliver is scoped by its `--run` tag.
+/// Two concurrent runs in one project share a deterministic *role* id (same provider/role),
+/// but their unique bus ids differ (`run_a:role` vs `run_b:role`) so a collision is
+/// structurally impossible: each run's deliver drains its own inbox directory, and neither
+/// can reach the other's. `deliver`/`send` accept the short role id + `--run` and resolve
+/// the unique id internally.
 #[test]
 fn deliver_is_run_scoped_across_identical_slot_ids() {
     let tmp = tempdir().unwrap();
@@ -216,14 +218,21 @@ fn deliver_is_run_scoped_across_identical_slot_ids() {
     let run_b = plan_and_approve(tmp.path());
     let agent_a = slot_for_provider(tmp.path(), &run_a, "cli:claude");
     let agent_b = slot_for_provider(tmp.path(), &run_b, "cli:claude");
-    // Premise: the slot id collides across the two runs (deterministic per provider/role).
-    assert_eq!(agent_a, agent_b, "slot ids must collide for this scenario");
+    // Premise: the role id collides across the two runs (deterministic per provider/role).
+    assert_eq!(agent_a, agent_b, "role ids must collide for this scenario");
     let agent = agent_a;
 
     send(tmp.path(), &run_a, &agent, "message for run A");
     send(tmp.path(), &run_b, &agent, "message for run B");
 
-    // Run B drains only its own run-tagged traffic; run A's message is left untouched.
+    // The two runs resolve to distinct unique bus ids, so they land in distinct inbox dirs.
+    let inbox_root = tmp.path().join(".spar/bus/inbox");
+    let ia = inbox_root.join(format!("{run_a}:{agent}"));
+    let ib = inbox_root.join(format!("{run_b}:{agent}"));
+    assert_ne!(ia, ib, "unique ids must differ across runs");
+    assert!(ia.is_dir() && ib.is_dir(), "each run has its own inbox dir");
+
+    // Run B drains only its own run's traffic; run A's message is in a different inbox.
     // (Planning emits run-tagged broadcasts to the slot, so `delivered` is >1 — the point
     // is that run A's message is never among them.)
     let db = deliver_json(tmp.path(), &run_b, &agent);

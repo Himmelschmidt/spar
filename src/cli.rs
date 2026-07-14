@@ -294,9 +294,9 @@ pub enum BusCmd {
         /// Atomically claim (drain) messages so each is delivered exactly once
         #[arg(long)]
         claim: bool,
-        /// Scope to one run's messages (`$SPAR_RUN_ID` for a run slot). Omit for a bare
-        /// agent — slot ids are not unique across runs, so an unscoped drain would claim
-        /// another run's messages for the same slot id.
+        /// Resolve a short role id to its unique bus id (`run:role`). Pass with a short
+        /// `<agent>` (`--run $SPAR_RUN_ID`); omit when `<agent>` is already the unique id
+        /// (`$SPAR_AGENT_ID`) or a bare agent. The drain keys on the unique id, not this tag.
         #[arg(long)]
         run: Option<String>,
         #[arg(long)]

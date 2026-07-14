@@ -53,9 +53,10 @@ fn is_zero(n: &usize) -> bool {
 
 /// Drain `agent`'s inbox and dispatch the claimed messages to `strategy`.
 ///
-/// `run` scopes the drain to the draining slot's run so a slot never claims another
-/// concurrent run's messages (slot ids are not unique across runs). It is threaded
-/// straight through to [`bus::inbox_claim`] / [`bus::inbox`].
+/// `agent` is the unique bus id (run slots: `run:slot`, bare agents: their own id), so
+/// the inbox directory already isolates one agent's traffic — no run filter is needed on
+/// the drain. `run` is still threaded to [`queue_path`] to keep each run's durable
+/// turn-boundary queue partitioned.
 ///
 /// `None` never consumes the inbox — an agent with no injection channel reads its own
 /// inbox on its next turn, so claiming here would strand the messages. Every other
@@ -72,7 +73,7 @@ pub fn deliver(
     dry_run: bool,
 ) -> Result<Delivery> {
     if strategy == DeliveryStrategy::None {
-        let pending = bus::inbox(paths, run, agent)?.len();
+        let pending = bus::inbox(paths, agent)?.len();
         return Ok(Delivery {
             strategy,
             action: DeliveryAction::LeftForInbox,
@@ -82,7 +83,7 @@ pub fn deliver(
         });
     }
 
-    let msgs = bus::inbox_claim(paths, run, agent)?;
+    let msgs = bus::inbox_claim(paths, agent)?;
     if msgs.is_empty() {
         return Ok(Delivery {
             strategy,
@@ -189,7 +190,7 @@ fn enqueue(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bus::{chat, join, MessageBudget};
+    use crate::bus::{agent_ref, chat, join, MessageBudget};
     use tempfile::tempdir;
 
     fn seed(paths: &SparPaths, n: usize) {
@@ -221,10 +222,11 @@ mod tests {
         let paths = SparPaths::new(tmp.path());
         seed(&paths, 2);
 
+        let ub = agent_ref(Some("r1"), "b");
         let d = deliver(
             &paths,
             Some("r1"),
-            "b",
+            &ub,
             DeliveryStrategy::StopHookInject,
             false,
         )
@@ -244,7 +246,7 @@ mod tests {
         let again = deliver(
             &paths,
             Some("r1"),
-            "b",
+            &ub,
             DeliveryStrategy::StopHookInject,
             false,
         )
@@ -259,10 +261,11 @@ mod tests {
         let paths = SparPaths::new(tmp.path());
         seed(&paths, 3);
 
+        let ub = agent_ref(Some("r1"), "b");
         let d = deliver(
             &paths,
             Some("r1"),
-            "b",
+            &ub,
             DeliveryStrategy::NativeQueue,
             false,
         )
@@ -270,7 +273,7 @@ mod tests {
         assert_eq!(d.action, DeliveryAction::Queued);
         assert_eq!(d.delivered, 3);
         assert!(d.payload.is_none());
-        let queued = fs::read_to_string(queue_path(&paths, Some("r1"), "b")).unwrap();
+        let queued = fs::read_to_string(queue_path(&paths, Some("r1"), &ub)).unwrap();
         assert_eq!(queued.lines().filter(|l| !l.is_empty()).count(), 3);
     }
 
@@ -280,10 +283,11 @@ mod tests {
         let paths = SparPaths::new(tmp.path());
         seed(&paths, 1);
 
-        let d = deliver(&paths, Some("r1"), "b", DeliveryStrategy::SdkPrompt, false).unwrap();
+        let ub = agent_ref(Some("r1"), "b");
+        let d = deliver(&paths, Some("r1"), &ub, DeliveryStrategy::SdkPrompt, false).unwrap();
         assert_eq!(d.action, DeliveryAction::Prompted);
         assert_eq!(d.delivered, 1);
-        assert!(queue_path(&paths, Some("r1"), "b").is_file());
+        assert!(queue_path(&paths, Some("r1"), &ub).is_file());
     }
 
     #[test]
@@ -292,12 +296,13 @@ mod tests {
         let paths = SparPaths::new(tmp.path());
         seed(&paths, 2);
 
-        let d = deliver(&paths, Some("r1"), "b", DeliveryStrategy::None, false).unwrap();
+        let ub = agent_ref(Some("r1"), "b");
+        let d = deliver(&paths, Some("r1"), &ub, DeliveryStrategy::None, false).unwrap();
         assert_eq!(d.action, DeliveryAction::LeftForInbox);
         assert_eq!(d.delivered, 0);
         assert_eq!(d.pending, 2);
         // The agent must still be able to claim them itself.
-        assert_eq!(bus::inbox_claim(&paths, Some("r1"), "b").unwrap().len(), 2);
+        assert_eq!(bus::inbox_claim(&paths, &ub).unwrap().len(), 2);
     }
 
     #[test]
@@ -306,15 +311,14 @@ mod tests {
         let paths = SparPaths::new(tmp.path());
         seed(&paths, 2);
 
-        let d = deliver(&paths, Some("r1"), "b", DeliveryStrategy::NativeQueue, true).unwrap();
+        let ub = agent_ref(Some("r1"), "b");
+        let d = deliver(&paths, Some("r1"), &ub, DeliveryStrategy::NativeQueue, true).unwrap();
         assert_eq!(d.action, DeliveryAction::Queued);
         assert_eq!(d.delivered, 2);
         // Injection call stubbed: no queue file written.
-        assert!(!queue_path(&paths, Some("r1"), "b").exists());
+        assert!(!queue_path(&paths, Some("r1"), &ub).exists());
         // But the drain is real (exactly-once): nothing remains to claim.
-        assert!(bus::inbox_claim(&paths, Some("r1"), "b")
-            .unwrap()
-            .is_empty());
+        assert!(bus::inbox_claim(&paths, &ub).unwrap().is_empty());
     }
 
     /// Two concurrent runs share a deterministic slot id ("b"), hence one workspace inbox,
@@ -348,10 +352,11 @@ mod tests {
         )
         .unwrap();
 
+        let (ua, ub) = (agent_ref(Some("rA"), "b"), agent_ref(Some("rB"), "b"));
         deliver(
             &paths,
             Some("rB"),
-            "b",
+            &ub,
             DeliveryStrategy::NativeQueue,
             false,
         )
@@ -359,14 +364,14 @@ mod tests {
         deliver(
             &paths,
             Some("rA"),
-            "b",
+            &ua,
             DeliveryStrategy::NativeQueue,
             false,
         )
         .unwrap();
 
-        let qa = fs::read_to_string(queue_path(&paths, Some("rA"), "b")).unwrap();
-        let qb = fs::read_to_string(queue_path(&paths, Some("rB"), "b")).unwrap();
+        let qa = fs::read_to_string(queue_path(&paths, Some("rA"), &ua)).unwrap();
+        let qb = fs::read_to_string(queue_path(&paths, Some("rB"), &ub)).unwrap();
         assert!(
             qa.contains("for run A") && !qa.contains("for run B"),
             "run A queue: {qa}"
@@ -375,5 +380,69 @@ mod tests {
             qb.contains("for run B") && !qb.contains("for run A"),
             "run B queue: {qb}"
         );
+    }
+
+    /// Cross-scope directed delivery (W5) through the *real* `deliver` path: a bare agent
+    /// and a run slot each address the other by its unique id, and each message is claimed
+    /// by the recipient's own `deliver` drain — the turn-boundary path — proving delivery
+    /// keys on the unique id with no run filter.
+    #[test]
+    fn cross_scope_directed_delivery_via_deliver() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        join(
+            &paths,
+            Some("r1"),
+            "slot",
+            Some("cli:claude"),
+            Some("native-cli"),
+        )
+        .unwrap();
+        join(&paths, None, "bare", Some("cli:grok"), Some("native-cli")).unwrap();
+        let slot_id = agent_ref(Some("r1"), "slot"); // "r1:slot"
+
+        // bare → r1:slot and r1:slot → bare, each addressed by the recipient's unique id.
+        chat(
+            &paths,
+            None,
+            "bare",
+            &slot_id,
+            "hi slot".to_string(),
+            MessageBudget::Chatty,
+        )
+        .unwrap();
+        chat(
+            &paths,
+            None,
+            &slot_id,
+            "bare",
+            "hi bare".to_string(),
+            MessageBudget::Chatty,
+        )
+        .unwrap();
+
+        // The slot claims only its own message via its unique-id drain.
+        let to_slot = deliver(
+            &paths,
+            Some("r1"),
+            &slot_id,
+            DeliveryStrategy::StopHookInject,
+            false,
+        )
+        .unwrap();
+        assert_eq!(to_slot.delivered, 1);
+        assert!(to_slot.payload.unwrap().contains("hi slot"));
+
+        // The bare agent claims only its own message via its unique-id drain.
+        let to_bare = deliver(
+            &paths,
+            None,
+            "bare",
+            DeliveryStrategy::StopHookInject,
+            false,
+        )
+        .unwrap();
+        assert_eq!(to_bare.delivered, 1);
+        assert!(to_bare.payload.unwrap().contains("hi bare"));
     }
 }

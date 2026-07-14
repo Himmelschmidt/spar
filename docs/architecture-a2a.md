@@ -19,19 +19,23 @@
 
 ## Layout
 
-The bus is a single **workspace-level** store keyed by `agent_id`. A bare agent
-(spawned from the Composer with `SPAR_AGENT_ID` but no run) and a run slot share it
-and can address each other directly. `run` is demoted to an optional message/presence
-tag; run-scoped views (`--run <id>`) filter by it.
+The bus is a single **workspace-level** store keyed by a **globally-unique** `agent_id`.
+Run-slot role ids (`orchestrator`, `impl-1`, …) repeat across concurrent runs, so a run
+slot's bus id is run-qualified to `run:slot` (`SPAR_AGENT_ID` carries this qualified id);
+a bare agent (spawned from the Composer with `SPAR_AGENT_ID` but no run) keeps its own
+already-unique id. Presence rows and inbox directories are keyed by this unique id, so a
+bare agent and a run slot address each other directly by id. `run` is demoted to an
+optional message/presence tag; run-scoped views (`--run <id>`) filter by it, but delivery
+never does.
 
 ```text
 .spar/bus/                # workspace bus (W5 canonical)
   agents.jsonl            # join / leave / heartbeat / status (each row optionally run-tagged)
   events.jsonl            # append-only: messages + activity (tail = live stream)
-  inbox/<agent_id>/       # keyed purely by agent id
+  inbox/<agent_id>/       # keyed by the unique id (run slots: `run:slot`, bare: own id)
     claimed/              # exactly-once drain lands here
   pending_ack/            # requires_ack redelivery records
-  queue/<agent_id>.jsonl  # durable turn-boundary delivery queue
+  queue/<run>/<agent_id>.jsonl  # durable turn-boundary queue, partitioned per run
   reserves.json           # path claims by bare agents
 
 .spar/runs/<run_id>/bus/  # run-scoped + back-compat mirror
@@ -62,9 +66,13 @@ tag; run-scoped views (`--run <id>`) filter by it.
 }
 ```
 
-`run` is an optional grouping tag (null for bare traffic). A broadcast reaches only
-agents sharing the message's `run` scope; cross-scope delivery is always explicit,
-addressed by `agent_id`.
+`run` is an optional grouping tag (null for bare traffic). A **broadcast** stays
+origin-scoped: it reaches only agents sharing the message's `run` scope (a bare broadcast
+reaches other bare agents, never run slots). **Directed** delivery is always explicit and
+keys purely on the recipient's unique `agent_id` — a short `to` is qualified with the
+sender's run, an already-qualified `run:slot` or bare id passes through, and there is **no
+run-tag filter** on the drain. That is what lets a bare agent and a run slot message each
+other across scopes.
 
 ---
 

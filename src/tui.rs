@@ -3120,7 +3120,67 @@ fn handle_composer(
             other => Ok(format!("Unknown /{other} — try /help")),
         };
     }
+    if let Some(rest) = cmd.strip_prefix('@') {
+        return send_mention(swarm, run_id, rest);
+    }
     Ok(format!("Noted (chat later): {}", truncate(cmd, 48)))
+}
+
+/// Composer `@<agent> <message>` — send a directed bus chat from the human to a slot or
+/// bare agent, resolving the mention to its unique bus id via [`resolve_mention`].
+fn send_mention(swarm: &SparPaths, run_id: Option<&str>, rest: &str) -> Result<String> {
+    let mut it = rest.splitn(2, char::is_whitespace);
+    let target = it.next().unwrap_or("").trim();
+    let body = it.next().map(str::trim).unwrap_or("");
+    if target.is_empty() || body.is_empty() {
+        anyhow::bail!("usage: @<agent> <message>");
+    }
+    let to = resolve_mention(swarm, run_id, target)?;
+    // Tag the message with the target's run scope (a run slot, or a reserved sink for the
+    // selected run) so it shows in that run's bus view; delivery keys on the unique id,
+    // not the tag.
+    let tag = if crate::bus::is_reserved_sink(&to) {
+        run_id
+    } else {
+        run_id.filter(|r| to.starts_with(&format!("{r}:")))
+    };
+    crate::bus::chat(
+        swarm,
+        tag,
+        "human",
+        &to,
+        body,
+        crate::bus::MessageBudget::Normal,
+    )?;
+    Ok(format!("sent to {to}"))
+}
+
+/// Resolve a composer mention to a unique bus id. An already-qualified id (`run:slot`)
+/// or reserved sink (`broadcast`/`@human`) passes through. A short id resolves against
+/// the workspace roster: the selected run's slot (`run:slot`) and any bare agent of that
+/// id are candidates — exactly one resolves, several error (listing them), and none
+/// falls back to the selected run's slot (or the bare id as typed).
+fn resolve_mention(swarm: &SparPaths, run_id: Option<&str>, target: &str) -> Result<String> {
+    if target.contains(':') || crate::bus::is_reserved_sink(target) {
+        return Ok(target.to_string());
+    }
+    let qualified = run_id.map(|r| crate::bus::agent_ref(Some(r), target));
+    let mut candidates: Vec<String> = crate::bus::list_presence(swarm, None)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| p.agent)
+        .filter(|a| Some(a.as_str()) == qualified.as_deref() || a == target)
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+    match candidates.len() {
+        1 => Ok(candidates.remove(0)),
+        0 => Ok(qualified.unwrap_or_else(|| target.to_string())),
+        _ => anyhow::bail!(
+            "ambiguous mention @{target}: candidates {}",
+            candidates.join(", ")
+        ),
+    }
 }
 
 /// How long to let a freshly launched CLI paint its input box before typing the
@@ -3309,7 +3369,7 @@ fn activity_feed(
         for m in alerts.iter().rev().take(6).rev() {
             lines.push(format!(
                 " {} {}",
-                short_agent(&m.from),
+                short_agent(short_in_run(&m.from, &st.id)),
                 truncate(&m.body, 30)
             ));
         }
@@ -3377,8 +3437,8 @@ fn activity_feed(
             for m in chat.iter().rev().take(8).rev() {
                 lines.push(format!(
                     " {}→{} {}",
-                    short_agent(&m.from),
-                    short_agent(&m.to),
+                    short_agent(short_in_run(&m.from, &st.id)),
+                    short_agent(short_in_run(&m.to, &st.id)),
                     truncate(&m.body, 28)
                 ));
             }
@@ -3407,6 +3467,14 @@ fn activity_feed(
 
 fn short_agent(s: &str) -> &str {
     s.rsplit(['-', '/']).next().unwrap_or(s)
+}
+
+/// Render a bus agent id inside run `run`'s view: drop a leading `run:` qualifier so a
+/// run slot shows as its short role id. Bare ids (no `run:` prefix) are left intact.
+fn short_in_run<'a>(id: &'a str, run: &str) -> &'a str {
+    id.strip_prefix(run)
+        .and_then(|rest| rest.strip_prefix(':'))
+        .unwrap_or(id)
 }
 
 fn activity_event_line(e: &events::Event) -> String {
