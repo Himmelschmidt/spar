@@ -108,7 +108,8 @@ spar bus deliver <agent> [--run <id>]              # drain inbox + inject at tur
 spar bus ack <msg_id> --from <agent> [--run <id>]  # stop a requires_ack redelivery
 ```
 
-A message to `@human` (or any `Blocked` agent) surfaces in the TUI alert panel and,
+A message to `@human` (or any `Blocked` agent) surfaces in the TUI's Activity tab (with a
+badge on the tab and the status line) and,
 if `[notify]` is configured, also fires an external notifier. A `requires_ack` message
 redelivers until acked, then escalates to `@human`.
 
@@ -126,9 +127,22 @@ spar logs <run_id> [slot] [-f|--follow]
 # Global home: open `spar` from anywhere. Runs stay under each project’s
 # `.spar/runs/`; project list is ~/.spar/registry.json (or $SPAR_HOME).
 # Projects appear when you use spar there — no hardcoded scan paths.
-# TUI: default = this project's runs; **p** / Esc = Projects (general view);
-# Enter opens a project.
 ```
+
+### TUI shape (humans)
+
+A **rail** + **one main area**. Main always shows the rail's selection.
+
+- Rail: `projects ▸ runs ▸ agents` drill-down. `Enter` pushes a level, `Esc` pops one
+  (never quits). `Enter` on an agent **takes it over** in the Shell tab.
+- Main tabs: `Log · Activity · Diff · Shell`, switched with `[` / `]` (Activity carries
+  the `@human` alert badge).
+- Focus: `1` rail · `2` main · `3` command (Tab cycles those three). `+` / `_` zoom Main.
+- Gates: `a` approve · `r` reject · `s` ship (or tap the buttons on the status line).
+- `p` = Projects · `w` log wrap · `g`/`G` top/bottom · `?` help · `Ctrl+C` twice exits.
+- Shell tab = a real tmux client: **every key goes to the agent**; `F12` (or `C-a d`)
+  hands focus back to spar.
+- Under 90 columns the rail folds away (Main + a tappable tab strip) for phone/SSH.
 
 - Run state: `.spar/runs/<id>/state.json`
 - Events (orchestrator): `.spar/runs/<id>/events.jsonl`
@@ -203,4 +217,4 @@ timeout_secs = 1800
 - State lives under `.spar/` in the project root.
 - **Spec channel (plan):** after planner+critic, a `test-author` freezes acceptance tests (`artifacts/test-contract.md` + worktree tests) from plan/critique (bus is audit trail), **before** the plan approval gate. Implement overlays those tests into the impl worktree (fail closed if author ran). Disable with `[spec] enabled = false`.
 - **Suite channel (implement/loop):** a dedicated `tester` slot runs full test suites; impl/review stay smoke/diff-only when it runs. Artifact: `artifacts/suite.md`. Independent `review` workflow does not spawn a tester by default.
-- **Human TUI `/spawn`:** `/spawn <cli:provider> <prompt>` launches an agent into a pane on spar's own `tmux -L spar` socket, joined to the selected run's bus — watch and steer it in the embedded terminal focus (Stages 8-11) without leaving spar.
+- **Human TUI `/spawn`:** `/spawn <cli:provider> <prompt>` launches an agent into a pane on spar's own `tmux -L spar` socket, joined to the selected run's bus — watch and steer it in Main's **Shell** tab without leaving spar.
