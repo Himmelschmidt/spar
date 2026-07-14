@@ -150,6 +150,22 @@ pub fn spawn_window(
     Ok(())
 }
 
+/// Select a window in a session so an attaching client lands on that slot's pane.
+/// Best-effort: callers ignore failure (the window may have closed already).
+pub fn select_window(session: &str, window: &str) -> Result<()> {
+    let target = format!("{session}:{window}");
+    let status = tmux()
+        .args(["select-window", "-t", &target])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("tmux select-window")?;
+    if !status.success() {
+        bail!("tmux select-window failed for {target}");
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 pub fn send_keys(session: &str, window: &str, keys: &str) -> Result<()> {
     let target = format!("{session}:{window}");

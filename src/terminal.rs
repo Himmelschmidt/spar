@@ -118,6 +118,17 @@ impl TerminalPane {
         self.session.as_deref()
     }
 
+    /// Whether the tmux `attach` client child is still running. A `Ctrl+b d`
+    /// detach or the session ending makes the child exit, so this flips to `false`
+    /// and lets the caller hand focus back to spar. With no PTY attached there is no
+    /// client to be dead, so this reports alive.
+    pub fn is_alive(&mut self) -> bool {
+        let Some(pty) = self.pty.as_mut() else {
+            return true;
+        };
+        matches!(pty.child.try_wait(), Ok(None))
+    }
+
     /// Drain the PTY's output channel into the parser. Cheap to call every frame.
     pub fn pump(&mut self) {
         let mut chunks = Vec::new();

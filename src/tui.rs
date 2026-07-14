@@ -232,6 +232,10 @@ struct App {
     /// rendered from its output bytes with raw keys/mouse/paste forwarded in. Lazily
     /// attached to the project's workspace shell when the Terminal focus is opened.
     terminal_pane: Option<crate::terminal::TerminalPane>,
+    /// Which tmux session the Terminal panel should attach to. `None` = the project
+    /// workspace shell; `Some(spar-<run_id>)` = an agent takeover selected from the
+    /// Agents pane. Cleared back to `None` when the client detaches or the session ends.
+    takeover_target: Option<String>,
     /// Sender for background tasks (e.g. deferred `/spawn`) to flash a result back
     /// onto the render loop. Set once the message channel exists.
     bg_tx: Option<mpsc::Sender<Msg>>,
@@ -344,6 +348,7 @@ impl App {
             reconcile_spawn: None,
             human_alerts_n: 0,
             terminal_pane: None,
+            takeover_target: None,
             bg_tx: None,
         }
     }
@@ -1019,6 +1024,29 @@ fn handle_key(
                         format!("Opened {}", p.name.as_deref().unwrap_or("project")),
                         GREEN,
                     );
+                }
+            } else if app.focus == Focus::Agents {
+                // Enter is unbound in the Agents pane, so it takes over the selected
+                // slot: point the passthrough Terminal at that run's tmux pane and focus
+                // it. Only runs launched with `--backend tmux` have a `spar-<run_id>`
+                // session; headless runs have no pane to attach to.
+                if let Some(slot) = full.and_then(|st| st.slots.get(app.selected_slot)) {
+                    let session = tmux::session_name(&full.unwrap().id);
+                    let slot_id = slot.id.clone();
+                    if tmux::has_session(&session) {
+                        app.takeover_target = Some(session.clone());
+                        let _ = tmux::select_window(&session, &slot_id);
+                        app.focus = Focus::Terminal;
+                        app.flash(
+                            format!("Took over {slot_id} — F12/Ctrl+b d to hand back"),
+                            GREEN,
+                        );
+                    } else {
+                        app.flash(
+                            "headless run — rerun with --backend tmux to take over",
+                            YELLOW,
+                        );
+                    }
                 }
             }
         }
@@ -2954,10 +2982,10 @@ fn situational_footer(full: Option<&RunState>, focus: Focus, browse: BrowseLevel
     }
     match focus {
         Focus::Runs => "j/k runs · Esc/p projects · Tab → Agents · ? help",
-        Focus::Agents => "j/k agent · log follows · Tab → Live log",
+        Focus::Agents => "j/k agent · Enter take over pane · log follows · Tab → Live log",
         Focus::Log => "scroll · w wrap · g/G top/end · up unfollows live · Tab",
         Focus::Activity => "run timeline · scroll · Tab → Terminal",
-        Focus::Terminal => "tmux passthrough · F12 → spar",
+        Focus::Terminal => "tmux passthrough · Ctrl+b d / F12 → spar",
         Focus::Composer => "type /approve /reject /ship /help · Enter · Esc",
     }
 }
@@ -3041,13 +3069,36 @@ fn manage_terminal(app: &mut App, project_root: &Path) {
         return;
     }
 
-    // The project's workspace shell (created on demand). It is detached and
-    // deliberately OUTLIVES the TUI, so a dev server started in it survives restarts.
-    let desired = match tmux::ensure_workspace_shell(project_root) {
-        Ok(name) => name,
-        Err(_) => {
+    // Dead client (Ctrl+b d detach, or the takeover session ended): the `attach`
+    // child exited. Drop the pane, revert to the workspace shell, and hand focus back
+    // to spar so the operator isn't stranded on a dead panel. The tmux SESSION is
+    // untouched — only our transient client went away.
+    if let Some(pane) = app.terminal_pane.as_mut() {
+        if !pane.is_alive() {
             app.terminal_pane = None;
+            app.takeover_target = None;
+            if app.focus == Focus::Terminal {
+                app.focus = Focus::Runs;
+            }
             return;
+        }
+    }
+
+    // Resolve the session to attach to: an agent takeover if one is set and its
+    // session still exists, otherwise the project workspace shell. A takeover whose
+    // session has since died silently reverts to the shell. The workspace shell is
+    // detached and deliberately OUTLIVES the TUI, so a dev server in it survives restarts.
+    let desired = match app.takeover_target.as_ref() {
+        Some(s) if tmux::has_session(s) => s.clone(),
+        _ => {
+            app.takeover_target = None;
+            match tmux::ensure_workspace_shell(project_root) {
+                Ok(name) => name,
+                Err(_) => {
+                    app.terminal_pane = None;
+                    return;
+                }
+            }
         }
     };
 
@@ -3079,11 +3130,16 @@ fn draw_terminal(f: &mut Frame, area: Rect, app: &mut App, project_root: &Path) 
         return;
     }
     let focused = app.focus == Focus::Terminal;
-    let base = project_root
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("project");
-    let title = format!(" Terminal · tmux · {base} ");
+    let title = match app.takeover_target.as_ref() {
+        Some(session) => format!(" Terminal · agent · {session} "),
+        None => {
+            let base = project_root
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("project");
+            format!(" Terminal · shell · {base} ")
+        }
+    };
     let block = panel(&title, focused);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -3092,7 +3148,8 @@ fn draw_terminal(f: &mut Frame, area: Rect, app: &mut App, project_root: &Path) 
         let hint = Paragraph::new(
             "Focus this panel to open a real tmux client for the project's workspace shell — \
              run a dev server, cargo, poke around; the session stays alive across TUI restarts.\n\n\
-             Full tmux: prefix C-b, copy-mode/scroll, splits, session switch. F12/Esc leave.",
+             Or select an agent in the Agents pane and press Enter to take over its live pane.\n\n\
+             Full tmux: prefix C-b, copy-mode/scroll, splits, session switch. Ctrl+b d / F12 → spar.",
         )
         .style(Style::default().fg(FG_DIM))
         .wrap(Wrap { trim: true });
@@ -3118,7 +3175,7 @@ fn draw_terminal(f: &mut Frame, area: Rect, app: &mut App, project_root: &Path) 
             ..inner
         };
         let hint = Paragraph::new(
-            "F12: back to spar · C-b [ scroll/copy · ] paste · % / \" split · s session",
+            "Ctrl+b d / F12 / tap a tab → spar · C-b [ scroll/copy · ] paste · % / \" split · s session",
         )
         .style(Style::default().fg(FG_DIM));
         f.render_widget(hint, footer);
