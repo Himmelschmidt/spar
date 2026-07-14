@@ -62,9 +62,32 @@ pub fn spar_home() -> PathBuf {
             return p;
         }
     }
+    fallback_home()
+}
+
+/// Real default home. Split out so unit tests never touch the developer's `~/.spar`.
+#[cfg(not(test))]
+fn fallback_home() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".spar")
+}
+
+/// Under `cargo test`, any in-process test that saves a run reaches `note_run` ->
+/// `touch_project`, which writes `spar_home()`. Without an explicit `SPAR_HOME`/override
+/// that would clobber the developer's real registry, so default to a per-process temp
+/// home instead. (Scenario tests spawn the real binary and set `SPAR_HOME` themselves.)
+#[cfg(test)]
+fn fallback_home() -> PathBuf {
+    use std::sync::OnceLock;
+    static TEST_HOME: OnceLock<PathBuf> = OnceLock::new();
+    TEST_HOME
+        .get_or_init(|| {
+            std::env::temp_dir()
+                .join(format!("spar-test-home-{}", std::process::id()))
+                .join(".spar")
+        })
+        .clone()
 }
 
 pub fn registry_path() -> PathBuf {
