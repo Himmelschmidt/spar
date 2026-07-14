@@ -62,8 +62,20 @@ pub fn ensure_workspace_shell(project_root: &Path) -> Result<String> {
     Ok(name)
 }
 
+/// Enable tmux mouse mode (server-global) on the spar socket so an attached client
+/// interprets the SGR mouse sequences we forward — wheel scroll into copy-mode,
+/// click-to-select. Best-effort and idempotent.
+pub fn ensure_mouse() {
+    let _ = tmux()
+        .args(["set", "-g", "mouse", "on"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 /// All session names on the spar socket, one per line. Empty when no server is
 /// running or the query fails.
+#[allow(dead_code)]
 pub fn list_sessions() -> Vec<String> {
     let out = tmux()
         .args(["list-sessions", "-F", "#{session_name}"])
@@ -75,6 +87,7 @@ pub fn list_sessions() -> Vec<String> {
 }
 
 /// Parse `list-sessions` stdout into trimmed, non-empty names. Pure, for testing.
+#[allow(dead_code)]
 fn parse_session_list(stdout: &str) -> Vec<String> {
     stdout
         .lines()
@@ -191,6 +204,10 @@ impl SendKey {
 /// Enter is a distinct submit) falls out naturally: each printable key maps to a
 /// [`SendKey::Literal`] and Enter maps to its own [`SendKey::Named`] `Enter`, so a
 /// per-keystroke forwarder never fuses text and the submit into one send.
+///
+/// Retained for `send-keys`-based delivery (workspace prompts); the embedded
+/// terminal now forwards raw bytes via `terminal::encode_key` instead.
+#[allow(dead_code)]
 pub fn map_key(code: KeyCode, mods: KeyModifiers) -> Option<SendKey> {
     let ctrl = mods.contains(KeyModifiers::CONTROL);
     let alt = mods.contains(KeyModifiers::ALT);
