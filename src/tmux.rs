@@ -62,15 +62,28 @@ pub fn ensure_workspace_shell(project_root: &Path) -> Result<String> {
     Ok(name)
 }
 
-/// Enable tmux mouse mode (server-global) on the spar socket so an attached client
-/// interprets the SGR mouse sequences we forward — wheel scroll into copy-mode,
-/// click-to-select. Best-effort and idempotent.
-pub fn ensure_mouse() {
-    let _ = tmux()
-        .args(["set", "-g", "mouse", "on"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+/// Server-global config for the spar socket, applied before a client attaches.
+/// Best-effort and idempotent.
+///
+/// - `mouse on` so an attached client interprets the SGR mouse sequences we forward
+///   (wheel scroll into copy-mode, click-to-select).
+/// - **prefix `C-a`, not the default `C-b`.** spar is normally run *inside* the user's
+///   own tmux, whose prefix is `C-b` — that outer tmux swallows `C-b` before spar's
+///   process ever sees the key, so the embedded client could never receive a prefix and
+///   every prefix command was dead. `C-a` passes through the outer tmux untouched.
+///   `C-a C-a` sends a literal `C-a` on to the program inside the pane.
+pub fn ensure_server_config() {
+    for args in [
+        ["set", "-g", "mouse", "on"].as_slice(),
+        ["set", "-g", "prefix", "C-a"].as_slice(),
+        ["bind", "C-a", "send-prefix"].as_slice(),
+    ] {
+        let _ = tmux()
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
 }
 
 /// All session names on the spar socket, one per line. Empty when no server is

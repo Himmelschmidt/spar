@@ -950,7 +950,7 @@ fn handle_key(
     }
 
     // Terminal panel focused: the panel IS a real tmux client, so every key is
-    // forwarded raw into its PTY — prefix (C-b), copy-mode, splits, session switch
+    // forwarded raw into its PTY — prefix (C-a), copy-mode, splits, session switch
     // are all tmux's own. F12 is the ONLY escape back to spar. With no pane attached
     // we deliberately fall through to the normal handler so an unattachable Terminal
     // panel can never trap the operator.
@@ -1038,7 +1038,7 @@ fn handle_key(
                         let _ = tmux::select_window(&session, &slot_id);
                         app.focus = Focus::Terminal;
                         app.flash(
-                            format!("Took over {slot_id} — F12/Ctrl+b d to hand back"),
+                            format!("Took over {slot_id} — F12/Ctrl+a d to hand back"),
                             GREEN,
                         );
                     } else {
@@ -2985,7 +2985,7 @@ fn situational_footer(full: Option<&RunState>, focus: Focus, browse: BrowseLevel
         Focus::Agents => "j/k agent · Enter take over pane · log follows · Tab → Live log",
         Focus::Log => "scroll · w wrap · g/G top/end · up unfollows live · Tab",
         Focus::Activity => "run timeline · scroll · Tab → Terminal",
-        Focus::Terminal => "tmux passthrough · Ctrl+b d / F12 → spar",
+        Focus::Terminal => "tmux passthrough · prefix C-a · Ctrl+a d / F12 → spar",
         Focus::Composer => "type /approve /reject /ship /help · Enter · Esc",
     }
 }
@@ -3069,7 +3069,7 @@ fn manage_terminal(app: &mut App, project_root: &Path) {
         return;
     }
 
-    // Dead client (Ctrl+b d detach, or the takeover session ended): the `attach`
+    // Dead client (Ctrl+a d detach, or the takeover session ended): the `attach`
     // child exited. Drop the pane, revert to the workspace shell, and hand focus back
     // to spar so the operator isn't stranded on a dead panel. The tmux SESSION is
     // untouched — only our transient client went away.
@@ -3112,7 +3112,7 @@ fn manage_terminal(app: &mut App, project_root: &Path) {
     // Attach lazily, only while the panel is focused.
     if app.focus == Focus::Terminal && app.terminal_pane.is_none() {
         // Enable tmux mouse so our forwarded SGR mouse is interpreted by the client.
-        tmux::ensure_mouse();
+        tmux::ensure_server_config();
         let (rows, cols) = terminal_dims(app.rect_terminal);
         let mut pane = crate::terminal::TerminalPane::new(rows, cols);
         if pane.attach(&desired).is_ok() {
@@ -3149,7 +3149,7 @@ fn draw_terminal(f: &mut Frame, area: Rect, app: &mut App, project_root: &Path) 
             "Focus this panel to open a real tmux client for the project's workspace shell — \
              run a dev server, cargo, poke around; the session stays alive across TUI restarts.\n\n\
              Or select an agent in the Agents pane and press Enter to take over its live pane.\n\n\
-             Full tmux: prefix C-b, copy-mode/scroll, splits, session switch. Ctrl+b d / F12 → spar.",
+             Full tmux: prefix C-a, copy-mode/scroll, splits, session switch. Ctrl+a d / F12 → spar.",
         )
         .style(Style::default().fg(FG_DIM))
         .wrap(Wrap { trim: true });
@@ -3175,7 +3175,7 @@ fn draw_terminal(f: &mut Frame, area: Rect, app: &mut App, project_root: &Path) 
             ..inner
         };
         let hint = Paragraph::new(
-            "Ctrl+b d / F12 / tap a tab → spar · C-b [ scroll/copy · ] paste · % / \" split · s session",
+            "Ctrl+a d / F12 / tap a tab → spar · C-a [ scroll/copy · ] paste · % / \" split · s session",
         )
         .style(Style::default().fg(FG_DIM));
         f.render_widget(hint, footer);
