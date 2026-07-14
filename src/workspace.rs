@@ -234,11 +234,14 @@ pub fn wait_working_then_idle(
     poll: Duration,
 ) -> Result<bool> {
     let mut w = WaitWorkingThenIdle::new();
+    // Presence is keyed by the unique id (`run:slot`), so qualify the short `agent` before
+    // matching — a raw short id would never match a run slot's presence row.
+    let want = bus::resolve_addr(run, agent);
     let start = Instant::now();
     loop {
         let status = bus::list_presence(paths, run)?
             .into_iter()
-            .find(|p| p.agent == agent)
+            .find(|p| p.agent == want)
             .map(|p| p.status);
         if let Some(status) = status {
             if w.observe(&status) == WaitPhase::Done {
@@ -364,5 +367,38 @@ mod tests {
         .unwrap();
         feeder.join().unwrap();
         assert!(done, "should complete after observing working then idle");
+    }
+
+    #[test]
+    fn live_driver_completes_for_run_slot_working_then_idle() {
+        // Regression guard: presence is keyed by the qualified id (`run:slot`), so the
+        // wait lookup must qualify too — a run slot's working->idle turn must be observed,
+        // not silently missed (which would make this path always time out).
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        bus::ensure_bus(&paths).unwrap();
+        bus::heartbeat(&paths, Some("r1"), "poke-3", "idle").unwrap();
+        let feeder = {
+            let paths = paths.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(40));
+                bus::heartbeat(&paths, Some("r1"), "poke-3", "working").unwrap();
+                std::thread::sleep(Duration::from_millis(60));
+                bus::heartbeat(&paths, Some("r1"), "poke-3", "idle").unwrap();
+            })
+        };
+        let done = wait_working_then_idle(
+            &paths,
+            Some("r1"),
+            "poke-3",
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        feeder.join().unwrap();
+        assert!(
+            done,
+            "run slot working->idle must be observed via the qualified lookup"
+        );
     }
 }

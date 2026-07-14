@@ -3161,7 +3161,16 @@ fn send_mention(swarm: &SparPaths, run_id: Option<&str>, rest: &str) -> Result<S
 /// id are candidates — exactly one resolves, several error (listing them), and none
 /// falls back to the selected run's slot (or the bare id as typed).
 fn resolve_mention(swarm: &SparPaths, run_id: Option<&str>, target: &str) -> Result<String> {
-    if target.contains(':') || crate::bus::is_reserved_sink(target) {
+    if crate::bus::is_reserved_sink(target) {
+        // Canonicalize a `human` alias to the HUMAN sink (`@human`) so it routes to the
+        // notifier and alert panel (which key on `@human`), not a literal `inbox/human`.
+        return Ok(if target == "human" {
+            crate::bus::HUMAN.to_string()
+        } else {
+            target.to_string()
+        });
+    }
+    if target.contains(':') {
         return Ok(target.to_string());
     }
     let qualified = run_id.map(|r| crate::bus::agent_ref(Some(r), target));

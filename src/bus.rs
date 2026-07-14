@@ -52,6 +52,13 @@ pub fn agent_ref(run: Option<&str>, slot: &str) -> String {
 /// pass through untouched; a short slot id is qualified with the message's `run`.
 /// Idempotent, so it is safe to hand an id that may already be qualified (e.g. a
 /// `SPAR_AGENT_ID` a slot self-drains with, or a composer-resolved mention).
+/// Resolve an address to a unique bus id. A reserved sink or an already-qualified id
+/// (`run:slot`, containing `:`) passes through; a short id is qualified with `run`.
+///
+/// Invariant for callers: a **short** (colon-less) `to`/holder is qualified with the
+/// message's `run`. To address an agent in a *different* scope — e.g. a run slot DMing a
+/// bare agent — pass that agent's already-unique id (bare ids are colon-less, so send it
+/// with `run = None`) or its fully-qualified `run:slot`. `send_mention` does exactly this.
 pub fn resolve_addr(run: Option<&str>, id: &str) -> String {
     if is_reserved_sink(id) || id.contains(':') {
         id.to_string()
@@ -684,6 +691,9 @@ fn reserve_at(
     now: DateTime<Utc>,
 ) -> Result<()> {
     ensure_bus(paths)?;
+    // Normalize the holder to its unique presence id (`run:slot`) so lease liveness can
+    // match it against the qualified presence roster; a short holder never matches.
+    let holder = resolve_addr(run, holder);
     let mut file = load_reserves(paths, run)?;
     let presence = list_presence(paths, run)?;
     let ttl = Duration::seconds(RESERVE_LEASE_TTL_SECS);
@@ -702,7 +712,7 @@ fn reserve_at(
     file.claims.retain(|c| c.path != path);
     file.claims.push(Reserve {
         path: path.into(),
-        holder: holder.into(),
+        holder,
         ts: now,
     });
     save_reserves(paths, run, &file)
@@ -714,6 +724,8 @@ fn holder_heartbeat(presence: &[Presence], holder: &str) -> Option<DateTime<Utc>
 }
 
 pub fn release(paths: &SparPaths, run: Option<&str>, path: &str, holder: &str) -> Result<()> {
+    // Normalize to the same unique holder id used when reserving (see `reserve_at`).
+    let holder = resolve_addr(run, holder);
     let mut file = load_reserves(paths, run)?;
     file.claims
         .retain(|c| !(c.path == path && c.holder == holder));
