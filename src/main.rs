@@ -442,6 +442,12 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool) -> Result<ExitCode>
                 }
                 None => println!("orchestrator: none"),
             }
+            if state.abandoned(&swarm) {
+                println!(
+                    "abandoned: no live orchestrator (resume with `spar implement --run {} --providers <…>` or `spar stop {}`)",
+                    state.id, state.id
+                );
+            }
             println!("slots: {}", state.slots.len());
             for slot in &state.slots {
                 let act = liveness::SlotActivity::observe(slot, cfg.timeouts.stall_warn_secs);
@@ -515,12 +521,16 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool) -> Result<ExitCode>
                 last_proj = proj;
             }
             let dry = if summary.dry_run { " dry" } else { "" };
+            let abandoned = if summary.abandoned { " ABANDONED" } else { "" };
             let task = summary
                 .task
                 .as_deref()
                 .map(|t| format!("  {}", truncate_cli(t, 40)))
                 .unwrap_or_default();
-            println!("    {}  {:?}{}{task}", summary.id, summary.phase, dry);
+            println!(
+                "    {}  {:?}{}{abandoned}{task}",
+                summary.id, summary.phase, dry
+            );
         }
     }
     Ok(ExitCode::Success)
@@ -558,6 +568,10 @@ fn run_status_json(
         obj.insert(
             "orchestrator_alive".into(),
             serde_json::Value::Bool(orch.map(|t| t.alive()).unwrap_or(false)),
+        );
+        obj.insert(
+            "abandoned".into(),
+            serde_json::Value::Bool(state.abandoned(swarm)),
         );
     }
     liveness::enrich_status_json(&mut v, &state.slots, cfg, swarm, &state.id);
@@ -651,13 +665,14 @@ fn phase_at_rest(phase: state::Phase) -> bool {
     finished || phase.is_gate()
 }
 
+/// Observe-only: the returned state is reconciled against on-disk markers, never written back.
 fn load_run_anywhere(
     run_id: &str,
     local_root: Option<&std::path::Path>,
 ) -> Result<(paths::SparPaths, Config, state::RunState)> {
     if let Some(root) = local_root {
         let swarm = paths::SparPaths::new(root);
-        if let Ok(state) = state::RunState::load(&swarm, run_id) {
+        if let Ok(state) = state::RunState::load_for_display(&swarm, run_id) {
             let cfg = Config::load(root).unwrap_or_default();
             return Ok((swarm, cfg, state));
         }
@@ -670,7 +685,7 @@ fn load_run_anywhere(
             continue;
         };
         let swarm = paths::SparPaths::new(&root);
-        if let Ok(state) = state::RunState::load(&swarm, run_id) {
+        if let Ok(state) = state::RunState::load_for_display(&swarm, run_id) {
             let cfg = Config::load(&root).unwrap_or_default();
             return Ok((swarm, cfg, state));
         }
@@ -836,7 +851,7 @@ fn attach_cmd(run_id: &str) -> Result<ExitCode> {
 fn cleanup_cmd(run_id: &str, json: bool, purge: bool) -> Result<ExitCode> {
     let (paths, _) = project_ctx()?;
     let state = state::RunState::load(&paths, run_id)?;
-    worktree::cleanup_run(&state)?;
+    let cleaned = worktree::cleanup_run(&state)?;
     if let Some(session) = &state.tmux_session {
         let _ = tmux::kill_session(session);
     }
@@ -854,9 +869,30 @@ fn cleanup_cmd(run_id: &str, json: bool, purge: bool) -> Result<ExitCode> {
                 "run_id": run_id,
                 "cleaned": true,
                 "purged": purge,
+                "worktrees": cleaned,
             })
         );
     } else {
+        for w in &cleaned {
+            if let Some(reason) = &w.skipped {
+                println!("skipped {}: {reason}", w.path.display());
+                continue;
+            }
+            if !w.killed.is_empty() {
+                let pids: Vec<String> = w.killed.iter().map(|p| p.to_string()).collect();
+                println!(
+                    "killed {} process(es) in {} (pid {})",
+                    w.killed.len(),
+                    w.path.display(),
+                    pids.join(", ")
+                );
+            }
+            if w.removed {
+                println!("removed worktree {}", w.path.display());
+            } else {
+                println!("could not remove {}", w.path.display());
+            }
+        }
         println!("cleaned worktrees for {run_id}");
         if purge {
             println!("purged run dir");

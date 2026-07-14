@@ -258,6 +258,9 @@ pub struct RunSummary {
     pub task: Option<String>,
     #[serde(default)]
     pub dry_run: bool,
+    /// In flight, but no live orchestrator owns it — computed at read time.
+    #[serde(default)]
+    pub abandoned: bool,
     /// Filled when listing across projects (global home).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_root: Option<PathBuf>,
@@ -321,6 +324,30 @@ impl RunState {
         Ok(state)
     }
 
+    /// Load for observation (`status`, TUI). `state.json` is only as fresh as the last
+    /// orchestrator write, so an orchestrator that died mid-phase leaves slots frozen at
+    /// `running` forever; their markers on disk say otherwise. Reconciles in memory only —
+    /// a read-only command never rewrites the run.
+    pub fn load_for_display(paths: &SparPaths, run_id: &str) -> Result<Self> {
+        let mut state = Self::load(paths, run_id)?;
+        state.reconcile_slots_from_markers(paths);
+        Ok(state)
+    }
+
+    pub fn reconcile_slots_from_markers(&mut self, paths: &SparPaths) {
+        let run_id = self.id.clone();
+        for slot in &mut self.slots {
+            let marker = crate::markers::terminal_marker(paths, &run_id, &slot.id);
+            slot.status = reconcile_slot_status(slot.status, marker);
+        }
+    }
+
+    /// True when the run is still mid-flight but nothing is driving it: the orchestrator
+    /// exited without reaching a terminal phase. Computed, never persisted.
+    pub fn abandoned(&self, paths: &SparPaths) -> bool {
+        is_abandoned(self.phase, orchestrator_alive(paths, &self.id))
+    }
+
     pub fn save(&self, paths: &SparPaths) -> Result<()> {
         paths.ensure_run_dirs(&self.id)?;
         let prev_phase = if paths.state_file(&self.id).is_file() {
@@ -382,6 +409,34 @@ impl RunState {
     }
 }
 
+/// On-disk markers beat `state.json` for a slot the orchestrator never got to update.
+/// Only a `running` slot is reconciled; a slot already at rest keeps its recorded verdict.
+pub fn reconcile_slot_status(
+    state_status: SlotStatus,
+    marker: Option<crate::markers::TerminalMarker>,
+) -> SlotStatus {
+    if state_status != SlotStatus::Running {
+        return state_status;
+    }
+    match marker {
+        Some(crate::markers::TerminalMarker::Done) => SlotStatus::Done,
+        Some(crate::markers::TerminalMarker::Failed) => SlotStatus::Failed,
+        None => SlotStatus::Running,
+    }
+}
+
+/// A run is abandoned when it is still in flight but no live process owns it. Phases at
+/// rest — terminal, a human gate, or `Stopped` — are *meant* to have no orchestrator.
+pub fn is_abandoned(phase: Phase, orchestrator_alive: bool) -> bool {
+    !phase.is_waitable_stop() && !orchestrator_alive
+}
+
+pub fn orchestrator_alive(paths: &SparPaths, run_id: &str) -> bool {
+    crate::runlock::RunLock::owner(paths, run_id)
+        .map(|t| t.alive())
+        .unwrap_or(false)
+}
+
 pub fn list_runs(paths: &SparPaths) -> Result<Vec<RunSummary>> {
     let runs_dir = paths.runs_dir();
     if !runs_dir.is_dir() {
@@ -398,6 +453,7 @@ pub fn list_runs(paths: &SparPaths) -> Result<Vec<RunSummary>> {
         let id = entry.file_name().to_string_lossy().into_owned();
         match RunState::load(paths, &id) {
             Ok(state) => out.push(RunSummary {
+                abandoned: state.abandoned(paths),
                 id: state.id,
                 workflow: state.workflow,
                 phase: state.phase,
@@ -447,6 +503,108 @@ mod tests {
         assert_eq!(loaded.phase, Phase::Stopped);
         assert_eq!(loaded.exit_code(), ExitCode::Failure);
         assert_eq!(loaded.status_exit_code(), Some(1));
+    }
+
+    #[test]
+    fn reconcile_running_slot_from_terminal_marker() {
+        use crate::markers::TerminalMarker;
+        assert_eq!(
+            reconcile_slot_status(SlotStatus::Running, Some(TerminalMarker::Done)),
+            SlotStatus::Done
+        );
+        assert_eq!(
+            reconcile_slot_status(SlotStatus::Running, Some(TerminalMarker::Failed)),
+            SlotStatus::Failed
+        );
+        assert_eq!(
+            reconcile_slot_status(SlotStatus::Running, None),
+            SlotStatus::Running
+        );
+    }
+
+    #[test]
+    fn reconcile_leaves_non_running_status_alone() {
+        use crate::markers::TerminalMarker;
+        for status in [
+            SlotStatus::Pending,
+            SlotStatus::Done,
+            SlotStatus::Failed,
+            SlotStatus::Stuck,
+        ] {
+            assert_eq!(
+                reconcile_slot_status(status, Some(TerminalMarker::Done)),
+                status
+            );
+            assert_eq!(
+                reconcile_slot_status(status, Some(TerminalMarker::Failed)),
+                status
+            );
+            assert_eq!(reconcile_slot_status(status, None), status);
+        }
+    }
+
+    /// The zombie run: orchestrator died in `review`, the slot's `.done` marker is on disk,
+    /// `state.json` still says `running`. Display must show `done`, and the file must not change.
+    #[test]
+    fn load_for_display_reconciles_without_rewriting_state() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new("zombie", WorkflowKind::Loop, tmp.path().to_path_buf());
+        state.phase = Phase::Review;
+        let mut slot = crate::executor::init_slot("review-a", "cli:grok", SlotRole::Reviewer);
+        slot.status = SlotStatus::Running;
+        state.slots.push(slot);
+        state.save(&paths).unwrap();
+        crate::markers::write_done(&paths, "zombie", "review-a").unwrap();
+
+        let shown = RunState::load_for_display(&paths, "zombie").unwrap();
+        assert_eq!(shown.slots[0].status, SlotStatus::Done);
+
+        let on_disk = RunState::load(&paths, "zombie").unwrap();
+        assert_eq!(
+            on_disk.slots[0].status,
+            SlotStatus::Running,
+            "display must not rewrite state.json"
+        );
+    }
+
+    #[test]
+    fn abandoned_only_when_in_flight_and_unowned() {
+        assert!(is_abandoned(Phase::Review, false));
+        assert!(is_abandoned(Phase::WaitCompletion, false));
+        assert!(!is_abandoned(Phase::Review, true));
+        // At rest by design: nobody is supposed to own these.
+        for phase in [
+            Phase::Done,
+            Phase::Failed,
+            Phase::Stuck,
+            Phase::Quota,
+            Phase::AwaitingPlanApproval,
+            Phase::AwaitingShipConfirm,
+            Phase::Stopped,
+        ] {
+            assert!(
+                !is_abandoned(phase, false),
+                "{phase:?} must not be abandoned"
+            );
+            assert!(
+                !is_abandoned(phase, true),
+                "{phase:?} must not be abandoned"
+            );
+        }
+    }
+
+    #[test]
+    fn list_runs_flags_abandoned_run() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new("zombie", WorkflowKind::Loop, tmp.path().to_path_buf());
+        state.phase = Phase::Review;
+        state.save(&paths).unwrap();
+
+        let runs = list_runs(&paths).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].abandoned, "no lock owner ⇒ abandoned");
     }
 
     #[test]

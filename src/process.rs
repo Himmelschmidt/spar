@@ -381,6 +381,90 @@ pub fn terminate_tree(pid: u32, group: bool) {
 #[cfg(not(unix))]
 pub fn terminate_tree(_pid: u32, _group: bool) {}
 
+/// SIGTERM every pid, one shared grace window, then SIGKILL whatever survived.
+#[cfg(unix)]
+pub fn terminate_all(pids: &[u32]) {
+    for &pid in pids {
+        raw_kill(pid as i32, SIGTERM);
+    }
+    let grace = Instant::now();
+    while grace.elapsed() < Duration::from_secs(2) {
+        if pids.iter().all(|&p| !pid_alive(p)) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    for &pid in pids {
+        if pid_alive(pid) {
+            raw_kill(pid as i32, SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn terminate_all(_pids: &[u32]) {}
+
+/// Pids whose working directory is inside `dir`, via `/proc/<pid>/cwd`.
+///
+/// Matching on cwd rather than command line is deliberate: a command-line match
+/// self-matches the `spar cleanup` invocation (and its shell), and killing those is how
+/// you take out your own terminal. Our own pid and every ancestor are excluded for the
+/// same reason — cleanup is often run from inside the worktree it is reaping.
+#[cfg(target_os = "linux")]
+pub fn pids_with_cwd_under(dir: &Path) -> Vec<u32> {
+    let Ok(root) = dir.canonicalize() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let skip = self_and_ancestors();
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if skip.contains(&pid) {
+            continue;
+        }
+        let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) else {
+            continue;
+        };
+        if cwd.starts_with(&root) {
+            out.push(pid);
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn pids_with_cwd_under(_dir: &Path) -> Vec<u32> {
+    Vec::new()
+}
+
+#[cfg(target_os = "linux")]
+fn self_and_ancestors() -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut pid = std::process::id();
+    while pid > 1 && !out.contains(&pid) {
+        out.push(pid);
+        match pid_parent(pid) {
+            Some(p) => pid = p,
+            None => break,
+        }
+    }
+    out
+}
+
+/// Parent pid: field 4 of `/proc/<pid>/stat`, i.e. the second field after `comm`.
+#[cfg(target_os = "linux")]
+fn pid_parent(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = &stat[stat.rfind(')')? + 1..];
+    after_comm.split_whitespace().nth(1)?.parse().ok()
+}
+
 fn stream_to_log(
     pipe: impl Read,
     log_path: &Path,
@@ -1087,6 +1171,30 @@ mod tests {
         let pid = child.id();
         child.wait().unwrap();
         assert!(!pid_alive(pid), "reaped child pid must be dead");
+    }
+
+    /// Cleanup is routinely run from inside the very tree it reaps; scanning our own cwd
+    /// must never hand back this process (or the shell that spawned it) as a kill target.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_never_returns_self_or_ancestors() {
+        let here = std::env::current_dir().unwrap();
+        let found = pids_with_cwd_under(&here);
+        for pid in self_and_ancestors() {
+            assert!(
+                !found.contains(&pid),
+                "pid {pid} (self or ancestor) must be excluded from reap targets"
+            );
+        }
+        assert!(self_and_ancestors().contains(&std::process::id()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwd_scan_of_empty_dir_finds_nothing() {
+        let tmp = tempdir().unwrap();
+        assert!(pids_with_cwd_under(tmp.path()).is_empty());
+        assert!(pids_with_cwd_under(&tmp.path().join("gone")).is_empty());
     }
 
     #[cfg(target_os = "linux")]

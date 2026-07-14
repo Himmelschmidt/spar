@@ -196,16 +196,70 @@ pub fn prepare_isolation(
     Ok(())
 }
 
-pub fn cleanup_run(state: &RunState) -> Result<()> {
+/// What cleanup did to one worktree.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WorktreeCleanup {
+    pub slot_id: String,
+    pub path: PathBuf,
+    /// Processes reaped because their cwd was inside the worktree.
+    pub killed: Vec<u32>,
+    pub removed: bool,
+    /// Set when the guard refused the path (never touched).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<String>,
+}
+
+/// Cleanup only ever touches a run's own worktrees. Refuse the project root itself and
+/// any ancestor of it — a bad record must never take out the checkout or `$HOME`.
+pub fn reapable_worktree(project_root: &Path, path: &Path) -> bool {
+    if path.as_os_str().is_empty() {
+        return false;
+    }
+    let wt = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    wt != root && !root.starts_with(&wt)
+}
+
+/// Reap first, then remove. Agents leave dev servers and watchers running with their cwd
+/// inside the worktree; those keep writing into it, which is how a `remove_dir_all` loses
+/// the race and leaves a half-deleted directory (and orphaned processes) behind for days.
+pub fn cleanup_run(state: &RunState) -> Result<Vec<WorktreeCleanup>> {
+    let mut report = Vec::new();
     for rec in &state.worktrees {
+        if !reapable_worktree(&state.project_root, &rec.path) {
+            report.push(WorktreeCleanup {
+                slot_id: rec.slot_id.clone(),
+                path: rec.path.clone(),
+                killed: Vec::new(),
+                removed: false,
+                skipped: Some("refusing path: not inside the run's own worktrees".into()),
+            });
+            continue;
+        }
+
+        let killed = crate::process::pids_with_cwd_under(&rec.path);
+        if !killed.is_empty() {
+            crate::process::terminate_all(&killed);
+        }
+
         if state.dry_run || rec.path.starts_with(state.project_root.join(".spar")) {
-            // dry-run cwd dirs live under .spar — just rm
+            // dry-run cwd dirs live under .spar and git never knew about them — just rm
             let _ = std::fs::remove_dir_all(&rec.path);
         } else {
             let _ = remove_worktree(&state.project_root, rec);
         }
+
+        report.push(WorktreeCleanup {
+            slot_id: rec.slot_id.clone(),
+            path: rec.path.clone(),
+            removed: !rec.path.exists(),
+            killed,
+            skipped: None,
+        });
     }
-    Ok(())
+    Ok(report)
 }
 
 /// Bring pre-coding acceptance tests from the test-author worktree into the implementer cwd.
@@ -382,6 +436,60 @@ mod tests {
         });
         apply_spec_tests_to_impl(&state, "test-author-x", &impl_cwd).unwrap();
         assert!(impl_cwd.join(".spar-dry-acceptance-tests").is_file());
+    }
+
+    #[test]
+    fn reap_guard_refuses_project_root_and_ancestors() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+
+        assert!(!reapable_worktree(&root, &root), "never the project root");
+        assert!(
+            !reapable_worktree(&root, tmp.path()),
+            "never a parent of the project root"
+        );
+        assert!(
+            !reapable_worktree(&root, Path::new("/")),
+            "never the filesystem root"
+        );
+        assert!(!reapable_worktree(&root, Path::new("")));
+
+        let sibling = tmp.path().join("repo-spar-r1-impl");
+        assert!(reapable_worktree(&root, &sibling), "sibling worktree is ok");
+        assert!(
+            reapable_worktree(&root, &root.join(".spar/runs/r1/cwd-impl")),
+            "dry-run cwd under .spar is ok"
+        );
+    }
+
+    #[test]
+    fn cleanup_run_skips_guarded_path_and_removes_own_worktree() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-spar-r1-impl");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join("file"), "x").unwrap();
+
+        let mut state = RunState::new("r1", crate::cli::WorkflowKind::Loop, root.clone());
+        state.dry_run = true;
+        state.worktrees.push(WorktreeRecord {
+            slot_id: "impl".into(),
+            path: wt.clone(),
+            branch: "spar/r1/impl".into(),
+        });
+        state.worktrees.push(WorktreeRecord {
+            slot_id: "bogus".into(),
+            path: root.clone(),
+            branch: "spar/r1/bogus".into(),
+        });
+
+        let report = cleanup_run(&state).unwrap();
+        assert!(report[0].removed);
+        assert!(!wt.exists());
+        assert!(report[1].skipped.is_some(), "project root must be refused");
+        assert!(root.is_dir(), "project root must survive cleanup");
     }
 
     #[test]
