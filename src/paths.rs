@@ -102,7 +102,16 @@ pub fn find_project_root() -> Result<PathBuf> {
 pub fn find_project_root_from(start: impl AsRef<Path>) -> Result<PathBuf> {
     let mut dir = start.as_ref().to_path_buf();
     loop {
-        if dir.join(".git").exists() || dir.join(".spar").exists() {
+        let git = dir.join(".git");
+        if git.exists() || dir.join(".spar").exists() {
+            // A linked worktree has a `.git` *file* (a `gitdir:` pointer). Map it to the
+            // repo's main worktree so a worktree registers under its parent project
+            // rather than as its own separate entry in the project list.
+            if git.is_file() {
+                if let Some(main) = main_worktree_root(&dir) {
+                    return Ok(main);
+                }
+            }
             return Ok(dir);
         }
         if !dir.pop() {
@@ -112,6 +121,24 @@ pub fn find_project_root_from(start: impl AsRef<Path>) -> Result<PathBuf> {
             );
         }
     }
+}
+
+/// The repo's main (primary) worktree via `git worktree list` — its first entry is
+/// always the main worktree. `None` if git is unavailable or `dir` isn't in a repo.
+fn main_worktree_root(dir: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let path = stdout.lines().next()?.strip_prefix("worktree ")?;
+    let main = PathBuf::from(path.trim());
+    main.is_dir().then_some(main)
 }
 
 #[cfg(test)]
@@ -127,6 +154,48 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         let root = find_project_root_from(&nested).unwrap();
         assert_eq!(root, tmp.path());
+    }
+
+    #[test]
+    fn worktree_resolves_to_main_checkout() {
+        let tmp = tempdir().unwrap();
+        let main = tmp.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&main)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        let wt = tmp.path().join("wt");
+        assert!(
+            git(&["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()])
+                .status
+                .success()
+        );
+
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap();
+        // From the worktree root and a nested subdir, resolve to the main checkout.
+        assert_eq!(
+            canon(&find_project_root_from(&wt).unwrap()),
+            canon(&main),
+            "worktree root must resolve to the main checkout"
+        );
+        let nested = wt.join("a/b");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(
+            canon(&find_project_root_from(&nested).unwrap()),
+            canon(&main),
+            "subdir of a worktree must resolve to the main checkout"
+        );
+        // The main checkout itself is unchanged (its `.git` is a dir, not a file).
+        assert_eq!(canon(&find_project_root_from(&main).unwrap()), canon(&main));
     }
 
     #[test]
