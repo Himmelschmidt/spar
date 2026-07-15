@@ -62,12 +62,16 @@ Supporting principles:
 - Diff renders the selected slot's real `git diff HEAD` (capped), falling back to
   artifacts when a slot has no worktree. Decisions U3/U4.
 
-## Stage C — the attention model
+## Stage C — the attention model (done)
 
-- Status roll-up: one line that answers "what needs me?" across every run.
-- Attention-sorted rail (gates and stalls float to the top).
-- `a` = jump to the next alert; toasts for gate transitions.
-- Width breakpoints beyond the single narrow/wide split.
+- Status roll-up: a status-line `⚑N need you` count across every run, plus a `⚑`
+  marker that rolls a wanting run up to its project row. Answers "what needs me?".
+- Attention-sorted rail: gates and broken runs float to the top; selection stays glued
+  to the run id as the order shifts.
+- `a` = jump to the next run that needs you (also the tappable roll-up token); toasts
+  when a run crosses into a gate / breakage.
+- Width bands: `<80` Main only · `80–119` rail + Main · `>=120` extra width to Main
+  (never a fourth box). Decision U5.
 
 ## Sources
 
