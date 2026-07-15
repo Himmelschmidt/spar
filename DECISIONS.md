@@ -76,12 +76,21 @@ Workspace initiative (2026-07-13). See `roadmap/workspace-initiative-plan.md` fo
 | Z3 | **`spar cleanup` reaps by cwd, never by command line.** Processes are matched via `/proc/<pid>/cwd` inside the run's own worktrees (self + ancestors excluded), SIGTERM → grace → SIGKILL, then the worktree is removed. Matching on command line self-matches the caller's shell | DECIDED |
 | W6 | **Image paste over SSH = local-companion bridge (option A).** A local `spar clip` reads the OS clipboard image (`arboard` / `wl-paste` / `pbpaste`), ships raw bytes to the remote spar over the existing SSH connection (ControlMaster-exec or a forwarded socket); the remote stages a `0600` temp file and injects its **path** into the agent pane via Track A `send-keys` (agents accept image file paths). Additive; fits the ssh-then-run + `tmux -L spar` model. Thin-client alternative deferred — see X7 | DECIDED — backlog feature 002 |
 
+## TUI
+
+TUI restructure (2026-07-14). See `roadmap/tui-redesign-plan.md` for the staged build.
+
+| ID | Decision | Status |
+|----|----------|--------|
+| U1 | TUI is a **rail + one main area** (content = f(selection × tab)), not N co-equal Tab-cycled panels. Rail is a `projects ▸ runs ▸ agents` drill-down (`Enter` pushes, `Esc` pops, breadcrumb in a single status line); Log/Activity/Diff/Shell are **tabs over Main**. Focus targets cut 6 → 3 (Rail/Main/Composer) with direct keys `1/2/3`. Chrome cut from 10 rows to 2. Researched against k9s / lazygit / lazydocker / herdr / claude-squad, which all use this shape; an N-way focus ring destroys spatial memory | DECIDED |
+| U2 | The embedded terminal is a **mode, not a panel** — it lives in Main's Shell tab (Stage A) and becomes a full-screen Driving mode (Stage B). Escape is a prefix (`C-a`) + `F12`, never `Esc`/`Tab` (the agent needs those — Shift+Tab is Claude Code's permission toggle) | DECIDED |
+
 ## Open
 
 | ID | Topic | Status |
 |----|-------|--------|
 | X1 | First API provider to spike (xAI / Anthropic / OpenAI) | DECIDED — OpenAI-compatible (`api:openai`, `api:xai`) via ureq |
-| X2 | TUI keymap / layout (mimic which product most?) | LEANING — j/k Tab a/r/s /commands (M1 shell) |
+| X2 | TUI keymap / layout (mimic which product most?) | DECIDED — rail + one main area, k9s/lazygit shape; see U1/U2 |
 | X3 | Project template overrides day one vs later | OPEN |
 | X4 | Bus steer reliability for native-cli headless | DECIDED — adapter-dispatched turn-boundary delivery (Stop-hook inject / native queue / SDK prompt / inbox-on-next-turn per adapter) |
 | X5 | vals scrape parser brittleness / grace TTL days / ship in-repo snapshot | OPEN — decide at MS phase A impl |
