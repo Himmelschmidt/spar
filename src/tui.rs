@@ -397,6 +397,12 @@ struct App {
     /// Sender for background tasks (e.g. deferred `/spawn`) to flash a result back
     /// onto the render loop. Set once the message channel exists.
     bg_tx: Option<mpsc::Sender<Msg>>,
+    /// Per-run attention level from the previous snapshot, for toast edge-detection.
+    /// `None` until the first snapshot primes it (so we never toast the initial fleet).
+    prev_attention: Option<Vec<(String, Attention)>>,
+    /// Hit rect of the fleet roll-up token on the status line; a tap jumps to the next
+    /// run that needs you (same as `a`). Zero-sized when nothing needs attention.
+    rect_attention: Rect,
 }
 
 /// A gate action reachable by both a key and a tappable button.
@@ -516,6 +522,8 @@ impl App {
             terminal_pane: None,
             takeover_target: None,
             bg_tx: None,
+            prev_attention: None,
+            rect_attention: Rect::default(),
         }
     }
 
@@ -852,7 +860,10 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache) -> Snapshot {
     let swarm = SparPaths::new(&sel.root);
     let projects = registry::projects();
     let runs = if sel.browse.in_project() {
-        registry::list_project_runs(&sel.root).unwrap_or_default()
+        let mut runs = registry::list_project_runs(&sel.root).unwrap_or_default();
+        // Attention-sorted rail: gates and broken runs float to the top (Stage C).
+        sort_runs_by_attention(&mut runs);
+        runs
     } else {
         Vec::new()
     };
@@ -1126,8 +1137,18 @@ fn run_loop(
         if snap.runs.is_empty() {
             app.selected_run = 0;
         } else {
+            // The attention sort reorders the rail as runs change state; keep the
+            // cursor glued to the same run id rather than the same row.
+            if let Some(prev) = sel.run_id.as_deref() {
+                if let Some(pos) = snap.runs.iter().position(|r| r.id == prev) {
+                    app.selected_run = pos;
+                }
+            }
             app.selected_run = app.selected_run.min(snap.runs.len() - 1);
         }
+        // Toast a run the moment it starts wanting the operator (gate/broken), so a
+        // fleet transition is noticed even while looking at another run.
+        emit_attention_toasts(&mut app, &snap.runs);
         let n_slots = snap.full.as_ref().map(|s| s.slots.len()).unwrap_or(0);
         app.selected_slot = if n_slots == 0 {
             0
@@ -1397,11 +1418,9 @@ fn handle_key(
             Focus::Rail => rail_move(app, projects, runs, n_slots, -5),
             Focus::Main => app.scroll_main_by(-i32::from(app.main_page())),
         },
-        KeyCode::Char('a') => {
-            if let Some(id) = selected_id {
-                run_gate_action(app, swarm, id, GateAction::Approve);
-            }
-        }
+        // a jumps to the next run that wants you (Stage C). Approve moved to the gate
+        // button / `:approve` when `a` became the fleet-wide attention binding.
+        KeyCode::Char('a') => jump_to_attention(app, runs),
         KeyCode::Char('r') => {
             if let Some(id) = selected_id {
                 run_gate_action(app, swarm, id, GateAction::Reject);
@@ -2133,6 +2152,11 @@ fn handle_mouse(
                 }
                 return;
             }
+            // Tapping the fleet roll-up token jumps to the next run that needs you.
+            if contains(app.rect_attention, x, y) {
+                jump_to_attention(app, runs);
+                return;
+            }
             if contains(app.rect_help, x, y) {
                 app.show_help = true;
                 return;
@@ -2244,11 +2268,13 @@ struct LayoutRects {
     narrow: bool,
 }
 
-/// Below this terminal width the rail folds away: Main only, with the MainTab strip
-/// on its own row — usable over a phone/Termux SSH session.
-const NARROW_WIDTH: u16 = 90;
+/// Width breakpoints (Stage C): `<80` Main only (phone/SSH — rail folds away, tab strip
+/// on its own row); `80–119` rail + Main; `>=120` rail + a **wider Main** (the primary
+/// object gets the extra columns — we never add a fourth box).
+const NARROW_WIDTH: u16 = 80;
 
-/// Rail width in the wide layout. Enough for `run id · phase · age`, no more.
+/// Rail width in the wide layout. Enough for `run id · phase · age`, no more. Fixed
+/// across the wide bands so the extra width at `>=120` all lands on Main.
 const RAIL_WIDTH: u16 = 24;
 
 /// Chrome budget: 1 status row + 1 footer row. Everything else on screen is content
@@ -2491,7 +2517,7 @@ fn status_cue(
         );
     }
     match st.phase {
-        Phase::AwaitingPlanApproval => ("plan ready — a approve · r reject".into(), BG, YELLOW),
+        Phase::AwaitingPlanApproval => ("plan ready — tap Approve · r reject".into(), BG, YELLOW),
         Phase::AwaitingWinnerConfirm => ("winner ready — confirm or reconcile".into(), BG, YELLOW),
         Phase::AwaitingShipConfirm => ("ready to ship — s (draft PR)".into(), BG, YELLOW),
         Phase::AwaitingReconcile => ("reconcile ready".into(), BG, YELLOW),
@@ -2596,6 +2622,29 @@ fn draw_status(
         if st.dry_run {
             spans.push(Span::styled(
                 " dry-run ",
+                Style::default().fg(BG).bg(YELLOW).bold(),
+            ));
+        }
+    }
+    // Fleet roll-up: how many runs anywhere want the operator, with the `a` jump hint.
+    // This is the "what needs me?" answer that does not depend on which run is selected.
+    app.rect_attention = Rect::default();
+    if app.browse.in_project() {
+        let need = runs_needing_attention(runs);
+        if need > 0 {
+            let token = format!(" ⚑{need} need you · a ");
+            let col: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+            let x = area.x.saturating_add(col as u16);
+            if x < area.right() {
+                app.rect_attention = Rect {
+                    x,
+                    y: area.y,
+                    width: (token.chars().count() as u16).min(area.right() - x),
+                    height: 1,
+                };
+            }
+            spans.push(Span::styled(
+                token,
                 Style::default().fg(BG).bg(YELLOW).bold(),
             ));
         }
@@ -2738,11 +2787,17 @@ fn rail_project_items<'a>(projects: &'a [registry::ProjectEntry], app: &App) -> 
                 }
             }
             let name = p.name.as_deref().unwrap_or("·");
-            let n = registry::list_project_runs(&p.root)
-                .map(|r| r.len())
-                .unwrap_or(0);
-            let line = Line::from(vec![
-                Span::styled(if sel { "› " } else { "  " }, Style::default().fg(ACCENT)),
+            let project_runs = registry::list_project_runs(&p.root).unwrap_or_default();
+            let n = project_runs.len();
+            // Roll-up: a run that wants the operator makes its whole project fly a ⚑.
+            let need = runs_needing_attention(&project_runs);
+            let lead = if need > 0 {
+                Span::styled("⚑ ", Style::default().fg(YELLOW).bold())
+            } else {
+                Span::styled(if sel { "› " } else { "  " }, Style::default().fg(ACCENT))
+            };
+            let mut spans = vec![
+                lead,
                 Span::styled(
                     format!("{:<12}", truncate(name, 12)),
                     Style::default()
@@ -2754,8 +2809,18 @@ fn rail_project_items<'a>(projects: &'a [registry::ProjectEntry], app: &App) -> 
                         }),
                 ),
                 Span::styled(format!(" {n}r "), Style::default().fg(FG_MUTED)),
-                Span::styled(relative_age(p.last_seen), Style::default().fg(FG_MUTED)),
-            ]);
+            ];
+            if need > 0 {
+                spans.push(Span::styled(
+                    format!("⚑{need} "),
+                    Style::default().fg(YELLOW).bold(),
+                ));
+            }
+            spans.push(Span::styled(
+                relative_age(p.last_seen),
+                Style::default().fg(FG_MUTED),
+            ));
+            let line = Line::from(spans);
             ListItem::new(line).style(if sel {
                 Style::default().bg(BG_RAISED)
             } else {
@@ -2791,8 +2856,15 @@ fn rail_run_items<'a>(runs: &'a [state::RunSummary], app: &App) -> Vec<ListItem<
             } else {
                 (truncate(&phase_label(r.phase), 10), phase_color(r.phase))
             };
+            // The lead glyph doubles as the attention marker: a run that wants you flies
+            // a ⚑ (yellow gate, red broken); otherwise it is the plain selection caret.
+            let lead = match run_attention(r) {
+                Attention::Gate => Span::styled("⚑ ", Style::default().fg(YELLOW).bold()),
+                Attention::Broken => Span::styled("⚑ ", Style::default().fg(RED).bold()),
+                _ => Span::styled(if sel { "› " } else { "  " }, Style::default().fg(ACCENT)),
+            };
             let line = Line::from(vec![
-                Span::styled(if sel { "› " } else { "  " }, Style::default().fg(ACCENT)),
+                lead,
                 Span::styled(
                     format!("{:<8}", truncate(&r.id, 8)),
                     Style::default()
@@ -3784,7 +3856,7 @@ fn situational_footer(
 ) -> &'static str {
     if let Some(st) = full {
         if st.phase == Phase::AwaitingPlanApproval {
-            return "a approve · r reject · or tap the buttons above";
+            return "tap Approve · r reject · :approve · a next alert";
         }
         if st.phase == Phase::AwaitingShipConfirm {
             return "s confirm ship (draft PR) · or tap Ship above";
@@ -3796,8 +3868,8 @@ fn situational_footer(
     match focus {
         Focus::Rail => match browse {
             BrowseLevel::Projects => "j/k · Enter open · / filter · : cmd · 2 main · ? help",
-            BrowseLevel::Runs => "j/k · Enter agents · / filter · : cmd · Esc back · ? help",
-            BrowseLevel::Agents => "j/k · Enter take over agent · Esc runs · : cmd · 2 main",
+            BrowseLevel::Runs => "j/k · Enter agents · a next-alert · / filter · : cmd · ? help",
+            BrowseLevel::Agents => "j/k · Enter take over · a next-alert · Esc runs · : cmd",
         },
         Focus::Main => match tab {
             MainTab::Log => "scroll · [ ] tabs · w wrap · g/G top/end · + zoom · 1 rail",
@@ -3825,6 +3897,7 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
  \n\
   Shape\n\
     Rail   projects ▸ runs ▸ agents  (Enter pushes, Esc pops)\n\
+           attention-sorted: gates and broken runs float to the top.\n\
     Main   one area · tabs: Log · Activity · Diff · Shell\n\
     Main always shows the rail's selection — nothing else moves.\n\
  \n\
@@ -3837,7 +3910,8 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
     [ ]                  previous / next Main tab\n\
     + / _                zoom Main fullscreen / restore\n\
     p                    jump to Projects\n\
-    a / r / s            approve · reject · ship (when gated)\n\
+    a                    jump to the next run that needs you\n\
+    r / s                reject · ship (when gated; approve = tap / :approve)\n\
     :                    command palette (approve/ship/takeover/…)\n\
     /                    filter the rail\n\
     w                    log wrap ↔ truncate long lines\n\
@@ -4493,6 +4567,118 @@ fn is_active_phase(phase: Phase) -> bool {
     !phase.is_waitable_stop()
 }
 
+/// How loudly a run wants the operator's eyes. Derived from the run summary alone
+/// (cheap — no per-run full-state load), it drives the attention-sorted rail, the
+/// status roll-up, and the `a` jump. Ordering matters: higher = louder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Attention {
+    Idle = 0,    // Done / Stopped — nothing to do
+    Working = 1, // actively running
+    Broken = 2,  // abandoned / failed / stuck / escalated / quota
+    Gate = 3,    // a human decision is blocking the run right now
+}
+
+impl Attention {
+    /// A run at or above this wants the operator; below it is just progress.
+    fn needs_you(self) -> bool {
+        self >= Attention::Broken
+    }
+}
+
+/// Attention level for one run, from its summary.
+fn run_attention(r: &state::RunSummary) -> Attention {
+    if r.phase.is_gate() {
+        return Attention::Gate;
+    }
+    if r.abandoned
+        || matches!(
+            r.phase,
+            Phase::Failed | Phase::Stuck | Phase::Escalated | Phase::Quota
+        )
+    {
+        return Attention::Broken;
+    }
+    if is_active_phase(r.phase) {
+        Attention::Working
+    } else {
+        Attention::Idle
+    }
+}
+
+/// Order runs for the rail: loudest attention first, then most-recently updated. The
+/// sort is applied at the data layer (in the snapshot) so navigation, selection, and
+/// rendering all see one order.
+fn sort_runs_by_attention(runs: &mut [state::RunSummary]) {
+    runs.sort_by(|a, b| {
+        run_attention(b)
+            .cmp(&run_attention(a))
+            .then(b.updated_at.cmp(&a.updated_at))
+    });
+}
+
+/// How many runs currently want the operator (gate or broken) — the fleet roll-up.
+fn runs_needing_attention(runs: &[state::RunSummary]) -> usize {
+    runs.iter().filter(|r| run_attention(r).needs_you()).count()
+}
+
+/// Flash a toast when a run first crosses into wanting the operator (Working/Idle →
+/// Gate/Broken) since the last snapshot. The first snapshot only primes the baseline
+/// so the existing fleet is never announced.
+fn emit_attention_toasts(app: &mut App, runs: &[state::RunSummary]) {
+    let now: Vec<(String, Attention)> = runs
+        .iter()
+        .map(|r| (r.id.clone(), run_attention(r)))
+        .collect();
+    if let Some(prev) = app.prev_attention.take() {
+        for (id, att) in &now {
+            let was = prev
+                .iter()
+                .find(|(pid, _)| pid == id)
+                .map(|(_, a)| *a)
+                .unwrap_or(Attention::Idle);
+            if att.needs_you() && !was.needs_you() {
+                let (what, color) = match att {
+                    Attention::Gate => ("needs your decision", YELLOW),
+                    _ => ("needs attention", RED),
+                };
+                app.flash_for(
+                    format!("⚠ {} {what} — a to jump", truncate(id, 8)),
+                    color,
+                    Duration::from_secs(6),
+                );
+            }
+        }
+    }
+    app.prev_attention = Some(now);
+}
+
+/// `a`: jump the rail selection to the next run that wants the operator, cycling from
+/// just after the current selection. Lands on the run (rail at the Runs level) so the
+/// status line shows its gate/breakage.
+fn jump_to_attention(app: &mut App, runs: &[state::RunSummary]) {
+    if !app.browse.in_project() {
+        app.flash("open a project first", FG_MUTED);
+        return;
+    }
+    let n = runs.len();
+    let next = (1..=n).map(|off| (app.selected_run + off) % n).find(|&i| {
+        runs.get(i)
+            .map(|r| run_attention(r).needs_you())
+            .unwrap_or(false)
+    });
+    match next {
+        Some(i) => {
+            app.selected_run = i;
+            app.browse = BrowseLevel::Runs;
+            app.focus = Focus::Rail;
+            app.reset_stream_view();
+            let id = runs.get(i).map(|r| r.id.as_str()).unwrap_or("");
+            app.flash(format!("→ {} needs you", truncate(id, 8)), YELLOW);
+        }
+        None => app.flash("nothing needs you", GREEN),
+    }
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -5117,5 +5303,86 @@ mod labels {
         .unwrap();
         assert!(!quit, "q inside the palette types, never quits");
         assert_eq!(app.palette.as_ref().map(|p| p.input.as_str()), Some("q"));
+    }
+
+    fn summary_phase(id: &str, phase: Phase) -> state::RunSummary {
+        state::RunSummary {
+            phase,
+            ..summary(id, None)
+        }
+    }
+
+    #[test]
+    fn attention_ranks_gate_over_broken_over_working() {
+        assert_eq!(
+            run_attention(&summary_phase("a", Phase::AwaitingPlanApproval)),
+            Attention::Gate
+        );
+        assert_eq!(
+            run_attention(&summary_phase("a", Phase::Failed)),
+            Attention::Broken
+        );
+        assert_eq!(
+            run_attention(&summary_phase("a", Phase::Review)),
+            Attention::Working
+        );
+        assert_eq!(
+            run_attention(&summary_phase("a", Phase::Done)),
+            Attention::Idle
+        );
+        // An abandoned running run reads as Broken, not Working.
+        let mut ab = summary_phase("a", Phase::Review);
+        ab.abandoned = true;
+        assert_eq!(run_attention(&ab), Attention::Broken);
+        assert!(Attention::Gate > Attention::Broken);
+        assert!(Attention::Broken.needs_you() && !Attention::Working.needs_you());
+    }
+
+    #[test]
+    fn sort_floats_gates_and_broken_to_the_top() {
+        let mut runs = vec![
+            summary_phase("work", Phase::Review),
+            summary_phase("gate", Phase::AwaitingShipConfirm),
+            summary_phase("idle", Phase::Done),
+            summary_phase("brok", Phase::Stuck),
+        ];
+        sort_runs_by_attention(&mut runs);
+        let order: Vec<&str> = runs.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(order, vec!["gate", "brok", "work", "idle"]);
+        assert_eq!(runs_needing_attention(&runs), 2);
+    }
+
+    #[test]
+    fn a_jumps_to_next_run_that_needs_you() {
+        let runs = vec![
+            summary_phase("r0", Phase::Review),
+            summary_phase("r1", Phase::Review),
+            summary_phase("r2", Phase::AwaitingPlanApproval),
+        ];
+        let mut app = App::new(None, 300, true);
+        app.browse = BrowseLevel::Runs;
+        app.selected_run = 0;
+        jump_to_attention(&mut app, &runs);
+        assert_eq!(app.selected_run, 2, "lands on the gated run");
+        // From the gate it wraps and, finding no other, stays put.
+        jump_to_attention(&mut app, &runs);
+        assert_eq!(app.selected_run, 2);
+    }
+
+    #[test]
+    fn toasts_prime_silently_then_fire_on_transition() {
+        let mut app = App::new(None, 300, true);
+        // First snapshot only primes: an existing gate is NOT toasted.
+        let runs = vec![summary_phase("r0", Phase::AwaitingPlanApproval)];
+        emit_attention_toasts(&mut app, &runs);
+        assert!(app.flash.is_none(), "initial fleet is never toasted");
+        // A run that was working and is now working: still silent.
+        let runs = vec![summary_phase("r0", Phase::Review)];
+        emit_attention_toasts(&mut app, &runs);
+        assert!(app.flash.is_none());
+        // Now it crosses into a gate: toast fires.
+        let runs = vec![summary_phase("r0", Phase::AwaitingPlanApproval)];
+        emit_attention_toasts(&mut app, &runs);
+        assert!(app.flash.is_some(), "gate transition toasts");
     }
 }

@@ -135,18 +135,22 @@ A **rail** + **one main area**. Main always shows the rail's selection.
 
 - Rail: `projects ▸ runs ▸ agents` drill-down. `Enter` pushes a level, `Esc` pops one
   (never quits). `Enter` on an agent **takes it over** in the Shell tab. `/` filters the
-  rail (Esc clears).
+  rail (Esc clears). The rail is **attention-sorted**: runs at a gate or broken fly a
+  `⚑` and float to the top (and roll up to their project row).
 - Main tabs: `Log · Activity · Diff · Shell`, switched with `[` / `]` (Activity carries
   the `@human` alert badge). Diff is the selected slot's real worktree diff.
 - Focus: `1` rail · `2` main (Tab cycles the two). `+` / `_` zoom Main.
 - `:` opens the **command palette** — `approve`/`reject`/`ship`/`confirm`/`reconcile`/
-  `takeover`/`implement`/`plan`/`spawn`/`chat`, Tab-completes run ids. `a`/`r`/`s` are
-  still one-key gate shortcuts (or tap the status-line buttons).
+  `takeover`/`implement`/`plan`/`spawn`/`chat`, Tab-completes run ids.
+- **`a` jumps to the next run that needs you** (or tap the `⚑N need you` status token);
+  the status line rolls up how many runs want you across the fleet. `r`/`s` reject/ship
+  at a gate; approve = tap the button or `:approve`.
 - `p` = Projects · `w` log wrap · `g`/`G` top/bottom · `?` help · **`q` quits**.
 - Shell tab = a real tmux client: **every key goes to the agent** (incl. `Ctrl+C`);
   `F12` (or `C-a d`) hands focus back to spar. Focusing it full-screen is **Driving
   mode** — green banner + border, rail collapsed.
-- Under 90 columns the rail folds away (Main + a tappable tab strip) for phone/SSH.
+- Width bands: `<80` cols Main only (rail folds away, tappable tab strip — phone/SSH);
+  `80–119` rail + Main; `>=120` the extra width goes to Main.
 
 - Run state: `.spar/runs/<id>/state.json`
 - Events (orchestrator): `.spar/runs/<id>/events.jsonl`
