@@ -50,13 +50,17 @@ Supporting principles:
 - Narrow (<90 cols): no rail, Main only, the same `MainTab` strip on its own tappable
   row — a tap on it is the escape from the Shell tab on a phone.
 
-## Stage B — the palette + Driving mode
+## Stage B — the palette + Driving mode (done)
 
-- `:` opens a command palette (the composer collapses into it); `q` becomes quit
-  (double-`Ctrl+C` retires).
-- The Shell tab promotes to a **full-screen Driving mode**: no rail, no chrome but a
-  one-line mode banner. Same escapes (`F12`, `C-a d`).
-- Diff renders the worktree diff for real (not just artifacts).
+- `:` opens a command palette (the composer is gone; focus is 2-wide, keys `1`/`2`);
+  `q` becomes quit (double-`Ctrl+C` retired). Verbs: approve/reject/ship/confirm/
+  reconcile/takeover/spawn/chat + implement/plan (reuse the run's recorded fleet), all
+  with run-id completion. `/` filters the rail.
+- The Shell tab promotes to a **full-screen Driving mode**: rail collapsed, structural
+  signalling (green status banner + green pane border), one-line banner. Same escapes
+  (`F12`, `C-a d`).
+- Diff renders the selected slot's real `git diff HEAD` (capped), falling back to
+  artifacts when a slot has no worktree. Decisions U3/U4.
 
 ## Stage C — the attention model
 

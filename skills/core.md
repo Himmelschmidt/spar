@@ -134,14 +134,18 @@ spar logs <run_id> [slot] [-f|--follow]
 A **rail** + **one main area**. Main always shows the rail's selection.
 
 - Rail: `projects ▸ runs ▸ agents` drill-down. `Enter` pushes a level, `Esc` pops one
-  (never quits). `Enter` on an agent **takes it over** in the Shell tab.
+  (never quits). `Enter` on an agent **takes it over** in the Shell tab. `/` filters the
+  rail (Esc clears).
 - Main tabs: `Log · Activity · Diff · Shell`, switched with `[` / `]` (Activity carries
-  the `@human` alert badge).
-- Focus: `1` rail · `2` main · `3` command (Tab cycles those three). `+` / `_` zoom Main.
-- Gates: `a` approve · `r` reject · `s` ship (or tap the buttons on the status line).
-- `p` = Projects · `w` log wrap · `g`/`G` top/bottom · `?` help · `Ctrl+C` twice exits.
-- Shell tab = a real tmux client: **every key goes to the agent**; `F12` (or `C-a d`)
-  hands focus back to spar.
+  the `@human` alert badge). Diff is the selected slot's real worktree diff.
+- Focus: `1` rail · `2` main (Tab cycles the two). `+` / `_` zoom Main.
+- `:` opens the **command palette** — `approve`/`reject`/`ship`/`confirm`/`reconcile`/
+  `takeover`/`implement`/`plan`/`spawn`/`chat`, Tab-completes run ids. `a`/`r`/`s` are
+  still one-key gate shortcuts (or tap the status-line buttons).
+- `p` = Projects · `w` log wrap · `g`/`G` top/bottom · `?` help · **`q` quits**.
+- Shell tab = a real tmux client: **every key goes to the agent** (incl. `Ctrl+C`);
+  `F12` (or `C-a d`) hands focus back to spar. Focusing it full-screen is **Driving
+  mode** — green banner + border, rail collapsed.
 - Under 90 columns the rail folds away (Main + a tappable tab strip) for phone/SSH.
 
 - Run state: `.spar/runs/<id>/state.json`
