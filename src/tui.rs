@@ -58,23 +58,17 @@ const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 enum Focus {
     Rail,
     Main,
-    Composer,
 }
 
 impl Focus {
     fn next(self) -> Self {
         match self {
             Focus::Rail => Focus::Main,
-            Focus::Main => Focus::Composer,
-            Focus::Composer => Focus::Rail,
+            Focus::Main => Focus::Rail,
         }
     }
     fn prev(self) -> Self {
-        match self {
-            Focus::Rail => Focus::Composer,
-            Focus::Main => Focus::Rail,
-            Focus::Composer => Focus::Main,
-        }
+        self.next()
     }
 }
 
@@ -113,6 +107,117 @@ impl MainTab {
     }
     fn prev(self) -> Self {
         MAIN_TABS[(self.idx() + MAIN_TABS.len() - 1) % MAIN_TABS.len()]
+    }
+}
+
+/// One entry in the `:` command palette. `needs_run` commands complete the run id
+/// from the workspace roster; `arg_hint` is the ghost text shown after the verb.
+struct PaletteCmd {
+    name: &'static str,
+    arg_hint: &'static str,
+    help: &'static str,
+    needs_run: bool,
+}
+
+/// The `:` palette verb table — the run-lifecycle actions the orchestrator brokers.
+/// This is the whole command surface; there is no hidden syntax.
+const PALETTE_CMDS: &[PaletteCmd] = &[
+    PaletteCmd {
+        name: "approve",
+        arg_hint: "[run]",
+        help: "approve the plan gate",
+        needs_run: true,
+    },
+    PaletteCmd {
+        name: "reject",
+        arg_hint: "[run] [reason]",
+        help: "reject the plan gate",
+        needs_run: true,
+    },
+    PaletteCmd {
+        name: "ship",
+        arg_hint: "[run]",
+        help: "confirm ship (draft PR)",
+        needs_run: true,
+    },
+    PaletteCmd {
+        name: "confirm",
+        arg_hint: "[run]",
+        help: "confirm the arena winner",
+        needs_run: true,
+    },
+    PaletteCmd {
+        name: "reconcile",
+        arg_hint: "[run]",
+        help: "start reconcile",
+        needs_run: true,
+    },
+    PaletteCmd {
+        name: "takeover",
+        arg_hint: "[run]",
+        help: "attach the run's tmux pane",
+        needs_run: true,
+    },
+    PaletteCmd {
+        name: "implement",
+        arg_hint: "[run]",
+        help: "advance a planned run into implement",
+        needs_run: true,
+    },
+    PaletteCmd {
+        name: "plan",
+        arg_hint: "<task>",
+        help: "start a plan (reuses the selected run's fleet)",
+        needs_run: false,
+    },
+    PaletteCmd {
+        name: "spawn",
+        arg_hint: "<provider> [task]",
+        help: "spawn a bare agent",
+        needs_run: false,
+    },
+    PaletteCmd {
+        name: "chat",
+        arg_hint: "@agent <msg>",
+        help: "send a bus message",
+        needs_run: false,
+    },
+    PaletteCmd {
+        name: "help",
+        arg_hint: "",
+        help: "open the keymap",
+        needs_run: false,
+    },
+    PaletteCmd {
+        name: "quit",
+        arg_hint: "",
+        help: "exit spar",
+        needs_run: false,
+    },
+];
+
+/// State for the open `:` palette: the typed line and the highlighted completion.
+#[derive(Default)]
+struct Palette {
+    input: String,
+    /// Index into the current completion list (commands, or run ids for the arg).
+    sel: usize,
+}
+
+impl Palette {
+    /// The verb word typed so far (everything before the first space), lowercased.
+    fn head(&self) -> String {
+        self.input
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    }
+
+    /// True once the operator has typed a space — i.e. is on the argument, so
+    /// completion switches from verbs to run ids.
+    fn on_arg(&self) -> bool {
+        self.input.contains(char::is_whitespace)
     }
 }
 
@@ -220,7 +325,14 @@ struct App {
     main_tab: MainTab,
     /// Main is zoomed to the full body (rail hidden); `+` / `_`.
     zoom: bool,
-    composer: String,
+    /// The `:` command palette. `Some` = open and capturing keys.
+    palette: Option<Palette>,
+    /// Incremental `/` rail filter. `Some` = editing it; the string also persists as
+    /// the active filter while navigating (empty string = filter shown but matches all).
+    filter: Option<String>,
+    /// True once `/` has committed (Enter): the filter still narrows the rail but keys
+    /// have returned to normal rail navigation. Cleared when the filter is dropped.
+    filter_committed: bool,
     status_line: String,
     stream_scroll: u16,
     bus_scroll: u16,
@@ -243,8 +355,6 @@ struct App {
     stall_warn_secs: u64,
     /// When false (default), long log lines truncate with …; `w` toggles wrap.
     log_expand: bool,
-    /// First Ctrl+C timestamp; second within 2s exits (Esc/q never quit).
-    last_ctrl_c: Option<Instant>,
     last_click: Option<(u16, u16, Instant)>,
     show_help: bool,
     /// Whether the current frame is part of an animation; drives the spinner so
@@ -256,7 +366,8 @@ struct App {
     rect_rail: Rect,
     /// The one main area, borders included.
     rect_main: Rect,
-    rect_composer: Rect,
+    /// The `:` palette overlay rect (for click-to-dismiss); zero-sized when closed.
+    rect_palette: Rect,
     /// Per-tab hit rects for the Main tab strip (wide: in Main's top border; narrow: its own row).
     main_tabs: Vec<(Rect, MainTab)>,
     /// One-shot: on first narrow render with an active run, jump to Main's Log tab.
@@ -362,7 +473,13 @@ impl App {
             },
             main_tab: MainTab::Log,
             zoom: false,
-            composer: task_seed.unwrap_or_default(),
+            // A launch task seed opens the palette pre-filled with a `plan` command.
+            palette: task_seed.map(|t| Palette {
+                input: format!("plan {t}"),
+                sel: 0,
+            }),
+            filter: None,
+            filter_committed: false,
             status_line: String::new(),
             stream_scroll: 0,
             bus_scroll: 0,
@@ -381,14 +498,13 @@ impl App {
             flash: None,
             stall_warn_secs,
             log_expand: false,
-            last_ctrl_c: None,
             last_click: None,
             show_help: false,
             animated: false,
             rect_status: Rect::default(),
             rect_rail: Rect::default(),
             rect_main: Rect::default(),
-            rect_composer: Rect::default(),
+            rect_palette: Rect::default(),
             main_tabs: Vec::new(),
             narrow_autofocus_done: false,
             gate_buttons: Vec::new(),
@@ -598,6 +714,18 @@ impl App {
     fn shell_active(&self) -> bool {
         self.focus == Focus::Main && self.main_tab == MainTab::Shell
     }
+
+    /// Driving mode: the Shell tab is focused with a live pane attached, so spar goes
+    /// full-screen for the agent. This is a *structural* mode — the rail collapses and
+    /// the chrome recolors (a text label alone is proven insufficient signalling).
+    fn driving(&self) -> bool {
+        self.shell_active() && self.terminal_pane.is_some()
+    }
+
+    /// True while a text field (palette or rail filter) owns keystrokes.
+    fn editing_text(&self) -> bool {
+        self.palette.is_some() || self.filter.is_some()
+    }
 }
 
 /// Apply a scroll delta and update follow-tail. Positive = toward newer lines.
@@ -772,14 +900,75 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache) -> Snapshot {
     }
 }
 
-/// Main's Diff tab. No new plumbing (Stage A): show the run's artifacts — the
-/// selected slot's own artifact when it has one, else the plan — and say so
-/// plainly when there is nothing to show yet.
+/// The real `git diff` of a slot's worktree against HEAD (Stage B): staged + unstaged,
+/// capped so a huge diff never blows the log buffer. `git -C` keeps us out of the
+/// primary checkout.
+fn worktree_diff(path: &Path) -> Result<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["--no-pager", "diff", "HEAD", "--stat"])
+        .output()?;
+    let stat = String::from_utf8_lossy(&out.stdout).into_owned();
+    let patch = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["--no-pager", "diff", "HEAD"])
+        .output()?;
+    if !patch.status.success() {
+        anyhow::bail!("{}", String::from_utf8_lossy(&patch.stderr).trim());
+    }
+    let body = String::from_utf8_lossy(&patch.stdout);
+    let capped: String = body.chars().take(DIFF_MAX_BYTES).collect();
+    let trailer = if body.len() > DIFF_MAX_BYTES {
+        "\n\n  … diff truncated (open the worktree to see the rest)"
+    } else {
+        ""
+    };
+    Ok(format!("{stat}\n{capped}{trailer}"))
+}
+
+/// Cap for the rendered worktree diff, in chars.
+const DIFF_MAX_BYTES: usize = 200_000;
+
+/// Main's Diff tab (Stage B): the selected slot's worktree diff against HEAD, falling
+/// back to the run's artifacts when the slot has no worktree (plan/review slots,
+/// headless runs) so the tab is never blank.
 fn diff_content(swarm: &SparPaths, full: Option<&RunState>, slot_idx: usize) -> String {
     let Some(st) = full else {
-        return "\n  No run selected.\n\n  Diff shows the run's artifacts (plan, review, suite)."
-            .into();
+        return "\n  No run selected.".into();
     };
+
+    // Prefer the real worktree diff for the selected slot (Stage B). Coding slots each
+    // get a worktree; map the selection to its record and diff it against HEAD.
+    if let Some(slot) = st.slots.get(slot_idx) {
+        if let Some(wt) = st.worktrees.iter().find(|w| w.slot_id == slot.id) {
+            match worktree_diff(&wt.path) {
+                Ok(text) if !text.trim().is_empty() => {
+                    return format!(
+                        "  {} · {}\n  {}\n\n{text}",
+                        slot.id,
+                        wt.branch,
+                        wt.path.display()
+                    );
+                }
+                Ok(_) => {
+                    return format!(
+                        "  {} · {}\n  {}\n\n  No changes in the worktree yet.",
+                        slot.id,
+                        wt.branch,
+                        wt.path.display()
+                    );
+                }
+                Err(e) => {
+                    return format!("  {} · {}\n\n  git diff failed: {e:#}", slot.id, wt.branch);
+                }
+            }
+        }
+    }
+
+    // No worktree for this slot (e.g. plan/review slot, or headless) — fall back to the
+    // run's artifacts so the tab is never blank.
     let dir = swarm.artifacts_dir(&st.id);
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .map(|rd| {
@@ -792,7 +981,7 @@ fn diff_content(swarm: &SparPaths, full: Option<&RunState>, slot_idx: usize) -> 
     names.sort();
     if names.is_empty() {
         return format!(
-            "\n  No artifacts yet for {}.\n\n  Diff will render the worktree diff in a later stage;\n  for now it shows this run's artifacts as they land:\n    {}\n",
+            "\n  No worktree diff and no artifacts yet for {}.\n\n  The Diff tab shows the selected slot's worktree changes once it has one;\n  until then it falls back to this run's artifacts:\n    {}\n",
             st.id,
             dir.display()
         );
@@ -827,7 +1016,7 @@ fn diff_content(swarm: &SparPaths, full: Option<&RunState>, slot_idx: usize) -> 
 /// Shipping — still animates so the header spinner keeps turning.
 fn animating(app: &App, snap: &Snapshot) -> bool {
     app.flash.is_some()
-        || app.focus == Focus::Composer
+        || app.editing_text()
         // A live terminal streams between disk snapshots; keep repainting it.
         || (app.main_tab == MainTab::Shell && app.terminal_pane.is_some())
         // An abandoned run is going nowhere: never spin for it.
@@ -1099,23 +1288,17 @@ fn handle_key(
     let selected_id = runs.get(app.selected_run).map(|r| r.id.as_str());
     let n_slots = full.map(|s| s.slots.len()).unwrap_or(0);
 
-    // Ctrl+C twice (within 2s) is the only quit path — never Esc or q. On Main's
-    // Shell tab, Ctrl+C belongs to the agent pane (SIGINT), so it falls through to
-    // forwarding; F12 out first to reach the quit arm.
-    if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) && !app.shell_active() {
-        if let Some(t) = app.last_ctrl_c {
-            if t.elapsed() < Duration::from_secs(2) {
-                return Ok(true);
-            }
-        }
-        app.last_ctrl_c = Some(Instant::now());
-        // Match the 2s double-press window so the hint doesn't outlive the arm.
-        app.flash_for("Ctrl+C again to exit", YELLOW, Duration::from_secs(2));
-        return Ok(false);
+    // The `:` palette owns every key while it is open — including Enter (run), Tab
+    // (complete), and Esc (close). It can only open when not in the Shell tab, so it
+    // never contends with the agent pane.
+    if app.palette.is_some() {
+        return handle_palette_key(app, code, mods, swarm, runs, full);
     }
-    // Any other key clears the first Ctrl+C arm.
-    if !mods.contains(KeyModifiers::CONTROL) {
-        app.last_ctrl_c = None;
+
+    // The `/` rail filter captures keys while it is being edited.
+    if app.filter.is_some() && !app.filter_committed {
+        handle_filter_key(app, code, projects, runs, n_slots);
+        return Ok(false);
     }
 
     if app.show_help {
@@ -1129,10 +1312,10 @@ fn handle_key(
     }
 
     // Main's Shell tab IS a real tmux client, so every key is forwarded raw into its
-    // PTY — prefix (C-a), copy-mode, splits, session switch are all tmux's own. F12 is
-    // the ONLY escape back to spar (Esc/Tab belong to the agent). With no pane attached
-    // we deliberately fall through to the normal handler so an unattachable Shell tab
-    // can never trap the operator.
+    // PTY — prefix (C-a), copy-mode, splits, session switch are all tmux's own, and
+    // Ctrl+C is the agent's SIGINT. F12 is the ONLY escape back to spar (Esc/Tab belong
+    // to the agent). With no pane attached we deliberately fall through to the normal
+    // handler so an unattachable Shell tab can never trap the operator.
     if app.shell_active() {
         if code == KeyCode::F(12) {
             app.focus = Focus::Rail;
@@ -1146,40 +1329,18 @@ fn handle_key(
         }
     }
 
-    if app.focus == Focus::Composer {
-        match code {
-            KeyCode::Esc => app.focus = Focus::Rail,
-            KeyCode::Enter => {
-                let line = app.composer.trim().to_string();
-                if !line.is_empty() {
-                    let bg = app.bg_tx.clone();
-                    match handle_composer(swarm, runs, app.selected_run, &line, bg) {
-                        Ok(msg) => {
-                            app.flash(msg, GREEN);
-                            app.composer.clear();
-                        }
-                        Err(e) => app.flash(format!("{e:#}"), RED),
-                    }
-                }
-            }
-            KeyCode::Backspace => {
-                app.composer.pop();
-            }
-            KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
-                app.composer.push(c);
-            }
-            KeyCode::Tab => app.focus = app.focus.next(),
-            KeyCode::BackTab => app.focus = app.focus.prev(),
-            _ => {}
-        }
-        return Ok(false);
-    }
-
     match code {
-        // Esc pops one rail level; from Main/Composer it returns to the rail. It
-        // never exits the app (at Projects it does nothing).
+        // q exits from any non-text context (Shell forwards it to the agent above, and
+        // the palette/filter capture it while editing). Ctrl+C is no longer a quit path
+        // — it belongs to the agent pane.
+        KeyCode::Char('q') => return Ok(true),
+        // Esc pops one rail level; from Main it returns to the rail. It never exits the
+        // app (at Projects it does nothing).
         KeyCode::Esc => {
-            if app.focus != Focus::Rail {
+            if app.filter.is_some() {
+                app.filter = None;
+                app.filter_committed = false;
+            } else if app.focus != Focus::Rail {
                 app.focus = Focus::Rail;
             } else {
                 app.rail_pop();
@@ -1189,14 +1350,13 @@ fn handle_key(
         KeyCode::BackTab => app.focus = app.focus.prev(),
         KeyCode::Char('1') => app.focus = Focus::Rail,
         KeyCode::Char('2') => app.focus = Focus::Main,
-        KeyCode::Char('3') => app.focus = Focus::Composer,
+        // : opens the command palette; / opens the rail filter.
+        KeyCode::Char(':') => app.palette = Some(Palette::default()),
         KeyCode::Char('/') => {
-            app.focus = Focus::Composer;
-            if !app.composer.starts_with('/') {
-                app.composer = "/".into();
-            }
+            app.focus = Focus::Rail;
+            app.filter = Some(String::new());
+            app.filter_committed = false;
         }
-        KeyCode::Char('i') => app.focus = Focus::Composer,
         // ] / [ move between Main's tabs — the only thing that changes on screen.
         KeyCode::Char(']') => {
             app.main_tab = app.main_tab.next();
@@ -1224,22 +1384,18 @@ fn handle_key(
         KeyCode::Char('j') | KeyCode::Down => match app.focus {
             Focus::Rail => rail_move(app, projects, runs, n_slots, 1),
             Focus::Main => app.scroll_main_by(3),
-            Focus::Composer => {}
         },
         KeyCode::Char('k') | KeyCode::Up => match app.focus {
             Focus::Rail => rail_move(app, projects, runs, n_slots, -1),
             Focus::Main => app.scroll_main_by(-3),
-            Focus::Composer => {}
         },
         KeyCode::PageDown => match app.focus {
             Focus::Rail => rail_move(app, projects, runs, n_slots, 5),
             Focus::Main => app.scroll_main_by(i32::from(app.main_page())),
-            Focus::Composer => {}
         },
         KeyCode::PageUp => match app.focus {
             Focus::Rail => rail_move(app, projects, runs, n_slots, -5),
             Focus::Main => app.scroll_main_by(-i32::from(app.main_page())),
-            Focus::Composer => {}
         },
         KeyCode::Char('a') => {
             if let Some(id) = selected_id {
@@ -1282,6 +1438,417 @@ fn handle_key(
     Ok(false)
 }
 
+/// What running a palette command produced.
+enum PaletteResult {
+    Flash(String, Color),
+    Quit,
+    Help,
+}
+
+/// The completion candidates for the palette right now: verb names while typing the
+/// command, or matching run ids once on the argument of a run-scoped verb.
+fn palette_completions(pal: &Palette, runs: &[state::RunSummary]) -> Vec<String> {
+    if !pal.on_arg() {
+        let head = pal.head();
+        return PALETTE_CMDS
+            .iter()
+            .filter(|c| c.name.starts_with(&head))
+            .map(|c| c.name.to_string())
+            .collect();
+    }
+    let cmd = PALETTE_CMDS.iter().find(|c| c.name == pal.head());
+    if cmd.map(|c| c.needs_run).unwrap_or(false) {
+        let arg = pal.input.split_whitespace().nth(1).unwrap_or("");
+        return runs
+            .iter()
+            .filter(|r| r.id.starts_with(arg))
+            .map(|r| r.id.clone())
+            .collect();
+    }
+    Vec::new()
+}
+
+/// Keys while the `:` palette is open. Returns `Ok(true)` only when a command quits.
+fn handle_palette_key(
+    app: &mut App,
+    code: KeyCode,
+    mods: KeyModifiers,
+    swarm: &SparPaths,
+    runs: &[state::RunSummary],
+    full: Option<&RunState>,
+) -> Result<bool> {
+    match code {
+        KeyCode::Esc => {
+            app.palette = None;
+        }
+        KeyCode::Enter => {
+            let input = app
+                .palette
+                .as_ref()
+                .map(|p| p.input.clone())
+                .unwrap_or_default();
+            if input.trim().is_empty() {
+                app.palette = None;
+                return Ok(false);
+            }
+            match run_palette(app, swarm, runs, full, &input) {
+                Ok(PaletteResult::Quit) => return Ok(true),
+                Ok(PaletteResult::Help) => {
+                    app.palette = None;
+                    app.show_help = true;
+                }
+                Ok(PaletteResult::Flash(msg, color)) => {
+                    app.palette = None;
+                    app.flash(msg, color);
+                }
+                Err(e) => {
+                    // Keep the palette open so the operator can fix the line.
+                    app.flash(format!("{e:#}"), RED);
+                }
+            }
+        }
+        KeyCode::Tab => {
+            let comps = app
+                .palette
+                .as_ref()
+                .map(|p| palette_completions(p, runs))
+                .unwrap_or_default();
+            if let Some(pal) = app.palette.as_mut() {
+                if let Some(pick) = comps.get(pal.sel).or_else(|| comps.first()) {
+                    if pal.on_arg() {
+                        let head = pal
+                            .input
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("")
+                            .to_string();
+                        pal.input = format!("{head} {pick}");
+                    } else {
+                        pal.input = format!("{pick} ");
+                    }
+                    pal.sel = 0;
+                }
+            }
+        }
+        KeyCode::Up => {
+            if let Some(pal) = app.palette.as_mut() {
+                pal.sel = pal.sel.saturating_sub(1);
+            }
+        }
+        KeyCode::Down => {
+            let n = app
+                .palette
+                .as_ref()
+                .map(|p| palette_completions(p, runs).len())
+                .unwrap_or(0);
+            if let Some(pal) = app.palette.as_mut() {
+                if pal.sel + 1 < n {
+                    pal.sel += 1;
+                }
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(pal) = app.palette.as_mut() {
+                pal.input.pop();
+                pal.sel = 0;
+            }
+        }
+        KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
+            if let Some(pal) = app.palette.as_mut() {
+                pal.input.push(c);
+                pal.sel = 0;
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+/// Split a run-scoped verb's argument into `(run_id, rest)`. A first token that
+/// matches a known run id (or unique prefix) is consumed as the id; otherwise the
+/// selected run is used and the whole argument is the remainder (e.g. a reject reason).
+fn split_run_arg<'a>(
+    runs: &[state::RunSummary],
+    selected: Option<&'a str>,
+    arg: &'a str,
+) -> (Option<String>, String) {
+    let mut it = arg.splitn(2, char::is_whitespace);
+    let first = it.next().unwrap_or("").trim();
+    let rest = it.next().map(str::trim).unwrap_or("").to_string();
+    if !first.is_empty() {
+        let matches: Vec<&state::RunSummary> =
+            runs.iter().filter(|r| r.id.starts_with(first)).collect();
+        if matches.len() == 1 {
+            return (Some(matches[0].id.clone()), rest);
+        }
+        if runs.iter().any(|r| r.id == first) {
+            return (Some(first.to_string()), rest);
+        }
+    }
+    (selected.map(str::to_string), arg.trim().to_string())
+}
+
+/// Execute one palette line. The verb table is the whole surface; `@…` is chat.
+fn run_palette(
+    app: &mut App,
+    swarm: &SparPaths,
+    runs: &[state::RunSummary],
+    full: Option<&RunState>,
+    input: &str,
+) -> Result<PaletteResult> {
+    let line = input.trim();
+    if let Some(rest) = line.strip_prefix('@') {
+        let run_id = runs.get(app.selected_run).map(|r| r.id.as_str());
+        return send_mention(swarm, run_id, rest).map(|m| PaletteResult::Flash(m, GREEN));
+    }
+    let mut parts = line.splitn(2, char::is_whitespace);
+    let head = parts.next().unwrap_or("").to_ascii_lowercase();
+    let arg = parts.next().map(str::trim).unwrap_or("");
+    let selected = runs.get(app.selected_run).map(|r| r.id.as_str());
+
+    match head.as_str() {
+        "help" | "?" | "h" => Ok(PaletteResult::Help),
+        "quit" | "q" | "exit" => Ok(PaletteResult::Quit),
+        "approve" => {
+            let (id, _) = split_run_arg(runs, selected, arg);
+            let id = id.ok_or_else(|| anyhow::anyhow!("no run selected"))?;
+            workflow::plan::approve(swarm, &id, false)?;
+            Ok(PaletteResult::Flash(format!("Approved plan {id}"), GREEN))
+        }
+        "reject" => {
+            let (id, reason) = split_run_arg(runs, selected, arg);
+            let id = id.ok_or_else(|| anyhow::anyhow!("no run selected"))?;
+            let reason = (!reason.is_empty()).then_some(reason);
+            workflow::plan::reject(swarm, &id, reason, false)?;
+            Ok(PaletteResult::Flash(format!("Rejected plan {id}"), GREEN))
+        }
+        "ship" => {
+            let (id, _) = split_run_arg(runs, selected, arg);
+            let id = id.ok_or_else(|| anyhow::anyhow!("no run selected"))?;
+            crate::ship::confirm_ship(swarm, &id, false)?;
+            Ok(PaletteResult::Flash(format!("Ship confirmed {id}"), GREEN))
+        }
+        "confirm" => {
+            let (id, _) = split_run_arg(runs, selected, arg);
+            let id = id.ok_or_else(|| anyhow::anyhow!("no run selected"))?;
+            run_gate_action(app, swarm, &id, GateAction::ConfirmWinner);
+            Ok(PaletteResult::Flash(
+                format!("Confirmed winner {id}"),
+                GREEN,
+            ))
+        }
+        "reconcile" => {
+            let (id, _) = split_run_arg(runs, selected, arg);
+            let id = id.ok_or_else(|| anyhow::anyhow!("no run selected"))?;
+            spawn_reconcile(app, swarm, &id);
+            Ok(PaletteResult::Flash(
+                format!("Reconcile started {id}"),
+                ACCENT,
+            ))
+        }
+        "takeover" => {
+            let (id, _) = split_run_arg(runs, selected, arg);
+            let id = id.ok_or_else(|| anyhow::anyhow!("no run selected"))?;
+            takeover_run(app, &id)
+        }
+        "implement" => {
+            let st = full.ok_or_else(|| anyhow::anyhow!("select a planned run first"))?;
+            if st.providers.is_empty() {
+                anyhow::bail!("run has no recorded providers — use the CLI");
+            }
+            let args = [
+                "implement".to_string(),
+                "--run".to_string(),
+                st.id.clone(),
+                "--providers".to_string(),
+                st.providers.join(","),
+            ];
+            spawn_detached_workflow(swarm, &args, &format!("Implement started {}", st.id))
+        }
+        "plan" => {
+            if arg.is_empty() {
+                anyhow::bail!("usage: plan <task>");
+            }
+            let st = full.ok_or_else(|| {
+                anyhow::anyhow!("select a run to reuse its fleet, or use the CLI")
+            })?;
+            if st.providers.is_empty() {
+                anyhow::bail!("selected run has no providers — use the CLI");
+            }
+            let args = [
+                "plan".to_string(),
+                "-t".to_string(),
+                arg.to_string(),
+                "--providers".to_string(),
+                st.providers.join(","),
+            ];
+            spawn_detached_workflow(swarm, &args, "Plan started")
+        }
+        "spawn" => {
+            let arg = (!arg.is_empty()).then_some(arg);
+            let bg = app.bg_tx.clone();
+            spawn_agent_command(runs, app.selected_run, arg, bg)
+                .map(|m| PaletteResult::Flash(m, GREEN))
+        }
+        "chat" => {
+            let run_id = selected;
+            send_mention(swarm, run_id, arg).map(|m| PaletteResult::Flash(m, GREEN))
+        }
+        other => anyhow::bail!("unknown command: {other} — Tab lists commands"),
+    }
+}
+
+/// Attach the Shell tab to a run's tmux session (palette `takeover`). Mirrors the
+/// rail's Enter-on-agent path but keyed only by run id.
+fn takeover_run(app: &mut App, id: &str) -> Result<PaletteResult> {
+    let session = tmux::session_name(id);
+    if tmux::has_session(&session) {
+        app.takeover_target = Some(session);
+        app.open_main(MainTab::Shell);
+        Ok(PaletteResult::Flash(
+            format!("Took over {id} — F12/Ctrl+a d to hand back"),
+            GREEN,
+        ))
+    } else {
+        anyhow::bail!("headless run — rerun with --backend tmux to take over")
+    }
+}
+
+/// Spawn a detached `spar <args>` for a lifecycle command the palette dispatches
+/// (plan / implement). Mirrors [`spawn_reconcile`]: null stdio, `SPAR_INTERNAL`.
+fn spawn_detached_workflow(
+    swarm: &SparPaths,
+    args: &[String],
+    ok_msg: &str,
+) -> Result<PaletteResult> {
+    let exe = std::env::current_exe()?;
+    std::process::Command::new(exe)
+        .args(args)
+        .arg("--json")
+        .current_dir(&swarm.project_root)
+        .env("SPAR_INTERNAL", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    Ok(PaletteResult::Flash(ok_msg.to_string(), ACCENT))
+}
+
+/// Keys while the `/` rail filter is being edited. Enter commits (keeps the filter,
+/// hands keys back to rail navigation); Esc clears it; typing narrows live.
+fn handle_filter_key(
+    app: &mut App,
+    code: KeyCode,
+    projects: &[registry::ProjectEntry],
+    runs: &[state::RunSummary],
+    n_slots: usize,
+) {
+    match code {
+        KeyCode::Esc => {
+            app.filter = None;
+            app.filter_committed = false;
+        }
+        KeyCode::Enter => {
+            if app.filter.as_deref().unwrap_or("").is_empty() {
+                app.filter = None;
+            }
+            app.filter_committed = true;
+        }
+        KeyCode::Backspace => {
+            if let Some(f) = app.filter.as_mut() {
+                f.pop();
+            }
+            snap_selection_to_filter(app, projects, runs, n_slots);
+        }
+        KeyCode::Char(c) => {
+            if let Some(f) = app.filter.as_mut() {
+                f.push(c);
+            }
+            snap_selection_to_filter(app, projects, runs, n_slots);
+        }
+        _ => {}
+    }
+}
+
+/// After the filter text changes, move the rail selection onto the first row that
+/// still matches so Main never shows a filtered-out run.
+fn snap_selection_to_filter(
+    app: &mut App,
+    projects: &[registry::ProjectEntry],
+    runs: &[state::RunSummary],
+    n_slots: usize,
+) {
+    let Some(f) = app.filter.as_deref() else {
+        return;
+    };
+    if f.is_empty() {
+        return;
+    }
+    match app.browse {
+        BrowseLevel::Projects => {
+            let cur = app.selected_project;
+            if let Some(i) = first_project_match(projects, f, cur) {
+                app.select_project(i, projects.len());
+            }
+        }
+        BrowseLevel::Runs | BrowseLevel::Agents => {
+            let cur = app.selected_run;
+            if !run_matches_filter(runs, cur, f) {
+                if let Some(i) = (0..runs.len()).find(|i| run_matches_filter(runs, *i, f)) {
+                    app.select_run(i, runs.len());
+                }
+            }
+            let _ = n_slots;
+        }
+    }
+}
+
+/// Case-insensitive match of a rail filter against a run's id / task / phase.
+fn run_matches_filter(runs: &[state::RunSummary], i: usize, f: &str) -> bool {
+    let Some(r) = runs.get(i) else { return false };
+    if f.is_empty() {
+        return true;
+    }
+    let f = f.to_ascii_lowercase();
+    r.id.to_ascii_lowercase().contains(&f)
+        || r.task
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .contains(&f)
+        || format!("{:?}", r.phase).to_ascii_lowercase().contains(&f)
+        || r.project_name
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .contains(&f)
+}
+
+/// Case-insensitive match against a project's name / root path.
+fn project_matches_filter(projects: &[registry::ProjectEntry], i: usize, f: &str) -> bool {
+    let Some(p) = projects.get(i) else {
+        return false;
+    };
+    if f.is_empty() {
+        return true;
+    }
+    let f = f.to_ascii_lowercase();
+    p.name
+        .as_deref()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .contains(&f)
+        || p.root.to_string_lossy().to_ascii_lowercase().contains(&f)
+}
+
+/// First project index matching the filter, preferring the current selection.
+fn first_project_match(projects: &[registry::ProjectEntry], f: &str, cur: usize) -> Option<usize> {
+    if project_matches_filter(projects, cur, f) {
+        return Some(cur);
+    }
+    (0..projects.len()).find(|i| project_matches_filter(projects, *i, f))
+}
+
 /// Move the rail selection by `delta` rows at whatever level it is on.
 fn rail_move(
     app: &mut App,
@@ -1297,18 +1864,54 @@ fn rail_move(
             (cur + delta as usize).min(n.saturating_sub(1))
         }
     };
+    // With a filter active the rail hides non-matching rows, so navigation walks the
+    // matching indices only. `stepv` maps a source index to its next matching one.
+    let filter = app.filter.clone().filter(|f| !f.is_empty());
     match app.browse {
         BrowseLevel::Projects if !projects.is_empty() => {
-            app.select_project(step(app.selected_project, projects.len()), projects.len());
+            let next = match &filter {
+                Some(f) => {
+                    let m: Vec<usize> = (0..projects.len())
+                        .filter(|i| project_matches_filter(projects, *i, f))
+                        .collect();
+                    step_matched(&m, app.selected_project, delta)
+                }
+                None => step(app.selected_project, projects.len()),
+            };
+            app.select_project(next, projects.len());
         }
         BrowseLevel::Runs if !runs.is_empty() => {
-            app.select_run(step(app.selected_run, runs.len()), runs.len());
+            let next = match &filter {
+                Some(f) => {
+                    let m: Vec<usize> = (0..runs.len())
+                        .filter(|i| run_matches_filter(runs, *i, f))
+                        .collect();
+                    step_matched(&m, app.selected_run, delta)
+                }
+                None => step(app.selected_run, runs.len()),
+            };
+            app.select_run(next, runs.len());
         }
         BrowseLevel::Agents if n_slots > 0 => {
             app.select_slot(step(app.selected_slot, n_slots), n_slots);
         }
         _ => {}
     }
+}
+
+/// Step within a list of matching indices by `delta`, staying on a match. Falls back
+/// to `cur` when nothing matches.
+fn step_matched(matched: &[usize], cur: usize, delta: i32) -> usize {
+    if matched.is_empty() {
+        return cur;
+    }
+    let pos = matched.iter().position(|&i| i == cur).unwrap_or(0);
+    let next = if delta < 0 {
+        pos.saturating_sub((-delta) as usize)
+    } else {
+        (pos + delta as usize).min(matched.len() - 1)
+    };
+    matched[next]
 }
 
 /// `Enter` in the rail: push one level. On a slot (the deepest level) there is
@@ -1514,6 +2117,13 @@ fn handle_mouse(
                 app.show_help = false;
                 return;
             }
+            // With the palette open, a tap outside it closes it; inside is swallowed.
+            if app.palette.is_some() {
+                if !contains(app.rect_palette, x, y) {
+                    app.palette = None;
+                }
+                return;
+            }
             // Tappable gate buttons take priority — they sit on the status line.
             // Target the run the buttons were painted from (`full`), not the rail
             // selection, which can lag by a snapshot cycle.
@@ -1537,9 +2147,7 @@ fn handle_mouse(
                 return;
             }
 
-            if contains(app.rect_composer, x, y) {
-                app.focus = Focus::Composer;
-            } else if contains(app.rect_rail, x, y) {
+            if contains(app.rect_rail, x, y) {
                 app.focus = Focus::Rail;
                 if let Some(row) = list_row_at(app.rect_rail, y, n_rail, rail_offset) {
                     rail_select(app, row, projects.len(), runs.len(), n_slots);
@@ -1620,13 +2228,14 @@ fn contains(r: Rect, x: u16, y: u16) -> bool {
 }
 
 struct LayoutRects {
-    /// One status line: breadcrumb + run context + gate cues/buttons.
+    /// One status line: breadcrumb + run context + gate cues/buttons (the Driving-mode
+    /// banner in driving mode).
     status: Rect,
-    /// The drill-down rail. Zero-sized when zoomed, or in narrow while Main is focused.
+    /// The drill-down rail. Zero-sized when zoomed, driving, or in narrow while Main
+    /// is focused.
     rail: Rect,
     /// The one main area (tab strip lives in its top border in the wide layout).
     main: Rect,
-    composer: Rect,
     footer: Rect,
     /// Narrow-mode MainTab strip; zero-sized in the wide layout (the strip is drawn
     /// inside Main's top border there).
@@ -1642,26 +2251,30 @@ const NARROW_WIDTH: u16 = 90;
 /// Rail width in the wide layout. Enough for `run id · phase · age`, no more.
 const RAIL_WIDTH: u16 = 24;
 
-/// Chrome budget: 1 status row + 3 composer rows + 1 footer row. Everything else
-/// on screen is content (rail + main).
-fn layout_rects(area: Rect, focus: Focus, zoom: bool) -> LayoutRects {
+/// Chrome budget: 1 status row + 1 footer row. Everything else on screen is content
+/// (rail + main). The `:` palette and `/` filter are overlays, not reserved rows.
+fn layout_rects(area: Rect, focus: Focus, zoom: bool, driving: bool) -> LayoutRects {
     let narrow = area.width < NARROW_WIDTH;
+    // Driving mode drops the narrow tab strip too — the banner + F12 is the whole chrome.
+    let strip = if narrow && !driving { 1 } else { 0 };
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // status line (breadcrumb + gate)
-            Constraint::Length(if narrow { 1 } else { 0 }), // narrow MainTab strip
-            Constraint::Min(4),    // body: rail + main
-            Constraint::Length(3), // command
-            Constraint::Length(1), // footer
+            Constraint::Length(1),     // status line / driving banner
+            Constraint::Length(strip), // narrow MainTab strip
+            Constraint::Min(4),        // body: rail + main
+            Constraint::Length(1),     // footer
         ])
         .split(area);
 
     let z = Rect::default();
+    // Zoom or driving both hide the rail in place; nothing else on screen moves.
+    let hide_rail = zoom || driving;
+
     if narrow {
         // One column. The rail takes the stage while it is focused; otherwise Main
         // has it. Tapping a tab (or the breadcrumb) moves between the two.
-        let (rail, main) = if focus == Focus::Rail {
+        let (rail, main) = if focus == Focus::Rail && !hide_rail {
             (root[2], z)
         } else {
             (z, root[2])
@@ -1670,15 +2283,13 @@ fn layout_rects(area: Rect, focus: Focus, zoom: bool) -> LayoutRects {
             status: root[0],
             rail,
             main,
-            composer: root[3],
-            footer: root[4],
+            footer: root[3],
             tabs: root[1],
             narrow: true,
         };
     }
 
-    // Wide: rail + one main area. Zoom hides the rail in place; nothing else moves.
-    let (rail, main) = if zoom {
+    let (rail, main) = if hide_rail {
         (z, root[2])
     } else {
         let body = Layout::default()
@@ -1692,8 +2303,7 @@ fn layout_rects(area: Rect, focus: Focus, zoom: bool) -> LayoutRects {
         status: root[0],
         rail,
         main,
-        composer: root[3],
-        footer: root[4],
+        footer: root[3],
         tabs: z,
         narrow: false,
     }
@@ -1731,18 +2341,23 @@ fn draw(
         }
     }
 
-    let lay = layout_rects(area, app.focus, app.zoom);
+    let driving = app.driving();
+    let lay = layout_rects(area, app.focus, app.zoom, driving);
     // Keep mouse hit regions aligned with the frame actually painted.
     app.rect_status = lay.status;
     app.rect_rail = lay.rail;
     app.rect_main = lay.main;
-    app.rect_composer = lay.composer;
+    app.rect_palette = Rect::default();
     // Rebuilt below by whatever paints this frame.
     app.gate_buttons.clear();
     app.main_tabs.clear();
 
-    draw_status(f, lay.status, swarm, projects, runs, full, app);
-    if lay.narrow {
+    if driving {
+        draw_driving_banner(f, lay.status, app);
+    } else {
+        draw_status(f, lay.status, swarm, projects, runs, full, app);
+    }
+    if lay.narrow && lay.tabs.height > 0 {
         draw_narrow_tabs(f, lay.tabs, app);
     }
     if lay.rail.width > 0 {
@@ -1761,8 +2376,12 @@ fn draw(
             !lay.narrow,
         );
     }
-    draw_composer(f, lay.composer, app);
     draw_footer(f, lay.footer, app, full);
+
+    // The `:` palette floats above the footer; the `/` filter shows inline in the rail.
+    if app.palette.is_some() {
+        draw_palette(f, area, runs, app);
+    }
 
     if app.show_help {
         draw_help_overlay(f, area);
@@ -2061,14 +2680,23 @@ fn draw_rail(
     state: &mut ListState,
 ) {
     let focused = app.focus == Focus::Rail;
+    // While the `/` filter is active, the title becomes the live filter field so the
+    // operator can see (and edit) what they are narrowing by.
+    let filt = |base: String| -> String {
+        match app.filter.as_deref() {
+            Some(f) if !app.filter_committed => format!(" /{f}▌ "),
+            Some(f) if !f.is_empty() => format!("{base}/{f} "),
+            _ => base,
+        }
+    };
     let (items, title) = match app.browse {
         BrowseLevel::Projects => (
             rail_project_items(projects, app),
-            format!(" Projects ({}) ", projects.len()),
+            filt(format!(" Projects ({}) ", projects.len())),
         ),
         BrowseLevel::Runs => (
             rail_run_items(runs, app),
-            format!(" Runs ({}) ", runs.len()),
+            filt(format!(" Runs ({}) ", runs.len())),
         ),
         BrowseLevel::Agents => {
             let slots = full.map(|s| s.slots.as_slice()).unwrap_or(&[]);
@@ -2095,11 +2723,20 @@ fn rail_project_items<'a>(projects: &'a [registry::ProjectEntry], app: &App) -> 
             Style::default().fg(FG_MUTED).italic(),
         ))];
     }
+    let filter = app.filter.as_deref().filter(|f| !f.is_empty());
     projects
         .iter()
         .enumerate()
         .map(|(i, p)| {
             let sel = i == app.selected_project;
+            if let Some(f) = filter {
+                if !project_matches_filter(projects, i, f) {
+                    return ListItem::new(Line::from(Span::styled(
+                        format!("  {}", truncate(p.name.as_deref().unwrap_or("·"), 12)),
+                        Style::default().fg(FG_MUTED).dim(),
+                    )));
+                }
+            }
             let name = p.name.as_deref().unwrap_or("·");
             let n = registry::list_project_runs(&p.root)
                 .map(|r| r.len())
@@ -2135,10 +2772,19 @@ fn rail_run_items<'a>(runs: &'a [state::RunSummary], app: &App) -> Vec<ListItem<
             Style::default().fg(FG_MUTED).italic(),
         ))];
     }
+    let filter = app.filter.as_deref().filter(|f| !f.is_empty());
     runs.iter()
         .enumerate()
         .map(|(i, r)| {
             let sel = i == app.selected_run;
+            if let Some(f) = filter {
+                if !run_matches_filter(runs, i, f) {
+                    return ListItem::new(Line::from(Span::styled(
+                        format!("  {}", truncate(&r.id, 8)),
+                        Style::default().fg(FG_MUTED).dim(),
+                    )));
+                }
+            }
             // Phase reads "review" forever on a run nobody is driving; say so.
             let (phase_text, phase_c) = if r.abandoned {
                 (format!("{} ✗", truncate(&phase_label(r.phase), 8)), RED)
@@ -2246,7 +2892,14 @@ fn draw_main(
         return;
     }
     let focused = app.focus == Focus::Main;
-    let border = if focused { BORDER_FOCUS } else { BORDER };
+    // Driving mode recolors the pane border green — structural, not just a label.
+    let border = if app.driving() {
+        GREEN
+    } else if focused {
+        BORDER_FOCUS
+    } else {
+        BORDER
+    };
 
     let mut title: Vec<Span> = Vec::new();
     if wide {
@@ -2931,43 +3584,113 @@ fn compact_u64(n: u64) -> String {
     }
 }
 
-/// The composer: one input row inside its border (3 rows total). Stage B replaces it
-/// with a `:` palette.
-fn draw_composer(f: &mut Frame, area: Rect, app: &App) {
-    let focused = app.focus == Focus::Composer;
-    let cursor_blink = if focused && (app.tick / 6).is_multiple_of(2) {
+/// The `:` command palette: a floating input line + a live completion menu (verbs, or
+/// run ids once on the argument). Anchored to the bottom, above the footer.
+fn draw_palette(f: &mut Frame, area: Rect, runs: &[state::RunSummary], app: &mut App) {
+    let Some(pal) = app.palette.as_ref() else {
+        return;
+    };
+    let comps = palette_completions(pal, runs);
+    // Show up to 8 completions, plus the input row and borders.
+    let menu_n = comps.len().min(8) as u16;
+    let h = menu_n + 3; // input row + top/bottom border + a hint row
+    let w = area.width.clamp(30, 76);
+    let x = area.x + 2;
+    let y = area.bottom().saturating_sub(h + 1);
+    let rect = Rect {
+        x,
+        y,
+        width: w.min(area.width.saturating_sub(4)),
+        height: h.min(area.height),
+    };
+    app.rect_palette = rect;
+    f.render_widget(Clear, rect);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .title(Span::styled(
+            " : command ",
+            Style::default().fg(ACCENT).bold(),
+        ))
+        .style(Style::default().bg(BG_RAISED));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.height == 0 {
+        return;
+    }
+
+    let cursor = if (app.tick / 6).is_multiple_of(2) {
         "▌"
-    } else if focused {
+    } else {
         " "
-    } else {
-        ""
     };
-    let prompt = if focused {
-        Span::styled(" › ", Style::default().fg(ACCENT).bold())
+    let input_line = Line::from(vec![
+        Span::styled(" : ", Style::default().fg(ACCENT).bold()),
+        Span::styled(&pal.input, Style::default().fg(FG)),
+        Span::styled(cursor, Style::default().fg(ACCENT)),
+    ]);
+
+    // The completion menu: verb + hint/help when on the command, run id list on the arg.
+    let on_arg = pal.on_arg();
+    let mut rows: Vec<Line> = vec![input_line];
+    for (i, c) in comps.iter().take(menu_n as usize).enumerate() {
+        let selected = i == pal.sel;
+        let mark = if selected { "▸ " } else { "  " };
+        let base = if selected {
+            Style::default().fg(BG).bg(ACCENT_SOFT).bold()
+        } else {
+            Style::default().fg(FG_DIM)
+        };
+        let tail = if on_arg {
+            String::new()
+        } else {
+            PALETTE_CMDS
+                .iter()
+                .find(|pc| pc.name == c)
+                .map(|pc| format!("  {} — {}", pc.arg_hint, pc.help))
+                .unwrap_or_default()
+        };
+        rows.push(Line::from(vec![
+            Span::styled(format!("{mark}{c}"), base),
+            Span::styled(tail, Style::default().fg(FG_MUTED)),
+        ]));
+    }
+    let hint = if on_arg {
+        "Tab complete run · Enter run · Esc close"
     } else {
-        Span::styled("   ", Style::default().fg(FG_MUTED))
+        "Tab complete · ↑↓ pick · Enter run · Esc close"
     };
-    let body = if app.composer.is_empty() && !focused {
-        Line::from(vec![
-            prompt,
-            Span::styled(
-                "/approve  /reject  /ship  /spawn  @agent …",
-                Style::default().fg(FG_MUTED).italic(),
-            ),
-        ])
-    } else {
-        Line::from(vec![
-            prompt,
-            Span::styled(&app.composer, Style::default().fg(FG)),
-            Span::styled(cursor_blink, Style::default().fg(ACCENT)),
-        ])
-    };
-    let title = if focused {
-        " Command · Enter run · Esc leave "
-    } else {
-        " Command · 3 or i or / "
-    };
-    f.render_widget(Paragraph::new(body).block(panel(title, focused)), area);
+    rows.push(Line::from(Span::styled(
+        hint,
+        Style::default().fg(FG_MUTED).italic(),
+    )));
+    f.render_widget(
+        Paragraph::new(rows).style(Style::default().bg(BG_RAISED)),
+        inner,
+    );
+}
+
+/// Driving mode's one-line banner replaces the status line: a loud recolored bar that
+/// (with the collapsed rail and recolored pane border) makes the mode structurally
+/// obvious — a text label alone is proven insufficient (Raskin).
+fn draw_driving_banner(f: &mut Frame, area: Rect, app: &App) {
+    let target = app
+        .takeover_target
+        .as_deref()
+        .map(|s| s.strip_prefix("spar-").unwrap_or(s))
+        .unwrap_or("workspace shell");
+    let left = format!("  ▶ DRIVING · {target} ");
+    let right = " keys → agent · F12 / C-a d → spar ";
+    let bg = Color::Rgb(20, 60, 40);
+    let used = (left.chars().count() + right.chars().count()) as u16;
+    let pad = area.width.saturating_sub(used).max(1) as usize;
+    let line = Line::from(vec![
+        Span::styled(left, Style::default().fg(BG).bg(GREEN).bold()),
+        Span::styled(" ".repeat(pad), Style::default().bg(bg)),
+        Span::styled(right, Style::default().fg(FG).bg(bg)),
+    ]);
+    f.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), area);
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &mut App, full: Option<&RunState>) {
@@ -3013,8 +3736,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &mut App, full: Option<&RunState>
     let sp = format!(" {} ", app.spinner());
     let proj = " Projects ";
     let help = " Help ";
-    let tail = " Ctrl+C×2 exit ";
-    // Display columns, not bytes — the × in `tail` is 2 bytes but 1 column.
+    let tail = " : cmd · q exit ";
     let right_w =
         (sp.chars().count() + proj.chars().count() + help.chars().count() + tail.chars().count())
             as u16;
@@ -3073,9 +3795,9 @@ fn situational_footer(
     }
     match focus {
         Focus::Rail => match browse {
-            BrowseLevel::Projects => "j/k · Enter open project · 2 main · 3 cmd · ? help",
-            BrowseLevel::Runs => "j/k · Enter agents · Esc projects · 2 main · ? help",
-            BrowseLevel::Agents => "j/k · Enter take over agent · Esc runs · 2 main",
+            BrowseLevel::Projects => "j/k · Enter open · / filter · : cmd · 2 main · ? help",
+            BrowseLevel::Runs => "j/k · Enter agents · / filter · : cmd · Esc back · ? help",
+            BrowseLevel::Agents => "j/k · Enter take over agent · Esc runs · : cmd · 2 main",
         },
         Focus::Main => match tab {
             MainTab::Log => "scroll · [ ] tabs · w wrap · g/G top/end · + zoom · 1 rail",
@@ -3083,7 +3805,6 @@ fn situational_footer(
             MainTab::Diff => "scroll · [ ] tabs · 1 rail",
             MainTab::Shell => "tmux passthrough · prefix C-a · Ctrl+a d / F12 → spar",
         },
-        Focus::Composer => "/approve /reject /ship /spawn · @agent msg · Enter · Esc",
     }
 }
 
@@ -3108,23 +3829,25 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
     Main always shows the rail's selection — nothing else moves.\n\
  \n\
   Keyboard\n\
-    1 / 2 / 3            focus Rail · Main · Command\n\
-    Tab / Shift-Tab      cycle those three\n\
+    1 / 2                focus Rail · Main\n\
+    Tab / Shift-Tab      cycle Rail ↔ Main\n\
     j k  or  ↑ ↓         move in the rail · scroll Main\n\
     Enter                push a rail level (on an agent: take it over)\n\
-    Esc                  pop a rail level (never quits)\n\
+    Esc                  pop a rail level · clear filter (never quits)\n\
     [ ]                  previous / next Main tab\n\
     + / _                zoom Main fullscreen / restore\n\
     p                    jump to Projects\n\
     a / r / s            approve · reject · ship (when gated)\n\
-    i  or  /             command bar\n\
+    :                    command palette (approve/ship/takeover/…)\n\
+    /                    filter the rail\n\
     w                    log wrap ↔ truncate long lines\n\
     g / G                top / bottom of Main\n\
     ?                    this help · Esc closes help\n\
-    Ctrl+C twice         exit (only quit path)\n\
+    q                    quit\n\
  \n\
-  Shell tab = a real tmux client: every key goes to the agent.\n\
-    prefix C-a · Ctrl+a d or F12 hands focus back to spar.\n\
+  Shell tab = a real tmux client: every key goes to the agent (incl.\n\
+    Ctrl+C). prefix C-a · Ctrl+a d or F12 hands focus back to spar.\n\
+    Focusing it full-screen is Driving mode (green banner + border).\n\
  \n\
   Mouse / touch: tap a tab, a rail row (double-tap = Enter), a gate\n\
   button, or the breadcrumb (back to the rail). Scroll to scroll.\n\
@@ -3281,55 +4004,7 @@ fn panel(title: &str, focused: bool) -> Block<'_> {
         .style(Style::default().bg(BG_PANEL))
 }
 
-fn handle_composer(
-    swarm: &SparPaths,
-    runs: &[state::RunSummary],
-    selected: usize,
-    line: &str,
-    bg: Option<mpsc::Sender<Msg>>,
-) -> Result<String> {
-    let run_id = runs.get(selected).map(|r| r.id.as_str());
-    let cmd = line.trim();
-    if let Some(rest) = cmd.strip_prefix('/') {
-        let mut parts = rest.splitn(2, char::is_whitespace);
-        let head = parts.next().unwrap_or("").to_ascii_lowercase();
-        let arg = parts.next().map(str::trim).filter(|s| !s.is_empty());
-        return match head.as_str() {
-            "q" | "quit" => Ok("Use Ctrl+C twice to exit (q does not quit)".into()),
-            "help" | "h" | "?" => Ok(
-                "Commands: /approve /reject [reason] /ship · press ? for full help · Ctrl+C×2 exit"
-                    .into(),
-            ),
-            "approve" => {
-                let id = arg
-                    .or(run_id)
-                    .ok_or_else(|| anyhow::anyhow!("no run selected"))?;
-                workflow::plan::approve(swarm, id, false)?;
-                Ok(format!("Approved plan {id}"))
-            }
-            "reject" => {
-                let id = run_id.ok_or_else(|| anyhow::anyhow!("no run selected"))?;
-                workflow::plan::reject(swarm, id, arg.map(|s| s.to_string()), false)?;
-                Ok(format!("Rejected plan {id}"))
-            }
-            "ship" => {
-                let id = arg
-                    .or(run_id)
-                    .ok_or_else(|| anyhow::anyhow!("no run selected"))?;
-                crate::ship::confirm_ship(swarm, id, false)?;
-                Ok(format!("Ship confirmed {id}"))
-            }
-            "spawn" => spawn_agent_command(runs, selected, arg, bg),
-            other => Ok(format!("Unknown /{other} — try /help")),
-        };
-    }
-    if let Some(rest) = cmd.strip_prefix('@') {
-        return send_mention(swarm, run_id, rest);
-    }
-    Ok(format!("Noted (chat later): {}", truncate(cmd, 48)))
-}
-
-/// Composer `@<agent> <message>` — send a directed bus chat from the human to a slot or
+/// Palette `chat`/`@<agent> <message>` — send a directed bus chat from the human to a
 /// bare agent, resolving the mention to its unique bus id via [`resolve_mention`].
 fn send_mention(swarm: &SparPaths, run_id: Option<&str>, rest: &str) -> Result<String> {
     let mut it = rest.splitn(2, char::is_whitespace);
@@ -3849,17 +4524,16 @@ mod labels {
             width: 120,
             height: 40,
         };
-        let lay = layout_rects(area, Focus::Main, false);
+        let lay = layout_rects(area, Focus::Main, false, false);
         assert!(!lay.narrow);
         // The tab strip rides in Main's top border, not on its own row.
         assert_eq!(lay.tabs, Rect::default());
         assert_eq!(lay.rail.width, RAIL_WIDTH);
         assert!(lay.main.width > 0);
-        // Fixed chrome is exactly 2 rows (status + footer); composer is 3.
+        // Fixed chrome is exactly 2 rows (status + footer) — the palette is an overlay.
         assert_eq!(lay.status.height, 1);
         assert_eq!(lay.footer.height, 1);
-        assert_eq!(lay.composer.height, 3);
-        assert_eq!(lay.rail.height + 5, area.height);
+        assert_eq!(lay.rail.height + 2, area.height);
         // Rail and Main are side by side, and together they fill the width.
         assert_eq!(lay.rail.right(), lay.main.x);
         assert_eq!(lay.main.right(), area.width);
@@ -3873,16 +4547,32 @@ mod labels {
             width: 120,
             height: 40,
         };
-        let plain = layout_rects(area, Focus::Main, false);
-        let zoomed = layout_rects(area, Focus::Main, true);
+        let plain = layout_rects(area, Focus::Main, false, false);
+        let zoomed = layout_rects(area, Focus::Main, true, false);
         assert_eq!(zoomed.rail, Rect::default());
         assert_eq!(zoomed.main.x, area.x);
         assert_eq!(zoomed.main.width, area.width);
         // Nothing else relocates.
         assert_eq!(zoomed.status, plain.status);
-        assert_eq!(zoomed.composer, plain.composer);
         assert_eq!(zoomed.footer, plain.footer);
         assert_eq!(zoomed.main.y, plain.main.y);
+    }
+
+    #[test]
+    fn driving_mode_collapses_the_rail_and_chrome() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 40,
+        };
+        let driving = layout_rects(area, Focus::Main, false, true);
+        assert_eq!(driving.rail, Rect::default(), "rail collapses when driving");
+        assert_eq!(driving.main.width, area.width);
+        // Narrow driving drops the tab-strip row too (zero-height).
+        let narrow = Rect { width: 60, ..area };
+        let nd = layout_rects(narrow, Focus::Main, false, true);
+        assert_eq!(nd.tabs.height, 0);
     }
 
     #[test]
@@ -3893,28 +4583,24 @@ mod labels {
             width: 60,
             height: 40,
         };
-        let lay = layout_rects(area, Focus::Main, false);
+        let lay = layout_rects(area, Focus::Main, false, false);
         assert!(lay.narrow);
         assert!(lay.tabs.width > 0, "MainTab strip is tappable on a phone");
         assert!(lay.main.width > 0);
         assert_eq!(lay.rail, Rect::default(), "no rail in narrow");
-        // Composer focus keeps Main on stage so you can watch while typing.
-        let composer = layout_rects(area, Focus::Composer, false);
-        assert!(composer.main.width > 0);
-        assert_eq!(composer.rail, Rect::default());
         // Rail focus swaps the single stage to the rail; the tab strip stays.
-        let rail = layout_rects(area, Focus::Rail, false);
+        let rail = layout_rects(area, Focus::Rail, false, false);
         assert!(rail.rail.width > 0);
         assert_eq!(rail.main, Rect::default());
         assert!(rail.tabs.width > 0);
     }
 
     #[test]
-    fn focus_ring_is_three_wide() {
+    fn focus_ring_is_two_wide() {
         assert_eq!(Focus::Rail.next(), Focus::Main);
-        assert_eq!(Focus::Main.next(), Focus::Composer);
-        assert_eq!(Focus::Composer.next(), Focus::Rail);
-        assert_eq!(Focus::Rail.prev(), Focus::Composer);
+        assert_eq!(Focus::Main.next(), Focus::Rail);
+        assert_eq!(Focus::Rail.prev(), Focus::Main);
+        assert_eq!(Focus::Main.prev(), Focus::Rail);
     }
 
     #[test]
@@ -4257,5 +4943,179 @@ mod labels {
         clamp_scroll(&mut scroll, &mut follow, 40);
         assert_eq!(scroll, 40);
         assert!(follow);
+    }
+
+    fn summary(id: &str, task: Option<&str>) -> state::RunSummary {
+        use crate::cli::WorkflowKind;
+        state::RunSummary {
+            id: id.to_string(),
+            workflow: WorkflowKind::Loop,
+            phase: Phase::Review,
+            updated_at: Utc::now(),
+            task: task.map(str::to_string),
+            dry_run: false,
+            abandoned: false,
+            project_root: None,
+            project_name: None,
+        }
+    }
+
+    #[test]
+    fn palette_completes_verbs_then_run_ids() {
+        let runs = [summary("3f2a", None), summary("9c11", None)];
+        // On the verb: prefix-filtered command names.
+        let mut pal = Palette {
+            input: "app".into(),
+            sel: 0,
+        };
+        assert_eq!(
+            palette_completions(&pal, &runs),
+            vec!["approve".to_string()]
+        );
+        // Past the space on a run-scoped verb: run ids matching the arg.
+        pal.input = "approve 9".into();
+        assert_eq!(palette_completions(&pal, &runs), vec!["9c11".to_string()]);
+        // A verb that takes no run offers no id completions.
+        pal.input = "help ".into();
+        assert!(palette_completions(&pal, &runs).is_empty());
+    }
+
+    #[test]
+    fn split_run_arg_picks_known_id_else_selected() {
+        let runs = [summary("3f2a", None), summary("9c11", None)];
+        // A leading token that is a known id is consumed; the rest is the reason.
+        let (id, rest) = split_run_arg(&runs, Some("3f2a"), "9c11 too risky");
+        assert_eq!(id.as_deref(), Some("9c11"));
+        assert_eq!(rest, "too risky");
+        // A leading token that is NOT an id falls back to the selected run.
+        let (id, rest) = split_run_arg(&runs, Some("3f2a"), "too risky");
+        assert_eq!(id.as_deref(), Some("3f2a"));
+        assert_eq!(rest, "too risky");
+        // Empty arg → selected run, empty reason.
+        let (id, rest) = split_run_arg(&runs, Some("3f2a"), "");
+        assert_eq!(id.as_deref(), Some("3f2a"));
+        assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn run_filter_matches_id_and_task() {
+        let runs = [summary("3f2a", Some("wire up auth")), summary("9c11", None)];
+        assert!(run_matches_filter(&runs, 0, "auth"));
+        assert!(run_matches_filter(&runs, 0, "3f"));
+        assert!(!run_matches_filter(&runs, 1, "auth"));
+        // Empty filter matches everything.
+        assert!(run_matches_filter(&runs, 1, ""));
+    }
+
+    #[test]
+    fn step_matched_walks_only_matches() {
+        // matches at source indices 1 and 3; stepping from 1 forward lands on 3.
+        let matched = [1usize, 3];
+        assert_eq!(step_matched(&matched, 1, 1), 3);
+        assert_eq!(step_matched(&matched, 3, -1), 1);
+        // Clamps at the ends.
+        assert_eq!(step_matched(&matched, 3, 1), 3);
+        assert_eq!(step_matched(&matched, 1, -1), 1);
+        // Selection not in the matched set starts at the first match.
+        assert_eq!(step_matched(&matched, 0, 1), 3);
+    }
+
+    #[test]
+    fn slash_opens_filter_and_esc_clears_it() {
+        let mut app = App::new(None, 300, true);
+        let sw = SparPaths::new(std::path::Path::new("/x"));
+        let mut root = PathBuf::from("/x");
+        // `/` opens the filter editor with focus on the rail.
+        handle_key(
+            &mut app,
+            KeyCode::Char('/'),
+            KeyModifiers::empty(),
+            &sw,
+            &[],
+            &[],
+            None,
+            &mut root,
+            None,
+        )
+        .unwrap();
+        assert_eq!(app.filter.as_deref(), Some(""));
+        assert!(!app.filter_committed);
+        assert!(app.editing_text());
+        // Typing narrows; Esc drops the filter entirely.
+        handle_key(
+            &mut app,
+            KeyCode::Char('a'),
+            KeyModifiers::empty(),
+            &sw,
+            &[],
+            &[],
+            None,
+            &mut root,
+            None,
+        )
+        .unwrap();
+        assert_eq!(app.filter.as_deref(), Some("a"));
+        handle_key(
+            &mut app,
+            KeyCode::Esc,
+            KeyModifiers::empty(),
+            &sw,
+            &[],
+            &[],
+            None,
+            &mut root,
+            None,
+        )
+        .unwrap();
+        assert!(app.filter.is_none());
+    }
+
+    #[test]
+    fn colon_opens_palette_and_q_quits() {
+        let mut app = App::new(None, 300, true);
+        let sw = SparPaths::new(std::path::Path::new("/x"));
+        let mut root = PathBuf::from("/x");
+        // q quits from a normal context.
+        let quit = handle_key(
+            &mut app,
+            KeyCode::Char('q'),
+            KeyModifiers::empty(),
+            &sw,
+            &[],
+            &[],
+            None,
+            &mut root,
+            None,
+        )
+        .unwrap();
+        assert!(quit, "q is the quit path");
+        // `:` opens the palette; then keys route to it (q types, does not quit).
+        handle_key(
+            &mut app,
+            KeyCode::Char(':'),
+            KeyModifiers::empty(),
+            &sw,
+            &[],
+            &[],
+            None,
+            &mut root,
+            None,
+        )
+        .unwrap();
+        assert!(app.palette.is_some());
+        let quit = handle_key(
+            &mut app,
+            KeyCode::Char('q'),
+            KeyModifiers::empty(),
+            &sw,
+            &[],
+            &[],
+            None,
+            &mut root,
+            None,
+        )
+        .unwrap();
+        assert!(!quit, "q inside the palette types, never quits");
+        assert_eq!(app.palette.as_ref().map(|p| p.input.as_str()), Some("q"));
     }
 }
