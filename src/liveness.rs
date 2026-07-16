@@ -16,25 +16,41 @@ pub struct SlotActivity {
     /// Seconds since last_log_at (None if unknown).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub silent_for_secs: Option<u64>,
-    /// Running and silent longer than `timeouts.stall_warn_secs` (0 disables).
+    /// RFC3339 timestamp of last heartbeat (process-liveness, independent of log output).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_heartbeat_at: Option<String>,
+    /// Running and silent — in both log output *and* heartbeat — longer than
+    /// `timeouts.stall_warn_secs` (0 disables). A quiet-but-heartbeating slot is healthy.
     pub stalled: bool,
 }
 
 impl SlotActivity {
-    pub fn observe(slot: &SlotState, stall_warn_secs: u64) -> Self {
+    /// `last_heartbeat` is the freshest process-liveness beat for the slot (see
+    /// [`crate::bus::last_heartbeat`]); `None` when the slot never heartbeat.
+    pub fn observe(
+        slot: &SlotState,
+        stall_warn_secs: u64,
+        last_heartbeat: Option<DateTime<Utc>>,
+    ) -> Self {
+        let now = Utc::now();
         let last = slot.log_path.as_ref().and_then(|p| last_log_time(p));
-        let silent_for_secs = last.map(|t| {
-            let now = Utc::now();
-            (now - t).num_seconds().max(0) as u64
-        });
+        let silent_for_secs = last.map(|t| (now - t).num_seconds().max(0) as u64);
+        // Log silence alone is not a stall: a streaming-json agent emits nothing loggable
+        // during a long tool/write turn yet keeps heartbeating. Require BOTH the log and
+        // the heartbeat to be quiet past the threshold before calling a slot stalled.
+        let heartbeat_silent = last_heartbeat
+            .map(|t| (now - t).num_seconds().max(0) as u64)
+            .unwrap_or(u64::MAX);
+        let log_silent = silent_for_secs.unwrap_or(0);
         let stalled = slot.status == SlotStatus::Running
             && stall_warn_secs > 0
-            && silent_for_secs
-                .map(|s| s >= stall_warn_secs)
-                .unwrap_or(false);
+            && log_silent >= stall_warn_secs
+            && heartbeat_silent >= stall_warn_secs;
         Self {
             last_log_at: last.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
             silent_for_secs,
+            last_heartbeat_at: last_heartbeat
+                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
             stalled,
         }
     }
@@ -122,17 +138,27 @@ pub fn enrich_status_json(
         let Some(slot) = id.as_deref().and_then(|id| by_id.get(id).copied()) else {
             continue;
         };
-        let act = SlotActivity::observe(slot, warn);
+        let hb = crate::bus::last_heartbeat(paths, Some(run_id), &slot.id);
+        let act = SlotActivity::observe(slot, warn, hb);
         let token = crate::markers::read_pid(paths, run_id, &slot.id)
             .or_else(|| slot.pid.map(crate::process::PidToken::from_pid));
         let pid = token.map(|t| t.pid);
         let pid_alive = token.map(|t| t.alive()).unwrap_or(false);
         if let Some(obj) = slot_val.as_object_mut() {
+            // Mirror the slot id under `slot` too: the state serialization names it `id`,
+            // but outer agents key per-slot data by `slot`.
+            obj.insert("slot".into(), serde_json::Value::String(slot.id.clone()));
             if let Some(t) = &act.last_log_at {
                 obj.insert("last_log_at".into(), serde_json::Value::String(t.clone()));
             }
             if let Some(s) = act.silent_for_secs {
                 obj.insert("silent_for_secs".into(), serde_json::json!(s));
+            }
+            if let Some(t) = &act.last_heartbeat_at {
+                obj.insert(
+                    "last_heartbeat_at".into(),
+                    serde_json::Value::String(t.clone()),
+                );
             }
             obj.insert("stalled".into(), serde_json::Value::Bool(act.stalled));
             obj.insert(
@@ -208,14 +234,36 @@ mod tests {
         filetime_set(&log, past);
 
         let slot = slot_with_log(&log, SlotStatus::Running);
-        let act = SlotActivity::observe(&slot, 300);
+        // No heartbeat: log-silent past threshold ⇒ stalled.
+        let act = SlotActivity::observe(&slot, 300, None);
         assert!(act.silent_for_secs.unwrap() >= 500);
         assert!(act.stalled);
         assert!(act.last_log_at.is_some());
 
         let done = slot_with_log(&log, SlotStatus::Done);
-        let act2 = SlotActivity::observe(&done, 300);
+        let act2 = SlotActivity::observe(&done, 300, None);
         assert!(!act2.stalled);
+    }
+
+    #[test]
+    fn fresh_heartbeat_prevents_stall_despite_silent_log() {
+        let tmp = tempdir().unwrap();
+        let log = tmp.path().join("s.log");
+        std::fs::write(&log, "hello\n").unwrap();
+        let past = SystemTime::now() - std::time::Duration::from_secs(600);
+        filetime_set(&log, past);
+
+        let slot = slot_with_log(&log, SlotStatus::Running);
+        // Log is 600s stale, but the process heartbeat is fresh ⇒ working, not stalled.
+        let act = SlotActivity::observe(&slot, 300, Some(Utc::now()));
+        assert!(act.silent_for_secs.unwrap() >= 500);
+        assert!(!act.stalled, "fresh heartbeat must clear the stall");
+        assert!(act.last_heartbeat_at.is_some());
+
+        // A stale heartbeat (older than the threshold) no longer protects it.
+        let stale_hb = Utc::now() - chrono::Duration::seconds(600);
+        let act2 = SlotActivity::observe(&slot, 300, Some(stale_hb));
+        assert!(act2.stalled, "stale heartbeat + silent log ⇒ stalled");
     }
 
     #[test]
@@ -246,7 +294,7 @@ mod tests {
         let past = SystemTime::now() - std::time::Duration::from_secs(600);
         filetime_set(&log, past);
         let slot = slot_with_log(&log, SlotStatus::Running);
-        let act = SlotActivity::observe(&slot, 0);
+        let act = SlotActivity::observe(&slot, 0, None);
         assert!(act.silent_for_secs.unwrap() >= 500);
         assert!(!act.stalled);
     }

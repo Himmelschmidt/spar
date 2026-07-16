@@ -353,6 +353,9 @@ struct App {
     /// (started, message, color, how long to show)
     flash: Option<(Instant, String, Color, Duration)>,
     stall_warn_secs: u64,
+    /// Freshest process heartbeat per slot id, refreshed from the snapshot each frame.
+    /// Feeds stall detection so a busy-but-log-quiet slot isn't flagged as stalled.
+    heartbeats: std::collections::HashMap<String, DateTime<Utc>>,
     /// When false (default), long log lines truncate with …; `w` toggles wrap.
     log_expand: bool,
     last_click: Option<(u16, u16, Instant)>,
@@ -503,6 +506,7 @@ impl App {
             tick: 0,
             flash: None,
             stall_warn_secs,
+            heartbeats: std::collections::HashMap::new(),
             log_expand: false,
             last_click: None,
             show_help: false,
@@ -794,6 +798,8 @@ struct Snapshot {
     human_alerts: usize,
     /// Selected run is in flight with no live orchestrator.
     abandoned: bool,
+    /// Freshest process heartbeat per slot id for the selected run.
+    heartbeats: std::collections::HashMap<String, DateTime<Utc>>,
 }
 
 enum Msg {
@@ -897,7 +903,28 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache) -> Snapshot {
         .as_ref()
         .map(|st| crate::bus::unresolved_alerts(&swarm, Some(&st.id)).unwrap_or_default())
         .unwrap_or_default();
-    let activity = activity_feed(&swarm, full.as_ref(), &quota, &alerts);
+    // One roster read per tick; slot id → freshest heartbeat. Process liveness
+    // independent of log output, so a quiet-but-working slot isn't shown as stalled.
+    let heartbeats = full
+        .as_ref()
+        .map(|st| {
+            let by_addr: std::collections::HashMap<String, DateTime<Utc>> =
+                crate::bus::list_presence(&swarm, Some(&st.id))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|p| (p.agent, p.ts))
+                    .collect();
+            st.slots
+                .iter()
+                .filter_map(|s| {
+                    by_addr
+                        .get(&crate::bus::resolve_addr(Some(&st.id), &s.id))
+                        .map(|ts| (s.id.clone(), *ts))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let activity = activity_feed(&swarm, full.as_ref(), &quota, &alerts, &heartbeats);
     Snapshot {
         swarm,
         projects,
@@ -908,6 +935,7 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache) -> Snapshot {
         diff_text,
         human_alerts: alerts.len(),
         abandoned,
+        heartbeats,
     }
 }
 
@@ -1167,6 +1195,7 @@ fn run_loop(
         app.animated = animating(&app, &snap);
         app.human_alerts_n = snap.human_alerts;
         app.abandoned = snap.abandoned;
+        app.heartbeats = snap.heartbeats.clone();
 
         if dirty {
             app.tick = app.tick.wrapping_add(1);
@@ -2902,7 +2931,8 @@ fn rail_slot_items<'a>(slots: &'a [SlotState], app: &App) -> Vec<ListItem<'a>> {
         .enumerate()
         .map(|(i, s)| {
             let sel = i == app.selected_slot;
-            let act = SlotActivity::observe(s, app.stall_warn_secs);
+            let act =
+                SlotActivity::observe(s, app.stall_warn_secs, app.heartbeats.get(&s.id).copied());
             let orphaned = app.abandoned && s.status == SlotStatus::Running;
             let color = if act.stalled || orphaned {
                 RED
@@ -3076,7 +3106,8 @@ fn draw_log_body(
     let slot = full.and_then(|st| st.slots.get(app.selected_slot));
     let silent_hint = slot
         .map(|s| {
-            let act = SlotActivity::observe(s, app.stall_warn_secs);
+            let act =
+                SlotActivity::observe(s, app.stall_warn_secs, app.heartbeats.get(&s.id).copied());
             if app.abandoned && s.status == SlotStatus::Running {
                 format!(" ORPHAN {} ", act.human_silent())
             } else if act.stalled {
@@ -4315,6 +4346,7 @@ fn activity_feed(
     full: Option<&RunState>,
     quota: &QuotaStore,
     alerts: &[crate::bus::BusMessage],
+    heartbeats: &std::collections::HashMap<String, DateTime<Utc>>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     let Some(st) = full else {
@@ -4350,7 +4382,7 @@ fn activity_feed(
     // Compact agent status
     lines.push("Agents".into());
     for s in &st.slots {
-        let act = SlotActivity::observe(s, 300);
+        let act = SlotActivity::observe(s, 300, heartbeats.get(&s.id).copied());
         let mark = match s.status {
             SlotStatus::Running if act.stalled => "!",
             SlotStatus::Running => "●",

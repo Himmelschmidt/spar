@@ -391,6 +391,26 @@ fn execute_prepared(
             usage: Some(usage),
         });
     }
+    // A clean exit is not success on its own: a slot that produced no artifact (e.g. an
+    // adapter that never received its prompt) must fail, not silently pass. Mirrors the
+    // gate in the sequential `run_headless` path.
+    if let Some(name) = &prep.job.expected_artifact {
+        let path = prep.paths.artifact(&prep.run_id, name);
+        let empty = !path.is_file() || std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) == 0;
+        if empty
+            && !markers::wait_for_artifact(&prep.paths, &prep.run_id, name, Duration::from_secs(2))
+                .unwrap_or(false)
+        {
+            return Ok(SlotOutcome {
+                ok: false,
+                pid,
+                exit_code: Some(0),
+                signal: None,
+                error: Some(format!("missing expected artifact {name}")),
+                usage: Some(usage),
+            });
+        }
+    }
     Ok(SlotOutcome {
         ok: true,
         pid,
@@ -451,13 +471,8 @@ fn apply_parallel_outcome(
             if let Some(u) = result.usage {
                 state.usage.push(u);
             }
-            // expected artifact check
-            if let Some(name) = &prep.job.expected_artifact {
-                let path = paths.artifact(&state.id, name);
-                if !path.is_file() {
-                    // soft: leave done; reviewer may still have written log
-                }
-            }
+            // Artifact presence is already enforced in `execute_prepared`; a slot that
+            // reaches here with `ok` has its expected artifact.
             let _ = crate::events::append(
                 paths,
                 &state.id,

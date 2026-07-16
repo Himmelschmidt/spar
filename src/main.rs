@@ -450,7 +450,8 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool) -> Result<ExitCode>
             }
             println!("slots: {}", state.slots.len());
             for slot in &state.slots {
-                let act = liveness::SlotActivity::observe(slot, cfg.timeouts.stall_warn_secs);
+                let hb = bus::last_heartbeat(&swarm, Some(&state.id), &slot.id);
+                let act = liveness::SlotActivity::observe(slot, cfg.timeouts.stall_warn_secs, hb);
                 let silent = act.human_silent();
                 let stall = if act.stalled { " STALL" } else { "" };
                 let token = markers::read_pid(&swarm, &state.id, &slot.id)
