@@ -449,9 +449,14 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool) -> Result<ExitCode>
                 );
             }
             println!("slots: {}", state.slots.len());
+            let hb_map = bus::heartbeat_map(&swarm, Some(&state.id));
             for slot in &state.slots {
-                let hb = bus::last_heartbeat(&swarm, Some(&state.id), &slot.id);
-                let act = liveness::SlotActivity::observe(slot, cfg.timeouts.stall_warn_secs, hb);
+                let hb = hb_map
+                    .get(&bus::resolve_addr(Some(&state.id), &slot.id))
+                    .copied();
+                let hard = executor::timeout_for_role(&cfg, slot.role).as_secs();
+                let act =
+                    liveness::SlotActivity::observe(slot, cfg.timeouts.stall_warn_secs, hard, hb);
                 let silent = act.human_silent();
                 let stall = if act.stalled { " STALL" } else { "" };
                 let token = markers::read_pid(&swarm, &state.id, &slot.id)

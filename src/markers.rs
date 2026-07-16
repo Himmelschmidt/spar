@@ -70,11 +70,10 @@ pub fn wait_for_artifact(
     let start = Instant::now();
     let poll = Duration::from_millis(200);
     loop {
-        if path.is_file() {
-            let meta = std::fs::metadata(&path)?;
-            if meta.len() > 0 {
-                return Ok(true);
-            }
+        // A transient metadata error (e.g. mid-write) must not abort the wait — keep
+        // polling until the deadline instead of failing the slot prematurely.
+        if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 0 {
+            return Ok(true);
         }
         if start.elapsed() >= timeout {
             return Ok(false);

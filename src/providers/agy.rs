@@ -50,9 +50,10 @@ impl ProviderAdapter for AgyAdapter {
     fn build_headless(&self, bin: &Path, opts: &SpawnOpts) -> Command {
         // agy uses Go's `flag` package: `-p`/`--print`/`--prompt` is a *string-valued*
         // flag whose value IS the prompt (not a boolean with a positional), and there is
-        // no `--prompt-file`. So every token must be a flag or a flag value — a bare
-        // positional would make `flag` stop parsing and swallow the following flag as the
-        // prompt. Emit all other flags first, then `--print <prompt>` last.
+        // no `--prompt-file`. Go's `flag` stops parsing at the first positional, so a bare
+        // positional would orphan every flag after it. Emit our own flags, then the prompt
+        // as `--print <value>`, and put caller `extra_args` LAST — a stray positional there
+        // is then a harmless trailing arg, not something that swallows `--print`.
         let mut cmd = Command::new(bin);
         // Default print timeout. Go durations require a unit ("1800" alone is rejected as
         // `missing unit in duration`). Override via extra_args if needed.
@@ -63,9 +64,6 @@ impl ProviderAdapter for AgyAdapter {
         if let Some(m) = &opts.model {
             cmd.arg("--model").arg(m);
         }
-        for a in &opts.extra_args {
-            cmd.arg(a);
-        }
         let prompt = if !opts.prompt.is_empty() {
             opts.prompt.clone()
         } else if let Some(pf) = &opts.prompt_file {
@@ -75,13 +73,16 @@ impl ProviderAdapter for AgyAdapter {
             String::new()
         };
         cmd.arg("--print").arg(prompt);
+        for a in &opts.extra_args {
+            cmd.arg(a);
+        }
         cmd.current_dir(&opts.cwd);
         cmd
     }
 
     fn build_interactive(&self, bin: &Path, opts: &SpawnOpts) -> Command {
         // Same flag-package semantics: the initial prompt rides `--prompt-interactive`
-        // (a value flag), never a positional.
+        // (a value flag), never a positional; `extra_args` come after it (see build_headless).
         let mut cmd = Command::new(bin);
         for a in self.permission_args(opts.trust) {
             cmd.arg(a);
@@ -89,11 +90,11 @@ impl ProviderAdapter for AgyAdapter {
         if let Some(m) = &opts.model {
             cmd.arg("--model").arg(m);
         }
-        for a in &opts.extra_args {
-            cmd.arg(a);
-        }
         if !opts.prompt.is_empty() {
             cmd.arg("--prompt-interactive").arg(&opts.prompt);
+        }
+        for a in &opts.extra_args {
+            cmd.arg(a);
         }
         cmd.current_dir(&opts.cwd);
         cmd
@@ -107,25 +108,49 @@ mod tests {
     use std::path::PathBuf;
 
     fn opts(prompt: &str, file: Option<&str>, model: Option<&str>) -> SpawnOpts {
+        opts_with(prompt, file, model, vec![])
+    }
+
+    fn opts_with(
+        prompt: &str,
+        file: Option<&str>,
+        model: Option<&str>,
+        extra_args: Vec<String>,
+    ) -> SpawnOpts {
         SpawnOpts {
             prompt: prompt.into(),
             prompt_file: file.map(PathBuf::from),
             cwd: PathBuf::from("/tmp"),
             trust: TrustPolicy::FullAuto,
-            extra_args: vec![],
+            extra_args,
             model: model.map(str::to_string),
         }
     }
 
     #[test]
-    fn headless_prompt_is_value_of_print_and_print_is_last() {
+    fn headless_prompt_is_value_of_print() {
         let cmd = AgyAdapter.build_headless(Path::new("agy"), &opts("review this", None, None));
         let (_, args) = command_to_parts(&cmd);
         let i = args.iter().position(|a| a == "--print").expect("--print");
         assert_eq!(args.get(i + 1).map(String::as_str), Some("review this"));
-        // `--print` and its value must be the final two tokens, so `--print` can never
-        // sit before another flag and swallow it as the prompt.
-        assert_eq!(args.len(), i + 2, "trailing args: {:?}", &args[i..]);
+    }
+
+    #[test]
+    fn headless_extra_args_positional_cannot_orphan_prompt() {
+        // A positional in extra_args must land AFTER `--print <prompt>`, so Go's flag
+        // parser has already bound the prompt before it stops at the positional.
+        let cmd = AgyAdapter.build_headless(
+            Path::new("agy"),
+            &opts_with("review this", None, None, vec!["a-positional".into()]),
+        );
+        let (_, args) = command_to_parts(&cmd);
+        let p = args.iter().position(|a| a == "--print").expect("--print");
+        assert_eq!(args.get(p + 1).map(String::as_str), Some("review this"));
+        let pos = args.iter().position(|a| a == "a-positional").unwrap();
+        assert!(
+            pos > p,
+            "extra_args positional must follow --print: {args:?}"
+        );
     }
 
     #[test]

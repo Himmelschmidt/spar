@@ -571,16 +571,17 @@ pub fn list_events(paths: &SparPaths, run: Option<&str>) -> Result<Vec<BusMessag
 
 /// Presence snapshot (last status per agent). `Some(run)` filters to that run's
 /// agents; `None` returns the whole workspace roster (bare agents included).
-/// Freshest heartbeat timestamp for one agent (a run slot's `LivenessBeat` refreshes this
-/// every [`LIVENESS_HEARTBEAT_SECS`] while its process runs). This is a process-liveness
-/// signal independent of log output, so a busy-but-quiet slot still reads as alive.
-pub fn last_heartbeat(paths: &SparPaths, run: Option<&str>, agent: &str) -> Option<DateTime<Utc>> {
-    let addr = resolve_addr(run, agent);
+/// Freshest heartbeat timestamp per agent address (`run:slot` / bare id), from one roster
+/// read. A run slot's `LivenessBeat` refreshes its entry every [`LIVENESS_HEARTBEAT_SECS`]
+/// while the process runs — a process-liveness signal independent of log output. Callers
+/// look an agent up with `map.get(&resolve_addr(run, agent))`; building the map once avoids
+/// an O(slots) full-roster re-read.
+pub fn heartbeat_map(paths: &SparPaths, run: Option<&str>) -> HashMap<String, DateTime<Utc>> {
     list_presence(paths, run)
-        .ok()?
+        .unwrap_or_default()
         .into_iter()
-        .find(|p| p.agent == addr)
-        .map(|p| p.ts)
+        .map(|p| (p.agent, p.ts))
+        .collect()
 }
 
 pub fn list_presence(paths: &SparPaths, run: Option<&str>) -> Result<Vec<Presence>> {
