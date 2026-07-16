@@ -7,7 +7,7 @@ Also: `spar skills get core` (preferred; always current).
 ## Principles
 
 1. Prefer `--json` and parse stdout. Both `run_id` and `id` are present on emit JSON.
-2. Prefer `--detach` + `wait` / `status` over long blocking calls when you need to stay responsive.
+2. **Subscribe, don't poll:** to wait on a run, `--detach` to launch it, then block on `spar wait <id> --follow --json` — it returns the instant the run hits a terminal state *or* a human gate (exit `2`), so you're woken exactly when there's something to do instead of having to remember to re-check `status`. Poll `status` only when you can't block (e.g. several runs at once: background one `wait` per run).
 3. Read artifacts from disk under `.spar/runs/<run-id>/` — do not rely on chat alone.
 4. Branch on exit codes, not only stderr text.
 5. Never merge to the default branch; shipping is gated.
@@ -55,7 +55,7 @@ spar ship "$RUN_ID" --confirm --json
 
 `--providers` is **required** for plan / implement / run (no implicit fleet).
 
-**Note:** `exit_code` in JSON is only set when the phase is terminal or a human gate (`null` while in-flight). Prefer `phase` + polling `wait`.
+**Note:** `exit_code` in JSON is only set when the phase is terminal or a human gate (`null` while in-flight). Block on `wait --follow` and branch on its exit code rather than polling `status` for `phase`.
 
 ## Path B (autonomous task)
 

@@ -129,6 +129,23 @@ spar logs <run_id> [slot] [-f|--follow]
 # Projects appear when you use spar there — no hardcoded scan paths.
 ```
 
+**Subscribe, don't poll.** When you are waiting on a run, block on `wait` instead
+of spinning on `status` — you don't have to remember to check back:
+
+```bash
+spar wait <run_id> --follow --json     # blocks; returns at terminal OR human gate
+# exit 0 done · 2 gate (needs you) · 3 stuck/wait-timeout · 4 quota
+```
+
+`wait` releases you the instant the run reaches a waitable stop — a **human gate**
+(exit `2`, needs a decision) as well as done/failed — so it wakes you exactly when
+there is something to act on, not just at the very end. `--json --follow` blocks
+quietly and prints the final `RunState` at the stop; text `--follow` live-tails the
+event log. `--timeout` (default `2h`) caps the block and returns exit `3` if it
+lapses. Poll `status --json` / `status --all` only when you genuinely can't block —
+e.g. supervising several runs at once, where you background one `wait --follow` per
+run and reconcile as each returns.
+
 ### TUI shape (humans)
 
 A **rail** + **one main area**. Main always shows the rail's selection.
@@ -169,7 +186,7 @@ A **rail** + **one main area**. Main always shows the rail's selection.
 | 3 | Stuck / escalated / wait timeout |
 | 4 | No usable providers (quota/pause) |
 
-**`status` is observe-only:** process exit is always `0` if the run loads. Read JSON `exit_code` / `phase` for run state. Use `wait` when you want the process exit coded by gate/stuck/quota.
+**`status` is observe-only:** process exit is always `0` if the run loads. Read JSON `exit_code` / `phase` for run state. Use `wait` (see **Subscribe, don't poll** above) when you want to block until the run needs you and get the process exit coded by gate/stuck/quota.
 
 **`--dry-run`:** stubs agent processes only; writes `.spar/runs/<id>/`. Does **not** create real git worktrees (cwd under `.spar/…/cwd-*`). Live runs create sibling worktrees.
 

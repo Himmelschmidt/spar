@@ -152,7 +152,8 @@ pub enum Command {
         timeout: String,
         #[arg(long)]
         json: bool,
-        /// Stream events until stop
+        /// Block until the run reaches a terminal state or a human gate; text mode
+        /// live-tails events, `--json` blocks quietly and prints final state at the stop
         #[arg(long)]
         follow: bool,
     },
