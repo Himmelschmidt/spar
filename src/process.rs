@@ -688,13 +688,17 @@ impl StreamCoalescer {
                 }
                 "error" => {
                     let mut out = self.flush_buf();
-                    out.push_str(&format!(
-                        "! {}\n",
-                        v.get("error")
-                            .or_else(|| v.get("message"))
-                            .map(|x| x.to_string())
-                            .unwrap_or_else(|| t.into())
-                    ));
+                    // Unwrap JSON string values so codex's top-level
+                    // `{"type":"error","message":"…"}` renders without literal quotes.
+                    let msg = v
+                        .get("error")
+                        .or_else(|| v.get("message"))
+                        .map(|x| match x {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        })
+                        .unwrap_or_else(|| t.into());
+                    out.push_str(&format!("! {msg}\n"));
                     return Some(out);
                 }
                 _ => {}
@@ -705,6 +709,8 @@ impl StreamCoalescer {
         if let Some(ty) = v.get("type").and_then(|x| x.as_str()) {
             match ty {
                 "thread.started" | "turn.started" | "item.started" => return None,
+                // `codex exec` emits exactly one turn.completed per invocation, so the
+                // `output_tokens` add in absorb_usage runs once (input uses max).
                 "turn.completed" => {
                     let mut out = self.flush_buf();
                     out.push_str(&format!(
@@ -755,15 +761,16 @@ impl StreamCoalescer {
                 }
             }
             "reasoning" => {
-                let text = item
+                // Fall through to the out.is_empty() check rather than returning
+                // early, so any buffer flushed above is never silently dropped.
+                if let Some(text) = item
                     .get("text")
                     .or_else(|| item.get("summary"))
                     .and_then(|x| x.as_str())
-                    .unwrap_or("");
-                if text.is_empty() {
-                    return None;
+                    .filter(|s| !s.is_empty())
+                {
+                    out.push_str(&format!("… {}\n", first_line(text, 90)));
                 }
-                out.push_str(&format!("… {}\n", first_line(text, 90)));
             }
             "command_execution" | "file_change" | "mcp_tool_call" | "web_search" => {
                 self.tools += 1;
@@ -1398,6 +1405,22 @@ mod tests {
         assert_eq!(c.input_tokens, 39189);
         assert_eq!(c.output_tokens, 117);
         assert_eq!(c.cache_read, 39185);
+    }
+
+    #[test]
+    fn codex_top_level_error_renders_unquoted() {
+        // Codex emits `{"type":"error","message":"…"}`; it must render without quotes.
+        let mut c = StreamCoalescer::new(false);
+        let chunk = c
+            .feed(
+                r#"{"type":"error","message":"Missing environment variable: OPENROUTER_API_KEY."}"#,
+            )
+            .unwrap();
+        assert!(chunk.contains("! Missing environment variable: OPENROUTER_API_KEY."));
+        assert!(
+            !chunk.contains('"'),
+            "message must not be quoted: {chunk:?}"
+        );
     }
 
     #[test]

@@ -14,19 +14,23 @@ const DEFAULT_CODEX_PROFILE: &str = "muse";
 fn codex_profile() -> Option<String> {
     match std::env::var("SPAR_CODEX_PROFILE") {
         Ok(p) if p.trim().is_empty() => None,
-        Ok(p) => Some(p),
+        Ok(p) => Some(p.trim().to_string()),
         Err(_) => Some(DEFAULT_CODEX_PROFILE.to_string()),
     }
 }
 
 /// Model override (`-m`). spar's per-slot model (`--select`) wins; otherwise
 /// `SPAR_CODEX_MODEL`; otherwise none (the profile's default model applies).
+/// Empty/whitespace values are ignored so we never emit `-m ""`.
 fn codex_model(opts: &SpawnOpts) -> Option<String> {
-    opts.model.clone().or_else(|| {
-        std::env::var("SPAR_CODEX_MODEL")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-    })
+    opts.model
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("SPAR_CODEX_MODEL")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
 }
 
 pub struct CodexAdapter;
@@ -101,27 +105,20 @@ impl ProviderAdapter for CodexAdapter {
         } else {
             String::new()
         };
+        // `--` ends option parsing so a prompt starting with `-` (or matching a
+        // `codex exec` subcommand like `review`/`resume`) is taken literally.
+        cmd.arg("--");
         cmd.arg(prompt);
         cmd.current_dir(&opts.cwd);
         cmd
     }
 
     fn build_interactive(&self, bin: &Path, opts: &SpawnOpts) -> Command {
-        let mut cmd = Command::new(bin);
-        if let Some(p) = codex_profile() {
-            cmd.arg("-p").arg(p);
-        }
-        if let Some(m) = codex_model(opts) {
-            cmd.arg("-m").arg(m);
-        }
-        if !opts.prompt.is_empty() {
-            cmd.arg(&opts.prompt);
-        }
-        for a in &opts.extra_args {
-            cmd.arg(a);
-        }
-        cmd.current_dir(&opts.cwd);
-        cmd
+        // codex has no wired interactive-takeover mode. If a run is forced onto the
+        // tmux backend (`--backend tmux`), run the same headless `exec --json`
+        // command in the pane so full-auto + token tracking are preserved — it is
+        // watchable, just not takeover-able (capabilities().interactive is false).
+        self.build_headless(bin, opts)
     }
 }
 
@@ -148,6 +145,8 @@ mod tests {
 
     #[test]
     fn headless_shape_and_prompt_last() {
+        // Lock: build_headless reads SPAR_CODEX_* env, which another test mutates.
+        let _guard = ENV_LOCK.lock().unwrap();
         // Structural flags are env-independent; profile value is covered separately.
         let cmd = CodexAdapter.build_headless(Path::new("codex"), &opts("do the thing", None));
         let (_, args) = command_to_parts(&cmd);
@@ -157,11 +156,19 @@ mod tests {
         assert!(args
             .iter()
             .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
+        // Prompt is the final positional, preceded by `--`.
         assert_eq!(args.last().map(String::as_str), Some("do the thing"));
+        let di = args.iter().position(|a| a == "--").expect("-- separator");
+        assert_eq!(
+            di,
+            args.len() - 2,
+            "-- must sit just before the prompt: {args:?}"
+        );
     }
 
     #[test]
     fn model_from_opts_precedes_prompt() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // opts.model (from --select) wins regardless of ambient env.
         let cmd = CodexAdapter
             .build_headless(Path::new("codex"), &opts("go", Some("meta/muse-spark-1.1")));
@@ -177,6 +184,7 @@ mod tests {
 
     #[test]
     fn prompt_policy_omits_bypass() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let mut o = opts("x", None);
         o.trust = TrustPolicy::Prompt;
         let cmd = CodexAdapter.build_headless(Path::new("codex"), &o);
