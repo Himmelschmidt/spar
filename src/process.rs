@@ -688,15 +688,52 @@ impl StreamCoalescer {
                 }
                 "error" => {
                     let mut out = self.flush_buf();
+                    // Unwrap JSON string values so codex's top-level
+                    // `{"type":"error","message":"…"}` renders without literal quotes.
+                    let msg = v
+                        .get("error")
+                        .or_else(|| v.get("message"))
+                        .map(|x| match x {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        })
+                        .unwrap_or_else(|| t.into());
+                    out.push_str(&format!("! {msg}\n"));
+                    return Some(out);
+                }
+                _ => {}
+            }
+        }
+
+        // Codex exec JSONL (thread.started / turn.* / item.* events).
+        if let Some(ty) = v.get("type").and_then(|x| x.as_str()) {
+            match ty {
+                "thread.started" | "turn.started" | "item.started" => return None,
+                // `codex exec` emits exactly one turn.completed per invocation, so the
+                // `output_tokens` add in absorb_usage runs once (input uses max).
+                "turn.completed" => {
+                    let mut out = self.flush_buf();
                     out.push_str(&format!(
-                        "! {}\n",
-                        v.get("error")
-                            .or_else(|| v.get("message"))
-                            .map(|x| x.to_string())
-                            .unwrap_or_else(|| t.into())
+                        "· turn  ·  {} tools  ·  {}\n",
+                        self.tools,
+                        format_tokens(
+                            self.input_tokens,
+                            self.output_tokens.max(self.est_output_tokens),
+                            self.cache_read
+                        )
                     ));
                     return Some(out);
                 }
+                "turn.failed" => {
+                    let mut out = self.flush_buf();
+                    let msg = v
+                        .pointer("/error/message")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("turn failed");
+                    out.push_str(&format!("! {}\n", first_line(msg, 160)));
+                    return Some(out);
+                }
+                "item.completed" => return self.handle_codex_item(&v),
                 _ => {}
             }
         }
@@ -705,6 +742,73 @@ impl StreamCoalescer {
             return None;
         }
         None
+    }
+
+    fn handle_codex_item(&mut self, v: &serde_json::Value) -> Option<String> {
+        let item = v.get("item")?;
+        let ity = item.get("type").and_then(|x| x.as_str()).unwrap_or("");
+        let mut out = self.flush_buf();
+        match ity {
+            "agent_message" => {
+                if let Some(text) = item.get("text").and_then(|x| x.as_str()) {
+                    if !text.is_empty() {
+                        out.push_str(text);
+                        if !text.ends_with('\n') {
+                            out.push('\n');
+                        }
+                        self.note_text(text);
+                    }
+                }
+            }
+            "reasoning" => {
+                // Fall through to the out.is_empty() check rather than returning
+                // early, so any buffer flushed above is never silently dropped.
+                if let Some(text) = item
+                    .get("text")
+                    .or_else(|| item.get("summary"))
+                    .and_then(|x| x.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    out.push_str(&format!("… {}\n", first_line(text, 90)));
+                }
+            }
+            "command_execution" | "file_change" | "mcp_tool_call" | "web_search" => {
+                self.tools += 1;
+                let failed = item
+                    .get("status")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.eq_ignore_ascii_case("failed") || s.eq_ignore_ascii_case("error"))
+                    .unwrap_or(false);
+                if failed {
+                    self.tool_errors += 1;
+                }
+                let detail = item
+                    .get("command")
+                    .or_else(|| item.get("query"))
+                    .or_else(|| item.pointer("/changes/0/path"))
+                    .and_then(|x| x.as_str())
+                    .map(|s| first_line(s, 90))
+                    .unwrap_or_default();
+                if detail.is_empty() {
+                    out.push_str(&format!("→ {ity}\n"));
+                } else {
+                    out.push_str(&format!("→ {ity}  {detail}\n"));
+                }
+            }
+            "error" => {
+                let msg = item
+                    .get("message")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("error");
+                out.push_str(&format!("! {}\n", first_line(msg, 160)));
+            }
+            _ => {}
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
     }
 
     fn handle_claude_assistant(&mut self, v: &serde_json::Value) -> Option<String> {
@@ -814,6 +918,8 @@ impl StreamCoalescer {
         if let Some(n) = u
             .get("cache_read_input_tokens")
             .or_else(|| u.pointer("/cache_read_input_tokens"))
+            // Codex reports cached prompt tokens as `cached_input_tokens`.
+            .or_else(|| u.get("cached_input_tokens"))
             .and_then(|x| x.as_u64())
         {
             self.cache_read = self.cache_read.max(n);
@@ -1277,6 +1383,55 @@ mod tests {
         assert_eq!(c.input_tokens, 100);
         assert!(c.cache_read >= 50);
         assert_eq!(c.model.as_deref(), Some("claude-opus"));
+    }
+
+    #[test]
+    fn codex_jsonl_text_and_usage() {
+        // Real `codex exec --json` event sequence (captured from codex-cli 0.144.4).
+        let mut c = StreamCoalescer::new(false);
+        let mut out = String::new();
+        for line in [
+            r#"{"type":"thread.started","thread_id":"t1"}"#,
+            r#"{"type":"turn.started"}"#,
+            r#"{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"done reviewing"}}"#,
+            r#"{"type":"turn.completed","usage":{"input_tokens":39189,"cached_input_tokens":39185,"output_tokens":117,"reasoning_output_tokens":106}}"#,
+        ] {
+            if let Some(chunk) = c.feed(line) {
+                out.push_str(&chunk);
+            }
+        }
+        assert!(out.contains("done reviewing"), "assistant text: {out:?}");
+        assert!(out.contains("· turn"), "turn marker: {out:?}");
+        assert_eq!(c.input_tokens, 39189);
+        assert_eq!(c.output_tokens, 117);
+        assert_eq!(c.cache_read, 39185);
+    }
+
+    #[test]
+    fn codex_top_level_error_renders_unquoted() {
+        // Codex emits `{"type":"error","message":"…"}`; it must render without quotes.
+        let mut c = StreamCoalescer::new(false);
+        let chunk = c
+            .feed(
+                r#"{"type":"error","message":"Missing environment variable: OPENROUTER_API_KEY."}"#,
+            )
+            .unwrap();
+        assert!(chunk.contains("! Missing environment variable: OPENROUTER_API_KEY."));
+        assert!(
+            !chunk.contains('"'),
+            "message must not be quoted: {chunk:?}"
+        );
+    }
+
+    #[test]
+    fn codex_jsonl_command_counts_tool() {
+        let mut c = StreamCoalescer::new(false);
+        let line = r#"{"type":"item.completed","item":{"id":"i2","type":"command_execution","command":"cargo test","status":"completed"}}"#;
+        let chunk = c.feed(line).unwrap();
+        assert!(chunk.contains("→ command_execution"));
+        assert!(chunk.contains("cargo test"));
+        assert_eq!(c.tools, 1);
+        assert_eq!(c.tool_errors, 0);
     }
 
     #[test]
