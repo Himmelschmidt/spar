@@ -1,5 +1,6 @@
 mod agy;
 mod claude;
+mod codex;
 pub mod delivery;
 mod grok;
 pub mod presence;
@@ -11,6 +12,7 @@ use std::process::Command;
 
 pub use agy::AgyAdapter;
 pub use claude::ClaudeAdapter;
+pub use codex::CodexAdapter;
 pub use grok::GrokAdapter;
 
 /// How the orchestrator hands a queued message to a *running* adapter at its next
@@ -180,6 +182,7 @@ pub fn all_adapters() -> Vec<Box<dyn ProviderAdapter>> {
         Box::new(ClaudeAdapter),
         Box::new(GrokAdapter),
         Box::new(AgyAdapter),
+        Box::new(CodexAdapter),
     ]
 }
 

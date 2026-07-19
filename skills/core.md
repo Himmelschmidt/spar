@@ -32,6 +32,25 @@ spar implement -t "..." --providers cli:claude,api:openai --dry-run
 spar run --workflow arena -t "..." --providers api:xai,cli:claude,cli:grok
 ```
 
+Native CLI adapters: `cli:claude`, `cli:grok`, `cli:agy`, `cli:codex`. Run `spar provider list`
+to see which resolve on this box.
+
+`cli:codex` (codex, `codex exec --json`) drives whatever backend + model a codex **profile**
+defines (a profile is codex's own (backend, model) bundle), and parses codex JSONL for real
+token/cost tracking. Not a takeover target. Selection, highest precedence first:
+- spar `--select` model (per-slot) → codex `-m`.
+- `SPAR_CODEX_MODEL` → `-m` override (e.g. any OpenRouter slug like `x-ai/grok-4`).
+- `SPAR_CODEX_PROFILE` picks the backend bundle (`-p`): **unset → the `muse` profile**
+  (OpenRouter + Muse Spark, the default); set-but-empty → omit `-p` (codex's own config default,
+  e.g. plain OpenAI); any other value → that `$CODEX_HOME/<name>.config.toml`.
+- OpenRouter profiles need `OPENROUTER_API_KEY` exported in spar's env (codex reads it via `env_key`).
+
+```bash
+spar run --workflow review -t "..." --providers cli:codex               # Muse Spark via OpenRouter
+SPAR_CODEX_MODEL=x-ai/grok-4 spar run ... --providers cli:codex          # different OpenRouter model
+SPAR_CODEX_PROFILE=gpt        spar run ... --providers cli:codex          # a different codex profile
+```
+
 API keys: `OPENAI_API_KEY`, `XAI_API_KEY`, optional `OPENAI_BASE_URL` / `XAI_BASE_URL` / `*_MODEL`.
 
 ## Workflows
