@@ -239,11 +239,10 @@ pub fn run_with(opts: TuiOpts) -> Result<crate::exit_codes::ExitCode> {
     } else {
         let _ = registry::ensure_known(None);
     }
-    let stall_warn_secs = local_root
+    let cfg = local_root
         .as_ref()
         .and_then(|r| Config::load(r).ok())
-        .map(|c| c.timeouts.stall_warn_secs)
-        .unwrap_or(300);
+        .unwrap_or_default();
 
     enable_raw_mode()?;
     // Install immediately so partial setup / panic still restores the terminal.
@@ -267,7 +266,7 @@ pub fn run_with(opts: TuiOpts) -> Result<crate::exit_codes::ExitCode> {
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
     terminal.clear()?;
 
-    run_loop(&mut terminal, local_root, opts.task_seed, stall_warn_secs)
+    run_loop(&mut terminal, local_root, opts.task_seed, cfg)
 }
 
 /// Narrow/mobile SGR mouse: basic tracking + SGR encoding only (Termux-compatible;
@@ -352,7 +351,11 @@ struct App {
     tick: u64,
     /// (started, message, color, how long to show)
     flash: Option<(Instant, String, Color, Duration)>,
-    stall_warn_secs: u64,
+    /// Loaded once at startup; supplies `stall_warn_secs` and per-role stall hard caps.
+    cfg: Config,
+    /// Freshest process heartbeat per slot id, refreshed from the snapshot each frame.
+    /// Feeds stall detection so a busy-but-log-quiet slot isn't flagged as stalled.
+    heartbeats: std::collections::HashMap<String, DateTime<Utc>>,
     /// When false (default), long log lines truncate with …; `w` toggles wrap.
     log_expand: bool,
     last_click: Option<(u16, u16, Instant)>,
@@ -465,7 +468,7 @@ impl LogCache {
 }
 
 impl App {
-    fn new(task_seed: Option<String>, stall_warn_secs: u64, start_in_project: bool) -> Self {
+    fn new(task_seed: Option<String>, cfg: Config, start_in_project: bool) -> Self {
         Self {
             selected_run: 0,
             selected_project: 0,
@@ -502,7 +505,8 @@ impl App {
             diff_view_h: 12,
             tick: 0,
             flash: None,
-            stall_warn_secs,
+            cfg,
+            heartbeats: std::collections::HashMap::new(),
             log_expand: false,
             last_click: None,
             show_help: false,
@@ -794,6 +798,8 @@ struct Snapshot {
     human_alerts: usize,
     /// Selected run is in flight with no live orchestrator.
     abandoned: bool,
+    /// Freshest process heartbeat per slot id for the selected run.
+    heartbeats: std::collections::HashMap<String, DateTime<Utc>>,
 }
 
 enum Msg {
@@ -838,6 +844,10 @@ fn marks_for(sel: &Selection, prev: Option<&Snapshot>) -> Marks {
             out.push(stamp(&swarm.state_file(id)));
             out.push(stamp(&events::events_file(&swarm, id)));
             out.push(stamp(&crate::bus::run_events_path(&swarm, id)));
+            // Heartbeats append to the workspace roster without touching state/events, so
+            // stamp it too — else a log-quiet-but-heartbeating slot never triggers a
+            // snapshot rebuild and its heartbeat (and stall status) goes stale in the TUI.
+            out.push(stamp(&crate::bus::agents_path(&swarm)));
             out.push(stamp(&swarm.artifacts_dir(id)));
             // The live log grows without the run state changing.
             let slot = prev
@@ -856,7 +866,7 @@ fn marks_for(sel: &Selection, prev: Option<&Snapshot>) -> Marks {
 }
 
 /// All blocking filesystem work lives here, never on the render thread.
-fn build_snapshot(sel: &Selection, cache: &mut LogCache) -> Snapshot {
+fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapshot {
     let swarm = SparPaths::new(&sel.root);
     let projects = registry::projects();
     let runs = if sel.browse.in_project() {
@@ -897,7 +907,23 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache) -> Snapshot {
         .as_ref()
         .map(|st| crate::bus::unresolved_alerts(&swarm, Some(&st.id)).unwrap_or_default())
         .unwrap_or_default();
-    let activity = activity_feed(&swarm, full.as_ref(), &quota, &alerts);
+    // One roster read per tick; slot id → freshest heartbeat. Process liveness
+    // independent of log output, so a quiet-but-working slot isn't shown as stalled.
+    let heartbeats = full
+        .as_ref()
+        .map(|st| {
+            let by_addr = crate::bus::heartbeat_map(&swarm, Some(&st.id));
+            st.slots
+                .iter()
+                .filter_map(|s| {
+                    by_addr
+                        .get(&crate::bus::resolve_addr(Some(&st.id), &s.id))
+                        .map(|ts| (s.id.clone(), *ts))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let activity = activity_feed(&swarm, full.as_ref(), &quota, &alerts, &heartbeats, cfg);
     Snapshot {
         swarm,
         projects,
@@ -908,6 +934,7 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache) -> Snapshot {
         diff_text,
         human_alerts: alerts.len(),
         abandoned,
+        heartbeats,
     }
 }
 
@@ -1042,9 +1069,9 @@ fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     local_root: Option<PathBuf>,
     task_seed: Option<String>,
-    stall_warn_secs: u64,
+    cfg: Config,
 ) -> Result<crate::exit_codes::ExitCode> {
-    let mut app = App::new(task_seed, stall_warn_secs, local_root.is_some());
+    let mut app = App::new(task_seed, cfg.clone(), local_root.is_some());
     let mut rail_state = ListState::default();
     let mut active_root: PathBuf = local_root.clone().unwrap_or_else(|| {
         registry::projects()
@@ -1064,7 +1091,7 @@ fn run_loop(
 
     // First paint needs data, so build one snapshot synchronously.
     let mut cache = LogCache::empty();
-    let snapshot = Arc::new(Mutex::new(Arc::new(build_snapshot(&sel, &mut cache))));
+    let snapshot = Arc::new(Mutex::new(Arc::new(build_snapshot(&sel, &mut cache, &cfg))));
 
     let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
     let (sel_tx, sel_rx) = mpsc::channel::<Selection>();
@@ -1085,6 +1112,7 @@ fn run_loop(
         let slot = Arc::clone(&snapshot);
         let mut sel = sel.clone();
         let mut marks = Marks::new();
+        let cfg = cfg.clone();
         thread::spawn(move || loop {
             let mut forced = false;
             match sel_rx.recv_timeout(REFRESH) {
@@ -1106,7 +1134,7 @@ fn run_loop(
             }
             marks = next_marks;
 
-            let next = Arc::new(build_snapshot(&sel, &mut cache));
+            let next = Arc::new(build_snapshot(&sel, &mut cache, &cfg));
             *slot.lock().unwrap() = next;
             if tx.send(Msg::Data).is_err() {
                 break;
@@ -1167,6 +1195,7 @@ fn run_loop(
         app.animated = animating(&app, &snap);
         app.human_alerts_n = snap.human_alerts;
         app.abandoned = snap.abandoned;
+        app.heartbeats = snap.heartbeats.clone();
 
         if dirty {
             app.tick = app.tick.wrapping_add(1);
@@ -2902,7 +2931,12 @@ fn rail_slot_items<'a>(slots: &'a [SlotState], app: &App) -> Vec<ListItem<'a>> {
         .enumerate()
         .map(|(i, s)| {
             let sel = i == app.selected_slot;
-            let act = SlotActivity::observe(s, app.stall_warn_secs);
+            let act = SlotActivity::observe(
+                s,
+                app.cfg.timeouts.stall_warn_secs,
+                crate::executor::timeout_for_role(&app.cfg, s.role).as_secs(),
+                app.heartbeats.get(&s.id).copied(),
+            );
             let orphaned = app.abandoned && s.status == SlotStatus::Running;
             let color = if act.stalled || orphaned {
                 RED
@@ -3076,7 +3110,12 @@ fn draw_log_body(
     let slot = full.and_then(|st| st.slots.get(app.selected_slot));
     let silent_hint = slot
         .map(|s| {
-            let act = SlotActivity::observe(s, app.stall_warn_secs);
+            let act = SlotActivity::observe(
+                s,
+                app.cfg.timeouts.stall_warn_secs,
+                crate::executor::timeout_for_role(&app.cfg, s.role).as_secs(),
+                app.heartbeats.get(&s.id).copied(),
+            );
             if app.abandoned && s.status == SlotStatus::Running {
                 format!(" ORPHAN {} ", act.human_silent())
             } else if act.stalled {
@@ -4315,6 +4354,8 @@ fn activity_feed(
     full: Option<&RunState>,
     quota: &QuotaStore,
     alerts: &[crate::bus::BusMessage],
+    heartbeats: &std::collections::HashMap<String, DateTime<Utc>>,
+    cfg: &Config,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     let Some(st) = full else {
@@ -4350,7 +4391,12 @@ fn activity_feed(
     // Compact agent status
     lines.push("Agents".into());
     for s in &st.slots {
-        let act = SlotActivity::observe(s, 300);
+        let act = SlotActivity::observe(
+            s,
+            cfg.timeouts.stall_warn_secs,
+            crate::executor::timeout_for_role(cfg, s.role).as_secs(),
+            heartbeats.get(&s.id).copied(),
+        );
         let mark = match s.status {
             SlotStatus::Running if act.stalled => "!",
             SlotStatus::Running => "●",
@@ -4803,7 +4849,7 @@ mod labels {
     fn clicking_a_tab_escapes_the_shell() {
         use crossterm::event::{MouseEvent, MouseEventKind};
         let swarm = SparPaths::new("/x");
-        let mut app = App::new(None, 300, true);
+        let mut app = App::new(None, Config::default(), true);
         app.open_main(MainTab::Shell);
         app.main_tabs = vec![
             (
@@ -4855,7 +4901,7 @@ mod labels {
 
     #[test]
     fn rail_pop_never_leaves_projects() {
-        let mut app = App::new(None, 300, true);
+        let mut app = App::new(None, Config::default(), true);
         app.browse = BrowseLevel::Agents;
         app.rail_pop();
         assert_eq!(app.browse, BrowseLevel::Runs);
@@ -4869,7 +4915,7 @@ mod labels {
 
     #[test]
     fn shell_active_only_on_focused_main_shell_tab() {
-        let mut app = App::new(None, 300, true);
+        let mut app = App::new(None, Config::default(), true);
         assert!(!app.shell_active());
         app.main_tab = MainTab::Shell;
         assert!(!app.shell_active(), "rail focus keeps keys in spar");
@@ -4882,7 +4928,7 @@ mod labels {
     #[test]
     fn takeover_opens_the_shell_tab() {
         use crate::cli::WorkflowKind;
-        let mut app = App::new(None, 300, true);
+        let mut app = App::new(None, Config::default(), true);
         app.open_main(MainTab::Shell);
         assert_eq!(app.focus, Focus::Main);
         assert_eq!(app.main_tab, MainTab::Shell);
@@ -4893,7 +4939,7 @@ mod labels {
             "cli:claude",
             crate::state::SlotRole::Implementer,
         ));
-        let mut app = App::new(None, 300, true);
+        let mut app = App::new(None, Config::default(), true);
         app.browse = BrowseLevel::Agents;
         let mut root = PathBuf::from("/x");
         rail_enter(&mut app, &[], &[], Some(&st), &mut root);
@@ -4931,7 +4977,7 @@ mod labels {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let mut term = Terminal::new(TestBackend::new(90, 3)).unwrap();
-        let mut app = App::new(None, 300, true);
+        let mut app = App::new(None, Config::default(), true);
         let buttons = vec![
             ("Approve", GateAction::Approve),
             ("Reject", GateAction::Reject),
@@ -4963,7 +5009,7 @@ mod labels {
         st.phase = Phase::AwaitingWinnerConfirm;
         let swarm = SparPaths::new("/x");
         let mut term = Terminal::new(TestBackend::new(90, 1)).unwrap();
-        let mut app = App::new(None, 300, true);
+        let mut app = App::new(None, Config::default(), true);
         app.human_alerts_n = 2;
         term.draw(|f| {
             let area = f.area();
@@ -4990,7 +5036,7 @@ mod labels {
         let st = RunState::new("run1", WorkflowKind::Loop, std::path::PathBuf::from("/x"));
         let swarm = SparPaths::new("/x");
         let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
-        let mut app = App::new(None, 300, true);
+        let mut app = App::new(None, Config::default(), true);
         app.human_alerts_n = 3;
         let area = Rect {
             x: 0,
@@ -5208,7 +5254,7 @@ mod labels {
 
     #[test]
     fn slash_opens_filter_and_esc_clears_it() {
-        let mut app = App::new(None, 300, true);
+        let mut app = App::new(None, Config::default(), true);
         let sw = SparPaths::new(std::path::Path::new("/x"));
         let mut root = PathBuf::from("/x");
         // `/` opens the filter editor with focus on the rail.
@@ -5258,7 +5304,7 @@ mod labels {
 
     #[test]
     fn colon_opens_palette_and_q_quits() {
-        let mut app = App::new(None, 300, true);
+        let mut app = App::new(None, Config::default(), true);
         let sw = SparPaths::new(std::path::Path::new("/x"));
         let mut root = PathBuf::from("/x");
         // q quits from a normal context.
@@ -5359,7 +5405,7 @@ mod labels {
             summary_phase("r1", Phase::Review),
             summary_phase("r2", Phase::AwaitingPlanApproval),
         ];
-        let mut app = App::new(None, 300, true);
+        let mut app = App::new(None, Config::default(), true);
         app.browse = BrowseLevel::Runs;
         app.selected_run = 0;
         jump_to_attention(&mut app, &runs);
@@ -5371,7 +5417,7 @@ mod labels {
 
     #[test]
     fn toasts_prime_silently_then_fire_on_transition() {
-        let mut app = App::new(None, 300, true);
+        let mut app = App::new(None, Config::default(), true);
         // First snapshot only primes: an existing gate is NOT toasted.
         let runs = vec![summary_phase("r0", Phase::AwaitingPlanApproval)];
         emit_attention_toasts(&mut app, &runs);

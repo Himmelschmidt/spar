@@ -129,6 +129,23 @@ spar logs <run_id> [slot] [-f|--follow]
 # Projects appear when you use spar there — no hardcoded scan paths.
 ```
 
+**Subscribe, don't poll.** When you are waiting on a run, block on `wait` instead
+of spinning on `status` — you don't have to remember to check back:
+
+```bash
+spar wait <run_id> --follow --json     # blocks; returns at terminal OR human gate
+# exit 0 done · 2 gate (needs you) · 3 stuck/wait-timeout · 4 quota
+```
+
+`wait` releases you the instant the run reaches a waitable stop — a **human gate**
+(exit `2`, needs a decision) as well as done/failed — so it wakes you exactly when
+there is something to act on, not just at the very end. `--json --follow` blocks
+quietly and prints the final `RunState` at the stop; text `--follow` live-tails the
+event log. `--timeout` (default `2h`) caps the block and returns exit `3` if it
+lapses. Poll `status --json` / `status --all` only when you genuinely can't block —
+e.g. supervising several runs at once, where you background one `wait --follow` per
+run and reconcile as each returns.
+
 ### TUI shape (humans)
 
 A **rail** + **one main area**. Main always shows the rail's selection.
@@ -155,7 +172,7 @@ A **rail** + **one main area**. Main always shows the rail's selection.
 - Run state: `.spar/runs/<id>/state.json`
 - Events (orchestrator): `.spar/runs/<id>/events.jsonl`
 - Logs: `.spar/runs/<id>/logs/<slot>.log`
-- `status --json` enriches each slot with `last_log_at`, `silent_for_secs`, `stalled` (log quiet longer than `timeouts.stall_warn_secs` while running)
+- `status --json` enriches each slot with `slot` (the slot id, mirroring `id`), `last_log_at`, `silent_for_secs`, `last_heartbeat_at`, `stalled`. `stalled` fires for a running slot that has been log-quiet past `timeouts.stall_warn_secs` **and** either has stopped heartbeating (process likely dead/gone) **or** has stayed silent for its entire role timeout (alive but hung too long). A slot that emits nothing loggable but is still heartbeating inside its role budget (e.g. a streaming-json agent mid tool-call) is working, not stalled. `stalled` is advisory (colouring/label only) — a hard hang still surfaces as `Phase::Stuck` / exit code 3 via the role timeout.
 - Slot status is reconciled against on-disk markers at read time: a slot recorded as `running` that has a `<slot>.done` / `<slot>.failed` marker is reported `done` / `failed`. `status` never rewrites `state.json`.
 - `status --json` also carries **`"abandoned": true|false`** per run: the run is in a non-terminal phase but no live orchestrator owns it (the driving process died). Not an exit code — exit codes are unchanged. Resume with `spar implement --run <id> --providers …`, park it with `spar stop <id>`, or discard with `spar cleanup <id>`.
 
@@ -169,7 +186,7 @@ A **rail** + **one main area**. Main always shows the rail's selection.
 | 3 | Stuck / escalated / wait timeout |
 | 4 | No usable providers (quota/pause) |
 
-**`status` is observe-only:** process exit is always `0` if the run loads. Read JSON `exit_code` / `phase` for run state. Use `wait` when you want the process exit coded by gate/stuck/quota.
+**`status` is observe-only:** process exit is always `0` if the run loads. Read JSON `exit_code` / `phase` for run state. Use `wait` (see **Subscribe, don't poll** above) when you want to block until the run needs you and get the process exit coded by gate/stuck/quota.
 
 **`--dry-run`:** stubs agent processes only; writes `.spar/runs/<id>/`. Does **not** create real git worktrees (cwd under `.spar/…/cwd-*`). Live runs create sibling worktrees.
 
