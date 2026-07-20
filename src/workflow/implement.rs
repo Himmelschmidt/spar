@@ -771,7 +771,8 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
                     );
                 }
             } else if let Some(text) = review_text {
-                if text.to_ascii_lowercase().contains("request_changes") {
+                // Fail closed: only an anchored `## Verdict` / approve clears the gate.
+                if !crate::workflow::review_result::parse_review(&text).approves() {
                     any_request_changes = true;
                 }
             }

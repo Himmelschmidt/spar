@@ -981,12 +981,16 @@ fn write_dry_artifacts(
             } else {
                 "approve"
             };
+            let body = format!(
+                "## Verdict\n{verdict}\n\n## Findings\n- severity: minor — dry-run synthetic review from {}\n\n## Tests\nsuite channel (dry-run); no full suite here\n",
+                job.provider
+            );
+            if let Some(name) = &job.expected_artifact {
+                std::fs::write(paths.artifact(&state.id, name), &body)?;
+            }
             std::fs::write(
                 paths.artifact(&state.id, &format!("review-{}.md", job.slot_id)),
-                format!(
-                    "## Verdict\n{verdict}\n\n## Findings\n- severity: minor — dry-run synthetic review from {}\n\n## Tests\nsuite channel (dry-run); no full suite here\n",
-                    job.provider
-                ),
+                &body,
             )?;
         }
         SlotRole::Ranker => {
