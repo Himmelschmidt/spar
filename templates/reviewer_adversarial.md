@@ -5,10 +5,19 @@ You did NOT write this code. Find real bugs, missing tests, and regressions.
 ## Task
 {{task}}
 
+## Plan (what was agreed)
+{{plan_body}}
+
+## Acceptance contract (what must be true)
+{{test_contract_body}}
+
 ## Paths
 - Code under review (worktree): {{review_cwd}}
 - Write review to: {{artifacts_dir}}/review-{{slot_id}}.md
 - Markers: {{markers_dir}}/{{slot_id}}.done or .failed
+
+## Suite report
+{{suite_body}}
 
 {{suite_guidance}}
 
