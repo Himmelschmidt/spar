@@ -19,8 +19,8 @@ fn codex_profile() -> Option<String> {
     }
 }
 
-/// Model override (`-m`). spar's per-slot model (`--select`) wins; otherwise
-/// `SPAR_CODEX_MODEL`; otherwise none (the profile's default model applies).
+/// Model override (`-m`). spar's per-slot model (`--select` or a `cli:codex@<model>` ref)
+/// wins; otherwise `SPAR_CODEX_MODEL`; otherwise none (the profile's default model applies).
 /// Empty/whitespace values are ignored so we never emit `-m ""`.
 fn codex_model(opts: &SpawnOpts) -> Option<String> {
     opts.model
@@ -31,6 +31,22 @@ fn codex_model(opts: &SpawnOpts) -> Option<String> {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
         })
+}
+
+/// Flags that select a model. A `/` marks an OpenRouter slug (`openai/gpt-4o-mini`,
+/// `tencent/hy3:free`) and routes explicitly through the openrouter provider; a bare
+/// model (`gpt-5`) goes to codex's own default provider.
+fn model_args(model: &str) -> Vec<String> {
+    if model.contains('/') {
+        vec![
+            "-c".into(),
+            "model_provider=openrouter".into(),
+            "-m".into(),
+            model.into(),
+        ]
+    } else {
+        vec!["-m".into(), model.into()]
+    }
 }
 
 pub struct CodexAdapter;
@@ -88,11 +104,19 @@ impl ProviderAdapter for CodexAdapter {
         for a in self.permission_args(opts.trust) {
             cmd.arg(a);
         }
-        if let Some(p) = codex_profile() {
-            cmd.arg("-p").arg(p);
-        }
-        if let Some(m) = codex_model(opts) {
-            cmd.arg("-m").arg(m);
+        // An explicit model is self-describing (it names its own provider), so it
+        // supersedes the profile; the profile is only the no-model default.
+        match codex_model(opts) {
+            Some(m) => {
+                for a in model_args(&m) {
+                    cmd.arg(a);
+                }
+            }
+            None => {
+                if let Some(p) = codex_profile() {
+                    cmd.arg("-p").arg(p);
+                }
+            }
         }
         for a in &opts.extra_args {
             cmd.arg(a);
@@ -211,12 +235,15 @@ mod tests {
         assert_eq!(dash_val(&a, "-p").as_deref(), Some("muse"));
         assert!(!a.iter().any(|x| x == "-m"));
 
-        // SPAR_CODEX_PROFILE picks a different backend bundle; SPAR_CODEX_MODEL fills -m.
+        // SPAR_CODEX_MODEL fills -m; an explicit model supersedes the profile, so -p is gone.
         std::env::set_var("SPAR_CODEX_PROFILE", "gpt");
         std::env::set_var("SPAR_CODEX_MODEL", "x-ai/grok-4");
         let (_, a) =
             command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &opts("x", None)));
-        assert_eq!(dash_val(&a, "-p").as_deref(), Some("gpt"));
+        assert!(
+            !a.iter().any(|x| x == "-p"),
+            "explicit model omits the profile"
+        );
         assert_eq!(dash_val(&a, "-m").as_deref(), Some("x-ai/grok-4"));
 
         // opts.model still wins over SPAR_CODEX_MODEL.
@@ -226,13 +253,56 @@ mod tests {
         );
         assert_eq!(dash_val(&a, "-m").as_deref(), Some("meta/muse-spark-1.1"));
 
-        // Set-but-empty profile -> omit -p entirely (codex's own config default backend).
-        std::env::set_var("SPAR_CODEX_PROFILE", "");
+        std::env::remove_var("SPAR_CODEX_PROFILE");
+        std::env::remove_var("SPAR_CODEX_MODEL");
+    }
+
+    #[test]
+    fn slug_model_routes_to_openrouter_and_omits_profile() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SPAR_CODEX_PROFILE");
+        std::env::remove_var("SPAR_CODEX_MODEL");
+        let (_, a) = command_to_parts(
+            &CodexAdapter.build_headless(Path::new("codex"), &opts("x", Some("tencent/hy3:free"))),
+        );
+        // -c model_provider=openrouter -m <slug>, and NO profile.
+        let ci = a.iter().position(|x| x == "-c").expect("-c present");
+        assert_eq!(
+            a.get(ci + 1).map(String::as_str),
+            Some("model_provider=openrouter")
+        );
+        let mi = a.iter().position(|x| x == "-m").expect("-m present");
+        assert_eq!(a.get(mi + 1).map(String::as_str), Some("tencent/hy3:free"));
+        assert!(mi > ci, "-c must precede -m");
+        assert!(!a.iter().any(|x| x == "-p"), "slug model omits the profile");
+        std::env::remove_var("SPAR_CODEX_PROFILE");
+    }
+
+    #[test]
+    fn bare_model_omits_provider_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SPAR_CODEX_PROFILE");
+        std::env::remove_var("SPAR_CODEX_MODEL");
+        let (_, a) = command_to_parts(
+            &CodexAdapter.build_headless(Path::new("codex"), &opts("x", Some("gpt-5"))),
+        );
+        let mi = a.iter().position(|x| x == "-m").expect("-m present");
+        assert_eq!(a.get(mi + 1).map(String::as_str), Some("gpt-5"));
+        assert!(
+            !a.iter().any(|x| x == "model_provider=openrouter"),
+            "bare model must not force the openrouter provider"
+        );
+        std::env::remove_var("SPAR_CODEX_PROFILE");
+    }
+
+    #[test]
+    fn no_model_uses_default_profile() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SPAR_CODEX_PROFILE");
         std::env::remove_var("SPAR_CODEX_MODEL");
         let (_, a) =
             command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &opts("x", None)));
-        assert!(!a.iter().any(|x| x == "-p"));
-
-        std::env::remove_var("SPAR_CODEX_PROFILE");
+        assert!(a.windows(2).any(|w| w[0] == "-p" && w[1] == "muse"));
+        assert!(!a.iter().any(|x| x == "-m"));
     }
 }

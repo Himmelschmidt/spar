@@ -53,7 +53,7 @@ Opt-in path: resolve fleet slots from benchmark data + user profiles + per-run u
 | MS4 | Named **profiles** in config (`best` / `value` / `fast` or custom) with weights for quality / cost / speed + optional `min_accuracy` | DECIDED |
 | MS5 | **Urgency** is a per-run multiplier on the chosen profile (high → speed↑ cost↓; low → cost↑), not a separate parallel system | DECIDED |
 | MS6 | Score: normalize metrics in candidate set; `score = w_q·acc − w_c·cost − w_s·latency`; apply floors/allowlists before rank | DECIDED |
-| MS7 | **CLI economics**: treat `cli:*` cost as **0** for scoring (flat sub); do not use vals $ against subscription CLIs | DECIDED |
+| MS7 | **CLI economics**: treat `cli:*` cost as **0** for scoring (flat sub); do not use vals $ against subscription CLIs — superseded by MS15 for `@model` refs | DECIDED |
 | MS8 | Resolve to **assignable slots** (`ProviderRef` + optional model), not abstract model names only; filter by doctor-available backends | DECIDED |
 | MS9 | Multi-slot fleets (plan/arena/review ≥2): prefer **provider-family diversity**, then next-best score | DECIDED |
 | MS10 | Always write **`artifacts/model-select.json`** (candidates, weights, urgency, winners, why) into the run | DECIDED |
@@ -61,6 +61,7 @@ Opt-in path: resolve fleet slots from benchmark data + user profiles + per-run u
 | MS12 | Role defaults in config (`planner`/`implementer`/`reviewer`/`tester`/`critic` → profile names); suite `tester` defaults toward **fast/value** | DECIDED |
 | MS13 | CLI surface: `spar model list|pick|refresh`; doctor reports cache age | DECIDED |
 | MS14 | Ship phases: **A** cache+parser+list/pick · **B** `--select` into plan/implement · **C** roles/urgency/diversity · **D** per-adapter CLI model flags + richer vals→spar map | DECIDED |
+| MS15 | **Revises MS7 for `@model` refs.** `cli:*` is zero-cost only when the adapter bills against its own subscription. `cli:codex@<openrouter-slug>` is a `cli:` ref that routes to OpenRouter and bills **per token** (observed: 29.5k input on a trivial task; 489k on a real review run), so cost scoring must key on the **resolved model**, not the backend prefix. Recording the decision here; joining `turn.completed.usage` (already parsed into `stats.json`) to the OpenRouter price table is follow-up work | DECIDED |
 
 ## Workspace + bus delivery
 
