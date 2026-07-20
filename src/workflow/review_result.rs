@@ -174,7 +174,6 @@ fn parse_ac_line(raw: &str) -> Option<AcLine> {
 
 /// Every `AC-<digits>` token in a contract body, uppercased, deduplicated,
 /// in first-appearance order.
-#[allow(dead_code)] // call site lands with the acceptance gate (Priority 3)
 pub fn parse_contract_criteria(body: &str) -> Vec<String> {
     let upper = body.to_ascii_uppercase();
     let b = upper.as_bytes();
