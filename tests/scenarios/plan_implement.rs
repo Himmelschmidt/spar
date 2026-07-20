@@ -20,6 +20,13 @@ fn spar_home_dir() -> std::path::PathBuf {
 fn spar_cmd() -> assert_cmd::Command {
     let mut c = cargo_bin_cmd!("spar");
     c.env("SPAR_HOME", spar_home_dir());
+    // spar exports these into every slot (providers/presence.rs), so when the suite runs
+    // *inside* a spar worktree the child would resolve the primary checkout instead of
+    // this test's temp project and write real runs into it. Clear them per-Command
+    // (never via process env — these binaries run tests in parallel).
+    c.env_remove("SPAR_PROJECT_ROOT");
+    c.env_remove("SPAR_RUN_ID");
+    c.env_remove("SPAR_AGENT_ID");
     c
 }
 
@@ -1036,4 +1043,50 @@ fn path_b_implement_task() {
         .assert()
         .code(2)
         .stdout(predicate::str::contains("awaiting_ship_confirm"));
+}
+
+/// Regression: spar exports `SPAR_PROJECT_ROOT` into every slot, so running this suite
+/// inside a spar worktree used to make the spawned binary resolve the *primary* checkout
+/// and write real run dirs into it (hundreds accumulated this way). `spar_cmd` must clear
+/// the slot identity vars so a run always lands in the project the test created.
+#[test]
+fn ambient_spar_project_root_does_not_capture_runs() {
+    let poison = tempdir().unwrap();
+    std::fs::create_dir_all(poison.path().join(".spar")).unwrap();
+
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+
+    // Simulate running the suite inside a spar slot: the vars are in the *ambient*
+    // process env, which children inherit. They must not reach the spawned binary.
+    // (Setting them per-Command would defeat the point — `.env()` after `.env_remove()`
+    // simply re-adds them.) Harmless to other tests here: spar_cmd strips them.
+    std::env::set_var("SPAR_PROJECT_ROOT", poison.path());
+    std::env::set_var("SPAR_RUN_ID", "deadbeef");
+    std::env::set_var("SPAR_AGENT_ID", "deadbeef:impl");
+
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "plan",
+            "-t",
+            "isolation guard",
+            "--providers",
+            "cli:claude",
+            "--dry-run",
+        ])
+        .assert()
+        .code(2); // plan ends at the human gate
+
+    let poisoned_runs = poison.path().join(".spar/runs");
+    let leaked = poisoned_runs.read_dir().map(|d| d.count()).unwrap_or(0);
+    let local_runs = tmp.path().join(".spar/runs");
+    let made = local_runs.read_dir().map(|d| d.count()).unwrap_or(0);
+
+    std::env::remove_var("SPAR_PROJECT_ROOT");
+    std::env::remove_var("SPAR_RUN_ID");
+    std::env::remove_var("SPAR_AGENT_ID");
+
+    assert_eq!(leaked, 0, "run leaked into ambient SPAR_PROJECT_ROOT");
+    assert!(made > 0, "run did not land in the test's own project");
 }
