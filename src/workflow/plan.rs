@@ -6,7 +6,7 @@ use crate::exit_codes::ExitCode;
 use crate::paths::SparPaths;
 use crate::providers;
 use crate::state::{Phase, RunState, SlotRole};
-use crate::util;
+use crate::util::{self, sanitize_slot};
 use crate::worktree;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -89,7 +89,7 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
         .flatten();
     let mut jobs = Vec::new();
     for (i, prov) in state.providers.iter().take(2).enumerate() {
-        let safe = prov.replace(['/', ':'], "-");
+        let safe = sanitize_slot(prov);
         let role_name = if i == 0 { "planner" } else { "critic" };
         let model = art.as_ref().and_then(|a| {
             a.choices
@@ -254,7 +254,7 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
                 .find(|c| c.role.as_deref() == Some("tester") || c.slot == 2)
                 .and_then(|c| c.model.clone())
         });
-    let safe = provider.replace(['/', ':'], "-");
+    let safe = sanitize_slot(&provider);
     let id = format!("test-author-{safe}");
 
     if state.slots.iter().all(|s| s.id != id) {
@@ -522,7 +522,7 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
     }
     if jobs.is_empty() {
         for (i, prov) in state.providers.iter().take(2).enumerate() {
-            let safe = prov.replace(['/', ':'], "-");
+            let safe = sanitize_slot(prov);
             let (id, role, template) = if i == 0 {
                 (format!("planner-{safe}"), SlotRole::Planner, "planner")
             } else {

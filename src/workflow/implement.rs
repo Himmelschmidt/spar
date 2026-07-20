@@ -5,7 +5,7 @@ use crate::exit_codes::ExitCode;
 use crate::paths::SparPaths;
 use crate::providers;
 use crate::state::{Phase, RunState, SlotRole, SlotStatus, SuiteOutcome};
-use crate::util;
+use crate::util::{self, sanitize_slot};
 use crate::workflow::review_result::{self, AcStatus, ReviewResult};
 use crate::worktree;
 use anyhow::{bail, Result};
@@ -417,10 +417,6 @@ fn suite_guidance(outcome: SuiteOutcome) -> String {
              - Instead, run 1–2 targeted tests on the files this change touches for confidence.\n"
         ),
     }
-}
-
-fn sanitize_slot(s: &str) -> String {
-    s.replace([':', '/'], "-")
 }
 
 fn run_with_task(
@@ -972,7 +968,7 @@ fn try_widen_reviewers(
         state.save(paths)?;
         return Ok(true);
     };
-    let id = format!("review-{prov}-wide");
+    let id = format!("review-{}-wide", sanitize_slot(&prov));
     if state.slots.iter().any(|s| s.id == id) {
         return Ok(false);
     }

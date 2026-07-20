@@ -5,7 +5,7 @@ use crate::exit_codes::ExitCode;
 use crate::paths::SparPaths;
 use crate::providers;
 use crate::state::{Phase, RunState, SlotRole, SlotStatus};
-use crate::util;
+use crate::util::{self, sanitize_slot};
 use crate::worktree;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -52,7 +52,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     }
 
     for (i, prov) in state.providers.iter().enumerate() {
-        let id = format!("arena-{i}-{prov}");
+        let id = format!("arena-{i}-{}", sanitize_slot(prov));
         state
             .slots
             .push(executor::init_slot(id, prov, SlotRole::Implementer));
@@ -64,7 +64,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         .cloned()
         .unwrap_or_else(|| "cli:claude".into());
     state.slots.push(executor::init_slot(
-        format!("ranker-{rank_p}"),
+        format!("ranker-{}", sanitize_slot(&rank_p)),
         rank_p,
         SlotRole::Ranker,
     ));
@@ -335,7 +335,7 @@ pub fn reconcile(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> R
         .first()
         .cloned()
         .unwrap_or_else(|| "cli:claude".into());
-    let recon_id = format!("reconcile-{recon_prov}");
+    let recon_id = format!("reconcile-{}", sanitize_slot(&recon_prov));
     if state.slots.iter().all(|s| s.id != recon_id) {
         state.slots.push(executor::init_slot(
             &recon_id,
@@ -372,7 +372,7 @@ pub fn reconcile(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> R
         .unwrap_or_else(|| state.project_root.clone());
     let rev_providers: Vec<String> = state.providers.iter().take(2).cloned().collect();
     for (i, prov) in rev_providers.iter().enumerate() {
-        let id = format!("reconcile-review-{i}-{prov}");
+        let id = format!("reconcile-review-{i}-{}", sanitize_slot(prov));
         if state.slots.iter().all(|s| s.id != id) {
             let mut slot = executor::init_slot(&id, prov, SlotRole::Reviewer);
             slot.cwd = Some(recon_cwd.clone());

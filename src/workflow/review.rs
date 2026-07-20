@@ -7,7 +7,7 @@ use crate::exit_codes::ExitCode;
 use crate::paths::SparPaths;
 use crate::providers;
 use crate::state::{Phase, RunState, SlotRole, SlotStatus};
-use crate::util;
+use crate::util::{self, sanitize_slot};
 use crate::worktree;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -59,7 +59,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     }
 
     for (i, prov) in state.providers.iter().enumerate() {
-        let id = format!("review-{}-{}", i, prov.replace(':', "-"));
+        let id = format!("review-{}-{}", i, sanitize_slot(prov));
         state
             .slots
             .push(executor::init_slot(&id, prov, SlotRole::Reviewer));
