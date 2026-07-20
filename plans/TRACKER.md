@@ -75,7 +75,7 @@ Folds `[suite].provider` and `[spec].provider` into `[roles].tester` and
 
 ## Current Focus
 
-**Priority 1 — Review result parser** → [01-review-result-parser.md](01-review-result-parser.md)
+**COMPLETE** — all 9 priorities merged to `main` (PRs #38–#47). Workstreams A, B, and C shipped.
 
 ## Quick Context
 
