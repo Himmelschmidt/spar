@@ -412,7 +412,12 @@ impl RunState {
             }
         }
         // Global index so `spar` from anywhere can find this project’s runs.
-        crate::registry::note_run(&self.project_root, &self.id);
+        // Dry runs are ephemeral verification fixtures (often in a temp dir), so they
+        // must not register their project in ~/.spar/registry.json and clutter
+        // `spar status --all` with throwaway roots.
+        if !self.dry_run {
+            crate::registry::note_run(&self.project_root, &self.id);
+        }
         Ok(())
     }
 

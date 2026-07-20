@@ -277,6 +277,38 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_does_not_register_project() {
+        let tmp = tempdir().unwrap();
+        set_home_override(&tmp.path().join("spar-home"));
+
+        let proj = tmp.path().join("ephemeral");
+        std::fs::create_dir_all(proj.join(".spar/runs")).unwrap();
+        let paths = SparPaths::new(&proj);
+
+        // Dry run (an ephemeral verification fixture) must NOT touch the global registry.
+        let mut dry =
+            state::RunState::new("dryrun01", crate::cli::WorkflowKind::Plan, proj.clone());
+        dry.dry_run = true;
+        dry.save(&paths).unwrap();
+        assert!(
+            Registry::load().unwrap().projects.is_empty(),
+            "dry run must not register its project"
+        );
+
+        // A real run still registers, so `spar status --all` finds it.
+        let real = state::RunState::new("realrun01", crate::cli::WorkflowKind::Plan, proj.clone());
+        real.save(&paths).unwrap();
+        assert!(
+            Registry::load()
+                .unwrap()
+                .projects
+                .iter()
+                .any(|p| p.root == canonicalize_best_effort(&proj)),
+            "a non-dry run must register its project"
+        );
+    }
+
+    #[test]
     fn default_home_is_dot_spar_under_home() {
         let h = spar_home();
         assert!(
