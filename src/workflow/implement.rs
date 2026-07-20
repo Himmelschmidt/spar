@@ -6,6 +6,7 @@ use crate::paths::SparPaths;
 use crate::providers;
 use crate::state::{Phase, RunState, SlotRole, SlotStatus, SuiteOutcome};
 use crate::util;
+use crate::workflow::review_result::{self, AcStatus, ReviewResult};
 use crate::worktree;
 use anyhow::{bail, Result};
 use std::collections::HashMap;
@@ -324,6 +325,52 @@ fn suite_blocks_ship(outcome: SuiteOutcome) -> bool {
     matches!(outcome, SuiteOutcome::Fail | SuiteOutcome::Inconclusive)
 }
 
+/// Acceptance gate (DECISIONS O19). An empty `criteria` means there is no contract at
+/// all (`[spec].enabled = false`) — acceptance is not evaluated and the verdict alone
+/// gates. Otherwise this is fail closed: a criterion the reviewer never mentioned counts
+/// against the ship exactly like a reported `fail`.
+fn acceptance_blocks_ship(criteria: &[String], res: &ReviewResult, cfg: &Config) -> bool {
+    if criteria.is_empty() {
+        return false;
+    }
+    criteria
+        .iter()
+        .any(|id| match res.acceptance.iter().find(|a| &a.id == id) {
+            None => true,
+            Some(a) => match a.status {
+                AcStatus::Fail => true,
+                AcStatus::Unverified => cfg.review.require_all_criteria,
+                AcStatus::Pass => false,
+            },
+        })
+}
+
+/// Which criteria blocked and why, so the next fix round's implementer prompt learns
+/// *which* AC failed rather than just "changes requested".
+fn acceptance_block_reason(criteria: &[String], res: &ReviewResult, cfg: &Config) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for id in criteria {
+        match res.acceptance.iter().find(|a| &a.id == id) {
+            None => parts.push(format!("{id}: not reported by the reviewer")),
+            Some(a) => match a.status {
+                AcStatus::Fail => {
+                    let ev = if a.evidence.is_empty() {
+                        "no evidence given".to_string()
+                    } else {
+                        a.evidence.clone()
+                    };
+                    parts.push(format!("{id}: fail — {ev}"));
+                }
+                AcStatus::Unverified if cfg.review.require_all_criteria => {
+                    parts.push(format!("{id}: unverified"))
+                }
+                _ => {}
+            },
+        }
+    }
+    parts.join("; ")
+}
+
 /// Why the suite was `Inconclusive`, for the bus broadcast and the reviewer prompt.
 fn suite_inconclusive_reason(
     slot_ok: bool,
@@ -507,6 +554,8 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
             "(no pre-written acceptance contract — implement without frozen tests)".into()
         })
     };
+    // Parsed once: the acceptance gate compares every reviewer against the same list.
+    let contract_criteria = review_result::parse_contract_criteria(&test_contract_body);
 
     // Bring pre-coding acceptance tests into implementer cwd (fail closed if author ran).
     if let Some(author) = state
@@ -753,18 +802,40 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
             if !review_ok || missing_or_empty {
                 any_request_changes = true;
                 if missing_or_empty {
+                    let acceptance = if contract_criteria.is_empty() {
+                        String::new()
+                    } else {
+                        let lines: Vec<String> = contract_criteria
+                            .iter()
+                            .map(|id| format!("{id}: unverified — reviewer produced no review"))
+                            .collect();
+                        format!("## Acceptance\n{}\n\n", lines.join("\n"))
+                    };
                     let _ = std::fs::write(
                         &review_path,
                         format!(
-                            "## Verdict\nrequest_changes\n\n## Findings\n- severity: major — review slot `{}` failed or produced no artifact\n",
+                            "## Verdict\nrequest_changes\n\n{acceptance}## Findings\n- severity: major — review slot `{}` failed or produced no artifact\n",
                             rev.id
                         ),
                     );
                 }
             } else if let Some(text) = review_text {
-                // Fail closed: only an anchored `## Verdict` / approve clears the gate.
-                if !crate::workflow::review_result::parse_review(&text).approves() {
+                // Fail closed: only an anchored `## Verdict` / approve clears the gate,
+                // and every contract criterion must be reported as passing (O19/O20).
+                let res = review_result::parse_review(&text);
+                if !res.approves() {
                     any_request_changes = true;
+                }
+                if acceptance_blocks_ship(&contract_criteria, &res, cfg) {
+                    any_request_changes = true;
+                    let reason = acceptance_block_reason(&contract_criteria, &res, cfg);
+                    let _ = crate::bus::broadcast(
+                        paths,
+                        Some(&state.id),
+                        "orchestrator",
+                        format!("acceptance gate blocked ship (review {}): {reason}", rev.id),
+                        state.message_budget,
+                    );
                 }
             }
         }
@@ -1057,10 +1128,83 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
 #[cfg(test)]
 mod suite_parse_tests {
     use super::{
-        derive_suite_outcome, should_stop, suite_blocks_ship, suite_guidance, SuiteOutcome,
+        acceptance_block_reason, acceptance_blocks_ship, derive_suite_outcome, should_stop,
+        suite_blocks_ship, suite_guidance, SuiteOutcome,
     };
+    use crate::config::Config;
     use crate::paths::SparPaths;
+    use crate::workflow::review_result::parse_review;
     use tempfile::tempdir;
+
+    fn criteria(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn relaxed() -> Config {
+        let mut cfg = Config::default();
+        cfg.review.require_all_criteria = false;
+        cfg
+    }
+
+    #[test]
+    fn acceptance_empty_criteria_never_blocks() {
+        let res = parse_review("");
+        assert!(!acceptance_blocks_ship(&[], &res, &Config::default()));
+    }
+
+    #[test]
+    fn acceptance_fail_blocks() {
+        let res = parse_review("## Verdict\napprove\n\n## Acceptance\nAC-1: fail — broken\n");
+        assert!(acceptance_blocks_ship(
+            &criteria(&["AC-1"]),
+            &res,
+            &Config::default()
+        ));
+    }
+
+    #[test]
+    fn acceptance_missing_criterion_blocks() {
+        let res = parse_review("## Verdict\napprove\n\n## Acceptance\nAC-1: pass — ok\n");
+        let c = criteria(&["AC-1", "AC-2"]);
+        assert!(acceptance_blocks_ship(&c, &res, &Config::default()));
+        assert!(acceptance_block_reason(&c, &res, &Config::default()).contains("AC-2"));
+        // Unmentioned criteria block even when unverified is tolerated.
+        assert!(acceptance_blocks_ship(&c, &res, &relaxed()));
+    }
+
+    #[test]
+    fn acceptance_unverified_blocks_by_default() {
+        let res =
+            parse_review("## Verdict\napprove\n\n## Acceptance\nAC-1: unverified — no time\n");
+        assert!(acceptance_blocks_ship(
+            &criteria(&["AC-1"]),
+            &res,
+            &Config::default()
+        ));
+    }
+
+    #[test]
+    fn acceptance_unverified_allowed_when_relaxed() {
+        let res = parse_review(
+            "## Verdict\napprove\n\n## Acceptance\nAC-1: pass — ok\nAC-2: unverified — no time\n",
+        );
+        assert!(!acceptance_blocks_ship(
+            &criteria(&["AC-1", "AC-2"]),
+            &res,
+            &relaxed()
+        ));
+    }
+
+    #[test]
+    fn acceptance_all_pass_does_not_block() {
+        let res =
+            parse_review("## Verdict\napprove\n\n## Acceptance\nAC-1: pass — a\nAC-2: pass — b\n");
+        assert!(!acceptance_blocks_ship(
+            &criteria(&["AC-1", "AC-2"]),
+            &res,
+            &Config::default()
+        ));
+    }
 
     #[test]
     fn should_stop_tracks_marker() {
@@ -1238,6 +1382,19 @@ mod suite_parse_tests {
         assert!(
             reviewer.contains("{{test_contract_body}}"),
             "reviewer must receive the acceptance contract"
+        );
+    }
+
+    #[test]
+    fn reviewer_template_declares_acceptance_block() {
+        let reviewer = include_str!("../../templates/reviewer_adversarial.md");
+        assert!(
+            reviewer.contains("## Acceptance"),
+            "reviewer output contract must declare the ## Acceptance section"
+        );
+        assert!(
+            reviewer.contains("unverified"),
+            "reviewer must be told the unverified status exists"
         );
     }
 

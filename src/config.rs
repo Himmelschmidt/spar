@@ -20,6 +20,9 @@ pub struct Config {
     pub timeouts: TimeoutConfig,
     #[serde(default)]
     pub suite: SuiteConfig,
+    /// Reviewer verdict / acceptance gate policy.
+    #[serde(default)]
+    pub review: ReviewConfig,
     /// Pre-coding acceptance tests (plan flow). Separate from suite channel.
     #[serde(default)]
     pub spec: SpecConfig,
@@ -273,6 +276,24 @@ fn default_suite_timeout_secs() -> u64 {
     7200
 }
 
+/// Acceptance gate policy. Review *timeouts* stay at `[timeouts].review_secs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewConfig {
+    /// When true (default), an `unverified` acceptance criterion blocks the ship the
+    /// same way a `fail` does. A criterion the reviewer never mentioned always blocks,
+    /// regardless of this setting.
+    #[serde(default = "default_true")]
+    pub require_all_criteria: bool,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            require_all_criteria: true,
+        }
+    }
+}
+
 /// Pre-coding test-author channel (plan → before human gate).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpecConfig {
@@ -327,6 +348,7 @@ impl Default for Config {
             ship: ShipConfig::default(),
             timeouts: TimeoutConfig::default(),
             suite: SuiteConfig::default(),
+            review: ReviewConfig::default(),
             spec: SpecConfig::default(),
             gates: GatesConfig::default(),
             autonomy: AutonomyLevel::default(),
@@ -366,6 +388,7 @@ struct ConfigFile {
     ship: Option<ShipConfigFile>,
     timeouts: Option<TimeoutConfigFile>,
     suite: Option<SuiteConfigFile>,
+    review: Option<ReviewConfigFile>,
     spec: Option<SpecConfigFile>,
     gates: Option<GatesConfigFile>,
     autonomy: Option<AutonomyLevel>,
@@ -415,6 +438,11 @@ struct SuiteConfigFile {
     enabled: Option<bool>,
     provider: Option<String>,
     timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ReviewConfigFile {
+    require_all_criteria: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -489,6 +517,11 @@ impl Config {
             }
             if let Some(v) = s.timeout_secs {
                 self.suite.timeout_secs = v;
+            }
+        }
+        if let Some(r) = &file.review {
+            if let Some(v) = r.require_all_criteria {
+                self.review.require_all_criteria = v;
             }
         }
         if let Some(s) = &file.spec {
@@ -647,6 +680,24 @@ timeout_secs = 900
         assert!(!cfg.spec.enabled);
         assert_eq!(cfg.spec.provider.as_deref(), Some("cli:agy"));
         assert_eq!(cfg.spec.timeout_secs, 900);
+    }
+
+    #[test]
+    fn review_config_defaults_to_strict() {
+        assert!(Config::default().review.require_all_criteria);
+    }
+
+    #[test]
+    fn review_config_overlay() {
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+        std::fs::write(
+            project.join("spar.toml"),
+            "[review]\nrequire_all_criteria = false\n",
+        )
+        .unwrap();
+        let cfg = Config::load(project).unwrap();
+        assert!(!cfg.review.require_all_criteria);
     }
 
     #[test]

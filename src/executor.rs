@@ -948,7 +948,7 @@ fn write_dry_artifacts(
             std::fs::write(
                 paths.artifact(&state.id, "test-contract.md"),
                 format!(
-                    "## Scenarios\n- [ ] dry-run acceptance for: {task}\n\n## Non-goals\n- live test generation\n\n## How to run\n- `dry-run` (stub)\n\n## Expected before implement\nred\n\n## Notes\nDry-run test-author slot `{}` ({}); wrote `{}`.\n",
+                    "## Scenarios\n- [ ] AC-1: dry-run acceptance for: {task} — verify: `dry-run` (stub)\n- [ ] AC-2: dry-run artifacts are written — verify: `dry-run` (stub)\n\n## Non-goals\n- live test generation\n\n## How to run\n- `dry-run` (stub)\n\n## Expected before implement\nred\n\n## Notes\nDry-run test-author slot `{}` ({}); wrote `{}`.\n",
                     job.slot_id,
                     job.provider,
                     stamp.display()
@@ -981,8 +981,41 @@ fn write_dry_artifacts(
             } else {
                 "approve"
             };
+            // The acceptance gate is fail closed, so the synthetic review must be
+            // schema-valid: every contract AC-n reported, or the dry-run backend would
+            // wedge every run in a fix loop.
+            let contract = std::fs::read_to_string(paths.artifact(&state.id, "test-contract.md"))
+                .unwrap_or_default();
+            let criteria = crate::workflow::review_result::parse_contract_criteria(&contract);
+            // `omit` drops the last criterion, `unverified` reports it as unverified —
+            // the two ways a well-meaning reviewer trips the acceptance gate.
+            let force_ac = std::env::var("SPAR_FORCE_AC_STATUS").unwrap_or_default();
+            let acceptance = if criteria.is_empty() {
+                String::new()
+            } else {
+                let last = criteria.len() - 1;
+                let lines: Vec<String> = criteria
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !(force_ac == "omit" && *i == last))
+                    .map(|(i, id)| {
+                        if force_rc && i == 0 {
+                            format!("{id}: fail — dry-run forced request_changes")
+                        } else if force_ac == "unverified" && i == last {
+                            format!("{id}: unverified — dry-run forced unverified")
+                        } else {
+                            format!("{id}: pass — dry-run synthetic evidence")
+                        }
+                    })
+                    .collect();
+                if lines.is_empty() {
+                    String::new()
+                } else {
+                    format!("## Acceptance\n{}\n\n", lines.join("\n"))
+                }
+            };
             let body = format!(
-                "## Verdict\n{verdict}\n\n## Findings\n- severity: minor — dry-run synthetic review from {}\n\n## Tests\nsuite channel (dry-run); no full suite here\n",
+                "## Verdict\n{verdict}\n\n{acceptance}## Findings\n- severity: minor — dry-run synthetic review from {}\n\n## Tests\nsuite channel (dry-run); no full suite here\n",
                 job.provider
             );
             if let Some(name) = &job.expected_artifact {

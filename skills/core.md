@@ -231,6 +231,9 @@ wait = "2h"
 enabled = true
 # provider = "cli:claude"   # else first usable of claude/grok/agy/api:xai/openai
 timeout_secs = 7200
+# Reviewer verdict / acceptance gate (review timeouts stay under [timeouts]).
+[review]
+require_all_criteria = true   # false ⇒ an `unverified` AC no longer blocks the ship
 # Pre-coding acceptance tests (plan). Separate test-author agent; not planner/critic.
 [spec]
 enabled = true
@@ -262,5 +265,7 @@ timeout_secs = 1800
 - **Spec channel (plan):** after planner+critic, a `test-author` freezes acceptance tests (`artifacts/test-contract.md` + worktree tests) from plan/critique (bus is audit trail), **before** the plan approval gate. Implement overlays those tests into the impl worktree (fail closed if author ran). Disable with `[spec] enabled = false`.
 - **Criterion ids:** scenarios in `artifacts/test-contract.md` carry stable `AC-<n>` ids (numbered from 1, contiguous, never renumbered) plus a `verify:` hint naming a command, `file:line` + assertion, or observable behavior.
 - **Reviewer context:** reviewers get the full `plan.md` and `test-contract.md` in their prompt, so they can check the change against the agreed plan and each `AC-n` criterion rather than guessing intent.
+- **Review artifact schema (enforced):** each `artifacts/review-<slot>.md` is `## Verdict` / `## Acceptance` / `## Findings` / `## Tests`. The verdict is read as an **anchored header** — the first non-blank line under the first `## Verdict` must be `approve` or `request_changes`; missing or unparseable is treated as `request_changes`. `## Acceptance` carries one `AC-n: pass|fail|unverified — evidence` line per criterion in `test-contract.md`.
+- **Acceptance gate:** a run cannot reach `awaiting_ship_confirm` while any contract `AC-n` is `fail`, is `unverified` (default; relax with `[review] require_all_criteria = false`), or is simply **absent** from a review — an unmentioned criterion always blocks. With no contract at all (`[spec] enabled = false`) the verdict alone gates.
 - **Suite channel (implement/loop):** a dedicated `tester` slot runs full test suites; impl/review stay smoke/diff-only when it runs. Artifact: `artifacts/suite.md`. Independent `review` workflow does not spawn a tester by default.
 - **Human TUI `/spawn`:** `/spawn <cli:provider> <prompt>` launches an agent into a pane on spar's own `tmux -L spar` socket, joined to the selected run's bus — watch and steer it in Main's **Shell** tab without leaving spar.

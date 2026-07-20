@@ -845,6 +845,122 @@ fn stuck_policy_dry_run_request_changes() {
     assert!(revs >= 3, "expected widen to add a reviewer, got {revs}");
 }
 
+/// Plan → approve, returning the run id, so acceptance tests start from a run that
+/// actually has a `test-contract.md` with AC ids.
+fn planned_run(dir: &std::path::Path) -> String {
+    let plan = spar_cmd()
+        .current_dir(dir)
+        .args([
+            "plan",
+            "--task",
+            "add a hello function",
+            "--providers",
+            "cli:claude,cli:grok",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2);
+    let stdout = String::from_utf8_lossy(plan.get_output().stdout.as_slice());
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("plan json");
+    let run_id = v["run_id"].as_str().expect("run_id").to_string();
+    spar_cmd()
+        .current_dir(dir)
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    run_id
+}
+
+#[test]
+fn implement_dry_run_missing_ac_requests_changes() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let run_id = planned_run(tmp.path());
+
+    // Reviews approve, but never mention the last contract criterion. The acceptance
+    // gate must block the ship anyway (O19) and drive the fix ladder to stuck.
+    spar_cmd()
+        .current_dir(tmp.path())
+        .env("SPAR_FORCE_AC_STATUS", "omit")
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--providers",
+            "cli:claude,cli:grok,cli:agy",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains("stuck"))
+        .stdout(predicate::str::contains("awaiting_ship_confirm").not());
+
+    let contract = std::fs::read_to_string(
+        tmp.path()
+            .join(".spar/runs")
+            .join(&run_id)
+            .join("artifacts/test-contract.md"),
+    )
+    .unwrap();
+    assert!(
+        contract.contains("AC-2"),
+        "dry-run contract must carry more than one AC id for this gate to be exercised"
+    );
+}
+
+#[test]
+fn implement_dry_run_unverified_ships_when_relaxed() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    std::fs::write(
+        tmp.path().join("spar.toml"),
+        "[review]\nrequire_all_criteria = false\n",
+    )
+    .unwrap();
+    let run_id = planned_run(tmp.path());
+
+    spar_cmd()
+        .current_dir(tmp.path())
+        .env("SPAR_FORCE_AC_STATUS", "unverified")
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--providers",
+            "cli:claude,cli:grok,cli:agy",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("awaiting_ship_confirm"));
+}
+
+#[test]
+fn implement_dry_run_unverified_blocks_by_default() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let run_id = planned_run(tmp.path());
+
+    spar_cmd()
+        .current_dir(tmp.path())
+        .env("SPAR_FORCE_AC_STATUS", "unverified")
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--providers",
+            "cli:claude,cli:grok,cli:agy",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains("awaiting_ship_confirm").not());
+}
+
 #[test]
 fn quota_exit_when_all_paused() {
     let tmp = tempdir().unwrap();

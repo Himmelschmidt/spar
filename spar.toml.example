@@ -32,6 +32,12 @@ enabled = true
 # provider = "cli:claude"   # optional; else first usable of claude/grok/agy/api:xai/openai
 timeout_secs = 7200
 
+# Reviewer verdict / acceptance gate. Review timeouts live under [timeouts].
+[review]
+# An `unverified` acceptance criterion blocks the ship like a `fail`. A criterion the
+# reviewer never mentioned always blocks, regardless of this setting.
+require_all_criteria = true
+
 # Pre-coding acceptance tests (plan flow). Separate agent freezes tests before implement.
 [spec]
 enabled = true
