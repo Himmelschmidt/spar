@@ -49,8 +49,14 @@ model chosen by `--select`.
 `cli:codex` (codex, `codex exec --json`) drives whatever backend + model a codex **profile**
 defines (a profile is codex's own (backend, model) bundle), and parses codex JSONL for real
 token/cost tracking. Not a takeover target. Selection, highest precedence first:
-- spar `--select` model (per-slot) → codex `-m`.
-- `SPAR_CODEX_MODEL` → `-m` override (e.g. any OpenRouter slug like `x-ai/grok-4`).
+- A per-slot model — from a `cli:codex@<model>` ref or `--select` — becomes codex's model.
+  A model containing `/` is treated as an OpenRouter slug and routed with
+  `-c model_provider=openrouter -m <slug>` (so `cli:codex@openai/gpt-4o-mini` and
+  `cli:codex@tencent/hy3:free` just work, and different slots can run different OpenRouter
+  models in one run); a bare model (`gpt-5`) uses codex's own default provider. An explicit
+  model **supersedes** the profile (`-p` is omitted). Discover tool-capable slugs with
+  `spar model list --provider openrouter`.
+- `SPAR_CODEX_MODEL` → same routing, when no per-slot model is set (e.g. `x-ai/grok-4`).
 - `SPAR_CODEX_PROFILE` picks the backend bundle (`-p`): **unset → the `muse` profile**
   (OpenRouter + Muse Spark, the default); set-but-empty → omit `-p` (codex's own config default,
   e.g. plain OpenAI); any other value → that `$CODEX_HOME/<name>.config.toml`.
