@@ -10,6 +10,7 @@ spar skills get core
 spar doctor [--json]
 spar provider list [--json]
 spar model list|pick|refresh|cache [--json]
+spar model list --provider openrouter [--all] [--json]   # OpenRouter catalog, tool-capable by default
 ```
 
 ## Default surfaces
@@ -55,7 +56,12 @@ token/cost tracking. Not a takeover target. Selection, highest precedence first:
   `cli:codex@tencent/hy3:free` just work, and different slots can run different OpenRouter
   models in one run); a bare model (`gpt-5`) uses codex's own default provider. An explicit
   model **supersedes** the profile (`-p` is omitted). Discover tool-capable slugs with
-  `spar model list --provider openrouter`.
+  `spar model list --provider openrouter` — it fetches the OpenRouter catalog (public, no
+  key) and shows id, context length, and per-million pricing. It **filters to tool-capable
+  models by default** (`supported_parameters` contains `tools`): a model without tool
+  support silently fails as an agent — it generates text and never calls a tool, exiting 0
+  with no artifact. Pass `--all` to include those; `--json` emits every entry with a
+  `tool_capable` boolean.
 - `SPAR_CODEX_MODEL` → same routing, when no per-slot model is set (e.g. `x-ai/grok-4`).
 - `SPAR_CODEX_PROFILE` picks the backend bundle (`-p`): **unset → the `muse` profile**
   (OpenRouter + Muse Spark, the default); set-but-empty → omit `-p` (codex's own config default,
