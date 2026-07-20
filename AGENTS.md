@@ -115,5 +115,12 @@ provider spawn, no tokens burned. Use it for anything touching run lifecycle.
 
 - **Don't extend `mailbox.rs`.** `bus.rs` replaced it; `send()` only mirrors to it for
   legacy readers.
+- **Tests that spawn the `spar` binary must strip the slot identity env.** spar exports
+  `SPAR_PROJECT_ROOT` / `SPAR_RUN_ID` / `SPAR_AGENT_ID` into every slot
+  (`providers/presence.rs`), and `find_project_root()` honors `SPAR_PROJECT_ROOT`. Without
+  `env_remove` on all three, running the suite *inside* a spar worktree makes the child
+  resolve the primary checkout and write real runs into it — this silently accumulated
+  ~1.5k run dirs. See `spar_cmd()` in `tests/scenarios/*` and the
+  `ambient_spar_project_root_does_not_capture_runs` guard.
 - **You cannot interrupt a working CLI agent.** Text sent to a busy agent's TTY queues
   unsubmitted in its input box. Deliver only at turn boundaries, when it's idle.
