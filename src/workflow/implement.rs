@@ -83,8 +83,8 @@ fn run_from_approved(
         std::env::set_var("SPAR_DRY_RUN", "1");
     }
     let n = cfg.max_agents.max(3) as usize;
-    let roles: Vec<&str> = std::iter::once("implementer")
-        .chain(std::iter::repeat("reviewer"))
+    let roles: Vec<&str> = std::iter::once(SlotRole::Implementer.as_config_key())
+        .chain(std::iter::repeat(SlotRole::Reviewer.as_config_key()))
         .take(n)
         .collect();
     let requested = opts.resolve_fleet(n, &roles, paths, cfg, &state.id)?;
@@ -124,6 +124,11 @@ fn run_from_approved(
     Ok(state.exit_code())
 }
 
+/// Reviewer slots spawned alongside the implementer. The fleet width (`max_agents.max(3)`)
+/// still bounds provider resolution; this names the review-panel size once instead of the
+/// three unrelated coincidences (the old `while` pad, two literal pushes, `.max(3)`).
+const DEFAULT_REVIEWERS: usize = 2;
+
 fn prepare_implement_slots(
     state: &mut RunState,
     requested: Option<&[String]>,
@@ -145,19 +150,13 @@ fn prepare_implement_slots(
         return Ok(());
     }
 
-    let Some(req) = requested.filter(|r| !r.is_empty()) else {
-        bail!("--providers is required");
-    };
+    let req = requested.unwrap_or_default();
     let n = cfg.max_agents.max(3) as usize;
     state.providers = providers::pick_providers(req, n, Some(req), dry);
     if state.providers.is_empty() {
-        bail!("no usable providers from --providers {:?}", req);
+        bail!("no usable providers (pass --providers, set a [roles] block, or --select)");
     }
-    // Cycle the explicit list to fill impl + reviewers (same provider may repeat).
-    let mut provs = state.providers.clone();
-    while provs.len() < 3 {
-        provs.push(provs[0].clone());
-    }
+    let fleet = state.providers.clone();
 
     // Apply model-select choices onto slots when artifact exists.
     let art = crate::model_select::load_select_artifact(paths, &state.id)
@@ -172,25 +171,37 @@ fn prepare_implement_slots(
         })
     };
 
+    // Implementer at fleet index 0; a fixed number of reviewers follow it positionally.
+    // `provider_for` keys each slot: explicit --providers wins, else [roles], else order.
+    let impl_prov =
+        crate::workflow::roles_resolve::provider_for(SlotRole::Implementer, 0, &fleet, cfg)
+            .ok_or_else(|| anyhow::anyhow!("no provider resolved for implementer"))?;
     state.slots.push(executor::init_slot_model(
         "impl",
-        &provs[0],
+        &impl_prov,
         SlotRole::Implementer,
         model_for(0),
     ));
     ensure_suite_slot(state, dry, cfg, paths)?;
-    state.slots.push(executor::init_slot_model(
-        format!("review-{}-a", sanitize_slot(&provs[1])),
-        &provs[1],
-        SlotRole::Reviewer,
-        model_for(1),
-    ));
-    state.slots.push(executor::init_slot_model(
-        format!("review-{}-b", sanitize_slot(&provs[2])),
-        &provs[2],
-        SlotRole::Reviewer,
-        model_for(2),
-    ));
+    for r in 0..DEFAULT_REVIEWERS {
+        let idx = r + 1;
+        let Some(prov) =
+            crate::workflow::roles_resolve::provider_for(SlotRole::Reviewer, idx, &fleet, cfg)
+        else {
+            continue;
+        };
+        // Id: reviewer index + the model-free provider name (storage_key drops `@model`),
+        // so two slots on `cli:codex@a` / `cli:codex@b` still get distinct ids.
+        let name = crate::provider_ref::ProviderRef::parse(&prov)
+            .map(|p| p.storage_key())
+            .unwrap_or_else(|_| prov.clone());
+        state.slots.push(executor::init_slot_model(
+            format!("review-{r}-{}", sanitize_slot(&name)),
+            &prov,
+            SlotRole::Reviewer,
+            model_for(idx),
+        ));
+    }
     Ok(())
 }
 
@@ -229,7 +240,11 @@ fn resolve_suite_provider(
     if let Some(p) = &cfg.roles.tester {
         crate::provider_ref::ProviderRef::parse(p)
             .map_err(|e| anyhow::anyhow!("invalid [roles].tester {p:?}: {e}"))?;
-        return Ok((p.clone(), None));
+        if dry || providers::is_provider_usable(p, false) {
+            return Ok((p.clone(), None));
+        }
+        // Fall through to model-select / prefs / fleet if the override is unusable
+        // (missing CLI / paused).
     }
     // Prefer model-select artifact / fresh pick with tester role (fast profile).
     if let (Some(paths), Some(run_id)) = (paths, run_id) {
@@ -446,8 +461,8 @@ fn run_with_task(
     state.big = opts.big;
     state.max_fix_rounds = 3;
     let n = cfg.max_agents.max(3) as usize;
-    let roles: Vec<&str> = std::iter::once("implementer")
-        .chain(std::iter::repeat("reviewer"))
+    let roles: Vec<&str> = std::iter::once(SlotRole::Implementer.as_config_key())
+        .chain(std::iter::repeat(SlotRole::Reviewer.as_config_key()))
         .take(n)
         .collect();
     let requested = opts.resolve_fleet(n, &roles, paths, cfg, &state.id)?;
@@ -867,13 +882,13 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
         state.fix_rounds += 1;
         if state.fix_rounds > state.max_fix_rounds {
             // stuck policy: rotate implementer → widen reviewers → escalate
-            if !state.rotated_implementer && try_rotate_implementer(state, paths)? {
+            if !state.rotated_implementer && try_rotate_implementer(state, paths, cfg)? {
                 state.rotated_implementer = true;
                 state.fix_rounds = 0;
                 state.save(paths)?;
                 continue;
             }
-            if !state.widened_reviewers && try_widen_reviewers(state, paths, &review_cwd)? {
+            if !state.widened_reviewers && try_widen_reviewers(state, paths, &review_cwd, cfg)? {
                 state.widened_reviewers = true;
                 state.fix_rounds = 0;
                 state.save(paths)?;
@@ -891,7 +906,7 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
 }
 
 /// Change implementer **provider** only; keep stable slot id and worktree.
-fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths) -> Result<bool> {
+fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<bool> {
     let current = state
         .slots
         .iter()
@@ -906,12 +921,14 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths) -> Result<boo
         .filter(|s| s.role == SlotRole::Implementer)
         .map(|s| s.provider.clone())
         .collect();
-    let defaults = ["cli:claude", "cli:grok", "cli:agy"];
-    let next = state
-        .providers
+    // Candidate order: [roles].implementer, then [providers].order, then the live fleet.
+    let next = cfg
+        .roles
+        .implementer
         .iter()
         .map(|s| s.as_str())
-        .chain(defaults.iter().copied())
+        .chain(cfg.providers.order.iter().map(|s| s.as_str()))
+        .chain(state.providers.iter().map(|s| s.as_str()))
         .find(|p| *p != cur.as_str() && !used.iter().any(|u| u == p))
         .map(|s| s.to_string());
     let Some(next) = next else {
@@ -937,6 +954,7 @@ fn try_widen_reviewers(
     state: &mut RunState,
     paths: &SparPaths,
     review_cwd: &std::path::Path,
+    cfg: &Config,
 ) -> Result<bool> {
     let existing: Vec<String> = state
         .slots
@@ -944,17 +962,15 @@ fn try_widen_reviewers(
         .filter(|s| s.role == SlotRole::Reviewer)
         .map(|s| s.provider.clone())
         .collect();
-    let candidate = [
-        "cli:claude",
-        "cli:grok",
-        "cli:agy",
-        "cli:claude",
-        "cli:grok",
-    ]
-    .iter()
-    .map(|s| (*s).to_string())
-    .chain(state.providers.iter().cloned())
-    .find(|p| !existing.contains(p));
+    // Draw the next reviewer from [roles].reviewer, then [providers].order, then the fleet.
+    let candidate = cfg
+        .roles
+        .reviewer
+        .iter()
+        .cloned()
+        .chain(cfg.providers.order.iter().cloned())
+        .chain(state.providers.iter().cloned())
+        .find(|p| !existing.contains(p));
     let Some(prov) = candidate else {
         // still widen with a synthetic extra reviewer on a repeated provider
         let prov = existing
@@ -995,11 +1011,13 @@ fn try_rotate_reviewer_provider(
     let Some(cur) = cur else {
         return Ok(false);
     };
-    let next = state
-        .providers
+    let next = cfg
+        .roles
+        .reviewer
         .iter()
         .find(|p| **p != cur)
         .cloned()
+        .or_else(|| state.providers.iter().find(|p| **p != cur).cloned())
         .or_else(|| cfg.providers.order.iter().find(|p| **p != cur).cloned());
     let Some(next) = next else {
         return Ok(false);

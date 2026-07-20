@@ -44,8 +44,13 @@ pub fn resolve_providers(
             artifact: None,
         });
     }
+    // No explicit `--providers`: a populated `[roles]` block satisfies the requirement,
+    // synthesizing the fleet per role (precedence [roles] > [providers].order).
+    if select.is_none() && !cfg.roles.is_empty() {
+        return synthesize_from_roles(n, roles, cfg);
+    }
     let Some(select) = select else {
-        bail!("--providers is required (or pass --select <profile>, e.g. --select value)");
+        bail!("--providers is required (or set a [roles] block, or pass --select <profile>, e.g. --select value)");
     };
     if select.is_empty() {
         bail!("--select requires at least one profile name (or auto)");
@@ -92,6 +97,43 @@ pub fn resolve_providers(
     Ok(ResolvedProviders {
         providers: out_providers,
         artifact: Some(artifact),
+    })
+}
+
+/// Build the fleet from `[roles]` when no `--providers`/`--select` were given. One
+/// provider per requested slot label, resolved through `provider_for` (the same
+/// precedence used everywhere else), so a populated `[roles]` satisfies the
+/// "`--providers` or `--select` is required" invariant.
+fn synthesize_from_roles(n: usize, roles: &[&str], cfg: &Config) -> Result<ResolvedProviders> {
+    if n == 0 {
+        bail!("need at least one slot to select");
+    }
+    use crate::state::SlotRole;
+    let mut out = Vec::with_capacity(n);
+    let mut reviewer_i = 0usize;
+    for i in 0..n {
+        let label = roles.get(i).copied().unwrap_or("implementer");
+        let role = SlotRole::from_config_key(label).unwrap_or(SlotRole::Implementer);
+        // Reviewers index into the [roles].reviewer list by their own position; every
+        // other role uses the slot index as the [providers].order fallback index.
+        let ridx = if role == SlotRole::Reviewer {
+            let x = reviewer_i;
+            reviewer_i += 1;
+            x
+        } else {
+            i
+        };
+        let p = crate::workflow::roles_resolve::provider_for(role, ridx, &[], cfg)
+            .with_context(|| {
+                format!(
+                    "slot {i} (role '{label}'): no provider in [roles] and [providers].order is exhausted"
+                )
+            })?;
+        out.push(p);
+    }
+    Ok(ResolvedProviders {
+        providers: out,
+        artifact: None,
     })
 }
 

@@ -5,6 +5,7 @@ pub mod plan;
 pub mod review;
 pub mod review_result;
 pub mod roles;
+pub mod roles_resolve;
 
 use crate::cli::{Backend, WorkflowKind};
 use crate::config::Config;
@@ -47,19 +48,6 @@ impl Default for CommonOpts {
 impl CommonOpts {
     pub fn resolve_dry_run(&self) -> bool {
         self.dry_run || util::env_truthy("SPAR_DRY_RUN")
-    }
-
-    #[allow(dead_code)]
-    pub fn require_providers(&self) -> Result<&[String]> {
-        if self.providers.is_empty() {
-            anyhow::bail!(
-                "--providers is required (e.g. --providers cli:claude), or use --select <profile>"
-            );
-        }
-        for p in &self.providers {
-            crate::provider_ref::ProviderRef::parse(p)?;
-        }
-        Ok(&self.providers)
     }
 
     /// Explicit providers or `--select` resolution. Writes `model-select.json` when selecting.

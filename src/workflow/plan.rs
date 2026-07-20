@@ -31,9 +31,16 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
     state.big = opts.big;
     let n_slots = if cfg.spec.enabled { 3 } else { 2 };
     let roles: &[&str] = if cfg.spec.enabled {
-        &["planner", "critic", "tester"]
+        &[
+            SlotRole::Planner.as_config_key(),
+            SlotRole::PlanCritic.as_config_key(),
+            SlotRole::TestAuthor.as_config_key(),
+        ]
     } else {
-        &["planner", "critic"]
+        &[
+            SlotRole::Planner.as_config_key(),
+            SlotRole::PlanCritic.as_config_key(),
+        ]
     };
     let requested = opts.resolve_fleet(n_slots, roles, paths, cfg, &state.id)?;
     state.providers = providers::pick_providers(&requested, n_slots, Some(&requested), dry);
@@ -88,30 +95,19 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
         .ok()
         .flatten();
     let mut jobs = Vec::new();
-    for (i, prov) in state.providers.iter().take(2).enumerate() {
-        let safe = sanitize_slot(prov);
-        let role_name = if i == 0 { "planner" } else { "critic" };
+    for (idx, (id, role, template, prov)) in plan_slot_specs(&state, cfg).into_iter().enumerate() {
         let model = art.as_ref().and_then(|a| {
             a.choices
                 .iter()
-                .find(|c| c.role.as_deref() == Some(role_name) || c.slot == i)
+                .find(|c| c.role.as_deref() == Some(role.as_config_key()) || c.slot == idx)
                 .and_then(|c| c.model.clone())
         });
-        let (id, role, template) = if i == 0 {
-            (format!("planner-{safe}"), SlotRole::Planner, "planner")
-        } else {
-            (
-                format!("critic-{safe}"),
-                SlotRole::PlanCritic,
-                "plan_critic",
-            )
-        };
         state
             .slots
-            .push(executor::init_slot_model(&id, prov, role, model.clone()));
+            .push(executor::init_slot_model(&id, &prov, role, model.clone()));
         jobs.push(SlotJob {
             slot_id: id,
-            provider: prov.clone(),
+            provider: prov,
             role,
             template: template.into(),
             extra_vars: HashMap::new(),
@@ -136,6 +132,30 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
         }
     }
     Ok(state.exit_code())
+}
+
+/// The planner + critic slot specs `(id, role, template, provider)`, drawn from the
+/// resolved fleet via `provider_for` so both the first-pass and re-plan paths key the
+/// two slots identically (explicit `--providers` positional > `[roles]` > order).
+fn plan_slot_specs(
+    state: &RunState,
+    cfg: &Config,
+) -> Vec<(String, SlotRole, &'static str, String)> {
+    let specs = [
+        (SlotRole::Planner, "planner", "planner"),
+        (SlotRole::PlanCritic, "critic", "plan_critic"),
+    ];
+    let mut out = Vec::with_capacity(specs.len());
+    for (idx, (role, prefix, template)) in specs.into_iter().enumerate() {
+        let Some(prov) =
+            crate::workflow::roles_resolve::provider_for(role, idx, &state.providers, cfg)
+        else {
+            continue;
+        };
+        let id = format!("{prefix}-{}", sanitize_slot(&prov));
+        out.push((id, role, template, prov));
+    }
+    out
 }
 
 pub fn execute_plan(
@@ -251,7 +271,9 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
         .and_then(|a| {
             a.choices
                 .iter()
-                .find(|c| c.role.as_deref() == Some("tester") || c.slot == 2)
+                .find(|c| {
+                    c.role.as_deref() == Some(SlotRole::TestAuthor.as_config_key()) || c.slot == 2
+                })
                 .and_then(|c| c.model.clone())
         });
     let safe = sanitize_slot(&provider);
@@ -521,23 +543,13 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
         });
     }
     if jobs.is_empty() {
-        for (i, prov) in state.providers.iter().take(2).enumerate() {
-            let safe = sanitize_slot(prov);
-            let (id, role, template) = if i == 0 {
-                (format!("planner-{safe}"), SlotRole::Planner, "planner")
-            } else {
-                (
-                    format!("critic-{safe}"),
-                    SlotRole::PlanCritic,
-                    "plan_critic",
-                )
-            };
+        for (id, role, template, prov) in plan_slot_specs(&state, cfg) {
             if state.slots.iter().all(|s| s.id != id) {
-                state.slots.push(executor::init_slot(&id, prov, role));
+                state.slots.push(executor::init_slot(&id, &prov, role));
             }
             jobs.push(SlotJob {
                 slot_id: id,
-                provider: prov.clone(),
+                provider: prov,
                 role,
                 template: template.into(),
                 extra_vars: HashMap::new(),
