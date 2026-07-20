@@ -29,6 +29,9 @@ wait = "2h"
 # Provider assignment by role. Values are @model-capable provider refs (cli:name / api:name).
 # `reviewer` is a list (the review fleet). Distinct from [model_select.role_profiles] below,
 # which picks a benchmark *profile* per role, not a provider.
+# Precedence: explicit --providers (positional) > [roles] > [providers].order. A populated
+# [roles] block satisfies the "--providers or --select is required" rule on its own, so
+# `spar plan`/`implement` can run with no --providers at all.
 [roles]
 # planner = "cli:claude"
 # plan_critic = "cli:grok"
