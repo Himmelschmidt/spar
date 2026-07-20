@@ -3,6 +3,7 @@ pub mod implement;
 pub mod peer;
 pub mod plan;
 pub mod review;
+pub mod review_result;
 pub mod roles;
 
 use crate::cli::{Backend, WorkflowKind};

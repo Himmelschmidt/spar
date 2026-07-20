@@ -397,23 +397,13 @@ pub fn reconcile(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> R
         }
         let review_path = paths.artifact(&state.id, &format!("review-reconcile-{i}.md"));
         let text = std::fs::read_to_string(&review_path).unwrap_or_default();
-        if text.trim().is_empty()
-            || text
-                .lines()
-                .any(|l| l.trim().eq_ignore_ascii_case("request_changes"))
-            || text
-                .to_ascii_lowercase()
-                .contains("## verdict\nrequest_changes")
-        {
-            // fail-closed only on explicit verdict line when present
-            if text.to_ascii_lowercase().contains("request_changes")
-                && text.to_ascii_lowercase().contains("verdict")
-            {
-                state.set_phase(Phase::Failed);
-                state.error = Some("reconcile review requested changes".into());
-                state.save(paths)?;
-                return Ok(ExitCode::Failure);
-            }
+        // Fail closed: a missing or unparseable verdict blocks, same as request_changes.
+        let verdict = crate::workflow::review_result::parse_review(&text).verdict;
+        if verdict != Some(crate::workflow::review_result::Verdict::Approve) {
+            state.set_phase(Phase::Failed);
+            state.error = Some("reconcile review requested changes".into());
+            state.save(paths)?;
+            return Ok(ExitCode::Failure);
         }
     }
 
