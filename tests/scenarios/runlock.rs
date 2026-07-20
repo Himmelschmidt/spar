@@ -25,6 +25,13 @@ fn spar_home_dir() -> std::path::PathBuf {
 fn spar_cmd() -> assert_cmd::Command {
     let mut c = cargo_bin_cmd!("spar");
     c.env("SPAR_HOME", spar_home_dir());
+    // spar exports these into every slot (providers/presence.rs), so when the suite runs
+    // *inside* a spar worktree the child would resolve the primary checkout instead of
+    // this test's temp project and write real runs into it. Clear them per-Command
+    // (never via process env — these binaries run tests in parallel).
+    c.env_remove("SPAR_PROJECT_ROOT");
+    c.env_remove("SPAR_RUN_ID");
+    c.env_remove("SPAR_AGENT_ID");
     c
 }
 
