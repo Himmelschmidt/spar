@@ -62,6 +62,7 @@ Opt-in path: resolve fleet slots from benchmark data + user profiles + per-run u
 | MS13 | CLI surface: `spar model list|pick|refresh`; doctor reports cache age | DECIDED |
 | MS14 | Ship phases: **A** cache+parser+list/pick · **B** `--select` into plan/implement · **C** roles/urgency/diversity · **D** per-adapter CLI model flags + richer vals→spar map | DECIDED |
 | MS15 | **Revises MS7 for `@model` refs.** `cli:*` is zero-cost only when the adapter bills against its own subscription. `cli:codex@<openrouter-slug>` is a `cli:` ref that routes to OpenRouter and bills **per token** (observed: 29.5k input on a trivial task; 489k on a real review run), so cost scoring must key on the **resolved model**, not the backend prefix. Recording the decision here; joining `turn.completed.usage` (already parsed into `stats.json`) to the OpenRouter price table is follow-up work | DECIDED |
+| MS16 | **`spar model list --provider openrouter` filters to `supported_parameters` containing `tools` by default** (268/339 models); the remaining 71 cannot function as agents and are hidden unless `--all` is passed. Guardrail, not a preference | DECIDED |
 
 ## Workspace + bus delivery
 

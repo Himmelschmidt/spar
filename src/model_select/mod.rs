@@ -2,6 +2,7 @@
 
 mod cache;
 mod map;
+mod openrouter;
 mod score;
 mod vals;
 
@@ -462,6 +463,90 @@ pub struct SelectChoice {
     pub reason: String,
 }
 
+/// `spar model list --provider openrouter [--all] [--json]`: list the OpenRouter model
+/// catalog, filtered by default to tool-capable models (guardrail, DECISIONS MS16).
+fn list_openrouter(
+    all: bool,
+    json: bool,
+    ms: &ModelSelectConfig,
+) -> Result<crate::exit_codes::ExitCode> {
+    use crate::exit_codes::ExitCode;
+
+    let catalog = openrouter::ensure_catalog(ms.cache_ttl_secs)?;
+    let total = catalog.models.len();
+
+    let mut models: Vec<&openrouter::OrModel> = catalog.models.iter().collect();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let shown: Vec<&openrouter::OrModel> = if all {
+        models.clone()
+    } else {
+        models
+            .iter()
+            .copied()
+            .filter(|m| openrouter::tool_capable(m))
+            .collect()
+    };
+    let hidden = total - shown.len();
+
+    if json {
+        let out = serde_json::json!({
+            "provider": "openrouter",
+            "source": "https://openrouter.ai/api/v1/models",
+            "fetched_at": catalog.fetched_at,
+            "all": all,
+            "total": total,
+            "shown": shown.len(),
+            "hidden": hidden,
+            "models": shown.iter().map(|m| serde_json::json!({
+                "id": m.id,
+                "name": m.name,
+                "context_length": m.context_length,
+                "price_prompt": m.pricing.prompt,
+                "price_completion": m.pricing.completion,
+                "price_per_million_in": openrouter::price_per_million(&m.pricing.prompt),
+                "price_per_million_out": openrouter::price_per_million(&m.pricing.completion),
+                "tool_capable": openrouter::tool_capable(m),
+            })).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(ExitCode::Success);
+    }
+
+    println!(
+        "provider=openrouter fetched={} ({} shown / {} total)",
+        catalog.fetched_at,
+        shown.len(),
+        total
+    );
+    println!(
+        "{:<48} {:>10} {:>9} {:>9} {:>6}",
+        "ID", "CTX", "$/M IN", "$/M OUT", "TOOLS"
+    );
+    for m in &shown {
+        let ctx = m
+            .context_length
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "{:<48} {:>10} {:>9} {:>9} {:>6}",
+            m.id,
+            ctx,
+            openrouter::fmt_price(&m.pricing.prompt),
+            openrouter::fmt_price(&m.pricing.completion),
+            if openrouter::tool_capable(m) {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+    }
+    if hidden > 0 {
+        println!("{hidden} models without tool support hidden (--all to show)");
+    }
+    Ok(ExitCode::Success)
+}
+
 /// CLI entry for `spar model …`
 pub fn run_cmd(
     action: crate::cli::ModelAction,
@@ -477,7 +562,15 @@ pub fn run_cmd(
             urgency,
             json,
             usable,
+            provider,
+            all,
         } => {
+            if let Some(p) = provider.as_deref() {
+                match p {
+                    "openrouter" => return list_openrouter(all, json, &cfg.model_select),
+                    other => bail!("unknown --provider '{other}' (valid: openrouter)"),
+                }
+            }
             let mut ms = cfg.model_select.clone();
             if let Some(b) = bench {
                 ms.benches = vec![b];

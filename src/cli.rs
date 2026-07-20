@@ -394,6 +394,13 @@ pub enum ModelAction {
         /// Only models whose mapped provider is usable now
         #[arg(long)]
         usable: bool,
+        /// Model catalog to list. "openrouter" lists the OpenRouter catalog (tool-capable
+        /// only by default); absent keeps the default vals-bench path.
+        #[arg(long)]
+        provider: Option<String>,
+        /// openrouter: include models that lack tool support (they silently fail as agents)
+        #[arg(long)]
+        all: bool,
     },
     /// Pick best model(s) for a role/profile
     Pick {
