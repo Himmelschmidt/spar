@@ -772,8 +772,7 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
                 }
             } else if let Some(text) = review_text {
                 // Fail closed: only an anchored `## Verdict` / approve clears the gate.
-                let verdict = crate::workflow::review_result::parse_review(&text).verdict;
-                if verdict != Some(crate::workflow::review_result::Verdict::Approve) {
+                if !crate::workflow::review_result::parse_review(&text).approves() {
                     any_request_changes = true;
                 }
             }

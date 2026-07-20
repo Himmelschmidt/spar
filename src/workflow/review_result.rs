@@ -32,6 +32,15 @@ pub struct ReviewResult {
     pub acceptance: Vec<AcLine>,
 }
 
+impl ReviewResult {
+    /// The fail-closed ship contract, shared by every call site so it cannot silently
+    /// drift back to a substring scan: **only an explicit parsed `approve` clears the
+    /// gate.** Missing, unparseable, and `request_changes` all block.
+    pub fn approves(&self) -> bool {
+        self.verdict == Some(Verdict::Approve)
+    }
+}
+
 /// Same noise set as `parse_suite_result`.
 const NOISE: [char; 5] = ['*', '`', '_', '-', ' '];
 
@@ -45,7 +54,6 @@ enum Section {
 pub fn parse_review(body: &str) -> ReviewResult {
     let mut out = ReviewResult::default();
     let mut section = Section::Other;
-    let mut verdict_done = false;
 
     for raw in body.lines() {
         if let Some(rest) = raw.trim_start().strip_prefix("##") {
@@ -55,11 +63,10 @@ pub fn parse_review(body: &str) -> ReviewResult {
                 .trim_matches(['*', '`', ':', ' '])
                 .to_ascii_lowercase();
             section = match title.as_str() {
-                // Latch on the heading so a later ## Verdict cannot fill an empty first section.
-                "verdict" if !verdict_done => {
-                    verdict_done = true;
-                    Section::Verdict
-                }
+                // Latch on the first *parsed* verdict, not the first heading: an empty or
+                // skeleton-only first section falls through to a later real one instead of
+                // permanently blocking. Once a verdict parses, later sections cannot flip it.
+                "verdict" if out.verdict.is_none() => Section::Verdict,
                 "acceptance" => Section::Acceptance,
                 _ => Section::Other,
             };
@@ -89,7 +96,9 @@ pub fn parse_review(body: &str) -> ReviewResult {
 fn parse_verdict_line(raw: &str) -> Option<Verdict> {
     let line = raw
         .trim()
-        .trim_start_matches(NOISE)
+        // `>` for a quoted verdict; NOISE on both ends so `_approve_` / `- approve` work.
+        .trim_start_matches(['>', ' '])
+        .trim_matches(NOISE)
         .to_ascii_lowercase()
         .replace(['*', '`'], "");
     if is_verdict_token(&line, "request_changes") {
@@ -101,18 +110,25 @@ fn parse_verdict_line(raw: &str) -> Option<Verdict> {
     None
 }
 
-/// Token must open the line. Rest may be empty, a parenthetical hedge, or trailing
-/// sentence punctuation only — not a format skeleton (`approve | request_changes`)
-/// and not prose (`approve is not warranted`).
+/// Token must open the line. The rest may be empty, a parenthetical hedge, a
+/// separator-introduced remark (`approve — LGTM`, `approve - nits`, `approve: ok`), or
+/// trailing sentence punctuation. It must NOT be a format skeleton
+/// (`approve | request_changes`) or bare prose (`approve is not warranted`) — a reviewer
+/// who never chose must fail closed rather than ship.
+///
+/// The separator forms matter: a verdict that false-blocks costs a whole fix round and an
+/// implementer rotation, which is the very failure this parser exists to prevent.
 fn is_verdict_token(line: &str, token: &str) -> bool {
     let Some(rest) = line.strip_prefix(token) else {
         return false;
     };
     let rest = rest.trim_start();
-    if rest.is_empty() {
+    if rest.is_empty() || rest.starts_with('(') {
         return true;
     }
-    if rest.starts_with('(') {
+    // A dash/colon separator marks commentary, not an alternative. `|` is excluded so the
+    // template's `approve | request_changes` skeleton stays unparseable.
+    if rest.starts_with(['—', '–', '-', ':', ';', ',']) {
         return true;
     }
     rest.chars()
@@ -262,9 +278,54 @@ mod tests {
     }
 
     #[test]
-    fn empty_first_verdict_section_stays_none() {
+    fn empty_first_verdict_section_falls_through_to_the_real_one() {
+        // Latching on the first *parsed* verdict (not the first heading) means an empty
+        // or skeleton-only section does not permanently block a reviewer who wrote the
+        // real verdict further down.
         let body = "## Verdict\n\n## Other\nnoise\n\n## Verdict\napprove\n";
-        assert_eq!(verdict(body), None);
+        assert_eq!(verdict(body), Some(Verdict::Approve));
+
+        let skeleton_first =
+            "## Verdict\napprove | request_changes\n\n## Verdict\nrequest_changes\n";
+        assert_eq!(verdict(skeleton_first), Some(Verdict::RequestChanges));
+    }
+
+    #[test]
+    fn verdict_with_separator_commentary_is_parsed() {
+        // A false block costs a fix round and an implementer rotation, so common hedges
+        // must parse. Regression net for the doom loop this parser exists to prevent.
+        for body in [
+            "## Verdict\napprove — LGTM\n",
+            "## Verdict\napprove - minor nits only\n",
+            "## Verdict\napprove: ship it\n",
+            "## Verdict\n_approve_\n",
+            "## Verdict\n> approve\n",
+            "## Verdict\n- approve\n",
+        ] {
+            assert_eq!(verdict(body), Some(Verdict::Approve), "body: {body:?}");
+        }
+        assert_eq!(
+            verdict("## Verdict\nrequest_changes — see findings\n"),
+            Some(Verdict::RequestChanges)
+        );
+    }
+
+    #[test]
+    fn separator_loosening_does_not_admit_skeleton_or_prose() {
+        // The guardrails that must survive the loosening above.
+        assert_eq!(verdict("## Verdict\napprove | request_changes\n"), None);
+        assert_eq!(verdict("## Verdict\napprove is not warranted\n"), None);
+    }
+
+    #[test]
+    fn approves_is_fail_closed() {
+        // The contract both call sites rely on: anything but a parsed approve blocks.
+        // Guards against a silent revert to a substring scan at the call sites.
+        assert!(parse_review("## Verdict\napprove\n").approves());
+        assert!(!parse_review("## Verdict\nrequest_changes\n").approves());
+        assert!(!parse_review("## Verdict\nlgtm\n").approves()); // unparseable
+        assert!(!parse_review("## Findings\n- none\n").approves()); // missing
+        assert!(!ReviewResult::default().approves());
     }
 
     #[test]
