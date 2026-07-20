@@ -26,10 +26,20 @@ slot_secs = 1800
 stall_warn_secs = 300  # running + no log output for this long ⇒ stalled in status/TUI (0 = off)
 wait = "2h"
 
+# Provider assignment by role. Values are @model-capable provider refs (cli:name / api:name).
+# `reviewer` is a list (the review fleet). Distinct from [model_select.role_profiles] below,
+# which picks a benchmark *profile* per role, not a provider.
+[roles]
+# planner = "cli:claude"
+# plan_critic = "cli:grok"
+# implementer = "cli:codex@anthropic/claude-opus-4.5"
+# reviewer = ["cli:grok", "cli:agy", "cli:claude"]
+# tester = "cli:agy"          # cheap suite runner (was [suite].provider)
+# test_author = "cli:grok"    # pre-coding test author (was [spec].provider)
+
 # Full test suite channel (cheap/dumb model). Implementers/reviewers must not run multi-hour suites.
 [suite]
 enabled = true
-# provider = "cli:claude"   # optional; else first usable of claude/grok/agy/api:xai/openai
 timeout_secs = 7200
 
 # Reviewer verdict / acceptance gate. Review timeouts live under [timeouts].
@@ -41,7 +51,6 @@ require_all_criteria = true
 # Pre-coding acceptance tests (plan flow). Separate agent freezes tests before implement.
 [spec]
 enabled = true
-# provider = "cli:agy"      # optional; prefer a third provider ≠ planner/critic
 timeout_secs = 1800
 
 # Dynamic model select from vals.ai (opt-in via --select). See `spar model list|pick|refresh`.
@@ -56,8 +65,10 @@ timeout_secs = 1800
 # cost = 0.8
 # speed = 0.3
 # min_accuracy = 70
-# [model_select.roles]
+# [model_select.role_profiles]   # role → benchmark profile (NOT provider; see [roles] above)
 # planner = "best"
+# plan_critic = "best"
 # implementer = "value"
 # reviewer = "value"
 # tester = "fast"
+# test_author = "fast"

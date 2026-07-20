@@ -378,9 +378,9 @@ fn resolve_spec_provider(
     fleet: &[String],
     used: &[String],
 ) -> Result<String> {
-    if let Some(p) = &cfg.spec.provider {
+    if let Some(p) = &cfg.roles.test_author {
         crate::provider_ref::ProviderRef::parse(p)
-            .map_err(|e| anyhow::anyhow!("invalid spec.provider {p:?}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("invalid [roles].test_author {p:?}: {e}"))?;
         if dry || providers::is_provider_usable(p, false) {
             return Ok(p.clone());
         }
@@ -413,7 +413,7 @@ fn resolve_spec_provider(
         return Ok(p);
     }
     anyhow::bail!(
-        "spec.enabled but no usable test-author provider (set [spec].provider or pass more --providers)"
+        "spec.enabled but no usable test-author provider (set [roles].test_author or pass more --providers)"
     )
 }
 

@@ -249,10 +249,20 @@ slot_secs = 1800
 # review_secs = 1800   # optional; defaults to slot_secs
 stall_warn_secs = 300  # running slot silent this long ⇒ stalled in status/TUI (0 = off)
 wait = "2h"
+# Provider assignment by role (@model-capable refs). `reviewer` is a list. This is
+# NOT [model_select.role_profiles] below — that maps a role to a benchmark *profile*,
+# this maps a role to a *provider*. tester/test_author replace the old [suite]/[spec]
+# `provider =` fields (removed).
+[roles]
+# planner = "cli:claude"
+# plan_critic = "cli:grok"
+# implementer = "cli:codex@anthropic/claude-opus-4.5"
+# reviewer = ["cli:grok", "cli:agy", "cli:claude"]
+# tester = "cli:agy"
+# test_author = "cli:grok"
 # Full suite channel (cheap/dumb model). Implementers/reviewers: smoke/diff only.
 [suite]
 enabled = true
-# provider = "cli:claude"   # else first usable of claude/grok/agy/api:xai/openai
 timeout_secs = 7200
 # Reviewer verdict / acceptance gate (review timeouts stay under [timeouts]).
 [review]
@@ -260,7 +270,6 @@ require_all_criteria = true   # false ⇒ an `unverified` AC no longer blocks th
 # Pre-coding acceptance tests (plan). Separate test-author agent; not planner/critic.
 [spec]
 enabled = true
-# provider = "cli:agy"      # prefer third provider ≠ planner/critic
 timeout_secs = 1800
 # External @human notifier (user-level config only; ignored from a repo spar.toml).
 [notify]
