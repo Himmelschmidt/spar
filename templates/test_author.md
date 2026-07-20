@@ -41,9 +41,16 @@ You freeze the acceptance bar **before** product code is written. You are **not*
 3. Done marker on success; failed marker with reason otherwise
 
 ## Contract format (`test-contract.md`)
+
+Every scenario carries a stable criterion id:
+- Ids are `AC-<n>`, numbered from 1, contiguous, and **never renumbered** once written. Later rounds append; they do not shuffle.
+- Each criterion must be independently verifiable by someone who did not write the code.
+- The `verify:` hint names a command, a `file:line` plus the assertion to look for, or an observable behavior. "check it works" is not a verify hint.
+
 ```
 ## Scenarios
-- [ ] …
+- [ ] AC-1: <observable statement> — verify: <how to check it>
+- [ ] AC-2: <observable statement> — verify: <how to check it>
 
 ## Non-goals
 - …

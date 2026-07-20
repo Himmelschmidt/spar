@@ -204,4 +204,25 @@ mod tests {
         assert!(s.contains("Do **not** kick off full"));
         assert!(!s.contains("{{suite_guidance}}"));
     }
+
+    #[test]
+    fn reviewer_leaves_no_unseeded_placeholder() {
+        let ctx = TemplateCtx {
+            task: "do X",
+            project_root: "/tmp/p",
+            cwd: "/tmp/wt",
+            run_id: "abc",
+            artifacts_dir: "/tmp/a",
+            markers_dir: "/tmp/m",
+            mailbox_dir: "/tmp/mb",
+            slot_id: "rev",
+            provider: "cli:claude",
+            branch: "spar/abc/rev",
+        };
+        let s = render("reviewer", &base_vars(&ctx)).unwrap();
+        assert!(
+            !s.contains("{{"),
+            "every reviewer placeholder must be seeded by base_vars:\n{s}"
+        );
+    }
 }

@@ -346,34 +346,28 @@ fn suite_inconclusive_reason(
     }
 }
 
-fn suite_guidance(outcome: SuiteOutcome, suite_body: &str, contract_note: &str) -> String {
-    let header = format!(
-        "## Suite channel (do not re-run full suites)\n\
-         A dedicated cheap tester slot runs the full suite. Results:\n\n\
-         {suite_body}\n\n"
-    );
+fn suite_guidance(outcome: SuiteOutcome) -> String {
+    let header = "## Suite channel (do not re-run full suites)\n\
+         A dedicated cheap tester slot runs the full suite; its output is the `## Suite report` section above.\n\n";
     match outcome {
         SuiteOutcome::Pass => format!(
             "{header}\
              - Do **not** kick off full multi-minute/hour test suites.\n\
              - At most: static/diff review, plus optional 1–2 targeted tests on suspect files.\n\
-             - Use the suite report above for pass/fail evidence.\n\
-             {contract_note}"
+             - Use the suite report above for pass/fail evidence.\n"
         ),
         SuiteOutcome::Fail => format!(
             "{header}\
              - Do **not** kick off full multi-minute/hour test suites.\n\
              - At most: static/diff review, plus optional 1–2 targeted tests on suspect files.\n\
              - Use the suite report above for pass/fail evidence.\n\
-             - Orchestrator treats suite **fail** as request_changes even if you approve.\n\
-             {contract_note}"
+             - Orchestrator treats suite **fail** as request_changes even if you approve.\n"
         ),
         SuiteOutcome::Inconclusive => format!(
             "{header}\
              - The suite channel is **inconclusive**: the runner fell over and the suite DID NOT RUN to a clean result. Do **not** cite this as a code or test failure.\n\
              - Do **not** kick off the full multi-minute/hour suite yourself.\n\
-             - Instead, run 1–2 targeted tests on the files this change touches for confidence.\n\
-             {contract_note}"
+             - Instead, run 1–2 targeted tests on the files this change touches for confidence.\n"
         ),
     }
 }
@@ -685,17 +679,10 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
             state.suite_outcome = Some(suite_outcome);
         }
 
-        let contract_note = if paths.artifact(&state.id, "test-contract.md").is_file() {
-            "\n- Check pre-written acceptance contract (`test-contract.md`) is still honored; do not accept deleted/weakened acceptance tests without a finding.\n"
-        } else {
-            ""
-        };
         let suite_guidance = if suite_channel_active {
-            suite_guidance(suite_outcome, &suite_body, contract_note)
+            suite_guidance(suite_outcome)
         } else {
-            format!(
-                "## Tests\nYou may run targeted or full suites as needed for confidence. Prefer evidence over claims.\n{contract_note}"
-            )
+            "## Tests\nYou may run targeted or full suites as needed for confidence. Prefer evidence over claims.\n".to_string()
         };
 
         state.set_phase(Phase::Review);
@@ -720,8 +707,12 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
             }
             let mut extra = HashMap::new();
             extra.insert("review_cwd".into(), review_cwd.display().to_string());
-            extra.insert("suite_body".into(), suite_body.clone());
+            if !suite_body.is_empty() {
+                extra.insert("suite_body".into(), suite_body.clone());
+            }
             extra.insert("suite_guidance".into(), suite_guidance.clone());
+            extra.insert("plan_body".into(), plan_body.clone());
+            extra.insert("test_contract_body".into(), test_contract_body.clone());
             let mut job = SlotJob {
                 slot_id: rev.id.clone(),
                 provider: rev.provider.clone(),
@@ -1214,13 +1205,48 @@ mod suite_parse_tests {
 
     #[test]
     fn guidance_distinguishes_inconclusive_from_fail() {
-        let inconclusive = suite_guidance(SuiteOutcome::Inconclusive, "body", "").to_lowercase();
+        let inconclusive = suite_guidance(SuiteOutcome::Inconclusive).to_lowercase();
         assert!(inconclusive.contains("did not run"));
         assert!(!inconclusive.contains("treats suite"));
 
-        let fail = suite_guidance(SuiteOutcome::Fail, "body", "").to_lowercase();
+        let fail = suite_guidance(SuiteOutcome::Fail).to_lowercase();
         assert!(fail.contains("request_changes"));
         assert!(fail.contains("treats suite"));
         assert!(!fail.contains("did not run"));
+    }
+
+    #[test]
+    fn test_author_template_emits_criterion_ids() {
+        let test_author = include_str!("../../templates/test_author.md");
+        assert!(
+            test_author.contains("AC-1:"),
+            "contract format must show the AC-n criterion id shape"
+        );
+        assert!(
+            test_author.contains("verify:"),
+            "each criterion must carry a verify: hint"
+        );
+    }
+
+    #[test]
+    fn reviewer_template_sees_plan_and_contract() {
+        let reviewer = include_str!("../../templates/reviewer_adversarial.md");
+        assert!(
+            reviewer.contains("{{plan_body}}"),
+            "reviewer must receive the plan"
+        );
+        assert!(
+            reviewer.contains("{{test_contract_body}}"),
+            "reviewer must receive the acceptance contract"
+        );
+    }
+
+    #[test]
+    fn reviewer_template_uses_suite_body() {
+        let reviewer = include_str!("../../templates/reviewer_adversarial.md");
+        assert!(
+            reviewer.contains("{{suite_body}}"),
+            "suite_body is seeded in base_vars and must be referenced"
+        );
     }
 }
