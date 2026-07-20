@@ -1,6 +1,7 @@
 use crate::config::IsolationMode;
 use crate::paths::SparPaths;
 use crate::state::{RunState, WorktreeRecord};
+use crate::util::sanitize_slot;
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -14,12 +15,12 @@ pub fn worktree_path(project_root: &Path, run_id: &str, slot_id: &str) -> Result
     let parent = project_root
         .parent()
         .ok_or_else(|| anyhow::anyhow!("project root has no parent"))?;
-    let slot_safe = slot_id.replace('/', "-");
+    let slot_safe = sanitize_slot(slot_id);
     Ok(parent.join(format!("{repo_name}-spar-{run_id}-{slot_safe}")))
 }
 
 pub fn branch_name(run_id: &str, slot_id: &str) -> String {
-    let slot_safe = slot_id.replace('/', "-");
+    let slot_safe = sanitize_slot(slot_id);
     format!("spar/{run_id}/{slot_safe}")
 }
 
@@ -163,7 +164,7 @@ pub fn prepare_isolation(
                 // ephemeral cwd under .spar/runs/<id>/ so agents are stubbed without
                 // mutating the repo's worktree list.
                 let rec = if state.dry_run {
-                    let safe = sid.replace(['/', ':'], "-");
+                    let safe = sanitize_slot(sid);
                     let path = paths.run_dir(&state.id).join(format!("cwd-{safe}"));
                     std::fs::create_dir_all(&path)?;
                     WorktreeRecord {

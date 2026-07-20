@@ -6,7 +6,7 @@ use crate::exit_codes::ExitCode;
 use crate::paths::SparPaths;
 use crate::providers;
 use crate::state::{Phase, RunState, SlotRole};
-use crate::util;
+use crate::util::{self, sanitize_slot};
 use crate::worktree;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -54,8 +54,8 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
 
     let a = state.providers[0].clone();
     let b = state.providers[1].clone();
-    let id_a = format!("peer-a-{}", a.replace(':', "-"));
-    let id_b = format!("peer-b-{}", b.replace(':', "-"));
+    let id_a = format!("peer-a-{}", sanitize_slot(&a));
+    let id_b = format!("peer-b-{}", sanitize_slot(&b));
     state
         .slots
         .push(executor::init_slot(&id_a, &a, SlotRole::Peer));
