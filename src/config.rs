@@ -20,6 +20,9 @@ pub struct Config {
     pub timeouts: TimeoutConfig,
     #[serde(default)]
     pub suite: SuiteConfig,
+    /// Provider assignment by role. Priority 9 consumes it to key the fleet.
+    #[serde(default)]
+    pub roles: RolesConfig,
     /// Reviewer verdict / acceptance gate policy.
     #[serde(default)]
     pub review: ReviewConfig,
@@ -70,9 +73,10 @@ pub struct ModelSelectConfig {
     pub allow: Vec<String>,
     #[serde(default)]
     pub profiles: std::collections::HashMap<String, crate::model_select::ProfileWeights>,
-    /// role name → profile name
+    /// role name → benchmark-profile name (distinct from top-level `[roles]`, which
+    /// assigns *providers*).
     #[serde(default)]
-    pub roles: std::collections::HashMap<String, String>,
+    pub role_profiles: std::collections::HashMap<String, String>,
     /// Auto-refresh a stale/missing vals cache during `--select` (default true). Set
     /// false to disable spar's network fetch: a stale cache is used as-is and a missing
     /// one errors instead of fetching. `spar model refresh` still works either way.
@@ -88,7 +92,7 @@ impl Default for ModelSelectConfig {
             cache_ttl_secs: default_model_select_ttl(),
             allow: Vec::new(),
             profiles: crate::model_select::default_profiles(),
-            roles: default_model_select_roles(),
+            role_profiles: default_model_select_role_profiles(),
             auto_refresh: default_model_select_auto_refresh(),
         }
     }
@@ -106,12 +110,12 @@ impl ModelSelectConfig {
     }
 
     pub fn role_profile(&self, role: &str) -> &str {
-        self.roles
+        self.role_profiles
             .get(role)
             .map(|s| s.as_str())
             .unwrap_or(match role {
-                "planner" | "critic" => "best",
-                "tester" => "fast",
+                "planner" | "plan_critic" => "best",
+                "tester" | "test_author" => "fast",
                 "reviewer" => "value",
                 _ => "value",
             })
@@ -140,13 +144,14 @@ fn default_model_select_auto_refresh() -> bool {
     true
 }
 
-fn default_model_select_roles() -> std::collections::HashMap<String, String> {
+fn default_model_select_role_profiles() -> std::collections::HashMap<String, String> {
     let mut m = std::collections::HashMap::new();
     m.insert("planner".into(), "best".into());
-    m.insert("critic".into(), "best".into());
+    m.insert("plan_critic".into(), "best".into());
     m.insert("implementer".into(), "value".into());
     m.insert("reviewer".into(), "value".into());
     m.insert("tester".into(), "fast".into());
+    m.insert("test_author".into(), "fast".into());
     m
 }
 
@@ -255,9 +260,6 @@ impl TimeoutConfig {
 pub struct SuiteConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Prefer a cheap provider (`cli:claude`, `cli:grok`, `api:xai`, …).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
     #[serde(default = "default_suite_timeout_secs")]
     pub timeout_secs: u64,
 }
@@ -266,7 +268,6 @@ impl Default for SuiteConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            provider: None,
             timeout_secs: default_suite_timeout_secs(),
         }
     }
@@ -274,6 +275,72 @@ impl Default for SuiteConfig {
 
 fn default_suite_timeout_secs() -> u64 {
     7200
+}
+
+/// Provider assignment by role (Priority 8). Values are `@model`-capable provider ref
+/// strings validated by `ProviderRef::parse`. `reviewer` is a list (a review fleet); an
+/// empty list is "unset". Distinct from `[model_select.role_profiles]`, which maps roles
+/// to *benchmark profiles*, not providers. Keys are the canonical `SlotRole` config keys.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RolesConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_critic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implementer: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviewer: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tester: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_author: Option<String>,
+}
+
+impl RolesConfig {
+    /// Priority 9 consumes this for the role-key invariant check.
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.planner.is_none()
+            && self.plan_critic.is_none()
+            && self.implementer.is_none()
+            && self.reviewer.is_empty()
+            && self.tester.is_none()
+            && self.test_author.is_none()
+    }
+
+    /// Validate every assigned ref through `ProviderRef::parse`, naming the offending
+    /// role key on failure. Keeps `init_slot_model`'s `.expect()` unreachable from config.
+    fn validate(&self) -> Result<()> {
+        let singles = [
+            ("planner", &self.planner),
+            ("plan_critic", &self.plan_critic),
+            ("implementer", &self.implementer),
+            ("tester", &self.tester),
+            ("test_author", &self.test_author),
+        ];
+        for (key, val) in singles {
+            if let Some(v) = val {
+                crate::provider_ref::ProviderRef::parse(v)
+                    .with_context(|| format!("invalid provider in [roles].{key}: {v:?}"))?;
+            }
+        }
+        for v in &self.reviewer {
+            crate::provider_ref::ProviderRef::parse(v)
+                .with_context(|| format!("invalid provider in [roles].reviewer: {v:?}"))?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RolesConfigFile {
+    planner: Option<String>,
+    plan_critic: Option<String>,
+    implementer: Option<String>,
+    reviewer: Option<Vec<String>>,
+    tester: Option<String>,
+    test_author: Option<String>,
 }
 
 /// Acceptance gate policy. Review *timeouts* stay at `[timeouts].review_secs`.
@@ -299,9 +366,6 @@ impl Default for ReviewConfig {
 pub struct SpecConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Prefer a third provider distinct from planner/critic when set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
     #[serde(default = "default_spec_timeout_secs")]
     pub timeout_secs: u64,
 }
@@ -310,7 +374,6 @@ impl Default for SpecConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            provider: None,
             timeout_secs: default_spec_timeout_secs(),
         }
     }
@@ -348,6 +411,7 @@ impl Default for Config {
             ship: ShipConfig::default(),
             timeouts: TimeoutConfig::default(),
             suite: SuiteConfig::default(),
+            roles: RolesConfig::default(),
             review: ReviewConfig::default(),
             spec: SpecConfig::default(),
             gates: GatesConfig::default(),
@@ -388,6 +452,7 @@ struct ConfigFile {
     ship: Option<ShipConfigFile>,
     timeouts: Option<TimeoutConfigFile>,
     suite: Option<SuiteConfigFile>,
+    roles: Option<RolesConfigFile>,
     review: Option<ReviewConfigFile>,
     spec: Option<SpecConfigFile>,
     gates: Option<GatesConfigFile>,
@@ -411,7 +476,7 @@ struct ModelSelectConfigFile {
     cache_ttl_secs: Option<u64>,
     allow: Option<Vec<String>>,
     profiles: Option<std::collections::HashMap<String, crate::model_select::ProfileWeights>>,
-    roles: Option<std::collections::HashMap<String, String>>,
+    role_profiles: Option<std::collections::HashMap<String, String>>,
     auto_refresh: Option<bool>,
 }
 
@@ -436,7 +501,6 @@ struct TimeoutConfigFile {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct SuiteConfigFile {
     enabled: Option<bool>,
-    provider: Option<String>,
     timeout_secs: Option<u64>,
 }
 
@@ -448,7 +512,6 @@ struct ReviewConfigFile {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct SpecConfigFile {
     enabled: Option<bool>,
-    provider: Option<String>,
     timeout_secs: Option<u64>,
 }
 
@@ -512,12 +575,30 @@ impl Config {
             if let Some(v) = s.enabled {
                 self.suite.enabled = v;
             }
-            if let Some(v) = &s.provider {
-                self.suite.provider = Some(v.clone());
-            }
             if let Some(v) = s.timeout_secs {
                 self.suite.timeout_secs = v;
             }
+        }
+        if let Some(r) = &file.roles {
+            if let Some(v) = &r.planner {
+                self.roles.planner = Some(v.clone());
+            }
+            if let Some(v) = &r.plan_critic {
+                self.roles.plan_critic = Some(v.clone());
+            }
+            if let Some(v) = &r.implementer {
+                self.roles.implementer = Some(v.clone());
+            }
+            if let Some(v) = &r.reviewer {
+                self.roles.reviewer = v.clone();
+            }
+            if let Some(v) = &r.tester {
+                self.roles.tester = Some(v.clone());
+            }
+            if let Some(v) = &r.test_author {
+                self.roles.test_author = Some(v.clone());
+            }
+            self.roles.validate()?;
         }
         if let Some(r) = &file.review {
             if let Some(v) = r.require_all_criteria {
@@ -527,9 +608,6 @@ impl Config {
         if let Some(s) = &file.spec {
             if let Some(v) = s.enabled {
                 self.spec.enabled = v;
-            }
-            if let Some(v) = &s.provider {
-                self.spec.provider = Some(v.clone());
             }
             if let Some(v) = s.timeout_secs {
                 self.spec.timeout_secs = v;
@@ -573,9 +651,11 @@ impl Config {
                     self.model_select.profiles.insert(k.clone(), prof.clone());
                 }
             }
-            if let Some(v) = &ms.roles {
+            if let Some(v) = &ms.role_profiles {
                 for (k, role) in v {
-                    self.model_select.roles.insert(k.clone(), role.clone());
+                    self.model_select
+                        .role_profiles
+                        .insert(k.clone(), role.clone());
                 }
             }
             if let Some(v) = ms.auto_refresh {
@@ -661,13 +741,15 @@ review_secs = 200
 
 [suite]
 enabled = false
-provider = "cli:grok"
 timeout_secs = 3600
 
 [spec]
 enabled = false
-provider = "cli:agy"
 timeout_secs = 900
+
+[roles]
+tester = "cli:grok"
+test_author = "cli:agy"
 "#,
         )
         .unwrap();
@@ -675,11 +757,113 @@ timeout_secs = 900
         assert_eq!(cfg.timeouts.slot_secs, 100);
         assert_eq!(cfg.timeouts.review_secs(), 200);
         assert!(!cfg.suite.enabled);
-        assert_eq!(cfg.suite.provider.as_deref(), Some("cli:grok"));
         assert_eq!(cfg.suite.timeout_secs, 3600);
         assert!(!cfg.spec.enabled);
-        assert_eq!(cfg.spec.provider.as_deref(), Some("cli:agy"));
         assert_eq!(cfg.spec.timeout_secs, 900);
+        assert_eq!(cfg.roles.tester.as_deref(), Some("cli:grok"));
+        assert_eq!(cfg.roles.test_author.as_deref(), Some("cli:agy"));
+    }
+
+    #[test]
+    fn roles_block_overlays() {
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+        std::fs::write(
+            project.join("spar.toml"),
+            r#"
+[roles]
+planner = "cli:claude"
+plan_critic = "cli:grok"
+implementer = "cli:codex@anthropic/claude-opus-4.5"
+reviewer = ["cli:grok", "cli:agy", "cli:claude"]
+tester = "cli:agy"
+test_author = "cli:grok"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(project).unwrap();
+        assert_eq!(cfg.roles.planner.as_deref(), Some("cli:claude"));
+        assert_eq!(cfg.roles.plan_critic.as_deref(), Some("cli:grok"));
+        assert_eq!(
+            cfg.roles.implementer.as_deref(),
+            Some("cli:codex@anthropic/claude-opus-4.5")
+        );
+        assert_eq!(
+            cfg.roles.reviewer,
+            vec!["cli:grok", "cli:agy", "cli:claude"]
+        );
+        assert_eq!(cfg.roles.tester.as_deref(), Some("cli:agy"));
+        assert_eq!(cfg.roles.test_author.as_deref(), Some("cli:grok"));
+        assert!(!cfg.roles.is_empty());
+    }
+
+    #[test]
+    fn roles_default_is_empty() {
+        assert!(Config::default().roles.is_empty());
+    }
+
+    #[test]
+    fn roles_reject_bad_ref() {
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+        std::fs::write(
+            project.join("spar.toml"),
+            "[roles]\nimplementer = \"claude\"\n",
+        )
+        .unwrap();
+        let err = Config::load(project).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("implementer"),
+            "error must name the role key, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn roles_accept_model_ref() {
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+        std::fs::write(
+            project.join("spar.toml"),
+            "[roles]\nimplementer = \"cli:codex@openai/gpt-4o-mini\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load(project).unwrap();
+        assert_eq!(
+            cfg.roles.implementer.as_deref(),
+            Some("cli:codex@openai/gpt-4o-mini")
+        );
+    }
+
+    #[test]
+    fn role_profiles_renamed() {
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+        std::fs::write(
+            project.join("spar.toml"),
+            r#"
+[model_select.role_profiles]
+planner = "value"
+
+[model_select.roles]
+planner = "best"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(project).unwrap();
+        assert_eq!(
+            cfg.model_select
+                .role_profiles
+                .get("planner")
+                .map(|s| s.as_str()),
+            Some("value"),
+            "the new role_profiles key overlays"
+        );
+        assert_eq!(
+            cfg.model_select.role_profile("planner"),
+            "value",
+            "old [model_select.roles] key is ignored, no shim"
+        );
     }
 
     #[test]

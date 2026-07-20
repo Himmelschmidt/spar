@@ -226,9 +226,9 @@ fn resolve_suite_provider(
     paths: Option<&SparPaths>,
     run_id: Option<&str>,
 ) -> Result<(String, Option<String>)> {
-    if let Some(p) = &cfg.suite.provider {
+    if let Some(p) = &cfg.roles.tester {
         crate::provider_ref::ProviderRef::parse(p)
-            .map_err(|e| anyhow::anyhow!("invalid suite.provider {p:?}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("invalid [roles].tester {p:?}: {e}"))?;
         return Ok((p.clone(), None));
     }
     // Prefer model-select artifact / fresh pick with tester role (fast profile).
@@ -275,7 +275,7 @@ fn resolve_suite_provider(
     {
         return Ok((p, None));
     }
-    bail!("suite.enabled but no usable suite provider (set [suite].provider or install a CLI)")
+    bail!("suite.enabled but no usable suite provider (set [roles].tester or install a CLI)")
 }
 
 enum SuiteResult {

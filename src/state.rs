@@ -238,6 +238,44 @@ pub enum SlotRole {
     Reconciler,
 }
 
+impl SlotRole {
+    /// Canonical config/state key — the `snake_case` serde representation. Single source
+    /// of truth shared by `state.json` and the `[roles]` config block. Priority 9 keys
+    /// the fleet off these.
+    #[allow(dead_code)]
+    pub fn as_config_key(&self) -> &'static str {
+        match self {
+            SlotRole::Planner => "planner",
+            SlotRole::PlanCritic => "plan_critic",
+            SlotRole::TestAuthor => "test_author",
+            SlotRole::Implementer => "implementer",
+            SlotRole::Tester => "tester",
+            SlotRole::Reviewer => "reviewer",
+            SlotRole::Ranker => "ranker",
+            SlotRole::Peer => "peer",
+            SlotRole::Reconciler => "reconciler",
+        }
+    }
+
+    /// Parse a canonical config/state key back into a `SlotRole`. No aliases —
+    /// `critic` is not accepted (see plan Priority 8: one vocabulary, not three).
+    #[allow(dead_code)]
+    pub fn from_config_key(s: &str) -> Option<SlotRole> {
+        Some(match s {
+            "planner" => SlotRole::Planner,
+            "plan_critic" => SlotRole::PlanCritic,
+            "test_author" => SlotRole::TestAuthor,
+            "implementer" => SlotRole::Implementer,
+            "tester" => SlotRole::Tester,
+            "reviewer" => SlotRole::Reviewer,
+            "ranker" => SlotRole::Ranker,
+            "peer" => SlotRole::Peer,
+            "reconciler" => SlotRole::Reconciler,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SlotStatus {
@@ -475,6 +513,36 @@ mod tests {
     use super::*;
     use crate::paths::SparPaths;
     use tempfile::tempdir;
+
+    #[test]
+    fn slot_role_config_key_matches_serde() {
+        let all = [
+            SlotRole::Planner,
+            SlotRole::PlanCritic,
+            SlotRole::TestAuthor,
+            SlotRole::Implementer,
+            SlotRole::Tester,
+            SlotRole::Reviewer,
+            SlotRole::Ranker,
+            SlotRole::Peer,
+            SlotRole::Reconciler,
+        ];
+        for role in all {
+            let serde_key = serde_json::to_value(role).unwrap();
+            let serde_key = serde_key.as_str().unwrap();
+            assert_eq!(
+                role.as_config_key(),
+                serde_key,
+                "as_config_key must match serde rename for {role:?}"
+            );
+            assert_eq!(
+                SlotRole::from_config_key(serde_key),
+                Some(role),
+                "from_config_key must round-trip {role:?}"
+            );
+        }
+        assert_eq!(SlotRole::from_config_key("critic"), None);
+    }
 
     #[test]
     fn roundtrip_state() {
