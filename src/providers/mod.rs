@@ -263,7 +263,7 @@ pub fn pick_providers(
     let base = if let Some(req) = requested {
         req.iter()
             .filter(|n| is_provider_usable(n, allow_missing))
-            .filter_map(|n| ProviderRef::parse(n).ok().map(|p| p.storage_key()))
+            .filter_map(|n| ProviderRef::parse(n).ok().map(|p| p.display()))
             .collect::<Vec<_>>()
     } else if allow_missing {
         if order.is_empty() {
@@ -271,7 +271,7 @@ pub fn pick_providers(
         } else {
             order
                 .iter()
-                .filter_map(|n| ProviderRef::parse(n).ok().map(|p| p.storage_key()))
+                .filter_map(|n| ProviderRef::parse(n).ok().map(|p| p.display()))
                 .collect()
         }
     } else {
@@ -315,6 +315,29 @@ mod tests {
         assert_eq!(picked.len(), 2);
         assert_eq!(picked[0], "api:openai");
         assert_eq!(picked[1], "cli:grok");
+    }
+
+    #[test]
+    fn model_survives_fleet_selection() {
+        let picked = pick_providers(
+            &[],
+            2,
+            Some(&[
+                "cli:codex@openai/gpt-4o-mini".into(),
+                "api:openai@gpt-5".into(),
+            ]),
+            true,
+        );
+        assert_eq!(picked.len(), 2);
+        assert_eq!(picked[0], "cli:codex@openai/gpt-4o-mini");
+        assert_eq!(picked[1], "api:openai@gpt-5");
+    }
+
+    #[test]
+    fn model_variant_usable_and_adapter_model_free() {
+        // The @model ref is usable and its adapter lookup ignores the model.
+        assert!(is_provider_usable("cli:claude@sonnet", true));
+        assert!(adapter_named("cli:claude@sonnet").is_some());
     }
 
     #[test]

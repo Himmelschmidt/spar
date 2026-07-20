@@ -1424,7 +1424,9 @@ pub fn init_slot_model(
     let pref = ProviderRef::parse(&provider).expect("slot provider must be cli:… or api:…");
     SlotState {
         id: id.into(),
-        provider,
+        // Model-free storage form: `@model` lives in `model`, not `provider`, so
+        // slot ids, worktree/artifact names, and quota lookups stay unaffected.
+        provider: pref.storage_key(),
         role,
         status: SlotStatus::Pending,
         backend: None,
@@ -1437,7 +1439,9 @@ pub fn init_slot_model(
         signal: None,
         artifact: None,
         usage: None,
-        model,
+        // An explicit `@model` on the ref is a direct instruction and beats a
+        // model chosen by `--select`'s model-select artifact (the `model` arg).
+        model: pref.model.clone().or(model),
     }
 }
 

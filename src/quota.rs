@@ -223,10 +223,18 @@ fn parse_rate_limits_value(
     ))
 }
 
+/// Model-free quota bucket key: `cli:claude@sonnet` and `cli:claude@haiku`
+/// share one bucket (rate limits are per account, not per model).
+fn quota_key(raw: &str) -> String {
+    crate::provider_ref::ProviderRef::parse(raw)
+        .map(|p| p.storage_key())
+        .unwrap_or_else(|_| raw.to_string())
+}
+
 pub fn filter_usable(names: &[String], store: &QuotaStore) -> Vec<String> {
     names
         .iter()
-        .filter(|n| store.is_usable(n))
+        .filter(|n| store.is_usable(&quota_key(n)))
         .cloned()
         .collect()
 }
@@ -262,6 +270,16 @@ mod tests {
         let mut loaded = loaded;
         loaded.resume("cli:claude");
         assert!(loaded.is_usable("cli:claude"));
+    }
+
+    #[test]
+    fn model_variants_share_bucket() {
+        // Pausing the bare provider filters out its @model variants: the model
+        // must not leak into the quota key.
+        let mut store = QuotaStore::default();
+        store.pause_manual("cli:claude", None);
+        let kept = filter_usable(&["cli:claude@sonnet".into(), "cli:grok".into()], &store);
+        assert_eq!(kept, vec!["cli:grok".to_string()]);
     }
 
     #[test]

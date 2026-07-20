@@ -30,10 +30,21 @@ spar plan -t "..." --providers cli:claude,cli:grok --dry-run
 # mix CLI + API slots
 spar implement -t "..." --providers cli:claude,api:openai --dry-run
 spar run --workflow arena -t "..." --providers api:xai,cli:claude,cli:grok
+
+# pin a model per slot with @model
+spar implement -t "..." --providers 'cli:codex@openai/gpt-4o-mini,api:openai@gpt-5' --dry-run
 ```
 
 Native CLI adapters: `cli:claude`, `cli:grok`, `cli:agy`, `cli:codex`. Run `spar provider list`
 to see which resolve on this box.
+
+**`@model` suffix.** Any ref may carry an optional model, split off on the **first `@`**:
+`cli:codex@openai/gpt-4o-mini`, `api:openai@gpt-5`. The split happens before the
+provider-name check, so the model may contain `:` and `/` (OpenRouter slugs like
+`tencent/hy3:free`) while the adapter name may not. `@model` variants share one quota
+bucket with their bare provider (`cli:claude@opus` and `cli:claude@haiku` both bucket as
+`cli:claude`) — rate limits are per account, not per model. An explicit `@model` beats a
+model chosen by `--select`.
 
 `cli:codex` (codex, `codex exec --json`) drives whatever backend + model a codex **profile**
 defines (a profile is codex's own (backend, model) bundle), and parses codex JSONL for real
