@@ -55,7 +55,11 @@ pub fn parse_review(body: &str) -> ReviewResult {
                 .trim_matches(['*', '`', ':', ' '])
                 .to_ascii_lowercase();
             section = match title.as_str() {
-                "verdict" if !verdict_done => Section::Verdict,
+                // Latch on the heading so a later ## Verdict cannot fill an empty first section.
+                "verdict" if !verdict_done => {
+                    verdict_done = true;
+                    Section::Verdict
+                }
                 "acceptance" => Section::Acceptance,
                 _ => Section::Other,
             };
@@ -67,7 +71,6 @@ pub fn parse_review(body: &str) -> ReviewResult {
                     continue;
                 }
                 out.verdict = parse_verdict_line(raw);
-                verdict_done = true;
                 section = Section::Other;
             }
             Section::Acceptance => {
@@ -89,23 +92,31 @@ fn parse_verdict_line(raw: &str) -> Option<Verdict> {
         .trim_start_matches(NOISE)
         .to_ascii_lowercase()
         .replace(['*', '`'], "");
-    if leads_with(&line, "request_changes") {
+    if is_verdict_token(&line, "request_changes") {
         return Some(Verdict::RequestChanges);
     }
-    if leads_with(&line, "approve") {
+    if is_verdict_token(&line, "approve") {
         return Some(Verdict::Approve);
     }
     None
 }
 
-/// The line must *open* with the token, with only punctuation after it — so a
-/// parenthetical hedge (`request_changes (see findings)`) still counts, while a
-/// sentence that merely opens with the word (`approve is not warranted`) does not.
-fn leads_with(line: &str, token: &str) -> bool {
+/// Token must open the line. Rest may be empty, a parenthetical hedge, or trailing
+/// sentence punctuation only — not a format skeleton (`approve | request_changes`)
+/// and not prose (`approve is not warranted`).
+fn is_verdict_token(line: &str, token: &str) -> bool {
     let Some(rest) = line.strip_prefix(token) else {
         return false;
     };
-    !rest.trim_start().starts_with(|c: char| c.is_alphanumeric())
+    let rest = rest.trim_start();
+    if rest.is_empty() {
+        return true;
+    }
+    if rest.starts_with('(') {
+        return true;
+    }
+    rest.chars()
+        .all(|c| matches!(c, '.' | '!' | '?' | ',' | ';' | ':'))
 }
 
 fn parse_ac_line(raw: &str) -> Option<AcLine> {
@@ -240,6 +251,29 @@ mod tests {
     fn verdict_garbage_is_none() {
         assert_eq!(verdict("## Verdict\nlgtm\n"), None);
         assert_eq!(verdict("## Verdict\napprove is not warranted\n"), None);
+    }
+
+    #[test]
+    fn format_skeleton_as_verdict_is_none() {
+        // templates/reviewer_adversarial.md puts this under ## Verdict as the format
+        // skeleton. A reviewer that pastes it without choosing must not ship.
+        assert_eq!(verdict("## Verdict\napprove | request_changes\n"), None);
+        assert_eq!(verdict("## Verdict\n`approve | request_changes`\n"), None);
+    }
+
+    #[test]
+    fn empty_first_verdict_section_stays_none() {
+        let body = "## Verdict\n\n## Other\nnoise\n\n## Verdict\napprove\n";
+        assert_eq!(verdict(body), None);
+    }
+
+    #[test]
+    fn trailing_punctuation_ok() {
+        assert_eq!(verdict("## Verdict\napprove.\n"), Some(Verdict::Approve));
+        assert_eq!(
+            verdict("## Verdict\nrequest_changes!\n"),
+            Some(Verdict::RequestChanges)
+        );
     }
 
     #[test]

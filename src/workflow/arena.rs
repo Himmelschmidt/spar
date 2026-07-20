@@ -401,7 +401,13 @@ pub fn reconcile(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> R
         let verdict = crate::workflow::review_result::parse_review(&text).verdict;
         if verdict != Some(crate::workflow::review_result::Verdict::Approve) {
             state.set_phase(Phase::Failed);
-            state.error = Some("reconcile review requested changes".into());
+            let reason = if verdict == Some(crate::workflow::review_result::Verdict::RequestChanges)
+            {
+                "reconcile review requested changes"
+            } else {
+                "reconcile review missing or unparseable verdict"
+            };
+            state.error = Some(reason.into());
             state.save(paths)?;
             return Ok(ExitCode::Failure);
         }
