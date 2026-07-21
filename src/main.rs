@@ -928,15 +928,22 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                 let enriched: Vec<serde_json::Value> = report
                     .iter()
                     .map(|p| {
-                        let q = quota.get(&quota::normalize_key(&p.name));
+                        let key = quota::normalize_key(&p.name);
+                        let q = quota.get(&key);
+                        // Effective status: a lapsed pause reads Available, so the
+                        // listing matches what a run will actually do (auto-recover).
+                        let status = quota.effective_status(&key);
+                        let hint = (status != quota::ProviderStatus::Available)
+                            .then_some(q.hint)
+                            .flatten();
                         serde_json::json!({
                             "name": p.name,
                             "available": p.available,
                             "path": p.path,
                             "version": p.version,
                             "capabilities": p.capabilities,
-                            "quota_status": q.status,
-                            "quota_hint": q.hint,
+                            "quota_status": status,
+                            "quota_hint": hint,
                         })
                     })
                     .collect();
@@ -944,11 +951,11 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
             } else {
                 for p in &report {
                     let mark = if p.available { "ok" } else { "missing" };
-                    let q = quota.get(&quota::normalize_key(&p.name));
+                    let status = quota.effective_status(&quota::normalize_key(&p.name));
                     println!(
                         "{:<8} {mark:<8} {:<12} {}",
                         p.name,
-                        format!("{:?}", q.status),
+                        format!("{status:?}"),
                         p.path.as_deref().unwrap_or("-")
                     );
                     if p.available {

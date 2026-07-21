@@ -1013,6 +1013,69 @@ fn quota_exit_when_all_paused() {
     }
 }
 
+// Regression guard for the positional-fleet collapse: with ONE of three providers
+// paused, the live gate must fail loud (exit 4) naming the paused ref and must NOT
+// compact the fleet (which would slide a different model into a role's slot). The old
+// `apply_quota_filter` would drop the paused entry and continue — never returning 4 —
+// so this distinguishes the fix from the bug. Mirrors the missing-binary conditionality
+// of `quota_exit_when_all_paused`: no vendor CLIs on PATH → exit 1 before the gate.
+#[test]
+fn quota_partial_pause_fails_loud_without_collapse() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["provider", "pause", "cli:grok"])
+        .assert()
+        .success();
+
+    let r = spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "plan",
+            "--task",
+            "x",
+            "--providers",
+            "cli:claude,cli:grok,cli:agy",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let code = r.status.code().unwrap_or(1);
+    if code == 4 {
+        let v: serde_json::Value = serde_json::from_slice(&r.stdout).expect("quota json");
+        assert_eq!(v["exit_code"], 4);
+        assert_eq!(v["phase"], "quota");
+        // Names the paused provider, not a silent swap.
+        assert!(
+            v["error"].as_str().unwrap_or_default().contains("cli:grok"),
+            "error must name the paused provider, got {}",
+            v["error"]
+        );
+        // Positional integrity: the fleet is NOT compacted — grok stays at index 1.
+        let provs: Vec<&str> = v["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            provs,
+            ["cli:claude", "cli:grok", "cli:agy"],
+            "paused provider must not be dropped/reindexed"
+        );
+    } else {
+        // Offline / no binaries on PATH: pick_providers filters by presence first.
+        assert_eq!(
+            code,
+            1,
+            "expected quota(4) when providers exist, got {code} stderr={}",
+            String::from_utf8_lossy(&r.stderr)
+        );
+    }
+}
+
 #[test]
 fn arena_dry_run() {
     let tmp = tempdir().unwrap();

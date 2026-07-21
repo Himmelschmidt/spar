@@ -83,6 +83,17 @@ impl QuotaStore {
         }
     }
 
+    /// Status as a run would see it: a pause that has lapsed (auto-recovered) reads
+    /// `Available`, so `provider list` matches what `plan`/`implement` will do rather
+    /// than showing a stale `Paused*` for a provider a run will happily pick up.
+    pub fn effective_status(&self, name: &str) -> ProviderStatus {
+        if self.is_usable(name) {
+            ProviderStatus::Available
+        } else {
+            self.get(name).status
+        }
+    }
+
     pub fn pause_manual(&mut self, name: &str, until: Option<DateTime<Utc>>) {
         let status = if until.is_some() {
             ProviderStatus::Cooldown
@@ -363,6 +374,25 @@ mod tests {
         let fleet = vec!["cli:grok".into(), "cli:claude".into(), "cli:grok".into()];
         let err = ensure_usable(&paths, &fleet).unwrap_err();
         assert!(err.to_string().contains("cli:claude"));
+    }
+
+    #[test]
+    fn effective_status_reflects_auto_recovery() {
+        let mut store = QuotaStore::default();
+        store.pause_manual("cli:claude", None);
+        assert_eq!(
+            store.effective_status("cli:claude"),
+            ProviderStatus::PausedManual,
+            "fresh pause shows its real status"
+        );
+
+        let stale = Utc::now() - chrono::Duration::minutes(DEFAULT_COOLDOWN_MINS + 1);
+        store.providers.get_mut("cli:claude").unwrap().updated_at = Some(stale);
+        assert_eq!(
+            store.effective_status("cli:claude"),
+            ProviderStatus::Available,
+            "a lapsed pause reads Available, matching what a run will do"
+        );
     }
 
     #[test]
