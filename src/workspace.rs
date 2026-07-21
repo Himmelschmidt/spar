@@ -107,6 +107,7 @@ pub fn spawn_agent(req: &SpawnRequest) -> Result<(String, String)> {
         trust: TrustPolicy::FullAuto,
         extra_args: vec![],
         model: None,
+        timeout_secs: None,
     };
     let cmd = adapter.build_interactive(&bin, &opts);
     let (program, args) = providers::command_to_parts(&cmd);

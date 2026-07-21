@@ -164,6 +164,7 @@ mod tests {
             trust: TrustPolicy::FullAuto,
             extra_args: vec![],
             model: model.map(Into::into),
+            timeout_secs: None,
         }
     }
 

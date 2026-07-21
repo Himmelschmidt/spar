@@ -40,6 +40,15 @@ spar implement -t "..." --providers 'cli:codex@openai/gpt-4o-mini,api:openai@gpt
 Native CLI adapters: `cli:claude`, `cli:grok`, `cli:agy`, `cli:codex`, `cli:opencode`. Run
 `spar provider list` to see which resolve on this box and their live pause/cooldown status.
 
+**agy note.** agy runs headless with `--print` and emits almost nothing to stdout, so spar
+recovers its tools/tokens/quota from disk: tool counts + activity from agy's per-conversation
+transcript, and token/quota counts by teeing agy's statusline payload. To capture the latter,
+spar installs a wrapper into `~/.gemini/antigravity-cli/settings.json` that **chains to your
+existing statusline** (it wraps, never replaces it) and tees payloads to `~/.gemini/antigravity-cli/.spar/`.
+Run `spar provider agy-statusline-uninstall` to remove the wrapper and restore your original.
+agy's `--print-timeout` is also derived from `[timeouts] slot_secs`/`review_secs`, so a long
+agy slot runs its full budget instead of dying at agy's 30-minute default.
+
 **Pause / cooldown.** A provider is paused manually (`spar provider pause <ref>`) or
 automatically when a slot hits a rate-limit signal. Pauses **auto-recover** ~30 min after
 they were set (or at an explicit cooldown reset), so the provider is re-probed rather than
@@ -277,7 +286,7 @@ plan = true
 winner = true
 ship = true
 [timeouts]
-slot_secs = 1800
+slot_secs = 1800       # per-slot wall clock; reaches each CLI's own self-timeout too
 # review_secs = 1800   # optional; defaults to slot_secs
 stall_warn_secs = 300  # running slot silent this long ⇒ stalled in status/TUI (0 = off)
 wait = "2h"

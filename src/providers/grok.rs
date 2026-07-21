@@ -99,6 +99,7 @@ mod tests {
             trust: TrustPolicy::FullAuto,
             extra_args: vec![],
             model: None,
+            timeout_secs: None,
         };
         let cmd = GrokAdapter.build_headless(Path::new("grok"), &opts);
         let (_, args) = command_to_parts(&cmd);
@@ -122,6 +123,7 @@ mod tests {
             trust: TrustPolicy::FullAuto,
             extra_args: vec![],
             model: None,
+            timeout_secs: None,
         };
         let cmd = GrokAdapter.build_headless(Path::new("grok"), &opts);
         let (_, args) = command_to_parts(&cmd);

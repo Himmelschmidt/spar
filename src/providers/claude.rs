@@ -107,6 +107,7 @@ mod tests {
             trust: TrustPolicy::Prompt,
             extra_args: vec![],
             model: None,
+            timeout_secs: None,
         };
         let cmd = ClaudeAdapter.build_headless(Path::new("claude"), &opts);
         let (_, args) = command_to_parts(&cmd);

@@ -1006,5 +1006,15 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
             }
             Ok(ExitCode::Success)
         }
+        cli::ProviderAction::AgyStatuslineUninstall => {
+            match providers::agy_telemetry::root() {
+                Some(root) => {
+                    providers::agy_telemetry::uninstall_statusline_hook(&root)?;
+                    println!("removed spar agy statusline wrapper; restored original");
+                }
+                None => println!("agy config dir not found; nothing to uninstall"),
+            }
+            Ok(ExitCode::Success)
+        }
     }
 }

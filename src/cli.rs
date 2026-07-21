@@ -377,6 +377,8 @@ pub enum ProviderAction {
         #[arg(long)]
         json: bool,
     },
+    /// Remove spar's agy statusline wrapper and restore the user's original statusline.
+    AgyStatuslineUninstall,
 }
 
 #[derive(Debug, Subcommand)]
