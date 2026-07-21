@@ -64,6 +64,24 @@ fn run_from_approved(
     if state.phase == Phase::Stopped {
         let _ = std::fs::remove_file(paths.marker(run_id, "stopped"));
     }
+    // Resuming a terminal run (a failed/stuck attempt): clear the dead verdict so the detach
+    // snapshot reads as a fresh re-dispatch, not `failed` with `exit_code: 1` (which reads as
+    // a refusal). This is purely for snapshot coherence — `execute_loop` re-dispatches the
+    // coding slots regardless of their incoming status; here we just make the persisted state
+    // it briefly emits honest. Per-slot terminal markers are cleared at dispatch by the executor.
+    if matches!(state.phase, Phase::Failed | Phase::Stuck) {
+        for s in &mut state.slots {
+            if matches!(s.status, SlotStatus::Failed | SlotStatus::Stuck) {
+                s.status = SlotStatus::Pending;
+                s.error = None;
+                s.exit_code = None;
+                s.signal = None;
+                s.pid = None;
+            }
+        }
+        state.error = None;
+        state.set_phase(Phase::PrepareIsolation);
+    }
     // `-t` on an approved run is a directive for THIS round only. It never rewrites
     // the run's task; absent `-t`, any prior amendment is cleared so it never silently
     // re-applies to a later round.

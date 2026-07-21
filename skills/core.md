@@ -160,6 +160,9 @@ signals the orchestrator then the slot process groups (SIGTERM → grace → SIG
 and sets `phase=stopped` (JSON `exit_code: 1`). It never removes the branch or the
 worktree — that is `spar cleanup`'s job. A stopped run is **resumable**: rerun
 `spar implement --run <id> --providers …` and it clears the marker and continues.
+A **failed/stuck** run is resumable the same way (its approved plan still counts):
+resume resets the failed slots to pending and re-dispatches, so `status` reflects the
+new attempt rather than the dead one's `failed` verdict.
 Use `stop` (not killing pids directly) so the orchestrator can't re-dispatch a slot
 you just killed.
 
