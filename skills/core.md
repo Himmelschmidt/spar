@@ -38,7 +38,14 @@ spar implement -t "..." --providers 'cli:codex@openai/gpt-4o-mini,api:openai@gpt
 ```
 
 Native CLI adapters: `cli:claude`, `cli:grok`, `cli:agy`, `cli:codex`, `cli:opencode`. Run
-`spar provider list` to see which resolve on this box.
+`spar provider list` to see which resolve on this box and their live pause/cooldown status.
+
+**Pause / cooldown.** A provider is paused manually (`spar provider pause <ref>`) or
+automatically when a slot hits a rate-limit signal. Pauses **auto-recover** ~30 min after
+they were set (or at an explicit cooldown reset), so the provider is re-probed rather than
+staying dead; `spar provider resume <ref>` clears one immediately. A paused provider is
+never silently swapped into another role: `plan`/`implement` exit `4` (quota) naming the
+paused ref so per-role assignment stays exactly what you specified.
 
 **Driving an OpenRouter model? Lead with `cli:opencode@<slug>`.** It is the recommended
 OpenRouter coder: same OpenRouter-slug routing as `cli:codex` but ~half the per-turn token
