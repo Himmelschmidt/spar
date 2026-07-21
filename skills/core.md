@@ -36,8 +36,13 @@ spar run --workflow arena -t "..." --providers api:xai,cli:claude,cli:grok
 spar implement -t "..." --providers 'cli:codex@openai/gpt-4o-mini,api:openai@gpt-5' --dry-run
 ```
 
-Native CLI adapters: `cli:claude`, `cli:grok`, `cli:agy`, `cli:codex`. Run `spar provider list`
-to see which resolve on this box.
+Native CLI adapters: `cli:claude`, `cli:grok`, `cli:agy`, `cli:codex`, `cli:opencode`. Run
+`spar provider list` to see which resolve on this box.
+
+**Driving an OpenRouter model? Lead with `cli:opencode@<slug>`.** It is the recommended
+OpenRouter coder: same OpenRouter-slug routing as `cli:codex` but ~half the per-turn token
+overhead (measured ~14.6k input vs codex ~29.5k on the same trivial task + model), so it is
+the default choice; `cli:codex` remains the documented alternative.
 
 **`@model` suffix.** Any ref may carry an optional model, split off on the **first `@`**:
 `cli:codex@openai/gpt-4o-mini`, `api:openai@gpt-5`. The split happens before the
@@ -72,6 +77,25 @@ token/cost tracking. Not a takeover target. Selection, highest precedence first:
 spar run --workflow review -t "..." --providers cli:codex               # Muse Spark via OpenRouter
 SPAR_CODEX_MODEL=x-ai/grok-4 spar run ... --providers cli:codex          # different OpenRouter model
 SPAR_CODEX_PROFILE=gpt        spar run ... --providers cli:codex          # a different codex profile
+```
+
+`cli:opencode` (opencode, `opencode run --format json`) is the **recommended OpenRouter
+coder** — OpenRouter is its default routing and its per-turn token overhead is roughly half
+codex's. spar parses opencode's NDJSON per-step tokens for real usage tracking. Not a
+takeover target. Model selection, highest precedence first:
+- A per-slot model — from a `cli:opencode@<model>` ref or `--select` — becomes opencode's
+  `-m`. A bare vendor slug is **prefixed with `openrouter/`** so OpenRouter is the default
+  (`cli:opencode@meta/muse-spark-1.1` → `-m openrouter/meta/muse-spark-1.1`); an already
+  `openrouter/…` model passes through unchanged; a bare word (`gpt-5`) passes through to
+  opencode's own default provider. Different slots can run different OpenRouter models in one
+  run. Discover tool-capable slugs with `spar model list --provider openrouter`.
+- `SPAR_OPENCODE_MODEL` → same routing, when no per-slot model is set.
+- Unset → opencode's own config default model.
+- OpenRouter models need `OPENROUTER_API_KEY` exported in spar's env (opencode reads it).
+
+```bash
+spar run --workflow review -t "..." --providers cli:opencode@meta/muse-spark-1.1  # -> openrouter/meta/muse-spark-1.1
+SPAR_OPENCODE_MODEL=x-ai/grok-4 spar run ... --providers cli:opencode              # different OpenRouter model
 ```
 
 API keys: `OPENAI_API_KEY`, `XAI_API_KEY`, optional `OPENAI_BASE_URL` / `XAI_BASE_URL` / `*_MODEL`.

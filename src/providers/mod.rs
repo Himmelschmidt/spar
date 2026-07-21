@@ -3,6 +3,7 @@ mod claude;
 mod codex;
 pub mod delivery;
 mod grok;
+mod opencode;
 pub mod presence;
 
 use crate::provider_ref::{ExecBackend, ProviderRef};
@@ -14,6 +15,7 @@ pub use agy::AgyAdapter;
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
 pub use grok::GrokAdapter;
+pub use opencode::OpencodeAdapter;
 
 /// How the orchestrator hands a queued message to a *running* adapter at its next
 /// turn boundary. The orchestrator asks the adapter for this; it never branches on
@@ -183,6 +185,7 @@ pub fn all_adapters() -> Vec<Box<dyn ProviderAdapter>> {
         Box::new(GrokAdapter),
         Box::new(AgyAdapter),
         Box::new(CodexAdapter),
+        Box::new(OpencodeAdapter),
     ]
 }
 
