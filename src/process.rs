@@ -536,6 +536,9 @@ struct StreamCoalescer {
     cache_write: u64,
     model: Option<String>,
     text_chars: u64,
+    /// opencode double-emits every event in dash and underscore spellings with the
+    /// same `part.id`; keyed by `(normalized type, part.id)` to count each once.
+    seen_opencode: std::collections::HashSet<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -560,6 +563,7 @@ impl StreamCoalescer {
             cache_write: 0,
             model: None,
             text_chars: 0,
+            seen_opencode: std::collections::HashSet::new(),
         }
     }
 
@@ -588,6 +592,15 @@ impl StreamCoalescer {
         };
 
         self.absorb_usage(&v);
+
+        // opencode `run --format json` NDJSON. Each line carries a top-level `sessionID`
+        // and a `part` object; that pair is unique to opencode and gates it off before
+        // the shared `type`-matched branches below (opencode reuses type strings like
+        // "text"/"tool_use" that Grok's stream also uses). Returned unconditionally so an
+        // opencode line never falls through to another provider's parser.
+        if v.get("sessionID").is_some() && v.get("part").is_some() {
+            return self.handle_opencode(&v);
+        }
 
         // Grok token stream
         if let Some(ty) = v.get("type").and_then(|x| x.as_str()) {
@@ -742,6 +755,68 @@ impl StreamCoalescer {
             return None;
         }
         None
+    }
+
+    fn handle_opencode(&mut self, v: &serde_json::Value) -> Option<String> {
+        let part = v.get("part")?;
+        // Normalize the double-emit: `step-finish` and `step_finish` both map to
+        // `step_finish`. The dedupe key includes the type so `step_start:X` and
+        // `step_finish:X` (same part.id, distinct events) are not collapsed.
+        let ptype = v.get("type").and_then(|x| x.as_str())?.replace('-', "_");
+        let pid = part.get("id").and_then(|x| x.as_str()).unwrap_or_default();
+        if !self.seen_opencode.insert(format!("{ptype}:{pid}")) {
+            return None;
+        }
+        match ptype.as_str() {
+            // One opencode step is one LLM call: input grows across steps (max),
+            // output is per-step (sum) — the same pattern absorb_usage uses.
+            "step_finish" => {
+                if let Some(tok) = part.get("tokens") {
+                    if let Some(n) = tok.get("input").and_then(|x| x.as_u64()) {
+                        self.input_tokens = self.input_tokens.max(n);
+                    }
+                    if let Some(n) = tok.get("output").and_then(|x| x.as_u64()) {
+                        self.output_tokens = self.output_tokens.saturating_add(n);
+                    }
+                    if let Some(n) = tok.pointer("/cache/read").and_then(|x| x.as_u64()) {
+                        self.cache_read = self.cache_read.max(n);
+                    }
+                    if let Some(n) = tok.pointer("/cache/write").and_then(|x| x.as_u64()) {
+                        self.cache_write = self.cache_write.max(n);
+                    }
+                }
+                None
+            }
+            "text" => {
+                let text = part
+                    .get("text")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default();
+                if text.is_empty() {
+                    return None;
+                }
+                let mut out = self.flush_buf();
+                out.push_str(text);
+                if !text.ends_with('\n') {
+                    out.push('\n');
+                }
+                self.note_text(text);
+                Some(out)
+            }
+            "tool" | "tool_use" => {
+                self.tools += 1;
+                let mut out = self.flush_buf();
+                if let Some(name) = part.get("tool").and_then(|x| x.as_str()) {
+                    out.push_str(&format!("→ {name}\n"));
+                }
+                if out.is_empty() {
+                    None
+                } else {
+                    Some(out)
+                }
+            }
+            _ => None,
+        }
     }
 
     fn handle_codex_item(&mut self, v: &serde_json::Value) -> Option<String> {
@@ -1405,6 +1480,51 @@ mod tests {
         assert_eq!(c.input_tokens, 39189);
         assert_eq!(c.output_tokens, 117);
         assert_eq!(c.cache_read, 39185);
+    }
+
+    #[test]
+    fn opencode_jsonl_dedupes_double_emit() {
+        // Real `opencode run --format json` events (captured from opencode 1.17.4). Every
+        // event double-emits in dash and underscore top-level spellings with one part.id;
+        // both must be counted once. Real single-step tokens: input 12738, output 19,
+        // cache.read 1920.
+        let mut c = StreamCoalescer::new(false);
+        let mut out = String::new();
+        for line in [
+            r#"{"type":"step_start","sessionID":"ses_1","part":{"id":"prt_s1","type":"step-start"}}"#,
+            r#"{"type":"tool_use","sessionID":"ses_1","part":{"type":"tool","tool":"write","callID":"call_1","state":{"status":"completed"}}}"#,
+            // The one real step-finish, fed in BOTH spellings with the same part.id.
+            r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_f1","type":"step-finish","tokens":{"total":14677,"input":12738,"output":19,"reasoning":0,"cache":{"write":0,"read":1920}}}}"#,
+            r#"{"type":"step-finish","sessionID":"ses_1","part":{"id":"prt_f1","type":"step-finish","tokens":{"total":14677,"input":12738,"output":19,"reasoning":0,"cache":{"write":0,"read":1920}}}}"#,
+            r#"{"type":"text","sessionID":"ses_1","part":{"id":"prt_t1","type":"text","text":"DONE"}}"#,
+        ] {
+            if let Some(chunk) = c.feed(line) {
+                out.push_str(&chunk);
+            }
+        }
+        out.push_str(&c.finish().unwrap_or_default());
+        assert!(out.contains("DONE"), "assistant text: {out:?}");
+        assert!(out.contains("→ write"), "tool marker: {out:?}");
+        assert_eq!(c.tools, 1);
+        // Dedupe: the two step-finish spellings add output once (19, not 38).
+        assert_eq!(c.output_tokens, 19, "output must count once, not double");
+        assert_eq!(c.input_tokens, 12738, "input is the max across steps");
+        assert_eq!(c.cache_read, 1920, "cache.read picked up");
+    }
+
+    #[test]
+    fn opencode_input_max_output_sum_across_steps() {
+        // Two distinct steps (different part.id): input uses max, output sums.
+        let mut c = StreamCoalescer::new(false);
+        for line in [
+            r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_a","type":"step-finish","tokens":{"input":12738,"output":19,"cache":{"read":1920,"write":0}}}}"#,
+            r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_b","type":"step-finish","tokens":{"input":97,"output":2,"cache":{"read":14592,"write":0}}}}"#,
+        ] {
+            c.feed(line);
+        }
+        assert_eq!(c.input_tokens, 12738);
+        assert_eq!(c.output_tokens, 21);
+        assert_eq!(c.cache_read, 14592);
     }
 
     #[test]
