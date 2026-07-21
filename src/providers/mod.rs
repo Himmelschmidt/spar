@@ -1,4 +1,5 @@
 mod agy;
+pub mod agy_telemetry;
 mod claude;
 mod codex;
 pub mod delivery;
@@ -110,6 +111,11 @@ pub struct SpawnOpts {
     pub extra_args: Vec<String>,
     /// Preferred model id (`--model` on CLIs that support it).
     pub model: Option<String>,
+    /// Resolved slot wall-clock budget in seconds. Adapters whose CLI has its own
+    /// self-timeout (e.g. agy's `--print-timeout`) derive it from this so config
+    /// (`[timeouts] slot_secs`/`review_secs`) reaches the live process instead of a
+    /// constant. `None` = adapter default.
+    pub timeout_secs: Option<u64>,
 }
 
 pub trait ProviderAdapter: Send + Sync {

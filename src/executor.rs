@@ -329,6 +329,11 @@ fn execute_prepared(
     let bin = adapter
         .resolve_binary()
         .ok_or_else(|| anyhow::anyhow!("provider {} not on PATH", prep.job.provider))?;
+    if provider_is_agy(&prep.job.provider) {
+        if let Some(root) = providers::agy_telemetry::root() {
+            let _ = providers::agy_telemetry::ensure_statusline_hook(&root);
+        }
+    }
     let opts = SpawnOpts {
         prompt: prep.prompt.clone(),
         prompt_file: Some(prep.prompt_path.clone()),
@@ -336,6 +341,7 @@ fn execute_prepared(
         trust: TrustPolicy::FullAuto,
         extra_args: vec![],
         model: prep.job.model.clone(),
+        timeout_secs: Some(timeout.as_secs()),
     };
     let cmd = adapter.build_headless(&bin, &opts);
     let (program, args) = providers::command_to_parts(&cmd);
@@ -364,8 +370,15 @@ fn execute_prepared(
         last: std::cell::Cell::new(std::time::Instant::now()),
     };
     let tick = || beat.tick();
-    let res = process::run_captured(&req, Some(&sink), Some(&tick))?;
+    let mut res = process::run_captured(&req, Some(&sink), Some(&tick))?;
     let pid = load_pid(&pid_cell);
+    enrich_agy_stats(
+        &mut res.stats,
+        &prep.job.provider,
+        &prep.cwd,
+        &prep.log_path,
+        &prep.paths,
+    );
     let usage = usage_from_stream(&prep.job.slot_id, &prep.job.provider, &res.stats);
     if res.timed_out {
         return Ok(SlotOutcome {
@@ -433,6 +446,73 @@ fn load_pid(cell: &std::sync::atomic::AtomicU32) -> Option<u32> {
     match cell.load(std::sync::atomic::Ordering::SeqCst) {
         0 => None,
         p => Some(p),
+    }
+}
+
+/// True when a provider ref resolves to the agy adapter (`cli:agy`, bare `agy`, `agy@model`).
+fn provider_is_agy(provider: &str) -> bool {
+    ProviderRef::parse(provider)
+        .ok()
+        .and_then(|p| p.cli_name().map(|n| n == "agy"))
+        .unwrap_or(provider == "agy")
+}
+
+/// agy emits ~nothing to stdout, so the stream stats are all zero. Recover the real
+/// tool/token/activity counts from agy's transcript + statusline sink and rewrite the
+/// slot's stats sidecar so `stats.json` and the TUI reflect what actually happened.
+/// Also drives a real agy quota cooldown from the payload's reset horizon (finding #3).
+fn enrich_agy_stats(
+    stats: &mut process::StreamStats,
+    provider: &str,
+    cwd: &Path,
+    log_path: &Path,
+    paths: &SparPaths,
+) {
+    if !provider_is_agy(provider) {
+        return;
+    }
+    let Some(root) = providers::agy_telemetry::root() else {
+        return;
+    };
+    let Some(t) = providers::agy_telemetry::collect(&root, cwd) else {
+        return;
+    };
+    if t.tools > 0 {
+        stats.tools = t.tools;
+    }
+    stats.tool_errors = stats.tool_errors.max(t.tool_errors);
+    if t.input_tokens > 0 {
+        stats.input_tokens = t.input_tokens;
+    }
+    if t.output_tokens > 0 {
+        stats.output_tokens = t.output_tokens;
+    }
+    if t.cache_read_tokens > 0 {
+        stats.cache_read_tokens = t.cache_read_tokens;
+    }
+    if t.context_tokens > 0 {
+        stats.context_tokens = t.context_tokens;
+    }
+    if let Some(ts) = t.last_activity {
+        stats.last_log_at = Some(ts.to_rfc3339());
+    }
+    let _ = stats.save(log_path);
+
+    // Finding #3: when the account's binding gemini quota is (near) exhausted, cool the
+    // provider down until its real reset instead of the fixed heuristic window.
+    if let (Some(frac), Some(reset)) = (t.quota_remaining_fraction, t.quota_reset_secs) {
+        if frac < 0.02 && reset > 0 {
+            let until = chrono::Utc::now() + chrono::Duration::seconds(reset);
+            let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+            store.pause_quota_until(
+                "cli:agy",
+                Some(until),
+                t.quota_hint
+                    .clone()
+                    .unwrap_or_else(|| "agy quota exhausted".into()),
+            );
+            let _ = store.save(paths);
+        }
     }
 }
 
@@ -1163,6 +1243,11 @@ fn run_headless(
     let bin = adapter
         .resolve_binary()
         .ok_or_else(|| anyhow::anyhow!("provider {} not on PATH", job.provider))?;
+    if provider_is_agy(&job.provider) {
+        if let Some(root) = providers::agy_telemetry::root() {
+            let _ = providers::agy_telemetry::ensure_statusline_hook(&root);
+        }
+    }
 
     let opts = SpawnOpts {
         prompt: prompt.to_string(),
@@ -1171,6 +1256,7 @@ fn run_headless(
         trust: TrustPolicy::FullAuto,
         extra_args: vec![],
         model: slot_model_for(Some(state), job),
+        timeout_secs: Some(timeout.as_secs()),
     };
     let cmd = adapter.build_headless(&bin, &opts);
     let (program, args) = providers::command_to_parts(&cmd);
@@ -1199,8 +1285,9 @@ fn run_headless(
         last: std::cell::Cell::new(std::time::Instant::now()),
     };
     let tick = || beat.tick();
-    let res = process::run_captured(&req, Some(&sink), Some(&tick))?;
+    let mut res = process::run_captured(&req, Some(&sink), Some(&tick))?;
     let pid = load_pid(&pid_cell);
+    enrich_agy_stats(&mut res.stats, &job.provider, cwd, log_path, paths);
     let usage = usage_from_stream(&job.slot_id, &job.provider, &res.stats);
     if res.timed_out {
         return Ok(SlotOutcome {
@@ -1320,6 +1407,7 @@ fn run_tmux(
         trust: TrustPolicy::FullAuto,
         extra_args: vec![],
         model: slot_model_for(Some(state), job),
+        timeout_secs: None,
     };
     // prefer interactive for tmux
     let cmd = adapter.build_interactive(&bin, &opts);

@@ -55,9 +55,15 @@ impl ProviderAdapter for AgyAdapter {
         // as `--print <value>`, and put caller `extra_args` LAST — a stray positional there
         // is then a harmless trailing arg, not something that swallows `--print`.
         let mut cmd = Command::new(bin);
-        // Default print timeout. Go durations require a unit ("1800" alone is rejected as
-        // `missing unit in duration`). Override via extra_args if needed.
-        cmd.arg("--print-timeout").arg("1800s");
+        // Print timeout = the resolved slot budget so agy runs the full wall clock the
+        // orchestrator granted it, not a fixed 30 min that silently kills long slots.
+        // Go durations require a unit ("1800" alone is rejected as `missing unit in
+        // duration`); fall back to 1800s only when no budget was supplied.
+        let print_timeout = opts
+            .timeout_secs
+            .map(|s| format!("{s}s"))
+            .unwrap_or_else(|| "1800s".into());
+        cmd.arg("--print-timeout").arg(print_timeout);
         for a in self.permission_args(opts.trust) {
             cmd.arg(a);
         }
@@ -124,6 +130,7 @@ mod tests {
             trust: TrustPolicy::FullAuto,
             extra_args,
             model: model.map(str::to_string),
+            timeout_secs: None,
         }
     }
 
@@ -161,6 +168,7 @@ mod tests {
             .iter()
             .position(|a| a == "--print-timeout")
             .expect("--print-timeout");
+        // No budget supplied by this helper → adapter default.
         assert_eq!(args.get(t + 1).map(String::as_str), Some("1800s"));
         // permission + model flags land before `--print`, never after (Go flag stops at
         // the first positional; the prompt value must not orphan them).
@@ -174,6 +182,21 @@ mod tests {
             skip < p && model < p,
             "flags must precede --print: {args:?}"
         );
+    }
+
+    #[test]
+    fn print_timeout_derives_from_slot_budget() {
+        // The resolved slot budget must reach agy's self-timeout, or a long slot dies
+        // at the 1800s default regardless of `[timeouts] slot_secs`.
+        let mut o = opts("hi", None, None);
+        o.timeout_secs = Some(10800);
+        let cmd = AgyAdapter.build_headless(Path::new("agy"), &o);
+        let (_, args) = command_to_parts(&cmd);
+        let t = args
+            .iter()
+            .position(|a| a == "--print-timeout")
+            .expect("--print-timeout");
+        assert_eq!(args.get(t + 1).map(String::as_str), Some("10800s"));
     }
 
     #[test]
