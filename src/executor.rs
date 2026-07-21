@@ -230,6 +230,9 @@ fn prepare_slot_execution(
     if job.model.is_none() {
         job.model = slot_model_for(Some(state), &job);
     }
+    // Drop any prior attempt's terminal/pid markers before this slot goes Running, so a
+    // stale `<slot>.failed` doesn't outrank the live process during reconciliation.
+    markers::clear_slot(paths, &state.id, &job.slot_id);
     if let Some(s) = state.slot_mut(&job.slot_id) {
         s.status = SlotStatus::Running;
         s.exec_backend = Some(pref.backend);
@@ -686,6 +689,8 @@ pub fn run_slot(
         .with_context(|| format!("write {}", prompt_path.display()))?;
 
     let pref = ProviderRef::parse(&job.provider)?;
+    // See prepare_slot_execution: clear a prior attempt's markers before going Running.
+    markers::clear_slot(paths, &state.id, &job.slot_id);
     if let Some(s) = state.slot_mut(&job.slot_id) {
         s.status = SlotStatus::Running;
         s.exec_backend = Some(pref.backend);

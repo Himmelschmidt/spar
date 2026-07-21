@@ -30,6 +30,17 @@ pub fn terminal_marker(paths: &SparPaths, run_id: &str, slot_id: &str) -> Option
     marker_exists(paths, run_id, &format!("{slot_id}.done")).then_some(TerminalMarker::Done)
 }
 
+/// Remove a slot's terminal + pid markers so a re-dispatched slot isn't reported with a
+/// prior attempt's verdict. Called at (re-)dispatch, before the slot runs: a stale
+/// `<slot>.failed` otherwise outranks the live process (reconciliation keys off markers)
+/// and `status`/TUI show the working slot as `failed` for its entire life. Best-effort —
+/// a missing marker is the expected case on a first dispatch.
+pub fn clear_slot(paths: &SparPaths, run_id: &str, slot_id: &str) {
+    for suffix in ["done", "failed", "pid"] {
+        let _ = std::fs::remove_file(paths.marker(run_id, &format!("{slot_id}.{suffix}")));
+    }
+}
+
 pub fn write_done(paths: &SparPaths, run_id: &str, slot_id: &str) -> Result<()> {
     write_marker(paths, run_id, &format!("{slot_id}.done"), "ok\n")
 }
@@ -112,5 +123,31 @@ mod tests {
             terminal_marker(&paths, "r1", "slot-a"),
             Some(TerminalMarker::Failed)
         );
+    }
+
+    #[test]
+    fn clear_slot_removes_stale_verdict_on_redispatch() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        write_failed(&paths, "r1", "impl", "died at print-timeout").unwrap();
+        write_pid(
+            &paths,
+            "r1",
+            "impl",
+            crate::process::PidToken::from_pid(4095415),
+        )
+        .unwrap();
+        assert_eq!(
+            terminal_marker(&paths, "r1", "impl"),
+            Some(TerminalMarker::Failed)
+        );
+
+        clear_slot(&paths, "r1", "impl");
+
+        // No stale verdict left: a re-dispatched Running slot reconciles as Running.
+        assert_eq!(terminal_marker(&paths, "r1", "impl"), None);
+        assert!(!marker_exists(&paths, "r1", "impl.pid"));
+        // Clearing a slot with no markers (first dispatch) is a harmless no-op.
+        clear_slot(&paths, "r1", "never-ran");
     }
 }
