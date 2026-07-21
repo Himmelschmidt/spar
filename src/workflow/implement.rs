@@ -88,24 +88,22 @@ fn run_from_approved(
         .take(n)
         .collect();
     let requested = opts.resolve_fleet(n, &roles, paths, cfg, &state.id)?;
-    // Quota filter before slot assignment so paused providers never get slots.
+    state.providers = providers::pick_providers(&requested, n, Some(&requested), state.dry_run);
+    // Gate the positional fleet in place — never compact it, or a paused provider would
+    // slide a different model into a role's slot (silent single-model collapse). Paused
+    // providers fail loud so the review panel stays exactly what was specified.
     if !state.dry_run {
-        match crate::quota::apply_quota_filter(paths, &requested) {
-            Ok(p) => state.providers = p,
-            Err(e) => {
-                state.error = Some(e.to_string());
-                state.set_phase(Phase::Quota);
-                state.save(paths)?;
-                if opts.json {
-                    executor::emit_run_json(&state)?;
-                } else {
-                    eprintln!("error: {e}");
-                }
-                return Ok(ExitCode::Quota);
+        if let Err(e) = crate::quota::ensure_usable(paths, &state.providers) {
+            state.error = Some(e.to_string());
+            state.set_phase(Phase::Quota);
+            state.save(paths)?;
+            if opts.json {
+                executor::emit_run_json(&state)?;
+            } else {
+                eprintln!("error: {e}");
             }
+            return Ok(ExitCode::Quota);
         }
-    } else {
-        state.providers = requested.clone();
     }
     let dry = state.dry_run;
     prepare_implement_slots(&mut state, Some(&requested), dry, cfg, paths)?;
@@ -466,25 +464,21 @@ fn run_with_task(
         .take(n)
         .collect();
     let requested = opts.resolve_fleet(n, &roles, paths, cfg, &state.id)?;
-
+    state.providers = providers::pick_providers(&requested, n, Some(&requested), dry);
+    // Gate the positional fleet in place — never compact it (see the sibling entry point).
     if !dry {
-        match crate::quota::apply_quota_filter(paths, &requested) {
-            Ok(p) => state.providers = p,
-            Err(e) => {
-                state.error = Some(e.to_string());
-                state.set_phase(Phase::Quota);
-                paths.ensure_run_dirs(&state.id)?;
-                state.save(paths)?;
-                if opts.json {
-                    executor::emit_run_json(&state)?;
-                } else {
-                    eprintln!("error: {e}");
-                }
-                return Ok(ExitCode::Quota);
+        if let Err(e) = crate::quota::ensure_usable(paths, &state.providers) {
+            state.error = Some(e.to_string());
+            state.set_phase(Phase::Quota);
+            paths.ensure_run_dirs(&state.id)?;
+            state.save(paths)?;
+            if opts.json {
+                executor::emit_run_json(&state)?;
+            } else {
+                eprintln!("error: {e}");
             }
+            return Ok(ExitCode::Quota);
         }
-    } else {
-        state.providers = requested.clone();
     }
     prepare_implement_slots(&mut state, Some(&requested), dry, cfg, paths)?;
 

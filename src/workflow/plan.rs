@@ -44,21 +44,22 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
     };
     let requested = opts.resolve_fleet(n_slots, roles, paths, cfg, &state.id)?;
     state.providers = providers::pick_providers(&requested, n_slots, Some(&requested), dry);
+    // `state.providers` is positional: `provider_for(role, idx, …)` maps each slot by
+    // index, so quota must gate the fleet in place, never compact it — dropping a paused
+    // entry would slide another model into a role's slot and silently collapse the fleet
+    // onto one model (identical assignment to --dry-run is the contract).
     if !dry {
-        match crate::quota::apply_quota_filter(paths, &state.providers) {
-            Ok(p) => state.providers = p,
-            Err(e) => {
-                state.error = Some(e.to_string());
-                state.set_phase(Phase::Quota);
-                paths.ensure_run_dirs(&state.id)?;
-                state.save(paths)?;
-                if opts.json {
-                    executor::emit_run_json(&state)?;
-                } else {
-                    eprintln!("error: {e}");
-                }
-                return Ok(ExitCode::Quota);
+        if let Err(e) = crate::quota::ensure_usable(paths, &state.providers) {
+            state.error = Some(e.to_string());
+            state.set_phase(Phase::Quota);
+            paths.ensure_run_dirs(&state.id)?;
+            state.save(paths)?;
+            if opts.json {
+                executor::emit_run_json(&state)?;
+            } else {
+                eprintln!("error: {e}");
             }
+            return Ok(ExitCode::Quota);
         }
     }
 

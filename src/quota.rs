@@ -4,6 +4,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// A pause with no explicit `cooldown_until` auto-recovers this long after it was
+/// set: the provider is re-probed by the next run rather than staying dead forever.
+/// If it is still rate-limited the run re-pauses it with a fresh window.
+const DEFAULT_COOLDOWN_MINS: i64 = 30;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderStatus {
@@ -65,14 +70,16 @@ impl QuotaStore {
         let q = self.get(name);
         match q.status {
             ProviderStatus::Available => true,
-            ProviderStatus::Cooldown => {
-                if let Some(until) = q.cooldown_until {
-                    Utc::now() >= until
-                } else {
-                    true
-                }
-            }
-            ProviderStatus::PausedManual | ProviderStatus::PausedQuota => false,
+            ProviderStatus::Cooldown => q.cooldown_until.is_none_or(|until| Utc::now() >= until),
+            // Pauses auto-recover: an explicit `cooldown_until` wins, otherwise the
+            // pause lapses DEFAULT_COOLDOWN_MINS after it was set so the provider is
+            // retried instead of staying unusable indefinitely.
+            ProviderStatus::PausedManual | ProviderStatus::PausedQuota => match q.cooldown_until {
+                Some(until) => Utc::now() >= until,
+                None => q.updated_at.is_some_and(|set| {
+                    Utc::now() >= set + chrono::Duration::minutes(DEFAULT_COOLDOWN_MINS)
+                }),
+            },
         }
     }
 
@@ -223,10 +230,18 @@ fn parse_rate_limits_value(
     ))
 }
 
-/// Model-free quota bucket key: `cli:claude@sonnet` and `cli:claude@haiku`
-/// share one bucket (rate limits are per account, not per model).
-fn quota_key(raw: &str) -> String {
-    crate::provider_ref::ProviderRef::parse(raw)
+/// Canonical quota bucket key. Model-free (`cli:claude@sonnet` and `cli:claude@haiku`
+/// share one bucket — rate limits are per account) and prefix-normalized, so a bare
+/// `claude` from the CLI or `provider list` maps to the same `cli:claude` bucket that
+/// slot providers and the auto-pause path write. Callers on both sides must go through
+/// this or the store keys silently disagree.
+pub fn normalize_key(raw: &str) -> String {
+    let candidate = if raw.contains(':') {
+        raw.to_string()
+    } else {
+        format!("cli:{raw}")
+    };
+    crate::provider_ref::ProviderRef::parse(&candidate)
         .map(|p| p.storage_key())
         .unwrap_or_else(|_| raw.to_string())
 }
@@ -234,13 +249,17 @@ fn quota_key(raw: &str) -> String {
 pub fn filter_usable(names: &[String], store: &QuotaStore) -> Vec<String> {
     names
         .iter()
-        .filter(|n| store.is_usable(&quota_key(n)))
+        .filter(|n| store.is_usable(&normalize_key(n)))
         .cloned()
         .collect()
 }
 
 /// Drop paused providers. Returns empty when every named provider is unusable
 /// (caller should exit with `ExitCode::Quota` rather than re-enabling them).
+///
+/// Only safe for a *pool* of interchangeable slots (e.g. arena competitors). For a
+/// positional, role-keyed fleet use [`ensure_usable`] — dropping an entry there would
+/// reindex the fleet and slide a different model into a role's slot.
 pub fn apply_quota_filter(paths: &SparPaths, names: &[String]) -> Result<Vec<String>> {
     if names.is_empty() {
         return Ok(Vec::new());
@@ -251,6 +270,27 @@ pub fn apply_quota_filter(paths: &SparPaths, names: &[String]) -> Result<Vec<Str
         bail!("no usable providers (all paused or on quota cooldown)");
     }
     Ok(filtered)
+}
+
+/// Gate a positional fleet in place: role→slot assignment maps by index, so a paused
+/// provider must fail the run loud rather than be dropped (which would collapse the
+/// per-role fleet onto one model silently). Errors naming the paused providers.
+pub fn ensure_usable(paths: &SparPaths, names: &[String]) -> Result<()> {
+    let store = QuotaStore::load(paths).unwrap_or_default();
+    let mut paused: Vec<String> = Vec::new();
+    for n in names {
+        let key = normalize_key(n);
+        if !store.is_usable(&key) && !paused.contains(&key) {
+            paused.push(key);
+        }
+    }
+    if !paused.is_empty() {
+        bail!(
+            "provider(s) paused or on cooldown: {}. resume with `spar provider resume <name>` or reassign the role",
+            paused.join(", ")
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -293,5 +333,53 @@ mod tests {
         let err =
             apply_quota_filter(&paths, &["cli:claude".into(), "cli:grok".into()]).unwrap_err();
         assert!(err.to_string().contains("no usable providers"));
+    }
+
+    #[test]
+    fn pause_auto_recovers_after_cooldown() {
+        // A pause with no explicit cooldown lapses once DEFAULT_COOLDOWN_MINS has
+        // passed since it was set: the provider is re-probed, not dead forever.
+        let mut store = QuotaStore::default();
+        store.pause_manual("cli:claude", None);
+        assert!(!store.is_usable("cli:claude"), "fresh pause is unusable");
+
+        let stale = Utc::now() - chrono::Duration::minutes(DEFAULT_COOLDOWN_MINS + 1);
+        store.providers.get_mut("cli:claude").unwrap().updated_at = Some(stale);
+        assert!(
+            store.is_usable("cli:claude"),
+            "pause older than the cooldown auto-recovers"
+        );
+    }
+
+    #[test]
+    fn ensure_usable_names_paused_without_reordering() {
+        // The positional fleet gate must fail loud naming the paused provider, never
+        // silently drop it (which would collapse per-role assignment onto one model).
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut store = QuotaStore::default();
+        store.pause_manual("cli:claude", None);
+        store.save(&paths).unwrap();
+        let fleet = vec!["cli:grok".into(), "cli:claude".into(), "cli:grok".into()];
+        let err = ensure_usable(&paths, &fleet).unwrap_err();
+        assert!(err.to_string().contains("cli:claude"));
+    }
+
+    #[test]
+    fn ensure_usable_passes_when_all_available() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let fleet = vec!["cli:grok".into(), "cli:claude".into()];
+        assert!(ensure_usable(&paths, &fleet).is_ok());
+    }
+
+    #[test]
+    fn normalize_key_bare_and_prefixed_match() {
+        // `provider list` (bare "claude"), the CLI arg, and slot providers must all
+        // resolve to the same bucket the auto-pause path writes.
+        assert_eq!(normalize_key("claude"), "cli:claude");
+        assert_eq!(normalize_key("cli:claude"), "cli:claude");
+        assert_eq!(normalize_key("cli:claude@opus"), "cli:claude");
+        assert_eq!(normalize_key("api:openai"), "api:openai");
     }
 }

@@ -928,7 +928,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                 let enriched: Vec<serde_json::Value> = report
                     .iter()
                     .map(|p| {
-                        let q = quota.get(&p.name);
+                        let q = quota.get(&quota::normalize_key(&p.name));
                         serde_json::json!({
                             "name": p.name,
                             "available": p.available,
@@ -944,7 +944,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
             } else {
                 for p in &report {
                     let mark = if p.available { "ok" } else { "missing" };
-                    let q = quota.get(&p.name);
+                    let q = quota.get(&quota::normalize_key(&p.name));
                     println!(
                         "{:<8} {mark:<8} {:<12} {}",
                         p.name,
@@ -965,6 +965,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
         }
         cli::ProviderAction::Pause { name, until, json } => {
             let (paths, _) = project_ctx()?;
+            let key = quota::normalize_key(&name);
             let mut store = quota::QuotaStore::load(&paths)?;
             let until_dt = if let Some(u) = until {
                 if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&u) {
@@ -976,24 +977,25 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
             } else {
                 None
             };
-            store.pause_manual(&name, until_dt);
+            store.pause_manual(&key, until_dt);
             store.save(&paths)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&store.get(&name))?);
+                println!("{}", serde_json::to_string_pretty(&store.get(&key))?);
             } else {
-                println!("paused provider {name}");
+                println!("paused provider {key}");
             }
             Ok(ExitCode::Success)
         }
         cli::ProviderAction::Resume { name, json } => {
             let (paths, _) = project_ctx()?;
+            let key = quota::normalize_key(&name);
             let mut store = quota::QuotaStore::load(&paths)?;
-            store.resume(&name);
+            store.resume(&key);
             store.save(&paths)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&store.get(&name))?);
+                println!("{}", serde_json::to_string_pretty(&store.get(&key))?);
             } else {
-                println!("resumed provider {name}");
+                println!("resumed provider {key}");
             }
             Ok(ExitCode::Success)
         }
