@@ -50,25 +50,45 @@ fn transcript_path(root: &Path, cid: &str) -> PathBuf {
         .join(".system_generated/logs/transcript.jsonl")
 }
 
+const WRAPPER_NAME: &str = "statusline-wrapper.sh";
+
+/// Serializes the read-modify-write of the user's global `settings.json` across parallel
+/// agy slots in this process (arena/parallel implement spawn several at once).
+static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Install (idempotently) a statusline wrapper that tees agy's payloads to our sink and
 /// chains to whatever statusline the user already had. Self-healing: if the user later
 /// points `statusLine.command` somewhere else, the next call re-captures it as the chain
 /// target and re-installs, so we never clobber their statusline — we wrap it.
+///
+/// Safety: this edits the user's *global* config. It (a) refuses to touch a `settings.json`
+/// that doesn't parse to an object — never resets it to `{}` and strips the user's keys;
+/// (b) writes atomically (temp + rename) so a reader never sees a torn file; (c) serializes
+/// concurrent installs; (d) detects "already ours" by the wrapper filename, not an exact
+/// string, so a reserialized command can't be captured as its own chain target (no loop).
 pub fn ensure_statusline_hook(root: &Path) -> Result<()> {
+    let _guard = INSTALL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sdir = spar_dir(root);
     std::fs::create_dir_all(&sdir).with_context(|| format!("create {}", sdir.display()))?;
     let wrapper = wrapper_path(root);
     let wrapper_cmd = format!("bash {}", wrapper.display());
 
     let settings_file = settings_path(root);
+    // Read existing settings. If the file exists but does not parse to a JSON object, abort
+    // the settings edit entirely: overwriting it would discard the user's keys (model, auth,
+    // preferences). Still lay down the wrapper + sink so a later fixed config can chain.
     let mut settings: Value = if settings_file.is_file() {
-        serde_json::from_str(&std::fs::read_to_string(&settings_file)?).unwrap_or(Value::Null)
+        let text = std::fs::read_to_string(&settings_file)?;
+        match serde_json::from_str::<Value>(&text) {
+            Ok(v) if v.is_object() => v,
+            _ => {
+                write_wrapper(&wrapper, &sink_path(root), &original_path(root))?;
+                return Ok(());
+            }
+        }
     } else {
-        Value::Null
+        serde_json::json!({})
     };
-    if !settings.is_object() {
-        settings = serde_json::json!({});
-    }
 
     let current = settings
         .get("statusLine")
@@ -76,23 +96,77 @@ pub fn ensure_statusline_hook(root: &Path) -> Result<()> {
         .and_then(|c| c.as_str())
         .unwrap_or("")
         .to_string();
+    let already_ours = current.contains(WRAPPER_NAME);
 
-    // Capture the chain target unless we're already installed.
-    if current != wrapper_cmd {
-        std::fs::write(original_path(root), current.as_bytes())?;
+    // Capture the chain target only when it isn't already our wrapper — matched by filename
+    // so a reformatted/requoted wrapper command is never mistaken for a user command and
+    // captured as its own chain target.
+    if !already_ours {
+        atomic_write(&original_path(root), current.as_bytes())?;
     }
-
     write_wrapper(&wrapper, &sink_path(root), &original_path(root))?;
     prune_sink(&sink_path(root));
 
-    if current != wrapper_cmd {
+    if !already_ours {
         settings["statusLine"] = serde_json::json!({
             "type": "command",
             "command": wrapper_cmd,
         });
-        std::fs::write(&settings_file, serde_json::to_string_pretty(&settings)?)
-            .with_context(|| format!("write {}", settings_file.display()))?;
+        atomic_write(
+            &settings_file,
+            serde_json::to_string_pretty(&settings)?.as_bytes(),
+        )
+        .with_context(|| format!("write {}", settings_file.display()))?;
     }
+    Ok(())
+}
+
+/// Remove the wrapper and restore the user's captured original statusline command.
+pub fn uninstall_statusline_hook(root: &Path) -> Result<()> {
+    let _guard = INSTALL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let settings_file = settings_path(root);
+    if !settings_file.is_file() {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(&settings_file)?;
+    let Ok(mut settings) = serde_json::from_str::<Value>(&text) else {
+        return Ok(());
+    };
+    if !settings.is_object() {
+        return Ok(());
+    }
+    let is_ours = settings
+        .get("statusLine")
+        .and_then(|s| s.get("command"))
+        .and_then(|c| c.as_str())
+        .map(|c| c.contains(WRAPPER_NAME))
+        .unwrap_or(false);
+    if !is_ours {
+        return Ok(()); // user pointed it elsewhere; leave it alone
+    }
+    let original = std::fs::read_to_string(original_path(root)).unwrap_or_default();
+    if original.trim().is_empty() {
+        settings.as_object_mut().unwrap().remove("statusLine");
+    } else {
+        settings["statusLine"] = serde_json::json!({"type": "command", "command": original});
+    }
+    atomic_write(
+        &settings_file,
+        serde_json::to_string_pretty(&settings)?.as_bytes(),
+    )?;
+    Ok(())
+}
+
+/// Write via temp file + rename so a concurrent reader sees either the old or the new
+/// complete file, never a truncated one. The temp name is pid-scoped to avoid collisions.
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_file_name(format!(
+        "{}.tmp.{}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("f"),
+        std::process::id()
+    ));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -171,14 +245,35 @@ fn parse_payload(v: &Value) -> Payload {
             .unwrap_or(0)
     };
     let current = cw.and_then(|c| c.get("current_usage"));
+    // agy's `context_window.total_*` count only *net-new* tokens and exclude the resident
+    // context (system prompt + history), so they undercount ~200x (observed: total_input=169
+    // while current_usage.input=34743 for the same call). `current_usage` is the real context
+    // the model processed, so we use it for input; output is taken cumulatively from `total_*`
+    // (the count of tokens actually generated across the run), falling back to the snapshot.
+    let input = {
+        let cur = get_u64(current, "input_tokens");
+        if cur > 0 {
+            cur
+        } else {
+            get_u64(cw, "total_input_tokens")
+        }
+    };
+    let output = {
+        let tot = get_u64(cw, "total_output_tokens");
+        if tot > 0 {
+            tot
+        } else {
+            get_u64(current, "output_tokens")
+        }
+    };
     let mut p = Payload {
         conversation_id: v
             .get("conversation_id")
             .or_else(|| v.get("session_id"))
             .and_then(|c| c.as_str())
             .map(str::to_string),
-        input_tokens: get_u64(cw, "total_input_tokens"),
-        output_tokens: get_u64(cw, "total_output_tokens"),
+        input_tokens: input,
+        output_tokens: output,
         cache_read_tokens: get_u64(current, "cache_read_input_tokens"),
         ..Default::default()
     };
@@ -215,12 +310,16 @@ fn parse_payload(v: &Value) -> Payload {
     p
 }
 
-/// Latest sink payload whose `cwd` matches the slot worktree. `cwd` is unique per slot
-/// (each coding slot gets its own worktree), so this is race-free across parallel slots.
+/// Best sink payload for the slot worktree. `cwd` is unique per slot, so matching is
+/// race-free across parallel slots. agy fires many payloads per run — early ones
+/// (`authenticating`/`initializing`) and any teardown frame carry zeroed tokens — so we
+/// return the last cwd-matching payload that has non-zero tokens, falling back to the last
+/// match (for the `conversation_id`) when none carry usage yet.
 pub fn latest_payload_for_cwd(root: &Path, cwd: &Path) -> Option<Payload> {
     let text = std::fs::read_to_string(sink_path(root)).ok()?;
     let want = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    let mut latest = None;
+    let mut last_any = None;
+    let mut last_with_tokens = None;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -232,13 +331,21 @@ pub fn latest_payload_for_cwd(root: &Path, cwd: &Path) -> Option<Payload> {
         let matches = v
             .get("cwd")
             .and_then(|c| c.as_str())
-            .map(|c| Path::new(c) == want.as_path())
+            // Canonicalize the payload cwd too (symlinked worktree / trailing slash) so a
+            // non-canonical path from agy still matches the slot.
+            .map(|c| std::fs::canonicalize(c).unwrap_or_else(|_| PathBuf::from(c)) == want)
             .unwrap_or(false);
-        if matches {
-            latest = Some(parse_payload(&v));
+        if !matches {
+            continue;
+        }
+        let p = parse_payload(&v);
+        if p.input_tokens > 0 || p.output_tokens > 0 {
+            last_with_tokens = Some(p);
+        } else {
+            last_any = Some(p);
         }
     }
-    latest
+    last_with_tokens.or(last_any)
 }
 
 /// Tool/activity stats parsed from a conversation transcript.
@@ -324,7 +431,11 @@ pub fn collect(root: &Path, cwd: &Path) -> Option<AgyTelemetry> {
         input_tokens: payload.input_tokens,
         output_tokens: payload.output_tokens,
         cache_read_tokens: payload.cache_read_tokens,
-        context_tokens: payload.input_tokens.saturating_add(payload.output_tokens),
+        // Context footprint including cache-read, matching StreamStats::context_tokens.
+        context_tokens: payload
+            .input_tokens
+            .saturating_add(payload.output_tokens)
+            .saturating_add(payload.cache_read_tokens),
         last_activity: tstats.last_activity,
         quota_hint: payload.quota_hint,
         quota_reset_secs: payload.quota_reset_secs,
@@ -405,20 +516,25 @@ mod tests {
         let cwd = tmp.path().join("wt");
         std::fs::create_dir_all(&cwd).unwrap();
         let cwd_s = std::fs::canonicalize(&cwd).unwrap();
-        // two payloads for this cwd; the later one wins. Plus a decoy for another cwd.
+        // Init frame (zeroed) + two token-bearing frames + a decoy cwd + a final zeroed
+        // teardown frame. The last *token-bearing* frame must win, not the teardown.
         let sink = format!(
-            "{}\n{}\n{}\n",
+            "{}\n{}\n{}\n{}\n{}\n",
+            serde_json::json!({"cwd": cwd_s, "conversation_id": cid, "agent_state": "initializing",
+                "context_window": {"total_input_tokens": 0, "total_output_tokens": 0}}),
             serde_json::json!({"cwd": "/other", "conversation_id": "nope",
                 "context_window": {"total_input_tokens": 1, "total_output_tokens": 1}}),
             serde_json::json!({"cwd": cwd_s, "conversation_id": cid,
                 "context_window": {"total_input_tokens": 100, "total_output_tokens": 50,
-                    "current_usage": {"cache_read_input_tokens": 20}},
+                    "current_usage": {"input_tokens": 12000, "cache_read_input_tokens": 20}},
                 "quota": {"gemini-5h": {"remaining_fraction": 0.01, "reset_in_seconds": 3600},
                           "gemini-weekly": {"remaining_fraction": 0.9, "reset_in_seconds": 99999}}}),
             serde_json::json!({"cwd": cwd_s, "conversation_id": cid,
                 "context_window": {"total_input_tokens": 200, "total_output_tokens": 90,
-                    "current_usage": {"cache_read_input_tokens": 40}},
+                    "current_usage": {"input_tokens": 34743, "cache_read_input_tokens": 40}},
                 "quota": {"gemini-5h": {"remaining_fraction": 0.005, "reset_in_seconds": 1800}}}),
+            serde_json::json!({"cwd": cwd_s, "conversation_id": cid, "agent_state": "idle",
+                "context_window": {"total_input_tokens": 0, "total_output_tokens": 0}}),
         );
         write(&sink_path(root), &sink);
         write(
@@ -435,10 +551,14 @@ mod tests {
         let t = collect(root, &cwd).expect("telemetry");
         assert_eq!(t.tools, 2, "RUN_COMMAND + VIEW_FILE");
         assert_eq!(t.tool_errors, 1, "the ERROR VIEW_FILE");
-        assert_eq!(t.input_tokens, 200, "latest payload wins");
-        assert_eq!(t.output_tokens, 90);
+        // Last token-bearing frame wins (not the zeroed teardown); input from current_usage.
+        assert_eq!(
+            t.input_tokens, 34743,
+            "current_usage.input, not total_input (200)"
+        );
+        assert_eq!(t.output_tokens, 90, "cumulative total_output");
         assert_eq!(t.cache_read_tokens, 40);
-        assert_eq!(t.context_tokens, 290);
+        assert_eq!(t.context_tokens, 34743 + 90 + 40);
         assert_eq!(
             t.last_activity.unwrap().to_rfc3339(),
             "2026-07-21T12:03:00+00:00"
@@ -446,6 +566,38 @@ mod tests {
         // Binding gemini quota is the near-exhausted 5h bucket.
         assert_eq!(t.quota_reset_secs, Some(1800));
         assert!(t.quota_remaining_fraction.unwrap() < 0.01);
+    }
+
+    #[test]
+    fn malformed_settings_is_never_overwritten() {
+        // A syntax error in the user's global config must NOT cause us to reset it to {}
+        // and strip their keys. We leave it untouched and skip the settings edit.
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let raw = "{ \"model\": \"x\", }  // trailing comma + comment: invalid json";
+        write(&settings_path(root), raw);
+        ensure_statusline_hook(root).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(settings_path(root)).unwrap(),
+            raw,
+            "malformed settings must be left byte-for-byte intact"
+        );
+    }
+
+    #[test]
+    fn uninstall_restores_original() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            &settings_path(root),
+            r#"{"model":"x","statusLine":{"type":"command","command":"bash /orig.sh"}}"#,
+        );
+        ensure_statusline_hook(root).unwrap();
+        uninstall_statusline_hook(root).unwrap();
+        let settings: Value =
+            serde_json::from_str(&std::fs::read_to_string(settings_path(root)).unwrap()).unwrap();
+        assert_eq!(settings["statusLine"]["command"], "bash /orig.sh");
+        assert_eq!(settings["model"], "x");
     }
 
     #[test]

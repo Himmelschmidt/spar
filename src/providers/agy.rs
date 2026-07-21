@@ -56,12 +56,14 @@ impl ProviderAdapter for AgyAdapter {
         // is then a harmless trailing arg, not something that swallows `--print`.
         let mut cmd = Command::new(bin);
         // Print timeout = the resolved slot budget so agy runs the full wall clock the
-        // orchestrator granted it, not a fixed 30 min that silently kills long slots.
-        // Go durations require a unit ("1800" alone is rejected as `missing unit in
-        // duration`); fall back to 1800s only when no budget was supplied.
+        // orchestrator granted it, not a fixed 30 min that silently kills long slots. Shave
+        // a small margin so agy hits its own timeout and exits cleanly a beat before spar's
+        // process backstop (same budget) SIGKILLs it mid-write. Go durations require a unit
+        // ("1800" alone is rejected as `missing unit in duration`); fall back to 1800s when
+        // no budget was supplied.
         let print_timeout = opts
             .timeout_secs
-            .map(|s| format!("{s}s"))
+            .map(|s| format!("{}s", if s > 20 { s - 10 } else { s }))
             .unwrap_or_else(|| "1800s".into());
         cmd.arg("--print-timeout").arg(print_timeout);
         for a in self.permission_args(opts.trust) {
@@ -196,7 +198,8 @@ mod tests {
             .iter()
             .position(|a| a == "--print-timeout")
             .expect("--print-timeout");
-        assert_eq!(args.get(t + 1).map(String::as_str), Some("10800s"));
+        // Budget minus a small self-terminate margin (10s) under spar's backstop.
+        assert_eq!(args.get(t + 1).map(String::as_str), Some("10790s"));
     }
 
     #[test]

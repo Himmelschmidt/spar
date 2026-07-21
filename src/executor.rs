@@ -1636,6 +1636,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn provider_is_agy_recognizes_forms() {
+        // This gate decides whether telemetry recovery + statusline install run at all.
+        assert!(provider_is_agy("cli:agy"));
+        assert!(provider_is_agy("cli:agy@gemini-3.5-flash"));
+        assert!(provider_is_agy("agy"));
+        assert!(!provider_is_agy("cli:grok"));
+        assert!(!provider_is_agy("cli:claude"));
+        assert!(!provider_is_agy("api:google"));
+    }
+
+    #[test]
     fn tmux_done_requires_process_exit() {
         // marker done + pane dead => success
         assert_eq!(

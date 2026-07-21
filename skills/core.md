@@ -45,6 +45,7 @@ recovers its tools/tokens/quota from disk: tool counts + activity from agy's per
 transcript, and token/quota counts by teeing agy's statusline payload. To capture the latter,
 spar installs a wrapper into `~/.gemini/antigravity-cli/settings.json` that **chains to your
 existing statusline** (it wraps, never replaces it) and tees payloads to `~/.gemini/antigravity-cli/.spar/`.
+Run `spar provider agy-statusline-uninstall` to remove the wrapper and restore your original.
 agy's `--print-timeout` is also derived from `[timeouts] slot_secs`/`review_secs`, so a long
 agy slot runs its full budget instead of dying at agy's 30-minute default.
 
