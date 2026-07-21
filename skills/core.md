@@ -7,6 +7,7 @@
 ```bash
 spar skills list
 spar skills get core
+spar skills get fleet   # cheap OpenRouter coders + smart plan/review, assigned by [roles]
 spar doctor [--json]
 spar provider list [--json]
 spar model list|pick|refresh|cache [--json]

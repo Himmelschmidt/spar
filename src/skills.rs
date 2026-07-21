@@ -3,6 +3,7 @@ use anyhow::{bail, Result};
 use serde::Serialize;
 
 const CORE_SKILL: &str = include_str!("../skills/core.md");
+const FLEET_SKILL: &str = include_str!("../skills/fleet.md");
 
 #[derive(Debug, Serialize)]
 struct SkillMeta {
@@ -24,10 +25,16 @@ pub enum SkillsAction {
 }
 
 fn catalog() -> Vec<SkillMeta> {
-    vec![SkillMeta {
-        name: "core".into(),
-        description: "How outer agents drive spar via CLI, exit codes, and discovery".into(),
-    }]
+    vec![
+        SkillMeta {
+            name: "core".into(),
+            description: "How outer agents drive spar via CLI, exit codes, and discovery".into(),
+        },
+        SkillMeta {
+            name: "fleet".into(),
+            description: "Cheap OpenRouter coders + smart plan/review, assigned by [roles]".into(),
+        },
+    ]
 }
 
 fn list(json: bool) -> Result<ExitCode> {
@@ -51,6 +58,13 @@ fn get(name: &str) -> Result<ExitCode> {
             }
             Ok(ExitCode::Success)
         }
+        "fleet" => {
+            print!("{FLEET_SKILL}");
+            if !FLEET_SKILL.ends_with('\n') {
+                println!();
+            }
+            Ok(ExitCode::Success)
+        }
         other => bail!("unknown skill '{other}' (try: spar skills list)"),
     }
 }
@@ -68,5 +82,17 @@ mod tests {
     #[test]
     fn catalog_has_core() {
         assert!(catalog().iter().any(|s| s.name == "core"));
+    }
+
+    #[test]
+    fn fleet_skill_served_and_listed() {
+        assert!(catalog().iter().any(|s| s.name == "fleet"));
+        assert!(FLEET_SKILL.contains("[roles]"));
+        assert!(FLEET_SKILL.contains("cli:opencode"));
+        assert!(get("fleet").is_ok());
+        // Every listed skill must resolve in get(), or `skills list` lies.
+        for s in catalog() {
+            assert!(get(&s.name).is_ok(), "listed skill {} not served", s.name);
+        }
     }
 }
