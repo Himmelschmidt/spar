@@ -1553,6 +1553,8 @@ pub fn emit_run_json(state: &RunState) -> Result<()> {
         "gates": state.gates,
         "error": state.error,
         "project_root": state.project_root,
+        "base_ref": state.base_ref,
+        "base_commit": state.base_commit,
         "parent_run": state.parent_run,
         "child_run": state.child_run,
         "usage": state.usage,
@@ -1569,6 +1571,9 @@ pub fn emit_run_json(state: &RunState) -> Result<()> {
 pub fn print_run_human(state: &RunState) {
     println!("run_id:  {}", state.id);
     println!("phase:   {:?}", state.phase);
+    if let (Some(r), Some(c)) = (&state.base_ref, &state.base_commit) {
+        println!("base:    {r} ({})", c.chars().take(8).collect::<String>());
+    }
     println!("workflow:{:?}", state.workflow);
     if let Some(t) = &state.task {
         println!("task:    {t}");

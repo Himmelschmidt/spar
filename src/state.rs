@@ -28,6 +28,15 @@ pub struct RunState {
     pub error: Option<String>,
     #[serde(default)]
     pub project_root: PathBuf,
+    /// Ref every slot worktree is cut from, as the operator named it (branch, tag, sha).
+    /// Resolved once at run creation from `--base` or the invoking directory's HEAD —
+    /// never from `project_root`'s HEAD, which is a different branch whenever spar is
+    /// driven from a linked worktree. `None` on runs created before this existed.
+    #[serde(default)]
+    pub base_ref: Option<String>,
+    /// Commit `base_ref` resolved to. This is what worktrees actually branch from.
+    #[serde(default)]
+    pub base_commit: Option<String>,
     /// Spawn mode for native-cli: auto|headless|tmux
     #[serde(default)]
     pub backend: Backend,
@@ -320,6 +329,8 @@ impl RunState {
             slots: Vec::new(),
             error: None,
             project_root,
+            base_ref: None,
+            base_commit: None,
             backend: Backend::Auto,
             isolation: IsolationMode::Worktree,
             dry_run: false,

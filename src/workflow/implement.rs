@@ -97,6 +97,15 @@ fn run_from_approved(
     state.dry_run = opts.resolve_dry_run();
     state.autonomy = cfg.autonomy;
     state.message_budget = cfg.message_budget;
+    // A resumed run keeps the base its plan phase was cut from; `--base` re-points it,
+    // but worktrees that already exist stay where they were.
+    if opts.base.is_some() {
+        let previous = state.base_commit.clone();
+        worktree::apply_run_base(&mut state, opts.base.as_deref(), opts.json)?;
+        if !opts.json && !state.worktrees.is_empty() && previous != state.base_commit {
+            eprintln!("note: existing slot worktrees keep the run's earlier base");
+        }
+    }
     if state.dry_run {
         std::env::set_var("SPAR_DRY_RUN", "1");
     }
@@ -470,6 +479,7 @@ fn run_with_task(
     );
     state.task = Some(task.clone());
     state.backend = opts.backend;
+    worktree::apply_run_base(&mut state, opts.base.as_deref(), opts.json)?;
     state.isolation = cfg.isolation;
     state.dry_run = dry;
     state.autonomy = cfg.autonomy;

@@ -12,6 +12,7 @@ Also: `spar skills get core` (preferred; always current).
 4. Branch on exit codes, not only stderr text.
 5. Never merge to the default branch; shipping is gated.
 6. Use `--dry-run` (or `SPAR_DRY_RUN=1`) to exercise workflows without live provider CLIs.
+7. **Know what branch the slots are on.** Slot worktrees are cut from the run's *base*: `--base <ref>` if given, else the HEAD of the directory you invoked spar from. Assert `base_commit` from the launch JSON before you trust a review or a diff.
 
 ## Exit codes
 
@@ -26,6 +27,24 @@ Also: `spar skills get core` (preferred; always current).
 **`status` is observe-only:** process exit is always `0` when the run loads. Read `phase` / JSON `exit_code` for run state. Use `wait` when you want process exit coded by gate/stuck.
 
 **`--dry-run`:** no real git worktrees; only `.spar/` state + stubbed agents. Live runs provision sibling worktrees.
+
+## Base ref
+
+`plan` / `implement` / `run` accept **`--base <ref>`** (branch, tag, sha, `origin/main`). It
+fixes the commit every slot worktree in the run is cut from. Without it the base is the HEAD
+of the invoking directory — *not* `project_root`, which is always the repo's main checkout
+even when you drive spar from a linked worktree (that is where `.spar/` lives).
+
+The base is resolved once per run id and reported as `base_ref` / `base_commit` in every run
+JSON and in `status --json`. It is a commit, so uncommitted work in your tree is not in it.
+
+```bash
+BASE=$(spar run --workflow review -t "$TASK" --providers cli:grok,cli:claude --json | jq -r .base_commit)
+[ "$BASE" = "$(git rev-parse HEAD)" ] || echo "slots are not on my branch"
+```
+
+`spar ship` targets its draft PR at the run's base branch when that branch exists on `origin`,
+else the repo default; `spar ship <id> --base <branch>` forces the target.
 
 ## Path A (plan → approve → implement) — **one run id**
 

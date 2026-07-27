@@ -24,6 +24,7 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
     );
     state.task = Some(task.clone());
     state.backend = opts.backend;
+    worktree::apply_run_base(&mut state, opts.base.as_deref(), opts.json)?;
     state.isolation = cfg.isolation;
     state.dry_run = dry;
     state.autonomy = cfg.autonomy;

@@ -69,3 +69,7 @@ path = "tests/scenarios/runlock.rs"
 [[test]]
 name = "bus_deliver"
 path = "tests/scenarios/bus_deliver.rs"
+
+[[test]]
+name = "worktree_base"
+path = "tests/scenarios/worktree_base.rs"

@@ -24,7 +24,119 @@ pub fn branch_name(run_id: &str, slot_id: &str) -> String {
     format!("spar/{run_id}/{slot_safe}")
 }
 
-pub fn create_worktree(project_root: &Path, run_id: &str, slot_id: &str) -> Result<WorktreeRecord> {
+/// The commit every slot worktree in a run is cut from, plus the ref that named it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunBase {
+    pub reference: String,
+    pub commit: String,
+}
+
+/// Resolve a run's base.
+///
+/// `requested` (`--base`) wins and is resolved against `project_root`, so `origin/main`,
+/// a tag or a sha all work. Otherwise the base is `cwd`'s HEAD — *not* `project_root`'s.
+/// `project_root` is the repo's main checkout (a linked worktree resolves to it so
+/// `.spar/` stays one per repo), and taking HEAD from there hands every slot the main
+/// checkout's branch when spar is driven from a worktree.
+///
+/// `Ok(None)` when git can't answer (not a repo, no commits) — callers keep the old
+/// `HEAD`-of-project-root behaviour. An unresolvable `--base` is an error, never a
+/// silent fallback.
+pub fn resolve_base(
+    project_root: &Path,
+    cwd: &Path,
+    requested: Option<&str>,
+) -> Result<Option<RunBase>> {
+    if let Some(reference) = requested {
+        let commit = git_out(
+            project_root,
+            &["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
+        )
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "--base {reference} does not resolve to a commit in {}",
+                project_root.display()
+            )
+        })?;
+        return Ok(Some(RunBase {
+            reference: reference.to_string(),
+            commit,
+        }));
+    }
+    if !same_repo(project_root, cwd) {
+        return Ok(None);
+    }
+    let Some(commit) = git_out(cwd, &["rev-parse", "--verify", "HEAD"]) else {
+        return Ok(None);
+    };
+    let branch = git_out(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default();
+    let reference = if branch.is_empty() || branch == "HEAD" {
+        commit.clone() // detached
+    } else {
+        branch
+    };
+    Ok(Some(RunBase { reference, commit }))
+}
+
+/// Resolve the base and record it on the run. Prints it unless `json`, because a base
+/// silently taken from the wrong branch produces a healthy-looking run against the wrong
+/// code — the operator has to be able to see it at launch.
+pub fn apply_run_base(state: &mut RunState, requested: Option<&str>, json: bool) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let Some(base) = resolve_base(&state.project_root, &cwd, requested)? else {
+        return Ok(());
+    };
+    if !json {
+        let short: String = base.commit.chars().take(8).collect();
+        eprintln!("base: {} ({short})", base.reference);
+        if requested.is_none() && dirty(&cwd) {
+            eprintln!(
+                "note: uncommitted changes in {} are not in the base commit",
+                cwd.display()
+            );
+        }
+    }
+    state.base_ref = Some(base.reference);
+    state.base_commit = Some(base.commit);
+    Ok(())
+}
+
+fn same_repo(a: &Path, b: &Path) -> bool {
+    let common = |d: &Path| {
+        git_out(
+            d,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .map(|p| std::fs::canonicalize(&p).unwrap_or_else(|_| PathBuf::from(p)))
+    };
+    match (common(a), common(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn dirty(dir: &Path) -> bool {
+    git_out(dir, &["status", "--porcelain"]).is_some_and(|s| !s.is_empty())
+}
+
+fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+pub fn create_worktree(
+    project_root: &Path,
+    run_id: &str,
+    slot_id: &str,
+    base: Option<&str>,
+) -> Result<WorktreeRecord> {
     let path = worktree_path(project_root, run_id, slot_id)?;
     let branch = branch_name(run_id, slot_id);
 
@@ -32,15 +144,19 @@ pub fn create_worktree(project_root: &Path, run_id: &str, slot_id: &str) -> Resu
         bail!("worktree path already exists: {}", path.display());
     }
 
-    // Create branch from HEAD without checking it out in primary.
-    let _ = git_quiet(project_root, &["branch", &branch, "HEAD"])?;
+    // Branch from the run's base without checking it out in primary.
+    let base = base.unwrap_or("HEAD");
+    let _ = git_quiet(project_root, &["branch", &branch, base])?;
 
     let path_s = path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("worktree path is not valid UTF-8: {}", path.display()))?;
     let ok = git_quiet(project_root, &["worktree", "add", path_s, &branch])?;
     if !ok {
-        let _ = git_quiet(project_root, &["worktree", "add", "-b", &branch, path_s])?;
+        let _ = git_quiet(
+            project_root,
+            &["worktree", "add", "-b", &branch, path_s, base],
+        )?;
         if !path.is_dir() {
             bail!("git worktree add failed for {}", path.display());
         }
@@ -173,7 +289,12 @@ pub fn prepare_isolation(
                         branch: branch_name(&state.id, sid),
                     }
                 } else {
-                    create_worktree(&state.project_root, &state.id, sid)?
+                    create_worktree(
+                        &state.project_root,
+                        &state.id,
+                        sid,
+                        state.base_commit.as_deref(),
+                    )?
                 };
                 if matches!(
                     state.isolation,
@@ -539,9 +660,95 @@ mod tests {
             .current_dir(&root)
             .status();
 
-        let rec = create_worktree(&root, "runtest1", "slot-a").unwrap();
+        let rec = create_worktree(&root, "runtest1", "slot-a", None).unwrap();
         assert!(rec.path.is_dir());
         remove_worktree(&root, &rec).unwrap();
         assert!(!rec.path.exists());
+    }
+
+    /// Build `<tmp>/repo` on its default branch plus a linked worktree `<tmp>/wt` on
+    /// `feat` with an extra commit. Returns (main root, worktree, feat commit).
+    fn repo_with_linked_worktree(tmp: &Path) -> Option<(PathBuf, PathBuf, String)> {
+        let root = tmp.join("repo");
+        std::fs::create_dir_all(&root).ok()?;
+        let git = |dir: &Path, args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        };
+        git(&root, &["init", "-q"])?;
+        git(&root, &["config", "user.email", "t@t.com"])?;
+        git(&root, &["config", "user.name", "t"])?;
+        std::fs::write(root.join("README"), "x").ok()?;
+        git(&root, &["add", "."])?;
+        git(&root, &["commit", "-q", "-m", "init"])?;
+
+        let wt = tmp.join("wt");
+        git(
+            &root,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str()?],
+        )?;
+        std::fs::write(wt.join("feature.txt"), "work\n").ok()?;
+        git(&wt, &["add", "."])?;
+        git(&wt, &["commit", "-q", "-m", "feature work"])?;
+        let head = git(&wt, &["rev-parse", "HEAD"])?;
+        assert_ne!(head, git(&root, &["rev-parse", "HEAD"])?);
+        Some((root, wt, head))
+    }
+
+    #[test]
+    fn base_defaults_to_invoking_worktree_not_project_root() {
+        let tmp = tempdir().unwrap();
+        let Some((root, wt, feat_head)) = repo_with_linked_worktree(tmp.path()) else {
+            return;
+        };
+        let base = resolve_base(&root, &wt, None).unwrap().unwrap();
+        assert_eq!(base.reference, "feat");
+        assert_eq!(base.commit, feat_head);
+
+        // Same call from the main checkout still gets the main checkout's HEAD.
+        let from_root = resolve_base(&root, &root, None).unwrap().unwrap();
+        assert_ne!(from_root.commit, feat_head);
+    }
+
+    #[test]
+    fn explicit_base_wins_and_bad_base_errors() {
+        let tmp = tempdir().unwrap();
+        let Some((root, wt, feat_head)) = repo_with_linked_worktree(tmp.path()) else {
+            return;
+        };
+        let base = resolve_base(&root, &root, Some("feat")).unwrap().unwrap();
+        assert_eq!(base.reference, "feat");
+        assert_eq!(base.commit, feat_head);
+        assert!(resolve_base(&root, &wt, Some("no/such/ref")).is_err());
+    }
+
+    #[test]
+    fn base_is_none_outside_the_project_repo() {
+        let tmp = tempdir().unwrap();
+        let Some((root, _wt, _)) = repo_with_linked_worktree(tmp.path()) else {
+            return;
+        };
+        let other = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&other).unwrap();
+        assert_eq!(resolve_base(&root, &other, None).unwrap(), None);
+    }
+
+    #[test]
+    fn worktree_is_cut_from_the_base_commit() {
+        let tmp = tempdir().unwrap();
+        let Some((root, wt, feat_head)) = repo_with_linked_worktree(tmp.path()) else {
+            return;
+        };
+        let base = resolve_base(&root, &wt, None).unwrap().unwrap();
+        let rec = create_worktree(&root, "runbase1", "slot-a", Some(&base.commit)).unwrap();
+        let head = git_out(&rec.path, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(head, feat_head, "slot must branch from the invoking HEAD");
+        assert!(rec.path.join("feature.txt").is_file());
+        remove_worktree(&root, &rec).unwrap();
     }
 }

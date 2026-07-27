@@ -22,6 +22,8 @@ pub struct CommonOpts {
     /// vals-backed profile list (`value` / `best` / `fast` / `auto` / multi).
     pub select: Vec<String>,
     pub urgency: String,
+    /// `--base`: ref every slot worktree is cut from. `None` = the invoking directory's HEAD.
+    pub base: Option<String>,
     pub detach: bool,
     pub json: bool,
     pub backend: Backend,
@@ -36,6 +38,7 @@ impl Default for CommonOpts {
             providers: Vec::new(),
             select: Vec::new(),
             urgency: "normal".into(),
+            base: None,
             detach: false,
             json: false,
             backend: Backend::Auto,

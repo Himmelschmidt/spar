@@ -34,7 +34,45 @@ pub fn confirm_ship(paths: &SparPaths, run_id: &str, json: bool) -> Result<ExitC
     Ok(ExitCode::Success)
 }
 
-pub fn ship(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> Result<ExitCode> {
+/// PR target branch: `--base` wins outright (the operator's call, passed through even if
+/// `gh` will reject it). Otherwise the run's own base, but only when it looks like a
+/// branch that exists on the remote — a sha, a detached HEAD, or a local-only branch is
+/// not a PR target, and falling through to `gh`'s default is better than a failed ship.
+fn pr_base(state: &RunState, cwd: &std::path::Path, override_base: Option<&str>) -> Option<String> {
+    if let Some(b) = override_base {
+        return Some(b.to_string());
+    }
+    let reference = state.base_ref.as_deref()?;
+    let branch = reference.strip_prefix("origin/").unwrap_or(reference);
+    if branch == "HEAD" || Some(branch) == state.base_commit.as_deref() {
+        return None;
+    }
+    remote_has_branch(cwd, branch).then(|| branch.to_string())
+}
+
+fn remote_has_branch(cwd: &std::path::Path, branch: &str) -> bool {
+    Command::new("git")
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/remotes/origin/{branch}"),
+        ])
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+pub fn ship(
+    paths: &SparPaths,
+    cfg: &Config,
+    run_id: &str,
+    json: bool,
+    base: Option<&str>,
+) -> Result<ExitCode> {
     let mut state = RunState::load(paths, run_id)?;
     if !matches!(
         state.phase,
@@ -67,13 +105,18 @@ pub fn ship(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> Result
 
     // Determine branch/worktree to push
     let (branch, cwd) = select_branch_cwd(&state)?;
+    let pr_base = pr_base(&state, &cwd, base);
+    let base_arg = match &pr_base {
+        Some(b) => format!(" --base {b}"),
+        None => String::new(),
+    };
     if state.dry_run {
         let push_cmd = format!(
             "git -C {} push --force-with-lease -u origin {branch}",
             cwd.display()
         );
         let pr_cmd = format!(
-            "cd {} && gh pr create --head {branch} --title dry-run --body dry-run",
+            "cd {} && gh pr create --head {branch}{base_arg} --title dry-run --body dry-run",
             cwd.display()
         );
         let commands = vec![push_cmd, pr_cmd];
@@ -108,7 +151,7 @@ pub fn ship(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> Result
         cwd.display()
     );
     let pr_cmd = format!(
-        "cd {} && gh pr create --head {branch} --title {} --body {}",
+        "cd {} && gh pr create --head {branch}{base_arg} --title {} --body {}",
         cwd.display(),
         shell_single_quote(&title),
         shell_single_quote(&format!("spar run `{}`", state.id))
@@ -141,19 +184,21 @@ pub fn ship(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> Result
     }
 
     if !failed {
-        let pr = Command::new("gh")
-            .args([
-                "pr",
-                "create",
-                "--head",
-                &branch,
-                "--title",
-                &title,
-                "--body",
-                &format!("Shipped by spar run {}", state.id),
-            ])
-            .current_dir(&cwd)
-            .output();
+        let mut args: Vec<String> = vec![
+            "pr".into(),
+            "create".into(),
+            "--head".into(),
+            branch.clone(),
+            "--title".into(),
+            title.clone(),
+            "--body".into(),
+            format!("Shipped by spar run {}", state.id),
+        ];
+        if let Some(b) = &pr_base {
+            args.push("--base".into());
+            args.push(b.clone());
+        }
+        let pr = Command::new("gh").args(&args).current_dir(&cwd).output();
         match pr {
             Ok(o) if o.status.success() => {
                 executed.push(String::from_utf8_lossy(&o.stdout).trim().to_string());
@@ -174,7 +219,8 @@ pub fn ship(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> Result
     std::fs::write(
         paths.artifact(run_id, "ship.md"),
         format!(
-            "# Ship\n\nBranch: `{branch}`\nCwd: `{}`\n\n## Commands\n```\n{}\n```\n\n## Result\n{}\n",
+            "# Ship\n\nBranch: `{branch}`\nPR base: `{}`\nCwd: `{}`\n\n## Commands\n```\n{}\n```\n\n## Result\n{}\n",
+            pr_base.as_deref().unwrap_or("(repo default)"),
             cwd.display(),
             commands.join("\n"),
             executed.join("\n")
@@ -246,4 +292,80 @@ fn select_branch_cwd(state: &RunState) -> Result<(String, std::path::PathBuf)> {
 
 fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::WorkflowKind;
+    use std::path::{Path, PathBuf};
+    use tempfile::tempdir;
+
+    /// Repo with one commit and a fake `origin/feat` remote-tracking ref (no network).
+    fn repo_with_origin_feat(dir: &Path) -> Option<String> {
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        };
+        git(&["init", "-q"])?;
+        git(&["config", "user.email", "t@t.com"])?;
+        git(&["config", "user.name", "t"])?;
+        std::fs::write(dir.join("README"), "x").ok()?;
+        git(&["add", "."])?;
+        git(&["commit", "-q", "-m", "init"])?;
+        let head = git(&["rev-parse", "HEAD"])?;
+        git(&["update-ref", "refs/remotes/origin/feat", &head])?;
+        Some(head)
+    }
+
+    fn state_with_base(reference: &str, commit: &str) -> RunState {
+        let mut s = RunState::new("r1", WorkflowKind::Loop, PathBuf::from("/x"));
+        s.base_ref = Some(reference.into());
+        s.base_commit = Some(commit.into());
+        s
+    }
+
+    #[test]
+    fn pr_base_prefers_override_then_remote_branch() {
+        let tmp = tempdir().unwrap();
+        let Some(head) = repo_with_origin_feat(tmp.path()) else {
+            return;
+        };
+
+        let state = state_with_base("feat", &head);
+        assert_eq!(
+            pr_base(&state, tmp.path(), Some("release/1")),
+            Some("release/1".into()),
+            "explicit --base is passed through untouched"
+        );
+        assert_eq!(pr_base(&state, tmp.path(), None), Some("feat".into()));
+
+        let remote_form = state_with_base("origin/feat", &head);
+        assert_eq!(pr_base(&remote_form, tmp.path(), None), Some("feat".into()));
+    }
+
+    #[test]
+    fn pr_base_none_for_sha_or_local_only_branch() {
+        let tmp = tempdir().unwrap();
+        let Some(head) = repo_with_origin_feat(tmp.path()) else {
+            return;
+        };
+        assert_eq!(
+            pr_base(&state_with_base(&head, &head), tmp.path(), None),
+            None,
+            "a detached base is not a PR target"
+        );
+        assert_eq!(
+            pr_base(&state_with_base("local-only", &head), tmp.path(), None),
+            None,
+            "unpushed base falls through to the repo default"
+        );
+        let no_base = RunState::new("r1", WorkflowKind::Loop, PathBuf::from("/x"));
+        assert_eq!(pr_base(&no_base, tmp.path(), None), None);
+    }
 }

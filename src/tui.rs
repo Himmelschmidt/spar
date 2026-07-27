@@ -4226,9 +4226,13 @@ fn spawn_agent_command(
     // Give the agent its own worktree (never the primary checkout) so presence hooks
     // install and it can run FullAuto safely. Done on this thread so a git failure
     // surfaces synchronously as a composer error rather than a silent background drop.
-    let record = crate::worktree::create_worktree(&project_root, &run.id, &agent_id)?;
-
     let paths = SparPaths::new(&project_root);
+    let base = state::RunState::load(&paths, &run.id)
+        .ok()
+        .and_then(|s| s.base_commit);
+    let record =
+        crate::worktree::create_worktree(&project_root, &run.id, &agent_id, base.as_deref())?;
+
     let run_id = run.id.clone();
     let provider_s = provider.to_string();
     let prompt_s = prompt.to_string();
