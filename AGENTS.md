@@ -70,6 +70,12 @@ either way.
 
 - **One run id** threads plan → implement → ship.
 - **Coding slots always get a worktree.** No exceptions.
+- **Worktrees are cut from `state.base_commit` whenever it is recorded**, never from
+  `project_root`'s HEAD. `project_root` is the repo's *main checkout* even when spar is
+  driven from a linked worktree, so HEAD there is somebody else's branch. The base comes
+  from `--base` or the invoking cwd, is resolved once per run, and is reported in
+  `status --json`. It is `None` only for pre-O26 runs or when git can't answer, and that
+  fallback says so on stderr (O26).
 - **`ship` opens a draft PR and never merges.** Force-push only ever to swarm branches.
 - **`--providers` or `--select` is required** on `plan` / `implement` / `run`.
 - **Exit codes are a public contract** for outer agents — `0` ok, `1` fail, `2` human

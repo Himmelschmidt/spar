@@ -148,9 +148,13 @@ spar run --workflow arena -t "..." --select best --urgency normal --dry-run
 # Independent concurrent multi-provider review (not split-stack peer):
 spar run --workflow review -t "Review PR #12 for auth bugs" --providers cli:claude,cli:grok
 
+# Cut the run from a specific branch/tag/sha instead of the invoking branch
+spar plan -t "..." --providers cli:claude --base origin/main
+spar run --workflow review -t "..." --providers cli:grok,cli:claude --base feat/checkout
+
 spar confirm <run_id> [--winner <slot>]   # arena winner
 spar reconcile <run_id>                  # arena merge-good-parts + review
-spar ship <run_id> --confirm             # draft PR (never merges)
+spar ship <run_id> --confirm [--base <branch>]   # draft PR (never merges)
 spar stop <run_id> [--json]              # halt dispatch, KEEP branch+worktree (resumable)
 spar cleanup <run_id> [--purge]          # remove worktrees (and --purge run data)
 ```
@@ -165,6 +169,52 @@ resume resets the failed slots to pending and re-dispatches, so `status` reflect
 new attempt rather than the dead one's `failed` verdict.
 Use `stop` (not killing pids directly) so the orchestrator can't re-dispatch a slot
 you just killed.
+
+## Base ref — what the slots actually see
+
+Every coding slot gets a fresh worktree cut from **one commit**, the run's *base*. It is
+resolved once, when the run is created, and reused for every later phase of that run id:
+
+1. `--base <ref>` if you pass it (branch, tag, sha, `origin/main`, `HEAD~2` — anything git
+   resolves). It is evaluated **in your current directory** when that directory belongs to
+   the project's repo (so `HEAD`-relative refs mean the worktree you are standing in), and
+   against the main checkout otherwise. An unresolvable ref is a hard error, never a silent
+   fallback.
+2. Otherwise **the HEAD of the directory you invoked spar from**.
+
+That second rule matters because `project_root` (what `status` prints, where `.spar/` lives)
+is always the repo's **main checkout** — a linked worktree deliberately resolves to it so one
+repo has one bus and one run store. Driving spar from a linked worktree therefore does **not**
+mean the slots see that branch by accident; the base is what puts them there.
+
+The base is a **commit**: uncommitted changes in your working tree are not in it (spar's own
+`.spar/` doesn't count). spar warns on **stderr** when the invoking tree is dirty (and when it could not resolve a base at all and
+is falling back to `project_root`'s HEAD) — those warnings are stderr-only, `--json` included,
+so a headless driver has to read stderr to see them. Commit first if the slots need the work.
+
+Assert it before you trust a run — every run reports it:
+
+```bash
+spar run --workflow review -t "..." --providers cli:grok,cli:claude --json | jq -r .base_commit
+spar status <run_id> --json | jq -r '.base_ref, .base_commit'
+```
+
+`base_ref` / `base_commit` are `null` for runs created before spar recorded them and whenever
+git could not answer — no commits yet, or a cwd that belongs to a different repo than
+`project_root` (e.g. a stale `SPAR_PROJECT_ROOT`). That case is announced on stderr and the
+run falls back to `project_root`'s HEAD.
+
+`spar implement --run <id>` inherits the run's base and **cannot be re-based**: a run's base
+is fixed when the run is created. Passing `--base` there with a different commit exits `1`
+(re-basing mid-flight would drop the plan phase's frozen tests, which are overlaid wholesale
+into the implementer, onto a different base). Plan a new run to change the base.
+
+`spar ship` targets its draft PR at the run's base branch when a local remote-tracking ref
+(`refs/remotes/origin/<branch>`) exists for it — ship never touches the network to decide
+this, so run `git fetch --prune` if your mirror is stale. A tag, a sha, a detached base or an
+unpushed branch falls through to the repo default, with a note on stderr. `spar ship <id>
+--base <branch>` forces a target. The chosen target is recorded in `artifacts/ship.md`
+(`PR base:`), on the dry-run path too.
 
 **`spar cleanup`** reaps before it removes: for each of the run's own worktrees it kills
 every process whose **cwd is inside that worktree** (SIGTERM → grace → SIGKILL — this is
@@ -255,6 +305,8 @@ A **rail** + **one main area**. Main always shows the rail's selection.
 - Width bands: `<80` cols Main only (rail folds away, tappable tab strip — phone/SSH);
   `80–119` rail + Main; `>=120` the extra width goes to Main.
 
+- `status --json` and every run JSON carry **`base_ref` / `base_commit`** — the ref and commit
+  all of the run's slot worktrees were cut from (see **Base ref** above).
 - Run state: `.spar/runs/<id>/state.json`
 - Events (orchestrator): `.spar/runs/<id>/events.jsonl`
 - Logs: `.spar/runs/<id>/logs/<slot>.log`

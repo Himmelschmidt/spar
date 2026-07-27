@@ -97,6 +97,22 @@ fn run_from_approved(
     state.dry_run = opts.resolve_dry_run();
     state.autonomy = cfg.autonomy;
     state.message_budget = cfg.message_budget;
+    // A resumed run keeps the base its plan phase was cut from. `--base` may only
+    // re-point a run with no worktrees yet: the plan phase's test-author worktree is
+    // reused as-is and its whole tree is overlaid onto the implementer, so a run
+    // straddling two bases produces a branch parented on the new base carrying the old
+    // base's file contents — a diff that reads as reverting the difference.
+    if opts.base.is_some() {
+        let previous = state.base_commit.clone();
+        worktree::apply_run_base(&mut state, opts.base.as_deref(), opts.json)?;
+        if !state.worktrees.is_empty() && previous != state.base_commit {
+            bail!(
+                "run {run_id} is already based on {}; a run's base is fixed when it is \
+                 created — plan a new run with `--base` instead",
+                previous.as_deref().unwrap_or("an unrecorded base")
+            );
+        }
+    }
     if state.dry_run {
         std::env::set_var("SPAR_DRY_RUN", "1");
     }
@@ -470,6 +486,7 @@ fn run_with_task(
     );
     state.task = Some(task.clone());
     state.backend = opts.backend;
+    worktree::apply_run_base(&mut state, opts.base.as_deref(), opts.json)?;
     state.isolation = cfg.isolation;
     state.dry_run = dry;
     state.autonomy = cfg.autonomy;

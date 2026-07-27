@@ -50,6 +50,10 @@ pub enum Command {
         /// Urgency for `--select`: low | normal | high | critical
         #[arg(long, default_value = "normal")]
         urgency: String,
+        /// Ref to cut every slot worktree from (branch, tag or sha).
+        /// Default: the HEAD of the directory spar was invoked from.
+        #[arg(long)]
+        base: Option<String>,
         #[arg(long)]
         detach: bool,
         #[arg(long)]
@@ -88,6 +92,11 @@ pub enum Command {
         plan: Option<std::path::PathBuf>,
         #[arg(long, short = 't')]
         task: Option<String>,
+        /// Ref to cut every slot worktree from (branch, tag or sha), for a NEW run.
+        /// Default: the HEAD of the directory spar was invoked from. A run's base is
+        /// fixed at creation, so `--run <id>` only accepts a base it already has.
+        #[arg(long)]
+        base: Option<String>,
         #[arg(long)]
         detach: bool,
         #[arg(long)]
@@ -115,6 +124,10 @@ pub enum Command {
         workflow: WorkflowKind,
         #[arg(long, short = 't')]
         task: Option<String>,
+        /// Ref to cut every slot worktree from (branch, tag or sha).
+        /// Default: the HEAD of the directory spar was invoked from.
+        #[arg(long)]
+        base: Option<String>,
         #[arg(long)]
         detach: bool,
         #[arg(long)]
@@ -190,6 +203,10 @@ pub enum Command {
         run_id: String,
         #[arg(long)]
         json: bool,
+        /// Branch the draft PR targets. Default: the run's base branch when it exists
+        /// on origin, else the repo default.
+        #[arg(long)]
+        base: Option<String>,
         /// Record ship confirmation (and optionally execute)
         #[arg(long)]
         confirm: bool,

@@ -1723,13 +1723,26 @@ fn run_palette(
             if st.providers.is_empty() {
                 anyhow::bail!("selected run has no providers — use the CLI");
             }
-            let args = [
+            let mut args = vec![
                 "plan".to_string(),
                 "-t".to_string(),
                 arg.to_string(),
                 "--providers".to_string(),
                 st.providers.join(","),
             ];
+            // The child runs in the project root (the TUI can act on another project's
+            // run), so the branch the operator actually started spar in has to be
+            // handed over explicitly or the plan is cut from the main checkout.
+            if let Ok(cwd) = std::env::current_dir() {
+                if let Ok(Some(base)) =
+                    crate::worktree::resolve_base(&swarm.project_root, &cwd, None)
+                {
+                    // The ref, not the sha: a run whose base_ref is its own commit reads
+                    // as detached, and `ship` then declines to target the branch.
+                    args.push("--base".to_string());
+                    args.push(base.reference);
+                }
+            }
             spawn_detached_workflow(swarm, &args, "Plan started")
         }
         "spawn" => {
@@ -4226,9 +4239,13 @@ fn spawn_agent_command(
     // Give the agent its own worktree (never the primary checkout) so presence hooks
     // install and it can run FullAuto safely. Done on this thread so a git failure
     // surfaces synchronously as a composer error rather than a silent background drop.
-    let record = crate::worktree::create_worktree(&project_root, &run.id, &agent_id)?;
-
     let paths = SparPaths::new(&project_root);
+    let base = state::RunState::load(&paths, &run.id)
+        .ok()
+        .and_then(|s| s.base_commit);
+    let record =
+        crate::worktree::create_worktree(&project_root, &run.id, &agent_id, base.as_deref())?;
+
     let run_id = run.id.clone();
     let provider_s = provider.to_string();
     let prompt_s = prompt.to_string();
@@ -5187,6 +5204,8 @@ mod labels {
             task: task.map(str::to_string),
             dry_run: false,
             abandoned: false,
+            base_ref: None,
+            base_commit: None,
             project_root: None,
             project_name: None,
         }

@@ -76,6 +76,7 @@ fn run() -> Result<ExitCode> {
             providers,
             select,
             urgency,
+            base,
             detach,
             json,
             backend,
@@ -88,6 +89,7 @@ fn run() -> Result<ExitCode> {
                 providers,
                 select,
                 urgency,
+                base,
                 detach,
                 json,
                 backend,
@@ -112,6 +114,7 @@ fn run() -> Result<ExitCode> {
             run_id,
             plan,
             task,
+            base,
             detach,
             json,
             backend,
@@ -127,6 +130,7 @@ fn run() -> Result<ExitCode> {
                 providers,
                 select,
                 urgency,
+                base,
                 detach,
                 json,
                 backend,
@@ -138,6 +142,7 @@ fn run() -> Result<ExitCode> {
         Command::Run {
             workflow,
             task,
+            base,
             detach,
             json,
             backend,
@@ -153,6 +158,7 @@ fn run() -> Result<ExitCode> {
                 providers,
                 select,
                 urgency,
+                base,
                 detach,
                 json,
                 backend,
@@ -194,6 +200,7 @@ fn run() -> Result<ExitCode> {
         Command::Ship {
             run_id,
             json,
+            base,
             confirm,
             confirm_only,
         } => {
@@ -204,7 +211,7 @@ fn run() -> Result<ExitCode> {
                     return Ok(ExitCode::Success);
                 }
             }
-            ship::ship(&paths, &cfg, &run_id, json)
+            ship::ship(&paths, &cfg, &run_id, json, base.as_deref())
         }
         Command::Confirm {
             run_id,
@@ -424,6 +431,9 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool) -> Result<ExitCode>
         } else {
             println!("run: {}", state.id);
             println!("project: {}", swarm.project_root.display());
+            if let (Some(r), Some(c)) = (&state.base_ref, &state.base_commit) {
+                println!("base: {r} ({})", c.chars().take(8).collect::<String>());
+            }
             println!("phase: {:?}", state.phase);
             println!("workflow: {:?}", state.workflow);
             if let Some(task) = &state.task {

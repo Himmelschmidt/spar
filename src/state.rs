@@ -28,6 +28,15 @@ pub struct RunState {
     pub error: Option<String>,
     #[serde(default)]
     pub project_root: PathBuf,
+    /// Ref every slot worktree is cut from, as the operator named it (branch, tag, sha).
+    /// Resolved once at run creation from `--base` or the invoking directory's HEAD —
+    /// never from `project_root`'s HEAD, which is a different branch whenever spar is
+    /// driven from a linked worktree. `None` on runs created before this existed.
+    #[serde(default)]
+    pub base_ref: Option<String>,
+    /// Commit `base_ref` resolved to. This is what worktrees actually branch from.
+    #[serde(default)]
+    pub base_commit: Option<String>,
     /// Spawn mode for native-cli: auto|headless|tmux
     #[serde(default)]
     pub backend: Backend,
@@ -299,6 +308,11 @@ pub struct RunSummary {
     /// In flight, but no live orchestrator owns it — computed at read time.
     #[serde(default)]
     pub abandoned: bool,
+    /// Ref/commit the run's slot worktrees were cut from (see `RunState::base_ref`).
+    #[serde(default)]
+    pub base_ref: Option<String>,
+    #[serde(default)]
+    pub base_commit: Option<String>,
     /// Filled when listing across projects (global home).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_root: Option<PathBuf>,
@@ -320,6 +334,8 @@ impl RunState {
             slots: Vec::new(),
             error: None,
             project_root,
+            base_ref: None,
+            base_commit: None,
             backend: Backend::Auto,
             isolation: IsolationMode::Worktree,
             dry_run: false,
@@ -503,6 +519,8 @@ pub fn list_runs(paths: &SparPaths) -> Result<Vec<RunSummary>> {
                 updated_at: state.updated_at,
                 task: state.task,
                 dry_run: state.dry_run,
+                base_ref: state.base_ref,
+                base_commit: state.base_commit,
                 project_root: None,
                 project_name: None,
             }),
