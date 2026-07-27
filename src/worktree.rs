@@ -47,15 +47,20 @@ pub fn resolve_base(
     cwd: &Path,
     requested: Option<&str>,
 ) -> Result<Option<RunBase>> {
+    let in_repo = same_repo(project_root, cwd);
     if let Some(reference) = requested {
+        // Resolve where the operator is standing: named refs are shared repo-wide, but
+        // `HEAD` (and anything relative to it) is per-worktree, so `--base HEAD` from a
+        // linked worktree must mean *that* worktree's HEAD.
+        let from = if in_repo { cwd } else { project_root };
         let commit = git_out(
-            project_root,
+            from,
             &["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
         )
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "--base {reference} does not resolve to a commit in {}",
-                project_root.display()
+                from.display()
             )
         })?;
         return Ok(Some(RunBase {
@@ -63,7 +68,7 @@ pub fn resolve_base(
             commit,
         }));
     }
-    if !same_repo(project_root, cwd) {
+    if !in_repo {
         return Ok(None);
     }
     let Some(commit) = git_out(cwd, &["rev-parse", "--verify", "HEAD"]) else {
@@ -84,17 +89,26 @@ pub fn resolve_base(
 pub fn apply_run_base(state: &mut RunState, requested: Option<&str>, json: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let Some(base) = resolve_base(&state.project_root, &cwd, requested)? else {
+        // Falling back to project_root's HEAD is the old behaviour and may well be the
+        // wrong branch, so it is never silent.
+        eprintln!(
+            "note: could not resolve a base from {} — worktrees will be cut from HEAD of {}",
+            cwd.display(),
+            state.project_root.display()
+        );
         return Ok(());
     };
     if !json {
         let short: String = base.commit.chars().take(8).collect();
         eprintln!("base: {} ({short})", base.reference);
-        if requested.is_none() && dirty(&cwd) {
-            eprintln!(
-                "note: uncommitted changes in {} are not in the base commit",
-                cwd.display()
-            );
-        }
+    }
+    // Always warned, `--json` included: the base is a commit, and a driver that never
+    // sees this has no other signal that the work in its tree isn't in the run.
+    if requested.is_none() && dirty(&cwd) {
+        eprintln!(
+            "note: uncommitted changes in {} are not in the base commit",
+            cwd.display()
+        );
     }
     state.base_ref = Some(base.reference);
     state.base_commit = Some(base.commit);
@@ -102,12 +116,13 @@ pub fn apply_run_base(state: &mut RunState, requested: Option<&str>, json: bool)
 }
 
 fn same_repo(a: &Path, b: &Path) -> bool {
+    // `--git-common-dir` may come back relative to the queried dir (and `--path-format`
+    // only exists in git >= 2.31), so resolve it against that dir before comparing.
     let common = |d: &Path| {
-        git_out(
-            d,
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        )
-        .map(|p| std::fs::canonicalize(&p).unwrap_or_else(|_| PathBuf::from(p)))
+        git_out(d, &["rev-parse", "--git-common-dir"]).map(|p| {
+            let p = d.join(p);
+            std::fs::canonicalize(&p).unwrap_or(p)
+        })
     };
     match (common(a), common(b)) {
         (Some(x), Some(y)) => x == y,
@@ -668,44 +683,54 @@ mod tests {
 
     /// Build `<tmp>/repo` on its default branch plus a linked worktree `<tmp>/wt` on
     /// `feat` with an extra commit. Returns (main root, worktree, feat commit).
-    fn repo_with_linked_worktree(tmp: &Path) -> Option<(PathBuf, PathBuf, String)> {
+    ///
+    /// Loud on purpose: a helper that swallowed git failures would leave every test in
+    /// this module passing while asserting nothing.
+    fn repo_with_linked_worktree(tmp: &Path) -> (PathBuf, PathBuf, String) {
         let root = tmp.join("repo");
-        std::fs::create_dir_all(&root).ok()?;
+        std::fs::create_dir_all(&root).unwrap();
         let git = |dir: &Path, args: &[&str]| {
-            Command::new("git")
+            let out = Command::new("git")
                 .args(args)
                 .current_dir(dir)
+                // Never let the developer's global config (gpg signing, hooks, commit
+                // templates) reach into the fixture and fail a commit.
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
                 .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_else(|e| panic!("spawn git {args:?}: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} in {}: {}",
+                dir.display(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
-        git(&root, &["init", "-q"])?;
-        git(&root, &["config", "user.email", "t@t.com"])?;
-        git(&root, &["config", "user.name", "t"])?;
-        std::fs::write(root.join("README"), "x").ok()?;
-        git(&root, &["add", "."])?;
-        git(&root, &["commit", "-q", "-m", "init"])?;
+        git(&root, &["init", "-q"]);
+        git(&root, &["config", "user.email", "t@t.com"]);
+        git(&root, &["config", "user.name", "t"]);
+        std::fs::write(root.join("README"), "x").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-q", "-m", "init"]);
 
         let wt = tmp.join("wt");
         git(
             &root,
-            &["worktree", "add", "-q", "-b", "feat", wt.to_str()?],
-        )?;
-        std::fs::write(wt.join("feature.txt"), "work\n").ok()?;
-        git(&wt, &["add", "."])?;
-        git(&wt, &["commit", "-q", "-m", "feature work"])?;
-        let head = git(&wt, &["rev-parse", "HEAD"])?;
-        assert_ne!(head, git(&root, &["rev-parse", "HEAD"])?);
-        Some((root, wt, head))
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+        std::fs::write(wt.join("feature.txt"), "work\n").unwrap();
+        git(&wt, &["add", "."]);
+        git(&wt, &["commit", "-q", "-m", "feature work"]);
+        let head = git(&wt, &["rev-parse", "HEAD"]);
+        assert_ne!(head, git(&root, &["rev-parse", "HEAD"]));
+        (root, wt, head)
     }
 
     #[test]
     fn base_defaults_to_invoking_worktree_not_project_root() {
         let tmp = tempdir().unwrap();
-        let Some((root, wt, feat_head)) = repo_with_linked_worktree(tmp.path()) else {
-            return;
-        };
+        let (root, wt, feat_head) = repo_with_linked_worktree(tmp.path());
         let base = resolve_base(&root, &wt, None).unwrap().unwrap();
         assert_eq!(base.reference, "feat");
         assert_eq!(base.commit, feat_head);
@@ -718,9 +743,7 @@ mod tests {
     #[test]
     fn explicit_base_wins_and_bad_base_errors() {
         let tmp = tempdir().unwrap();
-        let Some((root, wt, feat_head)) = repo_with_linked_worktree(tmp.path()) else {
-            return;
-        };
+        let (root, wt, feat_head) = repo_with_linked_worktree(tmp.path());
         let base = resolve_base(&root, &root, Some("feat")).unwrap().unwrap();
         assert_eq!(base.reference, "feat");
         assert_eq!(base.commit, feat_head);
@@ -730,20 +753,46 @@ mod tests {
     #[test]
     fn base_is_none_outside_the_project_repo() {
         let tmp = tempdir().unwrap();
-        let Some((root, _wt, _)) = repo_with_linked_worktree(tmp.path()) else {
-            return;
-        };
+        let (root, _wt, _) = repo_with_linked_worktree(tmp.path());
         let other = tmp.path().join("elsewhere");
         std::fs::create_dir_all(&other).unwrap();
         assert_eq!(resolve_base(&root, &other, None).unwrap(), None);
     }
 
+    /// The whole fix in its production shape: a live run whose recorded base is the
+    /// invoking worktree's HEAD must hand that commit to every slot. Guards the one
+    /// line (`prepare_isolation` → `create_worktree`) that no scenario test can reach,
+    /// because every scenario runs `--dry-run` and dry-run never touches git.
+    #[test]
+    fn prepare_isolation_cuts_live_slots_from_the_recorded_base() {
+        let tmp = tempdir().unwrap();
+        let (root, wt, feat_head) = repo_with_linked_worktree(tmp.path());
+
+        let mut state = RunState::new("runlive1", crate::cli::WorkflowKind::Loop, root.clone());
+        state.isolation = IsolationMode::Worktree;
+        state.dry_run = false;
+        let base = resolve_base(&root, &wt, None).unwrap().unwrap();
+        state.base_ref = Some(base.reference);
+        state.base_commit = Some(base.commit);
+
+        let paths = SparPaths::new(&root);
+        paths.ensure_run_dirs(&state.id).unwrap();
+        prepare_isolation(&mut state, &paths, &["impl-a".to_string()]).unwrap();
+
+        let rec = state.worktrees.first().expect("slot worktree recorded");
+        assert_eq!(
+            git_out(&rec.path, &["rev-parse", "HEAD"]).unwrap(),
+            feat_head,
+            "live slot must be cut from the run's base, not the main checkout"
+        );
+        assert!(rec.path.join("feature.txt").is_file());
+        cleanup_run(&state).unwrap();
+    }
+
     #[test]
     fn worktree_is_cut_from_the_base_commit() {
         let tmp = tempdir().unwrap();
-        let Some((root, wt, feat_head)) = repo_with_linked_worktree(tmp.path()) else {
-            return;
-        };
+        let (root, wt, feat_head) = repo_with_linked_worktree(tmp.path());
         let base = resolve_base(&root, &wt, None).unwrap().unwrap();
         let rec = create_worktree(&root, "runbase1", "slot-a", Some(&base.commit)).unwrap();
         let head = git_out(&rec.path, &["rev-parse", "HEAD"]).unwrap();

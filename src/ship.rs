@@ -35,9 +35,9 @@ pub fn confirm_ship(paths: &SparPaths, run_id: &str, json: bool) -> Result<ExitC
 }
 
 /// PR target branch: `--base` wins outright (the operator's call, passed through even if
-/// `gh` will reject it). Otherwise the run's own base, but only when it looks like a
-/// branch that exists on the remote — a sha, a detached HEAD, or a local-only branch is
-/// not a PR target, and falling through to `gh`'s default is better than a failed ship.
+/// `gh` will reject it). Otherwise the run's own base, but only when it names a branch
+/// origin actually has — a sha, a detached HEAD, a tag, or an unpushed branch is not a
+/// PR target, and falling through to `gh`'s default is better than a failed ship.
 fn pr_base(state: &RunState, cwd: &std::path::Path, override_base: Option<&str>) -> Option<String> {
     if let Some(b) = override_base {
         return Some(b.to_string());
@@ -47,17 +47,51 @@ fn pr_base(state: &RunState, cwd: &std::path::Path, override_base: Option<&str>)
     if branch == "HEAD" || Some(branch) == state.base_commit.as_deref() {
         return None;
     }
-    remote_has_branch(cwd, branch).then(|| branch.to_string())
-}
-
-fn remote_has_branch(cwd: &std::path::Path, branch: &str) -> bool {
-    Command::new("git")
-        .args([
+    // `--base v1.2` resolved through the tag when the run was created (git prefers
+    // refs/tags), so a same-named branch on origin is a different commit entirely.
+    if git_ok(
+        cwd,
+        &[
             "rev-parse",
             "--verify",
             "--quiet",
-            &format!("refs/remotes/origin/{branch}"),
-        ])
+            &format!("refs/tags/{branch}"),
+        ],
+    ) {
+        return None;
+    }
+    remote_has_branch(cwd, branch).then(|| branch.to_string())
+}
+
+/// Ask origin, not the local mirror: a stale remote-tracking ref for a branch deleted
+/// upstream would target the PR at a branch that no longer exists (a ship that used to
+/// succeed against the repo default), and an un-fetched branch would be missed. Falls
+/// back to the local mirror only when the remote can't be reached at all.
+fn remote_has_branch(cwd: &std::path::Path, branch: &str) -> bool {
+    let out = Command::new("git")
+        .args(["ls-remote", "--exit-code", "--heads", "origin", branch])
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match out.map(|s| s.code()) {
+        Ok(Some(0)) => true,
+        Ok(Some(2)) => false, // --exit-code: reached origin, no such branch
+        _ => git_ok(
+            cwd,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/remotes/origin/{branch}"),
+            ],
+        ),
+    }
+}
+
+fn git_ok(cwd: &std::path::Path, args: &[&str]) -> bool {
+    Command::new("git")
+        .args(args)
         .current_dir(cwd)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -110,6 +144,11 @@ pub fn ship(
         Some(b) => format!(" --base {b}"),
         None => String::new(),
     };
+    if pr_base.is_none() {
+        if let Some(r) = &state.base_ref {
+            eprintln!("note: run base {r} is not a branch on origin; PR targets the repo default");
+        }
+    }
     if state.dry_run {
         let push_cmd = format!(
             "git -C {} push --force-with-lease -u origin {branch}",

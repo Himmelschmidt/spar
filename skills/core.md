@@ -175,8 +175,9 @@ you just killed.
 Every coding slot gets a fresh worktree cut from **one commit**, the run's *base*. It is
 resolved once, when the run is created, and reused for every later phase of that run id:
 
-1. `--base <ref>` if you pass it (branch, tag, sha, `origin/main` — anything git resolves).
-   An unresolvable ref is a hard error, never a silent fallback.
+1. `--base <ref>` if you pass it (branch, tag, sha, `origin/main`, `HEAD~2` — anything git
+   resolves, evaluated **in your current directory**, so `HEAD`-relative refs mean the
+   worktree you are standing in). An unresolvable ref is a hard error, never a silent fallback.
 2. Otherwise **the HEAD of the directory you invoked spar from**.
 
 That second rule matters because `project_root` (what `status` prints, where `.spar/` lives)
@@ -184,8 +185,10 @@ is always the repo's **main checkout** — a linked worktree deliberately resolv
 repo has one bus and one run store. Driving spar from a linked worktree therefore does **not**
 mean the slots see that branch by accident; the base is what puts them there.
 
-The base is a **commit**: uncommitted changes in your working tree are not in it (spar says so
-at launch when the invoking tree is dirty). Commit first if the slots need to see that work.
+The base is a **commit**: uncommitted changes in your working tree are not in it. spar warns
+on **stderr** when the invoking tree is dirty (and when it could not resolve a base at all and
+is falling back to `project_root`'s HEAD) — those warnings are stderr-only, `--json` included,
+so a headless driver has to read stderr to see them. Commit first if the slots need the work.
 
 Assert it before you trust a run — every run reports it:
 
@@ -194,14 +197,21 @@ spar run --workflow review -t "..." --providers cli:grok,cli:claude --json | jq 
 spar status <run_id> --json | jq -r '.base_ref, .base_commit'
 ```
 
-`base_ref` / `base_commit` are `null` only for runs created before spar recorded them, or
-when the project isn't a git repo. `spar implement --run <id>` inherits the run's base;
-passing `--base` there re-points it for **new** worktrees only (existing slot worktrees keep
-the base they were cut from).
+`base_ref` / `base_commit` are `null` for runs created before spar recorded them and whenever
+git could not answer — no commits yet, or a cwd that belongs to a different repo than
+`project_root` (e.g. a stale `SPAR_PROJECT_ROOT`). That case is announced on stderr and the
+run falls back to `project_root`'s HEAD.
 
-`spar ship` targets its draft PR at the run's base branch when that branch exists on
-`origin`; otherwise it falls through to the repo default. `spar ship <id> --base <branch>`
-forces a target. The chosen target is recorded in `artifacts/ship.md`.
+`spar implement --run <id>` inherits the run's base. `--base` there is only accepted while
+the run has no worktrees yet: re-basing a run mid-flight would put the plan phase's frozen
+tests (overlaid wholesale into the implementer) on top of a different base, so it fails with
+exit `1` and tells you to `spar cleanup <id>` first.
+
+`spar ship` targets its draft PR at the run's base branch when **origin** has that branch
+(asked over the network, falling back to your local remote-tracking refs when origin is
+unreachable); a tag, a sha, a detached base or an unpushed branch falls through to the repo
+default, with a note on stderr. `spar ship <id> --base <branch>` forces a target. The chosen
+target is recorded in `artifacts/ship.md`.
 
 **`spar cleanup`** reaps before it removes: for each of the run's own worktrees it kills
 every process whose **cwd is inside that worktree** (SIGTERM → grace → SIGKILL — this is

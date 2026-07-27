@@ -122,6 +122,13 @@ fn explicit_base_overrides_the_invoking_branch() {
     let (_, base_commit) = plan_run_base(&wt, &["--base", &main_branch]);
     assert_eq!(base_commit, main_head);
 
+    // `HEAD` is per-worktree: the explicit spelling of "cut from where I am" must not
+    // silently resolve against the main checkout.
+    let (_, from_head) = plan_run_base(&wt, &["--base", "HEAD"]);
+    assert_eq!(from_head, git(&wt, &["rev-parse", "HEAD"]));
+
+    // Exit 1, not merely non-zero: the dry-run happy path already exits 2 (plan gate),
+    // so `.failure()` alone would pass even if the bad ref were silently ignored.
     spar_cmd()
         .current_dir(&wt)
         .args([
@@ -136,5 +143,130 @@ fn explicit_base_overrides_the_invoking_branch() {
             "no/such/ref",
         ])
         .assert()
-        .failure();
+        .code(1);
+}
+
+/// `implement --run <id>` inherits the plan's base, and refuses to re-point a run that
+/// already owns worktrees (the plan-phase test-author tree is overlaid onto the
+/// implementer wholesale, so straddling two bases silently reverts files).
+#[test]
+fn implement_inherits_the_runs_base_and_refuses_to_rebase_it() {
+    let tmp = tempdir().unwrap();
+    let (_root, wt) = repo_with_linked_worktree(tmp.path());
+    let feat_head = git(&wt, &["rev-parse", "HEAD"]);
+
+    let (run_id, base_commit) = plan_run_base(&wt, &[]);
+    assert_eq!(base_commit, feat_head);
+
+    spar_cmd()
+        .current_dir(&wt)
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+
+    // Inherit: no --base, and the run keeps the commit the plan phase resolved.
+    let out = spar_cmd()
+        .current_dir(&wt)
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--providers",
+            "cli:claude,cli:grok",
+            "--dry-run",
+            "--json",
+        ])
+        .assert();
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(out.get_output().stdout.as_slice()))
+            .expect("json");
+    assert_eq!(
+        v["base_commit"], feat_head,
+        "resume must keep the run's base"
+    );
+
+    // Re-point: refused now that the run has worktrees.
+    spar_cmd()
+        .current_dir(&wt)
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--providers",
+            "cli:claude",
+            "--dry-run",
+            "--json",
+            "--base",
+            "master",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("already has worktrees"));
+}
+
+/// `ship` targets the PR at the run's base branch, and `--base` overrides it. Dry-run
+/// ship records the exact `gh pr create` argv, which is where the flag has to land.
+#[test]
+fn ship_targets_the_runs_base_branch() {
+    let tmp = tempdir().unwrap();
+    let (root, wt) = repo_with_linked_worktree(tmp.path());
+    // A remote-tracking ref makes `feat` look pushed without a real remote.
+    git(
+        &root,
+        &[
+            "update-ref",
+            "refs/remotes/origin/feat",
+            &git(&wt, &["rev-parse", "HEAD"]),
+        ],
+    );
+
+    let (run_id, _) = plan_run_base(&wt, &[]);
+    spar_cmd()
+        .current_dir(&wt)
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    spar_cmd()
+        .current_dir(&wt)
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--providers",
+            "cli:claude,cli:grok",
+            "--dry-run",
+            "--json",
+        ])
+        .assert();
+    spar_cmd()
+        .current_dir(&wt)
+        .args(["ship", &run_id, "--confirm", "--json"])
+        .assert();
+
+    let ship_md = std::fs::read_to_string(
+        root.join(".spar/runs")
+            .join(&run_id)
+            .join("artifacts/ship.md"),
+    )
+    .expect("ship.md");
+    assert!(
+        ship_md.contains("--base feat"),
+        "PR must target the run's base branch; got:\n{ship_md}"
+    );
+
+    // Explicit override wins over the run's own base.
+    spar_cmd()
+        .current_dir(&wt)
+        .args(["ship", &run_id, "--json", "--base", "release/9"])
+        .assert();
+    let ship_md = std::fs::read_to_string(
+        root.join(".spar/runs")
+            .join(&run_id)
+            .join("artifacts/ship.md"),
+    )
+    .unwrap();
+    assert!(
+        ship_md.contains("--base release/9"),
+        "ship --base must override; got:\n{ship_md}"
+    );
 }

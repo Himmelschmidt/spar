@@ -1723,13 +1723,24 @@ fn run_palette(
             if st.providers.is_empty() {
                 anyhow::bail!("selected run has no providers — use the CLI");
             }
-            let args = [
+            let mut args = vec![
                 "plan".to_string(),
                 "-t".to_string(),
                 arg.to_string(),
                 "--providers".to_string(),
                 st.providers.join(","),
             ];
+            // The child runs in the project root (the TUI can act on another project's
+            // run), so the branch the operator actually started spar in has to be
+            // handed over explicitly or the plan is cut from the main checkout.
+            if let Ok(cwd) = std::env::current_dir() {
+                if let Ok(Some(base)) =
+                    crate::worktree::resolve_base(&swarm.project_root, &cwd, None)
+                {
+                    args.push("--base".to_string());
+                    args.push(base.commit);
+                }
+            }
             spawn_detached_workflow(swarm, &args, "Plan started")
         }
         "spawn" => {
@@ -5191,6 +5202,8 @@ mod labels {
             task: task.map(str::to_string),
             dry_run: false,
             abandoned: false,
+            base_ref: None,
+            base_commit: None,
             project_root: None,
             project_name: None,
         }

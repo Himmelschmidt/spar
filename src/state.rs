@@ -308,6 +308,11 @@ pub struct RunSummary {
     /// In flight, but no live orchestrator owns it — computed at read time.
     #[serde(default)]
     pub abandoned: bool,
+    /// Ref/commit the run's slot worktrees were cut from (see `RunState::base_ref`).
+    #[serde(default)]
+    pub base_ref: Option<String>,
+    #[serde(default)]
+    pub base_commit: Option<String>,
     /// Filled when listing across projects (global home).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_root: Option<PathBuf>,
@@ -514,6 +519,8 @@ pub fn list_runs(paths: &SparPaths) -> Result<Vec<RunSummary>> {
                 updated_at: state.updated_at,
                 task: state.task,
                 dry_run: state.dry_run,
+                base_ref: state.base_ref,
+                base_commit: state.base_commit,
                 project_root: None,
                 project_name: None,
             }),

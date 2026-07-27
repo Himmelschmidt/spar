@@ -97,13 +97,20 @@ fn run_from_approved(
     state.dry_run = opts.resolve_dry_run();
     state.autonomy = cfg.autonomy;
     state.message_budget = cfg.message_budget;
-    // A resumed run keeps the base its plan phase was cut from; `--base` re-points it,
-    // but worktrees that already exist stay where they were.
+    // A resumed run keeps the base its plan phase was cut from. `--base` may only
+    // re-point a run with no worktrees yet: the plan phase's test-author worktree is
+    // reused as-is and its whole tree is overlaid onto the implementer, so a run
+    // straddling two bases produces a branch parented on the new base carrying the old
+    // base's file contents — a diff that reads as reverting the difference.
     if opts.base.is_some() {
         let previous = state.base_commit.clone();
         worktree::apply_run_base(&mut state, opts.base.as_deref(), opts.json)?;
-        if !opts.json && !state.worktrees.is_empty() && previous != state.base_commit {
-            eprintln!("note: existing slot worktrees keep the run's earlier base");
+        if !state.worktrees.is_empty() && previous != state.base_commit {
+            bail!(
+                "run {run_id} already has worktrees cut from {}; \
+                 `spar cleanup {run_id}` before re-basing it",
+                previous.as_deref().unwrap_or("its original base")
+            );
         }
     }
     if state.dry_run {
