@@ -48,24 +48,11 @@ fn pr_base(state: &RunState, cwd: &std::path::Path, override_base: Option<&str>)
         return None;
     }
     // `--base v1.2` resolves through the tag when the run is created (git prefers
-    // refs/tags), and a same-named branch on origin is then a different commit. Only
-    // veto when the name really came from the tag: a branch base that merely shares its
-    // name with a local tag is still a fine PR target.
-    let tagged = git_ok(
-        cwd,
-        &[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("refs/tags/{branch}"),
-        ],
-    );
-    if tagged
-        && !branch_points_at(
-            cwd,
-            &format!("refs/heads/{branch}"),
-            state.base_commit.as_deref(),
-        )
+    // refs/tags), and a same-named branch on origin is a different commit. Veto only when
+    // the name is a tag and *not* also a local branch: a branch base that merely shares a
+    // name with a tag is still a fine PR target, whatever the branch tip has moved to.
+    if exact_ref(cwd, &format!("refs/tags/{branch}"))
+        && !exact_ref(cwd, &format!("refs/heads/{branch}"))
     {
         return None;
     }
@@ -77,28 +64,13 @@ fn pr_base(state: &RunState, cwd: &std::path::Path, override_base: Option<&str>)
 /// unreachable host would hang the command with its output already nulled. A stale
 /// mirror is the cost; `git fetch --prune` is the cure.
 fn remote_has_branch(cwd: &std::path::Path, branch: &str) -> bool {
-    git_ok(
-        cwd,
-        &[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("refs/remotes/origin/{branch}"),
-        ],
-    )
+    exact_ref(cwd, &format!("refs/remotes/origin/{branch}"))
 }
 
-fn branch_points_at(cwd: &std::path::Path, git_ref: &str, commit: Option<&str>) -> bool {
-    let Some(commit) = commit else {
-        return false;
-    };
-    Command::new("git")
-        .args(["rev-parse", "--verify", "--quiet", git_ref])
-        .current_dir(cwd)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == commit)
+/// `show-ref`, not `rev-parse`: `rev-parse refs/remotes/origin/main~1` happily resolves,
+/// which would turn a run based on `--base main~1` into `gh pr create --base main~1`.
+fn exact_ref(cwd: &std::path::Path, git_ref: &str) -> bool {
+    git_ok(cwd, &["show-ref", "--verify", "--quiet", git_ref])
 }
 
 fn git_ok(cwd: &std::path::Path, args: &[&str]) -> bool {
@@ -404,6 +376,45 @@ mod tests {
 
         let remote_form = state_with_base("origin/feat", &head);
         assert_eq!(pr_base(&remote_form, tmp.path(), None), Some("feat".into()));
+    }
+
+    /// `--base main~1` is documented as supported, and `refs/remotes/origin/main~1`
+    /// resolves through `rev-parse` — targeting a PR at a rev-expression `gh` rejects.
+    #[test]
+    fn pr_base_none_for_a_rev_expression_base() {
+        let tmp = tempdir().unwrap();
+        repo_with_origin_feat(tmp.path());
+        // A second commit, so `refs/remotes/origin/feat~1` is a *resolvable* rev-spec —
+        // otherwise the probe rejects it for the wrong reason and proves nothing.
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(tmp.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        std::fs::write(tmp.path().join("second"), "x").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "second"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        git(&["update-ref", "refs/remotes/origin/feat", &head]);
+        assert!(
+            !git(&[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/remotes/origin/feat~1"
+            ])
+            .is_empty(),
+            "fixture must make the rev-spec resolvable"
+        );
+
+        let state = state_with_base("feat~1", &head);
+        assert_eq!(pr_base(&state, tmp.path(), None), None);
     }
 
     #[test]

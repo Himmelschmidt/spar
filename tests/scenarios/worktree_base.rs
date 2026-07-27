@@ -203,7 +203,9 @@ fn implement_inherits_the_runs_base_and_refuses_to_rebase_it() {
             "--dry-run",
             "--json",
             "--base",
-            "master",
+            // Derived, never assumed: the fixture's default branch name follows the
+            // git version, and a wrong ref here fails as an unrelated stderr mismatch.
+            &git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]),
         ])
         .assert()
         .code(1)
