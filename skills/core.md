@@ -187,8 +187,8 @@ is always the repo's **main checkout** — a linked worktree deliberately resolv
 repo has one bus and one run store. Driving spar from a linked worktree therefore does **not**
 mean the slots see that branch by accident; the base is what puts them there.
 
-The base is a **commit**: uncommitted changes in your working tree are not in it. spar warns
-on **stderr** when the invoking tree is dirty (and when it could not resolve a base at all and
+The base is a **commit**: uncommitted changes in your working tree are not in it (spar's own
+`.spar/` doesn't count). spar warns on **stderr** when the invoking tree is dirty (and when it could not resolve a base at all and
 is falling back to `project_root`'s HEAD) — those warnings are stderr-only, `--json` included,
 so a headless driver has to read stderr to see them. Commit first if the slots need the work.
 

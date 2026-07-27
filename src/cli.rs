@@ -92,8 +92,9 @@ pub enum Command {
         plan: Option<std::path::PathBuf>,
         #[arg(long, short = 't')]
         task: Option<String>,
-        /// Ref to cut every slot worktree from (branch, tag or sha).
-        /// Default: the HEAD of the directory spar was invoked from.
+        /// Ref to cut every slot worktree from (branch, tag or sha), for a NEW run.
+        /// Default: the HEAD of the directory spar was invoked from. A run's base is
+        /// fixed at creation, so `--run <id>` only accepts a base it already has.
         #[arg(long)]
         base: Option<String>,
         #[arg(long)]

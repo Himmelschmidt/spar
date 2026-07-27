@@ -63,10 +63,13 @@ pub fn resolve_base(
                 from.display()
             )
         })?;
-        return Ok(Some(RunBase {
-            reference: reference.to_string(),
-            commit,
-        }));
+        // Record what `HEAD` *is*: a run whose base_ref is the literal "HEAD" reads as
+        // detached later, and `ship` then declines to target the branch it came from.
+        let reference = match reference {
+            "HEAD" => named_head(from).unwrap_or_else(|| reference.to_string()),
+            other => other.to_string(),
+        };
+        return Ok(Some(RunBase { reference, commit }));
     }
     if !in_repo {
         return Ok(None);
@@ -74,13 +77,14 @@ pub fn resolve_base(
     let Some(commit) = git_out(cwd, &["rev-parse", "--verify", "HEAD"]) else {
         return Ok(None);
     };
-    let branch = git_out(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default();
-    let reference = if branch.is_empty() || branch == "HEAD" {
-        commit.clone() // detached
-    } else {
-        branch
-    };
+    let reference = named_head(cwd).unwrap_or_else(|| commit.clone()); // else detached
     Ok(Some(RunBase { reference, commit }))
+}
+
+/// The branch name checked out in `dir`, or `None` when detached.
+fn named_head(dir: &Path) -> Option<String> {
+    let branch = git_out(dir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    (!branch.is_empty() && branch != "HEAD").then_some(branch)
 }
 
 /// Resolve the base and record it on the run. Prints it unless `json`, because a base
@@ -130,8 +134,11 @@ fn same_repo(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Excluding `.spar/`: spar writes its own run store into the project, and a project
+/// that hasn't gitignored it would see this warning on every single run — which is how
+/// the one stderr line that matters gets trained into background noise.
 fn dirty(dir: &Path) -> bool {
-    git_out(dir, &["status", "--porcelain"]).is_some_and(|s| !s.is_empty())
+    git_out(dir, &["status", "--porcelain", "--", ":!.spar"]).is_some_and(|s| !s.is_empty())
 }
 
 fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
@@ -748,6 +755,27 @@ mod tests {
         assert_eq!(base.reference, "feat");
         assert_eq!(base.commit, feat_head);
         assert!(resolve_base(&root, &wt, Some("no/such/ref")).is_err());
+    }
+
+    /// `--base HEAD` must record the branch, not the literal ref: a base_ref of "HEAD"
+    /// reads as detached downstream and costs `ship` its PR target. Also pins that
+    /// spar's own untracked `.spar/` never counts as a dirty tree.
+    #[test]
+    fn explicit_head_records_the_branch_and_spar_state_is_not_dirt() {
+        let tmp = tempdir().unwrap();
+        let (root, wt, feat_head) = repo_with_linked_worktree(tmp.path());
+        let base = resolve_base(&root, &wt, Some("HEAD")).unwrap().unwrap();
+        assert_eq!(base.reference, "feat");
+        assert_eq!(base.commit, feat_head);
+
+        std::fs::create_dir_all(wt.join(".spar/runs")).unwrap();
+        std::fs::write(wt.join(".spar/runs/state.json"), "{}").unwrap();
+        assert!(
+            !dirty(&wt),
+            "spar's own run store must not read as uncommitted work"
+        );
+        std::fs::write(wt.join("feature.txt"), "edited\n").unwrap();
+        assert!(dirty(&wt), "a real edit still counts");
     }
 
     #[test]
