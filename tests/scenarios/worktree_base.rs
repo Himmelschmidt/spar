@@ -32,6 +32,10 @@ fn git(dir: &std::path::Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .args(args)
         .current_dir(dir)
+        // The developer's global config (gpg signing, hooks, init.defaultBranch) must
+        // not decide what this fixture looks like or whether it builds at all.
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .output()
         .unwrap();
     assert!(out.status.success(), "git {args:?} failed in {dir:?}");
@@ -146,13 +150,13 @@ fn explicit_base_overrides_the_invoking_branch() {
         .code(1);
 }
 
-/// `implement --run <id>` inherits the plan's base, and refuses to re-point a run that
-/// already owns worktrees (the plan-phase test-author tree is overlaid onto the
-/// implementer wholesale, so straddling two bases silently reverts files).
+/// `implement --run <id>` inherits the plan's base, and refuses to re-point an existing
+/// run: the plan-phase test-author tree is overlaid onto the implementer wholesale, so a
+/// run straddling two bases silently reverts every file that differs between them.
 #[test]
 fn implement_inherits_the_runs_base_and_refuses_to_rebase_it() {
     let tmp = tempdir().unwrap();
-    let (_root, wt) = repo_with_linked_worktree(tmp.path());
+    let (root, wt) = repo_with_linked_worktree(tmp.path());
     let feat_head = git(&wt, &["rev-parse", "HEAD"]);
 
     let (run_id, base_commit) = plan_run_base(&wt, &[]);
@@ -164,9 +168,10 @@ fn implement_inherits_the_runs_base_and_refuses_to_rebase_it() {
         .assert()
         .success();
 
-    // Inherit: no --base, and the run keeps the commit the plan phase resolved.
+    // Resume from the MAIN checkout — a detached orchestrator or the TUI does exactly
+    // this. Running it from `wt` could not tell inheritance apart from re-resolution.
     let out = spar_cmd()
-        .current_dir(&wt)
+        .current_dir(&root)
         .args([
             "implement",
             "--run",
@@ -176,7 +181,8 @@ fn implement_inherits_the_runs_base_and_refuses_to_rebase_it() {
             "--dry-run",
             "--json",
         ])
-        .assert();
+        .assert()
+        .code(2);
     let v: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(out.get_output().stdout.as_slice()))
             .expect("json");
@@ -201,7 +207,9 @@ fn implement_inherits_the_runs_base_and_refuses_to_rebase_it() {
         ])
         .assert()
         .code(1)
-        .stderr(predicates::str::contains("already has worktrees"));
+        .stderr(predicates::str::contains(
+            "base is fixed when it is created",
+        ));
 }
 
 /// `ship` targets the PR at the run's base branch, and `--base` overrides it. Dry-run
@@ -237,11 +245,13 @@ fn ship_targets_the_runs_base_branch() {
             "--dry-run",
             "--json",
         ])
-        .assert();
+        .assert()
+        .code(2); // implement --dry-run stops at the ship gate
     spar_cmd()
         .current_dir(&wt)
         .args(["ship", &run_id, "--confirm", "--json"])
-        .assert();
+        .assert()
+        .success();
 
     let ship_md = std::fs::read_to_string(
         root.join(".spar/runs")
@@ -250,7 +260,7 @@ fn ship_targets_the_runs_base_branch() {
     )
     .expect("ship.md");
     assert!(
-        ship_md.contains("--base feat"),
+        ship_md.contains("PR base: `feat`") && ship_md.contains("--base 'feat'"),
         "PR must target the run's base branch; got:\n{ship_md}"
     );
 
@@ -258,7 +268,8 @@ fn ship_targets_the_runs_base_branch() {
     spar_cmd()
         .current_dir(&wt)
         .args(["ship", &run_id, "--json", "--base", "release/9"])
-        .assert();
+        .assert()
+        .success();
     let ship_md = std::fs::read_to_string(
         root.join(".spar/runs")
             .join(&run_id)
@@ -266,7 +277,7 @@ fn ship_targets_the_runs_base_branch() {
     )
     .unwrap();
     assert!(
-        ship_md.contains("--base release/9"),
+        ship_md.contains("PR base: `release/9`") && ship_md.contains("--base 'release/9'"),
         "ship --base must override; got:\n{ship_md}"
     );
 }

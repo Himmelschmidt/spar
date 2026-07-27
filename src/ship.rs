@@ -47,9 +47,11 @@ fn pr_base(state: &RunState, cwd: &std::path::Path, override_base: Option<&str>)
     if branch == "HEAD" || Some(branch) == state.base_commit.as_deref() {
         return None;
     }
-    // `--base v1.2` resolved through the tag when the run was created (git prefers
-    // refs/tags), so a same-named branch on origin is a different commit entirely.
-    if git_ok(
+    // `--base v1.2` resolves through the tag when the run is created (git prefers
+    // refs/tags), and a same-named branch on origin is then a different commit. Only
+    // veto when the name really came from the tag: a branch base that merely shares its
+    // name with a local tag is still a fine PR target.
+    let tagged = git_ok(
         cwd,
         &[
             "rev-parse",
@@ -57,36 +59,46 @@ fn pr_base(state: &RunState, cwd: &std::path::Path, override_base: Option<&str>)
             "--quiet",
             &format!("refs/tags/{branch}"),
         ],
-    ) {
+    );
+    if tagged
+        && !branch_points_at(
+            cwd,
+            &format!("refs/heads/{branch}"),
+            state.base_commit.as_deref(),
+        )
+    {
         return None;
     }
     remote_has_branch(cwd, branch).then(|| branch.to_string())
 }
 
-/// Ask origin, not the local mirror: a stale remote-tracking ref for a branch deleted
-/// upstream would target the PR at a branch that no longer exists (a ship that used to
-/// succeed against the repo default), and an un-fetched branch would be missed. Falls
-/// back to the local mirror only when the remote can't be reached at all.
+/// Local remote-tracking refs only — deliberately no `ls-remote`. Ship must not block on
+/// the network here: it runs on the `--dry-run` path too, and a credential prompt or an
+/// unreachable host would hang the command with its output already nulled. A stale
+/// mirror is the cost; `git fetch --prune` is the cure.
 fn remote_has_branch(cwd: &std::path::Path, branch: &str) -> bool {
-    let out = Command::new("git")
-        .args(["ls-remote", "--exit-code", "--heads", "origin", branch])
+    git_ok(
+        cwd,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/remotes/origin/{branch}"),
+        ],
+    )
+}
+
+fn branch_points_at(cwd: &std::path::Path, git_ref: &str, commit: Option<&str>) -> bool {
+    let Some(commit) = commit else {
+        return false;
+    };
+    Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", git_ref])
         .current_dir(cwd)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    match out.map(|s| s.code()) {
-        Ok(Some(0)) => true,
-        Ok(Some(2)) => false, // --exit-code: reached origin, no such branch
-        _ => git_ok(
-            cwd,
-            &[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("refs/remotes/origin/{branch}"),
-            ],
-        ),
-    }
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == commit)
 }
 
 fn git_ok(cwd: &std::path::Path, args: &[&str]) -> bool {
@@ -141,7 +153,7 @@ pub fn ship(
     let (branch, cwd) = select_branch_cwd(&state)?;
     let pr_base = pr_base(&state, &cwd, base);
     let base_arg = match &pr_base {
-        Some(b) => format!(" --base {b}"),
+        Some(b) => format!(" --base {}", shell_single_quote(b)),
         None => String::new(),
     };
     if pr_base.is_none() {
@@ -163,7 +175,8 @@ pub fn ship(
         std::fs::write(
             paths.artifact(run_id, "ship.md"),
             format!(
-                "# Ship (dry-run — not executed)\n\nBranch: `{branch}`\n\n```\n{}\n```\n",
+                "# Ship (dry-run — not executed)\n\nBranch: `{branch}`\nPR base: `{}`\n\n```\n{}\n```\n",
+                pr_base.as_deref().unwrap_or("(repo default)"),
                 commands.join("\n")
             ),
         )?;
@@ -341,25 +354,32 @@ mod tests {
     use tempfile::tempdir;
 
     /// Repo with one commit and a fake `origin/feat` remote-tracking ref (no network).
-    fn repo_with_origin_feat(dir: &Path) -> Option<String> {
+    /// Loud on failure: a fixture that skipped would let `pr_base` regressions pass.
+    fn repo_with_origin_feat(dir: &Path) -> String {
         let git = |args: &[&str]| {
-            Command::new("git")
+            let out = Command::new("git")
                 .args(args)
                 .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
                 .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_else(|e| panic!("spawn git {args:?}: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
-        git(&["init", "-q"])?;
-        git(&["config", "user.email", "t@t.com"])?;
-        git(&["config", "user.name", "t"])?;
-        std::fs::write(dir.join("README"), "x").ok()?;
-        git(&["add", "."])?;
-        git(&["commit", "-q", "-m", "init"])?;
-        let head = git(&["rev-parse", "HEAD"])?;
-        git(&["update-ref", "refs/remotes/origin/feat", &head])?;
-        Some(head)
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("README"), "x").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        git(&["update-ref", "refs/remotes/origin/feat", &head]);
+        head
     }
 
     fn state_with_base(reference: &str, commit: &str) -> RunState {
@@ -372,9 +392,7 @@ mod tests {
     #[test]
     fn pr_base_prefers_override_then_remote_branch() {
         let tmp = tempdir().unwrap();
-        let Some(head) = repo_with_origin_feat(tmp.path()) else {
-            return;
-        };
+        let head = repo_with_origin_feat(tmp.path());
 
         let state = state_with_base("feat", &head);
         assert_eq!(
@@ -391,9 +409,7 @@ mod tests {
     #[test]
     fn pr_base_none_for_sha_or_local_only_branch() {
         let tmp = tempdir().unwrap();
-        let Some(head) = repo_with_origin_feat(tmp.path()) else {
-            return;
-        };
+        let head = repo_with_origin_feat(tmp.path());
         assert_eq!(
             pr_base(&state_with_base(&head, &head), tmp.path(), None),
             None,

@@ -107,9 +107,9 @@ fn run_from_approved(
         worktree::apply_run_base(&mut state, opts.base.as_deref(), opts.json)?;
         if !state.worktrees.is_empty() && previous != state.base_commit {
             bail!(
-                "run {run_id} already has worktrees cut from {}; \
-                 `spar cleanup {run_id}` before re-basing it",
-                previous.as_deref().unwrap_or("its original base")
+                "run {run_id} is already based on {}; a run's base is fixed when it is \
+                 created — plan a new run with `--base` instead",
+                previous.as_deref().unwrap_or("an unrecorded base")
             );
         }
     }

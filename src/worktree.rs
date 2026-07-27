@@ -102,9 +102,9 @@ pub fn apply_run_base(state: &mut RunState, requested: Option<&str>, json: bool)
         let short: String = base.commit.chars().take(8).collect();
         eprintln!("base: {} ({short})", base.reference);
     }
-    // Always warned, `--json` included: the base is a commit, and a driver that never
-    // sees this has no other signal that the work in its tree isn't in the run.
-    if requested.is_none() && dirty(&cwd) {
+    // Always warned, `--json` and `--base` included: the base is a commit, and a driver
+    // that never sees this has no other signal that the work in its tree isn't in the run.
+    if dirty(&cwd) {
         eprintln!(
             "note: uncommitted changes in {} are not in the base commit",
             cwd.display()

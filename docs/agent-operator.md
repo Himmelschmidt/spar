@@ -31,7 +31,8 @@ Also: `spar skills get core` (preferred; always current).
 ## Base ref
 
 `plan` / `implement` / `run` accept **`--base <ref>`** (branch, tag, sha, `origin/main`,
-`HEAD~2`), resolved in your current directory. It fixes the commit every slot worktree in the
+`HEAD~2`), resolved in your current directory when it is inside the project's repo, against
+the main checkout otherwise. It fixes the commit every slot worktree in the
 run is cut from. Without it the base is the HEAD of the invoking directory — *not*
 `project_root`, which is always the repo's main checkout even when you drive spar from a
 linked worktree (that is where `.spar/` lives).
@@ -40,15 +41,16 @@ The base is resolved once per run id and reported as `base_ref` / `base_commit` 
 JSON and in `status --json` (both the single-run and the list form). It is a commit, so
 uncommitted work in your tree is not in it — spar warns about that on **stderr**, which is the
 only channel for it, so capture stderr as well as stdout. `implement --run <id>` inherits the
-base and refuses `--base` once the run owns worktrees (exit `1`).
+base; a run cannot be re-based after creation (`--base` with a different commit exits `1`).
 
 ```bash
 BASE=$(spar run --workflow review -t "$TASK" --providers cli:grok,cli:claude --json | jq -r .base_commit)
 [ "$BASE" = "$(git rev-parse HEAD)" ] || echo "slots are not on my branch"
 ```
 
-`spar ship` targets its draft PR at the run's base branch when origin has that branch, else
-the repo default (noted on stderr); `spar ship <id> --base <branch>` forces the target.
+`spar ship` targets its draft PR at the run's base branch when a local remote-tracking ref
+exists for it (no network call — `git fetch --prune` if stale), else the repo default (noted
+on stderr); `spar ship <id> --base <branch>` forces the target.
 
 ## Path A (plan → approve → implement) — **one run id**
 

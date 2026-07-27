@@ -176,8 +176,10 @@ Every coding slot gets a fresh worktree cut from **one commit**, the run's *base
 resolved once, when the run is created, and reused for every later phase of that run id:
 
 1. `--base <ref>` if you pass it (branch, tag, sha, `origin/main`, `HEAD~2` — anything git
-   resolves, evaluated **in your current directory**, so `HEAD`-relative refs mean the
-   worktree you are standing in). An unresolvable ref is a hard error, never a silent fallback.
+   resolves). It is evaluated **in your current directory** when that directory belongs to
+   the project's repo (so `HEAD`-relative refs mean the worktree you are standing in), and
+   against the main checkout otherwise. An unresolvable ref is a hard error, never a silent
+   fallback.
 2. Otherwise **the HEAD of the directory you invoked spar from**.
 
 That second rule matters because `project_root` (what `status` prints, where `.spar/` lives)
@@ -202,16 +204,17 @@ git could not answer — no commits yet, or a cwd that belongs to a different re
 `project_root` (e.g. a stale `SPAR_PROJECT_ROOT`). That case is announced on stderr and the
 run falls back to `project_root`'s HEAD.
 
-`spar implement --run <id>` inherits the run's base. `--base` there is only accepted while
-the run has no worktrees yet: re-basing a run mid-flight would put the plan phase's frozen
-tests (overlaid wholesale into the implementer) on top of a different base, so it fails with
-exit `1` and tells you to `spar cleanup <id>` first.
+`spar implement --run <id>` inherits the run's base and **cannot be re-based**: a run's base
+is fixed when the run is created. Passing `--base` there with a different commit exits `1`
+(re-basing mid-flight would drop the plan phase's frozen tests, which are overlaid wholesale
+into the implementer, onto a different base). Plan a new run to change the base.
 
-`spar ship` targets its draft PR at the run's base branch when **origin** has that branch
-(asked over the network, falling back to your local remote-tracking refs when origin is
-unreachable); a tag, a sha, a detached base or an unpushed branch falls through to the repo
-default, with a note on stderr. `spar ship <id> --base <branch>` forces a target. The chosen
-target is recorded in `artifacts/ship.md`.
+`spar ship` targets its draft PR at the run's base branch when a local remote-tracking ref
+(`refs/remotes/origin/<branch>`) exists for it — ship never touches the network to decide
+this, so run `git fetch --prune` if your mirror is stale. A tag, a sha, a detached base or an
+unpushed branch falls through to the repo default, with a note on stderr. `spar ship <id>
+--base <branch>` forces a target. The chosen target is recorded in `artifacts/ship.md`
+(`PR base:`), on the dry-run path too.
 
 **`spar cleanup`** reaps before it removes: for each of the run's own worktrees it kills
 every process whose **cwd is inside that worktree** (SIGTERM → grace → SIGKILL — this is

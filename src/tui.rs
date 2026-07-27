@@ -1737,8 +1737,10 @@ fn run_palette(
                 if let Ok(Some(base)) =
                     crate::worktree::resolve_base(&swarm.project_root, &cwd, None)
                 {
+                    // The ref, not the sha: a run whose base_ref is its own commit reads
+                    // as detached, and `ship` then declines to target the branch.
                     args.push("--base".to_string());
-                    args.push(base.commit);
+                    args.push(base.reference);
                 }
             }
             spawn_detached_workflow(swarm, &args, "Plan started")
