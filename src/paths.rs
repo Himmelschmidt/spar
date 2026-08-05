@@ -34,6 +34,13 @@ impl SparPaths {
         self.run_dir(run_id).join("state.json")
     }
 
+    /// The run's frozen config. Written once at creation; every later phase of the run
+    /// reads this instead of the project's live `spar.toml`, so a concurrent agent
+    /// editing that file can never change a run already in flight.
+    pub fn run_config_file(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("config.json")
+    }
+
     pub fn artifacts_dir(&self, run_id: &str) -> PathBuf {
         self.run_dir(run_id).join("artifacts")
     }

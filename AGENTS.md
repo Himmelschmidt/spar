@@ -76,6 +76,9 @@ either way.
   from `--base` or the invoking cwd, is resolved once per run, and is reported in
   `status --json`. It is `None` only for pre-O26 runs or when git can't answer, and that
   fallback says so on stderr (O26).
+- **A run reads its own frozen config**, `.spar/runs/<id>/config.json`, not the project's
+  live `spar.toml`. Parallel agents share one `spar.toml`; a run-scoped command that calls
+  `Config::load` instead of `Config::for_run` reintroduces cross-run config bleed (O27).
 - **`ship` opens a draft PR and never merges.** Force-push only ever to swarm branches.
 - **`--providers` or `--select` is required** on `plan` / `implement` / `run`.
 - **Exit codes are a public contract** for outer agents — `0` ok, `1` fail, `2` human
