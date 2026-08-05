@@ -558,7 +558,7 @@ fn maybe_auto_ship_or_cleanup(state: &mut RunState, paths: &SparPaths, cfg: &Con
 
 /// True once `spar stop` has dropped the `stopped` marker for this run.
 pub fn should_stop(paths: &SparPaths, run_id: &str) -> bool {
-    crate::markers::marker_exists(paths, run_id, "stopped")
+    crate::markers::marker_exists(paths, run_id, "stopped") || crate::process::shutdown_requested()
 }
 
 /// Halt without dispatching or touching worktrees; the run stays resumable.

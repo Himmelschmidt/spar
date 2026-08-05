@@ -69,6 +69,18 @@ fn run() -> Result<ExitCode> {
         });
     };
 
+    // Orchestrating commands reap their slots on SIGINT/SIGTERM. Never the TUI: there
+    // Ctrl+C is the agent's, not spar's.
+    if matches!(
+        command,
+        Command::Plan { .. }
+            | Command::Implement { .. }
+            | Command::Run { .. }
+            | Command::InternalContinue { .. }
+    ) {
+        process::install_shutdown_handler();
+    }
+
     match command {
         Command::Doctor { json } => doctor::run(json),
         Command::Plan {
@@ -234,7 +246,11 @@ fn run() -> Result<ExitCode> {
             workflow::arena::reconcile(&paths, &cfg, &run_id, json)
         }
         Command::Bus { action } => bus_cmd(action),
-        Command::Stop { run_id, json } => stop_cmd(&run_id, json),
+        Command::Stop {
+            run_id,
+            abandoned,
+            json,
+        } => stop_cmd(run_id.as_deref(), abandoned, json),
         Command::Cleanup {
             run_id,
             json,
@@ -627,16 +643,108 @@ fn run_status_json(
             "orchestrator_alive".into(),
             serde_json::Value::Bool(orch.map(|t| t.alive()).unwrap_or(false)),
         );
-        obj.insert(
-            "abandoned".into(),
-            serde_json::Value::Bool(state.abandoned(swarm)),
-        );
+        let abandoned = state.abandoned(swarm);
+        obj.insert("abandoned".into(), serde_json::Value::Bool(abandoned));
+        // Only meaningful when nobody owns the run: these are slot processes still
+        // burning tokens with no orchestrator to collect their work.
+        let orphans = if abandoned {
+            state::live_slot_pids(swarm, state)
+        } else {
+            Vec::new()
+        };
+        obj.insert("orphan_pids".into(), serde_json::json!(orphans));
     }
     liveness::enrich_status_json(&mut v, &state.slots, cfg, swarm, &state.id);
     Ok(v)
 }
 
-fn stop_cmd(run_id: &str, json: bool) -> Result<ExitCode> {
+fn stop_cmd(run_id: Option<&str>, abandoned: bool, json: bool) -> Result<ExitCode> {
+    match (run_id, abandoned) {
+        (Some(id), false) => stop_one(id, json),
+        (None, true) => stop_abandoned(json),
+        (Some(_), true) => {
+            anyhow::bail!("pass a run id or --abandoned, not both")
+        }
+        (None, false) => anyhow::bail!("usage: spar stop <run_id> | spar stop --abandoned"),
+    }
+}
+
+/// Reap every run that is in flight with no live orchestrator. Explicit by design: a
+/// read command must never kill processes, and a human driving a slot through the TUI
+/// holds no run lock, so their run reads as abandoned too.
+fn stop_abandoned(json: bool) -> Result<ExitCode> {
+    let (paths, _) = project_ctx()?;
+    let mut swept = Vec::new();
+    for summary in state::list_runs(&paths)? {
+        let Ok(state) = state::RunState::load(&paths, &summary.id) else {
+            continue;
+        };
+        if !state.abandoned(&paths) {
+            continue;
+        }
+        let orphans = state::live_slot_pids(&paths, &state);
+        let outcome = stop_one_quiet(&paths, &summary.id);
+        swept.push(serde_json::json!({
+            "run_id": summary.id,
+            "phase": format!("{:?}", state.phase),
+            "orphan_pids": orphans,
+            "stopped": outcome.is_ok(),
+        }));
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "swept": swept }))?
+        );
+    } else if swept.is_empty() {
+        println!("no abandoned runs");
+    } else {
+        for r in &swept {
+            println!(
+                "stopped {} (was {}), reaped {} slot process(es)",
+                r["run_id"].as_str().unwrap_or_default(),
+                r["phase"].as_str().unwrap_or_default(),
+                r["orphan_pids"].as_array().map(|a| a.len()).unwrap_or(0)
+            );
+        }
+    }
+    Ok(ExitCode::Success)
+}
+
+fn stop_one_quiet(paths: &paths::SparPaths, run_id: &str) -> Result<()> {
+    reap_run(paths, run_id)?;
+    let mut state = state::RunState::load(paths, run_id)?;
+    if !phase_at_rest(state.phase) {
+        state.set_phase(state::Phase::Stopped);
+        state.save(paths)?;
+    }
+    Ok(())
+}
+
+/// Marker, then orchestrator, then slot process groups — the order matters, see below.
+fn reap_run(paths: &paths::SparPaths, run_id: &str) -> Result<()> {
+    let state = state::RunState::load(paths, run_id)?;
+    // 1. Marker first: an orchestrator that survives the signal stops at its next
+    //    dispatch boundary instead of resurrecting a killed slot.
+    markers::write_marker(paths, run_id, "stopped", "stopped by operator\n")?;
+
+    // 2. Orchestrator before slots: signalling slots first lets the orchestrator
+    //    re-dispatch them. The orchestrator is not a group leader — bare pid.
+    if let Some(owner) = runlock::RunLock::owner(paths, run_id) {
+        if owner.alive() {
+            process::terminate_tree(owner.pid, false);
+        }
+    }
+
+    // 3. Slot process groups: reaps nested cargo test / pnpm build children too.
+    //    Start-time checked, so a recycled pid is never signalled.
+    for pid in state::live_slot_pids(paths, &state) {
+        process::terminate_tree(pid, true);
+    }
+    Ok(())
+}
+
+fn stop_one(run_id: &str, json: bool) -> Result<ExitCode> {
     let (paths, _) = project_ctx()?;
     let cfg = Config::for_run(&paths, run_id)?;
     let state = state::RunState::load(&paths, run_id)?;
@@ -653,37 +761,7 @@ fn stop_cmd(run_id: &str, json: bool) -> Result<ExitCode> {
         return Ok(ExitCode::Success);
     }
 
-    // 1. Marker first: an orchestrator that survives the signal stops at its next
-    //    dispatch boundary instead of resurrecting a killed slot.
-    markers::write_marker(&paths, run_id, "stopped", "stopped by operator\n")?;
-
-    // 2. Orchestrator before slots: signalling slots first lets the orchestrator
-    //    re-dispatch them. The orchestrator is not a group leader — bare pid.
-    if let Some(owner) = runlock::RunLock::owner(&paths, run_id) {
-        if owner.alive() {
-            process::terminate_tree(owner.pid, false);
-        }
-    }
-
-    // 3. Slot process groups: reaps nested cargo test / pnpm build children too.
-    //    Terminal slots were already reaped, so their recorded pid may name an
-    //    unrelated recycled process; never signal it. Only signal when the
-    //    recorded start-time still matches, so a recycled pid is never killed.
-    for slot in &state.slots {
-        if matches!(
-            slot.status,
-            state::SlotStatus::Done | state::SlotStatus::Failed | state::SlotStatus::Stuck
-        ) {
-            continue;
-        }
-        let token = markers::read_pid(&paths, run_id, &slot.id)
-            .or_else(|| slot.pid.map(process::PidToken::from_pid));
-        if let Some(token) = token {
-            if token.alive() {
-                process::terminate_tree(token.pid, true);
-            }
-        }
-    }
+    reap_run(&paths, run_id)?;
 
     // 4. The kill window above spans seconds; the orchestrator may have finished
     //    naturally and persisted a terminal/gate phase while dying. Reload and

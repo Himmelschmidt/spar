@@ -242,6 +242,9 @@ pub fn run_captured(
     let mut child = cmd
         .spawn()
         .with_context(|| format!("spawn {}", req.program.display()))?;
+    #[cfg(unix)]
+    shutdown::track(child.id());
+    let tracked_pid = child.id();
     if let Some(cb) = on_spawn {
         cb(child.id());
     }
@@ -275,6 +278,8 @@ pub fn run_captured(
                     let status = kill_process_group(&mut child)?;
                     let _ = t_out.join();
                     let _ = t_err.join();
+                    #[cfg(unix)]
+                    shutdown::untrack(tracked_pid);
                     append_log(&req.log_path, "\n! timed out\n")?;
                     let stats = stats_holder.lock().map(|s| s.clone()).unwrap_or_default();
                     let _ = stats.save(&req.log_path);
@@ -297,6 +302,8 @@ pub fn run_captured(
 
     let _ = t_out.join();
     let _ = t_err.join();
+    #[cfg(unix)]
+    shutdown::untrack(tracked_pid);
     let stats = stats_holder.lock().map(|s| s.clone()).unwrap_or_default();
     let _ = stats.save(&req.log_path);
     Ok(SpawnResult {
@@ -335,6 +342,125 @@ fn kill_process_group(child: &mut std::process::Child) -> Result<std::process::E
     {
         let _ = child.kill();
         child.wait().context("wait after kill")
+    }
+}
+
+/// Graceful shutdown for the orchestrator process.
+///
+/// Slots are spawned into their **own process groups** (so a slot timeout can reap
+/// nested `cargo test` / `pnpm build` children), which also means they survive the
+/// orchestrator's death — the orphaned-agents-still-burning-tokens case. On SIGINT or
+/// SIGTERM the orchestrator now signals every live slot group before it goes.
+///
+/// SIGKILL cannot be caught, so this covers the polite kill only; `spar stop --abandoned`
+/// and `spar wait`'s abandonment check exist for the rest.
+#[cfg(unix)]
+mod shutdown {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    /// Slot groups to signal from the handler. A fixed array, not a Vec behind a lock:
+    /// a signal handler may only touch async-signal-safe things, which rules out
+    /// allocation and locking. Fleets are single digits; 64 is far past any real run.
+    /// `sighandler_t` as the C library sees it: either the default disposition or a
+    /// handler function. Modelled as an enum so the handler is passed as a typed fn
+    /// pointer rather than cast through an integer.
+    #[repr(transparent)]
+    struct SigHandler(usize);
+
+    impl SigHandler {
+        const DFL: SigHandler = SigHandler(0);
+
+        #[allow(non_snake_case)]
+        fn Handler(f: extern "C" fn(i32)) -> SigHandler {
+            SigHandler(f as *const () as usize)
+        }
+    }
+
+    const SIG_DFL: SigHandler = SigHandler::DFL;
+
+    extern "C" {
+        fn signal(signum: i32, handler: SigHandler) -> SigHandler;
+        fn getpid() -> i32;
+    }
+
+    const MAX_TRACKED: usize = 64;
+    static SLOT_PIDS: [AtomicU32; MAX_TRACKED] = [const { AtomicU32::new(0) }; MAX_TRACKED];
+    static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+
+    pub fn track(pid: u32) {
+        for slot in SLOT_PIDS.iter() {
+            if slot
+                .compare_exchange(0, pid, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    pub fn untrack(pid: u32) {
+        for slot in SLOT_PIDS.iter() {
+            let _ = slot.compare_exchange(pid, 0, Ordering::SeqCst, Ordering::SeqCst);
+        }
+    }
+
+    pub fn requested() -> bool {
+        SHUTDOWN.load(Ordering::SeqCst)
+    }
+
+    /// Reap, then die as asked.
+    ///
+    /// Async-signal-safe: atomics and `kill(2)`, nothing else — no allocation, no locks,
+    /// no file I/O, so the run's phase is deliberately *not* written here. After
+    /// signalling the slot groups the handler restores the default disposition and
+    /// re-raises, so `spar` still terminates on the operator's signal instead of
+    /// surviving it and reporting some later phase as the run's outcome. The run is left
+    /// mid-phase, which reads as abandoned — `spar wait`, `spar status` and
+    /// `spar stop --abandoned` all handle that, and the tokens have stopped burning.
+    extern "C" fn on_signal(sig: i32) {
+        SHUTDOWN.store(true, Ordering::SeqCst);
+        for slot in SLOT_PIDS.iter() {
+            let pid = slot.load(Ordering::SeqCst);
+            if pid != 0 {
+                super::raw_kill(-(pid as i32), super::SIGTERM);
+            }
+        }
+        unsafe {
+            signal(sig, SIG_DFL);
+            super::raw_kill(getpid(), sig);
+        }
+    }
+
+    pub fn install() {
+        if INSTALLED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        const SIGINT: i32 = 2;
+        unsafe {
+            signal(SIGINT, SigHandler::Handler(on_signal));
+            signal(super::SIGTERM, SigHandler::Handler(on_signal));
+        }
+    }
+}
+
+/// Install the orchestrator's shutdown handler. Call once per orchestrating process —
+/// never from the TUI, where Ctrl+C belongs to the agent in the Shell tab.
+pub fn install_shutdown_handler() {
+    #[cfg(unix)]
+    shutdown::install();
+}
+
+/// True once SIGINT/SIGTERM arrived: dispatch loops stop at their next boundary and
+/// park the run at `Stopped` instead of leaving slots orphaned.
+pub fn shutdown_requested() -> bool {
+    #[cfg(unix)]
+    {
+        shutdown::requested()
+    }
+    #[cfg(not(unix))]
+    {
+        false
     }
 }
 

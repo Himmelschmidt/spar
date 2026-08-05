@@ -156,6 +156,7 @@ spar confirm <run_id> [--winner <slot>]   # arena winner
 spar reconcile <run_id>                  # arena merge-good-parts + review
 spar ship <run_id> --confirm [--base <branch>]   # draft PR (never merges)
 spar stop <run_id> [--json]              # halt dispatch, KEEP branch+worktree (resumable)
+spar stop --abandoned [--json]           # reap every run nobody is driving any more
 spar cleanup <run_id> [--purge]          # remove worktrees (and --purge run data)
 ```
 
@@ -215,6 +216,30 @@ this, so run `git fetch --prune` if your mirror is stale. A tag, a sha, a detach
 unpushed branch falls through to the repo default, with a note on stderr. `spar ship <id>
 --base <branch>` forces a target. The chosen target is recorded in `artifacts/ship.md`
 (`PR base:`), on the dry-run path too.
+
+## Abandoned runs
+
+A run is **abandoned** when it is still in a non-resting phase but no live orchestrator
+owns it: the process driving it died. Its slots do **not** die with it — they are spawned
+into their own process groups so a slot timeout can reap nested `cargo test`/`pnpm build`
+children — so they keep running and keep spending tokens with nobody collecting their work.
+
+- `spar wait` returns **exit 3** with `error: run abandoned …` once a run has read
+  abandoned for 15s (`SPAR_ABANDON_GRACE_SECS` overrides), instead of blocking to its
+  timeout on a run that can never advance. The grace exists because a just-detached
+  orchestrator has not taken the run lock yet.
+- `spar status <id> --json` carries **`orphan_pids`** — the slot processes still alive on
+  an abandoned run. Empty for every healthy run.
+- `spar stop --abandoned` sweeps them: every abandoned run in the project is reaped and
+  parked at `stopped` (resumable, worktrees kept). Runs at rest — terminal, a human gate,
+  or already stopped — are **never** swept; a plan waiting for approval is meant to have
+  no orchestrator.
+- On **SIGINT/SIGTERM** an orchestrating `spar` signals its slot groups before it exits,
+  so a polite kill no longer orphans anything. `SIGKILL` cannot be caught: that is what
+  the three above are for.
+
+Prefer `--detach` + `spar wait` over a foreground run precisely so a command timeout in
+your harness cannot orphan a fleet.
 
 **`spar cleanup`** reaps before it removes: for each of the run's own worktrees it kills
 every process whose **cwd is inside that worktree** (SIGTERM → grace → SIGKILL — this is

@@ -264,7 +264,12 @@ pub enum Command {
     /// Unlike `cleanup`, it never removes worktrees or the branch. Resume with
     /// `spar implement --run <id>`.
     Stop {
-        run_id: String,
+        /// Omit with `--abandoned` to sweep every abandoned run in the project.
+        run_id: Option<String>,
+        /// Stop every run that is in flight with no live orchestrator — the runs whose
+        /// slots are still burning tokens after the process driving them died.
+        #[arg(long)]
+        abandoned: bool,
         #[arg(long)]
         json: bool,
     },
