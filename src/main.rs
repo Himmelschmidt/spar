@@ -76,6 +76,7 @@ fn run() -> Result<ExitCode> {
             providers,
             select,
             urgency,
+            role,
             base,
             detach,
             json,
@@ -83,7 +84,8 @@ fn run() -> Result<ExitCode> {
             dry_run,
             big,
         } => {
-            let (paths, cfg) = project_ctx()?;
+            let (paths, mut cfg) = project_ctx()?;
+            cfg.apply_role_overrides(&role)?;
             let opts = CommonOpts {
                 task: Some(task.clone()),
                 providers,
@@ -114,6 +116,8 @@ fn run() -> Result<ExitCode> {
             run_id,
             plan,
             task,
+            role,
+            reload_config,
             base,
             detach,
             json,
@@ -124,7 +128,7 @@ fn run() -> Result<ExitCode> {
             urgency,
             big,
         } => {
-            let (paths, cfg) = project_ctx()?;
+            let (paths, cfg) = implement_ctx(run_id.as_deref(), &role, reload_config)?;
             let opts = CommonOpts {
                 task: task.clone(),
                 providers,
@@ -142,6 +146,7 @@ fn run() -> Result<ExitCode> {
         Command::Run {
             workflow,
             task,
+            role,
             base,
             detach,
             json,
@@ -152,7 +157,8 @@ fn run() -> Result<ExitCode> {
             urgency,
             big,
         } => {
-            let (paths, cfg) = project_ctx()?;
+            let (paths, mut cfg) = project_ctx()?;
+            cfg.apply_role_overrides(&role)?;
             let opts = CommonOpts {
                 task,
                 providers,
@@ -204,7 +210,8 @@ fn run() -> Result<ExitCode> {
             confirm,
             confirm_only,
         } => {
-            let (paths, cfg) = project_ctx()?;
+            let (paths, _) = project_ctx()?;
+            let cfg = Config::for_run(&paths, &run_id)?;
             if confirm || confirm_only {
                 ship::confirm_ship(&paths, &run_id, json)?;
                 if confirm_only {
@@ -222,7 +229,8 @@ fn run() -> Result<ExitCode> {
             workflow::arena::confirm_winner(&paths, &run_id, winner, json)
         }
         Command::Reconcile { run_id, json } => {
-            let (paths, cfg) = project_ctx()?;
+            let (paths, _) = project_ctx()?;
+            let cfg = Config::for_run(&paths, &run_id)?;
             workflow::arena::reconcile(&paths, &cfg, &run_id, json)
         }
         Command::Bus { action } => bus_cmd(action),
@@ -237,7 +245,8 @@ fn run() -> Result<ExitCode> {
             SkillsCmd::Get { name } => skills::run(skills::SkillsAction::Get { name }),
         },
         Command::InternalContinue { run_id } => {
-            let (paths, cfg) = project_ctx()?;
+            let (paths, _) = project_ctx()?;
+            let cfg = Config::for_run(&paths, &run_id)?;
             workflow::implement::continue_run(&paths, &cfg, &run_id)
         }
     }
@@ -410,6 +419,39 @@ fn bus_deliver(
         println!("{payload}");
     }
     Ok(ExitCode::Success)
+}
+
+/// Config for `spar implement`.
+///
+/// A new run (`--task` / `--plan`) starts from the project's live config; `--run <id>`
+/// binds to the config that run was created with, so an agent editing `spar.toml` for
+/// its own run cannot change the fleet, timeouts or ship gate of one already in flight.
+/// `--reload-config` is the deliberate way out: it re-reads the file and re-freezes the
+/// run against it.
+fn implement_ctx(
+    run_id: Option<&str>,
+    role: &[String],
+    reload_config: bool,
+) -> Result<(paths::SparPaths, Config)> {
+    let (paths, mut cfg) = project_ctx()?;
+    let Some(run_id) = run_id else {
+        cfg.apply_role_overrides(role)?;
+        return Ok((paths, cfg));
+    };
+    if !reload_config {
+        if !role.is_empty() {
+            anyhow::bail!(
+                "run {run_id} is bound to the config it was created with; \
+                 pass --reload-config to apply --role to it"
+            );
+        }
+        let cfg = Config::for_run(&paths, run_id)?;
+        return Ok((paths, cfg));
+    }
+    cfg.apply_role_overrides(role)?;
+    cfg.save_snapshot(&paths, run_id)?;
+    eprintln!("config: re-read spar.toml for run {run_id}");
+    Ok((paths, cfg))
 }
 
 fn project_ctx() -> Result<(paths::SparPaths, Config)> {
@@ -595,7 +637,8 @@ fn run_status_json(
 }
 
 fn stop_cmd(run_id: &str, json: bool) -> Result<ExitCode> {
-    let (paths, cfg) = project_ctx()?;
+    let (paths, _) = project_ctx()?;
+    let cfg = Config::for_run(&paths, run_id)?;
     let state = state::RunState::load(&paths, run_id)?;
 
     // A finished or gated run is already at rest: never downgrade it to Stopped or
@@ -689,7 +732,7 @@ fn load_run_anywhere(
     if let Some(root) = local_root {
         let swarm = paths::SparPaths::new(root);
         if let Ok(state) = state::RunState::load_for_display(&swarm, run_id) {
-            let cfg = Config::load(root).unwrap_or_default();
+            let cfg = Config::for_run(&swarm, run_id).unwrap_or_default();
             return Ok((swarm, cfg, state));
         }
     }
@@ -702,7 +745,7 @@ fn load_run_anywhere(
         };
         let swarm = paths::SparPaths::new(&root);
         if let Ok(state) = state::RunState::load_for_display(&swarm, run_id) {
-            let cfg = Config::load(&root).unwrap_or_default();
+            let cfg = Config::for_run(&swarm, run_id).unwrap_or_default();
             return Ok((swarm, cfg, state));
         }
     }

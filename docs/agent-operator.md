@@ -28,6 +28,19 @@ Also: `spar skills get core` (preferred; always current).
 
 **`--dry-run`:** no real git worktrees; only `.spar/` state + stubbed agents. Live runs provision sibling worktrees.
 
+## Run config isolation
+
+`spar.toml` is one file per project and every process reads it, so parallel agents writing
+`[roles]` into it clobber each other. Two things fix that:
+
+- **`--role <role>=<provider>`** on `plan` / `implement` / `run` assigns per role without
+  touching the file (repeatable; repeated `reviewer` builds the panel). It satisfies the
+  `--providers`-or-`--select` requirement on its own. Use it instead of editing `spar.toml`.
+- **Each run freezes its config** at creation into `.spar/runs/<id>/config.json`. Every later
+  phase of that run reads the snapshot, so another agent's edit cannot change its fleet,
+  timeouts, spec/suite channels, or ship gate. `spar implement --run <id> --reload-config`
+  re-reads the file and re-freezes; `--role` on a resume without it exits `1`.
+
 ## Base ref
 
 `plan` / `implement` / `run` accept **`--base <ref>`** (branch, tag, sha, `origin/main`,

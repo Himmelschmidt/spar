@@ -38,6 +38,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     state.task = Some(task);
     state.backend = opts.backend;
     worktree::apply_run_base(&mut state, opts.base.as_deref(), opts.json)?;
+    cfg.save_snapshot(paths, &state.id)?;
     // Reviews of existing trees: still isolate per reviewer so they don't stomp files.
     state.isolation = cfg.isolation;
     state.dry_run = dry;

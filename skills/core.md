@@ -328,7 +328,25 @@ A **rail** + **one main area**. Main always shows the rail's selection.
 
 **`--dry-run`:** stubs agent processes only; writes `.spar/runs/<id>/`. Does **not** create real git worktrees (cwd under `.spar/…/cwd-*`). Live runs create sibling worktrees.
 
-**Providers (three-tier precedence):** each slot's provider is resolved **explicit `--providers` (positional one-off) > `[roles]` > `[providers].order`**. `--providers` still works exactly as before — a single name fills every slot, multiple names map positionally (impl at 0, then reviewers). If you set a `[roles]` block (see config knobs), it satisfies the requirement on its own: `spar plan`/`implement` run with **no** `--providers`, drawing planner/critic/implementer/tester/test_author and the reviewer list from `[roles]`. `--select <profile>` is the fourth option. Explicit `--providers` always overrides `[roles]` positionally.
+**Providers (four-tier precedence):** each slot's provider is resolved **explicit `--providers` (positional one-off) > `--role` > `[roles]` > `[providers].order`**. `--providers` still works exactly as before — a single name fills every slot, multiple names map positionally (impl at 0, then reviewers). If you set a `[roles]` block (see config knobs), it satisfies the requirement on its own: `spar plan`/`implement` run with **no** `--providers`, drawing planner/critic/implementer/tester/test_author and the reviewer list from `[roles]`. `--select <profile>` is another option. Explicit `--providers` always overrides `[roles]` positionally.
+
+**`--role <role>=<provider>` assigns per role without touching `spar.toml`** — repeatable, and repeating `reviewer` builds the panel (replacing the file's, never appending). Like `[roles]`, it satisfies the "`--providers` or `--select` required" rule on its own. **Prefer it to editing the shared file:** `spar.toml` is one file per project, so parallel agents writing their own `[roles]` into it are writing over each other.
+
+```bash
+spar plan -t "…" --role planner=cli:grok --role plan_critic=cli:claude@opus --role reviewer=cli:grok
+```
+
+## A run is bound to the config it was created with
+
+`spar.toml` lives at the project root (the repo's **main checkout**, same place `.spar/` does) and every spar process reads it. To keep concurrent runs from re-configuring each other, **each run freezes the merged config at creation** into `.spar/runs/<id>/config.json`, and every later phase of that run — `implement --run`, the detached orchestrator, `ship`, `reconcile`, `status` — reads that snapshot, never the live file.
+
+So an agent editing `spar.toml` for its own run cannot change another run's fleet, timeouts, `[spec]`/`[suite]` channels, or ship-gate strictness (`[review].require_all_criteria`) mid-flight. New runs still pick up the current file.
+
+```bash
+spar implement --run <id> --reload-config   # deliberately re-read spar.toml and re-freeze
+```
+
+`--reload-config` is the only way to change an existing run's config; it replaces the snapshot, so later resumes keep the reloaded values. `--role` on a `--run <id>` resume without it exits `1` rather than silently re-fleeting the run. Runs created before snapshots existed fall back to the live file.
 
 ## Config knobs (`spar.toml`)
 

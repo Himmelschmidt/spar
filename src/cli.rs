@@ -50,6 +50,11 @@ pub enum Command {
         /// Urgency for `--select`: low | normal | high | critical
         #[arg(long, default_value = "normal")]
         urgency: String,
+        /// Assign a provider to a role for THIS run, without touching `spar.toml`:
+        /// `--role planner=cli:grok --role reviewer=cli:claude@opus`. Repeatable;
+        /// repeating `reviewer` builds the panel. Overrides the file's `[roles]`.
+        #[arg(long = "role", value_name = "ROLE=PROVIDER")]
+        role: Vec<String>,
         /// Ref to cut every slot worktree from (branch, tag or sha).
         /// Default: the HEAD of the directory spar was invoked from.
         #[arg(long)]
@@ -92,6 +97,16 @@ pub enum Command {
         plan: Option<std::path::PathBuf>,
         #[arg(long, short = 't')]
         task: Option<String>,
+        /// Assign a provider to a role for THIS run, without touching `spar.toml`:
+        /// `--role planner=cli:grok --role reviewer=cli:claude@opus`. Repeatable;
+        /// repeating `reviewer` builds the panel. Overrides the file's `[roles]`.
+        #[arg(long = "role", value_name = "ROLE=PROVIDER")]
+        role: Vec<String>,
+        /// Re-read `spar.toml` for an existing run and replace its frozen config.
+        /// Without this, `--run <id>` uses the config the run was created with, whatever
+        /// the project file says now.
+        #[arg(long)]
+        reload_config: bool,
         /// Ref to cut every slot worktree from (branch, tag or sha), for a NEW run.
         /// Default: the HEAD of the directory spar was invoked from. A run's base is
         /// fixed at creation, so `--run <id>` only accepts a base it already has.
@@ -124,6 +139,11 @@ pub enum Command {
         workflow: WorkflowKind,
         #[arg(long, short = 't')]
         task: Option<String>,
+        /// Assign a provider to a role for THIS run, without touching `spar.toml`:
+        /// `--role planner=cli:grok --role reviewer=cli:claude@opus`. Repeatable;
+        /// repeating `reviewer` builds the panel. Overrides the file's `[roles]`.
+        #[arg(long = "role", value_name = "ROLE=PROVIDER")]
+        role: Vec<String>,
         /// Ref to cut every slot worktree from (branch, tag or sha).
         /// Default: the HEAD of the directory spar was invoked from.
         #[arg(long)]

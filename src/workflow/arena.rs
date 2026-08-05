@@ -29,6 +29,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     state.task = Some(task);
     state.backend = opts.backend;
     worktree::apply_run_base(&mut state, opts.base.as_deref(), opts.json)?;
+    cfg.save_snapshot(paths, &state.id)?;
     state.isolation = cfg.isolation;
     state.dry_run = dry;
     let roles: Vec<&str> = (0..n).map(|_| "implementer").collect();

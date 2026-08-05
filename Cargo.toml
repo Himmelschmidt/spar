@@ -73,3 +73,7 @@ path = "tests/scenarios/bus_deliver.rs"
 [[test]]
 name = "worktree_base"
 path = "tests/scenarios/worktree_base.rs"
+
+[[test]]
+name = "run_config"
+path = "tests/scenarios/run_config.rs"

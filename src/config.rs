@@ -1,4 +1,5 @@
 use crate::bus::MessageBudget;
+use crate::paths::SparPaths;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -537,6 +538,77 @@ impl Config {
         Ok(cfg)
     }
 
+    /// The config a run is bound to. `spar.toml` is one mutable file per project, read
+    /// by every process, so a second agent editing it would otherwise change the fleet,
+    /// timeouts and ship-gate strictness of a run already in flight. A run reads its own
+    /// snapshot and nothing else; `implement --reload-config` is the only way to replace
+    /// it. Runs created before snapshots existed fall back to the live file.
+    pub fn for_run(paths: &SparPaths, run_id: &str) -> Result<Self> {
+        let snap = paths.run_config_file(run_id);
+        if snap.is_file() {
+            let text = std::fs::read_to_string(&snap)
+                .with_context(|| format!("read run config {}", snap.display()))?;
+            return serde_json::from_str(&text)
+                .with_context(|| format!("parse run config {}", snap.display()));
+        }
+        Self::load(&paths.project_root)
+    }
+
+    pub fn save_snapshot(&self, paths: &SparPaths, run_id: &str) -> Result<()> {
+        paths.ensure_run_dirs(run_id)?;
+        let path = paths.run_config_file(run_id);
+        std::fs::write(&path, serde_json::to_string_pretty(self)?)
+            .with_context(|| format!("write run config {}", path.display()))
+    }
+
+    /// Overlay `--role <role>=<provider>` onto `[roles]`, so a run's fleet can be chosen
+    /// per role without writing the project's shared `spar.toml` at all. Repeating
+    /// `--role reviewer=…` builds the reviewer list and replaces the file's, rather than
+    /// appending to it — otherwise a CLI panel could never be smaller than the file's.
+    pub fn apply_role_overrides(&mut self, assignments: &[String]) -> Result<()> {
+        if assignments.is_empty() {
+            return Ok(());
+        }
+        let mut reviewers = Vec::new();
+        for raw in assignments {
+            let (role, provider) = raw
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("--role expects <role>=<provider>, got {raw:?}"))?;
+            let (role, provider) = (role.trim(), provider.trim());
+            if provider.is_empty() {
+                anyhow::bail!("--role {role}= has no provider");
+            }
+            let slot = crate::state::SlotRole::from_config_key(role).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--role {role}: unknown role (planner, plan_critic, implementer, \
+                     reviewer, tester, test_author)"
+                )
+            })?;
+            match slot {
+                crate::state::SlotRole::Planner => self.roles.planner = Some(provider.into()),
+                crate::state::SlotRole::PlanCritic => {
+                    self.roles.plan_critic = Some(provider.into())
+                }
+                crate::state::SlotRole::Implementer => {
+                    self.roles.implementer = Some(provider.into())
+                }
+                crate::state::SlotRole::Tester => self.roles.tester = Some(provider.into()),
+                crate::state::SlotRole::TestAuthor => {
+                    self.roles.test_author = Some(provider.into())
+                }
+                crate::state::SlotRole::Reviewer => reviewers.push(provider.to_string()),
+                other => anyhow::bail!(
+                    "--role {}: not assignable (it is derived by the workflow)",
+                    other.as_config_key()
+                ),
+            }
+        }
+        if !reviewers.is_empty() {
+            self.roles.reviewer = reviewers;
+        }
+        self.roles.validate()
+    }
+
     fn apply_file(&mut self, file: &ConfigFile, trust: Trust) -> Result<()> {
         if let Some(v) = file.max_agents {
             self.max_agents = v;
@@ -902,6 +974,93 @@ planner = "best"
             cfg.notify.webhook.is_none(),
             "project spar.toml must not set notify.webhook"
         );
+    }
+
+    #[test]
+    fn role_overrides_replace_file_roles() {
+        let mut cfg = Config::default();
+        cfg.roles.planner = Some("cli:codex".into());
+        cfg.roles.reviewer = vec!["cli:codex".into(), "cli:codex".into(), "cli:codex".into()];
+
+        cfg.apply_role_overrides(&[
+            "planner=cli:grok".into(),
+            "plan_critic=cli:claude@opus".into(),
+            "reviewer=cli:grok".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(cfg.roles.planner.as_deref(), Some("cli:grok"));
+        assert_eq!(cfg.roles.plan_critic.as_deref(), Some("cli:claude@opus"));
+        assert_eq!(
+            cfg.roles.reviewer,
+            vec!["cli:grok".to_string()],
+            "CLI reviewers replace the file's panel, never append to it"
+        );
+    }
+
+    #[test]
+    fn role_overrides_reject_bad_input() {
+        let mut cfg = Config::default();
+        assert!(cfg.apply_role_overrides(&["planner".into()]).is_err());
+        assert!(cfg.apply_role_overrides(&["nope=cli:grok".into()]).is_err());
+        assert!(cfg.apply_role_overrides(&["planner=".into()]).is_err());
+        assert!(cfg
+            .apply_role_overrides(&["planner=nonsense".into()])
+            .is_err());
+        // A role the workflow derives is not assignable.
+        assert!(cfg
+            .apply_role_overrides(&["ranker=cli:grok".into()])
+            .is_err());
+        assert!(cfg.apply_role_overrides(&[]).is_ok());
+    }
+
+    /// The isolation guarantee: once a run is snapshotted, rewriting the project file
+    /// cannot reach it. Without this, a second agent's `spar.toml` edit silently changes
+    /// the fleet, timeouts and ship-gate strictness of a run already in flight.
+    #[test]
+    fn run_snapshot_survives_a_rewritten_project_file() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        std::fs::write(
+            tmp.path().join("spar.toml"),
+            "[roles]\nplanner = \"cli:grok\"\n[review]\nrequire_all_criteria = true\n",
+        )
+        .unwrap();
+
+        let created = Config::load(tmp.path()).unwrap();
+        created.save_snapshot(&paths, "run1").unwrap();
+
+        // Another agent rewrites the shared file.
+        std::fs::write(
+            tmp.path().join("spar.toml"),
+            "[roles]\nplanner = \"cli:codex\"\n[review]\nrequire_all_criteria = false\n",
+        )
+        .unwrap();
+
+        let bound = Config::for_run(&paths, "run1").unwrap();
+        assert_eq!(bound.roles.planner.as_deref(), Some("cli:grok"));
+        assert!(
+            bound.review.require_all_criteria,
+            "the ship gate must not loosen under a run in flight"
+        );
+
+        // The live file is still what a *new* run would get.
+        let fresh = Config::load(tmp.path()).unwrap();
+        assert_eq!(fresh.roles.planner.as_deref(), Some("cli:codex"));
+    }
+
+    #[test]
+    fn run_without_a_snapshot_falls_back_to_the_live_file() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        std::fs::write(
+            tmp.path().join("spar.toml"),
+            "[roles]\nplanner = \"cli:grok\"\n",
+        )
+        .unwrap();
+        // Pre-snapshot runs (created by an older spar) must still load.
+        let cfg = Config::for_run(&paths, "legacy-run").unwrap();
+        assert_eq!(cfg.roles.planner.as_deref(), Some("cli:grok"));
     }
 
     #[test]
