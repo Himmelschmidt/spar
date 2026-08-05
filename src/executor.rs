@@ -1589,6 +1589,18 @@ pub fn print_run_human(state: &RunState) {
     }
 }
 
+/// How long a run must read as abandoned before `wait` gives up on it. Covers the gap
+/// between `--detach` returning and the child acquiring the run lock, and the reacquire
+/// window on resume. `SPAR_ABANDON_GRACE_SECS` overrides it (tests, and boxes where
+/// detach is slower than this).
+fn abandon_grace() -> Duration {
+    std::env::var("SPAR_ABANDON_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(15))
+}
+
 pub fn wait_run(
     paths: &SparPaths,
     run_id: &str,
@@ -1600,6 +1612,7 @@ pub fn wait_run(
     let poll = Duration::from_millis(250);
     let mut event_off = 0u64;
     let mut last_phase = None;
+    let mut abandoned_since: Option<std::time::Instant> = None;
     loop {
         let state = RunState::load(paths, run_id)?;
         // The wait loop is a provider-agnostic delivery pulse: advance unacked-message
@@ -1626,6 +1639,35 @@ pub fn wait_run(
                 print_run_human(&state);
             }
             return Ok(state.exit_code());
+        }
+        // Nobody owns a run in a non-resting phase: whoever was driving it died, so no
+        // phase change is ever coming and blocking to the full timeout tells the caller
+        // nothing. Held for a grace window first — a just-detached orchestrator has not
+        // taken the lock yet, and a resume briefly drops it between load and re-acquire.
+        if state.abandoned(paths) {
+            let since = *abandoned_since.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() >= abandon_grace() {
+                let orphans = crate::state::live_slot_pids(paths, &state);
+                let mut state = state;
+                state.error = Some(match orphans.len() {
+                    0 => "run abandoned: no orchestrator owns it".to_string(),
+                    n => format!(
+                        "run abandoned: no orchestrator owns it; {n} slot process(es) still running"
+                    ),
+                });
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&state)?);
+                } else {
+                    eprintln!("{}", state.error.as_deref().unwrap_or_default());
+                    if !orphans.is_empty() {
+                        eprintln!("reap them: spar stop {run_id}   (or: spar stop --abandoned)");
+                    }
+                    print_run_human(&state);
+                }
+                return Ok(crate::exit_codes::ExitCode::Stuck);
+            }
+        } else {
+            abandoned_since = None;
         }
         if start.elapsed() >= timeout {
             if json {

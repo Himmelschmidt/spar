@@ -77,3 +77,7 @@ path = "tests/scenarios/worktree_base.rs"
 [[test]]
 name = "run_config"
 path = "tests/scenarios/run_config.rs"
+
+[[test]]
+name = "abandoned"
+path = "tests/scenarios/abandoned.rs"

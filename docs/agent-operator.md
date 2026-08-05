@@ -28,6 +28,16 @@ Also: `spar skills get core` (preferred; always current).
 
 **`--dry-run`:** no real git worktrees; only `.spar/` state + stubbed agents. Live runs provision sibling worktrees.
 
+## Abandoned runs
+
+A run in a non-resting phase with no live orchestrator is abandoned: the driver died and
+its slots are still running (they are in their own process groups by design). `spar wait`
+exits `3` with an `error` saying so after a 15s grace rather than blocking; `status --json`
+carries `orphan_pids`; `spar stop --abandoned` reaps every such run in the project and
+parks it at `stopped`. Runs at rest (terminal, gate, stopped) are never swept.
+SIGINT/SIGTERM to an orchestrating `spar` now reaps its slots first; SIGKILL cannot be
+caught, which is what the sweep is for.
+
 ## Run config isolation
 
 `spar.toml` is one file per project and every process reads it, so parallel agents writing

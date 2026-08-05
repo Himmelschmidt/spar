@@ -490,6 +490,31 @@ pub fn is_abandoned(phase: Phase, orchestrator_alive: bool) -> bool {
     !phase.is_waitable_stop() && !orchestrator_alive
 }
 
+/// Slot processes of `state` that are still alive.
+///
+/// Start-time checked: a terminal slot's recorded pid may since have been recycled onto
+/// an unrelated process, and reporting (or signalling) that would be worse than missing
+/// an orphan.
+pub fn live_slot_pids(paths: &SparPaths, state: &RunState) -> Vec<u32> {
+    let mut out = Vec::new();
+    for slot in &state.slots {
+        if matches!(
+            slot.status,
+            SlotStatus::Done | SlotStatus::Failed | SlotStatus::Stuck
+        ) {
+            continue;
+        }
+        let token = crate::markers::read_pid(paths, &state.id, &slot.id)
+            .or_else(|| slot.pid.map(crate::process::PidToken::from_pid));
+        if let Some(token) = token {
+            if token.alive() {
+                out.push(token.pid);
+            }
+        }
+    }
+    out
+}
+
 pub fn orchestrator_alive(paths: &SparPaths, run_id: &str) -> bool {
     crate::runlock::RunLock::owner(paths, run_id)
         .map(|t| t.alive())
