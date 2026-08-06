@@ -28,6 +28,14 @@ Also: `spar skills get core` (preferred; always current).
 
 **`--dry-run`:** no real git worktrees; only `.spar/` state + stubbed agents. Live runs provision sibling worktrees.
 
+## Reclaiming worktrees
+
+Nothing reclaims slot worktrees on its own: the normal successful path ends at the ship
+gate rather than `done`, and `auto_cleanup` is off by default. `spar cleanup --all` sweeps
+runs nothing can resume (`done`, `plan_rejected`); add `--older-than 7d` to also take
+resumable-but-stale ones (`stopped`, `failed`, `stuck`, `quota`, gates). In-flight runs are
+never swept — `spar stop --abandoned` first. `spar reject` reaps its own worktrees.
+
 ## Abandoned runs
 
 A run in a non-resting phase with no live orchestrator is abandoned: the driver died and

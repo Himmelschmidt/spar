@@ -81,3 +81,7 @@ path = "tests/scenarios/run_config.rs"
 [[test]]
 name = "abandoned"
 path = "tests/scenarios/abandoned.rs"
+
+[[test]]
+name = "cleanup_sweep"
+path = "tests/scenarios/cleanup_sweep.rs"

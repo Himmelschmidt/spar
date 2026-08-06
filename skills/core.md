@@ -158,6 +158,7 @@ spar ship <run_id> --confirm [--base <branch>]   # draft PR (never merges)
 spar stop <run_id> [--json]              # halt dispatch, KEEP branch+worktree (resumable)
 spar stop --abandoned [--json]           # reap every run nobody is driving any more
 spar cleanup <run_id> [--purge]          # remove worktrees (and --purge run data)
+spar cleanup --all [--older-than 7d]     # sweep finished runs project-wide
 ```
 
 **`spar stop`** halts a run without discarding work: it writes a `stopped` marker,
@@ -240,6 +241,18 @@ children — so they keep running and keep spending tokens with nobody collectin
 
 Prefer `--detach` + `spar wait` over a foreground run precisely so a command timeout in
 your harness cannot orphan a fleet.
+
+**Worktrees are not reclaimed on their own.** A successful run ends at the **ship gate**,
+not at `done`, and `auto_cleanup` is off by default, so a project accumulates one worktree
+per slot per run until you sweep. `spar cleanup --all` reaps every run nothing can resume
+(`done`, `plan_rejected`). Resumable runs at rest — `stopped`, `failed`, `stuck`, `quota`,
+and human gates — are spared unless you add `--older-than <dur>`, where the age is the
+evidence nobody is coming back for them. A run **in flight is never swept**, abandoned or
+not: park it first (`spar stop`, or `spar stop --abandoned`). Run data under
+`.spar/runs/<id>` survives a sweep unless you pass `--purge`; only worktrees go.
+
+Rejecting a plan (`spar reject`) reaps that run's worktrees immediately — nothing can
+resume a rejected plan — while keeping `plan.md` and the critique that justified it.
 
 **`spar cleanup`** reaps before it removes: for each of the run's own worktrees it kills
 every process whose **cwd is inside that worktree** (SIGTERM → grace → SIGKILL — this is

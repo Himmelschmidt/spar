@@ -276,7 +276,16 @@ pub enum Command {
 
     /// Remove worktrees and optional run data
     Cleanup {
-        run_id: String,
+        /// Omit with `--all` to sweep the project.
+        run_id: Option<String>,
+        /// Sweep every finished run that nothing can resume (`done`, `plan_rejected`).
+        #[arg(long)]
+        all: bool,
+        /// With `--all`, also sweep resumable runs at rest (stopped / failed / stuck /
+        /// quota / gates) untouched for this long, e.g. `7d`. Age is the evidence that
+        /// nobody is coming back to resume them.
+        #[arg(long, value_name = "DURATION")]
+        older_than: Option<String>,
         #[arg(long)]
         json: bool,
         /// Also delete `.spar/runs/<id>`

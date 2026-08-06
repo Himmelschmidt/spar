@@ -490,6 +490,37 @@ pub fn is_abandoned(phase: Phase, orchestrator_alive: bool) -> bool {
     !phase.is_waitable_stop() && !orchestrator_alive
 }
 
+/// Whether `spar cleanup --all` may reap this run's worktrees.
+///
+/// Two tiers, because a worktree is the only copy of an agent's work:
+/// - **Unresumable and at rest** (`done`, `plan_rejected`) is always sweepable. Nothing
+///   can ever pick these up again.
+/// - **Resumable at rest** (`stopped`, `failed`, `stuck`, `quota`, and human gates) only
+///   when `older_than` is given and the run has been untouched that long. Age is the
+///   evidence that nobody is coming back for it.
+///
+/// A run in flight is never swept, whether or not anyone still owns it: reaping a live
+/// fleet is `spar stop`'s job, and an abandoned one is `spar stop --abandoned`'s.
+pub fn sweepable(
+    phase: Phase,
+    idle: std::time::Duration,
+    older_than: Option<std::time::Duration>,
+) -> bool {
+    let unresumable = matches!(phase, Phase::Done | Phase::PlanRejected);
+    if unresumable {
+        return older_than.is_none_or(|min| idle >= min);
+    }
+    let resumable_at_rest = phase.is_gate()
+        || matches!(
+            phase,
+            Phase::Stopped | Phase::Failed | Phase::Stuck | Phase::Quota | Phase::PlanApproved
+        );
+    match (resumable_at_rest, older_than) {
+        (true, Some(min)) => idle >= min,
+        _ => false,
+    }
+}
+
 /// Slot processes of `state` that are still alive.
 ///
 /// Start-time checked: a terminal slot's recorded pid may since have been recycled onto
@@ -682,6 +713,42 @@ mod tests {
             SlotStatus::Running,
             "display must not rewrite state.json"
         );
+    }
+
+    #[test]
+    fn sweep_takes_finished_runs_and_spares_resumable_ones() {
+        use std::time::Duration;
+        let day = Duration::from_secs(86_400);
+        let week = Some(Duration::from_secs(7 * 86_400));
+
+        // Nothing can resume these: always sweepable.
+        for phase in [Phase::Done, Phase::PlanRejected] {
+            assert!(sweepable(phase, Duration::ZERO, None), "{phase:?}");
+        }
+        // Resumable at rest: only once age says nobody is coming back.
+        for phase in [
+            Phase::Stopped,
+            Phase::Failed,
+            Phase::Stuck,
+            Phase::Quota,
+            Phase::PlanApproved,
+            Phase::AwaitingPlanApproval,
+            Phase::AwaitingShipConfirm,
+        ] {
+            assert!(
+                !sweepable(phase, day * 30, None),
+                "{phase:?} must survive a bare --all: it can still be resumed"
+            );
+            assert!(sweepable(phase, day * 30, week), "{phase:?} at 30d");
+            assert!(!sweepable(phase, day, week), "{phase:?} at 1d");
+        }
+        // In flight is never swept, however old the state file looks.
+        for phase in [Phase::Dispatch, Phase::Review, Phase::WaitCompletion] {
+            assert!(!sweepable(phase, day * 30, None), "{phase:?}");
+            assert!(!sweepable(phase, day * 30, week), "{phase:?}");
+        }
+        // --older-than also holds back young finished runs.
+        assert!(!sweepable(Phase::Done, day, week));
     }
 
     #[test]
