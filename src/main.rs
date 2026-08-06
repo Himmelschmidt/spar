@@ -253,9 +253,11 @@ fn run() -> Result<ExitCode> {
         } => stop_cmd(run_id.as_deref(), abandoned, json),
         Command::Cleanup {
             run_id,
+            all,
+            older_than,
             json,
             purge,
-        } => cleanup_cmd(&run_id, json, purge),
+        } => cleanup_cmd(run_id.as_deref(), all, older_than.as_deref(), json, purge),
         Command::Skills { action } => match action {
             SkillsCmd::List { json } => skills::run(skills::SkillsAction::List { json }),
             SkillsCmd::Get { name } => skills::run(skills::SkillsAction::Get { name }),
@@ -985,7 +987,82 @@ fn attach_cmd(run_id: &str) -> Result<ExitCode> {
     Ok(ExitCode::Success)
 }
 
-fn cleanup_cmd(run_id: &str, json: bool, purge: bool) -> Result<ExitCode> {
+fn cleanup_cmd(
+    run_id: Option<&str>,
+    all: bool,
+    older_than: Option<&str>,
+    json: bool,
+    purge: bool,
+) -> Result<ExitCode> {
+    match (run_id, all) {
+        (Some(id), false) => cleanup_one(id, json, purge),
+        (None, true) => cleanup_sweep(older_than, json, purge),
+        (Some(_), true) => anyhow::bail!("pass a run id or --all, not both"),
+        (None, false) => anyhow::bail!("usage: spar cleanup <run_id> | spar cleanup --all"),
+    }
+}
+
+/// Reap the worktrees of every finished run in the project. Never touches a run that is
+/// in flight: `spar stop` (or `stop --abandoned`) parks those first, and only then does
+/// their work become garbage.
+fn cleanup_sweep(older_than: Option<&str>, json: bool, purge: bool) -> Result<ExitCode> {
+    let (paths, _) = project_ctx()?;
+    let min_idle = older_than.map(util::parse_duration).transpose()?;
+    let now = chrono::Utc::now();
+    let mut swept = Vec::new();
+    for summary in state::list_runs(&paths)? {
+        let Ok(state) = state::RunState::load(&paths, &summary.id) else {
+            continue;
+        };
+        let idle = (now - state.updated_at).to_std().unwrap_or_default();
+        if !state::sweepable(state.phase, idle, min_idle) {
+            continue;
+        }
+        let cleaned = worktree::cleanup_run(&state)?;
+        if let Some(session) = &state.tmux_session {
+            let _ = tmux::kill_session(session);
+        }
+        if purge {
+            let dir = paths.run_dir(&summary.id);
+            if dir.is_dir() {
+                std::fs::remove_dir_all(&dir)?;
+            }
+        }
+        swept.push(serde_json::json!({
+            "run_id": summary.id,
+            "phase": format!("{:?}", state.phase),
+            "idle_secs": idle.as_secs(),
+            "worktrees": cleaned,
+            "purged": purge,
+        }));
+    }
+    if purge {
+        worktree::prune_empty_spar_parents(&paths)?;
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "swept": swept }))?
+        );
+    } else if swept.is_empty() {
+        println!("nothing to sweep");
+    } else {
+        let mut trees = 0;
+        for r in &swept {
+            let n = r["worktrees"].as_array().map(|a| a.len()).unwrap_or(0);
+            trees += n;
+            println!(
+                "{} ({}): {n} worktree(s)",
+                r["run_id"].as_str().unwrap_or_default(),
+                r["phase"].as_str().unwrap_or_default()
+            );
+        }
+        println!("swept {} run(s), {trees} worktree(s)", swept.len());
+    }
+    Ok(ExitCode::Success)
+}
+
+fn cleanup_one(run_id: &str, json: bool, purge: bool) -> Result<ExitCode> {
     let (paths, _) = project_ctx()?;
     let state = state::RunState::load(&paths, run_id)?;
     let cleaned = worktree::cleanup_run(&state)?;

@@ -488,6 +488,12 @@ pub fn reject(
     state.set_phase(Phase::PlanRejected);
     state.error = reason;
     state.save(paths)?;
+    // Nothing can resume a rejected plan (`implement --run` requires an approved one),
+    // so its worktrees are garbage from here. Artifacts under `.spar/runs/<id>` stay:
+    // the plan and the critique are why you rejected it.
+    let _ = crate::worktree::cleanup_run(&state)?;
+    state.worktrees.clear();
+    state.save(paths)?;
     if json {
         executor::emit_run_json(&state)?;
     } else {
