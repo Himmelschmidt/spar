@@ -516,16 +516,29 @@ pub fn cleanup_run(state: &RunState) -> Result<Vec<WorktreeCleanup>> {
     Ok(report)
 }
 
+/// What the overlay left behind: paths git ignores in the author worktree, and where
+/// they still are. Directories are collapsed (`target/`), so this stays a short list.
+#[derive(Debug, Clone)]
+pub struct SpecOverlay {
+    pub author_path: PathBuf,
+    pub ignored: Vec<String>,
+}
+
 /// Bring pre-coding acceptance tests from the test-author worktree into the implementer cwd.
 ///
 /// Fail closed when the author worktree is missing. Always overlays the author working tree
 /// (agents often leave tests uncommitted). Live runs also try `git merge` of the author branch
 /// first for committed history; failed merges are aborted before overlay.
+///
+/// Returns what git ignored, because the caller has to say so out loud: a fixture the
+/// test-author wrote into an ignored path (`.env.test`, an ignored `tests/data/`) does not
+/// cross, and the implementer then meets a test that compiles and fails at runtime with
+/// nothing pointing at the plumbing.
 pub fn apply_spec_tests_to_impl(
     state: &RunState,
     author_slot: &str,
     impl_cwd: &Path,
-) -> Result<()> {
+) -> Result<SpecOverlay> {
     let spec = state
         .worktrees
         .iter()
@@ -544,7 +557,39 @@ pub fn apply_spec_tests_to_impl(
     }
     // Always overlay: uncommitted author files never appear in a merge.
     copy_tree_overlay(&spec.path, impl_cwd)?;
-    Ok(())
+    Ok(SpecOverlay {
+        author_path: spec.path.clone(),
+        ignored: ignored_entries(&spec.path),
+    })
+}
+
+/// Paths git ignores in `dir`, with fully-ignored directories collapsed to one entry.
+///
+/// `--directory` is what keeps this readable: without it a Rust worktree reports every
+/// file under `target/` individually.
+fn ignored_entries(dir: &Path) -> Vec<String> {
+    let Ok(out) = Command::new("git")
+        .args([
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+        ])
+        .current_dir(dir)
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    out.stdout
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect()
 }
 
 /// Attempt merge; on failure abort so the tree is never left in MERGING.
@@ -778,6 +823,78 @@ mod tests {
         std::fs::write(src.join("stub.txt"), "x").unwrap();
         copy_tree_overlay(&src, &dst).unwrap();
         assert!(dst.join("stub.txt").is_file());
+    }
+
+    /// The overlay carrying git-visible files only is the fix; doing it *silently* is the
+    /// new failure. An ignored fixture must come back named, so the caller can say where
+    /// it still is.
+    #[test]
+    fn overlay_reports_what_git_ignored() {
+        let tmp = tempdir().unwrap();
+        let project = tmp.path().join("proj");
+        let author = tmp.path().join("author");
+        let impl_cwd = tmp.path().join("impl");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(author.join("tests/data")).unwrap();
+        std::fs::create_dir_all(author.join("target/debug")).unwrap();
+        std::fs::create_dir_all(&impl_cwd).unwrap();
+        std::fs::write(
+            author.join(".gitignore"),
+            "target/\n.env.test\ntests/data/\n",
+        )
+        .unwrap();
+        std::fs::write(author.join("tests/acceptance.rs"), "fn t() {}\n").unwrap();
+        std::fs::write(author.join(".env.test"), "DB=x\n").unwrap();
+        std::fs::write(author.join("tests/data/golden.json"), "{}\n").unwrap();
+        std::fs::write(author.join("target/debug/huge.rlib"), vec![0u8; 512]).unwrap();
+
+        let git_ok = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&author)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !git_ok {
+            return;
+        }
+
+        let mut state = RunState::new("r1", crate::cli::WorkflowKind::Plan, project);
+        state.dry_run = true;
+        state.worktrees.push(WorktreeRecord {
+            slot_id: "test-author-x".into(),
+            path: author.clone(),
+            branch: "spar/r1/test-author-x".into(),
+        });
+
+        let overlay = apply_spec_tests_to_impl(&state, "test-author-x", &impl_cwd).unwrap();
+        assert!(impl_cwd.join("tests/acceptance.rs").is_file());
+        assert!(!impl_cwd.join(".env.test").exists());
+        assert!(!impl_cwd.join("target/debug/huge.rlib").exists());
+
+        assert_eq!(overlay.author_path, author);
+        assert!(
+            overlay.ignored.iter().any(|p| p == ".env.test"),
+            "an ignored fixture must be named, not silently dropped: {:?}",
+            overlay.ignored
+        );
+        assert!(
+            overlay.ignored.iter().any(|p| p.starts_with("tests/data")),
+            "{:?}",
+            overlay.ignored
+        );
+        // Directories collapse, so a Rust worktree never reports every file under target/.
+        assert!(
+            overlay.ignored.iter().any(|p| p.starts_with("target")),
+            "{:?}",
+            overlay.ignored
+        );
+        assert!(
+            overlay.ignored.len() < 6,
+            "ignored dirs must collapse to one entry each: {:?}",
+            overlay.ignored
+        );
     }
 
     /// Merged evidence is what lets the sweep reclaim without being asked, so it has to be

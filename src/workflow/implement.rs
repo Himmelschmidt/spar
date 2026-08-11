@@ -721,7 +721,10 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
         })
     };
     // Parsed once: the acceptance gate compares every reviewer against the same list.
+    // Parsed *before* the overlay note is appended below, so the note can never be read
+    // as a criterion.
     let contract_criteria = review_result::parse_contract_criteria(&test_contract_body);
+    let mut test_contract_body = test_contract_body;
 
     // Bring pre-coding acceptance tests into implementer cwd (fail closed if author ran).
     if let Some(author) = state
@@ -738,12 +741,57 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
             .ok_or_else(|| {
                 anyhow::anyhow!("implementer cwd missing; cannot apply acceptance tests")
             })?;
-        if let Err(e) = worktree::apply_spec_tests_to_impl(state, &author, &impl_cwd) {
-            return fail(
-                state,
-                paths,
-                anyhow::anyhow!("failed to apply acceptance tests from {author}: {e}"),
-            );
+        match worktree::apply_spec_tests_to_impl(state, &author, &impl_cwd) {
+            Err(e) => {
+                return fail(
+                    state,
+                    paths,
+                    anyhow::anyhow!("failed to apply acceptance tests from {author}: {e}"),
+                );
+            }
+            // Said out loud on every channel: the overlay carries git-visible files only,
+            // so a fixture the author wrote into an ignored path stays behind. Silent, that
+            // surfaces as an acceptance test failing at runtime for no visible reason —
+            // and the implementer is told it may weaken a test if it documents why.
+            Ok(overlay) if !overlay.ignored.is_empty() => {
+                let note = format!(
+                    "acceptance tests copied WITHOUT {} git-ignored path(s) ({}); \
+                     they remain in {}",
+                    overlay.ignored.len(),
+                    overlay.ignored.join(", "),
+                    overlay.author_path.display()
+                );
+                eprintln!("note: {note}");
+                let _ = crate::events::append(
+                    paths,
+                    &state.id,
+                    &crate::events::Event::info(note.clone()),
+                );
+                let _ = crate::bus::broadcast(
+                    paths,
+                    Some(&state.id),
+                    "orchestrator",
+                    note,
+                    state.message_budget,
+                );
+                test_contract_body.push_str(&format!(
+                    "\n## Not copied (git-ignored in the test-author worktree)\n\
+                     The acceptance tests above were copied from `{}`, but git ignores these \
+                     paths so they did **not** come with them:\n{}\n\n\
+                     If a test needs one of them, copy it across yourself from that worktree. \
+                     Do **not** copy build output or dependency directories (`target/`, \
+                     `node_modules/` and the like) — those are ignored on purpose and \
+                     rebuilding is cheaper than copying them.\n",
+                    overlay.author_path.display(),
+                    overlay
+                        .ignored
+                        .iter()
+                        .map(|p| format!("- `{p}`"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ));
+            }
+            Ok(_) => {}
         }
     }
 
