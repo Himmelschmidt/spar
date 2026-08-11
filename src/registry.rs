@@ -148,7 +148,8 @@ impl Registry {
                 last_run_id: last_run_id.map(|s| s.to_string()),
             });
         }
-        self.projects.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+        self.projects
+            .sort_by_key(|p| std::cmp::Reverse(p.last_seen));
         self.save()
     }
 
@@ -219,7 +220,7 @@ pub fn list_all_runs() -> Result<Vec<RunSummary>> {
             out.push(r);
         }
     }
-    out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    out.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
     Ok(out)
 }
 

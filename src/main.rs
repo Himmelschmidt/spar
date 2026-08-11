@@ -255,9 +255,17 @@ fn run() -> Result<ExitCode> {
             run_id,
             all,
             older_than,
+            merged,
             json,
             purge,
-        } => cleanup_cmd(run_id.as_deref(), all, older_than.as_deref(), json, purge),
+        } => cleanup_cmd(
+            run_id.as_deref(),
+            all,
+            older_than.as_deref(),
+            merged,
+            json,
+            purge,
+        ),
         Command::Skills { action } => match action {
             SkillsCmd::List { json } => skills::run(skills::SkillsAction::List { json }),
             SkillsCmd::Get { name } => skills::run(skills::SkillsAction::Get { name }),
@@ -991,12 +999,13 @@ fn cleanup_cmd(
     run_id: Option<&str>,
     all: bool,
     older_than: Option<&str>,
+    merged: bool,
     json: bool,
     purge: bool,
 ) -> Result<ExitCode> {
     match (run_id, all) {
         (Some(id), false) => cleanup_one(id, json, purge),
-        (None, true) => cleanup_sweep(older_than, json, purge),
+        (None, true) => cleanup_sweep(older_than, merged, json, purge),
         (Some(_), true) => anyhow::bail!("pass a run id or --all, not both"),
         (None, false) => anyhow::bail!("usage: spar cleanup <run_id> | spar cleanup --all"),
     }
@@ -1005,7 +1014,12 @@ fn cleanup_cmd(
 /// Reap the worktrees of every finished run in the project. Never touches a run that is
 /// in flight: `spar stop` (or `stop --abandoned`) parks those first, and only then does
 /// their work become garbage.
-fn cleanup_sweep(older_than: Option<&str>, json: bool, purge: bool) -> Result<ExitCode> {
+fn cleanup_sweep(
+    older_than: Option<&str>,
+    merged: bool,
+    json: bool,
+    purge: bool,
+) -> Result<ExitCode> {
     let (paths, _) = project_ctx()?;
     let min_idle = older_than.map(util::parse_duration).transpose()?;
     let now = chrono::Utc::now();
@@ -1018,7 +1032,22 @@ fn cleanup_sweep(older_than: Option<&str>, json: bool, purge: bool) -> Result<Ex
         let idle = (now - state.updated_at).to_std().unwrap_or_default();
         // Reported, not silent: a sweep that prints "nothing to sweep" while gigabytes of
         // finished work sit on disk reads as a refusal rather than a policy.
-        if let Some(reason) = state::sweep_skip_reason(state.phase, idle, min_idle) {
+        let mut skip = state::sweep_skip_reason(state.phase, idle, min_idle);
+        // `--merged` is evidence in its own right, and stronger than age: the work is in
+        // the base branch. It still cannot reach a run in flight.
+        if let (Some(why), true, true) = (&skip, merged, state::at_rest(state.phase)) {
+            skip = match worktree::merged_into_base(&state) {
+                Some(true) => None,
+                Some(false) => Some(format!(
+                    "{why}, and not merged into {}",
+                    state.base_ref.as_deref().unwrap_or("its base")
+                )),
+                None => Some(format!(
+                    "{why}, and has no base ref to judge merged against"
+                )),
+            };
+        }
+        if let Some(reason) = skip {
             spared.push(serde_json::json!({
                 "run_id": summary.id,
                 "phase": format!("{:?}", state.phase),

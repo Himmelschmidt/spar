@@ -264,6 +264,19 @@ A sweep says what it **spared** and why (`spared <run_id>: <reason>`; `spared[]`
 `--json`), so "nothing to sweep" is never confused with a refusal when there are
 gigabytes of resumable worktrees on disk.
 
+**`--merged` is evidence too, and stronger than age.** `spar cleanup --all --merged`
+also reaps at-rest runs whose every slot branch is already contained in the run's own
+`base_ref` — the work is in the base branch, so there is nothing left to lose. It still
+cannot touch a run in flight. Containment is **ancestry**, so a **squash-merged** branch
+reads as unmerged and needs `--older-than` or an explicit run id.
+
+**This also runs on its own.** `[worktree] auto_cleanup_merged` (default **true**) reaps
+merged at-rest runs project-wide just before a launch cuts new slot worktrees — the
+moment landed worktrees stop being worth their disk. It reports what it reclaimed on
+stderr and never fails a run. This is not `auto_cleanup` (still `false` by default):
+that one deletes resumable work on a phase check, this one only deletes what git says is
+already in the base branch. Set it `false` to keep every worktree until you sweep by hand.
+
 ## Swarm bus
 
 The bus is **workspace-scoped and keyed by a globally-unique `agent_id`**. Run-slot role
@@ -416,6 +429,7 @@ auto_cleanup = false
 # seed because rustc rewrites it in place and a shared inode would corrupt it.
 [worktree]
 # seed_dirs = ["target", "node_modules"]
+auto_cleanup_merged = true   # reap at-rest runs already contained in their base, at launch
 [gates]
 plan = true
 winner = true

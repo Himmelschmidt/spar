@@ -265,10 +265,24 @@ impl TimeoutConfig {
 /// Opt-in and empty by default: hardlinks share inodes, so a tool that rewrites a file
 /// in place rather than replacing it corrupts every worktree at once. Cargo and pnpm
 /// both replace, which is what makes this safe for the two dirs it exists for.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorktreeConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub seed_dirs: Vec<String>,
+    /// Reap at-rest runs whose branches are already in their base before cutting new slot
+    /// worktrees. On by default, unlike `auto_cleanup`: that one deletes resumable work on
+    /// a phase check, this one only deletes work git says is already in the base branch.
+    #[serde(default = "default_true")]
+    pub auto_cleanup_merged: bool,
+}
+
+impl Default for WorktreeConfig {
+    fn default() -> Self {
+        Self {
+            seed_dirs: Vec::new(),
+            auto_cleanup_merged: true,
+        }
+    }
 }
 
 /// Dedicated full-suite channel (cheap/dumb model). Separate from smart review/impl.
@@ -484,6 +498,7 @@ struct ConfigFile {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct WorktreeConfigFile {
     seed_dirs: Option<Vec<String>>,
+    auto_cleanup_merged: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -657,6 +672,9 @@ impl Config {
                     }
                 }
                 self.worktree.seed_dirs = dirs.clone();
+            }
+            if let Some(v) = w.auto_cleanup_merged {
+                self.worktree.auto_cleanup_merged = v;
             }
         }
         if let Some(p) = &file.providers {

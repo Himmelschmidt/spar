@@ -163,6 +163,9 @@ pub fn deliver_prompt(session: &str, window: &str, prompt: &str) -> Result<()> {
 }
 
 /// Where a [`WaitWorkingThenIdle`] observer sits in the turn lifecycle.
+// Same `allow` as the observer and its driver below: the API is kept and tested for the
+// turn-boundary delivery path, which no production caller has wired yet.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitPhase {
     /// Not yet seen the agent enter `working`. A leading `idle` here is the

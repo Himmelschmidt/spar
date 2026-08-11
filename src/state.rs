@@ -516,6 +516,12 @@ pub fn sweepable(
     }
 }
 
+/// Nobody is driving this run: it is finished, or parked. The precondition for any
+/// reclamation — an in-flight run's worktrees are in use whatever else is true of it.
+pub fn at_rest(phase: Phase) -> bool {
+    matches!(phase, Phase::Done | Phase::PlanRejected) || resumable_at_rest(phase)
+}
+
 /// A run that is not running and not finished: parked at a gate, stopped, failed, stuck
 /// or out of quota. Its worktrees are still live work — `implement --run` can pick it up.
 pub fn resumable_at_rest(phase: Phase) -> bool {
@@ -608,7 +614,7 @@ pub fn list_runs(paths: &SparPaths) -> Result<Vec<RunSummary>> {
             Err(_) => continue,
         }
     }
-    out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    out.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
     Ok(out)
 }
 
@@ -795,6 +801,36 @@ mod tests {
 
         let live = sweep_skip_reason(Phase::Review, day * 30, None).expect("spared");
         assert!(live.contains("in flight"), "{live}");
+    }
+
+    /// `at_rest` is the precondition for merged-evidence reclamation, so an in-flight
+    /// phase leaking into it would let the auto-sweep delete a live run's worktrees.
+    #[test]
+    fn at_rest_covers_finished_and_parked_but_never_in_flight() {
+        for phase in [
+            Phase::Done,
+            Phase::PlanRejected,
+            Phase::Stopped,
+            Phase::Failed,
+            Phase::Stuck,
+            Phase::Quota,
+            Phase::PlanApproved,
+            Phase::AwaitingShipConfirm,
+        ] {
+            assert!(at_rest(phase), "{phase:?}");
+        }
+        for phase in [
+            Phase::Init,
+            Phase::PrepareIsolation,
+            Phase::Dispatch,
+            Phase::Review,
+            Phase::Suite,
+            Phase::Fix,
+            Phase::Shipping,
+            Phase::WaitCompletion,
+        ] {
+            assert!(!at_rest(phase), "{phase:?} is in flight");
+        }
     }
 
     #[test]

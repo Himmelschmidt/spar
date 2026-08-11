@@ -68,7 +68,7 @@ pub fn list(paths: &SparPaths, run_id: &str) -> Result<Vec<Message>> {
             out.push(msg);
         }
     }
-    out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    out.sort_by_key(|m| m.created_at);
     Ok(out)
 }
 

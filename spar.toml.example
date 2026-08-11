@@ -14,6 +14,11 @@ auto_cleanup = false
 # hardlink shared across concurrent worktrees is how that corrupts.
 [worktree]
 # seed_dirs = ["target", "node_modules"]
+# Reap at-rest runs whose branches are already contained in their own base ref, just
+# before a launch cuts new worktrees. On by default: unlike auto_cleanup, this only
+# deletes work git says is already in the base branch. Squash merges are not ancestors
+# and are never reaped this way.
+auto_cleanup_merged = true
 
 [providers]
 # Mix CLI + API: "cli:claude", "cli:grok", "api:openai", "api:xai", ...

@@ -314,13 +314,44 @@ pub fn prepare_isolation(
             }
         }
         IsolationMode::Worktree | IsolationMode::WorktreeDb | IsolationMode::WorktreeBwrap => {
-            let seed_dirs = if state.dry_run {
-                Vec::new()
+            let cfg = if state.dry_run {
+                None
             } else {
-                crate::config::Config::for_run(paths, &state.id)
-                    .map(|c| c.worktree.seed_dirs)
-                    .unwrap_or_default()
+                crate::config::Config::for_run(paths, &state.id).ok()
             };
+            let seed_dirs = cfg
+                .as_ref()
+                .map(|c| c.worktree.seed_dirs.clone())
+                .unwrap_or_default();
+
+            // Reclaim before cutting, and only when actually cutting: the moment new
+            // worktrees appear is the moment landed ones stop being worth their disk.
+            let cutting_new = slot_ids.iter().any(|sid| {
+                !state
+                    .worktrees
+                    .iter()
+                    .any(|w| w.slot_id == *sid && w.path.is_dir())
+            });
+            if cutting_new && cfg.as_ref().is_some_and(|c| c.worktree.auto_cleanup_merged) {
+                match sweep_merged(paths, Some(&state.id)) {
+                    Ok(reaped) if !reaped.is_empty() => {
+                        let total: usize = reaped.iter().map(|(_, n)| n).sum();
+                        eprintln!(
+                            "reclaimed {total} merged worktree(s) from {} run(s): {}",
+                            reaped.len(),
+                            reaped
+                                .iter()
+                                .map(|(id, _)| id.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
+                    // Never fails a run: this is housekeeping, not the work.
+                    Ok(_) => {}
+                    Err(e) => eprintln!("note: merged-worktree sweep skipped: {e}"),
+                }
+            }
+
             for sid in slot_ids {
                 // Idempotent: reuse existing worktree for same slot (one-run re-entry).
                 let existing_path = state
@@ -394,6 +425,83 @@ pub fn prepare_isolation(
     }
     state.save(paths)?;
     Ok(())
+}
+
+/// Whether every branch this run cut is already contained in its own `base_ref`.
+///
+/// `None` when the question cannot be answered — no recorded base (pre-O26), a base that
+/// no longer resolves, or a run with no worktrees. Only `Some(true)` is evidence, and
+/// only evidence reaps.
+///
+/// Ancestry, not patch equivalence. A **squash-merged** branch is not an ancestor of its
+/// base and reads as unmerged here, so a squash-merged run still has to be swept by age
+/// or by run id. That is the safe direction to be wrong in: it keeps a worktree the
+/// operator might still want instead of deleting work that only looks landed.
+pub fn merged_into_base(state: &RunState) -> Option<bool> {
+    if state.worktrees.is_empty() {
+        return None;
+    }
+    let root = &state.project_root;
+    let base = resolve_commit(root, state.base_ref.as_deref()?)?;
+    for rec in &state.worktrees {
+        // A branch that is already gone cannot be holding unmerged work.
+        if resolve_commit(root, &rec.branch).is_none() {
+            continue;
+        }
+        let contained =
+            git_quiet(root, &["merge-base", "--is-ancestor", &rec.branch, &base]).unwrap_or(false);
+        if !contained {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+/// A ref as it resolves today: the local ref, else its `origin/` counterpart.
+fn resolve_commit(root: &Path, reference: &str) -> Option<String> {
+    git_out(
+        root,
+        &["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
+    )
+    .or_else(|| {
+        git_out(
+            root,
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("origin/{reference}^{{commit}}"),
+            ],
+        )
+    })
+}
+
+/// Reap the worktrees of every at-rest run whose branches are already in their base.
+///
+/// The disk-pollution backstop: a run that shipped and landed has nothing left to resume,
+/// but its phase (`awaiting_ship_confirm`, `stopped`) says otherwise, so age was the only
+/// evidence the sweep accepted and worktrees accumulated for as long as the operator went
+/// without running one. Merged is stronger evidence than age — the work is in the base
+/// branch — which is what makes this safe to do without being asked. `skip_run` is the
+/// run being launched right now.
+pub fn sweep_merged(paths: &SparPaths, skip_run: Option<&str>) -> Result<Vec<(String, usize)>> {
+    let mut reaped = Vec::new();
+    for summary in crate::state::list_runs(paths)? {
+        if skip_run == Some(summary.id.as_str()) {
+            continue;
+        }
+        let Ok(state) = RunState::load(paths, &summary.id) else {
+            continue;
+        };
+        if !crate::state::at_rest(state.phase) || merged_into_base(&state) != Some(true) {
+            continue;
+        }
+        let cleaned = cleanup_run(&state)?;
+        let removed = cleaned.iter().filter(|c| c.removed).count();
+        if removed > 0 {
+            reaped.push((summary.id, removed));
+        }
+    }
+    Ok(reaped)
 }
 
 /// What cleanup did to one worktree.
@@ -737,6 +845,70 @@ mod tests {
             std::fs::read_to_string(wt.join("target/debug/deps/libx.rlib")).unwrap(),
             "mine"
         );
+    }
+
+    /// Merged evidence is what lets the sweep reclaim without being asked, so it has to be
+    /// exact: contained in the base ⇒ reap, one unmerged commit ⇒ keep.
+    #[test]
+    fn merged_into_base_tracks_containment() {
+        let tmp = tempdir().unwrap();
+        let (root, _wt, _) = repo_with_linked_worktree(tmp.path());
+        let git = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let base_ref = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let base_commit = git(&root, &["rev-parse", "HEAD"]);
+
+        let mut state = RunState::new("runmerge", crate::cli::WorkflowKind::Loop, root.clone());
+        state.base_ref = Some(base_ref.clone());
+        state.base_commit = Some(base_commit);
+
+        assert_eq!(
+            merged_into_base(&state),
+            None,
+            "a run with no worktrees offers no evidence either way"
+        );
+
+        let rec = create_worktree(&root, "runmerge", "impl", state.base_commit.as_deref()).unwrap();
+        state.worktrees.push(rec.clone());
+        assert_eq!(
+            merged_into_base(&state),
+            Some(true),
+            "a branch that never moved is trivially contained"
+        );
+
+        std::fs::write(rec.path.join("work.txt"), "slot work\n").unwrap();
+        git(&rec.path, &["add", "."]);
+        git(&rec.path, &["commit", "-q", "-m", "slot work"]);
+        assert_eq!(
+            merged_into_base(&state),
+            Some(false),
+            "unmerged work must never read as reclaimable"
+        );
+
+        git(
+            &root,
+            &["merge", "--no-ff", "-q", "-m", "merge", &rec.branch],
+        );
+        assert_eq!(merged_into_base(&state), Some(true), "merged ⇒ reclaimable");
+
+        // Documented limitation: containment is ancestry, so a squash merge reads unmerged.
+        state.base_ref = None;
+        assert_eq!(
+            merged_into_base(&state),
+            None,
+            "no recorded base ⇒ no verdict, never a guess"
+        );
+
+        cleanup_run(&state).unwrap();
     }
 
     #[test]
