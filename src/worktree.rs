@@ -236,52 +236,6 @@ pub fn seed_env_files(project_root: &Path, worktree: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Hardlink-copy configured build-output dirs from the project checkout into a fresh
-/// slot worktree, so the slot's first build reuses the dependency artifacts already on
-/// disk instead of compiling them again.
-///
-/// `cp -al` links inodes: near-instant, no extra disk. Cargo and pnpm replace outputs
-/// rather than rewriting them in place, so a stale link just becomes a new inode on the
-/// next build. `incremental/` is excluded — rustc *does* rewrite there, and a shared
-/// inode across concurrent worktrees is how that corrupts.
-///
-/// Best-effort: a failed seed costs a cold build, never the run.
-pub fn seed_build_cache(project_root: &Path, worktree: &Path, dirs: &[String]) -> Result<()> {
-    for name in dirs {
-        let src = project_root.join(name);
-        let dst = worktree.join(name);
-        if !src.is_dir() || dst.exists() {
-            continue;
-        }
-        let ok = Command::new("cp")
-            .arg("-al")
-            .arg(&src)
-            .arg(&dst)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !ok {
-            let _ = std::fs::remove_dir_all(&dst);
-            eprintln!(
-                "note: could not seed {} from {} — slot will cold-build",
-                dst.display(),
-                src.display()
-            );
-            continue;
-        }
-        for incr in [
-            "debug/incremental",
-            "release/incremental",
-            "fast/incremental",
-        ] {
-            let _ = std::fs::remove_dir_all(dst.join(incr));
-        }
-    }
-    Ok(())
-}
-
 pub fn maybe_dbiso(project_root: &Path, worktree: &Path) -> Result<()> {
     if !project_root.join(".dbiso.env").is_file() {
         return Ok(());
@@ -319,11 +273,6 @@ pub fn prepare_isolation(
             } else {
                 crate::config::Config::for_run(paths, &state.id).ok()
             };
-            let seed_dirs = cfg
-                .as_ref()
-                .map(|c| c.worktree.seed_dirs.clone())
-                .unwrap_or_default();
-
             // Reclaim before cutting, and only when actually cutting: the moment new
             // worktrees appear is the moment landed ones stop being worth their disk.
             let cutting_new = slot_ids.iter().any(|sid| {
@@ -402,9 +351,6 @@ pub fn prepare_isolation(
                         state.base_commit.as_deref(),
                     )?
                 };
-                if !seed_dirs.is_empty() {
-                    seed_build_cache(&state.project_root, &rec.path, &seed_dirs)?;
-                }
                 if matches!(
                     state.isolation,
                     IsolationMode::WorktreeDb | IsolationMode::WorktreeBwrap
@@ -661,16 +607,26 @@ fn copy_tree_overlay(src: &Path, dst: &Path) -> Result<()> {
 ///
 /// Falls back to the full walk when git lists nothing: a dry-run cwd lives under an
 /// ignored `.spar/`, where `ls-files` is correctly empty but the stub artifacts still
-/// have to cross.
+/// have to cross. A git that *errored* (broken worktree admin dir, dubious ownership,
+/// git missing) falls back too, but says so — the walk is the gigabyte copy this change
+/// exists to stop, and it must never resume silently.
 fn overlay_sources(src: &Path) -> Result<Vec<PathBuf>> {
     match git_listed_files(src) {
-        Some(files) if !files.is_empty() => Ok(files),
-        _ => walkdir_regular_files(src),
+        Ok(files) if !files.is_empty() => Ok(files),
+        Ok(_) => walkdir_regular_files(src),
+        Err(why) => {
+            eprintln!(
+                "note: git could not list {} ({why}) — falling back to a full tree copy, \
+                 which will include build output",
+                src.display()
+            );
+            walkdir_regular_files(src)
+        }
     }
 }
 
-/// Regular files under `dir` that git tracks or would add. `None` when git can't answer.
-fn git_listed_files(dir: &Path) -> Option<Vec<PathBuf>> {
+/// Regular files under `dir` that git tracks or would add. `Err` when git can't answer.
+fn git_listed_files(dir: &Path) -> std::result::Result<Vec<PathBuf>, String> {
     let out = Command::new("git")
         .args([
             "ls-files",
@@ -681,19 +637,32 @@ fn git_listed_files(dir: &Path) -> Option<Vec<PathBuf>> {
         ])
         .current_dir(dir)
         .output()
-        .ok()?;
+        .map_err(|e| e.to_string())?;
     if !out.status.success() {
-        return None;
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
     let files = out
         .stdout
         .split(|b| *b == 0)
         .filter(|s| !s.is_empty())
-        .map(|s| dir.join(String::from_utf8_lossy(s).as_ref()))
+        // Raw bytes, not `from_utf8_lossy`: a replacement char would name a path that does
+        // not exist, and the file would be dropped instead of copied.
+        .map(|s| dir.join(bytes_to_path(s)))
         // `ls-files` also reports symlinks, submodules and deleted-but-tracked paths.
         .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file()))
         .collect();
-    Some(files)
+    Ok(files)
+}
+
+#[cfg(unix)]
+fn bytes_to_path(b: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    PathBuf::from(std::ffi::OsStr::from_bytes(b))
+}
+
+#[cfg(not(unix))]
+fn bytes_to_path(b: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(b).as_ref())
 }
 
 /// Regular files only — never follow or copy symlinks (agent could link secrets).
@@ -809,42 +778,6 @@ mod tests {
         std::fs::write(src.join("stub.txt"), "x").unwrap();
         copy_tree_overlay(&src, &dst).unwrap();
         assert!(dst.join("stub.txt").is_file());
-    }
-
-    #[test]
-    fn seed_build_cache_hardlinks_and_drops_incremental() {
-        let tmp = tempdir().unwrap();
-        let root = tmp.path().join("repo");
-        let wt = tmp.path().join("repo-spar-r1-impl");
-        std::fs::create_dir_all(root.join("target/debug/incremental/foo")).unwrap();
-        std::fs::create_dir_all(root.join("target/debug/deps")).unwrap();
-        std::fs::create_dir_all(&wt).unwrap();
-        std::fs::write(root.join("target/debug/deps/libx.rlib"), "obj").unwrap();
-        std::fs::write(root.join("target/debug/incremental/foo/dep"), "incr").unwrap();
-
-        seed_build_cache(&root, &wt, &["target".to_string()]).unwrap();
-
-        let seeded = wt.join("target/debug/deps/libx.rlib");
-        assert!(seeded.is_file(), "dependency artifacts must be seeded");
-        assert!(
-            !wt.join("target/debug/incremental").exists(),
-            "incremental must not be shared across worktrees"
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let a = std::fs::metadata(root.join("target/debug/deps/libx.rlib")).unwrap();
-            let b = std::fs::metadata(&seeded).unwrap();
-            assert_eq!(a.ino(), b.ino(), "seed must hardlink, not copy");
-        }
-
-        // A dir already present in the worktree is never clobbered.
-        std::fs::write(seeded, "mine").unwrap();
-        seed_build_cache(&root, &wt, &["target".to_string()]).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(wt.join("target/debug/deps/libx.rlib")).unwrap(),
-            "mine"
-        );
     }
 
     /// Merged evidence is what lets the sweep reclaim without being asked, so it has to be

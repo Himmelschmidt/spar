@@ -420,6 +420,10 @@ fn execute_prepared(
             && !markers::wait_for_artifact(&prep.paths, &prep.run_id, name, Duration::from_secs(2))
                 .unwrap_or(false)
             && !recover_artifact(&ArtifactRecovery {
+                paths: &prep.paths,
+                run_id: &prep.run_id,
+                slot_id: &prep.job.slot_id,
+                role: prep.job.role,
                 provider: &prep.job.provider,
                 model: prep.job.model.clone(),
                 cwd: &prep.cwd,
@@ -456,9 +460,13 @@ fn execute_prepared(
 /// is doing something other than what it was asked.
 const ARTIFACT_RECOVERY_SECS: u64 = 600;
 
-/// Everything a recovery turn needs. A struct because the call takes nine values and
-/// two of them are paths that must not be swapped.
+/// Everything a recovery turn needs. A struct because the call takes ten values and
+/// several of them are paths that must not be swapped.
 struct ArtifactRecovery<'a> {
+    paths: &'a SparPaths,
+    run_id: &'a str,
+    slot_id: &'a str,
+    role: SlotRole,
     provider: &'a str,
     model: Option<String>,
     cwd: &'a Path,
@@ -468,6 +476,27 @@ struct ArtifactRecovery<'a> {
     isolation: crate::config::IsolationMode,
     base_commit: Option<&'a str>,
     artifact: &'a Path,
+}
+
+/// Only the implementer may be recovered.
+///
+/// Recovery infers an artifact from whatever is in the slot's cwd, and it is the only
+/// role for which that inference is sound:
+///
+/// - `tester` and `reviewer` are pointed at the *implementer's* worktree, so
+///   `slot_has_work` is true for them whether or not they did anything. A recovered
+///   `suite.md` reading `## Result: pass` sets the authoritative gate green with no suite
+///   ever having run.
+/// - `test_author` writes the `AC-n` acceptance contract. Prose passes the non-empty
+///   check, `parse_contract_criteria` then finds no criteria, and the ship gate goes
+///   vacuous — a green run with nothing holding it.
+/// - `ranker` runs in `project_root`, whose tree is somebody else's WIP.
+///
+/// A failed slot in those roles is the correct outcome: the existing salvage path records
+/// why, and a human sees it. Only the implementer's deliverable is genuinely on disk with
+/// only the write-up missing.
+fn role_is_recoverable(role: SlotRole) -> bool {
+    matches!(role, SlotRole::Implementer)
 }
 
 /// Work the slot left behind: uncommitted changes, or commits past the run's base.
@@ -500,9 +529,10 @@ fn slot_has_work(cwd: &Path, base_commit: Option<&str>) -> bool {
 /// there throws away a full build and re-dispatches from scratch, which is the most
 /// expensive way to recover the cheapest thing to reproduce.
 ///
-/// Only fires when the tree actually holds work, so a slot that did nothing still fails.
+/// Only fires for the implementer, and only when the tree actually holds work — a slot
+/// that did nothing still fails.
 fn recover_artifact(r: &ArtifactRecovery) -> bool {
-    if !slot_has_work(r.cwd, r.base_commit) {
+    if !role_is_recoverable(r.role) || !slot_has_work(r.cwd, r.base_commit) {
         return false;
     }
     let Some(adapter) = providers::adapter_named(r.provider) else {
@@ -541,14 +571,45 @@ fn recover_artifact(r: &ArtifactRecovery) -> bool {
         program,
         args,
         cwd: r.cwd.to_path_buf(),
-        log_path: r.log_path.to_path_buf(),
+        // Its own log. `run_captured` opens with `File::create`, so reusing the slot's
+        // would truncate the transcript of the turn that did all the work — which is both
+        // the operator's only diagnosis and what `salvage_expected_artifact` tails when
+        // recovery itself fails.
+        log_path: recovery_log_path(r.log_path),
         env: r.env.to_vec(),
         timeout,
     };
-    if process::run_captured(&req, None, None).is_err() {
+    // Tracked like any other slot spawn: without the pid marker this agent is invisible to
+    // `stop --abandoned`, and without the heartbeat a recovery longer than
+    // `RESERVE_LEASE_TTL_SECS` lets a live holder's path reserves be reclaimed.
+    let pid_file = markers_pid_path(r.paths, r.run_id, r.slot_id);
+    let sink = move |pid: u32| {
+        let _ = std::fs::write(&pid_file, process::PidToken::capture(pid).encode());
+    };
+    let beat = LivenessBeat {
+        paths: r.paths,
+        run_id: r.run_id,
+        slot_id: r.slot_id,
+        last: std::cell::Cell::new(std::time::Instant::now()),
+    };
+    let tick = || beat.tick();
+    if process::run_captured(&req, Some(&sink), Some(&tick)).is_err() {
         return false;
     }
     artifact_written(r.artifact)
+}
+
+/// `<run_dir>/logs/<slot>.recovery.log`.
+fn recovery_log_path(log_path: &Path) -> PathBuf {
+    let stem = log_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("slot");
+    log_path.with_file_name(format!("{stem}.recovery.log"))
+}
+
+fn markers_pid_path(paths: &SparPaths, run_id: &str, slot_id: &str) -> PathBuf {
+    paths.markers_dir(run_id).join(format!("{slot_id}.pid"))
 }
 
 fn artifact_written(path: &Path) -> bool {
@@ -1454,6 +1515,10 @@ fn run_headless(
                 .unwrap_or(false);
             let recovered = !found
                 && recover_artifact(&ArtifactRecovery {
+                    paths,
+                    run_id: &state.id,
+                    slot_id: &job.slot_id,
+                    role: job.role,
                     provider: &job.provider,
                     model: slot_model_for(Some(state), job),
                     cwd,

@@ -541,15 +541,17 @@ pub fn sweep_skip_reason(
     if sweepable(phase, idle, older_than) {
         return None;
     }
+    // In flight first: an in-flight run is never swept at any age, so reporting it as
+    // merely too young implies it would be swept once it aged.
+    if !at_rest(phase) {
+        return Some(format!("{phase:?} is in flight — spar stop it first"));
+    }
     if older_than.is_some_and(|min| idle < min) {
         return Some(format!("idle {}s is below --older-than", idle.as_secs()));
     }
-    if resumable_at_rest(phase) {
-        return Some(format!(
-            "{phase:?} is resumable — sweep it with --older-than, or by run id"
-        ));
-    }
-    Some(format!("{phase:?} is in flight — spar stop it first"))
+    Some(format!(
+        "{phase:?} is resumable — sweep it with --older-than, or by run id"
+    ))
 }
 
 /// Slot processes of `state` that are still alive.
@@ -801,6 +803,11 @@ mod tests {
 
         let live = sweep_skip_reason(Phase::Review, day * 30, None).expect("spared");
         assert!(live.contains("in flight"), "{live}");
+
+        // An in-flight run is never swept at any age, so age must not be the reason given.
+        let live_young = sweep_skip_reason(Phase::Review, day, week).expect("spared");
+        assert!(live_young.contains("in flight"), "{live_young}");
+        assert!(!live_young.contains("--older-than"), "{live_young}");
     }
 
     /// `at_rest` is the precondition for merged-evidence reclamation, so an in-flight

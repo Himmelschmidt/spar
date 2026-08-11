@@ -1099,11 +1099,20 @@ fn cleanup_sweep(
         }
         println!("swept {} run(s), {trees} worktree(s)", swept.len());
     }
-    for r in &spared {
+    // Capped: a project that has accumulated hundreds of runs would otherwise bury the
+    // swept lines under a wall of spared ones. `--json` carries all of them.
+    const SPARED_SHOWN: usize = 10;
+    for r in spared.iter().take(SPARED_SHOWN) {
         println!(
             "spared {}: {}",
             r["run_id"].as_str().unwrap_or_default(),
             r["reason"].as_str().unwrap_or_default()
+        );
+    }
+    if spared.len() > SPARED_SHOWN {
+        println!(
+            "... and {} more spared (--json for all)",
+            spared.len() - SPARED_SHOWN
         );
     }
     Ok(ExitCode::Success)

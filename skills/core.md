@@ -373,15 +373,22 @@ A **rail** + **one main area**. Main always shows the rail's selection.
   role actually drew (`["planner=cli:grok", "reviewer=cli:grok+cli:claude@opus"]`), which
   is also what `plan` / `review` print at launch. `"providers"` is the run's *pool* and
   still lists refs no role ever drew; read `roles` to know what is running the work.
-- **A slot that exits clean with work in its tree but no artifact gets one recovery turn**
-  instead of failing: spar re-prompts the same provider for that artifact alone (10 min
-  budget, no new work). A slot whose worktree holds nothing — no commits past the base, no
-  dirty tree — still fails with `missing expected artifact <name>`.
+- **An implementer that exits clean with work in its tree but no artifact gets one
+  recovery turn** instead of failing: spar re-prompts the same provider for that artifact
+  alone (10 min budget, no new work), logging to `<slot>.recovery.log` so the original
+  transcript survives. An implementer whose worktree holds nothing — no commits past the
+  base, no dirty tree — still fails with `missing expected artifact <name>`.
+  **Implementer only.** `tester` and `reviewer` slots run *in* the implementer's worktree,
+  so "has work" is always true for them and a recovered `suite.md` could set the
+  authoritative gate green with no suite having run; a recovered `test-contract.md` would
+  carry no `AC-n` and make the ship gate vacuous. Those roles fail closed, as before.
 - **The suite gate is checked for coverage.** When the tester's commands select specific
-  targets (`--test foo`, `-p pkg`, a path) and the implementer added test files none of
-  them name, spar appends a `## Coverage warning` to `suite.md` and broadcasts it on the
-  bus. spar never edits the command list — a harness that rewrites its own gate is not a
-  gate. Silent when the suite runs the project default (`cargo test`, `pytest`).
+  targets (`--test foo`, `--lib`, `mod::case`, a named test file) and the implementer
+  committed test files none of them name, spar appends a `## Coverage warning` to
+  `suite.md` and broadcasts it on the bus. spar never edits the command list — a harness
+  that rewrites its own gate is not a gate. Silent when the suite runs the project default
+  (`cargo test`, `cargo test -p pkg`, `pytest tests/`, `go test ./...`), all of which
+  compile or collect new test files on their own.
 
 ## Exit codes (stable)
 
@@ -423,12 +430,7 @@ spar implement --run <id> --reload-config   # deliberately re-read spar.toml and
 autonomy = "manual" | "semi" | "high" | "full"
 message_budget = "none" | "lean" | "normal" | "chatty"
 auto_cleanup = false
-# Hardlink-seed build output into each fresh slot worktree so N slots don't each
-# cold-build identical dependencies. Names project-root-relative directories, single
-# components only. Empty (off) by default; `incremental/` is always dropped from the
-# seed because rustc rewrites it in place and a shared inode would corrupt it.
 [worktree]
-# seed_dirs = ["target", "node_modules"]
 auto_cleanup_merged = true   # reap at-rest runs already contained in their base, at launch
 [gates]
 plan = true

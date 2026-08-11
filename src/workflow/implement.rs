@@ -503,13 +503,41 @@ fn suite_commands(body: &str) -> Vec<String> {
     out
 }
 
-/// True when a command narrows what it runs instead of running the project default.
+/// True when a command narrows to specific *targets* instead of running the project's
+/// default set.
+///
+/// Explicit target flags plus test-file arguments only. Earlier this also counted any
+/// token containing `/`, which made `pytest tests/`, `go test ./...` and
+/// `./scripts/test.sh` all read as selective — the canonical full-suite command of three
+/// ecosystems, each of which does collect every new test file. Warning on those is the
+/// false-positive class this check exists to avoid.
+///
+/// `-p` / `--package` are deliberately absent: `cargo test -p foo` builds every test
+/// target in `foo`, including one added this round, so it covers what it does not name.
 fn command_is_selective(cmd: &str) -> bool {
-    const NARROWING: [&str; 6] = ["--test ", "--bin ", "--package ", "-p ", "--lib", "::"];
-    NARROWING.iter().any(|f| cmd.contains(f))
-        || cmd
-            .split_whitespace()
-            .any(|tok| tok.contains('/') && !tok.starts_with('-'))
+    const NARROWING: [&str; 4] = ["--test ", "--bin ", "--lib", "::"];
+    // Only the command itself, never a pipeline tail or a redirect target.
+    let head = cmd
+        .split(['|', '>', ';'])
+        .next()
+        .unwrap_or(cmd)
+        .split("&&")
+        .next()
+        .unwrap_or(cmd);
+    if NARROWING.iter().any(|f| head.contains(f)) {
+        return true;
+    }
+    // A named test *file* is selective; a directory or a glob is not. The first token is
+    // the runner, not a target.
+    head.split_whitespace().skip(1).any(|tok| {
+        !tok.starts_with('-') && !tok.ends_with('/') && is_test_path(tok) && has_ext(tok)
+    })
+}
+
+fn has_ext(tok: &str) -> bool {
+    let file = tok.rsplit('/').next().unwrap_or(tok);
+    file.rsplit_once('.')
+        .is_some_and(|(stem, ext)| !stem.is_empty() && !ext.is_empty() && !ext.contains('.'))
 }
 
 fn is_test_path(path: &str) -> bool {
@@ -886,8 +914,9 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
                     state.message_budget,
                 );
                 // Into the report the reviewers read: the gate itself cannot be trusted to
-                // notice a target it never compiled, but a reviewer can.
-                suite_body.push_str(&format!(
+                // notice a target it never compiled, but a reviewer can. Written to the
+                // artifact too, not just the prompt — `suite.md` is what a human opens.
+                let warning = format!(
                     "\n## Coverage warning (orchestrator)\nThe suite commands above select \
                      specific targets and name none of these added test files:\n{}\n\nTreat the \
                      suite result as not covering them.\n",
@@ -896,7 +925,15 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
                         .map(|f| format!("- {f}"))
                         .collect::<Vec<_>>()
                         .join("\n")
-                ));
+                );
+                suite_body.push_str(&warning);
+                let suite_path = paths.artifact(&state.id, "suite.md");
+                if suite_path.is_file() {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&suite_path) {
+                        let _ = f.write_all(warning.as_bytes());
+                    }
+                }
             }
         }
 
@@ -1184,7 +1221,20 @@ fn try_rotate_reviewer_provider(
         return Ok(false);
     };
     if let Some(s) = state.slot_mut(rev_id) {
-        s.provider = next;
+        // Same split `init_slot_model` applies: `provider` stays model-free (quota bucket,
+        // slot naming) and `@model` lives in `model`. The old provider's model must not
+        // survive the rotation either — it would be handed to the new CLI as `--model` and
+        // reported as a `provider@model` pair that does not exist.
+        match crate::provider_ref::ProviderRef::parse(&next) {
+            Ok(pref) => {
+                s.provider = pref.storage_key();
+                s.model = pref.model;
+            }
+            Err(_) => {
+                s.provider = next;
+                s.model = None;
+            }
+        }
         s.cwd = Some(review_cwd.to_path_buf());
         s.status = SlotStatus::Pending;
         s.error = None;
@@ -1586,8 +1636,6 @@ mod suite_parse_tests {
             vec!["cargo test --test existing"]
         );
 
-        assert!(!command_is_selective("cargo test"));
-        assert!(!command_is_selective("pnpm test"));
         assert!(suite_commands("## Commands\n- `cargo test` → exit 0\n")
             .iter()
             .all(|c| !command_is_selective(c)));
@@ -1605,6 +1653,42 @@ mod suite_parse_tests {
             "cargo test --test existing_more",
             "tests/existing.rs"
         ));
+    }
+
+    /// The canonical full-suite command of each ecosystem compiles or collects every new
+    /// test file, so warning on one is a false claim that fires every run. This is the
+    /// whole risk of the check, and the earlier "any token with a `/`" rule tripped on
+    /// `pytest tests/`, `go test ./...` and `./scripts/test.sh` alike.
+    #[test]
+    fn full_suite_commands_are_never_selective() {
+        for cmd in [
+            "cargo test",
+            "cargo test --workspace",
+            "cargo test -p mycrate",
+            "cargo nextest run -p spar",
+            "pnpm test",
+            "pytest",
+            "pytest tests/",
+            "go test ./...",
+            "./scripts/test.sh",
+            "cargo test 2>&1 | tee /tmp/suite.log",
+            "cd /repo && cargo test",
+        ] {
+            assert!(!command_is_selective(cmd), "must not be selective: {cmd}");
+        }
+    }
+
+    #[test]
+    fn naming_specific_targets_is_selective() {
+        for cmd in [
+            "pytest tests/test_users.py",
+            "cargo test --test existing",
+            "cargo test --lib",
+            "cargo test mymod::case",
+            "go test ./pkg/thing_test.go",
+        ] {
+            assert!(command_is_selective(cmd), "must be selective: {cmd}");
+        }
     }
 
     #[test]

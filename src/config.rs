@@ -258,17 +258,9 @@ impl TimeoutConfig {
     }
 }
 
-/// Slot worktree shaping. `seed_dirs` names project-root-relative build-output
-/// directories (`target`, `node_modules`) to hardlink-copy into every fresh slot
-/// worktree, so N slots don't each cold-build identical dependencies.
-///
-/// Opt-in and empty by default: hardlinks share inodes, so a tool that rewrites a file
-/// in place rather than replacing it corrupts every worktree at once. Cargo and pnpm
-/// both replace, which is what makes this safe for the two dirs it exists for.
+/// Slot worktree policy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorktreeConfig {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub seed_dirs: Vec<String>,
     /// Reap at-rest runs whose branches are already in their base before cutting new slot
     /// worktrees. On by default, unlike `auto_cleanup`: that one deletes resumable work on
     /// a phase check, this one only deletes work git says is already in the base branch.
@@ -279,7 +271,6 @@ pub struct WorktreeConfig {
 impl Default for WorktreeConfig {
     fn default() -> Self {
         Self {
-            seed_dirs: Vec::new(),
             auto_cleanup_merged: true,
         }
     }
@@ -497,7 +488,6 @@ struct ConfigFile {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct WorktreeConfigFile {
-    seed_dirs: Option<Vec<String>>,
     auto_cleanup_merged: Option<bool>,
 }
 
@@ -657,22 +647,6 @@ impl Config {
             self.isolation = v;
         }
         if let Some(w) = &file.worktree {
-            if let Some(dirs) = &w.seed_dirs {
-                // Single path components only: the entry is joined onto project_root and
-                // hardlinked into a sibling worktree, so `..` or an absolute path would
-                // make a config file pick what gets linked out of the filesystem.
-                for d in dirs {
-                    let bad = d.is_empty()
-                        || Path::new(d).components().count() != 1
-                        || Path::new(d).is_absolute();
-                    if bad {
-                        anyhow::bail!(
-                            "[worktree] seed_dirs: {d:?} must be a single directory name"
-                        );
-                    }
-                }
-                self.worktree.seed_dirs = dirs.clone();
-            }
             if let Some(v) = w.auto_cleanup_merged {
                 self.worktree.auto_cleanup_merged = v;
             }
@@ -1121,25 +1095,13 @@ planner = "best"
         assert_eq!(cfg.roles.planner.as_deref(), Some("cli:grok"));
     }
 
-    /// `seed_dirs` entries are joined onto the project root and hardlinked into a sibling
-    /// worktree, so anything but a plain directory name lets a config file choose what
-    /// gets linked out of the filesystem.
     #[test]
-    fn seed_dirs_reject_traversal_and_absolute_paths() {
-        let ok: ConfigFile =
-            toml::from_str("[worktree]\nseed_dirs = [\"target\", \"node_modules\"]\n").unwrap();
+    fn auto_cleanup_merged_defaults_on_and_is_overridable() {
+        assert!(Config::default().worktree.auto_cleanup_merged);
+        let file: ConfigFile = toml::from_str("[worktree]\nauto_cleanup_merged = false\n").unwrap();
         let mut cfg = Config::default();
-        cfg.apply_file(&ok, Trust::Project).unwrap();
-        assert_eq!(cfg.worktree.seed_dirs, vec!["target", "node_modules"]);
-
-        for bad in ["../secrets", "/etc", "a/b", ""] {
-            let file: ConfigFile =
-                toml::from_str(&format!("[worktree]\nseed_dirs = [\"{bad}\"]\n")).unwrap();
-            assert!(
-                Config::default().apply_file(&file, Trust::Project).is_err(),
-                "seed_dirs must reject {bad:?}"
-            );
-        }
+        cfg.apply_file(&file, Trust::Project).unwrap();
+        assert!(!cfg.worktree.auto_cleanup_merged);
     }
 
     #[test]
