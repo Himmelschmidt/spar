@@ -10,7 +10,7 @@ use crate::workflow::review_result::{self, AcStatus, ReviewResult};
 use crate::worktree;
 use anyhow::{bail, Result};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn run_from_cli(
     run_id: Option<String>,
@@ -440,6 +440,103 @@ fn suite_inconclusive_reason(
     }
 }
 
+/// Added test files that the suite's own command list never names.
+///
+/// The tester writes its command list itself, so an implementer that adds a new
+/// integration-test binary can leave the authoritative gate passing green without ever
+/// compiling the code written to prove the change. This warns; it never edits the
+/// command list, because a harness that rewrites its own gate is not a gate.
+///
+/// Silent unless the suite is *selective*. A bare `cargo test` / `pytest` compiles
+/// everything, so naming no files there means nothing — warning on it would fire on
+/// every run and train the operator to ignore it.
+fn unreferenced_test_files(cwd: &Path, base: Option<&str>, suite_body: &str) -> Vec<String> {
+    let base = match base {
+        Some(b) => b,
+        None => return Vec::new(),
+    };
+    let commands = suite_commands(suite_body);
+    if commands.is_empty() || !commands.iter().any(|c| command_is_selective(c)) {
+        return Vec::new();
+    }
+    let out = std::process::Command::new("git")
+        .args(["diff", "--name-only", "--diff-filter=A", base, "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|o| o.status.success());
+    let Some(out) = out else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|f| !f.is_empty() && is_test_path(f))
+        .filter(|f| !commands.iter().any(|c| command_names(c, f)))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Command lines from the report's `## Commands` section (`- \`cmd\` → exit N`).
+fn suite_commands(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_section = false;
+    for line in body.lines() {
+        let t = line.trim();
+        if t.starts_with("##") {
+            in_section = t
+                .trim_start_matches('#')
+                .trim()
+                .eq_ignore_ascii_case("commands");
+            continue;
+        }
+        if in_section {
+            if let Some(rest) = t.strip_prefix('-') {
+                let cmd = rest.trim().trim_start_matches('`');
+                let cmd = cmd.split('`').next().unwrap_or(cmd).trim();
+                if !cmd.is_empty() {
+                    out.push(cmd.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// True when a command narrows what it runs instead of running the project default.
+fn command_is_selective(cmd: &str) -> bool {
+    const NARROWING: [&str; 6] = ["--test ", "--bin ", "--package ", "-p ", "--lib", "::"];
+    NARROWING.iter().any(|f| cmd.contains(f))
+        || cmd
+            .split_whitespace()
+            .any(|tok| tok.contains('/') && !tok.starts_with('-'))
+}
+
+fn is_test_path(path: &str) -> bool {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    path.split('/')
+        .any(|c| c == "tests" || c == "test" || c == "__tests__")
+        || file.starts_with("test_")
+        || file.contains(".test.")
+        || file.contains(".spec.")
+        || file.ends_with("_test.go")
+        || file.ends_with("_test.py")
+}
+
+/// A command covers a file when it names the path or the file stem (cargo's `--test foo`
+/// for `tests/foo.rs`).
+fn command_names(cmd: &str, path: &str) -> bool {
+    if cmd.contains(path) {
+        return true;
+    }
+    let file = path.rsplit('/').next().unwrap_or(path);
+    let stem = file.split('.').next().unwrap_or(file);
+    !stem.is_empty()
+        && cmd
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .any(|t| t == stem)
+}
+
 fn suite_guidance(outcome: SuiteOutcome) -> String {
     let header = "## Suite channel (do not re-run full suites)\n\
          A dedicated cheap tester slot runs the full suite; its output is the `## Suite report` section above.\n\n";
@@ -767,6 +864,40 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
                 );
             }
             state.suite_outcome = Some(suite_outcome);
+
+            let unreferenced =
+                unreferenced_test_files(&review_cwd, state.base_commit.as_deref(), &suite_body);
+            if !unreferenced.is_empty() {
+                let note = format!(
+                    "suite gate does not reference {} added test file(s): {}",
+                    unreferenced.len(),
+                    unreferenced.join(", ")
+                );
+                let _ = crate::events::append(
+                    paths,
+                    &state.id,
+                    &crate::events::Event::info(note.clone()),
+                );
+                let _ = crate::bus::broadcast(
+                    paths,
+                    Some(&state.id),
+                    "orchestrator",
+                    note.clone(),
+                    state.message_budget,
+                );
+                // Into the report the reviewers read: the gate itself cannot be trusted to
+                // notice a target it never compiled, but a reviewer can.
+                suite_body.push_str(&format!(
+                    "\n## Coverage warning (orchestrator)\nThe suite commands above select \
+                     specific targets and name none of these added test files:\n{}\n\nTreat the \
+                     suite result as not covering them.\n",
+                    unreferenced
+                        .iter()
+                        .map(|f| format!("- {f}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ));
+            }
         }
 
         let suite_guidance = if suite_channel_active {
@@ -1172,8 +1303,9 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
 #[cfg(test)]
 mod suite_parse_tests {
     use super::{
-        acceptance_block_reason, acceptance_blocks_ship, derive_suite_outcome, should_stop,
-        suite_blocks_ship, suite_guidance, SuiteOutcome,
+        acceptance_block_reason, acceptance_blocks_ship, command_is_selective, command_names,
+        derive_suite_outcome, is_test_path, should_stop, suite_blocks_ship, suite_commands,
+        suite_guidance, SuiteOutcome,
     };
     use crate::config::Config;
     use crate::paths::SparPaths;
@@ -1440,6 +1572,50 @@ mod suite_parse_tests {
             reviewer.contains("unverified"),
             "reviewer must be told the unverified status exists"
         );
+    }
+
+    /// The gate is model-authored, so a new test binary it forgets to name passes green
+    /// without ever being compiled. Warn on that — but only when the commands actually
+    /// select targets, or the warning fires on every `cargo test` and gets tuned out.
+    #[test]
+    fn coverage_warning_only_fires_on_a_selective_suite() {
+        let selective = "## Commands\n- `cargo test --test existing` → exit 0\n";
+        assert!(command_is_selective("cargo test --test existing"));
+        assert_eq!(
+            suite_commands(selective),
+            vec!["cargo test --test existing"]
+        );
+
+        assert!(!command_is_selective("cargo test"));
+        assert!(!command_is_selective("pnpm test"));
+        assert!(suite_commands("## Commands\n- `cargo test` → exit 0\n")
+            .iter()
+            .all(|c| !command_is_selective(c)));
+
+        assert!(command_names(
+            "cargo test --test existing",
+            "tests/existing.rs"
+        ));
+        assert!(!command_names(
+            "cargo test --test existing",
+            "tests/brand_new.rs"
+        ));
+        // A stem that merely appears inside a longer word is not coverage.
+        assert!(!command_names(
+            "cargo test --test existing_more",
+            "tests/existing.rs"
+        ));
+    }
+
+    #[test]
+    fn test_paths_are_recognized_across_stacks() {
+        assert!(is_test_path("tests/scenarios/plan.rs"));
+        assert!(is_test_path("src/__tests__/thing.ts"));
+        assert!(is_test_path("pkg/thing_test.go"));
+        assert!(is_test_path("app/foo.spec.ts"));
+        assert!(is_test_path("api/test_users.py"));
+        assert!(!is_test_path("src/executor.rs"));
+        assert!(!is_test_path("docs/testing.md"));
     }
 
     #[test]

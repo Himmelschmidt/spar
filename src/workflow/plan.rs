@@ -77,18 +77,6 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
         }
         return Ok(ExitCode::Failure);
     }
-    if !opts.json {
-        eprintln!(
-            "providers: {}{}",
-            state.providers.join(", "),
-            if dry {
-                " (dry-run: no git worktrees; agents stubbed)"
-            } else {
-                ""
-            }
-        );
-    }
-
     paths.ensure_run_dirs(&state.id)?;
     let _ = bus::ensure_bus(paths);
     let _ = bus::join(paths, Some(&state.id), "orchestrator", None, None);
@@ -117,6 +105,20 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
             expected_artifact: Some("plan.md".into()),
             model,
         });
+    }
+
+    // Printed after the slots resolve, not off `state.providers`: the pool lists what the
+    // run *may* draw from, which is not what any role got.
+    if !opts.json {
+        eprintln!(
+            "roles: {}{}",
+            executor::role_assignments(&state).join(", "),
+            if dry {
+                " (dry-run: no git worktrees; agents stubbed)"
+            } else {
+                ""
+            }
+        );
     }
 
     if opts.detach {

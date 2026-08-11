@@ -510,15 +510,40 @@ pub fn sweepable(
     if unresumable {
         return older_than.is_none_or(|min| idle >= min);
     }
-    let resumable_at_rest = phase.is_gate()
-        || matches!(
-            phase,
-            Phase::Stopped | Phase::Failed | Phase::Stuck | Phase::Quota | Phase::PlanApproved
-        );
-    match (resumable_at_rest, older_than) {
+    match (resumable_at_rest(phase), older_than) {
         (true, Some(min)) => idle >= min,
         _ => false,
     }
+}
+
+/// A run that is not running and not finished: parked at a gate, stopped, failed, stuck
+/// or out of quota. Its worktrees are still live work — `implement --run` can pick it up.
+pub fn resumable_at_rest(phase: Phase) -> bool {
+    phase.is_gate()
+        || matches!(
+            phase,
+            Phase::Stopped | Phase::Failed | Phase::Stuck | Phase::Quota | Phase::PlanApproved
+        )
+}
+
+/// Why `sweepable` said no, for the sweep's report. `None` when it said yes.
+pub fn sweep_skip_reason(
+    phase: Phase,
+    idle: std::time::Duration,
+    older_than: Option<std::time::Duration>,
+) -> Option<String> {
+    if sweepable(phase, idle, older_than) {
+        return None;
+    }
+    if older_than.is_some_and(|min| idle < min) {
+        return Some(format!("idle {}s is below --older-than", idle.as_secs()));
+    }
+    if resumable_at_rest(phase) {
+        return Some(format!(
+            "{phase:?} is resumable — sweep it with --older-than, or by run id"
+        ));
+    }
+    Some(format!("{phase:?} is in flight — spar stop it first"))
 }
 
 /// Slot processes of `state` that are still alive.
@@ -749,6 +774,27 @@ mod tests {
         }
         // --older-than also holds back young finished runs.
         assert!(!sweepable(Phase::Done, day, week));
+    }
+
+    /// The sweep's silence was the real complaint: 124 GB of finished worktrees on disk
+    /// and "nothing to sweep" on stdout reads as a refusal rather than a policy.
+    #[test]
+    fn spared_runs_say_why_they_were_spared() {
+        use std::time::Duration;
+        let day = Duration::from_secs(86_400);
+        let week = Some(Duration::from_secs(7 * 86_400));
+
+        assert_eq!(sweep_skip_reason(Phase::Done, day, None), None);
+
+        let stopped = sweep_skip_reason(Phase::Stopped, day * 30, None).expect("spared");
+        assert!(stopped.contains("resumable"), "{stopped}");
+        assert!(stopped.contains("--older-than"), "{stopped}");
+
+        let young = sweep_skip_reason(Phase::Done, day, week).expect("spared");
+        assert!(young.contains("--older-than"), "{young}");
+
+        let live = sweep_skip_reason(Phase::Review, day * 30, None).expect("spared");
+        assert!(live.contains("in flight"), "{live}");
     }
 
     #[test]

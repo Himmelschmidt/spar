@@ -1010,12 +1010,21 @@ fn cleanup_sweep(older_than: Option<&str>, json: bool, purge: bool) -> Result<Ex
     let min_idle = older_than.map(util::parse_duration).transpose()?;
     let now = chrono::Utc::now();
     let mut swept = Vec::new();
+    let mut spared = Vec::new();
     for summary in state::list_runs(&paths)? {
         let Ok(state) = state::RunState::load(&paths, &summary.id) else {
             continue;
         };
         let idle = (now - state.updated_at).to_std().unwrap_or_default();
-        if !state::sweepable(state.phase, idle, min_idle) {
+        // Reported, not silent: a sweep that prints "nothing to sweep" while gigabytes of
+        // finished work sit on disk reads as a refusal rather than a policy.
+        if let Some(reason) = state::sweep_skip_reason(state.phase, idle, min_idle) {
+            spared.push(serde_json::json!({
+                "run_id": summary.id,
+                "phase": format!("{:?}", state.phase),
+                "idle_secs": idle.as_secs(),
+                "reason": reason,
+            }));
             continue;
         }
         let cleaned = worktree::cleanup_run(&state)?;
@@ -1042,9 +1051,11 @@ fn cleanup_sweep(older_than: Option<&str>, json: bool, purge: bool) -> Result<Ex
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({ "swept": swept }))?
+            serde_json::to_string_pretty(&serde_json::json!({ "swept": swept, "spared": spared }))?
         );
-    } else if swept.is_empty() {
+        return Ok(ExitCode::Success);
+    }
+    if swept.is_empty() {
         println!("nothing to sweep");
     } else {
         let mut trees = 0;
@@ -1058,6 +1069,13 @@ fn cleanup_sweep(older_than: Option<&str>, json: bool, purge: bool) -> Result<Ex
             );
         }
         println!("swept {} run(s), {trees} worktree(s)", swept.len());
+    }
+    for r in &spared {
+        println!(
+            "spared {}: {}",
+            r["run_id"].as_str().unwrap_or_default(),
+            r["reason"].as_str().unwrap_or_default()
+        );
     }
     Ok(ExitCode::Success)
 }

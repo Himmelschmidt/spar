@@ -85,8 +85,8 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     );
     if !opts.json {
         eprintln!(
-            "providers: {} (concurrent independent review)",
-            state.providers.join(", ")
+            "roles: {} (concurrent independent review)",
+            executor::role_assignments(&state).join(", ")
         );
     }
     state.save(paths)?;

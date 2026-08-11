@@ -8,6 +8,13 @@ autonomy = "semi"
 message_budget = "normal" # none | lean | normal | chatty
 auto_cleanup = false
 
+# Hardlink-seed build output into each new slot worktree (cp -al) so N slots don't each
+# cold-build the same dependencies. Single directory names, relative to the project root.
+# Off by default. `incremental/` is always excluded — rustc rewrites it in place, and a
+# hardlink shared across concurrent worktrees is how that corrupts.
+[worktree]
+# seed_dirs = ["target", "node_modules"]
+
 [providers]
 # Mix CLI + API: "cli:claude", "cli:grok", "api:openai", "api:xai", ...
 order = ["cli:claude", "cli:grok", "cli:agy"]

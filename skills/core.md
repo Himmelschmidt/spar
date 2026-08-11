@@ -260,6 +260,10 @@ how orphaned dev servers get collected), then removes the worktree, falling back
 directory delete if git no longer tracks it. It never touches the project root or anything
 outside the run's worktrees. `--json` reports `worktrees[]` with `killed` pids and `removed`.
 
+A sweep says what it **spared** and why (`spared <run_id>: <reason>`; `spared[]` under
+`--json`), so "nothing to sweep" is never confused with a refusal when there are
+gigabytes of resumable worktrees on disk.
+
 ## Swarm bus
 
 The bus is **workspace-scoped and keyed by a globally-unique `agent_id`**. Run-slot role
@@ -352,6 +356,20 @@ A **rail** + **one main area**. Main always shows the rail's selection.
 - Slot status is reconciled against on-disk markers at read time: a slot recorded as `running` that has a `<slot>.done` / `<slot>.failed` marker is reported `done` / `failed`. `status` never rewrites `state.json`.
 - `status --json` also carries **`"abandoned": true|false`** per run: the run is in a non-terminal phase but no live orchestrator owns it (the driving process died). Not an exit code — exit codes are unchanged. Resume with `spar implement --run <id> --providers …`, park it with `spar stop <id>`, or discard with `spar cleanup <id>`.
 
+- `status --json` carries **`"roles"`** — the resolved `role=provider` assignment each
+  role actually drew (`["planner=cli:grok", "reviewer=cli:grok+cli:claude@opus"]`), which
+  is also what `plan` / `review` print at launch. `"providers"` is the run's *pool* and
+  still lists refs no role ever drew; read `roles` to know what is running the work.
+- **A slot that exits clean with work in its tree but no artifact gets one recovery turn**
+  instead of failing: spar re-prompts the same provider for that artifact alone (10 min
+  budget, no new work). A slot whose worktree holds nothing — no commits past the base, no
+  dirty tree — still fails with `missing expected artifact <name>`.
+- **The suite gate is checked for coverage.** When the tester's commands select specific
+  targets (`--test foo`, `-p pkg`, a path) and the implementer added test files none of
+  them name, spar appends a `## Coverage warning` to `suite.md` and broadcasts it on the
+  bus. spar never edits the command list — a harness that rewrites its own gate is not a
+  gate. Silent when the suite runs the project default (`cargo test`, `pytest`).
+
 ## Exit codes (stable)
 
 | Code | Meaning |
@@ -392,6 +410,12 @@ spar implement --run <id> --reload-config   # deliberately re-read spar.toml and
 autonomy = "manual" | "semi" | "high" | "full"
 message_budget = "none" | "lean" | "normal" | "chatty"
 auto_cleanup = false
+# Hardlink-seed build output into each fresh slot worktree so N slots don't each
+# cold-build identical dependencies. Names project-root-relative directories, single
+# components only. Empty (off) by default; `incremental/` is always dropped from the
+# seed because rustc rewrites it in place and a shared inode would corrupt it.
+[worktree]
+# seed_dirs = ["target", "node_modules"]
 [gates]
 plan = true
 winner = true

@@ -14,6 +14,8 @@ pub struct Config {
     #[serde(default)]
     pub isolation: IsolationMode,
     #[serde(default)]
+    pub worktree: WorktreeConfig,
+    #[serde(default)]
     pub providers: ProviderConfig,
     #[serde(default)]
     pub ship: ShipConfig,
@@ -256,6 +258,19 @@ impl TimeoutConfig {
     }
 }
 
+/// Slot worktree shaping. `seed_dirs` names project-root-relative build-output
+/// directories (`target`, `node_modules`) to hardlink-copy into every fresh slot
+/// worktree, so N slots don't each cold-build identical dependencies.
+///
+/// Opt-in and empty by default: hardlinks share inodes, so a tool that rewrites a file
+/// in place rather than replacing it corrupts every worktree at once. Cargo and pnpm
+/// both replace, which is what makes this safe for the two dirs it exists for.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorktreeConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seed_dirs: Vec<String>,
+}
+
 /// Dedicated full-suite channel (cheap/dumb model). Separate from smart review/impl.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SuiteConfig {
@@ -406,6 +421,7 @@ impl Default for Config {
             max_agents: default_max_agents(),
             default_backend: crate::cli::Backend::Auto,
             isolation: IsolationMode::default(),
+            worktree: WorktreeConfig::default(),
             providers: ProviderConfig {
                 order: default_provider_order(),
             },
@@ -449,6 +465,7 @@ struct ConfigFile {
     max_agents: Option<u32>,
     default_backend: Option<crate::cli::Backend>,
     isolation: Option<IsolationMode>,
+    worktree: Option<WorktreeConfigFile>,
     providers: Option<ProviderConfigFile>,
     ship: Option<ShipConfigFile>,
     timeouts: Option<TimeoutConfigFile>,
@@ -462,6 +479,11 @@ struct ConfigFile {
     auto_cleanup: Option<bool>,
     model_select: Option<ModelSelectConfigFile>,
     notify: Option<NotifyConfigFile>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct WorktreeConfigFile {
+    seed_dirs: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -618,6 +640,24 @@ impl Config {
         }
         if let Some(v) = file.isolation {
             self.isolation = v;
+        }
+        if let Some(w) = &file.worktree {
+            if let Some(dirs) = &w.seed_dirs {
+                // Single path components only: the entry is joined onto project_root and
+                // hardlinked into a sibling worktree, so `..` or an absolute path would
+                // make a config file pick what gets linked out of the filesystem.
+                for d in dirs {
+                    let bad = d.is_empty()
+                        || Path::new(d).components().count() != 1
+                        || Path::new(d).is_absolute();
+                    if bad {
+                        anyhow::bail!(
+                            "[worktree] seed_dirs: {d:?} must be a single directory name"
+                        );
+                    }
+                }
+                self.worktree.seed_dirs = dirs.clone();
+            }
         }
         if let Some(p) = &file.providers {
             if let Some(order) = &p.order {
@@ -1061,6 +1101,27 @@ planner = "best"
         // Pre-snapshot runs (created by an older spar) must still load.
         let cfg = Config::for_run(&paths, "legacy-run").unwrap();
         assert_eq!(cfg.roles.planner.as_deref(), Some("cli:grok"));
+    }
+
+    /// `seed_dirs` entries are joined onto the project root and hardlinked into a sibling
+    /// worktree, so anything but a plain directory name lets a config file choose what
+    /// gets linked out of the filesystem.
+    #[test]
+    fn seed_dirs_reject_traversal_and_absolute_paths() {
+        let ok: ConfigFile =
+            toml::from_str("[worktree]\nseed_dirs = [\"target\", \"node_modules\"]\n").unwrap();
+        let mut cfg = Config::default();
+        cfg.apply_file(&ok, Trust::Project).unwrap();
+        assert_eq!(cfg.worktree.seed_dirs, vec!["target", "node_modules"]);
+
+        for bad in ["../secrets", "/etc", "a/b", ""] {
+            let file: ConfigFile =
+                toml::from_str(&format!("[worktree]\nseed_dirs = [\"{bad}\"]\n")).unwrap();
+            assert!(
+                Config::default().apply_file(&file, Trust::Project).is_err(),
+                "seed_dirs must reject {bad:?}"
+            );
+        }
     }
 
     #[test]

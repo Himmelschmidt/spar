@@ -236,6 +236,52 @@ pub fn seed_env_files(project_root: &Path, worktree: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Hardlink-copy configured build-output dirs from the project checkout into a fresh
+/// slot worktree, so the slot's first build reuses the dependency artifacts already on
+/// disk instead of compiling them again.
+///
+/// `cp -al` links inodes: near-instant, no extra disk. Cargo and pnpm replace outputs
+/// rather than rewriting them in place, so a stale link just becomes a new inode on the
+/// next build. `incremental/` is excluded — rustc *does* rewrite there, and a shared
+/// inode across concurrent worktrees is how that corrupts.
+///
+/// Best-effort: a failed seed costs a cold build, never the run.
+pub fn seed_build_cache(project_root: &Path, worktree: &Path, dirs: &[String]) -> Result<()> {
+    for name in dirs {
+        let src = project_root.join(name);
+        let dst = worktree.join(name);
+        if !src.is_dir() || dst.exists() {
+            continue;
+        }
+        let ok = Command::new("cp")
+            .arg("-al")
+            .arg(&src)
+            .arg(&dst)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            let _ = std::fs::remove_dir_all(&dst);
+            eprintln!(
+                "note: could not seed {} from {} — slot will cold-build",
+                dst.display(),
+                src.display()
+            );
+            continue;
+        }
+        for incr in [
+            "debug/incremental",
+            "release/incremental",
+            "fast/incremental",
+        ] {
+            let _ = std::fs::remove_dir_all(dst.join(incr));
+        }
+    }
+    Ok(())
+}
+
 pub fn maybe_dbiso(project_root: &Path, worktree: &Path) -> Result<()> {
     if !project_root.join(".dbiso.env").is_file() {
         return Ok(());
@@ -268,6 +314,13 @@ pub fn prepare_isolation(
             }
         }
         IsolationMode::Worktree | IsolationMode::WorktreeDb | IsolationMode::WorktreeBwrap => {
+            let seed_dirs = if state.dry_run {
+                Vec::new()
+            } else {
+                crate::config::Config::for_run(paths, &state.id)
+                    .map(|c| c.worktree.seed_dirs)
+                    .unwrap_or_default()
+            };
             for sid in slot_ids {
                 // Idempotent: reuse existing worktree for same slot (one-run re-entry).
                 let existing_path = state
@@ -318,6 +371,9 @@ pub fn prepare_isolation(
                         state.base_commit.as_deref(),
                     )?
                 };
+                if !seed_dirs.is_empty() {
+                    seed_build_cache(&state.project_root, &rec.path, &seed_dirs)?;
+                }
                 if matches!(
                     state.isolation,
                     IsolationMode::WorktreeDb | IsolationMode::WorktreeBwrap
@@ -468,7 +524,7 @@ fn copy_tree_overlay(src: &Path, dst: &Path) -> Result<()> {
     if !src.is_dir() {
         return Ok(());
     }
-    for entry in walkdir_regular_files(src)? {
+    for entry in overlay_sources(src)? {
         let rel = entry.strip_prefix(src).unwrap_or(&entry);
         if rel.as_os_str().is_empty() {
             continue;
@@ -485,6 +541,51 @@ fn copy_tree_overlay(src: &Path, dst: &Path) -> Result<()> {
             .with_context(|| format!("copy {} -> {}", entry.display(), target.display()))?;
     }
     Ok(())
+}
+
+/// What the author worktree hands the implementer: tracked files plus untracked ones
+/// git would keep, and nothing git ignores.
+///
+/// The unfiltered walk this replaced copied `target/` and `node_modules/` between
+/// worktrees — gigabytes of build output, byte-by-byte, per implementer, while the run
+/// still reported phase `prepare_isolation`. On a spinning disk that was the single
+/// largest cost in a run.
+///
+/// Falls back to the full walk when git lists nothing: a dry-run cwd lives under an
+/// ignored `.spar/`, where `ls-files` is correctly empty but the stub artifacts still
+/// have to cross.
+fn overlay_sources(src: &Path) -> Result<Vec<PathBuf>> {
+    match git_listed_files(src) {
+        Some(files) if !files.is_empty() => Ok(files),
+        _ => walkdir_regular_files(src),
+    }
+}
+
+/// Regular files under `dir` that git tracks or would add. `None` when git can't answer.
+fn git_listed_files(dir: &Path) -> Option<Vec<PathBuf>> {
+    let out = Command::new("git")
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let files = out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| dir.join(String::from_utf8_lossy(s).as_ref()))
+        // `ls-files` also reports symlinks, submodules and deleted-but-tracked paths.
+        .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file()))
+        .collect();
+    Some(files)
 }
 
 /// Regular files only — never follow or copy symlinks (agent could link secrets).
@@ -546,6 +647,96 @@ mod tests {
         {
             assert!(!dst.join("evil").exists());
         }
+    }
+
+    /// The overlay used to walk the author worktree unfiltered, so `target/` crossed into
+    /// every implementer — gigabytes of build output copied byte-by-byte on a spinning
+    /// disk, while the run still reported phase `prepare_isolation`.
+    #[test]
+    fn overlay_leaves_ignored_build_output_behind() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("author");
+        let dst = tmp.path().join("impl");
+        std::fs::create_dir_all(src.join("tests")).unwrap();
+        std::fs::create_dir_all(src.join("target/debug")).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join(".gitignore"), "target/\n").unwrap();
+        std::fs::write(src.join("tests/acceptance.rs"), "fn t() {}\n").unwrap();
+        std::fs::write(src.join("target/debug/huge.rlib"), vec![0u8; 4096]).unwrap();
+
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&src)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q"]) {
+            return;
+        }
+
+        copy_tree_overlay(&src, &dst).unwrap();
+        assert!(
+            dst.join("tests/acceptance.rs").is_file(),
+            "acceptance tests must still cross"
+        );
+        assert!(
+            !dst.join("target/debug/huge.rlib").exists(),
+            "gitignored build output must not cross"
+        );
+    }
+
+    /// Outside a repo (and in the dry-run cwd under an ignored `.spar/`) `ls-files` is
+    /// correctly empty, and the walk has to carry the files anyway.
+    #[test]
+    fn overlay_falls_back_to_the_walk_outside_a_repo() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("author");
+        let dst = tmp.path().join("impl");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("stub.txt"), "x").unwrap();
+        copy_tree_overlay(&src, &dst).unwrap();
+        assert!(dst.join("stub.txt").is_file());
+    }
+
+    #[test]
+    fn seed_build_cache_hardlinks_and_drops_incremental() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-spar-r1-impl");
+        std::fs::create_dir_all(root.join("target/debug/incremental/foo")).unwrap();
+        std::fs::create_dir_all(root.join("target/debug/deps")).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(root.join("target/debug/deps/libx.rlib"), "obj").unwrap();
+        std::fs::write(root.join("target/debug/incremental/foo/dep"), "incr").unwrap();
+
+        seed_build_cache(&root, &wt, &["target".to_string()]).unwrap();
+
+        let seeded = wt.join("target/debug/deps/libx.rlib");
+        assert!(seeded.is_file(), "dependency artifacts must be seeded");
+        assert!(
+            !wt.join("target/debug/incremental").exists(),
+            "incremental must not be shared across worktrees"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let a = std::fs::metadata(root.join("target/debug/deps/libx.rlib")).unwrap();
+            let b = std::fs::metadata(&seeded).unwrap();
+            assert_eq!(a.ino(), b.ino(), "seed must hardlink, not copy");
+        }
+
+        // A dir already present in the worktree is never clobbered.
+        std::fs::write(seeded, "mine").unwrap();
+        seed_build_cache(&root, &wt, &["target".to_string()]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(wt.join("target/debug/deps/libx.rlib")).unwrap(),
+            "mine"
+        );
     }
 
     #[test]
