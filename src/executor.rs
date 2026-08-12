@@ -115,6 +115,9 @@ struct PreparedSlot {
     /// Owned so the supervisor's liveness beat survives the move into a spawn thread.
     paths: SparPaths,
     run_id: String,
+    /// True when `cwd` is this slot's *own* recorded worktree. False under
+    /// `isolation = "none"`, where every slot runs in the project checkout.
+    owns_cwd: bool,
     /// The run's base, for deciding whether a slot missing its artifact left work behind.
     base_commit: Option<String>,
 }
@@ -256,6 +259,7 @@ fn prepare_slot_execution(
     );
     let _ = crate::bus::heartbeat(paths, Some(&state.id), &job.slot_id, "running");
     let env = wire_slot_presence(state, paths, &job, &cwd, &pref);
+    let owns_cwd = owns_cwd(state, &job.slot_id, &cwd);
 
     Ok(PreparedSlot {
         job,
@@ -268,7 +272,21 @@ fn prepare_slot_execution(
         paths: paths.clone(),
         run_id: state.id.clone(),
         base_commit: state.base_commit.clone(),
+        owns_cwd,
     })
+}
+
+/// Whether `cwd` is the slot's own recorded worktree.
+///
+/// Recovery's whole premise is "the work in this tree is yours". Under
+/// `isolation = "none"` every slot's cwd is `project_root`, so that premise fails for the
+/// implementer too and a recovery turn would write up the operator's own WIP as the run's
+/// deliverable. Role alone cannot see this — the cwd has to be checked.
+fn owns_cwd(state: &RunState, slot_id: &str, cwd: &Path) -> bool {
+    state
+        .worktrees
+        .iter()
+        .any(|w| w.slot_id == slot_id && w.path == cwd)
 }
 
 fn execute_prepared(
@@ -424,6 +442,7 @@ fn execute_prepared(
                 run_id: &prep.run_id,
                 slot_id: &prep.job.slot_id,
                 role: prep.job.role,
+                owns_cwd: prep.owns_cwd,
                 provider: &prep.job.provider,
                 model: prep.job.model.clone(),
                 cwd: &prep.cwd,
@@ -467,6 +486,8 @@ struct ArtifactRecovery<'a> {
     run_id: &'a str,
     slot_id: &'a str,
     role: SlotRole,
+    /// `cwd` is this slot's own worktree. See [`owns_cwd`].
+    owns_cwd: bool,
     provider: &'a str,
     model: Option<String>,
     cwd: &'a Path,
@@ -532,7 +553,7 @@ fn slot_has_work(cwd: &Path, base_commit: Option<&str>) -> bool {
 /// Only fires for the implementer, and only when the tree actually holds work — a slot
 /// that did nothing still fails.
 fn recover_artifact(r: &ArtifactRecovery) -> bool {
-    if !role_is_recoverable(r.role) || !slot_has_work(r.cwd, r.base_commit) {
+    if !role_is_recoverable(r.role) || !r.owns_cwd || !slot_has_work(r.cwd, r.base_commit) {
         return false;
     }
     let Some(adapter) = providers::adapter_named(r.provider) else {
@@ -1519,6 +1540,7 @@ fn run_headless(
                     run_id: &state.id,
                     slot_id: &job.slot_id,
                     role: job.role,
+                    owns_cwd: owns_cwd(state, &job.slot_id, cwd),
                     provider: &job.provider,
                     model: slot_model_for(Some(state), job),
                     cwd,

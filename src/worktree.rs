@@ -389,6 +389,7 @@ pub fn merged_into_base(state: &RunState) -> Option<bool> {
     }
     let root = &state.project_root;
     let base = resolve_commit(root, state.base_ref.as_deref()?)?;
+    let mut checked = 0usize;
     for rec in &state.worktrees {
         // Uncommitted work first, and it is the check that matters. Branch ancestry says
         // nothing about a dirty tree: a slot that wrote code and never committed leaves
@@ -405,11 +406,19 @@ pub fn merged_into_base(state: &RunState) -> Option<bool> {
         if resolve_commit(root, &rec.branch).is_none() {
             continue;
         }
+        checked += 1;
         let contained =
             git_quiet(root, &["merge-base", "--is-ancestor", &rec.branch, &base]).unwrap_or(false);
         if !contained {
             return Some(false);
         }
+    }
+    // Vacuous truth is not evidence. With every branch unresolvable the loop above skips
+    // them all and falls out here, turning "git could not answer for any of these" into
+    // "all of them are merged" — and a worktree can still hold committed work its branch
+    // no longer points at.
+    if checked == 0 {
+        return None;
     }
     Some(true)
 }

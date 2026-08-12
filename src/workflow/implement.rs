@@ -4,7 +4,7 @@ use crate::executor::{self, SlotJob};
 use crate::exit_codes::ExitCode;
 use crate::paths::SparPaths;
 use crate::providers;
-use crate::state::{Phase, RunState, SlotRole, SlotStatus, SuiteOutcome};
+use crate::state::{Phase, RunState, SlotRole, SlotState, SlotStatus, SuiteOutcome};
 use crate::util::{self, sanitize_slot};
 use crate::workflow::review_result::{self, AcStatus, ReviewResult};
 use crate::worktree;
@@ -531,12 +531,24 @@ fn command_is_selective(cmd: &str) -> bool {
         .split("&&")
         .map(|s| s.split(['|', '>', ';']).next().unwrap_or(s).trim())
         .filter(|s| !s.is_empty())
+        // A `cd repo &&` / `source .venv/bin/activate &&` prefix is setup, not a test
+        // invocation, and judging it would read the whole line as broad.
+        .filter(|s| !is_shell_setup(s))
         .collect();
     !stages.is_empty() && stages.iter().all(|s| stage_is_selective(s))
 }
 
+fn is_shell_setup(stage: &str) -> bool {
+    const SETUP: [&str; 6] = ["cd", "export", "source", ".", "set", "unset"];
+    stage
+        .split_whitespace()
+        .next()
+        .is_some_and(|head| SETUP.contains(&head))
+}
+
 fn stage_is_selective(stage: &str) -> bool {
-    const NARROWING: [&str; 4] = ["--test ", "--bin ", "--lib", "::"];
+    // Both spellings: `--test foo` and `--test=foo`.
+    const NARROWING: [&str; 6] = ["--test ", "--test=", "--bin ", "--bin=", "--lib", "::"];
     if NARROWING.iter().any(|f| stage.contains(f)) {
         return true;
     }
@@ -1232,12 +1244,32 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
         .map(|s| s.id.clone())
         .unwrap();
     if let Some(s) = state.slot_mut(&impl_id) {
-        s.provider = next;
+        set_slot_provider(s, next);
         s.status = SlotStatus::Pending;
         s.error = None;
     }
     state.save(paths)?;
     Ok(true)
+}
+
+/// Point a slot at a different provider, applying the same `provider` / `model` split
+/// `init_slot_model` does: `provider` stays model-free (it keys the quota bucket and slot
+/// naming) and any `@model` moves to `model`.
+///
+/// Assigning the raw ref instead leaves the *previous* provider's model in place, so the
+/// new CLI is handed a `--model` belonging to the old one and `status` reports a
+/// `provider@model` pair that does not exist.
+fn set_slot_provider(slot: &mut SlotState, provider: String) {
+    match crate::provider_ref::ProviderRef::parse(&provider) {
+        Ok(pref) => {
+            slot.provider = pref.storage_key();
+            slot.model = pref.model;
+        }
+        Err(_) => {
+            slot.provider = provider;
+            slot.model = None;
+        }
+    }
 }
 
 /// Add an extra adversarial reviewer from a provider not already reviewing.
@@ -1314,20 +1346,7 @@ fn try_rotate_reviewer_provider(
         return Ok(false);
     };
     if let Some(s) = state.slot_mut(rev_id) {
-        // Same split `init_slot_model` applies: `provider` stays model-free (quota bucket,
-        // slot naming) and `@model` lives in `model`. The old provider's model must not
-        // survive the rotation either — it would be handed to the new CLI as `--model` and
-        // reported as a `provider@model` pair that does not exist.
-        match crate::provider_ref::ProviderRef::parse(&next) {
-            Ok(pref) => {
-                s.provider = pref.storage_key();
-                s.model = pref.model;
-            }
-            Err(_) => {
-                s.provider = next;
-                s.model = None;
-            }
-        }
+        set_slot_provider(s, next);
         s.cwd = Some(review_cwd.to_path_buf());
         s.status = SlotStatus::Pending;
         s.error = None;
@@ -1766,6 +1785,7 @@ mod suite_parse_tests {
             "./scripts/test.sh",
             "cargo test 2>&1 | tee /tmp/suite.log",
             "cd /repo && cargo test",
+            "source .venv/bin/activate && pytest",
         ] {
             assert!(!command_is_selective(cmd), "must not be selective: {cmd}");
         }
@@ -1795,9 +1815,13 @@ mod suite_parse_tests {
         assert!(!command_is_selective(
             "cargo test --lib && cargo test --tests"
         ));
-        // Fail-safe: reads as non-selective, so it warns about nothing.
-        assert!(!command_is_selective("cd repo && cargo test --test foo"));
+        // A `cd` prefix is setup, not a verdict on the command behind it.
+        assert!(command_is_selective("cd repo && cargo test --test foo"));
+        assert!(!command_is_selective("cd repo && cargo test"));
         assert!(!command_is_selective("cargo build && cargo test"));
+        // Both spellings of the target flags.
+        assert!(command_is_selective("cargo test --test=foo"));
+        assert!(command_is_selective("cargo test --bin=cli"));
         // A path handed to a flag is not a target.
         assert!(!command_is_selective("pytest -c tests/pytest.ini"));
     }

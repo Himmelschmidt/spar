@@ -528,7 +528,14 @@ pub fn resumable_at_rest(phase: Phase) -> bool {
     phase.is_gate()
         || matches!(
             phase,
-            Phase::Stopped | Phase::Failed | Phase::Stuck | Phase::Quota | Phase::PlanApproved
+            Phase::Stopped
+                | Phase::Failed
+                | Phase::Stuck
+                | Phase::Quota
+                | Phase::PlanApproved
+                // Terminal, but nothing else claims it, and the alternative is telling
+                // the operator to `spar stop` a run that already finished.
+                | Phase::Escalated
         )
 }
 
