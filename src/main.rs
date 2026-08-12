@@ -1042,9 +1042,10 @@ fn cleanup_sweep(
                     "{why}, and not merged into {}",
                     state.base_ref.as_deref().unwrap_or("its base")
                 )),
-                None => Some(format!(
-                    "{why}, and has no base ref to judge merged against"
-                )),
+                // `None` is "no verdict", which covers a missing base ref *and* a run
+                // whose branches no longer resolve — naming only the first misreports
+                // the second, which is the state every already-reaped run is left in.
+                None => Some(format!("{why}, and has nothing left to judge as merged")),
             };
         }
         if let Some(reason) = skip {
