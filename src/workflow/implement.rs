@@ -456,7 +456,10 @@ fn unreferenced_test_files(cwd: &Path, base: Option<&str>, suite_body: &str) -> 
         None => return Vec::new(),
     };
     let commands = suite_commands(suite_body);
-    if commands.is_empty() || !commands.iter().any(|c| command_is_selective(c)) {
+    // *Every* command must be narrow. One command running the project default covers the
+    // added files whatever the others do, so `any` here would warn about files that were
+    // in fact compiled.
+    if commands.is_empty() || !commands.iter().all(|c| command_is_selective(c)) {
         return Vec::new();
     }
     let out = std::process::Command::new("git")
@@ -471,7 +474,11 @@ fn unreferenced_test_files(cwd: &Path, base: Option<&str>, suite_body: &str) -> 
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .map(str::trim)
-        .filter(|f| !f.is_empty() && is_test_path(f))
+        // Test *targets* only. A `tests/common/mod.rs` helper or a `tests/data/golden.json`
+        // fixture is not a target anything can name, so reporting it as uncovered is a
+        // false claim in the one place a false claim is most expensive: the reviewers'
+        // suite report.
+        .filter(|f| !f.is_empty() && is_test_path(f) && is_test_target(f))
         .filter(|f| !commands.iter().any(|c| command_names(c, f)))
         .map(str::to_string)
         .collect()
@@ -515,29 +522,67 @@ fn suite_commands(body: &str) -> Vec<String> {
 /// `-p` / `--package` are deliberately absent: `cargo test -p foo` builds every test
 /// target in `foo`, including one added this round, so it covers what it does not name.
 fn command_is_selective(cmd: &str) -> bool {
-    const NARROWING: [&str; 4] = ["--test ", "--bin ", "--lib", "::"];
-    // Only the command itself, never a pipeline tail or a redirect target.
-    let head = cmd
-        .split(['|', '>', ';'])
-        .next()
-        .unwrap_or(cmd)
+    // `a && b` runs both, so the line is narrow only if *every* stage is. Judging one
+    // stage is wrong in both directions: `cd repo && cargo test --test foo` would be read
+    // as the `cd`, and `cargo test --lib && cargo test --tests` as the `--lib` while
+    // `--tests` builds every integration target. Pipeline tails and redirect targets are
+    // dropped rather than judged.
+    let stages: Vec<&str> = cmd
         .split("&&")
-        .next()
-        .unwrap_or(cmd);
-    if NARROWING.iter().any(|f| head.contains(f)) {
-        return true;
-    }
-    // A named test *file* is selective; a directory or a glob is not. The first token is
-    // the runner, not a target.
-    head.split_whitespace().skip(1).any(|tok| {
-        !tok.starts_with('-') && !tok.ends_with('/') && is_test_path(tok) && has_ext(tok)
-    })
+        .map(|s| s.split(['|', '>', ';']).next().unwrap_or(s).trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    !stages.is_empty() && stages.iter().all(|s| stage_is_selective(s))
 }
 
-fn has_ext(tok: &str) -> bool {
+fn stage_is_selective(stage: &str) -> bool {
+    const NARROWING: [&str; 4] = ["--test ", "--bin ", "--lib", "::"];
+    if NARROWING.iter().any(|f| stage.contains(f)) {
+        return true;
+    }
+    // A named test *source file* is selective; a directory, a glob, or a path handed to a
+    // flag is not. The first token is the runner, not a target.
+    let mut prev_is_flag = false;
+    for tok in stage.split_whitespace().skip(1) {
+        let is_flag = tok.starts_with('-');
+        let candidate = !is_flag && !prev_is_flag && !tok.ends_with('/');
+        prev_is_flag = is_flag;
+        if candidate && is_test_path(tok) && is_test_source(tok) {
+            return true;
+        }
+    }
+    false
+}
+
+/// A test file that is its own target, i.e. one a suite command could name.
+///
+/// Cargo makes an integration target of `tests/*.rs` only at the top level: `tests/
+/// common/mod.rs` is a helper compiled into the others and can never be named by
+/// `--test`. Everything nested elsewhere is judged on the source-extension check alone.
+fn is_test_target(path: &str) -> bool {
+    if !is_test_source(path) {
+        return false;
+    }
+    let file = path.rsplit('/').next().unwrap_or(path);
+    if file == "mod.rs" {
+        return false;
+    }
+    match (path.find("tests/"), path.ends_with(".rs")) {
+        (Some(i), true) => !path[i + "tests/".len()..].contains('/'),
+        _ => true,
+    }
+}
+
+/// A file a test runner could compile or collect. The extension allowlist is what keeps
+/// `pytest -c tests/pytest.ini` and an added `tests/data/golden.json` from reading as
+/// test targets.
+fn is_test_source(tok: &str) -> bool {
+    const SOURCE_EXT: [&str; 11] = [
+        "rs", "py", "go", "ts", "tsx", "js", "jsx", "rb", "java", "kt", "swift",
+    ];
     let file = tok.rsplit('/').next().unwrap_or(tok);
     file.rsplit_once('.')
-        .is_some_and(|(stem, ext)| !stem.is_empty() && !ext.is_empty() && !ext.contains('.'))
+        .is_some_and(|(stem, ext)| !stem.is_empty() && SOURCE_EXT.contains(&ext))
 }
 
 fn is_test_path(path: &str) -> bool {
@@ -1402,8 +1447,8 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
 mod suite_parse_tests {
     use super::{
         acceptance_block_reason, acceptance_blocks_ship, command_is_selective, command_names,
-        derive_suite_outcome, is_test_path, should_stop, suite_blocks_ship, suite_commands,
-        suite_guidance, SuiteOutcome,
+        derive_suite_outcome, is_test_path, is_test_target, should_stop, suite_blocks_ship,
+        suite_commands, suite_guidance, SuiteOutcome,
     };
     use crate::config::Config;
     use crate::paths::SparPaths;
@@ -1734,9 +1779,40 @@ mod suite_parse_tests {
             "cargo test --lib",
             "cargo test mymod::case",
             "go test ./pkg/thing_test.go",
+            // Every stage narrow ⇒ the line is narrow.
+            "cargo test --test a && cargo test --test b",
         ] {
             assert!(command_is_selective(cmd), "must be selective: {cmd}");
         }
+    }
+
+    /// `a && b` runs both. Judging the line off one stage was wrong in both directions:
+    /// a narrow stage beside a full-suite stage is covered, and a `cd` prefix is not a
+    /// verdict on the command behind it.
+    #[test]
+    fn every_stage_must_be_narrow() {
+        // `--tests` builds every integration target, so the line covers new files.
+        assert!(!command_is_selective(
+            "cargo test --lib && cargo test --tests"
+        ));
+        // Fail-safe: reads as non-selective, so it warns about nothing.
+        assert!(!command_is_selective("cd repo && cargo test --test foo"));
+        assert!(!command_is_selective("cargo build && cargo test"));
+        // A path handed to a flag is not a target.
+        assert!(!command_is_selective("pytest -c tests/pytest.ini"));
+    }
+
+    /// Only files a suite command could actually name are reportable. A helper module or
+    /// a fixture is neither, and a false "not covered" claim is most expensive in the
+    /// reviewers' suite report.
+    #[test]
+    fn only_real_test_targets_are_reportable() {
+        assert!(is_test_target("tests/acceptance.rs"));
+        assert!(is_test_target("tests/test_users.py"));
+        assert!(is_test_target("pkg/thing_test.go"));
+        assert!(!is_test_target("tests/common/mod.rs"));
+        assert!(!is_test_target("tests/scenarios/plan.rs"));
+        assert!(!is_test_target("tests/data/golden.json"));
     }
 
     #[test]

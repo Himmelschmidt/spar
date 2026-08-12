@@ -390,6 +390,17 @@ pub fn merged_into_base(state: &RunState) -> Option<bool> {
     let root = &state.project_root;
     let base = resolve_commit(root, state.base_ref.as_deref()?)?;
     for rec in &state.worktrees {
+        // Uncommitted work first, and it is the check that matters. Branch ancestry says
+        // nothing about a dirty tree: a slot that wrote code and never committed leaves
+        // its branch sitting exactly on the base, which is trivially an ancestor, so
+        // ancestry alone reads "fully landed" for the work most at risk. `cleanup_run`
+        // then removes the worktree with `--force`. The phases this sweep can reach are
+        // `stopped` / `failed` / `stuck` / `quota` / gates — precisely the runs whose
+        // agents were interrupted mid-turn, and the ones `implement --run` exists to
+        // resume.
+        if rec.path.is_dir() && worktree_holds_uncommitted(&rec.path) {
+            return Some(false);
+        }
         // A branch that is already gone cannot be holding unmerged work.
         if resolve_commit(root, &rec.branch).is_none() {
             continue;
@@ -401,6 +412,16 @@ pub fn merged_into_base(state: &RunState) -> Option<bool> {
         }
     }
     Some(true)
+}
+
+/// Uncommitted work in a slot worktree. Fails **closed**: a git that cannot answer means
+/// the tree is treated as holding work, because the caller's only use for this is deciding
+/// whether it is safe to delete.
+fn worktree_holds_uncommitted(path: &Path) -> bool {
+    match git_out(path, &["status", "--porcelain"]) {
+        Some(s) => !s.is_empty(),
+        None => true,
+    }
 }
 
 /// A ref as it resolves today: the local ref, else its `origin/` counterpart.
@@ -438,7 +459,24 @@ pub fn sweep_merged(paths: &SparPaths, skip_run: Option<&str>) -> Result<Vec<(St
         let Ok(state) = RunState::load(paths, &summary.id) else {
             continue;
         };
-        if !crate::state::at_rest(state.phase) || merged_into_base(&state) != Some(true) {
+        if !crate::state::at_rest(state.phase) {
+            continue;
+        }
+        // The phase on disk is a snapshot, and a resuming orchestrator is between loading
+        // its state and saving the new one for a window this sweep can land in. Reaping
+        // then would not merely delete a live run's worktrees — `cleanup_run` also
+        // terminates every process whose cwd is inside them, i.e. that run's agents.
+        if crate::state::orchestrator_alive(paths, &summary.id) {
+            continue;
+        }
+        // Nothing on disk to reclaim: skip before touching git. Records outlive their
+        // worktrees (cleanup does not clear them), so without this every later sweep
+        // re-runs `worktree remove` / `branch -D` / `prune` per stale record and reports
+        // reclaiming what it already reclaimed.
+        if !state.worktrees.iter().any(|r| r.path.is_dir()) {
+            continue;
+        }
+        if merged_into_base(&state) != Some(true) {
             continue;
         }
         let cleaned = cleanup_run(&state)?;
@@ -563,7 +601,26 @@ pub fn apply_spec_tests_to_impl(
     })
 }
 
-/// Paths git ignores in `dir`, with fully-ignored directories collapsed to one entry.
+/// Build output and dependency trees. Not policy — a noise filter, so the "these did not
+/// come across" notice carries fixtures the implementer might actually need instead of
+/// `target/` on every single run, which is how a notice gets tuned out.
+const BUILD_OUTPUT_DIRS: [&str; 12] = [
+    "target",
+    "node_modules",
+    "dist",
+    "build",
+    "out",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".next",
+    ".nuxt",
+    ".gradle",
+    ".spar",
+];
+
+/// Paths git ignores in `dir` and worth telling somebody about, with fully-ignored
+/// directories collapsed to one entry.
 ///
 /// `--directory` is what keeps this readable: without it a Rust worktree reports every
 /// file under `target/` individually.
@@ -589,7 +646,12 @@ fn ignored_entries(dir: &Path) -> Vec<String> {
         .split(|b| *b == 0)
         .filter(|s| !s.is_empty())
         .map(|s| String::from_utf8_lossy(s).into_owned())
+        .filter(|p| !is_build_output(p))
         .collect()
+}
+
+fn is_build_output(entry: &str) -> bool {
+    entry.split('/').any(|c| BUILD_OUTPUT_DIRS.contains(&c))
 }
 
 /// Attempt merge; on failure abort so the tree is never left in MERGING.
@@ -884,14 +946,15 @@ mod tests {
             "{:?}",
             overlay.ignored
         );
-        // Directories collapse, so a Rust worktree never reports every file under target/.
+        // Build output is filtered out: every Rust run has a `target/`, and a notice that
+        // fires every run with nothing actionable in it is a notice nobody reads.
         assert!(
-            overlay.ignored.iter().any(|p| p.starts_with("target")),
-            "{:?}",
+            !overlay.ignored.iter().any(|p| p.starts_with("target")),
+            "build output must not be reported as a missing fixture: {:?}",
             overlay.ignored
         );
         assert!(
-            overlay.ignored.len() < 6,
+            overlay.ignored.len() < 5,
             "ignored dirs must collapse to one entry each: {:?}",
             overlay.ignored
         );
@@ -932,8 +995,18 @@ mod tests {
         assert_eq!(
             merged_into_base(&state),
             Some(true),
-            "a branch that never moved is trivially contained"
+            "a clean worktree on an unmoved branch holds nothing to lose"
         );
+
+        // The data-loss case: an agent wrote code and never committed, so the branch is
+        // still on the base and reads as trivially contained. Ancestry must not decide it.
+        std::fs::write(rec.path.join("uncommitted.rs"), "fn work() {}\n").unwrap();
+        assert_eq!(
+            merged_into_base(&state),
+            Some(false),
+            "uncommitted work must veto the merged verdict — cleanup removes with --force"
+        );
+        std::fs::remove_file(rec.path.join("uncommitted.rs")).unwrap();
 
         std::fs::write(rec.path.join("work.txt"), "slot work\n").unwrap();
         git(&rec.path, &["add", "."]);
