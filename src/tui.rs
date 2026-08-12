@@ -1254,16 +1254,14 @@ fn run_loop(
                             local_root.as_deref(),
                             rail_state.offset(),
                         ),
-                        Event::Paste(text) => {
-                            // Forward a paste to the tmux client as bracketed paste.
-                            if app.shell_active() {
-                                if let Some(pane) = app.terminal_pane.as_ref() {
-                                    let mut buf = Vec::with_capacity(text.len() + 12);
-                                    buf.extend_from_slice(b"\x1b[200~");
-                                    buf.extend_from_slice(text.as_bytes());
-                                    buf.extend_from_slice(b"\x1b[201~");
-                                    pane.write_input(&buf);
-                                }
+                        // Forward a paste to the tmux client as bracketed paste.
+                        Event::Paste(text) if app.shell_active() => {
+                            if let Some(pane) = app.terminal_pane.as_ref() {
+                                let mut buf = Vec::with_capacity(text.len() + 12);
+                                buf.extend_from_slice(b"\x1b[200~");
+                                buf.extend_from_slice(text.as_bytes());
+                                buf.extend_from_slice(b"\x1b[201~");
+                                pane.write_input(&buf);
                             }
                         }
                         _ => {}

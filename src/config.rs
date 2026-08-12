@@ -14,6 +14,8 @@ pub struct Config {
     #[serde(default)]
     pub isolation: IsolationMode,
     #[serde(default)]
+    pub worktree: WorktreeConfig,
+    #[serde(default)]
     pub providers: ProviderConfig,
     #[serde(default)]
     pub ship: ShipConfig,
@@ -256,6 +258,24 @@ impl TimeoutConfig {
     }
 }
 
+/// Slot worktree policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeConfig {
+    /// Reap at-rest runs whose branches are already in their base before cutting new slot
+    /// worktrees. On by default, unlike `auto_cleanup`: that one deletes resumable work on
+    /// a phase check, this one only deletes work git says is already in the base branch.
+    #[serde(default = "default_true")]
+    pub auto_cleanup_merged: bool,
+}
+
+impl Default for WorktreeConfig {
+    fn default() -> Self {
+        Self {
+            auto_cleanup_merged: true,
+        }
+    }
+}
+
 /// Dedicated full-suite channel (cheap/dumb model). Separate from smart review/impl.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SuiteConfig {
@@ -406,6 +426,7 @@ impl Default for Config {
             max_agents: default_max_agents(),
             default_backend: crate::cli::Backend::Auto,
             isolation: IsolationMode::default(),
+            worktree: WorktreeConfig::default(),
             providers: ProviderConfig {
                 order: default_provider_order(),
             },
@@ -449,6 +470,7 @@ struct ConfigFile {
     max_agents: Option<u32>,
     default_backend: Option<crate::cli::Backend>,
     isolation: Option<IsolationMode>,
+    worktree: Option<WorktreeConfigFile>,
     providers: Option<ProviderConfigFile>,
     ship: Option<ShipConfigFile>,
     timeouts: Option<TimeoutConfigFile>,
@@ -462,6 +484,11 @@ struct ConfigFile {
     auto_cleanup: Option<bool>,
     model_select: Option<ModelSelectConfigFile>,
     notify: Option<NotifyConfigFile>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct WorktreeConfigFile {
+    auto_cleanup_merged: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -618,6 +645,11 @@ impl Config {
         }
         if let Some(v) = file.isolation {
             self.isolation = v;
+        }
+        if let Some(w) = &file.worktree {
+            if let Some(v) = w.auto_cleanup_merged {
+                self.worktree.auto_cleanup_merged = v;
+            }
         }
         if let Some(p) = &file.providers {
             if let Some(order) = &p.order {
@@ -1061,6 +1093,15 @@ planner = "best"
         // Pre-snapshot runs (created by an older spar) must still load.
         let cfg = Config::for_run(&paths, "legacy-run").unwrap();
         assert_eq!(cfg.roles.planner.as_deref(), Some("cli:grok"));
+    }
+
+    #[test]
+    fn auto_cleanup_merged_defaults_on_and_is_overridable() {
+        assert!(Config::default().worktree.auto_cleanup_merged);
+        let file: ConfigFile = toml::from_str("[worktree]\nauto_cleanup_merged = false\n").unwrap();
+        let mut cfg = Config::default();
+        cfg.apply_file(&file, Trust::Project).unwrap();
+        assert!(!cfg.worktree.auto_cleanup_merged);
     }
 
     #[test]

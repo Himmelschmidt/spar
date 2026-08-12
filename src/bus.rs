@@ -621,7 +621,7 @@ pub fn inbox(paths: &SparPaths, agent: &str) -> Result<Vec<BusMessage>> {
             out.push(m);
         }
     }
-    out.sort_by(|a, b| a.ts.cmp(&b.ts));
+    out.sort_by_key(|m| m.ts);
     Ok(out)
 }
 
@@ -671,7 +671,7 @@ pub fn inbox_claim(paths: &SparPaths, agent: &str) -> Result<Vec<BusMessage>> {
         }
         out.push(m);
     }
-    out.sort_by(|a, b| a.ts.cmp(&b.ts));
+    out.sort_by_key(|m| m.ts);
     Ok(out)
 }
 
@@ -963,7 +963,7 @@ pub fn unresolved_alerts(paths: &SparPaths, run: Option<&str>) -> Result<Vec<Bus
             out.push(m);
         }
     }
-    out.sort_by(|a, b| a.ts.cmp(&b.ts));
+    out.sort_by_key(|m| m.ts);
     Ok(out)
 }
 

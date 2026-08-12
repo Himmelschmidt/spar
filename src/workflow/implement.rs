@@ -4,13 +4,13 @@ use crate::executor::{self, SlotJob};
 use crate::exit_codes::ExitCode;
 use crate::paths::SparPaths;
 use crate::providers;
-use crate::state::{Phase, RunState, SlotRole, SlotStatus, SuiteOutcome};
+use crate::state::{Phase, RunState, SlotRole, SlotState, SlotStatus, SuiteOutcome};
 use crate::util::{self, sanitize_slot};
 use crate::workflow::review_result::{self, AcStatus, ReviewResult};
 use crate::worktree;
 use anyhow::{bail, Result};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn run_from_cli(
     run_id: Option<String>,
@@ -440,6 +440,188 @@ fn suite_inconclusive_reason(
     }
 }
 
+/// Added test files that the suite's own command list never names.
+///
+/// The tester writes its command list itself, so an implementer that adds a new
+/// integration-test binary can leave the authoritative gate passing green without ever
+/// compiling the code written to prove the change. This warns; it never edits the
+/// command list, because a harness that rewrites its own gate is not a gate.
+///
+/// Silent unless the suite is *selective*. A bare `cargo test` / `pytest` compiles
+/// everything, so naming no files there means nothing — warning on it would fire on
+/// every run and train the operator to ignore it.
+fn unreferenced_test_files(cwd: &Path, base: Option<&str>, suite_body: &str) -> Vec<String> {
+    let base = match base {
+        Some(b) => b,
+        None => return Vec::new(),
+    };
+    let commands = suite_commands(suite_body);
+    // *Every* command must be narrow. One command running the project default covers the
+    // added files whatever the others do, so `any` here would warn about files that were
+    // in fact compiled.
+    if commands.is_empty() || !commands.iter().all(|c| command_is_selective(c)) {
+        return Vec::new();
+    }
+    let out = std::process::Command::new("git")
+        .args(["diff", "--name-only", "--diff-filter=A", base, "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|o| o.status.success());
+    let Some(out) = out else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        // Test *targets* only. A `tests/common/mod.rs` helper or a `tests/data/golden.json`
+        // fixture is not a target anything can name, so reporting it as uncovered is a
+        // false claim in the one place a false claim is most expensive: the reviewers'
+        // suite report.
+        .filter(|f| !f.is_empty() && is_test_path(f) && is_test_target(f))
+        .filter(|f| !commands.iter().any(|c| command_names(c, f)))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Command lines from the report's `## Commands` section (`- \`cmd\` → exit N`).
+fn suite_commands(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_section = false;
+    for line in body.lines() {
+        let t = line.trim();
+        if t.starts_with("##") {
+            in_section = t
+                .trim_start_matches('#')
+                .trim()
+                .eq_ignore_ascii_case("commands");
+            continue;
+        }
+        if in_section {
+            if let Some(rest) = t.strip_prefix('-') {
+                let cmd = rest.trim().trim_start_matches('`');
+                let cmd = cmd.split('`').next().unwrap_or(cmd).trim();
+                if !cmd.is_empty() {
+                    out.push(cmd.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// True when a command narrows to specific *targets* instead of running the project's
+/// default set.
+///
+/// Explicit target flags plus test-file arguments only. Earlier this also counted any
+/// token containing `/`, which made `pytest tests/`, `go test ./...` and
+/// `./scripts/test.sh` all read as selective — the canonical full-suite command of three
+/// ecosystems, each of which does collect every new test file. Warning on those is the
+/// false-positive class this check exists to avoid.
+///
+/// `-p` / `--package` are deliberately absent: `cargo test -p foo` builds every test
+/// target in `foo`, including one added this round, so it covers what it does not name.
+fn command_is_selective(cmd: &str) -> bool {
+    // `a && b` runs both, so the line is narrow only if *every* stage is. Judging one
+    // stage is wrong in both directions: `cd repo && cargo test --test foo` would be read
+    // as the `cd`, and `cargo test --lib && cargo test --tests` as the `--lib` while
+    // `--tests` builds every integration target. Pipeline tails and redirect targets are
+    // dropped rather than judged.
+    let stages: Vec<&str> = cmd
+        .split("&&")
+        .map(|s| s.split(['|', '>', ';']).next().unwrap_or(s).trim())
+        .filter(|s| !s.is_empty())
+        // A `cd repo &&` / `source .venv/bin/activate &&` prefix is setup, not a test
+        // invocation, and judging it would read the whole line as broad.
+        .filter(|s| !is_shell_setup(s))
+        .collect();
+    !stages.is_empty() && stages.iter().all(|s| stage_is_selective(s))
+}
+
+fn is_shell_setup(stage: &str) -> bool {
+    const SETUP: [&str; 6] = ["cd", "export", "source", ".", "set", "unset"];
+    stage
+        .split_whitespace()
+        .next()
+        .is_some_and(|head| SETUP.contains(&head))
+}
+
+fn stage_is_selective(stage: &str) -> bool {
+    // Both spellings: `--test foo` and `--test=foo`.
+    const NARROWING: [&str; 6] = ["--test ", "--test=", "--bin ", "--bin=", "--lib", "::"];
+    if NARROWING.iter().any(|f| stage.contains(f)) {
+        return true;
+    }
+    // A named test *source file* is selective; a directory, a glob, or a path handed to a
+    // flag is not. The first token is the runner, not a target.
+    let mut prev_is_flag = false;
+    for tok in stage.split_whitespace().skip(1) {
+        let is_flag = tok.starts_with('-');
+        let candidate = !is_flag && !prev_is_flag && !tok.ends_with('/');
+        prev_is_flag = is_flag;
+        if candidate && is_test_path(tok) && is_test_source(tok) {
+            return true;
+        }
+    }
+    false
+}
+
+/// A test file that is its own target, i.e. one a suite command could name.
+///
+/// Cargo makes an integration target of `tests/*.rs` only at the top level: `tests/
+/// common/mod.rs` is a helper compiled into the others and can never be named by
+/// `--test`. Everything nested elsewhere is judged on the source-extension check alone.
+fn is_test_target(path: &str) -> bool {
+    if !is_test_source(path) {
+        return false;
+    }
+    let file = path.rsplit('/').next().unwrap_or(path);
+    if file == "mod.rs" {
+        return false;
+    }
+    match (path.find("tests/"), path.ends_with(".rs")) {
+        (Some(i), true) => !path[i + "tests/".len()..].contains('/'),
+        _ => true,
+    }
+}
+
+/// A file a test runner could compile or collect. The extension allowlist is what keeps
+/// `pytest -c tests/pytest.ini` and an added `tests/data/golden.json` from reading as
+/// test targets.
+fn is_test_source(tok: &str) -> bool {
+    const SOURCE_EXT: [&str; 11] = [
+        "rs", "py", "go", "ts", "tsx", "js", "jsx", "rb", "java", "kt", "swift",
+    ];
+    let file = tok.rsplit('/').next().unwrap_or(tok);
+    file.rsplit_once('.')
+        .is_some_and(|(stem, ext)| !stem.is_empty() && SOURCE_EXT.contains(&ext))
+}
+
+fn is_test_path(path: &str) -> bool {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    path.split('/')
+        .any(|c| c == "tests" || c == "test" || c == "__tests__")
+        || file.starts_with("test_")
+        || file.contains(".test.")
+        || file.contains(".spec.")
+        || file.ends_with("_test.go")
+        || file.ends_with("_test.py")
+}
+
+/// A command covers a file when it names the path or the file stem (cargo's `--test foo`
+/// for `tests/foo.rs`).
+fn command_names(cmd: &str, path: &str) -> bool {
+    if cmd.contains(path) {
+        return true;
+    }
+    let file = path.rsplit('/').next().unwrap_or(path);
+    let stem = file.split('.').next().unwrap_or(file);
+    !stem.is_empty()
+        && cmd
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .any(|t| t == stem)
+}
+
 fn suite_guidance(outcome: SuiteOutcome) -> String {
     let header = "## Suite channel (do not re-run full suites)\n\
          A dedicated cheap tester slot runs the full suite; its output is the `## Suite report` section above.\n\n";
@@ -596,7 +778,10 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
         })
     };
     // Parsed once: the acceptance gate compares every reviewer against the same list.
+    // Parsed *before* the overlay note is appended below, so the note can never be read
+    // as a criterion.
     let contract_criteria = review_result::parse_contract_criteria(&test_contract_body);
+    let mut test_contract_body = test_contract_body;
 
     // Bring pre-coding acceptance tests into implementer cwd (fail closed if author ran).
     if let Some(author) = state
@@ -613,12 +798,57 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
             .ok_or_else(|| {
                 anyhow::anyhow!("implementer cwd missing; cannot apply acceptance tests")
             })?;
-        if let Err(e) = worktree::apply_spec_tests_to_impl(state, &author, &impl_cwd) {
-            return fail(
-                state,
-                paths,
-                anyhow::anyhow!("failed to apply acceptance tests from {author}: {e}"),
-            );
+        match worktree::apply_spec_tests_to_impl(state, &author, &impl_cwd) {
+            Err(e) => {
+                return fail(
+                    state,
+                    paths,
+                    anyhow::anyhow!("failed to apply acceptance tests from {author}: {e}"),
+                );
+            }
+            // Said out loud on every channel: the overlay carries git-visible files only,
+            // so a fixture the author wrote into an ignored path stays behind. Silent, that
+            // surfaces as an acceptance test failing at runtime for no visible reason —
+            // and the implementer is told it may weaken a test if it documents why.
+            Ok(overlay) if !overlay.ignored.is_empty() => {
+                let note = format!(
+                    "acceptance tests copied WITHOUT {} git-ignored path(s) ({}); \
+                     they remain in {}",
+                    overlay.ignored.len(),
+                    overlay.ignored.join(", "),
+                    overlay.author_path.display()
+                );
+                eprintln!("note: {note}");
+                let _ = crate::events::append(
+                    paths,
+                    &state.id,
+                    &crate::events::Event::info(note.clone()),
+                );
+                let _ = crate::bus::broadcast(
+                    paths,
+                    Some(&state.id),
+                    "orchestrator",
+                    note,
+                    state.message_budget,
+                );
+                test_contract_body.push_str(&format!(
+                    "\n## Not copied (git-ignored in the test-author worktree)\n\
+                     The acceptance tests above were copied from `{}`, but git ignores these \
+                     paths so they did **not** come with them:\n{}\n\n\
+                     If a test needs one of them, copy it across yourself from that worktree. \
+                     Do **not** copy build output or dependency directories (`target/`, \
+                     `node_modules/` and the like) — those are ignored on purpose and \
+                     rebuilding is cheaper than copying them.\n",
+                    overlay.author_path.display(),
+                    overlay
+                        .ignored
+                        .iter()
+                        .map(|p| format!("- `{p}`"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ));
+            }
+            Ok(_) => {}
         }
     }
 
@@ -767,6 +997,49 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
                 );
             }
             state.suite_outcome = Some(suite_outcome);
+
+            let unreferenced =
+                unreferenced_test_files(&review_cwd, state.base_commit.as_deref(), &suite_body);
+            if !unreferenced.is_empty() {
+                let note = format!(
+                    "suite gate does not reference {} added test file(s): {}",
+                    unreferenced.len(),
+                    unreferenced.join(", ")
+                );
+                let _ = crate::events::append(
+                    paths,
+                    &state.id,
+                    &crate::events::Event::info(note.clone()),
+                );
+                let _ = crate::bus::broadcast(
+                    paths,
+                    Some(&state.id),
+                    "orchestrator",
+                    note.clone(),
+                    state.message_budget,
+                );
+                // Into the report the reviewers read: the gate itself cannot be trusted to
+                // notice a target it never compiled, but a reviewer can. Written to the
+                // artifact too, not just the prompt — `suite.md` is what a human opens.
+                let warning = format!(
+                    "\n## Coverage warning (orchestrator)\nThe suite commands above select \
+                     specific targets and name none of these added test files:\n{}\n\nTreat the \
+                     suite result as not covering them.\n",
+                    unreferenced
+                        .iter()
+                        .map(|f| format!("- {f}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+                suite_body.push_str(&warning);
+                let suite_path = paths.artifact(&state.id, "suite.md");
+                if suite_path.is_file() {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&suite_path) {
+                        let _ = f.write_all(warning.as_bytes());
+                    }
+                }
+            }
         }
 
         let suite_guidance = if suite_channel_active {
@@ -971,12 +1244,32 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
         .map(|s| s.id.clone())
         .unwrap();
     if let Some(s) = state.slot_mut(&impl_id) {
-        s.provider = next;
+        set_slot_provider(s, next);
         s.status = SlotStatus::Pending;
         s.error = None;
     }
     state.save(paths)?;
     Ok(true)
+}
+
+/// Point a slot at a different provider, applying the same `provider` / `model` split
+/// `init_slot_model` does: `provider` stays model-free (it keys the quota bucket and slot
+/// naming) and any `@model` moves to `model`.
+///
+/// Assigning the raw ref instead leaves the *previous* provider's model in place, so the
+/// new CLI is handed a `--model` belonging to the old one and `status` reports a
+/// `provider@model` pair that does not exist.
+fn set_slot_provider(slot: &mut SlotState, provider: String) {
+    match crate::provider_ref::ProviderRef::parse(&provider) {
+        Ok(pref) => {
+            slot.provider = pref.storage_key();
+            slot.model = pref.model;
+        }
+        Err(_) => {
+            slot.provider = provider;
+            slot.model = None;
+        }
+    }
 }
 
 /// Add an extra adversarial reviewer from a provider not already reviewing.
@@ -1053,7 +1346,7 @@ fn try_rotate_reviewer_provider(
         return Ok(false);
     };
     if let Some(s) = state.slot_mut(rev_id) {
-        s.provider = next;
+        set_slot_provider(s, next);
         s.cwd = Some(review_cwd.to_path_buf());
         s.status = SlotStatus::Pending;
         s.error = None;
@@ -1172,8 +1465,9 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
 #[cfg(test)]
 mod suite_parse_tests {
     use super::{
-        acceptance_block_reason, acceptance_blocks_ship, derive_suite_outcome, should_stop,
-        suite_blocks_ship, suite_guidance, SuiteOutcome,
+        acceptance_block_reason, acceptance_blocks_ship, command_is_selective, command_names,
+        derive_suite_outcome, is_test_path, is_test_target, should_stop, suite_blocks_ship,
+        suite_commands, suite_guidance, SuiteOutcome,
     };
     use crate::config::Config;
     use crate::paths::SparPaths;
@@ -1440,6 +1734,120 @@ mod suite_parse_tests {
             reviewer.contains("unverified"),
             "reviewer must be told the unverified status exists"
         );
+    }
+
+    /// The gate is model-authored, so a new test binary it forgets to name passes green
+    /// without ever being compiled. Warn on that — but only when the commands actually
+    /// select targets, or the warning fires on every `cargo test` and gets tuned out.
+    #[test]
+    fn coverage_warning_only_fires_on_a_selective_suite() {
+        let selective = "## Commands\n- `cargo test --test existing` → exit 0\n";
+        assert!(command_is_selective("cargo test --test existing"));
+        assert_eq!(
+            suite_commands(selective),
+            vec!["cargo test --test existing"]
+        );
+
+        assert!(suite_commands("## Commands\n- `cargo test` → exit 0\n")
+            .iter()
+            .all(|c| !command_is_selective(c)));
+
+        assert!(command_names(
+            "cargo test --test existing",
+            "tests/existing.rs"
+        ));
+        assert!(!command_names(
+            "cargo test --test existing",
+            "tests/brand_new.rs"
+        ));
+        // A stem that merely appears inside a longer word is not coverage.
+        assert!(!command_names(
+            "cargo test --test existing_more",
+            "tests/existing.rs"
+        ));
+    }
+
+    /// The canonical full-suite command of each ecosystem compiles or collects every new
+    /// test file, so warning on one is a false claim that fires every run. This is the
+    /// whole risk of the check, and the earlier "any token with a `/`" rule tripped on
+    /// `pytest tests/`, `go test ./...` and `./scripts/test.sh` alike.
+    #[test]
+    fn full_suite_commands_are_never_selective() {
+        for cmd in [
+            "cargo test",
+            "cargo test --workspace",
+            "cargo test -p mycrate",
+            "cargo nextest run -p spar",
+            "pnpm test",
+            "pytest",
+            "pytest tests/",
+            "go test ./...",
+            "./scripts/test.sh",
+            "cargo test 2>&1 | tee /tmp/suite.log",
+            "cd /repo && cargo test",
+            "source .venv/bin/activate && pytest",
+        ] {
+            assert!(!command_is_selective(cmd), "must not be selective: {cmd}");
+        }
+    }
+
+    #[test]
+    fn naming_specific_targets_is_selective() {
+        for cmd in [
+            "pytest tests/test_users.py",
+            "cargo test --test existing",
+            "cargo test --lib",
+            "cargo test mymod::case",
+            "go test ./pkg/thing_test.go",
+            // Every stage narrow ⇒ the line is narrow.
+            "cargo test --test a && cargo test --test b",
+        ] {
+            assert!(command_is_selective(cmd), "must be selective: {cmd}");
+        }
+    }
+
+    /// `a && b` runs both. Judging the line off one stage was wrong in both directions:
+    /// a narrow stage beside a full-suite stage is covered, and a `cd` prefix is not a
+    /// verdict on the command behind it.
+    #[test]
+    fn every_stage_must_be_narrow() {
+        // `--tests` builds every integration target, so the line covers new files.
+        assert!(!command_is_selective(
+            "cargo test --lib && cargo test --tests"
+        ));
+        // A `cd` prefix is setup, not a verdict on the command behind it.
+        assert!(command_is_selective("cd repo && cargo test --test foo"));
+        assert!(!command_is_selective("cd repo && cargo test"));
+        assert!(!command_is_selective("cargo build && cargo test"));
+        // Both spellings of the target flags.
+        assert!(command_is_selective("cargo test --test=foo"));
+        assert!(command_is_selective("cargo test --bin=cli"));
+        // A path handed to a flag is not a target.
+        assert!(!command_is_selective("pytest -c tests/pytest.ini"));
+    }
+
+    /// Only files a suite command could actually name are reportable. A helper module or
+    /// a fixture is neither, and a false "not covered" claim is most expensive in the
+    /// reviewers' suite report.
+    #[test]
+    fn only_real_test_targets_are_reportable() {
+        assert!(is_test_target("tests/acceptance.rs"));
+        assert!(is_test_target("tests/test_users.py"));
+        assert!(is_test_target("pkg/thing_test.go"));
+        assert!(!is_test_target("tests/common/mod.rs"));
+        assert!(!is_test_target("tests/scenarios/plan.rs"));
+        assert!(!is_test_target("tests/data/golden.json"));
+    }
+
+    #[test]
+    fn test_paths_are_recognized_across_stacks() {
+        assert!(is_test_path("tests/scenarios/plan.rs"));
+        assert!(is_test_path("src/__tests__/thing.ts"));
+        assert!(is_test_path("pkg/thing_test.go"));
+        assert!(is_test_path("app/foo.spec.ts"));
+        assert!(is_test_path("api/test_users.py"));
+        assert!(!is_test_path("src/executor.rs"));
+        assert!(!is_test_path("docs/testing.md"));
     }
 
     #[test]

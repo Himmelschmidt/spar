@@ -286,6 +286,10 @@ pub enum Command {
         /// nobody is coming back to resume them.
         #[arg(long, value_name = "DURATION")]
         older_than: Option<String>,
+        /// With `--all`, also sweep at-rest runs whose branches are already contained in
+        /// their own base ref. Squash-merged branches are not ancestors and do not count.
+        #[arg(long)]
+        merged: bool,
         #[arg(long)]
         json: bool,
         /// Also delete `.spar/runs/<id>`

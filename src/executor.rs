@@ -115,6 +115,11 @@ struct PreparedSlot {
     /// Owned so the supervisor's liveness beat survives the move into a spawn thread.
     paths: SparPaths,
     run_id: String,
+    /// True when `cwd` is this slot's *own* recorded worktree. False under
+    /// `isolation = "none"`, where every slot runs in the project checkout.
+    owns_cwd: bool,
+    /// The run's base, for deciding whether a slot missing its artifact left work behind.
+    base_commit: Option<String>,
 }
 
 /// Refreshes a live slot's presence heartbeat while its child process runs, throttled
@@ -254,6 +259,7 @@ fn prepare_slot_execution(
     );
     let _ = crate::bus::heartbeat(paths, Some(&state.id), &job.slot_id, "running");
     let env = wire_slot_presence(state, paths, &job, &cwd, &pref);
+    let owns_cwd = owns_cwd(state, &job.slot_id, &cwd);
 
     Ok(PreparedSlot {
         job,
@@ -265,7 +271,22 @@ fn prepare_slot_execution(
         env,
         paths: paths.clone(),
         run_id: state.id.clone(),
+        base_commit: state.base_commit.clone(),
+        owns_cwd,
     })
+}
+
+/// Whether `cwd` is the slot's own recorded worktree.
+///
+/// Recovery's whole premise is "the work in this tree is yours". Under
+/// `isolation = "none"` every slot's cwd is `project_root`, so that premise fails for the
+/// implementer too and a recovery turn would write up the operator's own WIP as the run's
+/// deliverable. Role alone cannot see this — the cwd has to be checked.
+fn owns_cwd(state: &RunState, slot_id: &str, cwd: &Path) -> bool {
+    state
+        .worktrees
+        .iter()
+        .any(|w| w.slot_id == slot_id && w.path == cwd)
 }
 
 fn execute_prepared(
@@ -412,10 +433,26 @@ fn execute_prepared(
     // gate in the sequential `run_headless` path.
     if let Some(name) = &prep.job.expected_artifact {
         let path = prep.paths.artifact(&prep.run_id, name);
-        let empty = !path.is_file() || std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) == 0;
+        let empty = !artifact_written(&path);
         if empty
             && !markers::wait_for_artifact(&prep.paths, &prep.run_id, name, Duration::from_secs(2))
                 .unwrap_or(false)
+            && !recover_artifact(&ArtifactRecovery {
+                paths: &prep.paths,
+                run_id: &prep.run_id,
+                slot_id: &prep.job.slot_id,
+                role: prep.job.role,
+                owns_cwd: prep.owns_cwd,
+                provider: &prep.job.provider,
+                model: prep.job.model.clone(),
+                cwd: &prep.cwd,
+                log_path: &prep.log_path,
+                prompt_path: &recovery_prompt_path(&prep.prompt_path, &prep.job.slot_id),
+                env: &prep.env,
+                isolation,
+                base_commit: prep.base_commit.as_deref(),
+                artifact: &path,
+            })
         {
             return Ok(SlotOutcome {
                 ok: false,
@@ -435,6 +472,178 @@ fn execute_prepared(
         error: None,
         usage: Some(usage),
     })
+}
+
+/// Budget for the artifact-only recovery turn. Deliberately short: the work is already
+/// done and on disk, so this turn writes one file. A slot that spends longer than this
+/// is doing something other than what it was asked.
+const ARTIFACT_RECOVERY_SECS: u64 = 600;
+
+/// Everything a recovery turn needs. A struct because the call takes ten values and
+/// several of them are paths that must not be swapped.
+struct ArtifactRecovery<'a> {
+    paths: &'a SparPaths,
+    run_id: &'a str,
+    slot_id: &'a str,
+    role: SlotRole,
+    /// `cwd` is this slot's own worktree. See [`owns_cwd`].
+    owns_cwd: bool,
+    provider: &'a str,
+    model: Option<String>,
+    cwd: &'a Path,
+    log_path: &'a Path,
+    prompt_path: &'a Path,
+    env: &'a [(String, String)],
+    isolation: crate::config::IsolationMode,
+    base_commit: Option<&'a str>,
+    artifact: &'a Path,
+}
+
+/// Only the implementer may be recovered.
+///
+/// Recovery infers an artifact from whatever is in the slot's cwd, and it is the only
+/// role for which that inference is sound:
+///
+/// - `tester` and `reviewer` are pointed at the *implementer's* worktree, so
+///   `slot_has_work` is true for them whether or not they did anything. A recovered
+///   `suite.md` reading `## Result: pass` sets the authoritative gate green with no suite
+///   ever having run.
+/// - `test_author` writes the `AC-n` acceptance contract. Prose passes the non-empty
+///   check, `parse_contract_criteria` then finds no criteria, and the ship gate goes
+///   vacuous — a green run with nothing holding it.
+/// - `ranker` runs in `project_root`, whose tree is somebody else's WIP.
+///
+/// A failed slot in those roles is the correct outcome: the existing salvage path records
+/// why, and a human sees it. Only the implementer's deliverable is genuinely on disk with
+/// only the write-up missing.
+fn role_is_recoverable(role: SlotRole) -> bool {
+    matches!(role, SlotRole::Implementer)
+}
+
+/// Work the slot left behind: uncommitted changes, or commits past the run's base.
+///
+/// `base_commit` is `None` for pre-O26 runs and when git couldn't answer; there the
+/// dirty check stands alone rather than guessing at HEAD.
+fn slot_has_work(cwd: &Path, base_commit: Option<&str>) -> bool {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    if git(&["status", "--porcelain"]).is_some_and(|s| !s.is_empty()) {
+        return true;
+    }
+    match (base_commit, git(&["rev-parse", "HEAD"])) {
+        (Some(base), Some(head)) => head != base,
+        _ => false,
+    }
+}
+
+/// Re-prompt a clean-exiting slot for its artifact alone.
+///
+/// A slot that wrote and committed code and then exited without its summary is not a
+/// failed slot — the deliverable is on disk and only the write-up is missing. Failing it
+/// there throws away a full build and re-dispatches from scratch, which is the most
+/// expensive way to recover the cheapest thing to reproduce.
+///
+/// Only fires for the implementer, and only when the tree actually holds work — a slot
+/// that did nothing still fails.
+fn recover_artifact(r: &ArtifactRecovery) -> bool {
+    if !role_is_recoverable(r.role) || !r.owns_cwd || !slot_has_work(r.cwd, r.base_commit) {
+        return false;
+    }
+    let Some(adapter) = providers::adapter_named(r.provider) else {
+        return false;
+    };
+    let Some(bin) = adapter.resolve_binary() else {
+        return false;
+    };
+    let prompt = format!(
+        "Your previous turn ended without writing `{}`, but your work is still in this \
+         worktree ({}).\n\nWrite that file now, and nothing else. Read your own changes \
+         (`git status`, `git diff`, `git log`) and summarize what you did, what you \
+         verified, and anything you left undone or uncertain.\n\nDo not start new work. \
+         Do not run builds, linters or tests. Do not modify any file other than the one \
+         named above.\n",
+        r.artifact.display(),
+        r.cwd.display()
+    );
+    if std::fs::write(r.prompt_path, &prompt).is_err() {
+        return false;
+    }
+    let timeout = Duration::from_secs(ARTIFACT_RECOVERY_SECS);
+    let opts = SpawnOpts {
+        prompt,
+        prompt_file: Some(r.prompt_path.to_path_buf()),
+        cwd: r.cwd.to_path_buf(),
+        trust: TrustPolicy::FullAuto,
+        extra_args: vec![],
+        model: r.model.clone(),
+        timeout_secs: Some(timeout.as_secs()),
+    };
+    let cmd = adapter.build_headless(&bin, &opts);
+    let (program, args) = providers::command_to_parts(&cmd);
+    let (program, args) = sandbox::maybe_wrap(r.isolation, r.cwd, &program, &args);
+    let req = SpawnRequest {
+        program,
+        args,
+        cwd: r.cwd.to_path_buf(),
+        // Its own log. `run_captured` opens with `File::create`, so reusing the slot's
+        // would truncate the transcript of the turn that did all the work — which is both
+        // the operator's only diagnosis and what `salvage_expected_artifact` tails when
+        // recovery itself fails.
+        log_path: recovery_log_path(r.log_path),
+        env: r.env.to_vec(),
+        timeout,
+    };
+    // Tracked like any other slot spawn: without the pid marker this agent is invisible to
+    // `stop --abandoned`, and without the heartbeat a recovery longer than
+    // `RESERVE_LEASE_TTL_SECS` lets a live holder's path reserves be reclaimed.
+    let pid_file = markers_pid_path(r.paths, r.run_id, r.slot_id);
+    let sink = move |pid: u32| {
+        let _ = std::fs::write(&pid_file, process::PidToken::capture(pid).encode());
+    };
+    let beat = LivenessBeat {
+        paths: r.paths,
+        run_id: r.run_id,
+        slot_id: r.slot_id,
+        last: std::cell::Cell::new(std::time::Instant::now()),
+    };
+    let tick = || beat.tick();
+    if process::run_captured(&req, Some(&sink), Some(&tick)).is_err() {
+        return false;
+    }
+    artifact_written(r.artifact)
+}
+
+/// `<run_dir>/logs/<slot>.recovery.log`.
+fn recovery_log_path(log_path: &Path) -> PathBuf {
+    let stem = log_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("slot");
+    log_path.with_file_name(format!("{stem}.recovery.log"))
+}
+
+fn markers_pid_path(paths: &SparPaths, run_id: &str, slot_id: &str) -> PathBuf {
+    paths.markers_dir(run_id).join(format!("{slot_id}.pid"))
+}
+
+fn artifact_written(path: &Path) -> bool {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > 0
+}
+
+/// `<run_dir>/prompt-<slot>-artifact.md` — the recovery prompt, kept beside the slot's
+/// original so a failed recovery is readable after the fact.
+fn recovery_prompt_path(prompt_path: &Path, slot_id: &str) -> PathBuf {
+    prompt_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(format!("prompt-{slot_id}-artifact.md"))
 }
 
 /// Derive `<run_dir>/markers/<slot>.pid` from a slot log path (`<run_dir>/logs/<slot>.log`).
@@ -1321,11 +1530,28 @@ fn run_headless(
     }
     if let Some(name) = &job.expected_artifact {
         let path = paths.artifact(&state.id, name);
-        if !path.is_file() || std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) == 0 {
+        if !artifact_written(&path) {
             // short grace for late writers
             let found = markers::wait_for_artifact(paths, &state.id, name, Duration::from_secs(2))
                 .unwrap_or(false);
-            if !found {
+            let recovered = !found
+                && recover_artifact(&ArtifactRecovery {
+                    paths,
+                    run_id: &state.id,
+                    slot_id: &job.slot_id,
+                    role: job.role,
+                    owns_cwd: owns_cwd(state, &job.slot_id, cwd),
+                    provider: &job.provider,
+                    model: slot_model_for(Some(state), job),
+                    cwd,
+                    log_path,
+                    prompt_path: &recovery_prompt_path(prompt_path, &job.slot_id),
+                    env,
+                    isolation: state.isolation,
+                    base_commit: state.base_commit.as_deref(),
+                    artifact: &path,
+                });
+            if !found && !recovered {
                 return Ok(SlotOutcome {
                     ok: false,
                     pid,
@@ -1553,6 +1779,8 @@ pub fn emit_run_json(state: &RunState) -> Result<()> {
         "gates": state.gates,
         "error": state.error,
         "project_root": state.project_root,
+        // `providers` is the pool; this is what each role actually drew from it.
+        "roles": role_assignments(state),
         "base_ref": state.base_ref,
         "base_commit": state.base_commit,
         "parent_run": state.parent_run,
@@ -1568,6 +1796,33 @@ pub fn emit_run_json(state: &RunState) -> Result<()> {
     Ok(())
 }
 
+/// Resolved `role=provider` assignment in slot order, reviewers joined with `+`.
+///
+/// `state.providers` is the run's *pool*. Printing that as the answer to "what is
+/// running this" is wrong the moment `[roles]` or `--role` assigns anything: the pool
+/// still lists providers no role ever drew, so an operator who deliberately excluded one
+/// sees it on the launch line anyway.
+pub fn role_assignments(state: &RunState) -> Vec<String> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    for slot in &state.slots {
+        let role = slot.role.as_config_key().to_string();
+        let mut provider = slot.provider.clone();
+        if !provider.contains('@') {
+            if let Some(model) = slot.model.as_deref() {
+                provider = format!("{provider}@{model}");
+            }
+        }
+        match out.iter_mut().find(|(r, _)| *r == role) {
+            Some((_, ps)) if ps.contains(&provider) => {}
+            Some((_, ps)) => ps.push(provider),
+            None => out.push((role, vec![provider])),
+        }
+    }
+    out.into_iter()
+        .map(|(role, ps)| format!("{role}={}", ps.join("+")))
+        .collect()
+}
+
 pub fn print_run_human(state: &RunState) {
     println!("run_id:  {}", state.id);
     println!("phase:   {:?}", state.phase);
@@ -1581,8 +1836,14 @@ pub fn print_run_human(state: &RunState) {
     if let Some(a) = &state.amendment {
         println!("amendment: {a}");
     }
-    if !state.providers.is_empty() {
-        println!("providers: {}", state.providers.join(", "));
+    let roles = role_assignments(state);
+    if !roles.is_empty() {
+        println!("roles:   {}", roles.join(", "));
+    } else if !state.providers.is_empty() {
+        println!(
+            "providers: {} (pool; no slots dispatched yet)",
+            state.providers.join(", ")
+        );
     }
     if state.dry_run {
         println!("dry_run: true  (no git worktrees; agent processes stubbed only)");
@@ -1686,6 +1947,101 @@ pub fn wait_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Recovery must fire only for a slot that actually produced something. A slot that
+    /// exited clean having written nothing is a genuine failure and still fails.
+    #[test]
+    fn slot_has_work_needs_a_dirty_tree_or_a_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("wt");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default()
+        };
+        if std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+
+        assert!(
+            !slot_has_work(&repo, Some(&base)),
+            "an untouched worktree is not recoverable work"
+        );
+
+        std::fs::write(repo.join("b.txt"), "new").unwrap();
+        assert!(slot_has_work(&repo, Some(&base)), "untracked work counts");
+
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "slot work"]);
+        assert!(
+            slot_has_work(&repo, Some(&base)),
+            "committed work past the base counts"
+        );
+        assert!(
+            !slot_has_work(&repo, None),
+            "with no recorded base, only a dirty tree can be judged"
+        );
+    }
+
+    #[test]
+    fn role_assignments_report_what_each_role_drew() {
+        let mut state = RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            std::path::PathBuf::from("/tmp/x"),
+        );
+        // The pool lists a provider no role ever draws — the bug this replaces.
+        state.providers = vec!["cli:grok".into(), "cli:codex".into()];
+        state.slots.push(init_slot_model(
+            "impl-claude",
+            "cli:claude",
+            SlotRole::Implementer,
+            Some("sonnet".into()),
+        ));
+        state.slots.push(init_slot_model(
+            "rev-a",
+            "cli:grok",
+            SlotRole::Reviewer,
+            None,
+        ));
+        state.slots.push(init_slot_model(
+            "rev-b",
+            "cli:claude@opus",
+            SlotRole::Reviewer,
+            None,
+        ));
+
+        let roles = role_assignments(&state);
+        assert_eq!(
+            roles,
+            vec![
+                "implementer=cli:claude@sonnet".to_string(),
+                "reviewer=cli:grok+cli:claude@opus".to_string(),
+            ]
+        );
+        assert!(
+            !roles.iter().any(|r| r.contains("codex")),
+            "a pooled provider no role drew must not be reported as running the work"
+        );
+    }
 
     #[test]
     fn provider_is_agy_recognizes_forms() {

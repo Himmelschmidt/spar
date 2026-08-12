@@ -8,6 +8,13 @@ autonomy = "semi"
 message_budget = "normal" # none | lean | normal | chatty
 auto_cleanup = false
 
+[worktree]
+# Reap at-rest runs whose branches are already contained in their own base ref, just
+# before a launch cuts new worktrees. On by default: unlike auto_cleanup, this only
+# deletes work git says is already in the base branch. Squash merges are not ancestors
+# and are never reaped this way.
+auto_cleanup_merged = true
+
 [providers]
 # Mix CLI + API: "cli:claude", "cli:grok", "api:openai", "api:xai", ...
 order = ["cli:claude", "cli:grok", "cli:agy"]

@@ -268,6 +268,39 @@ pub fn prepare_isolation(
             }
         }
         IsolationMode::Worktree | IsolationMode::WorktreeDb | IsolationMode::WorktreeBwrap => {
+            let cfg = if state.dry_run {
+                None
+            } else {
+                crate::config::Config::for_run(paths, &state.id).ok()
+            };
+            // Reclaim before cutting, and only when actually cutting: the moment new
+            // worktrees appear is the moment landed ones stop being worth their disk.
+            let cutting_new = slot_ids.iter().any(|sid| {
+                !state
+                    .worktrees
+                    .iter()
+                    .any(|w| w.slot_id == *sid && w.path.is_dir())
+            });
+            if cutting_new && cfg.as_ref().is_some_and(|c| c.worktree.auto_cleanup_merged) {
+                match sweep_merged(paths, Some(&state.id)) {
+                    Ok(reaped) if !reaped.is_empty() => {
+                        let total: usize = reaped.iter().map(|(_, n)| n).sum();
+                        eprintln!(
+                            "reclaimed {total} merged worktree(s) from {} run(s): {}",
+                            reaped.len(),
+                            reaped
+                                .iter()
+                                .map(|(id, _)| id.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
+                    // Never fails a run: this is housekeeping, not the work.
+                    Ok(_) => {}
+                    Err(e) => eprintln!("note: merged-worktree sweep skipped: {e}"),
+                }
+            }
+
             for sid in slot_ids {
                 // Idempotent: reuse existing worktree for same slot (one-run re-entry).
                 let existing_path = state
@@ -340,6 +373,130 @@ pub fn prepare_isolation(
     Ok(())
 }
 
+/// Whether every branch this run cut is already contained in its own `base_ref`.
+///
+/// `None` when the question cannot be answered — no recorded base (pre-O26), a base that
+/// no longer resolves, or a run with no worktrees. Only `Some(true)` is evidence, and
+/// only evidence reaps.
+///
+/// Ancestry, not patch equivalence. A **squash-merged** branch is not an ancestor of its
+/// base and reads as unmerged here, so a squash-merged run still has to be swept by age
+/// or by run id. That is the safe direction to be wrong in: it keeps a worktree the
+/// operator might still want instead of deleting work that only looks landed.
+pub fn merged_into_base(state: &RunState) -> Option<bool> {
+    if state.worktrees.is_empty() {
+        return None;
+    }
+    let root = &state.project_root;
+    let base = resolve_commit(root, state.base_ref.as_deref()?)?;
+    let mut checked = 0usize;
+    for rec in &state.worktrees {
+        // Uncommitted work first, and it is the check that matters. Branch ancestry says
+        // nothing about a dirty tree: a slot that wrote code and never committed leaves
+        // its branch sitting exactly on the base, which is trivially an ancestor, so
+        // ancestry alone reads "fully landed" for the work most at risk. `cleanup_run`
+        // then removes the worktree with `--force`. The phases this sweep can reach are
+        // `stopped` / `failed` / `stuck` / `quota` / gates — precisely the runs whose
+        // agents were interrupted mid-turn, and the ones `implement --run` exists to
+        // resume.
+        if rec.path.is_dir() && worktree_holds_uncommitted(&rec.path) {
+            return Some(false);
+        }
+        // A branch that is already gone cannot be holding unmerged work.
+        if resolve_commit(root, &rec.branch).is_none() {
+            continue;
+        }
+        checked += 1;
+        let contained =
+            git_quiet(root, &["merge-base", "--is-ancestor", &rec.branch, &base]).unwrap_or(false);
+        if !contained {
+            return Some(false);
+        }
+    }
+    // Vacuous truth is not evidence. With every branch unresolvable the loop above skips
+    // them all and falls out here, turning "git could not answer for any of these" into
+    // "all of them are merged" — and a worktree can still hold committed work its branch
+    // no longer points at.
+    if checked == 0 {
+        return None;
+    }
+    Some(true)
+}
+
+/// Uncommitted work in a slot worktree. Fails **closed**: a git that cannot answer means
+/// the tree is treated as holding work, because the caller's only use for this is deciding
+/// whether it is safe to delete.
+fn worktree_holds_uncommitted(path: &Path) -> bool {
+    match git_out(path, &["status", "--porcelain"]) {
+        Some(s) => !s.is_empty(),
+        None => true,
+    }
+}
+
+/// A ref as it resolves today: the local ref, else its `origin/` counterpart.
+fn resolve_commit(root: &Path, reference: &str) -> Option<String> {
+    git_out(
+        root,
+        &["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
+    )
+    .or_else(|| {
+        git_out(
+            root,
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("origin/{reference}^{{commit}}"),
+            ],
+        )
+    })
+}
+
+/// Reap the worktrees of every at-rest run whose branches are already in their base.
+///
+/// The disk-pollution backstop: a run that shipped and landed has nothing left to resume,
+/// but its phase (`awaiting_ship_confirm`, `stopped`) says otherwise, so age was the only
+/// evidence the sweep accepted and worktrees accumulated for as long as the operator went
+/// without running one. Merged is stronger evidence than age — the work is in the base
+/// branch — which is what makes this safe to do without being asked. `skip_run` is the
+/// run being launched right now.
+pub fn sweep_merged(paths: &SparPaths, skip_run: Option<&str>) -> Result<Vec<(String, usize)>> {
+    let mut reaped = Vec::new();
+    for summary in crate::state::list_runs(paths)? {
+        if skip_run == Some(summary.id.as_str()) {
+            continue;
+        }
+        let Ok(state) = RunState::load(paths, &summary.id) else {
+            continue;
+        };
+        if !crate::state::at_rest(state.phase) {
+            continue;
+        }
+        // The phase on disk is a snapshot, and a resuming orchestrator is between loading
+        // its state and saving the new one for a window this sweep can land in. Reaping
+        // then would not merely delete a live run's worktrees — `cleanup_run` also
+        // terminates every process whose cwd is inside them, i.e. that run's agents.
+        if crate::state::orchestrator_alive(paths, &summary.id) {
+            continue;
+        }
+        // Nothing on disk to reclaim: skip before touching git. Records outlive their
+        // worktrees (cleanup does not clear them), so without this every later sweep
+        // re-runs `worktree remove` / `branch -D` / `prune` per stale record and reports
+        // reclaiming what it already reclaimed.
+        if !state.worktrees.iter().any(|r| r.path.is_dir()) {
+            continue;
+        }
+        if merged_into_base(&state) != Some(true) {
+            continue;
+        }
+        let cleaned = cleanup_run(&state)?;
+        let removed = cleaned.iter().filter(|c| c.removed).count();
+        if removed > 0 {
+            reaped.push((summary.id, removed));
+        }
+    }
+    Ok(reaped)
+}
+
 /// What cleanup did to one worktree.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WorktreeCleanup {
@@ -406,16 +563,29 @@ pub fn cleanup_run(state: &RunState) -> Result<Vec<WorktreeCleanup>> {
     Ok(report)
 }
 
+/// What the overlay left behind: paths git ignores in the author worktree, and where
+/// they still are. Directories are collapsed (`target/`), so this stays a short list.
+#[derive(Debug, Clone)]
+pub struct SpecOverlay {
+    pub author_path: PathBuf,
+    pub ignored: Vec<String>,
+}
+
 /// Bring pre-coding acceptance tests from the test-author worktree into the implementer cwd.
 ///
 /// Fail closed when the author worktree is missing. Always overlays the author working tree
 /// (agents often leave tests uncommitted). Live runs also try `git merge` of the author branch
 /// first for committed history; failed merges are aborted before overlay.
+///
+/// Returns what git ignored, because the caller has to say so out loud: a fixture the
+/// test-author wrote into an ignored path (`.env.test`, an ignored `tests/data/`) does not
+/// cross, and the implementer then meets a test that compiles and fails at runtime with
+/// nothing pointing at the plumbing.
 pub fn apply_spec_tests_to_impl(
     state: &RunState,
     author_slot: &str,
     impl_cwd: &Path,
-) -> Result<()> {
+) -> Result<SpecOverlay> {
     let spec = state
         .worktrees
         .iter()
@@ -434,7 +604,63 @@ pub fn apply_spec_tests_to_impl(
     }
     // Always overlay: uncommitted author files never appear in a merge.
     copy_tree_overlay(&spec.path, impl_cwd)?;
-    Ok(())
+    Ok(SpecOverlay {
+        author_path: spec.path.clone(),
+        ignored: ignored_entries(&spec.path),
+    })
+}
+
+/// Build output and dependency trees. Not policy — a noise filter, so the "these did not
+/// come across" notice carries fixtures the implementer might actually need instead of
+/// `target/` on every single run, which is how a notice gets tuned out.
+const BUILD_OUTPUT_DIRS: [&str; 12] = [
+    "target",
+    "node_modules",
+    "dist",
+    "build",
+    "out",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".next",
+    ".nuxt",
+    ".gradle",
+    ".spar",
+];
+
+/// Paths git ignores in `dir` and worth telling somebody about, with fully-ignored
+/// directories collapsed to one entry.
+///
+/// `--directory` is what keeps this readable: without it a Rust worktree reports every
+/// file under `target/` individually.
+fn ignored_entries(dir: &Path) -> Vec<String> {
+    let Ok(out) = Command::new("git")
+        .args([
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+        ])
+        .current_dir(dir)
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    out.stdout
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .filter(|p| !is_build_output(p))
+        .collect()
+}
+
+fn is_build_output(entry: &str) -> bool {
+    entry.split('/').any(|c| BUILD_OUTPUT_DIRS.contains(&c))
 }
 
 /// Attempt merge; on failure abort so the tree is never left in MERGING.
@@ -468,7 +694,7 @@ fn copy_tree_overlay(src: &Path, dst: &Path) -> Result<()> {
     if !src.is_dir() {
         return Ok(());
     }
-    for entry in walkdir_regular_files(src)? {
+    for entry in overlay_sources(src)? {
         let rel = entry.strip_prefix(src).unwrap_or(&entry);
         if rel.as_os_str().is_empty() {
             continue;
@@ -485,6 +711,74 @@ fn copy_tree_overlay(src: &Path, dst: &Path) -> Result<()> {
             .with_context(|| format!("copy {} -> {}", entry.display(), target.display()))?;
     }
     Ok(())
+}
+
+/// What the author worktree hands the implementer: tracked files plus untracked ones
+/// git would keep, and nothing git ignores.
+///
+/// The unfiltered walk this replaced copied `target/` and `node_modules/` between
+/// worktrees — gigabytes of build output, byte-by-byte, per implementer, while the run
+/// still reported phase `prepare_isolation`. On a spinning disk that was the single
+/// largest cost in a run.
+///
+/// Falls back to the full walk when git lists nothing: a dry-run cwd lives under an
+/// ignored `.spar/`, where `ls-files` is correctly empty but the stub artifacts still
+/// have to cross. A git that *errored* (broken worktree admin dir, dubious ownership,
+/// git missing) falls back too, but says so — the walk is the gigabyte copy this change
+/// exists to stop, and it must never resume silently.
+fn overlay_sources(src: &Path) -> Result<Vec<PathBuf>> {
+    match git_listed_files(src) {
+        Ok(files) if !files.is_empty() => Ok(files),
+        Ok(_) => walkdir_regular_files(src),
+        Err(why) => {
+            eprintln!(
+                "note: git could not list {} ({why}) — falling back to a full tree copy, \
+                 which will include build output",
+                src.display()
+            );
+            walkdir_regular_files(src)
+        }
+    }
+}
+
+/// Regular files under `dir` that git tracks or would add. `Err` when git can't answer.
+fn git_listed_files(dir: &Path) -> std::result::Result<Vec<PathBuf>, String> {
+    let out = Command::new("git")
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
+        .current_dir(dir)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    let files = out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        // Raw bytes, not `from_utf8_lossy`: a replacement char would name a path that does
+        // not exist, and the file would be dropped instead of copied.
+        .map(|s| dir.join(bytes_to_path(s)))
+        // `ls-files` also reports symlinks, submodules and deleted-but-tracked paths.
+        .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file()))
+        .collect();
+    Ok(files)
+}
+
+#[cfg(unix)]
+fn bytes_to_path(b: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    PathBuf::from(std::ffi::OsStr::from_bytes(b))
+}
+
+#[cfg(not(unix))]
+fn bytes_to_path(b: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(b).as_ref())
 }
 
 /// Regular files only — never follow or copy symlinks (agent could link secrets).
@@ -546,6 +840,207 @@ mod tests {
         {
             assert!(!dst.join("evil").exists());
         }
+    }
+
+    /// The overlay used to walk the author worktree unfiltered, so `target/` crossed into
+    /// every implementer — gigabytes of build output copied byte-by-byte on a spinning
+    /// disk, while the run still reported phase `prepare_isolation`.
+    #[test]
+    fn overlay_leaves_ignored_build_output_behind() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("author");
+        let dst = tmp.path().join("impl");
+        std::fs::create_dir_all(src.join("tests")).unwrap();
+        std::fs::create_dir_all(src.join("target/debug")).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join(".gitignore"), "target/\n").unwrap();
+        std::fs::write(src.join("tests/acceptance.rs"), "fn t() {}\n").unwrap();
+        std::fs::write(src.join("target/debug/huge.rlib"), vec![0u8; 4096]).unwrap();
+
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&src)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q"]) {
+            return;
+        }
+
+        copy_tree_overlay(&src, &dst).unwrap();
+        assert!(
+            dst.join("tests/acceptance.rs").is_file(),
+            "acceptance tests must still cross"
+        );
+        assert!(
+            !dst.join("target/debug/huge.rlib").exists(),
+            "gitignored build output must not cross"
+        );
+    }
+
+    /// Outside a repo (and in the dry-run cwd under an ignored `.spar/`) `ls-files` is
+    /// correctly empty, and the walk has to carry the files anyway.
+    #[test]
+    fn overlay_falls_back_to_the_walk_outside_a_repo() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("author");
+        let dst = tmp.path().join("impl");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("stub.txt"), "x").unwrap();
+        copy_tree_overlay(&src, &dst).unwrap();
+        assert!(dst.join("stub.txt").is_file());
+    }
+
+    /// The overlay carrying git-visible files only is the fix; doing it *silently* is the
+    /// new failure. An ignored fixture must come back named, so the caller can say where
+    /// it still is.
+    #[test]
+    fn overlay_reports_what_git_ignored() {
+        let tmp = tempdir().unwrap();
+        let project = tmp.path().join("proj");
+        let author = tmp.path().join("author");
+        let impl_cwd = tmp.path().join("impl");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(author.join("tests/data")).unwrap();
+        std::fs::create_dir_all(author.join("target/debug")).unwrap();
+        std::fs::create_dir_all(&impl_cwd).unwrap();
+        std::fs::write(
+            author.join(".gitignore"),
+            "target/\n.env.test\ntests/data/\n",
+        )
+        .unwrap();
+        std::fs::write(author.join("tests/acceptance.rs"), "fn t() {}\n").unwrap();
+        std::fs::write(author.join(".env.test"), "DB=x\n").unwrap();
+        std::fs::write(author.join("tests/data/golden.json"), "{}\n").unwrap();
+        std::fs::write(author.join("target/debug/huge.rlib"), vec![0u8; 512]).unwrap();
+
+        let git_ok = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&author)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !git_ok {
+            return;
+        }
+
+        let mut state = RunState::new("r1", crate::cli::WorkflowKind::Plan, project);
+        state.dry_run = true;
+        state.worktrees.push(WorktreeRecord {
+            slot_id: "test-author-x".into(),
+            path: author.clone(),
+            branch: "spar/r1/test-author-x".into(),
+        });
+
+        let overlay = apply_spec_tests_to_impl(&state, "test-author-x", &impl_cwd).unwrap();
+        assert!(impl_cwd.join("tests/acceptance.rs").is_file());
+        assert!(!impl_cwd.join(".env.test").exists());
+        assert!(!impl_cwd.join("target/debug/huge.rlib").exists());
+
+        assert_eq!(overlay.author_path, author);
+        assert!(
+            overlay.ignored.iter().any(|p| p == ".env.test"),
+            "an ignored fixture must be named, not silently dropped: {:?}",
+            overlay.ignored
+        );
+        assert!(
+            overlay.ignored.iter().any(|p| p.starts_with("tests/data")),
+            "{:?}",
+            overlay.ignored
+        );
+        // Build output is filtered out: every Rust run has a `target/`, and a notice that
+        // fires every run with nothing actionable in it is a notice nobody reads.
+        assert!(
+            !overlay.ignored.iter().any(|p| p.starts_with("target")),
+            "build output must not be reported as a missing fixture: {:?}",
+            overlay.ignored
+        );
+        assert!(
+            overlay.ignored.len() < 5,
+            "ignored dirs must collapse to one entry each: {:?}",
+            overlay.ignored
+        );
+    }
+
+    /// Merged evidence is what lets the sweep reclaim without being asked, so it has to be
+    /// exact: contained in the base ⇒ reap, one unmerged commit ⇒ keep.
+    #[test]
+    fn merged_into_base_tracks_containment() {
+        let tmp = tempdir().unwrap();
+        let (root, _wt, _) = repo_with_linked_worktree(tmp.path());
+        let git = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let base_ref = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let base_commit = git(&root, &["rev-parse", "HEAD"]);
+
+        let mut state = RunState::new("runmerge", crate::cli::WorkflowKind::Loop, root.clone());
+        state.base_ref = Some(base_ref.clone());
+        state.base_commit = Some(base_commit);
+
+        assert_eq!(
+            merged_into_base(&state),
+            None,
+            "a run with no worktrees offers no evidence either way"
+        );
+
+        let rec = create_worktree(&root, "runmerge", "impl", state.base_commit.as_deref()).unwrap();
+        state.worktrees.push(rec.clone());
+        assert_eq!(
+            merged_into_base(&state),
+            Some(true),
+            "a clean worktree on an unmoved branch holds nothing to lose"
+        );
+
+        // The data-loss case: an agent wrote code and never committed, so the branch is
+        // still on the base and reads as trivially contained. Ancestry must not decide it.
+        std::fs::write(rec.path.join("uncommitted.rs"), "fn work() {}\n").unwrap();
+        assert_eq!(
+            merged_into_base(&state),
+            Some(false),
+            "uncommitted work must veto the merged verdict — cleanup removes with --force"
+        );
+        std::fs::remove_file(rec.path.join("uncommitted.rs")).unwrap();
+
+        std::fs::write(rec.path.join("work.txt"), "slot work\n").unwrap();
+        git(&rec.path, &["add", "."]);
+        git(&rec.path, &["commit", "-q", "-m", "slot work"]);
+        assert_eq!(
+            merged_into_base(&state),
+            Some(false),
+            "unmerged work must never read as reclaimable"
+        );
+
+        git(
+            &root,
+            &["merge", "--no-ff", "-q", "-m", "merge", &rec.branch],
+        );
+        assert_eq!(merged_into_base(&state), Some(true), "merged ⇒ reclaimable");
+
+        // Documented limitation: containment is ancestry, so a squash merge reads unmerged.
+        state.base_ref = None;
+        assert_eq!(
+            merged_into_base(&state),
+            None,
+            "no recorded base ⇒ no verdict, never a guess"
+        );
+
+        cleanup_run(&state).unwrap();
     }
 
     #[test]

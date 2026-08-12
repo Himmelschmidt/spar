@@ -260,6 +260,23 @@ how orphaned dev servers get collected), then removes the worktree, falling back
 directory delete if git no longer tracks it. It never touches the project root or anything
 outside the run's worktrees. `--json` reports `worktrees[]` with `killed` pids and `removed`.
 
+A sweep says what it **spared** and why (`spared <run_id>: <reason>`; `spared[]` under
+`--json`), so "nothing to sweep" is never confused with a refusal when there are
+gigabytes of resumable worktrees on disk.
+
+**`--merged` is evidence too, and stronger than age.** `spar cleanup --all --merged`
+also reaps at-rest runs whose every slot branch is already contained in the run's own
+`base_ref` — the work is in the base branch, so there is nothing left to lose. It still
+cannot touch a run in flight. Containment is **ancestry**, so a **squash-merged** branch
+reads as unmerged and needs `--older-than` or an explicit run id.
+
+**This also runs on its own.** `[worktree] auto_cleanup_merged` (default **true**) reaps
+merged at-rest runs project-wide just before a launch cuts new slot worktrees — the
+moment landed worktrees stop being worth their disk. It reports what it reclaimed on
+stderr and never fails a run. This is not `auto_cleanup` (still `false` by default):
+that one deletes resumable work on a phase check, this one only deletes what git says is
+already in the base branch. Set it `false` to keep every worktree until you sweep by hand.
+
 ## Swarm bus
 
 The bus is **workspace-scoped and keyed by a globally-unique `agent_id`**. Run-slot role
@@ -352,6 +369,27 @@ A **rail** + **one main area**. Main always shows the rail's selection.
 - Slot status is reconciled against on-disk markers at read time: a slot recorded as `running` that has a `<slot>.done` / `<slot>.failed` marker is reported `done` / `failed`. `status` never rewrites `state.json`.
 - `status --json` also carries **`"abandoned": true|false`** per run: the run is in a non-terminal phase but no live orchestrator owns it (the driving process died). Not an exit code — exit codes are unchanged. Resume with `spar implement --run <id> --providers …`, park it with `spar stop <id>`, or discard with `spar cleanup <id>`.
 
+- `status --json` carries **`"roles"`** — the resolved `role=provider` assignment each
+  role actually drew (`["planner=cli:grok", "reviewer=cli:grok+cli:claude@opus"]`), which
+  is also what `plan` / `review` print at launch. `"providers"` is the run's *pool* and
+  still lists refs no role ever drew; read `roles` to know what is running the work.
+- **An implementer that exits clean with work in its tree but no artifact gets one
+  recovery turn** instead of failing: spar re-prompts the same provider for that artifact
+  alone (10 min budget, no new work), logging to `<slot>.recovery.log` so the original
+  transcript survives. An implementer whose worktree holds nothing — no commits past the
+  base, no dirty tree — still fails with `missing expected artifact <name>`.
+  **Implementer only.** `tester` and `reviewer` slots run *in* the implementer's worktree,
+  so "has work" is always true for them and a recovered `suite.md` could set the
+  authoritative gate green with no suite having run; a recovered `test-contract.md` would
+  carry no `AC-n` and make the ship gate vacuous. Those roles fail closed, as before.
+- **The suite gate is checked for coverage.** When the tester's commands select specific
+  targets (`--test foo`, `--lib`, `mod::case`, a named test file) and the implementer
+  committed test files none of them name, spar appends a `## Coverage warning` to
+  `suite.md` and broadcasts it on the bus. spar never edits the command list — a harness
+  that rewrites its own gate is not a gate. Silent when the suite runs the project default
+  (`cargo test`, `cargo test -p pkg`, `pytest tests/`, `go test ./...`), all of which
+  compile or collect new test files on their own.
+
 ## Exit codes (stable)
 
 | Code | Meaning |
@@ -392,6 +430,8 @@ spar implement --run <id> --reload-config   # deliberately re-read spar.toml and
 autonomy = "manual" | "semi" | "high" | "full"
 message_budget = "none" | "lean" | "normal" | "chatty"
 auto_cleanup = false
+[worktree]
+auto_cleanup_merged = true   # reap at-rest runs already contained in their base, at launch
 [gates]
 plan = true
 winner = true
@@ -446,7 +486,7 @@ timeout_secs = 1800
 - Coding slots always use git worktrees; never check out feature branches on the primary tree.
 - Ship is draft PR only — never merge.
 - State lives under `.spar/` in the project root.
-- **Spec channel (plan):** after planner+critic, a `test-author` freezes acceptance tests (`artifacts/test-contract.md` + worktree tests) from plan/critique (bus is audit trail), **before** the plan approval gate. Implement overlays those tests into the impl worktree (fail closed if author ran). Its provider comes from `[roles].test_author` (falls through to the fleet if unset/unusable). Disable with `[spec] enabled = false`.
+- **Spec channel (plan):** after planner+critic, a `test-author` freezes acceptance tests (`artifacts/test-contract.md` + worktree tests) from plan/critique (bus is audit trail), **before** the plan approval gate. Implement overlays those tests into the impl worktree (fail closed if author ran). The overlay carries **git-visible files only** — tracked plus untracked-not-ignored — so build output never crosses between worktrees. Anything git ignores stays behind and is named on stderr, in the event log, on the bus, and in the implementer's own prompt, with the author worktree path: if an acceptance test needs an ignored fixture (`.env.test`, an ignored `tests/data/`), the implementer copies it across itself. Its provider comes from `[roles].test_author` (falls through to the fleet if unset/unusable). Disable with `[spec] enabled = false`.
 - **Criterion ids:** scenarios in `artifacts/test-contract.md` carry stable `AC-<n>` ids (numbered from 1, contiguous, never renumbered) plus a `verify:` hint naming a command, `file:line` + assertion, or observable behavior.
 - **Reviewer context:** reviewers get the full `plan.md` and `test-contract.md` in their prompt, so they can check the change against the agreed plan and each `AC-n` criterion rather than guessing intent.
 - **Review artifact schema (enforced):** each `artifacts/review-<slot>.md` is `## Verdict` / `## Acceptance` / `## Findings` / `## Tests`. The verdict is read as an **anchored header** — the first non-blank line under the first `## Verdict` must be `approve` or `request_changes`; missing or unparseable is treated as `request_changes`. `## Acceptance` carries one `AC-n: pass|fail|unverified — evidence` line per criterion in `test-contract.md`.

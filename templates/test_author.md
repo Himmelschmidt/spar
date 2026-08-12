@@ -30,6 +30,7 @@ You freeze the acceptance bar **before** product code is written. You are **not*
 3. Write **real, runnable acceptance tests** for this stack (detect Cargo/pytest/go/npm/etc.). Prefer behavior over implementation detail.
 4. Tests should **fail** (or be clearly red) until the planned feature exists. Document expected failures.
 5. Do not claim green for missing behavior.
+6. Run any build or test command **in the foreground** and wait for it. No `&`, `nohup`, `disown`, or "start it and poll later" patterns — a slot that backgrounds a long build spends its remaining turns polling and exits without writing `test-contract.md`.
 
 ## Required outputs
 1. `{{artifacts_dir}}/test-contract.md` with:
