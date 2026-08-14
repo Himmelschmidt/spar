@@ -83,6 +83,11 @@ pub struct RunState {
     /// tests never produced a clean verdict — distinct from a real `Fail`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suite_outcome: Option<SuiteOutcome>,
+    /// When this run was archived, if it was. Archiving hides a finished run from
+    /// listings; it deletes nothing and is reversible. Distinct from cleanup, which
+    /// reclaims worktrees and leaves the record, and from `--purge`, which deletes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -308,6 +313,9 @@ pub struct RunSummary {
     /// In flight, but no live orchestrator owns it — computed at read time.
     #[serde(default)]
     pub abandoned: bool,
+    /// Hidden from default listings. The record and its artifacts are untouched.
+    #[serde(default)]
+    pub archived: bool,
     /// Ref/commit the run's slot worktrees were cut from (see `RunState::base_ref`).
     #[serde(default)]
     pub base_ref: Option<String>,
@@ -327,6 +335,7 @@ impl RunState {
             id: id.into(),
             workflow,
             phase: Phase::Init,
+            archived_at: None,
             task: None,
             amendment: None,
             created_at: now,
@@ -365,8 +374,18 @@ impl RunState {
     }
 
     pub fn set_phase(&mut self, phase: Phase) {
+        // Work resuming un-archives the run. Archiving means "finished, stop showing me
+        // this"; a run that is moving again is neither, and leaving it hidden would put a
+        // live run's gates out of sight.
+        if !at_rest(phase) {
+            self.archived_at = None;
+        }
         self.phase = phase;
         self.touch();
+    }
+
+    pub fn is_archived(&self) -> bool {
+        self.archived_at.is_some()
     }
 
     pub fn load(paths: &SparPaths, run_id: &str) -> Result<Self> {
@@ -586,6 +605,46 @@ pub fn live_slot_pids(paths: &SparPaths, state: &RunState) -> Vec<u32> {
     out
 }
 
+/// Phases that auto-archiving may take on its own: finished, and nothing can resume them.
+///
+/// Deliberately narrower than `at_rest`. A run parked at a **gate** is waiting on the
+/// operator — hiding those is how the one listing that matters gets lost, and payforge
+/// had 12 of them buried under 28 finished runs. `stopped` / `failed` / `stuck` / `quota`
+/// are ambiguous (they may be picked up again), so they stay visible until archived by
+/// hand.
+pub fn auto_archivable(phase: Phase) -> bool {
+    matches!(phase, Phase::Done | Phase::PlanRejected)
+}
+
+/// Archive every finished run idle at least `older_than`. Returns the ids archived.
+///
+/// Non-destructive and reversible: it sets a timestamp, and `spar archive --undo` or any
+/// resume clears it. Nothing on disk is removed — that is `cleanup --purge`.
+pub fn auto_archive(
+    paths: &SparPaths,
+    older_than: std::time::Duration,
+    now: DateTime<Utc>,
+) -> Result<Vec<String>> {
+    let mut archived = Vec::new();
+    for summary in list_runs(paths)? {
+        if summary.archived || !auto_archivable(summary.phase) {
+            continue;
+        }
+        let idle = (now - summary.updated_at).to_std().unwrap_or_default();
+        if idle < older_than {
+            continue;
+        }
+        let Ok(mut state) = RunState::load(paths, &summary.id) else {
+            continue;
+        };
+        state.archived_at = Some(now);
+        if state.save(paths).is_ok() {
+            archived.push(summary.id);
+        }
+    }
+    Ok(archived)
+}
+
 pub fn orchestrator_alive(paths: &SparPaths, run_id: &str) -> bool {
     crate::runlock::RunLock::owner(paths, run_id)
         .map(|t| t.alive())
@@ -609,6 +668,7 @@ pub fn list_runs(paths: &SparPaths) -> Result<Vec<RunSummary>> {
         match RunState::load(paths, &id) {
             Ok(state) => out.push(RunSummary {
                 abandoned: state.abandoned(paths),
+                archived: state.is_archived(),
                 id: state.id,
                 workflow: state.workflow,
                 phase: state.phase,
@@ -845,6 +905,81 @@ mod tests {
         ] {
             assert!(!at_rest(phase), "{phase:?} is in flight");
         }
+    }
+
+    /// Gates are the listing that matters: payforge had 12 runs waiting on a human buried
+    /// under 28 finished ones. Auto-archiving must never be what hides them.
+    #[test]
+    fn auto_archive_takes_finished_runs_and_never_gates() {
+        for phase in [Phase::Done, Phase::PlanRejected] {
+            assert!(auto_archivable(phase), "{phase:?}");
+        }
+        for phase in [
+            Phase::AwaitingPlanApproval,
+            Phase::AwaitingShipConfirm,
+            Phase::AwaitingWinnerConfirm,
+            Phase::AwaitingReconcile,
+            Phase::Stopped,
+            Phase::Failed,
+            Phase::Stuck,
+            Phase::Quota,
+            Phase::Review,
+            Phase::Dispatch,
+        ] {
+            assert!(!auto_archivable(phase), "{phase:?} must stay visible");
+        }
+    }
+
+    #[test]
+    fn auto_archive_respects_age_and_preserves_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let now = Utc::now();
+
+        let mut fresh = RunState::new("fresh", WorkflowKind::Loop, tmp.path().to_path_buf());
+        fresh.phase = Phase::Done;
+        fresh.updated_at = now - chrono::Duration::days(1);
+        fresh.save(&paths).unwrap();
+
+        let mut old = RunState::new("old", WorkflowKind::Loop, tmp.path().to_path_buf());
+        old.phase = Phase::Done;
+        old.updated_at = now - chrono::Duration::days(30);
+        old.save(&paths).unwrap();
+
+        let done = auto_archive(&paths, std::time::Duration::from_secs(14 * 86_400), now).unwrap();
+        assert_eq!(done, vec!["old".to_string()]);
+
+        // Age must survive archiving, or `cleanup --older-than` would see every archived
+        // run as freshly touched and spare it forever.
+        let reloaded = RunState::load(&paths, "old").unwrap();
+        assert!(reloaded.is_archived());
+        assert_eq!(reloaded.updated_at, old.updated_at);
+        assert!(!RunState::load(&paths, "fresh").unwrap().is_archived());
+
+        // Idempotent: a second pass finds nothing new.
+        assert!(
+            auto_archive(&paths, std::time::Duration::from_secs(14 * 86_400), now)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A run that starts moving again must come back into view, or its gates are invisible.
+    #[test]
+    fn resuming_an_archived_run_unarchives_it() {
+        let mut s = RunState::new("r1", WorkflowKind::Loop, PathBuf::from("/tmp/x"));
+        s.phase = Phase::Done;
+        s.archived_at = Some(Utc::now());
+        assert!(s.is_archived());
+
+        s.set_phase(Phase::Dispatch);
+        assert!(!s.is_archived(), "an in-flight run cannot stay hidden");
+
+        // Moving between at-rest phases is not a resume and leaves it archived.
+        let mut t = RunState::new("r2", WorkflowKind::Loop, PathBuf::from("/tmp/x"));
+        t.archived_at = Some(Utc::now());
+        t.set_phase(Phase::Stopped);
+        assert!(t.is_archived());
     }
 
     #[test]

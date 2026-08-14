@@ -79,6 +79,9 @@ fn run() -> Result<ExitCode> {
             | Command::InternalContinue { .. }
     ) {
         process::install_shutdown_handler();
+        // Launch is the one moment a mutation like this belongs: read commands must stay
+        // observe-only, so `status` can never be the thing that hid a run from you.
+        auto_archive_at_launch();
     }
 
     match command {
@@ -185,7 +188,12 @@ fn run() -> Result<ExitCode> {
             };
             workflow::run_named(workflow, opts, &paths, &cfg)
         }
-        Command::Status { run_id, json, all } => status_cmd(run_id, json, all),
+        Command::Status {
+            run_id,
+            json,
+            all,
+            archived,
+        } => status_cmd(run_id, json, all, archived),
         Command::Wait {
             run_id,
             timeout,
@@ -266,6 +274,13 @@ fn run() -> Result<ExitCode> {
             json,
             purge,
         ),
+        Command::Archive {
+            run_id,
+            all,
+            older_than,
+            undo,
+            json,
+        } => archive_cmd(run_id.as_deref(), all, older_than.as_deref(), undo, json),
         Command::Skills { action } => match action {
             SkillsCmd::List { json } => skills::run(skills::SkillsAction::List { json }),
             SkillsCmd::Get { name } => skills::run(skills::SkillsAction::Get { name }),
@@ -487,7 +502,26 @@ fn project_ctx() -> Result<(paths::SparPaths, Config)> {
     Ok((paths, cfg))
 }
 
-fn status_cmd(run_id: Option<String>, json: bool, all: bool) -> Result<ExitCode> {
+/// Archive finished runs that have gone quiet, once per launch. Best-effort and silent on
+/// failure: housekeeping must never be why a run did not start.
+fn auto_archive_at_launch() {
+    let Ok((paths, cfg)) = project_ctx() else {
+        return;
+    };
+    let Some(idle) = cfg.auto_archive_idle() else {
+        return;
+    };
+    match state::auto_archive(&paths, idle, chrono::Utc::now()) {
+        Ok(ids) if !ids.is_empty() => eprintln!(
+            "archived {} finished run(s) idle over {} (spar status --archived)",
+            ids.len(),
+            cfg.auto_archive_after
+        ),
+        _ => {}
+    }
+}
+
+fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> Result<ExitCode> {
     let local_root = paths::find_project_root().ok();
 
     // Observe-only: process exit is always 0 when the command succeeds.
@@ -563,12 +597,22 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool) -> Result<ExitCode>
     }
 
     let use_all = all || local_root.is_none();
-    let runs = if use_all {
+    let mut runs = if use_all {
         registry::list_all_runs()?
     } else {
         let root = local_root.as_ref().unwrap();
         let _ = registry::ensure_known(Some(root));
         registry::list_project_runs(root)?
+    };
+
+    // Filtered here, not in the listing functions: `load_run_anywhere` resolves a run id
+    // through the same registry walk, and an archived run has to stay addressable by id.
+    let hidden = if archived {
+        0
+    } else {
+        let before = runs.len();
+        runs.retain(|r| !r.archived);
+        before - runs.len()
     };
 
     if json {
@@ -588,6 +632,9 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool) -> Result<ExitCode>
                 local_root.as_ref().unwrap().join(".spar").display()
             );
         }
+        if hidden > 0 {
+            println!("({hidden} archived — spar status --archived)");
+        }
     } else {
         if use_all {
             println!(
@@ -606,15 +653,19 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool) -> Result<ExitCode>
             }
             let dry = if summary.dry_run { " dry" } else { "" };
             let abandoned = if summary.abandoned { " ABANDONED" } else { "" };
+            let arch = if summary.archived { " archived" } else { "" };
             let task = summary
                 .task
                 .as_deref()
                 .map(|t| format!("  {}", truncate_cli(t, 40)))
                 .unwrap_or_default();
             println!(
-                "    {}  {:?}{}{abandoned}{task}",
+                "    {}  {:?}{}{abandoned}{arch}{task}",
                 summary.id, summary.phase, dry
             );
+        }
+        if hidden > 0 {
+            println!("  ({hidden} archived hidden — spar status --archived)");
         }
     }
     Ok(ExitCode::Success)
@@ -992,6 +1043,78 @@ fn attach_cmd(run_id: &str) -> Result<ExitCode> {
         .tmux_session
         .unwrap_or_else(|| tmux::session_name(run_id));
     tmux::attach_command(&session)?;
+    Ok(ExitCode::Success)
+}
+
+/// Hide finished runs from listings, or bring them back.
+///
+/// Archiving is presentation, not lifecycle: nothing is deleted, the run stays addressable
+/// by id (`spar status <id>` works archived), and resuming it clears the flag. That is what
+/// separates it from `cleanup` (reclaims worktrees, keeps the record) and `--purge`
+/// (deletes the record and its artifacts).
+fn archive_cmd(
+    run_id: Option<&str>,
+    all: bool,
+    older_than: Option<&str>,
+    undo: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    let (paths, _) = project_ctx()?;
+    let now = chrono::Utc::now();
+    let changed: Vec<String> = match (run_id, all) {
+        (Some(_), true) => anyhow::bail!("pass a run id or --all, not both"),
+        (None, false) => anyhow::bail!("usage: spar archive <run_id> | spar archive --all"),
+        (Some(id), false) => {
+            let mut state = state::RunState::load(&paths, id)?;
+            if undo {
+                state.archived_at = None;
+            } else {
+                if !state::at_rest(state.phase) {
+                    anyhow::bail!(
+                        "run {id} is in flight ({:?}) — stop it before archiving",
+                        state.phase
+                    );
+                }
+                state.archived_at = Some(now);
+            }
+            state.save(&paths)?;
+            vec![id.to_string()]
+        }
+        (None, true) if undo => {
+            let mut out = Vec::new();
+            for summary in state::list_runs(&paths)? {
+                if !summary.archived {
+                    continue;
+                }
+                let Ok(mut s) = state::RunState::load(&paths, &summary.id) else {
+                    continue;
+                };
+                s.archived_at = None;
+                if s.save(&paths).is_ok() {
+                    out.push(summary.id);
+                }
+            }
+            out
+        }
+        (None, true) => {
+            let min_idle = older_than
+                .map(util::parse_duration)
+                .transpose()?
+                .unwrap_or_default();
+            state::auto_archive(&paths, min_idle, now)?
+        }
+    };
+    let verb = if undo { "unarchived" } else { "archived" };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ verb: changed }))?
+        );
+    } else if changed.is_empty() {
+        println!("nothing to {}", if undo { "unarchive" } else { "archive" });
+    } else {
+        println!("{verb} {} run(s): {}", changed.len(), changed.join(", "));
+    }
     Ok(ExitCode::Success)
 }
 

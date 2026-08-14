@@ -40,6 +40,10 @@ pub struct Config {
     pub message_budget: MessageBudget,
     #[serde(default)]
     pub auto_cleanup: bool,
+    /// Auto-archive finished runs idle at least this long, at launch. `"0"` / `"off"`
+    /// disables. Only `done` / `plan_rejected` — never a run parked at a gate.
+    #[serde(default = "default_auto_archive_after")]
+    pub auto_archive_after: String,
     #[serde(default)]
     pub model_select: ModelSelectConfig,
     /// Optional external `@human` notifier. Empty by default — the TUI alert panel
@@ -208,6 +212,28 @@ impl Default for GatesConfig {
 
 fn default_true() -> bool {
     true
+}
+
+/// Two weeks: long enough that a run you might still open is untouched, short enough that
+/// a busy project's listing does not become 69 rows of finished work.
+fn default_auto_archive_after() -> String {
+    "14d".into()
+}
+
+/// Spellings that turn auto-archiving off.
+pub fn is_archive_off(v: &str) -> bool {
+    let v = v.trim();
+    v.is_empty() || v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("never")
+}
+
+impl Config {
+    /// How long a finished run stays listed before auto-archiving. `None` = never.
+    pub fn auto_archive_idle(&self) -> Option<std::time::Duration> {
+        if is_archive_off(&self.auto_archive_after) {
+            return None;
+        }
+        crate::util::parse_duration(&self.auto_archive_after).ok()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -440,6 +466,7 @@ impl Default for Config {
             autonomy: AutonomyLevel::default(),
             message_budget: MessageBudget::default(),
             auto_cleanup: false,
+            auto_archive_after: default_auto_archive_after(),
             model_select: ModelSelectConfig::default(),
             notify: NotifyConfig::default(),
         }
@@ -482,6 +509,7 @@ struct ConfigFile {
     autonomy: Option<AutonomyLevel>,
     message_budget: Option<MessageBudget>,
     auto_cleanup: Option<bool>,
+    auto_archive_after: Option<String>,
     model_select: Option<ModelSelectConfigFile>,
     notify: Option<NotifyConfigFile>,
 }
@@ -736,6 +764,15 @@ impl Config {
         }
         if let Some(v) = file.auto_cleanup {
             self.auto_cleanup = v;
+        }
+        if let Some(v) = &file.auto_archive_after {
+            // Validated at load, not at use: a bad duration in a shared file should fail
+            // the command that reads it, not silently skip archiving forever.
+            if !is_archive_off(v) {
+                crate::util::parse_duration(v)
+                    .with_context(|| format!("[auto_archive_after] {v:?}"))?;
+            }
+            self.auto_archive_after = v.clone();
         }
         if let Some(ms) = &file.model_select {
             if let Some(v) = &ms.source {
