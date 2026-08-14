@@ -21,7 +21,9 @@ unmentioned (the acceptance gate). Smart reviewers + frozen tests catch grunt-mo
 
 - `spar doctor --json` reports `ok: true`.
 - The provider CLIs you name are installed and authed. `spar provider list` shows which resolve.
-- **For OpenRouter models** (the cheap-coder path): an OpenRouter-capable CLI installed
+- **For the muse-spark family** (the cheapest coder path): `muse` installed and logged in
+  (`muse login`). No API key to export; the CLI carries its own Meta account session.
+- **For OpenRouter models** (the other cheap-coder path): an OpenRouter-capable CLI installed
   (`opencode` recommended, `codex` supported) and **`OPENROUTER_API_KEY` exported** in the
   environment spar launches from. spar does not proxy the key — the CLI reads it.
 
@@ -32,9 +34,9 @@ unmentioned (the acceptance gate). Smart reviewers + frozen tests catch grunt-mo
 planner      = "cli:claude"                       # smart: architecture + plan
 plan_critic  = "cli:grok"                          # smart: tighten the plan
 test_author  = "cli:claude"                        # smart: freeze acceptance tests
-implementer  = "cli:opencode@meta/muse-spark-1.1"  # cheap grunt: writes the code
+implementer  = "cli:muse"                          # cheap grunt: writes the code
 reviewer     = ["cli:grok", "cli:claude"]          # smart panel: adversarial review
-tester       = "cli:opencode@openai/gpt-4o-mini"   # cheap: runs the full suite
+tester       = "cli:muse"                          # cheap: runs the full suite
 
 [spec]
 enabled = true                 # freeze acceptance tests before coding (recommended)
@@ -50,6 +52,12 @@ required" rule, so `spar implement --run <id>` needs no providers flag.
 ## 3. Provider + model syntax
 
 - `cli:<name>` — a subscription CLI (`claude`, `grok`, `agy`). Flat-rate, unmetered.
+- `cli:muse` — Muse Code on its own Meta account. **The cheapest coder slot**: the
+  contributor model bills ~0.10 in / 0.20 out per M tokens, roughly a twelfth of what the
+  same family costs through OpenRouter. Its discount is paid for with "your content may be
+  used for product improvement", so on a repo where that matters pin the full-price model
+  (`cli:muse@muse-spark-1.2`) instead. Model ids are plain (`muse-spark-1.2`), no vendor
+  prefix; with no `@model` at all, muse's own `settings.json` decides.
 - `cli:opencode` / `cli:codex` — CLIs that reach **OpenRouter**. `cli:api` refs also exist
   but use spar's thin in-tree loop — fine for judgment, weak for coding.
 - `…@<model>` — pin a model to that slot; different slots can run different models in one run.
@@ -83,10 +91,13 @@ quota. There is **no auto-resolver** — a gate is a deliberate decision point. 
 
 ## 5. Cost caveat (read this before picking models)
 
-`cli:*` is normally flat-rate. **But `cli:opencode@<slug>` and `cli:codex@<slug>` bill per
-token** — a coding agent re-sends its system prompt + tool schemas + history every turn
-(opencode ~14.6k input/turn, codex ~29.5k on a trivial task). Cheap ≠ free for the
-OpenRouter-backed slots. Put genuinely cheap slugs on the grunt roles; the spend
+`cli:*` is normally flat-rate. **But `cli:muse`, `cli:opencode@<slug>` and
+`cli:codex@<slug>` bill per token** — a coding agent re-sends its system prompt + tool
+schemas + history every turn (opencode ~14.6k input/turn, codex ~29.5k on a trivial task;
+muse ~46k across two model calls plus ~29k more in the subagents it fans out per turn).
+Cheap ≠ free for the metered slots. muse is the one whose *price* makes that overhead
+irrelevant: that whole trivial task cost under a cent on the contributor model. It is also
+the only adapter that counts its subagent spend, so its numbers are the honest ones. Put genuinely cheap slugs on the grunt roles; the spend
 concentrates on the smart judgment models. codex reports real per-run token cost, so
 whether this actually beats your subscriptions is measurable, not a guess.
 
