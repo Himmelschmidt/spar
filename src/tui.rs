@@ -3158,6 +3158,7 @@ fn draw_log_body(
                     cache_write_tokens: 0,
                     context_tokens: u.context_tokens,
                     model: u.model.clone(),
+                    session_id: None,
                     lines_in: 0,
                     chars_out: 0,
                     last_log_at: None,

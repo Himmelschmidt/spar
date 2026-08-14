@@ -50,10 +50,18 @@ pub fn map_candidates(vals_id: &str) -> Vec<MappedModel> {
             provider: "api:google".into(),
             model: Some(model_s),
         }],
-        "meta" => vec![MappedModel {
-            provider: "api:meta".into(),
-            model: Some(model_s),
-        }],
+        // The muse CLI reaches the muse-spark family on Meta's own account pricing;
+        // api:meta is the fallback when it is not installed.
+        "meta" => vec![
+            MappedModel {
+                provider: "cli:muse".into(),
+                model: Some(model_s.clone()),
+            },
+            MappedModel {
+                provider: "api:meta".into(),
+                model: Some(model_s),
+            },
+        ],
         // No first-class spar adapter yet.
         "cursor" | "poolside" | "zai" | "deepseek" | "moonshot" | "mistral" | "minimax"
         | "alibaba" | "cohere" | "nvidia" | "xiaomi" => Vec::new(),
@@ -99,6 +107,8 @@ mod tests {
         assert_eq!(m.provider, "api:openai");
         let m = map_model("xai/grok-4.5").unwrap();
         assert_eq!(m.provider, "cli:grok");
+        let m = map_model("meta/muse-spark-1.2-contributor").unwrap();
+        assert_eq!(m.provider, "cli:muse");
         assert!(map_model("zai/glm-5.2").is_none());
         assert_eq!(map_candidates("xai/grok-4").len(), 2);
     }

@@ -403,6 +403,7 @@ fn execute_prepared(
         &prep.log_path,
         &prep.paths,
     );
+    enrich_muse_stats(&mut res.stats, &prep.job.provider, &prep.log_path);
     let usage = usage_from_stream(&prep.job.slot_id, &prep.job.provider, &res.stats);
     if res.timed_out {
         return Ok(SlotOutcome {
@@ -667,6 +668,21 @@ fn provider_is_agy(provider: &str) -> bool {
         .ok()
         .and_then(|p| p.cli_name().map(|n| n == "agy"))
         .unwrap_or(provider == "agy")
+}
+
+/// muse emits no token counts on stdout at all; usage lives only in its session log.
+/// Sum that (including the subagent sessions muse fans out per turn) and rewrite the
+/// slot's stats sidecar so `stats.json` and the TUI reflect real spend.
+fn enrich_muse_stats(stats: &mut process::StreamStats, provider: &str, log_path: &Path) {
+    let is_muse = ProviderRef::parse(provider)
+        .ok()
+        .and_then(|p| p.cli_name().map(|n| n == "muse"))
+        .unwrap_or(provider == "muse");
+    if !is_muse {
+        return;
+    }
+    providers::muse_telemetry::enrich(stats);
+    let _ = stats.save(log_path);
 }
 
 /// agy emits ~nothing to stdout, so the stream stats are all zero. Recover the real
@@ -1502,6 +1518,7 @@ fn run_headless(
     let mut res = process::run_captured(&req, Some(&sink), Some(&tick))?;
     let pid = load_pid(&pid_cell);
     enrich_agy_stats(&mut res.stats, &job.provider, cwd, log_path, paths);
+    enrich_muse_stats(&mut res.stats, &job.provider, log_path);
     let usage = usage_from_stream(&job.slot_id, &job.provider, &res.stats);
     if res.timed_out {
         return Ok(SlotOutcome {

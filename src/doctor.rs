@@ -56,7 +56,10 @@ pub fn run(json: bool) -> Result<ExitCode> {
     let providers = providers::detect_all();
     let any_provider = providers.iter().any(|p| p.available);
     if !any_provider {
-        notes.push("no first-class providers found on PATH (claude, grok, agy, codex)".into());
+        notes.push(
+            "no first-class providers found on PATH (claude, grok, agy, codex, opencode, muse)"
+                .into(),
+        );
     }
 
     let cfg = project_root
