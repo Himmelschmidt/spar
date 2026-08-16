@@ -37,7 +37,7 @@ spar run --workflow arena -t "..." --providers api:xai,cli:claude,cli:grok
 spar implement -t "..." --providers 'cli:codex@openai/gpt-4o-mini,api:openai@gpt-5' --dry-run
 ```
 
-Native CLI adapters: `cli:claude`, `cli:grok`, `cli:agy`, `cli:codex`, `cli:opencode`. Run
+Native CLI adapters: `cli:claude`, `cli:grok`, `cli:agy`, `cli:codex`, `cli:opencode`, `cli:muse`. Run
 `spar provider list` to see which resolve on this box and their live pause/cooldown status.
 
 **agy note.** agy runs headless with `--print` and emits almost nothing to stdout, so spar
@@ -60,6 +60,11 @@ paused ref so per-role assignment stays exactly what you specified.
 OpenRouter coder: same OpenRouter-slug routing as `cli:codex` but ~half the per-turn token
 overhead (measured ~14.6k input vs codex ~29.5k on the same trivial task + model), so it is
 the default choice; `cli:codex` remains the documented alternative.
+
+**Want the muse-spark family? Use `cli:muse`, not OpenRouter.** The muse CLI reaches
+muse-spark on Meta's own account pricing, where the contributor tier is roughly 12x cheaper
+in and 21x cheaper out than the same family billed through OpenRouter. `cli:opencode@meta/…`
+is the fallback when muse is not installed.
 
 **`@model` suffix.** Any ref may carry an optional model, split off on the **first `@`**:
 `cli:codex@openai/gpt-4o-mini`, `api:openai@gpt-5`. The split happens before the
@@ -113,6 +118,35 @@ takeover target. Model selection, highest precedence first:
 ```bash
 spar run --workflow review -t "..." --providers cli:opencode@meta/muse-spark-1.1  # -> openrouter/meta/muse-spark-1.1
 SPAR_OPENCODE_MODEL=x-ai/grok-4 spar run ... --providers cli:opencode              # different OpenRouter model
+```
+
+`cli:muse` (Muse Code, `muse exec --json --yolo --user-input-auto-resolve`) runs the
+muse-spark family through muse's own Meta account, so it needs **no** OpenRouter key; log in
+once with `muse login`. It is the cheap-implementer route: the contributor model bills about
+0.10 in / 0.20 out per M tokens against 1.25 / 4.25 for the same family through OpenRouter.
+Not a takeover target. Model selection, highest precedence first:
+- A per-slot model, from a `cli:muse@<model>` ref or `--select`, becomes `--model`. Ids are
+  plain Meta model ids (`muse-spark-1.2`, `muse-spark-1.2-contributor`) with no vendor prefix,
+  since meta is the only provider behind this adapter.
+- `SPAR_MUSE_MODEL`, when no per-slot model is set.
+- Unset → **no `--model` flag at all**, so muse's own `settings.json` decides. That keeps the
+  choice of the contributor tier (whose discount is paid for with "your content may be used
+  for product improvement") a single decision on the box rather than something spar bakes
+  into every repo. On a repo where that matters, pin `cli:muse@muse-spark-1.2`.
+- `SPAR_MUSE_REASONING_EFFORT` maps to `--reasoning-effort` (none|minimal|low|medium|high|
+  xhigh|ultra); unset leaves muse's default of high.
+
+Token accounting differs from every other adapter, deliberately. muse reports **no** usage on
+stdout, so spar reads its session log
+(`${XDG_DATA_HOME:-~/.local/share}/muse/sessions/YYYY/MM/DD/<session-id>/`) after the slot
+exits and sums the `goal_usage_attribution` records, **including the subagent sessions muse
+fans out per turn**: six of them on a trivial one-file task, which is real spend the other
+adapters would not see. Input is **summed across model calls** rather than maxed, so
+`stats.json` reports billed tokens, not final context size.
+
+```bash
+spar implement -t "..." --role implementer=cli:muse --role tester=cli:muse   # muse settings pick the model
+spar run --workflow review -t "..." --providers cli:muse@muse-spark-1.2      # pin the non-contributor model
 ```
 
 API keys: `OPENAI_API_KEY`, `XAI_API_KEY`, optional `OPENAI_BASE_URL` / `XAI_BASE_URL` / `*_MODEL`.

@@ -28,6 +28,10 @@ pub struct StreamStats {
     pub context_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Provider-side session id, when the stream names one. muse's usage lives outside
+    /// its stdout stream, so this is how the slot's session log is found afterwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     pub lines_in: u64,
     pub chars_out: u64,
     /// RFC3339 of last successful log append (for stall detection).
@@ -617,6 +621,9 @@ fn stream_to_log(
                     if c.model.is_some() {
                         s.model = c.model.clone();
                     }
+                    if c.session_id.is_some() {
+                        s.session_id = c.session_id.clone();
+                    }
                     s.touch_context();
                     s.touch_log();
                     // Persist last_log_at every append so status/TUI never read a stale stamp.
@@ -635,6 +642,9 @@ fn stream_to_log(
                 s.cache_read_tokens = c.cache_read;
                 s.cache_write_tokens = c.cache_write;
                 s.model = c.model.clone();
+                if c.session_id.is_some() {
+                    s.session_id = c.session_id.clone();
+                }
                 s.touch_context();
                 s.touch_log();
                 let _ = s.save(log_path);
@@ -661,6 +671,7 @@ struct StreamCoalescer {
     cache_read: u64,
     cache_write: u64,
     model: Option<String>,
+    session_id: Option<String>,
     text_chars: u64,
     /// opencode double-emits every event in dash and underscore spellings with the
     /// same `part.id`; keyed by `(normalized type, part.id)` to count each once.
@@ -688,6 +699,7 @@ impl StreamCoalescer {
             cache_read: 0,
             cache_write: 0,
             model: None,
+            session_id: None,
             text_chars: 0,
             seen_opencode: std::collections::HashSet::new(),
         }
@@ -726,6 +738,15 @@ impl StreamCoalescer {
         // opencode line never falls through to another provider's parser.
         if v.get("sessionID").is_some() && v.get("part").is_some() {
             return self.handle_opencode(&v);
+        }
+
+        // `muse exec --json` event envelope. Every line carries `payload_type` plus a
+        // `stream` object; that pair is unique to muse and gates it off before the
+        // `type`-matched branches below, which muse lines would otherwise fall through.
+        if let Some(pt) = v.get("payload_type").and_then(|x| x.as_str()) {
+            if v.get("stream").is_some() {
+                return self.handle_muse(pt, &v);
+            }
         }
 
         // Grok token stream
@@ -881,6 +902,81 @@ impl StreamCoalescer {
             return None;
         }
         None
+    }
+
+    /// muse's stream carries no token counts at all; `providers::muse_telemetry` recovers
+    /// those from the session log after the slot exits, keyed by the session id captured here.
+    fn handle_muse(&mut self, payload_type: &str, v: &serde_json::Value) -> Option<String> {
+        match payload_type {
+            "run.model.configured" => {
+                let mut out = self.flush_buf();
+                let model = v
+                    .pointer("/payload/model_id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("muse");
+                self.model = Some(model.to_string());
+                if let Some(id) = v
+                    .pointer("/stream/id")
+                    .and_then(|x| x.as_str())
+                    .filter(|_| {
+                        v.pointer("/stream/kind").and_then(|x| x.as_str()) == Some("session")
+                    })
+                {
+                    self.session_id = Some(id.to_string());
+                }
+                out.push_str(&format!("· session  {model}\n"));
+                Some(out)
+            }
+            // Deltas arrive mid-word, so they buffer like any other token stream; emitting
+            // each one as its own line breaks identifiers and paths across lines.
+            "run.output.delta" => {
+                let text = v.pointer("/payload/text").and_then(|x| x.as_str())?;
+                if text.is_empty() {
+                    return None;
+                }
+                self.push_token(CoalesceKind::Text, text)
+            }
+            "tool.result" => {
+                let mut out = self.flush_buf();
+                self.tools += 1;
+                let name = v
+                    .pointer("/payload/correlation_facts/tool_name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("tool");
+                let outcome = v
+                    .pointer("/payload/correlation_facts/outcome")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("success");
+                if outcome != "success" {
+                    self.tool_errors += 1;
+                }
+                let detail = v
+                    .pointer("/payload/edit_facts/path")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default();
+                if detail.is_empty() {
+                    out.push_str(&format!("→ {name}  {outcome}\n"));
+                } else {
+                    out.push_str(&format!("→ {name}  {detail}  {outcome}\n"));
+                }
+                Some(out)
+            }
+            "run.terminal.completed" => {
+                let mut out = self.flush_buf();
+                out.push_str(&format!("· done  ·  {} tools\n", self.tools));
+                Some(out)
+            }
+            "run.terminal.failed" | "run.terminal.cancelled" => {
+                let mut out = self.flush_buf();
+                let reason = v
+                    .pointer("/payload/reason")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("run did not complete");
+                out.push_str(&format!("! {}\n", first_line(reason, 160)));
+                Some(out)
+            }
+            _ => None,
+        }
     }
 
     fn handle_opencode(&mut self, v: &serde_json::Value) -> Option<String> {
@@ -1606,6 +1702,58 @@ mod tests {
         assert_eq!(c.input_tokens, 39189);
         assert_eq!(c.output_tokens, 117);
         assert_eq!(c.cache_read, 39185);
+    }
+
+    #[test]
+    fn muse_jsonl_renders_session_tools_and_text() {
+        // Real `muse exec --json` events (captured from Muse Code 0.1.0-R708.1).
+        let lines = [
+            r#"{"schema_version":1,"stream":{"kind":"session","id":"11111111-2222-3333-4444-555555555555"},"record_type":"event","payload_type":"run.model.configured","payload":{"display_label":"muse-spark-1.2-contributor","kind":"run_model_configured","model_id":"muse-spark-1.2-contributor","provider_id":"meta","source":"startup"}}"#,
+            r#"{"schema_version":1,"stream":{"kind":"session","id":"11111111-2222-3333-4444-555555555555"},"record_type":"event","payload_type":"task.lifecycle.started","payload":{"kind":"task_lifecycle"}}"#,
+            r#"{"schema_version":1,"stream":{"kind":"session","id":"11111111-2222-3333-4444-555555555555"},"record_type":"event","payload_type":"tool.result","payload":{"call_id":"call_01","correlation_facts":{"outcome":"success","tool_name":"write_file"},"edit_facts":{"added":1,"path":"hello.txt","tool_name":"write_file"},"kind":"tool_result","text":"wrote 3 bytes"}}"#,
+            r#"{"schema_version":1,"stream":{"kind":"session","id":"11111111-2222-3333-4444-555555555555"},"record_type":"status","payload_type":"run.output.delta","payload":{"kind":"run_output_delta","text":"D"}}"#,
+            r#"{"schema_version":1,"stream":{"kind":"session","id":"11111111-2222-3333-4444-555555555555"},"record_type":"status","payload_type":"run.output.delta","payload":{"kind":"run_output_delta","text":"ONE"}}"#,
+            r#"{"schema_version":1,"stream":{"kind":"session","id":"11111111-2222-3333-4444-555555555555"},"record_type":"event","payload_type":"run.terminal.completed","payload":{"kind":"run_terminal","reason":null,"terminal":"completed","text":"DONE"}}"#,
+        ];
+        let mut c = StreamCoalescer::new(false);
+        let mut out = String::new();
+        for l in lines {
+            if let Some(chunk) = c.feed(l) {
+                out.push_str(&chunk);
+            }
+        }
+        assert_eq!(c.model.as_deref(), Some("muse-spark-1.2-contributor"));
+        assert_eq!(
+            c.session_id.as_deref(),
+            Some("11111111-2222-3333-4444-555555555555"),
+            "session id is how the usage log is found afterwards"
+        );
+        assert_eq!(c.tools, 1);
+        assert_eq!(c.tool_errors, 0);
+        assert!(out.contains("· session  muse-spark-1.2-contributor"));
+        assert!(out.contains("→ write_file  hello.txt  success"));
+        assert!(out.contains("DONE"));
+        assert!(
+            !out.contains("D\nONE"),
+            "output deltas must coalesce, not break mid-word: {out:?}"
+        );
+        assert!(out.contains("· done  ·  1 tools"));
+        // muse reports no usage on stdout; muse_telemetry fills these in post-exit.
+        assert_eq!(c.input_tokens, 0);
+        assert_eq!(c.output_tokens, 0);
+    }
+
+    #[test]
+    fn muse_tool_failure_counts_as_error() {
+        let mut c = StreamCoalescer::new(false);
+        let out = c
+            .feed(
+                r#"{"stream":{"kind":"session","id":"s1"},"payload_type":"tool.result","payload":{"correlation_facts":{"outcome":"error","tool_name":"shell"},"kind":"tool_result"}}"#,
+            )
+            .unwrap_or_default();
+        assert_eq!(c.tools, 1);
+        assert_eq!(c.tool_errors, 1);
+        assert!(out.contains("→ shell  error"));
     }
 
     #[test]

@@ -4,6 +4,8 @@ mod claude;
 mod codex;
 pub mod delivery;
 mod grok;
+mod muse;
+pub mod muse_telemetry;
 mod opencode;
 pub mod presence;
 
@@ -16,6 +18,7 @@ pub use agy::AgyAdapter;
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
 pub use grok::GrokAdapter;
+pub use muse::MuseAdapter;
 pub use opencode::OpencodeAdapter;
 
 /// How the orchestrator hands a queued message to a *running* adapter at its next
@@ -192,6 +195,7 @@ pub fn all_adapters() -> Vec<Box<dyn ProviderAdapter>> {
         Box::new(AgyAdapter),
         Box::new(CodexAdapter),
         Box::new(OpencodeAdapter),
+        Box::new(MuseAdapter),
     ]
 }
 
