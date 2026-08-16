@@ -284,3 +284,34 @@ fn auto_archive_can_be_turned_off() {
         "off means off, however old"
     );
 }
+
+/// Approving an auto-archived rejected plan must bring it back. It is approved and
+/// waiting for `spar implement`; leaving it hidden means nothing in any listing says so.
+#[test]
+fn approving_an_archived_rejected_plan_unarchives_it() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    init_repo(&proj);
+
+    std::fs::write(proj.join("spar.toml"), "auto_archive_after = \"off\"\n").unwrap();
+    let rejected = run_in(&proj, "plan_rejected", 30);
+    std::fs::write(proj.join("spar.toml"), "auto_archive_after = \"14d\"\n").unwrap();
+
+    // The launch hook archives it automatically -- no manual archive anywhere.
+    run_in(&proj, "done", 0);
+    assert!(
+        !listed_ids(&proj, false).contains(&rejected),
+        "auto-archived"
+    );
+
+    spar_cmd()
+        .current_dir(&proj)
+        .args(["approve", &rejected, "--json"])
+        .assert()
+        .code(0);
+    assert!(
+        listed_ids(&proj, false).contains(&rejected),
+        "an approved run must be visible"
+    );
+}

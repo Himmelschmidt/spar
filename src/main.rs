@@ -537,6 +537,16 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> 
                 println!("base: {r} ({})", c.chars().take(8).collect::<String>());
             }
             println!("phase: {:?}", state.phase);
+            // Looking a run up by id is the documented way to reach an archived one, so it
+            // has to say that it is hidden — otherwise the output is indistinguishable
+            // from a run that simply is not in the listing for some other reason.
+            if let Some(at) = state.archived_at {
+                println!(
+                    "archived: {}  (hidden from listings; spar archive {} --undo)",
+                    at.to_rfc3339(),
+                    state.id
+                );
+            }
             println!("workflow: {:?}", state.workflow);
             if let Some(task) = &state.task {
                 println!("task: {task}");
@@ -1061,6 +1071,11 @@ fn archive_cmd(
 ) -> Result<ExitCode> {
     let (paths, _) = project_ctx()?;
     let now = chrono::Utc::now();
+    // Flags that cannot apply are refused, not ignored: a silently dropped `--older-than`
+    // reads as "nothing qualified" and hides the fact that the filter never ran.
+    if older_than.is_some() && (run_id.is_some() || undo) {
+        anyhow::bail!("--older-than only applies to `spar archive --all`");
+    }
     let changed: Vec<String> = match (run_id, all) {
         (Some(_), true) => anyhow::bail!("pass a run id or --all, not both"),
         (None, false) => anyhow::bail!("usage: spar archive <run_id> | spar archive --all"),
@@ -1069,7 +1084,7 @@ fn archive_cmd(
             if undo {
                 state.archived_at = None;
             } else {
-                if !state::at_rest(state.phase) {
+                if !state::archivable_by_hand(state.phase) {
                     anyhow::bail!(
                         "run {id} is in flight ({:?}) — stop it before archiving",
                         state.phase

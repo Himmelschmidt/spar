@@ -232,7 +232,11 @@ impl Config {
         if is_archive_off(&self.auto_archive_after) {
             return None;
         }
-        crate::util::parse_duration(&self.auto_archive_after).ok()
+        // A parsed zero is off too. Otherwise `"0"` disables and `"0d"` archives every
+        // finished run the instant it finishes — two spellings of zero, opposite meanings.
+        crate::util::parse_duration(&self.auto_archive_after)
+            .ok()
+            .filter(|d| !d.is_zero())
     }
 }
 

@@ -275,8 +275,11 @@ Three rules make it safe to leave on:
   `awaiting_plan_approval` is waiting on *you*, and hiding those is how the one listing
   that matters gets lost. `stopped` / `failed` / `stuck` / `quota` are ambiguous and stay
   visible until archived by hand.
-- **Resuming un-archives.** Any phase change into an in-flight phase clears the flag, so a
-  run that starts moving again cannot stay hidden.
+- **A run stays archived only while it stays finished.** Any phase change to anything
+  other than `done` / `plan_rejected` clears the flag — resumed, re-approved, or parked at
+  a gate. (Keyed off the archivable set, not the sweep's notion of rest: `spar approve`
+  accepts a `plan_rejected` run and moves it to `plan_approved`, which *is* at rest, so the
+  narrower rule left an approved run hidden while it waited for `spar implement`.)
 - **Reads never archive.** `auto_archive_after` (default `14d`) fires at *launch*
   (`plan` / `implement` / `run`), never from `status`, so observing can never be what hid
   a run from you. Set it `"off"` to disable.

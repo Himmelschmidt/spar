@@ -374,10 +374,16 @@ impl RunState {
     }
 
     pub fn set_phase(&mut self, phase: Phase) {
-        // Work resuming un-archives the run. Archiving means "finished, stop showing me
-        // this"; a run that is moving again is neither, and leaving it hidden would put a
-        // live run's gates out of sight.
-        if !at_rest(phase) {
+        // A run stays archived only while it stays finished. Anything else — resumed,
+        // re-approved, parked at a gate — is visible again.
+        //
+        // Keyed off the archivable set, not `at_rest`. Using `at_rest` looked equivalent
+        // and was not: `spar approve` accepts a `plan_rejected` run and moves it to
+        // `PlanApproved`, which is *inside* `at_rest`, so an auto-archived rejected plan
+        // stayed hidden after being approved — approved, waiting for `spar implement`, and
+        // in no listing. This predicate also keeps archiving independent of the sweep's
+        // notion of rest, which is a separate question and is being changed separately.
+        if !auto_archivable(phase) {
             self.archived_at = None;
         }
         self.phase = phase;
@@ -616,6 +622,15 @@ pub fn auto_archivable(phase: Phase) -> bool {
     matches!(phase, Phase::Done | Phase::PlanRejected)
 }
 
+/// Phases an operator may archive by hand: anything nobody is currently driving.
+///
+/// Deliberately its own predicate rather than `at_rest`. The sweep's notion of rest exists
+/// to decide what is safe to *delete* and is under revision; archiving deletes nothing and
+/// should not silently change meaning when that lands.
+pub fn archivable_by_hand(phase: Phase) -> bool {
+    phase.is_terminal() || phase.is_gate() || matches!(phase, Phase::Stopped)
+}
+
 /// Archive every finished run idle at least `older_than`. Returns the ids archived.
 ///
 /// Non-destructive and reversible: it sets a timestamp, and `spar archive --undo` or any
@@ -632,6 +647,13 @@ pub fn auto_archive(
         }
         let idle = (now - summary.updated_at).to_std().unwrap_or_default();
         if idle < older_than {
+            continue;
+        }
+        // Same guard `sweep_merged` carries (O34): the phase on disk is a snapshot, and a
+        // finalizing orchestrator is briefly between load and save. `archive --all` passes
+        // a zero threshold, so a run that reached `Done` seconds ago is reachable here, and
+        // this writes the whole file.
+        if orchestrator_alive(paths, &summary.id) {
             continue;
         }
         let Ok(mut state) = RunState::load(paths, &summary.id) else {
@@ -964,22 +986,67 @@ mod tests {
         );
     }
 
-    /// A run that starts moving again must come back into view, or its gates are invisible.
+    /// A run stays archived only while it stays finished. Anything else has to come back
+    /// into view, or the operator is waiting on something no listing shows.
+    ///
+    /// `PlanApproved` is the case that motivated keying this off the archivable set rather
+    /// than `at_rest`: `spar approve` accepts a `plan_rejected` run, and `PlanApproved` is
+    /// inside `at_rest`, so an auto-archived rejected plan stayed hidden after approval —
+    /// approved, waiting for `spar implement`, and in no listing.
     #[test]
-    fn resuming_an_archived_run_unarchives_it() {
-        let mut s = RunState::new("r1", WorkflowKind::Loop, PathBuf::from("/tmp/x"));
-        s.phase = Phase::Done;
-        s.archived_at = Some(Utc::now());
-        assert!(s.is_archived());
+    fn a_run_stays_archived_only_while_it_stays_finished() {
+        let archived = |phase: Phase| {
+            let mut s = RunState::new("r", WorkflowKind::Loop, PathBuf::from("/tmp/x"));
+            s.archived_at = Some(Utc::now());
+            s.set_phase(phase);
+            s.is_archived()
+        };
 
-        s.set_phase(Phase::Dispatch);
-        assert!(!s.is_archived(), "an in-flight run cannot stay hidden");
+        assert!(archived(Phase::Done), "still finished");
+        assert!(archived(Phase::PlanRejected), "still finished");
 
-        // Moving between at-rest phases is not a resume and leaves it archived.
-        let mut t = RunState::new("r2", WorkflowKind::Loop, PathBuf::from("/tmp/x"));
-        t.archived_at = Some(Utc::now());
-        t.set_phase(Phase::Stopped);
-        assert!(t.is_archived());
+        assert!(
+            !archived(Phase::PlanApproved),
+            "approved runs want implement"
+        );
+        assert!(!archived(Phase::Dispatch), "in flight");
+        assert!(
+            !archived(Phase::AwaitingPlanApproval),
+            "a gate wants a human"
+        );
+        assert!(!archived(Phase::Stopped), "parked, not finished");
+        assert!(!archived(Phase::Failed), "failed runs are resumable");
+    }
+
+    /// The refusal is its own predicate, so a change to the sweep's notion of rest cannot
+    /// silently start refusing runs an operator may legitimately archive.
+    #[test]
+    fn archivable_by_hand_covers_everything_nobody_is_driving() {
+        for phase in [
+            Phase::Done,
+            Phase::PlanRejected,
+            Phase::PlanApproved,
+            Phase::Failed,
+            Phase::Stuck,
+            Phase::Quota,
+            Phase::Escalated,
+            Phase::Stopped,
+            Phase::AwaitingPlanApproval,
+            Phase::AwaitingShipConfirm,
+        ] {
+            assert!(archivable_by_hand(phase), "{phase:?}");
+        }
+        for phase in [
+            Phase::Init,
+            Phase::Dispatch,
+            Phase::Review,
+            Phase::Suite,
+            Phase::Fix,
+            Phase::Shipping,
+            Phase::WaitCompletion,
+        ] {
+            assert!(!archivable_by_hand(phase), "{phase:?} is in flight");
+        }
     }
 
     #[test]
