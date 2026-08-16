@@ -870,7 +870,7 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
     let swarm = SparPaths::new(&sel.root);
     let projects = registry::projects();
     let runs = if sel.browse.in_project() {
-        let mut runs = registry::list_project_runs(&sel.root).unwrap_or_default();
+        let mut runs = registry::list_visible_project_runs(&sel.root).unwrap_or_default();
         // Attention-sorted rail: gates and broken runs float to the top (Stage C).
         sort_runs_by_attention(&mut runs);
         runs
@@ -1309,7 +1309,7 @@ fn project_overview(projects: &[registry::ProjectEntry], idx: usize) -> String {
         );
     }
     let p = &projects[idx.min(projects.len() - 1)];
-    let n_runs = registry::list_project_runs(&p.root)
+    let n_runs = registry::list_visible_project_runs(&p.root)
         .map(|r| r.len())
         .unwrap_or(0);
     format!(
@@ -2827,7 +2827,7 @@ fn rail_project_items<'a>(projects: &'a [registry::ProjectEntry], app: &App) -> 
                 }
             }
             let name = p.name.as_deref().unwrap_or("·");
-            let project_runs = registry::list_project_runs(&p.root).unwrap_or_default();
+            let project_runs = registry::list_visible_project_runs(&p.root).unwrap_or_default();
             let n = project_runs.len();
             // Roll-up: a run that wants the operator makes its whole project fly a ⚑.
             let need = runs_needing_attention(&project_runs);
@@ -5198,6 +5198,7 @@ mod labels {
         state::RunSummary {
             id: id.to_string(),
             workflow: WorkflowKind::Loop,
+            archived: false,
             phase: Phase::Review,
             updated_at: Utc::now(),
             task: task.map(str::to_string),

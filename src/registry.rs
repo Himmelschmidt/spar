@@ -224,6 +224,16 @@ pub fn list_all_runs() -> Result<Vec<RunSummary>> {
     Ok(out)
 }
 
+/// Runs for one project with archived ones dropped — what a listing surface should show.
+///
+/// The unfiltered [`list_project_runs`] stays, because resolving a run by id has to reach
+/// archived runs: archiving hides a run from browsing, it does not retire the id.
+pub fn list_visible_project_runs(project_root: &Path) -> Result<Vec<RunSummary>> {
+    let mut runs = list_project_runs(project_root)?;
+    runs.retain(|r| !r.archived);
+    Ok(runs)
+}
+
 /// Runs for one project, annotated with project fields.
 pub fn list_project_runs(project_root: &Path) -> Result<Vec<RunSummary>> {
     let paths = SparPaths::new(project_root);

@@ -7,6 +7,10 @@ isolation = "worktree"   # none | worktree | worktree+db | worktree+bwrap
 autonomy = "semi"
 message_budget = "normal" # none | lean | normal | chatty
 auto_cleanup = false
+# Hide finished runs (done / plan_rejected only) from listings once they have been idle
+# this long. Fires at launch, never from `status`. Deletes nothing -- `spar archive --undo`
+# or any resume brings a run back. "off" / "0" disables.
+auto_archive_after = "14d"
 
 [worktree]
 # Reap at-rest runs whose branches are already contained in their own base ref, just

@@ -176,6 +176,26 @@ pub enum Command {
         /// List runs across all registered projects (global home)
         #[arg(long)]
         all: bool,
+        /// Include archived runs, which are hidden by default
+        #[arg(long)]
+        archived: bool,
+    },
+
+    /// Hide a finished run from listings. Deletes nothing; `--undo` brings it back
+    Archive {
+        /// Omit with `--all` to archive every finished run in the project.
+        run_id: Option<String>,
+        /// Archive every `done` / `plan_rejected` run in the project.
+        #[arg(long)]
+        all: bool,
+        /// With `--all`, only runs untouched for this long, e.g. `14d`.
+        #[arg(long, value_name = "DURATION")]
+        older_than: Option<String>,
+        /// Un-archive instead: bring the run back into listings.
+        #[arg(long)]
+        undo: bool,
+        #[arg(long)]
+        json: bool,
     },
 
     /// Block until a run reaches a terminal or gate phase

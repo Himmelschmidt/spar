@@ -193,6 +193,8 @@ spar stop <run_id> [--json]              # halt dispatch, KEEP branch+worktree (
 spar stop --abandoned [--json]           # reap every run nobody is driving any more
 spar cleanup <run_id> [--purge]          # remove worktrees (and --purge run data)
 spar cleanup --all [--older-than 7d]     # sweep finished runs project-wide
+spar archive <run_id> [--undo] [--json]  # hide a finished run from listings
+spar archive --all [--older-than 14d]    # hide every quiet finished run
 ```
 
 **`spar stop`** halts a run without discarding work: it writes a `stopped` marker,
@@ -293,6 +295,30 @@ every process whose **cwd is inside that worktree** (SIGTERM → grace → SIGKI
 how orphaned dev servers get collected), then removes the worktree, falling back to a
 directory delete if git no longer tracks it. It never touches the project root or anything
 outside the run's worktrees. `--json` reports `worktrees[]` with `killed` pids and `removed`.
+
+**Archiving is the third state, between listed forever and deleted.** `cleanup` reclaims
+worktrees and *keeps* the run record — that is where `plan.md`, `test-contract.md`, the
+reviews, `suite.md` and `stats.json` live — so a project that drives spar from the CLI
+accumulates one row per run forever. `spar archive <id>` hides a run from `status` and the
+TUI rail while deleting nothing; `--undo` brings it back, `spar status --archived` lists
+them, and the id stays addressable (`spar status <archived-id>` works). Only `--purge`
+deletes anything.
+
+Three rules make it safe to leave on:
+- **Gates are never auto-archived.** Only `done` / `plan_rejected`. A run parked at
+  `awaiting_plan_approval` is waiting on *you*, and hiding those is how the one listing
+  that matters gets lost. `stopped` / `failed` / `stuck` / `quota` are ambiguous and stay
+  visible until archived by hand.
+- **A run stays archived only while it stays finished.** Any phase change to anything
+  other than `done` / `plan_rejected` clears the flag — resumed, re-approved, or parked at
+  a gate. (Keyed off the archivable set, not the sweep's notion of rest: `spar approve`
+  accepts a `plan_rejected` run and moves it to `plan_approved`, which *is* at rest, so the
+  narrower rule left an approved run hidden while it waited for `spar implement`.)
+- **Reads never archive.** `auto_archive_after` (default `14d`) fires at *launch*
+  (`plan` / `implement` / `run`), never from `status`, so observing can never be what hid
+  a run from you. Set it `"off"` to disable.
+
+Archiving preserves `updated_at`, so `cleanup --older-than` still sees a run's true age.
 
 A sweep says what it **spared** and why (`spared <run_id>: <reason>`; `spared[]` under
 `--json`), so "nothing to sweep" is never confused with a refusal when there are
@@ -464,6 +490,8 @@ spar implement --run <id> --reload-config   # deliberately re-read spar.toml and
 autonomy = "manual" | "semi" | "high" | "full"
 message_budget = "none" | "lean" | "normal" | "chatty"
 auto_cleanup = false
+# Auto-archive finished runs idle this long, at launch. "off" / "0" disables.
+auto_archive_after = "14d"
 [worktree]
 auto_cleanup_merged = true   # reap at-rest runs already contained in their base, at launch
 [gates]
