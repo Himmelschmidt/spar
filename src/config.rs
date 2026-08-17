@@ -40,6 +40,11 @@ pub struct Config {
     pub message_budget: MessageBudget,
     #[serde(default)]
     pub auto_cleanup: bool,
+    /// Delete a run's own `target/` / `node_modules` when its orchestrator finishes.
+    /// On by default: it destroys nothing a build cannot regenerate, and build output is
+    /// the overwhelming majority of what spar leaves on disk.
+    #[serde(default = "default_true")]
+    pub auto_reclaim: bool,
     /// Auto-archive finished runs idle at least this long, at launch. `"0"` / `"off"`
     /// disables. Only `done` / `plan_rejected` — never a run parked at a gate.
     #[serde(default = "default_auto_archive_after")]
@@ -470,6 +475,7 @@ impl Default for Config {
             autonomy: AutonomyLevel::default(),
             message_budget: MessageBudget::default(),
             auto_cleanup: false,
+            auto_reclaim: true,
             auto_archive_after: default_auto_archive_after(),
             model_select: ModelSelectConfig::default(),
             notify: NotifyConfig::default(),
@@ -513,6 +519,7 @@ struct ConfigFile {
     autonomy: Option<AutonomyLevel>,
     message_budget: Option<MessageBudget>,
     auto_cleanup: Option<bool>,
+    auto_reclaim: Option<bool>,
     auto_archive_after: Option<String>,
     model_select: Option<ModelSelectConfigFile>,
     notify: Option<NotifyConfigFile>,
@@ -768,6 +775,9 @@ impl Config {
         }
         if let Some(v) = file.auto_cleanup {
             self.auto_cleanup = v;
+        }
+        if let Some(v) = file.auto_reclaim {
+            self.auto_reclaim = v;
         }
         if let Some(v) = &file.auto_archive_after {
             // Validated at load, not at use: a bad duration in a shared file should fail

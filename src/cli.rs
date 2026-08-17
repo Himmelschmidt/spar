@@ -181,6 +181,18 @@ pub enum Command {
         archived: bool,
     },
 
+    /// Delete regenerable build output (`target/`, `node_modules`) inside finished runs'
+    /// worktrees. Keeps the worktree, its branch and every commit — this is not `cleanup`
+    Reclaim {
+        /// Omit with `--all` to reclaim across every finished run in the project.
+        run_id: Option<String>,
+        /// Reclaim from every finished run in the project.
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Hide a finished run from listings. Deletes nothing; `--undo` brings it back
     Archive {
         /// Omit with `--all` to archive every finished run in the project.
@@ -315,6 +327,10 @@ pub enum Command {
         /// Also delete `.spar/runs/<id>`
         #[arg(long)]
         purge: bool,
+        /// Remove a worktree even if it holds uncommitted changes or unmerged commits.
+        /// Only with an explicit run id — there is deliberately no project-wide force.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Built-in skills for outer agents (agent-browser style)

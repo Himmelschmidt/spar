@@ -493,7 +493,7 @@ pub fn reject(
     // Nothing can resume a rejected plan (`implement --run` requires an approved one),
     // so its worktrees are garbage from here. Artifacts under `.spar/runs/<id>` stay:
     // the plan and the critique are why you rejected it.
-    let _ = crate::worktree::cleanup_run(&state)?;
+    let _ = crate::worktree::cleanup_run(&state, false)?;
     state.worktrees.clear();
     state.save(paths)?;
     if json {

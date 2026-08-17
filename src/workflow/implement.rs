@@ -733,7 +733,7 @@ fn maybe_auto_ship_or_cleanup(state: &mut RunState, paths: &SparPaths, cfg: &Con
         }
     }
     if cfg.auto_cleanup && state.phase.is_terminal() && matches!(state.phase, Phase::Done) {
-        let _ = crate::worktree::cleanup_run(state);
+        let _ = crate::worktree::cleanup_run(state, false);
     }
     Ok(())
 }
@@ -1396,12 +1396,39 @@ fn write_stuck(paths: &SparPaths, run_id: &str) -> Result<()> {
 }
 
 fn finish_out(state: &RunState, json: bool) -> Result<()> {
+    reclaim_own_cache(state, json);
     if json {
         executor::emit_run_json(state)?;
     } else {
         executor::print_run_human(state);
     }
     Ok(())
+}
+
+/// Drop this run's build output once its orchestrator is done with it.
+///
+/// Scoped to the run's **own** worktrees, at the moment its own orchestrator concludes —
+/// not a project-wide sweep, which is `spar reclaim --all` and stays explicit. Nothing here
+/// is unrecoverable: the worktree, its branch, its commits and any uncommitted changes all
+/// survive, so this asks no permission and needs no evidence. It is the largest single
+/// source of disk on the box (457 GB of 587 GB measured), and a *stopped* run's target dir
+/// was the biggest object on the machine.
+fn reclaim_own_cache(state: &RunState, json: bool) {
+    if state.dry_run
+        || !(state.phase.is_terminal() || state.phase == Phase::Stopped)
+        || !crate::config::Config::for_run(&SparPaths::new(&state.project_root), &state.id)
+            .map(|c| c.auto_reclaim)
+            .unwrap_or(true)
+    {
+        return;
+    }
+    let reap = worktree::reap_build_cache(state, &worktree::LiveCwds::snapshot());
+    if reap.freed_bytes > 0 && !json {
+        eprintln!(
+            "reclaimed {:.1} GB of build cache from this run's worktrees",
+            reap.freed_bytes as f64 / 1024.0 / 1024.0 / 1024.0
+        );
+    }
 }
 
 fn detach_implement(state: &RunState, paths: &SparPaths, json: bool) -> Result<ExitCode> {
