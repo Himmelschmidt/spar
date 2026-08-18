@@ -7,6 +7,10 @@ isolation = "worktree"   # none | worktree | worktree+db | worktree+bwrap
 autonomy = "semi"
 message_budget = "normal" # none | lean | normal | chatty
 auto_cleanup = false
+# Delete a run's own target/ and node_modules when its orchestrator finishes. Keeps the
+# worktree, its branch and every commit -- this is not cleanup, and it needs no evidence
+# because a build regenerates everything it takes.
+auto_reclaim = true
 # Hide finished runs (done / plan_rejected only) from listings once they have been idle
 # this long. Fires at launch, never from `status`. Deletes nothing -- `spar archive --undo`
 # or any resume brings a run back. "off" / "0" disables.

@@ -192,7 +192,9 @@ spar ship <run_id> --confirm [--base <branch>]   # draft PR (never merges)
 spar stop <run_id> [--json]              # halt dispatch, KEEP branch+worktree (resumable)
 spar stop --abandoned [--json]           # reap every run nobody is driving any more
 spar cleanup <run_id> [--purge]          # remove worktrees (and --purge run data)
+spar cleanup <run_id> --force            # remove even if it holds unsaved work
 spar cleanup --all [--older-than 7d]     # sweep finished runs project-wide
+spar reclaim <run_id> | --all [--json]   # delete build output, KEEP the worktree
 spar archive <run_id> [--undo] [--json]  # hide a finished run from listings
 spar archive --all [--older-than 14d]    # hide every quiet finished run
 ```
@@ -323,6 +325,26 @@ Archiving preserves `updated_at`, so `cleanup --older-than` still sees a run's t
 A sweep says what it **spared** and why (`spared <run_id>: <reason>`; `spared[]` under
 `--json`), so "nothing to sweep" is never confused with a refusal when there are
 gigabytes of resumable worktrees on disk.
+
+**Cleanup never removes a worktree that still holds work.** Uncommitted changes, or
+commits the run's base does not contain, and the worktree is skipped with a reason —
+`remove_worktree` runs `git worktree remove --force` *and* `git branch -D`, so an unmerged
+commit is as gone as an unsaved edit. The check lives at the removal itself, so every
+evidence path inherits it. `spar cleanup <id> --force` overrides for a run you name;
+there is deliberately no `--all --force`.
+
+**Age is never evidence for a run parked at a gate.** `awaiting_plan_approval` and friends
+are blocked on *you*: idle time there measures how busy you were, not whether the run was
+abandoned, so no `--older-than` will ever sweep one. Resolve the gate, or reap it by run id.
+
+**`spar reclaim` is not cleanup.** It deletes `target/` and `node_modules` *inside* a
+finished run's worktrees and keeps the worktree, its branch, every commit and any
+uncommitted changes. Because it destroys nothing a build cannot regenerate it needs no
+evidence, no age threshold and no confirmation — which is exactly why it is a separate
+command and not a `cleanup` flag. It skips any tree with a live process working in it.
+`auto_reclaim` (default **true**) does the same for a run's own worktrees when its
+orchestrator finishes. Measured: 457 GB of 587 GB under one projects dir was build output,
+and the largest single object on the machine was a *stopped* run's target dir.
 
 **`--merged` is evidence too, and stronger than age.** `spar cleanup --all --merged`
 also reaps at-rest runs whose every slot branch is already contained in the run's own
@@ -490,6 +512,7 @@ spar implement --run <id> --reload-config   # deliberately re-read spar.toml and
 autonomy = "manual" | "semi" | "high" | "full"
 message_budget = "none" | "lean" | "normal" | "chatty"
 auto_cleanup = false
+auto_reclaim = true    # drop a run's target/ + node_modules when it finishes
 # Auto-archive finished runs idle this long, at launch. "off" / "0" disables.
 auto_archive_after = "14d"
 [worktree]

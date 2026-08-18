@@ -192,7 +192,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
     }
     state.save(paths)?;
     if cfg.auto_cleanup && state.phase == Phase::Done {
-        let _ = worktree::cleanup_run(state);
+        let _ = worktree::cleanup_run(state, false);
     }
     Ok(())
 }

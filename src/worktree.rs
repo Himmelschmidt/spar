@@ -488,7 +488,7 @@ pub fn sweep_merged(paths: &SparPaths, skip_run: Option<&str>) -> Result<Vec<(St
         if merged_into_base(&state) != Some(true) {
             continue;
         }
-        let cleaned = cleanup_run(&state)?;
+        let cleaned = cleanup_run(&state, false)?;
         let removed = cleaned.iter().filter(|c| c.removed).count();
         if removed > 0 {
             reaped.push((summary.id, removed));
@@ -526,9 +526,265 @@ pub fn reapable_worktree(project_root: &Path, path: &Path) -> bool {
 /// Reap first, then remove. Agents leave dev servers and watchers running with their cwd
 /// inside the worktree; those keep writing into it, which is how a `remove_dir_all` loses
 /// the race and leaves a half-deleted directory (and orphaned processes) behind for days.
-pub fn cleanup_run(state: &RunState) -> Result<Vec<WorktreeCleanup>> {
+/// Reap build output from every run in the project that has finished.
+///
+/// `is_terminal()` plus `Stopped`: a stopped run is parked, and parking it is exactly when
+/// its 72 GB of build output stops earning its disk. Nothing here is unrecoverable, so
+/// unlike the worktree sweep this needs no age threshold and no evidence — only that the
+/// run is not currently running and nothing is working in the tree.
+pub fn reap_finished_caches(paths: &SparPaths, skip_run: Option<&str>) -> Result<Vec<CacheReap>> {
+    let live = LiveCwds::snapshot();
+    let mut out = Vec::new();
+    for summary in crate::state::list_runs(paths)? {
+        if skip_run == Some(summary.id.as_str()) {
+            continue;
+        }
+        if !(summary.phase.is_terminal() || summary.phase == crate::state::Phase::Stopped) {
+            continue;
+        }
+        let Ok(state) = RunState::load(paths, &summary.id) else {
+            continue;
+        };
+        // The phase on disk is a snapshot; a resuming orchestrator is briefly between load
+        // and save. Same guard the worktree sweep carries (O34).
+        if crate::state::orchestrator_alive(paths, &summary.id) {
+            continue;
+        }
+        let reap = reap_build_cache(&state, &live);
+        if reap.freed_bytes > 0 || !reap.skipped.is_empty() {
+            out.push(reap);
+        }
+    }
+    Ok(out)
+}
+
+/// Build-output directory names reaped from a finished run's worktrees.
+const CACHE_DIRS: [&str; 2] = ["target", "node_modules"];
+
+/// True when `dir` looks like a build cache rather than someone's source directory.
+///
+/// A **disjunction** on purpose. `CACHEDIR.TAG` alone is not enough: cargo writes it late,
+/// so a build interrupted before that point leaves a multi-GB tree with `.rustc_info.json`
+/// and `debug/` and no tag, which a tag-only test strands forever. Measured: one such tree
+/// held 22 GB.
+///
+/// `node_modules` is taken on the name alone — it has no marker file and is regenerable by
+/// definition.
+fn is_build_cache(dir: &Path, name: &str) -> bool {
+    if name == "node_modules" {
+        return dir.is_dir();
+    }
+    dir.join("CACHEDIR.TAG").is_file()
+        || dir.join(".rustc_info.json").is_file()
+        || dir.join("debug").is_dir()
+        || dir.join("release").is_dir()
+}
+
+/// What a cache reap did to one run.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CacheReap {
+    pub run_id: String,
+    pub freed_bytes: u64,
+    pub dirs: Vec<PathBuf>,
+    /// Paths left alone, with why. Never silent: a skipped 70 GB tree is the whole point.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<String>,
+}
+
+/// Delete regenerable build output inside a finished run's own worktrees.
+///
+/// Deliberately **not** cleanup. Cleanup decides whether a *worktree* may be removed and
+/// carries every question that comes with that — unsaved work, merged evidence, operator
+/// confirmation. This decides only whether regenerable bytes *inside a surviving worktree*
+/// may go, and the answer needs no evidence at all: the worktree, its branch, its commits
+/// and its uncommitted changes are all untouched. That is why it has its own command and
+/// must never become a route into a sweep.
+///
+/// Measured motivation: 457 GB of 587 GB under one projects dir was `target/` and
+/// `node_modules`, and the single largest object on the machine was a **stopped** run's
+/// target dir at 72.7 GB.
+pub fn reap_build_cache(state: &RunState, live: &LiveCwds) -> CacheReap {
+    let mut reap = CacheReap {
+        run_id: state.id.clone(),
+        freed_bytes: 0,
+        dirs: Vec::new(),
+        skipped: Vec::new(),
+    };
+    for rec in &state.worktrees {
+        if !rec.path.is_dir() || !reapable_worktree(&state.project_root, &rec.path) {
+            continue;
+        }
+        if live.inside(&rec.path) {
+            reap.skipped.push(format!(
+                "{}: a live process is working here",
+                rec.path.display()
+            ));
+            continue;
+        }
+        for name in CACHE_DIRS {
+            let dir = rec.path.join(name);
+            if !dir.is_dir() || !is_build_cache(&dir, name) {
+                continue;
+            }
+            // A symlinked cache points somewhere the operator chose — another disk, a
+            // shared cache. `remove_dir_all` would unlink it (it does not follow, so the
+            // real tree survives), which silently breaks their setup and reports bytes as
+            // freed that never were.
+            if std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink()) {
+                reap.skipped
+                    .push(format!("{}: symlinked elsewhere", dir.display()));
+                continue;
+            }
+            let bytes = dir_size(&dir);
+            if std::fs::remove_dir_all(&dir).is_ok() {
+                reap.freed_bytes += bytes;
+                reap.dirs.push(dir);
+            }
+        }
+    }
+    reap
+}
+
+fn dir_size(dir: &Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let Ok(meta) = e.metadata() else { continue };
+            if meta.is_dir() {
+                stack.push(e.path());
+            } else {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
+/// Every live process cwd, read once.
+///
+/// `process::pids_with_cwd_under` re-reads all of `/proc` and re-canonicalises per call.
+/// That is fine for the one worktree `cleanup` looks at and pathological across a project's
+/// worth of candidates on 7200rpm disks, which is where this runs.
+pub struct LiveCwds(Vec<PathBuf>);
+
+impl LiveCwds {
+    pub fn snapshot() -> Self {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir("/proc") {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+                    continue;
+                }
+                if let Ok(cwd) = std::fs::read_link(entry.path().join("cwd")) {
+                    out.push(cwd);
+                }
+            }
+        }
+        Self(out)
+    }
+
+    pub fn inside(&self, dir: &Path) -> bool {
+        let root = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        self.0.iter().any(|c| c.starts_with(&root))
+    }
+}
+
+/// Work a worktree holds that removing it would destroy: uncommitted changes, or commits
+/// the run's base does not contain. `None` when there is nothing to lose.
+///
+/// Both matter because `remove_worktree` runs `git worktree remove --force` *and*
+/// `git branch -D`, so an unmerged commit is as gone as an unsaved edit.
+///
+/// Fails **closed** throughout: an unresolvable base, an unanswerable git, or an
+/// unreadable count all count as holding work, because the only
+/// caller is deciding whether deletion is safe.
+fn unsaved_work(state: &RunState, rec: &WorktreeRecord) -> Option<String> {
+    if !rec.path.is_dir() {
+        return None;
+    }
+    // Dry-run cwds under `.spar/` are scratch dirs, not git worktrees. git cannot answer
+    // for them, and fail-closed on an unanswerable question would make the veto refuse
+    // every dry-run cleanup forever.
+    if state.dry_run || rec.path.starts_with(state.project_root.join(".spar")) {
+        return None;
+    }
+    match git_out(&rec.path, &["status", "--porcelain"]) {
+        None => return Some("git could not report status".into()),
+        Some(s) if !s.is_empty() => {
+            return Some(format!("{} uncommitted change(s)", s.lines().count()))
+        }
+        Some(_) => {}
+    }
+    // `base_commit` first: it is what the worktree was actually cut from (O26). `base_ref`
+    // is a *label*, and a label can be deleted or moved out from under a run — a feature
+    // branch merged and deleted last week is the common case, and pre-O26 runs have no ref
+    // at all. Both were reachable on the machine this fix came from.
+    let base = state.base_commit.clone().or_else(|| {
+        state
+            .base_ref
+            .as_deref()
+            .and_then(|r| resolve_commit(&state.project_root, r))
+    });
+    let Some(base) = base else {
+        // Unknowable, so refuse. Reading "I cannot determine the base" as "there is
+        // nothing to lose" is the same inversion this whole change exists to remove.
+        return Some("base cannot be resolved — cannot tell what is unmerged".into());
+    };
+    // HEAD *and* the recorded branch. The tree's HEAD is what an agent left checked out;
+    // `remove_worktree` deletes `rec.branch`. An agent that detached HEAD to compare
+    // against the base leaves HEAD clean and level while the branch still carries every
+    // commit it wrote.
+    for reference in ["HEAD", rec.branch.as_str()] {
+        if reference != "HEAD" && resolve_commit(&rec.path, reference).is_none() {
+            continue; // branch already gone; `branch -D` has nothing to destroy
+        }
+        let Some(count) = git_out(
+            &rec.path,
+            &["rev-list", "--count", &format!("{base}..{reference}")],
+        ) else {
+            return Some(format!(
+                "git could not compare {reference} against the base"
+            ));
+        };
+        match count.parse::<u32>() {
+            Ok(0) => {}
+            Ok(n) => return Some(format!("{n} commit(s) on {reference} not in the base")),
+            Err(_) => {
+                return Some(format!("unreadable commit count for {reference}"));
+            }
+        }
+    }
+    None
+}
+
+/// Reap first, then remove — unless the worktree still holds work.
+///
+/// The veto lives here, at the destructive operation, rather than in any one caller. It
+/// was originally written into `merged_into_base`, which guards only the `--merged`
+/// evidence path, so `--older-than` walked straight past it and force-removed worktrees
+/// holding uncommitted agent work. Guarding an evidence path leaves the next evidence path
+/// unguarded; guarding the deletion covers all of them, including ones not written yet.
+///
+/// `force` is the operator naming a run and meaning it.
+pub fn cleanup_run(state: &RunState, force: bool) -> Result<Vec<WorktreeCleanup>> {
     let mut report = Vec::new();
     for rec in &state.worktrees {
+        if !force {
+            if let Some(why) = unsaved_work(state, rec) {
+                report.push(WorktreeCleanup {
+                    slot_id: rec.slot_id.clone(),
+                    path: rec.path.clone(),
+                    killed: Vec::new(),
+                    removed: false,
+                    skipped: Some(format!("holds {why} — reap by run id with --force")),
+                });
+                continue;
+            }
+        }
         if !reapable_worktree(&state.project_root, &rec.path) {
             report.push(WorktreeCleanup {
                 slot_id: rec.slot_id.clone(),
@@ -1040,7 +1296,7 @@ mod tests {
             "no recorded base ⇒ no verdict, never a guess"
         );
 
-        cleanup_run(&state).unwrap();
+        cleanup_run(&state, false).unwrap();
     }
 
     #[test]
@@ -1075,6 +1331,251 @@ mod tests {
         });
         apply_spec_tests_to_impl(&state, "test-author-x", &impl_cwd).unwrap();
         assert!(impl_cwd.join(".spar-dry-acceptance-tests").is_file());
+    }
+
+    /// The veto belongs at the deletion, not at one evidence path. It was written into
+    /// `merged_into_base`, so `--older-than` walked past it and force-removed worktrees
+    /// holding uncommitted agent work.
+    #[test]
+    fn cleanup_refuses_a_worktree_holding_work_unless_forced() {
+        let tmp = tempdir().unwrap();
+        let (root, _wt, _) = repo_with_linked_worktree(tmp.path());
+        let base = git_out(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+
+        let mut state = RunState::new("runveto", crate::cli::WorkflowKind::Loop, root.clone());
+        state.base_ref = Some(base);
+        state.base_commit = git_out(&root, &["rev-parse", "HEAD"]);
+        let rec = create_worktree(&root, "runveto", "impl", state.base_commit.as_deref()).unwrap();
+        state.worktrees.push(rec.clone());
+
+        // Clean tree, nothing ahead: ordinary cleanup takes it.
+        assert!(unsaved_work(&state, &rec).is_none());
+
+        std::fs::write(rec.path.join("precious.rs"), "fn work() {}\n").unwrap();
+        assert!(
+            unsaved_work(&state, &rec).is_some(),
+            "uncommitted work counts"
+        );
+
+        let report = cleanup_run(&state, false).unwrap();
+        assert!(report[0].skipped.is_some(), "must refuse: {report:?}");
+        assert!(!report[0].removed);
+        assert!(rec.path.join("precious.rs").is_file(), "work survives");
+
+        // Committed-but-unmerged counts too: remove_worktree also runs `git branch -D`.
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&rec.path)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .unwrap();
+        };
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "slot work"]);
+        let why = unsaved_work(&state, &rec).expect("unmerged commits count");
+        assert!(why.contains("commit"), "{why}");
+        assert!(cleanup_run(&state, false).unwrap()[0].skipped.is_some());
+
+        // --force is the operator naming the run and meaning it.
+        let report = cleanup_run(&state, true).unwrap();
+        assert!(report[0].skipped.is_none(), "{report:?}");
+        assert!(!rec.path.exists());
+    }
+
+    /// "I cannot determine the base" must never read as "there is nothing to lose". Both
+    /// triggers were live on the machine this came from: pre-O26 runs carry no `base_ref`,
+    /// and a run based on a feature branch that has since been merged and deleted cannot
+    /// resolve one.
+    #[test]
+    fn an_unresolvable_base_vetoes_rather_than_permits() {
+        let tmp = tempdir().unwrap();
+        let (root, _wt, _) = repo_with_linked_worktree(tmp.path());
+        let mut state = RunState::new("runbase", crate::cli::WorkflowKind::Loop, root.clone());
+        let rec = create_worktree(&root, "runbase", "impl", None).unwrap();
+        state.worktrees.push(rec.clone());
+
+        // Pre-O26: neither field recorded.
+        state.base_ref = None;
+        state.base_commit = None;
+        let why = unsaved_work(&state, &rec).expect("must refuse");
+        assert!(why.contains("base cannot be resolved"), "{why}");
+        assert!(cleanup_run(&state, false).unwrap()[0].skipped.is_some());
+
+        // A ref that no longer exists, with no commit recorded either.
+        state.base_ref = Some("feat/deleted-last-week".into());
+        assert!(unsaved_work(&state, &rec).is_some(), "dead ref must refuse");
+
+        // base_commit is the ground truth and survives the ref going away.
+        state.base_commit = git_out(&root, &["rev-parse", "HEAD"]);
+        assert!(
+            unsaved_work(&state, &rec).is_none(),
+            "a resolvable base_commit is enough"
+        );
+        cleanup_run(&state, true).unwrap();
+    }
+
+    /// The veto reads the tree; `remove_worktree` deletes `rec.branch`. An agent that
+    /// detached HEAD leaves HEAD level with the base while the branch still carries every
+    /// commit it wrote.
+    #[test]
+    fn a_detached_head_does_not_hide_the_branchs_commits() {
+        let tmp = tempdir().unwrap();
+        let (root, _wt, _) = repo_with_linked_worktree(tmp.path());
+        let mut state = RunState::new("rundetach", crate::cli::WorkflowKind::Loop, root.clone());
+        state.base_commit = git_out(&root, &["rev-parse", "HEAD"]);
+        let rec =
+            create_worktree(&root, "rundetach", "impl", state.base_commit.as_deref()).unwrap();
+        state.worktrees.push(rec.clone());
+
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&rec.path)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        std::fs::write(rec.path.join("work.rs"), "fn work() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "slot work"]);
+        // Agent detaches to look at the original code and leaves it that way.
+        git(&[
+            "checkout",
+            "-q",
+            "--detach",
+            state.base_commit.as_deref().unwrap(),
+        ]);
+
+        let why = unsaved_work(&state, &rec).expect("branch commits must still count");
+        assert!(why.contains(&rec.branch), "{why}");
+        assert!(cleanup_run(&state, false).unwrap()[0].skipped.is_some());
+        cleanup_run(&state, true).unwrap();
+    }
+
+    #[test]
+    fn build_cache_detection_survives_an_interrupted_build() {
+        let tmp = tempdir().unwrap();
+        let t = tmp.path();
+
+        // Each marker alone is enough. The 22 GB tree that motivated this had no
+        // CACHEDIR.TAG because the build died before cargo wrote it.
+        for marker in ["CACHEDIR.TAG", ".rustc_info.json"] {
+            let d = t.join(marker.replace('.', "_"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(marker), "x").unwrap();
+            assert!(is_build_cache(&d, "target"), "{marker}");
+        }
+        for sub in ["debug", "release"] {
+            let d = t.join(format!("by-{sub}"));
+            std::fs::create_dir_all(d.join(sub)).unwrap();
+            assert!(is_build_cache(&d, "target"), "{sub}");
+        }
+
+        // A source directory that happens to be called `target` is not a cache.
+        let src = t.join("innocent");
+        std::fs::create_dir_all(src.join("src")).unwrap();
+        std::fs::write(src.join("src/main.rs"), "fn main() {}").unwrap();
+        assert!(!is_build_cache(&src, "target"));
+
+        // node_modules needs no marker; it is regenerable by definition.
+        let nm = t.join("nm");
+        std::fs::create_dir_all(&nm).unwrap();
+        assert!(is_build_cache(&nm, "node_modules"));
+    }
+
+    /// Reclaiming keeps everything a build cannot regenerate — that is what lets it run
+    /// without the evidence `cleanup` demands.
+    #[test]
+    fn reclaim_takes_only_build_output() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-spar-r1-impl");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(wt.join("target/debug")).unwrap();
+        std::fs::create_dir_all(wt.join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(wt.join("target/debug/huge.rlib"), vec![0u8; 4096]).unwrap();
+        std::fs::write(wt.join("node_modules/pkg/index.js"), "x").unwrap();
+        std::fs::write(wt.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(wt.join("uncommitted.txt"), "precious").unwrap();
+
+        let mut state = RunState::new("r1", crate::cli::WorkflowKind::Loop, root);
+        state.worktrees.push(WorktreeRecord {
+            slot_id: "impl".into(),
+            path: wt.clone(),
+            branch: "spar/r1/impl".into(),
+        });
+
+        let reap = reap_build_cache(&state, &LiveCwds(Vec::new()));
+        assert!(reap.freed_bytes >= 4096, "{reap:?}");
+        assert!(!wt.join("target").exists());
+        assert!(!wt.join("node_modules").exists());
+        assert!(wt.join("src/main.rs").is_file(), "source survives");
+        assert!(
+            wt.join("uncommitted.txt").is_file(),
+            "uncommitted work survives -- reclaim is not cleanup"
+        );
+        assert!(wt.is_dir(), "the worktree itself survives");
+    }
+
+    /// A symlinked `target/` belongs to whatever the operator pointed it at. Removing it
+    /// unlinks their setup and reports space that was never freed — `remove_dir_all` does
+    /// not follow, so the real tree survives and the byte count would be a lie.
+    #[test]
+    fn reclaim_leaves_a_symlinked_cache_alone() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-spar-r1-impl");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(elsewhere.join("debug")).unwrap();
+        std::fs::write(elsewhere.join("debug/x.rlib"), vec![0u8; 2048]).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&elsewhere, wt.join("target")).unwrap();
+
+        let mut state = RunState::new("r1", crate::cli::WorkflowKind::Loop, root);
+        state.worktrees.push(WorktreeRecord {
+            slot_id: "impl".into(),
+            path: wt.clone(),
+            branch: "spar/r1/impl".into(),
+        });
+
+        let reap = reap_build_cache(&state, &LiveCwds(Vec::new()));
+        assert_eq!(reap.freed_bytes, 0, "nothing was actually freed");
+        assert!(wt.join("target").exists(), "the symlink survives");
+        assert!(elsewhere.join("debug/x.rlib").is_file());
+        assert!(
+            reap.skipped.iter().any(|s| s.contains("symlinked")),
+            "{reap:?}"
+        );
+    }
+
+    #[test]
+    fn reclaim_skips_a_tree_someone_is_working_in() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-spar-r1-impl");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(wt.join("target/debug")).unwrap();
+        std::fs::write(wt.join("target/debug/x.rlib"), "obj").unwrap();
+
+        let mut state = RunState::new("r1", crate::cli::WorkflowKind::Loop, root);
+        state.worktrees.push(WorktreeRecord {
+            slot_id: "impl".into(),
+            path: wt.clone(),
+            branch: "spar/r1/impl".into(),
+        });
+
+        let live = LiveCwds(vec![wt.join("src")]);
+        let reap = reap_build_cache(&state, &live);
+        assert_eq!(reap.freed_bytes, 0);
+        assert_eq!(reap.skipped.len(), 1, "{reap:?}");
+        assert!(wt.join("target/debug/x.rlib").is_file());
     }
 
     #[test]
@@ -1124,7 +1625,7 @@ mod tests {
             branch: "spar/r1/bogus".into(),
         });
 
-        let report = cleanup_run(&state).unwrap();
+        let report = cleanup_run(&state, false).unwrap();
         assert!(report[0].removed);
         assert!(!wt.exists());
         assert!(report[1].skipped.is_some(), "project root must be refused");
@@ -1309,7 +1810,7 @@ mod tests {
             "live slot must be cut from the run's base, not the main checkout"
         );
         assert!(rec.path.join("feature.txt").is_file());
-        cleanup_run(&state).unwrap();
+        cleanup_run(&state, false).unwrap();
     }
 
     #[test]

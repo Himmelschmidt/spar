@@ -733,7 +733,7 @@ fn maybe_auto_ship_or_cleanup(state: &mut RunState, paths: &SparPaths, cfg: &Con
         }
     }
     if cfg.auto_cleanup && state.phase.is_terminal() && matches!(state.phase, Phase::Done) {
-        let _ = crate::worktree::cleanup_run(state);
+        let _ = crate::worktree::cleanup_run(state, false);
     }
     Ok(())
 }
@@ -1396,12 +1396,51 @@ fn write_stuck(paths: &SparPaths, run_id: &str) -> Result<()> {
 }
 
 fn finish_out(state: &RunState, json: bool) -> Result<()> {
+    reclaim_own_cache(state, json);
     if json {
         executor::emit_run_json(state)?;
     } else {
         executor::print_run_human(state);
     }
     Ok(())
+}
+
+/// Drop this run's build output once its orchestrator is done with it.
+///
+/// Scoped to the run's **own** worktrees, at the moment its own orchestrator concludes —
+/// not a project-wide sweep, which is `spar reclaim --all` and stays explicit. Nothing here
+/// is unrecoverable: the worktree, its branch, its commits and any uncommitted changes all
+/// survive, so this asks no permission and needs no evidence. It is the largest single
+/// source of disk on the box (457 GB of 587 GB measured), and a *stopped* run's target dir
+/// was the biggest object on the machine.
+/// Phases the *automatic* reclaim may take: finished, and nothing can resume them.
+///
+/// Narrower than `is_terminal()` on purpose. `Quota`, `Stuck` and `Failed` are terminal
+/// yet are exactly what `spar implement --run <id>` exists to pick up — a run that paused
+/// because a provider bucket ran dry is meant to be resumed when it refills. Deleting
+/// `node_modules` there is not free: regenerating it needs the network and an agent that
+/// knows to reinstall, and the resumed implementer just meets a broken suite. Those stay
+/// for the explicit `spar reclaim`, which is the operator's call.
+fn auto_reclaimable(phase: Phase) -> bool {
+    matches!(phase, Phase::Done | Phase::PlanRejected | Phase::Escalated)
+}
+
+fn reclaim_own_cache(state: &RunState, json: bool) {
+    if state.dry_run
+        || !auto_reclaimable(state.phase)
+        || !crate::config::Config::for_run(&SparPaths::new(&state.project_root), &state.id)
+            .map(|c| c.auto_reclaim)
+            .unwrap_or(true)
+    {
+        return;
+    }
+    let reap = worktree::reap_build_cache(state, &worktree::LiveCwds::snapshot());
+    if reap.freed_bytes > 0 && !json {
+        eprintln!(
+            "reclaimed {:.1} GB of build cache from this run's worktrees",
+            reap.freed_bytes as f64 / 1024.0 / 1024.0 / 1024.0
+        );
+    }
 }
 
 fn detach_implement(state: &RunState, paths: &SparPaths, json: bool) -> Result<ExitCode> {
@@ -1465,9 +1504,9 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
 #[cfg(test)]
 mod suite_parse_tests {
     use super::{
-        acceptance_block_reason, acceptance_blocks_ship, command_is_selective, command_names,
-        derive_suite_outcome, is_test_path, is_test_target, should_stop, suite_blocks_ship,
-        suite_commands, suite_guidance, SuiteOutcome,
+        acceptance_block_reason, acceptance_blocks_ship, auto_reclaimable, command_is_selective,
+        command_names, derive_suite_outcome, is_test_path, is_test_target, should_stop,
+        suite_blocks_ship, suite_commands, suite_guidance, Phase, SuiteOutcome,
     };
     use crate::config::Config;
     use crate::paths::SparPaths;
@@ -1848,6 +1887,27 @@ mod suite_parse_tests {
         assert!(is_test_path("api/test_users.py"));
         assert!(!is_test_path("src/executor.rs"));
         assert!(!is_test_path("docs/testing.md"));
+    }
+
+    /// Automatic reclaim is for runs nothing can resume. A quota pause is meant to be
+    /// picked back up when the bucket refills, and node_modules is not free to regenerate
+    /// -- it needs the network and an agent that knows to reinstall.
+    #[test]
+    fn auto_reclaim_spares_runs_that_can_be_resumed() {
+        for phase in [Phase::Done, Phase::PlanRejected, Phase::Escalated] {
+            assert!(auto_reclaimable(phase), "{phase:?}");
+        }
+        for phase in [
+            Phase::Quota,
+            Phase::Stuck,
+            Phase::Failed,
+            Phase::Stopped,
+            Phase::PlanApproved,
+            Phase::AwaitingShipConfirm,
+            Phase::Review,
+        ] {
+            assert!(!auto_reclaimable(phase), "{phase:?} is resumable or live");
+        }
     }
 
     #[test]

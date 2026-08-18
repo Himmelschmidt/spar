@@ -493,9 +493,25 @@ pub fn reject(
     // Nothing can resume a rejected plan (`implement --run` requires an approved one),
     // so its worktrees are garbage from here. Artifacts under `.spar/runs/<id>` stay:
     // the plan and the critique are why you rejected it.
-    let _ = crate::worktree::cleanup_run(&state)?;
-    state.worktrees.clear();
+    let cleaned = crate::worktree::cleanup_run(&state, false)?;
+    // Keep the record of anything the veto spared. Clearing unconditionally orphans it:
+    // no record means `cleanup <id> --force` iterates an empty list and silently does
+    // nothing, so a test-author's uncommitted acceptance tests would be unreachable by
+    // any spar command.
+    let kept: Vec<&std::path::Path> = cleaned
+        .iter()
+        .filter(|c| c.skipped.is_some())
+        .map(|c| c.path.as_path())
+        .collect();
+    state.worktrees.retain(|w| kept.contains(&w.path.as_path()));
     state.save(paths)?;
+    for c in cleaned.iter().filter(|c| c.skipped.is_some()) {
+        eprintln!(
+            "kept {}: {}",
+            c.path.display(),
+            c.skipped.as_deref().unwrap_or("")
+        );
+    }
     if json {
         executor::emit_run_json(&state)?;
     } else {

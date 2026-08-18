@@ -535,10 +535,21 @@ pub fn sweepable(
     if unresumable {
         return older_than.is_none_or(|min| idle >= min);
     }
-    match (resumable_at_rest(phase), older_than) {
+    match (age_sweepable(phase), older_than) {
         (true, Some(min)) => idle >= min,
         _ => false,
     }
+}
+
+/// Phases where *idle time* is evidence that nobody is coming back.
+///
+/// `resumable_at_rest` minus the gates, and the distinction is the whole point. A run at
+/// `awaiting_plan_approval` is blocked **on a human**: its idle time measures how busy that
+/// human was, not whether the run was abandoned. Age is close to anti-evidence there, and
+/// sweeping on it reaps the runs most likely to still be wanted. Gates are reclaimed by
+/// resolving them, by naming the run id, or by merged evidence — never by waiting.
+pub fn age_sweepable(phase: Phase) -> bool {
+    resumable_at_rest(phase) && !phase.is_gate()
 }
 
 /// Nobody is driving this run: it is finished, or parked. The precondition for any
@@ -577,6 +588,14 @@ pub fn sweep_skip_reason(
     // merely too young implies it would be swept once it aged.
     if !at_rest(phase) {
         return Some(format!("{phase:?} is in flight — spar stop it first"));
+    }
+    // Before the age reason, because for a gate the age reason is a lie: no `--older-than`
+    // will ever take it, so reporting "idle below --older-than" invites the operator to
+    // raise the threshold and wonder why nothing happens.
+    if phase.is_gate() {
+        return Some(format!(
+            "{phase:?} is waiting on you — age is not evidence here; resolve it, or reap by run id"
+        ));
     }
     if older_than.is_some_and(|min| idle < min) {
         return Some(format!("idle {}s is below --older-than", idle.as_secs()));
@@ -854,8 +873,6 @@ mod tests {
             Phase::Stuck,
             Phase::Quota,
             Phase::PlanApproved,
-            Phase::AwaitingPlanApproval,
-            Phase::AwaitingShipConfirm,
         ] {
             assert!(
                 !sweepable(phase, day * 30, None),
@@ -863,6 +880,11 @@ mod tests {
             );
             assert!(sweepable(phase, day * 30, week), "{phase:?} at 30d");
             assert!(!sweepable(phase, day, week), "{phase:?} at 1d");
+        }
+        // Gates moved out of the age path entirely: see `age_is_never_evidence_for_a_gate`.
+        for phase in [Phase::AwaitingPlanApproval, Phase::AwaitingShipConfirm] {
+            assert!(!sweepable(phase, day * 30, None), "{phase:?}");
+            assert!(!sweepable(phase, day * 30, week), "{phase:?} at any age");
         }
         // In flight is never swept, however old the state file looks.
         for phase in [Phase::Dispatch, Phase::Review, Phase::WaitCompletion] {
@@ -1046,6 +1068,41 @@ mod tests {
             Phase::WaitCompletion,
         ] {
             assert!(!archivable_by_hand(phase), "{phase:?} is in flight");
+        }
+    }
+
+    /// Age is evidence of abandonment for a parked run and anti-evidence for a gate: a
+    /// run at `awaiting_plan_approval` is idle because the *human* was busy. Sweeping on
+    /// age there reaps the runs most likely to still be wanted.
+    #[test]
+    fn age_is_never_evidence_for_a_gate() {
+        use std::time::Duration;
+        let month = Duration::from_secs(30 * 86_400);
+        let week = Some(Duration::from_secs(7 * 86_400));
+
+        for phase in [
+            Phase::AwaitingPlanApproval,
+            Phase::AwaitingShipConfirm,
+            Phase::AwaitingWinnerConfirm,
+            Phase::AwaitingReconcile,
+        ] {
+            assert!(!age_sweepable(phase), "{phase:?}");
+            assert!(
+                !sweepable(phase, month, week),
+                "{phase:?} must survive any --older-than"
+            );
+            let why = sweep_skip_reason(phase, month, week).expect("spared");
+            assert!(why.contains("waiting on you"), "{why}");
+            assert!(
+                !why.contains("below --older-than"),
+                "a gate must not be reported as merely too young: {why}"
+            );
+        }
+
+        // Parked-but-not-gated still sweeps on age, as before.
+        for phase in [Phase::Stopped, Phase::Failed, Phase::Stuck, Phase::Quota] {
+            assert!(age_sweepable(phase), "{phase:?}");
+            assert!(sweepable(phase, month, week), "{phase:?}");
         }
     }
 

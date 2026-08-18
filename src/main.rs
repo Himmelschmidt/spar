@@ -266,6 +266,7 @@ fn run() -> Result<ExitCode> {
             merged,
             json,
             purge,
+            force,
         } => cleanup_cmd(
             run_id.as_deref(),
             all,
@@ -273,7 +274,9 @@ fn run() -> Result<ExitCode> {
             merged,
             json,
             purge,
+            force,
         ),
+        Command::Reclaim { run_id, all, json } => reclaim_cmd(run_id.as_deref(), all, json),
         Command::Archive {
             run_id,
             all,
@@ -1056,6 +1059,65 @@ fn attach_cmd(run_id: &str) -> Result<ExitCode> {
     Ok(ExitCode::Success)
 }
 
+/// Delete build output inside finished runs' worktrees.
+///
+/// Kept apart from `cleanup` in the CLI on purpose: cleanup removes worktrees and carries
+/// the questions that come with that, this removes only bytes a build regenerates. Making
+/// it a `cleanup` flag would give an operator with a standing rule against autonomous
+/// sweeps a back door into one.
+fn reclaim_cmd(run_id: Option<&str>, all: bool, json: bool) -> Result<ExitCode> {
+    let (paths, _) = project_ctx()?;
+    let reaps = match (run_id, all) {
+        (Some(_), true) => anyhow::bail!("pass a run id or --all, not both"),
+        (None, false) => anyhow::bail!("usage: spar reclaim <run_id> | spar reclaim --all"),
+        (Some(id), false) => {
+            let state = state::RunState::load(&paths, id)?;
+            if !(state.phase.is_terminal() || state.phase == state::Phase::Stopped) {
+                anyhow::bail!(
+                    "run {id} is still running ({:?}) — its build cache is in use",
+                    state.phase
+                );
+            }
+            vec![worktree::reap_build_cache(
+                &state,
+                &worktree::LiveCwds::snapshot(),
+            )]
+        }
+        (None, true) => worktree::reap_finished_caches(&paths, None)?,
+    };
+    let freed: u64 = reaps.iter().map(|r| r.freed_bytes).sum();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &serde_json::json!({ "freed_bytes": freed, "runs": reaps })
+            )?
+        );
+        return Ok(ExitCode::Success);
+    }
+    for r in &reaps {
+        if r.freed_bytes > 0 {
+            println!("{}: {}", r.run_id, human_bytes(r.freed_bytes));
+        }
+        for s in &r.skipped {
+            println!("  skipped {s}");
+        }
+    }
+    println!("reclaimed {}", human_bytes(freed));
+    Ok(ExitCode::Success)
+}
+
+fn human_bytes(n: u64) -> String {
+    const UNIT: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNIT.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    format!("{v:.1} {}", UNIT[i])
+}
+
 /// Hide finished runs from listings, or bring them back.
 ///
 /// Archiving is presentation, not lifecycle: nothing is deleted, the run stays addressable
@@ -1140,9 +1202,16 @@ fn cleanup_cmd(
     merged: bool,
     json: bool,
     purge: bool,
+    force: bool,
 ) -> Result<ExitCode> {
+    // No project-wide force. A sweep decides *for you* which runs it touches, so pairing
+    // it with an override that ignores unsaved work is how one command destroys work
+    // across a project — the failure this whole change exists to prevent.
+    if force && all {
+        anyhow::bail!("--force applies to an explicit run id, not --all");
+    }
     match (run_id, all) {
-        (Some(id), false) => cleanup_one(id, json, purge),
+        (Some(id), false) => cleanup_one(id, json, purge, force),
         (None, true) => cleanup_sweep(older_than, merged, json, purge),
         (Some(_), true) => anyhow::bail!("pass a run id or --all, not both"),
         (None, false) => anyhow::bail!("usage: spar cleanup <run_id> | spar cleanup --all"),
@@ -1195,11 +1264,15 @@ fn cleanup_sweep(
             }));
             continue;
         }
-        let cleaned = worktree::cleanup_run(&state)?;
+        let cleaned = worktree::cleanup_run(&state, /* force */ false)?;
         if let Some(session) = &state.tmux_session {
             let _ = tmux::kill_session(session);
         }
-        if purge {
+        // Never purge the record of a run whose worktree was spared. The record is how
+        // `cleanup <id> --force` reaches it later, and it carries base_ref/base_commit and
+        // plan.md; deleting it strands the very work the veto just saved.
+        let kept_any = cleaned.iter().any(|c| c.skipped.is_some());
+        if purge && !kept_any {
             let dir = paths.run_dir(&summary.id);
             if dir.is_dir() {
                 std::fs::remove_dir_all(&dir)?;
@@ -1219,7 +1292,20 @@ fn cleanup_sweep(
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({ "swept": swept, "spared": spared }))?
+            serde_json::to_string_pretty(&serde_json::json!({
+                "swept": swept,
+                "spared": spared,
+                // Aggregates, because a driver reading `swept.len()` alone counts a run
+                // whose every worktree was refused as reclaimed.
+                "worktrees_removed": swept
+                    .iter()
+                    .map(|r| r["removed"].as_u64().unwrap_or(0))
+                    .sum::<u64>(),
+                "worktrees_kept": swept
+                    .iter()
+                    .map(|r| r["kept"].as_u64().unwrap_or(0))
+                    .sum::<u64>(),
+            }))?
         );
         return Ok(ExitCode::Success);
     }
@@ -1227,16 +1313,30 @@ fn cleanup_sweep(
         println!("nothing to sweep");
     } else {
         let mut trees = 0;
+        let mut kept = 0;
         for r in &swept {
-            let n = r["worktrees"].as_array().map(|a| a.len()).unwrap_or(0);
+            let entries = r["worktrees"].as_array().cloned().unwrap_or_default();
+            // Count what was actually removed. Counting every entry reports a worktree the
+            // veto *refused* as swept, which is the one number an operator would read as
+            // "the work is gone".
+            let n = entries.iter().filter(|w| w["removed"] == true).count();
             trees += n;
             println!(
                 "{} ({}): {n} worktree(s)",
                 r["run_id"].as_str().unwrap_or_default(),
                 r["phase"].as_str().unwrap_or_default()
             );
+            for w in entries.iter() {
+                if let Some(why) = w["skipped"].as_str() {
+                    kept += 1;
+                    println!("    kept {}: {why}", w["path"].as_str().unwrap_or_default());
+                }
+            }
         }
         println!("swept {} run(s), {trees} worktree(s)", swept.len());
+        if kept > 0 {
+            println!("kept {kept} worktree(s) still holding work");
+        }
     }
     // Capped: a project that has accumulated hundreds of runs would otherwise bury the
     // swept lines under a wall of spared ones. `--json` carries all of them.
@@ -1257,27 +1357,35 @@ fn cleanup_sweep(
     Ok(ExitCode::Success)
 }
 
-fn cleanup_one(run_id: &str, json: bool, purge: bool) -> Result<ExitCode> {
+fn cleanup_one(run_id: &str, json: bool, purge: bool, force: bool) -> Result<ExitCode> {
     let (paths, _) = project_ctx()?;
     let state = state::RunState::load(&paths, run_id)?;
-    let cleaned = worktree::cleanup_run(&state)?;
+    let cleaned = worktree::cleanup_run(&state, force)?;
+    let kept_any = cleaned.iter().any(|c| c.skipped.is_some());
     if let Some(session) = &state.tmux_session {
         let _ = tmux::kill_session(session);
     }
-    if purge {
+    // Same rule as the sweep: the record is the only route back to a spared worktree.
+    let purged = purge && !kept_any;
+    if purged {
         let dir = paths.run_dir(run_id);
         if dir.is_dir() {
             std::fs::remove_dir_all(&dir)?;
         }
         worktree::prune_empty_spar_parents(&paths)?;
     }
+    let removed = cleaned.iter().filter(|c| c.removed).count();
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "run_id": run_id,
-                "cleaned": true,
-                "purged": purge,
+                // `cleaned: true` regardless of outcome told an outer agent the removal
+                // happened when every worktree had been refused.
+                "cleaned": removed > 0,
+                "removed": removed,
+                "kept": cleaned.iter().filter(|c| c.skipped.is_some()).count(),
+                "purged": purged,
                 "worktrees": cleaned,
             })
         );
@@ -1303,7 +1411,10 @@ fn cleanup_one(run_id: &str, json: bool, purge: bool) -> Result<ExitCode> {
             }
         }
         println!("cleaned worktrees for {run_id}");
-        if purge {
+        if purge && kept_any {
+            println!("kept the run record: a worktree still holds work");
+        }
+        if purged {
             println!("purged run dir");
             if !paths.runs_dir().is_dir() {
                 println!("removed empty .spar/runs");
