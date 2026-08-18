@@ -19,6 +19,11 @@ fn spar_home_dir() -> std::path::PathBuf {
 fn spar_cmd() -> assert_cmd::Command {
     let mut c = cargo_bin_cmd!("spar");
     c.env("SPAR_HOME", spar_home_dir());
+    // Also isolate the *config* dir. SPAR_HOME only moves the registry; without this
+    // the spawned binary still layers the developer's ~/.config/spar/config.toml under
+    // the test's project, so an ordinary local setting fails scenarios that never
+    // mention it. (XDG applies on Linux, where the suite runs.)
+    c.env("XDG_CONFIG_HOME", spar_home_dir());
     c.env_remove("SPAR_PROJECT_ROOT");
     c.env_remove("SPAR_RUN_ID");
     c.env_remove("SPAR_AGENT_ID");
