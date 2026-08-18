@@ -626,6 +626,15 @@ pub fn reap_build_cache(state: &RunState, live: &LiveCwds) -> CacheReap {
             if !dir.is_dir() || !is_build_cache(&dir, name) {
                 continue;
             }
+            // A symlinked cache points somewhere the operator chose — another disk, a
+            // shared cache. `remove_dir_all` would unlink it (it does not follow, so the
+            // real tree survives), which silently breaks their setup and reports bytes as
+            // freed that never were.
+            if std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink()) {
+                reap.skipped
+                    .push(format!("{}: symlinked elsewhere", dir.display()));
+                continue;
+            }
             let bytes = dir_size(&dir);
             if std::fs::remove_dir_all(&dir).is_ok() {
                 reap.freed_bytes += bytes;
@@ -1414,6 +1423,39 @@ mod tests {
             "uncommitted work survives -- reclaim is not cleanup"
         );
         assert!(wt.is_dir(), "the worktree itself survives");
+    }
+
+    /// A symlinked `target/` belongs to whatever the operator pointed it at. Removing it
+    /// unlinks their setup and reports space that was never freed — `remove_dir_all` does
+    /// not follow, so the real tree survives and the byte count would be a lie.
+    #[test]
+    fn reclaim_leaves_a_symlinked_cache_alone() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-spar-r1-impl");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(elsewhere.join("debug")).unwrap();
+        std::fs::write(elsewhere.join("debug/x.rlib"), vec![0u8; 2048]).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&elsewhere, wt.join("target")).unwrap();
+
+        let mut state = RunState::new("r1", crate::cli::WorkflowKind::Loop, root);
+        state.worktrees.push(WorktreeRecord {
+            slot_id: "impl".into(),
+            path: wt.clone(),
+            branch: "spar/r1/impl".into(),
+        });
+
+        let reap = reap_build_cache(&state, &LiveCwds(Vec::new()));
+        assert_eq!(reap.freed_bytes, 0, "nothing was actually freed");
+        assert!(wt.join("target").exists(), "the symlink survives");
+        assert!(elsewhere.join("debug/x.rlib").is_file());
+        assert!(
+            reap.skipped.iter().any(|s| s.contains("symlinked")),
+            "{reap:?}"
+        );
     }
 
     #[test]
