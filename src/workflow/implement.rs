@@ -1413,9 +1413,21 @@ fn finish_out(state: &RunState, json: bool) -> Result<()> {
 /// survive, so this asks no permission and needs no evidence. It is the largest single
 /// source of disk on the box (457 GB of 587 GB measured), and a *stopped* run's target dir
 /// was the biggest object on the machine.
+/// Phases the *automatic* reclaim may take: finished, and nothing can resume them.
+///
+/// Narrower than `is_terminal()` on purpose. `Quota`, `Stuck` and `Failed` are terminal
+/// yet are exactly what `spar implement --run <id>` exists to pick up — a run that paused
+/// because a provider bucket ran dry is meant to be resumed when it refills. Deleting
+/// `node_modules` there is not free: regenerating it needs the network and an agent that
+/// knows to reinstall, and the resumed implementer just meets a broken suite. Those stay
+/// for the explicit `spar reclaim`, which is the operator's call.
+fn auto_reclaimable(phase: Phase) -> bool {
+    matches!(phase, Phase::Done | Phase::PlanRejected | Phase::Escalated)
+}
+
 fn reclaim_own_cache(state: &RunState, json: bool) {
     if state.dry_run
-        || !(state.phase.is_terminal() || state.phase == Phase::Stopped)
+        || !auto_reclaimable(state.phase)
         || !crate::config::Config::for_run(&SparPaths::new(&state.project_root), &state.id)
             .map(|c| c.auto_reclaim)
             .unwrap_or(true)
@@ -1492,9 +1504,9 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
 #[cfg(test)]
 mod suite_parse_tests {
     use super::{
-        acceptance_block_reason, acceptance_blocks_ship, command_is_selective, command_names,
-        derive_suite_outcome, is_test_path, is_test_target, should_stop, suite_blocks_ship,
-        suite_commands, suite_guidance, SuiteOutcome,
+        acceptance_block_reason, acceptance_blocks_ship, auto_reclaimable, command_is_selective,
+        command_names, derive_suite_outcome, is_test_path, is_test_target, should_stop,
+        suite_blocks_ship, suite_commands, suite_guidance, Phase, SuiteOutcome,
     };
     use crate::config::Config;
     use crate::paths::SparPaths;
@@ -1875,6 +1887,27 @@ mod suite_parse_tests {
         assert!(is_test_path("api/test_users.py"));
         assert!(!is_test_path("src/executor.rs"));
         assert!(!is_test_path("docs/testing.md"));
+    }
+
+    /// Automatic reclaim is for runs nothing can resume. A quota pause is meant to be
+    /// picked back up when the bucket refills, and node_modules is not free to regenerate
+    /// -- it needs the network and an agent that knows to reinstall.
+    #[test]
+    fn auto_reclaim_spares_runs_that_can_be_resumed() {
+        for phase in [Phase::Done, Phase::PlanRejected, Phase::Escalated] {
+            assert!(auto_reclaimable(phase), "{phase:?}");
+        }
+        for phase in [
+            Phase::Quota,
+            Phase::Stuck,
+            Phase::Failed,
+            Phase::Stopped,
+            Phase::PlanApproved,
+            Phase::AwaitingShipConfirm,
+            Phase::Review,
+        ] {
+            assert!(!auto_reclaimable(phase), "{phase:?} is resumable or live");
+        }
     }
 
     #[test]

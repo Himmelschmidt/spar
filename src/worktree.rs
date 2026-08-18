@@ -699,7 +699,8 @@ impl LiveCwds {
 /// Both matter because `remove_worktree` runs `git worktree remove --force` *and*
 /// `git branch -D`, so an unmerged commit is as gone as an unsaved edit.
 ///
-/// Fails **closed**: a git that cannot answer counts as holding work, because the only
+/// Fails **closed** throughout: an unresolvable base, an unanswerable git, or an
+/// unreadable count all count as holding work, because the only
 /// caller is deciding whether deletion is safe.
 fn unsaved_work(state: &RunState, rec: &WorktreeRecord) -> Option<String> {
     if !rec.path.is_dir() {
@@ -718,22 +719,46 @@ fn unsaved_work(state: &RunState, rec: &WorktreeRecord) -> Option<String> {
         }
         Some(_) => {}
     }
-    let base = state
-        .base_ref
-        .as_deref()
-        .and_then(|r| resolve_commit(&state.project_root, r))?;
-    let ahead = git_out(
-        &rec.path,
-        &["rev-list", "--count", &format!("{base}..HEAD")],
-    )?;
-    match ahead.parse::<u32>() {
-        Ok(0) => None,
-        Ok(n) => Some(format!(
-            "{n} commit(s) not in {}",
-            state.base_ref.as_deref()?
-        )),
-        Err(_) => None,
+    // `base_commit` first: it is what the worktree was actually cut from (O26). `base_ref`
+    // is a *label*, and a label can be deleted or moved out from under a run — a feature
+    // branch merged and deleted last week is the common case, and pre-O26 runs have no ref
+    // at all. Both were reachable on the machine this fix came from.
+    let base = state.base_commit.clone().or_else(|| {
+        state
+            .base_ref
+            .as_deref()
+            .and_then(|r| resolve_commit(&state.project_root, r))
+    });
+    let Some(base) = base else {
+        // Unknowable, so refuse. Reading "I cannot determine the base" as "there is
+        // nothing to lose" is the same inversion this whole change exists to remove.
+        return Some("base cannot be resolved — cannot tell what is unmerged".into());
+    };
+    // HEAD *and* the recorded branch. The tree's HEAD is what an agent left checked out;
+    // `remove_worktree` deletes `rec.branch`. An agent that detached HEAD to compare
+    // against the base leaves HEAD clean and level while the branch still carries every
+    // commit it wrote.
+    for reference in ["HEAD", rec.branch.as_str()] {
+        if reference != "HEAD" && resolve_commit(&rec.path, reference).is_none() {
+            continue; // branch already gone; `branch -D` has nothing to destroy
+        }
+        let Some(count) = git_out(
+            &rec.path,
+            &["rev-list", "--count", &format!("{base}..{reference}")],
+        ) else {
+            return Some(format!(
+                "git could not compare {reference} against the base"
+            ));
+        };
+        match count.parse::<u32>() {
+            Ok(0) => {}
+            Ok(n) => return Some(format!("{n} commit(s) on {reference} not in the base")),
+            Err(_) => {
+                return Some(format!("unreadable commit count for {reference}"));
+            }
+        }
     }
+    None
 }
 
 /// Reap first, then remove — unless the worktree still holds work.
@@ -1357,6 +1382,78 @@ mod tests {
         let report = cleanup_run(&state, true).unwrap();
         assert!(report[0].skipped.is_none(), "{report:?}");
         assert!(!rec.path.exists());
+    }
+
+    /// "I cannot determine the base" must never read as "there is nothing to lose". Both
+    /// triggers were live on the machine this came from: pre-O26 runs carry no `base_ref`,
+    /// and a run based on a feature branch that has since been merged and deleted cannot
+    /// resolve one.
+    #[test]
+    fn an_unresolvable_base_vetoes_rather_than_permits() {
+        let tmp = tempdir().unwrap();
+        let (root, _wt, _) = repo_with_linked_worktree(tmp.path());
+        let mut state = RunState::new("runbase", crate::cli::WorkflowKind::Loop, root.clone());
+        let rec = create_worktree(&root, "runbase", "impl", None).unwrap();
+        state.worktrees.push(rec.clone());
+
+        // Pre-O26: neither field recorded.
+        state.base_ref = None;
+        state.base_commit = None;
+        let why = unsaved_work(&state, &rec).expect("must refuse");
+        assert!(why.contains("base cannot be resolved"), "{why}");
+        assert!(cleanup_run(&state, false).unwrap()[0].skipped.is_some());
+
+        // A ref that no longer exists, with no commit recorded either.
+        state.base_ref = Some("feat/deleted-last-week".into());
+        assert!(unsaved_work(&state, &rec).is_some(), "dead ref must refuse");
+
+        // base_commit is the ground truth and survives the ref going away.
+        state.base_commit = git_out(&root, &["rev-parse", "HEAD"]);
+        assert!(
+            unsaved_work(&state, &rec).is_none(),
+            "a resolvable base_commit is enough"
+        );
+        cleanup_run(&state, true).unwrap();
+    }
+
+    /// The veto reads the tree; `remove_worktree` deletes `rec.branch`. An agent that
+    /// detached HEAD leaves HEAD level with the base while the branch still carries every
+    /// commit it wrote.
+    #[test]
+    fn a_detached_head_does_not_hide_the_branchs_commits() {
+        let tmp = tempdir().unwrap();
+        let (root, _wt, _) = repo_with_linked_worktree(tmp.path());
+        let mut state = RunState::new("rundetach", crate::cli::WorkflowKind::Loop, root.clone());
+        state.base_commit = git_out(&root, &["rev-parse", "HEAD"]);
+        let rec =
+            create_worktree(&root, "rundetach", "impl", state.base_commit.as_deref()).unwrap();
+        state.worktrees.push(rec.clone());
+
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&rec.path)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        std::fs::write(rec.path.join("work.rs"), "fn work() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "slot work"]);
+        // Agent detaches to look at the original code and leaves it that way.
+        git(&[
+            "checkout",
+            "-q",
+            "--detach",
+            state.base_commit.as_deref().unwrap(),
+        ]);
+
+        let why = unsaved_work(&state, &rec).expect("branch commits must still count");
+        assert!(why.contains(&rec.branch), "{why}");
+        assert!(cleanup_run(&state, false).unwrap()[0].skipped.is_some());
+        cleanup_run(&state, true).unwrap();
     }
 
     #[test]

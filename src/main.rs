@@ -1268,7 +1268,11 @@ fn cleanup_sweep(
         if let Some(session) = &state.tmux_session {
             let _ = tmux::kill_session(session);
         }
-        if purge {
+        // Never purge the record of a run whose worktree was spared. The record is how
+        // `cleanup <id> --force` reaches it later, and it carries base_ref/base_commit and
+        // plan.md; deleting it strands the very work the veto just saved.
+        let kept_any = cleaned.iter().any(|c| c.skipped.is_some());
+        if purge && !kept_any {
             let dir = paths.run_dir(&summary.id);
             if dir.is_dir() {
                 std::fs::remove_dir_all(&dir)?;
@@ -1288,7 +1292,20 @@ fn cleanup_sweep(
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({ "swept": swept, "spared": spared }))?
+            serde_json::to_string_pretty(&serde_json::json!({
+                "swept": swept,
+                "spared": spared,
+                // Aggregates, because a driver reading `swept.len()` alone counts a run
+                // whose every worktree was refused as reclaimed.
+                "worktrees_removed": swept
+                    .iter()
+                    .map(|r| r["removed"].as_u64().unwrap_or(0))
+                    .sum::<u64>(),
+                "worktrees_kept": swept
+                    .iter()
+                    .map(|r| r["kept"].as_u64().unwrap_or(0))
+                    .sum::<u64>(),
+            }))?
         );
         return Ok(ExitCode::Success);
     }
@@ -1344,23 +1361,31 @@ fn cleanup_one(run_id: &str, json: bool, purge: bool, force: bool) -> Result<Exi
     let (paths, _) = project_ctx()?;
     let state = state::RunState::load(&paths, run_id)?;
     let cleaned = worktree::cleanup_run(&state, force)?;
+    let kept_any = cleaned.iter().any(|c| c.skipped.is_some());
     if let Some(session) = &state.tmux_session {
         let _ = tmux::kill_session(session);
     }
-    if purge {
+    // Same rule as the sweep: the record is the only route back to a spared worktree.
+    let purged = purge && !kept_any;
+    if purged {
         let dir = paths.run_dir(run_id);
         if dir.is_dir() {
             std::fs::remove_dir_all(&dir)?;
         }
         worktree::prune_empty_spar_parents(&paths)?;
     }
+    let removed = cleaned.iter().filter(|c| c.removed).count();
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "run_id": run_id,
-                "cleaned": true,
-                "purged": purge,
+                // `cleaned: true` regardless of outcome told an outer agent the removal
+                // happened when every worktree had been refused.
+                "cleaned": removed > 0,
+                "removed": removed,
+                "kept": cleaned.iter().filter(|c| c.skipped.is_some()).count(),
+                "purged": purged,
                 "worktrees": cleaned,
             })
         );
@@ -1386,7 +1411,10 @@ fn cleanup_one(run_id: &str, json: bool, purge: bool, force: bool) -> Result<Exi
             }
         }
         println!("cleaned worktrees for {run_id}");
-        if purge {
+        if purge && kept_any {
+            println!("kept the run record: a worktree still holds work");
+        }
+        if purged {
             println!("purged run dir");
             if !paths.runs_dir().is_dir() {
                 println!("removed empty .spar/runs");
