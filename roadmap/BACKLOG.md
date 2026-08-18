@@ -30,3 +30,39 @@ Unscheduled ideas, grouped by theme. Promote to `roadmap/features/NNN-*.md` when
   `registry::list_visible_project_runs`, but there is no key to show archived runs, no
   archive/undo action and no hidden count, all of which the CLI has. On a TUI-first
   product the TUI can now hide runs it offers no way to recover.
+
+## Slot worktree cost
+
+Measured across `/data/projects` on 2026-08-17, after a disk-full incident: 457 GB of
+587 GB was `target/` + `node_modules`. `spar reclaim` / `auto_reclaim` (O37) now reclaims
+that for finished runs. These two reduce how much gets created in the first place.
+
+- **Collapse `test_author` and `impl` onto one worktree** — they never run concurrently
+  (test_author is dispatched in the plan phase, impl in the implement phase) and compile
+  the same crate graph, so each run carries the same dependency build twice: 5-6 GB per
+  run, and 5 of the 9 `target/` dirs found on the box belonged to test_author slots.
+  The tester slot already does exactly this correctly, reusing the implementer's cwd
+  (`implement.rs`, `s.cwd = Some(review_cwd.clone())`).
+  **Not a directory change — a branch identity change**, which is why it was not folded
+  into O37:
+  - Sharing a worktree shares its branch, so implementer commits land on
+    `spar/<run>/test-author-*`. That changes what `ship` pushes and what
+    `merged_into_base` reasons over, and **O26 ties the no-rebase rule specifically to
+    the author worktree being reused and overlaid**.
+  - `apply_spec_tests_to_impl` becomes a no-op, including the git-visible-only
+    enumeration and the ignored-file notice added in O30. That needs re-deciding, not
+    deleting.
+  - Must be **conditional on workflow**: arena dispatches N implementers that genuinely
+    do run concurrently (`arena.rs`), so an unconditional collapse puts concurrent
+    implementers in one tree — the isolation regression this is supposed to avoid.
+- **Non-building roles do not need a build-capable worktree** — planner, plan_critic and
+  reviewers emit markdown and produced no `target/` in any tree on the box, ever.
+  Lower payoff than it looks, and partly already done:
+  - In the **loop** workflow reviewers already share the implementer's cwd
+    (`implement.rs`, "Only isolate the implementer; reviewers share its cwd") — only the
+    standalone `review` workflow cuts one per reviewer (`review.rs`).
+  - What remains is planner + plan_critic + standalone-review reviewers at ~40 MB each:
+    tens of MB, so the value is preventing a future accidental compile, not reclaiming.
+  - Not free: dropping the worktree makes cwd fall back to `project_root`, which is the
+    `isolation = "none"` shape that artifact-recovery had to be guarded against in O31.
+    A shared read-only reviewer tree has to stay read-only against concurrent reviewers.
