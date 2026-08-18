@@ -301,12 +301,23 @@ pub struct WorktreeConfig {
     /// a phase check, this one only deletes work git says is already in the base branch.
     #[serde(default = "default_true")]
     pub auto_cleanup_merged: bool,
+
+    /// Where slot worktrees are cut.
+    ///
+    /// Unset keeps the historical layout: siblings of the repo, at
+    /// `../<repo>-spar-<run>-<slot>`. Setting it collects every run under one
+    /// directory instead, at `<root>/<repo>/<run>-<slot>`, which keeps a project's
+    /// parent directory clean and gives the whole tree a single place to sweep.
+    /// A leading `~` is expanded.
+    #[serde(default)]
+    pub root: Option<String>,
 }
 
 impl Default for WorktreeConfig {
     fn default() -> Self {
         Self {
             auto_cleanup_merged: true,
+            root: None,
         }
     }
 }
@@ -528,6 +539,7 @@ struct ConfigFile {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct WorktreeConfigFile {
     auto_cleanup_merged: Option<bool>,
+    root: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -688,6 +700,9 @@ impl Config {
         if let Some(w) = &file.worktree {
             if let Some(v) = w.auto_cleanup_merged {
                 self.worktree.auto_cleanup_merged = v;
+            }
+            if let Some(v) = &w.root {
+                self.worktree.root = Some(v.clone());
             }
         }
         if let Some(p) = &file.providers {

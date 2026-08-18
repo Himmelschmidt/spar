@@ -6,16 +6,55 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Sibling path: `../<repo>-spar-<run>-<slot>`
-pub fn worktree_path(project_root: &Path, run_id: &str, slot_id: &str) -> Result<PathBuf> {
+/// Expand a leading `~`, so `worktree.root` can be written the way a human types it.
+fn expand_tilde(raw: &str) -> PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    if raw == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
+    PathBuf::from(raw)
+}
+
+/// The configured `worktree.root`, expanded.
+///
+/// Takes the config rather than loading it so `worktree_path` stays a pure function of
+/// its arguments: callers already hold the run's config, and a path helper that reads
+/// ambient user config would make its own tests depend on the machine they run on.
+pub fn worktree_root(cfg: &crate::config::Config) -> Option<PathBuf> {
+    cfg.worktree.root.as_deref().map(expand_tilde)
+}
+
+/// Where a slot's worktree lives.
+///
+/// Default is the historical sibling path, `../<repo>-spar-<run>-<slot>`. With
+/// `worktree.root` set, runs are collected under it as `<root>/<repo>/<run>-<slot>`
+/// instead, which keeps the repo's parent directory clean and puts every worktree
+/// spar owns in one sweepable place.
+pub fn worktree_path(
+    project_root: &Path,
+    run_id: &str,
+    slot_id: &str,
+    root: Option<&Path>,
+) -> Result<PathBuf> {
     let repo_name = project_root
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("project");
+    let slot_safe = sanitize_slot(slot_id);
+
+    if let Some(root) = root {
+        return Ok(root.join(repo_name).join(format!("{run_id}-{slot_safe}")));
+    }
+
     let parent = project_root
         .parent()
         .ok_or_else(|| anyhow::anyhow!("project root has no parent"))?;
-    let slot_safe = sanitize_slot(slot_id);
     Ok(parent.join(format!("{repo_name}-spar-{run_id}-{slot_safe}")))
 }
 
@@ -158,8 +197,9 @@ pub fn create_worktree(
     run_id: &str,
     slot_id: &str,
     base: Option<&str>,
+    root: Option<&Path>,
 ) -> Result<WorktreeRecord> {
-    let path = worktree_path(project_root, run_id, slot_id)?;
+    let path = worktree_path(project_root, run_id, slot_id, root)?;
     let branch = branch_name(run_id, slot_id);
 
     if path.exists() {
@@ -273,6 +313,9 @@ pub fn prepare_isolation(
             } else {
                 crate::config::Config::for_run(paths, &state.id).ok()
             };
+            // Resolved once here, from the run's own config snapshot, so recovery below
+            // looks for worktrees where this run actually put them.
+            let wt_root = cfg.as_ref().and_then(worktree_root);
             // Reclaim before cutting, and only when actually cutting: the moment new
             // worktrees appear is the moment landed ones stop being worth their disk.
             let cutting_new = slot_ids.iter().any(|sid| {
@@ -316,7 +359,7 @@ pub fn prepare_isolation(
                         continue;
                     }
                 }
-                let expected = worktree_path(&state.project_root, &state.id, sid)?;
+                let expected = worktree_path(&state.project_root, &state.id, sid, wt_root.as_deref())?;
                 if expected.is_dir() {
                     let rec = WorktreeRecord {
                         slot_id: sid.clone(),
@@ -349,6 +392,7 @@ pub fn prepare_isolation(
                         &state.id,
                         sid,
                         state.base_commit.as_deref(),
+                        wt_root.as_deref(),
                     )?
                 };
                 if matches!(
@@ -1255,7 +1299,7 @@ mod tests {
             "a run with no worktrees offers no evidence either way"
         );
 
-        let rec = create_worktree(&root, "runmerge", "impl", state.base_commit.as_deref()).unwrap();
+        let rec = create_worktree(&root, "runmerge", "impl", state.base_commit.as_deref(), None).unwrap();
         state.worktrees.push(rec.clone());
         assert_eq!(
             merged_into_base(&state),
@@ -1345,7 +1389,7 @@ mod tests {
         let mut state = RunState::new("runveto", crate::cli::WorkflowKind::Loop, root.clone());
         state.base_ref = Some(base);
         state.base_commit = git_out(&root, &["rev-parse", "HEAD"]);
-        let rec = create_worktree(&root, "runveto", "impl", state.base_commit.as_deref()).unwrap();
+        let rec = create_worktree(&root, "runveto", "impl", state.base_commit.as_deref(), None).unwrap();
         state.worktrees.push(rec.clone());
 
         // Clean tree, nothing ahead: ordinary cleanup takes it.
@@ -1393,7 +1437,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let (root, _wt, _) = repo_with_linked_worktree(tmp.path());
         let mut state = RunState::new("runbase", crate::cli::WorkflowKind::Loop, root.clone());
-        let rec = create_worktree(&root, "runbase", "impl", None).unwrap();
+        let rec = create_worktree(&root, "runbase", "impl", None, None).unwrap();
         state.worktrees.push(rec.clone());
 
         // Pre-O26: neither field recorded.
@@ -1426,7 +1470,7 @@ mod tests {
         let mut state = RunState::new("rundetach", crate::cli::WorkflowKind::Loop, root.clone());
         state.base_commit = git_out(&root, &["rev-parse", "HEAD"]);
         let rec =
-            create_worktree(&root, "rundetach", "impl", state.base_commit.as_deref()).unwrap();
+            create_worktree(&root, "rundetach", "impl", state.base_commit.as_deref(), None).unwrap();
         state.worktrees.push(rec.clone());
 
         let git = |args: &[&str]| {
@@ -1635,7 +1679,7 @@ mod tests {
     #[test]
     fn path_shape() {
         let p =
-            worktree_path(Path::new("/home/u/projects/foo"), "abcd1234", "impl-claude").unwrap();
+            worktree_path(Path::new("/home/u/projects/foo"), "abcd1234", "impl-claude", None).unwrap();
         assert_eq!(
             p,
             PathBuf::from("/home/u/projects/foo-spar-abcd1234-impl-claude")
@@ -1644,6 +1688,43 @@ mod tests {
             branch_name("abcd1234", "impl-claude"),
             "spar/abcd1234/impl-claude"
         );
+    }
+
+    #[test]
+    fn configured_root_collects_runs_instead_of_scattering_siblings() {
+        let root = PathBuf::from("/srv/spar-worktrees");
+        let p = worktree_path(
+            Path::new("/home/u/projects/foo"),
+            "abcd1234",
+            "impl-claude",
+            Some(&root),
+        )
+        .unwrap();
+        assert_eq!(
+            p,
+            PathBuf::from("/srv/spar-worktrees/foo/abcd1234-impl-claude")
+        );
+        // The point of the setting: nothing lands beside the repo any more.
+        assert!(!p.starts_with("/home/u/projects/foo-spar"));
+        assert!(p.starts_with(&root));
+    }
+
+    #[test]
+    fn unset_root_keeps_the_sibling_layout() {
+        let cfg = crate::config::Config::default();
+        assert!(
+            worktree_root(&cfg).is_none(),
+            "default must stay the historical sibling path"
+        );
+    }
+
+    #[test]
+    fn configured_root_expands_a_leading_tilde() {
+        let mut cfg = crate::config::Config::default();
+        cfg.worktree.root = Some("~/projects/spar/worktrees".into());
+        let expanded = worktree_root(&cfg).expect("root is set");
+        assert!(expanded.is_absolute(), "~ must not survive into a git path");
+        assert!(expanded.ends_with("projects/spar/worktrees"));
     }
 
     #[test]
@@ -1678,7 +1759,7 @@ mod tests {
             .current_dir(&root)
             .status();
 
-        let rec = create_worktree(&root, "runtest1", "slot-a", None).unwrap();
+        let rec = create_worktree(&root, "runtest1", "slot-a", None, None).unwrap();
         assert!(rec.path.is_dir());
         remove_worktree(&root, &rec).unwrap();
         assert!(!rec.path.exists());
@@ -1818,7 +1899,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let (root, wt, feat_head) = repo_with_linked_worktree(tmp.path());
         let base = resolve_base(&root, &wt, None).unwrap().unwrap();
-        let rec = create_worktree(&root, "runbase1", "slot-a", Some(&base.commit)).unwrap();
+        let rec = create_worktree(&root, "runbase1", "slot-a", Some(&base.commit), None).unwrap();
         let head = git_out(&rec.path, &["rev-parse", "HEAD"]).unwrap();
         assert_eq!(head, feat_head, "slot must branch from the invoking HEAD");
         assert!(rec.path.join("feature.txt").is_file());
