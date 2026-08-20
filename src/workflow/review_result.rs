@@ -387,7 +387,7 @@ mod tests {
 
     #[test]
     fn contract_criteria_extracted_in_order() {
-        let body = "## Scenarios\n- AC-1 foo\n- AC-3 bar\n- AC-2 baz\n";
+        let body = "## Scenarios\n- [ ] AC-1: foo\n- [ ] AC-3: bar\n- [ ] AC-2: baz\n";
         assert_eq!(parse_contract_criteria(body), ["AC-1", "AC-3", "AC-2"]);
     }
 
@@ -400,5 +400,184 @@ mod tests {
     #[test]
     fn contract_criteria_empty_when_absent() {
         assert!(parse_contract_criteria("## Scenarios\nnothing here\n").is_empty());
+    }
+
+    fn ids(n: std::ops::RangeInclusive<u32>) -> Vec<String> {
+        n.map(|i| format!("AC-{i}")).collect()
+    }
+
+    /// AC-1. The checklist form the house template teaches, plus the bullet and ordered
+    /// markers an author reaches for without thinking about it.
+    #[test]
+    fn contract_checklist_forms_declare() {
+        let body = "\
+## Scenarios
+- [ ] AC-1: unchecked — verify: `x`
+- [x] AC-2: checked lower — verify: `x`
+- [X] AC-3: checked upper — verify: `x`
+* [ ] AC-4: star bullet — verify: `x`
++ [ ] AC-5: plus bullet — verify: `x`
+1. [ ] AC-6: ordered dot — verify: `x`
+2) [x] AC-7: ordered paren — verify: `x`
+3. AC-8: ordered, no checkbox — verify: `x`
+- AC-9: plain bullet — verify: `x`
+  - [ ] AC-10: indented two — verify: `x`
+    - [ ] AC-11: indented four — verify: `x`
+";
+        assert_eq!(parse_contract_criteria(body), ids(1..=11));
+    }
+
+    /// AC-1. Bare line-start and the markdown emphasis an author wraps the id in. The
+    /// colon may sit inside or outside the delimiters.
+    #[test]
+    fn contract_bare_and_emphasised_forms_declare() {
+        let body = "\
+AC-1: bare line start
+- **AC-2:** bold, colon inside
+- **AC-3**: bold, colon outside
+- `AC-4:` code span, colon inside
+- `AC-5`: code span, colon outside
+- _AC-6_: underscore
+**AC-7:** bold with no bullet
+";
+        assert_eq!(parse_contract_criteria(body), ids(1..=7));
+    }
+
+    /// AC-1. Heading form: a separator after the id is optional, and any level declares.
+    #[test]
+    fn contract_heading_forms_declare() {
+        let body = "\
+### AC-1
+#### AC-2: with colon
+## AC-3 - with dash
+###### AC-4 — with em dash
+### `AC-5`
+";
+        assert_eq!(parse_contract_criteria(body), ids(1..=5));
+    }
+
+    /// AC-2. The `d995e566` regression: a Notes aside naming a future id made `AC-17` a
+    /// criterion no reviewer could report, and the ship gate became unreachable.
+    #[test]
+    fn contract_prose_mentions_do_not_declare() {
+        let body = "\
+## Scenarios
+- [ ] AC-1: real — verify: `x`
+- [ ] AC-2: real — verify: `x`
+
+## Non-goals
+- do not implement AC-30 here
+
+## Notes
+**The 2 ids are frozen.** Later rounds append `AC-17` onward; they do not renumber.
+See AC-1 for the rationale, and compare with AC-18 in the sibling run.
+- AC-19 deferred to a later round
+- AC-20 was dropped: see the notes above
+- [ ] AC-21 — a checklist line with no colon after the id
+";
+        assert_eq!(parse_contract_criteria(body), ["AC-1", "AC-2"]);
+    }
+
+    /// AC-3. A contract that shows the house format in a fenced block declares nothing
+    /// from inside it, whatever fence character or length it uses.
+    #[test]
+    fn contract_fenced_blocks_declare_nothing() {
+        let body = "\
+## Scenarios
+- [ ] AC-1: real — verify: `x`
+
+## How to write one
+```
+- [ ] AC-40: fenced sample — verify: `x`
+```
+
+~~~markdown
+- [ ] AC-41: tilde fenced sample — verify: `x`
+~~~
+
+````text
+```
+- [ ] AC-42: nested fence sample — verify: `x`
+```
+````
+
+  ```md
+  - [ ] AC-43: indented fence — verify: `x`
+  ```
+
+## Scenarios (continued)
+- [ ] AC-2: still real — verify: `x`
+";
+        assert_eq!(parse_contract_criteria(body), ["AC-1", "AC-2"]);
+    }
+
+    /// AC-3. An unterminated fence swallows the rest of the file rather than reopening
+    /// the token scan, and criteria declared before it survive.
+    #[test]
+    fn contract_unclosed_fence_keeps_earlier_criteria() {
+        let body = "\
+## Scenarios
+- [ ] AC-1: real — verify: `x`
+
+```
+- [ ] AC-50: never closed — verify: `x`
+- [ ] AC-51: also swallowed — verify: `x`
+";
+        assert_eq!(parse_contract_criteria(body), ["AC-1"]);
+    }
+
+    /// AC-4. Case folding, first-appearance order and dedup are unchanged by the
+    /// grammar narrowing.
+    #[test]
+    fn contract_case_folded_and_deduplicated_in_declaration_order() {
+        let body = "\
+## Scenarios
+- [ ] ac-2: lower — verify: `x`
+- [ ] Ac-1: mixed — verify: `x`
+- [ ] AC-2: declared twice — verify: `x`
+";
+        assert_eq!(parse_contract_criteria(body), ["AC-2", "AC-1"]);
+    }
+
+    /// AC-4. `AC-` with no digits, and an id glued to a preceding word, are not tokens.
+    #[test]
+    fn contract_malformed_ids_declare_nothing() {
+        let body =
+            "## Scenarios\n- [ ] AC-: no digits\n- [ ] XAC-1: glued\n- [ ] AC-x1: not a digit\n";
+        assert!(parse_contract_criteria(body).is_empty());
+    }
+
+    /// AC-10. The overlay note appended to the *prompt copy* is declaration-shaped: the
+    /// gate must never be built from that copy. Pins the shape the end-to-end guard in
+    /// `tests/scenarios/contract_gate.rs` depends on.
+    #[test]
+    fn overlay_note_line_is_declaration_shaped() {
+        let note =
+            "## Not copied (git-ignored in the test-author worktree)\n- `AC-99:fixture.json`\n";
+        assert_eq!(parse_contract_criteria(note), ["AC-99"]);
+    }
+
+    /// AC-5. The reviewer-report side is a different parser with a different contract:
+    /// reviewers write bare `AC-n: pass` lines under `## Acceptance` and must keep
+    /// working. Narrowing the *contract* grammar must not narrow this one.
+    #[test]
+    fn reviewer_acceptance_lines_still_parse_without_declaration_syntax() {
+        let r = parse_review(
+            "## Verdict\napprove\n\n## Acceptance\nAC-1: pass — evidence\nac-2: pass - evidence\n- AC-3: fail — broken\n**AC-4**: unverified — no time\n",
+        );
+        let got: Vec<(&str, AcStatus)> = r
+            .acceptance
+            .iter()
+            .map(|a| (a.id.as_str(), a.status))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("AC-1", AcStatus::Pass),
+                ("AC-2", AcStatus::Pass),
+                ("AC-3", AcStatus::Fail),
+                ("AC-4", AcStatus::Unverified),
+            ]
+        );
     }
 }

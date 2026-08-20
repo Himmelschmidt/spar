@@ -1919,3 +1919,66 @@ mod suite_parse_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod contract_freeze_tests {
+    use super::FrozenContract;
+    use crate::workflow::review_result::parse_contract_criteria;
+
+    const BODY: &str = "## Scenarios\n- [ ] AC-1: a — verify: `x`\n- [ ] AC-2: b — verify: `x`\n";
+
+    /// AC-8.
+    #[test]
+    fn freeze_captures_the_declared_criteria_and_the_bytes_on_disk() {
+        let frozen = FrozenContract::freeze(BODY);
+        assert_eq!(frozen.criteria, ["AC-1", "AC-2"]);
+        assert_eq!(frozen.body, BODY);
+        assert!(
+            !frozen.fingerprint.is_empty(),
+            "the fingerprint is what `status --json` reports; it cannot be blank"
+        );
+    }
+
+    /// AC-8.
+    #[test]
+    fn fingerprint_is_stable_for_the_same_body_and_moves_with_it() {
+        let a = FrozenContract::freeze(BODY);
+        let b = FrozenContract::freeze(BODY);
+        assert_eq!(a.fingerprint, b.fingerprint);
+        let amended = format!("{BODY}- [ ] AC-3: c — verify: `x`\n");
+        assert_ne!(a.fingerprint, FrozenContract::freeze(&amended).fingerprint);
+    }
+
+    /// AC-9.
+    #[test]
+    fn drift_is_measured_against_the_body_that_was_frozen() {
+        let frozen = FrozenContract::freeze(BODY);
+        assert!(!frozen.drifted(BODY));
+        // Same length, one byte different: a fingerprint that only counted bytes would
+        // miss a criterion being reworded in place.
+        let same_len = BODY.replace("AC-2: b —", "AC-2: q —");
+        assert_eq!(same_len.len(), BODY.len());
+        assert!(frozen.drifted(&same_len));
+        assert!(frozen.drifted(&format!("{BODY}- [ ] AC-3: added mid-run\n")));
+    }
+
+    /// AC-9, AC-10. The invariant that survived the round loop only by accident of
+    /// ordering: the
+    /// overlay note is appended to the *prompt copy*, and the note names git-ignored
+    /// paths, so a file called `AC-99:fixture.json` reads as a criterion declaration.
+    /// The frozen criteria must come from the bytes on disk, never from that copy.
+    #[test]
+    fn overlay_note_on_the_prompt_copy_cannot_reach_the_gate() {
+        let frozen = FrozenContract::freeze(BODY);
+        let mut prompt_copy = frozen.body.clone();
+        prompt_copy.push_str(
+            "\n## Not copied (git-ignored in the test-author worktree)\n- `AC-99:fixture.json`\n",
+        );
+        assert!(
+            parse_contract_criteria(&prompt_copy).contains(&"AC-99".to_string()),
+            "guard is vacuous unless the note is declaration-shaped"
+        );
+        assert_eq!(frozen.criteria, ["AC-1", "AC-2"]);
+        assert!(!frozen.drifted(BODY), "the prompt copy is not the contract");
+    }
+}
