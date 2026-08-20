@@ -1,6 +1,6 @@
 # TUI information architecture: nouns, Home, and gate evidence
 
-**Status:** DECIDED (product planning)
+**Status:** DECIDED (product planning)  
 **Decisions:** U6-U13. Supersedes U3 in part. Extends U1, U4, U5, X2.
 
 ---
@@ -130,11 +130,12 @@ an animated transition.
 
 **Off-thread `Snapshot` scans (U13).** `rail_project_items` calls
 `registry::list_visible_project_runs(&p.root)` once per project per redraw to compute the
-flag roll-up (`src/tui.rs:2830`), and again at `src/tui.rs:1312`. That is a directory scan
-inside `draw`. The refresher thread already does it correctly off-thread, into the immutable
-`Snapshot`, at `src/tui.rs:873`. Both render-path call sites move onto `Snapshot` so `draw`
-never touches disk. This bites at the scale already hit once, when run dirs accumulated into
-the thousands.
+flag roll-up (`src/tui.rs:2830`). That is a directory scan inside `draw`, the one real
+render-path offender. `project_overview`'s call at `src/tui.rs:1312` is not: it runs inside
+`build_snapshot` (`src/tui.rs:869`), the refresher thread's off-thread builder, alongside the
+correct call at `src/tui.rs:873`. `rail_project_items` moves onto `Snapshot` so `draw` never
+touches disk. This bites at the scale already hit once, when run dirs accumulated into the
+thousands.
 
 **Design tokens and stability assertions.** A token set replaces scattered color consts,
 held to one accent and one alert colour, a consistent border and weight language, and

@@ -125,7 +125,7 @@ TUI restructure (2026-07-14). See `roadmap/tui-redesign-plan.md` for the staged 
 | U10 | **Motion is time-based** (`Instant`, easing curves, `Tween<T>`, enter/exit transitions), never tick-modulo. The frame clock ramps to ~16ms while `app.animated` is set and idles low otherwise; `FRAME` at a flat 100ms reads as a slideshow | DECIDED |
 | U11 | **Reserve space from the layout, never from the content.** Content clips into fixed slots, skeletons hold space before data lands, reorder is an animated transition. Kills all four current shift sources: width-summed gate buttons, attention re-sort, growing lists, the width-breakpoint tab strip | DECIDED |
 | U12 | **Design tokens, not scattered consts**, one accent and one alert colour held to strictly, a consistent border and weight language, braille/half-block density where it earns its place. Stability is asserted, not vibed: a `TestBackend` snapshot harness covers 20x5, empty project list, 400 runs, and "this region does not move when that value changes" | DECIDED |
-| U13 | **`draw` never touches disk.** Every read is the refresher thread's job and arrives on `Snapshot`. Today `registry::list_visible_project_runs` runs per project per redraw (`src/tui.rs:2830`, `src/tui.rs:1312`) while the refresher already does it correctly off-thread (`src/tui.rs:873`) | DECIDED |
+| U13 | **`draw` never touches disk.** Every read is the refresher thread's job and arrives on `Snapshot`. Today `rail_project_items` calls `registry::list_visible_project_runs` per project per redraw (`src/tui.rs:2830`), a real render-path scan, while the refresher already does the equivalent work correctly off-thread inside `build_snapshot` (`src/tui.rs:873`) | DECIDED |
 
 ## Open
 

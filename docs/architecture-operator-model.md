@@ -1,7 +1,7 @@
 # Operator model: the session is disposable
 
-**Status:** DECIDED (product planning)
-**Decisions:** P7, O38-O42, X9, X10
+**Status:** DECIDED (product planning)  
+**Decisions:** P7, O38-O42, X9, X10  
 **Supersedes:** nothing. Extends B1 (notify sink), Z2 (abandoned is computed), O1 (one run id).
 
 ---
@@ -34,9 +34,9 @@ fleet." It can, and the correction is scoped into feature 003.
 `RunState::save` already detects phase transitions and appends `phase` plus `gate` events
 (`src/state.rs:441-454`), but the only route to the external `[notify]` sink is `bus::send`
 routing an `@human`-addressed message (`src/bus.rs:451-454`). A run arriving at
-`awaiting_plan_approval` or `awaiting_ship_confirm` notify sink never fires; nothing sends a
-message that would trigger it. The operator finds out only if a live `spar wait` happens to
-be attached.
+`awaiting_plan_approval` or `awaiting_ship_confirm` never reaches the notify sink: nothing
+sends a message that would trigger it. The operator finds out only if a live `spar wait`
+happens to be attached.
 
 ### Cause 3: the monitor is single-shot and fragile
 
@@ -115,6 +115,8 @@ Task intake is a written brief on disk: `spar plan --spec <file>` or stdin, stor
 `spar resume <id>` recovers a stopped or abandoned run. Both give a disposable session a
 way to get current without having lived through the run.
 
+---
+
 ## The target flow
 
 1. Operator talks a task through with a chat session, exactly as today.
@@ -137,7 +139,7 @@ not require the TUI to host a conversation; that question stays open under X10.
 
 ---
 
-## The per-project daemon and `setsid`
+## Making `--detach` detach (O38)
 
 O38 makes `--detach` actually detach: `setsid` / `process_group(0)`, plus a startup
 handshake where the parent confirms the child holds the `RunLock`

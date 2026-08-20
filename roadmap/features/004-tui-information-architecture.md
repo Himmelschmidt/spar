@@ -41,8 +41,8 @@ start a run without one already selected, per U3's deliberate CLI punt.
 - Home replaces `BrowseLevel::Projects` as the landing view: what needs me (ranked by wait
   time), running, finished since last look, start something new.
 - New-run flow (`n` on Home): brief field plus fleet picker, superseding U3's punt.
-- Render-path directory scans (`src/tui.rs:2830`, `src/tui.rs:1312`) move onto the
-  off-thread `Snapshot` the refresher already builds correctly (`src/tui.rs:873`).
+- The render-path directory scan in `rail_project_items` (`src/tui.rs:2830`) moves onto
+  the off-thread `Snapshot` the refresher already builds correctly (`src/tui.rs:873`).
 
 ## Non-goals
 
@@ -59,9 +59,10 @@ Fix the stale focus-model comments at `src/tui.rs:55` and `src/tui.rs:4161`.
 
 ### Phase B: off-thread `Snapshot` directory scan migration
 
-Move both `registry::list_visible_project_runs` render-path call sites
-(`src/tui.rs:2830`, `src/tui.rs:1312`) onto `Snapshot`, matching the refresher's existing
-off-thread path (`src/tui.rs:873`), so `draw` never touches disk.
+Move `rail_project_items`'s `registry::list_visible_project_runs` call
+(`src/tui.rs:2830`) onto `Snapshot`, matching the refresher's existing off-thread path
+(`src/tui.rs:873`), so `draw` never touches disk. `project_overview`'s call
+(`src/tui.rs:1312`) already runs inside `build_snapshot` and needs no change.
 
 ### Phase C: Home landing view and wait-time ranking
 
