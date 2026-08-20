@@ -1111,34 +1111,39 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
 
         // Detected from disk, against the frozen body, never against `test_contract_body`
         // (which carries the overlay note appended above). Loud, not blocking: the gate
-        // still judges the frozen criteria, and spar never rewrites the artifact.
+        // still judges the frozen criteria, and spar never rewrites the artifact. A read
+        // error (the file removed mid-round) is the loudest possible tamper and must not
+        // go silent just because there is nothing to diff against; it is only skipped
+        // when the freeze itself had no real criteria (`[spec] enabled = false`), since
+        // there is nothing an operator needs to be told about a placeholder contract.
         let mut contract_drift_note = String::new();
-        if let Ok(on_disk) = std::fs::read_to_string(paths.artifact(&state.id, "test-contract.md"))
-        {
-            if frozen.drifted(&on_disk) {
-                state.contract_modified = true;
-                let msg = format!(
-                    "test-contract.md changed after the freeze (write window held by \
-                     implementer slot `{}`); the acceptance gate still judges the frozen \
-                     contract",
-                    impl_slot.id
-                );
-                eprintln!("warning: {msg}");
-                let _ = crate::events::append(
-                    paths,
-                    &state.id,
-                    &crate::events::Event::info(msg.clone()),
-                );
-                let _ = crate::bus::broadcast(
-                    paths,
-                    Some(&state.id),
-                    "orchestrator",
-                    msg.clone(),
-                    state.message_budget,
-                );
-                contract_drift_note = format!("\n**Contract drift detected.** {msg}\n");
-                state.save(paths)?;
-            }
+        let drift_reason =
+            match std::fs::read_to_string(paths.artifact(&state.id, "test-contract.md")) {
+                Ok(on_disk) if frozen.drifted(&on_disk) => Some("changed".to_string()),
+                Ok(_) => None,
+                Err(_) if !frozen.criteria.is_empty() => Some("could not be re-read".to_string()),
+                Err(_) => None,
+            };
+        if let Some(reason) = drift_reason {
+            state.contract_modified = true;
+            let msg = format!(
+                "test-contract.md {reason} after the freeze (write window held by \
+                 implementer slot `{}`); the acceptance gate still judges the frozen \
+                 contract",
+                impl_slot.id
+            );
+            eprintln!("warning: {msg}");
+            let _ =
+                crate::events::append(paths, &state.id, &crate::events::Event::info(msg.clone()));
+            let _ = crate::bus::broadcast(
+                paths,
+                Some(&state.id),
+                "orchestrator",
+                msg.clone(),
+                state.message_budget,
+            );
+            contract_drift_note = format!("\n**Contract drift detected.** {msg}\n");
+            state.save(paths)?;
         }
 
         let mut any_request_changes = suite_channel_active && suite_blocks_ship(suite_outcome);

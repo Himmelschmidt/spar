@@ -277,17 +277,30 @@ struct FenceState {
     len: usize,
 }
 
-/// A fence marker: up to 3 leading spaces, then 3+ of the same backtick/tilde.
-fn fence_marker(trimmed: &str, indent: usize) -> Option<FenceState> {
-    if indent > 3 {
-        return None;
-    }
+/// An opening fence: 3+ of the same backtick/tilde, any indentation. A phantom
+/// criterion (a fence not recognized as one) wedges the ship gate; a criterion missed
+/// inside a genuine fence only weakens it. Given that asymmetry, over-recognizing
+/// fences is the safe direction, so indentation is not a disqualifier here the way it
+/// is for CommonMark's top-level fences. An info string (` ```markdown `) may follow.
+fn fence_open(trimmed: &str) -> Option<FenceState> {
     let ch = trimmed.as_bytes().first().copied()?;
     if ch != b'`' && ch != b'~' {
         return None;
     }
     let len = trimmed.bytes().take_while(|&b| b == ch).count();
     (len >= 3).then_some(FenceState { ch, len })
+}
+
+/// Whether `trimmed` closes the fence opened by `open`: the same char, at least as
+/// long, and nothing but whitespace after the run. An info string on the line
+/// (` ```rust `) makes it an opener, not a closer, so a fence nested inside a
+/// differently-tagged outer fence cannot close the outer one early.
+fn fence_closes(trimmed: &str, open: &FenceState) -> bool {
+    if trimmed.as_bytes().first() != Some(&open.ch) {
+        return false;
+    }
+    let len = trimmed.bytes().take_while(|&b| b == open.ch).count();
+    len >= open.len && trimmed[len..].trim().is_empty()
 }
 
 /// Every `AC-<digits>` this contract *declares*: a checklist/bare-line item or a
@@ -302,17 +315,14 @@ pub fn parse_contract_criteria(body: &str) -> Vec<String> {
 
     for raw in body.lines() {
         let trimmed = raw.trim_start();
-        let indent = raw.len() - trimmed.len();
 
         if let Some(open) = &fence {
-            if let Some(close) = fence_marker(trimmed, indent) {
-                if close.ch == open.ch && close.len >= open.len {
-                    fence = None;
-                }
+            if fence_closes(trimmed, open) {
+                fence = None;
             }
             continue;
         }
-        if let Some(open) = fence_marker(trimmed, indent) {
+        if let Some(open) = fence_open(trimmed) {
             fence = Some(open);
             continue;
         }
@@ -656,6 +666,47 @@ See AC-1 for the rationale, and compare with AC-18 in the sibling run.
   ```
 
 ## Scenarios (continued)
+- [ ] AC-2: still real — verify: `x`
+";
+        assert_eq!(parse_contract_criteria(body), ["AC-1", "AC-2"]);
+    }
+
+    /// Review finding on this run: a fence indented four or more spaces is the ordinary
+    /// shape for a code sample nested inside a list item, and a cap at three spaces
+    /// (CommonMark's rule for top-level fences) let its contents parse as declarations
+    /// again, reopening defect 1's exact wedge. Fences declare nothing regardless of
+    /// indentation now.
+    #[test]
+    fn contract_deeply_indented_fence_declares_nothing() {
+        let body = "\
+## Scenarios
+- [ ] AC-1: real — verify: `x`
+
+- an example nested in a list item:
+    ```markdown
+    - [ ] AC-40: sample — verify: `x`
+    ```
+
+- [ ] AC-2: still real — verify: `x`
+";
+        assert_eq!(parse_contract_criteria(body), ["AC-1", "AC-2"]);
+    }
+
+    /// Review finding on this run: a same-length fence line that carries an info
+    /// string (` ```rust `) is an opener, not a bare closing delimiter, and must not
+    /// close the enclosing fence early. Only a delimiter line with nothing but the
+    /// fence characters (plus trailing whitespace) closes.
+    #[test]
+    fn contract_info_string_line_does_not_close_the_fence() {
+        let body = "\
+## Scenarios
+- [ ] AC-1: real — verify: `x`
+
+```markdown
+```rust
+- [ ] AC-40: swallowed regardless — verify: `x`
+```
+
 - [ ] AC-2: still real — verify: `x`
 ";
         assert_eq!(parse_contract_criteria(body), ["AC-1", "AC-2"]);
