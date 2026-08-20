@@ -961,6 +961,34 @@ fn implement_dry_run_unverified_blocks_by_default() {
         .stdout(predicate::str::contains("awaiting_ship_confirm").not());
 }
 
+/// A PATH containing stub `claude`, `grok` and `agy` binaries.
+///
+/// `pick_providers` filters by presence *before* the quota gate, so a provider that is
+/// not installed never reaches it. A test that needs a specific provider paused-but-live
+/// therefore depends on which vendor CLIs the developer happens to have — and quietly
+/// stops testing what it was written for on a machine that has only some of them.
+/// Stubbing them makes the fleet real regardless of the host.
+///
+/// The stubs are never executed here: these tests stop at the quota gate, which only
+/// consults presence. They must still be executable for `which` to resolve them.
+fn path_with_stub_provider_clis(bin: &std::path::Path) -> String {
+    std::fs::create_dir_all(bin).unwrap();
+    for name in ["claude", "grok", "agy"] {
+        let stub = bin.join(name);
+        std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
 #[test]
 fn quota_exit_when_all_paused() {
     let tmp = tempdir().unwrap();
@@ -1023,15 +1051,18 @@ fn quota_exit_when_all_paused() {
 fn quota_partial_pause_fails_loud_without_collapse() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
+    let path_env = path_with_stub_provider_clis(&tmp.path().join("bin"));
 
     spar_cmd()
         .current_dir(tmp.path())
+        .env("PATH", &path_env)
         .args(["provider", "pause", "cli:grok"])
         .assert()
         .success();
 
     let r = spar_cmd()
         .current_dir(tmp.path())
+        .env("PATH", &path_env)
         .args([
             "plan",
             "--task",
@@ -1042,38 +1073,37 @@ fn quota_partial_pause_fails_loud_without_collapse() {
         ])
         .output()
         .unwrap();
+
     let code = r.status.code().unwrap_or(1);
-    if code == 4 {
-        let v: serde_json::Value = serde_json::from_slice(&r.stdout).expect("quota json");
-        assert_eq!(v["exit_code"], 4);
-        assert_eq!(v["phase"], "quota");
-        // Names the paused provider, not a silent swap.
-        assert!(
-            v["error"].as_str().unwrap_or_default().contains("cli:grok"),
-            "error must name the paused provider, got {}",
-            v["error"]
-        );
-        // Positional integrity: the fleet is NOT compacted — grok stays at index 1.
-        let provs: Vec<&str> = v["providers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|p| p.as_str().unwrap())
-            .collect();
-        assert_eq!(
-            provs,
-            ["cli:claude", "cli:grok", "cli:agy"],
-            "paused provider must not be dropped/reindexed"
-        );
-    } else {
-        // Offline / no binaries on PATH: pick_providers filters by presence first.
-        assert_eq!(
-            code,
-            1,
-            "expected quota(4) when providers exist, got {code} stderr={}",
-            String::from_utf8_lossy(&r.stderr)
-        );
-    }
+    assert_eq!(
+        code,
+        4,
+        "all three CLIs are stubbed onto PATH, so the paused one reaches the gate; \
+         got {code} stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let v: serde_json::Value = serde_json::from_slice(&r.stdout).expect("quota json");
+    assert_eq!(v["exit_code"], 4);
+    assert_eq!(v["phase"], "quota");
+    // Names the paused provider, not a silent swap.
+    assert!(
+        v["error"].as_str().unwrap_or_default().contains("cli:grok"),
+        "error must name the paused provider, got {}",
+        v["error"]
+    );
+    // Positional integrity: the fleet is NOT compacted — grok stays at index 1.
+    let provs: Vec<&str> = v["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        provs,
+        ["cli:claude", "cli:grok", "cli:agy"],
+        "paused provider must not be dropped/reindexed"
+    );
 }
 
 #[test]
