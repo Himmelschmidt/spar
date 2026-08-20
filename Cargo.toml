@@ -89,3 +89,7 @@ path = "tests/scenarios/cleanup_sweep.rs"
 [[test]]
 name = "archive"
 path = "tests/scenarios/archive.rs"
+
+[[test]]
+name = "contract_gate"
+path = "tests/scenarios/contract_gate.rs"

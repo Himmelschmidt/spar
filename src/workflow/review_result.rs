@@ -172,12 +172,177 @@ fn parse_ac_line(raw: &str) -> Option<AcLine> {
     })
 }
 
-/// Every `AC-<digits>` token in a contract body, uppercased, deduplicated,
-/// in first-appearance order.
+/// Characters treated as markup noise around an id: emphasis and code-span delimiters.
+/// Distinct from `NOISE` above, which also folds in bullets and spaces for the
+/// reviewer-report parser's different grammar.
+const ID_NOISE: [char; 3] = ['*', '_', '`'];
+
+fn strip_id_noise(s: &str) -> &str {
+    s.trim_start_matches(ID_NOISE)
+}
+
+/// Matches a case-insensitive `AC-<digits>` at the start of `s`. Returns the
+/// canonical uppercased id and whatever follows the digits.
+fn match_ac_digits(s: &str) -> Option<(String, &str)> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 4 {
+        return None;
+    }
+    if !bytes[0].eq_ignore_ascii_case(&b'A')
+        || !bytes[1].eq_ignore_ascii_case(&b'C')
+        || bytes[2] != b'-'
+    {
+        return None;
+    }
+    let digit_len = s[3..].bytes().take_while(u8::is_ascii_digit).count();
+    if digit_len == 0 {
+        return None;
+    }
+    Some((format!("AC-{}", &s[3..3 + digit_len]), &s[3 + digit_len..]))
+}
+
+/// List/bare item form: optional bullet, optional checkbox, optional noise, the id,
+/// optional noise, then a required colon (which may sit on either side of that
+/// trailing noise run — `**AC-1:**` and `**AC-1**:` both declare).
+fn declared_id_list_or_bare(trimmed: &str) -> Option<String> {
+    let s = strip_checkbox(strip_bullet(trimmed));
+    let s = strip_id_noise(s);
+    let (id, rest) = match_ac_digits(s)?;
+    if strip_id_noise(rest).starts_with(':') {
+        Some(id)
+    } else {
+        None
+    }
+}
+
+/// `-`, `*`, `+` followed by whitespace, or an ordered marker (`\d+[.)]`) followed by
+/// whitespace. A marker char with no following whitespace is left untouched — it is
+/// markup (`**bold`), not a list item.
+fn strip_bullet(s: &str) -> &str {
+    if let Some(c) = s.chars().next() {
+        if matches!(c, '-' | '*' | '+') {
+            let rest = &s[c.len_utf8()..];
+            return rest
+                .strip_prefix(' ')
+                .map_or(s, |r| r.trim_start_matches(' '));
+        }
+    }
+    let digit_len = s.bytes().take_while(u8::is_ascii_digit).count();
+    if digit_len > 0 {
+        let after = &s[digit_len..];
+        if let Some(rest) = after.strip_prefix(['.', ')']) {
+            return rest
+                .strip_prefix(' ')
+                .map_or(s, |r| r.trim_start_matches(' '));
+        }
+    }
+    s
+}
+
+fn strip_checkbox(s: &str) -> &str {
+    for cb in ["[ ]", "[x]", "[X]"] {
+        if let Some(rest) = s.strip_prefix(cb) {
+            return rest.trim_start_matches(' ');
+        }
+    }
+    s
+}
+
+/// Heading form: `#`s, whitespace, optional noise, the id, optional noise, then a
+/// colon, dash, em dash, whitespace, or end of line. Anchored at the start of the
+/// heading text, so a heading that merely *mentions* an id further in ("## See AC-30
+/// in appendix") does not match.
+fn declared_id_heading(trimmed: &str) -> Option<String> {
+    let text = trimmed.trim_start_matches('#').trim_start();
+    let s = strip_id_noise(text);
+    let (id, rest) = match_ac_digits(s)?;
+    let rest = strip_id_noise(rest);
+    match rest.chars().next() {
+        None => Some(id),
+        Some(c) if c == ':' || c == '-' || c == '—' || c.is_whitespace() => Some(id),
+        _ => None,
+    }
+}
+
+fn declared_id(trimmed: &str) -> Option<String> {
+    if trimmed.starts_with('#') {
+        declared_id_heading(trimmed)
+    } else {
+        declared_id_list_or_bare(trimmed)
+    }
+}
+
+struct FenceState {
+    ch: u8,
+    len: usize,
+}
+
+/// An opening fence: 3+ of the same backtick/tilde, any indentation. A phantom
+/// criterion (a fence not recognized as one) wedges the ship gate; a criterion missed
+/// inside a genuine fence only weakens it. Given that asymmetry, over-recognizing
+/// fences is the safe direction, so indentation is not a disqualifier here the way it
+/// is for CommonMark's top-level fences. An info string (` ```markdown `) may follow.
+fn fence_open(trimmed: &str) -> Option<FenceState> {
+    let ch = trimmed.as_bytes().first().copied()?;
+    if ch != b'`' && ch != b'~' {
+        return None;
+    }
+    let len = trimmed.bytes().take_while(|&b| b == ch).count();
+    (len >= 3).then_some(FenceState { ch, len })
+}
+
+/// Whether `trimmed` closes the fence opened by `open`: the same char, at least as
+/// long, and nothing but whitespace after the run. An info string on the line
+/// (` ```rust `) makes it an opener, not a closer, so a fence nested inside a
+/// differently-tagged outer fence cannot close the outer one early.
+fn fence_closes(trimmed: &str, open: &FenceState) -> bool {
+    if trimmed.as_bytes().first() != Some(&open.ch) {
+        return false;
+    }
+    let len = trimmed.bytes().take_while(|&b| b == open.ch).count();
+    len >= open.len && trimmed[len..].trim().is_empty()
+}
+
+/// Every `AC-<digits>` this contract *declares*: a checklist/bare-line item or a
+/// heading, matched at the start of the line (after trimming and, for list items,
+/// stripping bullet/checkbox/emphasis noise) and requiring the terminator the
+/// declaration form calls for. A mention anywhere else — mid-sentence, inside Notes
+/// or Non-goals prose, or inside a fenced code block — is not a declaration. Ids are
+/// uppercased, deduplicated, in first-appearance order.
 pub fn parse_contract_criteria(body: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut fence: Option<FenceState> = None;
+
+    for raw in body.lines() {
+        let trimmed = raw.trim_start();
+
+        if let Some(open) = &fence {
+            if fence_closes(trimmed, open) {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some(open) = fence_open(trimmed) {
+            fence = Some(open);
+            continue;
+        }
+
+        if let Some(id) = declared_id(trimmed) {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
+/// Loose backstop for the vacuous-gate diagnostic: any `AC-<digits>` token anywhere in
+/// the body, including mentions and fenced samples. Used only to tell "no criteria
+/// because there's no contract" apart from "no criteria despite the contract talking
+/// about them" — never to build the gate itself.
+pub(crate) fn mentions_criterion_id(body: &str) -> bool {
     let upper = body.to_ascii_uppercase();
     let b = upper.as_bytes();
-    let mut out: Vec<String> = Vec::new();
     let mut i = 0;
     while i + 3 <= b.len() {
         if &b[i..i + 3] == b"AC-" && (i == 0 || !b[i - 1].is_ascii_alphanumeric()) {
@@ -186,17 +351,12 @@ pub fn parse_contract_criteria(body: &str) -> Vec<String> {
                 j += 1;
             }
             if j > i + 3 {
-                let tok = upper[i..j].to_string();
-                if !out.contains(&tok) {
-                    out.push(tok);
-                }
-                i = j;
-                continue;
+                return true;
             }
         }
         i += 1;
     }
-    out
+    false
 }
 
 #[cfg(test)]
@@ -387,7 +547,7 @@ mod tests {
 
     #[test]
     fn contract_criteria_extracted_in_order() {
-        let body = "## Scenarios\n- AC-1 foo\n- AC-3 bar\n- AC-2 baz\n";
+        let body = "## Scenarios\n- [ ] AC-1: foo\n- [ ] AC-3: bar\n- [ ] AC-2: baz\n";
         assert_eq!(parse_contract_criteria(body), ["AC-1", "AC-3", "AC-2"]);
     }
 
@@ -400,5 +560,225 @@ mod tests {
     #[test]
     fn contract_criteria_empty_when_absent() {
         assert!(parse_contract_criteria("## Scenarios\nnothing here\n").is_empty());
+    }
+
+    fn ids(n: std::ops::RangeInclusive<u32>) -> Vec<String> {
+        n.map(|i| format!("AC-{i}")).collect()
+    }
+
+    /// AC-1. The checklist form the house template teaches, plus the bullet and ordered
+    /// markers an author reaches for without thinking about it.
+    #[test]
+    fn contract_checklist_forms_declare() {
+        let body = "\
+## Scenarios
+- [ ] AC-1: unchecked — verify: `x`
+- [x] AC-2: checked lower — verify: `x`
+- [X] AC-3: checked upper — verify: `x`
+* [ ] AC-4: star bullet — verify: `x`
++ [ ] AC-5: plus bullet — verify: `x`
+1. [ ] AC-6: ordered dot — verify: `x`
+2) [x] AC-7: ordered paren — verify: `x`
+3. AC-8: ordered, no checkbox — verify: `x`
+- AC-9: plain bullet — verify: `x`
+  - [ ] AC-10: indented two — verify: `x`
+    - [ ] AC-11: indented four — verify: `x`
+";
+        assert_eq!(parse_contract_criteria(body), ids(1..=11));
+    }
+
+    /// AC-1. Bare line-start and the markdown emphasis an author wraps the id in. The
+    /// colon may sit inside or outside the delimiters.
+    #[test]
+    fn contract_bare_and_emphasised_forms_declare() {
+        let body = "\
+AC-1: bare line start
+- **AC-2:** bold, colon inside
+- **AC-3**: bold, colon outside
+- `AC-4:` code span, colon inside
+- `AC-5`: code span, colon outside
+- _AC-6_: underscore
+**AC-7:** bold with no bullet
+";
+        assert_eq!(parse_contract_criteria(body), ids(1..=7));
+    }
+
+    /// AC-1. Heading form: a separator after the id is optional, and any level declares.
+    #[test]
+    fn contract_heading_forms_declare() {
+        let body = "\
+### AC-1
+#### AC-2: with colon
+## AC-3 - with dash
+###### AC-4 — with em dash
+### `AC-5`
+";
+        assert_eq!(parse_contract_criteria(body), ids(1..=5));
+    }
+
+    /// AC-2. The `d995e566` regression: a Notes aside naming a future id made `AC-17` a
+    /// criterion no reviewer could report, and the ship gate became unreachable.
+    #[test]
+    fn contract_prose_mentions_do_not_declare() {
+        let body = "\
+## Scenarios
+- [ ] AC-1: real — verify: `x`
+- [ ] AC-2: real — verify: `x`
+
+## Non-goals
+- do not implement AC-30 here
+
+## Notes
+**The 2 ids are frozen.** Later rounds append `AC-17` onward; they do not renumber.
+See AC-1 for the rationale, and compare with AC-18 in the sibling run.
+- AC-19 deferred to a later round
+- AC-20 was dropped: see the notes above
+- [ ] AC-21 — a checklist line with no colon after the id
+";
+        assert_eq!(parse_contract_criteria(body), ["AC-1", "AC-2"]);
+    }
+
+    /// AC-3. A contract that shows the house format in a fenced block declares nothing
+    /// from inside it, whatever fence character or length it uses.
+    #[test]
+    fn contract_fenced_blocks_declare_nothing() {
+        let body = "\
+## Scenarios
+- [ ] AC-1: real — verify: `x`
+
+## How to write one
+```
+- [ ] AC-40: fenced sample — verify: `x`
+```
+
+~~~markdown
+- [ ] AC-41: tilde fenced sample — verify: `x`
+~~~
+
+````text
+```
+- [ ] AC-42: nested fence sample — verify: `x`
+```
+````
+
+  ```md
+  - [ ] AC-43: indented fence — verify: `x`
+  ```
+
+## Scenarios (continued)
+- [ ] AC-2: still real — verify: `x`
+";
+        assert_eq!(parse_contract_criteria(body), ["AC-1", "AC-2"]);
+    }
+
+    /// Review finding on this run: a fence indented four or more spaces is the ordinary
+    /// shape for a code sample nested inside a list item, and a cap at three spaces
+    /// (CommonMark's rule for top-level fences) let its contents parse as declarations
+    /// again, reopening defect 1's exact wedge. Fences declare nothing regardless of
+    /// indentation now.
+    #[test]
+    fn contract_deeply_indented_fence_declares_nothing() {
+        let body = "\
+## Scenarios
+- [ ] AC-1: real — verify: `x`
+
+- an example nested in a list item:
+    ```markdown
+    - [ ] AC-40: sample — verify: `x`
+    ```
+
+- [ ] AC-2: still real — verify: `x`
+";
+        assert_eq!(parse_contract_criteria(body), ["AC-1", "AC-2"]);
+    }
+
+    /// Review finding on this run: a same-length fence line that carries an info
+    /// string (` ```rust `) is an opener, not a bare closing delimiter, and must not
+    /// close the enclosing fence early. Only a delimiter line with nothing but the
+    /// fence characters (plus trailing whitespace) closes.
+    #[test]
+    fn contract_info_string_line_does_not_close_the_fence() {
+        let body = "\
+## Scenarios
+- [ ] AC-1: real — verify: `x`
+
+```markdown
+```rust
+- [ ] AC-40: swallowed regardless — verify: `x`
+```
+
+- [ ] AC-2: still real — verify: `x`
+";
+        assert_eq!(parse_contract_criteria(body), ["AC-1", "AC-2"]);
+    }
+
+    /// AC-3. An unterminated fence swallows the rest of the file rather than reopening
+    /// the token scan, and criteria declared before it survive.
+    #[test]
+    fn contract_unclosed_fence_keeps_earlier_criteria() {
+        let body = "\
+## Scenarios
+- [ ] AC-1: real — verify: `x`
+
+```
+- [ ] AC-50: never closed — verify: `x`
+- [ ] AC-51: also swallowed — verify: `x`
+";
+        assert_eq!(parse_contract_criteria(body), ["AC-1"]);
+    }
+
+    /// AC-4. Case folding, first-appearance order and dedup are unchanged by the
+    /// grammar narrowing.
+    #[test]
+    fn contract_case_folded_and_deduplicated_in_declaration_order() {
+        let body = "\
+## Scenarios
+- [ ] ac-2: lower — verify: `x`
+- [ ] Ac-1: mixed — verify: `x`
+- [ ] AC-2: declared twice — verify: `x`
+";
+        assert_eq!(parse_contract_criteria(body), ["AC-2", "AC-1"]);
+    }
+
+    /// AC-4. `AC-` with no digits, and an id glued to a preceding word, are not tokens.
+    #[test]
+    fn contract_malformed_ids_declare_nothing() {
+        let body =
+            "## Scenarios\n- [ ] AC-: no digits\n- [ ] XAC-1: glued\n- [ ] AC-x1: not a digit\n";
+        assert!(parse_contract_criteria(body).is_empty());
+    }
+
+    /// AC-10. The overlay note appended to the *prompt copy* is declaration-shaped: the
+    /// gate must never be built from that copy. Pins the shape the end-to-end guard in
+    /// `tests/scenarios/contract_gate.rs` depends on.
+    #[test]
+    fn overlay_note_line_is_declaration_shaped() {
+        let note =
+            "## Not copied (git-ignored in the test-author worktree)\n- `AC-99:fixture.json`\n";
+        assert_eq!(parse_contract_criteria(note), ["AC-99"]);
+    }
+
+    /// AC-5. The reviewer-report side is a different parser with a different contract:
+    /// reviewers write bare `AC-n: pass` lines under `## Acceptance` and must keep
+    /// working. Narrowing the *contract* grammar must not narrow this one.
+    #[test]
+    fn reviewer_acceptance_lines_still_parse_without_declaration_syntax() {
+        let r = parse_review(
+            "## Verdict\napprove\n\n## Acceptance\nAC-1: pass — evidence\nac-2: pass - evidence\n- AC-3: fail — broken\n**AC-4**: unverified — no time\n",
+        );
+        let got: Vec<(&str, AcStatus)> = r
+            .acceptance
+            .iter()
+            .map(|a| (a.id.as_str(), a.status))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("AC-1", AcStatus::Pass),
+                ("AC-2", AcStatus::Pass),
+                ("AC-3", AcStatus::Fail),
+                ("AC-4", AcStatus::Unverified),
+            ]
+        );
     }
 }
