@@ -10,6 +10,7 @@ use crate::workflow::review_result::{self, AcStatus, ReviewResult};
 use crate::worktree;
 use anyhow::{bail, Result};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 pub fn run_from_cli(
@@ -750,6 +751,33 @@ fn stop_now(state: &mut RunState, paths: &SparPaths) -> Result<()> {
     Ok(())
 }
 
+/// The acceptance contract as it stood when the round loop was entered. `body` is the
+/// bytes read from disk, never the prompt copy: the overlay note appended to the
+/// prompt below must not be readable as a criterion (defect 2, DECISIONS O43).
+pub struct FrozenContract {
+    pub body: String,
+    pub criteria: Vec<String>,
+    pub fingerprint: String,
+}
+
+impl FrozenContract {
+    pub fn freeze(body: &str) -> Self {
+        let criteria = review_result::parse_contract_criteria(body);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        body.hash(&mut hasher);
+        Self {
+            body: body.to_string(),
+            criteria,
+            fingerprint: format!("{:x}", hasher.finish()),
+        }
+    }
+
+    /// Compares against the frozen bytes, not the prompt copy the round mutates.
+    pub fn drifted(&self, on_disk: &str) -> bool {
+        self.body != on_disk
+    }
+}
+
 pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<()> {
     // Only isolate the implementer; reviewers share its cwd.
     let impl_ids: Vec<String> = state
@@ -777,10 +805,33 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
             "(no pre-written acceptance contract — implement without frozen tests)".into()
         })
     };
-    // Parsed once: the acceptance gate compares every reviewer against the same list.
-    // Parsed *before* the overlay note is appended below, so the note can never be read
-    // as a criterion.
-    let contract_criteria = review_result::parse_contract_criteria(&test_contract_body);
+    // Frozen once, from the bytes on disk, before the overlay note is appended below so
+    // the note can never be read as a criterion. Every round for the life of this
+    // `execute_loop` call judges reviewers against this same list; re-entering
+    // `implement --run <id>` is what re-freezes against an amended file (DECISIONS O43).
+    let frozen = FrozenContract::freeze(&test_contract_body);
+    if frozen.criteria.is_empty() && review_result::mentions_criterion_id(&frozen.body) {
+        let msg = "test-contract.md mentions AC-n ids but declares no criteria; \
+                    the acceptance gate is vacuous for this run until a declaration is added"
+            .to_string();
+        eprintln!("warning: {msg}");
+        let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg));
+    }
+    let previous_fingerprint = state.contract_fingerprint.clone();
+    state.contract_fingerprint = Some(frozen.fingerprint.clone());
+    state.contract_modified = false;
+    if previous_fingerprint.is_some_and(|prev| prev != frozen.fingerprint) {
+        let _ = crate::events::append(
+            paths,
+            &state.id,
+            &crate::events::Event::info(format!(
+                "contract re-frozen: {} criteria (fingerprint {})",
+                frozen.criteria.len(),
+                frozen.fingerprint
+            )),
+        );
+    }
+    state.save(paths)?;
     let mut test_contract_body = test_contract_body;
 
     // Bring pre-coding acceptance tests into implementer cwd (fail closed if author ran).
@@ -1058,6 +1109,38 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
             .cloned()
             .collect();
 
+        // Detected from disk, against the frozen body, never against `test_contract_body`
+        // (which carries the overlay note appended above). Loud, not blocking: the gate
+        // still judges the frozen criteria, and spar never rewrites the artifact.
+        let mut contract_drift_note = String::new();
+        if let Ok(on_disk) = std::fs::read_to_string(paths.artifact(&state.id, "test-contract.md"))
+        {
+            if frozen.drifted(&on_disk) {
+                state.contract_modified = true;
+                let msg = format!(
+                    "test-contract.md changed after the freeze (write window held by \
+                     implementer slot `{}`); the acceptance gate still judges the frozen \
+                     contract",
+                    impl_slot.id
+                );
+                eprintln!("warning: {msg}");
+                let _ = crate::events::append(
+                    paths,
+                    &state.id,
+                    &crate::events::Event::info(msg.clone()),
+                );
+                let _ = crate::bus::broadcast(
+                    paths,
+                    Some(&state.id),
+                    "orchestrator",
+                    msg.clone(),
+                    state.message_budget,
+                );
+                contract_drift_note = format!("\n**Contract drift detected.** {msg}\n");
+                state.save(paths)?;
+            }
+        }
+
         let mut any_request_changes = suite_channel_active && suite_blocks_ship(suite_outcome);
         for rev in &reviewers {
             // Stop boundary: before each reviewer job.
@@ -1076,6 +1159,7 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
             extra.insert("suite_guidance".into(), suite_guidance.clone());
             extra.insert("plan_body".into(), plan_body.clone());
             extra.insert("test_contract_body".into(), test_contract_body.clone());
+            extra.insert("contract_drift_note".into(), contract_drift_note.clone());
             let mut job = SlotJob {
                 slot_id: rev.id.clone(),
                 provider: rev.provider.clone(),
@@ -1116,10 +1200,11 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
             if !review_ok || missing_or_empty {
                 any_request_changes = true;
                 if missing_or_empty {
-                    let acceptance = if contract_criteria.is_empty() {
+                    let acceptance = if frozen.criteria.is_empty() {
                         String::new()
                     } else {
-                        let lines: Vec<String> = contract_criteria
+                        let lines: Vec<String> = frozen
+                            .criteria
                             .iter()
                             .map(|id| format!("{id}: unverified — reviewer produced no review"))
                             .collect();
@@ -1140,9 +1225,9 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
                 if !res.approves() {
                     any_request_changes = true;
                 }
-                if acceptance_blocks_ship(&contract_criteria, &res, cfg) {
+                if acceptance_blocks_ship(&frozen.criteria, &res, cfg) {
                     any_request_changes = true;
-                    let reason = acceptance_block_reason(&contract_criteria, &res, cfg);
+                    let reason = acceptance_block_reason(&frozen.criteria, &res, cfg);
                     let _ = crate::bus::broadcast(
                         paths,
                         Some(&state.id),

@@ -88,6 +88,16 @@ pub struct RunState {
     /// reclaims worktrees and leaves the record, and from `--purge`, which deletes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<DateTime<Utc>>,
+    /// Fingerprint of `test-contract.md` as frozen when the round loop was entered.
+    /// `None` only for runs from before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_fingerprint: Option<String>,
+    /// Set when the on-disk contract stopped matching the frozen fingerprint mid-run.
+    /// The gate still judges against the frozen version; this is the loud flag that it
+    /// moved. Not `skip_serializing_if`-omitted: an outer agent must see `false`
+    /// explicitly rather than infer it from the field's absence.
+    #[serde(default)]
+    pub contract_modified: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -366,6 +376,8 @@ impl RunState {
             arena_finish: None,
             usage: Vec::new(),
             suite_outcome: None,
+            contract_fingerprint: None,
+            contract_modified: false,
         }
     }
 

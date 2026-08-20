@@ -73,6 +73,7 @@ pub fn base_vars(ctx: &TemplateCtx<'_>) -> HashMap<String, String> {
         "test_contract_body".into(),
         "(no pre-written acceptance contract)".into(),
     );
+    m.insert("contract_drift_note".into(), String::new());
     m.insert("planner_slot".into(), String::new());
     m.insert("critic_slot".into(), String::new());
     m.insert("review_cwd".into(), ctx.cwd.into());

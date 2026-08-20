@@ -10,6 +10,7 @@ You did NOT write this code. Find real bugs, missing tests, and regressions.
 
 ## Acceptance contract (what must be true)
 {{test_contract_body}}
+{{contract_drift_note}}
 
 ## Paths
 - Code under review (worktree): {{review_cwd}}

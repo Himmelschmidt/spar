@@ -1806,6 +1806,8 @@ pub fn emit_run_json(state: &RunState) -> Result<()> {
         "big": state.big,
         "autonomy": state.autonomy,
         "suite_outcome": state.suite_outcome,
+        "contract_fingerprint": state.contract_fingerprint,
+        "contract_modified": state.contract_modified,
         // null while in-flight; only set at terminal/gate phases
         "exit_code": state.status_exit_code(),
     });
