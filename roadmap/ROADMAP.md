@@ -46,10 +46,10 @@
 
 ## Milestone 6: Operator model (session disposable, TUI primary)
 
-- [ ] **Durable run ownership** (setsid detach, per-project daemon, lifecycle notifications, brief on disk, concurrency cap) - see `features/003-durable-run-ownership.md`  
-- [ ] **TUI information architecture** (noun set, Home landing view, new-run flow, off-thread snapshot scans) - see `features/004-tui-information-architecture.md`  
-- [ ] **Gate evidence** (Plan tab, Review tab with AC-n status, diff and review verdicts) - see `features/005-gate-evidence.md`  
-- [ ] **Motion and visual identity** (time-based motion, reserved-space layout stability, token system, snapshot test harness) - see `features/006-motion-and-identity.md`  
+- [ ] **Durable run ownership** (setsid detach, per-project daemon, lifecycle notifications, brief on disk, concurrency cap) - see features/003-durable-run-ownership.md  
+- [ ] **TUI information architecture** (noun set, Home landing view, new-run flow, off-thread snapshot scans) - see features/004-tui-information-architecture.md  
+- [ ] **Gate evidence** (Plan tab, Review tab with AC-n status, diff and review verdicts) - see features/005-gate-evidence.md  
+- [ ] **Motion and visual identity** (time-based motion, reserved-space layout stability, token system, snapshot test harness) - see features/006-motion-and-identity.md  
 
 ## Later
 
