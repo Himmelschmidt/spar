@@ -27,10 +27,12 @@ workspace fallback, `/spawn` agents, provider session logs), and `docs/PRODUCT.m
 the conflation into the product's own pillar list. There is matching code drift:
 `src/tui.rs:55` still describes a three-target focus model (`Focus` has two variants, `3`
 is unbound, `App` has no composer field) and `src/tui.rs:4161` still calls itself "resolve a
-composer mention." There is also no landing view: the TUI opens onto
-`BrowseLevel::Projects`, a file browser, even though the attention roll-up
-(`runs_needing_attention`) already computes what needs the operator. And there is no way to
-start a run without one already selected, per U3's deliberate CLI punt.
+composer mention." There is also no landing view: launched outside a project the TUI opens
+onto `BrowseLevel::Projects`, a file browser; launched inside one (`start_in_project`,
+`src/tui.rs:477-482`) it skips straight to that project's `BrowseLevel::Runs` instead,
+scoped to a single repo. Neither is cross-project, even though the attention roll-up
+(`runs_needing_attention`) already computes what needs the operator across all of them. And
+there is no way to start a run without one already selected, per U3's deliberate CLI punt.
 
 ## Goals
 
@@ -38,8 +40,9 @@ start a run without one already selected, per U3's deliberate CLI punt.
   backend's internal name.
 - Stale composer-focus comments at `src/tui.rs:55` and `src/tui.rs:4161` corrected to match
   the real two-target focus model.
-- Home replaces `BrowseLevel::Projects` as the landing view: what needs me (ranked by wait
-  time), running, finished since last look, start something new.
+- Home replaces `BrowseLevel::Projects` and the `start_in_project` fast path onto
+  `BrowseLevel::Runs` as the landing view: what needs me (ranked by wait time), running,
+  finished since last look, start something new.
 - New-run flow (`n` on Home): brief field plus fleet picker, superseding U3's punt.
 - The render-path directory scan in `rail_project_items` (`src/tui.rs:2830`) moves onto
   the off-thread `Snapshot` the refresher already builds correctly (`src/tui.rs:873`).

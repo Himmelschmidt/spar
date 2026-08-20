@@ -33,10 +33,11 @@ fleet." It can, and the correction is scoped into feature 003.
 
 `RunState::save` already detects phase transitions and appends `phase` plus `gate` events
 (`src/state.rs:441-454`), but the only route to the external `[notify]` sink is `bus::send`
-routing an `@human`-addressed message (`src/bus.rs:451-454`). A run arriving at
-`awaiting_plan_approval` or `awaiting_ship_confirm` never reaches the notify sink: nothing
-sends a message that would trigger it. The operator finds out only if a live `spar wait`
-happens to be attached.
+on a message `is_human_alert` accepts: addressed to `@human`, or any `Blocked` report
+regardless of address (`src/bus.rs:451-461`). Neither fires from a phase transition. A run
+arriving at `awaiting_plan_approval` or `awaiting_ship_confirm` never reaches the notify
+sink: nothing sends a message that would trigger it. The operator finds out only if a live
+`spar wait` happens to be attached.
 
 ### Cause 3: the monitor is single-shot and fragile
 

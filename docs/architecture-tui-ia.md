@@ -15,21 +15,26 @@ four distinct ways.
    artifacts directory, commented "the run's artifacts for now (no new plumbing in Stage
    A)" (`src/tui.rs:3208`). Nothing renders `plan.md` as a document, nothing shows the
    critique, nothing shows `test-contract.md`, and `grep -n "criteria\|verdict" src/tui.rs`
-   returns nothing. The ship gate's whole premise is `require_all_criteria`: a run cannot
-   pass while any `AC-n` is fail, unverified, or unmentioned. The TUI cannot show those
-   criteria. Gate buttons without evidence are a rubber stamp.
+   returns nothing. The ship gate's whole premise is O19: a run cannot pass while any
+   `AC-n` is fail or unmentioned, and `unverified` blocks too unless
+   `[review].require_all_criteria` relaxes it. The TUI cannot show those criteria. Gate
+   buttons without evidence are a rubber stamp.
 2. **The vocabulary is conflated.** "Session" is overloaded four ways, all live (see
    Retiring "session" below), and `docs/PRODUCT.md:43` names the home view "Session / run
    home", so the conflation is baked in at the product level.
-3. **There is no central place to land.** You open onto `BrowseLevel::Projects`, a list of
-   registered repos, and drill down. That is a file browser, not a home. The attention data
-   already exists: `runs_needing_attention` computes the per-project flag roll-up, but it is
-   used as a decoration on a browser row rather than as the organizing principle.
-4. **There is no clean way to start a new run.** The `:plan` palette verb reuses the
-   selected run's fleet and has no field for a task, so creating a run requires already
-   having one selected. Per U3 this was deliberate: "a fresh fleet needs a provider picker a
-   text palette can't offer, so those error to the CLI." Under the operator model that punt
-   is no longer acceptable.
+3. **There is no central place to land.** Launched outside a project you open onto
+   `BrowseLevel::Projects`, a list of registered repos; launched inside one
+   (`start_in_project`, `src/tui.rs:477-482`) you skip straight to that project's
+   `BrowseLevel::Runs`. Either way there is no cross-project view: one is a file browser,
+   the other is scoped to a single repo, and neither is a home. The attention data already
+   exists: `runs_needing_attention` computes the per-project flag roll-up, but it is used as
+   a decoration on a browser row rather than as the organizing principle.
+4. **There is no clean way to start a new run.** The `:plan` palette verb takes a task
+   (`arg_hint: "<task>"`, `src/tui.rs:167-171`) but has no fleet picker: it bails "select a
+   run to reuse its fleet, or use the CLI" (`src/tui.rs:1718-1720`), so creating a run
+   requires already having one selected to borrow its fleet from. Per U3 this was
+   deliberate: "a fresh fleet needs a provider picker a text palette can't offer, so those
+   error to the CLI." Under the operator model that punt is no longer acceptable.
 
 ---
 
@@ -85,7 +90,10 @@ operator actually needs to see first:
 
 Drill-down survives as navigation, not the front door: `Enter` opens a project's runs or a
 run's agents, `Esc` pops back toward Home, exactly as U1's rail already does, but Home is
-where you land, not `BrowseLevel::Projects`.
+where you land, not `BrowseLevel::Projects` or `BrowseLevel::Runs`. That holds for the
+`start_in_project` launch path too: Home is cross-project by definition, so `spar` run
+inside a repo lands on Home scoped to that project's runs and attention state, not on the
+project's raw run list. Phase C settles the exact scoping.
 
 ---
 
@@ -102,9 +110,10 @@ than continuing to error to the CLI.
 
 The Plan tab renders `plan.md`, the critique, and `test-contract.md` as documents rather
 than an artifacts-directory dump. The Review tab renders per-`AC-n` pass/fail/unverified
-status alongside reviewer verdicts and the git diff. Both are tied directly to
-`require_all_criteria` (O15): the gate cannot show the predicate it enforces today, and a
-gate that cannot show its own predicate is a rubber stamp, not a decision aid.
+status alongside reviewer verdicts and the git diff. Both are tied directly to the
+acceptance predicate O19 enforces (relaxable for `unverified` via `require_all_criteria`):
+the gate cannot show that predicate today, and a gate that cannot show its own predicate is
+a rubber stamp, not a decision aid.
 
 ---
 
