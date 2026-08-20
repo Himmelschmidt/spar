@@ -26,8 +26,8 @@ The Diff tab falls back to dumping the artifacts directory, commented "the run's
 for now (no new plumbing in Stage A)" (`src/tui.rs:3208`). Nothing renders `plan.md` as a
 document, nothing shows the critique, nothing shows `test-contract.md`, and
 `grep -n "criteria\|verdict" src/tui.rs` returns nothing. The ship gate's whole premise is
-`require_all_criteria` (O15/O19): a run cannot pass while any `AC-n` is fail, unverified, or
-unmentioned. A gate button with no way to see the criteria it enforces is a rubber stamp.
+the acceptance predicate (O19): a run cannot pass while any `AC-n` is fail or unmentioned,
+and `unverified` blocks too unless `[review].require_all_criteria = false` relaxes it. A gate button with no way to see the criteria it enforces is a rubber stamp.
 
 ## Goals
 
@@ -39,7 +39,7 @@ unmentioned. A gate button with no way to see the criteria it enforces is a rubb
 
 ## Non-goals
 
-- No new acceptance-criteria semantics; `require_all_criteria` (O15/O19) is unchanged, only
+- No new acceptance-criteria semantics; the acceptance predicate (O19) is unchanged, only
   made visible.
 - No motion or visual-identity work (that is 006).
 

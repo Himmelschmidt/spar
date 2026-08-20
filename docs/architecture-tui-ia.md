@@ -53,7 +53,8 @@ Four nouns, not five. "Session" is retired as a user-facing term.
 
 ## Retiring "session"
 
-"Session" is overloaded four ways today, all live:
+"Session" is overloaded four ways in the running product, plus once more in the product doc.
+All five are live:
 
 | Current use | Becomes |
 |---|---|
