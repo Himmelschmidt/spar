@@ -61,7 +61,7 @@ Project-level product and architecture decisions. Status: `OPEN` | `LEANING` | `
 | O39 | Lifecycle notification fires from the `RunState::save` phase-transition choke point (`src/state.rs:441-454`), not per call site, into the existing B1 sink. Gate, stuck, quota, abandoned and terminal failure push; silence means healthy | DECIDED |
 | O40 | **Per-project daemon** supervises runs: restarts a dead orchestrator, pushes lifecycle notifications, computes abandonment (extends Z2), holds the cross-run queue. It never approves, confirms, merges, sweeps `cleanup`, or picks a fleet. Gates stay human | DECIDED |
 | O41 | Task intake is a **written brief on disk**: `spar plan --spec <file>` / stdin, stored at `.spar/briefs/<slug>.md`; `spar brief <id>` re-hydrates a fresh session in one call; `spar resume <id>` recovers a stopped or abandoned run | DECIDED |
-| O42 | **Cross-run concurrency cap**, enforced by the daemon, keyed on the quota bucket (X8 `storage_key()`), because `max_agents` (`src/config.rs:10`) is per-run width only. Five of seven standard-fleet seats bucket as `cli:claude`, so three concurrent runs lose three plans and three contracts to one limit | DECIDED |
+| O42 | **Cross-run concurrency cap**, enforced by the daemon, keyed on the quota bucket (X8 `storage_key()`), because `max_agents` (`src/config.rs:11`) is per-run width only. Five of seven standard-fleet seats bucket as `cli:claude`, so three concurrent runs lose three plans and three contracts to one limit | DECIDED |
 
 ## Model select (vals-backed)
 

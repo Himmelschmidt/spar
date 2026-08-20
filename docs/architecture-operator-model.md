@@ -152,7 +152,7 @@ longer signals it, and the daemon becomes the thing that notices if it dies anyw
 
 ## Cross-run concurrency cap (O42)
 
-`max_agents` (`src/config.rs:10`) is per-run fleet width. There is no cross-run concurrency
+`max_agents` (`src/config.rs:11`) is per-run fleet width. There is no cross-run concurrency
 cap anywhere. Under the standard fleet, planner, test_author, implementer, tester and one
 reviewer all resolve to `cli:claude`, and `@model` variants share a quota bucket with the
 bare provider (`storage_key()`, `src/provider_ref.rs:94`, X8) so that is five of seven seats.
