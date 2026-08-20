@@ -4242,8 +4242,16 @@ fn spawn_agent_command(
     let base = state::RunState::load(&paths, &run.id)
         .ok()
         .and_then(|s| s.base_commit);
-    let record =
-        crate::worktree::create_worktree(&project_root, &run.id, &agent_id, base.as_deref())?;
+    let wt_root = crate::config::Config::for_run(&paths, &run.id)
+        .ok()
+        .and_then(|c| crate::worktree::worktree_root(&c));
+    let record = crate::worktree::create_worktree(
+        &project_root,
+        &run.id,
+        &agent_id,
+        base.as_deref(),
+        wt_root.as_deref(),
+    )?;
 
     let run_id = run.id.clone();
     let provider_s = provider.to_string();
