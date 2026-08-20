@@ -274,6 +274,16 @@ fn ac3_changes_confined_to_the_deliverable_set() {
 
 /// AC-4: zero em dashes in the six new files and in every line added to the two
 /// appended files.
+///
+/// DECISIONS.md gets one cell-aware carve-out: AC-8 mandates editing U3's Status cell
+/// while leaving its pre-existing Decision text byte-identical, and that Decision text
+/// (written long before this run, U+2014 and all) is otherwise-unmodified prose the run
+/// did not author. A pure line-level diff cannot tell "line changed because of the
+/// sanctioned Status edit" from "line is newly authored", so it would flag those
+/// pre-existing dashes as new. Row-parse instead: when a row's id existed in the baseline
+/// with the same Decision cell, only its Status cell is new content and gets scanned;
+/// every other line (all genuinely new or altered content) still goes through the
+/// original whole-line check.
 #[test]
 fn ac4_no_em_dashes_in_new_content() {
     let mut bad = Vec::new();
@@ -285,23 +295,17 @@ fn ac4_no_em_dashes_in_new_content() {
         }
     }
     for (f, base) in [(DECISIONS, "DECISIONS.md"), (ROADMAP, "ROADMAP.md")] {
-        let baseline_text = read_baseline(base);
-        for (n, l) in added_lines(&read(f), &baseline_text) {
-            // AC-8 permits editing U3's Status cell while leaving its Decision text
-            // byte-identical; the whole-line diff below then sees a "new" line that
-            // carries U3's pre-existing, untouchable em dashes along with it. Only a
-            // status-only edit (same id, same Decision text as some baseline row) is
-            // exempt here; a genuinely new or reworded row is still checked.
-            if f == DECISIONS {
-                if let Some(cells) = row_cells(&l) {
-                    if cells.len() == 3
-                        && is_decision_id(&cells[0])
-                        && baseline_text
-                            .lines()
-                            .filter_map(row_cells)
-                            .any(|bc| bc.len() == 3 && bc[0] == cells[0] && bc[1] == cells[1])
-                    {
-                        continue;
+        let baseline = read_baseline(base);
+        for (n, l) in added_lines(&read(f), &baseline) {
+            if let Some(cells) = row_cells(&l) {
+                if cells.len() == 3 && is_decision_id(&cells[0]) {
+                    if let Some(base_cells) = decision_row(&baseline, &cells[0]) {
+                        if base_cells.len() == 3 && base_cells[1] == cells[1] {
+                            if cells[2].contains(EM_DASH) {
+                                bad.push(format!("{f}:{n}: {l} (new Status text)"));
+                            }
+                            continue;
+                        }
                     }
                 }
             }
