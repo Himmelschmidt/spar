@@ -172,12 +172,167 @@ fn parse_ac_line(raw: &str) -> Option<AcLine> {
     })
 }
 
-/// Every `AC-<digits>` token in a contract body, uppercased, deduplicated,
-/// in first-appearance order.
+/// Characters treated as markup noise around an id: emphasis and code-span delimiters.
+/// Distinct from `NOISE` above, which also folds in bullets and spaces for the
+/// reviewer-report parser's different grammar.
+const ID_NOISE: [char; 3] = ['*', '_', '`'];
+
+fn strip_id_noise(s: &str) -> &str {
+    s.trim_start_matches(ID_NOISE)
+}
+
+/// Matches a case-insensitive `AC-<digits>` at the start of `s`. Returns the
+/// canonical uppercased id and whatever follows the digits.
+fn match_ac_digits(s: &str) -> Option<(String, &str)> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 4 {
+        return None;
+    }
+    if !bytes[0].eq_ignore_ascii_case(&b'A')
+        || !bytes[1].eq_ignore_ascii_case(&b'C')
+        || bytes[2] != b'-'
+    {
+        return None;
+    }
+    let digit_len = s[3..].bytes().take_while(u8::is_ascii_digit).count();
+    if digit_len == 0 {
+        return None;
+    }
+    Some((format!("AC-{}", &s[3..3 + digit_len]), &s[3 + digit_len..]))
+}
+
+/// List/bare item form: optional bullet, optional checkbox, optional noise, the id,
+/// optional noise, then a required colon (which may sit on either side of that
+/// trailing noise run — `**AC-1:**` and `**AC-1**:` both declare).
+fn declared_id_list_or_bare(trimmed: &str) -> Option<String> {
+    let s = strip_checkbox(strip_bullet(trimmed));
+    let s = strip_id_noise(s);
+    let (id, rest) = match_ac_digits(s)?;
+    if strip_id_noise(rest).starts_with(':') {
+        Some(id)
+    } else {
+        None
+    }
+}
+
+/// `-`, `*`, `+` followed by whitespace, or an ordered marker (`\d+[.)]`) followed by
+/// whitespace. A marker char with no following whitespace is left untouched — it is
+/// markup (`**bold`), not a list item.
+fn strip_bullet(s: &str) -> &str {
+    if let Some(c) = s.chars().next() {
+        if matches!(c, '-' | '*' | '+') {
+            let rest = &s[c.len_utf8()..];
+            return rest
+                .strip_prefix(' ')
+                .map_or(s, |r| r.trim_start_matches(' '));
+        }
+    }
+    let digit_len = s.bytes().take_while(u8::is_ascii_digit).count();
+    if digit_len > 0 {
+        let after = &s[digit_len..];
+        if let Some(rest) = after.strip_prefix(['.', ')']) {
+            return rest
+                .strip_prefix(' ')
+                .map_or(s, |r| r.trim_start_matches(' '));
+        }
+    }
+    s
+}
+
+fn strip_checkbox(s: &str) -> &str {
+    for cb in ["[ ]", "[x]", "[X]"] {
+        if let Some(rest) = s.strip_prefix(cb) {
+            return rest.trim_start_matches(' ');
+        }
+    }
+    s
+}
+
+/// Heading form: `#`s, whitespace, optional noise, the id, optional noise, then a
+/// colon, dash, em dash, whitespace, or end of line. Anchored at the start of the
+/// heading text, so a heading that merely *mentions* an id further in ("## See AC-30
+/// in appendix") does not match.
+fn declared_id_heading(trimmed: &str) -> Option<String> {
+    let text = trimmed.trim_start_matches('#').trim_start();
+    let s = strip_id_noise(text);
+    let (id, rest) = match_ac_digits(s)?;
+    let rest = strip_id_noise(rest);
+    match rest.chars().next() {
+        None => Some(id),
+        Some(c) if c == ':' || c == '-' || c == '—' || c.is_whitespace() => Some(id),
+        _ => None,
+    }
+}
+
+fn declared_id(trimmed: &str) -> Option<String> {
+    if trimmed.starts_with('#') {
+        declared_id_heading(trimmed)
+    } else {
+        declared_id_list_or_bare(trimmed)
+    }
+}
+
+struct FenceState {
+    ch: u8,
+    len: usize,
+}
+
+/// A fence marker: up to 3 leading spaces, then 3+ of the same backtick/tilde.
+fn fence_marker(trimmed: &str, indent: usize) -> Option<FenceState> {
+    if indent > 3 {
+        return None;
+    }
+    let ch = trimmed.as_bytes().first().copied()?;
+    if ch != b'`' && ch != b'~' {
+        return None;
+    }
+    let len = trimmed.bytes().take_while(|&b| b == ch).count();
+    (len >= 3).then_some(FenceState { ch, len })
+}
+
+/// Every `AC-<digits>` this contract *declares*: a checklist/bare-line item or a
+/// heading, matched at the start of the line (after trimming and, for list items,
+/// stripping bullet/checkbox/emphasis noise) and requiring the terminator the
+/// declaration form calls for. A mention anywhere else — mid-sentence, inside Notes
+/// or Non-goals prose, or inside a fenced code block — is not a declaration. Ids are
+/// uppercased, deduplicated, in first-appearance order.
 pub fn parse_contract_criteria(body: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut fence: Option<FenceState> = None;
+
+    for raw in body.lines() {
+        let trimmed = raw.trim_start();
+        let indent = raw.len() - trimmed.len();
+
+        if let Some(open) = &fence {
+            if let Some(close) = fence_marker(trimmed, indent) {
+                if close.ch == open.ch && close.len >= open.len {
+                    fence = None;
+                }
+            }
+            continue;
+        }
+        if let Some(open) = fence_marker(trimmed, indent) {
+            fence = Some(open);
+            continue;
+        }
+
+        if let Some(id) = declared_id(trimmed) {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
+/// Loose backstop for the vacuous-gate diagnostic: any `AC-<digits>` token anywhere in
+/// the body, including mentions and fenced samples. Used only to tell "no criteria
+/// because there's no contract" apart from "no criteria despite the contract talking
+/// about them" — never to build the gate itself.
+pub(crate) fn mentions_criterion_id(body: &str) -> bool {
     let upper = body.to_ascii_uppercase();
     let b = upper.as_bytes();
-    let mut out: Vec<String> = Vec::new();
     let mut i = 0;
     while i + 3 <= b.len() {
         if &b[i..i + 3] == b"AC-" && (i == 0 || !b[i - 1].is_ascii_alphanumeric()) {
@@ -186,17 +341,12 @@ pub fn parse_contract_criteria(body: &str) -> Vec<String> {
                 j += 1;
             }
             if j > i + 3 {
-                let tok = upper[i..j].to_string();
-                if !out.contains(&tok) {
-                    out.push(tok);
-                }
-                i = j;
-                continue;
+                return true;
             }
         }
         i += 1;
     }
-    out
+    false
 }
 
 #[cfg(test)]
