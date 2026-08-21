@@ -2264,7 +2264,7 @@ fn rail_select(app: &mut App, row: usize, n_projects: usize, n_runs: usize, n_sl
     }
 }
 
-/// Map a mouse Y to a list row inside a bordered panel (title row skipped).
+/// Map a mouse Y to a list row.
 /// `offset` is the ListState scroll offset so clicks track the visible window.
 fn list_row_at(panel: Rect, y: u16, n_items: usize, offset: usize) -> Option<usize> {
     if n_items == 0 || panel.height == 0 || y < panel.y {
@@ -2456,7 +2456,10 @@ fn draw(
     app.rect_rail = lay.rail;
     app.rect_main = lay.main;
     app.rect_palette = Rect::default();
-    // Rebuilt below by whatever paints this frame.
+    // Rebuilt below by whatever paints this frame. `rect_attention` is cleared here,
+    // not in `draw_header`: driving mode skips the header entirely, and a stale chip
+    // rect would swallow a click meant for the agent's terminal.
+    app.rect_attention = Rect::default();
     app.gate_buttons.clear();
     app.main_tabs.clear();
 
@@ -2465,7 +2468,7 @@ fn draw(
     } else {
         draw_header(f, lay.header, swarm, projects, runs, full, app);
         if lay.context.height > 0 {
-            draw_context_band(f, lay.context, runs, full, app);
+            draw_context_band(f, lay.context, projects, runs, full, app);
         }
         if lay.labels.height > 0 {
             draw_labels(f, &lay, swarm, projects, runs, full, app);
@@ -2954,6 +2957,7 @@ fn stepper_spans(
 fn draw_context_band(
     f: &mut Frame,
     area: Rect,
+    projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
     app: &App,
@@ -2971,6 +2975,24 @@ fn draw_context_band(
     }
 
     let Some(st) = full else {
+        // Outside a project the refresher hands us no runs at all (`build_snapshot`),
+        // so a run roll-up here would always read "none" — count what we do have.
+        if !app.browse.in_project() {
+            let line = if projects.is_empty() {
+                Line::from(Span::styled(
+                    "no projects yet — run spar in a repo",
+                    muted(),
+                ))
+            } else {
+                Line::from(vec![
+                    Span::styled(format!("{} projects", projects.len()), dim()),
+                    Span::styled(" · ", muted()),
+                    Span::styled("Enter opens one", muted()),
+                ])
+            };
+            f.render_widget(Paragraph::new(line), pad);
+            return;
+        }
         let need = runs_needing_attention(runs);
         let running = runs.iter().filter(|r| is_active_phase(r.phase)).count();
         let line = if runs.is_empty() {
@@ -3100,15 +3122,27 @@ fn slot_model(s: &SlotState, max: usize) -> String {
     if m.chars().count() <= max {
         return m.to_string();
     }
-    // Too long: drop leading segments until the tail fits, and say that we did.
-    let mut cut = m;
+    // Still too long: the version segments go before the names do. `opus-4-5` must
+    // not shorten to `…4-5`, which every Anthropic tier shares — the 80-119 band's
+    // 26-column rail leaves 6 columns here, so this is the common case, not the edge.
+    let named: String = m
+        .split('-')
+        .filter(|seg| !seg.starts_with(|c: char| c.is_ascii_digit()))
+        .collect::<Vec<_>>()
+        .join("-");
+    if !named.is_empty() && named.chars().count() <= max {
+        return named;
+    }
+    // Names alone still do not fit: keep the tail, which is where the tier lives
+    // (`gemini-flash` vs `gemini-pro`), and say that we cut.
+    let mut cut = if named.is_empty() { m } else { named.as_str() };
     while let Some((_, tail)) = cut.split_once('-') {
         cut = tail;
         if cut.chars().count() < max {
             return format!("…{cut}");
         }
     }
-    truncate(m, max)
+    truncate(cut, max)
 }
 
 /// The header's cue and its colors. `Some(wash)` means an alert state (gate, quota,
@@ -3296,7 +3330,6 @@ fn draw_header(
 
     // Right cluster: the fleet roll-up ("what needs me?", independent of the rail
     // selection) and the unread human-alert count.
-    app.rect_attention = Rect::default();
     let mut right: Vec<Span> = Vec::new();
     let need = if app.browse.in_project() {
         runs_needing_attention(runs)
@@ -3477,8 +3510,10 @@ fn rail_empty(text: &'static str) -> Vec<ListItem<'static>> {
     ))]
 }
 
-/// Pad `spans` out to `w` with the age column flush right. The age is the only
-/// right-aligned cell in the rail, and it never moves.
+/// Pad `spans` out to `w` with the status/age column flush right — the rail's only
+/// right-aligned cell, and it never moves. The gap aims for one column of air before
+/// the seam but yields it when the row is full; the seam has a column of its own, so
+/// the two never touch.
 fn rail_row(
     lead: Span<'static>,
     mut body: Vec<Span<'static>>,
@@ -3627,11 +3662,11 @@ fn rail_slot_items(
             let orphaned = app.abandoned && s.status == SlotStatus::Running;
             let broken = act.stalled || orphaned;
             let color = if broken { ALERT } else { slot_color(s) };
-            let tail = if orphaned {
-                "ORPHAN".to_string()
-            } else if act.stalled {
-                "STALL".to_string()
-            } else if s.status == SlotStatus::Running {
+            // A live slot's cell is how long it has been quiet — including when that
+            // silence is what makes it stalled or orphaned. The word is redundant
+            // there (the red ⚑ in the lead column already says "broken") and the
+            // duration is the part the operator cannot get anywhere else in this view.
+            let tail = if broken || s.status == SlotStatus::Running {
                 act.human_silent()
             } else {
                 slot_status_label(s.status).to_string()
@@ -4455,7 +4490,7 @@ fn draw_palette(f: &mut Frame, area: Rect, runs: &[state::RunSummary], app: &mut
 }
 
 /// Driving mode's one-line banner replaces the status line: a loud recolored bar that
-/// (with the collapsed rail and recolored pane border) makes the mode structurally
+/// (with the collapsed rail and the bands folded away) makes the mode structurally
 /// obvious — a text label alone is proven insufficient (Raskin).
 fn draw_driving_banner(f: &mut Frame, area: Rect, app: &App) {
     let target = app
@@ -4534,7 +4569,9 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &mut App, full: Option<&RunState>
         Span::styled(proj, dim()),
         Span::styled("   ", muted()),
         Span::styled(help, dim()),
-        Span::styled("   ", muted()),
+        Span::styled("  ·  ", muted()),
+        Span::styled(": cmd", muted()),
+        Span::styled(" · ", muted()),
         Span::styled("q quit", muted()),
         Span::raw(" "),
     ];
@@ -4618,8 +4655,13 @@ fn situational_footer(
 }
 
 fn draw_help_overlay(f: &mut Frame, area: Rect) {
-    let w = area.width.clamp(40, 72);
-    let h = area.height.clamp(14, 32);
+    // `clamp(40, ..)` returns 40 on a 30-column terminal, i.e. a rect outside the
+    // buffer, and ratatui panics on the first cell. Never grow past the frame.
+    let w = area.width.min(72);
+    let h = area.height.min(32);
+    if w == 0 || h == 0 {
+        return;
+    }
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let rect = Rect {
@@ -6260,9 +6302,25 @@ mod render_stability {
         runs: &[state::RunSummary],
         full: Option<&RunState>,
     ) -> Terminal<TestBackend> {
+        paint_with(w, h, projects, runs, full, |_| {})
+    }
+
+    /// `tweak` runs against the `App` after construction, so a sweep can cover the
+    /// overlays: the help window and the `:` palette are the only widgets left that
+    /// size themselves rather than taking a band, which is exactly where a rect can
+    /// still escape the frame.
+    fn paint_with(
+        w: u16,
+        h: u16,
+        projects: &[registry::ProjectEntry],
+        runs: &[state::RunSummary],
+        full: Option<&RunState>,
+        tweak: impl Fn(&mut App),
+    ) -> Terminal<TestBackend> {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         let swarm = SparPaths::new("/x");
         let mut app = App::new(None, Config::default(), true);
+        tweak(&mut app);
         let mut rail = ListState::default();
         term.draw(|f| {
             draw(
@@ -6295,6 +6353,14 @@ mod render_stability {
         for w in (1..=200).step_by(3) {
             for h in (1..=60).step_by(2) {
                 paint(w, h, &[], &[], Some(&st));
+                if w % 9 == 1 {
+                    // `?` on a 30-column terminal used to panic: the help rect clamped
+                    // UP to its minimum and left the buffer.
+                    paint_with(w, h, &[], &[], Some(&st), |a| a.show_help = true);
+                    paint_with(w, h, &[], &[], Some(&st), |a| {
+                        a.palette = Some(Palette::default())
+                    });
+                }
             }
         }
         // The breakpoints themselves, and the no-run path.
@@ -6357,6 +6423,14 @@ mod render_stability {
         };
         assert!(painted.contains("acme-api"), "rail was: {painted:?}");
         assert!(painted.contains("PROJECTS"), "rail was: {painted:?}");
+        // The band counts what this level actually has. The refresher hands us no
+        // runs outside a project, so a run roll-up here would always read "none".
+        let band: String = {
+            let buf = term.backend().buffer();
+            (0..120).map(|x| buf[(x, 1)].symbol()).collect()
+        };
+        assert!(band.contains("3 projects"), "band was: {band:?}");
+        assert!(!band.contains("no runs"), "band was: {band:?}");
     }
 
     /// The scale that already bit once: thousands of run dirs on one project.
@@ -6675,6 +6749,21 @@ mod render_stability {
             slot_model(&s, w)
         };
         assert_eq!(label(Some("claude-opus-5"), "cli:claude", 12), "opus-5");
+        // The 80-119 band's rail leaves 6 columns here, so this is the common case:
+        // opus, sonnet and haiku must not all shorten to their shared version.
+        let narrow: Vec<String> = [
+            "claude-opus-4-5-20250929",
+            "claude-sonnet-4-5-20250929",
+            "claude-haiku-4-5-20251001",
+        ]
+        .iter()
+        .map(|m| label(Some(m), "cli:claude", 6))
+        .collect();
+        assert_eq!(narrow, ["opus", "sonnet", "haiku"], "tiers collapsed at 6");
+        assert_ne!(
+            label(Some("google/gemini-3.7-flash"), "cli:opencode", 6),
+            label(Some("google/gemini-3.7-pro"), "cli:opencode", 6),
+        );
         // A release date is dropped; a version number is not.
         assert_eq!(
             label(Some("claude-opus-4-5-20250929"), "cli:claude", 12),
@@ -6690,6 +6779,7 @@ mod render_stability {
         assert_ne!(flash, pro, "flash and pro rendered the same");
         assert!(flash.ends_with("flash"), "{flash}");
         assert!(pro.ends_with("pro"), "{pro}");
+        assert!(flash.starts_with("gemini"), "room for both at 12: {flash}");
         // No model recorded: name the adapter, never an empty cell.
         assert_eq!(label(None, "cli:opencode", 12), "opencode");
         assert_eq!(label(None, "cli:claude", 12), "claude");

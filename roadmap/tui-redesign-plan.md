@@ -101,9 +101,11 @@ identifies an agent: two rows both read `✓ review-… done`.
   washes and overlays paint one. Tokens live in `src/theme.rs`.
 - **Identity over ids.** The rail shows an agent's *role* (`review 0`, `builder`) and
   its model, never `review-0-cli-opencode`; the log drops the provider's opaque
-  `toolu_…` ids, ~30 columns of noise per result row. The model label keeps the
-  **tail** (`…3.7-flash`, `opus-4-5`), because that is where the tier lives — a
-  head-first shortening renders every Gemini as `gemini`.
+  `toolu_…` ids, ~30 columns of noise per result row. The model label drops the release
+  date, then version segments, then leading segments, in that order: names outrank
+  numbers because the tier is what the fleet policy is built on. A head-first
+  shortening renders every Gemini as `gemini`; a naive tail-first one renders opus,
+  sonnet and haiku all as `…4-5` in the 26-column rail the 80-119 band uses.
 - **Reserved space.** Gate buttons live in a fixed 23-column zone (80 columns and up)
   and are left-aligned inside it, so swapping gates cannot slide a button out from
   under a click; the Activity tab's alert badge has a reserved 4-column slot for the
