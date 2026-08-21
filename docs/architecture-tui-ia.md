@@ -171,5 +171,18 @@ list, 400 runs, and "this region does not move when that value changes."
 ## Sequencing
 
 004 (this doc's IA work) precedes 005 (gate evidence) because evidence rendered into a
-confusing layout is still confusing. 006 (motion and visual identity) is last, because
-animating a confusing layout gives you a confusing layout at 60fps.
+confusing layout is still confusing. 006's **motion** half (phases A and B) is last,
+because animating a confusing layout gives you a confusing layout at 60fps.
+
+**Amended (U14):** 006's **chrome and tokens** half (phases C and D) landed *first*,
+before this doc's 004. The ordering argument above is about motion; chrome is the surface
+004 and 005 render into, so building Home and the criteria grid into the old bordered
+shell would have meant building them twice. What landed: pane borders replaced by chrome
+bands over one seam, the run stepper, the token set in `src/theme.rs`, a terminal-native
+background, role-first agent identity in the rail, and the `TestBackend` stability suite.
+"Design tokens and stability assertions" under **Rendering discipline** is done, minus
+U12's braille/half-block clause: no density glyph earned its place in this pass. Two of
+the four layout-shift sources are fixed (width-summed gate buttons, growing lists); the
+attention re-sort needs the motion engine, and the narrow tab strip still flips mode at
+the 80-column breakpoint. `rail_project_items`' render-path directory scan (U13) is
+untouched and remains 004 Phase B's job.

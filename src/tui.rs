@@ -6,7 +6,7 @@ use crate::paths::{self, SparPaths};
 use crate::process;
 use crate::quota::QuotaStore;
 use crate::registry;
-use crate::state::{self, Phase, RunState, SlotState, SlotStatus};
+use crate::state::{self, Phase, RunState, SlotRole, SlotState, SlotStatus};
 use crate::tmux;
 use crate::workflow;
 use anyhow::Result;
@@ -22,8 +22,8 @@ use crossterm::ExecutableCommand;
 use ratatui::buffer::Buffer;
 use ratatui::prelude::*;
 use ratatui::widgets::{
-    Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
-    ScrollbarState, Widget, Wrap,
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Widget, Wrap,
 };
 use std::io::{stdout, Write};
 use std::path::{Path, PathBuf};
@@ -32,25 +32,22 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use tui_term::widget::PseudoTerminal;
 
-// ── palette ─────────────────────────────────────────────────────────────────
-
-const BG: Color = Color::Rgb(12, 14, 18);
-const BG_PANEL: Color = Color::Rgb(18, 21, 28);
-const BG_RAISED: Color = Color::Rgb(24, 28, 36);
-const BORDER: Color = Color::Rgb(42, 48, 60);
-const BORDER_FOCUS: Color = Color::Rgb(88, 166, 255);
-const FG: Color = Color::Rgb(220, 224, 232);
-const FG_DIM: Color = Color::Rgb(110, 118, 132);
-const FG_MUTED: Color = Color::Rgb(72, 80, 96);
-const ACCENT: Color = Color::Rgb(88, 166, 255);
-const ACCENT_SOFT: Color = Color::Rgb(56, 110, 180);
-const GREEN: Color = Color::Rgb(63, 185, 80);
-const YELLOW: Color = Color::Rgb(210, 168, 70);
-const RED: Color = Color::Rgb(248, 81, 73);
-const MAGENTA: Color = Color::Rgb(188, 120, 240);
-const CYAN: Color = Color::Rgb(57, 190, 200);
+use crate::theme::{
+    chip, dim, muted, rule, selected, ACCENT, ACCENT_SOFT, ALERT, ALERT_WASH, DRIVE_WASH, FG,
+    FG_DIM, FG_MUTED, GATE_WASH, HINT, INFO, INK, OK, RULE, WARN,
+};
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Chrome glyphs. One border language: a thin rule under the chrome bands, a thin
+/// seam between rail and Main, and a heavy underline marking the active tab.
+const RULE_H: &str = "─";
+const RULE_SEAM: &str = "│";
+const RULE_TEE: &str = "┬";
+const TAB_MARK: &str = "━";
+/// The rail's selection bar. Replaces the old raised-background row highlight, which
+/// needed a page background to sit on.
+const SEL_BAR: &str = "▌";
 
 /// Three focus targets, not an N-way ring: the drill-down rail, the one main
 /// area, and the composer. `1` / `2` / `3` jump straight to one (see U1).
@@ -367,8 +364,11 @@ struct App {
     rect_status: Rect,
     /// The drill-down rail (zero-sized when zoomed, or in narrow while Main is focused).
     rect_rail: Rect,
-    /// The one main area, borders included.
+    /// The one main area.
     rect_main: Rect,
+    /// Main's content rect: `rect_main` minus its left padding. What the embedded
+    /// terminal is sized to and what mouse forwarding is measured against.
+    rect_main_inner: Rect,
     /// The `:` palette overlay rect (for click-to-dismiss); zero-sized when closed.
     rect_palette: Rect,
     /// Per-tab hit rects for the Main tab strip (wide: in Main's top border; narrow: its own row).
@@ -514,6 +514,7 @@ impl App {
             rect_status: Rect::default(),
             rect_rail: Rect::default(),
             rect_main: Rect::default(),
+            rect_main_inner: Rect::default(),
             rect_palette: Rect::default(),
             main_tabs: Vec::new(),
             narrow_autofocus_done: false,
@@ -1549,7 +1550,7 @@ fn handle_palette_key(
                 }
                 Err(e) => {
                     // Keep the palette open so the operator can fix the line.
-                    app.flash(format!("{e:#}"), RED);
+                    app.flash(format!("{e:#}"), ALERT);
                 }
             }
         }
@@ -1645,7 +1646,7 @@ fn run_palette(
     let line = input.trim();
     if let Some(rest) = line.strip_prefix('@') {
         let run_id = runs.get(app.selected_run).map(|r| r.id.as_str());
-        return send_mention(swarm, run_id, rest).map(|m| PaletteResult::Flash(m, GREEN));
+        return send_mention(swarm, run_id, rest).map(|m| PaletteResult::Flash(m, OK));
     }
     let mut parts = line.splitn(2, char::is_whitespace);
     let head = parts.next().unwrap_or("").to_ascii_lowercase();
@@ -1659,29 +1660,26 @@ fn run_palette(
             let (id, _) = split_run_arg(runs, selected, arg);
             let id = id.ok_or_else(|| anyhow::anyhow!("no run selected"))?;
             workflow::plan::approve(swarm, &id, false)?;
-            Ok(PaletteResult::Flash(format!("Approved plan {id}"), GREEN))
+            Ok(PaletteResult::Flash(format!("Approved plan {id}"), OK))
         }
         "reject" => {
             let (id, reason) = split_run_arg(runs, selected, arg);
             let id = id.ok_or_else(|| anyhow::anyhow!("no run selected"))?;
             let reason = (!reason.is_empty()).then_some(reason);
             workflow::plan::reject(swarm, &id, reason, false)?;
-            Ok(PaletteResult::Flash(format!("Rejected plan {id}"), GREEN))
+            Ok(PaletteResult::Flash(format!("Rejected plan {id}"), OK))
         }
         "ship" => {
             let (id, _) = split_run_arg(runs, selected, arg);
             let id = id.ok_or_else(|| anyhow::anyhow!("no run selected"))?;
             crate::ship::confirm_ship(swarm, &id, false)?;
-            Ok(PaletteResult::Flash(format!("Ship confirmed {id}"), GREEN))
+            Ok(PaletteResult::Flash(format!("Ship confirmed {id}"), OK))
         }
         "confirm" => {
             let (id, _) = split_run_arg(runs, selected, arg);
             let id = id.ok_or_else(|| anyhow::anyhow!("no run selected"))?;
             run_gate_action(app, swarm, &id, GateAction::ConfirmWinner);
-            Ok(PaletteResult::Flash(
-                format!("Confirmed winner {id}"),
-                GREEN,
-            ))
+            Ok(PaletteResult::Flash(format!("Confirmed winner {id}"), OK))
         }
         "reconcile" => {
             let (id, _) = split_run_arg(runs, selected, arg);
@@ -1747,11 +1745,11 @@ fn run_palette(
             let arg = (!arg.is_empty()).then_some(arg);
             let bg = app.bg_tx.clone();
             spawn_agent_command(runs, app.selected_run, arg, bg)
-                .map(|m| PaletteResult::Flash(m, GREEN))
+                .map(|m| PaletteResult::Flash(m, OK))
         }
         "chat" => {
             let run_id = selected;
-            send_mention(swarm, run_id, arg).map(|m| PaletteResult::Flash(m, GREEN))
+            send_mention(swarm, run_id, arg).map(|m| PaletteResult::Flash(m, OK))
         }
         other => anyhow::bail!("unknown command: {other} — Tab lists commands"),
     }
@@ -1766,7 +1764,7 @@ fn takeover_run(app: &mut App, id: &str) -> Result<PaletteResult> {
         app.open_main(MainTab::Shell);
         Ok(PaletteResult::Flash(
             format!("Took over {id} — F12/Ctrl+a d to hand back"),
-            GREEN,
+            OK,
         ))
     } else {
         anyhow::bail!("headless run — rerun with --backend tmux to take over")
@@ -1992,7 +1990,7 @@ fn rail_enter(
                 app.open_project_runs();
                 app.flash(
                     format!("Opened {}", p.name.as_deref().unwrap_or("project")),
-                    GREEN,
+                    OK,
                 );
             }
         }
@@ -2016,12 +2014,12 @@ fn rail_enter(
                 app.open_main(MainTab::Shell);
                 app.flash(
                     format!("Took over {slot_id} — F12/Ctrl+a d to hand back"),
-                    GREEN,
+                    OK,
                 );
             } else {
                 app.flash(
                     "headless run — rerun with --backend tmux to take over",
-                    YELLOW,
+                    WARN,
                 );
             }
         }
@@ -2031,20 +2029,21 @@ fn rail_enter(
 /// Run a gate action from a key or a tapped button — one path for both.
 fn run_gate_action(app: &mut App, swarm: &SparPaths, id: &str, action: GateAction) {
     let res = match action {
-        GateAction::Approve => workflow::plan::approve(swarm, id, false)
-            .map(|_| (format!("Approved plan {id}"), GREEN)),
+        GateAction::Approve => {
+            workflow::plan::approve(swarm, id, false).map(|_| (format!("Approved plan {id}"), OK))
+        }
         GateAction::Reject => workflow::plan::reject(swarm, id, None, false)
-            .map(|_| (format!("Rejected plan {id}"), YELLOW)),
+            .map(|_| (format!("Rejected plan {id}"), WARN)),
         GateAction::Ship => crate::ship::confirm_ship(swarm, id, false)
-            .map(|_| (format!("Ship confirmed {id}"), GREEN)),
+            .map(|_| (format!("Ship confirmed {id}"), OK)),
         GateAction::ConfirmWinner => workflow::arena::confirm_winner(swarm, id, None, false)
-            .map(|_| (format!("Confirmed winner for {id}"), GREEN)),
+            .map(|_| (format!("Confirmed winner for {id}"), OK)),
         // Reconcile runs agents (minutes) — never on the render thread.
         GateAction::Reconcile => return spawn_reconcile(app, swarm, id),
     };
     match res {
         Ok((msg, color)) => app.flash(msg, color),
-        Err(e) => app.flash(format!("{} failed: {e:#}", action.verb()), RED),
+        Err(e) => app.flash(format!("{} failed: {e:#}", action.verb()), ALERT),
     }
 }
 
@@ -2053,14 +2052,14 @@ fn run_gate_action(app: &mut App, swarm: &SparPaths, id: &str, action: GateActio
 fn spawn_reconcile(app: &mut App, swarm: &SparPaths, id: &str) {
     if let Some((rid, t)) = &app.reconcile_spawn {
         if rid == id && t.elapsed() < Duration::from_secs(15) {
-            app.flash("Reconcile already starting…", YELLOW);
+            app.flash("Reconcile already starting…", WARN);
             return;
         }
     }
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
-            app.flash(format!("Reconcile failed to start: {e}"), RED);
+            app.flash(format!("Reconcile failed to start: {e}"), ALERT);
             return;
         }
     };
@@ -2082,7 +2081,7 @@ fn spawn_reconcile(app: &mut App, swarm: &SparPaths, id: &str) {
                 ACCENT,
             );
         }
-        Err(e) => app.flash(format!("Reconcile failed to start: {e}"), RED),
+        Err(e) => app.flash(format!("Reconcile failed to start: {e}"), ALERT),
     }
 }
 
@@ -2146,14 +2145,12 @@ fn handle_mouse(
     // the composer still changes focus.
     if app.shell_active() {
         if let Some(pane) = app.terminal_pane.as_ref() {
-            let r = app.rect_main;
-            if contains(r, x, y) && r.width > 2 && r.height > 2 {
-                let inner_x = r.x + 1;
-                let inner_y = r.y + 1;
-                let max_x = r.x + r.width - 2;
-                let max_y = r.y + r.height - 2;
-                let cx = x.clamp(inner_x, max_x) - inner_x;
-                let cy = y.clamp(inner_y, max_y) - inner_y;
+            let r = app.rect_main_inner;
+            if contains(r, x, y) && r.width > 0 && r.height > 0 {
+                let max_x = r.right() - 1;
+                let max_y = r.bottom() - 1;
+                let cx = x.clamp(r.x, max_x) - r.x;
+                let cy = y.clamp(r.y, max_y) - r.y;
                 if let Some(bytes) = crate::terminal::encode_mouse(m.kind, cx, cy, m.modifiers) {
                     pane.write_input(&bytes);
                 }
@@ -2267,16 +2264,16 @@ fn rail_select(app: &mut App, row: usize, n_projects: usize, n_runs: usize, n_sl
     }
 }
 
-/// Map a mouse Y to a list row inside a bordered panel (title row skipped).
+/// Map a mouse Y to a list row.
 /// `offset` is the ListState scroll offset so clicks track the visible window.
 fn list_row_at(panel: Rect, y: u16, n_items: usize, offset: usize) -> Option<usize> {
-    if n_items == 0 || panel.height < 3 {
+    if n_items == 0 || panel.height == 0 || y < panel.y {
         return None;
     }
-    // border top + title uses y = panel.y; first visible item at panel.y + 1
-    let inner_y = y.saturating_sub(panel.y.saturating_add(1));
-    let visible = panel.height.saturating_sub(2) as usize;
-    if inner_y as usize >= visible {
+    // The rail is borderless: its first row is the first item (the title rides the
+    // labels row above), so every row of `panel` is content.
+    let inner_y = y - panel.y;
+    if inner_y >= panel.height {
         return None;
     }
     let row = offset.saturating_add(inner_y as usize);
@@ -2292,18 +2289,26 @@ fn contains(r: Rect, x: u16, y: u16) -> bool {
 }
 
 struct LayoutRects {
-    /// One status line: breadcrumb + run context + gate cues/buttons (the Driving-mode
+    /// One header line: breadcrumb + run context + gate cues/buttons (the Driving-mode
     /// banner in driving mode).
-    status: Rect,
+    header: Rect,
+    /// The run stepper (or, with no run, the project roll-up). Zero-height on short
+    /// terminals and in Driving mode.
+    context: Rect,
+    /// One row carrying the rail's title on the left and the MainTab labels on the
+    /// right. Full width; the drawer slices it against `rail` / `main`.
+    labels: Rect,
+    /// The rule under `labels`: the chrome/content divider, doubling as the active
+    /// tab's underline.
+    rule: Rect,
     /// The drill-down rail. Zero-sized when zoomed, driving, or in narrow while Main
     /// is focused.
     rail: Rect,
-    /// The one main area (tab strip lives in its top border in the wide layout).
+    /// One-column seam between rail and Main. Zero-sized whenever the rail is.
+    seam: Rect,
+    /// The one main area — content only; its tabs live in `labels`.
     main: Rect,
     footer: Rect,
-    /// Narrow-mode MainTab strip; zero-sized in the wide layout (the strip is drawn
-    /// inside Main's top border there).
-    tabs: Rect,
     /// True when the single-column phone layout is active.
     narrow: bool,
 }
@@ -2313,64 +2318,100 @@ struct LayoutRects {
 /// object gets the extra columns — we never add a fourth box).
 const NARROW_WIDTH: u16 = 80;
 
-/// Rail width in the wide layout. Enough for `run id · phase · age`, no more. Fixed
-/// across the wide bands so the extra width at `>=120` all lands on Main.
-const RAIL_WIDTH: u16 = 24;
+/// Minimum height for the labels + rule rows, then for the context band on top. Below
+/// each, that band folds away rather than eating the content it describes.
+const LABELS_MIN_H: u16 = 9;
+const CONTEXT_MIN_H: u16 = 14;
 
-/// Chrome budget: 1 status row + 1 footer row. Everything else on screen is content
-/// (rail + main). The `:` palette and `/` filter are overlays, not reserved rows.
+/// Rail width, derived from the terminal width alone — never from the data, so rows
+/// cannot slide sideways as runs and agents arrive (U11). Wide enough for
+/// `role · model · age` at both bands; the `>=120` band spends 6 of its extra columns
+/// on making agent identity legible and the rest on Main.
+fn rail_width(total: u16) -> u16 {
+    if total >= 120 {
+        32
+    } else {
+        26
+    }
+}
+
+/// Chrome budget: header + context + labels + rule + footer, each foldable except the
+/// header and footer. Everything else is content. The `:` palette, `/` filter and help
+/// are overlays, not reserved rows.
 fn layout_rects(area: Rect, focus: Focus, zoom: bool, driving: bool) -> LayoutRects {
     let narrow = area.width < NARROW_WIDTH;
-    // Driving mode drops the narrow tab strip too — the banner + F12 is the whole chrome.
-    let strip = if narrow && !driving { 1 } else { 0 };
+    // Driving mode drops every band but the banner — it plus F12 is the whole chrome.
+    let labels_h = if !driving && area.height >= LABELS_MIN_H {
+        1
+    } else {
+        0
+    };
+    let ctx_h = if !driving && area.height >= CONTEXT_MIN_H {
+        1
+    } else {
+        0
+    };
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),     // status line / driving banner
-            Constraint::Length(strip), // narrow MainTab strip
-            Constraint::Min(4),        // body: rail + main
-            Constraint::Length(1),     // footer
+            Constraint::Length(1),        // header / driving banner
+            Constraint::Length(ctx_h),    // stepper or project roll-up
+            Constraint::Length(labels_h), // rail title + tab labels
+            Constraint::Length(labels_h), // rule / active-tab underline
+            Constraint::Min(2),           // body: rail + seam + main
+            Constraint::Length(1),        // footer
         ])
         .split(area);
 
     let z = Rect::default();
     // Zoom or driving both hide the rail in place; nothing else on screen moves.
     let hide_rail = zoom || driving;
+    let body = root[4];
 
     if narrow {
         // One column. The rail takes the stage while it is focused; otherwise Main
         // has it. Tapping a tab (or the breadcrumb) moves between the two.
         let (rail, main) = if focus == Focus::Rail && !hide_rail {
-            (root[2], z)
+            (body, z)
         } else {
-            (z, root[2])
+            (z, body)
         };
         return LayoutRects {
-            status: root[0],
+            header: root[0],
+            context: root[1],
+            labels: root[2],
+            rule: root[3],
             rail,
+            seam: z,
             main,
-            footer: root[3],
-            tabs: root[1],
+            footer: root[5],
             narrow: true,
         };
     }
 
-    let (rail, main) = if hide_rail {
-        (z, root[2])
+    let (rail, seam, main) = if hide_rail {
+        (z, z, body)
     } else {
-        let body = Layout::default()
+        let cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(RAIL_WIDTH), Constraint::Min(20)])
-            .split(root[2]);
-        (body[0], body[1])
+            .constraints([
+                Constraint::Length(rail_width(area.width)),
+                Constraint::Length(1),
+                Constraint::Min(20),
+            ])
+            .split(body);
+        (cols[0], cols[1], cols[2])
     };
 
     LayoutRects {
-        status: root[0],
+        header: root[0],
+        context: root[1],
+        labels: root[2],
+        rule: root[3],
         rail,
+        seam,
         main,
-        footer: root[3],
-        tabs: z,
+        footer: root[5],
         narrow: false,
     }
 }
@@ -2389,9 +2430,10 @@ fn draw(
     rail_state: &mut ListState,
 ) {
     let area = f.area();
-    // Full clear each frame — prevents styled-cell ghosting across the whole UI.
+    // Full clear each frame — prevents styled-cell ghosting across the whole UI, and
+    // leaves every cell on the terminal's own background (no page fill: the host
+    // theme, and its transparency, show through).
     f.render_widget(Clear, area);
-    f.render_widget(Block::default().style(Style::default().bg(BG)), area);
 
     // On the first narrow render with an active run, land on the live log so a
     // phone glance shows progress — but only once, and never over a manual move.
@@ -2410,37 +2452,37 @@ fn draw(
     let driving = app.driving();
     let lay = layout_rects(area, app.focus, app.zoom, driving);
     // Keep mouse hit regions aligned with the frame actually painted.
-    app.rect_status = lay.status;
+    app.rect_status = lay.header;
     app.rect_rail = lay.rail;
     app.rect_main = lay.main;
     app.rect_palette = Rect::default();
-    // Rebuilt below by whatever paints this frame.
+    // Rebuilt below by whatever paints this frame. `rect_attention` is cleared here,
+    // not in `draw_header`: driving mode skips the header entirely, and a stale chip
+    // rect would swallow a click meant for the agent's terminal.
+    app.rect_attention = Rect::default();
     app.gate_buttons.clear();
     app.main_tabs.clear();
 
     if driving {
-        draw_driving_banner(f, lay.status, app);
+        draw_driving_banner(f, lay.header, app);
     } else {
-        draw_status(f, lay.status, swarm, projects, runs, full, app);
+        draw_header(f, lay.header, swarm, projects, runs, full, app);
+        if lay.context.height > 0 {
+            draw_context_band(f, lay.context, projects, runs, full, app);
+        }
+        if lay.labels.height > 0 {
+            draw_labels(f, &lay, swarm, projects, runs, full, app);
+            draw_rule(f, &lay, app);
+        }
     }
-    if lay.narrow && lay.tabs.height > 0 {
-        draw_narrow_tabs(f, lay.tabs, app);
+    if lay.seam.width > 0 {
+        draw_seam(f, lay.seam);
     }
     if lay.rail.width > 0 {
         draw_rail(f, lay.rail, projects, runs, full, app, rail_state);
     }
     if lay.main.width > 0 {
-        draw_main(
-            f,
-            lay.main,
-            swarm,
-            full,
-            stream_text,
-            activity,
-            diff_text,
-            app,
-            !lay.narrow,
-        );
+        draw_main(f, lay.main, full, stream_text, activity, diff_text, app);
     }
     draw_footer(f, lay.footer, app, full);
 
@@ -2454,49 +2496,121 @@ fn draw(
     }
 }
 
-/// The Main tab strip. Labels + the Activity alert badge, active tab lit. Records a
-/// hit rect per tab so a click (or a phone tap) switches tabs.
+/// The Main tab strip. Labels + the Activity alert badge; the active tab is lit by
+/// weight and by the accent underline on the rule below it, never by a filled block.
 fn main_tab_spans(app: &App) -> Vec<(MainTab, String, Style)> {
     MAIN_TABS
         .iter()
         .map(|t| {
-            let badge = if *t == MainTab::Activity && app.human_alerts_n > 0 {
-                format!(" ⚠{}", app.human_alerts_n)
+            // Activity's alert badge lives in a fixed 4-column slot, blank when there
+            // is nothing to say: Activity is second of four, so a badge that changed
+            // width would shift Diff and Shell out from under a click (U11).
+            let badge = if *t == MainTab::Activity {
+                match app.human_alerts_n {
+                    0 => "    ".to_string(),
+                    n => format!(" ⚠{:<2}", n.min(99)),
+                }
             } else {
                 String::new()
             };
-            let text = format!(" {}{badge} ", t.label());
+            let text = format!("  {}{badge}  ", t.label());
             let style = if *t == app.main_tab {
-                Style::default().fg(BG).bg(ACCENT).bold()
+                Style::default().fg(ACCENT).bold()
             } else if *t == MainTab::Activity && app.human_alerts_n > 0 {
-                Style::default().fg(BG).bg(RED).bold()
+                Style::default().fg(ALERT).bold()
             } else {
-                Style::default().fg(FG_DIM).bg(BG_RAISED)
+                dim()
             };
             (*t, text, style)
         })
         .collect()
 }
 
-/// Narrow layout: the same MainTab strip on its own row, equal cells, tappable —
-/// the only escape from the Shell tab on a phone.
-fn draw_narrow_tabs(f: &mut Frame, area: Rect, app: &mut App) {
+/// One row: the rail's section title on the left, the MainTab labels on the right,
+/// and what the active tab is showing, right-aligned. In narrow the rail is gone, so
+/// the tabs spread across the whole row — still the escape from the Shell tab on a
+/// phone. Records a hit rect per tab.
+#[allow(clippy::too_many_arguments)]
+fn draw_labels(
+    f: &mut Frame,
+    lay: &LayoutRects,
+    swarm: &SparPaths,
+    projects: &[registry::ProjectEntry],
+    runs: &[state::RunSummary],
+    full: Option<&RunState>,
+    app: &mut App,
+) {
+    let area = lay.labels;
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let tabs = main_tab_spans(app);
-    let n = tabs.len() as u16;
-    let cell = (area.width / n).max(1);
-    let mut spans: Vec<Span> = Vec::with_capacity(tabs.len());
-    let mut x = area.x;
-    for (i, (tab, text, style)) in tabs.into_iter().enumerate() {
-        let w = if i as u16 == n - 1 {
-            area.width.saturating_sub(cell * (n - 1))
-        } else {
-            cell
+
+    if lay.narrow {
+        let tabs = main_tab_spans(app);
+        let n = tabs.len() as u16;
+        let cell = (area.width / n).max(1);
+        let mut spans: Vec<Span> = Vec::with_capacity(tabs.len());
+        let mut x = area.x;
+        for (i, (tab, text, style)) in tabs.into_iter().enumerate() {
+            let w = if i as u16 == n - 1 {
+                area.width.saturating_sub(cell * (n - 1))
+            } else {
+                cell
+            };
+            let label = truncate(text.trim(), w as usize);
+            spans.push(Span::styled(format!("{label:^w$}", w = w as usize), style));
+            app.main_tabs.push((
+                Rect {
+                    x,
+                    y: area.y,
+                    width: w,
+                    height: 1,
+                },
+                tab,
+            ));
+            x = x.saturating_add(w);
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
+
+    if lay.rail.width > 0 {
+        let title = rail_title(projects, runs, full, app);
+        let rail_row = Rect {
+            x: lay.rail.x.saturating_add(1),
+            width: lay.rail.width.saturating_sub(1),
+            ..area
         };
-        let label = truncate(text.trim(), w as usize);
-        spans.push(Span::styled(format!("{label:^w$}", w = w as usize), style));
+        let style = if app.focus == Focus::Rail {
+            Style::default().fg(ACCENT).bold()
+        } else {
+            muted().bold()
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                truncate(&title, rail_row.width as usize),
+                style,
+            )),
+            rail_row,
+        );
+    }
+
+    // Main's tabs sit on the labels row, aligned to Main's column.
+    let main = Rect {
+        y: area.y,
+        height: 1,
+        ..lay.main
+    };
+    if main.width == 0 {
+        return;
+    }
+    let mut spans: Vec<Span> = Vec::new();
+    let mut x = main.x;
+    for (tab, text, style) in main_tab_spans(app) {
+        let w = text.chars().count() as u16;
+        if x.saturating_add(w) > main.right() {
+            break;
+        }
         app.main_tabs.push((
             Rect {
                 x,
@@ -2507,21 +2621,538 @@ fn draw_narrow_tabs(f: &mut Frame, area: Rect, app: &mut App) {
             tab,
         ));
         x = x.saturating_add(w);
+        spans.push(Span::styled(text, style));
     }
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(BG_RAISED)),
-        area,
-    );
+    f.render_widget(Paragraph::new(Line::from(spans)), main);
+
+    // What the active tab is showing, parked on the right so the tabs never move.
+    let ctx = main_context(swarm, full, app);
+    let used = x.saturating_sub(main.x);
+    let room = main.width.saturating_sub(used).saturating_sub(1);
+    if !ctx.is_empty() && room > 8 {
+        let text = truncate(&ctx, room as usize);
+        let w = text.chars().count() as u16;
+        f.render_widget(
+            Paragraph::new(Span::styled(text, muted())),
+            Rect {
+                x: main.right().saturating_sub(w + 1),
+                y: area.y,
+                width: w,
+                height: 1,
+            },
+        );
+    }
 }
 
-/// The status line's cue and its colors. A background other than `BG_RAISED` means an
-/// alert state (gate, quota, failure, abandoned) worth surfacing loudly.
+/// The chrome/content divider. One rule across the frame, tee'd at the rail seam,
+/// carrying the active tab's underline — the tab indicator costs no extra row.
+fn draw_rule(f: &mut Frame, lay: &LayoutRects, app: &App) {
+    let area = lay.rule;
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    f.render_widget(
+        Paragraph::new(Span::styled(RULE_H.repeat(area.width as usize), rule())),
+        area,
+    );
+    if lay.seam.width > 0 {
+        f.render_widget(
+            Paragraph::new(Span::styled(RULE_TEE, rule())),
+            Rect {
+                x: lay.seam.x,
+                y: area.y,
+                width: 1,
+                height: 1,
+            },
+        );
+    }
+    if let Some((r, _)) = app.main_tabs.iter().find(|(_, t)| *t == app.main_tab) {
+        let w = r.width.min(area.right().saturating_sub(r.x));
+        if w > 0 {
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    TAB_MARK.repeat(w as usize),
+                    Style::default().fg(ACCENT),
+                )),
+                Rect {
+                    x: r.x,
+                    y: area.y,
+                    width: w,
+                    height: 1,
+                },
+            );
+        }
+    }
+}
+
+/// The one-column seam between rail and Main. No pane borders anywhere else.
+fn draw_seam(f: &mut Frame, area: Rect) {
+    let mut lines: Vec<Line> = Vec::with_capacity(area.height as usize);
+    for _ in 0..area.height {
+        lines.push(Line::from(Span::styled(RULE_SEAM, rule())));
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// One step of the run pipeline. A run *is* a stepper, and the shell says so in one
+/// row instead of hiding it in a parenthesised phase name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepState {
+    Pending,
+    Active,
+    Done,
+    Failed,
+    /// Finished, and now waiting on the operator.
+    Gate,
+    /// Was running when the run was halted, quota-paused or abandoned. Not progress,
+    /// not failure — nobody is driving it.
+    Halted,
+    /// Never happened and never will: a disabled channel, or a role this run's fleet
+    /// does not use. Distinguished from Pending, which promises it is still coming.
+    Skipped,
+}
+
+impl StepState {
+    fn glyph(self) -> &'static str {
+        match self {
+            StepState::Pending => "○",
+            StepState::Active => "◐",
+            StepState::Done => "●",
+            StepState::Failed => "✗",
+            StepState::Gate => "⚑",
+            StepState::Halted => "⏸",
+            StepState::Skipped => "·",
+        }
+    }
+    fn color(self) -> Color {
+        match self {
+            StepState::Pending | StepState::Skipped => FG_MUTED,
+            StepState::Active => INFO,
+            StepState::Done => OK,
+            StepState::Failed => ALERT,
+            StepState::Gate | StepState::Halted => WARN,
+        }
+    }
+}
+
+/// The pipeline a run of this **kind** walks, as `(label, owning role)`; `ship` is the
+/// one step with no role, read off the phase. Keyed on the workflow because the
+/// fleets differ: an arena has no planner and a roles run has nothing but peers, so
+/// one fixed seven-step table would show them six steps that never existed.
+fn steps_for(kind: crate::cli::WorkflowKind) -> &'static [(&'static str, Option<SlotRole>)] {
+    use crate::cli::WorkflowKind as W;
+    match kind {
+        W::Arena => &[
+            ("build", Some(SlotRole::Implementer)),
+            ("rank", Some(SlotRole::Ranker)),
+            ("reconcile", Some(SlotRole::Reconciler)),
+            ("review", Some(SlotRole::Reviewer)),
+            ("ship", None),
+        ],
+        W::Roles | W::Peer => &[("peers", Some(SlotRole::Peer)), ("ship", None)],
+        W::Review => &[("review", Some(SlotRole::Reviewer)), ("ship", None)],
+        W::Plan | W::Loop => &[
+            ("plan", Some(SlotRole::Planner)),
+            ("critique", Some(SlotRole::PlanCritic)),
+            ("spec", Some(SlotRole::TestAuthor)),
+            ("build", Some(SlotRole::Implementer)),
+            ("tests", Some(SlotRole::Tester)),
+            ("review", Some(SlotRole::Reviewer)),
+            ("ship", None),
+        ],
+    }
+}
+
+/// Which step a gate is holding. The plan gate hangs off the critic when the fleet
+/// ran one (else the planner); the winner gate off ranking, the reconcile gate off
+/// reconcile. Applied last and unconditionally, so a step whose slot failed still
+/// flies the flag — the gate is the actionable fact.
+fn gate_step(st: &RunState, steps: &[(&'static str, StepState)]) -> Option<usize> {
+    let find = |label: &str| steps.iter().position(|(l, _)| *l == label);
+    match st.phase {
+        Phase::AwaitingPlanApproval => plan_step(st, steps),
+        Phase::AwaitingWinnerConfirm => find("rank"),
+        Phase::AwaitingReconcile => find("reconcile"),
+        Phase::AwaitingShipConfirm => find("ship"),
+        _ => None,
+    }
+}
+
+/// The step the plan verdict lands on: the critic when the fleet ran one, else the
+/// planner.
+fn plan_step(st: &RunState, steps: &[(&'static str, StepState)]) -> Option<usize> {
+    let find = |label: &str| steps.iter().position(|(l, _)| *l == label);
+    if st.slots.iter().any(|s| s.role == SlotRole::PlanCritic) {
+        find("critique").or_else(|| find("plan"))
+    } else {
+        find("plan")
+    }
+}
+
+/// Step states read off the slots that actually ran, not off a phase-to-step guess:
+/// slots accumulate on the run, so their roles and statuses are the honest record of
+/// how far it got. Only `ship` comes from the phase. `abandoned` is the App's view
+/// (no orchestrator behind the run), which no field of `RunState` records.
+fn run_steps(st: &RunState, abandoned: bool) -> Vec<(&'static str, StepState)> {
+    let broken = matches!(st.phase, Phase::Failed | Phase::Stuck | Phase::Escalated);
+    let halted = abandoned || matches!(st.phase, Phase::Stopped | Phase::Quota);
+    let mut out: Vec<(&'static str, StepState)> = steps_for(st.workflow)
+        .iter()
+        .map(|(label, role)| {
+            let Some(role) = role else {
+                let ship = match st.phase {
+                    Phase::Done => StepState::Done,
+                    Phase::Shipping => StepState::Active,
+                    _ if broken => StepState::Failed,
+                    _ if halted => StepState::Halted,
+                    _ => StepState::Pending,
+                };
+                return (*label, ship);
+            };
+            let mine: Vec<&SlotState> = st.slots.iter().filter(|s| s.role == *role).collect();
+            if mine.is_empty() {
+                return (*label, StepState::Pending);
+            }
+            let state = if mine.iter().any(|s| s.status == SlotStatus::Running) {
+                if broken {
+                    StepState::Failed
+                } else if halted {
+                    StepState::Halted
+                } else {
+                    StepState::Active
+                }
+            } else if mine.iter().all(|s| s.status == SlotStatus::Failed) {
+                StepState::Failed
+            } else if mine.iter().any(|s| s.status == SlotStatus::Done) {
+                // A fleet that runs several of a role (arena implementers, two
+                // reviewers) survives one of them dying; the rail carries that.
+                StepState::Done
+            } else {
+                StepState::Pending
+            };
+            (*label, state)
+        })
+        .collect();
+
+    // A step nothing ever filled, on a run that has already moved past it, did not
+    // happen: a disabled channel (`[spec]`, `[suite]`) or an unused optional role.
+    // Saying "pending" there promises work that is never coming.
+    let terminal = matches!(
+        st.phase,
+        Phase::Done | Phase::Shipping | Phase::AwaitingShipConfirm
+    );
+    for i in 0..out.len() {
+        if out[i].1 != StepState::Pending {
+            continue;
+        }
+        let passed = terminal || out[i + 1..].iter().any(|(_, s)| *s != StepState::Pending);
+        if passed {
+            out[i].1 = StepState::Skipped;
+        }
+    }
+
+    // A rejected plan is not a pending one.
+    if st.phase == Phase::PlanRejected {
+        if let Some(i) = plan_step(st, &out) {
+            out[i].1 = StepState::Failed;
+        }
+    }
+    if let Some(i) = gate_step(st, &out) {
+        out[i].1 = StepState::Gate;
+    }
+    out
+}
+
+/// The stepper as spans. Tightens in three tiers — drawn connectors, then the labels
+/// on everything that is not live — and appends the live step's name only when it
+/// actually fits, so the row never clips mid-word.
+fn stepper_spans(
+    steps: &[(&'static str, StepState)],
+    width: u16,
+    spinner: &'static str,
+) -> Vec<Span<'static>> {
+    let labels_w: usize = steps
+        .iter()
+        .map(|(l, _)| l.chars().count() + 2)
+        .sum::<usize>();
+    let gaps = steps.len().saturating_sub(1);
+    let width = width as usize;
+    let (labelled, sep) = if labels_w + gaps * 3 <= width {
+        (true, " ─ ")
+    } else if labels_w + gaps <= width {
+        (true, " ")
+    } else {
+        (false, " ")
+    };
+    // Even glyph-only, seven steps need 13 columns. When they do not all fit, spend
+    // the last column on an ellipsis rather than letting the paragraph cut a step in
+    // half.
+    let sep_w = sep.chars().count();
+    let glyphs_w = steps.len() + gaps * sep_w;
+    let elided = glyphs_w > width;
+    let budget = if elided {
+        width.saturating_sub(1)
+    } else {
+        width
+    };
+    let mut used = 0usize;
+    let mut spans = Vec::with_capacity(steps.len() * 3);
+    for (i, (label, state)) in steps.iter().enumerate() {
+        // Stop cleanly at a step boundary.
+        if used + if i > 0 { sep_w + 1 } else { 1 } > budget {
+            break;
+        }
+        if i > 0 {
+            // The connector carries progress: lit behind everything already finished.
+            let done = matches!(steps[i - 1].1, StepState::Done | StepState::Gate);
+            spans.push(Span::styled(
+                sep,
+                Style::default().fg(if done { OK } else { RULE }),
+            ));
+            used += sep.chars().count();
+        }
+        let glyph = if *state == StepState::Active {
+            spinner
+        } else {
+            state.glyph()
+        };
+        spans.push(Span::styled(
+            glyph.to_string(),
+            Style::default().fg(state.color()).bold(),
+        ));
+        used += 1;
+        let live = matches!(
+            state,
+            StepState::Active | StepState::Gate | StepState::Halted
+        );
+        let room_for_label = used + 1 + label.chars().count() <= budget;
+        if (labelled || live) && room_for_label {
+            spans.push(Span::styled(
+                format!(" {label}"),
+                Style::default()
+                    .fg(match state {
+                        StepState::Pending | StepState::Skipped => FG_MUTED,
+                        StepState::Done => FG_DIM,
+                        s => s.color(),
+                    })
+                    .add_modifier(match state {
+                        StepState::Active
+                        | StepState::Gate
+                        | StepState::Halted
+                        | StepState::Failed => Modifier::BOLD,
+                        _ => Modifier::empty(),
+                    }),
+            ));
+            used += 1 + label.chars().count();
+        }
+    }
+    if elided && used < width {
+        spans.push(Span::styled("…", muted()));
+    }
+    spans
+}
+
+/// The band under the header: the run's pipeline plus its meters, or — with no run in
+/// hand — the project's roll-up. Always occupied, so nothing below it moves.
+fn draw_context_band(
+    f: &mut Frame,
+    area: Rect,
+    projects: &[registry::ProjectEntry],
+    runs: &[state::RunSummary],
+    full: Option<&RunState>,
+    app: &App,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let pad = Rect {
+        x: area.x.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        ..area
+    };
+    if pad.width == 0 {
+        return;
+    }
+
+    let Some(st) = full else {
+        // Outside a project the refresher hands us no runs at all (`build_snapshot`),
+        // so a run roll-up here would always read "none" — count what we do have.
+        if !app.browse.in_project() {
+            let line = if projects.is_empty() {
+                Line::from(Span::styled(
+                    "no projects yet — run spar in a repo",
+                    muted(),
+                ))
+            } else {
+                Line::from(vec![
+                    Span::styled(format!("{} projects", projects.len()), dim()),
+                    Span::styled(" · ", muted()),
+                    Span::styled("Enter opens one", muted()),
+                ])
+            };
+            f.render_widget(Paragraph::new(line), pad);
+            return;
+        }
+        let need = runs_needing_attention(runs);
+        let running = runs.iter().filter(|r| is_active_phase(r.phase)).count();
+        let line = if runs.is_empty() {
+            Line::from(Span::styled(
+                "no runs here yet — press : for the command palette",
+                muted(),
+            ))
+        } else {
+            Line::from(vec![
+                Span::styled(format!("{} runs", runs.len()), dim()),
+                Span::styled(" · ", muted()),
+                Span::styled(
+                    format!("{running} running"),
+                    Style::default().fg(if running > 0 { INFO } else { FG_MUTED }),
+                ),
+                Span::styled(" · ", muted()),
+                Span::styled(
+                    format!("⚑{need} need you"),
+                    Style::default().fg(if need > 0 { WARN } else { FG_MUTED }),
+                ),
+            ])
+        };
+        f.render_widget(Paragraph::new(line), pad);
+        return;
+    };
+
+    // Right meters first: they set the budget the stepper renders into.
+    let done = st
+        .slots
+        .iter()
+        .filter(|s| s.status == SlotStatus::Done)
+        .count();
+    // `state.usage` is the run's ledger: one entry pushed per dispatch. `slot.usage`
+    // is overwritten each time a slot is re-dispatched, so summing that under-reports
+    // a run with fix rounds and disagrees with `status --json` (executor.rs:1028).
+    let out: u64 = st.usage.iter().map(|u| u.output_tokens).sum();
+    let mut meters: Vec<Span> = vec![
+        Span::styled(relative_age(st.created_at), dim()),
+        Span::styled(" · ", muted()),
+        Span::styled(format!("{done}/{} agents", st.slots.len()), dim()),
+    ];
+    if out > 0 {
+        meters.push(Span::styled(" · ", muted()));
+        meters.push(Span::styled(format!("out {}", compact_u64(out)), dim()));
+    }
+    let meters_w: u16 = meters
+        .iter()
+        .map(|s| s.content.chars().count() as u16)
+        .sum();
+
+    // The stepper is the point of this band; the meters yield to it, never the other
+    // way round, so a narrow terminal never leaves the row blank.
+    let (room, meters) = match pad.width.checked_sub(meters_w + 2) {
+        Some(w) if w >= 8 => (w, meters),
+        _ => (pad.width, Vec::new()),
+    };
+    let meters_w: u16 = meters
+        .iter()
+        .map(|s| s.content.chars().count() as u16)
+        .sum();
+    let steps = run_steps(st, app.abandoned);
+    f.render_widget(
+        Paragraph::new(Line::from(stepper_spans(&steps, room, app.spinner()))),
+        Rect { width: room, ..pad },
+    );
+    if meters_w > 0 && meters_w < pad.width {
+        f.render_widget(
+            Paragraph::new(Line::from(meters)),
+            Rect {
+                x: pad.right().saturating_sub(meters_w),
+                width: meters_w,
+                ..pad
+            },
+        );
+    }
+}
+
+/// A slot's short name: its role, plus an index when the fleet runs more than one of
+/// that role (two reviewers, N arena implementers). The raw slot id carries the
+/// provider and is far too long for a breadcrumb or a rail row.
+fn slot_short(slots: &[SlotState], i: usize) -> String {
+    let Some(s) = slots.get(i) else {
+        return "—".into();
+    };
+    let label = role_label(s.role);
+    let peers: Vec<usize> = slots
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.role == s.role)
+        .map(|(j, _)| j)
+        .collect();
+    if peers.len() < 2 {
+        return label.to_string();
+    }
+    let n = peers.iter().position(|j| *j == i).unwrap_or(0);
+    format!("{label} {n}")
+}
+
+/// The model a slot is running, shortened to fit a rail column. Keeps the **tail**
+/// and marks the elision, because that is where the tier lives: `gemini-3.7-flash`
+/// and `gemini-3.7-pro` differ only in their last segment, and a head-first shortening
+/// renders both as `gemini`. Prefers the model the provider says it served over the
+/// one that was requested — for an OpenRouter-routed slot they can differ.
+fn slot_model(s: &SlotState, max: usize) -> String {
+    let served = s
+        .usage
+        .as_ref()
+        .and_then(|u| u.model.as_deref())
+        .or(s.model.as_deref());
+    let Some(m) = served else {
+        // No model recorded: name the adapter. `provider` is the model-free storage
+        // key by construction (executor::init_slot_model), so there is no `@model`
+        // left on it to strip.
+        return truncate(s.provider.rsplit(':').next().unwrap_or(&s.provider), max);
+    };
+    let m = m.rsplit('/').next().unwrap_or(m);
+    let m = m.strip_prefix("claude-").unwrap_or(m);
+    // Drop a trailing release date (`claude-opus-4-5-20250929`), never a version.
+    let m = match m.rsplit_once('-') {
+        Some((head, tail))
+            if tail.len() >= 6 && tail.chars().all(|c| c.is_ascii_digit()) && !head.is_empty() =>
+        {
+            head
+        }
+        _ => m,
+    };
+    if m.chars().count() <= max {
+        return m.to_string();
+    }
+    // Still too long: the version segments go before the names do. `opus-4-5` must
+    // not shorten to `…4-5`, which every Anthropic tier shares — the 80-119 band's
+    // 26-column rail leaves 6 columns here, so this is the common case, not the edge.
+    let named: String = m
+        .split('-')
+        .filter(|seg| !seg.starts_with(|c: char| c.is_ascii_digit()))
+        .collect::<Vec<_>>()
+        .join("-");
+    if !named.is_empty() && named.chars().count() <= max {
+        return named;
+    }
+    // Names alone still do not fit: keep the tail, which is where the tier lives
+    // (`gemini-flash` vs `gemini-pro`), and say that we cut.
+    let mut cut = if named.is_empty() { m } else { named.as_str() };
+    while let Some((_, tail)) = cut.split_once('-') {
+        cut = tail;
+        if cut.chars().count() < max {
+            return format!("…{cut}");
+        }
+    }
+    truncate(cut, max)
+}
+
+/// The header's cue and its colors. `Some(wash)` means an alert state (gate, quota,
+/// failure, abandoned) loud enough to earn a full-row background.
 fn status_cue(
     projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
     app: &App,
-) -> (String, Color, Color) {
+) -> (String, Color, Option<Color>) {
     if app.browse == BrowseLevel::Projects {
         if projects.is_empty() {
             return (
@@ -2530,20 +3161,20 @@ fn status_cue(
                     registry::spar_home().display()
                 ),
                 FG_DIM,
-                BG_RAISED,
+                None,
             );
         }
-        return ("Enter opens a project".into(), FG_MUTED, BG_RAISED);
+        return ("Enter opens a project".into(), FG_MUTED, None);
     }
     let Some(st) = full else {
         return if runs.is_empty() {
             (
                 "no runs — spar plan -t \"…\" --providers cli:claude".into(),
                 FG_DIM,
-                BG_RAISED,
+                None,
             )
         } else {
-            ("select a run".into(), FG_MUTED, BG_RAISED)
+            ("select a run".into(), FG_MUTED, None)
         };
     };
     if app.abandoned {
@@ -2553,36 +3184,65 @@ fn status_cue(
                 st.id
             ),
             FG,
-            Color::Rgb(48, 24, 24),
+            Some(ALERT_WASH),
         );
     }
     match st.phase {
-        Phase::AwaitingPlanApproval => ("plan ready — tap Approve · r reject".into(), BG, YELLOW),
-        Phase::AwaitingWinnerConfirm => ("winner ready — confirm or reconcile".into(), BG, YELLOW),
-        Phase::AwaitingShipConfirm => ("ready to ship — s (draft PR)".into(), BG, YELLOW),
-        Phase::AwaitingReconcile => ("reconcile ready".into(), BG, YELLOW),
+        Phase::AwaitingPlanApproval => (
+            "plan ready — tap Approve · r reject".into(),
+            WARN,
+            Some(GATE_WASH),
+        ),
+        Phase::AwaitingWinnerConfirm => (
+            "winner ready — confirm or reconcile".into(),
+            WARN,
+            Some(GATE_WASH),
+        ),
+        Phase::AwaitingShipConfirm => {
+            ("ready to ship — s (draft PR)".into(), WARN, Some(GATE_WASH))
+        }
+        Phase::AwaitingReconcile => ("reconcile ready".into(), WARN, Some(GATE_WASH)),
         Phase::Quota => (
             "all providers paused — spar provider resume".into(),
-            BG,
-            RED,
+            INK,
+            Some(ALERT),
         ),
         Phase::Failed | Phase::Stuck | Phase::Escalated => (
             format!("{} — check the Log tab", phase_label(st.phase)),
             FG,
-            Color::Rgb(48, 24, 24),
+            Some(ALERT_WASH),
         ),
-        _ if st.dry_run => ("dry-run".into(), FG_DIM, BG_RAISED),
-        _ => (String::new(), FG_MUTED, BG_RAISED),
+        _ if st.dry_run => ("dry-run".into(), FG_DIM, None),
+        _ => (String::new(), FG_MUTED, None),
     }
+}
+
+/// Width reserved on the right of the header for gate buttons, wide enough for the
+/// widest set (`Confirm` + `Reconcile`). Buttons are left-aligned inside it, so a
+/// different gate never slides them under a mid-click (U11).
+const GATE_ZONE_W: u16 = 23;
+
+/// The gate zone: a fixed slot, or `None` on a phone-width screen that cannot spare
+/// one (there the buttons fall back to right-aligned, the old behaviour).
+fn gate_zone(area: Rect) -> Option<Rect> {
+    if area.width < NARROW_WIDTH {
+        return None;
+    }
+    Some(Rect {
+        x: area.right().saturating_sub(GATE_ZONE_W),
+        y: area.y,
+        width: GATE_ZONE_W,
+        height: 1,
+    })
 }
 
 /// The whole top chrome: one line.
 ///
-/// `spar · acme/api ▸ run 3f2a ▸ impl#2 · implement (2/3) · ⚠2 · ABANDONED`
+/// ` spar  acme/api ▸ run 3f2a ▸ review 0 · Under review        ⚑2 need you  [Ship]`
 ///
-/// Breadcrumb (rail path) + phase + slot counts + alert/abandoned badges + the gate
-/// cue, with tappable gate buttons right-aligned on the same row.
-fn draw_status(
+/// Brand + breadcrumb + phase on the left, attention chips on the right, gate buttons
+/// in their reserved zone. Counts and progress live one row below, in the stepper.
+fn draw_header(
     f: &mut Frame,
     area: Rect,
     swarm: &SparPaths,
@@ -2594,10 +3254,12 @@ fn draw_status(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let (cue, cue_fg, cue_bg) = status_cue(projects, runs, full, app);
+    let (cue, cue_fg, wash) = status_cue(projects, runs, full, app);
     let buttons = gate_buttons_for(full);
-    let alert = cue_bg != BG_RAISED;
-    let bg = if alert { cue_bg } else { BG_RAISED };
+    // The only full-row fill in the product, and only for states worth shouting about.
+    if let Some(w) = wash {
+        f.render_widget(Paragraph::new("").style(Style::default().bg(w)), area);
+    }
 
     let project = swarm
         .project_root
@@ -2606,10 +3268,10 @@ fn draw_status(
         .unwrap_or(".");
 
     let mut spans = vec![
-        Span::styled(" spar ", Style::default().fg(BG).bg(ACCENT).bold()),
+        Span::styled(" spar ", chip(ACCENT)),
         Span::styled(
-            format!(" {} ", truncate(project, 20)),
-            Style::default().fg(FG).bg(bg).bold(),
+            format!("  {}", truncate(project, 20)),
+            Style::default().fg(FG).bold(),
         ),
     ];
     if app.browse.in_project() {
@@ -2617,95 +3279,48 @@ fn draw_status(
             .map(|s| s.id.clone())
             .or_else(|| runs.get(app.selected_run).map(|r| r.id.clone()))
             .unwrap_or_else(|| "—".into());
-        spans.push(Span::styled("▸ ", Style::default().fg(FG_MUTED).bg(bg)));
+        spans.push(Span::styled(" ▸ ", muted()));
         spans.push(Span::styled(
-            format!("run {run} "),
-            Style::default().fg(CYAN).bg(bg),
+            format!("run {run}"),
+            Style::default().fg(INFO),
         ));
     }
     if app.browse == BrowseLevel::Agents {
         let slot = full
-            .and_then(|s| s.slots.get(app.selected_slot))
-            .map(|s| s.id.clone())
+            .map(|s| slot_short(&s.slots, app.selected_slot))
             .unwrap_or_else(|| "—".into());
-        spans.push(Span::styled("▸ ", Style::default().fg(FG_MUTED).bg(bg)));
-        spans.push(Span::styled(
-            format!("{slot} "),
-            Style::default().fg(MAGENTA).bg(bg),
-        ));
+        spans.push(Span::styled(" ▸ ", muted()));
+        spans.push(Span::styled(slot, Style::default().fg(HINT)));
     }
 
     if let Some(st) = full {
-        let pc = if alert { cue_fg } else { phase_color(st.phase) };
-        spans.push(Span::styled("· ", Style::default().fg(FG_MUTED).bg(bg)));
+        let pc = if wash.is_some() {
+            cue_fg
+        } else {
+            phase_color(st.phase)
+        };
+        spans.push(Span::styled("  ", Style::default()));
         if !app.abandoned && is_active_phase(st.phase) {
             spans.push(Span::styled(
                 format!("{} ", app.spinner()),
-                Style::default().fg(pc).bg(bg),
+                Style::default().fg(pc),
             ));
         }
         spans.push(Span::styled(
             phase_label(st.phase),
-            Style::default().fg(pc).bg(bg).bold(),
+            Style::default().fg(pc).bold(),
         ));
-        if !st.slots.is_empty() {
-            let done = st
-                .slots
-                .iter()
-                .filter(|s| s.status == SlotStatus::Done)
-                .count();
-            spans.push(Span::styled(
-                format!(" ({done}/{}) ", st.slots.len()),
-                Style::default().fg(FG_DIM).bg(bg),
-            ));
-        }
         if st.dry_run {
-            spans.push(Span::styled(
-                " dry-run ",
-                Style::default().fg(BG).bg(YELLOW).bold(),
-            ));
+            spans.push(Span::styled(" dry-run ", chip(WARN)));
         }
     }
-    // Fleet roll-up: how many runs anywhere want the operator, with the `a` jump hint.
-    // This is the "what needs me?" answer that does not depend on which run is selected.
-    app.rect_attention = Rect::default();
-    if app.browse.in_project() {
-        let need = runs_needing_attention(runs);
-        if need > 0 {
-            let token = format!(" ⚑{need} need you · a ");
-            let col: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-            let x = area.x.saturating_add(col as u16);
-            if x < area.right() {
-                app.rect_attention = Rect {
-                    x,
-                    y: area.y,
-                    width: (token.chars().count() as u16).min(area.right() - x),
-                    height: 1,
-                };
-            }
-            spans.push(Span::styled(
-                token,
-                Style::default().fg(BG).bg(YELLOW).bold(),
-            ));
-        }
-    }
-    if app.human_alerts_n > 0 {
-        spans.push(Span::styled(
-            format!(" ⚠{} ", app.human_alerts_n),
-            Style::default().fg(BG).bg(RED).bold(),
-        ));
-    }
-    if app.abandoned {
-        spans.push(Span::styled(
-            " ABANDONED ",
-            Style::default().fg(BG).bg(RED).bold(),
-        ));
-    }
-    if !cue.is_empty() {
-        spans.push(Span::styled(" · ", Style::default().fg(FG_MUTED).bg(bg)));
+    // At a gate the buttons on the right and the footer already say what to press;
+    // repeating it here only crowds the breadcrumb.
+    if !cue.is_empty() && buttons.is_empty() {
+        spans.push(Span::styled(" · ", muted()));
         spans.push(Span::styled(
             cue,
-            Style::default().fg(cue_fg).bg(bg).add_modifier(if alert {
+            Style::default().fg(cue_fg).add_modifier(if wash.is_some() {
                 Modifier::BOLD
             } else {
                 Modifier::empty()
@@ -2713,20 +3328,68 @@ fn draw_status(
         ));
     }
 
+    // Right cluster: the fleet roll-up ("what needs me?", independent of the rail
+    // selection) and the unread human-alert count.
+    let mut right: Vec<Span> = Vec::new();
+    let need = if app.browse.in_project() {
+        runs_needing_attention(runs)
+    } else {
+        0
+    };
+    let attention_token = format!(" ⚑{need} need you · a ");
+    if need > 0 {
+        right.push(Span::styled(attention_token.clone(), chip(WARN)));
+    }
+    if app.human_alerts_n > 0 {
+        right.push(Span::styled(
+            format!(" ⚠{} ", app.human_alerts_n),
+            chip(ALERT),
+        ));
+    }
+    if app.abandoned {
+        right.push(Span::styled(" ABANDONED ", chip(ALERT)));
+    }
+
+    let zone = gate_zone(area);
+    let right_limit = zone.map(|z| z.x).unwrap_or(area.right());
+    let right_w: u16 = right.iter().map(|s| s.content.chars().count() as u16).sum();
+    let right_x = right_limit.saturating_sub(right_w + 1).max(area.x);
+
     f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(bg)),
-        area,
+        Paragraph::new(Line::from(spans)),
+        Rect {
+            width: right_x.saturating_sub(area.x),
+            ..area
+        },
     );
+    if right_w > 0 && right_x + right_w <= area.right() {
+        if need > 0 {
+            app.rect_attention = Rect {
+                x: right_x,
+                y: area.y,
+                width: attention_token.chars().count() as u16,
+                height: 1,
+            };
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(right)),
+            Rect {
+                x: right_x,
+                width: right_w,
+                ..area
+            },
+        );
+    }
     render_gate_buttons(f, area, app, &buttons);
 }
 
 fn button_style(action: GateAction) -> Style {
     let bg = match action {
-        GateAction::Approve | GateAction::Ship | GateAction::ConfirmWinner => GREEN,
-        GateAction::Reject => RED,
+        GateAction::Approve | GateAction::Ship | GateAction::ConfirmWinner => OK,
+        GateAction::Reject => ALERT,
         GateAction::Reconcile => ACCENT,
     };
-    Style::default().fg(BG).bg(bg).bold()
+    Style::default().fg(INK).bg(bg).bold()
 }
 
 /// Paint right-aligned tappable gate buttons filling every row of `area` and
@@ -2739,9 +3402,17 @@ fn render_gate_buttons(f: &mut Frame, area: Rect, app: &mut App, buttons: &[(&st
     let gap: u16 = 1;
     let widths: Vec<u16> = labels.iter().map(|s| s.chars().count() as u16).collect();
     let total: u16 = widths.iter().sum::<u16>() + gap * (buttons.len() as u16 - 1);
-    let mut cx = area.x + area.width.saturating_sub(total + 1); // 1-col right margin
+    // Inside the reserved zone the buttons start at a fixed x, so swapping gates never
+    // moves them; without a zone (narrow) they right-align as before.
+    let mut cx = match gate_zone(area) {
+        Some(z) => z.x,
+        None => area.x + area.width.saturating_sub(total + 1), // 1-col right margin
+    };
     cx = cx.max(area.x);
     for (i, ((_, action), w)) in buttons.iter().zip(widths.iter()).enumerate() {
+        if cx.saturating_add(*w) > area.right() {
+            break;
+        }
         let r = Rect {
             x: cx,
             y: area.y,
@@ -2757,8 +3428,37 @@ fn render_gate_buttons(f: &mut Frame, area: Rect, app: &mut App, buttons: &[(&st
     }
 }
 
+/// The rail's section title, shown on the labels row. While `/` is live the title
+/// becomes the filter field so the operator can see what they are narrowing by.
+fn rail_title(
+    projects: &[registry::ProjectEntry],
+    runs: &[state::RunSummary],
+    full: Option<&RunState>,
+    app: &App,
+) -> String {
+    let base = match app.browse {
+        BrowseLevel::Projects => format!("PROJECTS  {}", projects.len()),
+        BrowseLevel::Runs => format!("RUNS  {}", runs.len()),
+        BrowseLevel::Agents => {
+            let slots = full.map(|s| s.slots.as_slice()).unwrap_or(&[]);
+            let running = slots
+                .iter()
+                .filter(|s| s.status == SlotStatus::Running)
+                .count();
+            let word = if app.abandoned { "orphaned" } else { "live" };
+            format!("AGENTS  {running}/{} {word}", slots.len())
+        }
+    };
+    match app.filter.as_deref() {
+        Some(f) if !app.filter_committed => format!("/{f}▌"),
+        Some(f) if !f.is_empty() => format!("{base}  /{f}"),
+        _ => base,
+    }
+}
+
 /// The rail: one drill-down tree (`projects ▸ runs ▸ agents`), never a stack of
-/// co-equal panels. `Enter` pushes a level, `Esc` pops one.
+/// co-equal panels. `Enter` pushes a level, `Esc` pops one. No border: its title
+/// rides the labels row and the seam separates it from Main.
 fn draw_rail(
     f: &mut Frame,
     area: Rect,
@@ -2769,174 +3469,185 @@ fn draw_rail(
     state: &mut ListState,
 ) {
     let focused = app.focus == Focus::Rail;
-    // While the `/` filter is active, the title becomes the live filter field so the
-    // operator can see (and edit) what they are narrowing by.
-    let filt = |base: String| -> String {
-        match app.filter.as_deref() {
-            Some(f) if !app.filter_committed => format!(" /{f}▌ "),
-            Some(f) if !f.is_empty() => format!("{base}/{f} "),
-            _ => base,
-        }
-    };
-    let (items, title) = match app.browse {
-        BrowseLevel::Projects => (
-            rail_project_items(projects, app),
-            filt(format!(" Projects ({}) ", projects.len())),
-        ),
-        BrowseLevel::Runs => (
-            rail_run_items(runs, app),
-            filt(format!(" Runs ({}) ", runs.len())),
-        ),
+    let w = area.width;
+    let items = match app.browse {
+        BrowseLevel::Projects => rail_project_items(projects, app, w, focused),
+        BrowseLevel::Runs => rail_run_items(runs, app, w, focused),
         BrowseLevel::Agents => {
             let slots = full.map(|s| s.slots.as_slice()).unwrap_or(&[]);
-            let running = slots
-                .iter()
-                .filter(|s| s.status == SlotStatus::Running)
-                .count();
-            let title = if app.abandoned {
-                format!(" Agents {running}/{} orphaned ", slots.len())
-            } else {
-                format!(" Agents {running}/{} live ", slots.len())
-            };
-            (rail_slot_items(slots, app), title)
+            rail_slot_items(slots, app, w, focused)
         }
     };
-    let list = List::new(items).block(panel(&title, focused));
-    f.render_stateful_widget(list, area, state);
+    f.render_stateful_widget(List::new(items), area, state);
 }
 
-fn rail_project_items<'a>(projects: &'a [registry::ProjectEntry], app: &App) -> Vec<ListItem<'a>> {
+/// The lead column: one cell that is either an attention flag, the selection bar, or
+/// nothing. Fixed width, so a row never shifts when its state changes.
+fn rail_lead(sel: bool, focused: bool, flag: Option<Color>) -> Span<'static> {
+    match flag {
+        Some(c) => Span::styled("⚑", Style::default().fg(c).bold()),
+        None if sel => Span::styled(
+            SEL_BAR,
+            Style::default().fg(if focused { ACCENT } else { FG_MUTED }),
+        ),
+        None => Span::raw(" "),
+    }
+}
+
+/// A dimmed row for something the `/` filter did not match. Filtered rows stay in
+/// place rather than disappearing — hiding them would desync the selection index (U4).
+fn rail_filtered_row(text: &str, w: u16) -> ListItem<'static> {
+    ListItem::new(Line::from(Span::styled(
+        format!("  {}", truncate(text, w.saturating_sub(2) as usize)),
+        Style::default().fg(FG_MUTED).dim(),
+    )))
+}
+
+fn rail_empty(text: &'static str) -> Vec<ListItem<'static>> {
+    vec![ListItem::new(Span::styled(
+        format!("  {text}"),
+        Style::default().fg(FG_MUTED).italic(),
+    ))]
+}
+
+/// Pad `spans` out to `w` with the status/age column flush right — the rail's only
+/// right-aligned cell, and it never moves. The gap aims for one column of air before
+/// the seam but yields it when the row is full; the seam has a column of its own, so
+/// the two never touch.
+fn rail_row(
+    lead: Span<'static>,
+    mut body: Vec<Span<'static>>,
+    right: Span<'static>,
+    w: u16,
+) -> ListItem<'static> {
+    let body_w: usize = body.iter().map(|s| s.content.chars().count()).sum();
+    let right_w = right.content.chars().count();
+    // lead + space + body + gap + right + one column of air before the seam
+    let gap = (w as usize).saturating_sub(3 + body_w + right_w).max(1);
+    let mut spans = vec![lead, Span::raw(" ")];
+    spans.append(&mut body);
+    spans.push(Span::raw(" ".repeat(gap)));
+    spans.push(right);
+    ListItem::new(Line::from(spans))
+}
+
+fn rail_project_items(
+    projects: &[registry::ProjectEntry],
+    app: &App,
+    w: u16,
+    focused: bool,
+) -> Vec<ListItem<'static>> {
     if projects.is_empty() {
-        return vec![ListItem::new(Span::styled(
-            "  (no projects)",
-            Style::default().fg(FG_MUTED).italic(),
-        ))];
+        return rail_empty("(no projects)");
     }
     let filter = app.filter.as_deref().filter(|f| !f.is_empty());
+    let name_w = w.saturating_sub(14).clamp(8, 20) as usize;
     projects
         .iter()
         .enumerate()
         .map(|(i, p)| {
             let sel = i == app.selected_project;
+            let name = p.name.as_deref().unwrap_or("·");
             if let Some(f) = filter {
                 if !project_matches_filter(projects, i, f) {
-                    return ListItem::new(Line::from(Span::styled(
-                        format!("  {}", truncate(p.name.as_deref().unwrap_or("·"), 12)),
-                        Style::default().fg(FG_MUTED).dim(),
-                    )));
+                    return rail_filtered_row(name, w);
                 }
             }
-            let name = p.name.as_deref().unwrap_or("·");
             let project_runs = registry::list_visible_project_runs(&p.root).unwrap_or_default();
-            let n = project_runs.len();
             // Roll-up: a run that wants the operator makes its whole project fly a ⚑.
             let need = runs_needing_attention(&project_runs);
-            let lead = if need > 0 {
-                Span::styled("⚑ ", Style::default().fg(YELLOW).bold())
-            } else {
-                Span::styled(if sel { "› " } else { "  " }, Style::default().fg(ACCENT))
-            };
-            let mut spans = vec![
-                lead,
-                Span::styled(
-                    format!("{:<12}", truncate(name, 12)),
-                    Style::default()
-                        .fg(if sel { FG } else { CYAN })
-                        .add_modifier(if sel {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
-                ),
-                Span::styled(format!(" {n}r "), Style::default().fg(FG_MUTED)),
-            ];
+            let mut body = vec![Span::styled(
+                truncate(name, name_w),
+                if sel {
+                    selected(focused)
+                } else {
+                    Style::default().fg(INFO)
+                },
+            )];
+            body.push(Span::styled(format!("  {}r", project_runs.len()), muted()));
             if need > 0 {
-                spans.push(Span::styled(
-                    format!("⚑{need} "),
-                    Style::default().fg(YELLOW).bold(),
+                body.push(Span::styled(
+                    format!(" ⚑{need}"),
+                    Style::default().fg(WARN).bold(),
                 ));
             }
-            spans.push(Span::styled(
-                relative_age(p.last_seen),
-                Style::default().fg(FG_MUTED),
-            ));
-            let line = Line::from(spans);
-            ListItem::new(line).style(if sel {
-                Style::default().bg(BG_RAISED)
-            } else {
-                Style::default()
-            })
+            rail_row(
+                rail_lead(sel, focused, (need > 0).then_some(WARN)),
+                body,
+                Span::styled(relative_age(p.last_seen), muted()),
+                w,
+            )
         })
         .collect()
 }
 
-fn rail_run_items<'a>(runs: &'a [state::RunSummary], app: &App) -> Vec<ListItem<'a>> {
+fn rail_run_items(
+    runs: &[state::RunSummary],
+    app: &App,
+    w: u16,
+    focused: bool,
+) -> Vec<ListItem<'static>> {
     if runs.is_empty() {
-        return vec![ListItem::new(Span::styled(
-            "  (no runs)",
-            Style::default().fg(FG_MUTED).italic(),
-        ))];
+        return rail_empty("(no runs)");
     }
     let filter = app.filter.as_deref().filter(|f| !f.is_empty());
+    let phase_w = w.saturating_sub(17).clamp(6, 16) as usize;
     runs.iter()
         .enumerate()
         .map(|(i, r)| {
             let sel = i == app.selected_run;
             if let Some(f) = filter {
                 if !run_matches_filter(runs, i, f) {
-                    return ListItem::new(Line::from(Span::styled(
-                        format!("  {}", truncate(&r.id, 8)),
-                        Style::default().fg(FG_MUTED).dim(),
-                    )));
+                    return rail_filtered_row(&r.id, w);
                 }
             }
             // Phase reads "review" forever on a run nobody is driving; say so.
             let (phase_text, phase_c) = if r.abandoned {
-                (format!("{} ✗", truncate(&phase_label(r.phase), 8)), RED)
+                (
+                    format!("{} ✗", truncate(&phase_label(r.phase), phase_w - 2)),
+                    ALERT,
+                )
             } else {
-                (truncate(&phase_label(r.phase), 10), phase_color(r.phase))
+                (
+                    truncate(&phase_label(r.phase), phase_w),
+                    phase_color(r.phase),
+                )
             };
-            // The lead glyph doubles as the attention marker: a run that wants you flies
-            // a ⚑ (yellow gate, red broken); otherwise it is the plain selection caret.
-            let lead = match run_attention(r) {
-                Attention::Gate => Span::styled("⚑ ", Style::default().fg(YELLOW).bold()),
-                Attention::Broken => Span::styled("⚑ ", Style::default().fg(RED).bold()),
-                _ => Span::styled(if sel { "› " } else { "  " }, Style::default().fg(ACCENT)),
+            let flag = match run_attention(r) {
+                Attention::Gate => Some(WARN),
+                Attention::Broken => Some(ALERT),
+                _ => None,
             };
-            let line = Line::from(vec![
-                lead,
+            let body = vec![
                 Span::styled(
                     format!("{:<8}", truncate(&r.id, 8)),
-                    Style::default()
-                        .fg(if sel { FG } else { FG_DIM })
-                        .add_modifier(if sel {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
+                    if sel { selected(focused) } else { dim() },
                 ),
-                Span::styled(format!(" {phase_text:<10}"), Style::default().fg(phase_c)),
-                Span::styled(
-                    format!(" {}", relative_age(r.updated_at)),
-                    Style::default().fg(FG_MUTED),
-                ),
-            ]);
-            ListItem::new(line).style(if sel {
-                Style::default().bg(BG_RAISED)
-            } else {
-                Style::default()
-            })
+                Span::styled(format!("  {phase_text}"), Style::default().fg(phase_c)),
+            ];
+            rail_row(
+                rail_lead(sel, focused, flag),
+                body,
+                Span::styled(relative_age(r.updated_at), muted()),
+                w,
+            )
         })
         .collect()
 }
 
-fn rail_slot_items<'a>(slots: &'a [SlotState], app: &App) -> Vec<ListItem<'a>> {
+fn rail_slot_items(
+    slots: &[SlotState],
+    app: &App,
+    w: u16,
+    focused: bool,
+) -> Vec<ListItem<'static>> {
     if slots.is_empty() {
-        return vec![ListItem::new(Span::styled(
-            "  (no agents yet)",
-            Style::default().fg(FG_MUTED).italic(),
-        ))];
+        return rail_empty("(no agents yet)");
     }
+    // Role first and never elided: it is the agent's identity. The provider-suffixed
+    // slot id it replaces did not survive the rail at any width.
+    let role_w = 9usize;
+    let model_w = w.saturating_sub(20).clamp(4, 12) as usize;
     slots
         .iter()
         .enumerate()
@@ -2949,111 +3660,65 @@ fn rail_slot_items<'a>(slots: &'a [SlotState], app: &App) -> Vec<ListItem<'a>> {
                 app.heartbeats.get(&s.id).copied(),
             );
             let orphaned = app.abandoned && s.status == SlotStatus::Running;
-            let color = if act.stalled || orphaned {
-                RED
-            } else {
-                slot_color(s)
-            };
-            let tail = if s.status != SlotStatus::Running {
-                slot_status_label(s.status).to_string()
-            } else if orphaned {
-                format!("ORPHAN {}", act.human_silent())
-            } else if act.stalled {
-                format!("STALL {}", act.human_silent())
-            } else {
+            let broken = act.stalled || orphaned;
+            let color = if broken { ALERT } else { slot_color(s) };
+            // A live slot's cell is how long it has been quiet — including when that
+            // silence is what makes it stalled or orphaned. The word is redundant
+            // there (the red ⚑ in the lead column already says "broken") and the
+            // duration is the part the operator cannot get anywhere else in this view.
+            let tail = if broken || s.status == SlotStatus::Running {
                 act.human_silent()
+            } else {
+                slot_status_label(s.status).to_string()
             };
-            let line = Line::from(vec![
-                Span::styled(if sel { "› " } else { "  " }, Style::default().fg(ACCENT)),
+            let body = vec![
                 Span::styled(
                     format!("{} ", slot_icon(s, app)),
                     Style::default().fg(color),
                 ),
                 Span::styled(
-                    format!("{:<8}", truncate(&s.id, 8)),
-                    Style::default()
-                        .fg(if sel { FG } else { FG_DIM })
-                        .add_modifier(if sel {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
+                    format!("{:<role_w$}", truncate(&slot_short(slots, i), role_w)),
+                    if sel { selected(focused) } else { dim() },
                 ),
-                Span::styled(format!(" {tail}"), Style::default().fg(color)),
-            ]);
-            ListItem::new(line).style(if sel {
-                Style::default().bg(BG_RAISED)
-            } else {
-                Style::default()
-            })
+                Span::styled(slot_model(s, model_w), Style::default().fg(HINT)),
+            ];
+            rail_row(
+                rail_lead(sel, focused, broken.then_some(ALERT)),
+                body,
+                Span::styled(tail, Style::default().fg(color)),
+                w,
+            )
         })
         .collect()
 }
 
-/// Main: ONE area, content = f(rail selection × tab). The tab strip is painted into
-/// its top border (wide) or on its own row (narrow); nothing relocates when the tab
-/// changes.
-#[allow(clippy::too_many_arguments)]
+/// Main: ONE area, content = f(rail selection × tab). Its tabs live on the labels
+/// row above, so nothing relocates when the tab changes and the pane itself carries
+/// no border — one column of padding, then content.
 fn draw_main(
     f: &mut Frame,
     area: Rect,
-    swarm: &SparPaths,
     full: Option<&RunState>,
     stream_text: &str,
     activity: &[String],
     diff_text: &str,
     app: &mut App,
-    wide: bool,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let focused = app.focus == Focus::Main;
-    // Driving mode recolors the pane border green — structural, not just a label.
-    let border = if app.driving() {
-        GREEN
-    } else if focused {
-        BORDER_FOCUS
+    // The Shell tab is a real terminal: it gets every column, unpadded, so the agent's
+    // own layout is not reflowed by ours.
+    let inner = if app.main_tab == MainTab::Shell {
+        area
     } else {
-        BORDER
-    };
-
-    let mut title: Vec<Span> = Vec::new();
-    if wide {
-        // The strip lives in the border, so its hit rects start one cell in.
-        let mut x = area.x.saturating_add(1);
-        for (tab, text, style) in main_tab_spans(app) {
-            let w = text.chars().count() as u16;
-            if x.saturating_add(w) < area.right() {
-                app.main_tabs.push((
-                    Rect {
-                        x,
-                        y: area.y,
-                        width: w,
-                        height: 1,
-                    },
-                    tab,
-                ));
-            }
-            x = x.saturating_add(w);
-            title.push(Span::styled(text, style));
+        Rect {
+            x: area.x.saturating_add(1),
+            width: area.width.saturating_sub(1),
+            ..area
         }
-    }
-    let ctx = main_context(swarm, full, app);
-    if !ctx.is_empty() {
-        title.push(Span::styled(
-            format!(" {ctx} "),
-            Style::default().fg(FG_DIM),
-        ));
-    }
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border))
-        .title(Line::from(title))
-        .style(Style::default().bg(BG_PANEL));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    };
+    app.rect_main_inner = inner;
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -3071,24 +3736,23 @@ fn main_context(swarm: &SparPaths, full: Option<&RunState>, app: &App) -> String
     match app.main_tab {
         MainTab::Log => {
             let slot = full
-                .and_then(|st| st.slots.get(app.selected_slot))
-                .map(|s| s.id.as_str())
-                .unwrap_or("—");
+                .map(|st| slot_short(&st.slots, app.selected_slot))
+                .unwrap_or_else(|| "—".into());
             let mode = if app.log_expand { "wrap" } else { "trim" };
             let follow = if app.stream_follow { " · live" } else { "" };
-            format!("· {slot} · {mode}{follow}")
+            format!("{slot} · {mode}{follow}")
         }
-        MainTab::Activity => "· run timeline + bus".into(),
-        MainTab::Diff => "· artifacts".into(),
+        MainTab::Activity => "run timeline + bus".into(),
+        MainTab::Diff => "artifacts".into(),
         MainTab::Shell => match app.takeover_target.as_deref() {
-            Some(session) => format!("· agent · {session}"),
+            Some(session) => format!("agent · {session}"),
             None => {
                 let base = swarm
                     .project_root
                     .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("project");
-                format!("· shell · {base}")
+                format!("shell · {base}")
             }
         },
     }
@@ -3231,94 +3895,79 @@ fn draw_stream_stats(
         Span::raw("")
     } else {
         let c = if abandoned || silent_hint.contains("STALL") || silent_hint.contains("ORPHAN") {
-            RED
+            ALERT
         } else {
             FG_MUTED
         };
-        Span::styled(
-            silent_hint.to_string(),
-            Style::default().fg(c).bg(BG_RAISED),
-        )
+        Span::styled(silent_hint.to_string(), Style::default().fg(c))
     };
     let Some(s) = stats else {
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(
-                    "  waiting for agent output…",
-                    Style::default().fg(FG_MUTED).bg(BG_RAISED),
-                ),
+                Span::styled("waiting for agent output…", muted()),
                 quiet,
-            ]))
-            .style(Style::default().bg(BG_RAISED)),
+            ])),
             area,
         );
         return;
     };
     let ctx = s.context_tokens;
     let ctx_color = if ctx > 150_000 {
-        RED
+        ALERT
     } else if ctx > 80_000 {
-        YELLOW
+        WARN
     } else if ctx > 0 {
-        GREEN
+        OK
     } else {
         FG_MUTED
     };
     let tools_color = if s.tool_errors > 0 {
-        RED
+        ALERT
     } else if s.tools > 0 {
-        CYAN
+        INFO
     } else {
         FG_MUTED
     };
     let status_span = match status {
-        Some(SlotStatus::Running) => {
-            Span::styled(" LIVE ", Style::default().fg(BG).bg(CYAN).bold())
-        }
-        Some(SlotStatus::Done) => Span::styled(" DONE ", Style::default().fg(BG).bg(GREEN).bold()),
-        Some(SlotStatus::Failed) => Span::styled(" FAIL ", Style::default().fg(BG).bg(RED).bold()),
-        _ => Span::styled(" … ", Style::default().fg(FG_MUTED).bg(BG_RAISED)),
+        Some(SlotStatus::Running) => Span::styled(" LIVE ", chip(INFO)),
+        Some(SlotStatus::Done) => Span::styled(" DONE ", chip(OK)),
+        Some(SlotStatus::Failed) => Span::styled(" FAIL ", chip(ALERT)),
+        _ => Span::styled(" …… ", muted()),
     };
+    let sep = || Span::styled("  ·  ", muted());
     let line = Line::from(vec![
         status_span,
-        Span::raw(" "),
+        Span::raw("  "),
         Span::styled(
-            format!(" context {} ", compact_u64(ctx)),
-            Style::default().fg(ctx_color).bg(BG_RAISED).bold(),
+            format!("context {}", compact_u64(ctx)),
+            Style::default().fg(ctx_color),
         ),
-        Span::raw(" "),
+        sep(),
         Span::styled(
-            format!(" {} tools ", s.tools),
-            Style::default().fg(tools_color).bg(BG_RAISED),
+            format!("{} tools", s.tools),
+            Style::default().fg(tools_color),
         ),
-        Span::raw(" "),
+        sep(),
+        Span::styled(format!("in {}", compact_u64(s.input_tokens)), dim()),
         Span::styled(
-            format!(" in {} ", compact_u64(s.input_tokens)),
-            Style::default().fg(ACCENT).bg(BG_RAISED),
-        ),
-        Span::styled(
-            format!(" out {} ", compact_u64(s.output_tokens)),
-            Style::default().fg(MAGENTA).bg(BG_RAISED),
+            format!("  out {}", compact_u64(s.output_tokens)),
+            Style::default().fg(HINT),
         ),
         if s.cache_read_tokens > 0 {
             Span::styled(
-                format!(" cache {} ", compact_u64(s.cache_read_tokens)),
-                Style::default().fg(YELLOW).bg(BG_RAISED),
+                format!("  cache {}", compact_u64(s.cache_read_tokens)),
+                dim(),
             )
         } else {
             Span::raw("")
         },
-        Span::raw(" "),
-        Span::styled(
-            s.model.as_deref().unwrap_or(""),
-            Style::default().fg(FG_MUTED).bg(BG_RAISED),
-        ),
+        match s.model.as_deref() {
+            Some(m) => Span::styled(format!("  ·  {m}"), muted()),
+            None => Span::raw(""),
+        },
         quiet,
     ]);
-    f.render_widget(
-        Paragraph::new(line).style(Style::default().bg(BG_RAISED)),
-        area,
-    );
+    f.render_widget(Paragraph::new(line), area);
 }
 
 /// Paint a log viewport by writing cells directly (no Paragraph wrap/scroll).
@@ -3359,7 +4008,7 @@ fn render_scrollable_log(
     f.render_widget(
         CellLog {
             lines: visible,
-            fill: Style::default().bg(BG_PANEL).fg(FG),
+            fill: Style::default().fg(FG),
         },
         text_area,
     );
@@ -3374,8 +4023,12 @@ fn render_scrollable_log(
         .viewport_content_length(height);
     f.render_stateful_widget(
         Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .style(Style::default().fg(FG_MUTED).bg(BG_PANEL))
-            .thumb_style(Style::default().fg(ACCENT_SOFT).bg(BG_PANEL)),
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .thumb_symbol("┃")
+            .style(Style::default().fg(RULE))
+            .thumb_style(Style::default().fg(ACCENT_SOFT)),
         area,
         &mut sb,
     );
@@ -3422,23 +4075,28 @@ impl Widget for CellLog {
 }
 
 fn log_line_style(line: &str, colorize: bool) -> Style {
-    let base = Style::default().bg(BG_PANEL);
+    let base = Style::default();
+    // Section headers (Activity's Run / Agents / Timeline / Bus / Quota bands) carry
+    // weight in every mode — they are the only structure that view has.
+    if line.starts_with('\u{a7}') {
+        return base.fg(FG_DIM).bold();
+    }
     if !colorize {
         return base.fg(FG_DIM);
     }
     let t = line.trim_start();
     if t.starts_with('▸') || t.starts_with('→') {
-        base.fg(CYAN)
+        base.fg(INFO)
     } else if t.starts_with('◂') || t.starts_with('←') {
         if t.contains('✗') || t.contains("err") {
-            base.fg(RED)
+            base.fg(ALERT)
         } else {
-            base.fg(GREEN)
+            base.fg(OK)
         }
     } else if t.starts_with('·') || t.starts_with('…') || t.starts_with('│') {
         base.fg(FG_MUTED).italic()
     } else if t.starts_with('!') {
-        base.fg(RED).bold()
+        base.fg(ALERT).bold()
     } else if t.starts_with('#') {
         base.fg(FG_MUTED)
     } else {
@@ -3487,7 +4145,7 @@ fn log_rows_window(
             break;
         }
         let line = compact_log_line(raw);
-        let style = log_line_style(&line, colorize);
+        let style = log_line_style(raw, colorize);
         if line.is_empty() {
             if row >= start {
                 out.push((String::new(), style));
@@ -3526,7 +4184,7 @@ mod window_eq {
         let mut out = Vec::new();
         for raw in text.lines() {
             let line = compact_log_line(raw);
-            let style = log_line_style(&line, colorize);
+            let style = log_line_style(raw, colorize);
             if line.is_empty() {
                 out.push((String::new(), style));
                 continue;
@@ -3607,6 +4265,11 @@ fn compact_log_line(raw: &str) -> String {
     if s.is_empty() {
         return String::new();
     }
+    // Section header: rendered as a spaced-out cap, the one typographic device a
+    // terminal has for a heading.
+    if let Some(rest) = s.strip_prefix('\u{a7}') {
+        return rest.trim().to_uppercase();
+    }
     // Tool call / result markers from stream coalescer
     if let Some(rest) = s.strip_prefix('→') {
         let rest = rest.trim();
@@ -3614,8 +4277,8 @@ fn compact_log_line(raw: &str) -> String {
         return format!("▸ {}", collapse_ws(rest));
     }
     if let Some(rest) = s.strip_prefix('←') {
-        let rest = rest.trim();
-        return format!("◂ {}", collapse_ws(rest));
+        let rest = strip_tool_id(rest.trim());
+        return format!("◂ {}", collapse_ws(&rest));
     }
     if let Some(rest) = s.strip_prefix('·') {
         return format!("  {}", collapse_ws(rest.trim()));
@@ -3624,6 +4287,41 @@ fn compact_log_line(raw: &str) -> String {
         return format!("  {}", collapse_ws(s.trim_start_matches('…').trim()));
     }
     collapse_ws(s)
+}
+
+/// Drop the provider's tool-call id from a result line. It is ~27 columns of opaque
+/// hex that pairs with nothing on screen (the matching call line never carries it),
+/// and on a narrow pane it pushed the actual result off the right edge. The ✓/✗ mark
+/// stays: it is the row's only pass/fail signal.
+fn strip_tool_id(s: &str) -> String {
+    let mut it = s.split_whitespace();
+    let Some(first) = it.next() else {
+        return s.to_string();
+    };
+    let (mark, id) = if first == "✓" || first == "✗" {
+        (Some(first), it.next())
+    } else {
+        (None, Some(first))
+    };
+    let Some(id) = id else {
+        return s.to_string();
+    };
+    let opaque = id == "tool"
+        || (id.len() >= 10
+            && ["toolu_", "tooluse_", "call_", "fc_", "msg_"]
+                .iter()
+                .any(|p| id.starts_with(p)));
+    if !opaque {
+        return s.to_string();
+    }
+    let tail = match s.find(id) {
+        Some(i) => s[i + id.len()..].trim_start(),
+        None => "",
+    };
+    match mark {
+        Some(m) => format!("{m} {tail}"),
+        None => tail.to_string(),
+    }
 }
 
 fn collapse_ws(s: &str) -> String {
@@ -3731,12 +4429,12 @@ fn draw_palette(f: &mut Frame, area: Rect, runs: &[state::RunSummary], app: &mut
 
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(ACCENT))
         .title(Span::styled(
             " : command ",
             Style::default().fg(ACCENT).bold(),
-        ))
-        .style(Style::default().bg(BG_RAISED));
+        ));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
     if inner.height == 0 {
@@ -3761,9 +4459,9 @@ fn draw_palette(f: &mut Frame, area: Rect, runs: &[state::RunSummary], app: &mut
         let selected = i == pal.sel;
         let mark = if selected { "▸ " } else { "  " };
         let base = if selected {
-            Style::default().fg(BG).bg(ACCENT_SOFT).bold()
+            Style::default().fg(ACCENT).bold()
         } else {
-            Style::default().fg(FG_DIM)
+            dim()
         };
         let tail = if on_arg {
             String::new()
@@ -3788,14 +4486,11 @@ fn draw_palette(f: &mut Frame, area: Rect, runs: &[state::RunSummary], app: &mut
         hint,
         Style::default().fg(FG_MUTED).italic(),
     )));
-    f.render_widget(
-        Paragraph::new(rows).style(Style::default().bg(BG_RAISED)),
-        inner,
-    );
+    f.render_widget(Paragraph::new(rows), inner);
 }
 
 /// Driving mode's one-line banner replaces the status line: a loud recolored bar that
-/// (with the collapsed rail and recolored pane border) makes the mode structurally
+/// (with the collapsed rail and the bands folded away) makes the mode structurally
 /// obvious — a text label alone is proven insufficient (Raskin).
 fn draw_driving_banner(f: &mut Frame, area: Rect, app: &App) {
     let target = app
@@ -3805,11 +4500,11 @@ fn draw_driving_banner(f: &mut Frame, area: Rect, app: &App) {
         .unwrap_or("workspace shell");
     let left = format!("  ▶ DRIVING · {target} ");
     let right = " keys → agent · F12 / C-a d → spar ";
-    let bg = Color::Rgb(20, 60, 40);
+    let bg = DRIVE_WASH;
     let used = (left.chars().count() + right.chars().count()) as u16;
     let pad = area.width.saturating_sub(used).max(1) as usize;
     let line = Line::from(vec![
-        Span::styled(left, Style::default().fg(BG).bg(GREEN).bold()),
+        Span::styled(left, Style::default().fg(INK).bg(OK).bold()),
         Span::styled(" ".repeat(pad), Style::default().bg(bg)),
         Span::styled(right, Style::default().fg(FG).bg(bg)),
     ]);
@@ -3819,11 +4514,14 @@ fn draw_driving_banner(f: &mut Frame, area: Rect, app: &App) {
 fn draw_footer(f: &mut Frame, area: Rect, app: &mut App, full: Option<&RunState>) {
     app.rect_help = Rect::default();
     app.rect_projects = Rect::default();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
 
     let (msg, color) = if let Some((_, m, c, _)) = &app.flash {
         (m.as_str(), *c)
     } else if !app.status_line.is_empty() {
-        (app.status_line.as_str(), YELLOW)
+        (app.status_line.as_str(), WARN)
     } else {
         (
             situational_footer(full, app.focus, app.browse, app.main_tab),
@@ -3831,71 +4529,96 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &mut App, full: Option<&RunState>
         )
     };
 
-    let gate = full.map(|s| s.phase.is_gate()).unwrap_or(false);
-    let bg = if gate {
-        Color::Rgb(40, 30, 12)
-    } else {
-        BG_RAISED
-    };
-
-    if gate {
-        // At a gate the tappable buttons live on the status/action bar above.
-        let left_text = format!(" {msg} ");
-        let right_text = "  YOUR MOVE  ";
-        let left = Span::styled(left_text.clone(), Style::default().fg(color).bg(bg));
-        let right = Span::styled(right_text, Style::default().fg(BG).bg(YELLOW).bold());
-        let used = (left_text.chars().count() + right_text.chars().count()) as u16;
-        let pad = area.width.saturating_sub(used).max(1) as usize;
-        let line = Line::from(vec![
-            left,
-            Span::styled(" ".repeat(pad), Style::default().bg(bg)),
-            right,
-        ]);
-        f.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), area);
+    if full.map(|s| s.phase.is_gate()).unwrap_or(false) {
+        // At a gate the tappable buttons live on the header; the footer just says so.
+        f.render_widget(
+            Paragraph::new("").style(Style::default().bg(GATE_WASH)),
+            area,
+        );
+        let right = " YOUR MOVE ";
+        let right_w = right.chars().count() as u16;
+        if right_w >= area.width {
+            return;
+        }
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                format!(
+                    " {}",
+                    truncate(msg, area.width.saturating_sub(right_w + 2) as usize)
+                ),
+                Style::default().fg(color),
+            )),
+            area,
+        );
+        f.render_widget(
+            Paragraph::new(Span::styled(right, chip(WARN))),
+            Rect {
+                x: area.right().saturating_sub(right_w),
+                width: right_w,
+                ..area
+            },
+        );
         return;
     }
 
-    // Right cluster: spinner + tappable Projects/Help tokens + exit hint.
-    let sp = format!(" {} ", app.spinner());
-    let proj = " Projects ";
-    let help = " Help ";
-    let tail = " : cmd · q exit ";
-    let right_w =
-        (sp.chars().count() + proj.chars().count() + help.chars().count() + tail.chars().count())
-            as u16;
+    // Right cluster: two tappable words and the way out. Dim, because a footer is a
+    // reference strip, not a call to action.
+    let proj = "Projects";
+    let help = "Help";
+    let right: Vec<Span> = vec![
+        Span::styled(proj, dim()),
+        Span::styled("   ", muted()),
+        Span::styled(help, dim()),
+        Span::styled("  ·  ", muted()),
+        Span::styled(": cmd", muted()),
+        Span::styled(" · ", muted()),
+        Span::styled("q quit", muted()),
+        Span::raw(" "),
+    ];
+    let right_w: u16 = right.iter().map(|s| s.content.chars().count() as u16).sum();
+    // On a sliver of a terminal the keys strip is the first thing to go: the left
+    // hint is the one that changes with context.
+    if right_w + 8 > area.width {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                format!(" {}", truncate(msg, area.width.saturating_sub(1) as usize)),
+                Style::default().fg(color),
+            )),
+            area,
+        );
+        return;
+    }
+    let right_x = area.right().saturating_sub(right_w);
 
-    // Keep the tokens on screen by truncating the left hint to what's left.
-    let avail_left = area.width.saturating_sub(right_w + 1).max(1) as usize;
-    let left_text = truncate(&format!(" {msg} "), avail_left);
-    let used = left_text.chars().count() as u16 + right_w;
-    let pad = area.width.saturating_sub(used).max(1) as usize;
-
-    let tok_x = area.x + area.width.saturating_sub(right_w);
-    let proj_x = tok_x + sp.chars().count() as u16;
-    let help_x = proj_x + proj.chars().count() as u16;
     app.rect_projects = Rect {
-        x: proj_x,
+        x: right_x,
         y: area.y,
         width: proj.chars().count() as u16,
         height: 1,
     };
     app.rect_help = Rect {
-        x: help_x,
+        x: right_x + (proj.chars().count() + 3) as u16,
         y: area.y,
         width: help.chars().count() as u16,
         height: 1,
     };
 
-    let tok = Style::default().fg(BG).bg(ACCENT_SOFT).bold();
-    let line = Line::from(vec![
-        Span::styled(left_text, Style::default().fg(color).bg(bg)),
-        Span::styled(" ".repeat(pad), Style::default().bg(bg)),
-        Span::styled(sp, Style::default().fg(FG_MUTED).bg(bg)),
-        Span::styled(proj, tok),
-        Span::styled(help, tok),
-        Span::styled(tail, Style::default().fg(FG_MUTED).bg(bg)),
-    ]);
-    f.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), area);
+    let room = right_x.saturating_sub(area.x + 3);
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            format!(" {}", truncate(msg, room as usize)),
+            Style::default().fg(color),
+        )),
+        area,
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(right)),
+        Rect {
+            x: right_x,
+            width: right_w,
+            ..area
+        },
+    );
 }
 
 /// One row of keys that are valid *right now* — nothing else.
@@ -3932,8 +4655,13 @@ fn situational_footer(
 }
 
 fn draw_help_overlay(f: &mut Frame, area: Rect) {
-    let w = area.width.clamp(40, 72);
-    let h = area.height.clamp(14, 32);
+    // `clamp(40, ..)` returns 40 on a 30-column terminal, i.e. a rect outside the
+    // buffer, and ratatui panics on the first cell. Never grow past the frame.
+    let w = area.width.min(72);
+    let h = area.height.min(32);
+    if w == 0 || h == 0 {
+        return;
+    }
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let rect = Rect {
@@ -3972,29 +4700,28 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
  \n\
   Shell tab = a real tmux client: every key goes to the agent (incl.\n\
     Ctrl+C). prefix C-a · Ctrl+a d or F12 hands focus back to spar.\n\
-    Focusing it full-screen is Driving mode (green banner + border).\n\
+    Focusing it full-screen is Driving mode (green banner, bands collapsed).\n\
  \n\
   Mouse / touch: tap a tab, a rail row (double-tap = Enter), a gate\n\
   button, or the breadcrumb (back to the rail). Scroll to scroll.\n\
  \n\
   Esc, ?, or tap to close help";
-    let p = Paragraph::new(body)
-        .style(Style::default().fg(FG).bg(BG_RAISED))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(BORDER_FOCUS))
-                .title(Span::styled(" Help ", Style::default().fg(ACCENT).bold()))
-                .style(Style::default().bg(BG_RAISED)),
-        );
+    let p = Paragraph::new(body).style(Style::default().fg(FG)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .title(Span::styled(" Help ", Style::default().fg(ACCENT).bold())),
+    );
     f.render_widget(p, rect);
 }
 
-/// Rows/cols available inside the terminal panel's border, falling back to a
-/// standard 80x24 when the panel hasn't been laid out yet.
+/// Rows/cols available to the embedded terminal, falling back to a standard 80x24
+/// when the pane hasn't been laid out yet. The Shell tab is borderless and unpadded,
+/// so this is the rect itself.
 fn terminal_dims(rect: Rect) -> (u16, u16) {
-    let rows = rect.height.saturating_sub(2);
-    let cols = rect.width.saturating_sub(2);
+    let rows = rect.height;
+    let cols = rect.width;
     (
         if rows == 0 { 24 } else { rows },
         if cols == 0 { 80 } else { cols },
@@ -4061,7 +4788,7 @@ fn manage_terminal(app: &mut App, project_root: &Path) {
     if app.main_tab == MainTab::Shell && app.terminal_pane.is_none() {
         // Enable tmux mouse so our forwarded SGR mouse is interpreted by the client.
         tmux::ensure_server_config();
-        let (rows, cols) = terminal_dims(app.rect_main);
+        let (rows, cols) = terminal_dims(app.rect_main_inner);
         let mut pane = crate::terminal::TerminalPane::new(rows, cols);
         if pane.attach(&desired).is_ok() {
             app.terminal_pane = Some(pane);
@@ -4113,20 +4840,6 @@ fn draw_shell_body(f: &mut Frame, inner: Rect, app: &mut App) {
         .style(Style::default().fg(FG_DIM));
         f.render_widget(hint, footer);
     }
-}
-
-fn panel(title: &str, focused: bool) -> Block<'_> {
-    let border = if focused { BORDER_FOCUS } else { BORDER };
-    let title_style = if focused {
-        Style::default().fg(ACCENT).bold()
-    } else {
-        Style::default().fg(FG_DIM)
-    };
-    Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border))
-        .title(Span::styled(title.to_string(), title_style))
-        .style(Style::default().bg(BG_PANEL))
 }
 
 /// Palette `chat`/`@<agent> <message>` — send a directed bus chat from the human to a
@@ -4282,8 +4995,8 @@ fn spawn_agent_command(
         Some(tx) => {
             std::thread::spawn(move || {
                 let (msg, color) = match work() {
-                    Ok(m) => (m, GREEN),
-                    Err(e) => (format!("spawn failed: {e:#}"), RED),
+                    Ok(m) => (m, OK),
+                    Err(e) => (format!("spawn failed: {e:#}"), ALERT),
                 };
                 let _ = tx.send(Msg::Flash(msg, color));
             });
@@ -4394,7 +5107,7 @@ fn activity_feed(
         lines.push(String::new());
     }
 
-    lines.push(format!("Run  {}", st.id));
+    lines.push(format!("\u{a7}Run {}", st.id));
     lines.push(format!("  {}", phase_label(st.phase)));
     if st.dry_run {
         lines.push("  dry-run".into());
@@ -4405,7 +5118,7 @@ fn activity_feed(
     lines.push(String::new());
 
     // Compact agent status
-    lines.push("Agents".into());
+    lines.push("\u{a7}Agents".into());
     for s in &st.slots {
         let act = SlotActivity::observe(
             s,
@@ -4437,7 +5150,7 @@ fn activity_feed(
     let evs = events::read_all(swarm, &st.id).unwrap_or_default();
     if !evs.is_empty() {
         lines.push(String::new());
-        lines.push("Timeline".into());
+        lines.push("\u{a7}Timeline".into());
         for e in evs.iter().rev().take(14).rev() {
             lines.push(format!(" {}", activity_event_line(e)));
         }
@@ -4456,7 +5169,7 @@ fn activity_feed(
             .collect();
         if !chat.is_empty() {
             lines.push(String::new());
-            lines.push("Bus".into());
+            lines.push("\u{a7}Bus".into());
             for m in chat.iter().rev().take(8).rev() {
                 lines.push(format!(
                     " {}→{} {}",
@@ -4479,7 +5192,7 @@ fn activity_feed(
         .collect();
     if !paused.is_empty() {
         lines.push(String::new());
-        lines.push("Quota".into());
+        lines.push("\u{a7}Quota".into());
         for (name, q) in paused {
             lines.push(format!(" {} {:?}", name, q.status));
         }
@@ -4605,22 +5318,22 @@ fn slot_icon(s: &SlotState, app: &App) -> String {
 
 fn slot_color(s: &SlotState) -> Color {
     match s.status {
-        SlotStatus::Done => GREEN,
-        SlotStatus::Failed | SlotStatus::Stuck => RED,
-        SlotStatus::Running => CYAN,
+        SlotStatus::Done => OK,
+        SlotStatus::Failed | SlotStatus::Stuck => ALERT,
+        SlotStatus::Running => INFO,
         SlotStatus::Pending => FG_MUTED,
     }
 }
 
 fn phase_color(phase: Phase) -> Color {
     match phase {
-        Phase::Done | Phase::PlanApproved => GREEN,
-        Phase::Failed | Phase::PlanRejected | Phase::Quota => RED,
-        Phase::Stuck | Phase::Escalated => MAGENTA,
+        Phase::Done | Phase::PlanApproved => OK,
+        Phase::Failed | Phase::PlanRejected | Phase::Quota => ALERT,
+        Phase::Stuck | Phase::Escalated => HINT,
         Phase::AwaitingPlanApproval
         | Phase::AwaitingWinnerConfirm
         | Phase::AwaitingShipConfirm
-        | Phase::AwaitingReconcile => YELLOW,
+        | Phase::AwaitingReconcile => WARN,
         _ => ACCENT,
     }
 }
@@ -4700,8 +5413,8 @@ fn emit_attention_toasts(app: &mut App, runs: &[state::RunSummary]) {
                 .unwrap_or(Attention::Idle);
             if att.needs_you() && !was.needs_you() {
                 let (what, color) = match att {
-                    Attention::Gate => ("needs your decision", YELLOW),
-                    _ => ("needs attention", RED),
+                    Attention::Gate => ("needs your decision", WARN),
+                    _ => ("needs attention", ALERT),
                 };
                 app.flash_for(
                     format!("⚠ {} {what} — a to jump", truncate(id, 8)),
@@ -4735,9 +5448,9 @@ fn jump_to_attention(app: &mut App, runs: &[state::RunSummary]) {
             app.focus = Focus::Rail;
             app.reset_stream_view();
             let id = runs.get(i).map(|r| r.id.as_str()).unwrap_or("");
-            app.flash(format!("→ {} needs you", truncate(id, 8)), YELLOW);
+            app.flash(format!("→ {} needs you", truncate(id, 8)), WARN);
         }
-        None => app.flash("nothing needs you", GREEN),
+        None => app.flash("nothing needs you", OK),
     }
 }
 
@@ -4765,7 +5478,7 @@ mod labels {
     }
 
     #[test]
-    fn wide_layout_is_rail_plus_one_main() {
+    fn wide_layout_is_rail_plus_seam_plus_one_main() {
         let area = Rect {
             x: 0,
             y: 0,
@@ -4774,17 +5487,53 @@ mod labels {
         };
         let lay = layout_rects(area, Focus::Main, false, false);
         assert!(!lay.narrow);
-        // The tab strip rides in Main's top border, not on its own row.
-        assert_eq!(lay.tabs, Rect::default());
-        assert_eq!(lay.rail.width, RAIL_WIDTH);
+        assert_eq!(lay.rail.width, rail_width(120));
         assert!(lay.main.width > 0);
-        // Fixed chrome is exactly 2 rows (status + footer) — the palette is an overlay.
-        assert_eq!(lay.status.height, 1);
+        // Chrome is five rows: header, stepper, labels, rule, footer. No pane borders.
+        assert_eq!(lay.header.height, 1);
+        assert_eq!(lay.context.height, 1);
+        assert_eq!(lay.labels.height, 1);
+        assert_eq!(lay.rule.height, 1);
         assert_eq!(lay.footer.height, 1);
-        assert_eq!(lay.rail.height + 2, area.height);
-        // Rail and Main are side by side, and together they fill the width.
-        assert_eq!(lay.rail.right(), lay.main.x);
+        assert_eq!(lay.rail.height + 5, area.height);
+        // Rail, seam and Main are side by side and together fill the width.
+        assert_eq!(lay.seam.width, 1);
+        assert_eq!(lay.rail.right(), lay.seam.x);
+        assert_eq!(lay.seam.right(), lay.main.x);
         assert_eq!(lay.main.right(), area.width);
+        // The labels row and its rule span the whole frame, so the rail's title and
+        // Main's tabs sit on one line.
+        assert_eq!(lay.labels.width, area.width);
+        assert_eq!(lay.rule.width, area.width);
+    }
+
+    /// The bands fold from the bottom up as the terminal shrinks, and the header,
+    /// body and footer survive every size — including the 20x5 floor.
+    #[test]
+    fn chrome_bands_fold_on_short_terminals() {
+        let at = |h: u16| {
+            layout_rects(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: h,
+                },
+                Focus::Main,
+                false,
+                false,
+            )
+        };
+        let tall = at(40);
+        assert_eq!((tall.context.height, tall.labels.height), (1, 1));
+        let mid = at(10);
+        assert_eq!(mid.context.height, 0, "stepper folds first");
+        assert_eq!(mid.labels.height, 1, "tabs survive");
+        let short = at(5);
+        assert_eq!((short.context.height, short.labels.height), (0, 0));
+        assert_eq!(short.header.height, 1);
+        assert_eq!(short.footer.height, 1);
+        assert!(short.main.height >= 2, "content never vanishes");
     }
 
     #[test]
@@ -4798,10 +5547,12 @@ mod labels {
         let plain = layout_rects(area, Focus::Main, false, false);
         let zoomed = layout_rects(area, Focus::Main, true, false);
         assert_eq!(zoomed.rail, Rect::default());
+        assert_eq!(zoomed.seam, Rect::default());
         assert_eq!(zoomed.main.x, area.x);
         assert_eq!(zoomed.main.width, area.width);
         // Nothing else relocates.
-        assert_eq!(zoomed.status, plain.status);
+        assert_eq!(zoomed.header, plain.header);
+        assert_eq!(zoomed.context, plain.context);
         assert_eq!(zoomed.footer, plain.footer);
         assert_eq!(zoomed.main.y, plain.main.y);
     }
@@ -4817,10 +5568,13 @@ mod labels {
         let driving = layout_rects(area, Focus::Main, false, true);
         assert_eq!(driving.rail, Rect::default(), "rail collapses when driving");
         assert_eq!(driving.main.width, area.width);
-        // Narrow driving drops the tab-strip row too (zero-height).
+        // Driving is banner + pane: every other band is gone.
+        assert_eq!(driving.context.height, 0);
+        assert_eq!(driving.labels.height, 0);
+        assert_eq!(driving.rule.height, 0);
         let narrow = Rect { width: 60, ..area };
         let nd = layout_rects(narrow, Focus::Main, false, true);
-        assert_eq!(nd.tabs.height, 0);
+        assert_eq!(nd.labels.height, 0);
     }
 
     #[test]
@@ -4833,14 +5587,15 @@ mod labels {
         };
         let lay = layout_rects(area, Focus::Main, false, false);
         assert!(lay.narrow);
-        assert!(lay.tabs.width > 0, "MainTab strip is tappable on a phone");
+        assert!(lay.labels.width > 0, "MainTab strip is tappable on a phone");
         assert!(lay.main.width > 0);
         assert_eq!(lay.rail, Rect::default(), "no rail in narrow");
+        assert_eq!(lay.seam, Rect::default(), "no seam without a rail");
         // Rail focus swaps the single stage to the rail; the tab strip stays.
         let rail = layout_rects(area, Focus::Rail, false, false);
         assert!(rail.rail.width > 0);
         assert_eq!(rail.main, Rect::default());
-        assert!(rail.tabs.width > 0);
+        assert!(rail.labels.width > 0);
     }
 
     #[test]
@@ -5007,7 +5762,7 @@ mod labels {
         term.draw(|f| render_gate_buttons(f, area, &mut app, &buttons))
             .unwrap();
         assert_eq!(app.gate_buttons.len(), 2);
-        // Both buttons sit on the top row, in order, inside the area, right-aligned.
+        // Both buttons sit on the top row, in order, inside the area.
         assert!(app
             .gate_buttons
             .iter()
@@ -5016,25 +5771,61 @@ mod labels {
         assert_eq!(app.gate_buttons[1].1, GateAction::Reject);
     }
 
+    /// U11: the gate zone is reserved from the layout, so a different gate's labels
+    /// cannot slide the first button out from under a click already on its way.
     #[test]
-    fn status_line_carries_breadcrumb_and_gate_buttons() {
+    fn gate_buttons_start_at_a_fixed_x_across_gates() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 1,
+        };
+        let first_x = |buttons: Vec<(&str, GateAction)>| {
+            let mut term = Terminal::new(TestBackend::new(120, 1)).unwrap();
+            let mut app = App::new(None, Config::default(), true);
+            term.draw(|f| render_gate_buttons(f, area, &mut app, &buttons))
+                .unwrap();
+            app.gate_buttons[0].0.x
+        };
+        let approve = first_x(vec![
+            ("Approve", GateAction::Approve),
+            ("Reject", GateAction::Reject),
+        ]);
+        let ship = first_x(vec![("Ship", GateAction::Ship)]);
+        let winner = first_x(vec![
+            ("Confirm", GateAction::ConfirmWinner),
+            ("Reconcile", GateAction::Reconcile),
+        ]);
+        assert_eq!(approve, ship);
+        assert_eq!(approve, winner);
+        assert_eq!(approve, area.right() - GATE_ZONE_W);
+        // The zone covers every band that has a rail, not just the widest one.
+        assert!(gate_zone(Rect { width: 80, ..area }).is_some());
+        assert!(gate_zone(Rect { width: 79, ..area }).is_none());
+    }
+
+    #[test]
+    fn header_carries_breadcrumb_and_gate_buttons() {
         use crate::cli::WorkflowKind;
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let mut st = RunState::new("run1", WorkflowKind::Arena, std::path::PathBuf::from("/x"));
         st.phase = Phase::AwaitingWinnerConfirm;
         let swarm = SparPaths::new("/x");
-        let mut term = Terminal::new(TestBackend::new(90, 1)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(120, 1)).unwrap();
         let mut app = App::new(None, Config::default(), true);
         app.human_alerts_n = 2;
         term.draw(|f| {
             let area = f.area();
-            draw_status(f, area, &swarm, &[], &[], Some(&st), &mut app);
+            draw_header(f, area, &swarm, &[], &[], Some(&st), &mut app);
         })
         .unwrap();
         let row: String = {
             let buf = term.backend().buffer();
-            (0..90).map(|x| buf[(x, 0)].symbol()).collect()
+            (0..120).map(|x| buf[(x, 0)].symbol()).collect()
         };
         assert!(row.contains("spar"), "row was: {row:?}");
         assert!(row.contains("run run1"), "breadcrumb · row was: {row:?}");
@@ -5044,48 +5835,61 @@ mod labels {
         assert_eq!(app.gate_buttons.len(), 2);
     }
 
+    /// The tabs live on the labels row and are marked by the rule beneath them, so a
+    /// tab switch repaints two rows and moves nothing.
     #[test]
-    fn main_tab_strip_is_hit_testable_and_badges_alerts() {
+    fn main_tab_strip_is_hit_testable_and_underlined() {
         use crate::cli::WorkflowKind;
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let st = RunState::new("run1", WorkflowKind::Loop, std::path::PathBuf::from("/x"));
         let swarm = SparPaths::new("/x");
-        let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
         let mut app = App::new(None, Config::default(), true);
         app.human_alerts_n = 3;
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width: 90,
-            height: 12,
-        };
+        app.open_main(MainTab::Activity);
+        let lay = layout_rects(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 120,
+                height: 20,
+            },
+            Focus::Main,
+            false,
+            false,
+        );
         term.draw(|f| {
-            draw_main(
-                f,
-                area,
-                &swarm,
-                Some(&st),
-                "log",
-                &[],
-                "diff",
-                &mut app,
-                true,
-            );
+            draw_labels(f, &lay, &swarm, &[], &[], Some(&st), &mut app);
+            draw_rule(f, &lay, &app);
         })
         .unwrap();
         assert_eq!(app.main_tabs.len(), MAIN_TABS.len());
-        // The strip sits in Main's top border row, left to right, inside the frame.
-        assert!(app.main_tabs.iter().all(|(r, _)| r.y == area.y));
-        assert!(app.main_tabs[0].0.x > area.x);
+        assert!(app.main_tabs.iter().all(|(r, _)| r.y == lay.labels.y));
+        assert!(app.main_tabs[0].0.x >= lay.main.x);
         assert!(app.main_tabs.windows(2).all(|w| w[0].0.x < w[1].0.x));
         assert_eq!(app.main_tabs[3].1, MainTab::Shell);
-        let border: String = {
+
+        let row = |y: u16| -> String {
             let buf = term.backend().buffer();
-            (0..90).map(|x| buf[(x, 0)].symbol()).collect()
+            (0..120).map(|x| buf[(x, y)].symbol()).collect()
         };
-        assert!(border.contains("Activity ⚠3"), "border was: {border:?}");
-        assert!(border.contains("Shell"), "border was: {border:?}");
+        let labels = row(lay.labels.y);
+        assert!(labels.contains("Activity ⚠3"), "labels were: {labels:?}");
+        assert!(labels.contains("Shell"), "labels were: {labels:?}");
+        assert!(labels.contains("RUNS"), "rail title · was: {labels:?}");
+
+        // The rule carries the active tab's underline and the rail seam's tee.
+        let rule_row = row(lay.rule.y);
+        let active = app
+            .main_tabs
+            .iter()
+            .find(|(_, t)| *t == MainTab::Activity)
+            .unwrap()
+            .0;
+        assert_eq!(rule_row.chars().nth(active.x as usize), Some('━'));
+        assert_eq!(rule_row.chars().nth(lay.seam.x as usize), Some('┬'));
+        assert_eq!(rule_row.chars().next(), Some('─'));
     }
 
     #[test]
@@ -5096,12 +5900,15 @@ mod labels {
             width: 20,
             height: 8,
         };
-        assert_eq!(list_row_at(r, 11, 3, 0), Some(0));
-        assert_eq!(list_row_at(r, 12, 3, 0), Some(1));
-        assert_eq!(list_row_at(r, 20, 3, 0), None);
+        // Borderless: the rail's first row IS the first item.
+        assert_eq!(list_row_at(r, 10, 3, 0), Some(0));
+        assert_eq!(list_row_at(r, 11, 3, 0), Some(1));
+        assert_eq!(list_row_at(r, 13, 3, 0), None, "past the last item");
+        assert_eq!(list_row_at(r, 20, 30, 0), None, "past the pane");
+        assert_eq!(list_row_at(r, 9, 3, 0), None, "above the pane");
         // Scrolled list: first visible row is index 2
-        assert_eq!(list_row_at(r, 11, 10, 2), Some(2));
-        assert_eq!(list_row_at(r, 12, 10, 2), Some(3));
+        assert_eq!(list_row_at(r, 10, 10, 2), Some(2));
+        assert_eq!(list_row_at(r, 11, 10, 2), Some(3));
     }
 
     #[test]
@@ -5449,5 +6256,601 @@ mod labels {
         let runs = vec![summary_phase("r0", Phase::AwaitingPlanApproval)];
         emit_attention_toasts(&mut app, &runs);
         assert!(app.flash.is_some(), "gate transition toasts");
+    }
+}
+
+/// Rendering stability (U12): the shell must paint without panicking at any size the
+/// operator can produce, and the regions the eye anchors on must not move when the
+/// data behind them changes.
+#[cfg(test)]
+mod render_stability {
+    use super::*;
+    use crate::cli::WorkflowKind;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn run_with(phase: Phase, slots: usize) -> RunState {
+        let mut st = RunState::new("3f2a91c0", WorkflowKind::Loop, PathBuf::from("/x"));
+        st.phase = phase;
+        st.task = Some("stop prose mentions creating phantom criteria".into());
+        let roles = [
+            crate::state::SlotRole::Planner,
+            crate::state::SlotRole::PlanCritic,
+            crate::state::SlotRole::TestAuthor,
+            crate::state::SlotRole::Implementer,
+            crate::state::SlotRole::Tester,
+            crate::state::SlotRole::Reviewer,
+            crate::state::SlotRole::Reviewer,
+        ];
+        for (i, role) in roles.iter().take(slots).enumerate() {
+            let mut slot = crate::executor::init_slot(format!("slot-{i}"), "cli:claude", *role);
+            slot.status = if i + 1 == slots {
+                SlotStatus::Running
+            } else {
+                SlotStatus::Done
+            };
+            slot.model = Some("claude-opus-5".into());
+            st.slots.push(slot);
+        }
+        st
+    }
+
+    fn paint(
+        w: u16,
+        h: u16,
+        projects: &[registry::ProjectEntry],
+        runs: &[state::RunSummary],
+        full: Option<&RunState>,
+    ) -> Terminal<TestBackend> {
+        paint_with(w, h, projects, runs, full, |_| {})
+    }
+
+    /// `tweak` runs against the `App` after construction, so a sweep can cover the
+    /// overlays: the help window and the `:` palette are the only widgets left that
+    /// size themselves rather than taking a band, which is exactly where a rect can
+    /// still escape the frame.
+    fn paint_with(
+        w: u16,
+        h: u16,
+        projects: &[registry::ProjectEntry],
+        runs: &[state::RunSummary],
+        full: Option<&RunState>,
+        tweak: impl Fn(&mut App),
+    ) -> Terminal<TestBackend> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let swarm = SparPaths::new("/x");
+        let mut app = App::new(None, Config::default(), true);
+        tweak(&mut app);
+        let mut rail = ListState::default();
+        term.draw(|f| {
+            draw(
+                f,
+                &swarm,
+                projects,
+                runs,
+                full,
+                "→ Bash  read the contract\n← ✓ toolu_01HqnTTSQH5m7ZWYJVAtA7Vj ok\n",
+                &["§Timeline".into(), " 19:04 impl done".into()],
+                "diff",
+                &mut app,
+                &mut rail,
+            )
+        })
+        .unwrap();
+        term
+    }
+
+    fn row(term: &Terminal<TestBackend>, y: u16) -> String {
+        let buf = term.backend().buffer();
+        (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    /// Every size from a single cell up, swept rather than sampled: ratatui panics on
+    /// any Rect that leaves the buffer, and the band arithmetic has four breakpoints.
+    #[test]
+    fn renders_at_every_size_without_panicking() {
+        let st = run_with(Phase::AwaitingShipConfirm, 7);
+        for w in (1..=200).step_by(3) {
+            for h in (1..=60).step_by(2) {
+                paint(w, h, &[], &[], Some(&st));
+                if w % 9 == 1 {
+                    // `?` on a 30-column terminal used to panic: the help rect clamped
+                    // UP to its minimum and left the buffer.
+                    paint_with(w, h, &[], &[], Some(&st), |a| a.show_help = true);
+                    paint_with(w, h, &[], &[], Some(&st), |a| {
+                        a.palette = Some(Palette::default())
+                    });
+                }
+            }
+        }
+        // The breakpoints themselves, and the no-run path.
+        for (w, h) in [
+            (1, 1),
+            (20, 5),
+            (79, 24),
+            (80, 24),
+            (89, 24),
+            (90, 24),
+            (119, 40),
+            (120, 40),
+            (200, 60),
+        ] {
+            paint(w, h, &[], &[], Some(&st));
+            paint(w, h, &[], &[], None);
+        }
+    }
+
+    /// The Projects level renders its own row shape, and it is the one rail level the
+    /// other tests never reach (they all pass an empty project list).
+    #[test]
+    fn renders_the_projects_level() {
+        let projects: Vec<registry::ProjectEntry> =
+            ["acme-api", "spar", "a-very-long-project-name"]
+                .iter()
+                .map(|n| registry::ProjectEntry {
+                    root: PathBuf::from("/nonexistent").join(n),
+                    name: Some((*n).to_string()),
+                    last_seen: Utc::now(),
+                    last_run_id: None,
+                })
+                .collect();
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let swarm = SparPaths::new("/x");
+        let mut app = App::new(None, Config::default(), true);
+        app.open_projects_view();
+        let mut rail = ListState::default();
+        term.draw(|f| {
+            draw(
+                f,
+                &swarm,
+                &projects,
+                &[],
+                None,
+                "",
+                &[],
+                "",
+                &mut app,
+                &mut rail,
+            )
+        })
+        .unwrap();
+        let painted: String = {
+            let buf = term.backend().buffer();
+            (0..30)
+                .map(|y| (0..40).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(painted.contains("acme-api"), "rail was: {painted:?}");
+        assert!(painted.contains("PROJECTS"), "rail was: {painted:?}");
+        // The band counts what this level actually has. The refresher hands us no
+        // runs outside a project, so a run roll-up here would always read "none".
+        let band: String = {
+            let buf = term.backend().buffer();
+            (0..120).map(|x| buf[(x, 1)].symbol()).collect()
+        };
+        assert!(band.contains("3 projects"), "band was: {band:?}");
+        assert!(!band.contains("no runs"), "band was: {band:?}");
+    }
+
+    /// The scale that already bit once: thousands of run dirs on one project.
+    #[test]
+    fn renders_four_hundred_runs() {
+        let runs: Vec<state::RunSummary> = (0..400)
+            .map(|i| state::RunSummary {
+                id: format!("run{i:04}"),
+                workflow: WorkflowKind::Loop,
+                archived: false,
+                phase: Phase::Review,
+                updated_at: Utc::now(),
+                task: Some("a queued run".into()),
+                dry_run: false,
+                abandoned: i % 7 == 0,
+                base_ref: None,
+                base_commit: None,
+                project_root: None,
+                project_name: None,
+            })
+            .collect();
+        let term = paint(120, 40, &[], &runs, None);
+        assert!(row(&term, 0).contains("spar"));
+    }
+
+    /// U11: every tab keeps its column when the active tab changes AND when the
+    /// Activity badge appears or grows — Activity is second of four, so an unreserved
+    /// badge would shift Diff and Shell out from under a click.
+    #[test]
+    fn tab_positions_hold_across_tab_and_badge_changes() {
+        let st = run_with(Phase::Review, 7);
+        let tabs_x = |tab: MainTab, alerts: usize| {
+            let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            let swarm = SparPaths::new("/x");
+            let mut app = App::new(None, Config::default(), true);
+            app.open_main(tab);
+            app.human_alerts_n = alerts;
+            let mut rail = ListState::default();
+            term.draw(|f| {
+                draw(
+                    f,
+                    &swarm,
+                    &[],
+                    &[],
+                    Some(&st),
+                    "",
+                    &[],
+                    "",
+                    &mut app,
+                    &mut rail,
+                )
+            })
+            .unwrap();
+            app.main_tabs.iter().map(|(r, _)| r.x).collect::<Vec<_>>()
+        };
+        let base = tabs_x(MainTab::Log, 0);
+        assert_eq!(base.len(), MAIN_TABS.len());
+        for tab in MAIN_TABS {
+            for alerts in [0, 1, 9, 12, 99] {
+                assert_eq!(
+                    tabs_x(tab, alerts),
+                    base,
+                    "tabs moved on {tab:?} with {alerts} alerts"
+                );
+            }
+        }
+    }
+
+    /// The stepper is read off the slots that ran, so it says the same thing whether
+    /// or not the phase name happens to mention the step.
+    #[test]
+    fn stepper_tracks_slots_and_gates() {
+        let st = run_with(Phase::Review, 6);
+        let steps = run_steps(&st, false);
+        let by = |steps: &[(&str, StepState)], name: &str| {
+            steps.iter().find(|(l, _)| *l == name).unwrap().1
+        };
+        assert_eq!(by(&steps, "plan"), StepState::Done);
+        assert_eq!(by(&steps, "review"), StepState::Active);
+        assert_eq!(by(&steps, "ship"), StepState::Pending);
+
+        let mut gated = run_with(Phase::AwaitingPlanApproval, 2);
+        gated
+            .slots
+            .iter_mut()
+            .for_each(|s| s.status = SlotStatus::Done);
+        let steps = run_steps(&gated, false);
+        assert_eq!(by(&steps, "critique"), StepState::Gate);
+        assert_eq!(by(&steps, "build"), StepState::Pending);
+
+        let shipping = run_with(Phase::AwaitingShipConfirm, 7);
+        assert_eq!(by(&run_steps(&shipping, false), "ship"), StepState::Gate);
+    }
+
+    /// The pipeline is keyed on the workflow. An arena has no planner and a roles run
+    /// has nothing but peers; showing either one the seven-step loop pipeline invents
+    /// steps that never existed and marks them as still to come.
+    #[test]
+    fn stepper_shape_follows_the_workflow() {
+        use crate::cli::WorkflowKind;
+        let labels = |k: WorkflowKind| {
+            steps_for(k)
+                .iter()
+                .map(|(l, _)| *l)
+                .collect::<Vec<&'static str>>()
+        };
+        assert_eq!(
+            labels(WorkflowKind::Loop),
+            ["plan", "critique", "spec", "build", "tests", "review", "ship"]
+        );
+        assert_eq!(
+            labels(WorkflowKind::Arena),
+            ["build", "rank", "reconcile", "review", "ship"]
+        );
+        assert_eq!(labels(WorkflowKind::Roles), ["peers", "ship"]);
+        assert_eq!(labels(WorkflowKind::Peer), ["peers", "ship"]);
+        assert_eq!(labels(WorkflowKind::Review), ["review", "ship"]);
+
+        // A roles run's peers are its whole pipeline, and they are visible while live.
+        let mut st = RunState::new("r", WorkflowKind::Roles, PathBuf::from("/x"));
+        st.phase = Phase::Dispatch;
+        for i in 0..2 {
+            let mut s =
+                crate::executor::init_slot(format!("role-{i}"), "cli:claude", SlotRole::Peer);
+            s.status = SlotStatus::Running;
+            st.slots.push(s);
+        }
+        let steps = run_steps(&st, false);
+        assert_eq!(steps[0], ("peers", StepState::Active));
+
+        // The arena's winner gate is the ranking gate, not the ship gate.
+        let mut arena = RunState::new("a", WorkflowKind::Arena, PathBuf::from("/x"));
+        arena.phase = Phase::AwaitingWinnerConfirm;
+        for (role, status) in [
+            (SlotRole::Implementer, SlotStatus::Done),
+            (SlotRole::Implementer, SlotStatus::Failed),
+            (SlotRole::Ranker, SlotStatus::Done),
+        ] {
+            let mut s = crate::executor::init_slot("s", "cli:claude", role);
+            s.status = status;
+            arena.slots.push(s);
+        }
+        let steps = run_steps(&arena, false);
+        let by = |name: &str| steps.iter().find(|(l, _)| *l == name).unwrap().1;
+        assert_eq!(by("rank"), StepState::Gate, "the winner gate holds ranking");
+        assert_eq!(by("ship"), StepState::Pending);
+        // One of four implementers dying is the expected arena outcome, not a failed
+        // build step.
+        assert_eq!(by("build"), StepState::Done);
+    }
+
+    /// A channel that was switched off did not "not happen yet" — it is never coming,
+    /// and the row says so with a different mark.
+    #[test]
+    fn stepper_marks_skipped_rather_than_pending() {
+        let mut st = run_with(Phase::Done, 7);
+        st.slots.retain(|s| s.role != SlotRole::Tester); // [suite] enabled = false
+        st.slots
+            .iter_mut()
+            .for_each(|s| s.status = SlotStatus::Done);
+        let steps = run_steps(&st, false);
+        let by = |name: &str| steps.iter().find(|(l, _)| *l == name).unwrap().1;
+        assert_eq!(by("tests"), StepState::Skipped);
+        assert_eq!(by("ship"), StepState::Done);
+        // A run that simply has not got there yet still reads as pending.
+        let early = run_with(Phase::Spec, 3);
+        let steps = run_steps(&early, false);
+        assert_eq!(
+            steps.iter().find(|(l, _)| *l == "tests").unwrap().1,
+            StepState::Pending
+        );
+    }
+
+    /// The gate is the actionable fact, so it outranks the state of the slot it hangs
+    /// off: a tolerated critic failure must not swallow the plan gate's flag.
+    #[test]
+    fn stepper_flags_the_gate_even_when_that_step_failed() {
+        let mut st = run_with(Phase::AwaitingPlanApproval, 2);
+        st.slots[0].status = SlotStatus::Done; // planner
+        st.slots[1].status = SlotStatus::Failed; // plan_critic: tolerated, plan.rs:181
+        let steps = run_steps(&st, false);
+        assert_eq!(
+            steps.iter().find(|(l, _)| *l == "critique").unwrap().1,
+            StepState::Gate
+        );
+        // Rejected is not pending either.
+        let mut rejected = run_with(Phase::PlanRejected, 2);
+        rejected
+            .slots
+            .iter_mut()
+            .for_each(|s| s.status = SlotStatus::Done);
+        assert_eq!(
+            run_steps(&rejected, false)
+                .iter()
+                .find(|(l, _)| *l == "critique")
+                .unwrap()
+                .1,
+            StepState::Failed
+        );
+    }
+
+    /// Nobody is driving it: a halted, quota-paused or abandoned run must not keep
+    /// claiming a step is in progress while the header says ABANDONED.
+    #[test]
+    fn stepper_halts_instead_of_claiming_live() {
+        let live = run_with(Phase::Review, 6);
+        assert_eq!(
+            run_steps(&live, false)
+                .iter()
+                .find(|(l, _)| *l == "review")
+                .unwrap()
+                .1,
+            StepState::Active
+        );
+        assert_eq!(
+            run_steps(&live, true)
+                .iter()
+                .find(|(l, _)| *l == "review")
+                .unwrap()
+                .1,
+            StepState::Halted,
+            "abandoned"
+        );
+        for phase in [Phase::Stopped, Phase::Quota] {
+            let mut st = run_with(Phase::Review, 6);
+            st.phase = phase;
+            assert_eq!(
+                run_steps(&st, false)
+                    .iter()
+                    .find(|(l, _)| *l == "review")
+                    .unwrap()
+                    .1,
+                StepState::Halted,
+                "{phase:?}"
+            );
+        }
+        for phase in [Phase::Failed, Phase::Stuck, Phase::Escalated] {
+            let mut st = run_with(Phase::Review, 6);
+            st.phase = phase;
+            assert_eq!(
+                run_steps(&st, false)
+                    .iter()
+                    .find(|(l, _)| *l == "review")
+                    .unwrap()
+                    .1,
+                StepState::Failed,
+                "{phase:?}"
+            );
+        }
+    }
+
+    /// The stepper degrades to glyphs plus the live label, and drops even that rather
+    /// than clip it. Checked against the widest live label, not a convenient one.
+    #[test]
+    fn stepper_never_clips_a_label() {
+        for phase in [
+            Phase::Spec,
+            Phase::Review,
+            Phase::Suite,
+            Phase::AwaitingShipConfirm,
+        ] {
+            for slots in 1..=7 {
+                let st = run_with(phase, slots);
+                let steps = run_steps(&st, false);
+                for w in 0..=90u16 {
+                    let spans = stepper_spans(&steps, w, "◐");
+                    let painted: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+                    assert!(
+                        painted <= w as usize,
+                        "{phase:?} with {slots} slots overflowed {w}: {painted}"
+                    );
+                }
+            }
+        }
+        // The live step still keeps its name whenever there is room for it.
+        let st = run_with(Phase::Review, 6);
+        let tight: String = stepper_spans(&run_steps(&st, false), 20, "◐")
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(
+            tight.contains("review"),
+            "the live step keeps its name: {tight:?}"
+        );
+        assert!(
+            !tight.contains("critique"),
+            "finished steps give theirs up: {tight:?}"
+        );
+    }
+
+    #[test]
+    fn tool_ids_are_stripped_from_result_lines() {
+        let line = compact_log_line("← ✓  toolu_01HqnTTSQH5m7ZWYJVAtA7Vj  fn git(args: &[&str])");
+        assert_eq!(line, "◂ ✓ fn git(args: &[&str])");
+        // A result that leads with real content keeps every word of it.
+        let plain = compact_log_line("← ✗  cargo test failed");
+        assert_eq!(plain, "◂ ✗ cargo test failed");
+    }
+
+    /// A slot's identity in the rail is its role, never the provider-suffixed id.
+    #[test]
+    fn slot_names_are_roles_numbered_only_when_they_collide() {
+        let st = run_with(Phase::Review, 7);
+        assert_eq!(slot_short(&st.slots, 0), "planner");
+        assert_eq!(slot_short(&st.slots, 5), "review 0");
+        assert_eq!(slot_short(&st.slots, 6), "review 1");
+    }
+
+    /// The model column has to separate the tiers the fleet policy is built on. A
+    /// head-first shortening renders every Gemini as `gemini`, which is useless.
+    #[test]
+    fn model_labels_keep_the_tier() {
+        let label = |model: Option<&str>, provider: &str, w: usize| {
+            let mut s = crate::executor::init_slot("s", provider, SlotRole::Reviewer);
+            s.model = model.map(str::to_string);
+            slot_model(&s, w)
+        };
+        assert_eq!(label(Some("claude-opus-5"), "cli:claude", 12), "opus-5");
+        // The 80-119 band's rail leaves 6 columns here, so this is the common case:
+        // opus, sonnet and haiku must not all shorten to their shared version.
+        let narrow: Vec<String> = [
+            "claude-opus-4-5-20250929",
+            "claude-sonnet-4-5-20250929",
+            "claude-haiku-4-5-20251001",
+        ]
+        .iter()
+        .map(|m| label(Some(m), "cli:claude", 6))
+        .collect();
+        assert_eq!(narrow, ["opus", "sonnet", "haiku"], "tiers collapsed at 6");
+        assert_ne!(
+            label(Some("google/gemini-3.7-flash"), "cli:opencode", 6),
+            label(Some("google/gemini-3.7-pro"), "cli:opencode", 6),
+        );
+        // A release date is dropped; a version number is not.
+        assert_eq!(
+            label(Some("claude-opus-4-5-20250929"), "cli:claude", 12),
+            "opus-4-5"
+        );
+        assert_eq!(
+            label(Some("claude-3-5-haiku-20241022"), "cli:claude", 12),
+            "3-5-haiku"
+        );
+        // Same family, different tier: the labels must differ.
+        let flash = label(Some("google/gemini-3.7-flash"), "cli:opencode", 12);
+        let pro = label(Some("google/gemini-3.7-pro"), "cli:opencode", 12);
+        assert_ne!(flash, pro, "flash and pro rendered the same");
+        assert!(flash.ends_with("flash"), "{flash}");
+        assert!(pro.ends_with("pro"), "{pro}");
+        assert!(flash.starts_with("gemini"), "room for both at 12: {flash}");
+        // No model recorded: name the adapter, never an empty cell.
+        assert_eq!(label(None, "cli:opencode", 12), "opencode");
+        assert_eq!(label(None, "cli:claude", 12), "claude");
+        // What the provider says it served beats what was asked for.
+        let mut s = crate::executor::init_slot("s", "cli:opencode", SlotRole::Reviewer);
+        s.model = Some("anthropic/claude-opus-4.8".into());
+        s.usage = Some(crate::state::SlotUsage {
+            slot_id: "s".into(),
+            provider: "cli:opencode".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            context_tokens: 0,
+            tools: 0,
+            model: Some("x-ai/grok-4.5".into()),
+        });
+        assert_eq!(slot_model(&s, 12), "grok-4.5");
+    }
+
+    /// The band's token meter must agree with `status --json`, which reads the run's
+    /// own ledger. `slot.usage` is overwritten on re-dispatch (executor.rs:1024).
+    #[test]
+    fn token_meter_reads_the_run_ledger_not_the_last_dispatch() {
+        let mut st = run_with(Phase::Review, 2);
+        let usage = |out: u64| crate::state::SlotUsage {
+            slot_id: "impl".into(),
+            provider: "cli:claude".into(),
+            input_tokens: 0,
+            output_tokens: out,
+            cache_read_tokens: 0,
+            context_tokens: 0,
+            tools: 0,
+            model: None,
+        };
+        // Three dispatches of one slot: the ledger keeps all three, the slot field
+        // only the last.
+        st.usage = vec![usage(1000), usage(2000), usage(3000)];
+        st.slots[0].usage = Some(usage(3000));
+        let ledger: u64 = st.usage.iter().map(|u| u.output_tokens).sum();
+        let per_slot: u64 = st
+            .slots
+            .iter()
+            .filter_map(|s| s.usage.as_ref())
+            .map(|u| u.output_tokens)
+            .sum();
+        assert_eq!(ledger, 6000);
+        assert_eq!(per_slot, 3000, "fixture sanity");
+
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let swarm = SparPaths::new("/x");
+        let mut app = App::new(None, Config::default(), true);
+        let mut rail = ListState::default();
+        term.draw(|f| {
+            draw(
+                f,
+                &swarm,
+                &[],
+                &[],
+                Some(&st),
+                "",
+                &[],
+                "",
+                &mut app,
+                &mut rail,
+            )
+        })
+        .unwrap();
+        let band: String = {
+            let buf = term.backend().buffer();
+            (0..120).map(|x| buf[(x, 1)].symbol()).collect()
+        };
+        assert!(band.contains("out 6.0k"), "band was: {band:?}");
     }
 }

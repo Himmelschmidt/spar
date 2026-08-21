@@ -421,14 +421,28 @@ run and reconcile as each returns.
 
 ### TUI shape (humans)
 
-A **rail** + **one main area**. Main always shows the rail's selection.
+A **rail** + **one main area**, with no pane borders: chrome bands (breadcrumb, run
+stepper, labels + rule) sit above one body split by a single seam. Main always shows the
+rail's selection.
 
+- Header: brand + breadcrumb + phase, the `⚑N need you` roll-up, and gate buttons in a
+  fixed right-hand zone on 80 columns and up (their x never moves between gates; below
+  80 they right-align).
+- Stepper: the pipeline **for that workflow** — loop/plan is
+  `plan ─ critique ─ spec ─ build ─ tests ─ review ─ ship`, arena is
+  `build ─ rank ─ reconcile ─ review ─ ship`, roles/peer is `peers ─ ship`. Read off the
+  slots that actually ran: `●` done · `◐` live · `○` pending · `·` skipped (a disabled
+  channel or unused role, i.e. never coming) · `✗` failed · `⏸` halted (stopped, quota
+  or abandoned) · `⚑` on the step a gate is holding (plan gate on critique, winner gate
+  on rank, reconcile gate on reconcile, ship gate on ship). Meters on the right read the
+  run's usage ledger, the same numbers `status --json` reports. Folds away under 14 rows.
 - Rail: `projects ▸ runs ▸ agents` drill-down. `Enter` pushes a level, `Esc` pops one
   (never quits). `Enter` on an agent **takes it over** in the Shell tab. `/` filters the
   rail (Esc clears). The rail is **attention-sorted**: runs at a gate or broken fly a
   `⚑` and float to the top (and roll up to their project row).
-- Main tabs: `Log · Activity · Diff · Shell`, switched with `[` / `]` (Activity carries
-  the `@human` alert badge). Diff is the selected slot's real worktree diff.
+- Main tabs: `Log · Activity · Diff · Shell` on the labels row, marked by an accent
+  underline on the rule beneath them, switched with `[` / `]` (Activity carries the
+  `@human` alert badge). Diff is the selected slot's real worktree diff.
 - Focus: `1` rail · `2` main (Tab cycles the two). `+` / `_` zoom Main.
 - `:` opens the **command palette** — `approve`/`reject`/`ship`/`confirm`/`reconcile`/
   `takeover`/`implement`/`plan`/`spawn`/`chat`, Tab-completes run ids.
@@ -438,9 +452,12 @@ A **rail** + **one main area**. Main always shows the rail's selection.
 - `p` = Projects · `w` log wrap · `g`/`G` top/bottom · `?` help · **`q` quits**.
 - Shell tab = a real tmux client: **every key goes to the agent** (incl. `Ctrl+C`);
   `F12` (or `C-a d`) hands focus back to spar. Focusing it full-screen is **Driving
-  mode** — green banner + border, rail collapsed.
+  mode** — green banner, rail and every band but the footer collapsed, pane edge to edge.
 - Width bands: `<80` cols Main only (rail folds away, tappable tab strip — phone/SSH);
-  `80–119` rail + Main; `>=120` the extra width goes to Main.
+  `80–119` rail (26 cols) + Main; `>=120` rail 32, the rest of the extra width to Main.
+- Colour: spar paints no page background — it composites onto the terminal's own theme
+  (and its transparency). Backgrounds appear only on chips, gate/alert washes and
+  overlays.
 
 - `status --json` and every run JSON carry **`base_ref` / `base_commit`** — the ref and commit
   all of the run's slot worktrees were cut from (see **Base ref** above).

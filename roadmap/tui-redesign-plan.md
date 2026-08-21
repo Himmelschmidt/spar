@@ -73,6 +73,49 @@ Supporting principles:
 - Width bands: `<80` Main only · `80–119` rail + Main · `>=120` extra width to Main
   (never a fourth box). Decision U5.
 
+## Stage D — the chrome rebuild (done)
+
+Stages A–C fixed *where things are*; the shell still read like a 2015 curses app.
+Boxes were the problem: rail and Main each drew a full border, so the middle of the
+screen was a two-column wall (`┐┌`), the tab strip lived inside Main's top border
+mixed with slot identity and mode flags, and a painted `rgb(12,14,18)` slab fought
+every terminal theme it landed in. The 24-column fixed rail elided the one field that
+identifies an agent: two rows both read `✓ review-… done`.
+
+- **Bands, not boxes.** Header · stepper · labels · rule · body · footer, with one
+  1-column seam between rail and Main. The rule under the labels row doubles as the
+  active tab's underline, so tab indication costs no row. Bands fold in order of what
+  the operator can most afford to lose: the stepper below 14 rows, then labels+rule
+  below 9, leaving header + body + footer at the 20x5 floor.
+- **The run is a stepper**, shaped by its workflow: an arena has no planner and a
+  roles run has nothing but peers, so the step table is keyed on `WorkflowKind` rather
+  than fixed. States are read off the slots that actually ran (they accumulate on the
+  run) rather than guessed from the phase name, and the row distinguishes *pending*
+  from *skipped* — a disabled `[spec]` / `[suite]` channel never arrives, and saying
+  "not yet" for the life of the run is a lie. `⚑` marks the step a gate is holding
+  (plan gate on critique, winner gate on rank, reconcile on reconcile, ship on ship),
+  outranking that step's own state so a tolerated critic failure cannot swallow the
+  flag. `⏸` covers stopped, quota-paused and abandoned, which are not progress.
+  Degrades in three tiers and stops at a step boundary rather than clipping.
+- **The terminal owns the background.** No page fill; only chips, the gate/alert
+  washes and overlays paint one. Tokens live in `src/theme.rs`.
+- **Identity over ids.** The rail shows an agent's *role* (`review 0`, `builder`) and
+  its model, never `review-0-cli-opencode`; the log drops the provider's opaque
+  `toolu_…` ids, ~30 columns of noise per result row. The model label drops the release
+  date, then version segments, then leading segments, in that order: names outrank
+  numbers because the tier is what the fleet policy is built on. A head-first
+  shortening renders every Gemini as `gemini`; a naive tail-first one renders opus,
+  sonnet and haiku all as `…4-5` in the 26-column rail the 80-119 band uses.
+- **Reserved space.** Gate buttons live in a fixed 23-column zone (80 columns and up)
+  and are left-aligned inside it, so swapping gates cannot slide a button out from
+  under a click; the Activity tab's alert badge has a reserved 4-column slot for the
+  same reason; the rail width comes from the terminal width alone, never from the data.
+  Two of U11's four shift sources remain: the narrow tab strip still flips mode at the
+  80-column breakpoint, and the attention re-sort needs the motion engine (006 A/B).
+- Asserted by `mod render_stability`: a swept render over widths 1-200 x heights 1-60
+  plus every band breakpoint, the projects level, an empty project list, 400 runs, and
+  "this region does not move when that value changes." Decision U14.
+
 ## Sources
 
 - k9s — resource list + one main view, `:` palette, drill-down with `Enter`/`Esc`.

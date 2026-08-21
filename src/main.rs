@@ -25,6 +25,7 @@ mod state;
 mod tasks;
 mod templates;
 mod terminal;
+mod theme;
 mod tmux;
 mod tui;
 mod util;
