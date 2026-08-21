@@ -2499,8 +2499,14 @@ fn main_tab_spans(app: &App) -> Vec<(MainTab, String, Style)> {
     MAIN_TABS
         .iter()
         .map(|t| {
-            let badge = if *t == MainTab::Activity && app.human_alerts_n > 0 {
-                format!(" ⚠{}", app.human_alerts_n)
+            // Activity's alert badge lives in a fixed 4-column slot, blank when there
+            // is nothing to say: Activity is second of four, so a badge that changed
+            // width would shift Diff and Shell out from under a click (U11).
+            let badge = if *t == MainTab::Activity {
+                match app.human_alerts_n {
+                    0 => "    ".to_string(),
+                    n => format!(" ⚠{:<2}", n.min(99)),
+                }
             } else {
                 String::new()
             };
@@ -3065,10 +3071,10 @@ fn status_cue(
 /// different gate never slides them under a mid-click (U11).
 const GATE_ZONE_W: u16 = 23;
 
-/// The gate zone: a fixed slot, or `None` on a screen too narrow to spare one (there
-/// the buttons fall back to right-aligned, the old behaviour).
+/// The gate zone: a fixed slot, or `None` on a phone-width screen that cannot spare
+/// one (there the buttons fall back to right-aligned, the old behaviour).
 fn gate_zone(area: Rect) -> Option<Rect> {
-    if area.width < 90 {
+    if area.width < NARROW_WIDTH {
         return None;
     }
     Some(Rect {
@@ -4535,7 +4541,7 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
  \n\
   Shell tab = a real tmux client: every key goes to the agent (incl.\n\
     Ctrl+C). prefix C-a · Ctrl+a d or F12 hands focus back to spar.\n\
-    Focusing it full-screen is Driving mode (green banner + border).\n\
+    Focusing it full-screen is Driving mode (green banner, bands collapsed).\n\
  \n\
   Mouse / touch: tap a tab, a rail row (double-tap = Enter), a gate\n\
   button, or the breadcrumb (back to the rail). Scroll to scroll.\n\
@@ -5637,6 +5643,9 @@ mod labels {
         assert_eq!(approve, ship);
         assert_eq!(approve, winner);
         assert_eq!(approve, area.right() - GATE_ZONE_W);
+        // The zone covers every band that has a rail, not just the widest one.
+        assert!(gate_zone(Rect { width: 80, ..area }).is_some());
+        assert!(gate_zone(Rect { width: 79, ..area }).is_none());
     }
 
     #[test]
@@ -6161,15 +6170,76 @@ mod render_stability {
         (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
     }
 
-    /// Every size from a phone-sized sliver up, with and without data.
+    /// Every size from a single cell up, swept rather than sampled: ratatui panics on
+    /// any Rect that leaves the buffer, and the band arithmetic has four breakpoints.
     #[test]
     fn renders_at_every_size_without_panicking() {
-        let st = run_with(Phase::Review, 7);
-        let runs: Vec<state::RunSummary> = Vec::new();
-        for (w, h) in [(20, 5), (40, 8), (79, 24), (80, 24), (120, 40), (200, 60)] {
-            paint(w, h, &[], &runs, Some(&st));
+        let st = run_with(Phase::AwaitingShipConfirm, 7);
+        for w in (1..=200).step_by(3) {
+            for h in (1..=60).step_by(2) {
+                paint(w, h, &[], &[], Some(&st));
+            }
+        }
+        // The breakpoints themselves, and the no-run path.
+        for (w, h) in [
+            (1, 1),
+            (20, 5),
+            (79, 24),
+            (80, 24),
+            (89, 24),
+            (90, 24),
+            (119, 40),
+            (120, 40),
+            (200, 60),
+        ] {
+            paint(w, h, &[], &[], Some(&st));
             paint(w, h, &[], &[], None);
         }
+    }
+
+    /// The Projects level renders its own row shape, and it is the one rail level the
+    /// other tests never reach (they all pass an empty project list).
+    #[test]
+    fn renders_the_projects_level() {
+        let projects: Vec<registry::ProjectEntry> =
+            ["acme-api", "spar", "a-very-long-project-name"]
+                .iter()
+                .map(|n| registry::ProjectEntry {
+                    root: PathBuf::from("/nonexistent").join(n),
+                    name: Some((*n).to_string()),
+                    last_seen: Utc::now(),
+                    last_run_id: None,
+                })
+                .collect();
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let swarm = SparPaths::new("/x");
+        let mut app = App::new(None, Config::default(), true);
+        app.open_projects_view();
+        let mut rail = ListState::default();
+        term.draw(|f| {
+            draw(
+                f,
+                &swarm,
+                &projects,
+                &[],
+                None,
+                "",
+                &[],
+                "",
+                &mut app,
+                &mut rail,
+            )
+        })
+        .unwrap();
+        let painted: String = {
+            let buf = term.backend().buffer();
+            (0..30)
+                .map(|y| (0..40).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(painted.contains("acme-api"), "rail was: {painted:?}");
+        assert!(painted.contains("PROJECTS"), "rail was: {painted:?}");
     }
 
     /// The scale that already bit once: thousands of run dirs on one project.
@@ -6195,8 +6265,9 @@ mod render_stability {
         assert!(row(&term, 0).contains("spar"));
     }
 
-    /// U11: the tabs and their underline are painted from the layout, so switching
-    /// tabs (or growing the alert badge) cannot move them.
+    /// U11: every tab keeps its column when the active tab changes AND when the
+    /// Activity badge appears or grows — Activity is second of four, so an unreserved
+    /// badge would shift Diff and Shell out from under a click.
     #[test]
     fn tab_positions_hold_across_tab_and_badge_changes() {
         let st = run_with(Phase::Review, 7);
@@ -6222,22 +6293,19 @@ mod render_stability {
                 )
             })
             .unwrap();
-            app.main_tabs
-                .iter()
-                .filter(|(_, t)| *t != MainTab::Activity)
-                .map(|(r, _)| r.x)
-                .collect::<Vec<_>>()
+            app.main_tabs.iter().map(|(r, _)| r.x).collect::<Vec<_>>()
         };
-        // Only the Activity tab changes width when it badges, and it is last but one;
-        // the tabs before it never move.
-        let a = tabs_x(MainTab::Log, 0);
-        let b = tabs_x(MainTab::Diff, 0);
-        assert_eq!(a, b, "switching tabs must not move them");
-        assert_eq!(
-            a[0],
-            tabs_x(MainTab::Log, 9)[0],
-            "a badge must not move Log"
-        );
+        let base = tabs_x(MainTab::Log, 0);
+        assert_eq!(base.len(), MAIN_TABS.len());
+        for tab in MAIN_TABS {
+            for alerts in [0, 1, 9, 12, 99] {
+                assert_eq!(
+                    tabs_x(tab, alerts),
+                    base,
+                    "tabs moved on {tab:?} with {alerts} alerts"
+                );
+            }
+        }
     }
 
     /// The stepper is read off the slots that ran, so it says the same thing whether

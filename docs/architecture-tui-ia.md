@@ -180,6 +180,9 @@ before this doc's 004. The ordering argument above is about motion; chrome is th
 shell would have meant building them twice. What landed: pane borders replaced by chrome
 bands over one seam, the run stepper, the token set in `src/theme.rs`, a terminal-native
 background, role-first agent identity in the rail, and the `TestBackend` stability suite.
-The "Design tokens and stability assertions" and layout-shift items under **Rendering
-discipline** are therefore done except for the attention-resort transition, which needs
-the motion engine.
+"Design tokens and stability assertions" under **Rendering discipline** is done, minus
+U12's braille/half-block clause: no density glyph earned its place in this pass. Two of
+the four layout-shift sources are fixed (width-summed gate buttons, growing lists); the
+attention re-sort needs the motion engine, and the narrow tab strip still flips mode at
+the 80-column breakpoint. `rail_project_items`' render-path directory scan (U13) is
+untouched and remains 004 Phase B's job.

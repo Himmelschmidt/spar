@@ -426,8 +426,9 @@ stepper, labels + rule) sit above one body split by a single seam. Main always s
 rail's selection.
 
 - Header: brand + breadcrumb + phase, the `⚑N need you` roll-up, and gate buttons in a
-  fixed right-hand zone (their x never moves between gates).
-- Stepper: `plan · critique · spec · build · tests · review · ship`, read off the slots
+  fixed right-hand zone on 80 columns and up (their x never moves between gates; below
+  80 they right-align).
+- Stepper: `plan ─ critique ─ spec ─ build ─ tests ─ review ─ ship`, read off the slots
   that actually ran — done / live / pending / failed, with `⚑` on the step a gate is
   holding. Folds away under 14 rows.
 - Rail: `projects ▸ runs ▸ agents` drill-down. `Enter` pushes a level, `Esc` pops one
@@ -446,9 +447,9 @@ rail's selection.
 - `p` = Projects · `w` log wrap · `g`/`G` top/bottom · `?` help · **`q` quits**.
 - Shell tab = a real tmux client: **every key goes to the agent** (incl. `Ctrl+C`);
   `F12` (or `C-a d`) hands focus back to spar. Focusing it full-screen is **Driving
-  mode** — green banner, every other band collapsed, the pane edge to edge.
+  mode** — green banner, rail and every band but the footer collapsed, pane edge to edge.
 - Width bands: `<80` cols Main only (rail folds away, tappable tab strip — phone/SSH);
-  `80–119` rail + Main; `>=120` the extra width goes to Main.
+  `80–119` rail (26 cols) + Main; `>=120` rail 32, the rest of the extra width to Main.
 - Colour: spar paints no page background — it composites onto the terminal's own theme
   (and its transparency). Backgrounds appear only on chips, gate/alert washes and
   overlays.

@@ -21,7 +21,8 @@ Phases C and D **landed first**, ahead of features 004 and 005 (decision U14). T
 dependency argument — "animating a confusing layout gives you a confusing layout at
 60fps" — holds for motion (phases A and B), not for chrome and tokens: Home and the
 criteria grid would otherwise have been built into the old bordered shell and then
-rebuilt. Phases A and B still depend on feature 005.
+rebuilt. Phases A and B still depend on feature 005, which is what the `dependencies`
+field above refers to.
 
 ## Problem
 
@@ -73,10 +74,19 @@ three text weights, `INK` for chip text); the TUI paints no page background, so 
 composites onto the host terminal theme. Pane borders are replaced by chrome bands over
 one seam, the active tab is an accent underline on the band rule, the rail carries roles
 instead of provider-suffixed slot ids, the run stepper is new, and the log drops the
-provider's opaque tool-call ids. Recorded as U14.
+provider's opaque tool-call ids. Recorded as U14, which also records the U1 and U5 rows
+it amends.
+
+Not done here: U12's "braille/half-block density where it earns its place" — nothing in
+this pass earned it, so no density glyph was added. Of U11's four shift sources, the
+gate buttons and the alert badge are now reserved from the layout and lists no longer
+grow into their neighbours; the attention re-sort waits on phase A's motion engine and
+the narrow tab strip still flips mode at the 80-column breakpoint.
 
 ### Phase D: `TestBackend` snapshot assertion suite — DONE
 
-`mod render_stability` in `src/tui.rs`: renders at 20x5 through 200x60 with and without a
-run, an empty project list, 400 runs, and the layout-stability assertions (tab x positions
-hold across tab and badge changes; gate buttons start at a fixed x across gate sets).
+`mod render_stability` in `src/tui.rs`: a swept render over widths 1-200 x heights 1-60
+plus each band breakpoint, with and without a run; the projects level; an empty project
+list; 400 runs; and the layout-stability assertions (every tab holds its column across
+tab switches and alert-badge counts 0-99; gate buttons start at a fixed x across every
+gate set, down to the 80-column breakpoint).
