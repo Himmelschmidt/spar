@@ -356,6 +356,11 @@ pub struct RunSummary {
     /// only a listing surface sets it higher.
     #[serde(default = "one_round")]
     pub legs: u32,
+    /// How many of those legs want the operator. Only meaningful on a folded row
+    /// (`legs > 1`): a unit with two runs at gates must still be counted twice, or
+    /// folding becomes a way to hide a gate.
+    #[serde(default)]
+    pub wants: u32,
     /// Filled when listing across projects (global home).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_root: Option<PathBuf>,
@@ -785,6 +790,7 @@ pub fn list_runs(paths: &SparPaths) -> Result<Vec<RunSummary>> {
                 parent_run: state.parent_run,
                 round: state.round,
                 legs: 1,
+                wants: 0,
                 base_ref: state.base_ref,
                 base_commit: state.base_commit,
                 project_root: None,

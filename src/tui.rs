@@ -966,6 +966,12 @@ fn fold_units(
                 .then(b.updated_at.cmp(&a.updated_at))
         });
         let ids: Vec<String> = group.iter().map(|r| r.id.clone()).collect();
+        // Every leg that wants the operator still counts. Two gates folded into one
+        // row must read as two in the roll-up, or folding hides one of them.
+        let wants = group
+            .iter()
+            .filter(|r| run_attention(r).needs_you())
+            .count() as u32;
         let brief = group
             .iter()
             .find(|r| r.id == root)
@@ -980,6 +986,7 @@ fn fold_units(
         }
         row.abandoned = group.iter().any(|r| r.abandoned) || row.abandoned;
         row.legs = ids.len() as u32;
+        row.wants = wants;
         members.insert(row.id.clone(), ids);
         out.push(row);
     }
@@ -3756,12 +3763,20 @@ fn rail_run_items(
                 Attention::Broken => Some(ALERT),
                 _ => None,
             };
+            // A folded unit with more than one leg wanting you says so: the row can
+            // only act on one of them at a time.
+            let more = if r.wants > 1 {
+                r.wants.to_string()
+            } else {
+                String::new()
+            };
             let body = vec![
                 Span::styled(
                     format!("{:<8}", truncate(&r.id, 8)),
                     if sel { selected(focused) } else { dim() },
                 ),
                 Span::styled(format!("  {phase_text}"), Style::default().fg(phase_c)),
+                Span::styled(more, Style::default().fg(WARN).bold()),
             ];
             rail_row(
                 rail_lead(sel, focused, flag),
@@ -5530,8 +5545,19 @@ fn sort_runs_by_attention(runs: &mut [state::RunSummary]) {
 }
 
 /// How many runs currently want the operator (gate or broken) — the fleet roll-up.
+/// How many runs want the operator. A folded row (U15) stands for several runs, so it
+/// contributes each leg that wants you — otherwise a unit with two gates would read as
+/// one and folding would become a way to hide a gate.
 fn runs_needing_attention(runs: &[state::RunSummary]) -> usize {
-    runs.iter().filter(|r| run_attention(r).needs_you()).count()
+    runs.iter()
+        .map(|r| {
+            if r.legs > 1 {
+                r.wants as usize
+            } else {
+                usize::from(run_attention(r).needs_you())
+            }
+        })
+        .sum()
 }
 
 /// Flash a toast when a run first crosses into wanting the operator (Working/Idle →
@@ -6152,6 +6178,7 @@ mod labels {
             parent_run: None,
             round: 1,
             legs: 1,
+            wants: 0,
             base_ref: None,
             base_commit: None,
             project_root: None,
@@ -6590,6 +6617,7 @@ mod render_stability {
                 parent_run: None,
                 round: 1,
                 legs: 1,
+                wants: 0,
                 base_ref: None,
                 base_commit: None,
                 project_root: None,
@@ -7018,6 +7046,7 @@ mod folding {
             parent_run: parent.map(str::to_string),
             round: 1,
             legs: 1,
+            wants: 0,
             base_ref: None,
             base_commit: None,
             project_root: None,
@@ -7060,6 +7089,25 @@ mod folding {
         assert_eq!(run_attention(&rows[0]), Attention::Gate);
         assert_eq!(rows[0].id, "leg", "the gate is what the row acts on");
         assert_eq!(runs_needing_attention(&rows), 1);
+    }
+
+    /// Folding must never turn two gates into one. The roll-up counts legs, not rows.
+    #[test]
+    fn two_gates_in_one_unit_still_count_twice() {
+        let runs = vec![
+            summary("root", Phase::AwaitingShipConfirm, None, 30),
+            summary("leg", Phase::AwaitingPlanApproval, Some("root"), 10),
+            summary("elsewhere", Phase::Done, None, 5),
+        ];
+        let (rows, _) = fold_units(runs);
+        assert_eq!(rows.len(), 2, "one unit plus one unrelated run");
+        let unit = rows.iter().find(|r| r.legs > 1).unwrap();
+        assert_eq!(unit.wants, 2);
+        assert_eq!(
+            runs_needing_attention(&rows),
+            2,
+            "both gates are still counted"
+        );
     }
 
     #[test]
