@@ -2774,6 +2774,34 @@ fn draw_labels(
     }
 }
 
+/// Truncate a span list to `width` columns, marking the cut. A Paragraph wider than
+/// its rect is clipped by ratatui at the cell boundary with no ellipsis, which reads
+/// as a rendering fault: `Needs plan approval` becomes `Needs plan ` and the operator
+/// cannot tell whether the phase is truncated or just oddly named.
+fn fit_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Span<'static>> {
+    let total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    if total <= width as usize {
+        return spans;
+    }
+    let mut out = Vec::with_capacity(spans.len());
+    let mut used = 0usize;
+    for span in spans {
+        let w = span.content.chars().count();
+        if used + w <= width as usize {
+            used += w;
+            out.push(span);
+            continue;
+        }
+        let room = (width as usize).saturating_sub(used);
+        if room > 1 {
+            let style = span.style;
+            out.push(Span::styled(truncate(&span.content, room), style));
+        }
+        break;
+    }
+    out
+}
+
 /// The chrome/content divider. One rule across the frame, tee'd at the rail seam,
 /// carrying the active tab's underline — the tab indicator costs no extra row.
 fn draw_rule(f: &mut Frame, lay: &LayoutRects, app: &App) {
@@ -3496,14 +3524,20 @@ fn draw_header(
     }
 
     let zone = gate_zone(area);
-    let right_limit = zone.map(|z| z.x).unwrap_or(area.right());
+    // Without a reserved zone (phone width) the buttons overpaint whatever is beneath
+    // them, so the breadcrumb has to stop before they start — otherwise it is not
+    // clipped, it is buried, and it loses even its ellipsis.
+    let right_limit = zone
+        .map(|z| z.x)
+        .unwrap_or_else(|| area.right().saturating_sub(gate_buttons_width(&buttons)));
     let right_w: u16 = right.iter().map(|s| s.content.chars().count() as u16).sum();
     let right_x = right_limit.saturating_sub(right_w + 1).max(area.x);
 
+    let left_w = right_x.saturating_sub(area.x);
     f.render_widget(
-        Paragraph::new(Line::from(spans)),
+        Paragraph::new(Line::from(fit_spans(spans, left_w))),
         Rect {
-            width: right_x.saturating_sub(area.x),
+            width: left_w,
             ..area
         },
     );
@@ -3535,6 +3569,18 @@ fn button_style(action: GateAction) -> Style {
         GateAction::Reconcile => ACCENT,
     };
     Style::default().fg(INK).bg(bg).bold()
+}
+
+/// Columns a gate-button set occupies, including the gaps and the right margin.
+fn gate_buttons_width(buttons: &[(&str, GateAction)]) -> u16 {
+    if buttons.is_empty() {
+        return 0;
+    }
+    let labels: u16 = buttons
+        .iter()
+        .map(|(l, _)| l.chars().count() as u16 + 2)
+        .sum();
+    labels + buttons.len() as u16 - 1 + 1
 }
 
 /// Paint right-aligned tappable gate buttons filling every row of `area` and
@@ -3736,7 +3782,7 @@ fn rail_run_items(
         return rail_empty("(no runs)");
     }
     let filter = app.filter.as_deref().filter(|f| !f.is_empty());
-    let phase_w = w.saturating_sub(17).clamp(6, 16) as usize;
+    let phase_w_base = w.saturating_sub(17).clamp(6, 16) as usize;
     runs.iter()
         .enumerate()
         .map(|(i, r)| {
@@ -3746,6 +3792,15 @@ fn rail_run_items(
                     return rail_filtered_row(&r.id, w);
                 }
             }
+            // A folded unit with more than one leg wanting you says so: the row can
+            // only act on one of them at a time. Its columns come out of the phase,
+            // never out of the row width.
+            let more = if r.wants > 1 {
+                format!(" ⚑{}", r.wants)
+            } else {
+                String::new()
+            };
+            let phase_w = phase_w_base.saturating_sub(more.chars().count()).max(4);
             // Phase reads "review" forever on a run nobody is driving; say so.
             let (phase_text, phase_c) = if r.abandoned {
                 (
@@ -3762,13 +3817,6 @@ fn rail_run_items(
                 Attention::Gate => Some(WARN),
                 Attention::Broken => Some(ALERT),
                 _ => None,
-            };
-            // A folded unit with more than one leg wanting you says so: the row can
-            // only act on one of them at a time.
-            let more = if r.wants > 1 {
-                r.wants.to_string()
-            } else {
-                String::new()
             };
             let body = vec![
                 Span::styled(
@@ -4120,7 +4168,10 @@ fn draw_stream_stats(
         },
         quiet,
     ]);
-    f.render_widget(Paragraph::new(line), area);
+    f.render_widget(
+        Paragraph::new(Line::from(fit_spans(line.spans, area.width))),
+        area,
+    );
 }
 
 /// Paint a log viewport by writing cells directly (no Paragraph wrap/scroll).
@@ -5969,6 +6020,43 @@ mod labels {
         // The zone covers every band that has a rail, not just the widest one.
         assert!(gate_zone(Rect { width: 80, ..area }).is_some());
         assert!(gate_zone(Rect { width: 79, ..area }).is_none());
+    }
+
+    /// A Paragraph wider than its rect is clipped with no ellipsis, and gate buttons
+    /// overpaint what is under them: either way the breadcrumb loses its tail without
+    /// saying so. At every width the text must stop before the buttons.
+    #[test]
+    fn the_breadcrumb_is_never_buried_under_the_gate_buttons() {
+        use crate::cli::WorkflowKind;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut st = RunState::new(
+            "3f2a91c0",
+            WorkflowKind::Loop,
+            std::path::PathBuf::from("/x/a-project-with-a-long-name"),
+        );
+        st.phase = Phase::AwaitingPlanApproval;
+        let swarm = SparPaths::new("/x/a-project-with-a-long-name");
+        for w in 30..=140u16 {
+            let mut term = Terminal::new(TestBackend::new(w, 1)).unwrap();
+            let mut app = App::new(None, Config::default(), true);
+            app.human_alerts_n = 7;
+            term.draw(|f| {
+                let area = f.area();
+                draw_header(f, area, &swarm, &[], &[], Some(&st), &mut app);
+            })
+            .unwrap();
+            let Some((first, _)) = app.gate_buttons.first().copied() else {
+                continue;
+            };
+            let buf = term.backend().buffer();
+            assert!(first.x > 0, "w={w}");
+            assert_eq!(
+                buf[(first.x - 1, 0)].symbol(),
+                " ",
+                "text ran under the gate buttons at w={w}"
+            );
+        }
     }
 
     #[test]
