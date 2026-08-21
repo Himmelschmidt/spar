@@ -485,6 +485,10 @@ rail's selection.
   loudest attention — including how many of its legs want you, so folding can never hide
   a gate. The band names the round and the leg count. Drilling in stays scoped to the leg
   the row acts on: its agents, its worktrees, its tmux panes.
+- Rail rows lead with two fixed columns: the selection bar, then the attention flag.
+  They are separate facts — on a project where every run wants you, one shared column
+  meant the cursor was invisible. The phase is named for the width the column has
+  (`ship gate`, `plan gate`, `running`), not truncated from a sentence.
 - Rail: `projects ▸ runs ▸ agents` drill-down. `Enter` pushes a level, `Esc` pops one
   (never quits). `Enter` on an agent **takes it over** in the Shell tab. `/` filters the
   rail (Esc clears). The rail is **attention-sorted**: runs at a gate or broken fly a

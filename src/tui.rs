@@ -952,6 +952,7 @@ fn fold_units(
 /// All blocking filesystem work lives here, never on the render thread.
 fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapshot {
     let swarm = SparPaths::new(&sel.root);
+    let _ = PROJECT_PREFIX.set(sel.root.to_string_lossy().into_owned());
     let projects = registry::projects();
     let runs = if sel.browse.in_project() {
         let listed = registry::list_visible_project_runs(&sel.root).unwrap_or_default();
@@ -3630,17 +3631,24 @@ fn draw_rail(
     f.render_stateful_widget(List::new(items), area, state);
 }
 
-/// The lead column: one cell that is either an attention flag, the selection bar, or
-/// nothing. Fixed width, so a row never shifts when its state changes.
-fn rail_lead(sel: bool, focused: bool, flag: Option<Color>) -> Span<'static> {
-    match flag {
-        Some(c) => Span::styled("⚑", Style::default().fg(c).bold()),
-        None if sel => Span::styled(
-            SEL_BAR,
-            Style::default().fg(if focused { ACCENT } else { FG_MUTED }),
-        ),
-        None => Span::raw(" "),
-    }
+/// The lead columns: the selection bar, then the attention flag. Two cells, both fixed,
+/// because they are independent facts — one column for both meant that on a project
+/// where every run wants you (biddesk: 12 of 13) the cursor was invisible.
+fn rail_lead(sel: bool, focused: bool, flag: Option<Color>) -> Vec<Span<'static>> {
+    vec![
+        if sel {
+            Span::styled(
+                SEL_BAR,
+                Style::default().fg(if focused { ACCENT } else { FG_MUTED }),
+            )
+        } else {
+            Span::raw(" ")
+        },
+        match flag {
+            Some(c) => Span::styled("⚑", Style::default().fg(c).bold()),
+            None => Span::raw(" "),
+        },
+    ]
 }
 
 /// A dimmed row for something the `/` filter did not match. Filtered rows stay in
@@ -3664,16 +3672,20 @@ fn rail_empty(text: &'static str) -> Vec<ListItem<'static>> {
 /// the seam but yields it when the row is full; the seam has a column of its own, so
 /// the two never touch.
 fn rail_row(
-    lead: Span<'static>,
+    lead: Vec<Span<'static>>,
     mut body: Vec<Span<'static>>,
     right: Span<'static>,
     w: u16,
 ) -> ListItem<'static> {
     let body_w: usize = body.iter().map(|s| s.content.chars().count()).sum();
+    let lead_w: usize = lead.iter().map(|s| s.content.chars().count()).sum();
     let right_w = right.content.chars().count();
     // lead + space + body + gap + right + one column of air before the seam
-    let gap = (w as usize).saturating_sub(3 + body_w + right_w).max(1);
-    let mut spans = vec![lead, Span::raw(" ")];
+    let gap = (w as usize)
+        .saturating_sub(lead_w + 2 + body_w + right_w)
+        .max(1);
+    let mut spans = lead;
+    spans.push(Span::raw(" "));
     spans.append(&mut body);
     spans.push(Span::raw(" ".repeat(gap)));
     spans.push(right);
@@ -3759,18 +3771,16 @@ fn rail_run_items(
                 String::new()
             };
             let phase_w = phase_w_base.saturating_sub(more.chars().count()).max(4);
-            // Phase reads "review" forever on a run nobody is driving; say so.
-            let (phase_text, phase_c) = if r.abandoned {
-                (
-                    format!("{} ✗", truncate(&phase_label(r.phase), phase_w - 2)),
-                    ALERT,
-                )
-            } else {
-                (
-                    truncate(&phase_label(r.phase), phase_w),
-                    phase_color(r.phase),
-                )
-            };
+            // Phase reads "review" forever on a run nobody is driving; the red flag in
+            // the lead column already says that, so the phase keeps all its columns.
+            let (phase_text, phase_c) = (
+                truncate(&rail_phase(r.phase), phase_w),
+                if r.abandoned {
+                    ALERT
+                } else {
+                    phase_color(r.phase)
+                },
+            );
             let flag = match run_attention(r) {
                 Attention::Gate => Some(WARN),
                 Attention::Broken => Some(ALERT),
@@ -4422,6 +4432,24 @@ fn layout_log_rows(text: &str, width: usize, colorize: bool, expand: bool) -> Ve
     log_rows_window(text, width, colorize, expand, 0, usize::MAX)
 }
 
+/// The project root, for shortening the absolute paths agents print. Set once per
+/// process from the snapshot's own root — the log viewport has no other way to know it.
+static PROJECT_PREFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Absolute paths under the project (and under its sibling slot worktrees) eat the
+/// width without telling the reader anything: `/home/x/projects/biddesk/.spar/runs/...`
+/// is 40 columns of prefix the operator already knows.
+fn shorten_paths(s: &str) -> String {
+    let Some(root) = PROJECT_PREFIX.get() else {
+        return s.to_string();
+    };
+    if !s.contains(root.as_str()) {
+        return s.to_string();
+    }
+    s.replace(&format!("{root}/"), "")
+        .replace(root.as_str(), ".")
+}
+
 fn compact_log_line(raw: &str) -> String {
     let s = raw.trim_end();
     if s.is_empty() {
@@ -4436,11 +4464,11 @@ fn compact_log_line(raw: &str) -> String {
     if let Some(rest) = s.strip_prefix('→') {
         let rest = rest.trim();
         // "Bash  Fetch PR diff" → keep short tool + summary
-        return format!("▸ {}", collapse_ws(rest));
+        return format!("▸ {}", shorten_paths(&collapse_ws(rest)));
     }
     if let Some(rest) = s.strip_prefix('←') {
         let rest = strip_tool_id(rest.trim());
-        return format!("◂ {}", collapse_ws(&rest));
+        return format!("◂ {}", shorten_paths(&collapse_ws(&rest)));
     }
     if let Some(rest) = s.strip_prefix('·') {
         return format!("  {}", collapse_ws(rest.trim()));
@@ -4833,41 +4861,40 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         height: h,
     };
     f.render_widget(Clear, rect);
-    let body = "\
- spar — rail + one main area\n\
- \n\
-  Shape\n\
-    Rail   projects ▸ runs ▸ agents  (Enter pushes, Esc pops)\n\
-           attention-sorted: gates and broken runs float to the top.\n\
-    Main   one area · tabs: Log · Activity · Diff · Shell\n\
-    Main always shows the rail's selection — nothing else moves.\n\
- \n\
-  Keyboard\n\
-    1 / 2                focus Rail · Main\n\
-    Tab / Shift-Tab      cycle Rail ↔ Main\n\
-    j k  or  ↑ ↓         move in the rail · scroll Main\n\
-    Enter                push a rail level (on an agent: take it over)\n\
-    Esc                  pop a rail level · clear filter (never quits)\n\
-    [ ]                  previous / next Main tab\n\
-    + / _                zoom Main fullscreen / restore\n\
-    p                    jump to Projects\n\
-    a                    jump to the next run that needs you\n\
-    r / s                reject · ship (when gated; approve = tap / :approve)\n\
-    :                    command palette (approve/ship/takeover/…)\n\
-    /                    filter the rail\n\
-    w                    log wrap ↔ truncate long lines\n\
-    g / G                top / bottom of Main\n\
-    ?                    this help · Esc closes help\n\
-    q                    quit\n\
- \n\
-  Shell tab = a real tmux client: every key goes to the agent (incl.\n\
-    Ctrl+C). prefix C-a · Ctrl+a d or F12 hands focus back to spar.\n\
-    Focusing it full-screen is Driving mode (green banner, bands collapsed).\n\
- \n\
-  Mouse / touch: tap a tab, a rail row (double-tap = Enter), a gate\n\
-  button, or the breadcrumb (back to the rail). Scroll to scroll.\n\
- \n\
-  Esc, ?, or tap to close help";
+    let body = r#" spar — rail + one main area
+ 
+  Shape
+    Rail   projects ▸ runs ▸ agents  (Enter pushes, Esc pops)
+           attention-sorted: gates and broken runs float to the top.
+    Main   one area · tabs: Log · Activity · Diff · Shell
+    Main always shows the rail's selection — nothing else moves.
+ 
+  Keyboard
+    1 / 2                focus Rail · Main
+    Tab / Shift-Tab      cycle Rail ↔ Main
+    j k  or  ↑ ↓         move in the rail · scroll Main
+    Enter                push a rail level (on an agent: take it over)
+    Esc                  pop a rail level · clear filter (never quits)
+    [ ]                  previous / next Main tab
+    + / _                zoom Main fullscreen / restore
+    p                    jump to Projects
+    a                    jump to the next run that needs you
+    r / s                reject · ship (when gated; approve = tap / :approve)
+    :                    command palette (approve/ship/takeover/…)
+    /                    filter the rail
+    w                    log wrap ↔ truncate long lines
+    g / G                top / bottom of Main
+    ?                    this help · Esc closes help
+    q                    quit
+ 
+  Shell tab = a real tmux client: every key goes to the agent (incl.
+    Ctrl+C). prefix C-a · Ctrl+a d or F12 hands focus back to spar.
+    Focusing it full-screen is Driving mode (green banner, bands collapsed).
+ 
+  Mouse / touch: tap a tab, a rail row (double-tap = Enter), a gate
+  button, or the breadcrumb (back to the rail). Scroll to scroll.
+ 
+  Esc, ?, or tap to close help"#;
     let p = Paragraph::new(body).style(Style::default().fg(FG)).block(
         Block::default()
             .borders(Borders::ALL)
@@ -5399,6 +5426,37 @@ fn activity_event_line(e: &events::Event) -> String {
 }
 
 // ── human labels ────────────────────────────────────────────────────────────
+
+/// The phase in the width a rail column actually has. `phase_label` writes a sentence
+/// for the header ("Needs plan approval"); at 9 columns that renders "Needs pl…", which
+/// tells the operator nothing. These name the same states in the space available.
+fn rail_phase(phase: Phase) -> String {
+    match phase {
+        Phase::Init | Phase::PrepareIsolation | Phase::SpawnSlots => "starting",
+        Phase::Dispatch | Phase::WaitCompletion => "running",
+        Phase::PlanReady => "plan ready",
+        Phase::Spec => "spec",
+        Phase::AwaitingPlanApproval => "plan gate",
+        Phase::PlanApproved => "approved",
+        Phase::PlanRejected => "rejected",
+        Phase::Review => "review",
+        Phase::Suite => "tests",
+        Phase::Rank => "ranking",
+        Phase::Fix => "fix",
+        Phase::PeerRelay => "peers",
+        Phase::AwaitingWinnerConfirm => "winner gate",
+        Phase::AwaitingReconcile => "reconcile",
+        Phase::AwaitingShipConfirm => "ship gate",
+        Phase::Shipping => "shipping",
+        Phase::Done => "done",
+        Phase::Escalated => "escalated",
+        Phase::Failed => "failed",
+        Phase::Stuck => "stuck",
+        Phase::Quota => "quota",
+        Phase::Stopped => "stopped",
+    }
+    .into()
+}
 
 fn phase_label(phase: Phase) -> String {
     match phase {
@@ -6937,6 +6995,59 @@ mod render_stability {
             !tight.contains("critique"),
             "finished steps give theirs up: {tight:?}"
         );
+    }
+
+    /// The rail column is 9-12 columns wide; a phase name that does not fit is a
+    /// phase name the operator never reads.
+    #[test]
+    fn every_phase_fits_the_rail_column() {
+        use crate::state::Phase::*;
+        for phase in [
+            Init,
+            PrepareIsolation,
+            SpawnSlots,
+            Dispatch,
+            WaitCompletion,
+            PlanReady,
+            Spec,
+            AwaitingPlanApproval,
+            PlanApproved,
+            PlanRejected,
+            Review,
+            Suite,
+            Rank,
+            Fix,
+            PeerRelay,
+            AwaitingWinnerConfirm,
+            AwaitingReconcile,
+            AwaitingShipConfirm,
+            Shipping,
+            Done,
+            Escalated,
+            Failed,
+            Stuck,
+            Quota,
+            Stopped,
+        ] {
+            let label = rail_phase(phase);
+            assert!(
+                label.chars().count() <= 11,
+                "{phase:?} renders {label:?}, which the rail truncates"
+            );
+            assert!(!label.is_empty(), "{phase:?}");
+        }
+    }
+
+    /// Absolute project paths are 40 columns of prefix the reader already knows.
+    #[test]
+    fn log_lines_shorten_project_paths() {
+        let _ = PROJECT_PREFIX.set("/home/x/projects/acme".into());
+        let line =
+            compact_log_line("→ Read  /home/x/projects/acme/.spar/runs/3f2a/artifacts/plan.md");
+        assert_eq!(line, "▸ Read .spar/runs/3f2a/artifacts/plan.md");
+        // A path outside the project keeps every character.
+        let other = compact_log_line("→ Read  /etc/hosts");
+        assert_eq!(other, "▸ Read /etc/hosts");
     }
 
     #[test]
