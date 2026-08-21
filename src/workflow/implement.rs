@@ -17,6 +17,7 @@ pub fn run_from_cli(
     run_id: Option<String>,
     plan: Option<PathBuf>,
     task: Option<String>,
+    new: bool,
     opts: CommonOpts,
     paths: &SparPaths,
     cfg: &Config,
@@ -25,6 +26,18 @@ pub fn run_from_cli(
         return run_from_approved(&id, task, opts, paths, cfg);
     }
     if let Some(plan_path) = plan {
+        // A plan belongs to the run that produced it. Implementing it is that run
+        // continuing, not a new one (O40) — this is the bypass that split biddesk's
+        // work across two ids 35 times.
+        if let Some(id) = run_id_for_plan(&plan_path, paths) {
+            if !opts.json {
+                eprintln!("continuing run {id} (it wrote this plan)");
+            }
+            return run_from_approved(&id, task, opts, paths, cfg);
+        }
+        if !new {
+            bail!("{}", unlinked_plan_error(&plan_path, paths));
+        }
         let body = std::fs::read_to_string(&plan_path)?;
         let task =
             task.unwrap_or_else(|| format!("Implement approved plan from {}", plan_path.display()));
@@ -33,6 +46,64 @@ pub fn run_from_cli(
     let task =
         task.ok_or_else(|| anyhow::anyhow!("implement requires --run, --plan, or --task"))?;
     run_with_task(task, None, opts, paths, cfg, None)
+}
+
+/// The run that wrote this plan, if spar wrote it: plan artifacts live at
+/// `.spar/runs/<id>/artifacts/plan*.md`, so the id is in the path.
+fn run_id_for_plan(plan: &std::path::Path, paths: &SparPaths) -> Option<String> {
+    let plan = plan.canonicalize().ok()?;
+    let runs = paths.runs_dir().canonicalize().ok()?;
+    let rest = plan.strip_prefix(&runs).ok()?;
+    let id = rest.components().next()?.as_os_str().to_str()?.to_string();
+    paths.state_file(&id).is_file().then_some(id)
+}
+
+/// What to say when someone hands us a plan we cannot trace to a run. Naming the
+/// candidates is the point: the answer is almost always one of them.
+fn unlinked_plan_error(plan: &std::path::Path, paths: &SparPaths) -> String {
+    let mut msg = format!(
+        "--plan {} does not belong to a run, so spar cannot tell which unit of work this continues.\n\
+         A run covers a task from brief to draft PR; implementing its plan is that run continuing (O40).\n",
+        plan.display()
+    );
+    let mut candidates: Vec<crate::state::RunSummary> = crate::state::list_runs(paths)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| {
+            matches!(
+                r.phase,
+                Phase::PlanApproved
+                    | Phase::AwaitingPlanApproval
+                    | Phase::PlanReady
+                    | Phase::Stopped
+            )
+        })
+        .collect();
+    candidates.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
+    if candidates.is_empty() {
+        msg.push_str(
+            "\nNo run here is waiting to be implemented. If this really is new work: --new",
+        );
+    } else {
+        msg.push_str("\nContinue one of these instead:\n");
+        for r in candidates.iter().take(5) {
+            msg.push_str(&format!(
+                "  spar implement --run {}   # {} · {}\n",
+                r.id,
+                serde_json::to_string(&r.phase)
+                    .unwrap_or_default()
+                    .trim_matches('"'),
+                r.task
+                    .as_deref()
+                    .unwrap_or("(no task)")
+                    .chars()
+                    .take(56)
+                    .collect::<String>()
+            ));
+        }
+        msg.push_str("\nOr, if this really is a new unit of work: --new");
+    }
+    msg
 }
 
 pub fn run_loop(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode> {
@@ -83,10 +154,16 @@ fn run_from_approved(
         state.error = None;
         state.set_phase(Phase::PrepareIsolation);
     }
+    // Continuing an approved plan is this unit of work's next round, not a new run
+    // (O40). The id, brief, base, config and usage ledger all carry.
+    let round = state.begin_round();
     // `-t` on an approved run is a directive for THIS round only. It never rewrites
     // the run's task; absent `-t`, any prior amendment is cleared so it never silently
     // re-applies to a later round.
     state.amendment = amendment;
+    if !opts.json {
+        println!("run {run_id} · round {round}");
+    }
     if !opts.json {
         match &state.amendment {
             Some(a) => println!("amendment applied for this round: {a}"),

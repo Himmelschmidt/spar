@@ -89,6 +89,7 @@ fn run() -> Result<ExitCode> {
         Command::Doctor { json } => doctor::run(json),
         Command::Plan {
             task,
+            run_id,
             providers,
             select,
             urgency,
@@ -100,6 +101,13 @@ fn run() -> Result<ExitCode> {
             dry_run,
             big,
         } => {
+            // A replan reads the run's own frozen config (O27), never the live file.
+            if let Some(id) = run_id {
+                let (paths, _) = project_ctx()?;
+                let mut cfg = Config::for_run(&paths, &id)?;
+                cfg.apply_role_overrides(&role)?;
+                return workflow::plan::replan(&paths, &cfg, &id, task, json);
+            }
             let (paths, mut cfg) = project_ctx()?;
             cfg.apply_role_overrides(&role)?;
             let opts = CommonOpts {
@@ -130,6 +138,7 @@ fn run() -> Result<ExitCode> {
         }
         Command::Implement {
             run_id,
+            new,
             plan,
             task,
             role,
@@ -157,7 +166,7 @@ fn run() -> Result<ExitCode> {
                 dry_run,
                 big,
             };
-            workflow::implement::run_from_cli(run_id, plan, task, opts, &paths, &cfg)
+            workflow::implement::run_from_cli(run_id, plan, task, new, opts, &paths, &cfg)
         }
         Command::Run {
             workflow,
@@ -282,9 +291,23 @@ fn run() -> Result<ExitCode> {
             run_id,
             all,
             older_than,
+            halted,
             undo,
             json,
-        } => archive_cmd(run_id.as_deref(), all, older_than.as_deref(), undo, json),
+        } => archive_cmd(
+            run_id.as_deref(),
+            all,
+            older_than.as_deref(),
+            halted,
+            undo,
+            json,
+        ),
+        Command::Link {
+            run_id,
+            parent,
+            undo,
+            json,
+        } => link_cmd(&run_id, parent.as_deref(), undo, json),
         Command::Skills { action } => match action {
             SkillsCmd::List { json } => skills::run(skills::SkillsAction::List { json }),
             SkillsCmd::Get { name } => skills::run(skills::SkillsAction::Get { name }),
@@ -1125,10 +1148,60 @@ fn human_bytes(n: u64) -> String {
 /// by id (`spar status <id>` works archived), and resuming it clears the flag. That is what
 /// separates it from `cleanup` (reclaims worktrees, keeps the record) and `--purge`
 /// (deletes the record and its artifacts).
+/// Fold a run into another as a leg of the same unit of work (O41). spar never infers
+/// this: pairing legs by task text would silently merge two unrelated issues.
+fn link_cmd(run_id: &str, parent: Option<&str>, undo: bool, json: bool) -> Result<ExitCode> {
+    let (paths, _) = project_ctx()?;
+    let mut state = state::RunState::load(&paths, run_id)?;
+    if undo {
+        state.parent_run = None;
+    } else {
+        let parent =
+            parent.ok_or_else(|| anyhow::anyhow!("usage: spar link <run> --to <run> | --undo"))?;
+        if parent == run_id {
+            anyhow::bail!("a run cannot be a leg of itself");
+        }
+        // Resolve through the parent's own link so chains flatten to one unit of work.
+        let mut root = state::RunState::load(&paths, parent)?;
+        let mut hops = 0;
+        while let Some(next) = root.parent_run.clone() {
+            if next == run_id {
+                anyhow::bail!("that would make a cycle: {parent} is already a leg of {run_id}");
+            }
+            let Ok(up) = state::RunState::load(&paths, &next) else {
+                break;
+            };
+            root = up;
+            hops += 1;
+            if hops > 16 {
+                break;
+            }
+        }
+        state.parent_run = Some(root.id.clone());
+    }
+    state.save(&paths)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "run": state.id,
+                "parent_run": state.parent_run,
+            }))?
+        );
+    } else {
+        match &state.parent_run {
+            Some(p) => println!("{} is now a leg of {p}", state.id),
+            None => println!("{} stands on its own", state.id),
+        }
+    }
+    Ok(ExitCode::Success)
+}
+
 fn archive_cmd(
     run_id: Option<&str>,
     all: bool,
     older_than: Option<&str>,
+    halted: bool,
     undo: bool,
     json: bool,
 ) -> Result<ExitCode> {
@@ -1136,6 +1209,9 @@ fn archive_cmd(
     let now = chrono::Utc::now();
     // Flags that cannot apply are refused, not ignored: a silently dropped `--older-than`
     // reads as "nothing qualified" and hides the fact that the filter never ran.
+    if halted && (run_id.is_some() || undo || !all) {
+        anyhow::bail!("--halted only applies to `spar archive --all`");
+    }
     if older_than.is_some() && (run_id.is_some() || undo) {
         anyhow::bail!("--older-than only applies to `spar archive --all`");
     }
@@ -1179,7 +1255,7 @@ fn archive_cmd(
                 .map(util::parse_duration)
                 .transpose()?
                 .unwrap_or_default();
-            state::auto_archive(&paths, min_idle, now)?
+            state::archive_sweep(&paths, min_idle, now, halted)?
         }
     };
     let verb = if undo { "unarchived" } else { "archived" };

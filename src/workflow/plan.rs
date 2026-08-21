@@ -101,7 +101,10 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
             provider: prov,
             role,
             template: template.into(),
-            extra_vars: HashMap::new(),
+            extra_vars: HashMap::from([(
+                "amendment_section".to_string(),
+                plan_amendment_section(&state),
+            )]),
             expected_artifact: Some("plan.md".into()),
             model,
         });
@@ -547,9 +550,63 @@ fn detach_self(state: &RunState, json: bool) -> Result<ExitCode> {
     Ok(ExitCode::Success)
 }
 
+/// The directive for this plan round, rendered for the planner and critic prompts.
+/// On a replan it also carries why the last plan was rejected — that reason is the
+/// whole point of planning again.
+fn plan_amendment_section(state: &RunState) -> String {
+    let mut out = String::new();
+    if let Some(a) = state.amendment.as_deref() {
+        out.push_str(&format!(
+            "## Directive for this round (round {})\nThe operator asked for this plan to be redone. This directive takes precedence over the original task where they conflict: the task below is context, this is the work.\n\n{a}\n",
+            state.round
+        ));
+    }
+    if let Some(r) = state.gates.reject_reason.as_deref() {
+        out.push_str(&format!("\n## Why the previous plan was rejected\n{r}\n"));
+    }
+    out
+}
+
+/// Replan an existing run: a new round on the same id (O40), not a second run.
+/// The run keeps its brief, base, config and usage ledger — it is the same unit of
+/// work, being planned again.
+pub fn replan(
+    paths: &SparPaths,
+    cfg: &Config,
+    run_id: &str,
+    directive: String,
+    json: bool,
+) -> Result<ExitCode> {
+    let mut state = RunState::load(paths, run_id)?;
+    if state.workflow == crate::cli::WorkflowKind::Review {
+        anyhow::bail!("run {run_id} is a review run; there is no plan to redo");
+    }
+    if state.slots.iter().all(|s| s.role != SlotRole::Planner) {
+        anyhow::bail!(
+            "run {run_id} has no planner slot to re-run — start a plan with `spar plan -t \"…\"`"
+        );
+    }
+    let round = state.begin_round();
+    state.amendment = Some(directive);
+    // The gate reopens: whatever was approved or rejected was about the old plan.
+    state.gates.plan_approved = false;
+    state.set_phase(Phase::Init);
+    state.save(paths)?;
+    if !json {
+        eprintln!("replanning run {run_id} (round {round})");
+    }
+    let code = continue_run(paths, cfg, run_id)?;
+    if json {
+        let state = RunState::load(paths, run_id)?;
+        executor::emit_run_json(&state)?;
+    }
+    Ok(code)
+}
+
 pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<ExitCode> {
     let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
     let mut state = RunState::load(paths, run_id)?;
+    let amendment_section = plan_amendment_section(&state);
     let mut jobs = Vec::new();
     for slot in &state.slots {
         let template = match slot.role {
@@ -564,7 +621,10 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
             provider: slot.provider.clone(),
             role: slot.role,
             template: template.into(),
-            extra_vars: HashMap::new(),
+            extra_vars: HashMap::from([(
+                "amendment_section".to_string(),
+                amendment_section.clone(),
+            )]),
             expected_artifact: Some("plan.md".into()),
             model: None,
         });
@@ -579,7 +639,10 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
                 provider: prov,
                 role,
                 template: template.into(),
-                extra_vars: HashMap::new(),
+                extra_vars: HashMap::from([(
+                    "amendment_section".to_string(),
+                    amendment_section.clone(),
+                )]),
                 expected_artifact: Some("plan.md".into()),
                 model: None,
             });

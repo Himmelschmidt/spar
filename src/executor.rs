@@ -238,8 +238,13 @@ fn prepare_slot_execution(
     // Drop any prior attempt's terminal/pid markers before this slot goes Running, so a
     // stale `<slot>.failed` doesn't outrank the live process during reconciliation.
     markers::clear_slot(paths, &state.id, &job.slot_id);
+    let round = state.round;
     if let Some(s) = state.slot_mut(&job.slot_id) {
         s.status = SlotStatus::Running;
+        // Stamp the round at dispatch: slot ids are stable across re-dispatch (the
+        // implementer keeps its worktree through fix rounds), so this is where a slot
+        // joins the round that is running now (O40).
+        s.round = round;
         s.exec_backend = Some(pref.backend);
         s.backend = Some(if pref.is_api() {
             "api-sdk".into()
@@ -916,8 +921,13 @@ pub fn run_slot(
     let pref = ProviderRef::parse(&job.provider)?;
     // See prepare_slot_execution: clear a prior attempt's markers before going Running.
     markers::clear_slot(paths, &state.id, &job.slot_id);
+    let round = state.round;
     if let Some(s) = state.slot_mut(&job.slot_id) {
         s.status = SlotStatus::Running;
+        // Stamp the round at dispatch: slot ids are stable across re-dispatch (the
+        // implementer keeps its worktree through fix rounds), so this is where a slot
+        // joins the round that is running now (O40).
+        s.round = round;
         s.exec_backend = Some(pref.backend);
         s.backend = Some(if pref.is_api() {
             "api-sdk".into()
@@ -1778,6 +1788,7 @@ pub fn init_slot_model(
         // An explicit `@model` on the ref is a direct instruction and beats a
         // model chosen by `--select`'s model-select artifact (the `model` arg).
         model: pref.model.clone().or(model),
+        round: 1,
     }
 }
 

@@ -25,6 +25,7 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
     ScrollbarOrientation, ScrollbarState, Widget, Wrap,
 };
+use std::collections::HashMap;
 use std::io::{stdout, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
@@ -803,6 +804,50 @@ struct Snapshot {
     heartbeats: std::collections::HashMap<String, DateTime<Utc>>,
 }
 
+/// Pull the other legs of this unit of work into the view (U15): their agents and
+/// their usage belong to the same issue, so the agents list and the stepper see the
+/// whole thing. Purely in memory — the merged state is never saved, and the id and
+/// phase stay the active leg's, so every action still targets the right run.
+fn merge_legs(
+    swarm: &SparPaths,
+    mut st: RunState,
+    units: &HashMap<String, Vec<String>>,
+) -> RunState {
+    let Some(ids) = units.get(&st.id) else {
+        return st;
+    };
+    for id in ids.iter().filter(|id| **id != st.id) {
+        let Ok(leg) = RunState::load_for_display(swarm, id) else {
+            continue;
+        };
+        st.round = st.round.max(leg.round);
+        for slot in leg.slots {
+            if st.slots.iter().all(|s| s.id != slot.id) {
+                st.slots.push(slot);
+            }
+        }
+        st.usage.extend(leg.usage);
+    }
+    // Roles first, rounds second: the merged fleet reads as one pipeline.
+    st.slots.sort_by_key(|s| (s.round, step_rank(s.role)));
+    st
+}
+
+/// Where a role sits in the pipeline, for ordering a merged fleet.
+fn step_rank(role: SlotRole) -> u8 {
+    match role {
+        SlotRole::Planner => 0,
+        SlotRole::PlanCritic => 1,
+        SlotRole::TestAuthor => 2,
+        SlotRole::Implementer => 3,
+        SlotRole::Tester => 4,
+        SlotRole::Reviewer => 5,
+        SlotRole::Ranker => 6,
+        SlotRole::Reconciler => 7,
+        SlotRole::Peer => 8,
+    }
+}
+
 enum Msg {
     Input(Event),
     Data,
@@ -866,23 +911,101 @@ fn marks_for(sel: &Selection, prev: Option<&Snapshot>) -> Marks {
     out
 }
 
+/// One row per unit of work (U15). A run with `parent_run` set is a **leg**: it folds
+/// into its root's row. The row keeps the root's brief — that is the human-readable
+/// identity of the work — but takes the id, phase and age of the group's *active*
+/// member, so gate buttons, `:approve` and drill-down all act on the run that actually
+/// holds the state. Attention rolls up loudest-first: folding must never hide a gate.
+///
+/// Returns the folded rows and, for each row, every run id it stands for.
+fn fold_units(
+    runs: Vec<state::RunSummary>,
+) -> (Vec<state::RunSummary>, HashMap<String, Vec<String>>) {
+    let parents: HashMap<String, Option<String>> = runs
+        .iter()
+        .map(|r| (r.id.clone(), r.parent_run.clone()))
+        .collect();
+    // Resolve to a root, tolerating a parent that is archived or gone: an orphan leg
+    // stands on its own rather than vanishing from the list.
+    let root_of = |id: &str| -> String {
+        let mut cur = id.to_string();
+        for _ in 0..16 {
+            match parents.get(&cur).and_then(|p| p.clone()) {
+                Some(p) if parents.contains_key(&p) => cur = p,
+                _ => break,
+            }
+        }
+        cur
+    };
+
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<state::RunSummary>> = HashMap::new();
+    for r in runs {
+        let root = root_of(&r.id);
+        if !groups.contains_key(&root) {
+            order.push(root.clone());
+        }
+        groups.entry(root).or_default().push(r);
+    }
+
+    let mut out = Vec::with_capacity(order.len());
+    let mut members: HashMap<String, Vec<String>> = HashMap::new();
+    for root in order {
+        let mut group = groups.remove(&root).unwrap_or_default();
+        if group.len() == 1 {
+            let r = group.pop().expect("len 1");
+            members.insert(r.id.clone(), vec![r.id.clone()]);
+            out.push(r);
+            continue;
+        }
+        // Loudest attention first, then most recent: the active member is whatever the
+        // operator would want the row to be about.
+        group.sort_by(|a, b| {
+            run_attention(b)
+                .cmp(&run_attention(a))
+                .then(b.updated_at.cmp(&a.updated_at))
+        });
+        let ids: Vec<String> = group.iter().map(|r| r.id.clone()).collect();
+        let brief = group
+            .iter()
+            .find(|r| r.id == root)
+            .and_then(|r| r.task.clone());
+        let newest = group.iter().map(|r| r.updated_at).max();
+        let mut row = group.swap_remove(0);
+        if brief.is_some() {
+            row.task = brief;
+        }
+        if let Some(t) = newest {
+            row.updated_at = t;
+        }
+        row.abandoned = group.iter().any(|r| r.abandoned) || row.abandoned;
+        row.legs = ids.len() as u32;
+        members.insert(row.id.clone(), ids);
+        out.push(row);
+    }
+    (out, members)
+}
+
 /// All blocking filesystem work lives here, never on the render thread.
 fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapshot {
     let swarm = SparPaths::new(&sel.root);
     let projects = registry::projects();
-    let runs = if sel.browse.in_project() {
-        let mut runs = registry::list_visible_project_runs(&sel.root).unwrap_or_default();
-        // Attention-sorted rail: gates and broken runs float to the top (Stage C).
+    let (runs, units) = if sel.browse.in_project() {
+        let listed = registry::list_visible_project_runs(&sel.root).unwrap_or_default();
+        // One row per unit of work, then attention-sorted: gates and broken runs float
+        // to the top (Stage C, U15).
+        let (mut runs, units) = fold_units(listed);
         sort_runs_by_attention(&mut runs);
-        runs
+        (runs, units)
     } else {
-        Vec::new()
+        (Vec::new(), HashMap::new())
     };
     // Display path: markers, not state.json, decide whether a slot is still running.
     let full = if sel.browse.in_project() {
         sel.run_id
             .as_ref()
             .and_then(|id| RunState::load_for_display(&swarm, id).ok())
+            .map(|st| merge_legs(&swarm, st, &units))
     } else {
         None
     };
@@ -3034,6 +3157,21 @@ fn draw_context_band(
         Span::styled(" · ", muted()),
         Span::styled(format!("{done}/{} agents", st.slots.len()), dim()),
     ];
+    // A unit of work says how much of it there is: rounds it has been through, and
+    // how many run ids it folds in (U15).
+    if st.round > 1 {
+        meters.push(Span::styled(" · ", muted()));
+        meters.push(Span::styled(format!("round {}", st.round), dim()));
+    }
+    if let Some(legs) = runs
+        .iter()
+        .find(|r| r.id == st.id)
+        .map(|r| r.legs)
+        .filter(|n| *n > 1)
+    {
+        meters.push(Span::styled(" · ", muted()));
+        meters.push(Span::styled(format!("{legs} legs"), dim()));
+    }
     if out > 0 {
         meters.push(Span::styled(" · ", muted()));
         meters.push(Span::styled(format!("out {}", compact_u64(out)), dim()));
@@ -6011,6 +6149,9 @@ mod labels {
             task: task.map(str::to_string),
             dry_run: false,
             abandoned: false,
+            parent_run: None,
+            round: 1,
+            legs: 1,
             base_ref: None,
             base_commit: None,
             project_root: None,
@@ -6446,6 +6587,9 @@ mod render_stability {
                 task: Some("a queued run".into()),
                 dry_run: false,
                 abandoned: i % 7 == 0,
+                parent_run: None,
+                round: 1,
+                legs: 1,
                 base_ref: None,
                 base_commit: None,
                 project_root: None,
@@ -6852,5 +6996,112 @@ mod render_stability {
             (0..120).map(|x| buf[(x, 1)].symbol()).collect()
         };
         assert!(band.contains("out 6.0k"), "band was: {band:?}");
+    }
+}
+
+/// One row per unit of work (U15).
+#[cfg(test)]
+mod folding {
+    use super::*;
+    use crate::cli::WorkflowKind;
+
+    fn summary(id: &str, phase: Phase, parent: Option<&str>, mins_ago: i64) -> state::RunSummary {
+        state::RunSummary {
+            id: id.into(),
+            workflow: WorkflowKind::Loop,
+            archived: false,
+            phase,
+            updated_at: Utc::now() - chrono::Duration::minutes(mins_ago),
+            task: Some(format!("brief for {id}")),
+            dry_run: false,
+            abandoned: false,
+            parent_run: parent.map(str::to_string),
+            round: 1,
+            legs: 1,
+            base_ref: None,
+            base_commit: None,
+            project_root: None,
+            project_name: None,
+        }
+    }
+
+    #[test]
+    fn a_leg_folds_into_its_parents_row() {
+        let runs = vec![
+            summary("plan1", Phase::PlanApproved, None, 90),
+            summary("impl1", Phase::AwaitingShipConfirm, Some("plan1"), 5),
+            summary("other", Phase::Review, None, 20),
+        ];
+        let (rows, units) = fold_units(runs);
+        assert_eq!(rows.len(), 2, "two units of work, three runs");
+        let unit = rows.iter().find(|r| r.legs > 1).expect("a folded row");
+        // The row acts on the leg that holds the state, so a gate button hits the run
+        // that actually has the gate.
+        assert_eq!(unit.id, "impl1");
+        assert_eq!(unit.phase, Phase::AwaitingShipConfirm);
+        // But it is titled by the work, not by the leg.
+        assert_eq!(unit.task.as_deref(), Some("brief for plan1"));
+        assert_eq!(unit.legs, 2);
+        let mut members = units.get("impl1").cloned().unwrap_or_default();
+        members.sort();
+        assert_eq!(members, vec!["impl1".to_string(), "plan1".to_string()]);
+    }
+
+    /// Folding must never hide a run that wants the operator — the failure O36 exists
+    /// to prevent, re-appearing one layer up.
+    #[test]
+    fn the_group_takes_its_loudest_attention() {
+        let runs = vec![
+            summary("root", Phase::Done, None, 5),
+            summary("leg", Phase::AwaitingPlanApproval, Some("root"), 90),
+        ];
+        let (rows, _) = fold_units(runs);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(run_attention(&rows[0]), Attention::Gate);
+        assert_eq!(rows[0].id, "leg", "the gate is what the row acts on");
+        assert_eq!(runs_needing_attention(&rows), 1);
+    }
+
+    #[test]
+    fn an_orphan_leg_stands_on_its_own() {
+        // The parent is archived or purged, so it is not in the listing.
+        let runs = vec![summary("leg", Phase::Review, Some("gone"), 5)];
+        let (rows, _) = fold_units(runs);
+        assert_eq!(rows.len(), 1, "the leg must not vanish with its parent");
+        assert_eq!(rows[0].id, "leg");
+        assert_eq!(rows[0].legs, 1);
+    }
+
+    #[test]
+    fn chains_flatten_and_cycles_terminate() {
+        let runs = vec![
+            summary("a", Phase::Done, None, 30),
+            summary("b", Phase::Done, Some("a"), 20),
+            summary("c", Phase::Review, Some("b"), 10),
+        ];
+        let (rows, units) = fold_units(runs);
+        assert_eq!(rows.len(), 1, "a → b → c is one unit of work");
+        assert_eq!(units.get(&rows[0].id).map(|m| m.len()), Some(3));
+
+        // A cycle on disk (hand-edited) must not hang the render thread.
+        let cyclic = vec![
+            summary("x", Phase::Review, Some("y"), 10),
+            summary("y", Phase::Review, Some("x"), 10),
+        ];
+        let (rows, _) = fold_units(cyclic);
+        assert!(!rows.is_empty());
+    }
+
+    #[test]
+    fn the_age_shown_is_the_freshest_leg() {
+        let runs = vec![
+            summary("root", Phase::PlanApproved, None, 600),
+            summary("leg", Phase::Review, Some("root"), 3),
+        ];
+        let (rows, _) = fold_units(runs);
+        assert!(
+            (Utc::now() - rows[0].updated_at).num_minutes() < 10,
+            "a unit is as old as its newest activity"
+        );
     }
 }

@@ -83,6 +83,12 @@ pub struct RunState {
     /// tests never produced a clean verdict — distinct from a real `Fail`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suite_outcome: Option<SuiteOutcome>,
+    /// Which round of work this run is on. A run is a unit of work, not an
+    /// invocation (O40): continuing it — implementing an approved plan, replanning
+    /// after a rejection, a fix pass — opens a new round on the same id rather than
+    /// minting another run. `1` for every run created before rounds existed.
+    #[serde(default = "one_round")]
+    pub round: u32,
     /// When this run was archived, if it was. Archiving hides a finished run from
     /// listings; it deletes nothing and is reversible. Distinct from cleanup, which
     /// reclaims worktrees and leaves the record, and from `--purge`, which deletes it.
@@ -244,6 +250,13 @@ pub struct SlotState {
     /// Selected model id (from model-select or explicit); passed to CLI/API spawn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The run round this slot last ran in (O40). `1` for pre-rounds runs.
+    #[serde(default = "one_round")]
+    pub round: u32,
+}
+
+fn one_round() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -331,6 +344,18 @@ pub struct RunSummary {
     pub base_ref: Option<String>,
     #[serde(default)]
     pub base_commit: Option<String>,
+    /// Set when this run is a **leg** of another unit of work (O41): listing surfaces
+    /// fold it into its parent's row, and `--json` keeps carrying it so outer agents
+    /// can see the grouping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_run: Option<String>,
+    /// How many rounds this run has been through (O40). `1` unless it was continued.
+    #[serde(default = "one_round")]
+    pub round: u32,
+    /// How many runs this row stands for once legs are folded in (U15). `1` normally;
+    /// only a listing surface sets it higher.
+    #[serde(default = "one_round")]
+    pub legs: u32,
     /// Filled when listing across projects (global home).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_root: Option<PathBuf>,
@@ -378,11 +403,23 @@ impl RunState {
             suite_outcome: None,
             contract_fingerprint: None,
             contract_modified: false,
+            round: 1,
         }
     }
 
     pub fn touch(&mut self) {
         self.updated_at = Utc::now();
+    }
+
+    /// Open a new round on this run (O40). Bumps the counter, un-archives, and hands
+    /// back the new round number so the caller can stamp the slots it dispatches.
+    /// Everything else about the run — id, brief, base, config, usage ledger — is
+    /// deliberately untouched: it is the same unit of work.
+    pub fn begin_round(&mut self) -> u32 {
+        self.round = self.round.saturating_add(1);
+        self.archived_at = None;
+        self.touch();
+        self.round
     }
 
     pub fn set_phase(&mut self, phase: Phase) {
@@ -671,9 +708,26 @@ pub fn auto_archive(
     older_than: std::time::Duration,
     now: DateTime<Utc>,
 ) -> Result<Vec<String>> {
+    archive_sweep(paths, older_than, now, false)
+}
+
+/// The sweep behind `archive --all`. `halted` widens it from the auto-archivable set
+/// to everything an operator may archive by hand — `stopped` / `failed` / `stuck` /
+/// `quota`, which auto-archiving deliberately never touches (O36). Gates are excluded
+/// either way: hiding the runs that want a human is the failure archiving exists to
+/// prevent. Opt-in only, and `--undo` still reverses it.
+pub fn archive_sweep(
+    paths: &SparPaths,
+    older_than: std::time::Duration,
+    now: DateTime<Utc>,
+    halted: bool,
+) -> Result<Vec<String>> {
+    let reachable = |phase: Phase| {
+        auto_archivable(phase) || (halted && archivable_by_hand(phase) && !phase.is_gate())
+    };
     let mut archived = Vec::new();
     for summary in list_runs(paths)? {
-        if summary.archived || !auto_archivable(summary.phase) {
+        if summary.archived || !reachable(summary.phase) {
             continue;
         }
         let idle = (now - summary.updated_at).to_std().unwrap_or_default();
@@ -728,6 +782,9 @@ pub fn list_runs(paths: &SparPaths) -> Result<Vec<RunSummary>> {
                 updated_at: state.updated_at,
                 task: state.task,
                 dry_run: state.dry_run,
+                parent_run: state.parent_run,
+                round: state.round,
+                legs: 1,
                 base_ref: state.base_ref,
                 base_commit: state.base_commit,
                 project_root: None,

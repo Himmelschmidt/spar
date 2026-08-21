@@ -41,6 +41,10 @@ pub enum Command {
     Plan {
         #[arg(long, short = 't')]
         task: String,
+        /// Replan an existing run: a new plan round on the same id, keeping its brief,
+        /// base and config. `-t` is the directive for the round, not a new task (O40).
+        #[arg(long = "run")]
+        run_id: Option<String>,
         /// Comma-separated `cli:…` or `api:…` (required unless `--select`)
         #[arg(long, value_delimiter = ',')]
         providers: Vec<String>,
@@ -93,6 +97,11 @@ pub enum Command {
     Implement {
         #[arg(long = "run")]
         run_id: Option<String>,
+        /// Start a NEW run instead of continuing one. Required when `--plan` points at a
+        /// plan spar cannot trace to a run: a run is a unit of work, and implementing an
+        /// existing plan is that work continuing, not a second run (O40).
+        #[arg(long)]
+        new: bool,
         #[arg(long)]
         plan: Option<std::path::PathBuf>,
         #[arg(long, short = 't')]
@@ -203,7 +212,25 @@ pub enum Command {
         /// With `--all`, only runs untouched for this long, e.g. `14d`.
         #[arg(long, value_name = "DURATION")]
         older_than: Option<String>,
+        /// With `--all`, also archive the halted phases auto-archiving never touches:
+        /// `stopped` / `failed` / `stuck` / `quota`. Never gates. Reversible.
+        #[arg(long)]
+        halted: bool,
         /// Un-archive instead: bring the run back into listings.
+        #[arg(long)]
+        undo: bool,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Fold one run into another as a leg of the same unit of work
+    Link {
+        /// The run to fold in (the leg).
+        run_id: String,
+        /// The run it belongs to (the unit of work).
+        #[arg(long = "to", value_name = "RUN")]
+        parent: Option<String>,
+        /// Unlink instead: the run stands on its own again.
         #[arg(long)]
         undo: bool,
         #[arg(long)]
