@@ -42,7 +42,7 @@ pub enum Command {
         #[arg(long, short = 't')]
         task: String,
         /// Replan an existing run: a new plan round on the same id, keeping its brief,
-        /// base and config. `-t` is the directive for the round, not a new task (O40).
+        /// base and config. `-t` is the directive for the round, not a new task (O45).
         #[arg(long = "run")]
         run_id: Option<String>,
         /// Comma-separated `cli:…` or `api:…` (required unless `--select`)
@@ -99,7 +99,7 @@ pub enum Command {
         run_id: Option<String>,
         /// Start a NEW run instead of continuing one. Required when `--plan` points at a
         /// plan spar cannot trace to a run: a run is a unit of work, and implementing an
-        /// existing plan is that work continuing, not a second run (O40).
+        /// existing plan is that work continuing, not a second run (O45).
         #[arg(long)]
         new: bool,
         #[arg(long)]

@@ -1,4 +1,4 @@
-//! A run is a unit of work, not an invocation (O40/O41). Dry-run end-to-end.
+//! A run is a unit of work, not an invocation (O45/O46). Dry-run end-to-end.
 use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::prelude::*;
 use std::process::Command;
@@ -240,6 +240,143 @@ fn link_folds_a_leg_and_undo_restores_it() {
     assert!(state(tmp.path(), &leg)["parent_run"].is_null());
 }
 
+/// `--new` forks off a plan spar CAN trace, instead of being silently ignored.
+#[test]
+fn new_forks_even_from_a_traceable_plan() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let run = plan(tmp.path(), "add a hello world module");
+    let plan_path = tmp
+        .path()
+        .join(".spar/runs")
+        .join(&run)
+        .join("artifacts/plan.md");
+    let _ = spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "implement",
+            "--plan",
+            plan_path.to_str().unwrap(),
+            "--new",
+            "--providers",
+            "cli:claude",
+            "--dry-run",
+        ])
+        .assert();
+    assert_eq!(run_count(tmp.path()), 2, "--new must fork, not attach");
+    assert_eq!(
+        state(tmp.path(), &run)["round"],
+        1,
+        "the original is untouched"
+    );
+}
+
+/// Only an artifact is a plan. A log path under the run dir must not re-dispatch the
+/// whole implement fleet on a typo.
+#[test]
+fn a_log_path_is_not_a_plan() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let run = plan(tmp.path(), "add a hello world module");
+    let logs = tmp.path().join(".spar/runs").join(&run).join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let log = logs.join("planner-cli-claude.log");
+    std::fs::write(&log, "not a plan\n").unwrap();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "implement",
+            "--plan",
+            log.to_str().unwrap(),
+            "--providers",
+            "cli:claude",
+            "--dry-run",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("does not belong to a run"));
+    assert_eq!(
+        state(tmp.path(), &run)["round"],
+        1,
+        "nothing was dispatched"
+    );
+}
+
+/// Replanning a run someone else is driving must not half-write it, and a run
+/// mid-flight is refused outright.
+#[test]
+fn replan_refuses_a_run_in_flight_without_touching_it() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let run = plan(tmp.path(), "add a hello world module");
+    let sp = tmp.path().join(".spar/runs").join(&run).join("state.json");
+    let mut st: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sp).unwrap()).unwrap();
+    st["phase"] = serde_json::json!("review");
+    st["gates"]["plan_approved"] = serde_json::json!(true);
+    std::fs::write(&sp, serde_json::to_string_pretty(&st).unwrap()).unwrap();
+
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["plan", "--run", &run, "--task", "redo it"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("mid-flight"));
+
+    let after = state(tmp.path(), &run);
+    assert_eq!(after["phase"], "review", "phase untouched");
+    assert_eq!(after["round"], 1, "round untouched");
+    assert_eq!(after["gates"]["plan_approved"], true, "approval untouched");
+}
+
+/// A replan must not be able to present the previous round's plan at the gate.
+#[test]
+fn replan_moves_the_previous_rounds_artifacts_aside() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let run = plan(tmp.path(), "add a hello world module");
+    let art = tmp.path().join(".spar/runs").join(&run).join("artifacts");
+    assert!(art.join("plan.md").is_file());
+
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["plan", "--run", &run, "--task", "narrow it"])
+        .assert()
+        .code(2);
+
+    assert!(
+        art.join("plan-round1.md").is_file(),
+        "the old plan is kept, out of the way"
+    );
+    assert!(
+        art.join("test-contract-round1.md").is_file(),
+        "and so is the contract it froze"
+    );
+}
+
+/// Flags a replan cannot honor are refused, not dropped.
+#[test]
+fn replan_refuses_flags_it_cannot_apply() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let run = plan(tmp.path(), "add a hello world module");
+    for flag in [
+        vec!["--providers", "cli:grok"],
+        vec!["--detach"],
+        vec!["--big"],
+    ] {
+        let mut args = vec!["plan", "--run", run.as_str(), "--task", "redo"];
+        args.extend(flag.iter().copied());
+        spar_cmd()
+            .current_dir(tmp.path())
+            .args(&args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("cannot apply"));
+    }
+    assert_eq!(state(tmp.path(), &run)["round"], 1);
+}
+
 /// `--halted` reaches the phases auto-archiving refuses, and still never a gate.
 #[test]
 fn halted_archive_sweep_spares_gates() {
@@ -278,6 +415,24 @@ fn halted_archive_sweep_spares_gates() {
     assert!(
         state(tmp.path(), &gated)["archived_at"].is_null(),
         "a run waiting on a human is never swept"
+    );
+
+    // `plan_approved` is `is_terminal()` but it is NOT halted: it is the resting state
+    // between `approve` and `implement --run`, and the very thing an unlinked-plan
+    // error tells the operator to go continue.
+    let approved = plan(tmp.path(), "approved, waiting to be implemented");
+    let _ = spar_cmd()
+        .current_dir(tmp.path())
+        .args(["approve", &approved])
+        .assert();
+    assert_eq!(state(tmp.path(), &approved)["phase"], "plan_approved");
+    let _ = spar_cmd()
+        .current_dir(tmp.path())
+        .args(["archive", "--all", "--halted"])
+        .assert();
+    assert!(
+        state(tmp.path(), &approved)["archived_at"].is_null(),
+        "an approved plan is not halted work"
     );
 
     spar_cmd()

@@ -101,11 +101,32 @@ fn run() -> Result<ExitCode> {
             dry_run,
             big,
         } => {
-            // A replan reads the run's own frozen config (O27), never the live file.
+            // A replan reads the run's own frozen config (O27), never the live file,
+            // and re-dispatches the run's existing planner and critic slots. Flags that
+            // could only apply to a NEW run are refused, not silently dropped.
             if let Some(id) = run_id {
+                let ignored = [
+                    (!providers.is_empty(), "--providers"),
+                    (!select.is_empty(), "--select"),
+                    (!role.is_empty(), "--role"),
+                    (base.is_some(), "--base"),
+                    (big, "--big"),
+                    (detach, "--detach"),
+                    (dry_run, "--dry-run"),
+                ]
+                .into_iter()
+                .filter(|(set, _)| *set)
+                .map(|(_, name)| name)
+                .collect::<Vec<_>>();
+                if !ignored.is_empty() {
+                    anyhow::bail!(
+                        "`plan --run` replans an existing run and inherits its fleet, base and config; \
+                         {} cannot apply. Drop them, or start new work with `spar plan -t \"…\"`.",
+                        ignored.join(", ")
+                    );
+                }
                 let (paths, _) = project_ctx()?;
-                let mut cfg = Config::for_run(&paths, &id)?;
-                cfg.apply_role_overrides(&role)?;
+                let cfg = Config::for_run(&paths, &id)?;
                 return workflow::plan::replan(&paths, &cfg, &id, task, json);
             }
             let (paths, mut cfg) = project_ctx()?;
@@ -1142,16 +1163,13 @@ fn human_bytes(n: u64) -> String {
     format!("{v:.1} {}", UNIT[i])
 }
 
-/// Hide finished runs from listings, or bring them back.
-///
-/// Archiving is presentation, not lifecycle: nothing is deleted, the run stays addressable
-/// by id (`spar status <id>` works archived), and resuming it clears the flag. That is what
-/// separates it from `cleanup` (reclaims worktrees, keeps the record) and `--purge`
-/// (deletes the record and its artifacts).
-/// Fold a run into another as a leg of the same unit of work (O41). spar never infers
+/// Fold a run into another as a leg of the same unit of work (O46). spar never infers
 /// this: pairing legs by task text would silently merge two unrelated issues.
 fn link_cmd(run_id: &str, parent: Option<&str>, undo: bool, json: bool) -> Result<ExitCode> {
     let (paths, _) = project_ctx()?;
+    // Whole-file read-modify-write, so it needs the lock a live orchestrator holds:
+    // without it the orchestrator's next save silently drops the link.
+    let _lock = crate::runlock::RunLock::acquire(&paths, run_id)?;
     let mut state = state::RunState::load(&paths, run_id)?;
     if undo {
         state.parent_run = None;
@@ -1197,6 +1215,12 @@ fn link_cmd(run_id: &str, parent: Option<&str>, undo: bool, json: bool) -> Resul
     Ok(ExitCode::Success)
 }
 
+/// Hide finished runs from listings, or bring them back.
+///
+/// Archiving is presentation, not lifecycle: nothing is deleted, the run stays addressable
+/// by id (`spar status <id>` works archived), and resuming it clears the flag. That is what
+/// separates it from `cleanup` (reclaims worktrees, keeps the record) and `--purge`
+/// (deletes the record and its artifacts).
 fn archive_cmd(
     run_id: Option<&str>,
     all: bool,

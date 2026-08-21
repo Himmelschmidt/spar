@@ -567,7 +567,7 @@ fn plan_amendment_section(state: &RunState) -> String {
     out
 }
 
-/// Replan an existing run: a new round on the same id (O40), not a second run.
+/// Replan an existing run: a new round on the same id (O45), not a second run.
 /// The run keeps its brief, base, config and usage ledger — it is the same unit of
 /// work, being planned again.
 pub fn replan(
@@ -577,6 +577,11 @@ pub fn replan(
     directive: String,
     json: bool,
 ) -> Result<ExitCode> {
+    // Take the lock BEFORE touching anything. Acquiring it after the save meant a run
+    // someone else was driving got its approval cleared and its phase reset to `init`,
+    // and only then did the command fail — a torn state.json left behind by a command
+    // that reported an error.
+    let lock = crate::runlock::RunLock::acquire(paths, run_id)?;
     let mut state = RunState::load(paths, run_id)?;
     if state.workflow == crate::cli::WorkflowKind::Review {
         anyhow::bail!("run {run_id} is a review run; there is no plan to redo");
@@ -586,16 +591,41 @@ pub fn replan(
             "run {run_id} has no planner slot to re-run — start a plan with `spar plan -t \"…\"`"
         );
     }
+    // A run nobody can plan again: say so before mutating anything.
+    if !matches!(
+        state.phase,
+        Phase::AwaitingPlanApproval
+            | Phase::PlanRejected
+            | Phase::PlanApproved
+            | Phase::PlanReady
+            | Phase::Done
+            | Phase::Stopped
+            | Phase::Failed
+            | Phase::Stuck
+            | Phase::Quota
+    ) {
+        anyhow::bail!(
+            "run {run_id} is mid-flight (phase={:?}); stop it before replanning",
+            state.phase
+        );
+    }
     let round = state.begin_round();
     state.amendment = Some(directive);
     // The gate reopens: whatever was approved or rejected was about the old plan.
     state.gates.plan_approved = false;
+    // Keep the previous round's plan and contract as a record, and — more importantly
+    // — get them out of the way: `execute_plan` only notices a planner that wrote
+    // nothing by `plan.md` being absent, so leaving them in place lets a no-op round
+    // present the OLD plan (and the old frozen contract) at the approval gate.
+    archive_round_artifacts(paths, &state, round - 1);
+    state.contract_fingerprint = None;
     state.set_phase(Phase::Init);
     state.save(paths)?;
     if !json {
         eprintln!("replanning run {run_id} (round {round})");
     }
-    let code = continue_run(paths, cfg, run_id)?;
+    let code = continue_locked(paths, cfg, run_id)?;
+    drop(lock);
     if json {
         let state = RunState::load(paths, run_id)?;
         executor::emit_run_json(&state)?;
@@ -603,8 +633,27 @@ pub fn replan(
     Ok(code)
 }
 
+/// Move a finished round's plan and contract aside so the next round cannot be
+/// mistaken for it. Best-effort: a missing artifact is exactly the state we want.
+fn archive_round_artifacts(paths: &SparPaths, state: &RunState, round: u32) {
+    for name in ["plan.md", "test-contract.md"] {
+        let from = paths.artifact(&state.id, name);
+        if !from.is_file() {
+            continue;
+        }
+        let stem = name.trim_end_matches(".md");
+        let to = paths.artifact(&state.id, &format!("{stem}-round{round}.md"));
+        let _ = std::fs::rename(&from, &to);
+    }
+}
+
 pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<ExitCode> {
     let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
+    continue_locked(paths, cfg, run_id)
+}
+
+/// `continue_run`'s body, for callers that already hold the run lock.
+fn continue_locked(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<ExitCode> {
     let mut state = RunState::load(paths, run_id)?;
     let amendment_section = plan_amendment_section(&state);
     let mut jobs = Vec::new();

@@ -243,7 +243,7 @@ fn prepare_slot_execution(
         s.status = SlotStatus::Running;
         // Stamp the round at dispatch: slot ids are stable across re-dispatch (the
         // implementer keeps its worktree through fix rounds), so this is where a slot
-        // joins the round that is running now (O40).
+        // joins the round that is running now (O45).
         s.round = round;
         s.exec_backend = Some(pref.backend);
         s.backend = Some(if pref.is_api() {
@@ -926,7 +926,7 @@ pub fn run_slot(
         s.status = SlotStatus::Running;
         // Stamp the round at dispatch: slot ids are stable across re-dispatch (the
         // implementer keeps its worktree through fix rounds), so this is where a slot
-        // joins the round that is running now (O40).
+        // joins the round that is running now (O45).
         s.round = round;
         s.exec_backend = Some(pref.backend);
         s.backend = Some(if pref.is_api() {
@@ -1800,6 +1800,7 @@ pub fn emit_run_json(state: &RunState) -> Result<()> {
         "workflow": state.workflow,
         "phase": state.phase,
         "task": state.task,
+        "round": state.round,
         "amendment": state.amendment,
         "dry_run": state.dry_run,
         "slots": state.slots,

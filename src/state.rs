@@ -84,7 +84,7 @@ pub struct RunState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suite_outcome: Option<SuiteOutcome>,
     /// Which round of work this run is on. A run is a unit of work, not an
-    /// invocation (O40): continuing it — implementing an approved plan, replanning
+    /// invocation (O45): continuing it — implementing an approved plan, replanning
     /// after a rejection, a fix pass — opens a new round on the same id rather than
     /// minting another run. `1` for every run created before rounds existed.
     #[serde(default = "one_round")]
@@ -250,7 +250,7 @@ pub struct SlotState {
     /// Selected model id (from model-select or explicit); passed to CLI/API spawn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// The run round this slot last ran in (O40). `1` for pre-rounds runs.
+    /// The run round this slot last ran in (O45). `1` for pre-rounds runs.
     #[serde(default = "one_round")]
     pub round: u32,
 }
@@ -344,22 +344,25 @@ pub struct RunSummary {
     pub base_ref: Option<String>,
     #[serde(default)]
     pub base_commit: Option<String>,
-    /// Set when this run is a **leg** of another unit of work (O41): listing surfaces
+    /// Set when this run is a **leg** of another unit of work (O46): listing surfaces
     /// fold it into its parent's row, and `--json` keeps carrying it so outer agents
     /// can see the grouping.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_run: Option<String>,
-    /// How many rounds this run has been through (O40). `1` unless it was continued.
+    /// How many rounds this run has been through (O45). `1` unless it was continued.
     #[serde(default = "one_round")]
     pub round: u32,
     /// How many runs this row stands for once legs are folded in (U15). `1` normally;
-    /// only a listing surface sets it higher.
-    #[serde(default = "one_round")]
+    /// only a listing surface sets it higher. Never serialized: it is a property of a
+    /// rendered list, not of a run, and on disk or in `--json` it could only ever be
+    /// the constant 1.
+    #[serde(skip)]
     pub legs: u32,
     /// How many of those legs want the operator. Only meaningful on a folded row
     /// (`legs > 1`): a unit with two runs at gates must still be counted twice, or
-    /// folding becomes a way to hide a gate.
-    #[serde(default)]
+    /// folding becomes a way to hide a gate. Never serialized, for the same reason as
+    /// `legs`.
+    #[serde(skip)]
     pub wants: u32,
     /// Filled when listing across projects (global home).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -416,7 +419,7 @@ impl RunState {
         self.updated_at = Utc::now();
     }
 
-    /// Open a new round on this run (O40). Bumps the counter, un-archives, and hands
+    /// Open a new round on this run (O45). Bumps the counter, un-archives, and hands
     /// back the new round number so the caller can stamp the slots it dispatches.
     /// Everything else about the run — id, brief, base, config, usage ledger — is
     /// deliberately untouched: it is the same unit of work.
@@ -727,8 +730,17 @@ pub fn archive_sweep(
     now: DateTime<Utc>,
     halted: bool,
 ) -> Result<Vec<String>> {
+    // Spelled out, not derived: `archivable_by_hand` is `is_terminal() || is_gate() ||
+    // Stopped`, and `is_terminal()` includes `PlanApproved` — a run the operator
+    // approved and has not implemented yet, which is exactly what an unlinked-plan
+    // error tells them to go continue. Hiding that is the bug O36 already fixed once.
     let reachable = |phase: Phase| {
-        auto_archivable(phase) || (halted && archivable_by_hand(phase) && !phase.is_gate())
+        auto_archivable(phase)
+            || (halted
+                && matches!(
+                    phase,
+                    Phase::Stopped | Phase::Failed | Phase::Stuck | Phase::Quota
+                ))
     };
     let mut archived = Vec::new();
     for summary in list_runs(paths)? {

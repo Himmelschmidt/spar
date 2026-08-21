@@ -804,50 +804,6 @@ struct Snapshot {
     heartbeats: std::collections::HashMap<String, DateTime<Utc>>,
 }
 
-/// Pull the other legs of this unit of work into the view (U15): their agents and
-/// their usage belong to the same issue, so the agents list and the stepper see the
-/// whole thing. Purely in memory — the merged state is never saved, and the id and
-/// phase stay the active leg's, so every action still targets the right run.
-fn merge_legs(
-    swarm: &SparPaths,
-    mut st: RunState,
-    units: &HashMap<String, Vec<String>>,
-) -> RunState {
-    let Some(ids) = units.get(&st.id) else {
-        return st;
-    };
-    for id in ids.iter().filter(|id| **id != st.id) {
-        let Ok(leg) = RunState::load_for_display(swarm, id) else {
-            continue;
-        };
-        st.round = st.round.max(leg.round);
-        for slot in leg.slots {
-            if st.slots.iter().all(|s| s.id != slot.id) {
-                st.slots.push(slot);
-            }
-        }
-        st.usage.extend(leg.usage);
-    }
-    // Roles first, rounds second: the merged fleet reads as one pipeline.
-    st.slots.sort_by_key(|s| (s.round, step_rank(s.role)));
-    st
-}
-
-/// Where a role sits in the pipeline, for ordering a merged fleet.
-fn step_rank(role: SlotRole) -> u8 {
-    match role {
-        SlotRole::Planner => 0,
-        SlotRole::PlanCritic => 1,
-        SlotRole::TestAuthor => 2,
-        SlotRole::Implementer => 3,
-        SlotRole::Tester => 4,
-        SlotRole::Reviewer => 5,
-        SlotRole::Ranker => 6,
-        SlotRole::Reconciler => 7,
-        SlotRole::Peer => 8,
-    }
-}
-
 enum Msg {
     Input(Event),
     Data,
@@ -997,22 +953,24 @@ fn fold_units(
 fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapshot {
     let swarm = SparPaths::new(&sel.root);
     let projects = registry::projects();
-    let (runs, units) = if sel.browse.in_project() {
+    let runs = if sel.browse.in_project() {
         let listed = registry::list_visible_project_runs(&sel.root).unwrap_or_default();
         // One row per unit of work, then attention-sorted: gates and broken runs float
-        // to the top (Stage C, U15).
-        let (mut runs, units) = fold_units(listed);
+        // to the top (Stage C, U15). Drilling in stays scoped to the leg the row acts
+        // on — merging the other legs' slots into the view put agents, worktrees and
+        // tmux windows from one run under another run's id, which is how a takeover
+        // types into the wrong pane.
+        let (mut runs, _) = fold_units(listed);
         sort_runs_by_attention(&mut runs);
-        (runs, units)
+        runs
     } else {
-        (Vec::new(), HashMap::new())
+        Vec::new()
     };
     // Display path: markers, not state.json, decide whether a slot is still running.
     let full = if sel.browse.in_project() {
         sel.run_id
             .as_ref()
             .and_then(|id| RunState::load_for_display(&swarm, id).ok())
-            .map(|st| merge_legs(&swarm, st, &units))
     } else {
         None
     };

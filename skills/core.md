@@ -202,7 +202,8 @@ spar cleanup --all [--older-than 7d]     # sweep finished runs project-wide
 spar reclaim <run_id> | --all [--json]   # delete build output, KEEP the worktree
 spar archive <run_id> [--undo] [--json]  # hide a finished run from listings
 spar archive --all [--older-than 14d]    # hide every quiet finished run
-spar archive --all --halted              # also stopped/failed/stuck/quota (never gates)
+spar archive --all --halted              # also stopped/failed/stuck/quota (never gates,
+                                         # never plan_approved: that is work waiting on you)
 spar link <run_id> --to <run_id>         # fold a stray leg into its unit of work
 spar link <run_id> --undo                # and back out again
 ```
@@ -215,14 +216,26 @@ N fix rounds — is a **round inside that run**, and listing surfaces show it on
 
 So `implement` will not silently mint a second id for work that is already a run:
 
-- `--plan <path>` under `.spar/runs/<id>/artifacts/` **continues that run** (it says so
-  on stderr). This is the common case: implementing a plan spar wrote.
+- `--plan <path>` at `.spar/runs/<id>/artifacts/*.md` **continues that run** (it says so
+  on stderr). This is the common case: implementing a plan spar wrote. Any other path
+  under a run dir — a log, a marker — is not a plan and is not traced.
 - `--plan <path>` spar cannot trace to a run is **refused**, naming the runs you probably
   meant (`spar implement --run <id>`). Pass `--new` if it really is separate work.
 - `-t "..."` with no run and no plan is a fresh brief and creates a run, as before.
+- `--new` always forks, including from a plan spar could have traced.
 
-`state.json` / `status --json` carry `round` (which round the run is on) and, per slot,
-the round it last ran in. A run continued after finishing reopens: `archived_at` clears
+`spar plan --run <id>` **refuses** `--providers` / `--select` / `--role` / `--base` /
+`--big` / `--detach` / `--dry-run`: a replan inherits the run's fleet, base and frozen
+config, so a flag that could only apply to a new run is an error rather than a silent
+no-op. It also refuses a run that is mid-flight, and it moves the previous round's
+`plan.md` and `test-contract.md` to `plan-round<N>.md` / `test-contract-round<N>.md` so a
+round that writes nothing cannot present the old plan (or the old frozen contract) at the
+approval gate.
+
+`state.json`, `status --json` and the JSON that `plan` / `implement` emit all carry
+`round` (which round the run is on), and each slot carries the round it last ran in. A
+round is counted when work is actually dispatched, so an invocation that bounces off the
+quota gate does not claim one; a fix pass is a round. A run continued after finishing reopens: `archived_at` clears
 and the phase moves back into the pipeline.
 
 For legs that already exist, `spar link <leg> --to <run>` records the grouping
@@ -469,7 +482,9 @@ rail's selection.
   run's usage ledger, the same numbers `status --json` reports. Folds away under 14 rows.
 - The run list shows **units of work**: a run linked as a leg folds into its parent's
   row, which carries the parent's brief, the active leg's id and phase, and the group's
-  loudest attention. The band names the round and the leg count.
+  loudest attention — including how many of its legs want you, so folding can never hide
+  a gate. The band names the round and the leg count. Drilling in stays scoped to the leg
+  the row acts on: its agents, its worktrees, its tmux panes.
 - Rail: `projects ▸ runs ▸ agents` drill-down. `Enter` pushes a level, `Esc` pops one
   (never quits). `Enter` on an agent **takes it over** in the Shell tab. `/` filters the
   rail (Esc clears). The rail is **attention-sorted**: runs at a gate or broken fly a

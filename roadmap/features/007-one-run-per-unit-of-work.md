@@ -20,7 +20,7 @@ you open it, never rows beside it.
 
 The invariant already says this ("**One run id** threads plan → implement → ship",
 `AGENTS.md`). Nothing enforces it, and the CLI offers a bypass that outer agents take by
-default. Decisions: `DECISIONS.md` O40, O41, U15.
+default. Decisions: `DECISIONS.md` O45, O46, U15.
 
 ## Problem
 
@@ -80,6 +80,15 @@ terminal verdict, stamp the slots it dispatches. Reopening an archived run alrea
 inside `.spar/runs/<id>/artifacts/` resolves to that run, and a bare `-t`/`--plan` errors
 with the candidate runs named (approved, awaiting approval, or stopped, most recent
 first). `--new` is the explicit escape. `plan --run <id>` opens a replan round.
+
+### Known limitation
+
+A folded row drills into the leg it acts on, not into the union of the unit's legs. An
+earlier build merged every leg's slots into one view; it put agents, worktrees and tmux
+windows from one run under another run's id, so a takeover attached to the wrong pane and
+two implement legs with identical slot ids hid each other. Merging needs slots keyed by
+`(run_id, slot_id)` and per-slot worktree/heartbeat resolution — a follow-up, not a
+rename.
 
 ### Phase C: linking and folding
 

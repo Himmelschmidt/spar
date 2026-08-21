@@ -27,9 +27,10 @@ pub fn run_from_cli(
     }
     if let Some(plan_path) = plan {
         // A plan belongs to the run that produced it. Implementing it is that run
-        // continuing, not a new one (O40) — this is the bypass that split biddesk's
+        // continuing, not a new one (O45) — this is the bypass that split biddesk's
         // work across two ids 35 times.
-        if let Some(id) = run_id_for_plan(&plan_path, paths) {
+        // `--new` says this is separate work, so it wins over the trace.
+        if let Some(id) = run_id_for_plan(&plan_path, paths).filter(|_| !new) {
             if !opts.json {
                 eprintln!("continuing run {id} (it wrote this plan)");
             }
@@ -52,9 +53,23 @@ pub fn run_from_cli(
 /// `.spar/runs/<id>/artifacts/plan*.md`, so the id is in the path.
 fn run_id_for_plan(plan: &std::path::Path, paths: &SparPaths) -> Option<String> {
     let plan = plan.canonicalize().ok()?;
+    if plan.extension()?.to_str()? != "md" {
+        return None;
+    }
     let runs = paths.runs_dir().canonicalize().ok()?;
     let rest = plan.strip_prefix(&runs).ok()?;
-    let id = rest.components().next()?.as_os_str().to_str()?.to_string();
+    let mut parts = rest.components();
+    let id = parts.next()?.as_os_str().to_str()?.to_string();
+    // Exactly `<id>/artifacts/<something>.md`. Anything else under the run dir — a
+    // log, a marker, a nested project's `.spar` — is not a plan this run wrote, and
+    // attaching to it would re-dispatch the whole implement fleet on a typo.
+    if parts.next()?.as_os_str() != "artifacts" {
+        return None;
+    }
+    parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
     paths.state_file(&id).is_file().then_some(id)
 }
 
@@ -63,7 +78,7 @@ fn run_id_for_plan(plan: &std::path::Path, paths: &SparPaths) -> Option<String> 
 fn unlinked_plan_error(plan: &std::path::Path, paths: &SparPaths) -> String {
     let mut msg = format!(
         "--plan {} does not belong to a run, so spar cannot tell which unit of work this continues.\n\
-         A run covers a task from brief to draft PR; implementing its plan is that run continuing (O40).\n",
+         A run covers a task from brief to draft PR; implementing its plan is that run continuing (O45).\n",
         plan.display()
     );
     let mut candidates: Vec<crate::state::RunSummary> = crate::state::list_runs(paths)
@@ -154,16 +169,10 @@ fn run_from_approved(
         state.error = None;
         state.set_phase(Phase::PrepareIsolation);
     }
-    // Continuing an approved plan is this unit of work's next round, not a new run
-    // (O40). The id, brief, base, config and usage ledger all carry.
-    let round = state.begin_round();
     // `-t` on an approved run is a directive for THIS round only. It never rewrites
     // the run's task; absent `-t`, any prior amendment is cleared so it never silently
     // re-applies to a later round.
     state.amendment = amendment;
-    if !opts.json {
-        println!("run {run_id} · round {round}");
-    }
     if !opts.json {
         match &state.amendment {
             Some(a) => println!("amendment applied for this round: {a}"),
@@ -216,6 +225,15 @@ fn run_from_approved(
             }
             return Ok(ExitCode::Quota);
         }
+    }
+    // Continuing an approved plan is this unit of work's next round, not a new run
+    // (O45): the id, brief, base, config and usage ledger all carry. Counted here,
+    // past the quota gate, so an invocation that never dispatched anything does not
+    // leave the run claiming a round it did not run — five bounced retries against an
+    // exhausted bucket would otherwise read as round 6.
+    let round = state.begin_round();
+    if !opts.json {
+        println!("run {run_id} · round {round}");
     }
     let dry = state.dry_run;
     prepare_implement_slots(&mut state, Some(&requested), dry, cfg, paths)?;
@@ -1350,6 +1368,10 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
         }
 
         state.fix_rounds += 1;
+        // A fix pass re-dispatches the implementer and the panel, so it is a round of
+        // work in its own right (O45) — `fix_rounds` bounds the loop, `round` counts
+        // what happened on the run.
+        state.begin_round();
         if state.fix_rounds > state.max_fix_rounds {
             // stuck policy: rotate implementer → widen reviewers → escalate
             if !state.rotated_implementer && try_rotate_implementer(state, paths, cfg)? {
