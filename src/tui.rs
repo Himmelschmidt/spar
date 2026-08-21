@@ -6,7 +6,7 @@ use crate::paths::{self, SparPaths};
 use crate::process;
 use crate::quota::QuotaStore;
 use crate::registry;
-use crate::state::{self, Phase, RunState, SlotState, SlotStatus};
+use crate::state::{self, Phase, RunState, SlotRole, SlotState, SlotStatus};
 use crate::tmux;
 use crate::workflow;
 use anyhow::Result;
@@ -2691,9 +2691,8 @@ fn draw_seam(f: &mut Frame, area: Rect) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-/// One step of the run pipeline. A run *is* a stepper — plan, critique, spec, build,
-/// tests, review, ship — and the shell says so in one row instead of hiding it in a
-/// parenthesised phase name.
+/// One step of the run pipeline. A run *is* a stepper, and the shell says so in one
+/// row instead of hiding it in a parenthesised phase name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StepState {
     Pending,
@@ -2702,6 +2701,12 @@ enum StepState {
     Failed,
     /// Finished, and now waiting on the operator.
     Gate,
+    /// Was running when the run was halted, quota-paused or abandoned. Not progress,
+    /// not failure — nobody is driving it.
+    Halted,
+    /// Never happened and never will: a disabled channel, or a role this run's fleet
+    /// does not use. Distinguished from Pending, which promises it is still coming.
+    Skipped,
 }
 
 impl StepState {
@@ -2712,47 +2717,91 @@ impl StepState {
             StepState::Done => "●",
             StepState::Failed => "✗",
             StepState::Gate => "⚑",
+            StepState::Halted => "⏸",
+            StepState::Skipped => "·",
         }
     }
     fn color(self) -> Color {
         match self {
-            StepState::Pending => FG_MUTED,
+            StepState::Pending | StepState::Skipped => FG_MUTED,
             StepState::Active => INFO,
             StepState::Done => OK,
             StepState::Failed => ALERT,
-            StepState::Gate => WARN,
+            StepState::Gate | StepState::Halted => WARN,
         }
     }
 }
 
-/// The pipeline, in order, with the roles that own each step. `ship` has no role — it
-/// is read off the phase.
-const STEPS: [(&str, Option<crate::state::SlotRole>); 7] = [
-    ("plan", Some(crate::state::SlotRole::Planner)),
-    ("critique", Some(crate::state::SlotRole::PlanCritic)),
-    ("spec", Some(crate::state::SlotRole::TestAuthor)),
-    ("build", Some(crate::state::SlotRole::Implementer)),
-    ("tests", Some(crate::state::SlotRole::Tester)),
-    ("review", Some(crate::state::SlotRole::Reviewer)),
-    ("ship", None),
-];
+/// The pipeline a run of this **kind** walks, as `(label, owning role)`; `ship` is the
+/// one step with no role, read off the phase. Keyed on the workflow because the
+/// fleets differ: an arena has no planner and a roles run has nothing but peers, so
+/// one fixed seven-step table would show them six steps that never existed.
+fn steps_for(kind: crate::cli::WorkflowKind) -> &'static [(&'static str, Option<SlotRole>)] {
+    use crate::cli::WorkflowKind as W;
+    match kind {
+        W::Arena => &[
+            ("build", Some(SlotRole::Implementer)),
+            ("rank", Some(SlotRole::Ranker)),
+            ("reconcile", Some(SlotRole::Reconciler)),
+            ("review", Some(SlotRole::Reviewer)),
+            ("ship", None),
+        ],
+        W::Roles | W::Peer => &[("peers", Some(SlotRole::Peer)), ("ship", None)],
+        W::Review => &[("review", Some(SlotRole::Reviewer)), ("ship", None)],
+        W::Plan | W::Loop => &[
+            ("plan", Some(SlotRole::Planner)),
+            ("critique", Some(SlotRole::PlanCritic)),
+            ("spec", Some(SlotRole::TestAuthor)),
+            ("build", Some(SlotRole::Implementer)),
+            ("tests", Some(SlotRole::Tester)),
+            ("review", Some(SlotRole::Reviewer)),
+            ("ship", None),
+        ],
+    }
+}
+
+/// Which step a gate is holding. The plan gate hangs off the critic when the fleet
+/// ran one (else the planner); the winner gate off ranking, the reconcile gate off
+/// reconcile. Applied last and unconditionally, so a step whose slot failed still
+/// flies the flag — the gate is the actionable fact.
+fn gate_step(st: &RunState, steps: &[(&'static str, StepState)]) -> Option<usize> {
+    let find = |label: &str| steps.iter().position(|(l, _)| *l == label);
+    match st.phase {
+        Phase::AwaitingPlanApproval => plan_step(st, steps),
+        Phase::AwaitingWinnerConfirm => find("rank"),
+        Phase::AwaitingReconcile => find("reconcile"),
+        Phase::AwaitingShipConfirm => find("ship"),
+        _ => None,
+    }
+}
+
+/// The step the plan verdict lands on: the critic when the fleet ran one, else the
+/// planner.
+fn plan_step(st: &RunState, steps: &[(&'static str, StepState)]) -> Option<usize> {
+    let find = |label: &str| steps.iter().position(|(l, _)| *l == label);
+    if st.slots.iter().any(|s| s.role == SlotRole::PlanCritic) {
+        find("critique").or_else(|| find("plan"))
+    } else {
+        find("plan")
+    }
+}
 
 /// Step states read off the slots that actually ran, not off a phase-to-step guess:
 /// slots accumulate on the run, so their roles and statuses are the honest record of
-/// how far it got. Only `ship` comes from the phase.
-fn run_steps(st: &RunState) -> Vec<(&'static str, StepState)> {
-    let gate = st.phase.is_gate();
-    STEPS
+/// how far it got. Only `ship` comes from the phase. `abandoned` is the App's view
+/// (no orchestrator behind the run), which no field of `RunState` records.
+fn run_steps(st: &RunState, abandoned: bool) -> Vec<(&'static str, StepState)> {
+    let broken = matches!(st.phase, Phase::Failed | Phase::Stuck | Phase::Escalated);
+    let halted = abandoned || matches!(st.phase, Phase::Stopped | Phase::Quota);
+    let mut out: Vec<(&'static str, StepState)> = steps_for(st.workflow)
         .iter()
         .map(|(label, role)| {
             let Some(role) = role else {
                 let ship = match st.phase {
                     Phase::Done => StepState::Done,
                     Phase::Shipping => StepState::Active,
-                    Phase::AwaitingShipConfirm
-                    | Phase::AwaitingWinnerConfirm
-                    | Phase::AwaitingReconcile => StepState::Gate,
-                    Phase::Failed | Phase::Stuck | Phase::Escalated => StepState::Failed,
+                    _ if broken => StepState::Failed,
+                    _ if halted => StepState::Halted,
                     _ => StepState::Pending,
                 };
                 return (*label, ship);
@@ -2761,48 +2810,64 @@ fn run_steps(st: &RunState) -> Vec<(&'static str, StepState)> {
             if mine.is_empty() {
                 return (*label, StepState::Pending);
             }
-            let state = if mine.iter().any(|s| s.status == SlotStatus::Failed) {
-                StepState::Failed
-            } else if mine.iter().any(|s| s.status == SlotStatus::Running) {
-                if st.phase == Phase::Failed || st.phase == Phase::Stuck {
+            let state = if mine.iter().any(|s| s.status == SlotStatus::Running) {
+                if broken {
                     StepState::Failed
+                } else if halted {
+                    StepState::Halted
                 } else {
                     StepState::Active
                 }
-            } else if mine.iter().all(|s| s.status == SlotStatus::Done) {
-                // The plan gate flies its flag on the last step that finished before it.
-                if gate && st.phase == Phase::AwaitingPlanApproval && *role == last_plan_role(st) {
-                    StepState::Gate
-                } else {
-                    StepState::Done
-                }
+            } else if mine.iter().all(|s| s.status == SlotStatus::Failed) {
+                StepState::Failed
+            } else if mine.iter().any(|s| s.status == SlotStatus::Done) {
+                // A fleet that runs several of a role (arena implementers, two
+                // reviewers) survives one of them dying; the rail carries that.
+                StepState::Done
             } else {
                 StepState::Pending
             };
             (*label, state)
         })
-        .collect()
-}
+        .collect();
 
-/// Which role the plan gate hangs off: the critic when the run has one, else the planner.
-fn last_plan_role(st: &RunState) -> crate::state::SlotRole {
-    use crate::state::SlotRole;
-    if st.slots.iter().any(|s| s.role == SlotRole::PlanCritic) {
-        SlotRole::PlanCritic
-    } else {
-        SlotRole::Planner
+    // A step nothing ever filled, on a run that has already moved past it, did not
+    // happen: a disabled channel (`[spec]`, `[suite]`) or an unused optional role.
+    // Saying "pending" there promises work that is never coming.
+    let terminal = matches!(
+        st.phase,
+        Phase::Done | Phase::Shipping | Phase::AwaitingShipConfirm
+    );
+    for i in 0..out.len() {
+        if out[i].1 != StepState::Pending {
+            continue;
+        }
+        let passed = terminal || out[i + 1..].iter().any(|(_, s)| *s != StepState::Pending);
+        if passed {
+            out[i].1 = StepState::Skipped;
+        }
     }
+
+    // A rejected plan is not a pending one.
+    if st.phase == Phase::PlanRejected {
+        if let Some(i) = plan_step(st, &out) {
+            out[i].1 = StepState::Failed;
+        }
+    }
+    if let Some(i) = gate_step(st, &out) {
+        out[i].1 = StepState::Gate;
+    }
+    out
 }
 
-/// The stepper as spans. Falls back to glyphs-plus-the-live-label when the terminal
-/// cannot hold the full form, so the row never wraps or clips mid-word.
+/// The stepper as spans. Tightens in three tiers — drawn connectors, then the labels
+/// on everything that is not live — and appends the live step's name only when it
+/// actually fits, so the row never clips mid-word.
 fn stepper_spans(
     steps: &[(&'static str, StepState)],
     width: u16,
     spinner: &'static str,
 ) -> Vec<Span<'static>> {
-    // Three tiers, tightened in this order: drawn connectors, then the labels on
-    // everything that is not live. The names are the last thing to go.
     let labels_w: usize = steps
         .iter()
         .map(|(l, _)| l.chars().count() + 2)
@@ -2816,15 +2881,32 @@ fn stepper_spans(
     } else {
         (false, " ")
     };
+    // Even glyph-only, seven steps need 13 columns. When they do not all fit, spend
+    // the last column on an ellipsis rather than letting the paragraph cut a step in
+    // half.
+    let sep_w = sep.chars().count();
+    let glyphs_w = steps.len() + gaps * sep_w;
+    let elided = glyphs_w > width;
+    let budget = if elided {
+        width.saturating_sub(1)
+    } else {
+        width
+    };
+    let mut used = 0usize;
     let mut spans = Vec::with_capacity(steps.len() * 3);
     for (i, (label, state)) in steps.iter().enumerate() {
+        // Stop cleanly at a step boundary.
+        if used + if i > 0 { sep_w + 1 } else { 1 } > budget {
+            break;
+        }
         if i > 0 {
             // The connector carries progress: lit behind everything already finished.
-            let done = steps[i - 1].1 == StepState::Done || steps[i - 1].1 == StepState::Gate;
+            let done = matches!(steps[i - 1].1, StepState::Done | StepState::Gate);
             spans.push(Span::styled(
                 sep,
                 Style::default().fg(if done { OK } else { RULE }),
             ));
+            used += sep.chars().count();
         }
         let glyph = if *state == StepState::Active {
             spinner
@@ -2835,21 +2917,34 @@ fn stepper_spans(
             glyph.to_string(),
             Style::default().fg(state.color()).bold(),
         ));
-        if labelled || *state == StepState::Active || *state == StepState::Gate {
+        used += 1;
+        let live = matches!(
+            state,
+            StepState::Active | StepState::Gate | StepState::Halted
+        );
+        let room_for_label = used + 1 + label.chars().count() <= budget;
+        if (labelled || live) && room_for_label {
             spans.push(Span::styled(
                 format!(" {label}"),
                 Style::default()
                     .fg(match state {
-                        StepState::Pending => FG_MUTED,
+                        StepState::Pending | StepState::Skipped => FG_MUTED,
                         StepState::Done => FG_DIM,
                         s => s.color(),
                     })
                     .add_modifier(match state {
-                        StepState::Active | StepState::Gate | StepState::Failed => Modifier::BOLD,
+                        StepState::Active
+                        | StepState::Gate
+                        | StepState::Halted
+                        | StepState::Failed => Modifier::BOLD,
                         _ => Modifier::empty(),
                     }),
             ));
+            used += 1 + label.chars().count();
         }
+    }
+    if elided && used < width {
+        spans.push(Span::styled("…", muted()));
     }
     spans
 }
@@ -2908,13 +3003,11 @@ fn draw_context_band(
         .iter()
         .filter(|s| s.status == SlotStatus::Done)
         .count();
-    let out: u64 = st
-        .slots
-        .iter()
-        .filter_map(|s| s.usage.as_ref())
-        .map(|u| u.output_tokens)
-        .sum();
-    let mut meters = vec![
+    // `state.usage` is the run's ledger: one entry pushed per dispatch. `slot.usage`
+    // is overwritten each time a slot is re-dispatched, so summing that under-reports
+    // a run with fix rounds and disagrees with `status --json` (executor.rs:1028).
+    let out: u64 = st.usage.iter().map(|u| u.output_tokens).sum();
+    let mut meters: Vec<Span> = vec![
         Span::styled(relative_age(st.created_at), dim()),
         Span::styled(" · ", muted()),
         Span::styled(format!("{done}/{} agents", st.slots.len()), dim()),
@@ -2928,8 +3021,17 @@ fn draw_context_band(
         .map(|s| s.content.chars().count() as u16)
         .sum();
 
-    let room = pad.width.saturating_sub(meters_w + 2);
-    let steps = run_steps(st);
+    // The stepper is the point of this band; the meters yield to it, never the other
+    // way round, so a narrow terminal never leaves the row blank.
+    let (room, meters) = match pad.width.checked_sub(meters_w + 2) {
+        Some(w) if w >= 8 => (w, meters),
+        _ => (pad.width, Vec::new()),
+    };
+    let meters_w: u16 = meters
+        .iter()
+        .map(|s| s.content.chars().count() as u16)
+        .sum();
+    let steps = run_steps(st, app.abandoned);
     f.render_widget(
         Paragraph::new(Line::from(stepper_spans(&steps, room, app.spinner()))),
         Rect { width: room, ..pad },
@@ -2967,31 +3069,46 @@ fn slot_short(slots: &[SlotState], i: usize) -> String {
     format!("{label} {n}")
 }
 
-/// The model a slot is running, short enough for a rail column: the last meaningful
-/// segment of the model id, or the provider when no model was recorded.
-fn slot_model(s: &SlotState) -> String {
-    if let Some(m) = s
-        .model
-        .as_deref()
-        .or(s.usage.as_ref().and_then(|u| u.model.as_deref()))
-    {
-        let tail = m.rsplit('/').next().unwrap_or(m);
-        let tail = tail.strip_prefix("claude-").unwrap_or(tail);
-        return tail
-            .split('-')
-            .next()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(tail)
-            .to_string();
+/// The model a slot is running, shortened to fit a rail column. Keeps the **tail**
+/// and marks the elision, because that is where the tier lives: `gemini-3.7-flash`
+/// and `gemini-3.7-pro` differ only in their last segment, and a head-first shortening
+/// renders both as `gemini`. Prefers the model the provider says it served over the
+/// one that was requested — for an OpenRouter-routed slot they can differ.
+fn slot_model(s: &SlotState, max: usize) -> String {
+    let served = s
+        .usage
+        .as_ref()
+        .and_then(|u| u.model.as_deref())
+        .or(s.model.as_deref());
+    let Some(m) = served else {
+        // No model recorded: name the adapter. `provider` is the model-free storage
+        // key by construction (executor::init_slot_model), so there is no `@model`
+        // left on it to strip.
+        return truncate(s.provider.rsplit(':').next().unwrap_or(&s.provider), max);
+    };
+    let m = m.rsplit('/').next().unwrap_or(m);
+    let m = m.strip_prefix("claude-").unwrap_or(m);
+    // Drop a trailing release date (`claude-opus-4-5-20250929`), never a version.
+    let m = match m.rsplit_once('-') {
+        Some((head, tail))
+            if tail.len() >= 6 && tail.chars().all(|c| c.is_ascii_digit()) && !head.is_empty() =>
+        {
+            head
+        }
+        _ => m,
+    };
+    if m.chars().count() <= max {
+        return m.to_string();
     }
-    s.provider
-        .rsplit(':')
-        .next()
-        .unwrap_or(&s.provider)
-        .split('@')
-        .next()
-        .unwrap_or("")
-        .to_string()
+    // Too long: drop leading segments until the tail fits, and say that we did.
+    let mut cut = m;
+    while let Some((_, tail)) = cut.split_once('-') {
+        cut = tail;
+        if cut.chars().count() < max {
+            return format!("…{cut}");
+        }
+    }
+    truncate(m, max)
 }
 
 /// The header's cue and its colors. `Some(wash)` means an alert state (gate, quota,
@@ -3528,7 +3645,7 @@ fn rail_slot_items(
                     format!("{:<role_w$}", truncate(&slot_short(slots, i), role_w)),
                     if sel { selected(focused) } else { dim() },
                 ),
-                Span::styled(truncate(&slot_model(s), model_w), Style::default().fg(HINT)),
+                Span::styled(slot_model(s, model_w), Style::default().fg(HINT)),
             ];
             rail_row(
                 rail_lead(sel, focused, broken.then_some(ALERT)),
@@ -6313,57 +6430,210 @@ mod render_stability {
     #[test]
     fn stepper_tracks_slots_and_gates() {
         let st = run_with(Phase::Review, 6);
-        let steps = run_steps(&st);
-        let by = |name: &str| steps.iter().find(|(l, _)| *l == name).unwrap().1;
-        assert_eq!(by("plan"), StepState::Done);
-        assert_eq!(by("review"), StepState::Active);
-        assert_eq!(by("ship"), StepState::Pending);
+        let steps = run_steps(&st, false);
+        let by = |steps: &[(&str, StepState)], name: &str| {
+            steps.iter().find(|(l, _)| *l == name).unwrap().1
+        };
+        assert_eq!(by(&steps, "plan"), StepState::Done);
+        assert_eq!(by(&steps, "review"), StepState::Active);
+        assert_eq!(by(&steps, "ship"), StepState::Pending);
 
         let mut gated = run_with(Phase::AwaitingPlanApproval, 2);
         gated
             .slots
             .iter_mut()
             .for_each(|s| s.status = SlotStatus::Done);
-        let steps = run_steps(&gated);
+        let steps = run_steps(&gated, false);
+        assert_eq!(by(&steps, "critique"), StepState::Gate);
+        assert_eq!(by(&steps, "build"), StepState::Pending);
+
+        let shipping = run_with(Phase::AwaitingShipConfirm, 7);
+        assert_eq!(by(&run_steps(&shipping, false), "ship"), StepState::Gate);
+    }
+
+    /// The pipeline is keyed on the workflow. An arena has no planner and a roles run
+    /// has nothing but peers; showing either one the seven-step loop pipeline invents
+    /// steps that never existed and marks them as still to come.
+    #[test]
+    fn stepper_shape_follows_the_workflow() {
+        use crate::cli::WorkflowKind;
+        let labels = |k: WorkflowKind| {
+            steps_for(k)
+                .iter()
+                .map(|(l, _)| *l)
+                .collect::<Vec<&'static str>>()
+        };
+        assert_eq!(
+            labels(WorkflowKind::Loop),
+            ["plan", "critique", "spec", "build", "tests", "review", "ship"]
+        );
+        assert_eq!(
+            labels(WorkflowKind::Arena),
+            ["build", "rank", "reconcile", "review", "ship"]
+        );
+        assert_eq!(labels(WorkflowKind::Roles), ["peers", "ship"]);
+        assert_eq!(labels(WorkflowKind::Peer), ["peers", "ship"]);
+        assert_eq!(labels(WorkflowKind::Review), ["review", "ship"]);
+
+        // A roles run's peers are its whole pipeline, and they are visible while live.
+        let mut st = RunState::new("r", WorkflowKind::Roles, PathBuf::from("/x"));
+        st.phase = Phase::Dispatch;
+        for i in 0..2 {
+            let mut s =
+                crate::executor::init_slot(format!("role-{i}"), "cli:claude", SlotRole::Peer);
+            s.status = SlotStatus::Running;
+            st.slots.push(s);
+        }
+        let steps = run_steps(&st, false);
+        assert_eq!(steps[0], ("peers", StepState::Active));
+
+        // The arena's winner gate is the ranking gate, not the ship gate.
+        let mut arena = RunState::new("a", WorkflowKind::Arena, PathBuf::from("/x"));
+        arena.phase = Phase::AwaitingWinnerConfirm;
+        for (role, status) in [
+            (SlotRole::Implementer, SlotStatus::Done),
+            (SlotRole::Implementer, SlotStatus::Failed),
+            (SlotRole::Ranker, SlotStatus::Done),
+        ] {
+            let mut s = crate::executor::init_slot("s", "cli:claude", role);
+            s.status = status;
+            arena.slots.push(s);
+        }
+        let steps = run_steps(&arena, false);
+        let by = |name: &str| steps.iter().find(|(l, _)| *l == name).unwrap().1;
+        assert_eq!(by("rank"), StepState::Gate, "the winner gate holds ranking");
+        assert_eq!(by("ship"), StepState::Pending);
+        // One of four implementers dying is the expected arena outcome, not a failed
+        // build step.
+        assert_eq!(by("build"), StepState::Done);
+    }
+
+    /// A channel that was switched off did not "not happen yet" — it is never coming,
+    /// and the row says so with a different mark.
+    #[test]
+    fn stepper_marks_skipped_rather_than_pending() {
+        let mut st = run_with(Phase::Done, 7);
+        st.slots.retain(|s| s.role != SlotRole::Tester); // [suite] enabled = false
+        st.slots
+            .iter_mut()
+            .for_each(|s| s.status = SlotStatus::Done);
+        let steps = run_steps(&st, false);
+        let by = |name: &str| steps.iter().find(|(l, _)| *l == name).unwrap().1;
+        assert_eq!(by("tests"), StepState::Skipped);
+        assert_eq!(by("ship"), StepState::Done);
+        // A run that simply has not got there yet still reads as pending.
+        let early = run_with(Phase::Spec, 3);
+        let steps = run_steps(&early, false);
+        assert_eq!(
+            steps.iter().find(|(l, _)| *l == "tests").unwrap().1,
+            StepState::Pending
+        );
+    }
+
+    /// The gate is the actionable fact, so it outranks the state of the slot it hangs
+    /// off: a tolerated critic failure must not swallow the plan gate's flag.
+    #[test]
+    fn stepper_flags_the_gate_even_when_that_step_failed() {
+        let mut st = run_with(Phase::AwaitingPlanApproval, 2);
+        st.slots[0].status = SlotStatus::Done; // planner
+        st.slots[1].status = SlotStatus::Failed; // plan_critic: tolerated, plan.rs:181
+        let steps = run_steps(&st, false);
         assert_eq!(
             steps.iter().find(|(l, _)| *l == "critique").unwrap().1,
             StepState::Gate
         );
+        // Rejected is not pending either.
+        let mut rejected = run_with(Phase::PlanRejected, 2);
+        rejected
+            .slots
+            .iter_mut()
+            .for_each(|s| s.status = SlotStatus::Done);
         assert_eq!(
-            steps.iter().find(|(l, _)| *l == "build").unwrap().1,
-            StepState::Pending
-        );
-
-        let shipping = run_with(Phase::AwaitingShipConfirm, 7);
-        assert_eq!(
-            shipping.slots.len(),
-            7,
-            "fixture sanity: the ship gate needs a full fleet"
-        );
-        assert_eq!(
-            run_steps(&shipping)
+            run_steps(&rejected, false)
                 .iter()
-                .find(|(l, _)| *l == "ship")
+                .find(|(l, _)| *l == "critique")
                 .unwrap()
                 .1,
-            StepState::Gate
+            StepState::Failed
         );
     }
 
-    /// The stepper degrades to glyphs plus the live label rather than clipping words.
+    /// Nobody is driving it: a halted, quota-paused or abandoned run must not keep
+    /// claiming a step is in progress while the header says ABANDONED.
     #[test]
-    fn stepper_drops_labels_before_it_clips() {
-        let st = run_with(Phase::Review, 6);
-        let steps = run_steps(&st);
-        let width = |w: u16| {
-            stepper_spans(&steps, w, "◐")
+    fn stepper_halts_instead_of_claiming_live() {
+        let live = run_with(Phase::Review, 6);
+        assert_eq!(
+            run_steps(&live, false)
                 .iter()
-                .map(|s| s.content.chars().count())
-                .sum::<usize>()
-        };
-        assert!(width(80) <= 80);
-        assert!(width(20) <= 20);
-        let tight: String = stepper_spans(&steps, 20, "◐")
+                .find(|(l, _)| *l == "review")
+                .unwrap()
+                .1,
+            StepState::Active
+        );
+        assert_eq!(
+            run_steps(&live, true)
+                .iter()
+                .find(|(l, _)| *l == "review")
+                .unwrap()
+                .1,
+            StepState::Halted,
+            "abandoned"
+        );
+        for phase in [Phase::Stopped, Phase::Quota] {
+            let mut st = run_with(Phase::Review, 6);
+            st.phase = phase;
+            assert_eq!(
+                run_steps(&st, false)
+                    .iter()
+                    .find(|(l, _)| *l == "review")
+                    .unwrap()
+                    .1,
+                StepState::Halted,
+                "{phase:?}"
+            );
+        }
+        for phase in [Phase::Failed, Phase::Stuck, Phase::Escalated] {
+            let mut st = run_with(Phase::Review, 6);
+            st.phase = phase;
+            assert_eq!(
+                run_steps(&st, false)
+                    .iter()
+                    .find(|(l, _)| *l == "review")
+                    .unwrap()
+                    .1,
+                StepState::Failed,
+                "{phase:?}"
+            );
+        }
+    }
+
+    /// The stepper degrades to glyphs plus the live label, and drops even that rather
+    /// than clip it. Checked against the widest live label, not a convenient one.
+    #[test]
+    fn stepper_never_clips_a_label() {
+        for phase in [
+            Phase::Spec,
+            Phase::Review,
+            Phase::Suite,
+            Phase::AwaitingShipConfirm,
+        ] {
+            for slots in 1..=7 {
+                let st = run_with(phase, slots);
+                let steps = run_steps(&st, false);
+                for w in 0..=90u16 {
+                    let spans = stepper_spans(&steps, w, "◐");
+                    let painted: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+                    assert!(
+                        painted <= w as usize,
+                        "{phase:?} with {slots} slots overflowed {w}: {painted}"
+                    );
+                }
+            }
+        }
+        // The live step still keeps its name whenever there is room for it.
+        let st = run_with(Phase::Review, 6);
+        let tight: String = stepper_spans(&run_steps(&st, false), 20, "◐")
             .iter()
             .map(|s| s.content.to_string())
             .collect();
@@ -6393,6 +6663,104 @@ mod render_stability {
         assert_eq!(slot_short(&st.slots, 0), "planner");
         assert_eq!(slot_short(&st.slots, 5), "review 0");
         assert_eq!(slot_short(&st.slots, 6), "review 1");
-        assert_eq!(slot_model(&st.slots[0]), "opus");
+    }
+
+    /// The model column has to separate the tiers the fleet policy is built on. A
+    /// head-first shortening renders every Gemini as `gemini`, which is useless.
+    #[test]
+    fn model_labels_keep_the_tier() {
+        let label = |model: Option<&str>, provider: &str, w: usize| {
+            let mut s = crate::executor::init_slot("s", provider, SlotRole::Reviewer);
+            s.model = model.map(str::to_string);
+            slot_model(&s, w)
+        };
+        assert_eq!(label(Some("claude-opus-5"), "cli:claude", 12), "opus-5");
+        // A release date is dropped; a version number is not.
+        assert_eq!(
+            label(Some("claude-opus-4-5-20250929"), "cli:claude", 12),
+            "opus-4-5"
+        );
+        assert_eq!(
+            label(Some("claude-3-5-haiku-20241022"), "cli:claude", 12),
+            "3-5-haiku"
+        );
+        // Same family, different tier: the labels must differ.
+        let flash = label(Some("google/gemini-3.7-flash"), "cli:opencode", 12);
+        let pro = label(Some("google/gemini-3.7-pro"), "cli:opencode", 12);
+        assert_ne!(flash, pro, "flash and pro rendered the same");
+        assert!(flash.ends_with("flash"), "{flash}");
+        assert!(pro.ends_with("pro"), "{pro}");
+        // No model recorded: name the adapter, never an empty cell.
+        assert_eq!(label(None, "cli:opencode", 12), "opencode");
+        assert_eq!(label(None, "cli:claude", 12), "claude");
+        // What the provider says it served beats what was asked for.
+        let mut s = crate::executor::init_slot("s", "cli:opencode", SlotRole::Reviewer);
+        s.model = Some("anthropic/claude-opus-4.8".into());
+        s.usage = Some(crate::state::SlotUsage {
+            slot_id: "s".into(),
+            provider: "cli:opencode".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            context_tokens: 0,
+            tools: 0,
+            model: Some("x-ai/grok-4.5".into()),
+        });
+        assert_eq!(slot_model(&s, 12), "grok-4.5");
+    }
+
+    /// The band's token meter must agree with `status --json`, which reads the run's
+    /// own ledger. `slot.usage` is overwritten on re-dispatch (executor.rs:1024).
+    #[test]
+    fn token_meter_reads_the_run_ledger_not_the_last_dispatch() {
+        let mut st = run_with(Phase::Review, 2);
+        let usage = |out: u64| crate::state::SlotUsage {
+            slot_id: "impl".into(),
+            provider: "cli:claude".into(),
+            input_tokens: 0,
+            output_tokens: out,
+            cache_read_tokens: 0,
+            context_tokens: 0,
+            tools: 0,
+            model: None,
+        };
+        // Three dispatches of one slot: the ledger keeps all three, the slot field
+        // only the last.
+        st.usage = vec![usage(1000), usage(2000), usage(3000)];
+        st.slots[0].usage = Some(usage(3000));
+        let ledger: u64 = st.usage.iter().map(|u| u.output_tokens).sum();
+        let per_slot: u64 = st
+            .slots
+            .iter()
+            .filter_map(|s| s.usage.as_ref())
+            .map(|u| u.output_tokens)
+            .sum();
+        assert_eq!(ledger, 6000);
+        assert_eq!(per_slot, 3000, "fixture sanity");
+
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let swarm = SparPaths::new("/x");
+        let mut app = App::new(None, Config::default(), true);
+        let mut rail = ListState::default();
+        term.draw(|f| {
+            draw(
+                f,
+                &swarm,
+                &[],
+                &[],
+                Some(&st),
+                "",
+                &[],
+                "",
+                &mut app,
+                &mut rail,
+            )
+        })
+        .unwrap();
+        let band: String = {
+            let buf = term.backend().buffer();
+            (0..120).map(|x| buf[(x, 1)].symbol()).collect()
+        };
+        assert!(band.contains("out 6.0k"), "band was: {band:?}");
     }
 }

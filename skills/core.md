@@ -428,9 +428,14 @@ rail's selection.
 - Header: brand + breadcrumb + phase, the `⚑N need you` roll-up, and gate buttons in a
   fixed right-hand zone on 80 columns and up (their x never moves between gates; below
   80 they right-align).
-- Stepper: `plan ─ critique ─ spec ─ build ─ tests ─ review ─ ship`, read off the slots
-  that actually ran — done / live / pending / failed, with `⚑` on the step a gate is
-  holding. Folds away under 14 rows.
+- Stepper: the pipeline **for that workflow** — loop/plan is
+  `plan ─ critique ─ spec ─ build ─ tests ─ review ─ ship`, arena is
+  `build ─ rank ─ reconcile ─ review ─ ship`, roles/peer is `peers ─ ship`. Read off the
+  slots that actually ran: `●` done · `◐` live · `○` pending · `·` skipped (a disabled
+  channel or unused role, i.e. never coming) · `✗` failed · `⏸` halted (stopped, quota
+  or abandoned) · `⚑` on the step a gate is holding (plan gate on critique, winner gate
+  on rank, reconcile gate on reconcile, ship gate on ship). Meters on the right read the
+  run's usage ledger, the same numbers `status --json` reports. Folds away under 14 rows.
 - Rail: `projects ▸ runs ▸ agents` drill-down. `Enter` pushes a level, `Esc` pops one
   (never quits). `Enter` on an agent **takes it over** in the Shell tab. `/` filters the
   rail (Esc clears). The rail is **attention-sorted**: runs at a gate or broken fly a

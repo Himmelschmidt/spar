@@ -87,15 +87,23 @@ identifies an agent: two rows both read `✓ review-… done`.
   active tab's underline, so tab indication costs no row. Bands fold in order of what
   the operator can most afford to lose: the stepper below 14 rows, then labels+rule
   below 9, leaving header + body + footer at the 20x5 floor.
-- **The run is a stepper.** `plan ─ critique ─ spec ─ build ─ tests ─ review ─ ship`,
-  read off the slots that actually ran (they accumulate on the run) rather than
-  guessed from the phase name, with `⚑` on the step a gate is holding. Degrades in
-  three tiers before it clips.
+- **The run is a stepper**, shaped by its workflow: an arena has no planner and a
+  roles run has nothing but peers, so the step table is keyed on `WorkflowKind` rather
+  than fixed. States are read off the slots that actually ran (they accumulate on the
+  run) rather than guessed from the phase name, and the row distinguishes *pending*
+  from *skipped* — a disabled `[spec]` / `[suite]` channel never arrives, and saying
+  "not yet" for the life of the run is a lie. `⚑` marks the step a gate is holding
+  (plan gate on critique, winner gate on rank, reconcile on reconcile, ship on ship),
+  outranking that step's own state so a tolerated critic failure cannot swallow the
+  flag. `⏸` covers stopped, quota-paused and abandoned, which are not progress.
+  Degrades in three tiers and stops at a step boundary rather than clipping.
 - **The terminal owns the background.** No page fill; only chips, the gate/alert
   washes and overlays paint one. Tokens live in `src/theme.rs`.
 - **Identity over ids.** The rail shows an agent's *role* (`review 0`, `builder`) and
   its model, never `review-0-cli-opencode`; the log drops the provider's opaque
-  `toolu_…` ids, ~30 columns of noise per result row.
+  `toolu_…` ids, ~30 columns of noise per result row. The model label keeps the
+  **tail** (`…3.7-flash`, `opus-4-5`), because that is where the tier lives — a
+  head-first shortening renders every Gemini as `gemini`.
 - **Reserved space.** Gate buttons live in a fixed 23-column zone (80 columns and up)
   and are left-aligned inside it, so swapping gates cannot slide a button out from
   under a click; the Activity tab's alert badge has a reserved 4-column slot for the
