@@ -73,6 +73,34 @@ Supporting principles:
 - Width bands: `<80` Main only · `80–119` rail + Main · `>=120` extra width to Main
   (never a fourth box). Decision U5.
 
+## Stage D — the chrome rebuild (done)
+
+Stages A–C fixed *where things are*; the shell still read like a 2015 curses app.
+Boxes were the problem: rail and Main each drew a full border, so the middle of the
+screen was a two-column wall (`┐┌`), the tab strip lived inside Main's top border
+mixed with slot identity and mode flags, and a painted `rgb(12,14,18)` slab fought
+every terminal theme it landed in. The 24-column fixed rail elided the one field that
+identifies an agent: two rows both read `✓ review-… done`.
+
+- **Bands, not boxes.** Header · stepper · labels · rule · body · footer, with one
+  1-column seam between rail and Main. The rule under the labels row doubles as the
+  active tab's underline, so tab indication costs no row. Bands fold from the bottom
+  up: the stepper below 14 rows, labels+rule below 9.
+- **The run is a stepper.** `plan ─ critique ─ spec ─ build ─ tests ─ review ─ ship`,
+  read off the slots that actually ran (they accumulate on the run) rather than
+  guessed from the phase name, with `⚑` on the step a gate is holding. Degrades in
+  three tiers before it clips.
+- **The terminal owns the background.** No page fill; only chips, the gate/alert
+  washes and overlays paint one. Tokens live in `src/theme.rs`.
+- **Identity over ids.** The rail shows an agent's *role* (`review 0`, `builder`) and
+  its model, never `review-0-cli-opencode`; the log drops the provider's opaque
+  `toolu_…` ids, ~27 columns of noise per result row.
+- **Reserved space.** Gate buttons live in a fixed 23-column zone and are left-aligned
+  inside it, so swapping gates cannot slide a button out from under a click; the rail
+  width comes from the terminal width alone, never from the data.
+- Asserted by `mod render_stability`: 20x5 through 200x60, empty project list, 400
+  runs, and "this region does not move when that value changes." Decision U14.
+
 ## Sources
 
 - k9s — resource list + one main view, `:` palette, drill-down with `Enter`/`Esc`.

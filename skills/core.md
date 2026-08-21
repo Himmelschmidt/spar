@@ -421,14 +421,22 @@ run and reconcile as each returns.
 
 ### TUI shape (humans)
 
-A **rail** + **one main area**. Main always shows the rail's selection.
+A **rail** + **one main area**, with no pane borders: chrome bands (breadcrumb, run
+stepper, labels + rule) sit above one body split by a single seam. Main always shows the
+rail's selection.
 
+- Header: brand + breadcrumb + phase, the `⚑N need you` roll-up, and gate buttons in a
+  fixed right-hand zone (their x never moves between gates).
+- Stepper: `plan · critique · spec · build · tests · review · ship`, read off the slots
+  that actually ran — done / live / pending / failed, with `⚑` on the step a gate is
+  holding. Folds away under 14 rows.
 - Rail: `projects ▸ runs ▸ agents` drill-down. `Enter` pushes a level, `Esc` pops one
   (never quits). `Enter` on an agent **takes it over** in the Shell tab. `/` filters the
   rail (Esc clears). The rail is **attention-sorted**: runs at a gate or broken fly a
   `⚑` and float to the top (and roll up to their project row).
-- Main tabs: `Log · Activity · Diff · Shell`, switched with `[` / `]` (Activity carries
-  the `@human` alert badge). Diff is the selected slot's real worktree diff.
+- Main tabs: `Log · Activity · Diff · Shell` on the labels row, marked by an accent
+  underline on the rule beneath them, switched with `[` / `]` (Activity carries the
+  `@human` alert badge). Diff is the selected slot's real worktree diff.
 - Focus: `1` rail · `2` main (Tab cycles the two). `+` / `_` zoom Main.
 - `:` opens the **command palette** — `approve`/`reject`/`ship`/`confirm`/`reconcile`/
   `takeover`/`implement`/`plan`/`spawn`/`chat`, Tab-completes run ids.
@@ -438,9 +446,12 @@ A **rail** + **one main area**. Main always shows the rail's selection.
 - `p` = Projects · `w` log wrap · `g`/`G` top/bottom · `?` help · **`q` quits**.
 - Shell tab = a real tmux client: **every key goes to the agent** (incl. `Ctrl+C`);
   `F12` (or `C-a d`) hands focus back to spar. Focusing it full-screen is **Driving
-  mode** — green banner + border, rail collapsed.
+  mode** — green banner, every other band collapsed, the pane edge to edge.
 - Width bands: `<80` cols Main only (rail folds away, tappable tab strip — phone/SSH);
   `80–119` rail + Main; `>=120` the extra width goes to Main.
+- Colour: spar paints no page background — it composites onto the terminal's own theme
+  (and its transparency). Backgrounds appear only on chips, gate/alert washes and
+  overlays.
 
 - `status --json` and every run JSON carry **`base_ref` / `base_commit`** — the ref and commit
   all of the run's slot worktrees were cut from (see **Base ref** above).

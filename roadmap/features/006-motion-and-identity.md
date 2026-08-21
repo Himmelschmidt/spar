@@ -1,7 +1,7 @@
 ---
 id: 6
 title: Motion and visual identity
-status: backlog
+status: in-progress
 milestone: 6
 effort: M
 priority: medium
@@ -17,7 +17,11 @@ by reserving space from the layout instead of the content, and adds a design-tok
 plus a `TestBackend` snapshot harness so stability is asserted rather than eyeballed.
 Decisions: `DECISIONS.md` U10, U11, U12.
 
-Depends on feature 005: animating a confusing layout gives you a confusing layout at 60fps.
+Phases C and D **landed first**, ahead of features 004 and 005 (decision U14). The
+dependency argument — "animating a confusing layout gives you a confusing layout at
+60fps" — holds for motion (phases A and B), not for chrome and tokens: Home and the
+criteria grid would otherwise have been built into the old bordered shell and then
+rebuilt. Phases A and B still depend on feature 005.
 
 ## Problem
 
@@ -62,12 +66,17 @@ blink (`src/tui.rs:3746`).
 Fixed-slot layout primitives and skeleton placeholders that fix the gate-button
 (`src/tui.rs:2740-2745`), attention-resort, list-growth and tab-breakpoint shift sources.
 
-### Phase C: design tokens and density pass
+### Phase C: design tokens and density pass — DONE
 
-Token system replacing scattered color consts; consistent border and weight language;
-braille/half-block density pass.
+Landed as the chrome rebuild. `src/theme.rs` holds the token set (one accent, one alert,
+three text weights, `INK` for chip text); the TUI paints no page background, so it
+composites onto the host terminal theme. Pane borders are replaced by chrome bands over
+one seam, the active tab is an accent underline on the band rule, the rail carries roles
+instead of provider-suffixed slot ids, the run stepper is new, and the log drops the
+provider's opaque tool-call ids. Recorded as U14.
 
-### Phase D: `TestBackend` snapshot assertion suite
+### Phase D: `TestBackend` snapshot assertion suite — DONE
 
-Snapshot tests covering 20x5 rendering, empty project list, 400 runs, and layout-stability
-assertions per region.
+`mod render_stability` in `src/tui.rs`: renders at 20x5 through 200x60 with and without a
+run, an empty project list, 400 runs, and the layout-stability assertions (tab x positions
+hold across tab and badge changes; gate buttons start at a fixed x across gate sets).
