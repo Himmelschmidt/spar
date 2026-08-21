@@ -221,6 +221,7 @@ mod tests {
             artifact: None,
             usage: None,
             model: None,
+            round: 1,
         }
     }
 

@@ -101,7 +101,10 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
             provider: prov,
             role,
             template: template.into(),
-            extra_vars: HashMap::new(),
+            extra_vars: HashMap::from([(
+                "amendment_section".to_string(),
+                plan_amendment_section(&state),
+            )]),
             expected_artifact: Some("plan.md".into()),
             model,
         });
@@ -547,9 +550,112 @@ fn detach_self(state: &RunState, json: bool) -> Result<ExitCode> {
     Ok(ExitCode::Success)
 }
 
+/// The directive for this plan round, rendered for the planner and critic prompts.
+/// On a replan it also carries why the last plan was rejected — that reason is the
+/// whole point of planning again.
+fn plan_amendment_section(state: &RunState) -> String {
+    let mut out = String::new();
+    if let Some(a) = state.amendment.as_deref() {
+        out.push_str(&format!(
+            "## Directive for this round (round {})\nThe operator asked for this plan to be redone. This directive takes precedence over the original task where they conflict: the task below is context, this is the work.\n\n{a}\n",
+            state.round
+        ));
+    }
+    if let Some(r) = state.gates.reject_reason.as_deref() {
+        out.push_str(&format!("\n## Why the previous plan was rejected\n{r}\n"));
+    }
+    out
+}
+
+/// Replan an existing run: a new round on the same id (O45), not a second run.
+/// The run keeps its brief, base, config and usage ledger — it is the same unit of
+/// work, being planned again.
+pub fn replan(
+    paths: &SparPaths,
+    cfg: &Config,
+    run_id: &str,
+    directive: String,
+    json: bool,
+) -> Result<ExitCode> {
+    // Take the lock BEFORE touching anything. Acquiring it after the save meant a run
+    // someone else was driving got its approval cleared and its phase reset to `init`,
+    // and only then did the command fail — a torn state.json left behind by a command
+    // that reported an error.
+    let lock = crate::runlock::RunLock::acquire(paths, run_id)?;
+    let mut state = RunState::load(paths, run_id)?;
+    if state.workflow == crate::cli::WorkflowKind::Review {
+        anyhow::bail!("run {run_id} is a review run; there is no plan to redo");
+    }
+    if state.slots.iter().all(|s| s.role != SlotRole::Planner) {
+        anyhow::bail!(
+            "run {run_id} has no planner slot to re-run — start a plan with `spar plan -t \"…\"`"
+        );
+    }
+    // A run nobody can plan again: say so before mutating anything.
+    if !matches!(
+        state.phase,
+        Phase::AwaitingPlanApproval
+            | Phase::PlanRejected
+            | Phase::PlanApproved
+            | Phase::PlanReady
+            | Phase::Done
+            | Phase::Stopped
+            | Phase::Failed
+            | Phase::Stuck
+            | Phase::Quota
+    ) {
+        anyhow::bail!(
+            "run {run_id} is mid-flight (phase={:?}); stop it before replanning",
+            state.phase
+        );
+    }
+    let round = state.begin_round();
+    state.amendment = Some(directive);
+    // The gate reopens: whatever was approved or rejected was about the old plan.
+    state.gates.plan_approved = false;
+    // Keep the previous round's plan and contract as a record, and — more importantly
+    // — get them out of the way: `execute_plan` only notices a planner that wrote
+    // nothing by `plan.md` being absent, so leaving them in place lets a no-op round
+    // present the OLD plan (and the old frozen contract) at the approval gate.
+    archive_round_artifacts(paths, &state, round - 1);
+    state.contract_fingerprint = None;
+    state.set_phase(Phase::Init);
+    state.save(paths)?;
+    if !json {
+        eprintln!("replanning run {run_id} (round {round})");
+    }
+    let code = continue_locked(paths, cfg, run_id)?;
+    drop(lock);
+    if json {
+        let state = RunState::load(paths, run_id)?;
+        executor::emit_run_json(&state)?;
+    }
+    Ok(code)
+}
+
+/// Move a finished round's plan and contract aside so the next round cannot be
+/// mistaken for it. Best-effort: a missing artifact is exactly the state we want.
+fn archive_round_artifacts(paths: &SparPaths, state: &RunState, round: u32) {
+    for name in ["plan.md", "test-contract.md"] {
+        let from = paths.artifact(&state.id, name);
+        if !from.is_file() {
+            continue;
+        }
+        let stem = name.trim_end_matches(".md");
+        let to = paths.artifact(&state.id, &format!("{stem}-round{round}.md"));
+        let _ = std::fs::rename(&from, &to);
+    }
+}
+
 pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<ExitCode> {
     let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
+    continue_locked(paths, cfg, run_id)
+}
+
+/// `continue_run`'s body, for callers that already hold the run lock.
+fn continue_locked(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<ExitCode> {
     let mut state = RunState::load(paths, run_id)?;
+    let amendment_section = plan_amendment_section(&state);
     let mut jobs = Vec::new();
     for slot in &state.slots {
         let template = match slot.role {
@@ -564,7 +670,10 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
             provider: slot.provider.clone(),
             role: slot.role,
             template: template.into(),
-            extra_vars: HashMap::new(),
+            extra_vars: HashMap::from([(
+                "amendment_section".to_string(),
+                amendment_section.clone(),
+            )]),
             expected_artifact: Some("plan.md".into()),
             model: None,
         });
@@ -579,7 +688,10 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
                 provider: prov,
                 role,
                 template: template.into(),
-                extra_vars: HashMap::new(),
+                extra_vars: HashMap::from([(
+                    "amendment_section".to_string(),
+                    amendment_section.clone(),
+                )]),
                 expected_artifact: Some("plan.md".into()),
                 model: None,
             });

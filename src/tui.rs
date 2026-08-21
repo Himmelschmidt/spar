@@ -25,6 +25,7 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
     ScrollbarOrientation, ScrollbarState, Widget, Wrap,
 };
+use std::collections::HashMap;
 use std::io::{stdout, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
@@ -866,13 +867,101 @@ fn marks_for(sel: &Selection, prev: Option<&Snapshot>) -> Marks {
     out
 }
 
+/// One row per unit of work (U15). A run with `parent_run` set is a **leg**: it folds
+/// into its root's row. The row keeps the root's brief — that is the human-readable
+/// identity of the work — but takes the id, phase and age of the group's *active*
+/// member, so gate buttons, `:approve` and drill-down all act on the run that actually
+/// holds the state. Attention rolls up loudest-first: folding must never hide a gate.
+///
+/// Returns the folded rows and, for each row, every run id it stands for.
+fn fold_units(
+    runs: Vec<state::RunSummary>,
+) -> (Vec<state::RunSummary>, HashMap<String, Vec<String>>) {
+    let parents: HashMap<String, Option<String>> = runs
+        .iter()
+        .map(|r| (r.id.clone(), r.parent_run.clone()))
+        .collect();
+    // Resolve to a root, tolerating a parent that is archived or gone: an orphan leg
+    // stands on its own rather than vanishing from the list.
+    let root_of = |id: &str| -> String {
+        let mut cur = id.to_string();
+        for _ in 0..16 {
+            match parents.get(&cur).and_then(|p| p.clone()) {
+                Some(p) if parents.contains_key(&p) => cur = p,
+                _ => break,
+            }
+        }
+        cur
+    };
+
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<state::RunSummary>> = HashMap::new();
+    for r in runs {
+        let root = root_of(&r.id);
+        if !groups.contains_key(&root) {
+            order.push(root.clone());
+        }
+        groups.entry(root).or_default().push(r);
+    }
+
+    let mut out = Vec::with_capacity(order.len());
+    let mut members: HashMap<String, Vec<String>> = HashMap::new();
+    for root in order {
+        let mut group = groups.remove(&root).unwrap_or_default();
+        if group.len() == 1 {
+            let r = group.pop().expect("len 1");
+            members.insert(r.id.clone(), vec![r.id.clone()]);
+            out.push(r);
+            continue;
+        }
+        // Loudest attention first, then most recent: the active member is whatever the
+        // operator would want the row to be about.
+        group.sort_by(|a, b| {
+            run_attention(b)
+                .cmp(&run_attention(a))
+                .then(b.updated_at.cmp(&a.updated_at))
+        });
+        let ids: Vec<String> = group.iter().map(|r| r.id.clone()).collect();
+        // Every leg that wants the operator still counts. Two gates folded into one
+        // row must read as two in the roll-up, or folding hides one of them.
+        let wants = group
+            .iter()
+            .filter(|r| run_attention(r).needs_you())
+            .count() as u32;
+        let brief = group
+            .iter()
+            .find(|r| r.id == root)
+            .and_then(|r| r.task.clone());
+        let newest = group.iter().map(|r| r.updated_at).max();
+        let mut row = group.swap_remove(0);
+        if brief.is_some() {
+            row.task = brief;
+        }
+        if let Some(t) = newest {
+            row.updated_at = t;
+        }
+        row.abandoned = group.iter().any(|r| r.abandoned) || row.abandoned;
+        row.legs = ids.len() as u32;
+        row.wants = wants;
+        members.insert(row.id.clone(), ids);
+        out.push(row);
+    }
+    (out, members)
+}
+
 /// All blocking filesystem work lives here, never on the render thread.
 fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapshot {
     let swarm = SparPaths::new(&sel.root);
+    let _ = PROJECT_PREFIX.set(sel.root.to_string_lossy().into_owned());
     let projects = registry::projects();
     let runs = if sel.browse.in_project() {
-        let mut runs = registry::list_visible_project_runs(&sel.root).unwrap_or_default();
-        // Attention-sorted rail: gates and broken runs float to the top (Stage C).
+        let listed = registry::list_visible_project_runs(&sel.root).unwrap_or_default();
+        // One row per unit of work, then attention-sorted: gates and broken runs float
+        // to the top (Stage C, U15). Drilling in stays scoped to the leg the row acts
+        // on — merging the other legs' slots into the view put agents, worktrees and
+        // tmux windows from one run under another run's id, which is how a takeover
+        // types into the wrong pane.
+        let (mut runs, _) = fold_units(listed);
         sort_runs_by_attention(&mut runs);
         runs
     } else {
@@ -2644,6 +2733,34 @@ fn draw_labels(
     }
 }
 
+/// Truncate a span list to `width` columns, marking the cut. A Paragraph wider than
+/// its rect is clipped by ratatui at the cell boundary with no ellipsis, which reads
+/// as a rendering fault: `Needs plan approval` becomes `Needs plan ` and the operator
+/// cannot tell whether the phase is truncated or just oddly named.
+fn fit_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Span<'static>> {
+    let total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    if total <= width as usize {
+        return spans;
+    }
+    let mut out = Vec::with_capacity(spans.len());
+    let mut used = 0usize;
+    for span in spans {
+        let w = span.content.chars().count();
+        if used + w <= width as usize {
+            used += w;
+            out.push(span);
+            continue;
+        }
+        let room = (width as usize).saturating_sub(used);
+        if room > 1 {
+            let style = span.style;
+            out.push(Span::styled(truncate(&span.content, room), style));
+        }
+        break;
+    }
+    out
+}
+
 /// The chrome/content divider. One rule across the frame, tee'd at the rail seam,
 /// carrying the active tab's underline — the tab indicator costs no extra row.
 fn draw_rule(f: &mut Frame, lay: &LayoutRects, app: &App) {
@@ -3034,6 +3151,21 @@ fn draw_context_band(
         Span::styled(" · ", muted()),
         Span::styled(format!("{done}/{} agents", st.slots.len()), dim()),
     ];
+    // A unit of work says how much of it there is: rounds it has been through, and
+    // how many run ids it folds in (U15).
+    if st.round > 1 {
+        meters.push(Span::styled(" · ", muted()));
+        meters.push(Span::styled(format!("round {}", st.round), dim()));
+    }
+    if let Some(legs) = runs
+        .iter()
+        .find(|r| r.id == st.id)
+        .map(|r| r.legs)
+        .filter(|n| *n > 1)
+    {
+        meters.push(Span::styled(" · ", muted()));
+        meters.push(Span::styled(format!("{legs} legs"), dim()));
+    }
     if out > 0 {
         meters.push(Span::styled(" · ", muted()));
         meters.push(Span::styled(format!("out {}", compact_u64(out)), dim()));
@@ -3351,14 +3483,20 @@ fn draw_header(
     }
 
     let zone = gate_zone(area);
-    let right_limit = zone.map(|z| z.x).unwrap_or(area.right());
+    // Without a reserved zone (phone width) the buttons overpaint whatever is beneath
+    // them, so the breadcrumb has to stop before they start — otherwise it is not
+    // clipped, it is buried, and it loses even its ellipsis.
+    let right_limit = zone
+        .map(|z| z.x)
+        .unwrap_or_else(|| area.right().saturating_sub(gate_buttons_width(&buttons)));
     let right_w: u16 = right.iter().map(|s| s.content.chars().count() as u16).sum();
     let right_x = right_limit.saturating_sub(right_w + 1).max(area.x);
 
+    let left_w = right_x.saturating_sub(area.x);
     f.render_widget(
-        Paragraph::new(Line::from(spans)),
+        Paragraph::new(Line::from(fit_spans(spans, left_w))),
         Rect {
-            width: right_x.saturating_sub(area.x),
+            width: left_w,
             ..area
         },
     );
@@ -3390,6 +3528,18 @@ fn button_style(action: GateAction) -> Style {
         GateAction::Reconcile => ACCENT,
     };
     Style::default().fg(INK).bg(bg).bold()
+}
+
+/// Columns a gate-button set occupies, including the gaps and the right margin.
+fn gate_buttons_width(buttons: &[(&str, GateAction)]) -> u16 {
+    if buttons.is_empty() {
+        return 0;
+    }
+    let labels: u16 = buttons
+        .iter()
+        .map(|(l, _)| l.chars().count() as u16 + 2)
+        .sum();
+    labels + buttons.len() as u16 - 1 + 1
 }
 
 /// Paint right-aligned tappable gate buttons filling every row of `area` and
@@ -3481,17 +3631,24 @@ fn draw_rail(
     f.render_stateful_widget(List::new(items), area, state);
 }
 
-/// The lead column: one cell that is either an attention flag, the selection bar, or
-/// nothing. Fixed width, so a row never shifts when its state changes.
-fn rail_lead(sel: bool, focused: bool, flag: Option<Color>) -> Span<'static> {
-    match flag {
-        Some(c) => Span::styled("⚑", Style::default().fg(c).bold()),
-        None if sel => Span::styled(
-            SEL_BAR,
-            Style::default().fg(if focused { ACCENT } else { FG_MUTED }),
-        ),
-        None => Span::raw(" "),
-    }
+/// The lead columns: the selection bar, then the attention flag. Two cells, both fixed,
+/// because they are independent facts — one column for both meant that on a project
+/// where every run wants you (biddesk: 12 of 13) the cursor was invisible.
+fn rail_lead(sel: bool, focused: bool, flag: Option<Color>) -> Vec<Span<'static>> {
+    vec![
+        if sel {
+            Span::styled(
+                SEL_BAR,
+                Style::default().fg(if focused { ACCENT } else { FG_MUTED }),
+            )
+        } else {
+            Span::raw(" ")
+        },
+        match flag {
+            Some(c) => Span::styled("⚑", Style::default().fg(c).bold()),
+            None => Span::raw(" "),
+        },
+    ]
 }
 
 /// A dimmed row for something the `/` filter did not match. Filtered rows stay in
@@ -3515,16 +3672,20 @@ fn rail_empty(text: &'static str) -> Vec<ListItem<'static>> {
 /// the seam but yields it when the row is full; the seam has a column of its own, so
 /// the two never touch.
 fn rail_row(
-    lead: Span<'static>,
+    lead: Vec<Span<'static>>,
     mut body: Vec<Span<'static>>,
     right: Span<'static>,
     w: u16,
 ) -> ListItem<'static> {
     let body_w: usize = body.iter().map(|s| s.content.chars().count()).sum();
+    let lead_w: usize = lead.iter().map(|s| s.content.chars().count()).sum();
     let right_w = right.content.chars().count();
     // lead + space + body + gap + right + one column of air before the seam
-    let gap = (w as usize).saturating_sub(3 + body_w + right_w).max(1);
-    let mut spans = vec![lead, Span::raw(" ")];
+    let gap = (w as usize)
+        .saturating_sub(lead_w + 2 + body_w + right_w)
+        .max(1);
+    let mut spans = lead;
+    spans.push(Span::raw(" "));
     spans.append(&mut body);
     spans.push(Span::raw(" ".repeat(gap)));
     spans.push(right);
@@ -3591,7 +3752,7 @@ fn rail_run_items(
         return rail_empty("(no runs)");
     }
     let filter = app.filter.as_deref().filter(|f| !f.is_empty());
-    let phase_w = w.saturating_sub(17).clamp(6, 16) as usize;
+    let phase_w_base = w.saturating_sub(17).clamp(6, 16) as usize;
     runs.iter()
         .enumerate()
         .map(|(i, r)| {
@@ -3601,18 +3762,25 @@ fn rail_run_items(
                     return rail_filtered_row(&r.id, w);
                 }
             }
-            // Phase reads "review" forever on a run nobody is driving; say so.
-            let (phase_text, phase_c) = if r.abandoned {
-                (
-                    format!("{} ✗", truncate(&phase_label(r.phase), phase_w - 2)),
-                    ALERT,
-                )
+            // A folded unit with more than one leg wanting you says so: the row can
+            // only act on one of them at a time. Its columns come out of the phase,
+            // never out of the row width.
+            let more = if r.wants > 1 {
+                format!(" ⚑{}", r.wants)
             } else {
-                (
-                    truncate(&phase_label(r.phase), phase_w),
-                    phase_color(r.phase),
-                )
+                String::new()
             };
+            let phase_w = phase_w_base.saturating_sub(more.chars().count()).max(4);
+            // Phase reads "review" forever on a run nobody is driving; the red flag in
+            // the lead column already says that, so the phase keeps all its columns.
+            let (phase_text, phase_c) = (
+                truncate(&rail_phase(r.phase), phase_w),
+                if r.abandoned {
+                    ALERT
+                } else {
+                    phase_color(r.phase)
+                },
+            );
             let flag = match run_attention(r) {
                 Attention::Gate => Some(WARN),
                 Attention::Broken => Some(ALERT),
@@ -3624,6 +3792,7 @@ fn rail_run_items(
                     if sel { selected(focused) } else { dim() },
                 ),
                 Span::styled(format!("  {phase_text}"), Style::default().fg(phase_c)),
+                Span::styled(more, Style::default().fg(WARN).bold()),
             ];
             rail_row(
                 rail_lead(sel, focused, flag),
@@ -3967,7 +4136,10 @@ fn draw_stream_stats(
         },
         quiet,
     ]);
-    f.render_widget(Paragraph::new(line), area);
+    f.render_widget(
+        Paragraph::new(Line::from(fit_spans(line.spans, area.width))),
+        area,
+    );
 }
 
 /// Paint a log viewport by writing cells directly (no Paragraph wrap/scroll).
@@ -4260,6 +4432,24 @@ fn layout_log_rows(text: &str, width: usize, colorize: bool, expand: bool) -> Ve
     log_rows_window(text, width, colorize, expand, 0, usize::MAX)
 }
 
+/// The project root, for shortening the absolute paths agents print. Set once per
+/// process from the snapshot's own root — the log viewport has no other way to know it.
+static PROJECT_PREFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Absolute paths under the project (and under its sibling slot worktrees) eat the
+/// width without telling the reader anything: `/home/x/projects/biddesk/.spar/runs/...`
+/// is 40 columns of prefix the operator already knows.
+fn shorten_paths(s: &str) -> String {
+    let Some(root) = PROJECT_PREFIX.get() else {
+        return s.to_string();
+    };
+    if !s.contains(root.as_str()) {
+        return s.to_string();
+    }
+    s.replace(&format!("{root}/"), "")
+        .replace(root.as_str(), ".")
+}
+
 fn compact_log_line(raw: &str) -> String {
     let s = raw.trim_end();
     if s.is_empty() {
@@ -4274,11 +4464,11 @@ fn compact_log_line(raw: &str) -> String {
     if let Some(rest) = s.strip_prefix('→') {
         let rest = rest.trim();
         // "Bash  Fetch PR diff" → keep short tool + summary
-        return format!("▸ {}", collapse_ws(rest));
+        return format!("▸ {}", shorten_paths(&collapse_ws(rest)));
     }
     if let Some(rest) = s.strip_prefix('←') {
         let rest = strip_tool_id(rest.trim());
-        return format!("◂ {}", collapse_ws(&rest));
+        return format!("◂ {}", shorten_paths(&collapse_ws(&rest)));
     }
     if let Some(rest) = s.strip_prefix('·') {
         return format!("  {}", collapse_ws(rest.trim()));
@@ -4671,41 +4861,40 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         height: h,
     };
     f.render_widget(Clear, rect);
-    let body = "\
- spar — rail + one main area\n\
- \n\
-  Shape\n\
-    Rail   projects ▸ runs ▸ agents  (Enter pushes, Esc pops)\n\
-           attention-sorted: gates and broken runs float to the top.\n\
-    Main   one area · tabs: Log · Activity · Diff · Shell\n\
-    Main always shows the rail's selection — nothing else moves.\n\
- \n\
-  Keyboard\n\
-    1 / 2                focus Rail · Main\n\
-    Tab / Shift-Tab      cycle Rail ↔ Main\n\
-    j k  or  ↑ ↓         move in the rail · scroll Main\n\
-    Enter                push a rail level (on an agent: take it over)\n\
-    Esc                  pop a rail level · clear filter (never quits)\n\
-    [ ]                  previous / next Main tab\n\
-    + / _                zoom Main fullscreen / restore\n\
-    p                    jump to Projects\n\
-    a                    jump to the next run that needs you\n\
-    r / s                reject · ship (when gated; approve = tap / :approve)\n\
-    :                    command palette (approve/ship/takeover/…)\n\
-    /                    filter the rail\n\
-    w                    log wrap ↔ truncate long lines\n\
-    g / G                top / bottom of Main\n\
-    ?                    this help · Esc closes help\n\
-    q                    quit\n\
- \n\
-  Shell tab = a real tmux client: every key goes to the agent (incl.\n\
-    Ctrl+C). prefix C-a · Ctrl+a d or F12 hands focus back to spar.\n\
-    Focusing it full-screen is Driving mode (green banner, bands collapsed).\n\
- \n\
-  Mouse / touch: tap a tab, a rail row (double-tap = Enter), a gate\n\
-  button, or the breadcrumb (back to the rail). Scroll to scroll.\n\
- \n\
-  Esc, ?, or tap to close help";
+    let body = r#" spar — rail + one main area
+ 
+  Shape
+    Rail   projects ▸ runs ▸ agents  (Enter pushes, Esc pops)
+           attention-sorted: gates and broken runs float to the top.
+    Main   one area · tabs: Log · Activity · Diff · Shell
+    Main always shows the rail's selection — nothing else moves.
+ 
+  Keyboard
+    1 / 2                focus Rail · Main
+    Tab / Shift-Tab      cycle Rail ↔ Main
+    j k  or  ↑ ↓         move in the rail · scroll Main
+    Enter                push a rail level (on an agent: take it over)
+    Esc                  pop a rail level · clear filter (never quits)
+    [ ]                  previous / next Main tab
+    + / _                zoom Main fullscreen / restore
+    p                    jump to Projects
+    a                    jump to the next run that needs you
+    r / s                reject · ship (when gated; approve = tap / :approve)
+    :                    command palette (approve/ship/takeover/…)
+    /                    filter the rail
+    w                    log wrap ↔ truncate long lines
+    g / G                top / bottom of Main
+    ?                    this help · Esc closes help
+    q                    quit
+ 
+  Shell tab = a real tmux client: every key goes to the agent (incl.
+    Ctrl+C). prefix C-a · Ctrl+a d or F12 hands focus back to spar.
+    Focusing it full-screen is Driving mode (green banner, bands collapsed).
+ 
+  Mouse / touch: tap a tab, a rail row (double-tap = Enter), a gate
+  button, or the breadcrumb (back to the rail). Scroll to scroll.
+ 
+  Esc, ?, or tap to close help"#;
     let p = Paragraph::new(body).style(Style::default().fg(FG)).block(
         Block::default()
             .borders(Borders::ALL)
@@ -5238,6 +5427,37 @@ fn activity_event_line(e: &events::Event) -> String {
 
 // ── human labels ────────────────────────────────────────────────────────────
 
+/// The phase in the width a rail column actually has. `phase_label` writes a sentence
+/// for the header ("Needs plan approval"); at 9 columns that renders "Needs pl…", which
+/// tells the operator nothing. These name the same states in the space available.
+fn rail_phase(phase: Phase) -> String {
+    match phase {
+        Phase::Init | Phase::PrepareIsolation | Phase::SpawnSlots => "starting",
+        Phase::Dispatch | Phase::WaitCompletion => "running",
+        Phase::PlanReady => "plan ready",
+        Phase::Spec => "spec",
+        Phase::AwaitingPlanApproval => "plan gate",
+        Phase::PlanApproved => "approved",
+        Phase::PlanRejected => "rejected",
+        Phase::Review => "review",
+        Phase::Suite => "tests",
+        Phase::Rank => "ranking",
+        Phase::Fix => "fix",
+        Phase::PeerRelay => "peers",
+        Phase::AwaitingWinnerConfirm => "winner gate",
+        Phase::AwaitingReconcile => "reconcile",
+        Phase::AwaitingShipConfirm => "ship gate",
+        Phase::Shipping => "shipping",
+        Phase::Done => "done",
+        Phase::Escalated => "escalated",
+        Phase::Failed => "failed",
+        Phase::Stuck => "stuck",
+        Phase::Quota => "quota",
+        Phase::Stopped => "stopped",
+    }
+    .into()
+}
+
 fn phase_label(phase: Phase) -> String {
     match phase {
         Phase::Init => "Starting".into(),
@@ -5392,8 +5612,19 @@ fn sort_runs_by_attention(runs: &mut [state::RunSummary]) {
 }
 
 /// How many runs currently want the operator (gate or broken) — the fleet roll-up.
+/// How many runs want the operator. A folded row (U15) stands for several runs, so it
+/// contributes each leg that wants you — otherwise a unit with two gates would read as
+/// one and folding would become a way to hide a gate.
 fn runs_needing_attention(runs: &[state::RunSummary]) -> usize {
-    runs.iter().filter(|r| run_attention(r).needs_you()).count()
+    runs.iter()
+        .map(|r| {
+            if r.legs > 1 {
+                r.wants as usize
+            } else {
+                usize::from(run_attention(r).needs_you())
+            }
+        })
+        .sum()
 }
 
 /// Flash a toast when a run first crosses into wanting the operator (Working/Idle →
@@ -5807,6 +6038,43 @@ mod labels {
         assert!(gate_zone(Rect { width: 79, ..area }).is_none());
     }
 
+    /// A Paragraph wider than its rect is clipped with no ellipsis, and gate buttons
+    /// overpaint what is under them: either way the breadcrumb loses its tail without
+    /// saying so. At every width the text must stop before the buttons.
+    #[test]
+    fn the_breadcrumb_is_never_buried_under_the_gate_buttons() {
+        use crate::cli::WorkflowKind;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut st = RunState::new(
+            "3f2a91c0",
+            WorkflowKind::Loop,
+            std::path::PathBuf::from("/x/a-project-with-a-long-name"),
+        );
+        st.phase = Phase::AwaitingPlanApproval;
+        let swarm = SparPaths::new("/x/a-project-with-a-long-name");
+        for w in 30..=140u16 {
+            let mut term = Terminal::new(TestBackend::new(w, 1)).unwrap();
+            let mut app = App::new(None, Config::default(), true);
+            app.human_alerts_n = 7;
+            term.draw(|f| {
+                let area = f.area();
+                draw_header(f, area, &swarm, &[], &[], Some(&st), &mut app);
+            })
+            .unwrap();
+            let Some((first, _)) = app.gate_buttons.first().copied() else {
+                continue;
+            };
+            let buf = term.backend().buffer();
+            assert!(first.x > 0, "w={w}");
+            assert_eq!(
+                buf[(first.x - 1, 0)].symbol(),
+                " ",
+                "text ran under the gate buttons at w={w}"
+            );
+        }
+    }
+
     #[test]
     fn header_carries_breadcrumb_and_gate_buttons() {
         use crate::cli::WorkflowKind;
@@ -6011,6 +6279,10 @@ mod labels {
             task: task.map(str::to_string),
             dry_run: false,
             abandoned: false,
+            parent_run: None,
+            round: 1,
+            legs: 1,
+            wants: 0,
             base_ref: None,
             base_commit: None,
             project_root: None,
@@ -6446,6 +6718,10 @@ mod render_stability {
                 task: Some("a queued run".into()),
                 dry_run: false,
                 abandoned: i % 7 == 0,
+                parent_run: None,
+                round: 1,
+                legs: 1,
+                wants: 0,
                 base_ref: None,
                 base_commit: None,
                 project_root: None,
@@ -6721,6 +6997,59 @@ mod render_stability {
         );
     }
 
+    /// The rail column is 9-12 columns wide; a phase name that does not fit is a
+    /// phase name the operator never reads.
+    #[test]
+    fn every_phase_fits_the_rail_column() {
+        use crate::state::Phase::*;
+        for phase in [
+            Init,
+            PrepareIsolation,
+            SpawnSlots,
+            Dispatch,
+            WaitCompletion,
+            PlanReady,
+            Spec,
+            AwaitingPlanApproval,
+            PlanApproved,
+            PlanRejected,
+            Review,
+            Suite,
+            Rank,
+            Fix,
+            PeerRelay,
+            AwaitingWinnerConfirm,
+            AwaitingReconcile,
+            AwaitingShipConfirm,
+            Shipping,
+            Done,
+            Escalated,
+            Failed,
+            Stuck,
+            Quota,
+            Stopped,
+        ] {
+            let label = rail_phase(phase);
+            assert!(
+                label.chars().count() <= 11,
+                "{phase:?} renders {label:?}, which the rail truncates"
+            );
+            assert!(!label.is_empty(), "{phase:?}");
+        }
+    }
+
+    /// Absolute project paths are 40 columns of prefix the reader already knows.
+    #[test]
+    fn log_lines_shorten_project_paths() {
+        let _ = PROJECT_PREFIX.set("/home/x/projects/acme".into());
+        let line =
+            compact_log_line("→ Read  /home/x/projects/acme/.spar/runs/3f2a/artifacts/plan.md");
+        assert_eq!(line, "▸ Read .spar/runs/3f2a/artifacts/plan.md");
+        // A path outside the project keeps every character.
+        let other = compact_log_line("→ Read  /etc/hosts");
+        assert_eq!(other, "▸ Read /etc/hosts");
+    }
+
     #[test]
     fn tool_ids_are_stripped_from_result_lines() {
         let line = compact_log_line("← ✓  toolu_01HqnTTSQH5m7ZWYJVAtA7Vj  fn git(args: &[&str])");
@@ -6852,5 +7181,132 @@ mod render_stability {
             (0..120).map(|x| buf[(x, 1)].symbol()).collect()
         };
         assert!(band.contains("out 6.0k"), "band was: {band:?}");
+    }
+}
+
+/// One row per unit of work (U15).
+#[cfg(test)]
+mod folding {
+    use super::*;
+    use crate::cli::WorkflowKind;
+
+    fn summary(id: &str, phase: Phase, parent: Option<&str>, mins_ago: i64) -> state::RunSummary {
+        state::RunSummary {
+            id: id.into(),
+            workflow: WorkflowKind::Loop,
+            archived: false,
+            phase,
+            updated_at: Utc::now() - chrono::Duration::minutes(mins_ago),
+            task: Some(format!("brief for {id}")),
+            dry_run: false,
+            abandoned: false,
+            parent_run: parent.map(str::to_string),
+            round: 1,
+            legs: 1,
+            wants: 0,
+            base_ref: None,
+            base_commit: None,
+            project_root: None,
+            project_name: None,
+        }
+    }
+
+    #[test]
+    fn a_leg_folds_into_its_parents_row() {
+        let runs = vec![
+            summary("plan1", Phase::PlanApproved, None, 90),
+            summary("impl1", Phase::AwaitingShipConfirm, Some("plan1"), 5),
+            summary("other", Phase::Review, None, 20),
+        ];
+        let (rows, units) = fold_units(runs);
+        assert_eq!(rows.len(), 2, "two units of work, three runs");
+        let unit = rows.iter().find(|r| r.legs > 1).expect("a folded row");
+        // The row acts on the leg that holds the state, so a gate button hits the run
+        // that actually has the gate.
+        assert_eq!(unit.id, "impl1");
+        assert_eq!(unit.phase, Phase::AwaitingShipConfirm);
+        // But it is titled by the work, not by the leg.
+        assert_eq!(unit.task.as_deref(), Some("brief for plan1"));
+        assert_eq!(unit.legs, 2);
+        let mut members = units.get("impl1").cloned().unwrap_or_default();
+        members.sort();
+        assert_eq!(members, vec!["impl1".to_string(), "plan1".to_string()]);
+    }
+
+    /// Folding must never hide a run that wants the operator — the failure O36 exists
+    /// to prevent, re-appearing one layer up.
+    #[test]
+    fn the_group_takes_its_loudest_attention() {
+        let runs = vec![
+            summary("root", Phase::Done, None, 5),
+            summary("leg", Phase::AwaitingPlanApproval, Some("root"), 90),
+        ];
+        let (rows, _) = fold_units(runs);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(run_attention(&rows[0]), Attention::Gate);
+        assert_eq!(rows[0].id, "leg", "the gate is what the row acts on");
+        assert_eq!(runs_needing_attention(&rows), 1);
+    }
+
+    /// Folding must never turn two gates into one. The roll-up counts legs, not rows.
+    #[test]
+    fn two_gates_in_one_unit_still_count_twice() {
+        let runs = vec![
+            summary("root", Phase::AwaitingShipConfirm, None, 30),
+            summary("leg", Phase::AwaitingPlanApproval, Some("root"), 10),
+            summary("elsewhere", Phase::Done, None, 5),
+        ];
+        let (rows, _) = fold_units(runs);
+        assert_eq!(rows.len(), 2, "one unit plus one unrelated run");
+        let unit = rows.iter().find(|r| r.legs > 1).unwrap();
+        assert_eq!(unit.wants, 2);
+        assert_eq!(
+            runs_needing_attention(&rows),
+            2,
+            "both gates are still counted"
+        );
+    }
+
+    #[test]
+    fn an_orphan_leg_stands_on_its_own() {
+        // The parent is archived or purged, so it is not in the listing.
+        let runs = vec![summary("leg", Phase::Review, Some("gone"), 5)];
+        let (rows, _) = fold_units(runs);
+        assert_eq!(rows.len(), 1, "the leg must not vanish with its parent");
+        assert_eq!(rows[0].id, "leg");
+        assert_eq!(rows[0].legs, 1);
+    }
+
+    #[test]
+    fn chains_flatten_and_cycles_terminate() {
+        let runs = vec![
+            summary("a", Phase::Done, None, 30),
+            summary("b", Phase::Done, Some("a"), 20),
+            summary("c", Phase::Review, Some("b"), 10),
+        ];
+        let (rows, units) = fold_units(runs);
+        assert_eq!(rows.len(), 1, "a → b → c is one unit of work");
+        assert_eq!(units.get(&rows[0].id).map(|m| m.len()), Some(3));
+
+        // A cycle on disk (hand-edited) must not hang the render thread.
+        let cyclic = vec![
+            summary("x", Phase::Review, Some("y"), 10),
+            summary("y", Phase::Review, Some("x"), 10),
+        ];
+        let (rows, _) = fold_units(cyclic);
+        assert!(!rows.is_empty());
+    }
+
+    #[test]
+    fn the_age_shown_is_the_freshest_leg() {
+        let runs = vec![
+            summary("root", Phase::PlanApproved, None, 600),
+            summary("leg", Phase::Review, Some("root"), 3),
+        ];
+        let (rows, _) = fold_units(runs);
+        assert!(
+            (Utc::now() - rows[0].updated_at).num_minutes() < 10,
+            "a unit is as old as its newest activity"
+        );
     }
 }

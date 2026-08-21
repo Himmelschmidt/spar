@@ -5,6 +5,8 @@ Review the draft plan and tighten it.
 ## Task
 {{task}}
 
+{{amendment_section}}
+
 ## Paths
 - Plan draft: {{artifacts_dir}}/plan.md
 - Write critique to: {{artifacts_dir}}/plan-critique-{{slot_id}}.md

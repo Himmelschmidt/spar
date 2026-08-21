@@ -69,7 +69,10 @@ either way.
 
 ## Invariants — do not break these
 
-- **One run id** threads plan → implement → ship.
+- **One run id** threads plan → implement → ship. A run is a *unit of work*, not an
+  invocation: continuing it is a new **round** on the same id (`state.round`), and
+  `implement` refuses to mint a second id for a plan it can trace to a run (O45). Legs
+  that already exist are linked by hand (`spar link`), never inferred (O46).
 - **Coding slots always get a worktree.** No exceptions.
 - **Worktrees are cut from `state.base_commit` whenever it is recorded**, never from
   `project_root`'s HEAD. `project_root` is the repo's *main checkout* even when spar is
