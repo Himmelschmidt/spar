@@ -170,10 +170,15 @@ spar plan -t "…" --select auto --urgency high --dry-run
 spar approve <run_id> [--json]
 spar reject <run_id> [--reason "..."] [--json]
 
-# Implement continues THE SAME run id (plan → implement → ship)
+# Implement continues THE SAME run id (plan → implement → ship). Each continuation is
+# a new ROUND on that run, never a second run.
 spar implement --run <run_id> --providers cli:claude,cli:grok,cli:agy [--dry-run] [--json] [--detach]
-spar implement -t "small task" --providers cli:claude [--dry-run]
+spar implement -t "small task" --providers cli:claude [--dry-run]     # a fresh brief
 spar implement -t "small task" --select value --urgency high --dry-run
+
+# Replan in place: a second plan round on the same run. `-t` is the directive for the
+# round (it reaches the planner and critic), NOT a new task — the brief is identity.
+spar plan --run <run_id> -t "narrow it to the email path" [--json]
 
 # Named workflows
 spar run --workflow loop|arena|roles|peer|review -t "..." --providers cli:claude,cli:grok [--dry-run] [--big]
@@ -197,7 +202,46 @@ spar cleanup --all [--older-than 7d]     # sweep finished runs project-wide
 spar reclaim <run_id> | --all [--json]   # delete build output, KEEP the worktree
 spar archive <run_id> [--undo] [--json]  # hide a finished run from listings
 spar archive --all [--older-than 14d]    # hide every quiet finished run
+spar archive --all --halted              # also stopped/failed/stuck/quota (never gates,
+                                         # never plan_approved: that is work waiting on you)
+spar link <run_id> --to <run_id>         # fold a stray leg into its unit of work
+spar link <run_id> --undo                # and back out again
 ```
+
+### A run is a unit of work, not an invocation
+
+One run id covers an issue (or a bundle of them) from brief to draft PR. Everything
+spawned for it — planner, critic, test author, implementer, tester, reviewers, a replan,
+N fix rounds — is a **round inside that run**, and listing surfaces show it once.
+
+So `implement` will not silently mint a second id for work that is already a run:
+
+- `--plan <path>` at `.spar/runs/<id>/artifacts/*.md` **continues that run** (it says so
+  on stderr). This is the common case: implementing a plan spar wrote. Any other path
+  under a run dir — a log, a marker — is not a plan and is not traced.
+- `--plan <path>` spar cannot trace to a run is **refused**, naming the runs you probably
+  meant (`spar implement --run <id>`). Pass `--new` if it really is separate work.
+- `-t "..."` with no run and no plan is a fresh brief and creates a run, as before.
+- `--new` always forks, including from a plan spar could have traced.
+
+`spar plan --run <id>` **refuses** `--providers` / `--select` / `--role` / `--base` /
+`--big` / `--detach` / `--dry-run`: a replan inherits the run's fleet, base and frozen
+config, so a flag that could only apply to a new run is an error rather than a silent
+no-op. It also refuses a run that is mid-flight, and it moves the previous round's
+`plan.md` and `test-contract.md` to `plan-round<N>.md` / `test-contract-round<N>.md` so a
+round that writes nothing cannot present the old plan (or the old frozen contract) at the
+approval gate.
+
+`state.json`, `status --json` and the JSON that `plan` / `implement` emit all carry
+`round` (which round the run is on), and each slot carries the round it last ran in. A
+round is counted when work is actually dispatched, so an invocation that bounces off the
+quota gate does not claim one; a fix pass is a round. A run continued after finishing reopens: `archived_at` clears
+and the phase moves back into the pipeline.
+
+For legs that already exist, `spar link <leg> --to <run>` records the grouping
+(`parent_run`). spar never infers it — pairing runs by task text would merge unrelated
+issues. The TUI then shows one row per unit of work; `status --json` still lists every
+run and carries `parent_run`, so nothing is hidden from an outer agent.
 
 **`spar stop`** halts a run without discarding work: it writes a `stopped` marker,
 signals the orchestrator then the slot process groups (SIGTERM → grace → SIGKILL),
@@ -436,6 +480,15 @@ rail's selection.
   or abandoned) · `⚑` on the step a gate is holding (plan gate on critique, winner gate
   on rank, reconcile gate on reconcile, ship gate on ship). Meters on the right read the
   run's usage ledger, the same numbers `status --json` reports. Folds away under 14 rows.
+- The run list shows **units of work**: a run linked as a leg folds into its parent's
+  row, which carries the parent's brief, the active leg's id and phase, and the group's
+  loudest attention — including how many of its legs want you, so folding can never hide
+  a gate. The band names the round and the leg count. Drilling in stays scoped to the leg
+  the row acts on: its agents, its worktrees, its tmux panes.
+- Rail rows lead with two fixed columns: the selection bar, then the attention flag.
+  They are separate facts — on a project where every run wants you, one shared column
+  meant the cursor was invisible. The phase is named for the width the column has
+  (`ship gate`, `plan gate`, `running`), not truncated from a sentence.
 - Rail: `projects ▸ runs ▸ agents` drill-down. `Enter` pushes a level, `Esc` pops one
   (never quits). `Enter` on an agent **takes it over** in the Shell tab. `/` filters the
   rail (Esc clears). The rail is **attention-sorted**: runs at a gate or broken fly a

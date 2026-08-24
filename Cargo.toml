@@ -47,6 +47,10 @@ name = "plan_implement"
 path = "tests/scenarios/plan_implement.rs"
 
 [[test]]
+name = "one_run"
+path = "tests/scenarios/one_run.rs"
+
+[[test]]
 name = "roles_config"
 path = "tests/scenarios/roles_config.rs"
 

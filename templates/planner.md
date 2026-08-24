@@ -5,6 +5,8 @@ You are a planning agent in an spar run.
 ## Task
 {{task}}
 
+{{amendment_section}}
+
 ## Paths
 - Project root: {{project_root}}
 - Working directory: {{cwd}}
