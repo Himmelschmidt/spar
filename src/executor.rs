@@ -439,7 +439,11 @@ fn execute_prepared(
             provider: &prep.job.provider,
             role: prep.job.role,
             log_path: &prep.log_path,
-            artifacts: owed_artifacts(prep.job.role, &prep.job.slot_id, prep.job.expected_artifact.as_deref()),
+            artifacts: owed_artifacts(
+                prep.job.role,
+                &prep.job.slot_id,
+                prep.job.expected_artifact.as_deref(),
+            ),
             soft,
             ceiling: timeout,
             label: timeout_label(prep.job.role),

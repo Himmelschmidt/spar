@@ -44,6 +44,7 @@ Rules:
 - Every `AC-n` in the acceptance contract above must appear in `## Acceptance` **exactly once**. A criterion you omit blocks the ship exactly like a `fail`.
 - `unverified` means you could not check it — not that it looks fine. By default it blocks.
 - Evidence is mandatory for `pass`.
+- Keep long command output out of your context: redirect any build or test run to `{{artifacts_dir}}/check-{{slot_id}}.log` (slot-scoped: other slots share this dir) and read back the tail, or grep it for the failure. Read enough of it to cite real lines — thin reading is not grounds for `unverified`.
 - Write `## Verdict` once, and put `approve` or `request_changes` on the line under it. Do not restate this format block in your output.
 
 Be strict. Prefer false positives over silent bugs. No praise padding.
