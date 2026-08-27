@@ -439,7 +439,7 @@ fn execute_prepared(
             provider: &prep.job.provider,
             role: prep.job.role,
             log_path: &prep.log_path,
-            artifacts: prep.job.expected_artifact.as_deref().into_iter().collect(),
+            artifacts: owed_artifacts(prep.job.role, &prep.job.slot_id, prep.job.expected_artifact.as_deref()),
             soft,
             ceiling: timeout,
             label: timeout_label(prep.job.role),
@@ -1270,6 +1270,16 @@ impl SlotOutcome {
 }
 
 /// Config-key label for the timeout that governs a role, so a killed slot names its budget.
+/// Everything the slot owes this dispatch. The implementer also owes its carry-forward
+/// brief, and a nudge that names only the summary is how the round loop loses it.
+fn owed_artifacts(role: SlotRole, slot_id: &str, expected: Option<&str>) -> Vec<String> {
+    let mut v: Vec<String> = expected.map(str::to_string).into_iter().collect();
+    if role == SlotRole::Implementer {
+        v.push(crate::workflow::implement::carry_forward_name(slot_id));
+    }
+    v
+}
+
 fn timeout_label(role: SlotRole) -> &'static str {
     match role {
         SlotRole::Tester => "suite.timeout_secs",
@@ -1408,6 +1418,20 @@ fn write_dry_artifacts(
             }
         }
         SlotRole::Implementer => {
+            // Test hook: an implementer that edits the contract it is judged against.
+            // The slot really can do this — `artifacts_dir` is in its prompt — and it is
+            // what the O43 freeze and the O52 re-freeze guard exist to bound.
+            if crate::util::env_truthy("SPAR_FORCE_CONTRACT_TAMPER") {
+                let contract = paths.artifact(&state.id, "test-contract.md");
+                if let Ok(body) = std::fs::read_to_string(&contract) {
+                    let kept: String = body
+                        .lines()
+                        .filter(|l| !l.contains("AC-2:"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    std::fs::write(&contract, format!("{kept}\n"))?;
+                }
+            }
             let stamp = cwd.join(".spar-dry-implement");
             std::fs::write(
                 &stamp,
@@ -1701,7 +1725,7 @@ fn run_headless(
             provider: &job.provider,
             role: job.role,
             log_path,
-            artifacts: job.expected_artifact.as_deref().into_iter().collect(),
+            artifacts: owed_artifacts(job.role, &job.slot_id, job.expected_artifact.as_deref()),
             soft,
             ceiling: timeout,
             label: timeout_label(job.role),
@@ -2007,6 +2031,7 @@ pub fn emit_run_json(state: &RunState) -> Result<()> {
         "phase": state.phase,
         "task": state.task,
         "round": state.round,
+        "max_rounds": state.max_rounds,
         "amendment": state.amendment,
         "dry_run": state.dry_run,
         "slots": state.slots,

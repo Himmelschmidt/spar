@@ -91,6 +91,17 @@ timeout_secs = 7200
 # reviewer never mentioned always blocks, regardless of this setting.
 require_all_criteria = true
 
+# Round-loop economy. A round is a COLD re-dispatch: truncated log, empty context, the
+# slot re-derives the repo before doing new work. Measured over 197 runs, one fix round is
+# a 6.6x median run cost. `max` is the highest round a run may reach before it parks at the
+# awaiting_round_extension human gate (exit 2) instead of buying another; raise a specific
+# run's with `spar implement --run <id> --max-rounds <N>` (>= 1). Only 0 HERE disables the
+# ceiling -- the flag refuses it, so turning the bound off is a project decision.
+# `carry_forward_chars` caps the brief the previous round hands the next one.
+[rounds]
+max = 8
+carry_forward_chars = 4000
+
 # Pre-coding acceptance tests (plan flow). Separate agent freezes tests before implement.
 [spec]
 enabled = true

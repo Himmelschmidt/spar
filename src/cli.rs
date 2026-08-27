@@ -116,6 +116,21 @@ pub enum Command {
         /// the project file says now.
         #[arg(long)]
         reload_config: bool,
+        /// Raise this run's round ceiling to N and keep going. A run that reaches
+        /// `[rounds] max` parks at the `awaiting_round_extension` gate (exit 2) rather
+        /// than buying another cold re-dispatch; this is the operator saying the next
+        /// one is worth paying for. Sticky: it persists on the run. Must be >= 1 —
+        /// turning the ceiling off entirely is `[rounds] max = 0` in `spar.toml`, a
+        /// deliberate project setting rather than a flag typed under pressure at a gate.
+        #[arg(long, value_parser = parse_max_rounds)]
+        max_rounds: Option<u32>,
+        /// Adopt a `test-contract.md` that changed while the previous round was running.
+        /// Re-entering `implement` re-freezes the contract from disk (O43); spar refuses
+        /// to do that silently when it *detected* the file moving under the slot the
+        /// contract bounds, because the implementer can write to it. Read the diff
+        /// first: this is how a criterion gets deleted on the way to the ship gate.
+        #[arg(long)]
+        accept_contract: bool,
         /// Ref to cut every slot worktree from (branch, tag or sha), for a NEW run.
         /// Default: the HEAD of the directory spar was invoked from. A run's base is
         /// fixed at creation, so `--run <id>` only accepts a base it already has.
@@ -598,4 +613,22 @@ pub enum WorkflowKind {
     Peer,
     /// Concurrent independent multi-provider review (not split-stack peer)
     Review,
+}
+
+/// `--max-rounds` must buy at least one round. `0` means "no ceiling" in `spar.toml`,
+/// and silently accepting it here would let a run parked at a gate be uncapped by a
+/// flag typed under pressure — which is how a run reaches round 36.
+fn parse_max_rounds(s: &str) -> Result<u32, String> {
+    let n: u32 = s
+        .parse()
+        .map_err(|_| format!("{s:?} is not a whole number of rounds"))?;
+    if n == 0 {
+        return Err(
+            "0 would remove the ceiling entirely, not raise it. Pass a number >= 1, or \
+             set `[rounds] max = 0` in spar.toml if you really want this project \
+             unbounded."
+                .into(),
+        );
+    }
+    Ok(n)
 }

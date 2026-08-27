@@ -418,6 +418,10 @@ enum GateAction {
     Ship,
     ConfirmWinner,
     Reconcile,
+    /// Lift the round ceiling and re-dispatch (O52). The only gate whose resolution is
+    /// a *number*, which a button cannot ask for — it buys a fixed four more rounds,
+    /// and the CLI's `--max-rounds N` stays the way to name an exact one.
+    MoreRounds,
 }
 
 /// Avoid re-reading the slot log on every frame when the file is unchanged.
@@ -1790,14 +1794,12 @@ fn run_palette(
             if st.providers.is_empty() {
                 anyhow::bail!("run has no recorded providers — use the CLI");
             }
-            let args = [
-                "implement".to_string(),
-                "--run".to_string(),
-                st.id.clone(),
-                "--providers".to_string(),
-                st.providers.join(","),
-            ];
-            spawn_detached_workflow(swarm, &args, &format!("Implement started {}", st.id))
+            let msg = if st.phase == Phase::AwaitingRoundExtension {
+                format!("Bought {ROUND_GRANT} rounds for {}", st.id)
+            } else {
+                format!("Implement started {}", st.id)
+            };
+            spawn_detached_workflow(swarm, &implement_argv(st), &msg)
         }
         "plan" => {
             if arg.is_empty() {
@@ -1863,6 +1865,56 @@ fn takeover_run(app: &mut App, id: &str) -> Result<PaletteResult> {
 
 /// Spawn a detached `spar <args>` for a lifecycle command the palette dispatches
 /// (plan / implement). Mirrors [`spawn_reconcile`]: null stdio, `SPAR_INTERNAL`.
+/// `spar implement --run <id>` argv reusing the run's recorded fleet.
+///
+/// Carries `--max-rounds` when the run is parked at the round ceiling: without it the
+/// detached process gates again the instant it starts and the TUI reports "Implement
+/// started" over a run that never moved.
+fn implement_argv(st: &RunState) -> Vec<String> {
+    let mut args = vec![
+        "implement".to_string(),
+        "--run".to_string(),
+        st.id.clone(),
+        "--providers".to_string(),
+        st.providers.join(","),
+    ];
+    if st.phase == Phase::AwaitingRoundExtension {
+        args.push("--max-rounds".to_string());
+        args.push((st.max_rounds + ROUND_GRANT).to_string());
+    }
+    args
+}
+
+/// How many rounds the TUI's one-tap lift buys. A button cannot ask for a number, and
+/// the point of the gate is that each round is expensive — so it grants a few, not a
+/// blank cheque. `--max-rounds N` on the CLI is how you name an exact ceiling.
+const ROUND_GRANT: u32 = 4;
+
+/// Lift the round ceiling as a detached `spar implement`, so the re-dispatched fleet
+/// survives the TUI and never runs on the render thread.
+fn spawn_more_rounds(app: &mut App, swarm: &SparPaths, id: &str) {
+    let st = match RunState::load(swarm, id) {
+        Ok(st) => st,
+        Err(e) => {
+            app.flash(format!("Buy rounds failed: {e:#}"), ALERT);
+            return;
+        }
+    };
+    if st.providers.is_empty() {
+        app.flash("run has no recorded providers — use the CLI", ALERT);
+        return;
+    }
+    match spawn_detached_workflow(
+        swarm,
+        &implement_argv(&st),
+        &format!("Bought {ROUND_GRANT} rounds for {id}"),
+    ) {
+        Ok(PaletteResult::Flash(msg, color)) => app.flash(msg, color),
+        Ok(_) => {}
+        Err(e) => app.flash(format!("Buy rounds failed: {e:#}"), ALERT),
+    }
+}
+
 fn spawn_detached_workflow(
     swarm: &SparPaths,
     args: &[String],
@@ -2130,6 +2182,7 @@ fn run_gate_action(app: &mut App, swarm: &SparPaths, id: &str, action: GateActio
             .map(|_| (format!("Confirmed winner for {id}"), OK)),
         // Reconcile runs agents (minutes) — never on the render thread.
         GateAction::Reconcile => return spawn_reconcile(app, swarm, id),
+        GateAction::MoreRounds => return spawn_more_rounds(app, swarm, id),
     };
     match res {
         Ok((msg, color)) => app.flash(msg, color),
@@ -2188,6 +2241,7 @@ fn gate_buttons_for(full: Option<&RunState>) -> Vec<(&'static str, GateAction)> 
             ("Reconcile", GateAction::Reconcile),
         ],
         Some(Phase::AwaitingReconcile) => vec![("Reconcile", GateAction::Reconcile)],
+        Some(Phase::AwaitingRoundExtension) => vec![("+4 rounds", GateAction::MoreRounds)],
         _ => Vec::new(),
     }
 }
@@ -2200,6 +2254,7 @@ impl GateAction {
             GateAction::Ship => "Ship",
             GateAction::ConfirmWinner => "Confirm winner",
             GateAction::Reconcile => "Reconcile",
+            GateAction::MoreRounds => "Buy rounds",
         }
     }
 }
@@ -2892,6 +2947,8 @@ fn gate_step(st: &RunState, steps: &[(&'static str, StepState)]) -> Option<usize
         Phase::AwaitingWinnerConfirm => find("rank"),
         Phase::AwaitingReconcile => find("reconcile"),
         Phase::AwaitingShipConfirm => find("ship"),
+        // The ceiling stops the *build* from being re-dispatched, so it hangs off build.
+        Phase::AwaitingRoundExtension => find("build"),
         _ => None,
     }
 }
@@ -3338,6 +3395,11 @@ fn status_cue(
             ("ready to ship — s (draft PR)".into(), WARN, Some(GATE_WASH))
         }
         Phase::AwaitingReconcile => ("reconcile ready".into(), WARN, Some(GATE_WASH)),
+        Phase::AwaitingRoundExtension => (
+            "round ceiling — implement --max-rounds to buy more".into(),
+            WARN,
+            Some(GATE_WASH),
+        ),
         Phase::Quota => (
             "all providers paused — spar provider resume".into(),
             INK,
@@ -3529,7 +3591,7 @@ fn button_style(action: GateAction) -> Style {
     let bg = match action {
         GateAction::Approve | GateAction::Ship | GateAction::ConfirmWinner => OK,
         GateAction::Reject => ALERT,
-        GateAction::Reconcile => ACCENT,
+        GateAction::Reconcile | GateAction::MoreRounds => ACCENT,
     };
     Style::default().fg(INK).bg(bg).bold()
 }
@@ -4827,6 +4889,9 @@ fn situational_footer(
         if st.phase == Phase::AwaitingPlanApproval {
             return "tap Approve · r reject · :approve · a next alert";
         }
+        if st.phase == Phase::AwaitingRoundExtension {
+            return "round ceiling — tap +4 rounds · :implement · CLI --max-rounds N";
+        }
         if st.phase == Phase::AwaitingShipConfirm {
             return "s confirm ship (draft PR) · or tap Ship above";
         }
@@ -5452,6 +5517,7 @@ fn rail_phase(phase: Phase) -> String {
         Phase::AwaitingWinnerConfirm => "winner gate",
         Phase::AwaitingReconcile => "reconcile",
         Phase::AwaitingShipConfirm => "ship gate",
+        Phase::AwaitingRoundExtension => "round gate",
         Phase::Shipping => "shipping",
         Phase::Done => "done",
         Phase::Escalated => "escalated",
@@ -5483,6 +5549,7 @@ fn phase_label(phase: Phase) -> String {
         Phase::AwaitingWinnerConfirm => "Needs winner pick".into(),
         Phase::AwaitingReconcile => "Needs reconcile".into(),
         Phase::AwaitingShipConfirm => "Ready to ship".into(),
+        Phase::AwaitingRoundExtension => "Needs more rounds".into(),
         Phase::Shipping => "Shipping".into(),
         Phase::Done => "Done".into(),
         Phase::Escalated => "Escalated".into(),
@@ -5558,7 +5625,8 @@ fn phase_color(phase: Phase) -> Color {
         Phase::AwaitingPlanApproval
         | Phase::AwaitingWinnerConfirm
         | Phase::AwaitingShipConfirm
-        | Phase::AwaitingReconcile => WARN,
+        | Phase::AwaitingReconcile
+        | Phase::AwaitingRoundExtension => WARN,
         _ => ACCENT,
     }
 }
@@ -5954,6 +6022,29 @@ mod labels {
         assert_eq!(app.focus, Focus::Rail, "headless run: nothing to take over");
     }
 
+    /// The palette's `:implement` and the gate button share one argv builder: without
+    /// `--max-rounds` the detached process gates again immediately and the TUI reports
+    /// "Implement started" over a run that never moved.
+    #[test]
+    fn implement_argv_buys_rounds_only_at_the_round_gate() {
+        use crate::cli::WorkflowKind;
+        let mut st = RunState::new("r1", WorkflowKind::Loop, std::path::PathBuf::from("/x"));
+        st.providers = vec!["cli:claude".into()];
+        st.max_rounds = 8;
+
+        st.phase = Phase::PlanApproved;
+        let args = implement_argv(&st);
+        assert!(!args.iter().any(|a| a == "--max-rounds"), "{args:?}");
+
+        st.phase = Phase::AwaitingRoundExtension;
+        let args = implement_argv(&st);
+        let i = args
+            .iter()
+            .position(|a| a == "--max-rounds")
+            .expect("the round gate must be lifted, not re-hit");
+        assert_eq!(args[i + 1], (8 + ROUND_GRANT).to_string());
+    }
+
     #[test]
     fn gate_phases_map_to_buttons() {
         use crate::cli::WorkflowKind;
@@ -5977,6 +6068,12 @@ mod labels {
         let b = gate_buttons_for(Some(&st));
         assert_eq!(b.len(), 1);
         assert_eq!(b[0].1, GateAction::Reconcile);
+        // Every gate needs a way out of it from the TUI, or the phase is a dead end
+        // with a footer hint and nothing to press.
+        st.phase = Phase::AwaitingRoundExtension;
+        let b = gate_buttons_for(Some(&st));
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].1, GateAction::MoreRounds);
     }
 
     #[test]
@@ -7026,6 +7123,7 @@ mod render_stability {
             AwaitingWinnerConfirm,
             AwaitingReconcile,
             AwaitingShipConfirm,
+            AwaitingRoundExtension,
             Shipping,
             Done,
             Escalated,

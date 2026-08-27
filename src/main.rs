@@ -143,6 +143,8 @@ fn run() -> Result<ExitCode> {
                 backend,
                 dry_run,
                 big,
+                max_rounds: None,
+                accept_contract: false,
             };
             workflow::plan::run(task, opts, &paths, &cfg)
         }
@@ -165,6 +167,8 @@ fn run() -> Result<ExitCode> {
             task,
             role,
             reload_config,
+            max_rounds,
+            accept_contract,
             base,
             detach,
             json,
@@ -187,6 +191,8 @@ fn run() -> Result<ExitCode> {
                 backend,
                 dry_run,
                 big,
+                max_rounds,
+                accept_contract,
             };
             workflow::implement::run_from_cli(run_id, plan, task, new, opts, &paths, &cfg)
         }
@@ -217,6 +223,8 @@ fn run() -> Result<ExitCode> {
                 backend,
                 dry_run,
                 big,
+                max_rounds: None,
+                accept_contract: false,
             };
             workflow::run_named(workflow, opts, &paths, &cfg)
         }

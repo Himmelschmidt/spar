@@ -105,9 +105,23 @@ spar implement --run "$RUN_ID" --providers cli:claude,cli:grok,cli:agy --detach 
 
 spar wait "$RUN_ID" --json
 # exit 2 + awaiting_ship_confirm when ready
+# exit 2 + awaiting_round_extension if the run hit its round ceiling first:
+#   spar implement --run "$RUN_ID" --max-rounds 12 --detach --json
 
 spar ship "$RUN_ID" --confirm --json
 ```
+
+**Rounds are bounded (O52).** A round is a cold re-dispatch, and measured over 197 runs
+one fix round is a 6.6x median run cost. `[rounds] max` (default 8) caps `state.round`;
+reaching it parks the run at the `awaiting_round_extension` human gate (**exit 2**) with
+`round` / `max_rounds` in `status --json` and the reason in `error`. Raise it with
+`--max-rounds <N>` (>= 1, sticky on the run, clears `error`) or stop the run — do not
+loop on re-entering `implement`, which gates again without dispatching. Exit `3`
+(`stuck`) still outranks this gate, and a lift preserves the escalation ladder's
+progress, so a lift loop terminates. A re-entry that would adopt a `test-contract.md`
+that drifted mid-round exits `1` until you pass `--accept-contract`. Between rounds the implementer's
+`artifacts/carry-forward-<slot>.md` is seeded into the next round's prompt, capped by
+`[rounds] carry_forward_chars`.
 
 `--providers` is **required** for plan / implement / run (no implicit fleet).
 

@@ -69,7 +69,7 @@ pub struct NudgeWatch<'a> {
     /// them. A list rather than one name because a role can owe more than one artifact
     /// (a summary plus a carry-forward brief), and a nudge that names only the first
     /// tells the slot to stop after writing it.
-    artifacts: Vec<&'a str>,
+    artifacts: Vec<String>,
     strategy: providers::DeliveryStrategy,
     dry_run: bool,
     /// Set only for `cli:muse`, whose stdout carries no token counts at all.
@@ -95,7 +95,7 @@ pub struct WatchSpec<'a> {
     pub provider: &'a str,
     pub role: SlotRole,
     pub log_path: &'a Path,
-    pub artifacts: Vec<&'a str>,
+    pub artifacts: Vec<String>,
     pub soft: Duration,
     pub ceiling: Duration,
     pub label: &'static str,
@@ -296,7 +296,7 @@ mod tests {
             provider,
             role,
             log_path: log,
-            artifacts: vec!["summary-impl.md"],
+            artifacts: vec!["summary-impl.md".into()],
             soft: Duration::from_secs(60),
             ceiling: Duration::from_secs(180),
             label: "timeouts.slot_secs",
@@ -553,7 +553,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.budget.implementer = 10;
         let mut s = spec(&paths, &log, SlotRole::Implementer, "cli:opencode");
-        s.artifacts = vec!["summary-impl.md", "carry-forward-impl.md"];
+        s.artifacts = vec!["summary-impl.md".into(), "carry-forward-impl.md".into()];
         let w = NudgeWatch::new(s, &cfg);
         StreamStats {
             billed_tokens: 50,
