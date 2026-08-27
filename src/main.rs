@@ -11,6 +11,7 @@ mod mailbox;
 mod markers;
 mod model_select;
 mod notify;
+mod nudge;
 mod paths;
 mod process;
 mod provider_ref;
@@ -290,6 +291,13 @@ fn run() -> Result<ExitCode> {
             abandoned,
             json,
         } => stop_cmd(run_id.as_deref(), abandoned, json),
+        Command::ReconcileState {
+            run_id,
+            all,
+            apply,
+            dry_run: _,
+            json,
+        } => reconcile_state_cmd(run_id.as_deref(), all, apply, json),
         Command::Cleanup {
             run_id,
             all,
@@ -624,9 +632,9 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> 
                 let hb = hb_map
                     .get(&bus::resolve_addr(Some(&state.id), &slot.id))
                     .copied();
-                let hard = executor::timeout_for_role(&cfg, slot.role).as_secs();
+                let soft = executor::timeout_for_role(&cfg, slot.role).as_secs();
                 let act =
-                    liveness::SlotActivity::observe(slot, cfg.timeouts.stall_warn_secs, hard, hb);
+                    liveness::SlotActivity::observe(slot, cfg.timeouts.stall_warn_secs, soft, hb);
                 let silent = act.human_silent();
                 let stall = if act.stalled { " STALL" } else { "" };
                 let token = markers::read_pid(&swarm, &state.id, &slot.id)
@@ -831,8 +839,16 @@ fn stop_abandoned(json: bool) -> Result<ExitCode> {
 }
 
 fn stop_one_quiet(paths: &paths::SparPaths, run_id: &str) -> Result<()> {
+    let reason = halt_reason(paths, run_id);
     reap_run(paths, run_id)?;
     let mut state = state::RunState::load(paths, run_id)?;
+    // After the reap, before the phase: the orchestrator was killed inside its dispatch,
+    // so its slots are frozen at `running` and only this settles them (O49). `Nobody` is
+    // what the reap just established, not something to re-observe: a just-SIGKILLed
+    // orchestrator whose parent has not reaped it is a zombie, and a zombie answers
+    // `kill(pid, 0)` and keeps its `/proc` start-time, so observing here reads the
+    // process spar itself just killed as a live owner and skips the demotion.
+    state.reconcile_and_save(paths, state::RunOwner::Nobody, reason)?;
     if !phase_at_rest(state.phase) {
         state.set_phase(state::Phase::Stopped);
         state.save(paths)?;
@@ -856,17 +872,30 @@ fn reap_run(paths: &paths::SparPaths, run_id: &str) -> Result<()> {
     }
 
     // 3. Slot process groups: reaps nested cargo test / pnpm build children too.
-    //    Start-time checked, so a recycled pid is never signalled.
+    //    Start-time checked wherever the token carries one, which every `.pid` marker
+    //    now does; a legacy record with only `slot.pid` degrades to bare liveness,
+    //    deliberately, because missing an orphan leaves it burning tokens. The reconcile
+    //    path trades the other way; see `state::slot_process_alive`.
     for pid in state::live_slot_pids(paths, &state) {
         process::terminate_tree(pid, true);
     }
     Ok(())
 }
 
+/// What to record on a slot this stop is about to settle. Read **before** the reap,
+/// which kills the orchestrator and would make every stop look like a crash: a run that
+/// had a live orchestrator when the operator typed `spar stop` was halted, not orphaned.
+fn halt_reason(paths: &paths::SparPaths, run_id: &str) -> &'static str {
+    match state::RunOwner::observe(paths, run_id) {
+        state::RunOwner::Live => state::STOPPED_SLOT,
+        state::RunOwner::Nobody => state::ORPHANED_SLOT,
+    }
+}
+
 fn stop_one(run_id: &str, json: bool) -> Result<ExitCode> {
     let (paths, _) = project_ctx()?;
     let cfg = Config::for_run(&paths, run_id)?;
-    let state = state::RunState::load(&paths, run_id)?;
+    let state = state::RunState::load_for_display(&paths, run_id)?;
 
     // A finished or gated run is already at rest: never downgrade it to Stopped or
     // drop a resumable marker that would make a later `implement --run` redo work.
@@ -880,13 +909,17 @@ fn stop_one(run_id: &str, json: bool) -> Result<ExitCode> {
         return Ok(ExitCode::Success);
     }
 
+    let reason = halt_reason(&paths, run_id);
     reap_run(&paths, run_id)?;
 
     // 4. The kill window above spans seconds; the orchestrator may have finished
-    //    naturally and persisted a terminal/gate phase while dying. Reload and
+    //    naturally and persisted a terminal/gate phase while dying. Reload,
+    //    settle the slots the reap orphaned (`Nobody` is established by the reap, see
+    //    `stop_one_quiet`), and
     //    re-check: never downgrade a run that reached rest on its own, and drop the
     //    stopped marker so a later `implement --run` does not redo finished work.
     let mut state = state::RunState::load(&paths, run_id)?;
+    state.reconcile_and_save(&paths, state::RunOwner::Nobody, reason)?;
     if phase_at_rest(state.phase) {
         let _ = std::fs::remove_file(paths.marker(run_id, "stopped"));
         if json {
@@ -919,6 +952,153 @@ fn stop_one(run_id: &str, json: bool) -> Result<ExitCode> {
 fn phase_at_rest(phase: state::Phase) -> bool {
     let finished = phase.is_terminal() && phase != state::Phase::PlanApproved;
     finished || phase.is_gate()
+}
+
+/// Settle slots an orchestrator left at `running` when it died, on runs that already
+/// exist. The backfill counterpart of the reconciliation `stop` and resume now do.
+///
+/// Deliberately narrow, and deliberately **not** part of `spar cleanup`: the only writes
+/// are `slots[].status` and `slots[].error`, patched into the existing `state.json`
+/// document. It never resolves, reads or removes a worktree path, never touches
+/// `logs/` or `artifacts/`, and never signals a process. A worktree is often the only
+/// copy of a slot's work, and this command wears a housekeeping name.
+fn reconcile_state_cmd(
+    run_id: Option<&str>,
+    all: bool,
+    apply: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    let (paths, _) = project_ctx()?;
+    let ids: Vec<String> = match (run_id, all) {
+        (Some(_), true) => anyhow::bail!("pass a run id or --all, not both"),
+        (None, false) => {
+            anyhow::bail!("usage: spar reconcile-state <run_id> | spar reconcile-state --all")
+        }
+        (Some(id), false) => vec![id.to_string()],
+        (None, true) => state::list_runs(&paths)?
+            .into_iter()
+            .map(|s| s.id)
+            .collect(),
+    };
+
+    let mut changes = Vec::new();
+    let mut skipped = Vec::new();
+    for id in ids {
+        let Ok(state) = state::RunState::load(&paths, &id) else {
+            continue;
+        };
+        // A live orchestrator is the authority on its own run's slots. This command
+        // decides from a snapshot and writes some time later, so applying to a run in
+        // flight can stamp a verdict over one the orchestrator recorded in between.
+        // The realistic trigger is the intended use: `--all --apply` while work is running.
+        let owner = state::RunOwner::observe(&paths, &id);
+        if owner == state::RunOwner::Live {
+            skipped.push(serde_json::json!({ "run_id": id, "reason": "orchestrator is live" }));
+            continue;
+        }
+        let before: Vec<state::SlotStatus> = state.slots.iter().map(|s| s.status).collect();
+        let mut settled = state;
+        if !settled.reconcile_dead_slots(&paths, owner, state::ORPHANED_SLOT) {
+            continue;
+        }
+        let mut patch = Vec::new();
+        for (slot, was) in settled.slots.iter().zip(before) {
+            if slot.status == was {
+                continue;
+            }
+            patch.push((
+                slot.id.clone(),
+                serde_json::to_value(slot.status)?,
+                slot.error.clone(),
+            ));
+            changes.push(serde_json::json!({
+                "run_id": id,
+                "slot_id": slot.id,
+                "from": serde_json::to_value(was)?,
+                "to": serde_json::to_value(slot.status)?,
+                "error": slot.error,
+            }));
+        }
+        if apply {
+            patch_slot_status(&paths, &id, &patch)?;
+        }
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "applied": apply,
+                "changes": changes,
+                "skipped": skipped,
+            }))?
+        );
+        return Ok(ExitCode::Success);
+    }
+    for sk in &skipped {
+        println!(
+            "{}: skipped, {}",
+            sk["run_id"].as_str().unwrap_or_default(),
+            sk["reason"].as_str().unwrap_or_default()
+        );
+    }
+    if changes.is_empty() {
+        println!("nothing to reconcile");
+        return Ok(ExitCode::Success);
+    }
+    for c in &changes {
+        let reason = c["error"]
+            .as_str()
+            .map(|e| format!(" ({e})"))
+            .unwrap_or_default();
+        println!(
+            "{} {}: {} -> {}{reason}",
+            c["run_id"].as_str().unwrap_or_default(),
+            c["slot_id"].as_str().unwrap_or_default(),
+            c["from"].as_str().unwrap_or_default(),
+            c["to"].as_str().unwrap_or_default(),
+        );
+    }
+    if apply {
+        println!("updated {} slot(s)", changes.len());
+    } else {
+        println!(
+            "{} slot(s) would change; re-run with --apply",
+            changes.len()
+        );
+    }
+    Ok(ExitCode::Success)
+}
+
+/// Patch `status` (and `error`, where one was derived) into the run's existing
+/// `state.json` document.
+///
+/// Value-level rather than typed, so a field spar does not model survives the write; the
+/// document is re-read here rather than re-serialized from the caller's snapshot. Only
+/// those two fields change *in content*; the round trip does re-sort keys alphabetically
+/// until the next `RunState::save` writes struct order back.
+fn patch_slot_status(
+    paths: &paths::SparPaths,
+    run_id: &str,
+    patch: &[(String, serde_json::Value, Option<String>)],
+) -> Result<()> {
+    let file = paths.state_file(run_id);
+    let mut doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file)?)?;
+    let Some(slots) = doc.get_mut("slots").and_then(|s| s.as_array_mut()) else {
+        anyhow::bail!("run {run_id}: state.json has no slots array");
+    };
+    for (slot_id, status, error) in patch {
+        let Some(slot) = slots.iter_mut().find(|s| s["id"] == slot_id.as_str()) else {
+            continue;
+        };
+        slot["status"] = status.clone();
+        if let Some(e) = error {
+            slot["error"] = serde_json::Value::String(e.clone());
+        }
+    }
+    std::fs::write(&file, serde_json::to_string_pretty(&doc)?)
+        .map_err(|e| anyhow::anyhow!("write {}: {e}", file.display()))?;
+    Ok(())
 }
 
 /// Observe-only: the returned state is reconciled against on-disk markers, never written back.

@@ -47,3 +47,5 @@ Rules:
 - Write `## Verdict` once, and put `approve` or `request_changes` on the line under it. Do not restate this format block in your output.
 
 Be strict. Prefer false positives over silent bugs. No praise padding.
+
+{{nudge_protocol}}

@@ -24,6 +24,9 @@ pub enum DeliveryAction {
     Queued,
     /// opencode: claimed messages appended to the durable queue for the session flush.
     Prompted,
+    /// Written to the slot's poll file, which its role prompt tells it to read before
+    /// starting any new major step.
+    PolledFile,
     /// No injection channel (agy / unknown provider): the inbox is left untouched so
     /// the agent claims it itself on its next turn.
     LeftForInbox,
@@ -107,6 +110,10 @@ pub fn deliver(
             enqueue(paths, run, agent, &msgs, dry_run)?;
             (DeliveryAction::Prompted, None)
         }
+        DeliveryStrategy::PollFile => {
+            append_poll_file(paths, run, agent, &render_reason(&msgs), dry_run)?;
+            (DeliveryAction::PolledFile, None)
+        }
         DeliveryStrategy::None => unreachable!("None handled above"),
     };
 
@@ -185,6 +192,141 @@ fn enqueue(
         f.write_all(&line)?;
     }
     Ok(())
+}
+
+/// Where spar leaves messages for an adapter with no push channel into its running
+/// process. Slot-scoped, like every other per-slot file: `artifacts_dir` is shared by
+/// every slot in a run, and arena spawns N concurrent implementers off one template, so a
+/// run-scoped name would have them reading each other's nudges.
+///
+/// Lives under the run's `logs/`, not `artifacts/`: it is orchestrator-to-slot chatter,
+/// not a deliverable, and nothing downstream should mistake it for one.
+pub fn poll_file(paths: &SparPaths, run: Option<&str>, agent: &str) -> std::path::PathBuf {
+    match run {
+        Some(r) => paths
+            .logs_dir(r)
+            .join(format!("nudges-{}.md", slot_part(r, agent))),
+        None => bus::bus_root(paths)
+            .join("nudges")
+            .join(format!("{agent}.md")),
+    }
+}
+
+/// The inbox drain keys on the unique `run:slot` id, but the poll file sits in that run's
+/// own directory, so the run prefix would only be repeated in the name.
+fn slot_part<'a>(run: &str, agent: &'a str) -> &'a str {
+    agent.strip_prefix(&format!("{run}:")).unwrap_or(agent)
+}
+
+fn append_poll_file(
+    paths: &SparPaths,
+    run: Option<&str>,
+    agent: &str,
+    body: &str,
+    dry_run: bool,
+) -> Result<std::path::PathBuf> {
+    let path = poll_file(paths, run, agent);
+    if dry_run {
+        return Ok(path);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let stamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    writeln!(f, "\n## {stamp}\n\n{body}")?;
+    Ok(path)
+}
+
+/// What spar did with one nudge, for the event line and for tests.
+#[derive(Debug, Clone, Serialize)]
+pub struct NudgeDelivery {
+    pub strategy: DeliveryStrategy,
+    pub action: DeliveryAction,
+    /// Set when the nudge landed in a file the agent can read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// The sender id spar's own nudges carry on the bus. Not a slot, so it can never collide
+/// with one, and readable in an agent's inbox.
+pub const ORCHESTRATOR: &str = "spar";
+
+/// Push one orchestrator nudge at `agent` through whichever channel its adapter exposes.
+///
+/// The caller passes the strategy it got from the adapter and nothing else; which of
+/// these branches runs is the seam's business, not the orchestrator's. Text sent to a
+/// *busy* CLI agent's TTY only queues unsubmitted, so every branch here lands somewhere
+/// the agent reads at a turn boundary instead: claude's Stop hook drains its inbox, grok
+/// applies its native queue, and everything else reads the poll file its prompt names.
+pub fn nudge(
+    paths: &SparPaths,
+    run: Option<&str>,
+    agent: &str,
+    strategy: DeliveryStrategy,
+    text: &str,
+    dry_run: bool,
+) -> Result<NudgeDelivery> {
+    let (action, path) = match strategy {
+        // The hook is pull-based: it fires at the turn boundary and drains the inbox,
+        // so the inbox is how spar pushes into a claude slot.
+        DeliveryStrategy::StopHookInject => {
+            if !dry_run {
+                bus::send(
+                    paths,
+                    BusMessage {
+                        id: bus::new_id(),
+                        ts: chrono::Utc::now(),
+                        from: ORCHESTRATOR.into(),
+                        to: agent.into(),
+                        // `System` is exempt from the loop guard, which governs two
+                        // agents ping-ponging and has nothing to say about spar.
+                        kind: bus::MsgKind::System,
+                        body: text.to_string(),
+                        run: run.map(str::to_string),
+                        subject: Some("spar nudge".into()),
+                        refs: bus::MsgRefs::default(),
+                        requires_ack: false,
+                        meta: std::collections::HashMap::new(),
+                    },
+                    // Nudges are spar's own control channel; they must not be dropped
+                    // because the run's agents have been chatty.
+                    bus::MessageBudget::Chatty,
+                )?;
+            }
+            (DeliveryAction::StopHookBlock, None)
+        }
+        DeliveryStrategy::NativeQueue | DeliveryStrategy::SdkPrompt => {
+            let path = queue_path(paths, run, agent);
+            if !dry_run {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let mut f = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .with_context(|| format!("open {}", path.display()))?;
+                writeln!(f, "{}", serde_json::json!({ "nudge": text }))?;
+            }
+            (DeliveryAction::Queued, Some(path))
+        }
+        // `None` is agy, which has no channel at all. The poll file is still the best
+        // available drop: worst case the agent never reads it, which is where it started.
+        DeliveryStrategy::PollFile | DeliveryStrategy::None => (
+            DeliveryAction::PolledFile,
+            Some(append_poll_file(paths, run, agent, text, dry_run)?),
+        ),
+    };
+    Ok(NudgeDelivery {
+        strategy,
+        action,
+        path: path.map(|p| p.display().to_string()),
+    })
 }
 
 #[cfg(test)]

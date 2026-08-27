@@ -76,6 +76,22 @@ impl RunLock {
                     "orchestrator lock reclaimed by pid {me} from crashed pid {prev}"
                 )),
             );
+            // The one moment spar knows an orchestrator died: settle the slots it left
+            // at `running` before anything reads them (O49). Best-effort: a run with no
+            // state file yet is the normal case on a first acquire.
+            //
+            // `Nobody` is asserted, not observed. `reclaimed` is only `Some` when the
+            // previous owner left its pid behind, which `Drop` clears, so it died hard;
+            // and we hold the flock, so it cannot be driving anything. The lock file has
+            // already been overwritten with *our* live pid by this point, so observing
+            // it here would answer "an orchestrator is alive" and skip the demotion.
+            if let Ok(mut state) = crate::state::RunState::load(paths, run_id) {
+                let _ = state.reconcile_and_save(
+                    paths,
+                    crate::state::RunOwner::Nobody,
+                    crate::state::ORPHANED_SLOT,
+                );
+            }
         }
         Ok(RunLock {
             path,
@@ -193,6 +209,46 @@ mod tests {
             drop(results);
             let _ = fs::remove_file(lock_path(&paths, "r1"));
         }
+    }
+
+    /// Reclaiming a crashed orchestrator's lock is the one moment spar knows a run lost
+    /// its driver, and it must settle the slots that driver left at `running`. The trap
+    /// is ordering: `acquire` stamps its **own live pid** into the lock before it can
+    /// reconcile, so a reconcile that re-derives liveness from that file finds itself,
+    /// concludes an orchestrator is alive, and skips the demotion entirely. Against that
+    /// ordering this test sees `running`. The 86 corpus slots with no terminal marker
+    /// have nothing else that can settle them.
+    #[test]
+    fn reclaiming_a_dead_orchestrator_settles_the_slots_it_left_running() {
+        use crate::state::{RunState, SlotStatus};
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new(
+            "crashed",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.phase = crate::state::Phase::Dispatch;
+        let mut slot =
+            crate::executor::init_slot("impl", "cli:claude", crate::state::SlotRole::Implementer);
+        slot.status = SlotStatus::Running;
+        state.slots.push(slot);
+        state.save(&paths).unwrap();
+        // No terminal marker and no `.pid`: exactly the 86-slot population.
+        fs::write(lock_path(&paths, "crashed"), (i32::MAX as u32).to_string()).unwrap();
+
+        let _lock = RunLock::acquire(&paths, "crashed").unwrap();
+
+        let on_disk = RunState::load(&paths, "crashed").unwrap();
+        assert_eq!(
+            on_disk.slots[0].status,
+            SlotStatus::Failed,
+            "the reclaim must settle the dead orchestrator's slots"
+        );
+        assert_eq!(
+            on_disk.slots[0].error.as_deref(),
+            Some(crate::state::ORPHANED_SLOT)
+        );
     }
 
     #[test]

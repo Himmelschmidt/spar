@@ -66,3 +66,88 @@ that for finished runs. These two reduce how much gets created in the first plac
   - Not free: dropping the worktree makes cwd fall back to `project_root`, which is the
     `isolation = "none"` shape that artifact-recovery had to be guarded against in O31.
     A shared read-only reviewer tree has to stay read-only against concurrent reviewers.
+
+## Telemetry
+
+- **`cli:grok` token accounting is partial.** spar spawns grok with
+  `--output-format streaming-json` (`src/providers/grok.rs`), which grok's own help calls
+  the native ACP session-update stream; the Anthropic-wire option is
+  `streaming-messages-json` and spar does not request it. The consequences, measured
+  against grok's own `~/.grok/sessions/<cwd>/<id>/updates.jsonl` (its `turn_completed`
+  update is ground truth) rather than guessed:
+  - No grok log on the box carries a `· session`, `· done` or `· turn` marker, so grok
+    hits neither claude's `result` arm nor codex's `turn.completed`. It never gets a
+    terminal usage record and is scored entirely on the per-request path.
+  - Exact today: `cache_read` (2,853,504) and `input_tokens` as the uncached remainder
+    (124,866 = 2,978,370 - 2,853,504), both because grok emits them cumulatively and
+    `max` lands on the final value. The tool *count* is also exact (83 = 83 `tool_call`
+    updates).
+  - Wrong today: `output_tokens` read 61,292 against a real 30,646, a cumulative value
+    counted twice. O48 removed the duplicate `absorb_usage` calls, which is the likely
+    fix, but it is **unverified**: grok is out of quota and was deliberately not probed.
+    The mechanism is identified and fits every observation: `feed` absorbed usage from
+    every parsed line (`src/process.rs:732`), and `handle_claude_assistant` then absorbed
+    a second time via `v.pointer("/message").unwrap_or(v)` — on a line with no `/message`
+    the fallback re-absorbs the *same* value, which is exactly 2x and nothing else. It
+    also explains the rest of grok's symptoms together: `v.pointer("/message/content")?`
+    then returns `None`, so the arm bails before printing, which is why grok logs carry no
+    marker, and `/message/model` never resolves, which is why `model` is always `None`.
+    Measured on four matched slot/session pairs, the output ratio is 2.00 in all four and
+    `input + cache_read` reconstructs grok's `inputTokens` exactly in all four. Confirming
+    it needs one live capture showing grok's stdout carries top-level `type: "assistant"`.
+  - Still wrong after O48 regardless: `context_tokens` for grok is a cumulative total, not
+    a peak (grok's own `modelCalls: 31` says the real window is far smaller), so the
+    context gauge is meaningless for grok slots; `model` is never captured; `tool_errors`
+    is structurally always zero; tool names never resolve (every line is a bare `→ tool`).
+  - The fix is a real grok/ACP branch in `StreamCoalescer::feed` reading
+    `params.update.sessionUpdate` and the camelCase `turn_completed` usage
+    (`inputTokens` / `outputTokens` / `cachedReadTokens` / `cacheCreationTokens`, with
+    `reasoningTokens` already inside `outputTokens`). Needs one live grok run to confirm
+    the stdout shape, which is **not** byte-identical to the persisted envelope, since spar
+    matches `cache_read` today so stdout evidently uses different keys from the stored
+    JSON-RPC form. Do not rewrite the parser without that capture.
+
+- **opencode `task` subagent spend is structurally invisible.** opencode's json emitter
+  filters child sessions out of the stream it prints: the one `process.stdout.write` call
+  site sits behind `if (A.sessionID !== e) continue`, so a subagent's `step_finish` never
+  reaches `handle_opencode` and never reaches `billed_tokens`. Unlike muse, which walks
+  `subagent/*/session.jsonl` post-exit, there is no recovery pass. Measured against
+  `opencode.db` (`session.parent_id`, summing
+  `tokens_input + output + reasoning + cache_read + cache_write`): the top parent by child
+  spend books 1,384,565 against 6,605,838 across 4 children (4.8x), the next 1,234,061
+  against 6,106,099 (4.9x), and one 197,553 against 3,226,622 (16.3x). Latent under spar
+  today only because no spar role prompt tells an opencode slot to fan out. **The O48
+  verification cannot detect this**: it reconciles a slot against the provider's ledger for
+  the session spar named, so spend booked to a child session is out of frame by
+  construction. The fix is a post-exit pass in the shape of `muse_telemetry::collect`,
+  walking `session.parent_id` in `opencode.db` from the `sessionID` spar already records.
+
+- **`worktree+bwrap` cannot write artifacts or markers.** `src/sandbox/bwrap.rs` binds `/`
+  read-only and makes only the slot's `cwd` writable, but `artifacts_dir` and `markers_dir`
+  both live under `.spar/runs/<id>/`, outside the worktree. Under that isolation mode a
+  slot cannot write `summary-<slot>.md`, its `.done`/`.failed` marker, its build logs, or a
+  carry-forward brief, so every dispatch fails the artifact gate and every terminal verdict
+  has to be inferred. **Pre-existing on `main`, not introduced by the telemetry work**, and
+  latent because `Worktree` is the default and no project config on this box selects bwrap.
+  Fix sketch: `--bind` the run directory (`.spar/runs/<id>/`) read-write alongside `cwd`,
+  and add a scenario that runs one dispatch under `worktree+bwrap` end to end — the mode is
+  broken end to end today and nothing tests it.
+
+- **Two adapters still have no live token reading (O50).** The soft budget nudges on
+  `billed_tokens` read from the live sidecar, and two adapters cannot fill it mid-dispatch:
+  - **codex** reports usage only in `turn.completed`, its single terminal record, so a
+    codex slot gets a time nudge and never a token nudge. Fixing it means finding a
+    per-request usage record in `codex exec --json` that spar does not currently parse, or
+    accepting the gap.
+  - **claude** reports per-message usage, but `absorb_usage`'s Request arm `max`es the input
+    and cache-read components (correct, because providers disagree on delta vs running
+    total) until the terminal `result` supersedes them. So a live claude reading is a lower
+    bound and its token nudge fires late, never early. Settling it means learning whether
+    claude's per-message `input_tokens` / `cache_read_input_tokens` are per-call or
+    cumulative, from one instrumented run, not from the shape of the JSON.
+
+- **muse's turn-boundary socket is still unwired.** muse ships
+  `session-message send|serve` over a unix socket, which is a real inject channel into a
+  running session. O50 gave muse `DeliveryStrategy::PollFile` instead, which only lands at
+  the agent's next major step. Wiring the socket would make muse first-class for delivery
+  and would let a nudge interrupt an in-progress turn rather than waiting for one.

@@ -65,3 +65,5 @@ red | compile-only | skipped-reason
 ## Notes
 coordination / assumptions
 ```
+
+{{nudge_protocol}}

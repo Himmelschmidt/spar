@@ -53,6 +53,31 @@ pub struct TemplateCtx<'a> {
     pub slot_id: &'a str,
     pub provider: &'a str,
     pub branch: &'a str,
+    /// Absolute path to this slot's nudge file (`crate::nudge::poll_file`).
+    pub nudge_file: &'a str,
+}
+
+/// The block every role prompt carries: the shape an artifact has to take when a slot
+/// runs out of room, and where spar leaves the message telling it to (O50).
+///
+/// One text for both nudges and for the normal finish, so a summary written under
+/// pressure has a defined form instead of being improvised. Rendered here rather than
+/// duplicated per template so the two can never drift.
+pub fn nudge_protocol(nudge_file: &str) -> String {
+    format!(
+        "## Landing your work\n\n\
+Whatever else you do, what you write must answer three things, separately and explicitly:\n\
+- **Done**: what you completed.\n\
+- **Not reached**: what you did not get to.\n\
+- **Stuck on**: what is blocking you (\"nothing\" is a valid answer).\n\n\
+Write it before you run out of room, not after. spar gives you a soft token budget and a \
+soft wall clock; passing either is allowed and is not a failure, but past them spar will \
+ask you to land what you have.\n\n\
+Before you start any new major step, read `{nudge_file}` if it exists (it usually does \
+not, and a missing file means there is nothing waiting for you). That is where spar leaves \
+those messages for agents whose CLI has no way to interrupt them mid-turn. Act on anything \
+you find there.\n"
+    )
 }
 
 pub fn base_vars(ctx: &TemplateCtx<'_>) -> HashMap<String, String> {
@@ -67,6 +92,8 @@ pub fn base_vars(ctx: &TemplateCtx<'_>) -> HashMap<String, String> {
     m.insert("slot_id".into(), ctx.slot_id.into());
     m.insert("provider".into(), ctx.provider.into());
     m.insert("branch".into(), ctx.branch.into());
+    m.insert("nudge_file".into(), ctx.nudge_file.into());
+    m.insert("nudge_protocol".into(), nudge_protocol(ctx.nudge_file));
     m.insert("plan_body".into(), String::new());
     m.insert("amendment_section".into(), String::new());
     m.insert(
@@ -153,6 +180,7 @@ mod tests {
             slot_id: "impl",
             provider: "cli:claude",
             branch: "spar/abc/impl",
+            nudge_file: "/tmp/logs/nudges-impl.md",
         };
         let v = base_vars(&ctx);
         let s = render("implementer", &v).unwrap();
@@ -177,6 +205,7 @@ mod tests {
             slot_id: "impl",
             provider: "cli:claude",
             branch: "spar/abc/impl",
+            nudge_file: "/tmp/logs/nudges-impl.md",
         };
         let mut v = base_vars(&ctx);
         v.insert(
@@ -219,6 +248,7 @@ mod tests {
             slot_id: "rev",
             provider: "cli:claude",
             branch: "spar/abc/rev",
+            nudge_file: "/tmp/logs/nudges-rev.md",
         };
         let s = render("reviewer", &base_vars(&ctx)).unwrap();
         assert!(

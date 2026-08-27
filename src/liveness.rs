@@ -27,12 +27,14 @@ pub struct SlotActivity {
 impl SlotActivity {
     /// `last_heartbeat` is the freshest process-liveness beat for the slot (see
     /// [`crate::bus::heartbeat_map`]); `None` when the slot never heartbeat.
-    /// `hard_stall_secs` is the slot's role timeout — the point past which continued log
-    /// silence is a stall even while the process still heartbeats (0 disables that arm).
+    /// `role_soft_secs` is the slot's **soft** budget (`executor::timeout_for_role`), not
+    /// its hard ceiling: a slot that has said nothing for its whole budget is hung
+    /// whatever the ceiling still allows. Past it, continued log silence is a stall even
+    /// while the process still heartbeats (0 disables that arm).
     pub fn observe(
         slot: &SlotState,
         stall_warn_secs: u64,
-        hard_stall_secs: u64,
+        role_soft_secs: u64,
         last_heartbeat: Option<DateTime<Utc>>,
     ) -> Self {
         let now = Utc::now();
@@ -41,7 +43,7 @@ impl SlotActivity {
         // The heartbeat is process-liveness, not progress: a live child beats every ~30s
         // regardless of whether it is working. So a quiet-but-heartbeating slot is treated
         // as working — UNTIL it has been log-silent for its entire role budget
-        // (`hard_stall_secs`), at which point an alive-but-hung slot is stalled. A slot that
+        // (`role_soft_secs`), at which point an alive-but-hung slot is stalled. A slot that
         // has also stopped heartbeating (likely dead/gone) stalls at the warn threshold.
         let heartbeat_silent = last_heartbeat
             .map(|t| (now - t).num_seconds().max(0) as u64)
@@ -51,7 +53,7 @@ impl SlotActivity {
             && stall_warn_secs > 0
             && log_silent >= stall_warn_secs
             && (heartbeat_silent >= stall_warn_secs
-                || (hard_stall_secs > 0 && log_silent >= hard_stall_secs));
+                || (role_soft_secs > 0 && log_silent >= role_soft_secs));
         Self {
             last_log_at: last.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
             silent_for_secs,
@@ -148,8 +150,8 @@ pub fn enrich_status_json(
         let hb = hb_map
             .get(&crate::bus::resolve_addr(Some(run_id), &slot.id))
             .copied();
-        let hard = crate::executor::timeout_for_role(cfg, slot.role).as_secs();
-        let act = SlotActivity::observe(slot, warn, hard, hb);
+        let soft = crate::executor::timeout_for_role(cfg, slot.role).as_secs();
+        let act = SlotActivity::observe(slot, warn, soft, hb);
         let token = crate::markers::read_pid(paths, run_id, &slot.id)
             .or_else(|| slot.pid.map(crate::process::PidToken::from_pid));
         let pid = token.map(|t| t.pid);
@@ -179,6 +181,16 @@ pub fn enrich_status_json(
                 },
             );
             obj.insert("pid_alive".into(), serde_json::Value::Bool(pid_alive));
+            // A ceiling kill is spar ending the dispatch, not the slot crashing, and an
+            // outer agent has to be able to tell those apart without parsing prose.
+            obj.insert(
+                "ceiling_kill".into(),
+                serde_json::Value::Bool(
+                    slot.error
+                        .as_deref()
+                        .is_some_and(crate::nudge::is_ceiling_kill),
+                ),
+            );
             if let Some(c) = slot.exit_code {
                 obj.insert("exit_code".into(), serde_json::json!(c));
             }

@@ -34,3 +34,5 @@ You are a planning agent in an spar run.
 
 Do not implement code. Planning only. Do not write the acceptance test suite yourself.
 Stdout is secondary — always write artifacts on disk.
+
+{{nudge_protocol}}

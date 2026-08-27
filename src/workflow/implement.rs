@@ -874,6 +874,17 @@ impl FrozenContract {
 }
 
 pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<()> {
+    // A resume inherits whatever the last orchestrator left behind; settle its slots
+    // before this round stamps its own over them (O49). `Nobody`, asserted: the run lock
+    // is held by this process and nothing has been dispatched yet in this call, so any
+    // slot still `running` belongs to an orchestrator that is gone. Observing the lock
+    // here would find *us* and skip the demotion.
+    state.reconcile_and_save(
+        paths,
+        crate::state::RunOwner::Nobody,
+        crate::state::ORPHANED_SLOT,
+    )?;
+
     // Only isolate the implementer; reviewers share its cwd.
     let impl_ids: Vec<String> = state
         .slots
@@ -1888,9 +1899,11 @@ mod suite_parse_tests {
     fn tester_template_never_routes_budget_exhaustion_to_green() {
         let tester = include_str!("../../templates/tester.md");
         let lower = tester.to_lowercase();
+        // Keyed on the verdict the rule assigns, not on its prose: the wording moved once
+        // already when `suite.timeout_secs` stopped being a kill.
         let budget_rule = lower
             .lines()
-            .find(|l| l.contains("cannot complete within the budget"))
+            .find(|l| l.contains("`## result` = `inconclusive`"))
             .expect("budget-exhaustion rule must exist");
         assert!(
             budget_rule.contains("inconclusive"),

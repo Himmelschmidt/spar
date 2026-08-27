@@ -349,7 +349,8 @@ struct App {
     tick: u64,
     /// (started, message, color, how long to show)
     flash: Option<(Instant, String, Color, Duration)>,
-    /// Loaded once at startup; supplies `stall_warn_secs` and per-role stall hard caps.
+    /// Loaded once at startup; supplies `stall_warn_secs` and each role's soft budget,
+    /// which is the stall arm's second threshold.
     cfg: Config,
     /// Freshest process heartbeat per slot id, refreshed from the snapshot each frame.
     /// Feeds stall detection so a busy-but-log-quiet slot isn't flagged as stalled.
@@ -3145,7 +3146,7 @@ fn draw_context_band(
     // `state.usage` is the run's ledger: one entry pushed per dispatch. `slot.usage`
     // is overwritten each time a slot is re-dispatched, so summing that under-reports
     // a run with fix rounds and disagrees with `status --json` (executor.rs:1028).
-    let out: u64 = st.usage.iter().map(|u| u.output_tokens).sum();
+    let billed: u64 = st.usage.iter().map(|u| u.billed_tokens).sum();
     let mut meters: Vec<Span> = vec![
         Span::styled(relative_age(st.created_at), dim()),
         Span::styled(" · ", muted()),
@@ -3166,9 +3167,12 @@ fn draw_context_band(
         meters.push(Span::styled(" · ", muted()));
         meters.push(Span::styled(format!("{legs} legs"), dim()));
     }
-    if out > 0 {
+    if billed > 0 {
         meters.push(Span::styled(" · ", muted()));
-        meters.push(Span::styled(format!("out {}", compact_u64(out)), dim()));
+        meters.push(Span::styled(
+            format!("billed {}", compact_u64(billed)),
+            dim(),
+        ));
     }
     let meters_w: u16 = meters
         .iter()
@@ -3990,6 +3994,7 @@ fn draw_log_body(
                     cache_read_tokens: u.cache_read_tokens,
                     cache_write_tokens: 0,
                     context_tokens: u.context_tokens,
+                    billed_tokens: u.billed_tokens,
                     model: u.model.clone(),
                     session_id: None,
                     lines_in: 0,
@@ -7122,6 +7127,7 @@ mod render_stability {
             output_tokens: 0,
             cache_read_tokens: 0,
             context_tokens: 0,
+            billed_tokens: 0,
             tools: 0,
             model: Some("x-ai/grok-4.5".into()),
         });
@@ -7133,13 +7139,14 @@ mod render_stability {
     #[test]
     fn token_meter_reads_the_run_ledger_not_the_last_dispatch() {
         let mut st = run_with(Phase::Review, 2);
-        let usage = |out: u64| crate::state::SlotUsage {
+        let usage = |billed: u64| crate::state::SlotUsage {
             slot_id: "impl".into(),
             provider: "cli:claude".into(),
             input_tokens: 0,
-            output_tokens: out,
+            output_tokens: 0,
             cache_read_tokens: 0,
             context_tokens: 0,
+            billed_tokens: billed,
             tools: 0,
             model: None,
         };
@@ -7147,12 +7154,12 @@ mod render_stability {
         // only the last.
         st.usage = vec![usage(1000), usage(2000), usage(3000)];
         st.slots[0].usage = Some(usage(3000));
-        let ledger: u64 = st.usage.iter().map(|u| u.output_tokens).sum();
+        let ledger: u64 = st.usage.iter().map(|u| u.billed_tokens).sum();
         let per_slot: u64 = st
             .slots
             .iter()
             .filter_map(|s| s.usage.as_ref())
-            .map(|u| u.output_tokens)
+            .map(|u| u.billed_tokens)
             .sum();
         assert_eq!(ledger, 6000);
         assert_eq!(per_slot, 3000, "fixture sanity");
@@ -7180,7 +7187,7 @@ mod render_stability {
             let buf = term.backend().buffer();
             (0..120).map(|x| buf[(x, 1)].symbol()).collect()
         };
-        assert!(band.contains("out 6.0k"), "band was: {band:?}");
+        assert!(band.contains("billed 6.0k"), "band was: {band:?}");
     }
 }
 

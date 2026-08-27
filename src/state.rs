@@ -129,8 +129,14 @@ pub struct SlotUsage {
     pub output_tokens: u64,
     #[serde(default)]
     pub cache_read_tokens: u64,
+    /// Peak prompt footprint of a single request, for the context gauge. Never a total.
     #[serde(default)]
     pub context_tokens: u64,
+    /// Cumulative billed tokens for this dispatch (input + cache read + cache write +
+    /// output, reasoning folded into output). `state.usage` is the run's ledger, one
+    /// entry per dispatch, so a run's billed total is the sum over it.
+    #[serde(default)]
+    pub billed_tokens: u64,
     #[serde(default)]
     pub tools: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -478,6 +484,49 @@ impl RunState {
         }
     }
 
+    /// Reconcile and *persist*, for the paths that run once an orchestrator is gone:
+    /// `spar stop`, a run-lock reclaim, and resume. `load_for_display` stays read-only
+    /// by design, so a slot the orchestrator never got to finish would otherwise read
+    /// `running` on disk forever (O49).
+    ///
+    /// Beyond the marker pass, a slot still `running` in a run nothing owns is demoted
+    /// to `failed` with `reason`: `running` is durably saved at dispatch and a terminal
+    /// status only if the orchestrator survived the wait, so with no orchestrator alive
+    /// and no live slot process the record is stale by construction.
+    pub fn reconcile_and_save(
+        &mut self,
+        paths: &SparPaths,
+        owner: RunOwner,
+        reason: &str,
+    ) -> Result<()> {
+        if !self.reconcile_dead_slots(paths, owner, reason) {
+            return Ok(());
+        }
+        self.save(paths)
+    }
+
+    /// The in-memory half of [`RunState::reconcile_and_save`]. True when it changed something.
+    pub fn reconcile_dead_slots(
+        &mut self,
+        paths: &SparPaths,
+        owner: RunOwner,
+        reason: &str,
+    ) -> bool {
+        let before: Vec<SlotStatus> = self.slots.iter().map(|s| s.status).collect();
+        self.reconcile_slots_from_markers(paths);
+        if owner == RunOwner::Nobody {
+            let run_id = self.id.clone();
+            for slot in &mut self.slots {
+                if slot.status != SlotStatus::Running || slot_process_alive(paths, &run_id, slot) {
+                    continue;
+                }
+                slot.status = SlotStatus::Failed;
+                slot.error = Some(reason.into());
+            }
+        }
+        self.slots.iter().zip(&before).any(|(s, b)| s.status != *b)
+    }
+
     /// True when the run is still mid-flight but nothing is driving it: the orchestrator
     /// exited without reaching a terminal phase. Computed, never persisted.
     pub fn abandoned(&self, paths: &SparPaths) -> bool {
@@ -548,6 +597,51 @@ impl RunState {
     pub fn slot_mut(&mut self, id: &str) -> Option<&mut SlotState> {
         self.slots.iter_mut().find(|s| s.id == id)
     }
+}
+
+/// What a demoted slot records. Neither says the work was bad: both say the process
+/// supervising it is gone, and they differ on why, because "crashed" and "you stopped
+/// it" are not the same report to leave on an operator's own run.
+pub const ORPHANED_SLOT: &str = "orchestrator died mid-dispatch";
+pub const STOPPED_SLOT: &str = "halted by operator (spar stop)";
+
+/// Who is driving a run while it is reconciled.
+///
+/// A caller's *established fact*, never re-derived inside the reconcile, because the two
+/// places that know an orchestrator died cannot ask the lock file and get the truth:
+/// `RunLock::acquire` overwrites it with its own live pid before it can reconcile, and
+/// `execute_loop` already holds it. Asking there answers "yes, me" and skips the very
+/// demotion the reclaim exists to perform (O49).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOwner {
+    Live,
+    Nobody,
+}
+
+impl RunOwner {
+    /// For callers that genuinely have to ask, i.e. hold no lock of their own.
+    pub fn observe(paths: &SparPaths, run_id: &str) -> Self {
+        if orchestrator_alive(paths, run_id) {
+            Self::Live
+        } else {
+            Self::Nobody
+        }
+    }
+}
+
+/// Whether a slot's recorded process is still running.
+///
+/// **Deliberately stricter than `live_slot_pids`**, which reaps on a bare `alive()`.
+/// The two ask the same question for opposite stakes: there, a token that cannot prove
+/// identity is still worth signalling because missing an orphan leaves it burning
+/// tokens; here, believing one would leave a slot recorded `running` forever, which is
+/// the bug this exists to close. So a start-time-less token counts as *not* evidence of
+/// life. The `.pid` marker survives re-dispatch on purpose (`markers::clear_slot`), and
+/// the start-time check is what makes reading a prior dispatch's pid safe.
+fn slot_process_alive(paths: &SparPaths, run_id: &str, slot: &SlotState) -> bool {
+    crate::markers::read_pid(paths, run_id, &slot.id)
+        .or_else(|| slot.pid.map(crate::process::PidToken::from_pid))
+        .is_some_and(|t| t.starttime.is_some() && t.alive())
 }
 
 /// On-disk markers beat `state.json` for a slot the orchestrator never got to update.
@@ -941,6 +1035,87 @@ mod tests {
             SlotStatus::Running,
             "display must not rewrite state.json"
         );
+    }
+
+    /// The 86 slots markers alone can never settle: the orchestrator was killed *inside*
+    /// its dispatch, so no terminal marker was ever written and `running` is the last
+    /// durable word. With nobody owning the run and no live process behind the slot, the
+    /// record is stale by construction, and unlike display this one persists.
+    #[test]
+    fn reconcile_and_save_demotes_a_markerless_running_slot_with_no_live_process() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new("orphan", WorkflowKind::Loop, tmp.path().to_path_buf());
+        state.phase = Phase::Dispatch;
+        let mut slot = crate::executor::init_slot("impl", "cli:claude", SlotRole::Implementer);
+        slot.status = SlotStatus::Running;
+        slot.exit_code = Some(0);
+        state.slots.push(slot);
+        state.save(&paths).unwrap();
+
+        // No orchestrator lock, no `.pid` marker, no terminal marker: nothing owns it.
+        assert_eq!(
+            RunState::load_for_display(&paths, "orphan").unwrap().slots[0].status,
+            SlotStatus::Running,
+            "markers cannot settle a slot that never wrote one"
+        );
+
+        let mut state = RunState::load(&paths, "orphan").unwrap();
+        assert_eq!(RunOwner::observe(&paths, "orphan"), RunOwner::Nobody);
+        assert!(state
+            .reconcile_and_save(&paths, RunOwner::Nobody, ORPHANED_SLOT)
+            .is_ok());
+        let on_disk = RunState::load(&paths, "orphan").unwrap();
+        assert_eq!(on_disk.slots[0].status, SlotStatus::Failed);
+        assert_eq!(on_disk.slots[0].error.as_deref(), Some(ORPHANED_SLOT));
+    }
+
+    /// A run whose orchestrator is alive is being driven: `running` is the truth there,
+    /// and demoting it would fail a working slot out from under its supervisor.
+    #[test]
+    fn reconcile_leaves_running_slots_alone_while_an_orchestrator_owns_the_run() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new("owned", WorkflowKind::Loop, tmp.path().to_path_buf());
+        state.phase = Phase::Dispatch;
+        let mut slot = crate::executor::init_slot("impl", "cli:claude", SlotRole::Implementer);
+        slot.status = SlotStatus::Running;
+        state.slots.push(slot);
+        state.save(&paths).unwrap();
+
+        let _held = crate::runlock::RunLock::acquire(&paths, "owned").unwrap();
+        assert_eq!(
+            RunOwner::observe(&paths, "owned"),
+            RunOwner::Live,
+            "a held lock must read as owned"
+        );
+        assert!(!state.reconcile_dead_slots(&paths, RunOwner::Live, ORPHANED_SLOT));
+        assert_eq!(state.slots[0].status, SlotStatus::Running);
+    }
+
+    /// A slot whose own process is still up is an orphan, not a finished slot. Demoting
+    /// it would hide it from `live_slot_pids`, which is what `stop --abandoned` reaps by.
+    #[test]
+    fn reconcile_keeps_a_running_slot_whose_process_is_still_alive() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new("live-slot", WorkflowKind::Loop, tmp.path().to_path_buf());
+        state.phase = Phase::Dispatch;
+        let mut slot = crate::executor::init_slot("impl", "cli:claude", SlotRole::Implementer);
+        slot.status = SlotStatus::Running;
+        state.slots.push(slot);
+        state.save(&paths).unwrap();
+        // This test process stands in for the slot's child: live, with a start-time.
+        crate::markers::write_pid(
+            &paths,
+            "live-slot",
+            "impl",
+            crate::process::PidToken::capture(std::process::id()),
+        )
+        .unwrap();
+
+        assert!(!state.reconcile_dead_slots(&paths, RunOwner::Nobody, ORPHANED_SLOT));
+        assert_eq!(state.slots[0].status, SlotStatus::Running);
     }
 
     #[test]

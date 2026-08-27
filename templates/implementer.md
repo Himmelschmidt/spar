@@ -22,10 +22,12 @@ Implement the task in your isolated worktree. Do not modify the primary checkout
 ## Required
 1. Implement the change in `{{cwd}}` only. Pre-written acceptance tests may already be merged into this worktree — make them pass; do not delete or weaken them without documenting why in your summary.
 2. Smoke-check only: compile, typecheck, or 1–2 targeted tests for **your** change (including the acceptance tests if small). Do **not** run the full multi-minute/hour suite — a dedicated cheap `tester` slot runs that after you finish.
-3. Run every build, check, lint and test **in the foreground** and wait for it. No `&`, `nohup`, `disown`, background monitors, or "start it and poll later" patterns. A long build is fine — your wall-clock budget is `timeouts.slot_secs` (hours, not minutes), and blocking on it costs you nothing. Backgrounding it and burning your remaining turns polling is how a slot exits without ever writing its summary.
+3. Run every build, check, lint and test **in the foreground** and wait for it. No `&`, `nohup`, `disown`, background monitors, or "start it and poll later" patterns. A long build is fine: `timeouts.slot_secs` (90 minutes by default, and most projects raise it) is a **soft** budget, so blocking past it costs you nothing but a reminder to land your work, and the only wall that ends the dispatch sits several times higher. Backgrounding a build and burning your remaining turns polling is how a slot exits without ever writing its summary.
 4. Write a summary to `{{artifacts_dir}}/summary-{{slot_id}}.md`. Write it **before** you run out of turns — if you are unsure how much room is left, write it now and update it after.
 5. Write done marker `{{markers_dir}}/{{slot_id}}.done` or `.failed`
 
 Do not merge. Do not push unless explicitly told. Prefer small commits on branch `{{branch}}`.
 
 Do **not** use `pkill -f`, `pgrep -f`, or `killall` on any token derived from the task or a test name: your own process's argv contains the full task text, so those patterns match and kill YOU. Kill stray processes by pid instead.
+
+{{nudge_protocol}}

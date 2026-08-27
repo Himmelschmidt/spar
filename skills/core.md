@@ -46,7 +46,7 @@ transcript, and token/quota counts by teeing agy's statusline payload. To captur
 spar installs a wrapper into `~/.gemini/antigravity-cli/settings.json` that **chains to your
 existing statusline** (it wraps, never replaces it) and tees payloads to `~/.gemini/antigravity-cli/.spar/`.
 Run `spar provider agy-statusline-uninstall` to remove the wrapper and restore your original.
-agy's `--print-timeout` is also derived from `[timeouts] slot_secs`/`review_secs`, so a long
+agy's `--print-timeout` is also derived from the role's hard ceiling, so a long
 agy slot runs its full budget instead of dying at agy's 30-minute default.
 
 **Pause / cooldown.** A provider is paused manually (`spar provider pause <ref>`) or
@@ -142,7 +142,11 @@ stdout, so spar reads its session log
 exits and sums the `goal_usage_attribution` records, **including the subagent sessions muse
 fans out per turn**: six of them on a trivial one-file task, which is real spend the other
 adapters would not see. Input is **summed across model calls** rather than maxed, so
-`stats.json` reports billed tokens, not final context size.
+`stats.json` reports billed tokens, not final context size. Watch one trap if you reconcile
+these numbers yourself: muse's `cached_tokens` is a **subset** of `input_tokens`, not a
+sibling of it as in claude's disjoint pair, so adding the two double-counts. The tool count
+is recovered from the same log, so it survives a round that was killed before the stream
+reported one.
 
 ```bash
 spar implement -t "..." --role implementer=cli:muse --role tester=cli:muse   # muse settings pick the model
@@ -200,6 +204,8 @@ spar cleanup <run_id> [--purge]          # remove worktrees (and --purge run dat
 spar cleanup <run_id> --force            # remove even if it holds unsaved work
 spar cleanup --all [--older-than 7d]     # sweep finished runs project-wide
 spar reclaim <run_id> | --all [--json]   # delete build output, KEEP the worktree
+spar reconcile-state <run_id> | --all    # settle slots a dead orchestrator left `running`
+spar reconcile-state <run_id> --apply    # …and write it (bare form only reports)
 spar archive <run_id> [--undo] [--json]  # hide a finished run from listings
 spar archive --all [--older-than 14d]    # hide every quiet finished run
 spar archive --all --halted              # also stopped/failed/stuck/quota (never gates,
@@ -321,6 +327,88 @@ children — so they keep running and keep spending tokens with nobody collectin
   so a polite kill no longer orphans anything. `SIGKILL` cannot be caught: that is what
   the three above are for.
 
+### Budgets and nudges: nothing kills a slot on tokens (O50)
+
+**`timeouts.slot_secs` changed meaning.** It used to be the wall clock a slot was killed
+at. It is now the **soft** budget: past it spar asks the slot, every
+`timeouts.nudge_every_secs` (10 minutes by default), whether it is still making progress and
+tells it to land its work if it is not. The kill moved to
+`timeouts.hard_ceiling_multiple` (3.0 by default, so 3x the soft budget), which exists only
+as a backstop against a genuinely hung process. **The default also moved, 1800 → 5400**: at
+1800 a slot was killed below the median implementer dispatch, which is why every real
+project had already overridden it.
+
+**Not every role draws `slot_secs`, which is the easy thing to get wrong.** `tester` draws
+`[suite] timeout_secs` (7200) and `test_author` draws `[spec] timeout_secs` (**3600**,
+also raised from 1800 in this change); `reviewer` draws `[timeouts] review_secs`, which
+falls back to `slot_secs`. `hard_ceiling_multiple` multiplies whichever of those the role
+actually drew, so raising `slot_secs` alone does not move the tester or the test author.
+
+**Tokens never kill anything.** `[budget]` carries a per-role soft budget on one dispatch's
+`billed_tokens`, sized at that role's measured p90. Crossing it tells the slot to write its
+artifact now and say what it could not get to, and repeats every `nudge_fraction` of the
+budget past it. There is deliberately no token cap: of the 21 dispatches over 100M tokens in
+the corpus, 18 exited `0`.
+
+Both nudges ask for the same artifact shape, and the role prompts carry it too, so an
+incomplete summary has a defined form: **what was completed, what was not reached, what the
+slot is stuck on.**
+
+- Every nudge is an `Info` event tagged with the slot, so `wait --follow --json` and the TUI
+  surface it.
+- A slot the ceiling killed records `error: "hard ceiling: killed after …"` and
+  **`"ceiling_kill": true`** in `status --json`, which is how you tell it from a crash
+  (`exit 143`, a signal) without parsing prose. Exit codes are unchanged.
+- Delivery is per-adapter and you never choose it. **claude** takes nudges through its
+  inbox, which its `Stop` hook drains at the turn boundary. **grok** takes them on its
+  native queue. **opencode, muse and codex** have no way to interrupt a working agent, so
+  spar writes to `.spar/runs/<id>/logs/nudges-<slot>.md` and their role prompt tells them to
+  read it before starting any new major step. Thresholds are checked every 30 seconds, so a
+  nudge lands at the next 30s boundary rather than the instant a budget is crossed.
+- **Live token visibility differs by adapter**, so token nudges are not uniformly prompt.
+  **opencode** reports usage per step and is exact live. **muse** carries no tokens on
+  stdout at all, so spar tails its session log (`~/.local/share/muse/sessions/…`), which is
+  appended as the turn runs; that is exact live too. **claude** reports per-message usage
+  whose input and cache-read arms are `max`ed until its terminal `result` lands, so a live
+  reading runs low and its token nudge fires late rather than early. Not a categorical
+  guarantee: the same live path *sums* `output_tokens` across the repeated per-content-block
+  `assistant` events, which over-counts, and the under-count only dominates because
+  cache-read dwarfs output on a real claude slot. It is a lower bound in practice, not by
+  construction. **codex** reports
+  usage only in `turn.completed`, so it gets **no** live token nudge at all and is
+  time-nudged only. **grok**'s numbers are approximate (see below), so do not budget tightly
+  against it.
+
+### Slot status after an orchestrator dies
+
+`slots[].status` is written by the orchestrator, so a run whose orchestrator was killed
+mid-dispatch keeps a slot at `running` on disk with nothing behind it. Three things
+settle that, and you do not have to do anything to get the first two:
+
+- **`status --json` and `wait --json` report the reconciled view.** A slot's terminal
+  verdict is written as a marker under `.spar/runs/<id>/markers/` the moment its process
+  is reaped, before any state save, so it survives an orchestrator that does not. Read
+  commands reconcile against those markers **in memory** and never rewrite the run. spar
+  only ever *adds* a marker, so a `<slot>.failed` your agent wrote itself is never
+  deleted by the CLI exiting 0, and it still outranks `<slot>.done`.
+- **`spar stop`, a run-lock reclaim, and resume persist it.** A slot still `running` in a
+  run no live orchestrator owns, with no live process behind it, is recorded as `failed`
+  with an `error` naming what happened to its **supervisor**, not to the work:
+  `"orchestrator died mid-dispatch"` for a crash, `"halted by operator (spar stop)"` when
+  you stopped a run that was still being driven. Neither means the slot's code was bad,
+  and the run stays resumable either way.
+- **`spar reconcile-state`** backfills runs that were already left that way. It reports
+  by default and writes only with `--apply`; `--all` scans the project. It **skips any
+  run with a live orchestrator** (listed under `skipped` in `--json`) because that
+  orchestrator is the authority on its own slots. It rewrites **only** `slots[].status`
+  and `slots[].error` (never a worktree, branch, log or artifact) and is deliberately not
+  part of `spar cleanup`, which does remove worktrees. It always exits `0`.
+
+A slot's `exit_code` / `signal` / `pid` / `usage` describe its **last dispatch** and are
+cleared when it is re-dispatched, so a `running` slot never carries a previous round's
+exit code and a `done` slot never carries a previous round's error. The run's ledger is
+`state.usage[]`, one entry per completed dispatch; `slots[].usage` is the latest only.
+
 Prefer `--detach` + `spar wait` over a foreground run precisely so a command timeout in
 your harness cannot orphan a fleet.
 
@@ -438,7 +526,7 @@ event/presence mirror live under `.spar/runs/<id>/bus/`.
 
 ```bash
 spar status [run_id] [--json] [--all]   # --all = every registered project
-spar wait <run_id> [--timeout 2h] [--follow] [--json]
+spar wait <run_id> [--timeout 8h] [--follow] [--json]
 spar logs <run_id> [slot] [-f|--follow]
 
 # Global home: open `spar` from anywhere. Runs stay under each project’s
@@ -458,7 +546,8 @@ spar wait <run_id> --follow --json     # blocks; returns at terminal OR human ga
 (exit `2`, needs a decision) as well as done/failed — so it wakes you exactly when
 there is something to act on, not just at the very end. `--json --follow` blocks
 quietly and prints the final `RunState` at the stop; text `--follow` live-tails the
-event log. `--timeout` (default `2h`) caps the block and returns exit `3` if it
+event log. `--timeout` (default `8h`, above the implementer's 4.5h hard ceiling so a healthy
+run is never reported stuck) caps the block and returns exit `3` if it
 lapses. Poll `status --json` / `status --all` only when you genuinely can't block —
 e.g. supervising several runs at once, where you background one `wait --follow` per
 run and reconcile as each returns.
@@ -514,10 +603,56 @@ rail's selection.
 
 - `status --json` and every run JSON carry **`base_ref` / `base_commit`** — the ref and commit
   all of the run's slot worktrees were cut from (see **Base ref** above).
+- **Tokens: `billed_tokens` is spend, `context_tokens` is a gauge.** Every entry in
+  `"usage"` (the run's ledger, one entry per dispatch; sum it for the run total) and every
+  `logs/<slot>.stats.json` carries both.
+  - **`billed_tokens`**: cumulative tokens billed for that dispatch, exactly
+    `input_tokens + cache_read_tokens + cache_write_tokens + output_tokens` as reported
+    beside it, with reasoning tokens already folded into `output_tokens` (they bill at
+    output rates and no provider counts them there). The identity holds for every adapter,
+    including the two whose wire format reports a cached prompt as part of `input_tokens`
+    (see below) — spar normalizes those before writing the fields, so the four components
+    beside `billed_tokens` always add up to it. This is the number to budget on.
+  - **`context_tokens`**: the peak prompt footprint of a *single* request
+    (`input + cache read + cache write`), i.e. how full the agent's window got. It is a
+    maximum, never a running total, so it stays comparable to the model's window and does
+    not grow just because a run made more calls. Do **not** sum it and do not read it as
+    spend.
+  - Conventions per adapter, since the wire formats differ: **claude** is settled by the
+    terminal `result` record, which supersedes the per-message ones; **codex** by
+    `turn.completed` (its only usage record, so it also stands in for the gauge);
+    **opencode** by summing its per-step deltas; **muse** from its session log after the
+    slot exits. Those four reconcile against the provider's own session-level ledger, at
+    the session level: a codex slot's `billed_tokens` equals its `token_count`
+    `total_tokens`, a muse slot's equals the sum of its billed
+    `goal_usage_attribution` records, an opencode slot's equals `opencode.db`'s per-step
+    `tokens.total` summed. That verification is session-scoped and therefore cannot see
+    spend that never appears in the session it checked; the known instance is opencode's
+    `task` subagents (`roadmap/BACKLOG.md`).
+  - **Two adapters report a cached prompt as a slice of `input_tokens` rather than a
+    sibling of it**, the opposite of Anthropic's convention: codex's `cached_input_tokens`
+    and muse's `cached_tokens`. spar normalizes both on the way in, storing the uncached
+    remainder in `input_tokens`, so the identity above holds as written for every adapter
+    and you never have to know which convention the provider used. The consequence to be
+    aware of: `input_tokens` for a codex or muse slot is **not** the number that provider's
+    own dashboard shows under "input"; add `cache_read_tokens` back to get it.
+  - **`context_tokens` is a peak for every adapter except two.** `cli:grok` (below) reports
+    a cumulative total. `cli:agy` reports the *latest* call's prompt rather than the largest
+    one, because its statusline sink emits one snapshot and keeps no history; it is a real
+    window reading, just not a maximum.
+  - **`cli:grok` is the exception: treat its numbers as approximate.** spar runs grok on
+    its native ACP stream, which reaches no terminal-record branch, so grok's figures come
+    only from the per-request path. Against grok's own session store its cache-read and
+    input were exact but its output read 2x the truth, and `context_tokens` for a grok slot
+    is a cumulative total rather than a peak, so the 80k/150k gauge means nothing there.
+    grok slots also never report a `model`, never report a `tool_errors` above zero, and
+    never resolve tool *names* (the tool *count* is exact). Known defect, tracked
+    separately (`DECISIONS.md` O48); do not budget tightly against a grok slot until it is
+    fixed.
 - Run state: `.spar/runs/<id>/state.json`
 - Events (orchestrator): `.spar/runs/<id>/events.jsonl`
 - Logs: `.spar/runs/<id>/logs/<slot>.log`
-- `status --json` enriches each slot with `slot` (the slot id, mirroring `id`), `last_log_at`, `silent_for_secs`, `last_heartbeat_at`, `stalled`. `stalled` fires for a running slot that has been log-quiet past `timeouts.stall_warn_secs` **and** either has stopped heartbeating (process likely dead/gone) **or** has stayed silent for its entire role timeout (alive but hung too long). A slot that emits nothing loggable but is still heartbeating inside its role budget (e.g. a streaming-json agent mid tool-call) is working, not stalled. `stalled` is advisory (colouring/label only) — a hard hang still surfaces as `Phase::Stuck` / exit code 3 via the role timeout.
+- `status --json` enriches each slot with `slot` (the slot id, mirroring `id`), `last_log_at`, `silent_for_secs`, `last_heartbeat_at`, `stalled`, `ceiling_kill`. `stalled` fires for a running slot that has been log-quiet past `timeouts.stall_warn_secs` **and** either has stopped heartbeating (process likely dead/gone) **or** has stayed silent for its entire role timeout (alive but hung too long). A slot that emits nothing loggable but is still heartbeating inside its role budget (e.g. a streaming-json agent mid tool-call) is working, not stalled. `stalled` is advisory (colouring/label only) — a hard hang still surfaces as `Phase::Stuck` / exit code 3 via the role's hard ceiling. Note the stall arm reads the **soft** budget, not the ceiling: a slot that has said nothing for its whole budget is hung whatever the ceiling allows. `ceiling_kill` is true only for a slot the hard ceiling ended, never for a crash or a signal.
 - Slot status is reconciled against on-disk markers at read time: a slot recorded as `running` that has a `<slot>.done` / `<slot>.failed` marker is reported `done` / `failed`. `status` never rewrites `state.json`.
 - `status --json` also carries **`"abandoned": true|false`** per run: the run is in a non-terminal phase but no live orchestrator owns it (the driving process died). Not an exit code — exit codes are unchanged. Resume with `spar implement --run <id> --providers …`, park it with `spar stop <id>`, or discard with `spar cleanup <id>`.
 
@@ -592,10 +727,23 @@ plan = true
 winner = true
 ship = true
 [timeouts]
-slot_secs = 1800       # per-slot wall clock; reaches each CLI's own self-timeout too
-# review_secs = 1800   # optional; defaults to slot_secs
+slot_secs = 5400            # SOFT per-slot wall clock: nudges start here, nothing is killed
+# review_secs = 5400        # optional; defaults to slot_secs
+hard_ceiling_multiple = 3.0 # the only kill, as a multiple of the role's soft budget
+nudge_every_secs = 600      # re-ask a slot past its soft clock whether it is progressing
 stall_warn_secs = 300  # running slot silent this long ⇒ stalled in status/TUI (0 = off)
-wait = "2h"
+wait = "8h"
+# Per-role SOFT budget on one dispatch's billed tokens. Tokens never kill a slot.
+[budget]
+enabled = true
+nudge_fraction = 0.2   # renudge every 20% of the role budget past it
+planner = 8000000
+plan_critic = 6000000
+test_author = 20000000
+implementer = 60000000
+reviewer = 12000000
+tester = 6000000
+other = 12000000       # ranker / peer / reconciler
 # Provider assignment by role (@model-capable refs). `reviewer` is a list. This is
 # NOT [model_select.role_profiles] below — that maps a role to a benchmark *profile*,
 # this maps a role to a *provider*. tester/test_author replace the old [suite]/[spec]
@@ -617,7 +765,7 @@ require_all_criteria = true   # false ⇒ an `unverified` AC no longer blocks th
 # Pre-coding acceptance tests (plan). Separate test-author agent; not planner/critic.
 [spec]
 enabled = true
-timeout_secs = 1800
+timeout_secs = 3600    # test_author's SOFT clock; hard_ceiling_multiple applies to it
 # External @human notifier (user-level config only; ignored from a repo spar.toml).
 [notify]
 # command = "..."   # shell out; message on argv/stdin

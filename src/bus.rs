@@ -226,7 +226,7 @@ pub fn reserves_path(paths: &SparPaths, run: Option<&str>) -> PathBuf {
     }
 }
 
-fn new_id() -> String {
+pub fn new_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..12].to_string()
 }
 
