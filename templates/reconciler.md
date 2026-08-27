@@ -15,3 +15,5 @@ You merge the **best parts** of competing implementer worktrees into one coheren
 4. Do not force-push or open PRs — spar ships later.
 
 When done, ensure summary-reconcile.md exists.
+
+{{nudge_protocol}}

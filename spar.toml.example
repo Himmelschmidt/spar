@@ -36,10 +36,35 @@ ship = true
 auto_confirm = false
 
 [timeouts]
-slot_secs = 1800
-# review_secs = 1800   # optional; defaults to slot_secs (diff-focused, no full suites)
+# SOFT since O50: where spar starts asking a slot to land its work, not where it is killed.
+# Measured over 1869 real dispatches; 38.7% of implementer dispatches run past 30 minutes.
+slot_secs = 5400
+# review_secs = 5400   # optional; defaults to slot_secs (diff-focused, no full suites)
+# The only wall clock that still kills, as a multiple of whichever soft budget the role
+# draws. A backstop against a hung process, not a second budget: a slot killed here loses
+# everything it has not written down. 1.0 restores the pre-O50 kill-at-the-budget behaviour.
+hard_ceiling_multiple = 3.0
+# How often a slot past its soft wall clock is asked whether it is still making progress.
+nudge_every_secs = 600
 stall_warn_secs = 300  # running + no log output for this long ⇒ stalled in status/TUI (0 = off)
-wait = "2h"
+wait = "8h"
+
+# Per-role SOFT budget on one dispatch's billed tokens. Tokens never kill a slot: of the 21
+# dispatches over 100M billed tokens in the corpus, 18 exited 0, so the expensive tail is
+# expensive work and a cap would throw away finished implementations. Crossing a budget
+# tells the slot to write its artifact now and say what it did not reach; it is repeated
+# every `nudge_fraction` of the budget past it. Numbers are each role's measured p90 across
+# 1794 dispatches. 0 silences one role without disabling the rest.
+[budget]
+enabled = true
+nudge_fraction = 0.2
+planner = 8000000
+plan_critic = 6000000
+test_author = 20000000
+implementer = 60000000
+reviewer = 12000000
+tester = 6000000
+other = 12000000     # ranker / peer / reconciler: no measured distribution of their own
 
 # Provider assignment by role. Values are @model-capable provider refs (cli:name / api:name).
 # `reviewer` is a list (the review fleet). Distinct from [model_select.role_profiles] below,
@@ -69,7 +94,10 @@ require_all_criteria = true
 # Pre-coding acceptance tests (plan flow). Separate agent freezes tests before implement.
 [spec]
 enabled = true
-timeout_secs = 1800
+# The test_author's SOFT wall clock (it does not draw [timeouts] slot_secs), so the
+# hard_ceiling_multiple above applies to this number. Sized just over its measured p90 of
+# 45.8m; at the old 1800 the ceiling landed exactly on the observed max with no headroom.
+timeout_secs = 3600
 
 # Dynamic model select from vals.ai (opt-in via --select). See `spar model list|pick|refresh`.
 [model_select]

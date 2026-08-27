@@ -84,9 +84,8 @@ pub fn run_slots_parallel(
 
     let mut handles = Vec::new();
     for prep in prepared {
-        let timeout = timeout_for_role(cfg, prep.job.role);
         handles.push(std::thread::spawn(move || {
-            let outcome = execute_prepared(&prep, isolation, backend_policy, timeout);
+            let outcome = execute_prepared(&prep, isolation, backend_policy);
             (prep.job.slot_id.clone(), outcome, prep)
         }));
     }
@@ -94,7 +93,18 @@ pub fn run_slots_parallel(
     for h in handles {
         match h.join() {
             Ok((slot_id, outcome, prep)) => {
-                apply_parallel_outcome(state, paths, &slot_id, outcome, &prep)?;
+                if let Err(e) = apply_parallel_outcome(state, paths, &slot_id, outcome, &prep) {
+                    eprintln!("warning: recording slot {slot_id}'s outcome failed: {e:#}");
+                    // Continue, so one slot's failure cannot discard its siblings, but
+                    // never leave it claiming to run: that is the permanently-`running`
+                    // class arriving by a different door.
+                    if let Some(s) = state.slot_mut(&slot_id) {
+                        if s.status == SlotStatus::Running {
+                            s.status = SlotStatus::Failed;
+                            s.error = Some(format!("outcome not recorded: {e}"));
+                        }
+                    }
+                }
             }
             Err(_) => bail!("slot thread panicked"),
         }
@@ -120,6 +130,11 @@ struct PreparedSlot {
     owns_cwd: bool,
     /// The run's base, for deciding whether a slot missing its artifact left work behind.
     base_commit: Option<String>,
+    round: u32,
+    /// The run's frozen config (O27), carried across the thread boundary so a worker
+    /// sizes its budgets and nudge cadence off the same document every other phase reads.
+    cfg: Config,
+    dry_run: bool,
 }
 
 /// Refreshes a live slot's presence heartbeat while its child process runs, throttled
@@ -182,7 +197,7 @@ fn wire_slot_presence(
 fn prepare_slot_execution(
     state: &mut RunState,
     paths: &SparPaths,
-    _cfg: &Config,
+    cfg: &Config,
     job: &SlotJob,
 ) -> Result<PreparedSlot> {
     let slot = state
@@ -209,6 +224,9 @@ fn prepare_slot_execution(
     let artifacts_s = paths.artifacts_dir(&state.id).display().to_string();
     let markers_s = paths.markers_dir(&state.id).display().to_string();
     let mailbox_s = paths.mailbox_dir(&state.id).display().to_string();
+    let nudge_s = crate::nudge::poll_file(paths, &state.id, &job.slot_id)
+        .display()
+        .to_string();
     let mut vars = templates::base_vars(&templates::TemplateCtx {
         task: state.task.as_deref().unwrap_or(""),
         project_root: &project_root_s,
@@ -220,6 +238,7 @@ fn prepare_slot_execution(
         slot_id: &job.slot_id,
         provider: &job.provider,
         branch: &branch,
+        nudge_file: &nudge_s,
     });
     for (k, v) in &job.extra_vars {
         vars.insert(k.clone(), v.clone());
@@ -241,6 +260,15 @@ fn prepare_slot_execution(
     let round = state.round;
     if let Some(s) = state.slot_mut(&job.slot_id) {
         s.status = SlotStatus::Running;
+        // A dispatch's outcome fields describe *that* dispatch. Carried into the next
+        // one they read as an impossible record (`running` with the prior round's
+        // `exit_code: 0`) and, worse, survive onto the next terminal status: a `done`
+        // slot still carrying `error: "exit 143"` from the attempt before it.
+        s.exit_code = None;
+        s.signal = None;
+        s.pid = None;
+        s.error = None;
+        s.usage = None;
         // Stamp the round at dispatch: slot ids are stable across re-dispatch (the
         // implementer keeps its worktree through fix rounds), so this is where a slot
         // joins the round that is running now (O45).
@@ -278,6 +306,9 @@ fn prepare_slot_execution(
         run_id: state.id.clone(),
         base_commit: state.base_commit.clone(),
         owns_cwd,
+        round,
+        cfg: cfg.clone(),
+        dry_run: state.dry_run,
     })
 }
 
@@ -298,8 +329,9 @@ fn execute_prepared(
     prep: &PreparedSlot,
     isolation: crate::config::IsolationMode,
     backend_policy: Backend,
-    timeout: Duration,
 ) -> Result<SlotOutcome> {
+    let soft = timeout_for_role(&prep.cfg, prep.job.role);
+    let timeout = hard_ceiling_for_role(&prep.cfg, prep.job.role);
     if prep.pref.is_api() {
         let expected = prep.job.expected_artifact.as_ref().map(|n| {
             // artifact path reconstructed from log path parent layout
@@ -326,7 +358,8 @@ fn execute_prepared(
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
             cache_read_tokens: 0,
-            context_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
+            context_tokens: usage.peak_input_tokens,
+            billed_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
             tools: 0,
             model: usage.model.or(model),
         };
@@ -398,9 +431,39 @@ fn execute_prepared(
         slot_id: &prep.job.slot_id,
         last: std::cell::Cell::new(std::time::Instant::now()),
     };
-    let tick = || beat.tick();
+    let watch = crate::nudge::NudgeWatch::new(
+        crate::nudge::WatchSpec {
+            paths: &prep.paths,
+            run_id: &prep.run_id,
+            slot_id: &prep.job.slot_id,
+            provider: &prep.job.provider,
+            role: prep.job.role,
+            log_path: &prep.log_path,
+            artifacts: prep.job.expected_artifact.as_deref().into_iter().collect(),
+            soft,
+            ceiling: timeout,
+            label: timeout_label(prep.job.role),
+            dry_run: prep.dry_run,
+        },
+        &prep.cfg,
+    );
+    let tick = || {
+        beat.tick();
+        watch.tick();
+    };
     let mut res = process::run_captured(&req, Some(&sink), Some(&tick))?;
     let pid = load_pid(&pid_cell);
+    // Before the gates below, and before any state save: markers outlive an orchestrator
+    // that dies between here and the save, `state.json` does not (O49).
+    let mut verdict = markers::DispatchVerdict {
+        ok: !res.timed_out && res.exit_code == Some(0),
+        round: prep.round,
+        pid,
+        exit_code: res.exit_code,
+        signal: res.signal,
+        reason: None,
+    };
+    let _ = markers::write_dispatch_verdict(&prep.paths, &prep.run_id, &prep.job.slot_id, &verdict);
     enrich_agy_stats(
         &mut res.stats,
         &prep.job.provider,
@@ -411,16 +474,18 @@ fn execute_prepared(
     enrich_muse_stats(&mut res.stats, &prep.job.provider, &prep.log_path);
     let usage = usage_from_stream(&prep.job.slot_id, &prep.job.provider, &res.stats);
     if res.timed_out {
+        let error = crate::nudge::ceiling_error(timeout, soft, timeout_label(prep.job.role));
+        let _ = crate::events::append(
+            &prep.paths,
+            &prep.run_id,
+            &crate::events::Event::slot_note(&prep.job.slot_id, &error),
+        );
         return Ok(SlotOutcome {
             ok: false,
             pid,
             exit_code: res.exit_code,
             signal: res.signal,
-            error: Some(format!(
-                "timeout after {}s ({})",
-                timeout.as_secs(),
-                timeout_label(prep.job.role)
-            )),
+            error: Some(error),
             usage: Some(usage),
         });
     }
@@ -460,12 +525,21 @@ fn execute_prepared(
                 artifact: &path,
             })
         {
+            let error = format!("missing expected artifact {name}");
+            verdict.ok = false;
+            verdict.reason = Some(error.clone());
+            let _ = markers::write_dispatch_verdict(
+                &prep.paths,
+                &prep.run_id,
+                &prep.job.slot_id,
+                &verdict,
+            );
             return Ok(SlotOutcome {
                 ok: false,
                 pid,
                 exit_code: Some(0),
                 signal: None,
-                error: Some(format!("missing expected artifact {name}")),
+                error: Some(error),
                 usage: Some(usage),
             });
         }
@@ -726,6 +800,14 @@ fn enrich_agy_stats(
     if t.context_tokens > 0 {
         stats.context_tokens = t.context_tokens;
     }
+    let billed = stats
+        .input_tokens
+        .saturating_add(stats.output_tokens)
+        .saturating_add(stats.cache_read_tokens)
+        .saturating_add(stats.cache_write_tokens);
+    if billed > 0 {
+        stats.billed_tokens = billed;
+    }
     if let Some(ts) = t.last_activity {
         stats.last_log_at = Some(ts.to_rfc3339());
     }
@@ -757,6 +839,7 @@ fn usage_from_stream(slot_id: &str, provider: &str, s: &process::StreamStats) ->
         output_tokens: s.output_tokens,
         cache_read_tokens: s.cache_read_tokens,
         context_tokens: s.context_tokens,
+        billed_tokens: s.billed_tokens,
         tools: s.tools,
         model: s.model.clone(),
     }
@@ -771,7 +854,23 @@ fn apply_parallel_outcome(
 ) -> Result<()> {
     match outcome {
         Ok(result) if result.ok => {
-            markers::write_done(paths, &state.id, slot_id)?;
+            // Best-effort, and ordered before nothing: a marker write that fails must
+            // not return early and leave this slot at `running` while its siblings are
+            // recorded and the phase advances. That is the class of bug this file is
+            // fixing, so it must not be reintroduced by its own error handling.
+            let _ = markers::write_dispatch_verdict(
+                paths,
+                &state.id,
+                slot_id,
+                &markers::DispatchVerdict {
+                    ok: true,
+                    round: prep.round,
+                    pid: result.pid,
+                    exit_code: result.exit_code.or(Some(0)),
+                    signal: result.signal,
+                    reason: None,
+                },
+            );
             if let Some(s) = state.slot_mut(slot_id) {
                 s.status = SlotStatus::Done;
                 s.pid = result.pid;
@@ -817,9 +916,16 @@ fn apply_parallel_outcome(
         }
     }
     let _ = crate::bus::heartbeat(paths, Some(&state.id), slot_id, "done");
+    // Per join, not once after all of them: a batch that loses its orchestrator between
+    // joins otherwise discards every verdict already collected.
+    state.save(paths)?;
     Ok(())
 }
 
+/// The role's **soft** budget: where nudges start, not where the dispatch is killed
+/// (O50). Also what `SlotActivity` reads as the point past which continued log silence is
+/// a stall, which is unchanged by the soft/hard split — a slot that has said nothing for
+/// its whole budget is hung whatever the ceiling says.
 pub fn timeout_for_role(cfg: &Config, role: SlotRole) -> Duration {
     let secs = match role {
         SlotRole::Tester => cfg.suite.timeout_secs,
@@ -828,6 +934,14 @@ pub fn timeout_for_role(cfg: &Config, role: SlotRole) -> Duration {
         _ => cfg.timeouts.slot_secs,
     };
     Duration::from_secs(secs)
+}
+
+/// The only wall clock that still kills, and the one handed to `run_captured`. A slot's
+/// work is often the sole copy of the round's output, so the ceiling sits far above the
+/// soft budget and the recurring nudges do the bounding.
+pub fn hard_ceiling_for_role(cfg: &Config, role: SlotRole) -> Duration {
+    let soft = timeout_for_role(cfg, role);
+    Duration::from_secs((soft.as_secs() as f64 * cfg.timeouts.hard_multiple()).round() as u64)
 }
 
 /// On timeout/fail, keep any non-empty expected artifact; else salvage from the slot log.
@@ -894,6 +1008,9 @@ pub fn run_slot(
     let artifacts_s = paths.artifacts_dir(&state.id).display().to_string();
     let markers_s = paths.markers_dir(&state.id).display().to_string();
     let mailbox_s = paths.mailbox_dir(&state.id).display().to_string();
+    let nudge_s = crate::nudge::poll_file(paths, &state.id, &job.slot_id)
+        .display()
+        .to_string();
     let mut vars = templates::base_vars(&templates::TemplateCtx {
         task: state.task.as_deref().unwrap_or(""),
         project_root: &project_root_s,
@@ -905,6 +1022,7 @@ pub fn run_slot(
         slot_id: &job.slot_id,
         provider: &job.provider,
         branch: &branch,
+        nudge_file: &nudge_s,
     });
     for (k, v) in &job.extra_vars {
         vars.insert(k.clone(), v.clone());
@@ -924,6 +1042,15 @@ pub fn run_slot(
     let round = state.round;
     if let Some(s) = state.slot_mut(&job.slot_id) {
         s.status = SlotStatus::Running;
+        // A dispatch's outcome fields describe *that* dispatch. Carried into the next
+        // one they read as an impossible record (`running` with the prior round's
+        // `exit_code: 0`) and, worse, survive onto the next terminal status: a `done`
+        // slot still carrying `error: "exit 143"` from the attempt before it.
+        s.exit_code = None;
+        s.signal = None;
+        s.pid = None;
+        s.error = None;
+        s.usage = None;
         // Stamp the round at dispatch: slot ids are stable across re-dispatch (the
         // implementer keeps its worktree through fix rounds), so this is where a slot
         // joins the round that is running now (O45).
@@ -945,7 +1072,9 @@ pub fn run_slot(
     let _ = crate::bus::heartbeat(paths, Some(&state.id), &job.slot_id, "running");
     state.save(paths)?;
 
-    let timeout = timeout_for_role(cfg, job.role);
+    // The kill, not the budget: `timeouts.slot_secs` is soft since O50 and reaches the
+    // dispatch as the nudge threshold instead.
+    let timeout = hard_ceiling_for_role(cfg, job.role);
 
     if state.dry_run {
         return run_dry(state, paths, job, &cwd, &log_path, &prompt);
@@ -996,6 +1125,7 @@ pub fn run_slot(
                 match run_headless(
                     state,
                     paths,
+                    cfg,
                     job,
                     &cwd,
                     &log_path,
@@ -1024,7 +1154,19 @@ pub fn run_slot(
     };
 
     if result.ok {
-        markers::write_done(paths, &state.id, &job.slot_id)?;
+        markers::write_dispatch_verdict(
+            paths,
+            &state.id,
+            &job.slot_id,
+            &markers::DispatchVerdict {
+                ok: true,
+                round: state.round,
+                pid: result.pid,
+                exit_code: result.exit_code.or(Some(0)),
+                signal: result.signal,
+                reason: None,
+            },
+        )?;
         if let Some(s) = state.slot_mut(&job.slot_id) {
             s.status = SlotStatus::Done;
             s.pid = result.pid;
@@ -1045,7 +1187,19 @@ pub fn run_slot(
     } else {
         let err = result.error.as_deref().unwrap_or("failed");
         salvage_expected_artifact(paths, &state.id, job, &log_path, err);
-        markers::write_failed(paths, &state.id, &job.slot_id, err)?;
+        markers::write_dispatch_verdict(
+            paths,
+            &state.id,
+            &job.slot_id,
+            &markers::DispatchVerdict {
+                ok: false,
+                round: state.round,
+                pid: result.pid,
+                exit_code: result.exit_code,
+                signal: result.signal,
+                reason: Some(err.to_string()),
+            },
+        )?;
         if let Some(s) = state.slot_mut(&job.slot_id) {
             s.status = SlotStatus::Failed;
             s.error = result.error.clone();
@@ -1157,7 +1311,19 @@ fn mark_slot_failed(
     exit_code: Option<i32>,
     signal: Option<i32>,
 ) -> Result<()> {
-    let _ = markers::write_failed(paths, &state.id, slot_id, err);
+    let _ = markers::write_dispatch_verdict(
+        paths,
+        &state.id,
+        slot_id,
+        &markers::DispatchVerdict {
+            ok: false,
+            round: state.round,
+            pid,
+            exit_code,
+            signal,
+            reason: Some(err.to_string()),
+        },
+    );
     if let Some(s) = state.slot_mut(slot_id) {
         s.status = SlotStatus::Failed;
         s.error = Some(err.into());
@@ -1439,7 +1605,8 @@ fn run_api(
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         cache_read_tokens: 0,
-        context_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
+        context_tokens: usage.peak_input_tokens,
+        billed_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
         tools: 0,
         model: usage.model.or(model),
     };
@@ -1468,6 +1635,7 @@ fn run_api(
 fn run_headless(
     state: &RunState,
     paths: &SparPaths,
+    cfg: &Config,
     job: &SlotJob,
     cwd: &Path,
     log_path: &Path,
@@ -1524,23 +1692,57 @@ fn run_headless(
         slot_id: &job.slot_id,
         last: std::cell::Cell::new(std::time::Instant::now()),
     };
-    let tick = || beat.tick();
+    let soft = timeout_for_role(cfg, job.role);
+    let watch = crate::nudge::NudgeWatch::new(
+        crate::nudge::WatchSpec {
+            paths,
+            run_id: &state.id,
+            slot_id: &job.slot_id,
+            provider: &job.provider,
+            role: job.role,
+            log_path,
+            artifacts: job.expected_artifact.as_deref().into_iter().collect(),
+            soft,
+            ceiling: timeout,
+            label: timeout_label(job.role),
+            dry_run: state.dry_run,
+        },
+        cfg,
+    );
+    let tick = || {
+        beat.tick();
+        watch.tick();
+    };
     let mut res = process::run_captured(&req, Some(&sink), Some(&tick))?;
     let pid = load_pid(&pid_cell);
+    // See `execute_prepared`: the verdict lands on disk before the gates and before any
+    // state save, so an orchestrator that dies from here on still leaves a terminal
+    // record behind (O49).
+    let mut verdict = markers::DispatchVerdict {
+        ok: !res.timed_out && res.exit_code == Some(0),
+        round: state.round,
+        pid,
+        exit_code: res.exit_code,
+        signal: res.signal,
+        reason: None,
+    };
+    let _ = markers::write_dispatch_verdict(paths, &state.id, &job.slot_id, &verdict);
     enrich_agy_stats(&mut res.stats, &job.provider, cwd, log_path, paths);
     enrich_muse_stats(&mut res.stats, &job.provider, log_path);
     let usage = usage_from_stream(&job.slot_id, &job.provider, &res.stats);
     if res.timed_out {
+        let error = crate::nudge::ceiling_error(timeout, soft, timeout_label(job.role));
+        let _ = crate::events::append(
+            paths,
+            &state.id,
+            &crate::events::Event::slot_note(&job.slot_id, &error),
+        );
         return Ok(SlotOutcome {
             ok: false,
             pid,
             exit_code: res.exit_code,
             signal: res.signal,
-            error: Some(format!(
-                "timeout after {}s ({})",
-                timeout.as_secs(),
-                timeout_label(job.role)
-            )),
+            error: Some(error),
             usage: Some(usage),
         });
     }
@@ -1579,12 +1781,16 @@ fn run_headless(
                     artifact: &path,
                 });
             if !found && !recovered {
+                let error = format!("missing expected artifact {name}");
+                verdict.ok = false;
+                verdict.reason = Some(error.clone());
+                let _ = markers::write_dispatch_verdict(paths, &state.id, &job.slot_id, &verdict);
                 return Ok(SlotOutcome {
                     ok: false,
                     pid,
                     exit_code: Some(0),
                     signal: None,
-                    error: Some(format!("missing expected artifact {name}")),
+                    error: Some(error),
                     usage: Some(usage),
                 });
             }
@@ -1906,7 +2112,9 @@ pub fn wait_run(
     let mut last_phase = None;
     let mut abandoned_since: Option<std::time::Instant> = None;
     loop {
-        let state = RunState::load(paths, run_id)?;
+        // Reconciled: `wait --json` serializes the slots it prints, and a run whose
+        // orchestrator died mid-dispatch has slots frozen at `running` on disk.
+        let state = RunState::load_for_display(paths, run_id)?;
         // The wait loop is a provider-agnostic delivery pulse: advance unacked-message
         // redelivery/escalation so requires_ack works even in runs with no Claude slot
         // (whose Stop hook is the only other thing that ticks acks). Best-effort.
@@ -2030,6 +2238,82 @@ mod tests {
             !slot_has_work(&repo, None),
             "with no recorded base, only a dirty tree can be judged"
         );
+    }
+
+    /// A dispatch's outcome fields describe *that* dispatch. Carried into the next one
+    /// they produce the corpus's two artifacts: a `running` slot still holding the prior
+    /// round's `exit_code: 0`, and (worse, because it looks final) a `done` slot still
+    /// naming `error: "killed by signal 9 (SIGKILL)"` from the attempt before it.
+    #[test]
+    fn redispatch_clears_the_previous_dispatch_outcome() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let cfg = Config::default();
+        let mut state = RunState::new(
+            "r-reset",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.dry_run = true;
+        state.slots.push(init_slot_model(
+            "impl",
+            "cli:claude",
+            SlotRole::Implementer,
+            None,
+        ));
+        state.save(&paths).unwrap();
+        let job = SlotJob {
+            slot_id: "impl".into(),
+            provider: "cli:claude".into(),
+            role: SlotRole::Implementer,
+            template: "implementer".into(),
+            extra_vars: HashMap::new(),
+            expected_artifact: None,
+            model: None,
+        };
+
+        // Round 1 finishes, then dies the way a killed dispatch does.
+        run_slot(&mut state, &paths, &cfg, &job).unwrap();
+        {
+            let s = state.slot_mut("impl").unwrap();
+            assert_eq!(s.status, SlotStatus::Done);
+            s.pid = Some(4242);
+            s.signal = Some(9);
+            s.error = Some("killed by signal 9 (SIGKILL)".into());
+            s.usage = Some(SlotUsage {
+                slot_id: "impl".into(),
+                provider: "cli:claude".into(),
+                input_tokens: 1,
+                output_tokens: 2,
+                cache_read_tokens: 0,
+                context_tokens: 3,
+                billed_tokens: 3,
+                tools: 0,
+                model: None,
+            });
+        }
+
+        // Round 2, observed at the moment it goes Running.
+        state.round = 2;
+        prepare_slot_execution(&mut state, &paths, &cfg, &job).unwrap();
+        let s = state.slot_mut("impl").unwrap();
+        assert_eq!(s.status, SlotStatus::Running);
+        assert_eq!(s.round, 2);
+        assert_eq!(s.exit_code, None, "a running slot cannot have an exit code");
+        assert_eq!(s.signal, None);
+        assert_eq!(s.pid, None);
+        assert_eq!(s.error, None);
+        assert!(
+            s.usage.is_none(),
+            "usage describes one dispatch, not the slot"
+        );
+
+        // And the reset survives to the next terminal status: no stale error on `done`.
+        run_slot(&mut state, &paths, &cfg, &job).unwrap();
+        let s = state.slot_mut("impl").unwrap();
+        assert_eq!(s.status, SlotStatus::Done);
+        assert_eq!(s.error, None, "a done slot must not carry a prior failure");
+        assert_eq!(s.signal, None);
     }
 
     #[test]

@@ -13,6 +13,10 @@ use std::time::Duration;
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Largest single request's prompt, for the context gauge. The loop re-sends the
+    /// whole transcript each step, so `input_tokens` is cumulative spend, not a window.
+    #[serde(default)]
+    pub peak_input_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -106,6 +110,7 @@ pub fn run_api_slot(req: &ApiSlotRequest<'_>) -> Result<(bool, Option<String>, U
         let result = openai_compat::chat_completion(&cfg, &messages)?;
         usage.input_tokens += result.input_tokens;
         usage.output_tokens += result.output_tokens;
+        usage.peak_input_tokens = usage.peak_input_tokens.max(result.input_tokens);
         append_log(req.log_path, &result.content)?;
         append_log(req.log_path, "\n")?;
 

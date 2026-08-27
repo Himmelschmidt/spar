@@ -21,6 +21,9 @@ pub struct Config {
     pub ship: ShipConfig,
     #[serde(default)]
     pub timeouts: TimeoutConfig,
+    /// Per-role soft budget on one dispatch's billed tokens (O50).
+    #[serde(default)]
+    pub budget: BudgetConfig,
     #[serde(default)]
     pub suite: SuiteConfig,
     /// Provider assignment by role. Priority 9 consumes it to key the fleet.
@@ -257,13 +260,144 @@ pub struct ShipConfig {
     pub auto_confirm: bool,
 }
 
+/// Per-role **soft** budget on one dispatch's billed tokens, plus how often a slot past
+/// it is nudged again (O50).
+///
+/// Nothing here kills anything. Of the 21 dispatches in the local corpus that billed over
+/// 100M tokens, 18 exited `0`: the tail is expensive-but-working slots, not runaways, and
+/// a cap would throw away finished implementations and force a re-dispatch, which is the
+/// most expensive thing spar does. Crossing a budget only tells the slot to land its
+/// artifact and say what it did not reach.
+///
+/// Sized at each role's measured p90 across 1794 real dispatches, because the
+/// distributions differ by more than 10x: one global number low enough to notice an
+/// implementer overrun would nudge a reviewer at p50. Keys are the canonical role names,
+/// same vocabulary as `[roles]`; values are billed tokens, and `0` silences one role's
+/// token nudges without disabling the rest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Renudge every this fraction of the role budget past it, so a slot at 2x its budget
+    /// has been told five times rather than once. `<= 0.0` nudges exactly once.
+    #[serde(default = "default_nudge_fraction")]
+    pub nudge_fraction: f64,
+    #[serde(default = "default_budget_planner")]
+    pub planner: u64,
+    #[serde(default = "default_budget_plan_critic")]
+    pub plan_critic: u64,
+    #[serde(default = "default_budget_test_author")]
+    pub test_author: u64,
+    #[serde(default = "default_budget_implementer")]
+    pub implementer: u64,
+    #[serde(default = "default_budget_reviewer")]
+    pub reviewer: u64,
+    #[serde(default = "default_budget_tester")]
+    pub tester: u64,
+    /// Roles with no measured distribution: `ranker`, `peer`, `reconciler`.
+    #[serde(default = "default_budget_other")]
+    pub other: u64,
+}
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            nudge_fraction: default_nudge_fraction(),
+            planner: default_budget_planner(),
+            plan_critic: default_budget_plan_critic(),
+            test_author: default_budget_test_author(),
+            implementer: default_budget_implementer(),
+            reviewer: default_budget_reviewer(),
+            tester: default_budget_tester(),
+            other: default_budget_other(),
+        }
+    }
+}
+
+impl BudgetConfig {
+    /// This role's soft budget in billed tokens. `0` means no token nudges for it.
+    pub fn tokens_for(&self, role: crate::state::SlotRole) -> u64 {
+        use crate::state::SlotRole;
+        if !self.enabled {
+            return 0;
+        }
+        match role {
+            SlotRole::Planner => self.planner,
+            SlotRole::PlanCritic => self.plan_critic,
+            SlotRole::TestAuthor => self.test_author,
+            SlotRole::Implementer => self.implementer,
+            SlotRole::Reviewer => self.reviewer,
+            SlotRole::Tester => self.tester,
+            SlotRole::Ranker | SlotRole::Peer | SlotRole::Reconciler => self.other,
+        }
+    }
+
+    /// Tokens between one nudge and the next past the budget. Never zero while the role
+    /// has a budget, or the watcher would renudge on every poll.
+    pub fn nudge_step(&self, role: crate::state::SlotRole) -> u64 {
+        let budget = self.tokens_for(role);
+        if budget == 0 || self.nudge_fraction <= 0.0 {
+            return u64::MAX;
+        }
+        ((budget as f64) * self.nudge_fraction).round().max(1.0) as u64
+    }
+}
+
+/// Every 20% of the role budget. The budgets are p90s, so the first nudge already selects
+/// the slowest tenth of dispatches; 20% steps escalate a genuine overrun (five nudges by
+/// 2x budget) without spending a turn on a slot that is only a little over.
+fn default_nudge_fraction() -> f64 {
+    0.2
+}
+
+fn default_budget_planner() -> u64 {
+    8_000_000
+}
+
+fn default_budget_plan_critic() -> u64 {
+    6_000_000
+}
+
+fn default_budget_test_author() -> u64 {
+    20_000_000
+}
+
+fn default_budget_implementer() -> u64 {
+    60_000_000
+}
+
+fn default_budget_reviewer() -> u64 {
+    12_000_000
+}
+
+fn default_budget_tester() -> u64 {
+    6_000_000
+}
+
+/// No corpus of its own; the reviewer's p90 is the closest measured neighbour.
+fn default_budget_other() -> u64 {
+    12_000_000
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimeoutConfig {
+    /// **Soft** since O50: the point where a slot starts being asked to land its work,
+    /// not the point where it is killed. `hard_ceiling_multiple` is the kill.
     #[serde(default = "default_slot_timeout_secs")]
     pub slot_secs: u64,
-    /// Reviewer wall clock (diff-focused). Defaults to `slot_secs`.
+    /// Reviewer wall clock (diff-focused). Defaults to `slot_secs`. Also soft.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_secs: Option<u64>,
+    /// The kill, as a multiple of whichever soft budget the role draws. Deliberately far
+    /// above it: this is a backstop against a hung process, not a second budget, and a
+    /// slot killed here loses whatever it has not written down. Below `1.0` clamps to
+    /// `1.0`, which restores the pre-O50 behaviour of killing at the soft budget.
+    #[serde(default = "default_hard_ceiling_multiple")]
+    pub hard_ceiling_multiple: f64,
+    /// Renudge cadence past the soft budget. `0` nudges exactly once.
+    #[serde(default = "default_time_nudge_secs")]
+    pub nudge_every_secs: u64,
     /// Running slot with no log output for this long ⇒ `stalled` in status/TUI.
     /// `0` disables the stall flag (last_log_at still reported).
     #[serde(default = "default_stall_warn_secs")]
@@ -277,6 +411,8 @@ impl Default for TimeoutConfig {
         Self {
             slot_secs: default_slot_timeout_secs(),
             review_secs: None,
+            hard_ceiling_multiple: default_hard_ceiling_multiple(),
+            nudge_every_secs: default_time_nudge_secs(),
             stall_warn_secs: default_stall_warn_secs(),
             wait: default_wait_timeout(),
         }
@@ -287,9 +423,29 @@ fn default_stall_warn_secs() -> u64 {
     300
 }
 
+/// 3x the soft budget. The corpus cannot say what a legitimately long dispatch needs,
+/// because every observed maximum is the project's own kill (180.0m under payforge's
+/// 10800s, 90.0m under biddesk's 5400s): the distribution is censored at exactly the
+/// number under review. So the ceiling is set where it cannot plausibly be the thing that
+/// ends real work, and the recurring nudges do the actual bounding.
+fn default_hard_ceiling_multiple() -> f64 {
+    3.0
+}
+
+/// Ten minutes. Long enough that a slot mid-build is not interrupted every turn, short
+/// enough that a slot drifting past 3x its budget has been asked about it a couple of
+/// dozen times before the ceiling takes it.
+fn default_time_nudge_secs() -> u64 {
+    600
+}
+
 impl TimeoutConfig {
     pub fn review_secs(&self) -> u64 {
         self.review_secs.unwrap_or(self.slot_secs)
+    }
+
+    pub fn hard_multiple(&self) -> f64 {
+        self.hard_ceiling_multiple.max(1.0)
     }
 }
 
@@ -435,8 +591,15 @@ impl Default for SpecConfig {
     }
 }
 
+/// 60 minutes, sized the same way `default_slot_timeout_secs` was: just above the role's
+/// measured p90 (test_author 45.8m over 106 dispatches), which selects roughly its slowest
+/// 5% for nudging. At the old 1800 the *ceiling* (3x) landed on 5400s against an observed
+/// max of 89.6m, i.e. **zero headroom**, and test_author is the worst role to lose to a
+/// kill: its artifact is the frozen acceptance contract, so killing it wastes the plan and
+/// the critique above it too. At 3600 the ceiling moves to 10800s, about 90 minutes clear
+/// of anything observed. See O51 for the headroom table across every role.
 fn default_spec_timeout_secs() -> u64 {
-    1800
+    3600
 }
 
 fn default_max_agents() -> u32 {
@@ -447,12 +610,23 @@ fn default_provider_order() -> Vec<String> {
     vec!["cli:claude".into(), "cli:grok".into(), "cli:agy".into()]
 }
 
+/// 90 minutes. The old 1800 predated any measurement and contradicted what
+/// `templates/implementer.md` told agents; measured over 1869 real dispatches, 38.7% of
+/// implementer dispatches run longer than 30 minutes (p50 22.9m, p90 76.8m), so the old
+/// default was a kill sitting between the median implementer and its p90. At 5400 the
+/// threshold selects the slowest 6.6% of implementers, which is what a soft budget is
+/// for, and it matches what every project on this box had already overridden it to.
 fn default_slot_timeout_secs() -> u64 {
-    1800
+    5400
 }
 
+/// Must clear the longest legitimate dispatch, or `spar wait` reports a healthy run as
+/// stuck (exit 3) and the documented reaction to 3 is `spar stop`: the default would be
+/// telling operators to kill working implementers. The implementer's hard ceiling is
+/// `slot_secs` x `hard_ceiling_multiple` = 4.5h (O50), and a run is a fleet plus fix
+/// rounds, not one dispatch, so this sits above it rather than on it.
 fn default_wait_timeout() -> String {
-    "2h".into()
+    "8h".into()
 }
 
 impl Default for Config {
@@ -467,6 +641,7 @@ impl Default for Config {
             },
             ship: ShipConfig::default(),
             timeouts: TimeoutConfig::default(),
+            budget: BudgetConfig::default(),
             suite: SuiteConfig::default(),
             roles: RolesConfig::default(),
             review: ReviewConfig::default(),
@@ -511,6 +686,7 @@ struct ConfigFile {
     providers: Option<ProviderConfigFile>,
     ship: Option<ShipConfigFile>,
     timeouts: Option<TimeoutConfigFile>,
+    budget: Option<BudgetConfigFile>,
     suite: Option<SuiteConfigFile>,
     roles: Option<RolesConfigFile>,
     review: Option<ReviewConfigFile>,
@@ -558,9 +734,24 @@ struct ShipConfigFile {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+struct BudgetConfigFile {
+    enabled: Option<bool>,
+    nudge_fraction: Option<f64>,
+    planner: Option<u64>,
+    plan_critic: Option<u64>,
+    test_author: Option<u64>,
+    implementer: Option<u64>,
+    reviewer: Option<u64>,
+    tester: Option<u64>,
+    other: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 struct TimeoutConfigFile {
     slot_secs: Option<u64>,
     review_secs: Option<u64>,
+    hard_ceiling_multiple: Option<f64>,
+    nudge_every_secs: Option<u64>,
     stall_warn_secs: Option<u64>,
     wait: Option<String>,
 }
@@ -707,11 +898,46 @@ impl Config {
             if let Some(v) = t.review_secs {
                 self.timeouts.review_secs = Some(v);
             }
+            if let Some(v) = t.hard_ceiling_multiple {
+                self.timeouts.hard_ceiling_multiple = v;
+            }
+            if let Some(v) = t.nudge_every_secs {
+                self.timeouts.nudge_every_secs = v;
+            }
             if let Some(v) = t.stall_warn_secs {
                 self.timeouts.stall_warn_secs = v;
             }
             if let Some(v) = &t.wait {
                 self.timeouts.wait = v.clone();
+            }
+        }
+        if let Some(b) = &file.budget {
+            if let Some(v) = b.enabled {
+                self.budget.enabled = v;
+            }
+            if let Some(v) = b.nudge_fraction {
+                self.budget.nudge_fraction = v;
+            }
+            if let Some(v) = b.planner {
+                self.budget.planner = v;
+            }
+            if let Some(v) = b.plan_critic {
+                self.budget.plan_critic = v;
+            }
+            if let Some(v) = b.test_author {
+                self.budget.test_author = v;
+            }
+            if let Some(v) = b.implementer {
+                self.budget.implementer = v;
+            }
+            if let Some(v) = b.reviewer {
+                self.budget.reviewer = v;
+            }
+            if let Some(v) = b.tester {
+                self.budget.tester = v;
+            }
+            if let Some(v) = b.other {
+                self.budget.other = v;
             }
         }
         if let Some(s) = &file.suite {
@@ -880,7 +1106,113 @@ mod tests {
         assert!(cfg.suite.enabled);
         assert_eq!(cfg.suite.timeout_secs, 7200);
         assert!(cfg.spec.enabled);
-        assert_eq!(cfg.spec.timeout_secs, 1800);
+        assert_eq!(cfg.spec.timeout_secs, 3600);
+    }
+
+    /// The defaults are the whole design (O50): a soft wall clock at each role's measured
+    /// distribution, a ceiling far above it, and per-role token budgets that only nudge.
+    #[test]
+    fn budget_and_ceiling_defaults_and_overlay() {
+        use crate::state::SlotRole;
+        let d = Config::default();
+        assert_eq!(d.timeouts.slot_secs, 5400, "soft, not the old 1800 kill");
+        assert_eq!(
+            crate::executor::hard_ceiling_for_role(&d, SlotRole::Implementer).as_secs(),
+            16_200,
+            "the ceiling is 3x the soft budget, not the budget itself"
+        );
+        assert_eq!(d.budget.tokens_for(SlotRole::Implementer), 60_000_000);
+        assert_eq!(d.budget.tokens_for(SlotRole::Tester), 6_000_000);
+        assert_eq!(d.budget.tokens_for(SlotRole::Ranker), d.budget.other);
+        assert_eq!(d.budget.nudge_step(SlotRole::Implementer), 12_000_000);
+
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+        std::fs::write(
+            project.join("spar.toml"),
+            r#"
+[timeouts]
+slot_secs = 60
+hard_ceiling_multiple = 10.0
+nudge_every_secs = 30
+
+[budget]
+implementer = 1000
+nudge_fraction = 0.5
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(project).unwrap();
+        assert_eq!(
+            crate::executor::hard_ceiling_for_role(&cfg, SlotRole::Implementer).as_secs(),
+            600
+        );
+        assert_eq!(cfg.timeouts.nudge_every_secs, 30);
+        assert_eq!(cfg.budget.tokens_for(SlotRole::Implementer), 1000);
+        assert_eq!(cfg.budget.nudge_step(SlotRole::Implementer), 500);
+        // Untouched roles keep their measured defaults, not the overridden one.
+        assert_eq!(cfg.budget.tokens_for(SlotRole::Reviewer), 12_000_000);
+
+        // Disabling the budget silences token nudges without touching the clock.
+        let mut off = cfg.clone();
+        off.budget.enabled = false;
+        assert_eq!(off.budget.tokens_for(SlotRole::Implementer), 0);
+        assert_eq!(off.budget.nudge_step(SlotRole::Implementer), u64::MAX);
+
+        // A ceiling below the soft budget clamps rather than killing early.
+        let mut low = Config::default();
+        low.timeouts.hard_ceiling_multiple = 0.1;
+        assert_eq!(
+            crate::executor::hard_ceiling_for_role(&low, SlotRole::Implementer).as_secs(),
+            low.timeouts.slot_secs
+        );
+    }
+
+    /// Three roles do **not** draw `timeouts.slot_secs`, and the ceiling multiplies
+    /// whichever budget the role actually drew. Getting this wrong is silent: raising
+    /// `slot_secs` looks like it covered the fleet while the tester and the test author sit
+    /// on untouched numbers, which is exactly how `spec.timeout_secs` kept a ceiling with
+    /// zero headroom over its observed max (O51).
+    #[test]
+    fn each_role_draws_its_own_soft_budget_and_the_ceiling_follows_it() {
+        use crate::executor::{hard_ceiling_for_role, timeout_for_role};
+        use crate::state::SlotRole;
+        let mut cfg = Config::default();
+        // Distinct values so a role reading the wrong knob cannot pass by coincidence.
+        cfg.timeouts.slot_secs = 100;
+        cfg.timeouts.review_secs = Some(200);
+        cfg.suite.timeout_secs = 300;
+        cfg.spec.timeout_secs = 400;
+        cfg.timeouts.hard_ceiling_multiple = 2.0;
+
+        for (role, soft) in [
+            (SlotRole::Implementer, 100),
+            (SlotRole::Planner, 100),
+            (SlotRole::PlanCritic, 100),
+            (SlotRole::Reviewer, 200),
+            (SlotRole::Tester, 300),
+            (SlotRole::TestAuthor, 400),
+        ] {
+            assert_eq!(
+                timeout_for_role(&cfg, role).as_secs(),
+                soft,
+                "{role:?} soft"
+            );
+            assert_eq!(
+                hard_ceiling_for_role(&cfg, role).as_secs(),
+                soft * 2,
+                "{role:?} ceiling must multiply its own budget"
+            );
+        }
+
+        // And the shipped defaults leave the test author real headroom over its observed
+        // max of 89.6m, which 1800 did not (its ceiling was 5400s, i.e. exactly the max).
+        let d = Config::default();
+        assert_eq!(timeout_for_role(&d, SlotRole::TestAuthor).as_secs(), 3600);
+        assert_eq!(
+            hard_ceiling_for_role(&d, SlotRole::TestAuthor).as_secs(),
+            10_800
+        );
     }
 
     #[test]

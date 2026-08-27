@@ -240,7 +240,10 @@ pub enum Command {
     /// Block until a run reaches a terminal or gate phase
     Wait {
         run_id: String,
-        #[arg(long, default_value = "2h")]
+        /// Must clear the longest legitimate dispatch: the implementer's hard ceiling is
+        /// 4.5h (O50) and a run is a fleet plus fix rounds, so a shorter default returns
+        /// exit 3 on healthy work and the documented reaction to 3 is `spar stop`.
+        #[arg(long, default_value = "8h")]
         timeout: String,
         #[arg(long)]
         json: bool,
@@ -329,6 +332,28 @@ pub enum Command {
         /// slots are still burning tokens after the process driving them died.
         #[arg(long)]
         abandoned: bool,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Settle slots left at `running` by an orchestrator that never came back.
+    ///
+    /// Rewrites `slots[].status` and `slots[].error` in `state.json` and nothing else.
+    /// It never touches worktrees, branches, logs or artifacts, and it is deliberately
+    /// not part of `spar cleanup`. Dry-run unless `--apply`. Always exits 0.
+    #[command(name = "reconcile-state")]
+    ReconcileState {
+        /// Omit with `--all` to scan every run in the project.
+        run_id: Option<String>,
+        /// Scan every run in the project.
+        #[arg(long)]
+        all: bool,
+        /// Write the changes. Without it the command only reports them.
+        #[arg(long)]
+        apply: bool,
+        /// Report without writing (the default; accepted so it can be said out loud).
+        #[arg(long, conflicts_with = "apply")]
+        dry_run: bool,
         #[arg(long)]
         json: bool,
     },

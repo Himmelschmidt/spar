@@ -39,14 +39,14 @@ impl ProviderAdapter for OpencodeAdapter {
 
     // `opencode run --format json` emits NDJSON (session events with per-step
     // `part.tokens`) which the stream coalescer parses for tokens. v1 has no
-    // turn-boundary inject channel and no presence stream, so messages wait for the
-    // next turn and presence degrades to the process/output heuristic. opencode's SSE
+    // push channel into the running process and no presence stream, so delivery falls back
+    // to the poll file and presence degrades to the process/output heuristic. opencode's SSE
     // event stream (`GET /event`: session.idle / tool.execute.* / permission.ask) plus
     // `client.session.prompt()` could make this adapter first-class later
     // (DeliveryStrategy::SdkPrompt / PresenceSource::Sse — already reserved in mod.rs);
     // that is deliberately not wired here.
     fn delivery_strategy(&self) -> DeliveryStrategy {
-        DeliveryStrategy::None
+        DeliveryStrategy::PollFile
     }
 
     fn presence_source(&self) -> PresenceSource {

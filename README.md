@@ -258,12 +258,16 @@ ship = true
 auto_confirm = false
 
 [timeouts]
-slot_secs = 1800
+slot_secs = 5400           # SOFT: past it a slot is nudged, not killed
+hard_ceiling_multiple = 3.0 # the only wall that kills, applied to whichever soft budget the role drew
+nudge_every_secs = 600
 stall_warn_secs = 300
-wait = "2h"
+wait = "8h"
 ```
 
 Higher `autonomy` auto-approves more gates; ship still prefers an explicit human confirm unless you change that deliberately.
+
+`slot_secs` is not the kill. Roles also do not all draw it: `tester` draws `[suite] timeout_secs`, `test_author` draws `[spec] timeout_secs`, `reviewer` draws `[timeouts] review_secs`. See `spar.toml.example` for the full set.
 
 ---
 

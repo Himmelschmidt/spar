@@ -20,3 +20,5 @@ Mailbox: {{mailbox_dir}}
 5. Write `{{artifacts_dir}}/summary-{{slot_id}}.md` and marker done/failed.
 
 Keep messages short and actionable.
+
+{{nudge_protocol}}

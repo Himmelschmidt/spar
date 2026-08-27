@@ -20,3 +20,5 @@ Also write `{{artifacts_dir}}/winner.json`:
 ```
 
 Marker: `{{markers_dir}}/{{slot_id}}.done`
+
+{{nudge_protocol}}

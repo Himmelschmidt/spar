@@ -431,10 +431,12 @@ pub fn collect(root: &Path, cwd: &Path) -> Option<AgyTelemetry> {
         input_tokens: payload.input_tokens,
         output_tokens: payload.output_tokens,
         cache_read_tokens: payload.cache_read_tokens,
-        // Context footprint including cache-read, matching StreamStats::context_tokens.
+        // Prompt footprint only, matching `StreamStats::context_tokens`, which is a
+        // window gauge and excludes generated output. `current_usage` is a snapshot of
+        // the latest call rather than a peak over all of them, which is the closest the
+        // statusline sink gets: it reports one reading, not a history.
         context_tokens: payload
             .input_tokens
-            .saturating_add(payload.output_tokens)
             .saturating_add(payload.cache_read_tokens),
         last_activity: tstats.last_activity,
         quota_hint: payload.quota_hint,
@@ -558,7 +560,11 @@ mod tests {
         );
         assert_eq!(t.output_tokens, 90, "cumulative total_output");
         assert_eq!(t.cache_read_tokens, 40);
-        assert_eq!(t.context_tokens, 34743 + 90 + 40);
+        assert_eq!(
+            t.context_tokens,
+            34743 + 40,
+            "prompt only: the cumulative output is spend, not window"
+        );
         assert_eq!(
             t.last_activity.unwrap().to_rfc3339(),
             "2026-07-21T12:03:00+00:00"

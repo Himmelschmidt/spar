@@ -70,6 +70,21 @@ impl Event {
         }
     }
 
+    /// An informational event about one slot: same `Info` kind, with the slot named so
+    /// the TUI and `wait --follow --json` can attribute it. Used for nudges and for the
+    /// hard-ceiling kill.
+    pub fn slot_note(slot: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            ts: Utc::now(),
+            kind: EventKind::Info,
+            phase: None,
+            prev_phase: None,
+            slot: Some(slot.into()),
+            status: None,
+            message: Some(message.into()),
+        }
+    }
+
     pub fn gate(message: impl Into<String>, phase: Phase) -> Self {
         Self {
             ts: Utc::now(),
@@ -104,7 +119,10 @@ impl Event {
             }
             EventKind::Info => {
                 let msg = self.message.as_deref().unwrap_or("");
-                format!("{t} {msg}")
+                match self.slot.as_deref() {
+                    Some(slot) => format!("{t} {slot} {msg}"),
+                    None => format!("{t} {msg}"),
+                }
             }
         }
     }
@@ -114,6 +132,14 @@ pub fn events_file(paths: &SparPaths, run_id: &str) -> PathBuf {
     paths.run_dir(run_id).join("events.jsonl")
 }
 
+/// Append one event as a single locked `write_all`.
+///
+/// `serde_json::to_writer` straight at the `File` issues a syscall per fragment, so two
+/// appenders can interleave inside one record. That used to be theoretical here (only the
+/// orchestrator's own thread appended); slot dispatch and the nudge watcher now append
+/// from per-slot threads, and every reader `continue`s past a line it cannot parse while
+/// `read_from_offset` advances beyond it, so a torn record is lost silently rather than
+/// loudly. Mirrors `bus::append_jsonl`, which locks for exactly this reason.
 pub fn append(paths: &SparPaths, run_id: &str, event: &Event) -> Result<()> {
     paths.ensure_run_dirs(run_id)?;
     let path = events_file(paths, run_id);
@@ -122,8 +148,11 @@ pub fn append(paths: &SparPaths, run_id: &str, event: &Event) -> Result<()> {
         .append(true)
         .open(&path)
         .with_context(|| format!("open {}", path.display()))?;
-    serde_json::to_writer(&mut f, event)?;
-    f.write_all(b"\n")?;
+    rustix::fs::flock(&f, rustix::fs::FlockOperation::LockExclusive)
+        .with_context(|| format!("lock {}", path.display()))?;
+    let mut line = serde_json::to_vec(event)?;
+    line.push(b'\n');
+    f.write_all(&line)?;
     Ok(())
 }
 

@@ -327,6 +327,25 @@ fn sigkilled_orchestrator_leaves_orphans_that_status_names_and_sweep_reaps() {
             .status();
     }
     assert!(reaped, "sweep must reap the orphan");
+
+    // Read the file, not `spar status`: display reconciles in memory, which would mask
+    // exactly the bug: a run left on disk claiming slots that no process has been
+    // behind since the orchestrator died. The sweep is the last thing that touches this
+    // run, so if it does not settle the record, nothing ever will.
+    let on_disk: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(proj.join(".spar/runs").join(&run_id).join("state.json")).unwrap(),
+    )
+    .expect("state.json");
+    let stuck: Vec<&serde_json::Value> = on_disk["slots"]
+        .as_array()
+        .expect("slots")
+        .iter()
+        .filter(|s| s["status"] == "running")
+        .collect();
+    assert!(
+        stuck.is_empty(),
+        "no slot may still claim to be running after the sweep: {stuck:?}"
+    );
 }
 
 fn wait_for_pid(path: &std::path::Path) -> Option<u32> {

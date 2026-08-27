@@ -24,8 +24,18 @@ pub struct StreamStats {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
-    /// Best-effort context footprint (input + cache read + output seen so far)
+    /// Peak prompt footprint of a single request (input + cache read + cache write),
+    /// i.e. how full the agent's window got. Not a running total: it is what the
+    /// context gauge is read against, so a long run does not drift past every
+    /// threshold just by making more calls.
     pub context_tokens: u64,
+    /// Cumulative billed tokens for the whole slot, under each adapter's own
+    /// convention: `input + cache_read + cache_write + output` as written above, with
+    /// reasoning already folded into `output`. This is the spend meter and the number
+    /// a token budget is enforced on; `context_tokens` is the gauge and the two are
+    /// never interchangeable.
+    #[serde(default)]
+    pub billed_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Provider-side session id, when the stream names one. muse's usage lives outside
@@ -40,13 +50,6 @@ pub struct StreamStats {
 }
 
 impl StreamStats {
-    pub fn touch_context(&mut self) {
-        self.context_tokens = self
-            .input_tokens
-            .saturating_add(self.cache_read_tokens)
-            .saturating_add(self.output_tokens);
-    }
-
     pub fn touch_log(&mut self) {
         self.last_log_at =
             Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
@@ -608,53 +611,43 @@ fn stream_to_log(
         if let Ok(mut s) = stats.lock() {
             s.lines_in += 1;
         }
-        if let Some(chunk) = c.feed(&line) {
-            if append_log(log_path, &chunk).is_ok() {
-                if let Ok(mut s) = stats.lock() {
-                    s.chars_out += chunk.len() as u64;
-                    s.tools = c.tools;
-                    s.tool_errors = c.tool_errors;
-                    s.input_tokens = c.input_tokens;
-                    s.output_tokens = c.output_tokens.max(c.est_output_tokens);
-                    s.cache_read_tokens = c.cache_read;
-                    s.cache_write_tokens = c.cache_write;
-                    if c.model.is_some() {
-                        s.model = c.model.clone();
-                    }
-                    if c.session_id.is_some() {
-                        s.session_id = c.session_id.clone();
-                    }
-                    s.touch_context();
-                    s.touch_log();
-                    // Persist last_log_at every append so status/TUI never read a stale stamp.
-                    let _ = s.save(log_path);
-                }
+        // Counters are merged per line, not per log append: opencode's `step_finish`
+        // carries a whole model call's tokens and prints nothing, so gating the merge on
+        // an append left the sidecar behind the stream by however many silent events came
+        // last. A live token budget reads that sidecar, so "behind" means "never fires".
+        let chunk = c.feed(&line);
+        let appended = chunk
+            .as_ref()
+            .map(|ch| append_log(log_path, ch).is_ok())
+            .unwrap_or(false);
+        if let Ok(mut s) = stats.lock() {
+            if appended {
+                s.chars_out += chunk.map(|ch| ch.len() as u64).unwrap_or_default();
+                // Persist last_log_at every append so status/TUI never read a stale stamp.
+                s.touch_log();
             }
+            c.merge_counters_into(&mut s);
+            let _ = s.save(log_path);
         }
     }
-    if let Some(chunk) = c.finish() {
-        if append_log(log_path, &chunk).is_ok() {
-            if let Ok(mut s) = stats.lock() {
-                s.chars_out += chunk.len() as u64;
-                s.tools = c.tools;
-                s.input_tokens = c.input_tokens;
-                s.output_tokens = c.output_tokens.max(c.est_output_tokens);
-                s.cache_read_tokens = c.cache_read;
-                s.cache_write_tokens = c.cache_write;
-                s.model = c.model.clone();
-                if c.session_id.is_some() {
-                    s.session_id = c.session_id.clone();
-                }
-                s.touch_context();
-                s.touch_log();
-                let _ = s.save(log_path);
-            }
-        }
-    } else if let Ok(mut s) = stats.lock() {
-        // Keep any prior last_log_at (e.g. spawn header); do not wipe with defaults.
-        if s.last_log_at.is_none() {
+    // The final merge is unconditional. Counters used to ride along with a log append,
+    // so an event that updates them without printing anything (opencode's terminal
+    // `step_finish`, which is where its last call's tokens live) never reached the
+    // sidecar at all.
+    let tail = c.finish();
+    let appended = tail
+        .as_ref()
+        .map(|chunk| append_log(log_path, chunk).is_ok())
+        .unwrap_or(false);
+    if let Ok(mut s) = stats.lock() {
+        if appended {
+            s.chars_out += tail.map(|c| c.len() as u64).unwrap_or_default();
+            s.touch_log();
+        } else if s.last_log_at.is_none() {
+            // Keep any prior last_log_at (e.g. spawn header); do not wipe with defaults.
             s.touch_log();
         }
+        c.merge_counters_into(&mut s);
         let _ = s.save(log_path);
     }
 }
@@ -670,6 +663,11 @@ struct StreamCoalescer {
     est_output_tokens: u64,
     cache_read: u64,
     cache_write: u64,
+    /// Largest single-request prompt footprint seen, from per-request usage only.
+    context_peak: u64,
+    /// A cumulative end-of-invocation usage record has been absorbed, so per-request
+    /// records must no longer touch the billed components.
+    saw_terminal_usage: bool,
     model: Option<String>,
     session_id: Option<String>,
     text_chars: u64,
@@ -685,6 +683,15 @@ enum CoalesceKind {
     Thought,
 }
 
+/// What one `usage` record covers. Providers report both shapes on the same stream and
+/// they cannot be added together: claude's `result` and codex's `turn.completed` are the
+/// invocation total, every other record is one model call.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UsageScope {
+    Request,
+    Terminal,
+}
+
 impl StreamCoalescer {
     fn new(is_err: bool) -> Self {
         Self {
@@ -698,6 +705,8 @@ impl StreamCoalescer {
             est_output_tokens: 0,
             cache_read: 0,
             cache_write: 0,
+            context_peak: 0,
+            saw_terminal_usage: false,
             model: None,
             session_id: None,
             text_chars: 0,
@@ -729,7 +738,11 @@ impl StreamCoalescer {
             return Some(out);
         };
 
-        self.absorb_usage(&v);
+        let scope = match v.get("type").and_then(|x| x.as_str()) {
+            Some("result") | Some("turn.completed") => UsageScope::Terminal,
+            _ => UsageScope::Request,
+        };
+        self.absorb_usage(&v, scope);
 
         // opencode `run --format json` NDJSON. Each line carries a top-level `sessionID`
         // and a `part` object; that pair is unique to opencode and gates it off before
@@ -833,7 +846,6 @@ impl StreamCoalescer {
                 "user" => return self.handle_claude_user(&v),
                 "result" => {
                     let mut out = self.flush_buf();
-                    self.absorb_usage(&v);
                     let sub = v.get("subtype").and_then(|x| x.as_str()).unwrap_or("ok");
                     out.push_str(&format!(
                         "· done  {sub}  ·  {} tools  ·  {}\n",
@@ -869,8 +881,9 @@ impl StreamCoalescer {
         if let Some(ty) = v.get("type").and_then(|x| x.as_str()) {
             match ty {
                 "thread.started" | "turn.started" | "item.started" => return None,
-                // `codex exec` emits exactly one turn.completed per invocation, so the
-                // `output_tokens` add in absorb_usage runs once (input uses max).
+                // `codex exec` emits exactly one turn.completed per invocation, and it
+                // is the only usage record it emits at all, so it is Terminal-scoped and
+                // settles every counter outright.
                 "turn.completed" => {
                     let mut out = self.flush_buf();
                     out.push_str(&format!(
@@ -981,31 +994,53 @@ impl StreamCoalescer {
 
     fn handle_opencode(&mut self, v: &serde_json::Value) -> Option<String> {
         let part = v.get("part")?;
-        // Normalize the double-emit: `step-finish` and `step_finish` both map to
-        // `step_finish`. The dedupe key includes the type so `step_start:X` and
-        // `step_finish:X` (same part.id, distinct events) are not collapsed.
+        // opencode keeps its own per-session token ledger, so recording the id makes a
+        // slot's numbers checkable against `opencode.db` afterwards.
+        if self.session_id.is_none() {
+            if let Some(id) = v.get("sessionID").and_then(|x| x.as_str()) {
+                self.session_id = Some(id.to_string());
+            }
+        }
+        // opencode republishes `PartUpdated` for a part it already sent (every consumer
+        // in its own bundle upserts parts by `messageID:partID` rather than appending),
+        // so one `part.id` can legitimately arrive more than once. Since every field is
+        // summed below, a repeat would bill the step twice; the dedupe is what makes the
+        // sum safe. The key includes the type so `step_start:X` and `step_finish:X`
+        // (same part.id, distinct events) are not collapsed.
+        //
+        // The `-` to `_` normalization is belt and braces: the json emitter writes five
+        // hardcoded underscore literals (`tool_use`, `step_start`, `step_finish`, `text`,
+        // `reasoning`) and the dash spelling appears only on `part.type`, so no top-level
+        // `type` observed carries a dash.
         let ptype = v.get("type").and_then(|x| x.as_str())?.replace('-', "_");
         let pid = part.get("id").and_then(|x| x.as_str()).unwrap_or_default();
         if !self.seen_opencode.insert(format!("{ptype}:{pid}")) {
             return None;
         }
         match ptype.as_str() {
-            // One opencode step is one LLM call: input grows across steps (max),
-            // output is per-step (sum) — the same pattern absorb_usage uses.
+            // One opencode step is one LLM call and every field on it is that call's
+            // own delta, never a running total: opencode's session ledger is the plain
+            // sum of its steps (verified against `opencode.db`, where `tokens.total`
+            // per step is likewise input + output + reasoning + cache read + write).
+            // Summing is only safe because the republish dedupe above runs first.
             "step_finish" => {
                 if let Some(tok) = part.get("tokens") {
-                    if let Some(n) = tok.get("input").and_then(|x| x.as_u64()) {
-                        self.input_tokens = self.input_tokens.max(n);
-                    }
-                    if let Some(n) = tok.get("output").and_then(|x| x.as_u64()) {
-                        self.output_tokens = self.output_tokens.saturating_add(n);
-                    }
-                    if let Some(n) = tok.pointer("/cache/read").and_then(|x| x.as_u64()) {
-                        self.cache_read = self.cache_read.max(n);
-                    }
-                    if let Some(n) = tok.pointer("/cache/write").and_then(|x| x.as_u64()) {
-                        self.cache_write = self.cache_write.max(n);
-                    }
+                    let n = |k: &str| tok.get(k).and_then(|x| x.as_u64()).unwrap_or_default();
+                    let ptr = |k: &str| tok.pointer(k).and_then(|x| x.as_u64()).unwrap_or_default();
+                    let (input, cache_read, cache_write) =
+                        (n("input"), ptr("/cache/read"), ptr("/cache/write"));
+                    self.input_tokens = self.input_tokens.saturating_add(input);
+                    // Reasoning is billed at output rates and opencode reports it
+                    // outside `output`, so it belongs in the output component.
+                    self.output_tokens = self
+                        .output_tokens
+                        .saturating_add(n("output"))
+                        .saturating_add(n("reasoning"));
+                    self.cache_read = self.cache_read.saturating_add(cache_read);
+                    self.cache_write = self.cache_write.saturating_add(cache_write);
+                    self.context_peak = self
+                        .context_peak
+                        .max(input.saturating_add(cache_read).saturating_add(cache_write));
                 }
                 None
             }
@@ -1112,7 +1147,6 @@ impl StreamCoalescer {
         if let Some(m) = v.pointer("/message/model").and_then(|x| x.as_str()) {
             self.model = Some(m.to_string());
         }
-        self.absorb_usage(v.pointer("/message").unwrap_or(v));
         let mut out = self.flush_buf();
         let content = v.pointer("/message/content")?.as_array()?;
         for block in content {
@@ -1203,36 +1237,131 @@ impl StreamCoalescer {
         }
     }
 
-    fn absorb_usage(&mut self, v: &serde_json::Value) {
+    /// **Known gap: `cli:grok`.** grok is spawned with `--output-format streaming-json`
+    /// (`providers/grok.rs`), which its own help calls "NDJSON of the agent native ACP
+    /// session updates"; the Anthropic-wire option is `streaming-messages-json` and spar
+    /// does not ask for it. No grok slot log on this box contains a `· session`, `· done`
+    /// or `· turn` marker, so grok reaches neither the claude `result` arm nor codex's
+    /// `turn.completed` and **never gets a Terminal-scope record**, so its numbers come
+    /// entirely from the Request arm below. Measured against grok's own session store for
+    /// biddesk run 92ae513a (`~/.grok/sessions/<cwd>/<id>/updates.jsonl`, whose
+    /// `turn_completed` update carries the truth): `cache_read` matched exactly
+    /// (2,853,504) and `input_tokens` matched exactly as the uncached remainder (124,866
+    /// = 2,978,370 - 2,853,504), because grok emits both cumulatively and `max` lands on
+    /// the final value. `output_tokens` did **not**: 61,292 recorded against 30,646 real,
+    /// i.e. a cumulative value summed more than once. Removing the duplicate
+    /// `absorb_usage` calls (this change) is the likely fix but is **unverified**: grok
+    /// is out of quota and was not probed. Two consequences to fix separately, not here:
+    /// `context_tokens` for grok is a cumulative total wearing a peak's name (grok's
+    /// `modelCalls: 31` says the real window is far smaller), and `model` / `tool_errors`
+    /// / tool *names* are never recovered at all, though the tool *count* is exact.
+    fn absorb_usage(&mut self, v: &serde_json::Value, scope: UsageScope) {
         let u = v.get("usage").or_else(|| v.pointer("/message/usage"));
         let Some(u) = u else { return };
-        if let Some(n) = u.get("input_tokens").and_then(|x| x.as_u64()) {
-            self.input_tokens = self.input_tokens.max(n);
-        }
-        if let Some(n) = u.get("output_tokens").and_then(|x| x.as_u64()) {
-            self.output_tokens = self.output_tokens.saturating_add(n);
-        }
-        if let Some(n) = u
-            .get("cache_read_input_tokens")
-            .or_else(|| u.pointer("/cache_read_input_tokens"))
-            // Codex reports cached prompt tokens as `cached_input_tokens`.
-            .or_else(|| u.get("cached_input_tokens"))
+        let input = u
+            .get("input_tokens")
             .and_then(|x| x.as_u64())
-        {
-            self.cache_read = self.cache_read.max(n);
-        }
-        if let Some(n) = u
+            .unwrap_or_default();
+        let output = u
+            .get("output_tokens")
+            .and_then(|x| x.as_u64())
+            .unwrap_or_default();
+        // The two conventions are not interchangeable and adding them the same way is a
+        // 2x error. Anthropic's `cache_read_input_tokens` is disjoint from `input_tokens`;
+        // OpenAI/codex's `cached_input_tokens` is a *component of* `input_tokens`
+        // (verified across 105 `token_count` records in `~/.codex/sessions`: every one has
+        // `total_tokens == input_tokens + output_tokens` and none has `cached > input`).
+        // Codex is therefore normalized to the Anthropic shape here, with `input_tokens`
+        // reduced to the uncached remainder, so `input + cache_read + cache_write + output`
+        // stays the honest billed total for both.
+        let (input, cache_read) = match (
+            u.get("cache_read_input_tokens").and_then(|x| x.as_u64()),
+            u.get("cached_input_tokens").and_then(|x| x.as_u64()),
+        ) {
+            (Some(cr), _) => (input, cr),
+            (None, Some(cached)) => (input.saturating_sub(cached), cached),
+            (None, None) => (input, 0),
+        };
+        let cache_write = u
             .get("cache_creation_input_tokens")
             .and_then(|x| x.as_u64())
-        {
-            self.cache_write = self.cache_write.max(n);
+            .unwrap_or_default()
+            .max(
+                u.pointer("/cache_creation/ephemeral_1h_input_tokens")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or_default(),
+            );
+
+        if scope == UsageScope::Terminal {
+            // The invocation total supersedes whatever the per-call records added up
+            // to, and re-absorbing the same record must be idempotent.
+            self.input_tokens = input;
+            self.output_tokens = output;
+            self.cache_read = cache_read;
+            self.cache_write = cache_write;
+            self.saw_terminal_usage = true;
+            return;
         }
-        // nested cache_creation
-        if let Some(n) = u
-            .pointer("/cache_creation/ephemeral_1h_input_tokens")
-            .and_then(|x| x.as_u64())
-        {
-            self.cache_write = self.cache_write.max(n);
+
+        self.context_peak = self
+            .context_peak
+            .max(input.saturating_add(cache_read).saturating_add(cache_write));
+        if self.saw_terminal_usage {
+            return;
+        }
+        // Providers disagree on whether a per-call record is a delta or a running
+        // total, so the billed components stay on the conservative max/sum shape until
+        // a terminal record settles them.
+        self.input_tokens = self.input_tokens.max(input);
+        self.output_tokens = self.output_tokens.saturating_add(output);
+        self.cache_read = self.cache_read.max(cache_read);
+        self.cache_write = self.cache_write.max(cache_write);
+    }
+
+    /// Peak single-request prompt footprint. Adapters that report usage only once, at
+    /// the end of the invocation (codex), have no per-request record to peak over, so
+    /// their invocation total stands in.
+    fn context_tokens(&self) -> u64 {
+        if self.context_peak > 0 {
+            return self.context_peak;
+        }
+        self.input_tokens
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_write)
+    }
+
+    /// Cumulative billed tokens: exactly the sum of the four component counters this
+    /// coalescer writes into `StreamStats`, so the sidecar's own numbers always add up.
+    fn billed_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.output_tokens.max(self.est_output_tokens))
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_write)
+    }
+
+    /// Fold this coalescer's counters into the shared stats.
+    ///
+    /// A no-op on stderr. `run_captured` runs one coalescer per stream against one
+    /// `StreamStats`, and the stderr coalescer never parses anything, so copying its
+    /// counters over meant whichever stream wrote last decided the numbers: a slot
+    /// whose final line was stderr reported zero tools and zero tokens.
+    fn merge_counters_into(&self, s: &mut StreamStats) {
+        if self.is_err {
+            return;
+        }
+        s.tools = self.tools;
+        s.tool_errors = self.tool_errors;
+        s.input_tokens = self.input_tokens;
+        s.output_tokens = self.output_tokens.max(self.est_output_tokens);
+        s.cache_read_tokens = self.cache_read;
+        s.cache_write_tokens = self.cache_write;
+        s.context_tokens = self.context_tokens();
+        s.billed_tokens = self.billed_tokens();
+        if self.model.is_some() {
+            s.model = self.model.clone();
+        }
+        if self.session_id.is_some() {
+            s.session_id = self.session_id.clone();
         }
     }
 
@@ -1699,9 +1828,54 @@ mod tests {
         }
         assert!(out.contains("done reviewing"), "assistant text: {out:?}");
         assert!(out.contains("· turn"), "turn marker: {out:?}");
-        assert_eq!(c.input_tokens, 39189);
+        // codex's `cached_input_tokens` sits *inside* `input_tokens`, so it is split out
+        // rather than added: `input` becomes the uncached remainder. This exact record's
+        // own `token_count` entry in `~/.codex/sessions` reports `total_tokens: 39306`.
+        assert_eq!(c.input_tokens, 39189 - 39185);
         assert_eq!(c.output_tokens, 117);
         assert_eq!(c.cache_read, 39185);
+        assert_eq!(
+            c.billed_tokens(),
+            39306,
+            "codex's own total_tokens, not 2x it"
+        );
+        // codex reports usage only once, at the end, so there is no per-request record
+        // to peak over and the turn total stands in for the gauge. The whole prompt is
+        // `input_tokens`, cached part included.
+        assert_eq!(c.context_tokens(), 39189);
+    }
+
+    #[test]
+    fn claude_result_supersedes_per_message_usage() {
+        // Real `claude -p --output-format stream-json` shape: one `assistant` event per
+        // content block, all repeating that message's usage, then a `result` carrying
+        // the invocation total (input 49 = 10 + 39, cache_read 54623 = 18052 + 36571).
+        // Summing the assistant events would bill the first message three times.
+        let msg = |input: u64, cw: u64, cr: u64, out: u64| {
+            format!(
+                r#"{{"type":"assistant","message":{{"model":"claude-haiku","usage":{{"input_tokens":{input},"cache_creation_input_tokens":{cw},"cache_read_input_tokens":{cr},"output_tokens":{out}}},"content":[{{"type":"text","text":"hi"}}]}}}}"#
+            )
+        };
+        let mut c = StreamCoalescer::new(false);
+        for _ in 0..3 {
+            c.feed(&msg(10, 18519, 18052, 4));
+        }
+        for _ in 0..2 {
+            c.feed(&msg(39, 259, 36571, 1));
+        }
+        // Mid-run the gauge is already right, off per-request records alone.
+        assert_eq!(c.context_tokens(), 39 + 259 + 36571);
+        c.feed(
+            r#"{"type":"result","subtype":"success","usage":{"input_tokens":49,"cache_creation_input_tokens":18778,"cache_read_input_tokens":54623,"output_tokens":241}}"#,
+        );
+        assert_eq!(c.input_tokens, 49);
+        assert_eq!(c.output_tokens, 241, "the total replaces the per-call sum");
+        assert_eq!(c.cache_read, 54623);
+        assert_eq!(c.cache_write, 18778);
+        assert_eq!(c.billed_tokens(), 49 + 241 + 54623 + 18778);
+        // The gauge does not inherit the terminal record's cumulative cache read,
+        // which is what made every claude slot read as permanently over threshold.
+        assert_eq!(c.context_tokens(), 39 + 259 + 36571);
     }
 
     #[test]
@@ -1757,19 +1931,21 @@ mod tests {
     }
 
     #[test]
-    fn opencode_jsonl_dedupes_double_emit() {
-        // Real `opencode run --format json` events (captured from opencode 1.17.4). Every
-        // event double-emits in dash and underscore top-level spellings with one part.id;
-        // both must be counted once. Real single-step tokens: input 12738, output 19,
-        // cache.read 1920.
+    fn opencode_jsonl_dedupes_a_republished_part() {
+        // Real `opencode run --format json` events (captured from opencode 1.17.4). The
+        // top-level `type` is always the underscore spelling the emitter hardcodes; the
+        // dash spelling lives on `part.type`. What repeats is the *part*: opencode
+        // republishes `PartUpdated` for an id it already sent, so the same `prt_f1`
+        // arrives twice and must be billed once. Real single-step tokens: input 12738,
+        // output 19, cache.read 1920.
         let mut c = StreamCoalescer::new(false);
         let mut out = String::new();
+        let finish = r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_f1","type":"step-finish","tokens":{"total":14677,"input":12738,"output":19,"reasoning":0,"cache":{"write":0,"read":1920}}}}"#;
         for line in [
             r#"{"type":"step_start","sessionID":"ses_1","part":{"id":"prt_s1","type":"step-start"}}"#,
             r#"{"type":"tool_use","sessionID":"ses_1","part":{"type":"tool","tool":"write","callID":"call_1","state":{"status":"completed"}}}"#,
-            // The one real step-finish, fed in BOTH spellings with the same part.id.
-            r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_f1","type":"step-finish","tokens":{"total":14677,"input":12738,"output":19,"reasoning":0,"cache":{"write":0,"read":1920}}}}"#,
-            r#"{"type":"step-finish","sessionID":"ses_1","part":{"id":"prt_f1","type":"step-finish","tokens":{"total":14677,"input":12738,"output":19,"reasoning":0,"cache":{"write":0,"read":1920}}}}"#,
+            finish,
+            finish,
             r#"{"type":"text","sessionID":"ses_1","part":{"id":"prt_t1","type":"text","text":"DONE"}}"#,
         ] {
             if let Some(chunk) = c.feed(line) {
@@ -1780,15 +1956,42 @@ mod tests {
         assert!(out.contains("DONE"), "assistant text: {out:?}");
         assert!(out.contains("→ write"), "tool marker: {out:?}");
         assert_eq!(c.tools, 1);
-        // Dedupe: the two step-finish spellings add output once (19, not 38).
+        // Load-bearing now that every field sums: without it the republished step is
+        // billed twice.
         assert_eq!(c.output_tokens, 19, "output must count once, not double");
-        assert_eq!(c.input_tokens, 12738, "input is the max across steps");
-        assert_eq!(c.cache_read, 1920, "cache.read picked up");
+        assert_eq!(c.input_tokens, 12738, "input must count once, not double");
+        assert_eq!(c.cache_read, 1920, "cache.read must count once, not double");
+        assert_eq!(
+            c.session_id.as_deref(),
+            Some("ses_1"),
+            "session id makes the slot checkable against opencode's own ledger"
+        );
     }
 
     #[test]
-    fn opencode_input_max_output_sum_across_steps() {
-        // Two distinct steps (different part.id): input uses max, output sums.
+    fn opencode_dash_spelling_on_a_top_level_type_would_still_dedupe() {
+        // No opencode build observed emits a dash-spelled top-level `type` -- the json
+        // writer uses five hardcoded underscore literals -- so the `-` to `_` mapping is
+        // defensive. Pinned rather than deleted: if a future build did emit both, the
+        // dedupe key has to fold them together or every step bills twice.
+        let mut c = StreamCoalescer::new(false);
+        for line in [
+            r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_f1","type":"step-finish","tokens":{"input":12738,"output":19,"cache":{"read":1920,"write":0}}}}"#,
+            r#"{"type":"step-finish","sessionID":"ses_1","part":{"id":"prt_f1","type":"step-finish","tokens":{"input":12738,"output":19,"cache":{"read":1920,"write":0}}}}"#,
+        ] {
+            c.feed(line);
+        }
+        assert_eq!(c.input_tokens, 12738);
+        assert_eq!(c.output_tokens, 19);
+        assert_eq!(c.cache_read, 1920);
+    }
+
+    #[test]
+    fn opencode_sums_step_deltas() {
+        // Two distinct steps (different part.id). Every opencode step field is that
+        // call's own delta: opencode.db's session totals equal the sum of its steps
+        // (ses_fc0c768c2f: 20 steps, cache_read 2,550,766 = sum, max only 170,295), so
+        // maxing under-reported the cache-heavy fields by an order of magnitude.
         let mut c = StreamCoalescer::new(false);
         for line in [
             r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_a","type":"step-finish","tokens":{"input":12738,"output":19,"cache":{"read":1920,"write":0}}}}"#,
@@ -1796,9 +1999,142 @@ mod tests {
         ] {
             c.feed(line);
         }
-        assert_eq!(c.input_tokens, 12738);
+        assert_eq!(c.input_tokens, 12835);
         assert_eq!(c.output_tokens, 21);
-        assert_eq!(c.cache_read, 14592);
+        assert_eq!(c.cache_read, 16512);
+        // The gauge is the biggest single call, not the running total.
+        assert_eq!(c.context_tokens(), 14689, "97 + 14592 beats 12738 + 1920");
+        assert_eq!(c.billed_tokens(), 12835 + 21 + 16512);
+    }
+
+    #[test]
+    fn opencode_sums_reasoning_as_output_and_dedupes_each_step() {
+        // Each step republished once, as opencode's `PartUpdated` really does.
+        // `tokens.total` in opencode.db is input + output + reasoning + cache read +
+        // write, so reasoning is billed and is not already inside `output`.
+        let step = |id: &str, input: u64, out: u64, reason: u64, cr: u64| {
+            format!(
+                r#"{{"type":"step_finish","sessionID":"ses_1","part":{{"id":"{id}","type":"step-finish","tokens":{{"input":{input},"output":{out},"reasoning":{reason},"cache":{{"read":{cr},"write":0}}}}}}}}"#
+            )
+        };
+        let mut c = StreamCoalescer::new(false);
+        for line in [
+            step("prt_a", 15193, 23, 363, 1920),
+            step("prt_a", 15193, 23, 363, 1920),
+            step("prt_b", 18932, 177, 502, 64),
+            step("prt_b", 18932, 177, 502, 64),
+        ] {
+            c.feed(&line);
+        }
+        assert_eq!(c.input_tokens, 15193 + 18932);
+        assert_eq!(
+            c.output_tokens,
+            23 + 363 + 177 + 502,
+            "reasoning bills as output"
+        );
+        assert_eq!(c.cache_read, 1920 + 64);
+        // opencode's own `tokens.total` per step, summed.
+        assert_eq!(c.billed_tokens(), 17499 + 19675);
+    }
+
+    #[test]
+    fn stderr_stream_never_zeroes_the_shared_counters() {
+        // `run_captured` runs one coalescer per stream against one `StreamStats`, and
+        // the stderr coalescer parses nothing, so its counters are permanently zero.
+        // With stderr writing last, a real slot reported `"tools": 0` beside a log
+        // holding 191 tool lines (biddesk run 2736a545, whose final line is
+        // `! runtime command acknowledgement timed out after 30s`).
+        let tmp = tempdir().unwrap();
+        let log = tmp.path().join("slot.log");
+        let stats = std::sync::Arc::new(std::sync::Mutex::new(StreamStats::default()));
+
+        let stdout = concat!(
+            r#"{"type":"assistant","message":{"model":"claude-opus","usage":{"input_tokens":100,"output_tokens":5,"cache_read_input_tokens":50},"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}"#,
+            "
+",
+            r#"{"type":"result","subtype":"success","usage":{"input_tokens":100,"output_tokens":7,"cache_read_input_tokens":50}}"#,
+            "
+",
+        );
+        stream_to_log(
+            std::io::Cursor::new(stdout.as_bytes()),
+            &log,
+            false,
+            stats.clone(),
+        );
+        stream_to_log(
+            std::io::Cursor::new(
+                b"runtime command acknowledgement timed out after 30s
+",
+            ),
+            &log,
+            true,
+            stats.clone(),
+        );
+
+        let s = stats.lock().unwrap();
+        assert_eq!(s.tools, 1, "stderr must not wipe the tool count");
+        assert_eq!(s.input_tokens, 100, "stderr must not wipe the tokens");
+        assert_eq!(s.output_tokens, 7);
+        assert_eq!(s.cache_read_tokens, 50);
+        assert_eq!(s.billed_tokens, 157);
+        assert_eq!(s.model.as_deref(), Some("claude-opus"));
+        // stderr still counts as output and as liveness.
+        assert_eq!(s.lines_in, 3);
+        assert!(s.chars_out > 0);
+        assert!(s.last_log_at.is_some());
+        assert!(std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("! runtime command acknowledgement timed out"));
+    }
+
+    #[test]
+    fn last_event_without_log_output_still_lands_in_the_sidecar() {
+        // Counters used to be written only alongside a log append. opencode's terminal
+        // `step_finish` prints nothing, so the last call's tokens never reached
+        // `stats.json`, and a stream of nothing but step_finish reported all zeros.
+        let tmp = tempdir().unwrap();
+        let log = tmp.path().join("slot.log");
+        let stats = std::sync::Arc::new(std::sync::Mutex::new(StreamStats::default()));
+        let stream = concat!(
+            r#"{"type":"text","sessionID":"ses_1","part":{"id":"prt_t","type":"text","text":"DONE"}}"#,
+            "
+",
+            r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_f","type":"step-finish","tokens":{"input":12738,"output":19,"cache":{"read":1920,"write":0}}}}"#,
+            "
+",
+        );
+        stream_to_log(
+            std::io::Cursor::new(stream.as_bytes()),
+            &log,
+            false,
+            stats.clone(),
+        );
+        let s = stats.lock().unwrap();
+        assert_eq!(s.input_tokens, 12738);
+        assert_eq!(s.cache_read_tokens, 1920);
+        assert_eq!(s.billed_tokens, 12738 + 1920 + s.output_tokens);
+        assert_eq!(s.session_id.as_deref(), Some("ses_1"));
+    }
+
+    #[test]
+    fn finish_without_a_model_keeps_the_one_already_detected() {
+        // The finish branch used to assign `model` unconditionally, so a stream that
+        // ended with nothing buffered wiped a model the feed branch had found.
+        let tmp = tempdir().unwrap();
+        let log = tmp.path().join("slot.log");
+        let stats = std::sync::Arc::new(std::sync::Mutex::new(StreamStats::default()));
+        stats.lock().unwrap().model = Some("claude-opus".into());
+        stream_to_log(
+            std::io::Cursor::new(
+                b"plain trailing line
+",
+            ),
+            &log,
+            false,
+            stats.clone(),
+        );
+        assert_eq!(stats.lock().unwrap().model.as_deref(), Some("claude-opus"));
     }
 
     #[test]

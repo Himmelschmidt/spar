@@ -55,6 +55,7 @@ either way.
 | `tmux.rs` | Optional tmux backend (dedicated session per run). Small, opt-in |
 | `tui.rs` | ratatui TUI. Rail + one main area; chrome bands, no pane borders (U14) |
 | `theme.rs` | TUI design tokens. One accent, one alert, three text weights; no page background |
+| `nudge.rs` | Soft token/time budgets: watches a live dispatch, nudges past them, owns the hard-ceiling kill marker (O50) |
 | `bus.rs` | Swarm bus (A2A): presence, typed messages, inbox, path reserves |
 | `mailbox.rs` | **Legacy.** Superseded by `bus.rs`. Don't build on it |
 | `worktree.rs` | Git worktree lifecycle for coding slots |

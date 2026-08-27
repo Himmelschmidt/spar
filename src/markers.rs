@@ -50,8 +50,55 @@ pub fn write_done(paths: &SparPaths, run_id: &str, slot_id: &str) -> Result<()> 
     write_marker(paths, run_id, &format!("{slot_id}.done"), "ok\n")
 }
 
-pub fn write_failed(paths: &SparPaths, run_id: &str, slot_id: &str, reason: &str) -> Result<()> {
-    write_marker(paths, run_id, &format!("{slot_id}.failed"), reason)
+/// What spar itself saw when a dispatch's child was waited on.
+///
+/// Written as the terminal marker's body so a spar-authored verdict can be told apart
+/// from one an agent wrote by hand into the same path. `terminal_marker` deliberately
+/// still accepts either: an agent's marker is the only terminal record a slot has when
+/// its orchestrator never came back, and refusing it would lose that.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DispatchVerdict {
+    pub ok: bool,
+    pub round: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Record a dispatch's verdict on disk.
+///
+/// Called the moment the child is reaped, before the artifact and recovery gates that
+/// can still downgrade a clean exit. `state.json` is only written by an orchestrator
+/// that survives its whole dispatch, while this survives one that merely got its child
+/// back. The gates re-call it with `ok: false` to upgrade `.done` to `.failed`.
+///
+/// **Purely additive, like the `write_done` it replaced.** It must never remove the
+/// other marker, and `ok: true` least of all. Six templates tell the agent to write its
+/// own `<slot>.failed` with a reason, and a CLI agent exits 0 once its turn ends
+/// whatever it concluded, so "agent declares failure, process exits clean" is the normal
+/// case rather than a corner. Deleting `.failed` there would invert the precedence
+/// `terminal_marker` documents and reconcile a self-declared failure to `done`. Leaving
+/// both is what that precedence is for, and it also means there is never an instant with
+/// no terminal marker at all.
+pub fn write_dispatch_verdict(
+    paths: &SparPaths,
+    run_id: &str,
+    slot_id: &str,
+    verdict: &DispatchVerdict,
+) -> Result<()> {
+    let body = serde_json::to_string(verdict).unwrap_or_default();
+    let name = if verdict.ok { "done" } else { "failed" };
+    write_marker(
+        paths,
+        run_id,
+        &format!("{slot_id}.{name}"),
+        &format!("{body}\n"),
+    )
 }
 
 /// Record a running slot's pid (with its start-time identity) so an out-of-process
@@ -123,7 +170,7 @@ mod tests {
             Some(TerminalMarker::Done)
         );
 
-        write_failed(&paths, "r1", "slot-a", "boom").unwrap();
+        write_marker(&paths, "r1", "slot-a.failed", "boom").unwrap();
         assert_eq!(
             terminal_marker(&paths, "r1", "slot-a"),
             Some(TerminalMarker::Failed)
@@ -131,10 +178,81 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_verdict_stamps_a_body_and_the_gate_downgrade_wins() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut v = DispatchVerdict {
+            ok: true,
+            round: 2,
+            pid: Some(4242),
+            exit_code: Some(0),
+            signal: None,
+            reason: None,
+        };
+        write_dispatch_verdict(&paths, "r1", "impl", &v).unwrap();
+        assert_eq!(
+            terminal_marker(&paths, "r1", "impl"),
+            Some(TerminalMarker::Done)
+        );
+        let body = std::fs::read_to_string(paths.marker("r1", "impl.done")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
+        assert_eq!(parsed["pid"], 4242);
+        assert_eq!(parsed["round"], 2);
+
+        // The artifact gate downgrades a clean exit. `.failed` wins from then on, and
+        // there is no instant in between with no terminal marker at all.
+        v.ok = false;
+        v.reason = Some("missing expected artifact plan.md".into());
+        write_dispatch_verdict(&paths, "r1", "impl", &v).unwrap();
+        assert_eq!(
+            terminal_marker(&paths, "r1", "impl"),
+            Some(TerminalMarker::Failed)
+        );
+    }
+
+    /// Six templates tell the agent to write its own `<slot>.failed` with a reason, and
+    /// a CLI agent exits 0 when its turn ends regardless of what it concluded. spar's
+    /// clean-exit stamp must not delete that verdict: doing so reconciles a slot that
+    /// declared failure to `done`, inverting the precedence this module documents.
+    #[test]
+    fn a_clean_exit_never_overrides_an_agents_own_failed_marker() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        write_marker(&paths, "r1", "impl.failed", "could not build: no crate\n").unwrap();
+
+        write_dispatch_verdict(
+            &paths,
+            "r1",
+            "impl",
+            &DispatchVerdict {
+                ok: true,
+                round: 1,
+                pid: Some(7),
+                exit_code: Some(0),
+                signal: None,
+                reason: None,
+            },
+        )
+        .unwrap();
+
+        assert!(marker_exists(&paths, "r1", "impl.failed"));
+        assert_eq!(
+            terminal_marker(&paths, "r1", "impl"),
+            Some(TerminalMarker::Failed),
+            "the agent's own verdict outranks its exit status"
+        );
+        assert_eq!(
+            std::fs::read_to_string(paths.marker("r1", "impl.failed")).unwrap(),
+            "could not build: no crate\n",
+            "and its reason is preserved verbatim"
+        );
+    }
+
+    #[test]
     fn clear_slot_removes_stale_verdict_on_redispatch() {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
-        write_failed(&paths, "r1", "impl", "died at print-timeout").unwrap();
+        write_marker(&paths, "r1", "impl.failed", "died at print-timeout").unwrap();
         write_done(&paths, "r1", "impl").unwrap();
         write_pid(
             &paths,

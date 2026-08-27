@@ -57,11 +57,11 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     // `codex exec --json` emits JSONL (thread/turn/item events with turn.completed
-    // usage) which the stream coalescer parses for tokens. No turn-boundary inject
-    // channel and no presence stream, so messages wait for the next turn and
+    // usage) which the stream coalescer parses for tokens. No push channel into the
+    // running process and no presence stream, so delivery falls back to the poll file and
     // presence degrades to the process/output heuristic.
     fn delivery_strategy(&self) -> DeliveryStrategy {
-        DeliveryStrategy::None
+        DeliveryStrategy::PollFile
     }
 
     fn presence_source(&self) -> PresenceSource {

@@ -36,6 +36,11 @@ pub enum DeliveryStrategy {
     /// Declared for matrix completeness; constructed once the opencode adapter lands.
     #[allow(dead_code)]
     SdkPrompt,
+    /// No push channel into the running process, so spar writes to a slot-scoped file
+    /// and the role prompt tells the agent to read it before it starts any new major
+    /// step. That is the only moment a nudge is actionable anyway, so it needs no polling
+    /// loop, and one `cat` of a small file is nothing against a 60M-token dispatch.
+    PollFile,
     /// No injection channel — messages wait in the inbox for the agent's next turn.
     None,
 }
@@ -114,10 +119,12 @@ pub struct SpawnOpts {
     pub extra_args: Vec<String>,
     /// Preferred model id (`--model` on CLIs that support it).
     pub model: Option<String>,
-    /// Resolved slot wall-clock budget in seconds. Adapters whose CLI has its own
-    /// self-timeout (e.g. agy's `--print-timeout`) derive it from this so config
-    /// (`[timeouts] slot_secs`/`review_secs`) reaches the live process instead of a
-    /// constant. `None` = adapter default.
+    /// Resolved slot wall-clock budget in seconds: the role's **hard ceiling**, not its
+    /// soft budget (`executor::hard_ceiling_for_role`, i.e. whichever of `slot_secs` /
+    /// `review_secs` / `suite.timeout_secs` / `spec.timeout_secs` the role drew, times
+    /// `timeouts.hard_ceiling_multiple`). Adapters whose CLI has its own self-timeout
+    /// (e.g. agy's `--print-timeout`) derive it from this so the CLI's own kill lands no
+    /// earlier than spar's. `None` = adapter default.
     pub timeout_secs: Option<u64>,
 }
 
