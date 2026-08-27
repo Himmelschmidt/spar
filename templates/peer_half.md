@@ -20,3 +20,5 @@ Mailbox: {{mailbox_dir}}
 5. Write `{{artifacts_dir}}/summary-{{slot_id}}.md` and marker done/failed.
 
 Keep messages short and actionable.
+
+Keep long build and test output out of your context: redirect it to `{{artifacts_dir}}/build-{{slot_id}}.log` and read back the tail, grepping for the real error on failure.

@@ -31,6 +31,7 @@ You freeze the acceptance bar **before** product code is written. You are **not*
 4. Tests should **fail** (or be clearly red) until the planned feature exists. Document expected failures.
 5. Do not claim green for missing behavior.
 6. Run any build or test command **in the foreground** and wait for it. No `&`, `nohup`, `disown`, or "start it and poll later" patterns — a slot that backgrounds a long build spends its remaining turns polling and exits without writing `test-contract.md`.
+7. Keep long output out of your context: send compile and test output to a log (`<cmd> > {{artifacts_dir}}/test-build-{{slot_id}}.log 2>&1; tail -40 {{artifacts_dir}}/test-build-{{slot_id}}.log`). Volume only — still foreground (see 6). Read the log properly when something fails: the expected red state you document has to be the real error, not a guess.
 
 ## Required outputs
 1. `{{artifacts_dir}}/test-contract.md` with:
