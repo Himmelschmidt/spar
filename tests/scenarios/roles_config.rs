@@ -230,6 +230,8 @@ reviewer = ["cli:claude", "cli:grok", "api:openai"]
 "#,
     );
 
+    // Raised past the 13 rounds the full ladder costs, so the O52 ceiling does not gate
+    // the run before the widening step is reached. The subject here is the ladder.
     let out = spar_cmd()
         .current_dir(tmp.path())
         .env("SPAR_FORCE_REQUEST_CHANGES", "1")
@@ -237,6 +239,8 @@ reviewer = ["cli:claude", "cli:grok", "api:openai"]
             "implement",
             "--task",
             "force stuck path",
+            "--max-rounds",
+            "20",
             "--dry-run",
             "--json",
         ])

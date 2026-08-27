@@ -32,6 +32,9 @@ pub struct Config {
     /// Pre-coding acceptance tests (plan flow). Separate from suite channel.
     #[serde(default)]
     pub spec: SpecConfig,
+    /// Round-loop economy: the ceiling on re-dispatch and the carry-forward budget.
+    #[serde(default)]
+    pub rounds: RoundsConfig,
     #[serde(default)]
     pub gates: GatesConfig,
     #[serde(default)]
@@ -439,6 +442,50 @@ fn default_spec_timeout_secs() -> u64 {
     1800
 }
 
+/// Round-loop economy (O52).
+///
+/// A round is a **cold** re-dispatch: `run_captured` truncates the log, the slot starts
+/// with an empty context and re-derives the repo before it does any new work. Measured
+/// over 197 runs, one fix round is a 6.6x median run cost (10.8M -> 70.9M tokens) and
+/// runs with at least one are 65% of all spend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoundsConfig {
+    /// Highest `state.round` a run may reach. On reaching it the run escalates to the
+    /// `awaiting_round_extension` human gate (exit 2) instead of minting another round;
+    /// `spar implement --run <id> --max-rounds <N>` is what raises it. `0` disables the
+    /// ceiling, which is what the corpus of rounds 9, 13, 17, 19, 20, 26 and 34 looked
+    /// like. Frozen onto the run at creation, so editing `spar.toml` cannot move the
+    /// ceiling of a run already in flight (O27).
+    #[serde(default = "default_max_rounds")]
+    pub max: u32,
+    /// Hard cap on the carry-forward brief seeded into the next round's implementer
+    /// prompt. The brief exists to keep the context floor low, so it is truncated, not
+    /// grown: `plan.md` is already a median 30k chars and is inlined every round.
+    #[serde(default = "default_carry_forward_chars")]
+    pub carry_forward_chars: usize,
+}
+
+impl Default for RoundsConfig {
+    fn default() -> Self {
+        Self {
+            max: default_max_rounds(),
+            carry_forward_chars: default_carry_forward_chars(),
+        }
+    }
+}
+
+/// A plan round plus an implement round plus the whole 3-fix budget is round 5, which
+/// covers 95% of the measured corpus (188 of 197 runs used 3 fix rounds or fewer). 8
+/// leaves room for one replan or one implementer rotation on top of that and still stops
+/// well short of the tail where spend explodes with nothing to show for it.
+pub fn default_max_rounds() -> u32 {
+    8
+}
+
+fn default_carry_forward_chars() -> usize {
+    4000
+}
+
 fn default_max_agents() -> u32 {
     4
 }
@@ -471,6 +518,7 @@ impl Default for Config {
             roles: RolesConfig::default(),
             review: ReviewConfig::default(),
             spec: SpecConfig::default(),
+            rounds: RoundsConfig::default(),
             gates: GatesConfig::default(),
             autonomy: AutonomyLevel::default(),
             message_budget: MessageBudget::default(),
@@ -515,6 +563,7 @@ struct ConfigFile {
     roles: Option<RolesConfigFile>,
     review: Option<ReviewConfigFile>,
     spec: Option<SpecConfigFile>,
+    rounds: Option<RoundsConfigFile>,
     gates: Option<GatesConfigFile>,
     autonomy: Option<AutonomyLevel>,
     message_budget: Option<MessageBudget>,
@@ -580,6 +629,12 @@ struct ReviewConfigFile {
 struct SpecConfigFile {
     enabled: Option<bool>,
     timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RoundsConfigFile {
+    max: Option<u32>,
+    carry_forward_chars: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -756,6 +811,14 @@ impl Config {
                 self.spec.timeout_secs = v;
             }
         }
+        if let Some(r) = &file.rounds {
+            if let Some(v) = r.max {
+                self.rounds.max = v;
+            }
+            if let Some(v) = r.carry_forward_chars {
+                self.rounds.carry_forward_chars = v;
+            }
+        }
         if let Some(g) = &file.gates {
             if let Some(v) = g.plan {
                 self.gates.plan = v;
@@ -860,6 +923,46 @@ fn load_file(path: &Path) -> Result<ConfigFile> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// O52. The ceiling and the carry-forward budget are project-tunable; the defaults
+    /// are what every existing project gets without editing anything.
+    #[test]
+    fn rounds_section_overlays_and_defaults() {
+        let tmp = tempdir().unwrap();
+        assert_eq!(Config::default().rounds.max, 8);
+        assert_eq!(Config::default().rounds.carry_forward_chars, 4000);
+
+        std::fs::write(
+            tmp.path().join("spar.toml"),
+            "[rounds]\nmax = 4\ncarry_forward_chars = 1500\n",
+        )
+        .unwrap();
+        let cfg = Config::load(tmp.path()).unwrap();
+        assert_eq!(cfg.rounds.max, 4);
+        assert_eq!(cfg.rounds.carry_forward_chars, 1500);
+
+        // A partial section keeps the other default rather than zeroing it: a
+        // `carry_forward_chars = 0` inferred from absence would disable truncation.
+        std::fs::write(tmp.path().join("spar.toml"), "[rounds]\nmax = 2\n").unwrap();
+        let cfg = Config::load(tmp.path()).unwrap();
+        assert_eq!(cfg.rounds.max, 2);
+        assert_eq!(cfg.rounds.carry_forward_chars, 4000);
+    }
+
+    /// A run reads its own frozen snapshot (O27), so the ceiling has to survive the
+    /// round trip through `config.json`.
+    #[test]
+    fn rounds_survive_the_run_config_snapshot() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut cfg = Config::default();
+        cfg.rounds.max = 5;
+        cfg.rounds.carry_forward_chars = 900;
+        cfg.save_snapshot(&paths, "r1").unwrap();
+        let bound = Config::for_run(&paths, "r1").unwrap();
+        assert_eq!(bound.rounds.max, 5);
+        assert_eq!(bound.rounds.carry_forward_chars, 900);
+    }
 
     #[test]
     fn partial_project_overlays_user() {

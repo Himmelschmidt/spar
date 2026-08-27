@@ -1242,6 +1242,20 @@ fn write_dry_artifacts(
             }
         }
         SlotRole::Implementer => {
+            // Test hook: an implementer that edits the contract it is judged against.
+            // The slot really can do this — `artifacts_dir` is in its prompt — and it is
+            // what the O43 freeze and the O52 re-freeze guard exist to bound.
+            if crate::util::env_truthy("SPAR_FORCE_CONTRACT_TAMPER") {
+                let contract = paths.artifact(&state.id, "test-contract.md");
+                if let Ok(body) = std::fs::read_to_string(&contract) {
+                    let kept: String = body
+                        .lines()
+                        .filter(|l| !l.contains("AC-2:"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    std::fs::write(&contract, format!("{kept}\n"))?;
+                }
+            }
             let stamp = cwd.join(".spar-dry-implement");
             std::fs::write(
                 &stamp,
@@ -1801,6 +1815,7 @@ pub fn emit_run_json(state: &RunState) -> Result<()> {
         "phase": state.phase,
         "task": state.task,
         "round": state.round,
+        "max_rounds": state.max_rounds,
         "amendment": state.amendment,
         "dry_run": state.dry_run,
         "slots": state.slots,

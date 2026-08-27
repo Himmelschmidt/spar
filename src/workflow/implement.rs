@@ -139,7 +139,10 @@ fn run_from_approved(
     let mut state = RunState::load(paths, run_id)?;
     let resumable = state.gates.plan_approved
         || state.phase == Phase::PlanApproved
-        || state.phase == Phase::Stopped;
+        || state.phase == Phase::Stopped
+        // The round-ceiling gate is lifted by re-entering implement, so a run parked
+        // there has to be resumable even when no plan gate ever ran (`--workflow loop`).
+        || state.phase == Phase::AwaitingRoundExtension;
     if !resumable {
         bail!(
             "run {run_id} plan is not approved (phase={:?})",
@@ -231,12 +234,35 @@ fn run_from_approved(
     // past the quota gate, so an invocation that never dispatched anything does not
     // leave the run claiming a round it did not run — five bounced retries against an
     // exhausted bucket would otherwise read as round 6.
+    let from_round_gate = state.phase == Phase::AwaitingRoundExtension;
+    if let Some(m) = opts.max_rounds {
+        state.max_rounds = m;
+    }
+    if state.round_ceiling_reached() {
+        escalate_round_ceiling(&mut state, paths)?;
+        finish_out(&state, opts.json)?;
+        return Ok(state.exit_code());
+    }
+    // The ceiling has been lifted: drop the verdict that parked the run, or a run that
+    // goes on to reach the ship gate still reports "round ceiling reached" as its
+    // reason, and an outer agent reading `error` at exit 2 re-issues `--max-rounds`
+    // instead of shipping.
+    if from_round_gate {
+        state.error = None;
+    }
     let round = state.begin_round();
     if !opts.json {
         println!("run {run_id} · round {round}");
     }
     let dry = state.dry_run;
-    prepare_implement_slots(&mut state, Some(&requested), dry, cfg, paths)?;
+    prepare_implement_slots(
+        &mut state,
+        Some(&requested),
+        dry,
+        cfg,
+        paths,
+        from_round_gate,
+    )?;
     if state.slots.iter().all(|s| s.role != SlotRole::Implementer) {
         bail!("no implementer slot after provider pick");
     }
@@ -246,7 +272,7 @@ fn run_from_approved(
     }
     let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
     state.save(paths)?;
-    execute_loop(&mut state, paths, cfg)?;
+    execute_loop(&mut state, paths, cfg, opts.accept_contract)?;
     maybe_auto_ship_or_cleanup(&mut state, paths, cfg)?;
     finish_out(&state, opts.json)?;
     Ok(state.exit_code())
@@ -263,13 +289,20 @@ fn prepare_implement_slots(
     dry: bool,
     cfg: &Config,
     paths: &SparPaths,
+    resuming_from_round_gate: bool,
 ) -> Result<()> {
     state.workflow = crate::cli::WorkflowKind::Loop;
     state.max_fix_rounds = 3;
     state.child_run = None;
-    state.fix_rounds = 0;
-    state.rotated_implementer = false;
-    state.widened_reviewers = false;
+    // A run lifted off the round ceiling is the *same* escalation continuing: the
+    // operator bought rounds, not a fresh stuck ladder. Resetting these here made
+    // `stuck` unreachable in a lift loop, because every lift handed the run another
+    // rotate + widen it had already spent (O52).
+    if !resuming_from_round_gate {
+        state.fix_rounds = 0;
+        state.rotated_implementer = false;
+        state.widened_reviewers = false;
+    }
 
     // Keep planner slots as historical; add impl/review if missing.
     let has_impl = state.slots.iter().any(|s| s.role == SlotRole::Implementer);
@@ -488,9 +521,12 @@ fn acceptance_blocks_ship(criteria: &[String], res: &ReviewResult, cfg: &Config)
         })
 }
 
-/// Which criteria blocked and why, so the next fix round's implementer prompt learns
-/// *which* AC failed rather than just "changes requested".
-fn acceptance_block_reason(criteria: &[String], res: &ReviewResult, cfg: &Config) -> String {
+/// Which criteria blocked and why, one line each.
+///
+/// Per criterion rather than pre-joined: the carry-forward brief renders these as bullets
+/// and truncates on line boundaries, so a single joined line (measured at 4k-10k chars on
+/// real reviews) is dropped whole and leaves a heading saying nothing blocked.
+fn acceptance_block_reasons(criteria: &[String], res: &ReviewResult, cfg: &Config) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
     for id in criteria {
         match res.acceptance.iter().find(|a| &a.id == id) {
@@ -511,7 +547,7 @@ fn acceptance_block_reason(criteria: &[String], res: &ReviewResult, cfg: &Config
             },
         }
     }
-    parts.join("; ")
+    parts
 }
 
 /// Why the suite was `Inconclusive`, for the bus broadcast and the reviewer prompt.
@@ -772,6 +808,7 @@ fn run_with_task(
     state.message_budget = cfg.message_budget;
     state.big = opts.big;
     state.max_fix_rounds = 3;
+    state.max_rounds = opts.max_rounds.unwrap_or(cfg.rounds.max);
     let n = cfg.max_agents.max(3) as usize;
     let roles: Vec<&str> = std::iter::once(SlotRole::Implementer.as_config_key())
         .chain(std::iter::repeat(SlotRole::Reviewer.as_config_key()))
@@ -794,7 +831,7 @@ fn run_with_task(
             return Ok(ExitCode::Quota);
         }
     }
-    prepare_implement_slots(&mut state, Some(&requested), dry, cfg, paths)?;
+    prepare_implement_slots(&mut state, Some(&requested), dry, cfg, paths, false)?;
 
     paths.ensure_run_dirs(&state.id)?;
     let _ = crate::bus::ensure_bus(paths);
@@ -812,7 +849,7 @@ fn run_with_task(
     }
 
     let _lock = crate::runlock::RunLock::acquire(paths, &state.id)?;
-    execute_loop(&mut state, paths, cfg)?;
+    execute_loop(&mut state, paths, cfg, opts.accept_contract)?;
     maybe_auto_ship_or_cleanup(&mut state, paths, cfg)?;
     finish_out(&state, opts.json)?;
     Ok(state.exit_code())
@@ -873,7 +910,12 @@ impl FrozenContract {
     }
 }
 
-pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<()> {
+pub fn execute_loop(
+    state: &mut RunState,
+    paths: &SparPaths,
+    cfg: &Config,
+    accept_contract: bool,
+) -> Result<()> {
     // Only isolate the implementer; reviewers share its cwd.
     let impl_ids: Vec<String> = state
         .slots
@@ -913,18 +955,46 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
         let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg));
     }
     let previous_fingerprint = state.contract_fingerprint.clone();
+    let moved = previous_fingerprint
+        .as_ref()
+        .is_some_and(|prev| *prev != frozen.fingerprint);
+    // O43 made re-freezing a *deliberate* human act — stop, edit, re-run — and the round
+    // ceiling (O52) turned it into a routine one that spar itself prompts for. So a
+    // re-entry may not adopt a contract spar watched move under the slot the contract
+    // bounds: the implementer can write to `artifacts/`, and "delete the criterion you
+    // cannot pass, then let the ceiling invite the operator to re-freeze it" is a clean
+    // path past the acceptance gate. `contract_modified` is exactly the flag that says
+    // spar saw it happen, so it is the flag that closes the door.
+    if moved && state.contract_modified && !accept_contract {
+        bail!(
+            "test-contract.md changed while the previous round was running, and this \
+             re-entry would adopt it: {} criteria now ({}), was fingerprint {}.\n\
+             The implementer can write to that file, so spar will not re-freeze it for \
+             you. Diff it against what you approved, then either revert it or re-run \
+             with --accept-contract.",
+            frozen.criteria.len(),
+            frozen.fingerprint,
+            previous_fingerprint.as_deref().unwrap_or("(none)")
+        );
+    }
     state.contract_fingerprint = Some(frozen.fingerprint.clone());
     state.contract_modified = false;
-    if previous_fingerprint.is_some_and(|prev| prev != frozen.fingerprint) {
-        let _ = crate::events::append(
-            paths,
-            &state.id,
-            &crate::events::Event::info(format!(
-                "contract re-frozen: {} criteria (fingerprint {})",
-                frozen.criteria.len(),
-                frozen.fingerprint
-            )),
+    if moved {
+        let msg = format!(
+            "contract re-frozen: {} criteria (fingerprint {}, was {}){}",
+            frozen.criteria.len(),
+            frozen.fingerprint,
+            previous_fingerprint.as_deref().unwrap_or("(none)"),
+            if accept_contract {
+                " — adopted a drifted contract via --accept-contract"
+            } else {
+                ""
+            }
         );
+        // Loud, like the adjacent vacuous-contract warning: a re-freeze changes what the
+        // ship gate enforces, and one line in events.jsonl is not somewhere anyone looks.
+        eprintln!("warning: {msg}");
+        let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg));
     }
     state.save(paths)?;
     let mut test_contract_body = test_contract_body;
@@ -998,6 +1068,13 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
         }
     }
 
+    // What the previous round's review panel rejected. Recovered from the artifacts on
+    // disk rather than carried in memory: the round after a gate — the one a human just
+    // paid for — is a fresh process, and an in-memory list would leave it running blind
+    // on the most expensive round of the run. Nothing in the implementer's prompt tells
+    // it to go read `review-*.md` on its own.
+    let mut blockers: Vec<String> = blockers_from_disk(state, paths, &frozen.criteria, cfg);
+
     loop {
         // Stop boundary: before the implementer (and every fix-round re-dispatch).
         if should_stop(paths, &state.id) {
@@ -1019,10 +1096,20 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
             s.error = None;
         }
 
+        let brief = take_carry_forward(paths, &state.id, &impl_slot.id);
         let mut extra = HashMap::new();
         extra.insert("plan_body".into(), plan_body.clone());
         extra.insert("test_contract_body".into(), test_contract_body.clone());
         extra.insert("amendment_section".into(), amendment_section.clone());
+        extra.insert(
+            "carry_forward_section".into(),
+            carry_forward_section(
+                state.round,
+                &blockers,
+                brief.as_deref(),
+                cfg.rounds.carry_forward_chars,
+            ),
+        );
         let impl_model = impl_slot.model.clone();
         let impl_job = SlotJob {
             slot_id: impl_slot.id.clone(),
@@ -1242,6 +1329,17 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
         }
 
         let mut any_request_changes = suite_channel_active && suite_blocks_ship(suite_outcome);
+        blockers.clear();
+        if any_request_changes {
+            blockers.push(format!(
+                "suite channel {}: see {}",
+                match suite_outcome {
+                    SuiteOutcome::Fail => "red",
+                    _ => "inconclusive",
+                },
+                paths.artifact(&state.id, "suite.md").display()
+            ));
+        }
         for rev in &reviewers {
             // Stop boundary: before each reviewer job.
             if should_stop(paths, &state.id) {
@@ -1299,6 +1397,10 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
             // Timeout salvage may have already written a partial review-*.md.
             if !review_ok || missing_or_empty {
                 any_request_changes = true;
+                blockers.push(format!(
+                    "review slot `{}` failed or produced no review",
+                    rev.id
+                ));
                 if missing_or_empty {
                     let acceptance = if frozen.criteria.is_empty() {
                         String::new()
@@ -1324,15 +1426,30 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
                 let res = review_result::parse_review(&text);
                 if !res.approves() {
                     any_request_changes = true;
+                    blockers.push(format!(
+                        "review `{}` requested changes: {}",
+                        rev.id,
+                        review_path.display()
+                    ));
                 }
                 if acceptance_blocks_ship(&frozen.criteria, &res, cfg) {
                     any_request_changes = true;
-                    let reason = acceptance_block_reason(&frozen.criteria, &res, cfg);
+                    let reasons = acceptance_block_reasons(&frozen.criteria, &res, cfg);
+                    // Into the next round's prompt, not only onto the bus: without this
+                    // the fix round's implementer prompt is byte-identical to round 1's
+                    // and never learns which criterion it failed.
+                    for r in &reasons {
+                        blockers.push(format!("acceptance (review `{}`): {r}", rev.id));
+                    }
                     let _ = crate::bus::broadcast(
                         paths,
                         Some(&state.id),
                         "orchestrator",
-                        format!("acceptance gate blocked ship (review {}): {reason}", rev.id),
+                        format!(
+                            "acceptance gate blocked ship (review {}): {}",
+                            rev.id,
+                            reasons.join("; ")
+                        ),
                         state.message_budget,
                     );
                 }
@@ -1368,30 +1485,37 @@ pub fn execute_loop(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Re
         }
 
         state.fix_rounds += 1;
+        if state.fix_rounds > state.max_fix_rounds {
+            // Stuck policy: rotate implementer → widen reviewers → escalate. Resolved
+            // *before* the round ceiling, so `stuck` (exit 3, "this cannot be fixed")
+            // always beats the ceiling gate (exit 2, "this is costing too much"). The
+            // other order let a run whose ladder was already exhausted present as a
+            // question for the operator instead of a verdict.
+            if !state.rotated_implementer && try_rotate_implementer(state, paths, cfg)? {
+                state.rotated_implementer = true;
+                state.fix_rounds = 0;
+            } else if !state.widened_reviewers
+                && try_widen_reviewers(state, paths, &review_cwd, cfg)?
+            {
+                state.widened_reviewers = true;
+                state.fix_rounds = 0;
+            } else {
+                state.set_phase(Phase::Stuck);
+                state.error = Some("fix rounds exhausted; escalated".into());
+                state.save(paths)?;
+                write_stuck(paths, &state.id)?;
+                return Ok(());
+            }
+        }
+        // Every path that reaches here is about to buy another cold re-dispatch, the
+        // ladder's own retries included, so the ceiling bounds all of them.
+        if state.round_ceiling_reached() {
+            return escalate_round_ceiling(state, paths);
+        }
         // A fix pass re-dispatches the implementer and the panel, so it is a round of
         // work in its own right (O45) — `fix_rounds` bounds the loop, `round` counts
         // what happened on the run.
         state.begin_round();
-        if state.fix_rounds > state.max_fix_rounds {
-            // stuck policy: rotate implementer → widen reviewers → escalate
-            if !state.rotated_implementer && try_rotate_implementer(state, paths, cfg)? {
-                state.rotated_implementer = true;
-                state.fix_rounds = 0;
-                state.save(paths)?;
-                continue;
-            }
-            if !state.widened_reviewers && try_widen_reviewers(state, paths, &review_cwd, cfg)? {
-                state.widened_reviewers = true;
-                state.fix_rounds = 0;
-                state.save(paths)?;
-                continue;
-            }
-            state.set_phase(Phase::Stuck);
-            state.error = Some("fix rounds exhausted; escalated".into());
-            state.save(paths)?;
-            write_stuck(paths, &state.id)?;
-            return Ok(());
-        }
         state.set_phase(Phase::Fix);
         state.save(paths)?;
     }
@@ -1576,6 +1700,170 @@ fn write_impl_summary(state: &RunState, paths: &SparPaths) -> Result<()> {
     Ok(())
 }
 
+/// Park the run at the round-ceiling gate instead of buying another cold re-dispatch.
+///
+/// Same idiom as the fix-round exhaustion path below it — set an error, write
+/// `escalation.md`, stop — with one deliberate difference: this is a **gate** (exit 2),
+/// not `Stuck` (exit 3). Nothing is broken; the run has simply spent the re-dispatch
+/// budget it was allowed to spend on its own, and only a human can authorise more.
+fn escalate_round_ceiling(state: &mut RunState, paths: &SparPaths) -> Result<()> {
+    // Deliberately does not offer `ship`: `confirm_ship` accepts only the ship and
+    // winner gates, so from here it exits 1.
+    let msg = format!(
+        "round ceiling reached: round {} of a maximum {}. Each further round is a cold \
+         re-dispatch. Buy more with `spar implement --run {} --max-rounds {}`, or \
+         `spar stop {}` and take it over by hand.",
+        state.round,
+        state.max_rounds,
+        state.id,
+        state.max_rounds + 2,
+        state.id
+    );
+    state.set_phase(Phase::AwaitingRoundExtension);
+    state.error = Some(msg.clone());
+    state.save(paths)?;
+    // `print_run_human` shows the phase but not `error`, so without this an operator
+    // running implement interactively sees a phase name and no way out of it.
+    eprintln!("{msg}");
+    std::fs::write(
+        paths.artifact(&state.id, "escalation.md"),
+        format!(
+            "# Escalation: round ceiling\n\n{msg}\n\nFix rounds this leg: {}\nSuite: {:?}\n",
+            state.fix_rounds, state.suite_outcome
+        ),
+    )?;
+    let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg.clone()));
+    let _ = crate::bus::broadcast(
+        paths,
+        Some(&state.id),
+        "orchestrator",
+        msg,
+        state.message_budget,
+    );
+    Ok(())
+}
+
+/// Rebuild the previous round's blocker list from the review artifacts on disk.
+///
+/// Seeds the round loop on entry so a re-dispatch after *any* pause — the round-ceiling
+/// gate, a stop, a quota bounce, a crashed orchestrator — starts knowing which `AC-n`
+/// failed. Silent when the reviews approved: a stale approval is not a blocker, and the
+/// live round overwrites this list at its own review step anyway.
+fn blockers_from_disk(
+    state: &RunState,
+    paths: &SparPaths,
+    criteria: &[String],
+    cfg: &Config,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if matches!(state.suite_outcome, Some(SuiteOutcome::Fail)) {
+        out.push(format!(
+            "suite channel red last round: see {}",
+            paths.artifact(&state.id, "suite.md").display()
+        ));
+    }
+    for rev in state.slots.iter().filter(|s| s.role == SlotRole::Reviewer) {
+        let path = paths.artifact(&state.id, &format!("review-{}.md", rev.id));
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let res = review_result::parse_review(&text);
+        if !res.approves() {
+            out.push(format!(
+                "review `{}` requested changes: {}",
+                rev.id,
+                path.display()
+            ));
+        }
+        for r in acceptance_block_reasons(criteria, &res, cfg) {
+            out.push(format!("acceptance (review `{}`): {r}", rev.id));
+        }
+    }
+    out
+}
+
+/// Read and consume the previous round's carry-forward brief.
+///
+/// **Consumed on read.** A round whose implementer died without writing one gets
+/// nothing, rather than a brief describing a worktree two rounds stale — which reads as
+/// "what I just tried" and is worse than silence.
+///
+/// Per **slot**, not per run: `artifacts_dir` is shared and arena spawns N concurrent
+/// implementers off one template, so an unscoped name would have them overwriting each
+/// other. Rounds re-dispatch the same slot id (rotation changes the provider and keeps
+/// the id and the worktree), so a slot always reads back its own last round.
+fn take_carry_forward(paths: &SparPaths, run_id: &str, slot_id: &str) -> Option<String> {
+    let path = paths.artifact(run_id, &format!("carry-forward-{slot_id}.md"));
+    let body = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    let body = body.trim().to_string();
+    (!body.is_empty()).then_some(body)
+}
+
+/// The `{{carry_forward_section}}` seeded into the next round's implementer.
+///
+/// Blockers first, deliberately: they are the machine-known half (which `AC-n` failed and
+/// why, whether the suite went red) and the truncation eats the tail, so a slot that
+/// wrote a 40k-character essay cannot squeeze them out. The whole section is capped —
+/// carrying more every round is the quadratic problem this exists to avoid.
+fn carry_forward_section(
+    round: u32,
+    blockers: &[String],
+    brief: Option<&str>,
+    max_chars: usize,
+) -> String {
+    if blockers.is_empty() && brief.is_none() {
+        return String::new();
+    }
+    let mut out = format!(
+        "## Carry-forward (you already ran on this worktree — this is round {round})\n\
+         Context from the previous round, not a verdict. It is here so you do not spend \
+         this round re-deriving what the last one already learned. The acceptance gate \
+         never reads it.\n\n"
+    );
+    if !blockers.is_empty() {
+        out.push_str("### What blocked the ship last round\n");
+        for b in blockers {
+            // Clamped per bullet, not just in aggregate. A reviewer that pastes a stack
+            // trace as its evidence produces one line longer than the whole budget, and
+            // the line-boundary truncation below would drop it whole — rendering an
+            // empty heading, which reads as "nothing blocked".
+            out.push_str(&format!("- {}\n", clamp_line(b, max_chars / 4)));
+        }
+        out.push('\n');
+    }
+    if let Some(brief) = brief {
+        out.push_str("### The previous round's own notes\n");
+        out.push_str(brief);
+        out.push('\n');
+    }
+    truncate_at_line(&out, max_chars)
+}
+
+/// Cut to `max` characters on a line boundary, saying so where the cut happened.
+/// A silent truncation reads as an agent that stopped mid-sentence for its own reasons.
+fn truncate_at_line(s: &str, max: usize) -> String {
+    if max == 0 || s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max).collect();
+    let head = match cut.rfind('\n') {
+        Some(i) if i > 0 => &cut[..i],
+        _ => cut.as_str(),
+    };
+    format!("{head}\n\n_(carry-forward truncated by spar at {max} characters.)_\n")
+}
+
+/// Clamp one line so no single bullet can eat the whole section budget.
+fn clamp_line(s: &str, max: usize) -> String {
+    let one_line = s.replace('\n', " ");
+    if one_line.chars().count() <= max {
+        return one_line;
+    }
+    let head: String = one_line.chars().take(max.saturating_sub(3)).collect();
+    format!("{head}...")
+}
+
 fn write_stuck(paths: &SparPaths, run_id: &str) -> Result<()> {
     std::fs::write(
         paths.artifact(run_id, "escalation.md"),
@@ -1671,7 +1959,9 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
     let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
     match state.workflow {
         crate::cli::WorkflowKind::Loop => {
-            execute_loop(&mut state, paths, cfg)?;
+            // A daemon/`continue` resume is nobody's deliberate amendment, so it never
+            // adopts a contract that moved under the previous round.
+            execute_loop(&mut state, paths, cfg, false)?;
         }
         crate::cli::WorkflowKind::Arena => {
             crate::workflow::arena::execute(&mut state, paths, cfg)?;
@@ -1693,7 +1983,7 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
 #[cfg(test)]
 mod suite_parse_tests {
     use super::{
-        acceptance_block_reason, acceptance_blocks_ship, auto_reclaimable, command_is_selective,
+        acceptance_block_reasons, acceptance_blocks_ship, auto_reclaimable, command_is_selective,
         command_names, derive_suite_outcome, is_test_path, is_test_target, should_stop,
         suite_blocks_ship, suite_commands, suite_guidance, Phase, SuiteOutcome,
     };
@@ -1733,7 +2023,14 @@ mod suite_parse_tests {
         let res = parse_review("## Verdict\napprove\n\n## Acceptance\nAC-1: pass — ok\n");
         let c = criteria(&["AC-1", "AC-2"]);
         assert!(acceptance_blocks_ship(&c, &res, &Config::default()));
-        assert!(acceptance_block_reason(&c, &res, &Config::default()).contains("AC-2"));
+        let reasons = acceptance_block_reasons(&c, &res, &Config::default());
+        assert!(reasons.iter().any(|r| r.contains("AC-2")), "{reasons:?}");
+        // One entry per criterion: a joined line is dropped whole by the carry-forward's
+        // line-boundary truncation, leaving a heading that reads as "nothing blocked".
+        assert!(
+            reasons.iter().all(|r| !r.contains(';')),
+            "reasons must stay per-criterion: {reasons:?}"
+        );
         // Unmentioned criteria block even when unverified is tolerated.
         assert!(acceptance_blocks_ship(&c, &res, &relaxed()));
     }
@@ -2169,5 +2466,210 @@ mod contract_freeze_tests {
         );
         assert_eq!(frozen.criteria, ["AC-1", "AC-2"]);
         assert!(!frozen.drifted(BODY), "the prompt copy is not the contract");
+    }
+}
+
+#[cfg(test)]
+mod carry_forward_tests {
+    use super::*;
+
+    fn brief_of(round: u32, blockers: &[String], brief: Option<&str>, max: usize) -> String {
+        carry_forward_section(round, blockers, brief, max)
+    }
+
+    /// A first round has nothing to carry, and an empty section must render as nothing
+    /// at all — an empty "## Carry-forward" heading is a prompt telling the model there
+    /// was a previous round when there was not.
+    #[test]
+    fn nothing_to_carry_renders_nothing() {
+        assert_eq!(brief_of(2, &[], None, 4000), "");
+    }
+
+    /// The whole point: the failed criterion and its evidence reach the next round's
+    /// implementer, which before this only ever went to the bus.
+    #[test]
+    fn blockers_name_the_failed_criterion() {
+        let blockers = vec!["acceptance (review `rev-1`): AC-2: fail — no test exists".into()];
+        let out = brief_of(4, &blockers, None, 4000);
+        assert!(out.contains("AC-2: fail — no test exists"), "{out}");
+        assert!(out.contains("round 4"), "{out}");
+    }
+
+    /// The cap is on the whole section, and blockers lead, so a slot that wrote an essay
+    /// cannot push the machine-known half out of the prompt.
+    #[test]
+    fn truncation_eats_the_slot_prose_not_the_blockers() {
+        let blockers = vec!["acceptance (review `rev-1`): AC-2: fail — missing guard".into()];
+        let essay = "padding line that goes on and on\n".repeat(400);
+        assert!(
+            essay.len() > 4000,
+            "guard is vacuous unless the brief is long"
+        );
+        let out = brief_of(3, &blockers, Some(&essay), 1200);
+        assert!(out.chars().count() <= 1400, "capped, got {}", out.len());
+        assert!(out.contains("AC-2: fail — missing guard"), "{out}");
+        assert!(
+            out.contains("truncated by spar"),
+            "a silent cut is a lie:\n{out}"
+        );
+    }
+
+    /// Two rounds of the same size must produce the same size. A section that appended
+    /// would recreate the quadratic context growth it exists to avoid.
+    #[test]
+    fn the_section_does_not_grow_with_the_round_number() {
+        let blockers = vec!["acceptance (review `rev-1`): AC-1: fail — x".into()];
+        let brief = "- touched src/a.rs: added the guard\n- rejected: a feature flag\n";
+        let round_3 = brief_of(3, &blockers, Some(brief), 4000);
+        let round_9 = brief_of(9, &blockers, Some(brief), 4000);
+        assert_eq!(round_3.len(), round_9.len());
+    }
+
+    /// The measured defect: `acceptance_block_reasons` used to join every failing
+    /// criterion into one line, real reviews produced 4k-10k of it, and a line-boundary
+    /// truncation drops an over-cap line **whole** — leaving a bare "What blocked the
+    /// ship last round" heading, which reads as "nothing blocked".
+    #[test]
+    fn one_giant_blocker_never_leaves_an_empty_heading() {
+        let huge = format!(
+            "acceptance (review `rev-1`): AC-2: fail — {}",
+            "x".repeat(9000)
+        );
+        let out = brief_of(4, &[huge], None, 1000);
+        assert!(
+            out.contains("### What blocked the ship last round"),
+            "{out}"
+        );
+        let after_heading = out
+            .split_once("### What blocked the ship last round\n")
+            .map(|(_, rest)| rest.trim().to_string())
+            .unwrap_or_default();
+        assert!(
+            after_heading.starts_with("- acceptance"),
+            "the heading must still carry its bullet:\n{out}"
+        );
+        assert!(after_heading.contains("AC-2: fail"), "{out}");
+    }
+
+    /// Many failing criteria stay separately visible instead of collapsing into one
+    /// line that the cap then eats entirely.
+    #[test]
+    fn each_criterion_is_its_own_bullet() {
+        let blockers: Vec<String> = (1..=6)
+            .map(|n| format!("acceptance (review `rev-1`): AC-{n}: fail — evidence {n}"))
+            .collect();
+        let out = brief_of(3, &blockers, None, 4000);
+        for n in 1..=6 {
+            assert!(
+                out.contains(&format!("AC-{n}: fail")),
+                "AC-{n} missing:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn clamp_line_collapses_and_caps() {
+        assert_eq!(clamp_line("short", 40), "short");
+        assert_eq!(clamp_line("a\nb", 40), "a b");
+        let out = clamp_line(&"y".repeat(100), 10);
+        assert_eq!(out.chars().count(), 10);
+        assert!(out.ends_with("..."), "{out}");
+    }
+
+    #[test]
+    fn truncate_keeps_whole_lines() {
+        let out = truncate_at_line("alpha\nbravo\ncharlie\n", 9);
+        assert!(out.starts_with("alpha\n"), "{out}");
+        assert!(!out.contains("charlie"), "{out}");
+    }
+
+    /// Consumed on read: a round whose implementer died writes nothing, and must inherit
+    /// nothing, rather than a brief describing a worktree two rounds stale.
+    #[test]
+    fn carry_forward_is_consumed_on_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("r1").unwrap();
+        let f = paths.artifact("r1", "carry-forward-impl-cli-claude.md");
+        std::fs::write(&f, "- touched src/a.rs\n").unwrap();
+
+        let first = take_carry_forward(&paths, "r1", "impl-cli-claude");
+        assert_eq!(first.as_deref(), Some("- touched src/a.rs"));
+        assert!(!f.exists(), "the brief must not survive its own round");
+        assert!(take_carry_forward(&paths, "r1", "impl-cli-claude").is_none());
+    }
+
+    /// The round bought at a gate is a fresh process with an empty `blockers` list, so
+    /// the list is rebuilt from the review artifacts rather than carried in memory.
+    #[test]
+    fn blockers_are_recovered_from_the_review_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("r1").unwrap();
+        let mut state = RunState::new("r1", crate::cli::WorkflowKind::Loop, tmp.path().into());
+        state.slots.push(crate::executor::init_slot(
+            "rev-1",
+            "cli:claude",
+            SlotRole::Reviewer,
+        ));
+        std::fs::write(
+            paths.artifact("r1", "review-rev-1.md"),
+            "## Verdict\nrequest_changes\n\n## Acceptance\nAC-1: fail — no guard exists\n",
+        )
+        .unwrap();
+
+        let out = blockers_from_disk(&state, &paths, &["AC-1".to_string()], &Config::default());
+        assert!(
+            out.iter()
+                .any(|b| b.contains("AC-1: fail — no guard exists")),
+            "{out:?}"
+        );
+        assert!(
+            out.iter().any(|b| b.contains("requested changes")),
+            "{out:?}"
+        );
+    }
+
+    /// A stale *approval* is not a blocker; only the live round's review can clear or
+    /// re-raise the gate.
+    #[test]
+    fn an_approving_review_seeds_no_blockers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("r1").unwrap();
+        let mut state = RunState::new("r1", crate::cli::WorkflowKind::Loop, tmp.path().into());
+        state.slots.push(crate::executor::init_slot(
+            "rev-1",
+            "cli:claude",
+            SlotRole::Reviewer,
+        ));
+        std::fs::write(
+            paths.artifact("r1", "review-rev-1.md"),
+            "## Verdict\napprove\n\n## Acceptance\nAC-1: pass — done\n",
+        )
+        .unwrap();
+        assert!(
+            blockers_from_disk(&state, &paths, &["AC-1".to_string()], &Config::default())
+                .is_empty()
+        );
+    }
+
+    /// `artifacts_dir` is shared per run and arena spawns N implementers at once, so the
+    /// brief has to be slot-scoped or they clobber each other.
+    #[test]
+    fn briefs_are_scoped_per_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("r1").unwrap();
+        std::fs::write(paths.artifact("r1", "carry-forward-a.md"), "from a\n").unwrap();
+        std::fs::write(paths.artifact("r1", "carry-forward-b.md"), "from b\n").unwrap();
+        assert_eq!(
+            take_carry_forward(&paths, "r1", "a").as_deref(),
+            Some("from a")
+        );
+        assert_eq!(
+            take_carry_forward(&paths, "r1", "b").as_deref(),
+            Some("from b")
+        );
     }
 }

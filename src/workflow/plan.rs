@@ -31,6 +31,9 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
     state.autonomy = cfg.autonomy;
     state.message_budget = cfg.message_budget;
     state.big = opts.big;
+    // Frozen here because a plan run is where most units of work are created, and the
+    // ceiling has to be the one the project set when the work started (O27/O52).
+    state.max_rounds = cfg.rounds.max;
     let n_slots = if cfg.spec.enabled { 3 } else { 2 };
     let roles: &[&str] = if cfg.spec.enabled {
         &[

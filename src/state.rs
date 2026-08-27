@@ -61,6 +61,12 @@ pub struct RunState {
     pub fix_rounds: u32,
     #[serde(default)]
     pub max_fix_rounds: u32,
+    /// Highest `round` this run may reach before it escalates to a human instead of
+    /// re-dispatching again (O52). Frozen from `[rounds] max` when the run is created and
+    /// moved only by an explicit `implement --max-rounds`, so a later `spar.toml` edit
+    /// cannot silently re-ceiling a run in flight. `0` disables the ceiling.
+    #[serde(default = "crate::config::default_max_rounds")]
+    pub max_rounds: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmux_session: Option<String>,
     #[serde(default)]
@@ -179,6 +185,10 @@ pub enum Phase {
     AwaitingWinnerConfirm,
     AwaitingReconcile,
     AwaitingShipConfirm,
+    /// Round ceiling reached: the run wants more re-dispatch than it is allowed to buy
+    /// on its own (O52). A gate, not a failure — `implement --run <id> --max-rounds <N>`
+    /// is the operator saying the next round is worth paying for.
+    AwaitingRoundExtension,
     Shipping,
     Done,
     Escalated,
@@ -211,6 +221,7 @@ impl Phase {
                 | Phase::AwaitingWinnerConfirm
                 | Phase::AwaitingReconcile
                 | Phase::AwaitingShipConfirm
+                | Phase::AwaitingRoundExtension
         )
     }
 
@@ -399,6 +410,7 @@ impl RunState {
             ship_commands: None,
             fix_rounds: 0,
             max_fix_rounds: 3,
+            max_rounds: crate::config::default_max_rounds(),
             tmux_session: None,
             providers: Vec::new(),
             rotated_implementer: false,
@@ -428,6 +440,12 @@ impl RunState {
         self.archived_at = None;
         self.touch();
         self.round
+    }
+
+    /// Whether opening another round would take this run past its ceiling (O52).
+    /// Asked *before* `begin_round`, so `max_rounds` is the highest round that runs.
+    pub fn round_ceiling_reached(&self) -> bool {
+        self.max_rounds > 0 && self.round >= self.max_rounds
     }
 
     pub fn set_phase(&mut self, phase: Phase) {
@@ -527,7 +545,8 @@ impl RunState {
             Phase::AwaitingPlanApproval
             | Phase::AwaitingWinnerConfirm
             | Phase::AwaitingReconcile
-            | Phase::AwaitingShipConfirm => ExitCode::HumanGate,
+            | Phase::AwaitingShipConfirm
+            | Phase::AwaitingRoundExtension => ExitCode::HumanGate,
             Phase::Stuck | Phase::Escalated => ExitCode::Stuck,
             Phase::Quota => ExitCode::Quota,
             Phase::Failed | Phase::PlanRejected | Phase::Stopped => ExitCode::Failure,
@@ -862,6 +881,67 @@ mod tests {
         let loaded = RunState::load(&paths, "run1").unwrap();
         assert_eq!(loaded.phase, Phase::AwaitingPlanApproval);
         assert_eq!(loaded.exit_code(), ExitCode::HumanGate);
+    }
+
+    /// O52. The ceiling escalates to a **human**, so it must be exit 2 and not exit 3:
+    /// nothing is broken, the run has just spent the re-dispatch budget it was allowed
+    /// to spend on its own.
+    #[test]
+    fn round_ceiling_gate_is_a_human_gate_not_a_failure() {
+        let phase = Phase::AwaitingRoundExtension;
+        assert!(phase.is_gate());
+        assert!(!phase.is_terminal());
+        assert!(phase.is_waitable_stop());
+        assert!(resumable_at_rest(phase), "the next round has to be buyable");
+        assert!(
+            !age_sweepable(phase),
+            "age at a gate measures how busy the operator was, not abandonment"
+        );
+        assert!(
+            !auto_archivable(phase),
+            "a run waiting on you must stay visible"
+        );
+
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new("run-ceil", WorkflowKind::Loop, tmp.path().to_path_buf());
+        state.phase = phase;
+        state.save(&paths).unwrap();
+        let loaded = RunState::load(&paths, "run-ceil").unwrap();
+        assert_eq!(loaded.exit_code(), ExitCode::HumanGate);
+        assert_eq!(loaded.status_exit_code(), Some(2));
+    }
+
+    /// The predicate is asked before `begin_round`, so `max_rounds` is the highest round
+    /// that actually runs — an off-by-one here silently buys or refuses a whole round.
+    #[test]
+    fn round_ceiling_is_the_last_round_that_runs() {
+        let tmp = tempdir().unwrap();
+        let mut state = RunState::new("r", WorkflowKind::Loop, tmp.path().to_path_buf());
+        state.max_rounds = 3;
+        state.round = 2;
+        assert!(!state.round_ceiling_reached());
+        assert_eq!(state.begin_round(), 3);
+        assert!(state.round_ceiling_reached());
+        state.max_rounds = 0;
+        assert!(!state.round_ceiling_reached(), "0 disables the ceiling");
+    }
+
+    /// Runs written before the ceiling existed have no `max_rounds`; they must load with
+    /// the default rather than `0`, which would read as "unbounded".
+    #[test]
+    fn state_without_max_rounds_defaults_to_the_ceiling() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let state = RunState::new("legacy", WorkflowKind::Loop, tmp.path().to_path_buf());
+        state.save(&paths).unwrap();
+        let file = paths.state_file("legacy");
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("max_rounds");
+        std::fs::write(&file, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        let loaded = RunState::load(&paths, "legacy").unwrap();
+        assert_eq!(loaded.max_rounds, crate::config::default_max_rounds());
     }
 
     #[test]

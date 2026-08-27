@@ -69,6 +69,7 @@ pub fn base_vars(ctx: &TemplateCtx<'_>) -> HashMap<String, String> {
     m.insert("branch".into(), ctx.branch.into());
     m.insert("plan_body".into(), String::new());
     m.insert("amendment_section".into(), String::new());
+    m.insert("carry_forward_section".into(), String::new());
     m.insert(
         "test_contract_body".into(),
         "(no pre-written acceptance contract)".into(),
@@ -204,6 +205,57 @@ mod tests {
         assert!(s.contains("## Result\npass"));
         assert!(s.contains("Do **not** kick off full"));
         assert!(!s.contains("{{suite_guidance}}"));
+    }
+
+    /// The implementer template grew a carry-forward slot; an unsubstituted `{{...}}`
+    /// reaches the model as literal text.
+    #[test]
+    fn implementer_leaves_no_unseeded_placeholder() {
+        let ctx = TemplateCtx {
+            task: "do X",
+            project_root: "/tmp/p",
+            cwd: "/tmp/wt",
+            run_id: "abc",
+            artifacts_dir: "/tmp/a",
+            markers_dir: "/tmp/m",
+            mailbox_dir: "/tmp/mb",
+            slot_id: "impl",
+            provider: "cli:claude",
+            branch: "spar/abc/impl",
+        };
+        let s = render("implementer", &base_vars(&ctx)).unwrap();
+        assert!(
+            !s.contains("{{"),
+            "every implementer placeholder must be seeded by base_vars:\n{s}"
+        );
+        assert!(
+            s.contains("carry-forward-impl.md"),
+            "the brief must be slot-scoped so concurrent arena implementers cannot \
+             overwrite each other:\n{s}"
+        );
+    }
+
+    #[test]
+    fn implementer_carry_forward_section_renders() {
+        let ctx = TemplateCtx {
+            task: "do X",
+            project_root: "/tmp/p",
+            cwd: "/tmp/wt",
+            run_id: "abc",
+            artifacts_dir: "/tmp/a",
+            markers_dir: "/tmp/m",
+            mailbox_dir: "/tmp/mb",
+            slot_id: "impl",
+            provider: "cli:claude",
+            branch: "spar/abc/impl",
+        };
+        let mut v = base_vars(&ctx);
+        v.insert(
+            "carry_forward_section".into(),
+            "## Carry-forward\nSENTINEL-CF\n".into(),
+        );
+        let s = render("implementer", &v).unwrap();
+        assert!(s.contains("SENTINEL-CF"));
     }
 
     #[test]

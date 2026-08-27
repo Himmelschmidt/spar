@@ -238,6 +238,70 @@ round is counted when work is actually dispatched, so an invocation that bounces
 quota gate does not claim one; a fix pass is a round. A run continued after finishing reopens: `archived_at` clears
 and the phase moves back into the pipeline.
 
+### Rounds cost money, so they are bounded
+
+A round is a **cold re-dispatch**: the slot's log is truncated, a fresh process starts
+with an empty context, and it re-derives the repo before doing any new work. Measured
+over 197 real runs, one fix round is a **6.6x** median run (10.8M → 70.9M tokens) and
+runs with at least one account for the bulk of all spend.
+
+So a run has a **round ceiling**, `[rounds] max` (default `8`, frozen at creation like
+the rest of a run's config). Reaching it parks the run at `awaiting_round_extension` —
+a human gate, **exit 2**, phase `awaiting_round_extension` in `status --json` alongside
+`round` and `max_rounds`, with `escalation.md` written and the reason in `error`. It is a
+gate and not `stuck`: nothing is broken, the run has simply spent the re-dispatch budget
+it may spend on its own.
+
+```bash
+spar implement --run <id> --max-rounds 12   # buy more rounds; sticky on the run
+```
+
+- Re-entering `implement` at the ceiling with no flag gates again **before dispatching
+  anything**, so a bounced re-entry costs nothing and claims no round.
+- **`stuck` outranks the ceiling.** The rotate-implementer → widen-reviewers → `stuck`
+  ladder is resolved first, so a run that genuinely cannot be fixed still exits `3`
+  rather than presenting as a question. The full ladder costs about 13 rounds, so at the
+  default ceiling you will be asked before it completes — that is the ceiling working,
+  and lifting repeatedly does reach `stuck`.
+- **A lift buys rounds, not a fresh ladder.** `rotated_implementer` / `widened_reviewers`
+  / `fix_rounds` survive a lift, so an outer agent that lifts in a loop terminates.
+- Lifting clears `error`, so a run that goes on to the ship gate does not still report
+  the round gate's reason.
+- `--max-rounds` must be `>= 1`. Turning the ceiling off entirely is `[rounds] max = 0`
+  in `spar.toml`: a deliberate project setting, not a flag typed at a gate.
+- **The gate does not re-freeze a tampered contract.** Re-entering `implement` re-freezes
+  `test-contract.md` from disk (O43), and the ceiling makes that routine — so a re-entry
+  whose incoming state has `contract_modified: true` **refuses** (exit `1`) rather than
+  adopt an edit spar watched happen under the slot the contract bounds. Read the diff,
+  then revert it or pass `--accept-contract`. Every re-freeze is announced on stderr.
+
+### Carry-forward between rounds
+
+At the end of a round the implementer writes `artifacts/carry-forward-<slot>.md`; the
+next round's implementer prompt is seeded with it, so a cold dispatch starts with
+knowledge instead of re-deriving it. It carries only what a fresh agent cannot cheaply
+re-derive — files touched and why, what was tried and rejected, what the slot was stuck
+on — never a restatement of the plan or contract, which the next round is handed anyway.
+
+- **Bounded, not accumulating.** The whole section is hard-capped at
+  `[rounds] carry_forward_chars` (default `4000`) and truncated with a visible marker.
+  Orchestrator-known blockers (which `AC-n` failed and the reviewer's evidence, which
+  review requested changes, whether the suite went red) come **first**, so a slot that
+  writes an essay cannot squeeze them out, and each blocker is one bullet per criterion
+  clamped to its own share of the budget.
+- **Rebuilt from disk each time the loop starts**, not carried in memory, so the round an
+  operator buys at the ceiling gate — a fresh process — still knows which `AC-n` failed.
+- **Consumed on read.** A round whose implementer died without writing one inherits
+  nothing rather than a brief describing a worktree two rounds stale.
+- **Per slot, not per run.** `artifacts/` is shared and arena runs N implementers at
+  once; rounds re-dispatch the *same* slot id (rotation changes the provider and keeps
+  the id and worktree), so a slot always reads back its own last round.
+- **Context, never a verdict.** No reviewer and no gate reads it. It cannot argue a
+  failed `AC-n` past the acceptance gate.
+- **Not session resume.** Resuming the vendor CLI session was considered and rejected:
+  it carries the whole failed attempt's transcript, so round N+1 starts its context climb
+  from a huge base. See DECISIONS O52.
+
 For legs that already exist, `spar link <leg> --to <run>` records the grouping
 (`parent_run`). spar never infers it — pairing runs by task text would merge unrelated
 issues. The TUI then shows one row per unit of work; `status --json` still lists every
@@ -548,7 +612,7 @@ rail's selection.
 |------|---------|
 | 0 | Success / terminal ok (e.g. plan approved, done) |
 | 1 | Failure / halted by operator (`spar stop`, phase=stopped) |
-| 2 | Human gate (approve plan / winner / ship) |
+| 2 | Human gate (approve plan / winner / ship / raise the round ceiling) |
 | 3 | Stuck / escalated / wait timeout |
 | 4 | No usable providers (quota/pause) |
 
@@ -614,6 +678,13 @@ timeout_secs = 7200
 # Reviewer verdict / acceptance gate (review timeouts stay under [timeouts]).
 [review]
 require_all_criteria = true   # false ⇒ an `unverified` AC no longer blocks the ship
+# Round-loop economy. A round is a cold re-dispatch; measured, one fix round is 6.6x the
+# median run cost. `max` is the highest round a run may reach before it parks at the
+# awaiting_round_extension gate (exit 2); 0 disables. `carry_forward_chars` caps the brief
+# seeded into the next round's implementer.
+[rounds]
+max = 8
+carry_forward_chars = 4000
 # Pre-coding acceptance tests (plan). Separate test-author agent; not planner/critic.
 [spec]
 enabled = true
@@ -649,4 +720,7 @@ timeout_secs = 1800
 - **Review artifact schema (enforced):** each `artifacts/review-<slot>.md` is `## Verdict` / `## Acceptance` / `## Findings` / `## Tests`. The verdict is read as an **anchored header** — the first non-blank line under the first `## Verdict` must be `approve` or `request_changes`; missing or unparseable is treated as `request_changes`. `## Acceptance` carries one `AC-n: pass|fail|unverified — evidence` line per criterion in `test-contract.md`.
 - **Acceptance gate:** a run cannot reach `awaiting_ship_confirm` while any contract `AC-n` is `fail`, is `unverified` (default; relax with `[review] require_all_criteria = false`), or is simply **absent** from a review — an unmentioned criterion always blocks. With no contract at all (`[spec] enabled = false`) the verdict alone gates.
 - **Suite channel (implement/loop):** a dedicated `tester` slot runs full test suites; impl/review stay smoke/diff-only when it runs. Its provider comes from `[roles].tester` (falls through to model-select/fleet if unset/unusable). Artifact: `artifacts/suite.md`. Independent `review` workflow does not spawn a tester by default.
+- **Round ceiling:** `state.round` is bounded by `[rounds] max` (default 8). Hitting it is a **gate** (exit 2, phase `awaiting_round_extension`), lifted with `implement --run <id> --max-rounds <N>` (>= 1; sticky; clears `error`). The rotate/widen/`stuck` ladder resolves **first**, so exit 3 always beats the gate, and a lift preserves the ladder's progress rather than re-buying it.
+- **Contract re-freeze is guarded:** a re-entry that would adopt a `test-contract.md` spar saw drift mid-round refuses with exit `1` unless `--accept-contract` is passed. Re-freezes are announced on stderr, not just in `events.jsonl`.
+- **Carry-forward:** the implementer writes `artifacts/carry-forward-<slot>.md`, which seeds the next round's implementer prompt (blockers first, capped at `[rounds] carry_forward_chars`, consumed on read). It never reaches a reviewer or the acceptance gate.
 - **Human TUI `/spawn`:** `/spawn <cli:provider> <prompt>` launches an agent into a pane on spar's own `tmux -L spar` socket, joined to the selected run's bus — watch and steer it in Main's **Shell** tab without leaving spar.

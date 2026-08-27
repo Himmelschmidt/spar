@@ -97,3 +97,7 @@ path = "tests/scenarios/archive.rs"
 [[test]]
 name = "contract_gate"
 path = "tests/scenarios/contract_gate.rs"
+
+[[test]]
+name = "round_loop"
+path = "tests/scenarios/round_loop.rs"

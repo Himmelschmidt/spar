@@ -806,7 +806,10 @@ fn stuck_policy_dry_run_request_changes() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
 
-    // Force request_changes every review → fix rounds → rotate → widen → stuck
+    // Force request_changes every review → fix rounds → rotate → widen → stuck.
+    // The full rotate → widen → stuck ladder costs 13 rounds, and the default O52
+    // ceiling (8) will not buy that many without being asked. Raised, not disabled: the
+    // subject here is the ladder's terminal state, and `stuck` must still be reachable.
     let out = spar_cmd()
         .current_dir(tmp.path())
         .env("SPAR_FORCE_REQUEST_CHANGES", "1")
@@ -816,6 +819,8 @@ fn stuck_policy_dry_run_request_changes() {
             "force stuck path",
             "--providers",
             "cli:claude,cli:grok,cli:agy",
+            "--max-rounds",
+            "20",
             "--dry-run",
             "--json",
         ])
@@ -880,6 +885,8 @@ fn implement_dry_run_missing_ac_requests_changes() {
 
     // Reviews approve, but never mention the last contract criterion. The acceptance
     // gate must block the ship anyway (O19) and drive the fix ladder to stuck.
+    // Raised past the 13 rounds the full ladder costs, so the O52 ceiling does not
+    // answer first; the subject here is the acceptance gate, not the ceiling.
     spar_cmd()
         .current_dir(tmp.path())
         .env("SPAR_FORCE_AC_STATUS", "omit")
@@ -889,6 +896,8 @@ fn implement_dry_run_missing_ac_requests_changes() {
             &run_id,
             "--providers",
             "cli:claude,cli:grok,cli:agy",
+            "--max-rounds",
+            "20",
             "--dry-run",
             "--json",
         ])
@@ -953,6 +962,8 @@ fn implement_dry_run_unverified_blocks_by_default() {
             &run_id,
             "--providers",
             "cli:claude,cli:grok,cli:agy",
+            "--max-rounds",
+            "20",
             "--dry-run",
             "--json",
         ])
