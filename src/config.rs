@@ -1132,8 +1132,18 @@ enum Trust {
     Project,
 }
 
+#[cfg(not(test))]
 fn user_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("spar").join("config.toml"))
+}
+
+/// Under `cargo test`, `Config::load` must not read the developer's real
+/// `~/.config/spar/config.toml`: the overlay tests assert against defaults, so a
+/// machine that happens to set `providers.order` (or anything else) there fails a
+/// suite that has nothing to do with its change. Mirrors `registry::fallback_home`.
+#[cfg(test)]
+fn user_config_path() -> Option<PathBuf> {
+    None
 }
 
 fn load_file(path: &Path) -> Result<ConfigFile> {
