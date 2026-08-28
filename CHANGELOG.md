@@ -2,6 +2,20 @@
 
 All notable changes to spar are recorded here.
 
+## [Unreleased]
+
+### Fixed
+
+- **Dispatching acceptance tests to a coding agent could wipe out the work it had already
+  done.** Every dispatch after the first quietly reverted source files in the agent's
+  working copy to the versions on the test author's branch, so agents redid work they had
+  finished, or handed back a branch that had silently lost a feature. Only the test
+  author's unsaved work is copied across now; everything else arrives the way ordinary
+  changes do, without overwriting anyone. Committing before a dispatch was never a way
+  around this, and is no longer needed.
+- **A dispatch that could not deliver the acceptance tests now stops and says so** instead
+  of continuing quietly and grading the coding agent against tests that never reached it.
+
 ## [0.0.2] - 2026-08-27
 
 ### Fixed
