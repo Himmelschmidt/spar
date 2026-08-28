@@ -829,9 +829,12 @@ pub struct SpecOverlay {
 
 /// Bring pre-coding acceptance tests from the test-author worktree into the implementer cwd.
 ///
-/// Fail closed when the author worktree is missing. Always overlays the author working tree
-/// (agents often leave tests uncommitted). Live runs also try `git merge` of the author branch
-/// first for committed history; failed merges are aborted before overlay.
+/// Fail closed when the author worktree is missing. Committed author work crosses by
+/// `git merge` of the author branch, and the overlay adds only what a merge cannot carry:
+/// the files the author left uncommitted. The overlay used to copy every git-visible file
+/// in the author worktree — 3202 of them on a live BidDesk run — which reverted the
+/// implementer's own source to the author branch's revision on every dispatch after the
+/// first (O53).
 ///
 /// Returns what git ignored, because the caller has to say so out loud: a fixture the
 /// test-author wrote into an ignored path (`.env.test`, an ignored `tests/data/`) does not
@@ -855,11 +858,13 @@ pub fn apply_spec_tests_to_impl(
     }
 
     let dry_or_spar = state.dry_run || impl_cwd.starts_with(state.project_root.join(".spar"));
-    if !dry_or_spar {
-        try_merge_spec_branch(impl_cwd, &spec.branch)?;
-    }
-    // Always overlay: uncommitted author files never appear in a merge.
-    copy_tree_overlay(&spec.path, impl_cwd)?;
+    let scope = if dry_or_spar {
+        OverlayScope::WholeTree
+    } else {
+        merge_spec_branch(impl_cwd, &spec.branch)?;
+        OverlayScope::Uncommitted
+    };
+    copy_tree_overlay(&spec.path, impl_cwd, scope)?;
     Ok(SpecOverlay {
         author_path: spec.path.clone(),
         ignored: ignored_entries(&spec.path),
@@ -919,9 +924,15 @@ fn is_build_output(entry: &str) -> bool {
     entry.split('/').any(|c| BUILD_OUTPUT_DIRS.contains(&c))
 }
 
-/// Attempt merge; on failure abort so the tree is never left in MERGING.
-fn try_merge_spec_branch(impl_cwd: &Path, branch: &str) -> Result<()> {
-    let status = Command::new("git")
+/// Merge the author branch into the implementer worktree. Abort on failure so the tree is
+/// never left in MERGING, then fail the dispatch.
+///
+/// This used to swallow a failed merge, because the overlay copied the author's committed
+/// files too and would deliver the acceptance tests anyway. It no longer does, so the merge
+/// is the only path committed author work takes: a swallowed failure here means the
+/// implementer is told to satisfy acceptance tests that are not in its worktree (O53).
+fn merge_spec_branch(impl_cwd: &Path, branch: &str) -> Result<()> {
+    let out = Command::new("git")
         .args([
             "merge",
             "--no-edit",
@@ -930,11 +941,9 @@ fn try_merge_spec_branch(impl_cwd: &Path, branch: &str) -> Result<()> {
             branch,
         ])
         .current_dir(impl_cwd)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+        .output()
         .with_context(|| format!("git merge {branch} into {}", impl_cwd.display()))?;
-    if status.success() {
+    if out.status.success() {
         return Ok(());
     }
     let _ = Command::new("git")
@@ -943,14 +952,36 @@ fn try_merge_spec_branch(impl_cwd: &Path, branch: &str) -> Result<()> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
-    Ok(())
+    // Conflict detail lands on stdout ("CONFLICT (content): …"); refusals to start
+    // ("Your local changes … would be overwritten") land on stderr. Both are the answer.
+    let why = [&out.stderr, &out.stdout]
+        .into_iter()
+        .map(|s| String::from_utf8_lossy(s).trim().to_string())
+        .find(|s| !s.is_empty())
+        .unwrap_or_else(|| "no output".into());
+    bail!(
+        "git merge {branch} into {} failed (aborted, worktree left clean): {why}",
+        impl_cwd.display()
+    );
 }
 
-fn copy_tree_overlay(src: &Path, dst: &Path) -> Result<()> {
+/// Which of the author's files the overlay has to carry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OverlayScope {
+    /// A merge already delivered every committed author file, so the overlay adds only
+    /// what a merge cannot: the author's uncommitted work. Anything wider reverts the
+    /// implementer's own source to the author branch's revision.
+    Uncommitted,
+    /// No merge ran (dry runs, `.spar/`-hosted cwds have no shared history), so nothing
+    /// else delivers the author's files and the overlay carries the visible tree.
+    WholeTree,
+}
+
+fn copy_tree_overlay(src: &Path, dst: &Path, scope: OverlayScope) -> Result<()> {
     if !src.is_dir() {
         return Ok(());
     }
-    for entry in overlay_sources(src)? {
+    for entry in overlay_sources(src, scope)? {
         let rel = entry.strip_prefix(src).unwrap_or(&entry);
         if rel.as_os_str().is_empty() {
             continue;
@@ -969,20 +1000,29 @@ fn copy_tree_overlay(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// What the author worktree hands the implementer: tracked files plus untracked ones
-/// git would keep, and nothing git ignores.
+/// What the author worktree hands the implementer, per `scope`.
 ///
-/// The unfiltered walk this replaced copied `target/` and `node_modules/` between
-/// worktrees — gigabytes of build output, byte-by-byte, per implementer, while the run
-/// still reported phase `prepare_isolation`. On a spinning disk that was the single
-/// largest cost in a run.
+/// `Uncommitted` is the live-run set and it never falls back to a wider one. An empty
+/// answer is the *normal* answer there — an author who committed everything has nothing a
+/// merge did not already deliver — so emptiness cannot mean "list more". A git that
+/// errored cannot mean it either: the wide sets below copy the author's revision of every
+/// production file over the implementer's, which is exactly the data loss this scope
+/// exists to prevent, so a broken git is a hard error instead.
 ///
-/// Falls back to the full walk when git lists nothing: a dry-run cwd lives under an
-/// ignored `.spar/`, where `ls-files` is correctly empty but the stub artifacts still
-/// have to cross. A git that *errored* (broken worktree admin dir, dubious ownership,
-/// git missing) falls back too, but says so — the walk is the gigabyte copy this change
-/// exists to stop, and it must never resume silently.
-fn overlay_sources(src: &Path) -> Result<Vec<PathBuf>> {
+/// `WholeTree` keeps the pre-existing behaviour, git-visible files with a walk behind
+/// them: a dry-run cwd lives under an ignored `.spar/` where `ls-files` is correctly empty
+/// but the stub artifacts still have to cross. The walk copies build output (`target/`,
+/// `node_modules/`), so a git that *errored* into it says so out loud.
+fn overlay_sources(src: &Path, scope: OverlayScope) -> Result<Vec<PathBuf>> {
+    if scope == OverlayScope::Uncommitted {
+        return uncommitted_files(src).map_err(|why| {
+            anyhow::anyhow!(
+                "git could not list uncommitted files in {} ({why}); refusing to overlay \
+                 the whole author worktree, which would revert the implementer's work",
+                src.display()
+            )
+        });
+    }
     match git_listed_files(src) {
         Ok(files) if !files.is_empty() => Ok(files),
         Ok(_) => walkdir_regular_files(src),
@@ -997,16 +1037,36 @@ fn overlay_sources(src: &Path) -> Result<Vec<PathBuf>> {
     }
 }
 
+/// Regular files in `dir` that a merge of its branch cannot deliver: tracked files with
+/// uncommitted modifications (staged or not), plus untracked files git would keep.
+fn uncommitted_files(dir: &Path) -> std::result::Result<Vec<PathBuf>, String> {
+    let mut out = git_paths(dir, &["diff", "-z", "--name-only", "HEAD"])?;
+    for p in git_paths(dir, &["ls-files", "-z", "--others", "--exclude-standard"])? {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    Ok(out)
+}
+
 /// Regular files under `dir` that git tracks or would add. `Err` when git can't answer.
 fn git_listed_files(dir: &Path) -> std::result::Result<Vec<PathBuf>, String> {
-    let out = Command::new("git")
-        .args([
+    git_paths(
+        dir,
+        &[
             "ls-files",
             "-z",
             "--cached",
             "--others",
             "--exclude-standard",
-        ])
+        ],
+    )
+}
+
+/// Run a NUL-separated path-listing git command in `dir` and resolve what it names.
+fn git_paths(dir: &Path, args: &[&str]) -> std::result::Result<Vec<PathBuf>, String> {
+    let out = Command::new("git")
+        .args(args)
         .current_dir(dir)
         .output()
         .map_err(|e| e.to_string())?;
@@ -1020,7 +1080,7 @@ fn git_listed_files(dir: &Path) -> std::result::Result<Vec<PathBuf>, String> {
         // Raw bytes, not `from_utf8_lossy`: a replacement char would name a path that does
         // not exist, and the file would be dropped instead of copied.
         .map(|s| dir.join(bytes_to_path(s)))
-        // `ls-files` also reports symlinks, submodules and deleted-but-tracked paths.
+        // These also report symlinks, submodules, and paths deleted in the working tree.
         .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file()))
         .collect();
     Ok(files)
@@ -1078,6 +1138,199 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// git in a fixture, never reading the developer's global config (gpg signing, hooks,
+    /// commit templates), which would otherwise fail a commit here.
+    fn fixture_git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap_or_else(|e| panic!("spawn git {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} in {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A repo with production source, plus a test-author and an implementer worktree cut
+    /// from one base, wired into a live (non-dry-run) run state.
+    fn author_and_impl_worktrees(tmp: &Path) -> (RunState, PathBuf, PathBuf) {
+        let root = tmp.join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        fixture_git(&root, &["init", "-q"]);
+        fixture_git(&root, &["config", "user.email", "t@t.com"]);
+        fixture_git(&root, &["config", "user.name", "t"]);
+        // Local config, so the merge spar itself runs (which does not scrub global config,
+        // because production must not) still commits on a machine that signs by default.
+        fixture_git(&root, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("src/task.rs"), "fn base() {}\n").unwrap();
+        std::fs::write(root.join("src/download.rs"), "fn download() {}\n").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "mod task;\nmod download;\n").unwrap();
+        fixture_git(&root, &["add", "."]);
+        fixture_git(&root, &["commit", "-q", "-m", "init"]);
+        let base = fixture_git(&root, &["rev-parse", "HEAD"]);
+
+        let mut state = RunState::new("ovl", crate::cli::WorkflowKind::Loop, root.clone());
+        state.base_commit = Some(base.clone());
+        let author = create_worktree(&root, "ovl", "test-author-x", Some(&base)).unwrap();
+        let implementer = create_worktree(&root, "ovl", "impl", Some(&base)).unwrap();
+        let paths = (author.path.clone(), implementer.path.clone());
+        state.worktrees.push(author);
+        state.worktrees.push(implementer);
+        (state, paths.0, paths.1)
+    }
+
+    /// The regression: the overlay listed `--cached` files, so it copied the author
+    /// branch's revision of every tracked file over the implementer's worktree. On a live
+    /// BidDesk run that was 3202 files, 486 of them production source, to deliver zero
+    /// uncommitted ones — and `models/task.rs` came back byte-identical to the author tip
+    /// with the implementer's work gone (O53).
+    #[test]
+    fn overlay_carries_only_the_authors_uncommitted_work() {
+        let tmp = tempdir().unwrap();
+        let (state, author, impl_cwd) = author_and_impl_worktrees(tmp.path());
+
+        // What a test author leaves behind: committed acceptance tests, plus a tracked
+        // edit and a new file it never got round to committing.
+        std::fs::create_dir_all(author.join("tests")).unwrap();
+        std::fs::write(author.join("tests/committed_acc.rs"), "fn committed() {}\n").unwrap();
+        fixture_git(&author, &["add", "."]);
+        fixture_git(&author, &["commit", "-q", "-m", "acceptance tests"]);
+        std::fs::write(
+            author.join("src/lib.rs"),
+            "mod task;\nmod download;\n#[cfg(test)]\nmod acc;\n",
+        )
+        .unwrap();
+        std::fs::write(author.join("tests/uncommitted_acc.rs"), "fn pending() {}\n").unwrap();
+
+        // The implementer has written the feature into a file the author never touched.
+        let implemented = "pub struct PipelineSuite;\n";
+        std::fs::write(impl_cwd.join("src/task.rs"), implemented).unwrap();
+
+        apply_spec_tests_to_impl(&state, "test-author-x", &impl_cwd).unwrap();
+
+        assert!(
+            impl_cwd.join("tests/committed_acc.rs").is_file(),
+            "committed author tests arrive by merge"
+        );
+        assert_eq!(
+            std::fs::read_to_string(impl_cwd.join("tests/uncommitted_acc.rs")).unwrap(),
+            "fn pending() {}\n",
+            "an untracked author file is what the overlay exists for"
+        );
+        assert!(
+            std::fs::read_to_string(impl_cwd.join("src/lib.rs"))
+                .unwrap()
+                .contains("mod acc"),
+            "a tracked-but-modified author file crosses too"
+        );
+        assert_eq!(
+            std::fs::read_to_string(impl_cwd.join("src/task.rs")).unwrap(),
+            implemented,
+            "a production file the author never touched must survive byte-for-byte"
+        );
+        assert_eq!(
+            std::fs::read_to_string(impl_cwd.join("src/download.rs")).unwrap(),
+            "fn download() {}\n",
+            "and so must every other file the author never touched"
+        );
+    }
+
+    /// The shape that lost a whole fix round in run `e663edaf`: dispatch two, into a
+    /// worktree where the implementer has already committed.
+    #[test]
+    fn a_second_dispatch_leaves_committed_implementer_work_intact() {
+        let tmp = tempdir().unwrap();
+        let (state, author, impl_cwd) = author_and_impl_worktrees(tmp.path());
+
+        std::fs::create_dir_all(author.join("tests")).unwrap();
+        std::fs::write(author.join("tests/round1.rs"), "fn r1() {}\n").unwrap();
+        fixture_git(&author, &["add", "."]);
+        fixture_git(&author, &["commit", "-q", "-m", "round 1 tests"]);
+        apply_spec_tests_to_impl(&state, "test-author-x", &impl_cwd).unwrap();
+
+        let feature = "pub struct PipelineSuite;\npub fn run() {}\n";
+        std::fs::write(impl_cwd.join("src/task.rs"), feature).unwrap();
+        std::fs::write(
+            impl_cwd.join("src/download.rs"),
+            "fn download() { /* long */ }\n",
+        )
+        .unwrap();
+        fixture_git(&impl_cwd, &["add", "."]);
+        fixture_git(
+            &impl_cwd,
+            &["commit", "-q", "-m", "implement pipeline suite"],
+        );
+
+        std::fs::write(author.join("tests/round2.rs"), "fn r2() {}\n").unwrap();
+        fixture_git(&author, &["add", "."]);
+        fixture_git(&author, &["commit", "-q", "-m", "round 2 tests"]);
+        apply_spec_tests_to_impl(&state, "test-author-x", &impl_cwd).unwrap();
+
+        assert!(
+            impl_cwd.join("tests/round2.rs").is_file(),
+            "the new round's tests still have to arrive"
+        );
+        assert_eq!(
+            std::fs::read_to_string(impl_cwd.join("src/task.rs")).unwrap(),
+            feature,
+            "round-1 work must survive the round-2 dispatch"
+        );
+        assert_eq!(
+            std::fs::read_to_string(impl_cwd.join("src/download.rs")).unwrap(),
+            "fn download() { /* long */ }\n"
+        );
+    }
+
+    /// The wide walk is the clobber with a different list behind it, so the narrow scope
+    /// never falls back to it. The wide scope keeps its fallback: dry-run cwds live under
+    /// an ignored `.spar/` where `ls-files` is correctly empty.
+    #[test]
+    fn the_narrow_overlay_refuses_rather_than_widening_when_git_cannot_answer() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("not-a-repo");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("prod.rs"), "fn prod() {}\n").unwrap();
+
+        let err = overlay_sources(&src, OverlayScope::Uncommitted).unwrap_err();
+        assert!(err.to_string().contains("refusing"), "err={err}");
+        assert!(!overlay_sources(&src, OverlayScope::WholeTree)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The merge is now the only path committed author work takes, so swallowing a failed
+    /// one hands the implementer acceptance tests that are not in its worktree.
+    #[test]
+    fn a_failed_merge_fails_the_dispatch_instead_of_dropping_the_tests() {
+        let tmp = tempdir().unwrap();
+        let (state, author, impl_cwd) = author_and_impl_worktrees(tmp.path());
+
+        std::fs::write(author.join("src/task.rs"), "fn author_side() {}\n").unwrap();
+        fixture_git(&author, &["add", "."]);
+        fixture_git(&author, &["commit", "-q", "-m", "author edit"]);
+        std::fs::write(impl_cwd.join("src/task.rs"), "fn impl_side() {}\n").unwrap();
+        fixture_git(&impl_cwd, &["add", "."]);
+        fixture_git(&impl_cwd, &["commit", "-q", "-m", "impl edit"]);
+
+        let err = apply_spec_tests_to_impl(&state, "test-author-x", &impl_cwd).unwrap_err();
+        assert!(err.to_string().contains("git merge"), "err={err}");
+        assert_eq!(
+            std::fs::read_to_string(impl_cwd.join("src/task.rs")).unwrap(),
+            "fn impl_side() {}\n",
+            "the aborted merge leaves the implementer's committed work alone"
+        );
+        assert!(
+            fixture_git(&impl_cwd, &["status", "--porcelain"]).is_empty(),
+            "the worktree must never be left MERGING"
+        );
+    }
+
     #[test]
     fn overlay_copies_files_skips_symlinks() {
         let tmp = tempdir().unwrap();
@@ -1090,7 +1343,7 @@ mod tests {
         {
             let _ = std::os::unix::fs::symlink("/etc/passwd", src.join("evil"));
         }
-        copy_tree_overlay(&src, &dst).unwrap();
+        copy_tree_overlay(&src, &dst, OverlayScope::WholeTree).unwrap();
         assert!(dst.join("tests/a.rs").is_file());
         #[cfg(unix)]
         {
@@ -1127,7 +1380,7 @@ mod tests {
             return;
         }
 
-        copy_tree_overlay(&src, &dst).unwrap();
+        copy_tree_overlay(&src, &dst, OverlayScope::WholeTree).unwrap();
         assert!(
             dst.join("tests/acceptance.rs").is_file(),
             "acceptance tests must still cross"
@@ -1148,7 +1401,7 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::create_dir_all(&dst).unwrap();
         std::fs::write(src.join("stub.txt"), "x").unwrap();
-        copy_tree_overlay(&src, &dst).unwrap();
+        copy_tree_overlay(&src, &dst, OverlayScope::WholeTree).unwrap();
         assert!(dst.join("stub.txt").is_file());
     }
 
