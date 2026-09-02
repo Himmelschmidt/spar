@@ -155,9 +155,60 @@ spar run --workflow review -t "..." --providers cli:muse@muse-spark-1.2      # p
 
 API keys: `OPENAI_API_KEY`, `XAI_API_KEY`, optional `OPENAI_BASE_URL` / `XAI_BASE_URL` / `*_MODEL`.
 
+## Slots and roles
+
+A **slot** is one agent process: one provider, one prompt template, one worktree, one log,
+one expected artifact. A **role** is what that slot is for. There are nine roles. Six are
+assignable by name in `[roles]` / `--role`; three are workflow-internal and take fleet
+positions.
+
+| Role | In `[roles]` | Spawned by | Count | What it does | Artifact |
+|---|---|---|---|---|---|
+| `planner` | yes | `plan` | 1 | Writes the plan from the brief. The only plan-phase slot whose failure fails the run. | `plan.md` |
+| `plan_critic` | yes | `plan` | 1 | Reads the draft, edits `plan.md` directly, names gaps and the scenarios the test-author must cover (it writes no tests). Its failure is tolerated: the run keeps the plan. | `plan.md`, `plan-critique-<slot>.md` |
+| `test_author` | yes | `plan`, if `[spec] enabled` | 1 | Freezes acceptance criteria (`AC-n`) and real test files **before** the plan gate. | `test-contract.md` |
+| `implementer` | yes | `loop`, `arena` | 1 (`loop`), `max_agents` (`arena`) | Writes the code in its own worktree. Smoke/diff tests only while the suite channel runs. | `summary-<slot>.md`, `carry-forward-<slot>.md` |
+| `tester` | yes | `loop`, if `[suite] enabled` | 1 | Runs the **full** suite and nothing else. Deliberately a cheap model: it runs tests, it does not judge them. | `suite.md` |
+| `reviewer` | yes | `loop` (2), `review` (N), `reconcile` (2) | see left | Adversarial review of the diff against `plan.md` and every `AC-n`. Verdict is `approve` or `request_changes`. | `review-<slot>.md` |
+| `ranker` | no | `arena` | 1 | Reads every implementer summary and picks a winner. Runs in the project root, not a worktree. | `ranking.md` |
+| `reconciler` | no | `spar reconcile` | 1 | Merges the best parts of the candidate worktrees into one implementation in its own worktree. | `summary-reconcile.md` |
+| `peer` | no | `roles`, `peer` | 2 | One half of a split-stack pair (`roles` = frontend/backend, `peer` = symmetric), coordinating over the bus. | `summary-<slot>.md` |
+
+- **Only the six assignable roles read `[roles]` / `--role`.** `ranker`, `reconciler` and
+  `peer` take fleet positions instead: the ranker gets the **last** provider in the fleet,
+  the reconciler the **first**, the peers the first two. All three bill against
+  `[budget] other`, not a role budget.
+- **The reviewer panel in `loop` is fixed at 2** and is not a config knob. A `[roles].reviewer`
+  list longer than two still only fills two slots there; the extra entries matter in
+  `--workflow review`, which sizes itself from `--providers`. A shorter list falls through to
+  `[providers].order` for the remaining position rather than shrinking the panel.
+- **The fleet is positional and cycles.** `loop` resolves `max(max_agents, 3)` providers as
+  `implementer, reviewer, reviewer, …`; `arena` resolves `max(max_agents, 2)`, all
+  implementers. A fleet shorter than the slot count repeats from the start, so an arena
+  driven from a single-entry `[roles].implementer` runs N slots on the **same** provider.
+  Pass explicit `--providers` when you want a diverse field.
+- **Templates are per role**, embedded in the binary (`templates/`): `planner`, `plan_critic`,
+  `test_author`, `implementer`, `tester`, `reviewer_adversarial`, `ranker`, `reconciler`,
+  `peer_half` (+ `role_frontend` / `role_backend` notes appended for `--workflow roles`).
+
 ## Workflows
 
 **`--providers` or `--select`** is required for `plan`, `implement`, and `run` (no silent default fleet).
+
+| `--workflow` | Slots | Ends at |
+|---|---|---|
+| `plan` | `planner` + `plan_critic`, then `test_author` when `[spec] enabled` | plan gate (`awaiting_plan_approval`, exit 2) |
+| `loop` | `implementer` ×1, `tester` ×1 when `[suite] enabled`, `reviewer` ×2; up to 3 fix rounds, then rotate/widen/`stuck` | ship gate (`awaiting_ship_confirm`) |
+| `arena` | `implementer` ×`max_agents` in waves, then `ranker` ×1 | winner gate (`awaiting_winner_confirm`) |
+| `roles` | `peer` ×2, frontend/backend split, dispatched one after the other | `done` (no review, no gate) |
+| `peer` | `peer` ×2, symmetric, dispatched in parallel over the bus | `done` (no review, no gate) |
+| `review` | `reviewer` ×N (one per `--providers` entry, default 2), in parallel, no implementer and no tester | `done` |
+
+`spar plan -t` is `--workflow plan`. `spar implement -t` is `--workflow loop`: a fresh brief
+straight into build/review with **no** planner, critic or test-contract, which is the cheap
+middle setting between `--workflow review` and the full `plan → approve → implement` path.
+`spar reconcile <id>` is an arena continuation, not a workflow: it adds a `reconciler` plus
+two more `reviewer` slots on the reconciled tree.
 
 ```bash
 # Plan (ends HumanGate / awaiting_plan_approval unless autonomy auto-approves)
@@ -185,7 +236,7 @@ spar implement -t "small task" --select value --urgency high --dry-run
 spar plan --run <run_id> -t "narrow it to the email path" [--json]
 
 # Named workflows
-spar run --workflow loop|arena|roles|peer|review -t "..." --providers cli:claude,cli:grok [--dry-run] [--big]
+spar run --workflow plan|loop|arena|roles|peer|review -t "..." --providers cli:claude,cli:grok [--dry-run] [--big]
 spar run --workflow arena -t "..." --select best --urgency normal --dry-run
 
 # Independent concurrent multi-provider review (not split-stack peer):
