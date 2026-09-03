@@ -76,3 +76,8 @@ attention level from rail decoration to organizing principle.
 
 Brief-entry field writing `.spar/briefs/<slug>.md` plus a fleet picker over the roster,
 reachable with `n` from Home.
+
+**Amended (U16).** The brief field is superseded by feature 008's orchestrator
+conversation, so this phase builds the new-run *surface* and the fleet picker; 008 fills the
+brief half with a conversation. The picker is not throwaway work — it stays as the manual
+path that costs no tokens.
