@@ -2705,20 +2705,51 @@ fn draw_labels(
     }
 
     if lay.narrow {
-        // Same fixed per-tab padding as the wide strip (uniform gaps either way),
-        // just centered as one block across the full-width row since there is no
-        // rail title sharing it.
-        let tabs = main_tab_spans(app);
-        let total_w: u16 = tabs
+        // The wide strip's fixed per-tab padding (badge slot on every tab, U11) exists
+        // to keep tabs from shifting under the rail's columns. Narrow has no rail row
+        // to stay aligned with, so it spends the width on an even gap instead — that
+        // is what lets all four tabs still fit down to a phone-width terminal, where
+        // the wide padding scheme would starve Shell off the strip entirely.
+        let tabs: Vec<(MainTab, String, Style)> = MAIN_TABS
             .iter()
-            .map(|(_, text, _)| text.chars().count() as u16)
-            .sum();
+            .map(|t| {
+                let badge = if *t == MainTab::Activity && app.human_alerts_n > 0 {
+                    format!(" ⚠{:<2}", app.human_alerts_n.min(99))
+                } else {
+                    String::new()
+                };
+                let text = format!("{}{badge}", t.label());
+                let style = if *t == app.main_tab {
+                    Style::default().fg(ACCENT).bold()
+                } else if *t == MainTab::Activity && app.human_alerts_n > 0 {
+                    Style::default().fg(ALERT).bold()
+                } else {
+                    dim()
+                };
+                (*t, text, style)
+            })
+            .collect();
+        let n = tabs.len() as u16;
+        let label_total: u16 = tabs.iter().map(|(_, t, _)| t.chars().count() as u16).sum();
+        let gap = if n > 1 {
+            area.width.saturating_sub(label_total) / (n - 1)
+        } else {
+            0
+        };
+        let total_w = (label_total + gap * n.saturating_sub(1)).min(area.width);
         let start_x = area.x + area.width.saturating_sub(total_w) / 2;
         let mut spans: Vec<Span> = Vec::with_capacity(tabs.len());
         let mut x = start_x;
-        for (tab, text, style) in tabs {
-            let w = text.chars().count() as u16;
-            if x.saturating_add(w) > area.right() {
+        let n_tabs = tabs.len();
+        for (i, (tab, text, style)) in tabs.into_iter().enumerate() {
+            let avail = area.right().saturating_sub(x);
+            let raw_w = text.chars().count() as u16;
+            let (text, w) = if raw_w > avail {
+                (truncate(&text, avail as usize), avail)
+            } else {
+                (text, raw_w)
+            };
+            if w == 0 {
                 break;
             }
             app.main_tabs.push((
@@ -2732,6 +2763,9 @@ fn draw_labels(
             ));
             spans.push(Span::styled(text, style));
             x = x.saturating_add(w);
+            if i + 1 < n_tabs {
+                x = x.saturating_add(gap);
+            }
         }
         let line = Rect {
             x: start_x,
@@ -3995,6 +4029,9 @@ fn draw_main(
 /// The subtitle that rides after the tab strip: what the active tab is showing.
 fn main_context(swarm: &SparPaths, full: Option<&RunState>, app: &App) -> String {
     match app.main_tab {
+        // No run: there is no slot to name and nothing live streaming, so the caption
+        // would just be a placeholder contradicting the empty state one row up.
+        MainTab::Log if full.is_none() => String::new(),
         MainTab::Log => {
             let slot = full
                 .map(|st| slot_short(&st.slots, app.selected_slot))
@@ -4957,9 +4994,10 @@ fn situational_footer(
 }
 
 /// Word-wrap a single line to `width` columns without collapsing internal
-/// whitespace runs (unlike `soft_wrap`, which rejoins on a single space) — the
-/// help text's alignment depends on the run of spaces between a key and its
-/// description.
+/// whitespace runs (unlike `soft_wrap`, which rejoins on a single space) — a
+/// key and its description stay aligned by their run of spaces as long as the
+/// line fits on one row; a row that has to wrap restarts at column 0 and does
+/// not carry that indent forward.
 fn wrap_line_preserve(line: &str, width: usize) -> Vec<String> {
     let chars: Vec<char> = line.chars().collect();
     if width == 0 || chars.len() <= width {
@@ -7399,6 +7437,57 @@ mod render_stability {
     /// "approve" and "collapsed" mid-word. It must now size to its longest line (up
     /// to the frame) so every line renders whole.
     #[test]
+    fn wrap_line_preserve_breaks_only_at_spaces() {
+        let line = "Rail   projects ▸ runs ▸ agents  (Enter pushes, Esc pops)";
+        let rows = wrap_line_preserve(line, 20);
+        for w in &rows {
+            assert!(w.chars().count() <= 20, "row too wide: {w:?}");
+        }
+        // Rejoining the wrapped rows on a space and re-splitting on whitespace must
+        // reproduce the original word sequence: no word was cut mid-token.
+        assert_eq!(
+            rows.join(" ").split_whitespace().collect::<Vec<_>>(),
+            line.split_whitespace().collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn wrap_line_preserve_force_splits_a_token_longer_than_width() {
+        let rows = wrap_line_preserve("supercalifragilisticexpialidocious", 10);
+        assert!(rows.iter().all(|w| w.chars().count() <= 10), "{rows:?}");
+        assert_eq!(rows.concat(), "supercalifragilisticexpialidocious");
+    }
+
+    #[test]
+    fn wrap_line_preserve_handles_zero_width() {
+        assert_eq!(wrap_line_preserve("abc", 0), vec!["abc".to_string()]);
+    }
+
+    /// AC-1's wrap path: the original lock only ran at a width wide enough that the
+    /// longest `HELP_BODY` line never took the wrapping branch. Scan both the
+    /// unscrolled top and the scrolled-to-max bottom so every wrapped row is checked.
+    #[test]
+    fn help_overlay_wraps_narrow_lines_without_cutting_a_word() {
+        let st = run_with(Phase::Review, 3);
+        let top = paint_with(50, 12, &[], &[], Some(&st), |a| a.show_help = true);
+        let bottom = paint_with(50, 12, &[], &[], Some(&st), |a| {
+            a.show_help = true;
+            a.help_scroll = 9999;
+        });
+        let joined: String = (0..12)
+            .map(|y| row(&top, y))
+            .chain((0..12).map(|y| row(&bottom, y)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for phrase in ["pushes,", "Esc pops)", "bands collapsed)."] {
+            assert!(
+                joined.contains(phrase),
+                "word split by the wrap: {joined:?}"
+            );
+        }
+    }
+
+    #[test]
     fn help_overlay_never_hard_clips_a_line() {
         let st = run_with(Phase::Review, 3);
         let term = paint_with(100, 40, &[], &[], Some(&st), |a| a.show_help = true);
@@ -7462,7 +7551,25 @@ mod render_stability {
             "hint row was clipped: {buf:?}"
         );
 
-        // `quit` is PALETTE_CMDS[11] — unreachable under the old hard cap of 8.
+        // `quit` is PALETTE_CMDS[11] — unreachable under the old hard cap of 8. The
+        // footer also has a permanent "q quit" hint, so the assertion has to target
+        // the menu's own selected-row marker or it would pass even with the window
+        // never scrolled at all.
+        let unscrolled = paint_with(120, 40, &[], &[], None, |a| {
+            a.palette = Some(Palette {
+                input: String::new(),
+                sel: 0,
+            });
+        });
+        let unscrolled_buf: String = (0..40)
+            .map(|y| row(&unscrolled, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !unscrolled_buf.contains("▸ quit"),
+            "quit should not be selected/visible at the top of the menu: {unscrolled_buf:?}"
+        );
+
         let term = paint_with(120, 40, &[], &[], None, |a| {
             a.palette = Some(Palette {
                 input: String::new(),
@@ -7474,7 +7581,7 @@ mod render_stability {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            buf.contains("quit"),
+            buf.contains("▸ quit"),
             "scrolled menu should reach quit: {buf:?}"
         );
     }
@@ -7572,13 +7679,63 @@ mod render_stability {
         );
     }
 
+    /// The uniform-gap fix for the narrow strip used to buy its spacing by silently
+    /// dropping Shell (and, at the narrowest widths, Diff too) once the wide strip's
+    /// fixed per-tab padding stopped fitting — invisible and untappable, with no
+    /// ellipsis to say a tab existed. Every width in the narrow band must keep all
+    /// four.
+    #[test]
+    fn narrow_tab_strip_never_drops_a_tab() {
+        let st = run_with(Phase::Review, 3);
+        for width in 24..80u16 {
+            let mut term = Terminal::new(TestBackend::new(width, 30)).unwrap();
+            let swarm = SparPaths::new("/x");
+            let mut app = App::new(None, Config::default(), true);
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: 30,
+            };
+            let lay = layout_rects(area, Focus::Main, false, false);
+            term.draw(|f| draw_labels(f, &lay, &swarm, &[], &[], Some(&st), &mut app))
+                .unwrap();
+            assert_eq!(
+                app.main_tabs.len(),
+                4,
+                "width {width} dropped a tab: {:?}",
+                app.main_tabs
+            );
+        }
+    }
+
     /// With no runs at all, the header, rail and Main must agree on a single story —
     /// not a header offering a run breadcrumb ("run —") next to "no runs", nor a Main
     /// pane still painting stale log content or a scrollbar behind it.
     #[test]
     fn empty_state_is_coherent_with_no_stale_chrome() {
+        // Prove the "no stale content" guarantee against a real stale scenario rather
+        // than one the test builds for itself: load a run's log that genuinely
+        // contains a stream line, then drop to no-run on the same cache and confirm
+        // it does not survive the transition.
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("slot.log");
+        std::fs::write(&log_path, "→ Bash  read the contract\n← ✓ ok\n").unwrap();
+        let mut st = run_with(Phase::Review, 1);
+        st.slots[0].log_path = Some(log_path);
+
         let mut cache = LogCache::empty();
+        let live = stream_content(&SparPaths::new("/x"), Some(&st), 0, &mut cache, true);
+        assert!(
+            live.contains("Bash"),
+            "fixture should carry real stream content: {live:?}"
+        );
+
         let text = stream_content(&SparPaths::new("/x"), None, 0, &mut cache, false);
+        assert!(
+            !text.contains("Bash"),
+            "stale log content survived the drop to no-run: {text:?}"
+        );
         assert!(
             !text.to_lowercase().contains("select a run"),
             "nothing to select with zero runs: {text:?}"
