@@ -2299,8 +2299,15 @@ fn handle_mouse(
     // to its content, not a fixed box), so it must be hit-tested before the strip or
     // a tap meant to dismiss help silently changes the tab underneath instead.
     if app.show_help {
-        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
-            app.show_help = false;
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => app.show_help = false,
+            MouseEventKind::ScrollDown => {
+                app.help_scroll = app.help_scroll.saturating_add(1);
+            }
+            MouseEventKind::ScrollUp => {
+                app.help_scroll = app.help_scroll.saturating_sub(1);
+            }
+            _ => {}
         }
         return;
     }
@@ -2721,18 +2728,17 @@ fn draw_labels(
     if lay.narrow {
         // The wide strip's fixed per-tab padding (badge slot on every tab, U11) exists
         // to keep tabs from shifting under the rail's columns. Narrow has no rail row
-        // to stay aligned with, so it spends the width on an even gap instead — that
-        // is what lets all four tabs still fit down to a phone-width terminal, where
-        // the wide padding scheme would starve Shell off the strip entirely.
-        let tabs: Vec<(MainTab, String, Style)> = MAIN_TABS
+        // to stay aligned with, so it would rather spend the width on an even gap —
+        // but a badge glued onto Activity alone grows only the gap next to it (AC-4:
+        // measured [18, 22, 18] at 79 cols with alerts present). So narrow reserves
+        // the same fixed-width slot on every tab too, same as wide, whenever the
+        // width can afford it; only once that reservation would starve a tab off the
+        // strip entirely does it fall back to gluing the badge onto Activity alone,
+        // trading gap uniformity for keeping all four tabs on screen.
+        let badge_w: u16 = if app.human_alerts_n > 0 { 4 } else { 0 };
+        let raw: Vec<(MainTab, &str, Style)> = MAIN_TABS
             .iter()
             .map(|t| {
-                let badge = if *t == MainTab::Activity && app.human_alerts_n > 0 {
-                    format!(" ⚠{:<2}", app.human_alerts_n.min(99))
-                } else {
-                    String::new()
-                };
-                let text = format!("{}{badge}", t.label());
                 let style = if *t == app.main_tab {
                     Style::default().fg(ACCENT).bold()
                 } else if *t == MainTab::Activity && app.human_alerts_n > 0 {
@@ -2740,16 +2746,36 @@ fn draw_labels(
                 } else {
                     dim()
                 };
-                (*t, text, style)
+                (*t, t.label(), style)
             })
             .collect();
-        let n = tabs.len() as u16;
-        let label_total: u16 = tabs.iter().map(|(_, t, _)| t.chars().count() as u16).sum();
-        let gap = if n > 1 {
-            area.width.saturating_sub(label_total) / (n - 1)
-        } else {
+        let n = raw.len() as u16;
+        let plain_total: u16 = raw.iter().map(|(_, l, _)| l.chars().count() as u16).sum();
+        let reserved = plain_total + badge_w * n;
+        let reserve_all = n > 1 && reserved <= area.width;
+        let gap = if n <= 1 {
             0
+        } else if reserve_all {
+            (area.width - reserved) / (n - 1)
+        } else {
+            let label_total = plain_total + badge_w;
+            area.width.saturating_sub(label_total) / (n - 1)
         };
+        let tabs: Vec<(MainTab, String, Style)> = raw
+            .into_iter()
+            .map(|(t, label, style)| {
+                let is_alert_tab = t == MainTab::Activity && app.human_alerts_n > 0;
+                let badge = if is_alert_tab {
+                    format!(" ⚠{:<2}", app.human_alerts_n.min(99))
+                } else if reserve_all {
+                    " ".repeat(badge_w as usize)
+                } else {
+                    String::new()
+                };
+                (t, format!("{label}{badge}"), style)
+            })
+            .collect();
+        let label_total: u16 = tabs.iter().map(|(_, t, _)| t.chars().count() as u16).sum();
         let total_w = (label_total + gap * n.saturating_sub(1)).min(area.width);
         let start_x = area.x + area.width.saturating_sub(total_w) / 2;
         let mut spans: Vec<Span> = Vec::with_capacity(tabs.len());
@@ -4872,9 +4898,17 @@ fn draw_palette(f: &mut Frame, area: Rect, runs: &[state::RunSummary], app: &mut
         ]));
     }
     let hint = if on_arg {
-        "Tab complete run · Enter run · Esc close"
+        "Tab complete run · Enter run · Esc close".to_string()
     } else {
-        "Tab complete · ↑↓ pick · Enter run · Esc close"
+        "Tab complete · ↑↓ pick · Enter run · Esc close".to_string()
+    };
+    // The menu scrolls rather than hard-capping at 8 (AC-2), but an 8-row window
+    // alone still looks like the whole list — nothing said `spawn`/`chat`/`help`/
+    // `quit` exist below the fold. A position counter makes the overflow visible.
+    let hint = if comps.len() > menu_n as usize {
+        format!("{hint}  ({}/{})", pal.sel + 1, comps.len())
+    } else {
+        hint
     };
     rows.push(Line::from(Span::styled(
         hint,
@@ -5099,7 +5133,7 @@ const HELP_BODY: &str = r#" spar — rail + one main area
   Keyboard
     1 / 2                focus Rail · Main
     Tab / Shift-Tab      cycle Rail ↔ Main
-    j k  or  ↑ ↓         move in the rail · scroll Main
+    j k  or  ↑ ↓         move in the rail · scroll Main · scroll this help
     Enter                push a rail level (on an agent: take it over)
     Esc                  pop a rail level · clear filter (never quits)
     [ ]                  previous / next Main tab
@@ -7940,6 +7974,15 @@ mod render_stability {
                 "narrow tab strip has dead columns between rects (human_alerts_n={n}): {:?}",
                 narrow.rect_gaps
             );
+            // The visible glyph gaps must be uniform too, alert badge or not — it used
+            // to grow only the Activity-Diff gap (18, 22, 18) whenever an alert badge
+            // was glued onto Activity alone with no matching reservation on its
+            // neighbors.
+            assert!(
+                narrow.glyph_gaps.windows(2).all(|w| w[0] == w[1]) && narrow.glyph_gaps[0] > 0,
+                "narrow tab gaps not uniform (human_alerts_n={n}): {:?}",
+                narrow.glyph_gaps
+            );
             assert_rects_cover_labels("narrow", &narrow.starts, &narrow.rects, n);
         }
     }
@@ -7995,6 +8038,42 @@ mod render_stability {
                      {expected:?} (row: {row:?})",
                     rect.x,
                     rect.width
+                );
+            }
+        }
+    }
+
+    /// The wide strip's per-tab badge slot (AC-4) grew the strip from 40 to 52
+    /// columns, leaving only a one-column margin at width 80 — the narrowest the
+    /// wide band ever renders at (`NARROW_WIDTH`). Nothing caught a future badge or
+    /// label change eating that margin, so lock it directly.
+    #[test]
+    fn wide_tab_strip_never_drops_a_tab_at_the_tightest_widths() {
+        let st = run_with(Phase::Review, 3);
+        for width in [80u16, 81] {
+            for &alerts in &[0usize, 3, 12] {
+                let mut term = Terminal::new(TestBackend::new(width, 30)).unwrap();
+                let swarm = SparPaths::new("/x");
+                let mut app = App::new(None, Config::default(), true);
+                app.human_alerts_n = alerts;
+                let area = Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height: 30,
+                };
+                let lay = layout_rects(area, Focus::Main, false, false);
+                assert!(
+                    !lay.narrow,
+                    "width {width} unexpectedly took the narrow band"
+                );
+                term.draw(|f| draw_labels(f, &lay, &swarm, &[], &[], Some(&st), &mut app))
+                    .unwrap();
+                assert_eq!(
+                    app.main_tabs.len(),
+                    4,
+                    "width {width} (alerts={alerts}) dropped a tab: {:?}",
+                    app.main_tabs
                 );
             }
         }
