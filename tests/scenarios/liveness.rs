@@ -214,14 +214,33 @@ fn assert_foreground_lock(workflow: &str) {
     );
 
     // While the orchestrator holds its lock, status must expose it as alive.
-    let st = spar_cmd()
-        .current_dir(&proj)
-        .args(["status", &run_id, "--json"])
-        .assert()
-        .code(0)
-        .get_output()
-        .stdout
-        .clone();
+    //
+    // The run id above comes from the run *directory*, which exists as soon as the lock
+    // is written. Registry registration lands a moment later, so a single `status` call
+    // here races it and exits 1 with "not found in current project or global registry"
+    // under parallel suite load. Poll until the run resolves rather than assuming the
+    // first call wins; what the test actually asserts (the pid, and alive) is unchanged.
+    let st_deadline = Instant::now() + Duration::from_secs(20);
+    let st = loop {
+        let out = spar_cmd()
+            .current_dir(&proj)
+            .args(["status", &run_id, "--json"])
+            .output()
+            .unwrap();
+        if out.status.success() {
+            break out.stdout;
+        }
+        if Instant::now() >= st_deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "status never resolved run {run_id} for {workflow} while its \
+                 orchestrator held the lock: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
     let sv: Value = serde_json::from_slice(&st).unwrap();
 
     let _ = child.kill();
