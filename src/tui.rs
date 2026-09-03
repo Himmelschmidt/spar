@@ -359,6 +359,8 @@ struct App {
     log_expand: bool,
     last_click: Option<(u16, u16, Instant)>,
     show_help: bool,
+    /// Scroll offset into the help overlay; reset whenever help is (re)opened.
+    help_scroll: u16,
     /// Whether the current frame is part of an animation; drives the spinner so
     /// it shows a static glyph when idle instead of a frame frozen mid-spin.
     animated: bool,
@@ -516,6 +518,7 @@ impl App {
             log_expand: false,
             last_click: None,
             show_help: false,
+            help_scroll: 0,
             animated: false,
             rect_status: Rect::default(),
             rect_rail: Rect::default(),
@@ -986,7 +989,7 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
         .unwrap_or(false);
     let quota = QuotaStore::load(&swarm).unwrap_or_default();
     let stream_text = if sel.browse.in_project() {
-        stream_content(&swarm, full.as_ref(), sel.slot_idx, cache)
+        stream_content(&swarm, full.as_ref(), sel.slot_idx, cache, !runs.is_empty())
     } else {
         cache.clear();
         project_overview(&projects, sel.project_idx)
@@ -1449,6 +1452,12 @@ fn handle_key(
             KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter => {
                 app.show_help = false;
             }
+            KeyCode::Char('j') | KeyCode::Down => {
+                app.help_scroll = app.help_scroll.saturating_add(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                app.help_scroll = app.help_scroll.saturating_sub(1);
+            }
             _ => {}
         }
         return Ok(false);
@@ -1561,6 +1570,7 @@ fn handle_key(
         }
         KeyCode::Char('?') => {
             app.show_help = true;
+            app.help_scroll = 0;
         }
         KeyCode::Char('w') => {
             app.log_expand = !app.log_expand;
@@ -1637,6 +1647,7 @@ fn handle_palette_key(
                 Ok(PaletteResult::Help) => {
                     app.palette = None;
                     app.show_help = true;
+                    app.help_scroll = 0;
                 }
                 Ok(PaletteResult::Flash(msg, color)) => {
                     app.palette = None;
@@ -2341,6 +2352,7 @@ fn handle_mouse(
             }
             if contains(app.rect_help, x, y) {
                 app.show_help = true;
+                app.help_scroll = 0;
                 return;
             }
             if contains(app.rect_projects, x, y) {
@@ -2637,7 +2649,7 @@ fn draw(
     }
 
     if app.show_help {
-        draw_help_overlay(f, area);
+        draw_help_overlay(f, area, app);
     }
 }
 
@@ -2647,16 +2659,18 @@ fn main_tab_spans(app: &App) -> Vec<(MainTab, String, Style)> {
     MAIN_TABS
         .iter()
         .map(|t| {
-            // Activity's alert badge lives in a fixed 4-column slot, blank when there
-            // is nothing to say: Activity is second of four, so a badge that changed
-            // width would shift Diff and Shell out from under a click (U11).
+            // Every tab reserves the same 4-column badge slot, blank unless it is
+            // Activity with something to say: Activity is second of four, so a badge
+            // that changed width would shift Diff and Shell out from under a click
+            // (U11) — and a slot reserved on one tab only would make the gap either
+            // side of it uneven with every other tab-to-tab gap.
             let badge = if *t == MainTab::Activity {
                 match app.human_alerts_n {
                     0 => "    ".to_string(),
                     n => format!(" ⚠{:<2}", n.min(99)),
                 }
             } else {
-                String::new()
+                "    ".to_string()
             };
             let text = format!("  {}{badge}  ", t.label());
             let style = if *t == app.main_tab {
@@ -2691,19 +2705,22 @@ fn draw_labels(
     }
 
     if lay.narrow {
+        // Same fixed per-tab padding as the wide strip (uniform gaps either way),
+        // just centered as one block across the full-width row since there is no
+        // rail title sharing it.
         let tabs = main_tab_spans(app);
-        let n = tabs.len() as u16;
-        let cell = (area.width / n).max(1);
+        let total_w: u16 = tabs
+            .iter()
+            .map(|(_, text, _)| text.chars().count() as u16)
+            .sum();
+        let start_x = area.x + area.width.saturating_sub(total_w) / 2;
         let mut spans: Vec<Span> = Vec::with_capacity(tabs.len());
-        let mut x = area.x;
-        for (i, (tab, text, style)) in tabs.into_iter().enumerate() {
-            let w = if i as u16 == n - 1 {
-                area.width.saturating_sub(cell * (n - 1))
-            } else {
-                cell
-            };
-            let label = truncate(text.trim(), w as usize);
-            spans.push(Span::styled(format!("{label:^w$}", w = w as usize), style));
+        let mut x = start_x;
+        for (tab, text, style) in tabs {
+            let w = text.chars().count() as u16;
+            if x.saturating_add(w) > area.right() {
+                break;
+            }
             app.main_tabs.push((
                 Rect {
                     x,
@@ -2713,9 +2730,15 @@ fn draw_labels(
                 },
                 tab,
             ));
+            spans.push(Span::styled(text, style));
             x = x.saturating_add(w);
         }
-        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        let line = Rect {
+            x: start_x,
+            width: area.right().saturating_sub(start_x),
+            ..area
+        };
+        f.render_widget(Paragraph::new(Line::from(spans)), line);
         return;
     }
 
@@ -3472,16 +3495,19 @@ fn draw_header(
             Style::default().fg(FG).bold(),
         ),
     ];
+    // No fallback to "—": with no run in hand (and none selected), the breadcrumb
+    // omits itself rather than sitting next to the "no runs" cue and contradicting it.
     if app.browse.in_project() {
         let run = full
             .map(|s| s.id.clone())
-            .or_else(|| runs.get(app.selected_run).map(|r| r.id.clone()))
-            .unwrap_or_else(|| "—".into());
-        spans.push(Span::styled(" ▸ ", muted()));
-        spans.push(Span::styled(
-            format!("run {run}"),
-            Style::default().fg(INFO),
-        ));
+            .or_else(|| runs.get(app.selected_run).map(|r| r.id.clone()));
+        if let Some(run) = run {
+            spans.push(Span::styled(" ▸ ", muted()));
+            spans.push(Span::styled(
+                format!("run {run}"),
+                Style::default().fg(INFO),
+            ));
+        }
     }
     if app.browse == BrowseLevel::Agents {
         let slot = full
@@ -4252,25 +4278,28 @@ fn render_scrollable_log(
         text_area,
     );
 
-    // Map our tail-scroll model (position in [0, max_scroll], last screenful
-    // pinned to the bottom) onto ratatui's scrollbar, whose thumb only reaches
-    // the track bottom when position == content_length - 1. content_length is
-    // the number of scroll positions, not content rows, so the thumb lands flush
-    // at the bottom when start == max_scroll and its length stays height/total.
-    let mut sb = ScrollbarState::new(max_scroll as usize + 1)
-        .position(start)
-        .viewport_content_length(height);
-    f.render_stateful_widget(
-        Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None)
-            .track_symbol(Some("│"))
-            .thumb_symbol("┃")
-            .style(Style::default().fg(RULE))
-            .thumb_style(Style::default().fg(ACCENT_SOFT)),
-        area,
-        &mut sb,
-    );
+    // Nothing to scroll to: don't paint a thumb that implies otherwise.
+    if max_scroll > 0 {
+        // Map our tail-scroll model (position in [0, max_scroll], last screenful
+        // pinned to the bottom) onto ratatui's scrollbar, whose thumb only reaches
+        // the track bottom when position == content_length - 1. content_length is
+        // the number of scroll positions, not content rows, so the thumb lands flush
+        // at the bottom when start == max_scroll and its length stays height/total.
+        let mut sb = ScrollbarState::new(max_scroll as usize + 1)
+            .position(start)
+            .viewport_content_length(height);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some("│"))
+                .thumb_symbol("┃")
+                .style(Style::default().fg(RULE))
+                .thumb_style(Style::default().fg(ACCENT_SOFT)),
+            area,
+            &mut sb,
+        );
+    }
     max_scroll
 }
 
@@ -4669,9 +4698,17 @@ fn draw_palette(f: &mut Frame, area: Rect, runs: &[state::RunSummary], app: &mut
         return;
     };
     let comps = palette_completions(pal, runs);
-    // Show up to 8 completions, plus the input row and borders.
+    // Show up to 8 completions at a time, scrolled to keep the selection in view —
+    // PALETTE_CMDS has 12 verbs, so a hard cap here would make the last four
+    // unreachable by browsing.
     let menu_n = comps.len().min(8) as u16;
-    let h = menu_n + 3; // input row + top/bottom border + a hint row
+    let win_start = if pal.sel >= menu_n as usize {
+        (pal.sel + 1 - menu_n as usize).min(comps.len().saturating_sub(menu_n as usize))
+    } else {
+        0
+    };
+    // input row + completion rows + hint row + top/bottom border.
+    let h = menu_n + 2 + 2;
     let w = area.width.clamp(30, 76);
     let x = area.x + 2;
     let y = area.bottom().saturating_sub(h + 1);
@@ -4712,7 +4749,12 @@ fn draw_palette(f: &mut Frame, area: Rect, runs: &[state::RunSummary], app: &mut
     // The completion menu: verb + hint/help when on the command, run id list on the arg.
     let on_arg = pal.on_arg();
     let mut rows: Vec<Line> = vec![input_line];
-    for (i, c) in comps.iter().take(menu_n as usize).enumerate() {
+    for (i, c) in comps
+        .iter()
+        .enumerate()
+        .skip(win_start)
+        .take(menu_n as usize)
+    {
         let selected = i == pal.sel;
         let mark = if selected { "▸ " } else { "  " };
         let base = if selected {
@@ -4914,31 +4956,43 @@ fn situational_footer(
     }
 }
 
-fn draw_help_overlay(f: &mut Frame, area: Rect) {
-    // `clamp(40, ..)` returns 40 on a 30-column terminal, i.e. a rect outside the
-    // buffer, and ratatui panics on the first cell. Never grow past the frame.
-    let w = area.width.min(72);
-    let h = area.height.min(32);
-    if w == 0 || h == 0 {
-        return;
+/// Word-wrap a single line to `width` columns without collapsing internal
+/// whitespace runs (unlike `soft_wrap`, which rejoins on a single space) — the
+/// help text's alignment depends on the run of spaces between a key and its
+/// description.
+fn wrap_line_preserve(line: &str, width: usize) -> Vec<String> {
+    let chars: Vec<char> = line.chars().collect();
+    if width == 0 || chars.len() <= width {
+        return vec![line.to_string()];
     }
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let rect = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
-    f.render_widget(Clear, rect);
-    let body = r#" spar — rail + one main area
- 
+    let mut rows = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        let mut end = (start + width).min(chars.len());
+        if end < chars.len() {
+            if let Some(brk) = (start..end).rev().find(|&i| chars[i] == ' ') {
+                if brk > start {
+                    end = brk;
+                }
+            }
+        }
+        rows.push(chars[start..end].iter().collect());
+        start = end;
+        while start < chars.len() && chars[start] == ' ' {
+            start += 1;
+        }
+    }
+    rows
+}
+
+const HELP_BODY: &str = r#" spar — rail + one main area
+
   Shape
     Rail   projects ▸ runs ▸ agents  (Enter pushes, Esc pops)
            attention-sorted: gates and broken runs float to the top.
     Main   one area · tabs: Log · Activity · Diff · Shell
     Main always shows the rail's selection — nothing else moves.
- 
+
   Keyboard
     1 / 2                focus Rail · Main
     Tab / Shift-Tab      cycle Rail ↔ Main
@@ -4956,22 +5010,68 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
     g / G                top / bottom of Main
     ?                    this help · Esc closes help
     q                    quit
- 
+
   Shell tab = a real tmux client: every key goes to the agent (incl.
     Ctrl+C). prefix C-a · Ctrl+a d or F12 hands focus back to spar.
     Focusing it full-screen is Driving mode (green banner, bands collapsed).
- 
+
   Mouse / touch: tap a tab, a rail row (double-tap = Enter), a gate
   button, or the breadcrumb (back to the rail). Scroll to scroll.
- 
+
   Esc, ?, or tap to close help"#;
-    let p = Paragraph::new(body).style(Style::default().fg(FG)).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(ACCENT))
-            .title(Span::styled(" Help ", Style::default().fg(ACCENT).bold())),
-    );
+
+/// Sized to its content, up to the frame — never a fixed box that hard-clips a
+/// line mid-word. Wraps at word boundaries when the frame is narrower than the
+/// longest line, and scrolls with j/k when it is shorter than the content.
+fn draw_help_overlay(f: &mut Frame, area: Rect, app: &mut App) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    const BORDER: u16 = 2;
+    let lines: Vec<&str> = HELP_BODY.lines().collect();
+    let content_w = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
+    let w = (content_w + BORDER).min(area.width);
+    if w <= BORDER {
+        return;
+    }
+    let inner_w = (w - BORDER) as usize;
+    let wrapped: Vec<String> = lines
+        .iter()
+        .flat_map(|l| wrap_line_preserve(l, inner_w))
+        .collect();
+    let content_h = wrapped.len() as u16;
+    let h = (content_h + BORDER).min(area.height);
+    if h <= BORDER {
+        return;
+    }
+    let inner_h = h - BORDER;
+    let max_scroll = content_h.saturating_sub(inner_h);
+    app.help_scroll = app.help_scroll.min(max_scroll);
+
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let title = if max_scroll > 0 {
+        " Help · j/k scroll "
+    } else {
+        " Help "
+    };
+    let p = Paragraph::new(wrapped.join("\n"))
+        .style(Style::default().fg(FG))
+        .scroll((app.help_scroll, 0))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(ACCENT))
+                .title(Span::styled(title, Style::default().fg(ACCENT).bold())),
+        );
     f.render_widget(p, rect);
 }
 
@@ -5270,10 +5370,17 @@ fn stream_content(
     full: Option<&RunState>,
     slot_idx: usize,
     cache: &mut LogCache,
+    has_runs: bool,
 ) -> String {
     let Some(st) = full else {
         cache.clear();
-        return "\n  Select a run on the left.\n\n  New work:\n    spar plan -t \"describe the change\" --providers cli:claude\n".into();
+        // Distinct from "pick one of these" — there is nothing to pick yet, so the
+        // empty state doesn't tell the operator to do something that isn't possible.
+        return if has_runs {
+            "\n  Select a run on the left.\n".into()
+        } else {
+            "\n  No runs yet.\n\n  New work:\n    spar plan -t \"describe the change\" --providers cli:claude\n".into()
+        };
     };
     if st.slots.is_empty() {
         cache.clear();
@@ -7286,6 +7393,242 @@ mod render_stability {
             (0..120).map(|x| buf[(x, 1)].symbol()).collect()
         };
         assert!(band.contains("billed 6.0k"), "band was: {band:?}");
+    }
+
+    /// The help overlay used to hard-clip at a fixed 72 columns, cutting words like
+    /// "approve" and "collapsed" mid-word. It must now size to its longest line (up
+    /// to the frame) so every line renders whole.
+    #[test]
+    fn help_overlay_never_hard_clips_a_line() {
+        let st = run_with(Phase::Review, 3);
+        let term = paint_with(100, 40, &[], &[], Some(&st), |a| a.show_help = true);
+        let rows: Vec<String> = (0..40).map(|y| row(&term, y)).collect();
+        let joined = rows.join("\n");
+        assert!(
+            joined.contains("reject · ship (when gated; approve = tap / :approve)"),
+            "line was cut: {joined:?}"
+        );
+        assert!(
+            joined.contains("Driving mode (green banner, bands collapsed)."),
+            "line was cut: {joined:?}"
+        );
+    }
+
+    /// On a terminal too short for the whole body, the overlay must scroll rather
+    /// than silently hiding the tail — and the scroll offset must clamp instead of
+    /// running past the last line.
+    #[test]
+    fn help_overlay_scrolls_and_clamps_on_a_short_terminal() {
+        let st = run_with(Phase::Review, 3);
+        let top = paint_with(100, 12, &[], &[], Some(&st), |a| a.show_help = true);
+        let top_text = (0..12).map(|y| row(&top, y)).collect::<Vec<_>>().join("\n");
+        assert!(
+            top_text.contains("Shape"),
+            "top of the body should be visible unscrolled: {top_text:?}"
+        );
+        assert!(
+            !top_text.contains("Esc, ?, or tap to close help"),
+            "the last line shouldn't fit an unscrolled 12-row overlay: {top_text:?}"
+        );
+
+        let scrolled = paint_with(100, 12, &[], &[], Some(&st), |a| {
+            a.show_help = true;
+            a.help_scroll = 9999; // clamps to the true max instead of panicking
+        });
+        let bottom_text = (0..12)
+            .map(|y| row(&scrolled, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            bottom_text.contains("Esc, ?, or tap to close help"),
+            "scrolling to the max should reach the last line: {bottom_text:?}"
+        );
+    }
+
+    /// The palette used to under-count its own height by one row, clipping the hint
+    /// line every time it opened. It also hard-capped the menu at 8 of the 12 verbs,
+    /// so `spawn`/`chat`/`help`/`quit` could never be reached by browsing.
+    #[test]
+    fn palette_hint_is_never_clipped_and_every_verb_is_reachable() {
+        let term = paint_with(120, 40, &[], &[], None, |a| {
+            a.palette = Some(Palette::default());
+        });
+        let buf: String = (0..40)
+            .map(|y| row(&term, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            buf.contains("Tab complete · ↑↓ pick · Enter run · Esc close"),
+            "hint row was clipped: {buf:?}"
+        );
+
+        // `quit` is PALETTE_CMDS[11] — unreachable under the old hard cap of 8.
+        let term = paint_with(120, 40, &[], &[], None, |a| {
+            a.palette = Some(Palette {
+                input: String::new(),
+                sel: PALETTE_CMDS.len() - 1,
+            });
+        });
+        let buf: String = (0..40)
+            .map(|y| row(&term, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            buf.contains("quit"),
+            "scrolled menu should reach quit: {buf:?}"
+        );
+    }
+
+    /// A scrollbar thumb implies there is more to see. It must not paint when the
+    /// content already fits the viewport.
+    #[test]
+    fn scrollbar_only_paints_when_content_overflows() {
+        let st = run_with(Phase::Review, 1);
+        let has_scrollbar = |text: &str| {
+            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let swarm = SparPaths::new("/x");
+            let mut app = App::new(None, Config::default(), true);
+            app.open_main(MainTab::Diff);
+            let mut rail = ListState::default();
+            term.draw(|f| {
+                draw(
+                    f,
+                    &swarm,
+                    &[],
+                    &[],
+                    Some(&st),
+                    "",
+                    &[],
+                    text,
+                    &mut app,
+                    &mut rail,
+                )
+            })
+            .unwrap();
+            let inner = app.rect_main_inner;
+            let x = inner.right().saturating_sub(1);
+            let buf = term.backend().buffer();
+            (inner.top()..inner.bottom()).any(|y| {
+                let sym = buf[(x, y)].symbol();
+                sym == "┃" || sym == "│"
+            })
+        };
+        assert!(!has_scrollbar("one short line"), "no overflow, no thumb");
+        let long: String = (0..200)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(has_scrollbar(&long), "content overflows, thumb expected");
+    }
+
+    /// The gap between adjacent Main tab labels must be the same everywhere — it used
+    /// to jump from 4 to 8 columns around Activity's alert-badge slot, and the narrow
+    /// strip had its own, differently uneven spacing.
+    #[test]
+    fn tab_strip_gaps_are_uniform() {
+        let st = run_with(Phase::Review, 3);
+        let gaps = |width: u16| -> Vec<usize> {
+            let mut term = Terminal::new(TestBackend::new(width, 30)).unwrap();
+            let swarm = SparPaths::new("/x");
+            let mut app = App::new(None, Config::default(), true);
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: 30,
+            };
+            let lay = layout_rects(area, Focus::Main, false, false);
+            term.draw(|f| draw_labels(f, &lay, &swarm, &[], &[], Some(&st), &mut app))
+                .unwrap();
+            let text: String = {
+                let buf = term.backend().buffer();
+                (0..width)
+                    .map(|x| buf[(x, lay.labels.y)].symbol())
+                    .collect()
+            };
+            let labels = ["Log", "Activity", "Diff", "Shell"];
+            let mut cursor = 0usize;
+            let mut ends = Vec::new();
+            let mut starts = Vec::new();
+            for label in labels {
+                let start = text[cursor..].find(label).unwrap() + cursor;
+                starts.push(start);
+                cursor = start + label.len();
+                ends.push(cursor);
+            }
+            (0..labels.len() - 1)
+                .map(|i| starts[i + 1] - ends[i])
+                .collect()
+        };
+        let wide = gaps(120);
+        assert!(
+            wide.windows(2).all(|w| w[0] == w[1]),
+            "wide tab gaps not uniform: {wide:?}"
+        );
+        let narrow = gaps(79);
+        assert!(
+            narrow.windows(2).all(|w| w[0] == w[1]),
+            "narrow tab gaps not uniform: {narrow:?}"
+        );
+    }
+
+    /// With no runs at all, the header, rail and Main must agree on a single story —
+    /// not a header offering a run breadcrumb ("run —") next to "no runs", nor a Main
+    /// pane still painting stale log content or a scrollbar behind it.
+    #[test]
+    fn empty_state_is_coherent_with_no_stale_chrome() {
+        let mut cache = LogCache::empty();
+        let text = stream_content(&SparPaths::new("/x"), None, 0, &mut cache, false);
+        assert!(
+            !text.to_lowercase().contains("select a run"),
+            "nothing to select with zero runs: {text:?}"
+        );
+
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let swarm = SparPaths::new("/x");
+        let mut app = App::new(None, Config::default(), true);
+        let mut rail = ListState::default();
+        term.draw(|f| {
+            draw(
+                f,
+                &swarm,
+                &[],
+                &[],
+                None,
+                &text,
+                &[],
+                "",
+                &mut app,
+                &mut rail,
+            )
+        })
+        .unwrap();
+
+        let header = row(&term, 0);
+        assert!(
+            !header.contains("run —"),
+            "incoherent breadcrumb: {header:?}"
+        );
+        assert!(header.contains("no runs"), "header: {header:?}");
+
+        let whole: String = {
+            let buf = term.backend().buffer();
+            (0..30)
+                .map(|y| (0..120).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(whole.contains("(no runs)"), "rail: {whole:?}");
+        assert!(!whole.contains("Bash"), "stale log content: {whole:?}");
+
+        let inner = app.rect_main_inner;
+        let x = inner.right().saturating_sub(1);
+        let buf = term.backend().buffer();
+        let scrollbar = (inner.top()..inner.bottom()).any(|y| {
+            let sym = buf[(x, y)].symbol();
+            sym == "┃" || sym == "│"
+        });
+        assert!(!scrollbar, "no content to scroll in the empty state");
     }
 }
 
