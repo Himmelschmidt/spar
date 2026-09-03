@@ -50,8 +50,9 @@ const TAB_MARK: &str = "━";
 /// needed a page background to sit on.
 const SEL_BAR: &str = "▌";
 
-/// Three focus targets, not an N-way ring: the drill-down rail, the one main
-/// area, and the composer. `1` / `2` / `3` jump straight to one (see U1).
+/// Two focus targets, not an N-way ring: the drill-down rail and the one main
+/// area. `1` / `2` jump straight to one; `Tab` / `BackTab` cycles between them
+/// (see U1). The `:` palette is a transient overlay, not a third ring member.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Rail,
@@ -165,7 +166,7 @@ const PALETTE_CMDS: &[PaletteCmd] = &[
     PaletteCmd {
         name: "plan",
         arg_hint: "<task>",
-        help: "start a plan (reuses the selected run's fleet)",
+        help: "start a plan (fleet picker, or the selected run's fleet)",
         needs_run: false,
     },
     PaletteCmd {
@@ -287,10 +288,13 @@ impl Drop for TerminalGuard {
 /// Bytes of slot log kept in the live-log viewport (tail window).
 const LOG_TAIL_BYTES: usize = 256_000;
 
-/// The rail is one drill-down tree: `projects ▸ runs ▸ agents`. `Enter` pushes a
-/// level, `Esc` pops one (and never exits the app at the root).
+/// The rail is one drill-down tree, rooted at Home: `Home ▸ runs ▸ agents`, with
+/// `Projects` reachable as navigation (`p`, or a Home row) rather than the root.
+/// `Enter` pushes a level, `Esc` pops one (and never exits the app at the root).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BrowseLevel {
+    /// The cross-project landing view — the rail root (U7/U18).
+    Home,
     /// General view — registered projects only (not a wall of runs).
     Projects,
     /// Per-project view — runs for `active_root` only.
@@ -302,14 +306,137 @@ enum BrowseLevel {
 impl BrowseLevel {
     /// Levels that need this project's runs (and the selected run) loaded.
     fn in_project(self) -> bool {
-        !matches!(self, BrowseLevel::Projects)
+        matches!(self, BrowseLevel::Runs | BrowseLevel::Agents)
     }
     fn pop(self) -> Self {
         match self {
             BrowseLevel::Agents => BrowseLevel::Runs,
-            _ => BrowseLevel::Projects,
+            BrowseLevel::Runs => BrowseLevel::Home,
+            BrowseLevel::Projects => BrowseLevel::Home,
+            BrowseLevel::Home => BrowseLevel::Home,
         }
     }
+}
+
+/// Home's four bands, in fixed display order (U7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HomeBand {
+    NeedsMe,
+    Running,
+    Finished,
+    StartNew,
+}
+
+/// Home's four bands flattened into one list, headers included so they are always
+/// present even when a band is empty (U14: reserve space from the layout, never the
+/// content). Built off-thread in `build_snapshot` — `draw` only ever consumes this.
+// `run: state::RunSummary` makes `Run` the largest variant by a wide margin, but
+// boxing it would break the test contract's direct-construction call sites — Home
+// rows never number in the thousands per frame (`HOME_BAND_CAP`), so the copy cost
+// is not worth that.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+enum HomeRow {
+    Header(HomeBand),
+    Run {
+        band: HomeBand,
+        run: state::RunSummary,
+        waited: Duration,
+    },
+    /// A capped band's tail: how many more rows it is not showing.
+    More {
+        band: HomeBand,
+        n: usize,
+    },
+    /// Index into the snapshot's `projects` — band 4's project switcher.
+    Project(usize),
+    /// Band 4's action row — opens the Phase D new-run surface.
+    NewRun,
+}
+
+/// Home's scope: everything registered, or one project. Filters which rows land in
+/// the bands; it never changes the bands themselves (U20).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HomeScope {
+    All,
+    Project(PathBuf),
+}
+
+/// Per-project roll-up for the rail's Projects level and Home's project rows,
+/// index-aligned with `Snapshot::projects`. Computed off-thread because `draw`
+/// never scans (U13).
+#[derive(Debug, Clone, Copy, Default)]
+struct ProjectStat {
+    n_runs: usize,
+    needs_you: usize,
+}
+
+/// Home's off-thread roll-up: the flattened band rows plus the per-project stats the
+/// Projects level and Home's project rows both need. One `Snapshot` field.
+#[derive(Default)]
+struct HomeData {
+    rows: Vec<HomeRow>,
+    project_stats: Vec<ProjectStat>,
+}
+
+/// Per-band cap on rendered rows, so a thousand-run workspace does not build a
+/// thousand `ListItem`s a frame. Band 1 (`NeedsMe`) is exempt — the cap must never
+/// hide something that wants the operator.
+const HOME_BAND_CAP: usize = 50;
+
+/// Field the Phase D new-run modal is currently editing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewRunField {
+    Project,
+    Task,
+    Fleet,
+}
+
+/// Where a roster entry came from — shown so the operator knows why it is (or is
+/// not) selectable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RosterSource {
+    /// Listed in `spar.toml`'s `[providers] order`.
+    Configured,
+    /// Found on `PATH` by `providers::detect_all()` but not configured.
+    Detected,
+    /// The most recently run's recorded fleet, offered as one row.
+    RecentFleet,
+}
+
+/// What picking a roster row adds to the fleet: one provider, or (for a recent-fleet
+/// row) several at once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RosterChoice {
+    Provider(String),
+    Fleet(Vec<String>),
+}
+
+/// One row in the fleet picker.
+#[derive(Debug, Clone)]
+struct RosterEntry {
+    choice: RosterChoice,
+    label: String,
+    available: bool,
+    reason: Option<String>,
+    source: RosterSource,
+}
+
+/// Phase D's new-run modal: a one-line task (U16's manual seam — the brief file is
+/// 008's half) plus a fleet picker over the provider roster (U8/U21/U22).
+struct NewRun {
+    /// The target project. `None` means no launchable target (R5/AC-32).
+    project: Option<PathBuf>,
+    /// Cycleable project choices when Home's scope is `All`.
+    projects: Vec<PathBuf>,
+    task: String,
+    /// Snapshotted once, when the modal opens (U22) — never touched again in `draw`.
+    roster: Vec<RosterEntry>,
+    /// Indices into `roster`, in the order they were picked.
+    picked: Vec<usize>,
+    field: NewRunField,
+    /// Cursor row within the roster list.
+    sel: usize,
 }
 
 struct App {
@@ -416,6 +543,22 @@ struct App {
     /// Hit rect of the fleet roll-up token on the status line; a tap jumps to the next
     /// run that needs you (same as `a`). Zero-sized when nothing needs attention.
     rect_attention: Rect,
+    /// Rail cursor at the Home level. Rebuilt every snapshot; see `home_key`.
+    selected_home: usize,
+    /// Whether Home shows every registered project's rows or one project's. `P` toggles.
+    home_scope: HomeScope,
+    /// "Finished since last look" boundary — read once at startup, held for the whole
+    /// session so band 3 does not empty under the operator while they are looking (U19).
+    home_watermark: DateTime<Utc>,
+    /// Identity of the row `selected_home` points at (not its index — Home re-ranks
+    /// every snapshot). `resync_home_selection` uses this to follow the row across
+    /// rebuilds instead of a position that can slide out from under the cursor (R3).
+    home_key: Option<String>,
+    /// Set by `rail_enter` on a Home run row so the one-tick snapshot handoff into
+    /// `Agents` selects the row's own run, not whatever the rail happened to have.
+    home_target_run: Option<String>,
+    /// Phase D's new-run modal. `Some` = open and capturing keys.
+    new_run: Option<NewRun>,
 }
 
 /// A gate action reachable by both a key and a tappable button.
@@ -482,25 +625,35 @@ impl LogCache {
 }
 
 impl App {
-    fn new(task_seed: Option<String>, cfg: Config, start_in_project: bool) -> Self {
+    fn new(task_seed: Option<String>, cfg: Config, local_root: Option<&Path>) -> Self {
+        let home_scope = match local_root {
+            Some(root) => HomeScope::Project(root.to_path_buf()),
+            None => HomeScope::All,
+        };
+        // A launch task seed opens the new-run surface pre-filled (U3/U21) — it no
+        // longer opens the palette, which had no way to offer a fresh fleet.
+        let new_run = task_seed.map(|t| NewRun {
+            project: local_root.map(Path::to_path_buf),
+            projects: local_root
+                .map(|r| vec![r.to_path_buf()])
+                .unwrap_or_default(),
+            task: t,
+            roster: Vec::new(),
+            picked: Vec::new(),
+            field: NewRunField::Task,
+            sel: 0,
+        });
         Self {
             selected_run: 0,
             selected_project: 0,
             selected_slot: 0,
             focus: Focus::Rail,
-            // Inside a project → that project's runs. Outside → project picker.
-            browse: if start_in_project {
-                BrowseLevel::Runs
-            } else {
-                BrowseLevel::Projects
-            },
+            // Home is always the landing view (U7/U18); Projects survives as
+            // navigation, reachable with `p` or a Home row.
+            browse: BrowseLevel::Home,
             main_tab: MainTab::Log,
             zoom: false,
-            // A launch task seed opens the palette pre-filled with a `plan` command.
-            palette: task_seed.map(|t| Palette {
-                input: format!("plan {t}"),
-                sel: 0,
-            }),
+            palette: None,
             filter: None,
             filter_committed: false,
             status_line: String::new(),
@@ -545,6 +698,12 @@ impl App {
             bg_tx: None,
             prev_attention: None,
             rect_attention: Rect::default(),
+            selected_home: 0,
+            home_scope,
+            home_watermark: read_watermark(&watermark_path()),
+            home_key: None,
+            home_target_run: None,
+            new_run,
         }
     }
 
@@ -625,15 +784,24 @@ impl App {
         self.focus = Focus::Rail;
     }
 
-    /// `Esc` in the rail: pop one level. At `Projects` this is a no-op — the rail
-    /// root is never an exit.
+    /// Back to the landing view. `Projects`/`Runs`/`Agents` all pop here eventually.
+    fn open_home(&mut self) {
+        self.browse = BrowseLevel::Home;
+        self.selected_slot = 0;
+        self.reset_stream_view();
+        self.reset_bus_view();
+        self.focus = Focus::Rail;
+    }
+
+    /// `Esc` in the rail: pop one level. At `Home` this is a no-op — the rail root
+    /// is never an exit (U18).
     fn rail_pop(&mut self) {
-        if self.browse == BrowseLevel::Projects {
+        if self.browse == BrowseLevel::Home {
             return;
         }
         let next = self.browse.pop();
-        if next == BrowseLevel::Projects {
-            self.open_projects_view();
+        if next == BrowseLevel::Home {
+            self.open_home();
         } else {
             self.browse = next;
             self.selected_slot = 0;
@@ -848,6 +1016,8 @@ struct Selection {
     run_id: Option<String>,
     slot_idx: usize,
     project_idx: usize,
+    home_scope: HomeScope,
+    home_watermark: DateTime<Utc>,
 }
 
 /// An immutable view of the world, produced off-thread and rendered as-is.
@@ -866,6 +1036,8 @@ struct Snapshot {
     abandoned: bool,
     /// Freshest process heartbeat per slot id for the selected run.
     heartbeats: std::collections::HashMap<String, DateTime<Utc>>,
+    /// Home's bands and the per-project roll-up, built off-thread (U13/B).
+    home: HomeData,
 }
 
 enum Msg {
@@ -925,6 +1097,45 @@ fn marks_for(sel: &Selection, prev: Option<&Snapshot>) -> Marks {
                     .clone()
                     .unwrap_or_else(|| swarm.log_file(id, &sl.id));
                 out.push(stamp(&p));
+            }
+        }
+    }
+    out
+}
+
+/// How often the refresher is allowed to sweep every registered project's run dirs
+/// for Home/Projects. Far coarser than `REFRESH`: at "thousands of run dirs" scale
+/// (the scale that has already bitten once, per the IA doc) a per-200ms sweep across
+/// every project is a permanent stat storm (U23).
+const CROSS_PROJECT_REFRESH: Duration = Duration::from_secs(2);
+
+/// Whether the refresher should re-sweep every registered project's marks right now.
+/// Only Home and Projects are cross-project; `Runs`/`Agents` are scoped to one
+/// project and must never trigger the sweep, no matter how long it has been.
+fn cross_project_due(browse: BrowseLevel, since_last: Duration, forced: bool) -> bool {
+    if !matches!(browse, BrowseLevel::Home | BrowseLevel::Projects) {
+        return false;
+    }
+    forced || since_last >= CROSS_PROJECT_REFRESH
+}
+
+/// Marks for every registered project's run listing — the cross-project half of
+/// `marks_for`, called at `CROSS_PROJECT_REFRESH` cadence rather than every tick.
+fn cross_project_marks(projects: &[registry::ProjectEntry]) -> Marks {
+    let mut out = Vec::new();
+    for p in projects {
+        let swarm = SparPaths::new(&p.root);
+        let runs_dir = swarm.runs_dir();
+        out.push(stamp(&runs_dir));
+        if let Ok(entries) = std::fs::read_dir(&runs_dir) {
+            let mut ids: Vec<String> = entries
+                .flatten()
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            ids.sort();
+            for id in ids {
+                out.push(stamp(&swarm.state_file(&id)));
             }
         }
     }
@@ -1044,8 +1255,34 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
         .map(|st| st.abandoned(&swarm))
         .unwrap_or(false);
     let quota = QuotaStore::load(&swarm).unwrap_or_default();
+    // Home and Projects both need the per-project roll-up (U13/B); only Home needs
+    // the flattened band rows, which Projects has no use for.
+    let home = if matches!(sel.browse, BrowseLevel::Home | BrowseLevel::Projects) {
+        let folded = gather_home(&projects);
+        let project_stats = project_stats_of(&folded);
+        let rows = if sel.browse == BrowseLevel::Home {
+            build_home_rows(
+                &projects,
+                &folded,
+                &sel.home_scope,
+                sel.home_watermark,
+                Utc::now(),
+            )
+        } else {
+            Vec::new()
+        };
+        HomeData {
+            rows,
+            project_stats,
+        }
+    } else {
+        HomeData::default()
+    };
     let stream_text = if sel.browse.in_project() {
         stream_content(&swarm, full.as_ref(), sel.slot_idx, cache, !runs.is_empty())
+    } else if sel.browse == BrowseLevel::Home {
+        cache.clear();
+        home_overview(&home.rows, &sel.home_scope, sel.home_watermark)
     } else {
         cache.clear();
         project_overview(&projects, sel.project_idx)
@@ -1089,7 +1326,468 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
         human_alerts: alerts.len(),
         abandoned,
         heartbeats,
+        home,
     }
+}
+
+/// Disk half of U13/B: one folded, archived-filtered run listing per registered
+/// project, index-aligned with `projects`. A missing project root degrades to an
+/// empty listing rather than panicking. Called off-thread only.
+fn gather_home(projects: &[registry::ProjectEntry]) -> Vec<Vec<state::RunSummary>> {
+    projects
+        .iter()
+        .map(|p| {
+            let listed = registry::list_visible_project_runs(&p.root).unwrap_or_default();
+            let (folded, _) = fold_units(listed);
+            folded
+        })
+        .collect()
+}
+
+/// Pure roll-up over an already-folded, per-project listing: run count and how many
+/// legs want the operator (U15's `wants`, not the row count).
+fn project_stats_of(folded: &[Vec<state::RunSummary>]) -> Vec<ProjectStat> {
+    folded
+        .iter()
+        .map(|runs| ProjectStat {
+            n_runs: runs.len(),
+            needs_you: runs_needing_attention(runs),
+        })
+        .collect()
+}
+
+/// A run's wait — how long it has sat since its last update, clamped to zero for a
+/// clock that ran backwards rather than sorting a skewed timestamp to the top forever.
+fn home_wait(updated_at: DateTime<Utc>, now: DateTime<Utc>) -> Duration {
+    (now - updated_at).to_std().unwrap_or(Duration::ZERO)
+}
+
+fn push_home_band(
+    rows: &mut Vec<HomeRow>,
+    band: HomeBand,
+    runs: &[state::RunSummary],
+    now: DateTime<Utc>,
+    cap: Option<usize>,
+) {
+    let shown = match cap {
+        Some(c) => runs.len().min(c),
+        None => runs.len(),
+    };
+    for r in &runs[..shown] {
+        rows.push(HomeRow::Run {
+            band,
+            run: r.clone(),
+            waited: home_wait(r.updated_at, now),
+        });
+    }
+    if let Some(c) = cap {
+        if runs.len() > c {
+            rows.push(HomeRow::More {
+                band,
+                n: runs.len() - c,
+            });
+        }
+    }
+}
+
+/// Pure banding/ranking/capping (C): first match wins, so a run lands in exactly one
+/// band. `NeedsMe` is never capped (U5/AC-21); `Finished` is bounded by `watermark`
+/// (U19); band membership is declared per phase, not a fallthrough (AC-18).
+fn build_home_rows(
+    projects: &[registry::ProjectEntry],
+    folded: &[Vec<state::RunSummary>],
+    scope: &HomeScope,
+    watermark: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Vec<HomeRow> {
+    let mut needs_me: Vec<state::RunSummary> = Vec::new();
+    let mut running: Vec<state::RunSummary> = Vec::new();
+    let mut finished: Vec<state::RunSummary> = Vec::new();
+
+    for (i, runs) in folded.iter().enumerate() {
+        let Some(proj) = projects.get(i) else {
+            continue;
+        };
+        if let HomeScope::Project(root) = scope {
+            if &proj.root != root {
+                continue;
+            }
+        }
+        for r in runs {
+            if r.abandoned || run_attention(r).needs_you() {
+                needs_me.push(r.clone());
+            } else if is_active_phase(r.phase) {
+                running.push(r.clone());
+            } else if matches!(r.phase, Phase::Done | Phase::Stopped | Phase::PlanRejected)
+                && r.updated_at > watermark
+            {
+                finished.push(r.clone());
+            }
+        }
+    }
+
+    // Band 1: longest wait first. Bands 2/3: most recently updated first.
+    needs_me.sort_by_key(|r| std::cmp::Reverse(home_wait(r.updated_at, now)));
+    running.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
+    finished.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
+
+    let mut rows = Vec::new();
+    rows.push(HomeRow::Header(HomeBand::NeedsMe));
+    push_home_band(&mut rows, HomeBand::NeedsMe, &needs_me, now, None);
+    rows.push(HomeRow::Header(HomeBand::Running));
+    push_home_band(
+        &mut rows,
+        HomeBand::Running,
+        &running,
+        now,
+        Some(HOME_BAND_CAP),
+    );
+    rows.push(HomeRow::Header(HomeBand::Finished));
+    push_home_band(
+        &mut rows,
+        HomeBand::Finished,
+        &finished,
+        now,
+        Some(HOME_BAND_CAP),
+    );
+    rows.push(HomeRow::Header(HomeBand::StartNew));
+    rows.push(HomeRow::NewRun);
+    for i in 0..projects.len() {
+        rows.push(HomeRow::Project(i));
+    }
+    rows
+}
+
+fn home_band_label(b: HomeBand) -> &'static str {
+    match b {
+        HomeBand::NeedsMe => "NEEDS YOU",
+        HomeBand::Running => "RUNNING",
+        HomeBand::Finished => "FINISHED SINCE YOUR LAST LOOK",
+        HomeBand::StartNew => "START SOMETHING NEW",
+    }
+}
+
+fn home_band_empty_text(b: HomeBand) -> &'static str {
+    match b {
+        HomeBand::NeedsMe => "nothing needs you",
+        HomeBand::Running => "nothing running",
+        HomeBand::Finished => "nothing finished since your last look",
+        HomeBand::StartNew => "",
+    }
+}
+
+fn home_scope_label(scope: &HomeScope) -> String {
+    match scope {
+        HomeScope::All => "all projects".to_string(),
+        HomeScope::Project(p) => p
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "project".to_string()),
+    }
+}
+
+/// How many runs need the operator at Home — a folded row with `legs > 1` still
+/// counts every leg that wants attention (U15), matching `runs_needing_attention`.
+fn home_needs_you(rows: &[HomeRow]) -> usize {
+    rows.iter()
+        .filter_map(|r| match r {
+            HomeRow::Run {
+                band: HomeBand::NeedsMe,
+                run,
+                ..
+            } => Some(if run.legs > 1 { run.wants as usize } else { 1 }),
+            _ => None,
+        })
+        .sum()
+}
+
+fn home_band_count(rows: &[HomeRow], band: HomeBand) -> usize {
+    rows.iter()
+        .filter(|r| matches!(r, HomeRow::Run { band: b, .. } if *b == band))
+        .count()
+}
+
+/// Main's Home body: the four bands, headers always present, each empty band saying
+/// so on its own line (U14's reserved-space rule applied to Home).
+fn home_overview(rows: &[HomeRow], scope: &HomeScope, watermark: DateTime<Utc>) -> String {
+    let _ = watermark;
+    let mut out = format!("\n  Home · {}\n\n", home_scope_label(scope));
+    let mut i = 0;
+    while i < rows.len() {
+        let HomeRow::Header(band) = rows[i] else {
+            i += 1;
+            continue;
+        };
+        out.push_str(&format!("  {}\n", home_band_label(band)));
+        let mut j = i + 1;
+        let mut any = false;
+        while j < rows.len() && !matches!(rows[j], HomeRow::Header(_)) {
+            match &rows[j] {
+                HomeRow::Run { run, waited, .. } => {
+                    any = true;
+                    let flag = if run.wants > 1 {
+                        format!(" ⚑{}", run.wants)
+                    } else {
+                        String::new()
+                    };
+                    out.push_str(&format!(
+                        "    {} · {} · {} · waited {}{flag}\n",
+                        run.project_name.as_deref().unwrap_or("?"),
+                        truncate(&run.id, 8),
+                        rail_phase(run.phase),
+                        relative_wait(*waited),
+                    ));
+                }
+                HomeRow::More { n, .. } => {
+                    any = true;
+                    out.push_str(&format!("    … {n} more\n"));
+                }
+                HomeRow::NewRun => {
+                    any = true;
+                    out.push_str("    n — start something new\n");
+                }
+                HomeRow::Project(_) => {}
+                HomeRow::Header(_) => unreachable!(),
+            }
+            j += 1;
+        }
+        if !any {
+            let t = home_band_empty_text(band);
+            if !t.is_empty() {
+                out.push_str(&format!("    {t}\n"));
+            }
+        }
+        out.push('\n');
+        i = j;
+    }
+    out
+}
+
+fn relative_wait(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86400)
+    }
+}
+
+/// Identity of a Home row, for `resync_home_selection` to follow the cursor across a
+/// re-ranked snapshot instead of a position (R3).
+fn home_row_key(row: &HomeRow) -> String {
+    match row {
+        HomeRow::Header(b) => format!("hdr:{b:?}"),
+        HomeRow::Run { run, .. } => format!("run:{}", run.id),
+        HomeRow::More { band, .. } => format!("more:{band:?}"),
+        HomeRow::Project(i) => format!("proj:{i}"),
+        HomeRow::NewRun => "newrun".to_string(),
+    }
+}
+
+/// Re-glue the Home cursor to the row it was on, by identity, after a rebuild (R3).
+/// A row that vanished clamps to the nearest non-header row rather than indexing out
+/// of bounds or landing on a header.
+fn resync_home_selection(app: &mut App, rows: &[HomeRow]) {
+    if rows.is_empty() {
+        app.selected_home = 0;
+        app.home_key = None;
+        return;
+    }
+    if let Some(key) = app.home_key.clone() {
+        if let Some(i) = rows.iter().position(|r| home_row_key(r) == key) {
+            app.selected_home = i;
+            return;
+        }
+    }
+    let mut i = app.selected_home.min(rows.len() - 1);
+    if matches!(rows[i], HomeRow::Header(_)) {
+        if let Some(f) = (i..rows.len()).find(|&j| !matches!(rows[j], HomeRow::Header(_))) {
+            i = f;
+        } else if let Some(b) = (0..i)
+            .rev()
+            .find(|&j| !matches!(rows[j], HomeRow::Header(_)))
+        {
+            i = b;
+        }
+    }
+    app.selected_home = i;
+    app.home_key = rows.get(i).map(home_row_key);
+}
+
+/// `P`: toggle Home's scope between "everything" and the local project.
+fn toggle_home_scope(app: &mut App, local_root: Option<&Path>) {
+    app.home_scope = match &app.home_scope {
+        HomeScope::All => match local_root {
+            Some(root) => HomeScope::Project(root.to_path_buf()),
+            None => HomeScope::All,
+        },
+        HomeScope::Project(_) => HomeScope::All,
+    };
+}
+
+/// Where the "finished since last look" watermark lives. Cross-project state cannot
+/// live in a per-project `.spar/` (U19).
+fn watermark_path() -> PathBuf {
+    registry::spar_home().join("home_watermark.json")
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WatermarkFile {
+    seen_at: DateTime<Utc>,
+}
+
+/// A missing or corrupt watermark reads as a day ago — nonfatal, and it only ever
+/// makes band 3 show *more*, never fewer.
+fn read_watermark(path: &Path) -> DateTime<Utc> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<WatermarkFile>(&s).ok())
+        .map(|w| w.seen_at)
+        .unwrap_or_else(|| Utc::now() - chrono::Duration::hours(24))
+}
+
+fn write_watermark(path: &Path, at: DateTime<Utc>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let text = serde_json::to_string(&WatermarkFile { seen_at: at })?;
+    std::fs::write(path, text)?;
+    Ok(())
+}
+
+/// Build the fleet picker's roster (D2). Pure: `detected` is the result of
+/// `providers::detect_all()` already resolved by the caller — this never touches
+/// `PATH` itself (U22, U13). Parse failures are listed first (so a broken config
+/// entry is not lost among usable ones), then configured entries in their
+/// `spar.toml` order, then whatever `detect_all` found that config did not already
+/// list, then the most recent run's fleet as one row.
+fn build_roster(
+    cfg: &Config,
+    detected: &[(String, bool)],
+    recent: Option<(&str, &[String])>,
+) -> Vec<RosterEntry> {
+    let mut invalid = Vec::new();
+    let mut valid: Vec<crate::provider_ref::ProviderRef> = Vec::new();
+    for raw in &cfg.providers.order {
+        match crate::provider_ref::ProviderRef::parse(raw) {
+            Ok(r) => valid.push(r),
+            Err(e) => invalid.push(RosterEntry {
+                choice: RosterChoice::Provider(raw.clone()),
+                label: raw.clone(),
+                available: false,
+                reason: Some(e.to_string()),
+                source: RosterSource::Configured,
+            }),
+        }
+    }
+    let mut roster = invalid;
+    let mut configured_native: Vec<String> = Vec::new();
+    for r in &valid {
+        let (available, reason) = if r.is_api() {
+            (true, None)
+        } else {
+            match detected.iter().find(|(n, _)| n == &r.name) {
+                Some((_, true)) => (true, None),
+                _ => (false, Some("not on PATH".to_string())),
+            }
+        };
+        if let Some(name) = r.cli_name() {
+            configured_native.push(name.to_string());
+        }
+        roster.push(RosterEntry {
+            choice: RosterChoice::Provider(r.display()),
+            label: r.display(),
+            available,
+            reason,
+            source: RosterSource::Configured,
+        });
+    }
+    for (name, avail) in detected {
+        if configured_native.iter().any(|n| n == name) {
+            continue;
+        }
+        roster.push(RosterEntry {
+            choice: RosterChoice::Provider(format!("cli:{name}")),
+            label: format!("cli:{name}"),
+            available: *avail,
+            reason: (!avail).then(|| "not on PATH".to_string()),
+            source: RosterSource::Detected,
+        });
+    }
+    if let Some((run_id, providers)) = recent {
+        roster.push(RosterEntry {
+            choice: RosterChoice::Fleet(providers.to_vec()),
+            label: format!("reuse {}'s fleet", truncate(run_id, 8)),
+            available: true,
+            reason: None,
+            source: RosterSource::RecentFleet,
+        });
+    }
+    roster
+}
+
+/// Expand `picked` roster indices into provider refs, in pick order, deduplicated
+/// keeping the first occurrence — a `Fleet` choice can repeat a provider a `Provider`
+/// choice already picked.
+fn new_run_providers(nr: &NewRun) -> Vec<String> {
+    let mut out = Vec::new();
+    for &idx in &nr.picked {
+        let Some(entry) = nr.roster.get(idx) else {
+            continue;
+        };
+        match &entry.choice {
+            RosterChoice::Provider(p) => out.push(p.clone()),
+            RosterChoice::Fleet(v) => out.extend(v.iter().cloned()),
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|p| seen.insert(p.clone()));
+    out
+}
+
+/// Validate the new-run surface, then build the argv `run_palette`'s `plan` arm
+/// already sends. The `--base` resolution stays at the call site (it needs the
+/// operator's actual cwd, which this pure function does not have).
+fn new_run_launch(nr: &NewRun) -> std::result::Result<(PathBuf, Vec<String>), String> {
+    let target = nr.project.clone().ok_or_else(|| {
+        "no project to launch into — open spar in a project or choose a registered project"
+            .to_string()
+    })?;
+    if nr.task.trim().is_empty() {
+        return Err("task cannot be empty".to_string());
+    }
+    if nr.picked.is_empty() {
+        return Err("pick at least one provider".to_string());
+    }
+    for &idx in &nr.picked {
+        match nr.roster.get(idx) {
+            Some(e) if e.available => {}
+            Some(e) => {
+                return Err(format!(
+                    "{} is not available: {}",
+                    e.label,
+                    e.reason.as_deref().unwrap_or("unavailable")
+                ))
+            }
+            None => return Err("invalid roster selection".to_string()),
+        }
+    }
+    let providers = new_run_providers(nr);
+    if providers.is_empty() {
+        return Err("no providers resolved".to_string());
+    }
+    let argv = vec![
+        "plan".to_string(),
+        "-t".to_string(),
+        nr.task.clone(),
+        "--providers".to_string(),
+        providers.join(","),
+    ];
+    Ok((target, argv))
 }
 
 /// The real `git diff` of a slot's worktree against HEAD (Stage B): staged + unstaged,
@@ -1203,7 +1901,7 @@ fn diff_content(swarm: &SparPaths, full: Option<&RunState>, slot_idx: usize) -> 
 }
 
 /// Redraw is only worth it while something is moving on screen: a flash timer,
-/// the composer cursor, or a run that is actively working (active phase or a
+/// the palette/filter cursor, or a run that is actively working (active phase or a
 /// running slot). An active phase with no running slot — Suite, Review,
 /// Shipping — still animates so the header spinner keeps turning.
 fn animating(app: &App, snap: &Snapshot) -> bool {
@@ -1225,7 +1923,7 @@ fn run_loop(
     task_seed: Option<String>,
     cfg: Config,
 ) -> Result<crate::exit_codes::ExitCode> {
-    let mut app = App::new(task_seed, cfg.clone(), local_root.is_some());
+    let mut app = App::new(task_seed, cfg.clone(), local_root.as_deref());
     let mut rail_state = ListState::default();
     let mut active_root: PathBuf = local_root.clone().unwrap_or_else(|| {
         registry::projects()
@@ -1241,6 +1939,8 @@ fn run_loop(
         run_id: None,
         slot_idx: 0,
         project_idx: 0,
+        home_scope: app.home_scope.clone(),
+        home_watermark: app.home_watermark,
     };
 
     // First paint needs data, so build one snapshot synchronously.
@@ -1266,6 +1966,10 @@ fn run_loop(
         let slot = Arc::clone(&snapshot);
         let mut sel = sel.clone();
         let mut marks = Marks::new();
+        let mut cross_marks = Marks::new();
+        // Fire the cross-project sweep on the very first loop iteration.
+        let mut last_cross = Instant::now() - CROSS_PROJECT_REFRESH;
+        let mut prev_cross_key = (sel.browse, sel.home_scope.clone());
         let cfg = cfg.clone();
         thread::spawn(move || loop {
             let mut forced = false;
@@ -1281,12 +1985,27 @@ fn run_loop(
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
 
+            let cross_key = (sel.browse, sel.home_scope.clone());
+            let forced_cross = forced && cross_key != prev_cross_key;
+            prev_cross_key = cross_key;
+
             let prev = Arc::clone(&*slot.lock().unwrap());
             let next_marks = marks_for(&sel, Some(&prev));
-            if !forced && next_marks == marks {
+            let mut rebuild = forced || next_marks != marks;
+            marks = next_marks;
+
+            if cross_project_due(sel.browse, last_cross.elapsed(), forced_cross) {
+                let next_cross = cross_project_marks(&registry::projects());
+                if forced_cross || next_cross != cross_marks {
+                    rebuild = true;
+                }
+                cross_marks = next_cross;
+                last_cross = Instant::now();
+            }
+
+            if !rebuild {
                 continue; // nothing on disk moved; don't rebuild, don't repaint
             }
-            marks = next_marks;
 
             let next = Arc::new(build_snapshot(&sel, &mut cache, &cfg));
             *slot.lock().unwrap() = next;
@@ -1329,16 +2048,35 @@ fn run_loop(
             app.selected_run = app.selected_run.min(snap.runs.len() - 1);
         }
         // Toast a run the moment it starts wanting the operator (gate/broken), so a
-        // fleet transition is noticed even while looking at another run.
-        emit_attention_toasts(&mut app, &snap.runs);
+        // fleet transition is noticed even while looking at another run. At Home
+        // there is no `snap.runs` (it is cross-project) — feed it Home's rows instead
+        // so the toast still fires there.
+        if app.browse == BrowseLevel::Home {
+            let home_runs: Vec<state::RunSummary> = snap
+                .home
+                .rows
+                .iter()
+                .filter_map(|r| match r {
+                    HomeRow::Run { run, .. } => Some(run.clone()),
+                    _ => None,
+                })
+                .collect();
+            emit_attention_toasts(&mut app, &home_runs);
+        } else {
+            emit_attention_toasts(&mut app, &snap.runs);
+        }
         let n_slots = snap.full.as_ref().map(|s| s.slots.len()).unwrap_or(0);
         app.selected_slot = if n_slots == 0 {
             0
         } else {
             app.selected_slot.min(n_slots - 1)
         };
+        if app.browse == BrowseLevel::Home {
+            resync_home_selection(&mut app, &snap.home.rows);
+        }
 
         rail_state.select(match app.browse {
+            BrowseLevel::Home if !snap.home.rows.is_empty() => Some(app.selected_home),
             BrowseLevel::Projects if !snap.projects.is_empty() => Some(app.selected_project),
             BrowseLevel::Runs if !snap.runs.is_empty() => Some(app.selected_run),
             BrowseLevel::Agents if n_slots > 0 => Some(app.selected_slot),
@@ -1363,6 +2101,7 @@ fn run_loop(
                     &snap.stream_text,
                     &snap.activity,
                     &snap.diff_text,
+                    &snap.home,
                     &mut app,
                     &mut rail_state,
                 );
@@ -1389,11 +2128,13 @@ fn run_loop(
                                 key.modifiers,
                                 &snap.swarm,
                                 &snap.projects,
+                                &snap.home.rows,
                                 &snap.runs,
                                 snap.full.as_ref(),
                                 &mut active_root,
                                 local_root.as_deref(),
                             )? {
+                                let _ = write_watermark(&watermark_path(), Utc::now());
                                 return Ok(crate::exit_codes::ExitCode::Success);
                             }
                         }
@@ -1402,6 +2143,7 @@ fn run_loop(
                             m,
                             &snap.swarm,
                             &snap.projects,
+                            &snap.home.rows,
                             &snap.runs,
                             snap.full.as_ref(),
                             &mut active_root,
@@ -1437,7 +2179,8 @@ fn run_loop(
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Ok(crate::exit_codes::ExitCode::Success)
+                let _ = write_watermark(&watermark_path(), Utc::now());
+                return Ok(crate::exit_codes::ExitCode::Success);
             }
         }
 
@@ -1447,6 +2190,8 @@ fn run_loop(
             run_id: snap.runs.get(app.selected_run).map(|r| r.id.clone()),
             slot_idx: app.selected_slot,
             project_idx: app.selected_project,
+            home_scope: app.home_scope.clone(),
+            home_watermark: app.home_watermark,
         };
         if next_sel != sel {
             sel = next_sel.clone();
@@ -1482,6 +2227,7 @@ fn handle_key(
     mods: KeyModifiers,
     swarm: &SparPaths,
     projects: &[registry::ProjectEntry],
+    home_rows: &[HomeRow],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
     active_root: &mut PathBuf,
@@ -1489,6 +2235,13 @@ fn handle_key(
 ) -> Result<bool> {
     let selected_id = runs.get(app.selected_run).map(|r| r.id.as_str());
     let n_slots = full.map(|s| s.slots.len()).unwrap_or(0);
+
+    // The Phase D new-run modal owns every key while it is open, same precedence as
+    // the `:` palette.
+    if app.new_run.is_some() {
+        handle_new_run_key(app, code, mods);
+        return Ok(false);
+    }
 
     // The `:` palette owns every key while it is open — including Enter (run), Tab
     // (complete), and Esc (close). It can only open when not in the Shell tab, so it
@@ -1576,7 +2329,7 @@ fn handle_key(
         KeyCode::Char('_') => app.zoom = false,
         KeyCode::Enter => {
             if app.focus == Focus::Rail {
-                rail_enter(app, projects, runs, full, active_root);
+                rail_enter(app, projects, home_rows, runs, full, active_root);
             }
         }
         KeyCode::Char('p') => {
@@ -1589,29 +2342,39 @@ fn handle_key(
             }
             app.flash("Projects (general view)", ACCENT);
         }
+        KeyCode::Char('n') => {
+            open_new_run(app, projects, home_rows, local_root);
+        }
+        KeyCode::Char('P') => {
+            toggle_home_scope(app, local_root);
+            app.flash(
+                format!("Home scope: {}", home_scope_label(&app.home_scope)),
+                ACCENT,
+            );
+        }
         KeyCode::Char('j') | KeyCode::Down => match app.focus {
-            Focus::Rail => rail_move(app, projects, runs, n_slots, 1),
+            Focus::Rail => rail_move(app, projects, home_rows, runs, n_slots, 1),
             Focus::Main => app.scroll_main_by(3, full.is_some()),
         },
         KeyCode::Char('k') | KeyCode::Up => match app.focus {
-            Focus::Rail => rail_move(app, projects, runs, n_slots, -1),
+            Focus::Rail => rail_move(app, projects, home_rows, runs, n_slots, -1),
             Focus::Main => app.scroll_main_by(-3, full.is_some()),
         },
         KeyCode::PageDown => match app.focus {
-            Focus::Rail => rail_move(app, projects, runs, n_slots, 5),
+            Focus::Rail => rail_move(app, projects, home_rows, runs, n_slots, 5),
             Focus::Main => {
                 app.scroll_main_by(i32::from(app.main_page(full.is_some())), full.is_some())
             }
         },
         KeyCode::PageUp => match app.focus {
-            Focus::Rail => rail_move(app, projects, runs, n_slots, -5),
+            Focus::Rail => rail_move(app, projects, home_rows, runs, n_slots, -5),
             Focus::Main => {
                 app.scroll_main_by(-i32::from(app.main_page(full.is_some())), full.is_some())
             }
         },
         // a jumps to the next run that wants you (Stage C). Approve moved to the gate
         // button / `:approve` when `a` became the fleet-wide attention binding.
-        KeyCode::Char('a') => jump_to_attention(app, runs),
+        KeyCode::Char('a') => jump_to_attention(app, runs, home_rows),
         KeyCode::Char('r') => {
             if let Some(id) = selected_id {
                 run_gate_action(app, swarm, id, GateAction::Reject);
@@ -1647,6 +2410,157 @@ fn handle_key(
         _ => {}
     }
     Ok(false)
+}
+
+/// `n`: open the Phase D new-run surface. The target project follows the scope
+/// (D2): a scoped Home defaults to its project, an all-project Home defaults to the
+/// selected row's project (falling back to the local repo), and the picker offers
+/// every registered project to cycle through.
+fn open_new_run(
+    app: &mut App,
+    projects: &[registry::ProjectEntry],
+    home_rows: &[HomeRow],
+    local_root: Option<&Path>,
+) {
+    let target = match &app.home_scope {
+        HomeScope::Project(root) => Some(root.clone()),
+        HomeScope::All => home_rows
+            .get(app.selected_home)
+            .and_then(|r| match r {
+                HomeRow::Run { run, .. } => run.project_root.clone(),
+                HomeRow::Project(i) => projects.get(*i).map(|p| p.root.clone()),
+                _ => None,
+            })
+            .or_else(|| local_root.map(Path::to_path_buf)),
+    };
+    let all_projects: Vec<PathBuf> = projects.iter().map(|p| p.root.clone()).collect();
+    let project = target.or_else(|| all_projects.first().cloned());
+
+    // Detection and the recent-fleet lookup are disk/process work — fine here (this
+    // is a key handler, not `draw`), and it happens once when the modal opens, not
+    // once a frame (U22).
+    let detected: Vec<(String, bool)> = crate::providers::detect_all()
+        .into_iter()
+        .map(|r| (r.name, r.available))
+        .collect();
+    let recent_fleet: Option<(String, Vec<String>)> = registry::projects()
+        .into_iter()
+        .find_map(|p| p.last_run_id.map(|id| (p.root, id)))
+        .and_then(|(root, id)| {
+            let paths = SparPaths::new(&root);
+            RunState::load(&paths, &id)
+                .ok()
+                .map(|st| (id, st.providers))
+        });
+    let recent_ref = recent_fleet
+        .as_ref()
+        .map(|(id, v)| (id.as_str(), v.as_slice()));
+    let roster = build_roster(&app.cfg, &detected, recent_ref);
+
+    app.new_run = Some(NewRun {
+        project,
+        projects: all_projects,
+        task: String::new(),
+        roster,
+        picked: Vec::new(),
+        field: NewRunField::Task,
+        sel: 0,
+    });
+}
+
+/// Keys while the Phase D new-run modal is open.
+fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+    if code == KeyCode::Esc {
+        app.new_run = None;
+        return;
+    }
+    if code == KeyCode::Enter {
+        let Some(nr) = app.new_run.as_ref() else {
+            return;
+        };
+        match new_run_launch(nr) {
+            Ok((target, mut args)) => {
+                let target_swarm = SparPaths::new(&target);
+                if let Ok(cwd) = std::env::current_dir() {
+                    if let Ok(Some(base)) =
+                        crate::worktree::resolve_base(&target_swarm.project_root, &cwd, None)
+                    {
+                        args.push("--base".to_string());
+                        args.push(base.reference);
+                    }
+                }
+                match spawn_detached_workflow(&target_swarm, &args, "Plan started") {
+                    Ok(PaletteResult::Flash(msg, color)) => app.flash(msg, color),
+                    Ok(_) => {}
+                    Err(e) => app.flash(format!("Plan failed to start: {e:#}"), ALERT),
+                }
+                app.new_run = None;
+            }
+            Err(e) => app.flash(e, ALERT),
+        }
+        return;
+    }
+    let Some(nr) = app.new_run.as_mut() else {
+        return;
+    };
+    match code {
+        KeyCode::Tab => {
+            nr.field = match nr.field {
+                NewRunField::Project => NewRunField::Task,
+                NewRunField::Task => NewRunField::Fleet,
+                NewRunField::Fleet => NewRunField::Project,
+            };
+        }
+        KeyCode::BackTab => {
+            nr.field = match nr.field {
+                NewRunField::Project => NewRunField::Fleet,
+                NewRunField::Task => NewRunField::Project,
+                NewRunField::Fleet => NewRunField::Task,
+            };
+        }
+        KeyCode::Left if nr.field == NewRunField::Project && !nr.projects.is_empty() => {
+            let i = nr
+                .project
+                .as_ref()
+                .and_then(|p| nr.projects.iter().position(|q| q == p))
+                .unwrap_or(0);
+            let i = if i == 0 { nr.projects.len() - 1 } else { i - 1 };
+            nr.project = nr.projects.get(i).cloned();
+        }
+        KeyCode::Right if nr.field == NewRunField::Project && !nr.projects.is_empty() => {
+            let i = nr
+                .project
+                .as_ref()
+                .and_then(|p| nr.projects.iter().position(|q| q == p))
+                .unwrap_or(0);
+            let i = (i + 1) % nr.projects.len();
+            nr.project = nr.projects.get(i).cloned();
+        }
+        KeyCode::Char(' ') if nr.field == NewRunField::Fleet => {
+            if let Some(pos) = nr.picked.iter().position(|&i| i == nr.sel) {
+                nr.picked.remove(pos);
+            } else if nr.roster.get(nr.sel).map(|e| e.available).unwrap_or(false) {
+                nr.picked.push(nr.sel);
+            }
+        }
+        KeyCode::Char('j') | KeyCode::Down if nr.field == NewRunField::Fleet => {
+            if !nr.roster.is_empty() {
+                nr.sel = (nr.sel + 1).min(nr.roster.len() - 1);
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up if nr.field == NewRunField::Fleet => {
+            nr.sel = nr.sel.saturating_sub(1);
+        }
+        KeyCode::Backspace if nr.field == NewRunField::Task => {
+            nr.task.pop();
+        }
+        KeyCode::Char(c)
+            if nr.field == NewRunField::Task && !mods.contains(KeyModifiers::CONTROL) =>
+        {
+            nr.task.push(c);
+        }
+        _ => {}
+    }
 }
 
 /// What running a palette command produced.
@@ -1876,12 +2790,29 @@ fn run_palette(
             if arg.is_empty() {
                 anyhow::bail!("usage: plan <task>");
             }
-            let st = full.ok_or_else(|| {
-                anyhow::anyhow!("select a run to reuse its fleet, or use the CLI")
-            })?;
-            if st.providers.is_empty() {
-                anyhow::bail!("selected run has no providers — use the CLI");
-            }
+            let Some(st) = full.filter(|st| !st.providers.is_empty()) else {
+                // No run to reuse a fleet from — U3's punt is retired: open the
+                // new-run surface pre-filled with the typed task instead of erroring
+                // to the CLI (U21).
+                let detected: Vec<(String, bool)> = crate::providers::detect_all()
+                    .into_iter()
+                    .map(|r| (r.name, r.available))
+                    .collect();
+                let roster = build_roster(&app.cfg, &detected, None);
+                app.new_run = Some(NewRun {
+                    project: Some(swarm.project_root.clone()),
+                    projects: vec![swarm.project_root.clone()],
+                    task: arg.to_string(),
+                    roster,
+                    picked: Vec::new(),
+                    field: NewRunField::Fleet,
+                    sel: 0,
+                });
+                return Ok(PaletteResult::Flash(
+                    "Pick a fleet to start".to_string(),
+                    ACCENT,
+                ));
+            };
             let mut args = vec![
                 "plan".to_string(),
                 "-t".to_string(),
@@ -2055,6 +2986,9 @@ fn snap_selection_to_filter(
         return;
     }
     match app.browse {
+        // Home has no `/` filter of its own — the rail filter is a Projects/Runs
+        // concept and does not reach the landing view.
+        BrowseLevel::Home => {}
         BrowseLevel::Projects => {
             let cur = app.selected_project;
             if let Some(i) = first_project_match(projects, f, cur) {
@@ -2120,9 +3054,28 @@ fn first_project_match(projects: &[registry::ProjectEntry], f: &str, cur: usize)
 }
 
 /// Move the rail selection by `delta` rows at whatever level it is on.
+/// Step the Home rail by `delta`, skipping header rows entirely — the cursor must
+/// never land on one, at either end of the list (AC-26).
+fn step_home(rows: &[HomeRow], cur: usize, delta: i32) -> usize {
+    let selectable: Vec<usize> = (0..rows.len())
+        .filter(|&i| !matches!(rows[i], HomeRow::Header(_)))
+        .collect();
+    if selectable.is_empty() {
+        return cur;
+    }
+    let pos = selectable.iter().position(|&i| i == cur).unwrap_or(0);
+    let next = if delta < 0 {
+        pos.saturating_sub((-delta) as usize)
+    } else {
+        (pos + delta as usize).min(selectable.len() - 1)
+    };
+    selectable[next]
+}
+
 fn rail_move(
     app: &mut App,
     projects: &[registry::ProjectEntry],
+    home_rows: &[HomeRow],
     runs: &[state::RunSummary],
     n_slots: usize,
     delta: i32,
@@ -2138,6 +3091,11 @@ fn rail_move(
     // matching indices only. `stepv` maps a source index to its next matching one.
     let filter = app.filter.clone().filter(|f| !f.is_empty());
     match app.browse {
+        BrowseLevel::Home if !home_rows.is_empty() => {
+            let next = step_home(home_rows, app.selected_home, delta);
+            app.selected_home = next;
+            app.home_key = home_rows.get(next).map(home_row_key);
+        }
         BrowseLevel::Projects if !projects.is_empty() => {
             let next = match &filter {
                 Some(f) => {
@@ -2192,11 +3150,34 @@ fn step_matched(matched: &[usize], cur: usize, delta: i32) -> usize {
 fn rail_enter(
     app: &mut App,
     projects: &[registry::ProjectEntry],
+    home_rows: &[HomeRow],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
     active_root: &mut PathBuf,
 ) {
     match app.browse {
+        BrowseLevel::Home => match home_rows.get(app.selected_home) {
+            Some(HomeRow::Run { run, .. }) => {
+                if let Some(root) = run.project_root.clone() {
+                    *active_root = root;
+                }
+                app.home_target_run = Some(run.id.clone());
+                app.browse = BrowseLevel::Agents;
+                app.selected_slot = 0;
+                app.reset_stream_view();
+            }
+            Some(HomeRow::Project(i)) => {
+                if let Some(p) = projects.get(*i) {
+                    *active_root = p.root.clone();
+                    app.open_project_runs();
+                }
+            }
+            Some(HomeRow::NewRun) => {
+                let root = active_root.clone();
+                open_new_run(app, projects, home_rows, Some(root.as_path()));
+            }
+            Some(HomeRow::Header(_)) | Some(HomeRow::More { .. }) | None => {}
+        },
         BrowseLevel::Projects => {
             if let Some(p) = projects.get(app.selected_project) {
                 *active_root = p.root.clone();
@@ -2336,6 +3317,7 @@ fn handle_mouse(
     m: crossterm::event::MouseEvent,
     swarm: &SparPaths,
     projects: &[registry::ProjectEntry],
+    home_rows: &[HomeRow],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
     active_root: &mut PathBuf,
@@ -2344,7 +3326,13 @@ fn handle_mouse(
 ) {
     let (x, y) = (m.column, m.row);
     let n_slots = full.map(|s| s.slots.len()).unwrap_or(0);
-    let n_rail = rail_len(app.browse, projects.len(), runs.len(), n_slots);
+    let n_rail = rail_len(
+        app.browse,
+        projects.len(),
+        home_rows.len(),
+        runs.len(),
+        n_slots,
+    );
 
     // The help overlay can grow tall enough to sit on top of the tab strip (it sizes
     // to its content, not a fixed box), so it must be hit-tested before the strip or
@@ -2375,7 +3363,7 @@ fn handle_mouse(
     // Shell tab with a live pane: mouse over the terminal body is tmux's (wheel scroll
     // into copy-mode, click-select). Translate to pane-relative coords inside the border
     // and forward as SGR mouse. Events outside it fall through so clicking the rail or
-    // the composer still changes focus.
+    // Main still changes focus.
     if app.shell_active() {
         if let Some(pane) = app.terminal_pane.as_ref() {
             let r = app.rect_main_inner;
@@ -2419,7 +3407,7 @@ fn handle_mouse(
             }
             // Tapping the fleet roll-up token jumps to the next run that needs you.
             if contains(app.rect_attention, x, y) {
-                jump_to_attention(app, runs);
+                jump_to_attention(app, runs, home_rows);
                 return;
             }
             if contains(app.rect_help, x, y) {
@@ -2440,10 +3428,17 @@ fn handle_mouse(
             if contains(app.rect_rail, x, y) {
                 app.focus = Focus::Rail;
                 if let Some(row) = list_row_at(app.rect_rail, y, n_rail, rail_offset) {
-                    rail_select(app, row, projects.len(), runs.len(), n_slots);
+                    rail_select(
+                        app,
+                        row,
+                        projects.len(),
+                        home_rows.len(),
+                        runs.len(),
+                        n_slots,
+                    );
                     // Double-click = Enter: drill one level (and take over on a slot).
                     if dbl {
-                        rail_enter(app, projects, runs, full, active_root);
+                        rail_enter(app, projects, home_rows, runs, full, active_root);
                     }
                 }
             } else if contains(app.rect_main, x, y) {
@@ -2459,7 +3454,7 @@ fn handle_mouse(
                 app.scroll_main_by(3, full.is_some());
             } else if contains(app.rect_rail, x, y) {
                 app.focus = Focus::Rail;
-                rail_move(app, projects, runs, n_slots, 1);
+                rail_move(app, projects, home_rows, runs, n_slots, 1);
             }
         }
         MouseEventKind::ScrollUp => {
@@ -2468,7 +3463,7 @@ fn handle_mouse(
                 app.scroll_main_by(-3, full.is_some());
             } else if contains(app.rect_rail, x, y) {
                 app.focus = Focus::Rail;
-                rail_move(app, projects, runs, n_slots, -1);
+                rail_move(app, projects, home_rows, runs, n_slots, -1);
             }
         }
         _ => {}
@@ -2476,17 +3471,37 @@ fn handle_mouse(
 }
 
 /// Row count of the rail at its current level — the list the mouse hit-tests against.
-fn rail_len(browse: BrowseLevel, n_projects: usize, n_runs: usize, n_slots: usize) -> usize {
+fn rail_len(
+    browse: BrowseLevel,
+    n_projects: usize,
+    n_home: usize,
+    n_runs: usize,
+    n_slots: usize,
+) -> usize {
     match browse {
+        BrowseLevel::Home => n_home,
         BrowseLevel::Projects => n_projects,
         BrowseLevel::Runs => n_runs,
         BrowseLevel::Agents => n_slots,
     }
 }
 
-/// Select rail row `row` at whatever level the rail is on.
-fn rail_select(app: &mut App, row: usize, n_projects: usize, n_runs: usize, n_slots: usize) {
+/// Select rail row `row` at whatever level the rail is on. At Home this cannot know
+/// row content (headers are skipped by `rail_move`/`resync_home_selection`, which do
+/// have it); it only guards against landing on band 1's header, which is always row 0.
+fn rail_select(
+    app: &mut App,
+    row: usize,
+    n_projects: usize,
+    n_home: usize,
+    n_runs: usize,
+    n_slots: usize,
+) {
     match app.browse {
+        BrowseLevel::Home if n_home > 0 => {
+            app.selected_home = row.max(1).min(n_home - 1);
+        }
+        BrowseLevel::Home => {}
         BrowseLevel::Projects => app.select_project(row, n_projects),
         BrowseLevel::Runs => app.select_run(row, n_runs),
         BrowseLevel::Agents => app.select_slot(row, n_slots),
@@ -2655,6 +3670,7 @@ fn draw(
     stream_text: &str,
     activity: &[String],
     diff_text: &str,
+    home: &HomeData,
     app: &mut App,
     rail_state: &mut ListState,
 ) {
@@ -2668,13 +3684,20 @@ fn draw(
     // phone glance shows progress — but only once, and never over a manual move.
     // Zero runs gets the same treatment: the rail's "(no runs)" row has no CTA of its
     // own, so leaving focus on it would strand the phone view on a blank pane with
-    // the coherent empty-state message (Main) never shown (AC-5).
+    // the coherent empty-state message (Main) never shown (AC-5). An empty Home (no
+    // actual Run/Project rows, only its headers and the action row) gets the same
+    // treatment, or the phone view strands the operator on a rail with no CTA (R9).
     if area.width < NARROW_WIDTH && !app.narrow_autofocus_done {
         let active = full.map(|s| {
             is_active_phase(s.phase) || s.slots.iter().any(|sl| sl.status == SlotStatus::Running)
         });
         let no_runs = app.browse == BrowseLevel::Runs && full.is_none() && runs.is_empty();
-        if active == Some(true) || no_runs {
+        let empty_home = app.browse == BrowseLevel::Home
+            && !home
+                .rows
+                .iter()
+                .any(|r| matches!(r, HomeRow::Run { .. } | HomeRow::Project(_)));
+        if active == Some(true) || no_runs || empty_home {
             if app.focus == Focus::Rail {
                 app.open_main(MainTab::Log);
             }
@@ -2700,12 +3723,12 @@ fn draw(
     if driving {
         draw_driving_banner(f, lay.header, app);
     } else {
-        draw_header(f, lay.header, swarm, projects, runs, full, app);
+        draw_header(f, lay.header, swarm, projects, runs, full, home, app);
         if lay.context.height > 0 {
-            draw_context_band(f, lay.context, projects, runs, full, app);
+            draw_context_band(f, lay.context, projects, runs, full, home, app);
         }
         if lay.labels.height > 0 {
-            draw_labels(f, &lay, swarm, projects, runs, full, app);
+            draw_labels(f, &lay, swarm, projects, runs, full, home, app);
             draw_rule(f, &lay, app);
         }
     }
@@ -2713,10 +3736,19 @@ fn draw(
         draw_seam(f, lay.seam);
     }
     if lay.rail.width > 0 {
-        draw_rail(f, lay.rail, projects, runs, full, app, rail_state);
+        draw_rail(f, lay.rail, projects, runs, full, home, app, rail_state);
     }
     if lay.main.width > 0 {
-        draw_main(f, lay.main, full, stream_text, activity, diff_text, app);
+        draw_main(
+            f,
+            lay.main,
+            full,
+            stream_text,
+            activity,
+            diff_text,
+            home,
+            app,
+        );
     }
     draw_footer(f, lay.footer, app, full);
 
@@ -2727,6 +3759,9 @@ fn draw(
 
     if app.show_help {
         draw_help_overlay(f, area, app);
+    }
+    if app.new_run.is_some() {
+        draw_new_run(f, area, projects, app);
     }
 }
 
@@ -2774,6 +3809,7 @@ fn draw_labels(
     projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
+    home: &HomeData,
     app: &mut App,
 ) {
     let area = lay.labels;
@@ -2904,7 +3940,7 @@ fn draw_labels(
     }
 
     if lay.rail.width > 0 {
-        let title = rail_title(projects, runs, full, app);
+        let title = rail_title(projects, runs, full, home, app);
         let rail_row = Rect {
             x: lay.rail.x.saturating_add(1),
             width: lay.rail.width.saturating_sub(1),
@@ -3318,6 +4354,7 @@ fn draw_context_band(
     projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
+    home: &HomeData,
     app: &App,
 ) {
     if area.width == 0 || area.height == 0 {
@@ -3329,6 +4366,29 @@ fn draw_context_band(
         ..area
     };
     if pad.width == 0 {
+        return;
+    }
+
+    if app.browse == BrowseLevel::Home {
+        let need = home_needs_you(&home.rows);
+        let running = home_band_count(&home.rows, HomeBand::Running);
+        let finished = home_band_count(&home.rows, HomeBand::Finished);
+        let line = Line::from(vec![
+            Span::styled(
+                format!("{need} need you"),
+                Style::default().fg(if need > 0 { WARN } else { FG_MUTED }),
+            ),
+            Span::styled(" · ", muted()),
+            Span::styled(
+                format!("{running} running"),
+                Style::default().fg(if running > 0 { INFO } else { FG_MUTED }),
+            ),
+            Span::styled(" · ", muted()),
+            Span::styled(format!("{finished} finished"), dim()),
+            Span::styled(" · ", muted()),
+            Span::styled(home_scope_label(&app.home_scope), muted()),
+        ]);
+        f.render_widget(Paragraph::new(line), pad);
         return;
     }
 
@@ -3354,10 +4414,8 @@ fn draw_context_band(
         let need = runs_needing_attention(runs);
         let running = runs.iter().filter(|r| is_active_phase(r.phase)).count();
         let line = if runs.is_empty() {
-            // The palette's own `plan` command needs a run to reuse a fleet from
-            // (see dispatch_command), so it cannot bootstrap the first run — only the
-            // CLI command the header states can. Repeating that same instruction here
-            // in different words would just be a second, contradictory CTA.
+            // `n` from Home opens the new-run surface and its fleet picker (Phase D);
+            // this level just states what it has.
             Line::from(Span::styled("no runs yet", muted()))
         } else {
             Line::from(vec![
@@ -3528,8 +4586,27 @@ fn status_cue(
     projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
+    home: &HomeData,
     app: &App,
 ) -> (String, Color, Option<Color>) {
+    if app.browse == BrowseLevel::Home {
+        if projects.is_empty() {
+            return (
+                format!(
+                    "no projects yet — run spar in a repo · {}",
+                    registry::spar_home().display()
+                ),
+                FG_DIM,
+                None,
+            );
+        }
+        let need = home_needs_you(&home.rows);
+        return if need > 0 {
+            (format!("⚑{need} need you"), WARN, None)
+        } else {
+            ("nothing needs you · n starts a run".into(), FG_MUTED, None)
+        };
+    }
     if app.browse == BrowseLevel::Projects {
         if projects.is_empty() {
             return (
@@ -3624,6 +4701,7 @@ fn gate_zone(area: Rect) -> Option<Rect> {
 ///
 /// Brand + breadcrumb + phase on the left, attention chips on the right, gate buttons
 /// in their reserved zone. Counts and progress live one row below, in the stepper.
+#[allow(clippy::too_many_arguments)]
 fn draw_header(
     f: &mut Frame,
     area: Rect,
@@ -3631,12 +4709,13 @@ fn draw_header(
     projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
+    home: &HomeData,
     app: &mut App,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let (cue, cue_fg, wash) = status_cue(projects, runs, full, app);
+    let (cue, cue_fg, wash) = status_cue(projects, runs, full, home, app);
     let buttons = gate_buttons_for(full);
     // The only full-row fill in the product, and only for states worth shouting about.
     if let Some(w) = wash {
@@ -3704,6 +4783,10 @@ fn draw_header(
     let mut right: Vec<Span> = Vec::new();
     let need = if app.browse.in_project() {
         runs_needing_attention(runs)
+    } else if app.browse == BrowseLevel::Home {
+        // Home is the one view that is organised around this roll-up (U7); it must
+        // not be the only view that never shows it.
+        home_needs_you(&home.rows)
     } else {
         0
     };
@@ -3844,9 +4927,11 @@ fn rail_title(
     projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
+    home: &HomeData,
     app: &App,
 ) -> String {
     let base = match app.browse {
+        BrowseLevel::Home => format!("HOME  {} need you", home_needs_you(&home.rows)),
         BrowseLevel::Projects => format!("PROJECTS  {}", projects.len()),
         BrowseLevel::Runs => format!("RUNS  {}", runs.len()),
         BrowseLevel::Agents => {
@@ -3869,19 +4954,22 @@ fn rail_title(
 /// The rail: one drill-down tree (`projects ▸ runs ▸ agents`), never a stack of
 /// co-equal panels. `Enter` pushes a level, `Esc` pops one. No border: its title
 /// rides the labels row and the seam separates it from Main.
+#[allow(clippy::too_many_arguments)]
 fn draw_rail(
     f: &mut Frame,
     area: Rect,
     projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
+    home: &HomeData,
     app: &App,
     state: &mut ListState,
 ) {
     let focused = app.focus == Focus::Rail;
     let w = area.width;
     let items = match app.browse {
-        BrowseLevel::Projects => rail_project_items(projects, app, w, focused),
+        BrowseLevel::Home => rail_home_items(&home.rows, projects, app, w, focused),
+        BrowseLevel::Projects => rail_project_items(projects, &home.project_stats, app, w, focused),
         BrowseLevel::Runs => rail_run_items(runs, app, w, focused),
         BrowseLevel::Agents => {
             let slots = full.map(|s| s.slots.as_slice()).unwrap_or(&[]);
@@ -3952,8 +5040,12 @@ fn rail_row(
     ListItem::new(Line::from(spans))
 }
 
+/// Projects-level rows read their counts off `stats` (U13/B) rather than scanning
+/// disk. `stats` can lag `projects` by one snapshot right after a new project
+/// registers — that degrades to a blank count, never a panic.
 fn rail_project_items(
     projects: &[registry::ProjectEntry],
+    stats: &[ProjectStat],
     app: &App,
     w: u16,
     focused: bool,
@@ -3974,9 +5066,8 @@ fn rail_project_items(
                     return rail_filtered_row(name, w);
                 }
             }
-            let project_runs = registry::list_visible_project_runs(&p.root).unwrap_or_default();
+            let stat = stats.get(i).copied().unwrap_or_default();
             // Roll-up: a run that wants the operator makes its whole project fly a ⚑.
-            let need = runs_needing_attention(&project_runs);
             let mut body = vec![Span::styled(
                 truncate(name, name_w),
                 if sel {
@@ -3985,19 +5076,110 @@ fn rail_project_items(
                     Style::default().fg(INFO)
                 },
             )];
-            body.push(Span::styled(format!("  {}r", project_runs.len()), muted()));
-            if need > 0 {
+            body.push(Span::styled(format!("  {}r", stat.n_runs), muted()));
+            if stat.needs_you > 0 {
                 body.push(Span::styled(
-                    format!(" ⚑{need}"),
+                    format!(" ⚑{}", stat.needs_you),
                     Style::default().fg(WARN).bold(),
                 ));
             }
             rail_row(
-                rail_lead(sel, focused, (need > 0).then_some(WARN)),
+                rail_lead(sel, focused, (stat.needs_you > 0).then_some(WARN)),
                 body,
                 Span::styled(relative_age(p.last_seen), muted()),
                 w,
             )
+        })
+        .collect()
+}
+
+/// Home's rail rows: band headers dim and uppercase, run rows sharing `rail_row`'s
+/// two fixed lead columns and right-aligned wait column with every other level, the
+/// action row and project switcher closing out band 4.
+fn rail_home_items(
+    rows: &[HomeRow],
+    projects: &[registry::ProjectEntry],
+    app: &App,
+    w: u16,
+    focused: bool,
+) -> Vec<ListItem<'static>> {
+    if rows.is_empty() {
+        return rail_empty("(loading)");
+    }
+    rows.iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let sel = i == app.selected_home;
+            match row {
+                HomeRow::Header(b) => ListItem::new(Span::styled(
+                    format!("  {}", home_band_label(*b)),
+                    muted().bold(),
+                )),
+                HomeRow::Run { run, waited, .. } => {
+                    let flag = if run.wants > 1 || run_attention(run).needs_you() {
+                        Some(if run_attention(run) == Attention::Gate {
+                            WARN
+                        } else {
+                            ALERT
+                        })
+                    } else {
+                        None
+                    };
+                    let more = if run.wants > 1 {
+                        format!(" ⚑{}", run.wants)
+                    } else {
+                        String::new()
+                    };
+                    let phase_w = w.saturating_sub(17).clamp(6, 16) as usize;
+                    let body = vec![
+                        Span::styled(
+                            format!("{:<8}", truncate(&run.id, 8)),
+                            if sel { selected(focused) } else { dim() },
+                        ),
+                        Span::styled(
+                            format!("  {}", truncate(&rail_phase(run.phase), phase_w)),
+                            Style::default().fg(phase_color(run.phase)),
+                        ),
+                        Span::styled(more, Style::default().fg(WARN).bold()),
+                    ];
+                    rail_row(
+                        rail_lead(sel, focused, flag),
+                        body,
+                        Span::styled(relative_wait(*waited), muted()),
+                        w,
+                    )
+                }
+                HomeRow::More { n, .. } => ListItem::new(Span::styled(
+                    format!("  … {n} more"),
+                    Style::default().fg(FG_MUTED).italic(),
+                )),
+                HomeRow::Project(idx) => {
+                    let name = projects
+                        .get(*idx)
+                        .and_then(|p| p.name.as_deref())
+                        .unwrap_or("·");
+                    let body = vec![Span::styled(
+                        truncate(name, w.saturating_sub(4) as usize),
+                        if sel {
+                            selected(focused)
+                        } else {
+                            Style::default().fg(INFO)
+                        },
+                    )];
+                    rail_row(rail_lead(sel, focused, None), body, Span::raw(""), w)
+                }
+                HomeRow::NewRun => {
+                    let body = vec![Span::styled(
+                        "n · start something new",
+                        if sel {
+                            selected(focused)
+                        } else {
+                            Style::default().fg(ACCENT)
+                        },
+                    )];
+                    rail_row(rail_lead(sel, focused, None), body, Span::raw(""), w)
+                }
+            }
         })
         .collect()
 }
@@ -4132,6 +5314,7 @@ fn draw_main(
     stream_text: &str,
     activity: &[String],
     diff_text: &str,
+    home: &HomeData,
     app: &mut App,
 ) {
     if area.width == 0 || area.height == 0 {
@@ -4153,6 +5336,14 @@ fn draw_main(
         return;
     }
 
+    // At Home every tab but Shell shows the same four-band overview — there is no
+    // per-run Activity/Diff to show at a cross-project landing view. Shell stays the
+    // real project-scoped workspace terminal regardless (see `manage_terminal`).
+    if app.browse == BrowseLevel::Home && app.main_tab != MainTab::Shell {
+        draw_home_body(f, inner, home, app);
+        return;
+    }
+
     // With no run selected, Log/Activity/Diff have nothing real to show — Log's
     // already-coherent empty message is the one story all three tell instead of each
     // inventing its own. Shell never joins that story: it is project-scoped, not
@@ -4166,6 +5357,22 @@ fn draw_main(
         MainTab::Diff => draw_diff_body(f, inner, diff_text, app),
         MainTab::Shell => draw_shell_body(f, inner, app),
     }
+}
+
+/// Main's Home body: the four bands (C7). Reuses the same scrollable-log viewport as
+/// the other no-run bodies.
+fn draw_home_body(f: &mut Frame, inner: Rect, home: &HomeData, app: &mut App) {
+    let text = home_overview(&home.rows, &app.home_scope, app.home_watermark);
+    app.stream_view_h = inner.height;
+    app.stream_max = render_scrollable_log(
+        f,
+        inner,
+        &text,
+        &mut app.stream_scroll,
+        &mut app.stream_follow,
+        false,
+        app.log_expand,
+    );
 }
 
 /// The subtitle that rides after the tab strip: what the active tab is showing.
@@ -4187,7 +5394,12 @@ fn main_context(swarm: &SparPaths, full: Option<&RunState>, app: &App) -> String
         MainTab::Diff if full.is_none() => String::new(),
         MainTab::Diff => "artifacts".into(),
         MainTab::Shell => match app.takeover_target.as_deref() {
-            Some(session) => format!("agent · {session}"),
+            Some(_) => {
+                let run_id = full
+                    .map(|st| truncate(&st.id, 8))
+                    .unwrap_or_else(|| "agent".into());
+                format!("agent · {run_id}")
+            }
             None => {
                 let base = swarm
                     .project_root
@@ -5136,6 +6348,7 @@ fn situational_footer(
     }
     match focus {
         Focus::Rail => match browse {
+            BrowseLevel::Home => "j/k · Enter open · n new run · P scope · p projects · a next-alert · : cmd · ? help",
             BrowseLevel::Projects => "j/k · Enter open · / filter · : cmd · 2 main · ? help",
             BrowseLevel::Runs => "j/k · Enter agents · a next-alert · / filter · : cmd · ? help",
             BrowseLevel::Agents => "j/k · Enter take over · a next-alert · Esc runs · : cmd",
@@ -5189,8 +6402,9 @@ fn wrap_line_preserve(line: &str, width: usize) -> Vec<String> {
 const HELP_BODY: &str = r#" spar — rail + one main area
 
   Shape
-    Rail   projects ▸ runs ▸ agents  (Enter pushes, Esc pops)
-           attention-sorted: gates and broken runs float to the top.
+    Rail   Home ▸ runs ▸ agents  (Enter pushes, Esc pops)
+           p opens the project list; Home bands: needs you, running,
+           finished since last look, start something new.
     Main   one area · tabs: Log · Activity · Diff · Shell
     Main always shows the rail's selection — nothing else moves.
 
@@ -5202,6 +6416,8 @@ const HELP_BODY: &str = r#" spar — rail + one main area
     Esc                  pop a rail level · clear filter (never quits)
     [ ]                  previous / next Main tab
     + / _                zoom Main fullscreen / restore
+    n                    new run + fleet picker
+    P                    toggle Home scope (this project ↔ all)
     p                    jump to Projects
     a                    jump to the next run that needs you
     r / s                reject · ship (when gated; approve = tap / :approve)
@@ -5274,6 +6490,143 @@ fn draw_help_overlay(f: &mut Frame, area: Rect, app: &mut App) {
                 .title(Span::styled(title, Style::default().fg(ACCENT).bold())),
         );
     f.render_widget(p, rect);
+}
+
+/// Phase D's new-run overlay: Project / Task / Fleet, sized to content and clamped
+/// to the frame exactly like `draw_help_overlay` — reusing its clamp/centre
+/// arithmetic so the 30-column panic class it already fixed cannot come back.
+fn draw_new_run(f: &mut Frame, area: Rect, projects: &[registry::ProjectEntry], app: &mut App) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let Some(nr) = app.new_run.as_ref() else {
+        return;
+    };
+    const BORDER: u16 = 2;
+    let content_w: u16 = 64;
+    let w = (content_w + BORDER).min(area.width);
+    if w <= BORDER {
+        return;
+    }
+    let inner_w = (w - BORDER) as usize;
+
+    let field_style = |f: NewRunField| {
+        if nr.field == f {
+            Style::default().fg(ACCENT).bold()
+        } else {
+            Style::default().fg(FG)
+        }
+    };
+    let project_label = nr
+        .project
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "none — open spar in a project or choose one".to_string());
+    let cycle_hint = if nr.projects.len() > 1 {
+        "  ←/→"
+    } else {
+        ""
+    };
+
+    let mut lines: Vec<(String, Style)> = Vec::new();
+    lines.push((
+        format!("Project: {project_label}{cycle_hint}"),
+        field_style(NewRunField::Project),
+    ));
+    lines.push((String::new(), Style::default()));
+    lines.push((
+        format!("Task: {}▌", nr.task),
+        field_style(NewRunField::Task),
+    ));
+    lines.push((String::new(), Style::default()));
+    lines.push(("Fleet:".to_string(), field_style(NewRunField::Fleet)));
+    if nr.roster.is_empty() {
+        lines.push((
+            "  nothing usable — spar doctor".to_string(),
+            Style::default().fg(FG_MUTED),
+        ));
+    }
+    const MAX_ROSTER_ROWS: usize = 8;
+    for (i, e) in nr.roster.iter().enumerate().take(MAX_ROSTER_ROWS) {
+        let picked_n = nr.picked.iter().position(|&p| p == i);
+        let mark = match picked_n {
+            Some(n) => format!("{}.", n + 1),
+            None if e.available => "[ ]".to_string(),
+            None => "[x]".to_string(),
+        };
+        let cursor = if nr.field == NewRunField::Fleet && nr.sel == i {
+            ">"
+        } else {
+            " "
+        };
+        let style = if !e.available {
+            Style::default().fg(FG_DIM)
+        } else if picked_n.is_some() {
+            Style::default().fg(OK)
+        } else {
+            Style::default().fg(FG)
+        };
+        let reason = e
+            .reason
+            .as_deref()
+            .map(|r| format!("  ({r})"))
+            .unwrap_or_default();
+        let source = match e.source {
+            RosterSource::Configured => "",
+            RosterSource::Detected => "  detected",
+            RosterSource::RecentFleet => "",
+        };
+        lines.push((
+            format!("{cursor} {mark} {}{source}{reason}", e.label),
+            style,
+        ));
+    }
+    if nr.roster.len() > MAX_ROSTER_ROWS {
+        lines.push((
+            format!("  … {} more", nr.roster.len() - MAX_ROSTER_ROWS),
+            Style::default().fg(FG_MUTED),
+        ));
+    }
+    lines.push((String::new(), Style::default()));
+    lines.push((
+        "Tab field · space pick · Enter start · Esc cancel".to_string(),
+        Style::default().fg(FG_MUTED),
+    ));
+
+    let content_h = lines.len() as u16;
+    let h = (content_h + BORDER).min(area.height);
+    if h <= BORDER {
+        return;
+    }
+    let inner_h = (h - BORDER) as usize;
+
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let text: Vec<Line> = lines
+        .into_iter()
+        .take(inner_h)
+        .map(|(s, style)| Line::from(Span::styled(truncate(&s, inner_w), style)))
+        .collect();
+    let p = Paragraph::new(text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ACCENT))
+            .title(Span::styled(
+                " New run ",
+                Style::default().fg(ACCENT).bold(),
+            )),
+    );
+    f.render_widget(p, rect);
+    let _ = projects;
 }
 
 /// Rows/cols available to the embedded terminal, falling back to a standard 80x24
@@ -5366,9 +6719,9 @@ fn draw_shell_body(f: &mut Frame, inner: Rect, app: &mut App) {
     let Some(pane) = app.terminal_pane.as_mut() else {
         let hint = Paragraph::new(
             "Opening a real tmux client for the project's workspace shell — \
-             run a dev server, cargo, poke around; the session stays alive across TUI restarts.\n\n\
+             run a dev server, cargo, poke around; the shell stays alive across TUI restarts.\n\n\
              Or select an agent in the rail (Enter on a run, then Enter on a slot) to take over its live pane.\n\n\
-             Full tmux: prefix C-a, copy-mode/scroll, splits, session switch. Ctrl+a d / F12 → spar.\n\n\
+             Full tmux underneath: prefix C-a, copy-mode/scroll, splits. Ctrl+a d / F12 → spar.\n\n\
              (No tmux on PATH? The Shell tab needs it.)",
         )
         .style(Style::default().fg(FG_DIM))
@@ -5395,7 +6748,7 @@ fn draw_shell_body(f: &mut Frame, inner: Rect, app: &mut App) {
             ..inner
         };
         let hint = Paragraph::new(
-            "Ctrl+a d / F12 / tap a tab → spar · C-a [ scroll/copy · ] paste · % / \" split · s session",
+            "Ctrl+a d / F12 / tap a tab → spar · C-a [ scroll/copy · ] paste · % / \" split · C-a s tmux picker",
         )
         .style(Style::default().fg(FG_DIM));
         f.render_widget(hint, footer);
@@ -5431,7 +6784,8 @@ fn send_mention(swarm: &SparPaths, run_id: Option<&str>, rest: &str) -> Result<S
     Ok(format!("sent to {to}"))
 }
 
-/// Resolve a composer mention to a unique bus id. An already-qualified id (`run:slot`)
+/// Resolve an `@mention` (from the `:` palette's `@`/`chat` form) to a unique bus id.
+/// An already-qualified id (`run:slot`)
 /// or reserved sink (`broadcast`/`@human`) passes through. A short id resolves against
 /// the workspace roster: the selected run's slot (`run:slot`) and any bare agent of that
 /// id are candidates — exactly one resolves, several error (listing them), and none
@@ -6041,8 +7395,39 @@ fn emit_attention_toasts(app: &mut App, runs: &[state::RunSummary]) {
 
 /// `a`: jump the rail selection to the next run that wants the operator, cycling from
 /// just after the current selection. Lands on the run (rail at the Runs level) so the
-/// status line shows its gate/breakage.
-fn jump_to_attention(app: &mut App, runs: &[state::RunSummary]) {
+/// status line shows its gate/breakage. At Home it cycles through band 1 instead —
+/// Home is not a place where `a` is dead (AC-29).
+fn jump_to_attention(app: &mut App, runs: &[state::RunSummary], home_rows: &[HomeRow]) {
+    if app.browse == BrowseLevel::Home {
+        let candidates: Vec<usize> = home_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| {
+                matches!(
+                    r,
+                    HomeRow::Run {
+                        band: HomeBand::NeedsMe,
+                        ..
+                    }
+                )
+                .then_some(i)
+            })
+            .collect();
+        if candidates.is_empty() {
+            app.flash("nothing needs you", OK);
+            return;
+        }
+        let next = match candidates.iter().position(|&i| i == app.selected_home) {
+            Some(p) => candidates[(p + 1) % candidates.len()],
+            None => candidates[0],
+        };
+        app.selected_home = next;
+        app.home_key = home_rows.get(next).map(home_row_key);
+        if let Some(HomeRow::Run { run, .. }) = home_rows.get(next) {
+            app.flash(format!("→ {} needs you", truncate(&run.id, 8)), WARN);
+        }
+        return;
+    }
     if !app.browse.in_project() {
         app.flash("open a project first", FG_MUTED);
         return;
@@ -6272,6 +7657,7 @@ mod labels {
             &swarm,
             &[],
             &[],
+            &[],
             None,
             &mut root,
             None,
@@ -6313,6 +7699,7 @@ mod labels {
                 modifiers: KeyModifiers::NONE,
             },
             &swarm,
+            &[],
             &[],
             &[],
             None,
@@ -6523,7 +7910,16 @@ mod labels {
             app.human_alerts_n = 7;
             term.draw(|f| {
                 let area = f.area();
-                draw_header(f, area, &swarm, &[], &[], Some(&st), &mut app);
+                draw_header(
+                    f,
+                    area,
+                    &swarm,
+                    &[],
+                    &[],
+                    Some(&st),
+                    &HomeData::default(),
+                    &mut app,
+                );
             })
             .unwrap();
             let Some((first, _)) = app.gate_buttons.first().copied() else {
@@ -6552,7 +7948,16 @@ mod labels {
         app.human_alerts_n = 2;
         term.draw(|f| {
             let area = f.area();
-            draw_header(f, area, &swarm, &[], &[], Some(&st), &mut app);
+            draw_header(
+                f,
+                area,
+                &swarm,
+                &[],
+                &[],
+                Some(&st),
+                &HomeData::default(),
+                &mut app,
+            );
         })
         .unwrap();
         let row: String = {
@@ -6592,7 +7997,16 @@ mod labels {
             false,
         );
         term.draw(|f| {
-            draw_labels(f, &lay, &swarm, &[], &[], Some(&st), &mut app);
+            draw_labels(
+                f,
+                &lay,
+                &swarm,
+                &[],
+                &[],
+                Some(&st),
+                &HomeData::default(),
+                &mut app,
+            );
             draw_rule(f, &lay, &app);
         })
         .unwrap();
@@ -6827,6 +8241,7 @@ mod labels {
             &sw,
             &[],
             &[],
+            &[],
             None,
             &mut root,
             None,
@@ -6843,6 +8258,7 @@ mod labels {
             &sw,
             &[],
             &[],
+            &[],
             None,
             &mut root,
             None,
@@ -6854,6 +8270,7 @@ mod labels {
             KeyCode::Esc,
             KeyModifiers::empty(),
             &sw,
+            &[],
             &[],
             &[],
             None,
@@ -6877,6 +8294,7 @@ mod labels {
             &sw,
             &[],
             &[],
+            &[],
             None,
             &mut root,
             None,
@@ -6891,6 +8309,7 @@ mod labels {
             &sw,
             &[],
             &[],
+            &[],
             None,
             &mut root,
             None,
@@ -6902,6 +8321,7 @@ mod labels {
             KeyCode::Char('q'),
             KeyModifiers::empty(),
             &sw,
+            &[],
             &[],
             &[],
             None,
@@ -7973,8 +9393,19 @@ mod render_stability {
                 height: 30,
             };
             let lay = layout_rects(area, Focus::Main, false, false);
-            term.draw(|f| draw_labels(f, &lay, &swarm, &[], &[], Some(&st), &mut app))
-                .unwrap();
+            term.draw(|f| {
+                draw_labels(
+                    f,
+                    &lay,
+                    &swarm,
+                    &[],
+                    &[],
+                    Some(&st),
+                    &HomeData::default(),
+                    &mut app,
+                )
+            })
+            .unwrap();
             // Column positions, not byte offsets: the Activity badge's `⚠` is a
             // multi-byte char, so a `str::find`-based byte offset silently drifts out
             // of alignment with the terminal columns `app.main_tabs` records.
@@ -8087,7 +9518,16 @@ mod render_stability {
                 };
                 let lay = layout_rects(area, Focus::Main, false, false);
                 term.draw(|f| {
-                    draw_labels(f, &lay, &swarm, &[], &[], Some(&st), &mut app);
+                    draw_labels(
+                        f,
+                        &lay,
+                        &swarm,
+                        &[],
+                        &[],
+                        Some(&st),
+                        &HomeData::default(),
+                        &mut app,
+                    );
                     draw_rule(f, &lay, &app);
                 })
                 .unwrap();
@@ -8135,8 +9575,19 @@ mod render_stability {
                     height: 30,
                 };
                 let lay = layout_rects(area, Focus::Main, false, false);
-                term.draw(|f| draw_labels(f, &lay, &swarm, &[], &[], Some(&st), &mut app))
-                    .unwrap();
+                term.draw(|f| {
+                    draw_labels(
+                        f,
+                        &lay,
+                        &swarm,
+                        &[],
+                        &[],
+                        Some(&st),
+                        &HomeData::default(),
+                        &mut app,
+                    )
+                })
+                .unwrap();
                 assert_eq!(
                     app.main_tabs.len(),
                     4,
@@ -8196,8 +9647,19 @@ mod render_stability {
                     !lay.narrow,
                     "width {width} unexpectedly took the narrow band"
                 );
-                term.draw(|f| draw_labels(f, &lay, &swarm, &[], &[], Some(&st), &mut app))
-                    .unwrap();
+                term.draw(|f| {
+                    draw_labels(
+                        f,
+                        &lay,
+                        &swarm,
+                        &[],
+                        &[],
+                        Some(&st),
+                        &HomeData::default(),
+                        &mut app,
+                    )
+                })
+                .unwrap();
                 assert_eq!(
                     app.main_tabs.len(),
                     4,
@@ -9451,7 +10913,7 @@ mod home_ia {
         std::fs::create_dir_all(root.join(".spar/runs")).unwrap();
         let paths = SparPaths::new(&root);
 
-        let mut save = |id: &str, phase: Phase, parent: Option<&str>, archived: bool| {
+        let save = |id: &str, phase: Phase, parent: Option<&str>, archived: bool| {
             paths.ensure_run_dirs(id).unwrap();
             let mut st = RunState::new(id, WorkflowKind::Loop, root.clone());
             st.phase = phase;

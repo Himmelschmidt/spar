@@ -4,6 +4,15 @@ All notable changes to spar are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- **The TUI now opens on a Home screen** that shows what needs you across every
+  project, what's running, what finished since you last looked, and a way to start
+  something new — instead of dropping you straight into one project's run list.
+- **You can start a new run from inside the TUI**, picking which providers to use
+  from a list, instead of being sent to the command line whenever no run was already
+  selected.
+
 ### Fixed
 
 - **Dispatching acceptance tests to a coding agent could wipe out the work it had already

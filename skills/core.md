@@ -18,7 +18,7 @@ spar model list --provider openrouter [--all] [--json]   # OpenRouter catalog, t
 
 | Who | How |
 |-----|-----|
-| Human | `spar` (no subcommand) → product TUI in current git repo |
+| Human | `spar` (no subcommand) → product TUI, landing on Home (scoped to the current repo when run inside one) |
 | Outer agent | subcommands + `--json` + exit codes |
 
 ## Dual backend
@@ -693,10 +693,18 @@ rail's selection.
   They are separate facts — on a project where every run wants you, one shared column
   meant the cursor was invisible. The phase is named for the width the column has
   (`ship gate`, `plan gate`, `running`), not truncated from a sentence.
-- Rail: `projects ▸ runs ▸ agents` drill-down. `Enter` pushes a level, `Esc` pops one
-  (never quits). `Enter` on an agent **takes it over** in the Shell tab. `/` filters the
-  rail (Esc clears). The rail is **attention-sorted**: runs at a gate or broken fly a
-  `⚑` and float to the top (and roll up to their project row).
+- Rail: `Home ▸ runs ▸ agents` drill-down, rooted at **Home** — the cross-project
+  landing view. `Enter` pushes a level, `Esc` pops one (never quits, and never past
+  Home). `Enter` on an agent **takes it over** in the Shell tab. `/` filters the rail
+  (Esc clears). The rail is **attention-sorted**: runs at a gate or broken fly a `⚑`
+  and float to the top (and roll up to their project row).
+- Home has four bands, always in this order and always present even when empty:
+  **needs you** (runs at a gate, ranked by wait time), **running**, **finished since
+  last look** (a watermark of what landed while you were away), **start something
+  new**. `p` still opens the flat Projects list; `n` opens the new-run surface with a
+  fleet picker over the provider roster (superseding the old "use the CLI" punt for a
+  fresh fleet); `P` toggles Home's scope between the current project and everything
+  registered.
 - Main tabs: `Log · Activity · Diff · Shell` on the labels row, marked by an accent
   underline on the rule beneath them, switched with `[` / `]` (Activity carries the
   `@human` alert badge). Diff is the selected slot's real worktree diff.
@@ -706,7 +714,8 @@ rail's selection.
 - **`a` jumps to the next run that needs you** (or tap the `⚑N need you` status token);
   the status line rolls up how many runs want you across the fleet. `r`/`s` reject/ship
   at a gate; approve = tap the button or `:approve`.
-- `p` = Projects · `w` log wrap · `g`/`G` top/bottom · `?` help · **`q` quits**.
+- `p` = Projects · `n` new run · `P` toggle Home scope · `w` log wrap ·
+  `g`/`G` top/bottom · `?` help · **`q` quits**.
 - Shell tab = a real tmux client: **every key goes to the agent** (incl. `Ctrl+C`);
   `F12` (or `C-a d`) hands focus back to spar. Focusing it full-screen is **Driving
   mode** — green banner, rail and every band but the footer collapsed, pane edge to edge.

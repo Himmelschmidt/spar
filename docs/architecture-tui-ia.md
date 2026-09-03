@@ -195,4 +195,5 @@ U12's braille/half-block clause: no density glyph earned its place in this pass.
 the four layout-shift sources are fixed (width-summed gate buttons, growing lists); the
 attention re-sort needs the motion engine, and the narrow tab strip still flips mode at
 the 80-column breakpoint. `rail_project_items`' render-path directory scan (U13) is
-untouched and remains 004 Phase B's job.
+done: 004 Phase B moved it onto `Snapshot`'s off-thread `HomeData`, so `draw` consumes
+per-project stats instead of scanning.
