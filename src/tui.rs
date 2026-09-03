@@ -1289,7 +1289,7 @@ fn run_loop(
             _ => None,
         });
 
-        manage_terminal(&mut app, &active_root);
+        manage_terminal(&mut app, &active_root, !snap.runs.is_empty());
         app.animated = animating(&app, &snap);
         app.human_alerts_n = snap.human_alerts;
         app.abandoned = snap.abandoned;
@@ -2639,7 +2639,16 @@ fn draw(
         draw_rail(f, lay.rail, projects, runs, full, app, rail_state);
     }
     if lay.main.width > 0 {
-        draw_main(f, lay.main, full, stream_text, activity, diff_text, app);
+        draw_main(
+            f,
+            lay.main,
+            full,
+            stream_text,
+            activity,
+            diff_text,
+            !runs.is_empty(),
+            app,
+        );
     }
     draw_footer(f, lay.footer, app, full);
 
@@ -2765,6 +2774,9 @@ fn draw_labels(
             x = x.saturating_add(w);
             if i + 1 < n_tabs {
                 x = x.saturating_add(gap);
+                if gap > 0 {
+                    spans.push(Span::raw(" ".repeat(gap as usize)));
+                }
             }
         }
         let line = Rect {
@@ -3228,10 +3240,11 @@ fn draw_context_band(
         let need = runs_needing_attention(runs);
         let running = runs.iter().filter(|r| is_active_phase(r.phase)).count();
         let line = if runs.is_empty() {
-            Line::from(Span::styled(
-                "no runs here yet — press : for the command palette",
-                muted(),
-            ))
+            // The palette's own `plan` command needs a run to reuse a fleet from
+            // (see dispatch_command), so it cannot bootstrap the first run — only the
+            // CLI command the header states can. Repeating that same instruction here
+            // in different words would just be a second, contradictory CTA.
+            Line::from(Span::styled("no runs yet", muted()))
         } else {
             Line::from(vec![
                 Span::styled(format!("{} runs", runs.len()), dim()),
@@ -3419,7 +3432,7 @@ fn status_cue(
     let Some(st) = full else {
         return if runs.is_empty() {
             (
-                "no runs — spar plan -t \"…\" --providers cli:claude".into(),
+                "no runs — spar plan -t \"describe the change\" --providers cli:claude".into(),
                 FG_DIM,
                 None,
             )
@@ -3990,6 +4003,7 @@ fn rail_slot_items(
 /// Main: ONE area, content = f(rail selection × tab). Its tabs live on the labels
 /// row above, so nothing relocates when the tab changes and the pane itself carries
 /// no border — one column of padding, then content.
+#[allow(clippy::too_many_arguments)]
 fn draw_main(
     f: &mut Frame,
     area: Rect,
@@ -3997,6 +4011,7 @@ fn draw_main(
     stream_text: &str,
     activity: &[String],
     diff_text: &str,
+    has_runs: bool,
     app: &mut App,
 ) {
     if area.width == 0 || area.height == 0 {
@@ -4018,10 +4033,20 @@ fn draw_main(
         return;
     }
 
+    // With no run selected, every tab's own body (the timeline, the artifacts list,
+    // the terminal) has nothing real to show — Log's already-coherent empty message
+    // (has_runs-aware) is the one story every tab tells instead of each inventing its
+    // own. Shell only joins that story when there are no runs anywhere yet: once a run
+    // exists, its workspace shell is a legitimate always-available terminal, not stale
+    // run content.
+    let nothing_to_run = full.is_none() && !has_runs;
     match app.main_tab {
         MainTab::Log => draw_log_body(f, inner, full, stream_text, app),
+        MainTab::Activity if full.is_none() => draw_log_body(f, inner, full, stream_text, app),
         MainTab::Activity => draw_activity_body(f, inner, activity, app),
+        MainTab::Diff if full.is_none() => draw_log_body(f, inner, full, stream_text, app),
         MainTab::Diff => draw_diff_body(f, inner, diff_text, app),
+        MainTab::Shell if nothing_to_run => draw_log_body(f, inner, full, stream_text, app),
         MainTab::Shell => draw_shell_body(f, inner, app),
     }
 }
@@ -4040,7 +4065,9 @@ fn main_context(swarm: &SparPaths, full: Option<&RunState>, app: &App) -> String
             let follow = if app.stream_follow { " · live" } else { "" };
             format!("{slot} · {mode}{follow}")
         }
+        MainTab::Activity if full.is_none() => String::new(),
         MainTab::Activity => "run timeline + bus".into(),
+        MainTab::Diff if full.is_none() => String::new(),
         MainTab::Diff => "artifacts".into(),
         MainTab::Shell => match app.takeover_target.as_deref() {
             Some(session) => format!("agent · {session}"),
@@ -4737,9 +4764,13 @@ fn draw_palette(f: &mut Frame, area: Rect, runs: &[state::RunSummary], app: &mut
     let comps = palette_completions(pal, runs);
     // Show up to 8 completions at a time, scrolled to keep the selection in view —
     // PALETTE_CMDS has 12 verbs, so a hard cap here would make the last four
-    // unreachable by browsing.
-    let menu_n = comps.len().min(8) as u16;
-    let win_start = if pal.sel >= menu_n as usize {
+    // unreachable by browsing. On a short frame, shrink the menu first so the
+    // input and hint rows (the frame's edges) are always the last thing cut.
+    let max_menu_n = area.height.saturating_sub(4); // borders(2) + input(1) + hint(1)
+    let menu_n = comps.len().min(8).min(max_menu_n as usize) as u16;
+    let win_start = if menu_n == 0 {
+        0
+    } else if pal.sel >= menu_n as usize {
         (pal.sel + 1 - menu_n as usize).min(comps.len().saturating_sub(menu_n as usize))
     } else {
         0
@@ -5130,10 +5161,15 @@ fn terminal_dims(rect: Rect) -> (u16, u16) {
 /// lazily while the Shell tab is up, and pump live output into the vt100 buffer every
 /// frame. The pane is project-scoped, not run-scoped: by default it shows the
 /// project's persistent workspace shell.
-fn manage_terminal(app: &mut App, project_root: &Path) {
+fn manage_terminal(app: &mut App, project_root: &Path, has_runs: bool) {
     // Nothing to do until the Shell tab is opened; avoids forking tmux every frame
     // while the operator is on another tab.
     if app.main_tab != MainTab::Shell && app.terminal_pane.is_none() {
+        return;
+    }
+    // With no runs anywhere yet, Shell joins the rest of Main's unified empty state
+    // (draw_main) instead of quietly opening an unrelated workspace shell behind it.
+    if !has_runs && app.terminal_pane.is_none() {
         return;
     }
     if !tmux::available() {
@@ -7586,6 +7622,22 @@ mod render_stability {
         );
     }
 
+    /// The hint row must survive a short frame too, not just a tall one: shrinking
+    /// the completion menu is what has to give, not the hint at the frame's own edge.
+    #[test]
+    fn palette_hint_survives_a_short_frame() {
+        for h in [10u16, 12, 14] {
+            let term = paint_with(120, h, &[], &[], None, |a| {
+                a.palette = Some(Palette::default());
+            });
+            let buf: String = (0..h).map(|y| row(&term, y)).collect::<Vec<_>>().join("\n");
+            assert!(
+                buf.contains("Tab complete · ↑↓ pick · Enter run · Esc close"),
+                "hint row was clipped at height {h}: {buf:?}"
+            );
+        }
+    }
+
     /// A scrollbar thumb implies there is more to see. It must not paint when the
     /// content already fits the viewport.
     #[test]
@@ -7634,10 +7686,30 @@ mod render_stability {
     #[test]
     fn tab_strip_gaps_are_uniform() {
         let st = run_with(Phase::Review, 3);
-        let gaps = |width: u16| -> Vec<usize> {
+        // Returns (gaps between labels, painted-start-x per label, recorded hit-rect
+        // x per label) so the test can catch not just uneven gaps but a strip that
+        // paints contiguous text while its click rects sit elsewhere (the round-2
+        // regression: `[0, 0, 0]` gaps read as "uniform" even though nothing painted
+        // agreed with where clicks landed).
+        let labels = ["Log", "Activity", "Diff", "Shell"];
+        // Returns (glyph-to-glyph gaps, cell-to-cell/rect gaps, painted-start-x per
+        // label, recorded hit rects). Two different gap metrics because the two bands
+        // use two different layouts: wide bakes a fixed-width badge slot into each
+        // label's own padded text, so adjacent rects legitimately abut (rect gap 0)
+        // and the badge never widens the visible run between labels (glyph gap
+        // constant); narrow has no baked-in padding and a badge that really does grow
+        // the cell, so its uniformity lives in the rects, not the glyphs.
+        struct Probe {
+            glyph_gaps: Vec<usize>,
+            rect_gaps: Vec<usize>,
+            starts: Vec<usize>,
+            rects: Vec<Rect>,
+        }
+        let probe = |width: u16, human_alerts_n: usize| -> Probe {
             let mut term = Terminal::new(TestBackend::new(width, 30)).unwrap();
             let swarm = SparPaths::new("/x");
             let mut app = App::new(None, Config::default(), true);
+            app.human_alerts_n = human_alerts_n;
             let area = Rect {
                 x: 0,
                 y: 0,
@@ -7647,36 +7719,80 @@ mod render_stability {
             let lay = layout_rects(area, Focus::Main, false, false);
             term.draw(|f| draw_labels(f, &lay, &swarm, &[], &[], Some(&st), &mut app))
                 .unwrap();
-            let text: String = {
-                let buf = term.backend().buffer();
-                (0..width)
-                    .map(|x| buf[(x, lay.labels.y)].symbol())
-                    .collect()
+            // Column positions, not byte offsets: the Activity badge's `⚠` is a
+            // multi-byte char, so a `str::find`-based byte offset silently drifts out
+            // of alignment with the terminal columns `app.main_tabs` records.
+            let cols: Vec<char> = (0..width)
+                .map(|x| {
+                    term.backend().buffer()[(x, lay.labels.y)]
+                        .symbol()
+                        .chars()
+                        .next()
+                        .unwrap_or(' ')
+                })
+                .collect();
+            let find_at = |label: &str, from: usize| -> usize {
+                let needle: Vec<char> = label.chars().collect();
+                (from..=cols.len().saturating_sub(needle.len()))
+                    .find(|&i| cols[i..i + needle.len()] == needle[..])
+                    .unwrap()
             };
-            let labels = ["Log", "Activity", "Diff", "Shell"];
             let mut cursor = 0usize;
-            let mut ends = Vec::new();
             let mut starts = Vec::new();
+            let mut ends = Vec::new();
             for label in labels {
-                let start = text[cursor..].find(label).unwrap() + cursor;
+                let start = find_at(label, cursor);
                 starts.push(start);
-                cursor = start + label.len();
+                cursor = start + label.chars().count();
                 ends.push(cursor);
             }
-            (0..labels.len() - 1)
+            let glyph_gaps = (0..labels.len() - 1)
                 .map(|i| starts[i + 1] - ends[i])
-                .collect()
+                .collect();
+            let rects: Vec<Rect> = app.main_tabs.iter().map(|(r, _)| *r).collect();
+            let rect_gaps = (0..rects.len() - 1)
+                .map(|i| (rects[i + 1].x - (rects[i].x + rects[i].width)) as usize)
+                .collect();
+            Probe {
+                glyph_gaps,
+                rect_gaps,
+                starts,
+                rects,
+            }
         };
-        let wide = gaps(120);
-        assert!(
-            wide.windows(2).all(|w| w[0] == w[1]),
-            "wide tab gaps not uniform: {wide:?}"
-        );
-        let narrow = gaps(79);
-        assert!(
-            narrow.windows(2).all(|w| w[0] == w[1]),
-            "narrow tab gaps not uniform: {narrow:?}"
-        );
+        // A recorded hit rect can legitimately be wider than the glyphs it labels (the
+        // wide strip pads each cell for a bigger touch target) but it must still cover
+        // the text it claims to hit — the round-2 regression left the narrow strip's
+        // rects pointing at blank columns entirely disjoint from the painted labels.
+        let assert_rects_cover_labels = |band: &str, starts: &[usize], rects: &[Rect], n: usize| {
+            for (i, (&start, rect)) in starts.iter().zip(rects).enumerate() {
+                let label_end = start + labels[i].len();
+                assert!(
+                    (rect.x as usize) <= start && label_end <= (rect.x + rect.width) as usize,
+                    "{band} rect for {:?} (x={}, w={}) does not cover painted label at {start} (human_alerts_n={n})",
+                    labels[i],
+                    rect.x,
+                    rect.width
+                );
+            }
+        };
+        for &n in &[0usize, 3, 12] {
+            let wide = probe(120, n);
+            assert!(
+                wide.glyph_gaps.windows(2).all(|w| w[0] == w[1]) && wide.glyph_gaps[0] > 0,
+                "wide tab gaps not uniform (human_alerts_n={n}): {:?}",
+                wide.glyph_gaps
+            );
+            assert_rects_cover_labels("wide", &wide.starts, &wide.rects, n);
+
+            let narrow = probe(79, n);
+            assert!(
+                narrow.rect_gaps.windows(2).all(|w| w[0] == w[1]) && narrow.rect_gaps[0] > 0,
+                "narrow tab gaps not uniform (human_alerts_n={n}): {:?}",
+                narrow.rect_gaps
+            );
+            assert_rects_cover_labels("narrow", &narrow.starts, &narrow.rects, n);
+        }
     }
 
     /// The uniform-gap fix for the narrow strip used to buy its spacing by silently
@@ -7687,6 +7803,7 @@ mod render_stability {
     #[test]
     fn narrow_tab_strip_never_drops_a_tab() {
         let st = run_with(Phase::Review, 3);
+        let labels = ["Log", "Activity", "Diff", "Shell"];
         for width in 24..80u16 {
             let mut term = Terminal::new(TestBackend::new(width, 30)).unwrap();
             let swarm = SparPaths::new("/x");
@@ -7706,6 +7823,29 @@ mod render_stability {
                 "width {width} dropped a tab: {:?}",
                 app.main_tabs
             );
+            // A recorded rect is not enough on its own: it must also point at a
+            // painted glyph, not a blank column the label never reached (the
+            // round-2 regression, where rects and paint disagreed).
+            let row: String = {
+                let buf = term.backend().buffer();
+                (0..width)
+                    .map(|x| buf[(x, lay.labels.y)].symbol())
+                    .collect()
+            };
+            let row_chars: Vec<char> = row.chars().collect();
+            for (i, (rect, tab)) in app.main_tabs.iter().enumerate() {
+                let expected = labels[i];
+                let at_rect: String = row_chars
+                    .iter()
+                    .skip(rect.x as usize)
+                    .take(expected.chars().count())
+                    .collect();
+                assert_eq!(
+                    at_rect, expected,
+                    "width {width}: rect for {tab:?} at x={} does not match painted label (row: {row:?})",
+                    rect.x
+                );
+            }
         }
     }
 
@@ -7778,6 +7918,23 @@ mod render_stability {
         assert!(whole.contains("(no runs)"), "rail: {whole:?}");
         assert!(!whole.contains("Bash"), "stale log content: {whole:?}");
 
+        // One coherent call to action. Header and Main both surface the same plan
+        // command (reinforcement, not incoherence) — but they used to phrase it two
+        // different ways (`"…"` vs `"describe the change"`, a round-2 regression), and
+        // the context band offered a second, contradictory one: the palette's `plan`
+        // command needs an existing run to reuse a fleet from, so "press :" cannot
+        // bootstrap the very first run.
+        let cta = "spar plan -t \"describe the change\" --providers cli:claude";
+        assert_eq!(
+            whole.matches(cta).count(),
+            whole.matches("spar plan -t").count(),
+            "every occurrence of the plan CTA must use identical wording: {whole:?}"
+        );
+        assert!(
+            !whole.contains("press :"),
+            "the command palette cannot start a first run with zero runs to reuse a fleet from: {whole:?}"
+        );
+
         let inner = app.rect_main_inner;
         let x = inner.right().saturating_sub(1);
         let buf = term.backend().buffer();
@@ -7786,6 +7943,78 @@ mod render_stability {
             sym == "┃" || sym == "│"
         });
         assert!(!scrollbar, "no content to scroll in the empty state");
+    }
+
+    /// The same coherent empty-state text (not a tab-specific message, and not stale
+    /// chrome) must show on every Main tab when there are no runs at all — Activity,
+    /// Diff and Shell used to each tell their own, different story.
+    #[test]
+    fn empty_state_is_uniform_across_every_main_tab() {
+        let text = stream_content(
+            &SparPaths::new("/x"),
+            None,
+            0,
+            &mut LogCache::empty(),
+            false,
+        );
+        for tab in [
+            MainTab::Log,
+            MainTab::Activity,
+            MainTab::Diff,
+            MainTab::Shell,
+        ] {
+            let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+            let swarm = SparPaths::new("/x");
+            let mut app = App::new(None, Config::default(), true);
+            app.open_main(tab);
+            let mut rail = ListState::default();
+            term.draw(|f| {
+                draw(
+                    f,
+                    &swarm,
+                    &[],
+                    &[],
+                    None,
+                    &text,
+                    &[],
+                    "",
+                    &mut app,
+                    &mut rail,
+                )
+            })
+            .unwrap();
+            let whole: String = {
+                let buf = term.backend().buffer();
+                (0..30)
+                    .map(|y| (0..120).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            assert!(
+                whole.contains("No runs yet"),
+                "{tab:?} did not show the unified empty state: {whole:?}"
+            );
+            assert!(
+                !whole.contains("Opening a real tmux client"),
+                "{tab:?} must not open the workspace shell with zero runs: {whole:?}"
+            );
+            assert!(
+                !whole.contains("No run selected"),
+                "{tab:?} fell back to its own stale message instead of the unified one: {whole:?}"
+            );
+
+            let inner = app.rect_main_inner;
+            let x = inner.right().saturating_sub(1);
+            let buf = term.backend().buffer();
+            let scrollbar = (inner.top()..inner.bottom()).any(|y| {
+                let sym = buf[(x, y)].symbol();
+                sym == "┃" || sym == "│"
+            });
+            assert!(
+                !scrollbar,
+                "{tab:?}: no content to scroll in the empty state"
+            );
+        }
     }
 }
 
