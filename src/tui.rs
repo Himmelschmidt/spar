@@ -559,6 +559,12 @@ struct App {
     home_target_run: Option<String>,
     /// Phase D's new-run modal. `Some` = open and capturing keys.
     new_run: Option<NewRun>,
+    /// The new-run overlay's outer rect (for click-outside-to-cancel); zero-sized when
+    /// closed. Mirrors `rect_palette`.
+    rect_new_run: Rect,
+    /// Painted roster row rects this frame, index-aligned with `new_run.roster`, for
+    /// click-to-toggle. Only as many entries as were actually rendered.
+    rect_new_run_roster: Vec<Rect>,
 }
 
 /// A gate action reachable by both a key and a tappable button.
@@ -631,17 +637,16 @@ impl App {
             None => HomeScope::All,
         };
         // A launch task seed opens the new-run surface pre-filled (U3/U21) — it no
-        // longer opens the palette, which had no way to offer a fresh fleet.
-        let new_run = task_seed.map(|t| NewRun {
-            project: local_root.map(Path::to_path_buf),
-            projects: local_root
-                .map(|r| vec![r.to_path_buf()])
-                .unwrap_or_default(),
-            task: t,
-            roster: Vec::new(),
-            picked: Vec::new(),
-            field: NewRunField::Task,
-            sel: 0,
+        // longer opens the palette, which had no way to offer a fresh fleet. The
+        // roster is built here too (`seeded_new_run`), or a `spar --task` launch opens
+        // a surface with nothing to pick and no key that can populate it (AC-33).
+        let new_run = task_seed.map(|t| {
+            let all_projects: Vec<PathBuf> =
+                registry::projects().into_iter().map(|p| p.root).collect();
+            let project = local_root
+                .map(Path::to_path_buf)
+                .or_else(|| all_projects.first().cloned());
+            seeded_new_run(&cfg, project, all_projects, t)
         });
         Self {
             selected_run: 0,
@@ -704,6 +709,8 @@ impl App {
             home_key: None,
             home_target_run: None,
             new_run,
+            rect_new_run: Rect::default(),
+            rect_new_run_roster: Vec::new(),
         }
     }
 
@@ -1414,7 +1421,8 @@ fn build_home_rows(
             }
         }
         for r in runs {
-            if r.abandoned || run_attention(r).needs_you() {
+            // `run_attention` already folds `r.abandoned` into `Broken` (needs_you).
+            if run_attention(r).needs_you() {
                 needs_me.push(r.clone());
             } else if is_active_phase(r.phase) {
                 running.push(r.clone());
@@ -1452,7 +1460,12 @@ fn build_home_rows(
     );
     rows.push(HomeRow::Header(HomeBand::StartNew));
     rows.push(HomeRow::NewRun);
-    for i in 0..projects.len() {
+    for (i, proj) in projects.iter().enumerate() {
+        if let HomeScope::Project(root) = scope {
+            if &proj.root != root {
+                continue;
+            }
+        }
         rows.push(HomeRow::Project(i));
     }
     rows
@@ -1783,7 +1796,7 @@ fn new_run_launch(nr: &NewRun) -> std::result::Result<(PathBuf, Vec<String>), St
     let argv = vec![
         "plan".to_string(),
         "-t".to_string(),
-        nr.task.clone(),
+        nr.task.trim().to_string(),
         "--providers".to_string(),
         providers.join(","),
     ];
@@ -2187,7 +2200,14 @@ fn run_loop(
         let next_sel = Selection {
             browse: app.browse,
             root: active_root.clone(),
-            run_id: snap.runs.get(app.selected_run).map(|r| r.id.clone()),
+            // A Home Enter carries the run by id (`home_target_run`), because the
+            // outgoing snapshot's `snap.runs`/`app.selected_run` still describe the
+            // *previous* project — consumed once, then the id-glue clamp above takes
+            // over once the target project's snapshot arrives (R2/AC-27).
+            run_id: app
+                .home_target_run
+                .take()
+                .or_else(|| snap.runs.get(app.selected_run).map(|r| r.id.clone())),
             slot_idx: app.selected_slot,
             project_idx: app.selected_project,
             home_scope: app.home_scope.clone(),
@@ -2329,7 +2349,15 @@ fn handle_key(
         KeyCode::Char('_') => app.zoom = false,
         KeyCode::Enter => {
             if app.focus == Focus::Rail {
-                rail_enter(app, projects, home_rows, runs, full, active_root);
+                rail_enter(
+                    app,
+                    projects,
+                    home_rows,
+                    runs,
+                    full,
+                    active_root,
+                    local_root,
+                );
             }
         }
         KeyCode::Char('p') => {
@@ -2435,10 +2463,25 @@ fn open_new_run(
     };
     let all_projects: Vec<PathBuf> = projects.iter().map(|p| p.root.clone()).collect();
     let project = target.or_else(|| all_projects.first().cloned());
+    app.new_run = Some(seeded_new_run(
+        &app.cfg,
+        project,
+        all_projects,
+        String::new(),
+    ));
+}
 
-    // Detection and the recent-fleet lookup are disk/process work — fine here (this
-    // is a key handler, not `draw`), and it happens once when the modal opens, not
-    // once a frame (U22).
+/// Build a ready-to-launch `NewRun`: the roster and recent-fleet lookup are disk/
+/// process work (`detect_all`, a registry read), fine here since this only ever runs
+/// once when the modal opens or the TUI starts, never once a frame (U22). Shared by
+/// `open_new_run` (the `n` key) and `App::new`'s `--task` seed (AC-33) — a seeded
+/// surface with an empty roster can never launch.
+fn seeded_new_run(
+    cfg: &Config,
+    project: Option<PathBuf>,
+    all_projects: Vec<PathBuf>,
+    task: String,
+) -> NewRun {
     let detected: Vec<(String, bool)> = crate::providers::detect_all()
         .into_iter()
         .map(|r| (r.name, r.available))
@@ -2455,17 +2498,27 @@ fn open_new_run(
     let recent_ref = recent_fleet
         .as_ref()
         .map(|(id, v)| (id.as_str(), v.as_slice()));
-    let roster = build_roster(&app.cfg, &detected, recent_ref);
+    let roster = build_roster(cfg, &detected, recent_ref);
 
-    app.new_run = Some(NewRun {
+    NewRun {
         project,
         projects: all_projects,
-        task: String::new(),
+        task,
         roster,
         picked: Vec::new(),
         field: NewRunField::Task,
         sel: 0,
-    });
+    }
+}
+
+/// Toggle roster entry `i`'s pick, same rule for the `space` key and a roster-row
+/// click: picked → unpicked, unavailable → no-op, else picked.
+fn toggle_roster_pick(nr: &mut NewRun, i: usize) {
+    if let Some(pos) = nr.picked.iter().position(|&p| p == i) {
+        nr.picked.remove(pos);
+    } else if nr.roster.get(i).map(|e| e.available).unwrap_or(false) {
+        nr.picked.push(i);
+    }
 }
 
 /// Keys while the Phase D new-run modal is open.
@@ -2536,13 +2589,7 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             let i = (i + 1) % nr.projects.len();
             nr.project = nr.projects.get(i).cloned();
         }
-        KeyCode::Char(' ') if nr.field == NewRunField::Fleet => {
-            if let Some(pos) = nr.picked.iter().position(|&i| i == nr.sel) {
-                nr.picked.remove(pos);
-            } else if nr.roster.get(nr.sel).map(|e| e.available).unwrap_or(false) {
-                nr.picked.push(nr.sel);
-            }
-        }
+        KeyCode::Char(' ') if nr.field == NewRunField::Fleet => toggle_roster_pick(nr, nr.sel),
         KeyCode::Char('j') | KeyCode::Down if nr.field == NewRunField::Fleet => {
             if !nr.roster.is_empty() {
                 nr.sel = (nr.sel + 1).min(nr.roster.len() - 1);
@@ -3154,6 +3201,7 @@ fn rail_enter(
     runs: &[state::RunSummary],
     full: Option<&RunState>,
     active_root: &mut PathBuf,
+    local_root: Option<&Path>,
 ) {
     match app.browse {
         BrowseLevel::Home => match home_rows.get(app.selected_home) {
@@ -3173,8 +3221,13 @@ fn rail_enter(
                 }
             }
             Some(HomeRow::NewRun) => {
-                let root = active_root.clone();
-                open_new_run(app, projects, home_rows, Some(root.as_path()));
+                // `active_root` is the rail's current browsing root, not a verified
+                // project — outside a repo with an empty registry it degrades to an
+                // arbitrary cwd (`run_loop`'s `active_root` init). Route through the
+                // same verified `local_root` the `n` key and `open_new_run`'s own
+                // `HomeScope::All` fallback use, or the no-target refusal never fires
+                // (AC-32).
+                open_new_run(app, projects, home_rows, local_root);
             }
             Some(HomeRow::Header(_)) | Some(HomeRow::More { .. }) | None => {}
         },
@@ -3351,6 +3404,29 @@ fn handle_mouse(
         return;
     }
 
+    // The Phase D new-run modal owns every click while it is open, same precedence as
+    // the `:` palette (D4): a click on a roster row toggles it, a click outside cancels,
+    // and everything else underneath (rail, tabs, gate buttons) is swallowed rather
+    // than reached through the overlay.
+    if app.new_run.is_some() {
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if !contains(app.rect_new_run, x, y) {
+                app.new_run = None;
+            } else if let Some(i) = app
+                .rect_new_run_roster
+                .iter()
+                .position(|r| contains(*r, x, y))
+            {
+                if let Some(nr) = app.new_run.as_mut() {
+                    nr.field = NewRunField::Fleet;
+                    nr.sel = i;
+                    toggle_roster_pick(nr, i);
+                }
+            }
+        }
+        return;
+    }
+
     // The tab strip is chrome, never the agent's — it is the escape hatch out of the
     // Shell tab on a touch screen, so it is hit-tested BEFORE the terminal forward.
     if let Some(&(_, tab)) = app.main_tabs.iter().find(|(r, _)| contains(*r, x, y)) {
@@ -3428,17 +3504,18 @@ fn handle_mouse(
             if contains(app.rect_rail, x, y) {
                 app.focus = Focus::Rail;
                 if let Some(row) = list_row_at(app.rect_rail, y, n_rail, rail_offset) {
-                    rail_select(
-                        app,
-                        row,
-                        projects.len(),
-                        home_rows.len(),
-                        runs.len(),
-                        n_slots,
-                    );
+                    rail_select(app, row, projects.len(), home_rows, runs.len(), n_slots);
                     // Double-click = Enter: drill one level (and take over on a slot).
                     if dbl {
-                        rail_enter(app, projects, home_rows, runs, full, active_root);
+                        rail_enter(
+                            app,
+                            projects,
+                            home_rows,
+                            runs,
+                            full,
+                            active_root,
+                            local_root,
+                        );
                     }
                 }
             } else if contains(app.rect_main, x, y) {
@@ -3486,22 +3563,29 @@ fn rail_len(
     }
 }
 
-/// Select rail row `row` at whatever level the rail is on. At Home this cannot know
-/// row content (headers are skipped by `rail_move`/`resync_home_selection`, which do
-/// have it); it only guards against landing on band 1's header, which is always row 0.
+/// Select rail row `row` at whatever level the rail is on. At Home a click on any
+/// header row (not just row 0) is ignored — a click is a pointer at content, and a
+/// header is not content — and a landed selection glues `home_key` to the row's
+/// identity, the same as every other Home cursor mover (`rail_move`,
+/// `jump_to_attention`), or the very next snapshot yanks the cursor back (AC-28).
 fn rail_select(
     app: &mut App,
     row: usize,
     n_projects: usize,
-    n_home: usize,
+    home_rows: &[HomeRow],
     n_runs: usize,
     n_slots: usize,
 ) {
     match app.browse {
-        BrowseLevel::Home if n_home > 0 => {
-            app.selected_home = row.max(1).min(n_home - 1);
+        BrowseLevel::Home => {
+            if matches!(home_rows.get(row), Some(HomeRow::Header(_))) {
+                return;
+            }
+            if row < home_rows.len() {
+                app.selected_home = row;
+                app.home_key = home_rows.get(row).map(home_row_key);
+            }
         }
-        BrowseLevel::Home => {}
         BrowseLevel::Projects => app.select_project(row, n_projects),
         BrowseLevel::Runs => app.select_run(row, n_runs),
         BrowseLevel::Agents => app.select_slot(row, n_slots),
@@ -6548,6 +6632,7 @@ fn draw_new_run(f: &mut Frame, area: Rect, projects: &[registry::ProjectEntry], 
         ));
     }
     const MAX_ROSTER_ROWS: usize = 8;
+    let roster_line_start = lines.len();
     for (i, e) in nr.roster.iter().enumerate().take(MAX_ROSTER_ROWS) {
         let picked_n = nr.picked.iter().position(|&p| p == i);
         let mark = match picked_n {
@@ -6609,6 +6694,19 @@ fn draw_new_run(f: &mut Frame, area: Rect, projects: &[registry::ProjectEntry], 
         width: w,
         height: h,
     };
+    // Click-outside-to-cancel / click-a-roster-row-to-toggle (D4), mirroring
+    // `rect_palette`. Only rows actually painted (post-truncation) are hit-testable.
+    let rendered_roster_rows = nr.roster.len().min(MAX_ROSTER_ROWS);
+    app.rect_new_run_roster = (0..rendered_roster_rows)
+        .filter(|i| roster_line_start + i < inner_h)
+        .map(|i| Rect {
+            x: rect.x + 1,
+            y: rect.y + 1 + (roster_line_start + i) as u16,
+            width: inner_w as u16,
+            height: 1,
+        })
+        .collect();
+    app.rect_new_run = rect;
     f.render_widget(Clear, rect);
     let text: Vec<Line> = lines
         .into_iter()
@@ -7766,7 +7864,7 @@ mod labels {
         let mut app = test_app();
         app.browse = BrowseLevel::Agents;
         let mut root = PathBuf::from("/x");
-        rail_enter(&mut app, &[], &[], &[], Some(&st), &mut root);
+        rail_enter(&mut app, &[], &[], &[], Some(&st), &mut root, None);
         assert!(app.takeover_target.is_none());
         assert_eq!(app.focus, Focus::Rail, "headless run: nothing to take over");
     }
@@ -10932,6 +11030,10 @@ mod home_ia {
         );
         save("cccc0003", Phase::Review, None, false);
         save("dddd0004", Phase::Done, None, true);
+        // cccc0003 is mid-flight, not abandoned: hold its lock like a live orchestrator
+        // would, or `is_abandoned` reads a lockless active phase as Broken (state.rs:684)
+        // and this fixture would assert something other than what it names.
+        let _cccc_lock = crate::runlock::RunLock::acquire(&paths, "cccc0003").unwrap();
 
         let missing = tmp.path().join("gone");
         let projects = [project_at(&root, "proj"), project_at(&missing, "gone")];
@@ -11453,12 +11555,12 @@ mod home_ia {
         }
         // A mouse click on a header is ignored rather than selecting it.
         app.selected_home = 1;
-        rail_select(&mut app, 0, 0, rows.len(), 0, 0);
+        rail_select(&mut app, 0, 0, &rows, 0, 0);
         assert_eq!(
             app.selected_home, 1,
             "a click on a header must not move the cursor"
         );
-        rail_select(&mut app, 3, 0, rows.len(), 0, 0);
+        rail_select(&mut app, 3, 0, &rows, 0, 0);
         assert_eq!(app.selected_home, 3, "a click on a run row selects it");
     }
 
@@ -11473,7 +11575,7 @@ mod home_ia {
         let mut app = App::new(None, Config::default(), None);
         app.selected_home = 1; // the gated run
         let mut active = PathBuf::from("/nonexistent/elsewhere");
-        rail_enter(&mut app, &[], &rows, &[], None, &mut active);
+        rail_enter(&mut app, &[], &rows, &[], None, &mut active, None);
         assert_eq!(
             app.browse,
             BrowseLevel::Agents,
@@ -11503,14 +11605,14 @@ mod home_ia {
         let mut app = App::new(None, Config::default(), None);
         app.selected_home = 2;
         let mut active = PathBuf::from("/nonexistent/elsewhere");
-        rail_enter(&mut app, &projects, &rows, &[], None, &mut active);
+        rail_enter(&mut app, &projects, &rows, &[], None, &mut active, None);
         assert_eq!(app.browse, BrowseLevel::Runs);
         assert_eq!(active, root);
 
         let mut app = App::new(None, Config::default(), None);
         app.selected_home = 1;
         let mut active = PathBuf::from("/nonexistent/elsewhere");
-        rail_enter(&mut app, &projects, &rows, &[], None, &mut active);
+        rail_enter(&mut app, &projects, &rows, &[], None, &mut active, None);
         assert!(
             app.new_run.is_some(),
             "the action row opens the new-run surface"
@@ -11520,7 +11622,7 @@ mod home_ia {
         let mut app = App::new(None, Config::default(), None);
         app.selected_home = 0;
         let before = app.browse;
-        rail_enter(&mut app, &projects, &rows, &[], None, &mut active);
+        rail_enter(&mut app, &projects, &rows, &[], None, &mut active, None);
         assert_eq!(app.browse, before, "Enter on a header does nothing");
         assert!(app.new_run.is_none());
     }
@@ -11532,7 +11634,7 @@ mod home_ia {
         let root = PathBuf::from("/nonexistent/spar");
         let rows = nav_rows(&root);
         let mut app = App::new(None, Config::default(), None);
-        rail_select(&mut app, 3, 0, rows.len(), 0, 0); // the running run
+        rail_select(&mut app, 3, 0, &rows, 0, 0); // the running run
         assert_eq!(app.home_key.as_deref(), Some("run:work0001"));
 
         // Next snapshot: a new gate arrives and pushes everything down.
