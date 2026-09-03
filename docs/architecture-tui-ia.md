@@ -105,6 +105,16 @@ fleet picker over the roster. This supersedes U3's punt ("a fresh fleet needs a 
 picker a text palette can't offer, so those error to the CLI") by building the picker rather
 than continuing to error to the CLI.
 
+**Amended (U16).** The text field becomes a conversation. `n` opens the resident
+orchestrator, which interviews the operator, writes the same brief to the same path, and
+proposes a fleet; the picker survives as the manual path that costs no tokens. This settles
+X10 yes: the TUI hosts a conversation. It does not disturb the operator model, because the
+conversation *is* the disposable session P7 already describes — its prompt is the embedded
+core skill, it gets current by reading `.spar/runs/<id>/`, and killing it loses nothing. The
+orchestrator is an **Agent** under U6, not a fifth noun, and its surface is a fifth Main tab
+whose content is `f(rail selection)` like every other tab. Its authority is bounded by U17:
+it proposes, the operator disposes. See `roadmap/features/008-orchestrator-conversation.md`.
+
 ---
 
 ## Gate evidence (U9)
