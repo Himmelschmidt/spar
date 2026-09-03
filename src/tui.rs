@@ -376,7 +376,13 @@ struct App {
     /// The `:` palette overlay rect (for click-to-dismiss); zero-sized when closed.
     rect_palette: Rect,
     /// Per-tab hit rects for the Main tab strip (wide: in Main's top border; narrow: its own row).
+    /// Padded for touch in narrow (half of each neighboring gap), so not the same as
+    /// the painted glyph span — `main_tab_glyphs` below is the one to underline.
     main_tabs: Vec<(Rect, MainTab)>,
+    /// Per-tab painted glyph rects for the Main tab strip, unpadded. `draw_rule` reads
+    /// this for the active-tab underline; using `main_tabs` there would stretch the
+    /// accent into the touch-target padding on either side of the label (narrow band).
+    main_tab_glyphs: Vec<(Rect, MainTab)>,
     /// One-shot: on first narrow render with an active run, jump to Main's Log tab.
     narrow_autofocus_done: bool,
     /// Tappable gate buttons painted this frame, for touch/mouse hit-testing.
@@ -526,6 +532,7 @@ impl App {
             rect_main_inner: Rect::default(),
             rect_palette: Rect::default(),
             main_tabs: Vec::new(),
+            main_tab_glyphs: Vec::new(),
             narrow_autofocus_done: false,
             gate_buttons: Vec::new(),
             rect_help: Rect::default(),
@@ -2615,11 +2622,15 @@ fn draw(
 
     // On the first narrow render with an active run, land on the live log so a
     // phone glance shows progress — but only once, and never over a manual move.
+    // Zero runs gets the same treatment: the rail's "(no runs)" row has no CTA of its
+    // own, so leaving focus on it would strand the phone view on a blank pane with
+    // the coherent empty-state message (Main) never shown (AC-5).
     if area.width < NARROW_WIDTH && !app.narrow_autofocus_done {
         let active = full.map(|s| {
             is_active_phase(s.phase) || s.slots.iter().any(|sl| sl.status == SlotStatus::Running)
         });
-        if active == Some(true) {
+        let no_runs = app.browse == BrowseLevel::Runs && full.is_none() && runs.is_empty();
+        if active == Some(true) || no_runs {
             if app.focus == Focus::Rail {
                 app.open_main(MainTab::Log);
             }
@@ -2640,6 +2651,7 @@ fn draw(
     app.rect_attention = Rect::default();
     app.gate_buttons.clear();
     app.main_tabs.clear();
+    app.main_tab_glyphs.clear();
 
     if driving {
         draw_driving_banner(f, lay.header, app);
@@ -2828,6 +2840,15 @@ fn draw_labels(
                 },
                 tab,
             ));
+            app.main_tab_glyphs.push((
+                Rect {
+                    x: gx,
+                    y: area.y,
+                    width: gw,
+                    height: 1,
+                },
+                tab,
+            ));
         }
         let line = Rect {
             x: start_x,
@@ -2875,15 +2896,14 @@ fn draw_labels(
         if x.saturating_add(w) > main.right() {
             break;
         }
-        app.main_tabs.push((
-            Rect {
-                x,
-                y: area.y,
-                width: w,
-                height: 1,
-            },
-            tab,
-        ));
+        let rect = Rect {
+            x,
+            y: area.y,
+            width: w,
+            height: 1,
+        };
+        app.main_tabs.push((rect, tab));
+        app.main_tab_glyphs.push((rect, tab));
         x = x.saturating_add(w);
         spans.push(Span::styled(text, style));
     }
@@ -2958,7 +2978,7 @@ fn draw_rule(f: &mut Frame, lay: &LayoutRects, app: &App) {
             },
         );
     }
-    if let Some((r, _)) = app.main_tabs.iter().find(|(_, t)| *t == app.main_tab) {
+    if let Some((r, _)) = app.main_tab_glyphs.iter().find(|(_, t)| *t == app.main_tab) {
         let w = r.width.min(area.right().saturating_sub(r.x));
         if w > 0 {
             f.render_widget(
@@ -7987,58 +8007,110 @@ mod render_stability {
         }
     }
 
+    /// `draw_rule`'s active-tab underline used to read `app.main_tabs`, the touch-target
+    /// hit rect — in the narrow band that rect is padded out to split each neighboring
+    /// gap for a bigger tap zone, so the accent underline ballooned to 14-27 columns and
+    /// sat detached from the 3-8 column label it was meant to mark. The underline must
+    /// track the painted glyph span (`main_tab_glyphs`) instead, at both bands.
+    #[test]
+    fn active_tab_underline_matches_the_painted_label_not_the_touch_target() {
+        let st = run_with(Phase::Review, 3);
+        for width in [35u16, 60, 79, 120] {
+            for &n in &[0usize, 3] {
+                let mut term = Terminal::new(TestBackend::new(width, 30)).unwrap();
+                let swarm = SparPaths::new("/x");
+                let mut app = App::new(None, Config::default(), true);
+                app.human_alerts_n = n;
+                app.main_tab = MainTab::Log;
+                let area = Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height: 30,
+                };
+                let lay = layout_rects(area, Focus::Main, false, false);
+                term.draw(|f| {
+                    draw_labels(f, &lay, &swarm, &[], &[], Some(&st), &mut app);
+                    draw_rule(f, &lay, &app);
+                })
+                .unwrap();
+
+                let (glyph_rect, _) = app
+                    .main_tab_glyphs
+                    .iter()
+                    .find(|(_, t)| *t == MainTab::Log)
+                    .unwrap();
+                let underline_w = (0..width)
+                    .filter(|&x| term.backend().buffer()[(x, lay.rule.y)].symbol() == TAB_MARK)
+                    .count() as u16;
+                assert_eq!(
+                    underline_w, glyph_rect.width,
+                    "width {width} human_alerts_n={n}: underline is {underline_w} cols wide, \
+                     label glyph span is {} cols",
+                    glyph_rect.width
+                );
+            }
+        }
+    }
+
     /// The uniform-gap fix for the narrow strip used to buy its spacing by silently
     /// dropping Shell (and, at the narrowest widths, Diff too) once the wide strip's
     /// fixed per-tab padding stopped fitting — invisible and untappable, with no
     /// ellipsis to say a tab existed. Every width in the narrow band must keep all
-    /// four.
+    /// four — with an alert badge in play too: below ~36 columns the badge-reservation
+    /// fallback glues the badge onto Activity alone (trading gap uniformity, covered by
+    /// `tab_strip_gaps_are_uniform`'s 79-column probe, for keeping every tab on
+    /// screen), and that fallback path was only ever swept with zero alerts.
     #[test]
     fn narrow_tab_strip_never_drops_a_tab() {
         let st = run_with(Phase::Review, 3);
         let labels = ["Log", "Activity", "Diff", "Shell"];
         for width in 24..80u16 {
-            let mut term = Terminal::new(TestBackend::new(width, 30)).unwrap();
-            let swarm = SparPaths::new("/x");
-            let mut app = App::new(None, Config::default(), true);
-            let area = Rect {
-                x: 0,
-                y: 0,
-                width,
-                height: 30,
-            };
-            let lay = layout_rects(area, Focus::Main, false, false);
-            term.draw(|f| draw_labels(f, &lay, &swarm, &[], &[], Some(&st), &mut app))
-                .unwrap();
-            assert_eq!(
-                app.main_tabs.len(),
-                4,
-                "width {width} dropped a tab: {:?}",
-                app.main_tabs
-            );
-            // A recorded rect is not enough on its own: it must also point at a
-            // painted glyph, not a blank column the label never reached (the
-            // round-2 regression, where rects and paint disagreed).
-            let row: String = {
-                let buf = term.backend().buffer();
-                (0..width)
-                    .map(|x| buf[(x, lay.labels.y)].symbol())
-                    .collect()
-            };
-            let row_chars: Vec<char> = row.chars().collect();
-            for (i, (rect, tab)) in app.main_tabs.iter().enumerate() {
-                let expected = labels[i];
-                let window: String = row_chars
-                    .iter()
-                    .skip(rect.x as usize)
-                    .take(rect.width as usize)
-                    .collect();
-                assert!(
-                    window.contains(expected),
-                    "width {width}: rect for {tab:?} (x={}, w={}) does not cover painted label \
-                     {expected:?} (row: {row:?})",
-                    rect.x,
-                    rect.width
+            for &alerts in &[0usize, 3] {
+                let mut term = Terminal::new(TestBackend::new(width, 30)).unwrap();
+                let swarm = SparPaths::new("/x");
+                let mut app = App::new(None, Config::default(), true);
+                app.human_alerts_n = alerts;
+                let area = Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height: 30,
+                };
+                let lay = layout_rects(area, Focus::Main, false, false);
+                term.draw(|f| draw_labels(f, &lay, &swarm, &[], &[], Some(&st), &mut app))
+                    .unwrap();
+                assert_eq!(
+                    app.main_tabs.len(),
+                    4,
+                    "width {width} (alerts={alerts}) dropped a tab: {:?}",
+                    app.main_tabs
                 );
+                // A recorded rect is not enough on its own: it must also point at a
+                // painted glyph, not a blank column the label never reached (the
+                // round-2 regression, where rects and paint disagreed).
+                let row: String = {
+                    let buf = term.backend().buffer();
+                    (0..width)
+                        .map(|x| buf[(x, lay.labels.y)].symbol())
+                        .collect()
+                };
+                let row_chars: Vec<char> = row.chars().collect();
+                for (i, (rect, tab)) in app.main_tabs.iter().enumerate() {
+                    let expected = labels[i];
+                    let window: String = row_chars
+                        .iter()
+                        .skip(rect.x as usize)
+                        .take(rect.width as usize)
+                        .collect();
+                    assert!(
+                        window.contains(expected),
+                        "width {width} (alerts={alerts}): rect for {tab:?} (x={}, w={}) does not \
+                         cover painted label {expected:?} (row: {row:?})",
+                        rect.x,
+                        rect.width
+                    );
+                }
             }
         }
     }
@@ -8304,6 +8376,62 @@ mod render_stability {
             whole.contains("shell ·"),
             "Shell's caption must agree with its body, not the unified empty state: {whole:?}"
         );
+    }
+
+    /// With zero runs, default focus (`Focus::Rail`) left Main's rect zero-width in the
+    /// narrow band (`layout_rects`), so the coherent empty-state CTA above never
+    /// painted — the phone screen showed only the rail's bare `(no runs)` row, or
+    /// nothing at all once the context band folded too. The no-run case must land on
+    /// Main just like the "active run" narrow autofocus already does, so the CTA is
+    /// the one thing on screen rather than unreachable behind a dead rail.
+    #[test]
+    fn empty_state_is_reachable_at_narrow_width() {
+        let text = stream_content(
+            &SparPaths::new("/x"),
+            None,
+            0,
+            &mut LogCache::empty(),
+            false,
+        );
+        for width in [50u16, 79] {
+            let mut term = Terminal::new(TestBackend::new(width, 20)).unwrap();
+            let swarm = SparPaths::new("/x");
+            let mut app = App::new(None, Config::default(), true);
+            let mut rail = ListState::default();
+            term.draw(|f| {
+                draw(
+                    f,
+                    &swarm,
+                    &[],
+                    &[],
+                    None,
+                    &text,
+                    &[],
+                    "",
+                    &mut app,
+                    &mut rail,
+                )
+            })
+            .unwrap();
+
+            assert_eq!(
+                app.focus,
+                Focus::Main,
+                "width {width}: zero runs must autofocus Main so the empty state is reachable"
+            );
+
+            let whole: String = {
+                let buf = term.backend().buffer();
+                (0..20)
+                    .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            assert!(
+                whole.contains("No runs yet"),
+                "width {width}: empty-state CTA unreachable: {whole:?}"
+            );
+        }
     }
 }
 
