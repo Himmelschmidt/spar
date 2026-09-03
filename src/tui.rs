@@ -680,31 +680,36 @@ impl App {
     }
 
     /// Scroll whichever view Main is showing. The Shell tab is a live tmux client:
-    /// it never scrolls from here (its input is forwarded raw).
-    fn scroll_main_by(&mut self, delta: i32) {
+    /// it never scrolls from here (its input is forwarded raw). Without a run
+    /// selected, Activity and Diff fall back to the same overview body Log uses
+    /// (`draw_log_body`), so scrolling must follow that body — `stream_*` — rather
+    /// than the run-scoped `bus_*`/`diff_*` state those tabs normally own.
+    fn scroll_main_by(&mut self, delta: i32, has_full: bool) {
         match self.main_tab {
             MainTab::Log => self.scroll_stream_by(delta),
-            MainTab::Activity => self.scroll_bus_by(delta),
-            MainTab::Diff => self.scroll_diff_by(delta),
+            MainTab::Activity if has_full => self.scroll_bus_by(delta),
+            MainTab::Activity => self.scroll_stream_by(delta),
+            MainTab::Diff if has_full => self.scroll_diff_by(delta),
+            MainTab::Diff => self.scroll_stream_by(delta),
             MainTab::Shell => {}
         }
     }
 
-    fn main_page(&self) -> u16 {
+    fn main_page(&self, has_full: bool) -> u16 {
         match self.main_tab {
-            MainTab::Activity => self.bus_page(),
-            MainTab::Diff => self.diff_page(),
+            MainTab::Activity if has_full => self.bus_page(),
+            MainTab::Diff if has_full => self.diff_page(),
             _ => self.stream_page(),
         }
     }
 
-    fn home_for_main(&mut self) {
+    fn home_for_main(&mut self, has_full: bool) {
         match self.main_tab {
-            MainTab::Activity => {
+            MainTab::Activity if has_full => {
                 self.bus_follow = false;
                 self.bus_scroll = 0;
             }
-            MainTab::Diff => {
+            MainTab::Diff if has_full => {
                 self.diff_follow = false;
                 self.diff_scroll = 0;
             }
@@ -715,13 +720,13 @@ impl App {
         }
     }
 
-    fn end_for_main(&mut self) {
+    fn end_for_main(&mut self, has_full: bool) {
         match self.main_tab {
-            MainTab::Activity => {
+            MainTab::Activity if has_full => {
                 self.bus_follow = true;
                 self.bus_scroll = self.bus_max;
             }
-            MainTab::Diff => {
+            MainTab::Diff if has_full => {
                 self.diff_follow = true;
                 self.diff_scroll = self.diff_max;
             }
@@ -1289,7 +1294,7 @@ fn run_loop(
             _ => None,
         });
 
-        manage_terminal(&mut app, &active_root, !snap.runs.is_empty());
+        manage_terminal(&mut app, &active_root);
         app.animated = animating(&app, &snap);
         app.human_alerts_n = snap.human_alerts;
         app.abandoned = snap.abandoned;
@@ -1535,19 +1540,23 @@ fn handle_key(
         }
         KeyCode::Char('j') | KeyCode::Down => match app.focus {
             Focus::Rail => rail_move(app, projects, runs, n_slots, 1),
-            Focus::Main => app.scroll_main_by(3),
+            Focus::Main => app.scroll_main_by(3, full.is_some()),
         },
         KeyCode::Char('k') | KeyCode::Up => match app.focus {
             Focus::Rail => rail_move(app, projects, runs, n_slots, -1),
-            Focus::Main => app.scroll_main_by(-3),
+            Focus::Main => app.scroll_main_by(-3, full.is_some()),
         },
         KeyCode::PageDown => match app.focus {
             Focus::Rail => rail_move(app, projects, runs, n_slots, 5),
-            Focus::Main => app.scroll_main_by(i32::from(app.main_page())),
+            Focus::Main => {
+                app.scroll_main_by(i32::from(app.main_page(full.is_some())), full.is_some())
+            }
         },
         KeyCode::PageUp => match app.focus {
             Focus::Rail => rail_move(app, projects, runs, n_slots, -5),
-            Focus::Main => app.scroll_main_by(-i32::from(app.main_page())),
+            Focus::Main => {
+                app.scroll_main_by(-i32::from(app.main_page(full.is_some())), full.is_some())
+            }
         },
         // a jumps to the next run that wants you (Stage C). Approve moved to the gate
         // button / `:approve` when `a` became the fleet-wide attention binding.
@@ -1563,10 +1572,10 @@ fn handle_key(
             }
         }
         KeyCode::Char('g') | KeyCode::Home => {
-            app.home_for_main();
+            app.home_for_main(full.is_some());
         }
         KeyCode::Char('G') | KeyCode::End => {
-            app.end_for_main();
+            app.end_for_main(full.is_some());
         }
         KeyCode::Char('?') => {
             app.show_help = true;
@@ -2286,6 +2295,16 @@ fn handle_mouse(
     let n_slots = full.map(|s| s.slots.len()).unwrap_or(0);
     let n_rail = rail_len(app.browse, projects.len(), runs.len(), n_slots);
 
+    // The help overlay can grow tall enough to sit on top of the tab strip (it sizes
+    // to its content, not a fixed box), so it must be hit-tested before the strip or
+    // a tap meant to dismiss help silently changes the tab underneath instead.
+    if app.show_help {
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            app.show_help = false;
+        }
+        return;
+    }
+
     // The tab strip is chrome, never the agent's — it is the escape hatch out of the
     // Shell tab on a touch screen, so it is hit-tested BEFORE the terminal forward.
     if let Some(&(_, tab)) = app.main_tabs.iter().find(|(r, _)| contains(*r, x, y)) {
@@ -2324,11 +2343,6 @@ fn handle_mouse(
                 .unwrap_or(false);
             app.last_click = Some((x, y, now));
 
-            // A tap anywhere dismisses the help overlay first.
-            if app.show_help {
-                app.show_help = false;
-                return;
-            }
             // With the palette open, a tap outside it closes it; inside is swallowed.
             if app.palette.is_some() {
                 if !contains(app.rect_palette, x, y) {
@@ -2384,7 +2398,7 @@ fn handle_mouse(
         MouseEventKind::ScrollDown => {
             if contains(app.rect_main, x, y) {
                 app.focus = Focus::Main;
-                app.scroll_main_by(3);
+                app.scroll_main_by(3, full.is_some());
             } else if contains(app.rect_rail, x, y) {
                 app.focus = Focus::Rail;
                 rail_move(app, projects, runs, n_slots, 1);
@@ -2393,7 +2407,7 @@ fn handle_mouse(
         MouseEventKind::ScrollUp => {
             if contains(app.rect_main, x, y) {
                 app.focus = Focus::Main;
-                app.scroll_main_by(-3);
+                app.scroll_main_by(-3, full.is_some());
             } else if contains(app.rect_rail, x, y) {
                 app.focus = Focus::Rail;
                 rail_move(app, projects, runs, n_slots, -1);
@@ -2639,16 +2653,7 @@ fn draw(
         draw_rail(f, lay.rail, projects, runs, full, app, rail_state);
     }
     if lay.main.width > 0 {
-        draw_main(
-            f,
-            lay.main,
-            full,
-            stream_text,
-            activity,
-            diff_text,
-            !runs.is_empty(),
-            app,
-        );
+        draw_main(f, lay.main, full, stream_text, activity, diff_text, app);
     }
     draw_footer(f, lay.footer, app, full);
 
@@ -2748,6 +2753,11 @@ fn draw_labels(
         let total_w = (label_total + gap * n.saturating_sub(1)).min(area.width);
         let start_x = area.x + area.width.saturating_sub(total_w) / 2;
         let mut spans: Vec<Span> = Vec::with_capacity(tabs.len());
+        // Label glyph rects first, `gap` columns of dead space between each pair —
+        // then a second pass below pads each hit rect out into half of each
+        // neighboring gap, so a tap anywhere on the strip lands on a tab (U11's touch
+        // requirement) rather than only on the glyphs themselves.
+        let mut glyphs: Vec<(MainTab, u16, u16)> = Vec::with_capacity(tabs.len());
         let mut x = start_x;
         let n_tabs = tabs.len();
         for (i, (tab, text, style)) in tabs.into_iter().enumerate() {
@@ -2761,15 +2771,7 @@ fn draw_labels(
             if w == 0 {
                 break;
             }
-            app.main_tabs.push((
-                Rect {
-                    x,
-                    y: area.y,
-                    width: w,
-                    height: 1,
-                },
-                tab,
-            ));
+            glyphs.push((tab, x, w));
             spans.push(Span::styled(text, style));
             x = x.saturating_add(w);
             if i + 1 < n_tabs {
@@ -2778,6 +2780,28 @@ fn draw_labels(
                     spans.push(Span::raw(" ".repeat(gap as usize)));
                 }
             }
+        }
+        let n_glyphs = glyphs.len();
+        for (i, (tab, gx, gw)) in glyphs.into_iter().enumerate() {
+            let left = if i == 0 {
+                area.x
+            } else {
+                gx.saturating_sub(gap / 2)
+            };
+            let right = if i + 1 == n_glyphs {
+                area.right()
+            } else {
+                gx + gw + gap.saturating_sub(gap / 2)
+            };
+            app.main_tabs.push((
+                Rect {
+                    x: left,
+                    y: area.y,
+                    width: right.saturating_sub(left),
+                    height: 1,
+                },
+                tab,
+            ));
         }
         let line = Rect {
             x: start_x,
@@ -3585,20 +3609,6 @@ fn draw_header(
             spans.push(Span::styled(" dry-run ", chip(WARN)));
         }
     }
-    // At a gate the buttons on the right and the footer already say what to press;
-    // repeating it here only crowds the breadcrumb.
-    if !cue.is_empty() && buttons.is_empty() {
-        spans.push(Span::styled(" · ", muted()));
-        spans.push(Span::styled(
-            cue,
-            Style::default().fg(cue_fg).add_modifier(if wash.is_some() {
-                Modifier::BOLD
-            } else {
-                Modifier::empty()
-            }),
-        ));
-    }
-
     // Right cluster: the fleet roll-up ("what needs me?", independent of the rail
     // selection) and the unread human-alert count.
     let mut right: Vec<Span> = Vec::new();
@@ -3632,6 +3642,27 @@ fn draw_header(
     let right_x = right_limit.saturating_sub(right_w + 1).max(area.x);
 
     let left_w = right_x.saturating_sub(area.x);
+
+    // At a gate the buttons on the right and the footer already say what to press;
+    // repeating it here only crowds the breadcrumb. And like the run breadcrumb
+    // above, a cue that cannot fit whole is omitted rather than shown truncated —
+    // Main renders the same wording in full, so a clipped fragment here would just
+    // be a second, disagreeing spelling of it (round-4 review finding).
+    if !cue.is_empty() && buttons.is_empty() {
+        let base_w: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+        let cue_w = 3 + cue.chars().count() as u16; // " · " + cue
+        if base_w + cue_w <= left_w {
+            spans.push(Span::styled(" · ", muted()));
+            spans.push(Span::styled(
+                cue,
+                Style::default().fg(cue_fg).add_modifier(if wash.is_some() {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+            ));
+        }
+    }
     f.render_widget(
         Paragraph::new(Line::from(fit_spans(spans, left_w))),
         Rect {
@@ -4011,7 +4042,6 @@ fn draw_main(
     stream_text: &str,
     activity: &[String],
     diff_text: &str,
-    has_runs: bool,
     app: &mut App,
 ) {
     if area.width == 0 || area.height == 0 {
@@ -4033,20 +4063,17 @@ fn draw_main(
         return;
     }
 
-    // With no run selected, every tab's own body (the timeline, the artifacts list,
-    // the terminal) has nothing real to show — Log's already-coherent empty message
-    // (has_runs-aware) is the one story every tab tells instead of each inventing its
-    // own. Shell only joins that story when there are no runs anywhere yet: once a run
-    // exists, its workspace shell is a legitimate always-available terminal, not stale
-    // run content.
-    let nothing_to_run = full.is_none() && !has_runs;
+    // With no run selected, Log/Activity/Diff have nothing real to show — Log's
+    // already-coherent empty message is the one story all three tell instead of each
+    // inventing its own. Shell never joins that story: it is project-scoped, not
+    // run-scoped (see `manage_terminal`), so it always shows the real workspace
+    // terminal regardless of run count.
     match app.main_tab {
         MainTab::Log => draw_log_body(f, inner, full, stream_text, app),
         MainTab::Activity if full.is_none() => draw_log_body(f, inner, full, stream_text, app),
         MainTab::Activity => draw_activity_body(f, inner, activity, app),
         MainTab::Diff if full.is_none() => draw_log_body(f, inner, full, stream_text, app),
         MainTab::Diff => draw_diff_body(f, inner, diff_text, app),
-        MainTab::Shell if nothing_to_run => draw_log_body(f, inner, full, stream_text, app),
         MainTab::Shell => draw_shell_body(f, inner, app),
     }
 }
@@ -5045,7 +5072,14 @@ fn wrap_line_preserve(line: &str, width: usize) -> Vec<String> {
                 }
             }
         }
-        rows.push(chars[start..end].iter().collect());
+        let row: String = chars[start..end].iter().collect();
+        // A break search that lands inside leading indentation (width small enough
+        // that the nearest space behind `end` is part of the indent, not a word gap)
+        // produces a row of pure whitespace — drop it rather than growing the overlay
+        // with a blank line indentation alone accounts for.
+        if !row.is_empty() && !row.chars().all(|c| c == ' ') {
+            rows.push(row);
+        }
         start = end;
         while start < chars.len() && chars[start] == ' ' {
             start += 1;
@@ -5161,15 +5195,10 @@ fn terminal_dims(rect: Rect) -> (u16, u16) {
 /// lazily while the Shell tab is up, and pump live output into the vt100 buffer every
 /// frame. The pane is project-scoped, not run-scoped: by default it shows the
 /// project's persistent workspace shell.
-fn manage_terminal(app: &mut App, project_root: &Path, has_runs: bool) {
+fn manage_terminal(app: &mut App, project_root: &Path) {
     // Nothing to do until the Shell tab is opened; avoids forking tmux every frame
     // while the operator is on another tab.
     if app.main_tab != MainTab::Shell && app.terminal_pane.is_none() {
-        return;
-    }
-    // With no runs anywhere yet, Shell joins the rest of Main's unified empty state
-    // (draw_main) instead of quietly opening an unrelated workspace shell behind it.
-    if !has_runs && app.terminal_pane.is_none() {
         return;
     }
     if !tmux::available() {
@@ -6153,6 +6182,52 @@ mod labels {
         assert_eq!(app.main_tab, MainTab::Activity);
         assert_eq!(app.focus, Focus::Main);
         assert!(!app.shell_active());
+    }
+
+    /// The help overlay sizes to its content, so on a tall enough terminal it covers
+    /// the tab strip underneath it. A tap meant to dismiss help must not fall through
+    /// to the strip's hit-test and silently change the active tab instead.
+    #[test]
+    fn tapping_help_over_the_tab_strip_dismisses_help_not_the_tab() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let swarm = SparPaths::new("/x");
+        let mut app = App::new(None, Config::default(), true);
+        app.open_main(MainTab::Log);
+        app.show_help = true;
+        // A tab-strip rect that would normally win the hit-test if help were not
+        // checked first.
+        app.main_tabs = vec![(
+            Rect {
+                x: 1,
+                y: 2,
+                width: 5,
+                height: 1,
+            },
+            MainTab::Activity,
+        )];
+        let mut root = PathBuf::from("/x");
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            &swarm,
+            &[],
+            &[],
+            None,
+            &mut root,
+            None,
+            0,
+        );
+        assert!(!app.show_help, "tap on the overlay must dismiss it");
+        assert_eq!(
+            app.main_tab,
+            MainTab::Log,
+            "tap on the overlay must not fall through to the tab strip underneath it"
+        );
     }
 
     #[test]
@@ -7499,6 +7574,27 @@ mod render_stability {
         assert_eq!(wrap_line_preserve("abc", 0), vec!["abc".to_string()]);
     }
 
+    /// A narrow enough width can put the break search's nearest space inside the
+    /// line's own leading indentation rather than a word gap — that used to emit a
+    /// whitespace-only row ahead of the real content, inflating the overlay's height
+    /// with a blank line indentation alone accounted for.
+    #[test]
+    fn wrap_line_preserve_never_emits_a_whitespace_only_row() {
+        let rows = wrap_line_preserve("    Rail   projects", 5);
+        for row in &rows {
+            assert!(
+                !row.chars().all(|c| c == ' '),
+                "blank row from indentation alone: {rows:?}"
+            );
+        }
+        let rejoined: String = rows.concat();
+        assert_eq!(
+            rejoined.chars().filter(|c| *c != ' ').collect::<String>(),
+            "Railprojects",
+            "no non-space character was dropped along with the indentation: {rows:?}"
+        );
+    }
+
     /// AC-1's wrap path: the original lock only ran at a width wide enough that the
     /// longest `HELP_BODY` line never took the wrapping branch. Scan both the
     /// unscrolled top and the scrolled-to-max bottom so every wrapped row is checked.
@@ -7680,6 +7776,55 @@ mod render_stability {
         assert!(has_scrollbar(&long), "content overflows, thumb expected");
     }
 
+    /// Without a run selected, Activity and Diff fall back to the same overview body
+    /// Log uses (`draw_main`'s `full.is_none()` branch, which paints `stream_*` via
+    /// `draw_log_body`). Scroll input has to follow that body — `stream_scroll` —
+    /// instead of the run-scoped `bus_scroll`/`diff_scroll` those tabs normally own,
+    /// or the rendered scrollbar silently stops responding to j/k/G once a run is
+    /// deselected (a scrollbar promising an affordance that isn't wired).
+    #[test]
+    fn overview_tabs_scroll_the_overview_body_not_run_scoped_state() {
+        let mut app = App::new(None, Config::default(), true);
+        app.stream_max = 50;
+        app.bus_max = 50;
+        app.diff_max = 50;
+
+        app.main_tab = MainTab::Activity;
+        app.scroll_main_by(10, false);
+        assert_eq!(
+            app.stream_scroll, 10,
+            "Activity's overview body must scroll stream_scroll"
+        );
+        assert_eq!(
+            app.bus_scroll, 0,
+            "Activity's overview body must not touch bus_scroll"
+        );
+
+        app.main_tab = MainTab::Diff;
+        app.scroll_main_by(10, false);
+        assert_eq!(
+            app.stream_scroll, 20,
+            "Diff's overview body must scroll stream_scroll"
+        );
+        assert_eq!(
+            app.diff_scroll, 0,
+            "Diff's overview body must not touch diff_scroll"
+        );
+
+        // Once a run is selected, Activity/Diff render their own bodies again and own
+        // their own run-scoped scroll state.
+        app.main_tab = MainTab::Activity;
+        app.scroll_main_by(10, true);
+        assert_eq!(
+            app.bus_scroll, 10,
+            "Activity with a run selected must scroll bus_scroll"
+        );
+        assert_eq!(
+            app.stream_scroll, 20,
+            "must not touch stream_scroll once a run is selected"
+        );
+    }
+
     /// The gap between adjacent Main tab labels must be the same everywhere — it used
     /// to jump from 4 to 8 columns around Activity's alert-badge slot, and the narrow
     /// strip had its own, differently uneven spacing.
@@ -7786,9 +7931,13 @@ mod render_stability {
             assert_rects_cover_labels("wide", &wide.starts, &wide.rects, n);
 
             let narrow = probe(79, n);
+            // Narrow has no baked-in padding to reserve for a bigger touch target, so
+            // its hit rects are instead padded out to split each glyph gap with the
+            // neighbor on either side — the strip tiles edge to edge with zero dead
+            // columns between rects, rather than a uniform *nonzero* rect gap.
             assert!(
-                narrow.rect_gaps.windows(2).all(|w| w[0] == w[1]) && narrow.rect_gaps[0] > 0,
-                "narrow tab gaps not uniform (human_alerts_n={n}): {:?}",
+                narrow.rect_gaps.iter().all(|&g| g == 0),
+                "narrow tab strip has dead columns between rects (human_alerts_n={n}): {:?}",
                 narrow.rect_gaps
             );
             assert_rects_cover_labels("narrow", &narrow.starts, &narrow.rects, n);
@@ -7835,15 +7984,17 @@ mod render_stability {
             let row_chars: Vec<char> = row.chars().collect();
             for (i, (rect, tab)) in app.main_tabs.iter().enumerate() {
                 let expected = labels[i];
-                let at_rect: String = row_chars
+                let window: String = row_chars
                     .iter()
                     .skip(rect.x as usize)
-                    .take(expected.chars().count())
+                    .take(rect.width as usize)
                     .collect();
-                assert_eq!(
-                    at_rect, expected,
-                    "width {width}: rect for {tab:?} at x={} does not match painted label (row: {row:?})",
-                    rect.x
+                assert!(
+                    window.contains(expected),
+                    "width {width}: rect for {tab:?} (x={}, w={}) does not cover painted label \
+                     {expected:?} (row: {row:?})",
+                    rect.x,
+                    rect.width
                 );
             }
         }
@@ -7881,73 +8032,99 @@ mod render_stability {
             "nothing to select with zero runs: {text:?}"
         );
 
-        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
-        let swarm = SparPaths::new("/x");
-        let mut app = App::new(None, Config::default(), true);
-        let mut rail = ListState::default();
-        term.draw(|f| {
-            draw(
-                f,
-                &swarm,
-                &[],
-                &[],
-                None,
-                &text,
-                &[],
-                "",
-                &mut app,
-                &mut rail,
-            )
-        })
-        .unwrap();
+        // Swept across widths, not just 120: a round-4 review finding was that the
+        // "identical wording" invariant below only held at 120 columns — the header's
+        // cue is long enough (`describe the change`) that the gate zone at 90 columns
+        // used to truncate it with an ellipsis while Main showed the same command in
+        // full, i.e. two different renderings of the same CTA on screen at once. The
+        // header must now omit a cue it cannot show whole rather than truncate it
+        // (same "omit rather than contradict" rule the run breadcrumb already follows
+        // a few lines up in `draw_header`). Below 90, Main's own pane column is
+        // narrow enough that its body starts trimming the long CTA line on its own
+        // (the pre-existing, unrelated "trim" log mode) — nothing to compare the
+        // header against there, so that band is excluded rather than asserting
+        // Main's line wrapping never trims, which is out of this fix's scope.
+        for width in [90u16, 120] {
+            let mut term = Terminal::new(TestBackend::new(width, 30)).unwrap();
+            let swarm = SparPaths::new("/x");
+            let mut app = App::new(None, Config::default(), true);
+            let mut rail = ListState::default();
+            term.draw(|f| {
+                draw(
+                    f,
+                    &swarm,
+                    &[],
+                    &[],
+                    None,
+                    &text,
+                    &[],
+                    "",
+                    &mut app,
+                    &mut rail,
+                )
+            })
+            .unwrap();
 
-        let header = row(&term, 0);
-        assert!(
-            !header.contains("run —"),
-            "incoherent breadcrumb: {header:?}"
-        );
-        assert!(header.contains("no runs"), "header: {header:?}");
+            let header = row(&term, 0);
+            assert!(
+                !header.contains("run —"),
+                "width {width}: incoherent breadcrumb: {header:?}"
+            );
 
-        let whole: String = {
+            let whole: String = {
+                let buf = term.backend().buffer();
+                (0..30)
+                    .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            assert!(
+                whole.contains("(no runs)"),
+                "width {width}: rail: {whole:?}"
+            );
+            assert!(
+                !whole.contains("Bash"),
+                "width {width}: stale log content: {whole:?}"
+            );
+
+            // One coherent call to action. Header and Main both surface the same plan
+            // command (reinforcement, not incoherence) — but they used to phrase it
+            // two different ways (`"…"` vs `"describe the change"`, a round-2
+            // regression), and the context band offered a second, contradictory one:
+            // the palette's `plan` command needs an existing run to reuse a fleet
+            // from, so "press :" cannot bootstrap the very first run.
+            let cta = "spar plan -t \"describe the change\" --providers cli:claude";
+            assert_eq!(
+                whole.matches(cta).count(),
+                whole.matches("spar plan -t").count(),
+                "width {width}: every occurrence of the plan CTA must use identical wording: {whole:?}"
+            );
+            assert!(
+                !whole.contains("press :"),
+                "width {width}: the command palette cannot start a first run with zero runs to reuse a fleet from: {whole:?}"
+            );
+
+            let inner = app.rect_main_inner;
+            let x = inner.right().saturating_sub(1);
             let buf = term.backend().buffer();
-            (0..30)
-                .map(|y| (0..120).map(|x| buf[(x, y)].symbol()).collect::<String>())
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        assert!(whole.contains("(no runs)"), "rail: {whole:?}");
-        assert!(!whole.contains("Bash"), "stale log content: {whole:?}");
-
-        // One coherent call to action. Header and Main both surface the same plan
-        // command (reinforcement, not incoherence) — but they used to phrase it two
-        // different ways (`"…"` vs `"describe the change"`, a round-2 regression), and
-        // the context band offered a second, contradictory one: the palette's `plan`
-        // command needs an existing run to reuse a fleet from, so "press :" cannot
-        // bootstrap the very first run.
-        let cta = "spar plan -t \"describe the change\" --providers cli:claude";
-        assert_eq!(
-            whole.matches(cta).count(),
-            whole.matches("spar plan -t").count(),
-            "every occurrence of the plan CTA must use identical wording: {whole:?}"
-        );
-        assert!(
-            !whole.contains("press :"),
-            "the command palette cannot start a first run with zero runs to reuse a fleet from: {whole:?}"
-        );
-
-        let inner = app.rect_main_inner;
-        let x = inner.right().saturating_sub(1);
-        let buf = term.backend().buffer();
-        let scrollbar = (inner.top()..inner.bottom()).any(|y| {
-            let sym = buf[(x, y)].symbol();
-            sym == "┃" || sym == "│"
-        });
-        assert!(!scrollbar, "no content to scroll in the empty state");
+            let scrollbar = (inner.top()..inner.bottom()).any(|y| {
+                let sym = buf[(x, y)].symbol();
+                sym == "┃" || sym == "│"
+            });
+            assert!(
+                !scrollbar,
+                "width {width}: no content to scroll in the empty state"
+            );
+        }
     }
 
     /// The same coherent empty-state text (not a tab-specific message, and not stale
-    /// chrome) must show on every Main tab when there are no runs at all — Activity,
-    /// Diff and Shell used to each tell their own, different story.
+    /// chrome) must show on Log, Activity and Diff when there are no runs at all —
+    /// they used to each tell their own, different story. Shell is the one deliberate
+    /// exception: it is project-scoped, not run-scoped (`manage_terminal`'s doc
+    /// comment), so it keeps showing its own real workspace-shell body regardless of
+    /// run count — that is a live surface, not stale content, and its caption must
+    /// agree with what it shows rather than claim "no runs" over a working shell.
     #[test]
     fn empty_state_is_uniform_across_every_main_tab() {
         let text = stream_content(
@@ -7957,12 +8134,7 @@ mod render_stability {
             &mut LogCache::empty(),
             false,
         );
-        for tab in [
-            MainTab::Log,
-            MainTab::Activity,
-            MainTab::Diff,
-            MainTab::Shell,
-        ] {
+        for tab in [MainTab::Log, MainTab::Activity, MainTab::Diff] {
             let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
             let swarm = SparPaths::new("/x");
             let mut app = App::new(None, Config::default(), true);
@@ -7995,10 +8167,6 @@ mod render_stability {
                 "{tab:?} did not show the unified empty state: {whole:?}"
             );
             assert!(
-                !whole.contains("Opening a real tmux client"),
-                "{tab:?} must not open the workspace shell with zero runs: {whole:?}"
-            );
-            assert!(
                 !whole.contains("No run selected"),
                 "{tab:?} fell back to its own stale message instead of the unified one: {whole:?}"
             );
@@ -8015,6 +8183,48 @@ mod render_stability {
                 "{tab:?}: no content to scroll in the empty state"
             );
         }
+
+        // Shell: real workspace-shell hint body, unconditionally, with a caption that
+        // agrees with it — never the unified "no runs" message behind it.
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let swarm = SparPaths::new("/x");
+        let mut app = App::new(None, Config::default(), true);
+        app.open_main(MainTab::Shell);
+        let mut rail = ListState::default();
+        term.draw(|f| {
+            draw(
+                f,
+                &swarm,
+                &[],
+                &[],
+                None,
+                &text,
+                &[],
+                "",
+                &mut app,
+                &mut rail,
+            )
+        })
+        .unwrap();
+        let whole: String = {
+            let buf = term.backend().buffer();
+            (0..30)
+                .map(|y| (0..120).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            whole.contains("Opening a real tmux client"),
+            "Shell must keep showing its own workspace-shell body with zero runs: {whole:?}"
+        );
+        assert!(
+            !whole.contains("No runs yet"),
+            "Shell must not show the Log/Activity/Diff empty state behind its own body: {whole:?}"
+        );
+        assert!(
+            whole.contains("shell ·"),
+            "Shell's caption must agree with its body, not the unified empty state: {whole:?}"
+        );
     }
 }
 
