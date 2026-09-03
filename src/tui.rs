@@ -791,6 +791,50 @@ fn clamp_scroll(scroll: &mut u16, follow: &mut bool, max: u16) {
     }
 }
 
+/// Test fixture: an `App` pinned to the **Runs** level, which is where every
+/// pre-Home render test means to be. `App::new` now always lands on `Home`
+/// (feature 004 Phase C), so a test that wants a project's run list has to say so.
+#[cfg(test)]
+fn test_app() -> App {
+    let mut app = App::new(None, Config::default(), Some(Path::new("/x")));
+    app.browse = BrowseLevel::Runs;
+    app
+}
+
+/// Test fixture: the Phase D new-run modal, open on a real target project with a
+/// two-entry roster and one provider picked. Shared by `render_stability` (overlay
+/// sweep) and `home_ia` (picker semantics).
+#[cfg(test)]
+fn new_run_fixture() -> NewRun {
+    NewRun {
+        project: Some(PathBuf::from("/nonexistent/spar")),
+        projects: vec![
+            PathBuf::from("/nonexistent/spar"),
+            PathBuf::from("/nonexistent/acme-api"),
+        ],
+        task: "stop prose mentions creating phantom criteria".into(),
+        roster: vec![
+            RosterEntry {
+                choice: RosterChoice::Provider("cli:claude@opus".into()),
+                label: "cli:claude@opus".into(),
+                available: true,
+                reason: None,
+                source: RosterSource::Configured,
+            },
+            RosterEntry {
+                choice: RosterChoice::Provider("cli:codex".into()),
+                label: "cli:codex".into(),
+                available: true,
+                reason: None,
+                source: RosterSource::Detected,
+            },
+        ],
+        picked: vec![0],
+        field: NewRunField::Fleet,
+        sel: 0,
+    }
+}
+
 /// How often the background thread re-reads the run state from disk.
 const REFRESH: Duration = Duration::from_millis(200);
 /// Upper bound on how long the render thread sleeps; also the animation rate.
@@ -6188,7 +6232,7 @@ mod labels {
     fn clicking_a_tab_escapes_the_shell() {
         use crossterm::event::{MouseEvent, MouseEventKind};
         let swarm = SparPaths::new("/x");
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         app.open_main(MainTab::Shell);
         app.main_tabs = vec![
             (
@@ -6245,7 +6289,7 @@ mod labels {
     fn tapping_help_over_the_tab_strip_dismisses_help_not_the_tab() {
         use crossterm::event::{MouseEvent, MouseEventKind};
         let swarm = SparPaths::new("/x");
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         app.open_main(MainTab::Log);
         app.show_help = true;
         // A tab-strip rect that would normally win the hit-test if help were not
@@ -6285,22 +6329,30 @@ mod labels {
     }
 
     #[test]
-    fn rail_pop_never_leaves_projects() {
-        let mut app = App::new(None, Config::default(), true);
+    fn rail_pop_never_leaves_home() {
+        let mut app = test_app();
         app.browse = BrowseLevel::Agents;
         app.rail_pop();
         assert_eq!(app.browse, BrowseLevel::Runs);
         app.rail_pop();
-        assert_eq!(app.browse, BrowseLevel::Projects);
+        assert_eq!(
+            app.browse,
+            BrowseLevel::Home,
+            "Runs pops to Home, not Projects"
+        );
         // Root: Esc is a no-op, never an exit.
         app.rail_pop();
-        assert_eq!(app.browse, BrowseLevel::Projects);
+        assert_eq!(app.browse, BrowseLevel::Home);
         assert_eq!(app.focus, Focus::Rail);
+        // Projects survives as navigation reachable from Home, and pops back to it.
+        app.browse = BrowseLevel::Projects;
+        app.rail_pop();
+        assert_eq!(app.browse, BrowseLevel::Home);
     }
 
     #[test]
     fn shell_active_only_on_focused_main_shell_tab() {
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         assert!(!app.shell_active());
         app.main_tab = MainTab::Shell;
         assert!(!app.shell_active(), "rail focus keeps keys in spar");
@@ -6313,7 +6365,7 @@ mod labels {
     #[test]
     fn takeover_opens_the_shell_tab() {
         use crate::cli::WorkflowKind;
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         app.open_main(MainTab::Shell);
         assert_eq!(app.focus, Focus::Main);
         assert_eq!(app.main_tab, MainTab::Shell);
@@ -6324,10 +6376,10 @@ mod labels {
             "cli:claude",
             crate::state::SlotRole::Implementer,
         ));
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         app.browse = BrowseLevel::Agents;
         let mut root = PathBuf::from("/x");
-        rail_enter(&mut app, &[], &[], Some(&st), &mut root);
+        rail_enter(&mut app, &[], &[], &[], Some(&st), &mut root);
         assert!(app.takeover_target.is_none());
         assert_eq!(app.focus, Focus::Rail, "headless run: nothing to take over");
     }
@@ -6391,7 +6443,7 @@ mod labels {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let mut term = Terminal::new(TestBackend::new(90, 3)).unwrap();
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         let buttons = vec![
             ("Approve", GateAction::Approve),
             ("Reject", GateAction::Reject),
@@ -6428,7 +6480,7 @@ mod labels {
         };
         let first_x = |buttons: Vec<(&str, GateAction)>| {
             let mut term = Terminal::new(TestBackend::new(120, 1)).unwrap();
-            let mut app = App::new(None, Config::default(), true);
+            let mut app = test_app();
             term.draw(|f| render_gate_buttons(f, area, &mut app, &buttons))
                 .unwrap();
             app.gate_buttons[0].0.x
@@ -6467,7 +6519,7 @@ mod labels {
         let swarm = SparPaths::new("/x/a-project-with-a-long-name");
         for w in 30..=140u16 {
             let mut term = Terminal::new(TestBackend::new(w, 1)).unwrap();
-            let mut app = App::new(None, Config::default(), true);
+            let mut app = test_app();
             app.human_alerts_n = 7;
             term.draw(|f| {
                 let area = f.area();
@@ -6496,7 +6548,7 @@ mod labels {
         st.phase = Phase::AwaitingWinnerConfirm;
         let swarm = SparPaths::new("/x");
         let mut term = Terminal::new(TestBackend::new(120, 1)).unwrap();
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         app.human_alerts_n = 2;
         term.draw(|f| {
             let area = f.area();
@@ -6525,7 +6577,7 @@ mod labels {
         let st = RunState::new("run1", WorkflowKind::Loop, std::path::PathBuf::from("/x"));
         let swarm = SparPaths::new("/x");
         let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         app.human_alerts_n = 3;
         app.open_main(MainTab::Activity);
         let lay = layout_rects(
@@ -6764,7 +6816,7 @@ mod labels {
 
     #[test]
     fn slash_opens_filter_and_esc_clears_it() {
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         let sw = SparPaths::new(std::path::Path::new("/x"));
         let mut root = PathBuf::from("/x");
         // `/` opens the filter editor with focus on the rail.
@@ -6814,7 +6866,7 @@ mod labels {
 
     #[test]
     fn colon_opens_palette_and_q_quits() {
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         let sw = SparPaths::new(std::path::Path::new("/x"));
         let mut root = PathBuf::from("/x");
         // q quits from a normal context.
@@ -6915,19 +6967,19 @@ mod labels {
             summary_phase("r1", Phase::Review),
             summary_phase("r2", Phase::AwaitingPlanApproval),
         ];
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         app.browse = BrowseLevel::Runs;
         app.selected_run = 0;
-        jump_to_attention(&mut app, &runs);
+        jump_to_attention(&mut app, &runs, &[]);
         assert_eq!(app.selected_run, 2, "lands on the gated run");
         // From the gate it wraps and, finding no other, stays put.
-        jump_to_attention(&mut app, &runs);
+        jump_to_attention(&mut app, &runs, &[]);
         assert_eq!(app.selected_run, 2);
     }
 
     #[test]
     fn toasts_prime_silently_then_fire_on_transition() {
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         // First snapshot only primes: an existing gate is NOT toasted.
         let runs = vec![summary_phase("r0", Phase::AwaitingPlanApproval)];
         emit_attention_toasts(&mut app, &runs);
@@ -7003,7 +7055,7 @@ mod render_stability {
     ) -> Terminal<TestBackend> {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         let swarm = SparPaths::new("/x");
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         tweak(&mut app);
         let mut rail = ListState::default();
         term.draw(|f| {
@@ -7016,6 +7068,7 @@ mod render_stability {
                 "→ Bash  read the contract\n← ✓ toolu_01HqnTTSQH5m7ZWYJVAtA7Vj ok\n",
                 &["§Timeline".into(), " 19:04 impl done".into()],
                 "diff",
+                &HomeData::default(),
                 &mut app,
                 &mut rail,
             )
@@ -7080,7 +7133,7 @@ mod render_stability {
                 .collect();
         let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
         let swarm = SparPaths::new("/x");
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         app.open_projects_view();
         let mut rail = ListState::default();
         term.draw(|f| {
@@ -7093,6 +7146,7 @@ mod render_stability {
                 "",
                 &[],
                 "",
+                &HomeData::default(),
                 &mut app,
                 &mut rail,
             )
@@ -7153,7 +7207,7 @@ mod render_stability {
         let tabs_x = |tab: MainTab, alerts: usize| {
             let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
             let swarm = SparPaths::new("/x");
-            let mut app = App::new(None, Config::default(), true);
+            let mut app = test_app();
             app.open_main(tab);
             app.human_alerts_n = alerts;
             let mut rail = ListState::default();
@@ -7167,6 +7221,7 @@ mod render_stability {
                     "",
                     &[],
                     "",
+                    &HomeData::default(),
                     &mut app,
                     &mut rail,
                 )
@@ -7574,7 +7629,7 @@ mod render_stability {
 
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
         let swarm = SparPaths::new("/x");
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         let mut rail = ListState::default();
         term.draw(|f| {
             draw(
@@ -7586,6 +7641,7 @@ mod render_stability {
                 "",
                 &[],
                 "",
+                &HomeData::default(),
                 &mut app,
                 &mut rail,
             )
@@ -7796,7 +7852,7 @@ mod render_stability {
         let has_scrollbar = |text: &str| {
             let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
             let swarm = SparPaths::new("/x");
-            let mut app = App::new(None, Config::default(), true);
+            let mut app = test_app();
             app.open_main(MainTab::Diff);
             let mut rail = ListState::default();
             term.draw(|f| {
@@ -7809,6 +7865,7 @@ mod render_stability {
                     "",
                     &[],
                     text,
+                    &HomeData::default(),
                     &mut app,
                     &mut rail,
                 )
@@ -7838,7 +7895,7 @@ mod render_stability {
     /// deselected (a scrollbar promising an affordance that isn't wired).
     #[test]
     fn overview_tabs_scroll_the_overview_body_not_run_scoped_state() {
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         app.stream_max = 50;
         app.bus_max = 50;
         app.diff_max = 50;
@@ -7907,7 +7964,7 @@ mod render_stability {
         let probe = |width: u16, human_alerts_n: usize| -> Probe {
             let mut term = Terminal::new(TestBackend::new(width, 30)).unwrap();
             let swarm = SparPaths::new("/x");
-            let mut app = App::new(None, Config::default(), true);
+            let mut app = test_app();
             app.human_alerts_n = human_alerts_n;
             let area = Rect {
                 x: 0,
@@ -8019,7 +8076,7 @@ mod render_stability {
             for &n in &[0usize, 3] {
                 let mut term = Terminal::new(TestBackend::new(width, 30)).unwrap();
                 let swarm = SparPaths::new("/x");
-                let mut app = App::new(None, Config::default(), true);
+                let mut app = test_app();
                 app.human_alerts_n = n;
                 app.main_tab = MainTab::Log;
                 let area = Rect {
@@ -8069,7 +8126,7 @@ mod render_stability {
             for &alerts in &[0usize, 3] {
                 let mut term = Terminal::new(TestBackend::new(width, 30)).unwrap();
                 let swarm = SparPaths::new("/x");
-                let mut app = App::new(None, Config::default(), true);
+                let mut app = test_app();
                 app.human_alerts_n = alerts;
                 let area = Rect {
                     x: 0,
@@ -8126,7 +8183,7 @@ mod render_stability {
             for &alerts in &[0usize, 3, 12] {
                 let mut term = Terminal::new(TestBackend::new(width, 30)).unwrap();
                 let swarm = SparPaths::new("/x");
-                let mut app = App::new(None, Config::default(), true);
+                let mut app = test_app();
                 app.human_alerts_n = alerts;
                 let area = Rect {
                     x: 0,
@@ -8198,7 +8255,7 @@ mod render_stability {
         for width in [90u16, 120] {
             let mut term = Terminal::new(TestBackend::new(width, 30)).unwrap();
             let swarm = SparPaths::new("/x");
-            let mut app = App::new(None, Config::default(), true);
+            let mut app = test_app();
             let mut rail = ListState::default();
             term.draw(|f| {
                 draw(
@@ -8210,6 +8267,7 @@ mod render_stability {
                     &text,
                     &[],
                     "",
+                    &HomeData::default(),
                     &mut app,
                     &mut rail,
                 )
@@ -8288,7 +8346,7 @@ mod render_stability {
         for tab in [MainTab::Log, MainTab::Activity, MainTab::Diff] {
             let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
             let swarm = SparPaths::new("/x");
-            let mut app = App::new(None, Config::default(), true);
+            let mut app = test_app();
             app.open_main(tab);
             let mut rail = ListState::default();
             term.draw(|f| {
@@ -8301,6 +8359,7 @@ mod render_stability {
                     &text,
                     &[],
                     "",
+                    &HomeData::default(),
                     &mut app,
                     &mut rail,
                 )
@@ -8339,7 +8398,7 @@ mod render_stability {
         // agrees with it — never the unified "no runs" message behind it.
         let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
         let swarm = SparPaths::new("/x");
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         app.open_main(MainTab::Shell);
         let mut rail = ListState::default();
         term.draw(|f| {
@@ -8352,6 +8411,7 @@ mod render_stability {
                 &text,
                 &[],
                 "",
+                &HomeData::default(),
                 &mut app,
                 &mut rail,
             )
@@ -8396,7 +8456,7 @@ mod render_stability {
         for width in [50u16, 79] {
             let mut term = Terminal::new(TestBackend::new(width, 20)).unwrap();
             let swarm = SparPaths::new("/x");
-            let mut app = App::new(None, Config::default(), true);
+            let mut app = test_app();
             let mut rail = ListState::default();
             term.draw(|f| {
                 draw(
@@ -8408,6 +8468,7 @@ mod render_stability {
                     &text,
                     &[],
                     "",
+                    &HomeData::default(),
                     &mut app,
                     &mut rail,
                 )
@@ -8432,6 +8493,625 @@ mod render_stability {
                 "width {width}: empty-state CTA unreachable: {whole:?}"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Feature 004 Phase C — Home landing view.
+    //
+    // Every test below paints at `BrowseLevel::Home` with `HomeData` supplied
+    // by hand: that *is* the U13 assertion. `draw` gets its rows and its
+    // per-project counts from the snapshot the refresher built off-thread, so
+    // these fixtures point at project roots that do not exist on disk and the
+    // paint still has to be correct.
+    // ---------------------------------------------------------------------
+
+    fn home_project(name: &str) -> registry::ProjectEntry {
+        registry::ProjectEntry {
+            root: PathBuf::from("/nonexistent").join(name),
+            name: Some(name.to_string()),
+            last_seen: Utc::now(),
+            last_run_id: None,
+        }
+    }
+
+    fn home_run(id: &str, phase: Phase, mins_ago: i64, project: &str) -> state::RunSummary {
+        state::RunSummary {
+            id: id.into(),
+            workflow: WorkflowKind::Loop,
+            archived: false,
+            phase,
+            updated_at: Utc::now() - chrono::Duration::minutes(mins_ago),
+            task: Some(format!("brief for {id}")),
+            dry_run: false,
+            abandoned: false,
+            parent_run: None,
+            round: 1,
+            legs: 1,
+            wants: 0,
+            base_ref: None,
+            base_commit: None,
+            project_root: Some(PathBuf::from("/nonexistent").join(project)),
+            project_name: Some(project.to_string()),
+        }
+    }
+
+    fn home_row(band: HomeBand, run: state::RunSummary, waited_mins: u64) -> HomeRow {
+        HomeRow::Run {
+            band,
+            run,
+            waited: Duration::from_secs(waited_mins * 60),
+        }
+    }
+
+    /// A Home fixture with one row in each of the first three bands.
+    fn home_data(projects: &[registry::ProjectEntry]) -> HomeData {
+        HomeData {
+            rows: vec![
+                HomeRow::Header(HomeBand::NeedsMe),
+                home_row(
+                    HomeBand::NeedsMe,
+                    home_run("gate0001", Phase::AwaitingShipConfirm, 90, "acme-api"),
+                    90,
+                ),
+                HomeRow::Header(HomeBand::Running),
+                home_row(
+                    HomeBand::Running,
+                    home_run("work0001", Phase::Review, 4, "spar"),
+                    4,
+                ),
+                HomeRow::Header(HomeBand::Finished),
+                home_row(
+                    HomeBand::Finished,
+                    home_run("done0001", Phase::Done, 20, "spar"),
+                    20,
+                ),
+                HomeRow::Header(HomeBand::StartNew),
+                HomeRow::NewRun,
+            ],
+            project_stats: projects
+                .iter()
+                .map(|_| ProjectStat {
+                    n_runs: 3,
+                    needs_you: 1,
+                })
+                .collect(),
+        }
+    }
+
+    fn paint_home(
+        w: u16,
+        h: u16,
+        projects: &[registry::ProjectEntry],
+        home: &HomeData,
+        tweak: impl Fn(&mut App),
+    ) -> Terminal<TestBackend> {
+        paint_home_app(w, h, projects, home, tweak).0
+    }
+
+    fn paint_home_app(
+        w: u16,
+        h: u16,
+        projects: &[registry::ProjectEntry],
+        home: &HomeData,
+        tweak: impl Fn(&mut App),
+    ) -> (Terminal<TestBackend>, App) {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let swarm = SparPaths::new("/x");
+        let mut app = App::new(None, Config::default(), None);
+        assert_eq!(app.browse, BrowseLevel::Home, "App::new must land on Home");
+        tweak(&mut app);
+        let mut rail = ListState::default();
+        term.draw(|f| {
+            draw(
+                f,
+                &swarm,
+                projects,
+                &[],
+                None,
+                "",
+                &[],
+                "",
+                home,
+                &mut app,
+                &mut rail,
+            )
+        })
+        .unwrap();
+        (term, app)
+    }
+
+    fn whole(term: &Terminal<TestBackend>) -> String {
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// AC-1. The same swept grid the pre-Home levels get, at the new landing
+    /// view, with the two self-sizing overlays (help, and Phase D's new-run
+    /// surface) opened at the cadence that caught the 30-column help panic.
+    #[test]
+    fn renders_home_at_every_size_without_panicking() {
+        let projects = [home_project("acme-api"), home_project("spar")];
+        let home = home_data(&projects);
+        for w in (1..=200).step_by(3) {
+            for h in (1..=60).step_by(2) {
+                paint_home(w, h, &projects, &home, |_| {});
+                if w % 9 == 1 {
+                    paint_home(w, h, &projects, &home, |a| a.show_help = true);
+                    paint_home(w, h, &projects, &home, |a| {
+                        a.palette = Some(Palette::default())
+                    });
+                    paint_home(w, h, &projects, &home, |a| {
+                        a.new_run = Some(new_run_fixture());
+                    });
+                }
+            }
+        }
+        for (w, h) in [
+            (1, 1),
+            (20, 5),
+            (79, 24),
+            (80, 24),
+            (89, 24),
+            (90, 24),
+            (119, 40),
+            (120, 40),
+            (200, 60),
+        ] {
+            paint_home(w, h, &projects, &home, |_| {});
+            paint_home(w, h, &[], &HomeData::default(), |_| {});
+        }
+    }
+
+    /// AC-2. Nothing registered, nothing run, no watermark: Home is still a
+    /// coherent screen. All four band headers, each band's own empty line, and
+    /// the `n` call to action reachable — including on the phone-width band
+    /// where the rail and Main do not coexist.
+    #[test]
+    fn home_renders_with_an_empty_everything() {
+        let empty = HomeData {
+            rows: vec![
+                HomeRow::Header(HomeBand::NeedsMe),
+                HomeRow::Header(HomeBand::Running),
+                HomeRow::Header(HomeBand::Finished),
+                HomeRow::Header(HomeBand::StartNew),
+                HomeRow::NewRun,
+            ],
+            project_stats: Vec::new(),
+        };
+        for (w, h) in [(120u16, 30u16), (90, 24), (79, 20), (50, 20), (20, 5)] {
+            let term = paint_home(w, h, &[], &empty, |_| {});
+            let text = whole(&term).to_lowercase();
+            if w >= 50 {
+                assert!(
+                    text.contains("needs you") || text.contains("needs me"),
+                    "{w}x{h}: band 1 header missing: {text:?}"
+                );
+                assert!(
+                    text.contains("new run") || text.contains("start something new"),
+                    "{w}x{h}: the `n` CTA must be reachable on an empty Home: {text:?}"
+                );
+            }
+            assert!(
+                !text.contains("no run selected"),
+                "{w}x{h}: stale pre-Home empty state: {text:?}"
+            );
+        }
+    }
+
+    /// AC-3. Scale: hundreds of folded units across several projects. The
+    /// paint completes, `NeedsMe` is never truncated, and a capped band says
+    /// so rather than silently dropping rows.
+    #[test]
+    fn home_renders_a_large_run_count() {
+        let projects = [
+            home_project("acme-api"),
+            home_project("spar"),
+            home_project("biddesk"),
+        ];
+        let mut rows = vec![HomeRow::Header(HomeBand::NeedsMe)];
+        for i in 0..(HOME_BAND_CAP + 12) {
+            rows.push(home_row(
+                HomeBand::NeedsMe,
+                home_run(
+                    &format!("gate{i:04}"),
+                    Phase::AwaitingPlanApproval,
+                    i as i64,
+                    "acme-api",
+                ),
+                i as u64,
+            ));
+        }
+        rows.push(HomeRow::Header(HomeBand::Running));
+        for i in 0..HOME_BAND_CAP {
+            rows.push(home_row(
+                HomeBand::Running,
+                home_run(&format!("work{i:04}"), Phase::Review, i as i64, "spar"),
+                i as u64,
+            ));
+        }
+        rows.push(HomeRow::More {
+            band: HomeBand::Running,
+            n: 300,
+        });
+        rows.push(HomeRow::Header(HomeBand::Finished));
+        rows.push(HomeRow::Header(HomeBand::StartNew));
+        rows.push(HomeRow::NewRun);
+
+        let needs_me = rows
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    HomeRow::Run {
+                        band: HomeBand::NeedsMe,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            needs_me > HOME_BAND_CAP,
+            "the NeedsMe band must not be capped: {needs_me} <= {HOME_BAND_CAP}"
+        );
+        let home = HomeData {
+            rows,
+            project_stats: projects
+                .iter()
+                .map(|_| ProjectStat {
+                    n_runs: 400,
+                    needs_you: 61,
+                })
+                .collect(),
+        };
+        let term = paint_home(120, 40, &projects, &home, |_| {});
+        let text = whole(&term);
+        assert!(text.contains("more"), "a capped band must say so: {text:?}");
+    }
+
+    /// AC-4. Layout stability: the four band headers are present, in band
+    /// order, whether or not their band has rows — so band 4 does not slide up
+    /// under the cursor when band 1 empties.
+    #[test]
+    fn home_band_headers_hold_their_order_and_never_disappear() {
+        let full = HomeData {
+            rows: vec![
+                HomeRow::Header(HomeBand::NeedsMe),
+                home_row(
+                    HomeBand::NeedsMe,
+                    home_run("gate0001", Phase::AwaitingShipConfirm, 90, "spar"),
+                    90,
+                ),
+                HomeRow::Header(HomeBand::Running),
+                home_row(
+                    HomeBand::Running,
+                    home_run("work0001", Phase::Review, 2, "spar"),
+                    2,
+                ),
+                HomeRow::Header(HomeBand::Finished),
+                home_row(
+                    HomeBand::Finished,
+                    home_run("done0001", Phase::Done, 8, "spar"),
+                    8,
+                ),
+                HomeRow::Header(HomeBand::StartNew),
+                HomeRow::NewRun,
+            ],
+            project_stats: Vec::new(),
+        };
+        let drained = HomeData {
+            rows: vec![
+                HomeRow::Header(HomeBand::NeedsMe),
+                HomeRow::Header(HomeBand::Running),
+                HomeRow::Header(HomeBand::Finished),
+                HomeRow::Header(HomeBand::StartNew),
+                HomeRow::NewRun,
+            ],
+            project_stats: Vec::new(),
+        };
+        // Main's body carries the four headers; assert on it directly so the
+        // ordering claim does not depend on the rail's viewport height.
+        for home in [&full, &drained] {
+            let body = home_overview(&home.rows, &HomeScope::All, Utc::now()).to_lowercase();
+            let idx = |needle: &str| {
+                body.find(needle)
+                    .unwrap_or_else(|| panic!("band header {needle:?} missing from: {body:?}"))
+            };
+            let a = idx("needs");
+            let b = idx("running");
+            let c = idx("finished");
+            let d = idx("start something new");
+            assert!(a < b && b < c && c < d, "bands out of order: {body:?}");
+        }
+        // Each empty band still says what is empty, on its own line.
+        let body = home_overview(&drained.rows, &HomeScope::All, Utc::now()).to_lowercase();
+        for phrase in [
+            "nothing needs you",
+            "nothing running",
+            "nothing finished since your last look",
+        ] {
+            assert!(body.contains(phrase), "missing {phrase:?} in: {body:?}");
+        }
+    }
+
+    /// AC-5. The rail's right-hand wait/age column does not move when the run
+    /// id next to it changes length.
+    #[test]
+    fn home_wait_column_does_not_move_with_row_content() {
+        let ts = Utc::now() - chrono::Duration::minutes(7);
+        let mut short = home_run("bb22", Phase::AwaitingPlanApproval, 0, "spar");
+        short.updated_at = ts;
+        short.task = Some("s".into());
+        let mut long = home_run("aaaa1111", Phase::AwaitingPlanApproval, 0, "spar");
+        long.updated_at = ts;
+        long.task = Some("a considerably longer brief for this unit of work".into());
+        let home = HomeData {
+            rows: vec![
+                HomeRow::Header(HomeBand::NeedsMe),
+                home_row(HomeBand::NeedsMe, short, 7 * 60),
+                home_row(HomeBand::NeedsMe, long, 7 * 60),
+                HomeRow::Header(HomeBand::Running),
+                HomeRow::Header(HomeBand::Finished),
+                HomeRow::Header(HomeBand::StartNew),
+                HomeRow::NewRun,
+            ],
+            project_stats: Vec::new(),
+        };
+        let (term, app) = paint_home_app(120, 30, &[], &home, |_| {});
+        let rail = app.rect_rail;
+        assert!(rail.width > 0, "the rail must be visible at 120 columns");
+        let buf = term.backend().buffer();
+        let last_glyph_x = |y: u16| -> Option<u16> {
+            (rail.x..rail.right())
+                .rev()
+                .find(|&x| buf[(x, y)].symbol().trim() != "")
+        };
+        let ends: Vec<u16> = (rail.y..rail.bottom())
+            .filter_map(|y| {
+                let line: String = (rail.x..rail.right())
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect();
+                if line.contains("bb22") || line.contains("aaaa1111") {
+                    last_glyph_x(y)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(ends.len(), 2, "both run rows must paint in the rail");
+        assert_eq!(
+            ends[0], ends[1],
+            "the wait column moved with the row's content"
+        );
+    }
+
+    /// AC-6. The `start something new` action row is always present and is the
+    /// first row of the last band, so `n` has a visible home no matter what
+    /// the other three bands hold.
+    #[test]
+    fn home_start_something_new_is_always_present() {
+        for home in [
+            home_data(&[]),
+            HomeData {
+                rows: vec![
+                    HomeRow::Header(HomeBand::NeedsMe),
+                    HomeRow::Header(HomeBand::Running),
+                    HomeRow::Header(HomeBand::Finished),
+                    HomeRow::Header(HomeBand::StartNew),
+                    HomeRow::NewRun,
+                ],
+                project_stats: Vec::new(),
+            },
+        ] {
+            let i = home
+                .rows
+                .iter()
+                .position(|r| matches!(r, HomeRow::Header(HomeBand::StartNew)))
+                .expect("band 4 header");
+            assert!(
+                matches!(home.rows.get(i + 1), Some(HomeRow::NewRun)),
+                "the new-run action row must follow band 4's header: {:?}",
+                &home.rows[i..]
+            );
+            assert!(
+                home.rows[i + 1..]
+                    .iter()
+                    .all(|r| matches!(r, HomeRow::NewRun | HomeRow::Project(_))),
+                "band 4 holds only the action row and the project list"
+            );
+        }
+    }
+
+    /// AC-7. U14's reserved chrome zones still hold at the new landing view:
+    /// painting the same run at Home and at the Runs level must not move the
+    /// gate-button zone or the Main tab strip.
+    #[test]
+    fn home_does_not_move_the_reserved_chrome_zones() {
+        let st = run_with(Phase::AwaitingShipConfirm, 7);
+        let probe = |level: BrowseLevel| -> (Vec<Rect>, Vec<Rect>) {
+            let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+            let swarm = SparPaths::new("/x");
+            let mut app = App::new(None, Config::default(), None);
+            app.browse = level;
+            let mut rail = ListState::default();
+            let home = home_data(&[]);
+            term.draw(|f| {
+                draw(
+                    f,
+                    &swarm,
+                    &[],
+                    &[],
+                    Some(&st),
+                    "",
+                    &[],
+                    "",
+                    &home,
+                    &mut app,
+                    &mut rail,
+                )
+            })
+            .unwrap();
+            (
+                app.gate_buttons.iter().map(|(r, _)| *r).collect(),
+                app.main_tabs.iter().map(|(r, _)| *r).collect(),
+            )
+        };
+        let (home_gates, home_tabs) = probe(BrowseLevel::Home);
+        let (runs_gates, runs_tabs) = probe(BrowseLevel::Runs);
+        assert_eq!(home_tabs, runs_tabs, "the tab strip moved at Home");
+        assert_eq!(home_gates, runs_gates, "the gate zone moved at Home");
+    }
+
+    /// AC-8. R9: at phone width the rail and Main do not coexist. Home must
+    /// autofocus Main the way the zero-run Runs level already does, or the
+    /// operator is stranded on a rail with no call to action.
+    #[test]
+    fn home_is_reachable_at_narrow_width() {
+        let empty = HomeData {
+            rows: vec![
+                HomeRow::Header(HomeBand::NeedsMe),
+                HomeRow::Header(HomeBand::Running),
+                HomeRow::Header(HomeBand::Finished),
+                HomeRow::Header(HomeBand::StartNew),
+                HomeRow::NewRun,
+            ],
+            project_stats: Vec::new(),
+        };
+        for width in [50u16, 79] {
+            let mut term = Terminal::new(TestBackend::new(width, 20)).unwrap();
+            let swarm = SparPaths::new("/x");
+            let mut app = App::new(None, Config::default(), None);
+            let mut rail = ListState::default();
+            term.draw(|f| {
+                draw(
+                    f,
+                    &swarm,
+                    &[],
+                    &[],
+                    None,
+                    "",
+                    &[],
+                    "",
+                    &empty,
+                    &mut app,
+                    &mut rail,
+                )
+            })
+            .unwrap();
+            assert_eq!(
+                app.focus,
+                Focus::Main,
+                "width {width}: an empty Home must land on Main so its CTA is reachable"
+            );
+            let text = whole(&term).to_lowercase();
+            assert!(
+                text.contains("start something new") || text.contains("new run"),
+                "width {width}: no CTA on screen: {text:?}"
+            );
+        }
+    }
+
+    /// AC-9. U13, the rendering half: the Projects level's per-project run and
+    /// attention counts come off the snapshot. Every root here is a path that
+    /// does not exist, so a `draw` that still scanned would paint zeroes.
+    #[test]
+    fn projects_level_counts_come_from_the_snapshot_not_the_disk() {
+        let projects = [home_project("acme-api"), home_project("spar")];
+        let home = HomeData {
+            rows: Vec::new(),
+            project_stats: vec![
+                ProjectStat {
+                    n_runs: 17,
+                    needs_you: 3,
+                },
+                ProjectStat {
+                    n_runs: 4,
+                    needs_you: 0,
+                },
+            ],
+        };
+        let term = paint_home(120, 30, &projects, &home, |a| a.open_projects_view());
+        let text = whole(&term);
+        assert!(
+            text.contains("17"),
+            "supplied run count not painted: {text:?}"
+        );
+        assert!(
+            text.contains("⚑3"),
+            "supplied attention roll-up not painted: {text:?}"
+        );
+
+        // A stat slice shorter than the project list is one snapshot of lag
+        // after a project registers. It must degrade, never index-panic.
+        let short = HomeData {
+            rows: Vec::new(),
+            project_stats: vec![ProjectStat {
+                n_runs: 1,
+                needs_you: 0,
+            }],
+        };
+        paint_home(120, 30, &projects, &short, |a| a.open_projects_view());
+        paint_home(120, 30, &projects, &HomeData::default(), |a| {
+            a.open_projects_view()
+        });
+    }
+
+    /// AC-10. Phase A: the tmux session name is an implementation detail of
+    /// the tmux backend and must never reach the screen, in the Shell tab's
+    /// caption or in its hint body.
+    #[test]
+    fn the_shell_tab_never_prints_a_tmux_session_name() {
+        let st = run_with(Phase::Review, 7);
+        let swarm = SparPaths::new("/x");
+        let mut app = test_app();
+        app.open_main(MainTab::Shell);
+        app.takeover_target = Some(tmux::session_name(&st.id));
+        let caption = main_context(&swarm, Some(&st), &app);
+        assert!(
+            caption.contains(&st.id[..8]),
+            "the caption must name the run: {caption:?}"
+        );
+        assert!(
+            !caption.contains("spar-"),
+            "the tmux session name leaked into the caption: {caption:?}"
+        );
+        assert!(
+            !caption.to_lowercase().contains("session"),
+            "retired noun in the caption: {caption:?}"
+        );
+
+        // The Shell body's own hint text is the other place the noun lived.
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let mut app = test_app();
+        app.open_main(MainTab::Shell);
+        let mut rail = ListState::default();
+        term.draw(|f| {
+            draw(
+                f,
+                &swarm,
+                &[],
+                &[],
+                None,
+                "",
+                &[],
+                "",
+                &HomeData::default(),
+                &mut app,
+                &mut rail,
+            )
+        })
+        .unwrap();
+        let text = whole(&term).to_lowercase();
+        assert!(
+            !text.contains("session"),
+            "retired noun on screen in the Shell tab: {text:?}"
+        );
     }
 }
 
@@ -8548,6 +9228,46 @@ mod folding {
         assert!(!rows.is_empty());
     }
 
+    /// AC-34. Home ranks the same units the rail folds, so the two roll-ups
+    /// must agree: folding across a whole registry must never turn N gates into
+    /// fewer than N. Legs are folded **per project** — two projects can hold
+    /// two different runs whose 8-hex ids collide, and folding them together
+    /// would merge unrelated work.
+    #[test]
+    fn home_folds_per_project_and_keeps_every_gate() {
+        let unfolded = vec![
+            summary("root", Phase::AwaitingShipConfirm, None, 30),
+            summary("leg", Phase::AwaitingPlanApproval, Some("root"), 10),
+            summary("solo", Phase::Failed, None, 5),
+        ];
+        let before = unfolded
+            .iter()
+            .filter(|r| run_attention(r).needs_you())
+            .count();
+        let (rows, _) = fold_units(unfolded);
+        assert_eq!(
+            runs_needing_attention(&rows),
+            before,
+            "folding lost a gate on the way to Home"
+        );
+
+        // Same id in two projects: folding is per project, so `b`'s parent
+        // reference must not reach across into the other project's `a`.
+        let mut p1 = summary("a", Phase::Review, None, 5);
+        p1.project_root = Some(PathBuf::from("/nonexistent/one"));
+        let mut p2 = summary("b", Phase::AwaitingPlanApproval, Some("a"), 5);
+        p2.project_root = Some(PathBuf::from("/nonexistent/two"));
+        let (r1, _) = fold_units(vec![p1]);
+        let (r2, _) = fold_units(vec![p2]);
+        assert_eq!(r1.len(), 1);
+        assert_eq!(
+            r2.len(),
+            1,
+            "an orphan leg stands on its own in its project"
+        );
+        assert_eq!(runs_needing_attention(&r2), 1);
+    }
+
     #[test]
     fn the_age_shown_is_the_freshest_leg() {
         let runs = vec![
@@ -8558,6 +9278,1116 @@ mod folding {
         assert!(
             (Utc::now() - rows[0].updated_at).num_minutes() < 10,
             "a unit is as old as its newest activity"
+        );
+    }
+}
+
+/// Feature 004's acceptance suite: the information-architecture behaviour that
+/// sits under the paint (`mod render_stability` covers the paint itself).
+///
+/// **Seams this contract binds to.** The assertions are the contract; the names
+/// below are the agreed surface the plan (`artifacts/plan.md`) already fixes. If
+/// an implementation renames one, rename it here too — do not weaken an
+/// assertion to fit a different shape.
+///
+/// | Seam | Phase | What it must be |
+/// |---|---|---|
+/// | `BrowseLevel::Home` | C | the rail root; `pop()` lands here from Runs and Projects |
+/// | `App::new(seed, cfg, local_root: Option<&Path>)` | C | always starts at Home; `local_root` sets the scope |
+/// | `HomeData { rows, project_stats }` on `Snapshot`, passed to `draw` | B/C | the off-thread roll-up `draw` consumes |
+/// | `gather_home(&[ProjectEntry]) -> Vec<Vec<RunSummary>>` | B/C | one folded, archived-filtered listing per project; disk, off-thread |
+/// | `project_stats_of(&[Vec<RunSummary>]) -> Vec<ProjectStat>` | B | pure; counts folded rows |
+/// | `build_home_rows(projects, folded, scope, watermark, now)` | C | pure; banding, ranking, capping |
+/// | `home_overview(rows, scope, watermark) -> String` | C | Main's Home body |
+/// | `read_watermark` / `write_watermark` / `watermark_path` | C | the "finished since last look" clock |
+/// | `cross_project_due(browse, since_last, forced)` | B | bounded cross-project invalidation |
+/// | `build_roster(cfg, detected, recent)` / `new_run_providers` / `new_run_launch` | D | the fleet picker, with no disk in `draw` |
+#[cfg(test)]
+mod home_ia {
+    use super::*;
+    use crate::cli::WorkflowKind;
+    use std::path::Path;
+
+    fn project_at(root: &Path, name: &str) -> registry::ProjectEntry {
+        registry::ProjectEntry {
+            root: root.to_path_buf(),
+            name: Some(name.to_string()),
+            last_seen: Utc::now(),
+            last_run_id: None,
+        }
+    }
+
+    fn run_in(id: &str, phase: Phase, mins_ago: i64, root: &Path) -> state::RunSummary {
+        state::RunSummary {
+            id: id.into(),
+            workflow: WorkflowKind::Loop,
+            archived: false,
+            phase,
+            updated_at: Utc::now() - chrono::Duration::minutes(mins_ago),
+            task: Some(format!("brief for {id}")),
+            dry_run: false,
+            abandoned: false,
+            parent_run: None,
+            round: 1,
+            legs: 1,
+            wants: 0,
+            base_ref: None,
+            base_commit: None,
+            project_root: Some(root.to_path_buf()),
+            project_name: root.file_name().map(|s| s.to_string_lossy().into_owned()),
+        }
+    }
+
+    fn band_of(rows: &[HomeRow], id: &str) -> Option<HomeBand> {
+        rows.iter().find_map(|r| match r {
+            HomeRow::Run { band, run, .. } if run.id == id => Some(*band),
+            _ => None,
+        })
+    }
+
+    fn ids_in(rows: &[HomeRow], want: HomeBand) -> Vec<String> {
+        rows.iter()
+            .filter_map(|r| match r {
+                HomeRow::Run { band, run, .. } if *band == want => Some(run.id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // -- Phase A: the retired noun and the comments that describe a dead model --
+
+    /// AC-11. The four comments the feature file names describe a focus model
+    /// that no longer exists. Needles are assembled from fragments so this
+    /// test's own source cannot satisfy the search it performs.
+    #[test]
+    fn retired_focus_and_composer_comments_are_gone() {
+        let src = include_str!("tui.rs");
+        for needle in [
+            concat!("Three focus ", "targets"),
+            concat!("composer ", "mention"),
+            concat!("or the composer ", "still changes focus"),
+            concat!("the composer ", "cursor"),
+        ] {
+            assert!(
+                !src.contains(needle),
+                "src/tui.rs still documents a focus model that does not exist: {needle:?}"
+            );
+        }
+        // `1`/`2` are the two real direct-focus keys; `3` was never bound.
+        assert!(
+            !src.contains(concat!("`1` / `2` / ", "`3` jump")),
+            "the focus doc still offers a third target"
+        );
+    }
+
+    /// AC-12. The product doc bakes the run/Home conflation in at the pillar
+    /// level; U6 retires it.
+    #[test]
+    fn the_product_doc_no_longer_conflates_home_with_a_session() {
+        let doc = include_str!("../docs/PRODUCT.md");
+        assert!(
+            !doc.contains(concat!("Session / ", "run home")),
+            "docs/PRODUCT.md still names the retired noun in pillar 1"
+        );
+        assert!(
+            doc.contains("Home"),
+            "pillar 1 must name the landing view it describes"
+        );
+    }
+
+    /// AC-13. Discoverability (R6): `n` and `P` are new bindings, so they have
+    /// to appear in the help body, and the help body's rail shape has to
+    /// describe the tree that actually exists.
+    #[test]
+    fn home_keys_are_documented_in_the_help_body() {
+        let help = HELP_BODY;
+        assert!(help.contains(" n "), "`n` is undiscoverable: {help}");
+        assert!(help.contains(" P "), "`P` is undiscoverable: {help}");
+        assert!(
+            help.contains("Home"),
+            "the help body's rail shape must start at Home"
+        );
+        assert!(
+            !help.contains(concat!("projects ▸ runs", " ▸ agents")),
+            "the help body still describes Projects as the rail root"
+        );
+        // The Shape line keeps its parenthetical: `help_overlay_wraps_narrow_lines_
+        // without_cutting_a_word` is the only long-line wrap probe in the suite and
+        // it reads its phrases off this line.
+        assert!(
+            help.contains("(Enter pushes, Esc pops)"),
+            "the Shape line must keep the parenthetical the wrap test probes"
+        );
+    }
+
+    // -- Phase B: the render-path scan moves off-thread (U13) ------------------
+
+    /// AC-14. `project_stats_of` counts **folded** rows, so the `⚑N` on the
+    /// Projects level agrees with the roll-up the Runs level shows. Today's
+    /// `rail_project_items` counts unfolded runs and can disagree.
+    #[test]
+    fn project_stats_count_folded_units_not_invocations() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let mut parent = run_in("root0001", Phase::AwaitingShipConfirm, 30, &root);
+        parent.legs = 2;
+        parent.wants = 2; // the unit holds two gates
+        let plain = run_in("solo0001", Phase::Review, 5, &root);
+        let stats = project_stats_of(&[vec![parent, plain]]);
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].n_runs, 2, "one row per unit of work");
+        assert_eq!(
+            stats[0].needs_you, 2,
+            "a two-gate unit contributes both gates (U15)"
+        );
+    }
+
+    /// AC-15. The other half of U13: `gather_home` really reads disk, drops
+    /// archived runs, folds legs into their parent, and degrades a project root
+    /// that is not there to an empty listing instead of panicking.
+    #[test]
+    fn gather_home_lists_visible_folded_runs_and_survives_a_missing_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(root.join(".spar/runs")).unwrap();
+        let paths = SparPaths::new(&root);
+
+        let mut save = |id: &str, phase: Phase, parent: Option<&str>, archived: bool| {
+            paths.ensure_run_dirs(id).unwrap();
+            let mut st = RunState::new(id, WorkflowKind::Loop, root.clone());
+            st.phase = phase;
+            st.parent_run = parent.map(str::to_string);
+            if archived {
+                st.archived_at = Some(Utc::now());
+            }
+            st.save(&paths).unwrap();
+        };
+        save("aaaa0001", Phase::PlanApproved, None, false);
+        save(
+            "bbbb0002",
+            Phase::AwaitingShipConfirm,
+            Some("aaaa0001"),
+            false,
+        );
+        save("cccc0003", Phase::Review, None, false);
+        save("dddd0004", Phase::Done, None, true);
+
+        let missing = tmp.path().join("gone");
+        let projects = [project_at(&root, "proj"), project_at(&missing, "gone")];
+        let folded = gather_home(&projects);
+        assert_eq!(folded.len(), projects.len(), "index-aligned with projects");
+
+        let ids: Vec<&str> = folded[0].iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            folded[0].len(),
+            2,
+            "archived dropped, the leg folded into its parent: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"dddd0004"),
+            "an archived run must not reach Home: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"aaaa0001") || !ids.contains(&"bbbb0002"),
+            "the leg and its parent must be one row: {ids:?}"
+        );
+        assert!(folded[1].is_empty(), "a missing project root reads as zero");
+
+        // And the stats derived from that same pass agree with it.
+        let stats = project_stats_of(&folded);
+        assert_eq!(stats[0].n_runs, 2);
+        assert_eq!(stats[0].needs_you, 1, "one gate in the unit");
+        assert_eq!(stats[1].n_runs, 0);
+    }
+
+    /// AC-16. The cross-project sweep Home needs is bounded: a Home that has
+    /// not changed does not re-list every registered project on every 200ms
+    /// refresh tick, entering Home forces one immediate build, and levels that
+    /// are not cross-project never trigger it at all.
+    #[test]
+    fn cross_project_refresh_is_bounded_and_forced_on_entry() {
+        assert!(
+            CROSS_PROJECT_REFRESH > REFRESH,
+            "a per-tick cross-project sweep is the scale failure this moves off draw"
+        );
+        assert!(
+            !cross_project_due(BrowseLevel::Home, REFRESH, false),
+            "one refresh tick is not a cross-project rebuild"
+        );
+        assert!(
+            cross_project_due(BrowseLevel::Home, CROSS_PROJECT_REFRESH, false),
+            "the cadence must eventually fire"
+        );
+        assert!(
+            cross_project_due(BrowseLevel::Home, Duration::from_millis(0), true),
+            "entering Home or toggling scope forces one build"
+        );
+        assert!(
+            cross_project_due(BrowseLevel::Projects, CROSS_PROJECT_REFRESH, false),
+            "the Projects level needs the same per-project stats"
+        );
+        for level in [BrowseLevel::Runs, BrowseLevel::Agents] {
+            assert!(
+                !cross_project_due(level, CROSS_PROJECT_REFRESH * 10, false),
+                "{level:?} is scoped to one project and must not sweep the registry"
+            );
+        }
+    }
+
+    // -- Phase C: bands, ranking, scope, watermark ----------------------------
+
+    /// AC-17. Four bands, in order, headers always emitted, first match wins so
+    /// a run is in exactly one band.
+    #[test]
+    fn home_emits_four_bands_in_order_with_headers_always_present() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let watermark = Utc::now() - chrono::Duration::hours(1);
+        let now = Utc::now();
+        for folded in [
+            vec![vec![]],
+            vec![vec![
+                run_in("gate0001", Phase::AwaitingPlanApproval, 30, &root),
+                run_in("work0001", Phase::Review, 2, &root),
+                run_in("done0001", Phase::Done, 10, &root),
+            ]],
+        ] {
+            let rows = build_home_rows(&projects, &folded, &HomeScope::All, watermark, now);
+            let headers: Vec<HomeBand> = rows
+                .iter()
+                .filter_map(|r| match r {
+                    HomeRow::Header(b) => Some(*b),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                headers,
+                vec![
+                    HomeBand::NeedsMe,
+                    HomeBand::Running,
+                    HomeBand::Finished,
+                    HomeBand::StartNew
+                ],
+                "band headers must be present and in order even when empty"
+            );
+            assert!(
+                rows.iter().any(|r| matches!(r, HomeRow::NewRun)),
+                "band 4's action row is always there"
+            );
+            // Exactly one band per run.
+            let mut seen: Vec<&str> = Vec::new();
+            for r in &rows {
+                if let HomeRow::Run { run, .. } = r {
+                    assert!(!seen.contains(&run.id.as_str()), "{} in two bands", run.id);
+                    seen.push(&run.id);
+                }
+            }
+        }
+    }
+
+    /// AC-18. Band membership is declared, not a fallthrough: gates and broken
+    /// runs are band 1 (U5's `needs_you`, so a broken run is never dropped),
+    /// active runs are band 2, and only genuinely-finished runs newer than the
+    /// watermark are band 3. `Stopped` and `PlanRejected` must not be quietly
+    /// filed as "finished".
+    #[test]
+    fn phases_land_in_their_declared_bands() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let watermark = Utc::now() - chrono::Duration::hours(6);
+        let now = Utc::now();
+        let cases: Vec<(&str, Phase, Option<HomeBand>)> = vec![
+            ("gate", Phase::AwaitingPlanApproval, Some(HomeBand::NeedsMe)),
+            ("ship", Phase::AwaitingShipConfirm, Some(HomeBand::NeedsMe)),
+            ("fail", Phase::Failed, Some(HomeBand::NeedsMe)),
+            ("stuk", Phase::Stuck, Some(HomeBand::NeedsMe)),
+            ("quot", Phase::Quota, Some(HomeBand::NeedsMe)),
+            ("esca", Phase::Escalated, Some(HomeBand::NeedsMe)),
+            ("revw", Phase::Review, Some(HomeBand::Running)),
+            ("disp", Phase::Dispatch, Some(HomeBand::Running)),
+            ("done", Phase::Done, Some(HomeBand::Finished)),
+            ("stop", Phase::Stopped, Some(HomeBand::Finished)),
+            ("rejd", Phase::PlanRejected, Some(HomeBand::Finished)),
+        ];
+        let runs: Vec<state::RunSummary> = cases
+            .iter()
+            .map(|(id, phase, _)| run_in(id, *phase, 1, &root))
+            .collect();
+        let rows = build_home_rows(&projects, &[runs], &HomeScope::All, watermark, now);
+        for (id, phase, want) in &cases {
+            assert_eq!(
+                band_of(&rows, id),
+                *want,
+                "{phase:?} landed in the wrong band"
+            );
+        }
+        // An abandoned run is broken, not running.
+        let mut abandoned = run_in("aban", Phase::Review, 1, &root);
+        abandoned.abandoned = true;
+        let rows = build_home_rows(
+            &projects,
+            &[vec![abandoned]],
+            &HomeScope::All,
+            watermark,
+            now,
+        );
+        assert_eq!(band_of(&rows, "aban"), Some(HomeBand::NeedsMe));
+    }
+
+    /// AC-19. Band 1 is ranked by wait time descending — the longest-waiting
+    /// gate first. That is deliberately *not* the rail's recency-first
+    /// attention sort.
+    #[test]
+    fn needs_me_ranks_by_wait_time_descending() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let now = Utc::now();
+        let folded = vec![vec![
+            run_in("recent01", Phase::AwaitingShipConfirm, 1, &root),
+            run_in("oldest01", Phase::AwaitingPlanApproval, 60, &root),
+            run_in("middle01", Phase::AwaitingShipConfirm, 15, &root),
+        ]];
+        let rows = build_home_rows(
+            &projects,
+            &folded,
+            &HomeScope::All,
+            now - chrono::Duration::hours(6),
+            now,
+        );
+        assert_eq!(
+            ids_in(&rows, HomeBand::NeedsMe),
+            vec!["oldest01", "middle01", "recent01"],
+            "band 1 is longest-waiting first"
+        );
+        // The recorded wait is what the row renders, and it is monotonic with
+        // the ranking.
+        let waits: Vec<Duration> = rows
+            .iter()
+            .filter_map(|r| match r {
+                HomeRow::Run {
+                    band: HomeBand::NeedsMe,
+                    waited,
+                    ..
+                } => Some(*waited),
+                _ => None,
+            })
+            .collect();
+        assert!(waits.windows(2).all(|w| w[0] >= w[1]), "{waits:?}");
+
+        // Bands 2 and 3 are recency-first instead.
+        let folded = vec![vec![
+            run_in("old_work", Phase::Review, 60, &root),
+            run_in("new_work", Phase::Review, 1, &root),
+        ]];
+        let rows = build_home_rows(
+            &projects,
+            &folded,
+            &HomeScope::All,
+            now - chrono::Duration::hours(6),
+            now,
+        );
+        assert_eq!(
+            ids_in(&rows, HomeBand::Running),
+            vec!["new_work", "old_work"]
+        );
+    }
+
+    /// AC-20. A clock that ran backwards (a future `updated_at` from a skewed
+    /// host or a hand-edited state file) must produce a zero wait, not a panic
+    /// and not a row that sorts to the top forever.
+    #[test]
+    fn a_future_updated_at_is_zero_wait_not_a_panic() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let now = Utc::now();
+        let folded = vec![vec![
+            run_in("future01", Phase::AwaitingShipConfirm, -600, &root),
+            run_in("normal01", Phase::AwaitingShipConfirm, 30, &root),
+        ]];
+        let rows = build_home_rows(
+            &projects,
+            &folded,
+            &HomeScope::All,
+            now - chrono::Duration::hours(6),
+            now,
+        );
+        let waited = |id: &str| {
+            rows.iter()
+                .find_map(|r| match r {
+                    HomeRow::Run { run, waited, .. } if run.id == id => Some(*waited),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(waited("future01"), Duration::from_secs(0));
+        assert_eq!(
+            ids_in(&rows, HomeBand::NeedsMe),
+            vec!["normal01", "future01"],
+            "a future timestamp must not outrank a real wait"
+        );
+    }
+
+    /// AC-21. The band cap keeps a thousand-run workspace from building a
+    /// thousand rows a frame — but it must never truncate band 1, and a band it
+    /// does cap has to say how many it dropped.
+    #[test]
+    fn the_band_cap_never_truncates_what_needs_you() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let now = Utc::now();
+        let n = HOME_BAND_CAP + 25;
+        let mut runs: Vec<state::RunSummary> = (0..n)
+            .map(|i| {
+                run_in(
+                    &format!("gate{i:04}"),
+                    Phase::AwaitingPlanApproval,
+                    i as i64,
+                    &root,
+                )
+            })
+            .collect();
+        runs.extend((0..n).map(|i| run_in(&format!("work{i:04}"), Phase::Review, i as i64, &root)));
+        let rows = build_home_rows(
+            &projects,
+            &[runs],
+            &HomeScope::All,
+            now - chrono::Duration::hours(6),
+            now,
+        );
+        assert_eq!(
+            ids_in(&rows, HomeBand::NeedsMe).len(),
+            n,
+            "band 1 must never be capped"
+        );
+        assert_eq!(
+            ids_in(&rows, HomeBand::Running).len(),
+            HOME_BAND_CAP,
+            "band 2 caps"
+        );
+        let more = rows.iter().find_map(|r| match r {
+            HomeRow::More { band, n } => Some((*band, *n)),
+            _ => None,
+        });
+        assert_eq!(
+            more,
+            Some((HomeBand::Running, n - HOME_BAND_CAP)),
+            "a capped band must account for what it dropped"
+        );
+    }
+
+    /// AC-22. U15 at Home: folding is a display choice, never a way to lose a
+    /// gate. A two-leg unit with two gates is one row that says `⚑2` and
+    /// contributes 2 to the roll-up.
+    #[test]
+    fn folding_never_hides_a_gate_from_home() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let now = Utc::now();
+        let mut unit = run_in("legb0002", Phase::AwaitingPlanApproval, 20, &root);
+        unit.legs = 2;
+        unit.wants = 2;
+        let rows = build_home_rows(
+            &projects,
+            &[vec![unit]],
+            &HomeScope::All,
+            now - chrono::Duration::hours(6),
+            now,
+        );
+        let band1: Vec<state::RunSummary> = rows
+            .iter()
+            .filter_map(|r| match r {
+                HomeRow::Run {
+                    band: HomeBand::NeedsMe,
+                    run,
+                    ..
+                } => Some(run.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(band1.len(), 1, "one unit of work, one row");
+        assert_eq!(band1[0].wants, 2, "the row must carry both gates");
+        assert_eq!(
+            runs_needing_attention(&band1),
+            2,
+            "the roll-up counts legs, not rows"
+        );
+        assert!(
+            home_overview(&rows, &HomeScope::All, now - chrono::Duration::hours(6)).contains("⚑2"),
+            "a multi-gate unit says so on screen"
+        );
+    }
+
+    /// AC-23. Scope filters rows; it does not change the view. Both scopes emit
+    /// the same four headers in the same order (U20).
+    #[test]
+    fn home_scope_filters_rows_without_changing_the_bands() {
+        let a = PathBuf::from("/nonexistent/acme-api");
+        let b = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&a, "acme-api"), project_at(&b, "spar")];
+        let now = Utc::now();
+        let folded = vec![
+            vec![run_in("acme0001", Phase::AwaitingShipConfirm, 10, &a)],
+            vec![run_in("spar0001", Phase::AwaitingShipConfirm, 10, &b)],
+        ];
+        let watermark = now - chrono::Duration::hours(6);
+        let all = build_home_rows(&projects, &folded, &HomeScope::All, watermark, now);
+        let scoped = build_home_rows(
+            &projects,
+            &folded,
+            &HomeScope::Project(b.clone()),
+            watermark,
+            now,
+        );
+        let headers = |rows: &[HomeRow]| -> Vec<HomeBand> {
+            rows.iter()
+                .filter_map(|r| match r {
+                    HomeRow::Header(x) => Some(*x),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(headers(&all), headers(&scoped), "scope changed the bands");
+        assert_eq!(ids_in(&all, HomeBand::NeedsMe).len(), 2);
+        assert_eq!(ids_in(&scoped, HomeBand::NeedsMe), vec!["spar0001"]);
+
+        // `spar` inside a repo lands on Home scoped to that repo, not on the
+        // project's raw run list.
+        let app = App::new(None, Config::default(), Some(b.as_path()));
+        assert_eq!(app.browse, BrowseLevel::Home);
+        assert_eq!(app.home_scope, HomeScope::Project(b.clone()));
+        // Outside a repo it is every registered project.
+        let app = App::new(None, Config::default(), None);
+        assert_eq!(app.home_scope, HomeScope::All);
+        // `P` toggles between the two and back.
+        let mut app = App::new(None, Config::default(), Some(b.as_path()));
+        toggle_home_scope(&mut app, Some(b.as_path()));
+        assert_eq!(app.home_scope, HomeScope::All);
+        toggle_home_scope(&mut app, Some(b.as_path()));
+        assert_eq!(app.home_scope, HomeScope::Project(b));
+    }
+
+    /// AC-24. The watermark: a run that finished before the operator's last
+    /// look is not in band 3; one that finished after it is. A missing or
+    /// corrupt file reads as a day ago, so a first run shows a useful band
+    /// rather than an empty one, and it lives under the global spar home
+    /// because Home is cross-project and `.spar/` is not.
+    #[test]
+    fn the_finished_band_is_bounded_by_the_watermark() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let now = Utc::now();
+        let watermark = now - chrono::Duration::hours(2);
+        let folded = vec![vec![
+            run_in("recentdn", Phase::Done, 30, &root),
+            run_in("olderdne", Phase::Done, 600, &root),
+        ]];
+        let rows = build_home_rows(&projects, &folded, &HomeScope::All, watermark, now);
+        assert_eq!(
+            ids_in(&rows, HomeBand::Finished),
+            vec!["recentdn"],
+            "only what landed since the last look"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("home_watermark.json");
+        let missing = read_watermark(&path);
+        assert!(
+            (now - missing).num_hours() >= 23 && (now - missing).num_hours() <= 25,
+            "a missing watermark reads as a day ago, not the epoch: {missing}"
+        );
+        std::fs::write(&path, "{ not json").unwrap();
+        let corrupt = read_watermark(&path);
+        assert!(
+            (now - corrupt).num_hours() >= 23,
+            "a corrupt watermark must be nonfatal: {corrupt}"
+        );
+        let at = now - chrono::Duration::minutes(5);
+        write_watermark(&path, at).unwrap();
+        assert!(
+            (read_watermark(&path) - at).num_seconds().abs() <= 1,
+            "watermark round-trip"
+        );
+        // Writing into a directory that does not exist must not take the app down.
+        let _ = write_watermark(&tmp.path().join("nope/deeper/w.json"), at);
+        assert!(
+            watermark_path().starts_with(registry::spar_home()),
+            "a cross-project watermark cannot live in a per-project .spar/"
+        );
+    }
+
+    /// AC-25. The band the operator is looking at must not empty underneath
+    /// them: the watermark is read once and held for the session, so re-deriving
+    /// Home from the same `App` gives the same band 3.
+    #[test]
+    fn the_finished_band_is_stable_while_the_session_is_open() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let app = App::new(None, Config::default(), Some(root.as_path()));
+        let folded = vec![vec![run_in("justdone", Phase::Done, 1, &root)]];
+        let first = build_home_rows(
+            &projects,
+            &folded,
+            &app.home_scope,
+            app.home_watermark,
+            Utc::now(),
+        );
+        let later = build_home_rows(
+            &projects,
+            &folded,
+            &app.home_scope,
+            app.home_watermark,
+            Utc::now() + chrono::Duration::minutes(30),
+        );
+        assert_eq!(
+            ids_in(&first, HomeBand::Finished),
+            ids_in(&later, HomeBand::Finished),
+            "the watermark must not advance while the operator is looking at it"
+        );
+        assert!(!ids_in(&first, HomeBand::Finished).is_empty());
+    }
+
+    // -- Phase C: navigation --------------------------------------------------
+
+    fn nav_rows(root: &Path) -> Vec<HomeRow> {
+        vec![
+            HomeRow::Header(HomeBand::NeedsMe),
+            HomeRow::Run {
+                band: HomeBand::NeedsMe,
+                run: run_in("gate0001", Phase::AwaitingShipConfirm, 90, root),
+                waited: Duration::from_secs(5400),
+            },
+            HomeRow::Header(HomeBand::Running),
+            HomeRow::Run {
+                band: HomeBand::Running,
+                run: run_in("work0001", Phase::Review, 2, root),
+                waited: Duration::from_secs(120),
+            },
+            HomeRow::Header(HomeBand::Finished),
+            HomeRow::Header(HomeBand::StartNew),
+            HomeRow::NewRun,
+        ]
+    }
+
+    /// AC-26. Navigation steps over headers, and never lands on one — including
+    /// at both ends of the list, where a naive clamp puts the cursor on the
+    /// band-1 header or the band-4 header.
+    #[test]
+    fn home_navigation_never_lands_on_a_header() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let rows = nav_rows(&root);
+        let mut app = App::new(None, Config::default(), None);
+        assert_eq!(rail_len(BrowseLevel::Home, 0, rows.len(), 0, 0), rows.len());
+        // Sweep the whole list in both directions, plus the paging deltas.
+        for delta in [1i32, -1, 5, -5] {
+            let mut app = App::new(None, Config::default(), None);
+            for _ in 0..(rows.len() * 2) {
+                rail_move(&mut app, &[], &rows, &[], 0, delta);
+                assert!(
+                    !matches!(rows.get(app.selected_home), Some(HomeRow::Header(_))),
+                    "delta {delta} landed the cursor on a header at {}",
+                    app.selected_home
+                );
+                assert!(app.selected_home < rows.len(), "cursor left the list");
+            }
+        }
+        // A mouse click on a header is ignored rather than selecting it.
+        app.selected_home = 1;
+        rail_select(&mut app, 0, 0, rows.len(), 0, 0);
+        assert_eq!(
+            app.selected_home, 1,
+            "a click on a header must not move the cursor"
+        );
+        rail_select(&mut app, 3, 0, rows.len(), 0, 0);
+        assert_eq!(app.selected_home, 3, "a click on a run row selects it");
+    }
+
+    /// AC-27. `Enter` on a Home run row opens **that run's agents** (the
+    /// feature's navigation rule), switching the active project to the row's
+    /// own project. `Esc` then exposes that project's runs, and the next `Esc`
+    /// returns to Home. `Esc` at Home is a no-op and never quits.
+    #[test]
+    fn enter_on_a_home_run_row_opens_that_runs_agents() {
+        let root = PathBuf::from("/nonexistent/acme-api");
+        let rows = nav_rows(&root);
+        let mut app = App::new(None, Config::default(), None);
+        app.selected_home = 1; // the gated run
+        let mut active = PathBuf::from("/nonexistent/elsewhere");
+        rail_enter(&mut app, &[], &rows, &[], None, &mut active);
+        assert_eq!(
+            app.browse,
+            BrowseLevel::Agents,
+            "Enter opens the run's agents"
+        );
+        assert_eq!(active, root, "the active project follows the row");
+        assert_eq!(
+            app.home_target_run.as_deref(),
+            Some("gate0001"),
+            "the run is carried by identity across the snapshot handoff"
+        );
+        app.rail_pop();
+        assert_eq!(app.browse, BrowseLevel::Runs);
+        app.rail_pop();
+        assert_eq!(app.browse, BrowseLevel::Home);
+        app.rail_pop();
+        assert_eq!(app.browse, BrowseLevel::Home, "Esc at the root is a no-op");
+
+        // A project row takes the project route instead; the action row opens
+        // the Phase D surface.
+        let projects = [project_at(&root, "acme-api")];
+        let rows = vec![
+            HomeRow::Header(HomeBand::StartNew),
+            HomeRow::NewRun,
+            HomeRow::Project(0),
+        ];
+        let mut app = App::new(None, Config::default(), None);
+        app.selected_home = 2;
+        let mut active = PathBuf::from("/nonexistent/elsewhere");
+        rail_enter(&mut app, &projects, &rows, &[], None, &mut active);
+        assert_eq!(app.browse, BrowseLevel::Runs);
+        assert_eq!(active, root);
+
+        let mut app = App::new(None, Config::default(), None);
+        app.selected_home = 1;
+        let mut active = PathBuf::from("/nonexistent/elsewhere");
+        rail_enter(&mut app, &projects, &rows, &[], None, &mut active);
+        assert!(
+            app.new_run.is_some(),
+            "the action row opens the new-run surface"
+        );
+
+        // A header is inert.
+        let mut app = App::new(None, Config::default(), None);
+        app.selected_home = 0;
+        let before = app.browse;
+        rail_enter(&mut app, &projects, &rows, &[], None, &mut active);
+        assert_eq!(app.browse, before, "Enter on a header does nothing");
+        assert!(app.new_run.is_none());
+    }
+
+    /// AC-28. R3: Home re-ranks every snapshot (wait time changes every
+    /// minute), so the cursor is glued to the row's identity, not its index.
+    #[test]
+    fn the_home_cursor_follows_the_row_not_the_index() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let rows = nav_rows(&root);
+        let mut app = App::new(None, Config::default(), None);
+        rail_select(&mut app, 3, 0, rows.len(), 0, 0); // the running run
+        assert_eq!(app.home_key.as_deref(), Some("run:work0001"));
+
+        // Next snapshot: a new gate arrives and pushes everything down.
+        let mut reordered = vec![
+            HomeRow::Header(HomeBand::NeedsMe),
+            HomeRow::Run {
+                band: HomeBand::NeedsMe,
+                run: run_in("newgate1", Phase::AwaitingPlanApproval, 120, &root),
+                waited: Duration::from_secs(7200),
+            },
+        ];
+        reordered.extend(rows.iter().skip(1).cloned());
+        resync_home_selection(&mut app, &reordered);
+        match reordered.get(app.selected_home) {
+            Some(HomeRow::Run { run, .. }) => assert_eq!(run.id, "work0001"),
+            other => panic!("cursor jumped to {other:?}"),
+        }
+
+        // The row it was on disappearing must clamp, not index out of bounds.
+        let shrunk = vec![HomeRow::Header(HomeBand::StartNew), HomeRow::NewRun];
+        resync_home_selection(&mut app, &shrunk);
+        assert!(app.selected_home < shrunk.len());
+        assert!(!matches!(shrunk[app.selected_home], HomeRow::Header(_)));
+    }
+
+    /// AC-29. `a` still works at the landing view: it cycles the Home cursor
+    /// through band 1 instead of telling the operator to open a project first.
+    #[test]
+    fn a_cycles_the_needs_me_band_at_home() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let rows = vec![
+            HomeRow::Header(HomeBand::NeedsMe),
+            HomeRow::Run {
+                band: HomeBand::NeedsMe,
+                run: run_in("gate0001", Phase::AwaitingShipConfirm, 90, &root),
+                waited: Duration::from_secs(5400),
+            },
+            HomeRow::Run {
+                band: HomeBand::NeedsMe,
+                run: run_in("gate0002", Phase::AwaitingPlanApproval, 30, &root),
+                waited: Duration::from_secs(1800),
+            },
+            HomeRow::Header(HomeBand::Running),
+            HomeRow::Run {
+                band: HomeBand::Running,
+                run: run_in("work0001", Phase::Review, 2, &root),
+                waited: Duration::from_secs(120),
+            },
+            HomeRow::Header(HomeBand::Finished),
+            HomeRow::Header(HomeBand::StartNew),
+            HomeRow::NewRun,
+        ];
+        let mut app = App::new(None, Config::default(), None);
+        app.selected_home = 1;
+        jump_to_attention(&mut app, &[], &rows);
+        assert_eq!(app.selected_home, 2, "next gate");
+        jump_to_attention(&mut app, &[], &rows);
+        assert_eq!(app.selected_home, 1, "wraps within band 1");
+        let flashed = app
+            .flash
+            .as_ref()
+            .map(|(_, m, _, _)| m.clone())
+            .unwrap_or_default();
+        assert!(
+            !flashed.contains("open a project first"),
+            "Home is not a place where `a` is dead: {flashed:?}"
+        );
+    }
+
+    // -- Phase D: the new-run surface and the fleet picker --------------------
+
+    fn cfg_with(order: &[&str]) -> Config {
+        Config {
+            providers: crate::config::ProviderConfig {
+                order: order.iter().map(|s| s.to_string()).collect(),
+            },
+            ..Config::default()
+        }
+    }
+
+    /// AC-30. The roster is built from configured refs, detected CLIs and the
+    /// most recent fleet. A configured `api:` ref stays selectable even though
+    /// CLI detection knows nothing about it; a configured native ref whose
+    /// binary is not on PATH is disabled **with a reason**; a malformed ref is
+    /// disabled and says why.
+    #[test]
+    fn the_roster_keeps_api_refs_selectable_and_explains_what_it_disables() {
+        let cfg = cfg_with(&[
+            "api:openai@gpt-5.6",
+            "cli:claude@opus",
+            "cli:nosuchcli",
+            "claude",
+        ]);
+        let detected = [
+            ("claude".to_string(), true),
+            ("codex".to_string(), true),
+            ("nosuchcli".to_string(), false),
+        ];
+        let roster = build_roster(&cfg, &detected, None);
+        let by = |label: &str| {
+            roster
+                .iter()
+                .find(|e| e.label.contains(label))
+                .unwrap_or_else(|| panic!("{label} missing from roster: {roster:?}"))
+        };
+        let api = by("api:openai");
+        assert!(api.available, "a supported api: ref must stay selectable");
+        assert_eq!(api.source, RosterSource::Configured);
+
+        let claude = by("cli:claude@opus");
+        assert!(claude.available);
+        assert!(
+            claude.label.contains("@opus"),
+            "a configured model pin must survive into the picker: {:?}",
+            claude.label
+        );
+
+        let missing = by("cli:nosuchcli");
+        assert!(!missing.available);
+        assert!(
+            missing.reason.as_deref().is_some_and(|r| !r.is_empty()),
+            "a disabled row must say why"
+        );
+
+        let malformed = by("claude");
+        assert!(
+            !malformed.available && malformed.reason.is_some(),
+            "a bare name is not a provider ref and must explain itself: {malformed:?}"
+        );
+
+        // Detection adds what config did not list, and never duplicates it.
+        assert_eq!(
+            roster
+                .iter()
+                .filter(|e| matches!(&e.choice, RosterChoice::Provider(p) if p.starts_with("cli:claude")))
+                .count(),
+            1,
+            "a detected CLI must not duplicate its configured entry: {roster:?}"
+        );
+        let codex = by("cli:codex");
+        assert_eq!(codex.source, RosterSource::Detected);
+
+        // R7: nothing configured, nothing on PATH — an explanatory empty
+        // roster, not an empty selectable list.
+        let bare = build_roster(&cfg_with(&[]), &[("claude".into(), false)], None);
+        assert!(
+            bare.iter().all(|e| !e.available),
+            "nothing usable must be nothing selectable: {bare:?}"
+        );
+    }
+
+    /// AC-31. A recent fleet is one roster row standing for several providers.
+    /// Picking it expands, and expansion deduplicates in first-picked order —
+    /// a comma-joined string is not a provider reference.
+    #[test]
+    fn a_recent_fleet_expands_and_dedupes_in_pick_order() {
+        let cfg = cfg_with(&["cli:claude@opus", "cli:codex@gpt-5.6-terra"]);
+        let fleet = vec![
+            "cli:codex@gpt-5.6-terra".to_string(),
+            "cli:muse@muse-spark-1.2-contributor".to_string(),
+        ];
+        let roster = build_roster(&cfg, &[("claude".into(), true)], Some(("ab12cd34", &fleet)));
+        let fleet_idx = roster
+            .iter()
+            .position(|e| matches!(e.choice, RosterChoice::Fleet(_)))
+            .expect("the recent fleet is a roster choice");
+        assert_eq!(roster[fleet_idx].source, RosterSource::RecentFleet);
+        assert!(
+            roster[fleet_idx].label.contains("ab12cd34"),
+            "the fleet row names the run it came from: {:?}",
+            roster[fleet_idx].label
+        );
+
+        let claude_idx = roster
+            .iter()
+            .position(|e| matches!(&e.choice, RosterChoice::Provider(p) if p == "cli:claude@opus"))
+            .unwrap();
+        let codex_idx = roster
+            .iter()
+            .position(
+                |e| matches!(&e.choice, RosterChoice::Provider(p) if p == "cli:codex@gpt-5.6-terra"),
+            )
+            .unwrap();
+
+        let mut nr = new_run_fixture();
+        nr.roster = roster;
+        nr.picked = vec![claude_idx, fleet_idx, codex_idx];
+        assert_eq!(
+            new_run_providers(&nr),
+            vec![
+                "cli:claude@opus".to_string(),
+                "cli:codex@gpt-5.6-terra".to_string(),
+                "cli:muse@muse-spark-1.2-contributor".to_string(),
+            ],
+            "expanded, deduplicated, in the order they were picked"
+        );
+    }
+
+    /// AC-32. R8/O-invariant: `--providers` is required on `plan`, so the
+    /// surface refuses rather than building a malformed argv. It also refuses
+    /// without a task and without a target project — the empty-registry case,
+    /// where an arbitrary cwd must never be treated as a project.
+    #[test]
+    fn the_new_run_surface_refuses_before_it_spawns() {
+        let mut nr = new_run_fixture();
+        nr.picked.clear();
+        assert!(
+            new_run_launch(&nr).is_err(),
+            "zero providers must not dispatch a fleet-less plan"
+        );
+
+        let mut nr = new_run_fixture();
+        nr.task = "   ".into();
+        assert!(
+            new_run_launch(&nr).is_err(),
+            "an empty task must not dispatch"
+        );
+
+        let mut nr = new_run_fixture();
+        nr.project = None;
+        nr.projects.clear();
+        let err = new_run_launch(&nr).unwrap_err();
+        assert!(
+            !err.is_empty(),
+            "no target project must be an explained refusal, not a launch against the cwd"
+        );
+
+        // A disabled roster row cannot be picked into a fleet.
+        let mut nr = new_run_fixture();
+        nr.roster[1].available = false;
+        nr.roster[1].reason = Some("not on PATH".into());
+        nr.picked = vec![1];
+        assert!(
+            new_run_launch(&nr).is_err(),
+            "an unavailable provider must not reach argv"
+        );
+
+        // The happy path: the target project comes from the surface, not from
+        // whatever the active root happens to be, and the argv is the same
+        // `plan -t … --providers …` the palette already sends.
+        let nr = new_run_fixture();
+        let (target, argv) = new_run_launch(&nr).expect("a valid surface launches");
+        assert_eq!(target, PathBuf::from("/nonexistent/spar"));
+        assert_eq!(argv[0], "plan");
+        let t = argv.iter().position(|a| a == "-t").expect("-t");
+        assert_eq!(argv[t + 1], nr.task);
+        let p = argv
+            .iter()
+            .position(|a| a == "--providers")
+            .expect("--providers is required on plan");
+        assert_eq!(argv[p + 1], "cli:claude@opus");
+    }
+
+    /// AC-35. The docs and decision rows are part of this change, not a
+    /// follow-up: the embedded operator skill describes a rail root that will
+    /// no longer exist, the IA doc still lists the Phase B scan as outstanding,
+    /// and the calls a future agent could reverse need rows.
+    #[test]
+    fn the_agent_facing_docs_move_with_the_feature() {
+        let core = include_str!("../skills/core.md");
+        assert!(
+            !core.contains(concat!("projects ▸ runs", " ▸ agents")),
+            "skills/core.md still calls Projects the rail root"
+        );
+        assert!(
+            core.contains("Home"),
+            "skills/core.md must describe the landing view"
+        );
+        for key in ["`n`", "`P`"] {
+            assert!(
+                core.contains(key),
+                "skills/core.md must document the new key {key}"
+            );
+        }
+
+        let ia = include_str!("../docs/architecture-tui-ia.md");
+        assert!(
+            !ia.contains(concat!("remains 004 ", "Phase B's job")),
+            "the IA doc still lists the render-path scan as outstanding"
+        );
+
+        let decisions = include_str!("../DECISIONS.md");
+        for row in [
+            "| U18 |", "| U19 |", "| U20 |", "| U21 |", "| U22 |", "| U23 |",
+        ] {
+            assert!(
+                decisions.contains(row),
+                "DECISIONS.md is missing {row} — a reversible call went unrecorded"
+            );
+        }
+    }
+
+    /// AC-33. U3's punt is retired where it is spoken: with no run selected the
+    /// palette's `plan` opens the surface pre-filled instead of erroring to the
+    /// CLI, `spar --task` seeds the surface rather than the palette, and the
+    /// palette's own help text no longer promises only a reused fleet.
+    #[test]
+    fn the_fresh_fleet_punt_is_retired() {
+        let app = App::new(Some("describe the change".into()), Config::default(), None);
+        let nr = app
+            .new_run
+            .as_ref()
+            .expect("`spar --task` must open the new-run surface");
+        assert_eq!(nr.task, "describe the change");
+        assert!(
+            app.palette.is_none(),
+            "the task seed no longer opens a pre-filled palette"
+        );
+
+        let plan_help = PALETTE_CMDS
+            .iter()
+            .find(|c| c.name == "plan")
+            .map(|c| c.help)
+            .expect("a plan verb");
+        assert!(
+            !plan_help.contains("reuses the selected run's fleet"),
+            "the palette still says a fresh fleet is impossible: {plan_help:?}"
         );
     }
 }
