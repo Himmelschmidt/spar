@@ -349,6 +349,10 @@ enum HomeRow {
     Run {
         band: HomeBand,
         run: state::RunSummary,
+        // Ranking-time snapshot of the wait, kept for AC-19/AC-20's monotonicity
+        // assertions; both renderers recompute a live wait from `run.updated_at`
+        // at paint time instead of reading this, so it is unread outside tests.
+        #[allow(dead_code)]
         waited: Duration,
     },
     /// A capped band's tail: how many more rows it is not showing.
@@ -1328,8 +1332,12 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
     let stream_text = if sel.browse.in_project() {
         stream_content(&swarm, full.as_ref(), sel.slot_idx, cache, !runs.is_empty())
     } else if sel.browse == BrowseLevel::Home {
+        // `draw_home_body` renders Home's body straight from `HomeData` with a
+        // freshly read clock (so the wait column doesn't freeze between snapshot
+        // rebuilds); a `home_overview` built here off a snapshot-time clock would
+        // never be read.
         cache.clear();
-        home_overview(&home.rows, &sel.home_scope, sel.home_watermark)
+        String::new()
     } else {
         cache.clear();
         project_overview(&projects, sel.project_idx)
@@ -1488,7 +1496,11 @@ fn build_home_rows(
         }
         for r in runs {
             // `run_attention` already folds `r.abandoned` into `Broken` (needs_you).
-            if run_attention(r).needs_you() {
+            // `PlanApproved` is `is_terminal()` but not a gate and not broken, so
+            // `run_attention` alone would drop the plan->implement handoff off Home
+            // entirely; it is declared into NeedsMe here rather than left to fall
+            // through (AC-18 review finding).
+            if run_attention(r).needs_you() || r.phase == Phase::PlanApproved {
                 needs_me.push(r.clone());
             } else if is_active_phase(r.phase) {
                 running.push(r.clone());
@@ -1500,8 +1512,13 @@ fn build_home_rows(
         }
     }
 
-    // Band 1: longest wait first. Bands 2/3: most recently updated first.
-    needs_me.sort_by_key(|r| std::cmp::Reverse(home_wait(r.updated_at, now)));
+    // Band 1: longest wait first, then Gate above Broken (above the PlanApproved
+    // handoff, which carries no `Attention` of its own) as the tiebreak on equal wait.
+    needs_me.sort_by(|a, b| {
+        home_wait(b.updated_at, now)
+            .cmp(&home_wait(a.updated_at, now))
+            .then_with(|| run_attention(b).cmp(&run_attention(a)))
+    });
     running.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
     finished.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
 
@@ -1595,8 +1612,16 @@ fn home_band_count(rows: &[HomeRow], band: HomeBand) -> usize {
 }
 
 /// Main's Home body: the four bands, headers always present, each empty band saying
-/// so on its own line (U14's reserved-space rule applied to Home).
-fn home_overview(rows: &[HomeRow], scope: &HomeScope, watermark: DateTime<Utc>) -> String {
+/// so on its own line (U14's reserved-space rule applied to Home). `now` is read
+/// fresh at render time rather than trusting each row's stored `waited` (which is
+/// only as fresh as the last snapshot rebuild, and a gated run with nothing else
+/// changing can go a long time between rebuilds) — a review finding.
+fn home_overview(
+    rows: &[HomeRow],
+    scope: &HomeScope,
+    watermark: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> String {
     let mut out = format!("\n  Home · {}\n\n", home_scope_label(scope));
     let mut i = 0;
     while i < rows.len() {
@@ -1616,7 +1641,7 @@ fn home_overview(rows: &[HomeRow], scope: &HomeScope, watermark: DateTime<Utc>) 
         let mut any = false;
         while j < rows.len() && !matches!(rows[j], HomeRow::Header(_)) {
             match &rows[j] {
-                HomeRow::Run { run, waited, .. } => {
+                HomeRow::Run { run, .. } => {
                     any = true;
                     let flag = if run.wants > 1 {
                         format!(" ⚑{}", run.wants)
@@ -1628,7 +1653,7 @@ fn home_overview(rows: &[HomeRow], scope: &HomeScope, watermark: DateTime<Utc>) 
                         run.project_name.as_deref().unwrap_or("?"),
                         truncate(&run.id, 8),
                         rail_phase(run.phase),
-                        relative_wait(*waited),
+                        relative_wait(home_wait(run.updated_at, now)),
                     ));
                 }
                 HomeRow::More { n, .. } => {
@@ -1697,13 +1722,11 @@ fn resync_home_selection(app: &mut App, rows: &[HomeRow]) {
         }
     }
     let mut i = app.selected_home.min(rows.len() - 1);
-    if matches!(rows[i], HomeRow::Header(_)) {
-        if let Some(f) = (i..rows.len()).find(|&j| !matches!(rows[j], HomeRow::Header(_))) {
+    let unselectable = |r: &HomeRow| matches!(r, HomeRow::Header(_) | HomeRow::More { .. });
+    if unselectable(&rows[i]) {
+        if let Some(f) = (i..rows.len()).find(|&j| !unselectable(&rows[j])) {
             i = f;
-        } else if let Some(b) = (0..i)
-            .rev()
-            .find(|&j| !matches!(rows[j], HomeRow::Header(_)))
-        {
+        } else if let Some(b) = (0..i).rev().find(|&j| !unselectable(&rows[j])) {
             i = b;
         }
     }
@@ -2599,7 +2622,14 @@ fn open_new_run(
             })
             .or_else(|| local_root.map(Path::to_path_buf)),
     };
-    let mut all_projects: Vec<PathBuf> = projects.iter().map(|p| p.root.clone()).collect();
+    // A scoped Home only offers its one target to cycle through — every other
+    // registered project is out of scope, and offering them let `←`/`→` launch a
+    // plan against a project the operator was not looking at (review finding).
+    // Cycling is only meaningful at `HomeScope::All`.
+    let mut all_projects: Vec<PathBuf> = match &app.home_scope {
+        HomeScope::Project(_) => Vec::new(),
+        HomeScope::All => projects.iter().map(|p| p.root.clone()).collect(),
+    };
     // A scoped Home's target may be one refresh ahead of the registry (a project
     // just entered but not yet registered) — without this, `←`/`→` cycling can't
     // find the target in `nr.projects`, falls back to index 0, and silently
@@ -5484,7 +5514,7 @@ fn rail_home_items(
                     format!("  {}", home_band_label(*b)),
                     muted().bold(),
                 )),
-                HomeRow::Run { run, waited, .. } => {
+                HomeRow::Run { run, .. } => {
                     let flag = if run.wants > 1 || run_attention(run).needs_you() {
                         Some(if run_attention(run) == Attention::Gate {
                             WARN
@@ -5514,7 +5544,10 @@ fn rail_home_items(
                     rail_row(
                         rail_lead(sel, focused, flag),
                         body,
-                        Span::styled(relative_wait(*waited), muted()),
+                        Span::styled(
+                            relative_wait(home_wait(run.updated_at, Utc::now())),
+                            muted(),
+                        ),
                         w,
                     )
                 }
@@ -5736,7 +5769,7 @@ fn draw_main(
 /// Main's Home body: the four bands (C7). Reuses the same scrollable-log viewport as
 /// the other no-run bodies.
 fn draw_home_body(f: &mut Frame, inner: Rect, home: &HomeData, app: &mut App) {
-    let text = home_overview(&home.rows, &app.home_scope, app.home_watermark);
+    let text = home_overview(&home.rows, &app.home_scope, app.home_watermark, Utc::now());
     app.stream_view_h = inner.height;
     app.stream_max = render_scrollable_log(
         f,
@@ -6920,7 +6953,11 @@ fn draw_new_run(f: &mut Frame, area: Rect, projects: &[registry::ProjectEntry], 
             "  checking roster…".to_string(),
             Style::default().fg(FG_MUTED),
         ));
-    } else if nr.roster.is_empty() {
+    } else if nr.roster.iter().all(|e| !e.available) {
+        // Not just "empty": the shipped default `providers.order` still emits one
+        // configured, unavailable row per entry when nothing is on PATH, so the
+        // roster is rarely literally empty — it is a roster with nothing usable
+        // (R7 review finding).
         lines.push((
             "  nothing usable — spar doctor".to_string(),
             Style::default().fg(FG_MUTED),
@@ -10561,6 +10598,73 @@ mod render_stability {
         }
     }
 
+    /// R7 review finding: the doctor pointer must fire on the realistic shape a
+    /// default install produces — every entry in `providers.order` configured but
+    /// unavailable (nothing on PATH), which is a non-empty roster, not the empty
+    /// one an explicit `order = []` produces.
+    #[test]
+    fn new_run_shows_the_doctor_pointer_when_nothing_is_usable() {
+        let projects = [home_project("spar")];
+        let home = home_data(&projects);
+        let term = paint_home(120, 30, &projects, &home, |a| {
+            let mut nr = new_run_fixture();
+            nr.roster = vec![
+                RosterEntry {
+                    choice: RosterChoice::Provider("cli:claude".into()),
+                    label: "cli:claude".into(),
+                    available: false,
+                    reason: Some("not on PATH".into()),
+                    source: RosterSource::Configured,
+                },
+                RosterEntry {
+                    choice: RosterChoice::Provider("cli:grok".into()),
+                    label: "cli:grok".into(),
+                    available: false,
+                    reason: Some("not on PATH".into()),
+                    source: RosterSource::Configured,
+                },
+            ];
+            nr.picked.clear();
+            a.new_run = Some(nr);
+        });
+        assert!(
+            whole(&term).contains("spar doctor"),
+            "a non-empty but all-unavailable roster must still point at spar doctor"
+        );
+    }
+
+    /// Review finding: the wait column must read from the run's own `updated_at`
+    /// at paint time, not from `HomeRow::Run.waited`, which is only as fresh as
+    /// the last snapshot rebuild and can go stale on an idle fleet. A row whose
+    /// `updated_at` is fresh but whose stored `waited` is hours old must still
+    /// paint a fresh wait.
+    #[test]
+    fn home_wait_column_reads_live_not_the_stale_stored_value() {
+        let projects = [home_project("spar")];
+        let run = home_run("gate0001", Phase::AwaitingPlanApproval, 0, "spar");
+        let home = HomeData {
+            rows: vec![
+                HomeRow::Header(HomeBand::NeedsMe),
+                HomeRow::Run {
+                    band: HomeBand::NeedsMe,
+                    run,
+                    waited: Duration::from_secs(6 * 3600),
+                },
+                HomeRow::Header(HomeBand::Running),
+                HomeRow::Header(HomeBand::Finished),
+                HomeRow::Header(HomeBand::StartNew),
+                HomeRow::NewRun,
+            ],
+            project_stats: Vec::new(),
+        };
+        let term = paint_home(120, 30, &projects, &home, |_| {});
+        let screen = whole(&term);
+        assert!(
+            !screen.contains("6h"),
+            "the rail must not paint the stale stored wait: {screen:?}"
+        );
+    }
+
     /// AC-2. Nothing registered, nothing run, no watermark: Home is still a
     /// coherent screen. All four band headers, each band's own empty line, and
     /// the `n` call to action reachable — including on the phone-width band
@@ -10710,7 +10814,8 @@ mod render_stability {
         // Main's body carries the four headers; assert on it directly so the
         // ordering claim does not depend on the rail's viewport height.
         for home in [&full, &drained] {
-            let body = home_overview(&home.rows, &HomeScope::All, Utc::now()).to_lowercase();
+            let body =
+                home_overview(&home.rows, &HomeScope::All, Utc::now(), Utc::now()).to_lowercase();
             let idx = |needle: &str| {
                 body.find(needle)
                     .unwrap_or_else(|| panic!("band header {needle:?} missing from: {body:?}"))
@@ -10722,7 +10827,8 @@ mod render_stability {
             assert!(a < b && b < c && c < d, "bands out of order: {body:?}");
         }
         // Each empty band still says what is empty, on its own line.
-        let body = home_overview(&drained.rows, &HomeScope::All, Utc::now()).to_lowercase();
+        let body =
+            home_overview(&drained.rows, &HomeScope::All, Utc::now(), Utc::now()).to_lowercase();
         for phrase in [
             "nothing needs you",
             "nothing running",
@@ -11315,7 +11421,7 @@ mod folding {
 /// | `gather_home(&[ProjectEntry]) -> Vec<Vec<RunSummary>>` | B/C | one folded, archived-filtered listing per project; disk, off-thread |
 /// | `project_stats_of(&[Vec<RunSummary>]) -> Vec<ProjectStat>` | B | pure; counts folded rows |
 /// | `build_home_rows(projects, folded, scope, watermark, now)` | C | pure; banding, ranking, capping |
-/// | `home_overview(rows, scope, watermark) -> String` | C | Main's Home body |
+/// | `home_overview(rows, scope, watermark, now) -> String` | C | Main's Home body |
 /// | `read_watermark` / `write_watermark` / `watermark_path` | C | the "finished since last look" clock |
 /// | `cross_project_due(browse, since_last, forced)` | B | bounded cross-project invalidation |
 /// | `build_roster(cfg, detected, recent)` / `new_run_providers` / `new_run_launch` | D | the fleet picker, with no disk in `draw` |
@@ -11623,6 +11729,7 @@ mod home_ia {
             ("stuk", Phase::Stuck, Some(HomeBand::NeedsMe)),
             ("quot", Phase::Quota, Some(HomeBand::NeedsMe)),
             ("esca", Phase::Escalated, Some(HomeBand::NeedsMe)),
+            ("plap", Phase::PlanApproved, Some(HomeBand::NeedsMe)),
             ("revw", Phase::Review, Some(HomeBand::Running)),
             ("disp", Phase::Dispatch, Some(HomeBand::Running)),
             ("done", Phase::Done, Some(HomeBand::Finished)),
@@ -11709,6 +11816,33 @@ mod home_ia {
         assert_eq!(
             ids_in(&rows, HomeBand::Running),
             vec!["new_work", "old_work"]
+        );
+    }
+
+    /// AC-19/review finding: on an equal wait, a Gate outranks a Broken run —
+    /// the plan's stated tiebreak, not registry/listing order.
+    #[test]
+    fn needs_me_ties_break_gate_above_broken() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let now = Utc::now();
+        let same_updated = now - chrono::Duration::minutes(30);
+        let mut broken = run_in("broken01", Phase::Failed, 30, &root);
+        broken.updated_at = same_updated;
+        let mut gate = run_in("gate0001", Phase::AwaitingPlanApproval, 30, &root);
+        gate.updated_at = same_updated;
+        let folded = vec![vec![broken, gate]];
+        let rows = build_home_rows(
+            &projects,
+            &folded,
+            &HomeScope::All,
+            now - chrono::Duration::hours(6),
+            now,
+        );
+        assert_eq!(
+            ids_in(&rows, HomeBand::NeedsMe),
+            vec!["gate0001", "broken01"],
+            "equal wait: Gate ranks above Broken"
         );
     }
 
@@ -11832,7 +11966,13 @@ mod home_ia {
             "the roll-up counts legs, not rows"
         );
         assert!(
-            home_overview(&rows, &HomeScope::All, now - chrono::Duration::hours(6)).contains("⚑2"),
+            home_overview(
+                &rows,
+                &HomeScope::All,
+                now - chrono::Duration::hours(6),
+                now
+            )
+            .contains("⚑2"),
             "a multi-gate unit says so on screen"
         );
     }
@@ -12305,6 +12445,21 @@ mod home_ia {
             bare.is_empty(),
             "nothing usable must be an empty roster, not disabled rows: {bare:?}"
         );
+
+        // R7, the realistic shape: an untouched `Config::default()` still carries
+        // `default_provider_order()`, so with nothing on PATH the roster is three
+        // *configured*, unavailable rows, not empty. `draw_new_run` gates the
+        // doctor pointer on "nothing available", not "nothing present" — see the
+        // render-level assertion in `render_stability`.
+        let default_roster = build_roster(&Config::default(), &[], None);
+        assert!(
+            !default_roster.is_empty(),
+            "the default provider order must still emit configured rows: {default_roster:?}"
+        );
+        assert!(
+            default_roster.iter().all(|e| !e.available),
+            "with nothing on PATH every default-order row must be unavailable: {default_roster:?}"
+        );
     }
 
     /// Round-7 review finding (review-0-cli-codex, minor): the registry lists
@@ -12374,6 +12529,40 @@ mod home_ia {
             app.new_run.as_ref().unwrap().project.as_deref(),
             Some(root.as_path()),
             "a full cycle must land back on the original scope target"
+        );
+    }
+
+    /// Review finding (review-0-cli-codex, major): a scoped Home used to offer
+    /// every registered project to cycle through even though it is scoped to
+    /// one, so `→` could silently launch the plan against a project the
+    /// operator was not looking at. With two other registered projects in the
+    /// registry, the scoped target must be the *only* entry in `nr.projects`.
+    #[test]
+    fn open_new_run_cannot_cycle_out_of_a_scoped_home() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let mut app = App::new(None, Config::default(), Some(root.as_path()));
+        assert_eq!(app.home_scope, HomeScope::Project(root.clone()));
+
+        let projects = [
+            project_at(&root, "spar"),
+            project_at(&PathBuf::from("/nonexistent/acme-api"), "acme-api"),
+            project_at(&PathBuf::from("/nonexistent/other"), "other"),
+        ];
+        open_new_run(&mut app, &projects, &[], Some(root.as_path()));
+        let nr = app.new_run.as_ref().unwrap();
+        assert_eq!(
+            nr.projects,
+            vec![root.clone()],
+            "a scoped Home must not offer projects outside its scope: {:?}",
+            nr.projects
+        );
+
+        app.new_run.as_mut().unwrap().field = NewRunField::Project;
+        handle_new_run_key(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(
+            app.new_run.as_ref().unwrap().project.as_deref(),
+            Some(root.as_path()),
+            "→ must not be able to leave the scoped target"
         );
     }
 
