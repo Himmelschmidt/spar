@@ -492,10 +492,7 @@ fn execute_prepared(
     );
     enrich_muse_stats(&mut res.stats, &prep.job.provider, &prep.log_path);
     let quota_rejected = res.stats.quota_rejected.clone();
-    let quota_resets_at = res
-        .stats
-        .quota_resets_at
-        .and_then(chrono::DateTime::from_timestamp_secs);
+    let quota_resets_at = resets_at_from_epoch_secs(res.stats.quota_resets_at);
     let usage = usage_from_stream(&prep.job.slot_id, &prep.job.provider, &res.stats);
     if res.timed_out {
         let error = crate::nudge::ceiling_error(timeout, soft, timeout_label(prep.job.role));
@@ -933,9 +930,18 @@ fn apply_parallel_outcome(
             );
         }
         Ok(result) => {
-            let agy_quota_hit = result.agy_quota_hit;
-            let quota_rejected = result.quota_rejected.clone();
-            let quota_resets_at = result.quota_resets_at;
+            // True-parallel dispatch (`run_slots_parallel`, e.g. `--workflow review`)
+            // had no quota detection at all before this: a rate-limited slot here left
+            // its provider unpaused. This only pauses/records the hit on the slot; it
+            // is `review`/`peer`/`roles`'s own terminal-phase mapping that reads
+            // `quota_hit` back off the slot to route the run to `Phase::Quota`. Read
+            // through `&result` here, before anything below moves its fields out: see
+            // `quota_hit_for_outcome`.
+            let quota_hit =
+                quota_hit_for_outcome(paths, &prep.job.provider, &prep.log_path, &result);
+            if let Some(s) = state.slot_mut(slot_id) {
+                s.quota_hit = quota_hit;
+            }
             let err = result.error.unwrap_or_else(|| "failed".into());
             salvage_expected_artifact(paths, &state.id, &prep.job, &prep.log_path, &err);
             if let Some(u) = result.usage {
@@ -943,24 +949,6 @@ fn apply_parallel_outcome(
                     s.usage = Some(u.clone());
                 }
                 state.usage.push(u);
-            }
-            // True-parallel dispatch (`run_slots_parallel`, e.g. `--workflow review`)
-            // had no quota detection at all before this: a rate-limited slot here left
-            // its provider unpaused. This only pauses/records the hit on the slot; it
-            // is `review`/`peer`/`roles`'s own terminal-phase mapping that reads
-            // `quota_hit` back off the slot to route the run to `Phase::Quota`. agy's
-            // own stdout is ~empty, so the log scrape alone never sees its rejection;
-            // `enrich_agy_stats`'s telemetry-driven verdict is ORed in instead.
-            let log_text = process::tail_log(&prep.log_path, 8000);
-            let quota_hit = detect_and_pause_quota(
-                paths,
-                &prep.job.provider,
-                &log_text,
-                quota_rejected.as_deref(),
-                quota_resets_at,
-            ) || agy_quota_hit;
-            if let Some(s) = state.slot_mut(slot_id) {
-                s.quota_hit = quota_hit;
             }
             mark_slot_failed(
                 state,
@@ -1307,6 +1295,9 @@ pub fn run_slot(
             &crate::events::Event::slot(&job.slot_id, SlotStatus::Done),
         );
     } else {
+        // Read through `&result` before anything below moves its fields out — see
+        // `quota_hit_for_outcome`.
+        let quota_hit = quota_hit_for_outcome(paths, &job.provider, &log_path, &result);
         let err = result.error.as_deref().unwrap_or("failed");
         salvage_expected_artifact(paths, &state.id, job, &log_path, err);
         markers::write_dispatch_verdict(
@@ -1340,16 +1331,6 @@ pub fn run_slot(
             &state.id,
             &crate::events::Event::slot(&job.slot_id, SlotStatus::Failed),
         );
-        let log_text = process::tail_log(&log_path, 8000);
-        // agy's own stdout is ~empty, so the log scrape alone never sees its rejection;
-        // `enrich_agy_stats`'s telemetry-driven verdict is ORed in instead.
-        let quota_hit = detect_and_pause_quota(
-            paths,
-            &job.provider,
-            &log_text,
-            result.quota_rejected.as_deref(),
-            result.quota_resets_at,
-        ) || result.agy_quota_hit;
         if let Some(s) = state.slot_mut(&job.slot_id) {
             s.quota_hit = quota_hit;
         }
@@ -1410,6 +1391,15 @@ fn plausible_reset_instant(until: chrono::DateTime<chrono::Utc>) -> bool {
     until > now && until < now + chrono::Duration::days(MAX_PLAUSIBLE_RESET_HORIZON_DAYS)
 }
 
+/// `StreamStats::quota_resets_at` is epoch **seconds**, per the adapter's own schema.
+/// `chrono::DateTime::from_timestamp_secs` does not reject an out-of-range value on its
+/// own — a millisecond timestamp misread as seconds still parses, just to a date
+/// decades out — so this conversion alone must never be trusted as "plausible"; that
+/// judgment is `plausible_reset_instant`'s, applied by every caller of this function.
+fn resets_at_from_epoch_secs(secs: Option<i64>) -> Option<chrono::DateTime<chrono::Utc>> {
+    secs.and_then(chrono::DateTime::from_timestamp_secs)
+}
+
 /// `structured` is the adapter's own typed verdict on this request, when it has one:
 /// `StreamStats::quota_rejected`, carrying the `rateLimitType` from a `rate_limit_event`
 /// whose status was `rejected`. When present it decides routing on its own and the text
@@ -1455,17 +1445,54 @@ fn detect_and_pause_quota(
                 );
                 let _ = store.save(paths);
             }
-            None if resets_at.is_some() => {
-                eprintln!(
-                    "spar: {key} stated a reset instant outside the plausible window; \
-                     falling back to the generic pause"
-                );
+            None => {
+                if resets_at.is_some() {
+                    eprintln!(
+                        "spar: {key} stated a reset instant outside the plausible window; \
+                         falling back to the generic pause"
+                    );
+                }
+                // The scrapes above only pause if `log_text` happens to carry rate-limit
+                // prose. It usually does (the coalescer renders a line alongside every
+                // structured event), but the tail is capped and can roll that line out,
+                // and an adapter can emit the structured event with no prose at all — in
+                // both cases a typed rejection with no usable instant must still leave
+                // the provider paused, not `Available`. Write the generic pause
+                // explicitly rather than assume an earlier scrape already did; only if
+                // one hasn't, so a more precise cooldown a scrape *did* write is not
+                // downgraded.
+                let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+                if store.is_usable(&key) {
+                    store.pause_quota(&key, format!("{key} {window} limit rejected"));
+                    let _ = store.save(paths);
+                }
             }
-            None => {}
         }
         return true;
     }
     crate::quota::QuotaStore::scrape_strong_quota_signal(log_text).is_some()
+}
+
+/// The glue between a finished `SlotOutcome` and [`detect_and_pause_quota`], shared by
+/// `run_slot`'s and `apply_parallel_outcome`'s failed-dispatch arms. Takes `&SlotOutcome`
+/// whole, rather than three fields pre-extracted into locals at each call site: a
+/// mutation dropping `quota_resets_at` between the outcome and the call — the exact
+/// class of regression review rounds kept finding here — now has to happen inside this
+/// one tested function instead of silently at either caller.
+fn quota_hit_for_outcome(
+    paths: &SparPaths,
+    provider: &str,
+    log_path: &Path,
+    outcome: &SlotOutcome,
+) -> bool {
+    let log_text = process::tail_log(log_path, 8000);
+    detect_and_pause_quota(
+        paths,
+        provider,
+        &log_text,
+        outcome.quota_rejected.as_deref(),
+        outcome.quota_resets_at,
+    ) || outcome.agy_quota_hit
 }
 
 /// Same discriminator as [`detect_and_pause_quota`], but also scrapes `extra`
@@ -2030,10 +2057,7 @@ fn run_headless(
     let agy_quota_hit = enrich_agy_stats(&mut res.stats, &job.provider, cwd, log_path, paths);
     enrich_muse_stats(&mut res.stats, &job.provider, log_path);
     let quota_rejected = res.stats.quota_rejected.clone();
-    let quota_resets_at = res
-        .stats
-        .quota_resets_at
-        .and_then(chrono::DateTime::from_timestamp_secs);
+    let quota_resets_at = resets_at_from_epoch_secs(res.stats.quota_resets_at);
     let usage = usage_from_stream(&job.slot_id, &job.provider, &res.stats);
     if res.timed_out {
         let error = crate::nudge::ceiling_error(timeout, soft, timeout_label(job.role));
@@ -2571,6 +2595,14 @@ mod tests {
     /// A stated instant already in the past must not be written as a `Cooldown` — that
     /// reads as immediately usable, worse than no cooldown. It must fall back to the
     /// generic auto-recovering pause instead.
+    ///
+    /// `log_text` is deliberately empty (no rendered rate-limit line, no prose at all):
+    /// the earlier version of this test passed `FIVE_HOUR_REJECTION_LOG` and so
+    /// couldn't tell the fallback pause this test names apart from the text scrape
+    /// upstream in `detect_and_pause_quota` happening to have already written one. An
+    /// adapter can state `structured`/`resets_at` with a log tail that rolled the
+    /// rendered line out of its 8 KB window (or carries no prose at all), and the
+    /// fallback must still fire from the structured branch itself.
     #[test]
     fn detect_and_pause_quota_with_a_past_typed_reset_falls_back_to_the_generic_pause() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2579,7 +2611,7 @@ mod tests {
         assert!(detect_and_pause_quota(
             &paths,
             "cli:claude",
-            FIVE_HOUR_REJECTION_LOG,
+            "",
             Some("five_hour"),
             Some(past)
         ));
@@ -2592,13 +2624,15 @@ mod tests {
         );
         assert!(
             !store.is_usable("cli:claude"),
-            "the generic fallback pause must still apply"
+            "the generic fallback pause must still apply even with no rate-limit prose \
+             anywhere in the log tail"
         );
     }
 
     /// A stated instant further out than any real Claude window (e.g. a millisecond
     /// timestamp misread as seconds, landing decades away) must not be trusted either:
-    /// it would brick the provider with no auto-recovery.
+    /// it would brick the provider with no auto-recovery. See the past-instant test
+    /// above for why `log_text` is empty here too.
     #[test]
     fn detect_and_pause_quota_with_an_implausible_typed_reset_falls_back_to_the_generic_pause() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2607,7 +2641,7 @@ mod tests {
         assert!(detect_and_pause_quota(
             &paths,
             "cli:claude",
-            FIVE_HOUR_REJECTION_LOG,
+            "",
             Some("five_hour"),
             Some(absurd)
         ));
@@ -2620,8 +2654,140 @@ mod tests {
         );
         assert!(
             !store.is_usable("cli:claude"),
-            "the generic fallback pause must still apply"
+            "the generic fallback pause must still apply even with no rate-limit prose \
+             anywhere in the log tail"
         );
+    }
+
+    /// The `structured = Some(_)` with no stated instant at all (`resets_at: None`) arm
+    /// has the same hole as the past/implausible cases: it must still leave the
+    /// provider paused, not `Available`, even with no rate-limit prose in the log.
+    #[test]
+    fn detect_and_pause_quota_with_a_typed_rejection_and_no_reset_falls_back_to_the_generic_pause()
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        assert!(detect_and_pause_quota(
+            &paths,
+            "cli:claude",
+            "",
+            Some("unknown"),
+            None
+        ));
+        let store = crate::quota::QuotaStore::load(&paths).unwrap();
+        assert!(
+            !store.is_usable("cli:claude"),
+            "a typed rejection with no stated instant must still pause the provider"
+        );
+    }
+
+    /// A more precise cooldown a text scrape already wrote from real prose in the same
+    /// log tail must not be downgraded to the coarse generic pause just because the
+    /// structured instant itself was unusable.
+    #[test]
+    fn detect_and_pause_quota_keeps_a_scraped_cooldown_when_the_typed_reset_is_unusable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let past = chrono::Utc::now() - chrono::Duration::hours(1);
+        assert!(detect_and_pause_quota(
+            &paths,
+            "cli:claude",
+            WEEKLY_LIMIT_LOG,
+            Some("seven_day"),
+            Some(past)
+        ));
+        let store = crate::quota::QuotaStore::load(&paths).unwrap();
+        let q = store.get("cli:claude");
+        assert_eq!(
+            q.hint.as_deref(),
+            Some("claude weekly limit (no stated reset instant, default cooldown)"),
+            "the scrape's own pause must survive, not get overwritten by the generic fallback"
+        );
+    }
+
+    /// The wiring between a `SlotOutcome` and `detect_and_pause_quota`, not just the
+    /// callee: a future stated instant on the outcome must pause the store until
+    /// exactly then, with no rate-limit prose in the log to do it via the text scrape
+    /// instead. Deleting the `outcome.quota_resets_at` forwarding inside
+    /// `quota_hit_for_outcome` (or passing `None` at either of its two call sites)
+    /// makes this fail.
+    #[test]
+    fn quota_hit_for_outcome_carries_a_future_typed_reset_into_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log_path = tmp.path().join("s1.log");
+        std::fs::write(&log_path, b"").unwrap();
+        let until = chrono::Utc::now() + chrono::Duration::hours(2);
+        let outcome = SlotOutcome {
+            quota_rejected: Some("five_hour".into()),
+            quota_resets_at: Some(until),
+            ..SlotOutcome::err("boom")
+        };
+        assert!(quota_hit_for_outcome(
+            &paths,
+            "cli:claude",
+            &log_path,
+            &outcome
+        ));
+        let store = crate::quota::QuotaStore::load(&paths).unwrap();
+        let q = store.get("cli:claude");
+        assert_eq!(q.status, crate::quota::ProviderStatus::Cooldown);
+        assert_eq!(q.cooldown_until, Some(until));
+    }
+
+    /// Same wiring, the past/implausible half: an unusable stated instant on the
+    /// outcome must still leave the provider paused via the generic fallback, with no
+    /// rate-limit prose in the log to fall back onto instead.
+    #[test]
+    fn quota_hit_for_outcome_falls_back_when_the_typed_reset_is_unusable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log_path = tmp.path().join("s1.log");
+        std::fs::write(&log_path, b"").unwrap();
+        let outcome = SlotOutcome {
+            quota_rejected: Some("five_hour".into()),
+            quota_resets_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+            ..SlotOutcome::err("boom")
+        };
+        assert!(quota_hit_for_outcome(
+            &paths,
+            "cli:claude",
+            &log_path,
+            &outcome
+        ));
+        let store = crate::quota::QuotaStore::load(&paths).unwrap();
+        assert!(!store.is_usable("cli:claude"));
+    }
+
+    /// A slot with no typed verdict at all must still reach the prose fallback: the
+    /// wiring must pass `None`/`None` through, not swallow the log tail.
+    #[test]
+    fn quota_hit_for_outcome_with_no_typed_verdict_still_reaches_the_prose_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log_path = tmp.path().join("s1.log");
+        std::fs::write(&log_path, WEEKLY_LIMIT_LOG).unwrap();
+        let outcome = SlotOutcome::err("boom");
+        assert!(quota_hit_for_outcome(
+            &paths,
+            "cli:claude",
+            &log_path,
+            &outcome
+        ));
+    }
+
+    /// `StreamStats::quota_resets_at` is epoch seconds; this must not silently accept a
+    /// value chrono can still parse into a `DateTime` at some other scale. The bound
+    /// that actually catches a millisecond timestamp is `plausible_reset_instant`, not
+    /// this conversion — this test only pins down that the conversion itself stays
+    /// seconds-based rather than growing its own (wrong) unit guess later.
+    #[test]
+    fn resets_at_from_epoch_secs_treats_the_input_as_seconds() {
+        assert_eq!(
+            resets_at_from_epoch_secs(Some(1_700_000_000)),
+            chrono::DateTime::from_timestamp(1_700_000_000, 0)
+        );
+        assert_eq!(resets_at_from_epoch_secs(None), None);
     }
 
     /// The discriminator must not fire for an ordinary defect — a false positive here

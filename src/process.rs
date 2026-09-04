@@ -836,38 +836,48 @@ impl StreamCoalescer {
                         .pointer("/rate_limit_info/rateLimitType")
                         .and_then(|x| x.as_str())
                         .unwrap_or("");
-                    if status == "rejected" {
-                        // Captured here, typed, rather than recovered downstream from
-                        // the rendered line: `status` is the provider's own verdict on
-                        // this request, so routing on it cannot false-positive on prose
-                        // that merely mentions limits.
-                        self.quota_rejected = Some(if kind.is_empty() {
-                            "unknown".to_string()
-                        } else {
-                            kind.to_string()
-                        });
-                        // The same object states when the window reopens, as an absolute
-                        // instant in epoch seconds — day included, no timezone, nothing
-                        // inferred. Prefer the window-specific entry when the payload
-                        // carries `unifiedWindows`, else the top-level one. Reading the
-                        // rendered sentence's wall-clock time instead is what made the
-                        // weekly reset look unknowable when it never was.
-                        self.quota_resets_at = v
-                            .pointer(&format!("/rate_limit_info/unifiedWindows/{kind}/resetsAt"))
-                            .and_then(|x| x.as_i64())
-                            .or_else(|| {
-                                v.pointer("/rate_limit_info/resetsAt")
-                                    .and_then(|x| x.as_i64())
+                    match status {
+                        "rejected" => {
+                            // Captured here, typed, rather than recovered downstream from
+                            // the rendered line: `status` is the provider's own verdict on
+                            // this request, so routing on it cannot false-positive on prose
+                            // that merely mentions limits.
+                            self.quota_rejected = Some(if kind.is_empty() {
+                                "unknown".to_string()
+                            } else {
+                                kind.to_string()
                             });
-                    } else {
-                        // A `rejected` status does not latch: a stream can be rejected,
-                        // fall back to another window, and keep going. A later
-                        // allowed/allowed_warning event means this dispatch is not
-                        // (or is no longer) blocked, so it must clear the verdict rather
-                        // than let an earlier rejection outlive its own recovery and
-                        // misroute an unrelated later failure onto `Phase::Quota`.
-                        self.quota_rejected = None;
-                        self.quota_resets_at = None;
+                            // The same object states when the window reopens, as an absolute
+                            // instant in epoch seconds — day included, no timezone, nothing
+                            // inferred. Prefer the window-specific entry when the payload
+                            // carries `unifiedWindows`, else the top-level one. Reading the
+                            // rendered sentence's wall-clock time instead is what made the
+                            // weekly reset look unknowable when it never was.
+                            self.quota_resets_at = v
+                                .pointer(&format!(
+                                    "/rate_limit_info/unifiedWindows/{kind}/resetsAt"
+                                ))
+                                .and_then(|x| x.as_i64())
+                                .or_else(|| {
+                                    v.pointer("/rate_limit_info/resetsAt")
+                                        .and_then(|x| x.as_i64())
+                                });
+                        }
+                        "allowed" | "allowed_warning" => {
+                            // A `rejected` status does not latch: a stream can be rejected,
+                            // fall back to another window, and keep going. A later
+                            // allowed/allowed_warning event means this dispatch is not
+                            // (or is no longer) blocked, so it must clear the verdict rather
+                            // than let an earlier rejection outlive its own recovery and
+                            // misroute an unrelated later failure onto `Phase::Quota`.
+                            self.quota_rejected = None;
+                            self.quota_resets_at = None;
+                        }
+                        // Anything outside the three known values (missing/non-string
+                        // `status`, or a future enum member) means this event could not be
+                        // read, not that the window reopened — leaving a genuine, already
+                        // recorded rejection alone is safer than clearing it on a guess.
+                        _ => {}
                     }
                     if status != "allowed" {
                         return Some(format!("! rate limit  {kind}  {status}\n"));
@@ -1407,10 +1417,14 @@ impl StreamCoalescer {
         s.cache_write_tokens = self.cache_write;
         s.context_tokens = self.context_tokens();
         s.billed_tokens = self.billed_tokens();
-        if self.quota_rejected.is_some() {
-            s.quota_rejected = self.quota_rejected.clone();
-            s.quota_resets_at = self.quota_resets_at;
-        }
+        // Unconditional, like every other counter above: `self.quota_rejected` already
+        // reflects the coalescer's *current* verdict (the rate_limit_event handler
+        // clears it on recovery), so gating this copy on `is_some()` was the latch —
+        // a clear could never overwrite an already-merged `Some` in `StreamStats`, and
+        // a stream that was rejected, recovered, then failed for an unrelated reason
+        // still routed to `Phase::Quota` on the stale value.
+        s.quota_rejected = self.quota_rejected.clone();
+        s.quota_resets_at = self.quota_resets_at;
         if self.model.is_some() {
             s.model = self.model.clone();
         }
@@ -1750,6 +1764,74 @@ mod tests {
         );
         assert_eq!(c.quota_resets_at, Some(1788000000));
     }
+
+    /// `unifiedWindows` present but missing this window's own entry must fall through
+    /// to the top-level `resetsAt`, not silently drop the instant.
+    #[test]
+    fn a_window_absent_from_unified_windows_falls_back_to_the_top_level_reset_instant() {
+        let mut c = StreamCoalescer::new(false);
+        c.feed(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"seven_day","resetsAt":1788000000,"unifiedWindows":{"five_hour":{"resetsAt":1}}}}"#,
+        );
+        assert_eq!(c.quota_resets_at, Some(1788000000));
+    }
+
+    /// An empty `rateLimitType` becomes the `"unknown"` window for `quota_rejected`, but
+    /// the `unifiedWindows` lookup still keys off the raw (empty) `kind`, which can never
+    /// match a real window entry — this must fall back to the top-level `resetsAt`
+    /// rather than come back empty.
+    #[test]
+    fn an_empty_rate_limit_type_falls_back_to_the_top_level_reset_instant() {
+        let mut c = StreamCoalescer::new(false);
+        c.feed(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1788000000}}"#,
+        );
+        assert_eq!(c.quota_rejected.as_deref(), Some("unknown"));
+        assert_eq!(c.quota_resets_at, Some(1788000000));
+    }
+
+    /// `status` outside the three known values (here: missing, so `unwrap_or("?")`)
+    /// means the event could not be read, not that the window reopened. Clearing a
+    /// genuine, already-recorded rejection on that guess would un-latch it for the
+    /// wrong reason — the same false-positive class this whole change exists to close,
+    /// arriving through a malformed event instead of a recovered one.
+    #[test]
+    fn a_malformed_status_does_not_clear_an_existing_rejection() {
+        let mut c = StreamCoalescer::new(false);
+        c.feed(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":1788000000}}"#,
+        );
+        c.feed(r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour"}}"#);
+        assert_eq!(c.quota_rejected.as_deref(), Some("five_hour"));
+        assert_eq!(c.quota_resets_at, Some(1788000000));
+    }
+
+    /// The critical latch: `merge_counters_into` must not gate the copy on
+    /// `quota_rejected.is_some()`, or a clear can never overwrite an already-merged
+    /// `Some` in `StreamStats` — a stream that was rejected, recovered, then failed for
+    /// an unrelated reason later would still route to `Phase::Quota` on the stale value.
+    /// Regresses to the guarded form and this fails.
+    #[test]
+    fn a_recovered_stream_is_not_latched_in_stream_stats() {
+        let mut c = StreamCoalescer::new(false);
+        let mut stats = StreamStats::default();
+        c.feed(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":1788000000}}"#,
+        );
+        c.merge_counters_into(&mut stats);
+        assert_eq!(stats.quota_rejected.as_deref(), Some("five_hour"));
+
+        c.feed(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour"}}"#,
+        );
+        c.merge_counters_into(&mut stats);
+        assert_eq!(
+            stats.quota_rejected, None,
+            "a later allowed event must un-latch the stats a failed dispatch reads"
+        );
+        assert_eq!(stats.quota_resets_at, None);
+    }
+
     use super::*;
     use tempfile::tempdir;
 
