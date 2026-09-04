@@ -2,7 +2,7 @@
 
 All notable changes to spar are recorded here.
 
-## [Unreleased]
+## [0.0.3] - 2026-09-04
 
 ### Added
 
@@ -12,9 +12,25 @@ All notable changes to spar are recorded here.
 - **You can start a new run from inside the TUI**, picking which providers to use
   from a list, instead of being sent to the command line whenever no run was already
   selected.
+- **Running a project's test suite no longer requires starting a separate agent for it.**
 
 ### Fixed
 
+- **The help screen cut its own text off mid-word** and could not be scrolled, so several
+  keyboard shortcuts were unreadable. It now sizes itself to fit, wraps instead of
+  chopping, and scrolls when the window is short.
+- **The command palette never showed its hint line, and four of its twelve commands could
+  not be reached** by scrolling the list. Every command is now reachable and the list
+  shows where you are in it.
+- **A scrollbar appeared on panels that had nothing to scroll.**
+- **The gaps between tabs were uneven**, and on narrow windows the labels ran together
+  with no space between them.
+- **Opening a project with no runs showed a broken heading and leftover text from
+  whatever was on screen before.** It now shows a single clear message and how to start.
+- **A run waiting on you could vanish from the "needs you" list.** When a run's plan had
+  been approved while another part of the same work was still running, the list showed
+  nothing while the counter beside it still said one — so the two disagreed and the
+  handoff was easy to miss. The list and the count now always agree.
 - **Dispatching acceptance tests to a coding agent could wipe out the work it had already
   done.** Every dispatch after the first quietly reverted source files in the agent's
   working copy to the versions on the test author's branch, so agents redid work they had

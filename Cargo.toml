@@ -1,6 +1,6 @@
 [package]
 name = "spar"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 description = "Multi-agent coding product: fleet TUI, dual backends, plan/review/arena/ship"
 license = "MIT"
