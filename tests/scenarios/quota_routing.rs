@@ -286,6 +286,106 @@ fn structured_rate_limit_event_on_a_parallel_dispatch_pauses_until_the_stated_in
     );
 }
 
+/// The seam major review round 2 (9d636209) flagged: `structured_rate_limit_event_...`
+/// above proves the `StreamStats -> SlotOutcome` extraction carries a *live* rejection
+/// end to end, but severing that same extraction (hardcoding `quota_recovered: false`
+/// at the call site instead of reading `res.stats.quota_recovered`) left every existing
+/// test green, because none of them streamed a rejection that later recovered through a
+/// real spawned process. This fakes exactly that: a real `rate_limit_event` rejection,
+/// followed by a real `allowed` event clearing it, followed by an unrelated panic and a
+/// non-zero exit. The dispatch must fail ordinarily (`Phase::Failed`, exit `1`), not park
+/// on `Phase::Quota`/exit `4` off the earlier rejection's rendered line still sitting in
+/// the log tail. Mutating the sequential path's extraction (`run_headless`) to discard
+/// `quota_recovered` makes this fail; see the `..._on_a_parallel_dispatch_...` sibling
+/// below for `execute_prepared`'s copy of the same seam.
+#[test]
+fn a_recovered_rate_limit_event_does_not_park_a_later_genuine_failure_on_quota() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    let proj = dir.join("proj");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&proj).unwrap();
+    init_repo(&proj);
+    let until = chrono::Utc::now() + chrono::Duration::hours(2);
+    let body = format!(
+        "{{\"type\":\"rate_limit_event\",\"rate_limit_info\":{{\"status\":\"rejected\",\"rateLimitType\":\"five_hour\",\"resetsAt\":{}}}}}\n\
+         {{\"type\":\"rate_limit_event\",\"rate_limit_info\":{{\"status\":\"allowed\",\"rateLimitType\":\"five_hour\"}}}}\n\
+         thread 'main' panicked at src/main.rs:42:\nindex out of bounds",
+        until.timestamp()
+    );
+    let path_env = fake_claude_binary(&bin, &body);
+
+    spar_cmd()
+        .current_dir(&proj)
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--providers",
+            "cli:claude",
+        ])
+        .env("PATH", &path_env)
+        .assert()
+        .code(1);
+
+    let run_id = only_run_id(&proj);
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(proj.join(".spar/runs").join(&run_id).join("state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["phase"], "failed");
+}
+
+/// Same recovered-then-failed scenario as
+/// `a_recovered_rate_limit_event_does_not_park_a_later_genuine_failure_on_quota`, but
+/// through `run_slots_parallel` -> `execute_prepared`, whose `res.stats -> SlotOutcome`
+/// extraction is a separate copy from `run_headless`'s and needs its own end-to-end
+/// pin. Uses `--workflow review`, not `peer`: peer's own terminal-phase mapping reads
+/// any non-quota failure as `Phase::Done` regardless (a pre-existing, documented gap,
+/// see `workflow/peer.rs`'s own comment and DECISIONS.md O54), so it cannot distinguish
+/// "the seam correctly saw no quota hit" from "peer never reports failure at all".
+/// `review`'s mapping does discriminate quota from genuine failure, so both reviewers
+/// hitting the same recovered-and-then-panicking log must fail the run ordinarily.
+#[test]
+fn a_recovered_rate_limit_event_on_a_parallel_dispatch_does_not_park_on_quota() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    let proj = dir.join("proj");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&proj).unwrap();
+    init_repo(&proj);
+    let until = chrono::Utc::now() + chrono::Duration::hours(2);
+    let body = format!(
+        "{{\"type\":\"rate_limit_event\",\"rate_limit_info\":{{\"status\":\"rejected\",\"rateLimitType\":\"five_hour\",\"resetsAt\":{}}}}}\n\
+         {{\"type\":\"rate_limit_event\",\"rate_limit_info\":{{\"status\":\"allowed\",\"rateLimitType\":\"five_hour\"}}}}\n\
+         thread 'main' panicked at src/main.rs:42:\nindex out of bounds",
+        until.timestamp()
+    );
+    let path_env = fake_claude_binary(&bin, &body);
+
+    spar_cmd()
+        .current_dir(&proj)
+        .args([
+            "run",
+            "--workflow",
+            "review",
+            "-t",
+            "review this",
+            "--providers",
+            "cli:claude,cli:claude",
+        ])
+        .env("PATH", &path_env)
+        .assert()
+        .code(1);
+
+    let run_id = only_run_id(&proj);
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(proj.join(".spar/runs").join(&run_id).join("state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["phase"], "failed");
+}
+
 /// `--workflow review` dispatches its N reviewers concurrently through
 /// `run_slots_parallel`, a different code path from `implement`'s `run_slot` ->
 /// `bail!`. Both reviewers hitting the same rate limit must still park the run at

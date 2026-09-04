@@ -383,7 +383,7 @@ fn execute_prepared(
                 agy_quota_hit: false,
                 quota_rejected: None,
                 quota_resets_at: None,
-                quota_seen: false,
+                quota_recovered: false,
             }
         } else {
             SlotOutcome {
@@ -396,7 +396,7 @@ fn execute_prepared(
                 agy_quota_hit: false,
                 quota_rejected: None,
                 quota_resets_at: None,
-                quota_seen: false,
+                quota_recovered: false,
             }
         });
     }
@@ -495,7 +495,7 @@ fn execute_prepared(
     enrich_muse_stats(&mut res.stats, &prep.job.provider, &prep.log_path);
     let quota_rejected = res.stats.quota_rejected.clone();
     let quota_resets_at = resets_at_from_epoch_secs(res.stats.quota_resets_at);
-    let quota_seen = res.stats.quota_seen;
+    let quota_recovered = res.stats.quota_recovered;
     let usage = usage_from_stream(&prep.job.slot_id, &prep.job.provider, &res.stats);
     if res.timed_out {
         let error = crate::nudge::ceiling_error(timeout, soft, timeout_label(prep.job.role));
@@ -514,7 +514,7 @@ fn execute_prepared(
             agy_quota_hit,
             quota_rejected: quota_rejected.clone(),
             quota_resets_at,
-            quota_seen,
+            quota_recovered,
         });
     }
     if res.exit_code != Some(0) {
@@ -528,7 +528,7 @@ fn execute_prepared(
             agy_quota_hit,
             quota_rejected: quota_rejected.clone(),
             quota_resets_at,
-            quota_seen,
+            quota_recovered,
         });
     }
     // A clean exit is not success on its own: a slot that produced no artifact (e.g. an
@@ -576,7 +576,7 @@ fn execute_prepared(
                 agy_quota_hit,
                 quota_rejected: quota_rejected.clone(),
                 quota_resets_at,
-                quota_seen,
+                quota_recovered,
             });
         }
     }
@@ -590,7 +590,7 @@ fn execute_prepared(
         agy_quota_hit,
         quota_rejected: quota_rejected.clone(),
         quota_resets_at,
-        quota_seen,
+        quota_recovered,
     })
 }
 
@@ -1363,6 +1363,16 @@ pub fn run_slot(
 /// at all; an adapter with a longer real window would need this raised, not gated.
 const MAX_PLAUSIBLE_RESET_HORIZON_DAYS: i64 = 8;
 
+/// A stated instant that is strictly future but only by a sliver (clock skew between
+/// the adapter and this process, or the time spent between the event arriving and this
+/// function running) would write a `Cooldown` that reads as expired on the very next
+/// poll — the same "worse than no cooldown" failure `implausible_reset` rejects for a
+/// non-future instant, displaced by an epsilon instead of eliminated. The stated instant
+/// is still what gets reported in the pause reason; only the value actually written to
+/// the store is floored, so a genuine near-future reset degrades to a short real pause
+/// rather than to nothing.
+const MIN_WRITTEN_COOLDOWN_SECS: i64 = 5;
+
 /// Why a stated reset instant cannot be trusted as a `Cooldown`. Kept as two variants,
 /// not one boolean, because the two directions are opposite failures needing different
 /// operator-facing words: one is a stale-but-sane value, the other means the payload
@@ -1446,24 +1456,35 @@ fn resets_at_from_epoch_secs(secs: Option<i64>) -> Option<chrono::DateTime<chron
 /// false positive in this change's review history turned out to be. The prose scrape stays
 /// as the fallback for adapters that emit no such event.
 ///
-/// `quota_seen` is `structured`'s companion: whether the adapter has ever emitted a
-/// `rate_limit_event` with a known status during this dispatch, regardless of whether the
-/// *last* one was a rejection. `structured: None` alone is ambiguous — it means either
-/// "this adapter never speaks about quota" or "it spoke, and its last word was allowed" —
-/// and only the first should fall through to the prose scrape below. Without this, a
-/// stream that was rejected, recovered, and then failed for an unrelated reason would
-/// still route to `Phase::Quota`: the coalescer renders a line into the log the moment
-/// the rejection arrives, and that line outlives the event's own recovery in the log
-/// tail, so `scrape_strong_quota_signal` would match it regardless of the final verdict.
+/// `quota_recovered` is `structured`'s companion: whether a `rejected` event earlier in
+/// this dispatch was later cleared by an `allowed`/`allowed_warning` one. `structured:
+/// None` alone is ambiguous — it means either "this adapter never spoke about quota"
+/// (must still fall through to the prose scrape) or "it was rejected, and then
+/// recovered" (must not route on prose alone) — and only the first should fall through
+/// below. Routine `allowed` traffic with no prior rejection does *not* set this, so it
+/// never disables the fallback for a dispatch that never actually saw a rejection.
+/// Without this, a stream that was rejected, recovered, and then failed for an unrelated
+/// reason would still route to `Phase::Quota`: the coalescer renders a line into the log
+/// the moment the rejection arrives, and that line outlives the event's own recovery in
+/// the log tail, so `scrape_strong_quota_signal` would match it regardless of the final
+/// verdict.
+///
+/// When `quota_recovered` is true and there is no current `structured` rejection, the
+/// prose scrapes below are skipped entirely, not just the final signal check: the same
+/// stale rendered line that must not decide routing must also not leave the provider
+/// paused in the store off a rejection this dispatch already recovered from.
 fn detect_and_pause_quota(
     paths: &SparPaths,
     provider: &str,
     log_text: &str,
     structured: Option<&str>,
     resets_at: Option<chrono::DateTime<chrono::Utc>>,
-    quota_seen: bool,
+    quota_recovered: bool,
 ) -> bool {
     let key = crate::quota::normalize_key(provider);
+    if quota_recovered && structured.is_none() {
+        return false;
+    }
     if let Some(hint) = crate::quota::QuotaStore::scrape_log_hint(log_text) {
         let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
         store.pause_quota(&key, hint);
@@ -1494,10 +1515,12 @@ fn detect_and_pause_quota(
         });
         match usable {
             Some(until) => {
+                let write_until = until
+                    .max(chrono::Utc::now() + chrono::Duration::seconds(MIN_WRITTEN_COOLDOWN_SECS));
                 let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
                 store.pause_quota_until(
                     &key,
-                    Some(until),
+                    Some(write_until),
                     format!(
                         "{key} {window} limit rejected, resets {}",
                         until.to_rfc3339()
@@ -1524,12 +1547,8 @@ fn detect_and_pause_quota(
         }
         return true;
     }
-    if quota_seen {
-        // The adapter did speak about quota for this dispatch, and its last word was
-        // allowed: trust that typed verdict over a rendered rejection line an earlier,
-        // already-recovered event may have left sitting in the log tail.
-        return false;
-    }
+    // `quota_recovered` was already handled above (before either scrape ran): reaching
+    // here means it was false, or `structured` would have taken the branch above.
     crate::quota::QuotaStore::scrape_strong_quota_signal(log_text).is_some()
 }
 
@@ -1552,7 +1571,7 @@ fn quota_hit_for_outcome(
         &log_text,
         outcome.quota_rejected.as_deref(),
         outcome.quota_resets_at,
-        outcome.quota_seen,
+        outcome.quota_recovered,
     ) || outcome.agy_quota_hit
 }
 
@@ -1563,7 +1582,7 @@ fn quota_hit_for_outcome(
 /// `?` unwinds, so the log tail alone would miss it even though
 /// `scrape_strong_quota_signal` already recognizes "429 Too Many Requests".
 ///
-/// Takes no `structured`/`resets_at`/`quota_seen`: both call sites are `Err` arms that
+/// Takes no `structured`/`resets_at`/`quota_recovered`: both call sites are `Err` arms that
 /// by construction never produced a `SlotOutcome`, so a typed verdict cannot exist yet
 /// to thread through. That used to be a parameter every caller passed `None` to — dead
 /// weight a future caller could silently fail to fill in; dropping it from the
@@ -1614,13 +1633,14 @@ struct SlotOutcome {
     quota_rejected: Option<String>,
     /// When that window reopens, as the adapter stated it.
     quota_resets_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Whether the adapter ever emitted a `rate_limit_event` with a known status during
-    /// this dispatch, regardless of `quota_rejected`'s final value. `quota_rejected: None`
-    /// is ambiguous on its own: it means either "this adapter never speaks about quota"
-    /// (must still fall through to the prose scrape) or "it spoke, and its last word was
-    /// allowed" (must not route on prose alone, or a rendered rejection line an earlier,
-    /// recovered event left in the log tail would misroute an unrelated later failure).
-    quota_seen: bool,
+    /// Whether a `rejected` event earlier in this dispatch was later cleared by an
+    /// `allowed`/`allowed_warning` one. `quota_rejected: None` is ambiguous on its own:
+    /// it means either "this adapter never spoke about quota" (must still fall through
+    /// to the prose scrape) or "it was rejected, and then recovered" (must not route on
+    /// prose alone, or a rendered rejection line the earlier event left in the log tail
+    /// would misroute an unrelated later failure). Routine `allowed` traffic with no
+    /// prior rejection leaves this false.
+    quota_recovered: bool,
 }
 
 impl SlotOutcome {
@@ -1635,7 +1655,7 @@ impl SlotOutcome {
             agy_quota_hit: false,
             quota_rejected: None,
             quota_resets_at: None,
-            quota_seen: false,
+            quota_recovered: false,
         }
     }
 }
@@ -2016,7 +2036,7 @@ fn run_api(
             agy_quota_hit: false,
             quota_rejected: None,
             quota_resets_at: None,
-            quota_seen: false,
+            quota_recovered: false,
         })
     } else {
         Ok(SlotOutcome {
@@ -2029,7 +2049,7 @@ fn run_api(
             agy_quota_hit: false,
             quota_rejected: None,
             quota_resets_at: None,
-            quota_seen: false,
+            quota_recovered: false,
         })
     }
 }
@@ -2134,7 +2154,7 @@ fn run_headless(
     enrich_muse_stats(&mut res.stats, &job.provider, log_path);
     let quota_rejected = res.stats.quota_rejected.clone();
     let quota_resets_at = resets_at_from_epoch_secs(res.stats.quota_resets_at);
-    let quota_seen = res.stats.quota_seen;
+    let quota_recovered = res.stats.quota_recovered;
     let usage = usage_from_stream(&job.slot_id, &job.provider, &res.stats);
     if res.timed_out {
         let error = crate::nudge::ceiling_error(timeout, soft, timeout_label(job.role));
@@ -2153,7 +2173,7 @@ fn run_headless(
             agy_quota_hit,
             quota_rejected: quota_rejected.clone(),
             quota_resets_at,
-            quota_seen,
+            quota_recovered,
         });
     }
     let code = res.exit_code;
@@ -2168,7 +2188,7 @@ fn run_headless(
             agy_quota_hit,
             quota_rejected: quota_rejected.clone(),
             quota_resets_at,
-            quota_seen,
+            quota_recovered,
         });
     }
     if let Some(name) = &job.expected_artifact {
@@ -2209,7 +2229,7 @@ fn run_headless(
                     agy_quota_hit,
                     quota_rejected: quota_rejected.clone(),
                     quota_resets_at,
-                    quota_seen,
+                    quota_recovered,
                 });
             }
         }
@@ -2224,7 +2244,7 @@ fn run_headless(
         agy_quota_hit,
         quota_rejected: quota_rejected.clone(),
         quota_resets_at,
-        quota_seen,
+        quota_recovered,
     })
 }
 
@@ -2342,7 +2362,7 @@ fn run_tmux(
                     agy_quota_hit: false,
                     quota_rejected: None,
                     quota_resets_at: None,
-                    quota_seen: false,
+                    quota_recovered: false,
                 })
             }
             TmuxDecision::Failed => {
@@ -2356,7 +2376,7 @@ fn run_tmux(
                     agy_quota_hit: false,
                     quota_rejected: None,
                     quota_resets_at: None,
-                    quota_seen: false,
+                    quota_recovered: false,
                 })
             }
             TmuxDecision::DoneButAlive => {
@@ -2370,7 +2390,7 @@ fn run_tmux(
                     agy_quota_hit: false,
                     quota_rejected: None,
                     quota_resets_at: None,
-                    quota_seen: false,
+                    quota_recovered: false,
                 })
             }
             TmuxDecision::Wait => {
@@ -2701,6 +2721,43 @@ mod tests {
         assert_eq!(q.cooldown_until, Some(until));
     }
 
+    /// A stated instant only an epsilon in the future (clock skew, or the gap between
+    /// the event arriving and this function running) must not be written as-is: reading
+    /// it back a moment later would find it already expired, which is the same "worse
+    /// than no cooldown" failure a non-future instant produces — displaced, not
+    /// eliminated. The value actually written to the store must be floored to at least
+    /// `MIN_WRITTEN_COOLDOWN_SECS`, even though the stated instant itself is still
+    /// honored as real (not rejected the way `implausible_reset` rejects a non-future
+    /// value).
+    #[test]
+    fn detect_and_pause_quota_with_an_epsilon_future_typed_reset_floors_the_written_cooldown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let until = chrono::Utc::now() + chrono::Duration::milliseconds(50);
+        assert!(detect_and_pause_quota(
+            &paths,
+            "cli:claude",
+            FIVE_HOUR_REJECTION_LOG,
+            Some("five_hour"),
+            Some(until),
+            true
+        ));
+        let store = crate::quota::QuotaStore::load(&paths).unwrap();
+        let q = store.get("cli:claude");
+        assert_eq!(q.status, crate::quota::ProviderStatus::Cooldown);
+        let written = q.cooldown_until.expect("cooldown_until present");
+        assert!(
+            written
+                >= chrono::Utc::now() + chrono::Duration::seconds(MIN_WRITTEN_COOLDOWN_SECS - 1),
+            "written cooldown {written} must be floored, not the near-instant stated value {until}"
+        );
+        assert!(
+            !store.is_usable("cli:claude"),
+            "an epsilon-future instant must still leave the provider paused, not \
+             immediately usable"
+        );
+    }
+
     /// A stated instant already in the past must not be written as a `Cooldown` — that
     /// reads as immediately usable, worse than no cooldown. It must fall back to the
     /// generic auto-recovering pause instead.
@@ -2918,9 +2975,9 @@ mod tests {
     /// route to `Phase::Quota` on its own stale rejection line — the coalescer renders
     /// that line into the log the moment the rejection arrives, and it outlives the
     /// event's own recovery in the tail. `quota_rejected: None` alone cannot tell "this
-    /// adapter never spoke" apart from "it spoke, and recovered"; only `quota_seen`
+    /// adapter never spoke" apart from "it spoke, and recovered"; only `quota_recovered`
     /// can, and this is the exact log/verdict combination that distinguishes them:
-    /// same rejection line, opposite `quota_seen`, opposite route.
+    /// same rejection line, opposite `quota_recovered`, opposite route.
     #[test]
     fn detect_and_pause_quota_a_recovered_stream_does_not_route_on_its_own_stale_rejection_line() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2934,8 +2991,14 @@ mod tests {
                 None,
                 true
             ),
-            "a recovered stream (quota_seen, no current rejection) must not route on a \
+            "a recovered stream (quota_recovered, no current rejection) must not route on a \
              rendered rejection line an earlier, already-recovered event left behind"
+        );
+        let store = crate::quota::QuotaStore::load(&paths).unwrap_or_default();
+        assert!(
+            store.is_usable("cli:claude"),
+            "a recovered stream must not leave the provider paused off the same stale \
+             rejection line that routing correctly ignored"
         );
         assert!(
             detect_and_pause_quota(
@@ -2946,15 +3009,15 @@ mod tests {
                 None,
                 false
             ),
-            "the same log, with quota_seen false (adapter never spoke this dispatch), \
+            "the same log, with quota_recovered false (adapter never spoke this dispatch), \
              must still reach the prose fallback"
         );
     }
 
     /// The wiring for the AC-3 fix, not just the callee: a `SlotOutcome` whose stream
-    /// recovered (`quota_seen: true`, `quota_rejected: None`) must not route a later,
+    /// recovered (`quota_recovered: true`, `quota_rejected: None`) must not route a later,
     /// genuinely unrelated failure onto `Phase::Quota` just because the log tail still
-    /// carries the earlier rejection's rendered line. Deleting the `outcome.quota_seen`
+    /// carries the earlier rejection's rendered line. Deleting the `outcome.quota_recovered`
     /// forwarding inside `quota_hit_for_outcome` makes this fail.
     #[test]
     fn quota_hit_for_outcome_does_not_route_a_recovered_stream_on_its_stale_log_line() {
@@ -2967,7 +3030,7 @@ mod tests {
         )
         .unwrap();
         let outcome = SlotOutcome {
-            quota_seen: true,
+            quota_recovered: true,
             ..SlotOutcome::err("index out of bounds")
         };
         assert!(
