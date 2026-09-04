@@ -186,8 +186,13 @@ pub fn execute_plan(
     for job in jobs {
         if let Err(e) = executor::run_slot(state, paths, cfg, job) {
             if job.role == SlotRole::Planner {
-                state.set_phase(Phase::Failed);
                 state.error = Some(e.to_string());
+                if executor::slot_quota_hit(state, &job.slot_id) {
+                    state.set_phase(Phase::Quota);
+                    state.save(paths)?;
+                    return Ok(());
+                }
+                state.set_phase(Phase::Failed);
                 state.save(paths)?;
                 return Err(e);
             }
@@ -235,6 +240,12 @@ pub fn execute_plan(
                 let _ = state.save(paths);
             }
             return Err(e);
+        }
+        // `run_test_author` parks quota-detected failures itself (returning `Ok`, not
+        // `Err`), so this must be checked separately from the `Err` arm above or the
+        // `auto_plan()` branch below would immediately clobber `Phase::Quota`.
+        if state.phase == Phase::Quota {
+            return Ok(());
         }
     }
 
@@ -320,8 +331,13 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
     };
 
     if let Err(e) = executor::run_slot(state, paths, cfg, &job) {
-        state.set_phase(Phase::Failed);
         state.error = Some(format!("test-author failed: {e}"));
+        if executor::slot_quota_hit(state, &id) {
+            state.set_phase(Phase::Quota);
+            state.save(paths)?;
+            return Ok(());
+        }
+        state.set_phase(Phase::Failed);
         state.save(paths)?;
         return Err(e);
     }

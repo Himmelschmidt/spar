@@ -1141,11 +1141,7 @@ pub fn execute_loop(
             model: impl_model,
         };
         if let Err(e) = executor::run_slot(state, paths, cfg, &impl_job) {
-            let quota_hit = state
-                .slots
-                .iter()
-                .find(|s| s.id == impl_job.slot_id)
-                .is_some_and(|s| s.quota_hit);
+            let quota_hit = executor::slot_quota_hit(state, &impl_job.slot_id);
             return fail(state, paths, e, quota_hit);
         }
 
@@ -1213,6 +1209,17 @@ pub fn execute_loop(
                     model: tester.model.clone(),
                 };
                 let suite_ok = executor::run_slot(state, paths, cfg, &suite_job).is_ok();
+                if !suite_ok && executor::slot_quota_hit(state, &tester.id) {
+                    // A rate-limited tester must park the run, not read as an
+                    // inconclusive suite that burns a fix round against the same
+                    // paused provider.
+                    return fail(
+                        state,
+                        paths,
+                        anyhow::anyhow!("tester slot `{}` rate-limited", tester.id),
+                        true,
+                    );
+                }
                 // Absence is meaningful: a missing suite.md is Inconclusive, never a synthesized fail.
                 let body_opt = std::fs::read_to_string(&suite_path).ok();
                 let (exit_code, signal) = state
@@ -1409,6 +1416,18 @@ pub fn execute_loop(
                     }
                     review_ok = executor::run_slot(state, paths, cfg, &job).is_ok();
                 }
+            }
+            if !review_ok && executor::slot_quota_hit(state, &rev.id) {
+                // Both the original provider and (if rotation found one) its
+                // replacement are rate-limited: park the run rather than reading
+                // this as "request changes" and burning a fix round against a
+                // panel that cannot currently answer.
+                return fail(
+                    state,
+                    paths,
+                    anyhow::anyhow!("review slot `{}` rate-limited", rev.id),
+                    true,
+                );
             }
 
             let review_path = paths.artifact(&state.id, &format!("review-{}.md", rev.id));

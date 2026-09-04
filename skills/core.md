@@ -371,15 +371,24 @@ worktree — that is `spar cleanup`'s job. A stopped run is **resumable**: rerun
 `spar implement --run <id> --providers …` and it clears the marker and continues.
 A **failed/stuck/quota** run is resumable the same way (its approved plan still counts):
 resume resets the failed slots to pending and re-dispatches, so `status` reflects the
-new attempt rather than the dead one's `failed` verdict. A provider that dies mid-dispatch
-from a rate limit parks the run at `quota` (exit `4`), not `failed` (exit `1`) — the
-discriminator is whether the dying slot's own log matched a quota/rate-limit signal;
-resuming picks the same run back up, and if the provider is still on cooldown it re-parks
-at `quota` immediately rather than dispatching into the same wall. Claude's CLI states its
-own weekly-limit reset time in the rejection line; spar parses that into the cooldown
-instead of using the generic ~30-minute default, so a weekly-window pause does not get
-re-probed for days. The other adapters (codex, opencode, muse, grok) have no
-provider-specific reset parser, so their rate limits fall back to the generic cooldown.
+new attempt rather than the dead one's `failed` verdict. A slot that dies mid-dispatch
+from a rate limit parks the run at `quota` (exit `4`), not `failed` (exit `1`) — for the
+planner, test-author, implementer, tester, reviewer, and the arena reconciler. The
+discriminator requires a rejection phrase, not a bare word: a log with a stray `429` in a
+stack trace, a mention of "capacity", or code that edits spar's own quota module does not
+misroute a genuine defect onto the quota gate. Resuming picks the same run back up, and if
+the provider is still on cooldown it re-parks at `quota` immediately rather than
+dispatching into the same wall. Claude's CLI states its own weekly-limit reset time in the
+rejection line; spar parses that (local time + IANA zone) into the cooldown instead of
+using the generic ~30-minute default. That parsed cooldown is capped at the *next
+occurrence* of the stated time-of-day (~24h out), not the actual weekly rollover — a big
+improvement over the default, but a weekly pause is still re-probed daily rather than left
+alone for the full week, since Claude's line carries no date. The other adapters (codex,
+opencode, muse, grok) have no provider-specific reset parser, so their rate limits are
+still detected (a generic rejection-phrase match) but fall back to the generic cooldown. A
+rate limit hit by a live parallel panel (`--workflow review`/`peer`) is paused the same
+way; it does not yet route that run to `quota` since those workflows have no run-level
+failure-to-phase mapping today.
 Use `stop` (not killing pids directly) so the orchestrator can't re-dispatch a slot
 you just killed.
 

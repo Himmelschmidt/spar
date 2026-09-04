@@ -905,6 +905,16 @@ fn apply_parallel_outcome(
                 }
                 state.usage.push(u);
             }
+            // True-parallel dispatch (`run_slots_parallel`, e.g. `--workflow review`)
+            // had no quota detection at all before this: a rate-limited slot here left
+            // its provider unpaused. This only pauses/records the hit on the slot;
+            // callers of this path have no `fail()`-style terminal-phase mapping, so
+            // it does not by itself route the run to `Phase::Quota`.
+            let log_text = process::tail_log(&prep.log_path, 8000);
+            let quota_hit = detect_and_pause_quota(paths, &prep.job.provider, &log_text);
+            if let Some(s) = state.slot_mut(slot_id) {
+                s.quota_hit = quota_hit;
+            }
             mark_slot_failed(
                 state,
                 paths,
@@ -917,6 +927,11 @@ fn apply_parallel_outcome(
         }
         Err(e) => {
             salvage_expected_artifact(paths, &state.id, &prep.job, &prep.log_path, &e.to_string());
+            let log_text = process::tail_log(&prep.log_path, 8000);
+            let quota_hit = detect_and_pause_quota(paths, &prep.job.provider, &log_text);
+            if let Some(s) = state.slot_mut(slot_id) {
+                s.quota_hit = quota_hit;
+            }
             mark_slot_failed(state, paths, slot_id, &e.to_string(), None, None, None)?;
         }
     }
@@ -1248,25 +1263,40 @@ pub fn run_slot(
 }
 
 /// Best-effort quota detection on a failed dispatch's log: pauses the provider in the
-/// quota store and reports whether this failure looks like a rate limit rather than a
-/// genuine defect. This is the discriminator callers route `Phase::Quota` vs
-/// `Phase::Failed` on — a real bug's log matches none of these needles and stays
-/// `Failed`, so a false positive here would misroute one as the other.
+/// quota store (cheap, auto-recovering, driven by `scrape_log_hint`'s broad needles)
+/// and reports whether this failure looks like a rate limit rather than a genuine
+/// defect. The `bool` returned is the discriminator callers route `Phase::Quota` vs
+/// `Phase::Failed` on, so it is deliberately narrower than the pause: it only fires on
+/// `scrape_claude_rate_limits` (Claude's own structured/stated-reset shapes) or
+/// `scrape_strong_quota_signal` (a rejection phrase, not a bare word, for every other
+/// adapter). A false positive on the pause is harmless — the provider re-probes after
+/// its cooldown; a false positive on the returned bool would park a real failure on
+/// the quota gate instead of failing the run, which is worse than the bug this exists
+/// to fix.
 fn detect_and_pause_quota(paths: &SparPaths, provider: &str, log_text: &str) -> bool {
-    let mut hit = false;
     if let Some(hint) = crate::quota::QuotaStore::scrape_log_hint(log_text) {
         let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
         store.pause_quota(provider, hint);
         let _ = store.save(paths);
-        hit = true;
     }
-    if let Some((name, until, hint)) = crate::quota::scrape_claude_rate_limits(log_text) {
+    if let Some((name, until, hint)) = crate::quota::scrape_claude_rate_limits(provider, log_text) {
         let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
         store.pause_quota_until(&name, until, hint);
         let _ = store.save(paths);
-        hit = true;
+        return true;
     }
-    hit
+    crate::quota::QuotaStore::scrape_strong_quota_signal(log_text).is_some()
+}
+
+/// `state.slots` lookup used by every caller that maps a `run_slot` failure onto
+/// `Phase::Quota` vs `Phase::Failed` (see `detect_and_pause_quota`'s doc comment for
+/// the discriminator itself).
+pub fn slot_quota_hit(state: &RunState, slot_id: &str) -> bool {
+    state
+        .slots
+        .iter()
+        .find(|s| s.id == slot_id)
+        .is_some_and(|s| s.quota_hit)
 }
 
 struct SlotOutcome {
@@ -2269,6 +2299,30 @@ mod tests {
         assert!(!detect_and_pause_quota(&paths, "cli:claude", log));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         assert!(store.is_usable("cli:claude"));
+    }
+
+    /// A genuine failure whose log happens to contain one of `scrape_log_hint`'s broad
+    /// needles (here: a line number containing "429") is allowed to pause the provider
+    /// — cheap and auto-recovering — but must not be reported as a quota hit, which
+    /// would misroute the run onto `Phase::Quota` instead of failing it.
+    #[test]
+    fn detect_and_pause_quota_does_not_route_a_broad_needle_false_positive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log = "thread 'main' panicked at src/state.rs:429:\nindex out of bounds\n";
+        assert!(!detect_and_pause_quota(&paths, "cli:claude", log));
+    }
+
+    /// A generic rejection phrase (no Claude-specific shape) must still route, so
+    /// non-claude adapters are covered by the same discriminator.
+    #[test]
+    fn detect_and_pause_quota_routes_a_generic_rejection_phrase() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log = "error: usage limit reached for this account\n";
+        assert!(detect_and_pause_quota(&paths, "cli:codex", log));
+        let store = crate::quota::QuotaStore::load(&paths).unwrap();
+        assert!(!store.is_usable("cli:codex"));
     }
 
     /// Recovery must fire only for a slot that actually produced something. A slot that

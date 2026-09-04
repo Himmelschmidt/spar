@@ -160,7 +160,12 @@ impl QuotaStore {
         );
     }
 
-    /// Best-effort scan of log text for quota / rate-limit language.
+    /// Best-effort scan of log text for quota / rate-limit language. Deliberately
+    /// broad: a false positive here only pauses a provider, which is cheap and
+    /// auto-recovers (see `is_usable`). This alone must never decide whether a run
+    /// routes to `Phase::Quota` — that decision needs [`scrape_strong_quota_signal`]
+    /// or [`scrape_claude_rate_limits`], which require a rejection phrase rather than
+    /// a single bare word like "quota" or "capacity" or "429".
     pub fn scrape_log_hint(log: &str) -> Option<String> {
         let lower = log.to_ascii_lowercase();
         let needles = [
@@ -182,13 +187,48 @@ impl QuotaStore {
         }
         None
     }
+
+    /// Narrow, line-scoped signal used only to decide whether a failed dispatch
+    /// routes the *run* to `Phase::Quota`. Each pattern pairs the limit phrase with a
+    /// rejection word on the same line, so a stack trace with a `429` in a line
+    /// number, a test file that mentions "rate limiter", or an implementer editing
+    /// this very module's "quota" code do not misroute a genuine defect as a quota
+    /// hit — the failure mode a broad single-word match (`scrape_log_hint`) is prone
+    /// to and that a routing decision cannot afford.
+    pub fn scrape_strong_quota_signal(log: &str) -> Option<String> {
+        for line in log.lines() {
+            let lower = line.to_ascii_lowercase();
+            let hit = (lower.contains("rate limit")
+                && (lower.contains("rejected") || lower.contains("exceeded")))
+                || (lower.contains("usage limit")
+                    && (lower.contains("reached") || lower.contains("exceeded")))
+                || (lower.contains("too many requests") && lower.contains("429"))
+                || lower.contains("out of credits")
+                || lower.contains("quota exceeded");
+            if hit {
+                return Some(line.trim().to_string());
+            }
+        }
+        None
+    }
 }
 
 /// Parse Claude-style `rate_limits.five_hour` JSON fragments from logs/statusline, or
 /// (failing that) the CLI's plain-text weekly/five-hour rejection line, e.g. `! rate
 /// limit  seven_day  rejected` followed by "You've hit your weekly limit · resets 12am
 /// (America/New_York)". Returns (provider_name, cooldown_until, hint).
-pub fn scrape_claude_rate_limits(log: &str) -> Option<(String, Option<DateTime<Utc>>, String)> {
+///
+/// Gated on `provider` actually being a claude adapter: both shapes are specific to
+/// the Claude CLI's own output, and a codex/grok/opencode log that happens to contain
+/// "resets " next to a limit phrase must not pause `cli:claude` (a provider that is
+/// fine) instead of, or in addition to, the one that actually failed.
+pub fn scrape_claude_rate_limits(
+    provider: &str,
+    log: &str,
+) -> Option<(String, Option<DateTime<Utc>>, String)> {
+    if normalize_key(provider) != "cli:claude" {
+        return None;
+    }
     // Look for embedded JSON objects containing rate_limits
     for line in log.lines() {
         let t = line.trim();
@@ -509,7 +549,8 @@ mod tests {
 
     #[test]
     fn scrape_claude_rate_limits_parses_stated_weekly_reset() {
-        let (name, until, hint) = scrape_claude_rate_limits(WEEKLY_LIMIT_LOG).unwrap();
+        let (name, until, hint) =
+            scrape_claude_rate_limits("cli:claude", WEEKLY_LIMIT_LOG).unwrap();
         assert_eq!(name, "cli:claude");
         let until = until.expect("stated reset must parse into a cooldown");
         // "12am America/New_York" is midnight Eastern, which is 04:00 or 05:00 UTC
@@ -527,7 +568,7 @@ mod tests {
     fn scrape_claude_rate_limits_falls_back_when_reset_unparseable() {
         let log = "! rate limit  seven_day  rejected\n\
             You've hit your weekly limit \u{b7} resets whenever (Nowhere/Fake)\n";
-        let (name, until, hint) = scrape_claude_rate_limits(log).unwrap();
+        let (name, until, hint) = scrape_claude_rate_limits("cli:claude", log).unwrap();
         assert_eq!(name, "cli:claude");
         assert!(
             until.is_none(),
@@ -540,8 +581,21 @@ mod tests {
     fn scrape_claude_rate_limits_ignores_unrelated_logs() {
         // Must not fire on an ordinary log that happens to contain "resets" or
         // "rate limit" out of context — that would misroute a genuine failure.
-        assert!(scrape_claude_rate_limits("build succeeded, resets are fine").is_none());
-        assert!(scrape_claude_rate_limits("connection rate limited by nginx").is_none());
+        assert!(
+            scrape_claude_rate_limits("cli:claude", "build succeeded, resets are fine").is_none()
+        );
+        assert!(
+            scrape_claude_rate_limits("cli:claude", "connection rate limited by nginx").is_none()
+        );
+    }
+
+    #[test]
+    fn scrape_claude_rate_limits_ignores_non_claude_providers() {
+        // The plain-text stated-reset shape is Claude-specific output; a codex/grok
+        // log that happens to say "resets " next to a limit phrase must not pause
+        // `cli:claude`, a provider that has nothing to do with the failure.
+        assert!(scrape_claude_rate_limits("cli:codex", WEEKLY_LIMIT_LOG).is_none());
+        assert!(scrape_claude_rate_limits("cli:grok", WEEKLY_LIMIT_LOG).is_none());
     }
 
     #[test]
@@ -557,5 +611,38 @@ mod tests {
         .unwrap();
         assert!(until > now);
         assert!(until - now < chrono::Duration::hours(9));
+    }
+
+    #[test]
+    fn strong_quota_signal_matches_the_real_incident_line() {
+        assert!(QuotaStore::scrape_strong_quota_signal(WEEKLY_LIMIT_LOG).is_some());
+        assert!(
+            QuotaStore::scrape_strong_quota_signal("429 Too Many Requests from upstream").is_some()
+        );
+        assert!(QuotaStore::scrape_strong_quota_signal("usage limit reached, try later").is_some());
+        assert!(QuotaStore::scrape_strong_quota_signal("account is out of credits").is_some());
+    }
+
+    /// Four realistic non-quota failures that each contain one of `scrape_log_hint`'s
+    /// broad needles. Driven, not read: before this fix each of these misrouted a real
+    /// defect onto the quota gate.
+    #[test]
+    fn strong_quota_signal_ignores_realistic_false_positives() {
+        let panic_with_429 = "thread 'main' panicked at src/state.rs:429:\nindex out of bounds";
+        let quota_module_edit = "implementer: refactoring QuotaStore::pause_quota in src/quota.rs";
+        let rate_limiter_under_test =
+            "test: app rate limiter rejects requests after threshold ... FAILED\nassertion failed";
+        let capacity_doc_edit = "updated docs/capacity-planning.md with Q3 projections";
+        for log in [
+            panic_with_429,
+            quota_module_edit,
+            rate_limiter_under_test,
+            capacity_doc_edit,
+        ] {
+            assert!(
+                QuotaStore::scrape_strong_quota_signal(log).is_none(),
+                "false positive on: {log}"
+            );
+        }
     }
 }

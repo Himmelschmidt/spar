@@ -359,10 +359,19 @@ pub fn reconcile(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> R
         model: None,
     };
     if let Err(e) = executor::run_slot(&mut state, paths, cfg, &job) {
-        state.set_phase(Phase::Failed);
+        let quota_hit = executor::slot_quota_hit(&state, &recon_id);
+        state.set_phase(if quota_hit {
+            Phase::Quota
+        } else {
+            Phase::Failed
+        });
         state.error = Some(e.to_string());
         state.save(paths)?;
-        return Ok(ExitCode::Failure);
+        return Ok(if quota_hit {
+            ExitCode::Quota
+        } else {
+            ExitCode::Failure
+        });
     }
 
     // dual review on reconcile result
@@ -392,10 +401,19 @@ pub fn reconcile(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> R
             model: None,
         };
         if let Err(e) = executor::run_slot(&mut state, paths, cfg, &job) {
-            state.set_phase(Phase::Failed);
+            let quota_hit = executor::slot_quota_hit(&state, &job.slot_id);
+            state.set_phase(if quota_hit {
+                Phase::Quota
+            } else {
+                Phase::Failed
+            });
             state.error = Some(format!("reconcile review failed: {e:#}"));
             state.save(paths)?;
-            return Ok(ExitCode::Failure);
+            return Ok(if quota_hit {
+                ExitCode::Quota
+            } else {
+                ExitCode::Failure
+            });
         }
         let review_path = paths.artifact(&state.id, &format!("review-reconcile-{i}.md"));
         let text = std::fs::read_to_string(&review_path).unwrap_or_default();
