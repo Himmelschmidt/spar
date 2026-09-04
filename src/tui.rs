@@ -1745,7 +1745,14 @@ fn build_roster(
     let mut configured_native: Vec<String> = Vec::new();
     for r in &valid {
         let (available, reason) = if r.is_api() {
-            (true, None)
+            if crate::providers::api_provider_supported(&r.name) {
+                (true, None)
+            } else {
+                (
+                    false,
+                    Some(format!("unsupported api provider '{}'", r.name)),
+                )
+            }
         } else {
             match detected.iter().find(|(n, _)| n == &r.name) {
                 Some((_, true)) => (true, None),
@@ -1802,7 +1809,7 @@ fn build_roster(
 /// PATH lookup, native refs need to be in `detected` and available.
 fn provider_ref_available(raw: &str, detected: &[(String, bool)]) -> bool {
     match crate::provider_ref::ProviderRef::parse(raw) {
-        Ok(r) if r.is_api() => true,
+        Ok(r) if r.is_api() => crate::providers::api_provider_supported(&r.name),
         Ok(r) => detected.iter().any(|(n, avail)| *n == r.name && *avail),
         Err(_) => false,
     }
@@ -11931,6 +11938,7 @@ mod home_ia {
     fn the_roster_keeps_api_refs_selectable_and_explains_what_it_disables() {
         let cfg = cfg_with(&[
             "api:openai@gpt-5.6",
+            "api:notreal",
             "cli:claude@opus",
             "cli:nosuchcli",
             "claude",
@@ -11950,6 +11958,16 @@ mod home_ia {
         let api = by("api:openai");
         assert!(api.available, "a supported api: ref must stay selectable");
         assert_eq!(api.source, RosterSource::Configured);
+
+        let unsupported = by("api:notreal");
+        assert!(
+            !unsupported.available,
+            "an unsupported api: provider must not be launchable"
+        );
+        assert!(
+            unsupported.reason.as_deref().is_some_and(|r| !r.is_empty()),
+            "a disabled unsupported api: ref must say why"
+        );
 
         let claude = by("cli:claude@opus");
         assert!(claude.available);
