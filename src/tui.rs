@@ -232,7 +232,15 @@ pub fn run_with(opts: TuiOpts) -> Result<crate::exit_codes::ExitCode> {
         std::env::set_current_dir(cwd)?;
     }
     // Optional: cwd may not be a git project — global home still works.
-    let local_root = paths::find_project_root().ok();
+    // Canonicalized to match how the registry stores project roots
+    // (`registry::register`): `find_project_root` returns `SPAR_PROJECT_ROOT`
+    // verbatim when set, which spar exports to every agent it spawns, so an agent
+    // running the TUI is the likely path that would otherwise mismatch and leave
+    // `HomeScope::Project` filtering every row out (Home renders empty with no
+    // explanation why).
+    let local_root = paths::find_project_root()
+        .ok()
+        .map(|r| registry::canonicalize_best_effort(&r));
     if let Some(root) = &local_root {
         let _ = registry::ensure_known(Some(root));
     } else {
@@ -437,6 +445,13 @@ struct NewRun {
     field: NewRunField,
     /// Cursor row within the roster list.
     sel: usize,
+    /// True while the background roster probe (`detect_all`, a registry read) is
+    /// still in flight — `draw` shows "checking roster" instead of an empty list.
+    loading: bool,
+    /// Tags which `open_new_run`/`begin_new_run` call this modal belongs to, so a
+    /// slow probe from a cancelled or reopened modal cannot clobber a later one
+    /// (D2 — the `Msg::RosterReady` guard).
+    gen: u64,
 }
 
 struct App {
@@ -559,12 +574,16 @@ struct App {
     home_target_run: Option<String>,
     /// Phase D's new-run modal. `Some` = open and capturing keys.
     new_run: Option<NewRun>,
+    /// Bumped every time the new-run modal opens; tags `NewRun::gen` and
+    /// `Msg::RosterReady` so a stale background probe cannot land in a later modal.
+    new_run_gen: u64,
     /// The new-run overlay's outer rect (for click-outside-to-cancel); zero-sized when
     /// closed. Mirrors `rect_palette`.
     rect_new_run: Rect,
-    /// Painted roster row rects this frame, index-aligned with `new_run.roster`, for
-    /// click-to-toggle. Only as many entries as were actually rendered.
-    rect_new_run_roster: Vec<Rect>,
+    /// Painted roster row rects this frame as `(roster_index, rect)`, for
+    /// click-to-toggle. Only as many entries as were actually rendered (post-cap,
+    /// post-scroll).
+    rect_new_run_roster: Vec<(usize, Rect)>,
 }
 
 /// A gate action reachable by both a key and a tappable button.
@@ -638,16 +657,20 @@ impl App {
         };
         // A launch task seed opens the new-run surface pre-filled (U3/U21) — it no
         // longer opens the palette, which had no way to offer a fresh fleet. The
-        // roster is built here too (`seeded_new_run`), or a `spar --task` launch opens
-        // a surface with nothing to pick and no key that can populate it (AC-33).
+        // roster itself is *not* built here: `bg_tx` doesn't exist yet at this point
+        // in startup, and `detect_all()` spawns every provider with `--version` (D2)
+        // — that cannot sit on the startup path. `run_loop` kicks off the probe once
+        // the channel is wired, or a `spar --task` launch opens a surface with
+        // nothing to pick and no key that can populate it (AC-33).
         let new_run = task_seed.map(|t| {
             let all_projects: Vec<PathBuf> =
                 registry::projects().into_iter().map(|p| p.root).collect();
             let project = local_root
                 .map(Path::to_path_buf)
                 .or_else(|| all_projects.first().cloned());
-            seeded_new_run(&cfg, project, all_projects, t)
+            pending_new_run(project, all_projects, t, NewRunField::Task, 1)
         });
+        let new_run_gen = if new_run.is_some() { 1 } else { 0 };
         Self {
             selected_run: 0,
             selected_project: 0,
@@ -709,6 +732,7 @@ impl App {
             home_key: None,
             home_target_run: None,
             new_run,
+            new_run_gen,
             rect_new_run: Rect::default(),
             rect_new_run_roster: Vec::new(),
         }
@@ -1007,6 +1031,8 @@ fn new_run_fixture() -> NewRun {
         picked: vec![0],
         field: NewRunField::Fleet,
         sel: 0,
+        loading: false,
+        gen: 1,
     }
 }
 
@@ -1053,6 +1079,10 @@ enum Msg {
     /// A status line pushed from a background task (e.g. `/spawn`'s deferred
     /// spawn+deliver), flashed on the next render tick.
     Flash(String, Color),
+    /// The new-run modal's background roster probe landed (D2). The `u64` is the
+    /// `NewRun::gen` it was built for — applied only if the open modal is still on
+    /// that generation, so a cancelled or reopened modal can't be clobbered.
+    RosterReady(u64, Vec<RosterEntry>),
 }
 
 /// Size+mtime of everything a snapshot is derived from. Comparing these is a
@@ -1514,16 +1544,23 @@ fn home_needs_you(rows: &[HomeRow]) -> usize {
         .sum()
 }
 
+/// Total rows in `band`, including what a per-band cap trimmed (`HomeRow::More`'s
+/// `n`) — otherwise the context band's count undercounts a capped band while
+/// `home_needs_you` (uncapped) reads exact, mixing exact and truncated numbers on
+/// the same line.
 fn home_band_count(rows: &[HomeRow], band: HomeBand) -> usize {
     rows.iter()
-        .filter(|r| matches!(r, HomeRow::Run { band: b, .. } if *b == band))
-        .count()
+        .filter_map(|r| match r {
+            HomeRow::Run { band: b, .. } if *b == band => Some(1),
+            HomeRow::More { band: b, n } if *b == band => Some(*n),
+            _ => None,
+        })
+        .sum()
 }
 
 /// Main's Home body: the four bands, headers always present, each empty band saying
 /// so on its own line (U14's reserved-space rule applied to Home).
 fn home_overview(rows: &[HomeRow], scope: &HomeScope, watermark: DateTime<Utc>) -> String {
-    let _ = watermark;
     let mut out = format!("\n  Home · {}\n\n", home_scope_label(scope));
     let mut i = 0;
     while i < rows.len() {
@@ -1531,7 +1568,14 @@ fn home_overview(rows: &[HomeRow], scope: &HomeScope, watermark: DateTime<Utc>) 
             i += 1;
             continue;
         };
-        out.push_str(&format!("  {}\n", home_band_label(band)));
+        // The Finished band's header names the watermark it is bounded by, so the
+        // operator knows what "last look" means without opening a project (AC-25).
+        let suffix = if band == HomeBand::Finished {
+            format!(" (since {})", relative_age(watermark))
+        } else {
+            String::new()
+        };
+        out.push_str(&format!("  {}{suffix}\n", home_band_label(band)));
         let mut j = i + 1;
         let mut any = false;
         while j < rows.len() && !matches!(rows[j], HomeRow::Header(_)) {
@@ -1732,15 +1776,36 @@ fn build_roster(
         });
     }
     if let Some((run_id, providers)) = recent {
+        // A recent fleet is only as launchable as its least available member — the
+        // same rule a directly-picked ref already gets (AC-30); otherwise picking
+        // this row could build a `--providers` argv with a ref that isn't on PATH.
+        let missing = providers
+            .iter()
+            .find(|p| !provider_ref_available(p, detected));
+        let (available, reason) = match missing {
+            None => (true, None),
+            Some(p) => (false, Some(format!("{p} not on PATH"))),
+        };
         roster.push(RosterEntry {
             choice: RosterChoice::Fleet(providers.to_vec()),
             label: format!("reuse {}'s fleet", truncate(run_id, 8)),
-            available: true,
-            reason: None,
+            available,
+            reason,
             source: RosterSource::RecentFleet,
         });
     }
     roster
+}
+
+/// Whether a provider ref (as recorded in a run's `providers` list) is currently
+/// usable, by the same rule a configured roster entry gets: `api:` refs need no
+/// PATH lookup, native refs need to be in `detected` and available.
+fn provider_ref_available(raw: &str, detected: &[(String, bool)]) -> bool {
+    match crate::provider_ref::ProviderRef::parse(raw) {
+        Ok(r) if r.is_api() => true,
+        Ok(r) => detected.iter().any(|(n, avail)| *n == r.name && *avail),
+        Err(_) => false,
+    }
 }
 
 /// Expand `picked` roster indices into provider refs, in pick order, deduplicated
@@ -1964,6 +2029,20 @@ fn run_loop(
     let (sel_tx, sel_rx) = mpsc::channel::<Selection>();
     app.bg_tx = Some(msg_tx.clone());
 
+    // `App::new`'s `--task` seed opened the modal before `bg_tx` existed, so its
+    // roster probe was deferred (D2) — kick it off now that the channel is wired.
+    if let Some(nr) = app.new_run.as_ref() {
+        if nr.loading {
+            let gen = nr.gen;
+            let cfg = app.cfg.clone();
+            let tx = msg_tx.clone();
+            thread::spawn(move || {
+                let roster = compute_new_run_roster(&cfg);
+                let _ = tx.send(Msg::RosterReady(gen, roster));
+            });
+        }
+    }
+
     {
         let tx = msg_tx.clone();
         thread::spawn(move || {
@@ -2050,6 +2129,17 @@ fn run_loop(
         }
         if snap.runs.is_empty() {
             app.selected_run = 0;
+        } else if let Some(target) = app.home_target_run.as_deref() {
+            // A Home Enter carries a run id ahead of the snapshot that actually
+            // contains it (R2/AC-27): the snapshot in hand may still be Home's
+            // (cross-project, `snap.runs` empty) or a stale project's. Hold the
+            // target and only clear it once a snapshot arrives whose `runs`
+            // actually contains it; until then the id-glue clamp below is
+            // skipped so a stale `sel.run_id` cannot steal the selection.
+            if let Some(pos) = snap.runs.iter().position(|r| r.id == target) {
+                app.selected_run = pos;
+                app.home_target_run = None;
+            }
         } else {
             // The attention sort reorders the rail as runs change state; keep the
             // cursor glued to the same run id rather than the same row.
@@ -2128,6 +2218,10 @@ fn run_loop(
                 app.flash(msg, color);
                 dirty = true;
             }
+            Ok(Msg::RosterReady(gen, roster)) => {
+                apply_roster_ready(&mut app, gen, roster);
+                dirty = true;
+            }
             Ok(Msg::Input(ev)) => {
                 dirty = true;
                 let mut ev = Some(ev);
@@ -2181,6 +2275,10 @@ fn run_loop(
                             app.flash(msg, color);
                             None
                         }
+                        Ok(Msg::RosterReady(gen, roster)) => {
+                            apply_roster_ready(&mut app, gen, roster);
+                            None
+                        }
                         Ok(Msg::Data) => None,
                         Err(_) => None,
                     };
@@ -2202,11 +2300,13 @@ fn run_loop(
             root: active_root.clone(),
             // A Home Enter carries the run by id (`home_target_run`), because the
             // outgoing snapshot's `snap.runs`/`app.selected_run` still describe the
-            // *previous* project — consumed once, then the id-glue clamp above takes
-            // over once the target project's snapshot arrives (R2/AC-27).
+            // *previous* project. Keep resending it (not `take()`) until the clamp
+            // above observes a snapshot that actually contains it and clears it —
+            // otherwise this send races that clamp and can overwrite the target
+            // with `None` a tick early (R2/AC-27).
             run_id: app
                 .home_target_run
-                .take()
+                .clone()
                 .or_else(|| snap.runs.get(app.selected_run).map(|r| r.id.clone())),
             slot_idx: app.selected_slot,
             project_idx: app.selected_project,
@@ -2316,7 +2416,7 @@ fn handle_key(
         // — it belongs to the agent pane.
         KeyCode::Char('q') => return Ok(true),
         // Esc pops one rail level; from Main it returns to the rail. It never exits the
-        // app (at Projects it does nothing).
+        // app (at Home, the root, it does nothing).
         KeyCode::Esc => {
             if app.filter.is_some() {
                 app.filter = None;
@@ -2463,25 +2563,70 @@ fn open_new_run(
     };
     let all_projects: Vec<PathBuf> = projects.iter().map(|p| p.root.clone()).collect();
     let project = target.or_else(|| all_projects.first().cloned());
-    app.new_run = Some(seeded_new_run(
-        &app.cfg,
-        project,
-        all_projects,
-        String::new(),
-    ));
+    begin_new_run(app, project, all_projects, String::new(), NewRunField::Task);
 }
 
-/// Build a ready-to-launch `NewRun`: the roster and recent-fleet lookup are disk/
-/// process work (`detect_all`, a registry read), fine here since this only ever runs
-/// once when the modal opens or the TUI starts, never once a frame (U22). Shared by
-/// `open_new_run` (the `n` key) and `App::new`'s `--task` seed (AC-33) — a seeded
-/// surface with an empty roster can never launch.
-fn seeded_new_run(
-    cfg: &Config,
+/// A `NewRun` in its initial "checking roster" state — no disk or process I/O, so
+/// this is safe to call before the background channel exists (`App::new`'s task
+/// seed, before `run_loop` wires `bg_tx`).
+fn pending_new_run(
+    project: Option<PathBuf>,
+    projects: Vec<PathBuf>,
+    task: String,
+    field: NewRunField,
+    gen: u64,
+) -> NewRun {
+    NewRun {
+        project,
+        projects,
+        task,
+        roster: Vec::new(),
+        picked: Vec::new(),
+        field,
+        sel: 0,
+        loading: true,
+        gen,
+    }
+}
+
+/// Open the modal in its "checking roster" state, then hand the disk/process work
+/// (`detect_all`, a registry read) to a background thread so `n`, `:plan` and startup
+/// never block on a slow or stuck provider probe (D2). The probe is tagged with a
+/// fresh `gen`; `Msg::RosterReady` only applies if the modal it was built for is still
+/// open and still on that generation, so a cancelled or reopened modal can't be
+/// clobbered by a stale result. With no `bg_tx` (before the channel is wired, or in a
+/// test) the probe runs inline instead of being silently lost.
+fn begin_new_run(
+    app: &mut App,
     project: Option<PathBuf>,
     all_projects: Vec<PathBuf>,
     task: String,
-) -> NewRun {
+    field: NewRunField,
+) {
+    app.new_run_gen += 1;
+    let gen = app.new_run_gen;
+    app.new_run = Some(pending_new_run(project, all_projects, task, field, gen));
+    match app.bg_tx.clone() {
+        Some(tx) => {
+            let cfg = app.cfg.clone();
+            thread::spawn(move || {
+                let roster = compute_new_run_roster(&cfg);
+                let _ = tx.send(Msg::RosterReady(gen, roster));
+            });
+        }
+        None => {
+            let roster = compute_new_run_roster(&app.cfg);
+            if let Some(nr) = app.new_run.as_mut() {
+                nr.roster = roster;
+                nr.loading = false;
+            }
+        }
+    }
+}
+
+/// The roster and recent-fleet lookup: disk/process work (`detect_all`, a registry
+/// read) that must never run on the input thread (U13/D2) — see `begin_new_run`.
+fn compute_new_run_roster(cfg: &Config) -> Vec<RosterEntry> {
     let detected: Vec<(String, bool)> = crate::providers::detect_all()
         .into_iter()
         .map(|r| (r.name, r.available))
@@ -2498,16 +2643,18 @@ fn seeded_new_run(
     let recent_ref = recent_fleet
         .as_ref()
         .map(|(id, v)| (id.as_str(), v.as_slice()));
-    let roster = build_roster(cfg, &detected, recent_ref);
+    build_roster(cfg, &detected, recent_ref)
+}
 
-    NewRun {
-        project,
-        projects: all_projects,
-        task,
-        roster,
-        picked: Vec::new(),
-        field: NewRunField::Task,
-        sel: 0,
+/// Apply a background roster probe's result (D2) if the modal it was built for is
+/// still open on the same generation; a stale result from a cancelled or reopened
+/// modal is dropped.
+fn apply_roster_ready(app: &mut App, gen: u64, roster: Vec<RosterEntry>) {
+    if let Some(nr) = app.new_run.as_mut() {
+        if nr.gen == gen {
+            nr.roster = roster;
+            nr.loading = false;
+        }
     }
 }
 
@@ -2840,21 +2987,16 @@ fn run_palette(
             let Some(st) = full.filter(|st| !st.providers.is_empty()) else {
                 // No run to reuse a fleet from — U3's punt is retired: open the
                 // new-run surface pre-filled with the typed task instead of erroring
-                // to the CLI (U21).
-                let detected: Vec<(String, bool)> = crate::providers::detect_all()
-                    .into_iter()
-                    .map(|r| (r.name, r.available))
-                    .collect();
-                let roster = build_roster(&app.cfg, &detected, None);
-                app.new_run = Some(NewRun {
-                    project: Some(swarm.project_root.clone()),
-                    projects: vec![swarm.project_root.clone()],
-                    task: arg.to_string(),
-                    roster,
-                    picked: Vec::new(),
-                    field: NewRunField::Fleet,
-                    sel: 0,
-                });
+                // to the CLI (U21). Same background probe as `n` (D2), not a
+                // hand-rolled roster build, so this path also gets the recent-fleet
+                // row `open_new_run` offers.
+                begin_new_run(
+                    app,
+                    Some(swarm.project_root.clone()),
+                    vec![swarm.project_root.clone()],
+                    arg.to_string(),
+                    NewRunField::Fleet,
+                );
                 return Ok(PaletteResult::Flash(
                     "Pick a fleet to start".to_string(),
                     ACCENT,
@@ -3415,7 +3557,8 @@ fn handle_mouse(
             } else if let Some(i) = app
                 .rect_new_run_roster
                 .iter()
-                .position(|r| contains(*r, x, y))
+                .find(|(_, r)| contains(*r, x, y))
+                .map(|(i, _)| *i)
             {
                 if let Some(nr) = app.new_run.as_mut() {
                     nr.field = NewRunField::Fleet;
@@ -5482,7 +5625,19 @@ fn main_context(swarm: &SparPaths, full: Option<&RunState>, app: &App) -> String
                 let run_id = full
                     .map(|st| truncate(&st.id, 8))
                     .unwrap_or_else(|| "agent".into());
-                format!("agent · {run_id}")
+                // The tmux pane is attached (`terminal_pane`) once the window is
+                // actually resolvable, at which point the slot it names is worth
+                // showing; before that (still resolving, or a run with no slots)
+                // the shorter run-only form is all there is to say.
+                match (full, app.terminal_pane.is_some()) {
+                    (Some(st), true) => {
+                        format!(
+                            "agent · {run_id} ▸ {}",
+                            slot_short(&st.slots, app.selected_slot)
+                        )
+                    }
+                    _ => format!("agent · {run_id}"),
+                }
             }
             None => {
                 let base = swarm
@@ -6625,15 +6780,42 @@ fn draw_new_run(f: &mut Frame, area: Rect, projects: &[registry::ProjectEntry], 
     ));
     lines.push((String::new(), Style::default()));
     lines.push(("Fleet:".to_string(), field_style(NewRunField::Fleet)));
-    if nr.roster.is_empty() {
+    if nr.loading {
+        lines.push((
+            "  checking roster…".to_string(),
+            Style::default().fg(FG_MUTED),
+        ));
+    } else if nr.roster.is_empty() {
         lines.push((
             "  nothing usable — spar doctor".to_string(),
             Style::default().fg(FG_MUTED),
         ));
     }
     const MAX_ROSTER_ROWS: usize = 8;
+    // Keep `nr.sel` inside the painted window — otherwise a roster past the cap
+    // has rows the keyboard can select but neither paint nor a click can reach.
+    let roster_scroll = if nr.roster.len() <= MAX_ROSTER_ROWS {
+        0
+    } else {
+        nr.sel
+            .saturating_sub(MAX_ROSTER_ROWS - 1)
+            .min(nr.roster.len() - MAX_ROSTER_ROWS)
+    };
+    let roster_window: Vec<(usize, &RosterEntry)> = nr
+        .roster
+        .iter()
+        .enumerate()
+        .skip(roster_scroll)
+        .take(MAX_ROSTER_ROWS)
+        .collect();
+    if roster_scroll > 0 {
+        lines.push((
+            format!("  ↑ {roster_scroll} more"),
+            Style::default().fg(FG_MUTED),
+        ));
+    }
     let roster_line_start = lines.len();
-    for (i, e) in nr.roster.iter().enumerate().take(MAX_ROSTER_ROWS) {
+    for (i, e) in roster_window.iter().copied() {
         let picked_n = nr.picked.iter().position(|&p| p == i);
         let mark = match picked_n {
             Some(n) => format!("{}.", n + 1),
@@ -6667,11 +6849,9 @@ fn draw_new_run(f: &mut Frame, area: Rect, projects: &[registry::ProjectEntry], 
             style,
         ));
     }
-    if nr.roster.len() > MAX_ROSTER_ROWS {
-        lines.push((
-            format!("  … {} more", nr.roster.len() - MAX_ROSTER_ROWS),
-            Style::default().fg(FG_MUTED),
-        ));
+    let below = nr.roster.len() - roster_scroll - roster_window.len();
+    if below > 0 {
+        lines.push((format!("  ↓ {below} more"), Style::default().fg(FG_MUTED)));
     }
     lines.push((String::new(), Style::default()));
     lines.push((
@@ -6695,15 +6875,23 @@ fn draw_new_run(f: &mut Frame, area: Rect, projects: &[registry::ProjectEntry], 
         height: h,
     };
     // Click-outside-to-cancel / click-a-roster-row-to-toggle (D4), mirroring
-    // `rect_palette`. Only rows actually painted (post-truncation) are hit-testable.
-    let rendered_roster_rows = nr.roster.len().min(MAX_ROSTER_ROWS);
-    app.rect_new_run_roster = (0..rendered_roster_rows)
-        .filter(|i| roster_line_start + i < inner_h)
-        .map(|i| Rect {
-            x: rect.x + 1,
-            y: rect.y + 1 + (roster_line_start + i) as u16,
-            width: inner_w as u16,
-            height: 1,
+    // `rect_palette`. Only rows actually painted (post-truncation, post-scroll)
+    // are hit-testable, keyed by the roster's real index so a click on a
+    // scrolled-into-view row toggles the right entry.
+    app.rect_new_run_roster = roster_window
+        .iter()
+        .enumerate()
+        .filter(|(row, _)| roster_line_start + row < inner_h)
+        .map(|(row, (i, _))| {
+            (
+                *i,
+                Rect {
+                    x: rect.x + 1,
+                    y: rect.y + 1 + (roster_line_start + row) as u16,
+                    width: inner_w as u16,
+                    height: 1,
+                },
+            )
         })
         .collect();
     app.rect_new_run = rect;
