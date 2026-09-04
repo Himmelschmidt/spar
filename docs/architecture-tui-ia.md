@@ -148,14 +148,14 @@ width breakpoint. The rule: reserve space from the layout, never from the conten
 clips into fixed slots; skeleton placeholders hold space before data lands; reorder becomes
 an animated transition.
 
-**Off-thread `Snapshot` scans (U13).** `rail_project_items` calls
+**Off-thread `Snapshot` scans (U13). Done.** `rail_project_items` used to call
 `registry::list_visible_project_runs(&p.root)` once per project per redraw to compute the
-flag roll-up (`src/tui.rs:2830`). That is a directory scan inside `draw`, the one real
-render-path offender. `project_overview`'s call at `src/tui.rs:1312` is not: it runs inside
+flag roll-up, a directory scan inside `draw`, the one real render-path offender.
+`project_overview`'s call at `src/tui.rs:1312` was never the problem: it runs inside
 `build_snapshot` (`src/tui.rs:869`), the refresher thread's off-thread builder, alongside the
-correct call at `src/tui.rs:873`. `rail_project_items` moves onto `Snapshot` so `draw` never
-touches disk. This bites at the scale already hit once, when run dirs accumulated into the
-thousands.
+correct call at `src/tui.rs:873`. 004 Phase B moved `rail_project_items` onto `Snapshot`'s
+off-thread `HomeData`, so `draw` now consumes per-project stats instead of scanning. This
+bites at the scale already hit once, when run dirs accumulated into the thousands.
 
 **Design tokens and stability assertions.** A token set replaces scattered color consts,
 held to one accent and one alert colour, a consistent border and weight language, and

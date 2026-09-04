@@ -1119,7 +1119,14 @@ impl Snapshot {
     /// every registered project's run directory, which is the "thousands of run
     /// dirs" scale the IA doc names as the thing that already bit once (round-11
     /// review finding). `SparPaths::new` only joins paths, so this touches no disk.
+    ///
+    /// `home.rows` is seeded with `build_home_rows` over an empty project/run
+    /// listing rather than left empty: that is a pure function over no data, so it
+    /// still touches no disk, but it means the four band headers and the `n` CTA are
+    /// present on frame one instead of Home looking blank for a `REFRESH` tick
+    /// (round-11 review, minor).
     fn loading(root: &Path) -> Self {
+        let now = Utc::now();
         Self {
             swarm: SparPaths::new(root),
             projects: Vec::new(),
@@ -1131,7 +1138,10 @@ impl Snapshot {
             human_alerts: 0,
             abandoned: false,
             heartbeats: std::collections::HashMap::new(),
-            home: HomeData::default(),
+            home: HomeData {
+                rows: build_home_rows(&[], &[], &HomeScope::All, now, now),
+                project_stats: Vec::new(),
+            },
             log_stats: None,
         }
     }
@@ -1520,6 +1530,15 @@ fn push_home_band(
     }
 }
 
+/// The identity Home shows and drills into: `unit_id` when folded (stable across a
+/// loudest-leg swap), else `id`. Never `id` alone — it follows whichever leg
+/// `fold_units` currently picks as loudest and can visibly change between snapshots,
+/// which used to make a Home run row change its displayed identity out from under
+/// the operator (round-11 review, major; AC-28).
+fn home_display_id(run: &state::RunSummary) -> &str {
+    run.unit_id.as_deref().unwrap_or(&run.id)
+}
+
 /// Pure banding/ranking/capping (C): first match wins, so a run lands in exactly one
 /// band. `NeedsMe` is never capped (U5/AC-21); `Finished` is bounded by `watermark`
 /// (U19); band membership is declared per phase, not a fallthrough (AC-18).
@@ -1698,7 +1717,7 @@ fn home_overview(
                     out.push_str(&format!(
                         "    {} · {} · {} · waited {}{flag}\n",
                         run.project_name.as_deref().unwrap_or("?"),
-                        truncate(&run.id, 8),
+                        truncate(home_display_id(run), 8),
                         rail_phase(run.phase),
                         relative_wait(home_wait(run.updated_at, now)),
                     ));
@@ -1749,8 +1768,19 @@ fn home_row_key(row: &HomeRow) -> String {
         // `run.id` follows whichever leg `fold_units` currently judges loudest, which
         // can change between snapshots. `unit_id` is the fold root and does not move
         // (AC-28); a row that was never folded has no `unit_id`, so `id` is stable.
+        // Home is cross-project by definition, and folding is per project (round-11
+        // review, AC-34), so the project root is part of the identity too — without
+        // it, two projects whose 8-hex ids happen to collide would glue the cursor to
+        // the wrong project's row (round-11 review, minor).
         HomeRow::Run { run, .. } => {
-            format!("run:{}", run.unit_id.as_deref().unwrap_or(&run.id))
+            format!(
+                "run:{}:{}",
+                run.project_root
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                run.unit_id.as_deref().unwrap_or(&run.id)
+            )
         }
         HomeRow::More { band, .. } => format!("more:{band:?}"),
         HomeRow::Project(_, root) => format!("proj:{}", root.display()),
@@ -2257,10 +2287,18 @@ fn run_loop(
                 active_root = snap.projects[app.selected_project].root.clone();
             }
         }
-        if snap.runs.is_empty() {
-            app.selected_run = 0;
-        } else if app.home_target_run.is_some() {
+        if app.home_target_run.is_some() {
+            // Must run even with an empty `snap.runs` — a Home Enter into a project
+            // whose Runs listing has not landed yet (R2's one-tick lag) would
+            // otherwise never tick `home_target_ticks` and pin `home_target_run`
+            // forever, leaving Main/Agents blank with no way out (round-11 review,
+            // major).
             resolve_home_target(&mut app, &snap.runs);
+            if !snap.runs.is_empty() {
+                app.selected_run = app.selected_run.min(snap.runs.len() - 1);
+            }
+        } else if snap.runs.is_empty() {
+            app.selected_run = 0;
         } else {
             // The attention sort reorders the rail as runs change state; keep the
             // cursor glued to the same run id rather than the same row.
@@ -2600,7 +2638,8 @@ fn handle_key(
             app.flash("Projects (general view)", ACCENT);
         }
         KeyCode::Char('n') => {
-            open_new_run(app, projects, home_rows, local_root);
+            let browsed = app.browse.in_project().then_some(active_root.as_path());
+            open_new_run(app, projects, home_rows, local_root, browsed);
         }
         KeyCode::Char('P') => {
             toggle_home_scope(app, local_root);
@@ -2678,30 +2717,45 @@ fn handle_key(
 /// palette fallback when nothing is selected to reuse a fleet from. Both must agree,
 /// or `:plan` in cross-project Home can silently target a different project than the
 /// one the operator is looking at (round-9 review finding).
+///
+/// `browsed_project` is `Some` whenever the caller is inside a project view
+/// (`BrowseLevel::in_project()` — Runs or Agents), and always wins: the operator has
+/// drilled into that project, so it is never stale the way `active_root` can be while
+/// still browsing Home. Without this, `n`/`:plan` pressed after `Enter`-ing a Home run
+/// row for project B (which sets `active_root = B` but leaves `home_scope`/`home_rows`
+/// pointed at A) would target A — the wrong project — with no way to correct it,
+/// since a scoped Home offers only its own root to cycle through (round-11 review
+/// finding).
 fn new_run_target(
     app: &App,
     projects: &[registry::ProjectEntry],
     home_rows: &[HomeRow],
     local_root: Option<&Path>,
+    browsed_project: Option<&Path>,
 ) -> (Option<PathBuf>, Vec<PathBuf>) {
-    let target = match &app.home_scope {
-        HomeScope::Project(root) => Some(root.clone()),
-        HomeScope::All => home_rows
-            .get(app.selected_home)
-            .and_then(|r| match r {
-                HomeRow::Run { run, .. } => run.project_root.clone(),
-                HomeRow::Project(_, root) => Some(root.clone()),
-                _ => None,
-            })
-            .or_else(|| local_root.map(Path::to_path_buf)),
-    };
-    // A scoped Home only offers its one target to cycle through — every other
-    // registered project is out of scope, and offering them let `←`/`→` launch a
-    // plan against a project the operator was not looking at (review finding).
-    // Cycling is only meaningful at `HomeScope::All`.
-    let mut all_projects: Vec<PathBuf> = match &app.home_scope {
-        HomeScope::Project(_) => Vec::new(),
-        HomeScope::All => projects.iter().map(|p| p.root.clone()).collect(),
+    let scoped = browsed_project.is_some() || matches!(app.home_scope, HomeScope::Project(_));
+    let target = browsed_project
+        .map(Path::to_path_buf)
+        .or_else(|| match &app.home_scope {
+            HomeScope::Project(root) => Some(root.clone()),
+            HomeScope::All => home_rows
+                .get(app.selected_home)
+                .and_then(|r| match r {
+                    HomeRow::Run { run, .. } => run.project_root.clone(),
+                    HomeRow::Project(_, root) => Some(root.clone()),
+                    _ => None,
+                })
+                .or_else(|| local_root.map(Path::to_path_buf)),
+        });
+    // A scoped target (whether from `home_scope` or from browsing inside a project)
+    // only offers itself to cycle through — every other registered project is out of
+    // scope, and offering them let `←`/`→` launch a plan against a project the
+    // operator was not looking at (review finding). Cycling is only meaningful at an
+    // unscoped, all-project Home.
+    let mut all_projects: Vec<PathBuf> = if scoped {
+        Vec::new()
+    } else {
+        projects.iter().map(|p| p.root.clone()).collect()
     };
     // A scoped Home's target may be one refresh ahead of the registry (a project
     // just entered but not yet registered) — without this, `←`/`→` cycling can't
@@ -2722,8 +2776,10 @@ fn open_new_run(
     projects: &[registry::ProjectEntry],
     home_rows: &[HomeRow],
     local_root: Option<&Path>,
+    browsed_project: Option<&Path>,
 ) {
-    let (project, all_projects) = new_run_target(app, projects, home_rows, local_root);
+    let (project, all_projects) =
+        new_run_target(app, projects, home_rows, local_root, browsed_project);
     begin_new_run(app, project, all_projects, String::new(), NewRunField::Task);
 }
 
@@ -3181,10 +3237,17 @@ fn run_palette(
                 // row `open_new_run` offers.
                 //
                 // Target selection goes through `new_run_target`, the same rule `n`
-                // uses: the highlighted Home run/project in cross-project Home, not
-                // `swarm.project_root` (`active_root`, stale while browsing Home and
-                // can point at whichever project was entered first — round-9 review).
-                let (target, all_projects) = new_run_target(app, projects, home_rows, local_root);
+                // uses: `swarm.project_root` when a project is actually being
+                // browsed (Runs/Agents — never stale there), else the highlighted
+                // Home run/project in cross-project Home. `swarm.project_root` is
+                // only unreliable while still browsing Home, where it can point at
+                // whichever project was entered first (round-9 review).
+                let browsed = app
+                    .browse
+                    .in_project()
+                    .then_some(swarm.project_root.as_path());
+                let (target, all_projects) =
+                    new_run_target(app, projects, home_rows, local_root, browsed);
                 begin_new_run(
                     app,
                     target,
@@ -3534,19 +3597,27 @@ fn step_matched(matched: &[usize], cur: usize, delta: i32) -> usize {
 /// `CROSS_PROJECT_REFRESH` cadence, so a normal drill-down never trips it.
 const HOME_TARGET_GIVE_UP: u32 = 25;
 
-/// A Home `Enter` carries a run id ahead of the snapshot that actually contains it
-/// (R2/AC-27): the snapshot in hand may still be Home's (cross-project, `runs`
-/// empty) or a stale project's. Hold the target and only clear it once a snapshot
-/// arrives whose `runs` actually contains it. If it never reappears — archived,
-/// its directory removed, or folded into a different loudest leg — give up after
-/// `HOME_TARGET_GIVE_UP` snapshots and return to Home rather than leaving
-/// Main/Agents pinned to a ghost run forever (round-7 review finding). Returns
-/// `true` when the target was found and selected this call.
+/// A Home `Enter` carries a run's fold-stable `unit_id` ahead of the snapshot that
+/// actually contains it (R2/AC-27): the snapshot in hand may still be Home's
+/// (cross-project, `runs` empty) or a stale project's. Hold the target and only
+/// clear it once a snapshot arrives whose `runs` actually contains it. Matching on
+/// `unit_id` first (falling back to `id` for a row that was never folded) means a
+/// unit whose loudest leg changes between the Home snapshot and the target
+/// project's own snapshot is still found — matching on `id` alone would miss it,
+/// since `id` follows whichever leg is currently loudest (round-11 review, major;
+/// AC-28). If it never reappears — archived, its directory removed, or the whole
+/// unit gone — give up after `HOME_TARGET_GIVE_UP` snapshots and return to Home
+/// rather than leaving Main/Agents pinned to a ghost run forever (round-7 review
+/// finding). Returns `true` when the target was found and selected this call.
 fn resolve_home_target(app: &mut App, runs: &[state::RunSummary]) -> bool {
     let Some(target) = app.home_target_run.clone() else {
         return false;
     };
-    if let Some(pos) = runs.iter().position(|r| r.id == target) {
+    let found = runs
+        .iter()
+        .position(|r| r.unit_id.as_deref() == Some(target.as_str()))
+        .or_else(|| runs.iter().position(|r| r.id == target));
+    if let Some(pos) = found {
         app.selected_run = pos;
         app.home_target_run = None;
         app.home_target_ticks = 0;
@@ -3586,7 +3657,11 @@ fn rail_enter(
                 if let Some(root) = run.project_root.clone() {
                     *active_root = root;
                 }
-                app.home_target_run = Some(run.id.clone());
+                // Pin the fold-stable `unit_id`, not `id` — `id` follows whichever
+                // leg is loudest and can pick a different leg by the time the target
+                // project's own snapshot lands, stranding the pin on a leg that no
+                // longer exists under that name (round-11 review, major; AC-28).
+                app.home_target_run = Some(run.unit_id.clone().unwrap_or_else(|| run.id.clone()));
                 app.home_target_ticks = 0;
                 app.browse = BrowseLevel::Agents;
                 app.selected_slot = 0;
@@ -3605,7 +3680,7 @@ fn rail_enter(
                 // same verified `local_root` the `n` key and `open_new_run`'s own
                 // `HomeScope::All` fallback use, or the no-target refusal never fires
                 // (AC-32).
-                open_new_run(app, projects, home_rows, local_root);
+                open_new_run(app, projects, home_rows, local_root, None);
             }
             Some(HomeRow::Header(_)) | Some(HomeRow::More { .. }) | None => {}
         },
@@ -5623,7 +5698,7 @@ fn rail_home_items(
                     let phase_w = w.saturating_sub(17).clamp(6, 16) as usize;
                     let body = vec![
                         Span::styled(
-                            format!("{:<8}", truncate(&run.id, 8)),
+                            format!("{:<8}", truncate(home_display_id(run), 8)),
                             if sel { selected(focused) } else { dim() },
                         ),
                         Span::styled(
@@ -8004,7 +8079,10 @@ fn jump_to_attention(app: &mut App, runs: &[state::RunSummary], home_rows: &[Hom
         app.selected_home = next;
         app.home_key = home_rows.get(next).map(home_row_key);
         if let Some(HomeRow::Run { run, .. }) = home_rows.get(next) {
-            app.flash(format!("→ {} needs you", truncate(&run.id, 8)), WARN);
+            app.flash(
+                format!("→ {} needs you", truncate(home_display_id(run), 8)),
+                WARN,
+            );
         }
         return;
     }
@@ -11225,15 +11303,25 @@ mod render_stability {
     /// first snapshot cross-project; building it synchronously before the first
     /// paint would block startup on the same scan U13 already keeps out of `draw`.
     /// `Snapshot::loading` is what the first frame paints instead: it must come back
-    /// empty and instantly, and must not need its root to exist, proving it does no
-    /// disk I/O to construct.
+    /// instantly and must not need its root to exist, proving it does no disk I/O to
+    /// construct. `home.rows` is *not* empty — it is seeded with `build_home_rows`
+    /// over no projects/runs, a pure function, so the four band headers and the `n`
+    /// CTA are present on frame one instead of Home looking blank for a `REFRESH`
+    /// tick (round-11 review, minor).
     #[test]
     fn snapshot_loading_needs_no_disk_and_paints_empty() {
         let root = PathBuf::from("/nonexistent/definitely-not-here");
         let snap = Snapshot::loading(&root);
         assert!(snap.projects.is_empty());
         assert!(snap.runs.is_empty());
-        assert!(snap.home.rows.is_empty());
+        assert!(
+            snap.home
+                .rows
+                .iter()
+                .all(|r| matches!(r, HomeRow::Header(_) | HomeRow::NewRun)),
+            "no disk-backed rows, but the static chrome is present: {:?}",
+            snap.home.rows
+        );
         assert!(snap.home.project_stats.is_empty());
         assert!(snap.full.is_none());
     }
@@ -12556,7 +12644,10 @@ mod home_ia {
         let rows = nav_rows(&root);
         let mut app = App::new(None, Config::default(), None);
         rail_select(&mut app, 3, 0, &rows, 0, 0); // the running run
-        assert_eq!(app.home_key.as_deref(), Some("run:work0001"));
+        assert_eq!(
+            app.home_key.as_deref(),
+            Some("run:/nonexistent/spar:work0001")
+        );
 
         // Next snapshot: a new gate arrives and pushes everything down.
         let mut reordered = vec![
@@ -12779,6 +12870,7 @@ mod home_ia {
             std::slice::from_ref(&other),
             &[],
             Some(root.as_path()),
+            None,
         );
         let nr = app.new_run.as_ref().unwrap();
         assert_eq!(nr.project.as_deref(), Some(root.as_path()));
@@ -12819,7 +12911,7 @@ mod home_ia {
             project_at(&PathBuf::from("/nonexistent/acme-api"), "acme-api"),
             project_at(&PathBuf::from("/nonexistent/other"), "other"),
         ];
-        open_new_run(&mut app, &projects, &[], Some(root.as_path()));
+        open_new_run(&mut app, &projects, &[], Some(root.as_path()), None);
         let nr = app.new_run.as_ref().unwrap();
         assert_eq!(
             nr.projects,
@@ -12880,6 +12972,38 @@ mod home_ia {
             app.new_run.as_ref().unwrap().project.as_deref(),
             Some(b.as_path()),
             "the fallback must target the selected Home row's project, not active_root"
+        );
+    }
+
+    /// Round-11 review (review-1-cli-claude, major): `n` used to target the wrong
+    /// project whenever the operator had drilled into a project other than their
+    /// Home scope, with no way to correct it. `spar` inside repo A scopes Home to A;
+    /// `Enter` on a Home run row in project B sets `active_root = B` and opens
+    /// `Agents`, at which point `home_rows` is empty (only populated at Home/Projects)
+    /// and `home_scope` still reads `Project(A)`. `n` pressed there must target B, the
+    /// project actually being browsed, not the stale scope.
+    #[test]
+    fn open_new_run_targets_the_browsed_project_not_a_stale_home_scope() {
+        let a = PathBuf::from("/nonexistent/repo-a");
+        let b = PathBuf::from("/nonexistent/repo-b");
+        let mut app = App::new(None, Config::default(), Some(a.as_path()));
+        assert_eq!(app.home_scope, HomeScope::Project(a.clone()));
+        app.browse = BrowseLevel::Agents;
+
+        let projects = [project_at(&a, "repo-a"), project_at(&b, "repo-b")];
+        open_new_run(&mut app, &projects, &[], None, Some(b.as_path()));
+        let nr = app.new_run.as_ref().unwrap();
+        assert_eq!(
+            nr.project.as_deref(),
+            Some(b.as_path()),
+            "n must target the project actually being browsed, not the Home scope"
+        );
+        assert_eq!(
+            nr.projects,
+            vec![b.clone()],
+            "browsing inside a project is scoped exactly like a scoped Home: no \
+             cycling to an unrelated project: {:?}",
+            nr.projects
         );
     }
 
