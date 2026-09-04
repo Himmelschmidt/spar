@@ -585,7 +585,8 @@ struct App {
     /// Set by `rail_enter` on a Home run row so the one-tick snapshot handoff into
     /// `Agents` selects the row's own run, not whatever the rail happened to have.
     home_target_run: Option<String>,
-    /// Snapshots since `home_target_run` was set without finding it — the target's
+    /// Wall-clock start of the give-up budget (`HOME_TARGET_GIVE_UP`) once a snapshot
+    /// of the target's own project has been seen without finding it — the target's
     /// project may still be one refresh behind (R2), but a run that never reappears
     /// (archived, dir removed, folded into a different loudest leg) must eventually
     /// release the pin rather than leave Main/Agents permanently empty (round-7
@@ -1301,22 +1302,42 @@ fn fold_units(
             out.push(r);
             continue;
         }
-        // Loudest attention first, then most recent: the active member is whatever the
-        // operator would want the row to be about. Deliberately NOT ordered by
-        // `wants_operator`: the row's id and phase are what gate buttons, `:approve`
-        // and drill-down act on, and `PlanApproved` scores `Idle`, so promoting a
-        // wanting leg here would both retarget those actions and sink the whole unit
-        // below every working run in the attention-sorted rail. Whether the *unit*
-        // wants the operator is `unit_wants_operator`, which reads `wants`.
+        // Loudest attention first (U18): a working leg must outrank an idle one so the
+        // row's id and phase, which gate buttons, `:approve` and drill-down all act on,
+        // never come from a leg that isn't actually holding the state. Reordering by
+        // `wants_operator` first (instead of as a tiebreak) sank a `PlanApproved` unit
+        // with a live child below every working run and retargeted those actions onto
+        // the idle leg — see U18. `wants_operator` only breaks a tie *within* one
+        // attention level: an idle `PlanApproved` leg and an idle `Done` leg sort
+        // equally on attention alone, and picking the `Done` one as representative
+        // would leave a NEEDS YOU row with nothing to act on. Attention can never tie
+        // across a Working leg, since every active phase scores `Working`, so this
+        // tiebreak can only ever reorder among idle (or among gate, or among broken)
+        // legs — it never overrides the active leg attention already selected.
         group.sort_by(|a, b| {
             run_attention(b)
                 .cmp(&run_attention(a))
+                .then_with(|| wants_operator(b).cmp(&wants_operator(a)))
                 .then(b.updated_at.cmp(&a.updated_at))
         });
         let ids: Vec<String> = group.iter().map(|r| r.id.clone()).collect();
-        // Every leg that wants the operator still counts. Two gates folded into one
-        // row must read as two in the roll-up, or folding hides one of them.
-        let wants = group.iter().filter(|r| wants_operator(r)).count() as u32;
+        // Every leg that wants the operator still counts, so two gates folded into one
+        // row read as two in the roll-up rather than one. But `PlanApproved` (U18) is a
+        // handoff only while nothing in the unit is running: once a sibling leg has
+        // taken it up, the approval is stale bookkeeping, not a second thing waiting on
+        // the operator, so it must not inflate `wants` (and, via `unit_wants_operator`,
+        // must not raise a NEEDS YOU nobody can act on for the unit's live leg).
+        let unit_has_active_leg = group.iter().any(|r| is_active_phase(r.phase));
+        let wants = group
+            .iter()
+            .filter(|r| {
+                if r.phase == Phase::PlanApproved && unit_has_active_leg {
+                    false
+                } else {
+                    wants_operator(r)
+                }
+            })
+            .count() as u32;
         let brief = group
             .iter()
             .find(|r| r.id == root)
@@ -2299,9 +2320,12 @@ fn run_loop(
             // whose Runs listing has not landed yet (R2's one-tick lag) would
             // otherwise never start the give-up clock and pin `home_target_run`
             // forever, leaving Main/Agents blank with no way out (round-11 review,
-            // major). Gated on a *new* snapshot so the give-up budget is measured in
-            // refreshes rather than in 100ms render wakes.
-            resolve_home_target(&mut app, &snap.runs);
+            // major). Called unconditionally, every loop iteration: `resolve_home_target`
+            // itself withholds the give-up clock until `snap` is actually a scan of the
+            // target's project (below), so this being unconditional does not start the
+            // budget early.
+            let snapshot_for_target = snap.swarm.project_root == active_root;
+            resolve_home_target(&mut app, &snap.runs, snapshot_for_target);
             if !snap.runs.is_empty() {
                 app.selected_run = app.selected_run.min(snap.runs.len() - 1);
             }
@@ -3259,14 +3283,19 @@ fn run_palette(
                 //
                 // Target selection goes through `new_run_target`, the same rule `n`
                 // uses: `swarm.project_root` when a project is actually being
-                // browsed (Runs/Agents — never stale there), else the highlighted
-                // Home run/project in cross-project Home. `swarm.project_root` is
-                // only unreliable while still browsing Home, where it can point at
-                // whichever project was entered first (round-9 review).
-                let browsed = app
-                    .browse
-                    .in_project()
-                    .then_some(swarm.project_root.as_path());
+                // browsed (Runs/Agents — never stale there); the highlighted row
+                // read directly from `projects`, not from `swarm.project_root`, at
+                // Projects, since a queued `j`/click followed by `:plan` in the same
+                // input burst leaves `swarm.project_root` one selection stale (the
+                // same bug review 3be317b2 found here after `n` was already fixed);
+                // else the highlighted Home run/project in cross-project Home.
+                let browsed = if app.browse == BrowseLevel::Projects {
+                    projects.get(app.selected_project).map(|p| p.root.as_path())
+                } else if app.browse.in_project() {
+                    Some(swarm.project_root.as_path())
+                } else {
+                    None
+                };
                 let (target, all_projects) =
                     new_run_target(app, projects, home_rows, local_root, browsed);
                 begin_new_run(
@@ -3618,9 +3647,14 @@ fn step_matched(matched: &[usize], cur: usize, delta: i32) -> usize {
 /// 2.5s during a slow project scan, and ticking per *installed snapshot* starved the
 /// escape completely, because the refresher deliberately retains the current `Arc` when
 /// nothing on disk changed — a removed run gets one forced empty snapshot and then
-/// silence, pinning Main forever (review e72f434e, major). Generous relative to R2's
-/// one-tick lag and Home's `CROSS_PROJECT_REFRESH` cadence, so a normal drill-down
-/// never trips it.
+/// silence, pinning Main forever (review e72f434e, major). The clock itself only starts
+/// once `resolve_home_target` has actually been handed a snapshot of the target's own
+/// project (`resolve_home_target`'s `snapshot_for_target`): starting it on the first
+/// post-`Enter` frame, whose snapshot is normally still Home's, let an unbounded
+/// cross-project scan (thousands of run dirs) burn the whole budget before the target
+/// project's snapshot ever landed (review 3be317b2, major). 10s is still generous
+/// relative to R2's one-tick lag and Home's `CROSS_PROJECT_REFRESH` cadence once the
+/// scan has actually started, so a normal drill-down never trips it.
 const HOME_TARGET_GIVE_UP: Duration = Duration::from_secs(10);
 
 /// A Home `Enter` carries a run's fold-stable `unit_id` ahead of the snapshot that
@@ -3632,10 +3666,21 @@ const HOME_TARGET_GIVE_UP: Duration = Duration::from_secs(10);
 /// project's own snapshot is still found — matching on `id` alone would miss it,
 /// since `id` follows whichever leg is currently loudest (round-11 review, major;
 /// AC-28). If it never reappears — archived, its directory removed, or the whole
-/// unit gone — give up after `HOME_TARGET_GIVE_UP` snapshots and return to Home
-/// rather than leaving Main/Agents pinned to a ghost run forever (round-7 review
-/// finding). Returns `true` when the target was found and selected this call.
-fn resolve_home_target(app: &mut App, runs: &[state::RunSummary]) -> bool {
+/// unit gone — give up after `HOME_TARGET_GIVE_UP` and return to Home rather than
+/// leaving Main/Agents pinned to a ghost run forever (round-7 review finding).
+/// `snapshot_for_target` tells the give-up clock whether `runs` actually came from a
+/// scan of the target's own project: the first post-`Enter` frame is normally still
+/// Home's snapshot (cross-project, `runs` empty), and that project's own scan is
+/// unbounded (thousands of run dirs), so starting the clock before the target project
+/// has even been scanned once could time out a legitimate Enter before its snapshot
+/// ever lands (review 3be317b2, major). The clock only starts once a snapshot for the
+/// right project has actually been seen; once started it does not reset. Returns
+/// `true` when the target was found and selected this call.
+fn resolve_home_target(
+    app: &mut App,
+    runs: &[state::RunSummary],
+    snapshot_for_target: bool,
+) -> bool {
     let Some(target) = app.home_target_run.clone() else {
         return false;
     };
@@ -3648,6 +3693,9 @@ fn resolve_home_target(app: &mut App, runs: &[state::RunSummary]) -> bool {
         app.home_target_run = None;
         app.home_target_since = None;
         return true;
+    }
+    if !snapshot_for_target && app.home_target_since.is_none() {
+        return false;
     }
     let since = *app.home_target_since.get_or_insert_with(Instant::now);
     if since.elapsed() > HOME_TARGET_GIVE_UP {
@@ -11583,15 +11631,18 @@ mod folding {
         assert_eq!(members, vec!["impl1".to_string(), "plan1".to_string()]);
     }
 
-    /// `wants_operator` is not a function of `run_attention`: `PlanApproved` is a
-    /// handoff nothing else will complete, but it scores `Idle`. A unit whose plan is
-    /// approved while a child works therefore folds to the *child* — correctly, because
-    /// the row's id and phase are what gate buttons and drill-down act on — and every
-    /// surface that then asked `wants_operator(row)` instead of the `wants` count lost
-    /// the handoff. Twelve review rounds passed the 36-criterion contract with this
-    /// live, because no criterion paired a wanting leg with a louder one.
+    /// U18, first rule: `PlanApproved` is a handoff only while nothing in the unit is
+    /// running. A unit whose plan is approved *and* which has an active leg has
+    /// already been dispatched, so the approval is stale bookkeeping and nobody is
+    /// waiting. Two rejected operator fixes (runs `e72f434e`, `3be317b2`) got this
+    /// scenario wrong in opposite directions: one retargeted the row onto the idle
+    /// `PlanApproved` leg and sank the unit in the attention sort; the other left the
+    /// row on the active leg but still reported the unit as wanting the operator,
+    /// producing a permanent NEEDS YOU with no action to take (`Review` has no gate
+    /// button, and nothing else can act on the stale approval). Neither may happen:
+    /// the row acts on the active leg, and the unit must not claim to want you.
     #[test]
-    fn a_folded_unit_reports_a_wanting_leg_even_when_a_louder_one_represents_it() {
+    fn a_plan_approved_leg_with_an_active_sibling_does_not_want_the_operator() {
         let runs = vec![
             summary("plan1", Phase::PlanApproved, None, 90),
             summary("impl1", Phase::Review, Some("plan1"), 5),
@@ -11600,32 +11651,61 @@ mod folding {
         assert_eq!(rows.len(), 1, "one unit of work");
         let unit = &rows[0];
 
-        // The row still acts on the active leg: retargeting it would send gate buttons
-        // and `:approve` at the wrong run, and sink the unit in the attention sort.
-        assert_eq!(unit.id, "impl1");
+        assert_eq!(unit.id, "impl1", "the row still acts on the active leg");
         assert_eq!(unit.phase, Phase::Review);
-
-        // But the unit is reported as wanting the operator, by the one predicate every
-        // band, flag and cycle key goes through.
-        assert_eq!(unit.wants, 1);
+        assert_eq!(
+            unit.wants, 0,
+            "impl1 is live, so plan1's approval is not a live handoff"
+        );
         assert!(
-            unit_wants_operator(unit),
-            "the folded unit must read as wanting the operator: {unit:?}"
+            !unit_wants_operator(unit),
+            "a working sibling means nobody is actually waiting: {unit:?}"
         );
         assert!(
             !wants_operator(unit),
-            "the representative leg itself does not want the operator — that gap is \
-             exactly what `unit_wants_operator` exists to close"
+            "the representative leg agrees — this is the only self-consistent answer"
         );
         assert_eq!(
             runs_needing_attention(&rows),
-            1,
+            0,
             "the roll-up and the row must agree"
         );
         assert!(
-            attention_flag(unit, unit_wants_operator(unit)).is_some(),
-            "the rail must fly a flag for it"
+            attention_flag(unit, unit_wants_operator(unit)).is_none(),
+            "no flag on a row with nothing to act on"
         );
+    }
+
+    /// U18's other half: once the active leg finishes, the approval is a live handoff
+    /// again, and the row must fold to the *approvable* leg (`plan1`), not the
+    /// finished one (`impl1`) — `plan1` is the only leg with a real action
+    /// (`:implement`) to take. This is `fold_units`' `wants_operator` tiebreak: both
+    /// legs are `Attention::Idle`, so attention alone cannot pick between them, and
+    /// picking `impl1` by recency alone would reproduce the unactionable-alert bug
+    /// with a `Done` leg standing in for `Review`.
+    #[test]
+    fn a_plan_approved_leg_wants_the_operator_once_its_sibling_finishes() {
+        let runs = vec![
+            summary("plan1", Phase::PlanApproved, None, 90),
+            summary("impl1", Phase::Done, Some("plan1"), 5),
+        ];
+        let (rows, _) = fold_units(runs);
+        assert_eq!(rows.len(), 1, "one unit of work");
+        let unit = &rows[0];
+
+        assert_eq!(
+            unit.id, "plan1",
+            "the approvable leg must represent the row, not the finished one"
+        );
+        assert_eq!(unit.phase, Phase::PlanApproved);
+        assert_eq!(unit.wants, 1);
+        assert!(unit_wants_operator(unit), "{unit:?}");
+        assert!(
+            wants_operator(unit),
+            "the representative leg agrees — this is the only self-consistent answer"
+        );
+        assert_eq!(runs_needing_attention(&rows), 1);
+        assert!(attention_flag(unit, unit_wants_operator(unit)).is_some());
     }
 
     /// Folding must never hide a run that wants the operator — the failure O36 exists
@@ -12467,8 +12547,135 @@ mod home_ia {
             })
             .expect("PlanApproved lands in NeedsMe");
         assert!(
-            attention_flag(row, row.wants > 1).is_some(),
+            attention_flag(row, unit_wants_operator(row)).is_some(),
             "the rail flag must fire for the row Home says needs you"
+        );
+    }
+
+    /// U18, driven through the real pipeline (`fold_units` then `build_home_rows`)
+    /// rather than a hand-built row: a `PlanApproved` unit with a live sibling has
+    /// already been dispatched, so it must not appear in NEEDS YOU, and the roll-up
+    /// Home's header reads (`home_needs_you`) must agree with the fleet-wide one
+    /// (`runs_needing_attention`) that a Runs-level view over the same folded data
+    /// would compute.
+    #[test]
+    fn a_plan_approved_unit_with_an_active_leg_is_not_needs_you() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let now = Utc::now();
+        let plan1 = run_in("plan0001", Phase::PlanApproved, 90, &root);
+        let mut impl1 = run_in("impl0001", Phase::Review, 5, &root);
+        impl1.parent_run = Some("plan0001".to_string());
+
+        let (folded, _) = fold_units(vec![plan1, impl1]);
+        assert_eq!(folded.len(), 1, "one unit of work");
+
+        let rows = build_home_rows(
+            &projects,
+            std::slice::from_ref(&folded),
+            &HomeScope::All,
+            now - chrono::Duration::hours(6),
+            now,
+        );
+        assert_eq!(
+            band_of(&rows, "impl0001"),
+            Some(HomeBand::Running),
+            "impl0001 is live and there is nothing to act on"
+        );
+        assert_eq!(home_needs_you(&rows), 0);
+        assert_eq!(
+            runs_needing_attention(&folded),
+            0,
+            "Home's header and the fleet roll-up must agree"
+        );
+    }
+
+    /// U18's other half, through the same real pipeline: once the active leg
+    /// finishes, the unit is a live handoff again, and the row Home renders must be
+    /// the approvable leg — the one a NEEDS YOU alert can actually be acted on.
+    #[test]
+    fn a_plan_approved_unit_wants_you_and_is_actionable_once_its_leg_finishes() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let now = Utc::now();
+        let plan1 = run_in("plan0001", Phase::PlanApproved, 90, &root);
+        let mut impl1 = run_in("impl0001", Phase::Done, 5, &root);
+        impl1.parent_run = Some("plan0001".to_string());
+
+        let (folded, _) = fold_units(vec![plan1, impl1]);
+        assert_eq!(folded.len(), 1, "one unit of work");
+
+        let rows = build_home_rows(
+            &projects,
+            std::slice::from_ref(&folded),
+            &HomeScope::All,
+            now - chrono::Duration::hours(6),
+            now,
+        );
+        assert_eq!(
+            band_of(&rows, "plan0001"),
+            Some(HomeBand::NeedsMe),
+            "the approvable leg, not the finished one, must be the row that's flagged"
+        );
+        assert_eq!(home_needs_you(&rows), 1);
+        assert_eq!(runs_needing_attention(&folded), 1);
+        let row = rows
+            .iter()
+            .find_map(|r| match r {
+                HomeRow::Run {
+                    band: HomeBand::NeedsMe,
+                    run,
+                    ..
+                } => Some(run),
+                _ => None,
+            })
+            .expect("the row lands in NeedsMe");
+        assert_eq!(
+            row.id, "plan0001",
+            "Home's row must act on the leg that has something to do"
+        );
+        assert_eq!(row.phase, Phase::PlanApproved);
+        assert!(attention_flag(row, unit_wants_operator(row)).is_some());
+    }
+
+    /// The `a` cycle key (`jump_to_attention`) goes through `unit_wants_operator` at
+    /// the Runs level too — a folded unit stuck on U18's stale-approval case must not
+    /// be a cycle target, and must become one again once it is genuinely actionable.
+    #[test]
+    fn jump_to_attention_follows_the_u18_conditional() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let plan1 = run_in("plan0001", Phase::PlanApproved, 90, &root);
+        let mut impl1 = run_in("impl0001", Phase::Review, 5, &root);
+        impl1.parent_run = Some("plan0001".to_string());
+        let (stale, _) = fold_units(vec![plan1.clone(), impl1]);
+        assert_eq!(stale.len(), 1);
+
+        let mut app = App::new(None, Config::default(), None);
+        app.browse = BrowseLevel::Runs;
+        app.selected_run = 0;
+        jump_to_attention(&mut app, &stale, &[]);
+        assert_eq!(
+            app.flash.as_ref().map(|(_, msg, ..)| msg.clone()),
+            Some("nothing needs you".to_string()),
+            "no cycle target while impl0001 is still live"
+        );
+
+        let mut impl1_done = run_in("impl0001", Phase::Done, 5, &root);
+        impl1_done.parent_run = Some("plan0001".to_string());
+        let (live, _) = fold_units(vec![plan1, impl1_done]);
+        assert_eq!(live.len(), 1);
+
+        let mut app = App::new(None, Config::default(), None);
+        app.browse = BrowseLevel::Runs;
+        app.selected_run = 0;
+        jump_to_attention(&mut app, &live, &[]);
+        assert_eq!(
+            app.selected_run, 0,
+            "the sole run in the list is the target"
+        );
+        assert_eq!(
+            app.flash.as_ref().map(|(_, msg, ..)| msg.clone()),
+            Some("→ plan0001 needs you".to_string())
         );
     }
 
@@ -12742,7 +12949,7 @@ mod home_ia {
         let mut app = App::new(None, Config::default(), None);
         app.home_target_run = Some("keep0001".into());
         app.browse = BrowseLevel::Agents;
-        assert!(resolve_home_target(&mut app, &runs));
+        assert!(resolve_home_target(&mut app, &runs, true));
         assert!(app.home_target_run.is_none());
         assert!(app.home_target_since.is_none());
         assert_eq!(app.selected_run, 0);
@@ -12755,7 +12962,7 @@ mod home_ia {
         app.home_target_run = Some("ghost0001".into());
         app.browse = BrowseLevel::Agents;
         for _ in 0..200 {
-            assert!(!resolve_home_target(&mut app, &runs));
+            assert!(!resolve_home_target(&mut app, &runs, true));
             assert!(
                 app.home_target_run.is_some(),
                 "must not give up while inside the budget"
@@ -12765,8 +12972,12 @@ mod home_ia {
 
         // Past the deadline: the pin releases and Home reclaims focus. Backdating the
         // start beats sleeping for the budget.
-        app.home_target_since = Instant::now().checked_sub(HOME_TARGET_GIVE_UP * 2);
-        assert!(!resolve_home_target(&mut app, &runs));
+        app.home_target_since = Some(
+            Instant::now()
+                .checked_sub(HOME_TARGET_GIVE_UP * 2)
+                .expect("monotonic clock is older than the give-up budget"),
+        );
+        assert!(!resolve_home_target(&mut app, &runs, true));
         assert!(app.home_target_run.is_none(), "the ghost pin must release");
         assert!(app.home_target_since.is_none());
         assert_eq!(app.browse, BrowseLevel::Home);
@@ -12774,6 +12985,47 @@ mod home_ia {
             app.flash.is_some(),
             "the operator must be told the run went away"
         );
+    }
+
+    /// Review 3be317b2 (major): the give-up clock used to start on the very first
+    /// post-`Enter` frame, whose snapshot is normally still Home's own (cross-project,
+    /// `runs` empty) rather than the target project's. A slow scan of the target
+    /// project (the "thousands of run dirs" scale the give-up budget exists at) could
+    /// then exceed `HOME_TARGET_GIVE_UP` before that project's snapshot ever landed,
+    /// discarding a perfectly legitimate Home `Enter`. The clock must not start until
+    /// `resolve_home_target` has actually been handed a snapshot for the target's own
+    /// project — an arbitrary number of misses against a snapshot for some *other*
+    /// project must not burn the budget at all.
+    #[test]
+    fn the_give_up_clock_does_not_start_before_the_target_projects_own_snapshot() {
+        let runs: Vec<state::RunSummary> = Vec::new();
+
+        let mut app = App::new(None, Config::default(), None);
+        app.home_target_run = Some("ghost0001".into());
+        app.browse = BrowseLevel::Agents;
+
+        // Home's own (cross-project) snapshot keeps arriving instead of the target
+        // project's — none of these may start the clock.
+        for _ in 0..50 {
+            assert!(!resolve_home_target(&mut app, &runs, false));
+            assert!(app.home_target_since.is_none(), "clock must not start yet");
+        }
+
+        // The target project's own snapshot finally lands (still without the run):
+        // only now does the clock start.
+        assert!(!resolve_home_target(&mut app, &runs, true));
+        assert!(app.home_target_since.is_some(), "clock starts here");
+        assert_eq!(app.browse, BrowseLevel::Agents, "still inside the budget");
+
+        // Backdate past the deadline and confirm the give-up still fires from here.
+        app.home_target_since = Some(
+            Instant::now()
+                .checked_sub(HOME_TARGET_GIVE_UP * 2)
+                .expect("monotonic clock is older than the give-up budget"),
+        );
+        assert!(!resolve_home_target(&mut app, &runs, true));
+        assert!(app.home_target_run.is_none(), "the ghost pin must release");
+        assert_eq!(app.browse, BrowseLevel::Home);
     }
 
     /// AC-28. R3: Home re-ranks every snapshot (wait time changes every
@@ -13112,6 +13364,43 @@ mod home_ia {
             app.new_run.as_ref().unwrap().project.as_deref(),
             Some(b.as_path()),
             "the fallback must target the selected Home row's project, not active_root"
+        );
+    }
+
+    /// Review 3be317b2 (major): `:plan <task>` at `BrowseLevel::Projects` had the
+    /// identical bug `n` was fixed for — it read `swarm.project_root`, which the run
+    /// loop only refreshes in the pre-input clamp, so a queued `j` (or a click)
+    /// followed by `:plan` in the same input burst targeted the previously
+    /// highlighted project. The fix reads `projects[app.selected_project]` directly,
+    /// same as `n`.
+    #[test]
+    fn plan_palette_at_projects_targets_the_row_selected_in_the_same_input_burst() {
+        let a = PathBuf::from("/nonexistent/alpha");
+        let b = PathBuf::from("/nonexistent/bravo");
+        let projects = [project_at(&a, "alpha"), project_at(&b, "bravo")];
+        let mut app = App::new(None, Config::default(), None);
+        app.open_projects_view();
+        app.selected_project = 1; // `j` already moved the highlight to bravo
+
+        // Stale on purpose: this is what the pre-input clamp left behind for `alpha`,
+        // exactly as `run_loop` would hand it to `run_palette` mid-burst.
+        let swarm = SparPaths::new(&a);
+        let runs: Vec<state::RunSummary> = Vec::new();
+        run_palette(
+            &mut app,
+            &swarm,
+            &projects,
+            &[],
+            None,
+            &runs,
+            None,
+            "plan do the thing",
+        )
+        .unwrap();
+        assert_eq!(
+            app.new_run.as_ref().unwrap().project.as_deref(),
+            Some(b.as_path()),
+            "the modal must target the row `j` just selected, not the stale swarm.project_root"
         );
     }
 
