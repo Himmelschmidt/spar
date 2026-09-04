@@ -388,12 +388,19 @@ quota module (including a doc comment quoting a stated-reset line), or a
 misroute a genuine defect onto the quota gate (all of those can still drive the
 harmless, auto-recovering pause — just not the routing decision). A rate limiter under
 test ("the rate limiter rejected the request") doesn't trip it either — the phrase match
-requires a word boundary, so "rate limiter" doesn't read as "rate limit". The discriminator
+requires a word boundary, so "rate limiter"/"rate limiting" don't read as "rate limit";
+the plural/past-tense forms a provider actually reports ("rate limits exceeded", "rate
+limited ... reached") do still match. The discriminator
 also recognizes a rejection sentence standing alone on one line with no separate "rate
-limit ... rejected" line beside it — "You've hit your weekly/usage limit" (Claude,
-codex) and "rate limit reached" (the wording several adapters use, previously only
-"rejected"/"exceeded" routed) are each treated as complete one-line rejection
-statements, the same class as the bare `"out of credits"` match.
+limit ... rejected" line beside it — the exact phrases "You've hit your weekly limit"
+(Claude) and "You've hit your usage limit" (codex), and "rate limit reached" (the
+wording several adapters use, previously only "rejected"/"exceeded" routed) — are each
+treated as complete one-line rejection statements, the same class as the bare
+`"out of credits"` match; unrelated prose that merely contains "hit your" and "limit"
+elsewhere on the line (e.g. "hit your retry limit") does not match, only those two exact
+sentences do. On the api-sdk backend a 429 propagates as a Rust `Result::Err` before its
+text ever reaches the slot's log file, so the discriminator scrapes that error's own
+text alongside the log tail rather than missing it.
 Resuming picks the same run back up, and if the provider is still on cooldown it
 re-parks at `quota` immediately rather than dispatching into the same wall. Claude's CLI
 states its own weekly-limit reset time in the rejection line; spar parses that (local

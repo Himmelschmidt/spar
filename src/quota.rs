@@ -9,25 +9,36 @@ use std::collections::HashMap;
 /// If it is still rate-limited the run re-pauses it with a fresh window.
 const DEFAULT_COOLDOWN_MINS: i64 = 30;
 
-/// `lower.contains(phrase)` but rejects a match immediately followed by another
-/// ASCII letter, so "rate limit" does not match inside "rate limiter" / "rate
-/// limiting" — an ordinary implementer building or testing a rate limiter must not
-/// trip the same discriminator that routes a run to `Phase::Quota`.
+/// `lower.contains(phrase)` but only accepts a word boundary immediately after the
+/// match, or the plural/past-tense inflections "s"/"ed" followed by a word boundary
+/// ("rate limits", "rate limited"). Rejects "er"/"ing" continuations ("rate limiter",
+/// "rate limiting") and anything else — an ordinary implementer building or testing a
+/// rate limiter must not trip the same discriminator that routes a run to
+/// `Phase::Quota`, but a provider reporting "rate limits exceeded" must.
 fn contains_phrase(lower: &str, phrase: &str) -> bool {
     let mut start = 0;
     while let Some(pos) = lower[start..].find(phrase) {
         let idx = start + pos;
         let after = &lower[idx + phrase.len()..];
-        if !after
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic())
-        {
+        if word_boundary_after_phrase(after) {
             return true;
         }
         start = idx + phrase.len();
     }
     false
+}
+
+fn word_boundary_after_phrase(after: &str) -> bool {
+    let mut chars = after.chars();
+    match chars.next() {
+        None => true,
+        Some(c) if !c.is_ascii_alphabetic() => true,
+        Some('s') => chars.next().is_none_or(|c| !c.is_ascii_alphabetic()),
+        Some('e') => {
+            chars.next() == Some('d') && chars.next().is_none_or(|c| !c.is_ascii_alphabetic())
+        }
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,14 +236,18 @@ impl QuotaStore {
                     || lower.contains("reached")))
                 || (contains_phrase(&lower, "usage limit")
                     && (lower.contains("reached") || lower.contains("exceeded")))
-                || (lower.contains("too many requests") && lower.contains("429"))
+                || lower.contains("too many requests")
                 || lower.contains("out of credits")
                 || lower.contains("quota exceeded")
                 // Claude's and codex's own rejection sentences ("You've hit your weekly
                 // limit", "You've hit your usage limit.") are complete, one-line rejection
                 // statements in the same class as the bare "out of credits" above — no
-                // separate rejection word needed, since "hit your ... limit" already is one.
-                || (lower.contains("hit your") && lower.contains("limit"));
+                // separate rejection word needed, since "hit your ... limit" already is
+                // one. Matched as exact phrases, not "hit your" and "limit" appearing
+                // anywhere on the line: that looser form also matched unrelated prose
+                // ("hit your retry limit") and this crate's own test assertion text.
+                || contains_phrase(&lower, "hit your weekly limit")
+                || contains_phrase(&lower, "hit your usage limit");
             if hit {
                 return Some(line.trim().to_string());
             }
@@ -715,6 +730,44 @@ mod tests {
         .is_some());
         assert!(QuotaStore::scrape_strong_quota_signal(
             "Rate limit reached for gpt-5 in organization org-abc on requests per min. Limit: 3/min."
+        )
+        .is_some());
+    }
+
+    /// Round 6's `"hit your" && "limit"` disjunct required neither adjacency nor a
+    /// rejection word, so ordinary prose that happens to contain both substrings
+    /// anywhere on the same line matched — swallowing a real failure as quota, worse
+    /// than the bug this whole fix exists to close. Fixed by matching the two known
+    /// exact phrases instead of the loose pair.
+    #[test]
+    fn strong_quota_signal_ignores_unrelated_hit_your_limit_prose() {
+        assert!(QuotaStore::scrape_strong_quota_signal(
+            "you must not have hit your retry limit before this point"
+        )
+        .is_none());
+    }
+
+    /// `contains_phrase`'s word-boundary guard rejected any letter following the
+    /// phrase, which excluded the plural/past-tense forms providers actually use.
+    #[test]
+    fn strong_quota_signal_matches_plural_and_past_tense_rate_limit() {
+        assert!(QuotaStore::scrape_strong_quota_signal(
+            "Error: rate limits exceeded for model claude-opus"
+        )
+        .is_some());
+        assert!(QuotaStore::scrape_strong_quota_signal(
+            "you have been rate limited; limit reached, retry after 60s"
+        )
+        .is_some());
+    }
+
+    /// "too many requests" alone is already an unambiguous rejection sentence; the
+    /// prior `&& "429"` pairing missed common JSON error-body shapes that carry no
+    /// numeric status text.
+    #[test]
+    fn strong_quota_signal_matches_too_many_requests_without_a_429() {
+        assert!(QuotaStore::scrape_strong_quota_signal(
+            r#"{"error":{"message":"Too many requests"}}"#
         )
         .is_some());
     }

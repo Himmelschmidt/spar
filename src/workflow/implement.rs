@@ -91,6 +91,7 @@ fn unlinked_plan_error(plan: &std::path::Path, paths: &SparPaths) -> String {
                     | Phase::AwaitingPlanApproval
                     | Phase::PlanReady
                     | Phase::Stopped
+                    | Phase::Quota
             )
         })
         .collect();

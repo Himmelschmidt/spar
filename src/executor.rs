@@ -950,8 +950,16 @@ fn apply_parallel_outcome(
         }
         Err(e) => {
             salvage_expected_artifact(paths, &state.id, &prep.job, &prep.log_path, &e.to_string());
+            // Same api-sdk gap as `run_slot`'s early-err arm: a 429 propagates as this
+            // `Err` without ever reaching `prep.log_path`, so the error text itself is
+            // scraped alongside the log tail.
             let log_text = process::tail_log(&prep.log_path, 8000);
-            let quota_hit = detect_and_pause_quota(paths, &prep.job.provider, &log_text);
+            let quota_hit = detect_and_pause_quota_with_err(
+                paths,
+                &prep.job.provider,
+                &log_text,
+                &e.to_string(),
+            );
             if let Some(s) = state.slot_mut(slot_id) {
                 s.quota_hit = quota_hit;
             }
@@ -1129,11 +1137,15 @@ pub fn run_slot(
     // A backend `Err` (spawn/setup failure, not a completed dispatch) still writes a
     // log a rate-limit rejection could land in on some adapters, so it gets the same
     // quota scrape as the `!result.ok` branch below rather than silently skipping
-    // detection because this failure surfaced a step earlier.
+    // detection because this failure surfaced a step earlier. On the api-sdk backend a
+    // 429 propagates as this very `Err` and its text never reaches `log_path` at all
+    // (`openai_compat::chat_completion`'s error is never appended to the log before the
+    // `?` unwinds), so the error's own `to_string()` is scraped alongside the log tail
+    // rather than the log alone.
     let quota_on_early_err =
-        |state: &mut RunState, log_path: &Path, provider: &str, slot_id: &str| {
+        |state: &mut RunState, log_path: &Path, provider: &str, slot_id: &str, err_text: &str| {
             let log_text = process::tail_log(log_path, 8000);
-            let quota_hit = detect_and_pause_quota(paths, provider, &log_text);
+            let quota_hit = detect_and_pause_quota_with_err(paths, provider, &log_text, err_text);
             if let Some(s) = state.slot_mut(slot_id) {
                 s.quota_hit = quota_hit;
             }
@@ -1143,7 +1155,13 @@ pub fn run_slot(
             Ok(r) => r,
             Err(e) => {
                 salvage_expected_artifact(paths, &state.id, job, &log_path, &e.to_string());
-                quota_on_early_err(state, &log_path, &job.provider, &job.slot_id);
+                quota_on_early_err(
+                    state,
+                    &log_path,
+                    &job.provider,
+                    &job.slot_id,
+                    &e.to_string(),
+                );
                 mark_slot_failed(state, paths, &job.slot_id, &e.to_string(), None, None, None)?;
                 return Err(e);
             }
@@ -1165,7 +1183,13 @@ pub fn run_slot(
                     Ok(r) => r,
                     Err(e) => {
                         salvage_expected_artifact(paths, &state.id, job, &log_path, &e.to_string());
-                        quota_on_early_err(state, &log_path, &job.provider, &job.slot_id);
+                        quota_on_early_err(
+                            state,
+                            &log_path,
+                            &job.provider,
+                            &job.slot_id,
+                            &e.to_string(),
+                        );
                         mark_slot_failed(
                             state,
                             paths,
@@ -1195,7 +1219,13 @@ pub fn run_slot(
                     Ok(r) => r,
                     Err(e) => {
                         salvage_expected_artifact(paths, &state.id, job, &log_path, &e.to_string());
-                        quota_on_early_err(state, &log_path, &job.provider, &job.slot_id);
+                        quota_on_early_err(
+                            state,
+                            &log_path,
+                            &job.provider,
+                            &job.slot_id,
+                            &e.to_string(),
+                        );
                         mark_slot_failed(
                             state,
                             paths,
@@ -1335,6 +1365,21 @@ fn detect_and_pause_quota(paths: &SparPaths, provider: &str, log_text: &str) -> 
         let _ = store.save(paths);
     }
     crate::quota::QuotaStore::scrape_strong_quota_signal(log_text).is_some()
+}
+
+/// Same discriminator as [`detect_and_pause_quota`], but also scrapes `extra`
+/// (typically a propagated error's `to_string()`) alongside the log tail. On the
+/// api-sdk backend a 429 propagates as a `Result::Err` from
+/// `openai_compat::chat_completion` and its text never reaches `log_path` before the
+/// `?` unwinds, so the log tail alone would miss it even though
+/// `scrape_strong_quota_signal` already recognizes "429 Too Many Requests".
+fn detect_and_pause_quota_with_err(
+    paths: &SparPaths,
+    provider: &str,
+    log_text: &str,
+    extra: &str,
+) -> bool {
+    detect_and_pause_quota(paths, provider, &format!("{log_text}\n{extra}"))
 }
 
 /// `state.slots` lookup used by every caller that maps a `run_slot` failure onto
@@ -2374,6 +2419,28 @@ mod tests {
         let paths = SparPaths::new(tmp.path());
         let log = "thread 'main' panicked at src/state.rs:429:\nindex out of bounds\n";
         assert!(!detect_and_pause_quota(&paths, "cli:claude", log));
+    }
+
+    /// On the api-sdk backend a 429 propagates as a `Result::Err` whose text never
+    /// reaches the log file (`api/runtime.rs` appends the request/response around
+    /// `chat_completion`'s call, not the error it can raise) — the log tail alone must
+    /// miss it, and scraping the error text alongside it must catch it.
+    #[test]
+    fn detect_and_pause_quota_with_err_catches_a_429_only_in_the_propagated_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log = "--- api step 0 model=gpt-5 ---\n";
+        assert!(
+            !detect_and_pause_quota(&paths, "api:openai", log),
+            "the log alone carries no rate-limit signal"
+        );
+        let err_text = "api openai status 429: rate limit exceeded, too many requests";
+        assert!(detect_and_pause_quota_with_err(
+            &paths,
+            "api:openai",
+            log,
+            err_text
+        ));
     }
 
     /// A generic rejection phrase (no Claude-specific shape) must still route, so
