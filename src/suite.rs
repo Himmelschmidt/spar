@@ -177,11 +177,41 @@ fn derive(runs: &[CommandRun]) -> SuiteOutcome {
 /// `pipefail`, and passing it there fails every command, so bash is preferred and plain
 /// `sh` is the fallback rather than the default.
 fn shell() -> (&'static str, &'static [&'static str]) {
-    if which::which("bash").is_ok() {
+    use std::sync::OnceLock;
+    static PIPEFAIL: OnceLock<bool> = OnceLock::new();
+    // Probed, not assumed: a `bash` on PATH that is a busybox applet or a restricted
+    // build rejects `-o pipefail` and would fail *every* command, wedging the run at a
+    // gate no round can clear.
+    let ok = *PIPEFAIL.get_or_init(|| {
+        Command::new("bash")
+            .args(["-o", "pipefail", "-c", "true"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    });
+    if ok {
         ("bash", &["-o", "pipefail", "-c"])
     } else {
         ("sh", &["-c"])
     }
+}
+
+/// What actually gets spawned for one command: the shell, plus the run's isolation.
+///
+/// Split out because it is the only place the sandbox is applied, and a silent
+/// regression here is a `worktree+bwrap` run compiling model-authored code unconfined.
+fn spawn_argv(
+    isolation: IsolationMode,
+    cwd: &Path,
+    command: &str,
+) -> (std::path::PathBuf, Vec<String>) {
+    let (program, flags) = shell();
+    let mut argv: Vec<String> = flags.iter().map(|f| (*f).to_string()).collect();
+    argv.push(command.to_string());
+    crate::sandbox::maybe_wrap(isolation, cwd, &std::path::PathBuf::from(program), &argv)
 }
 
 fn run_one(opts: &Options, command: &str, timeout: Duration) -> CommandRun {
@@ -201,16 +231,7 @@ fn run_one(opts: &Options, command: &str, timeout: Duration) -> CommandRun {
         Err(e) => return not_run(format!("suite log unwritable: {e}")),
     };
 
-    let (program, flags) = shell();
-    let mut argv: Vec<String> = flags.iter().map(|f| (*f).to_string()).collect();
-    argv.push(command.to_string());
-    let (program, argv) = crate::sandbox::maybe_wrap(
-        opts.isolation,
-        opts.cwd,
-        &std::path::PathBuf::from(program),
-        &argv,
-    );
-
+    let (program, argv) = spawn_argv(opts.isolation, opts.cwd, command);
     let mut cmd = Command::new(&program);
     cmd.args(&argv)
         .current_dir(opts.cwd)
@@ -258,9 +279,9 @@ fn run_one(opts: &Options, command: &str, timeout: Duration) -> CommandRun {
     (opts.on_pid)(None);
 
     let status = classify(status, killed);
-    // End offset now, not at render time: a command that leaves a descendant writing to
-    // the inherited log fd would otherwise splice its output into a later command's
-    // excerpt, and O54(c) promises excerpts are scoped to their own command.
+    // Bound the excerpt at the log's length *now*. Reading to EOF instead would pick up
+    // whatever a descendant of this command kept writing after it exited, which is output
+    // the report would attribute to a command that had already finished.
     let end = std::fs::metadata(opts.log_path)
         .map(|m| m.len())
         .unwrap_or(0);
@@ -326,11 +347,13 @@ fn tail_range(log_path: &Path, start: u64, end: u64) -> String {
     if f.seek(SeekFrom::Start(from)).is_err() {
         return String::new();
     }
-    let mut buf = vec![0u8; (end - from) as usize];
-    let Ok(n) = f.read(&mut buf) else {
+    // `read_to_end` over a bounded `take`, not a single `read`: a bare `read` neither
+    // retries on EINTR (spar installs signal handlers) nor loops on a short read, and
+    // either one silently empties the excerpt a reviewer is meant to diagnose from.
+    let mut buf = Vec::new();
+    if f.take(end - from).read_to_end(&mut buf).is_err() {
         return String::new();
-    };
-    buf.truncate(n);
+    }
     let text = String::from_utf8_lossy(&buf);
     let mut lines: Vec<&str> = text.lines().collect();
     // The window can start mid-line (and mid-UTF-8 sequence), so the first line is a
@@ -390,9 +413,19 @@ fn render(runs: &[CommandRun], outcome: SuiteOutcome) -> String {
     match outcome {
         SuiteOutcome::Pass => s.push_str("All exited 0.\n"),
         SuiteOutcome::Fail => s.push_str(&format!("{} did not exit 0.\n", failed.len())),
-        SuiteOutcome::Inconclusive => s.push_str(
-            "The suite did not reach a clean verdict inside its wall clock; treat it as unknown, not as a code failure.\n",
-        ),
+        SuiteOutcome::Inconclusive => {
+            // Name the actual cause. "Ran out of wall clock" over a run the operator
+            // stopped, or a command that could not spawn, sends the next round chasing a
+            // timeout that never happened.
+            let why = runs
+                .iter()
+                .find(|r| !r.status.ok())
+                .map(|r| r.status.text())
+                .unwrap_or_else(|| "no commands configured".into());
+            s.push_str(&format!(
+                "The suite did not reach a clean verdict ({why}); treat it as unknown, not as a code failure.\n"
+            ));
+        }
     }
 
     s.push_str("\n## Failures\n");
@@ -671,6 +704,45 @@ mod tests {
             rep.body.contains("Excerpt clipped"),
             "total cap must announce itself"
         );
+    }
+
+    /// The sandbox is the one thing here with no visible failure mode: drop the
+    /// `maybe_wrap` call and every other test still passes while a `worktree+bwrap` run
+    /// compiles model-authored code with the operator's full ambient privileges.
+    #[test]
+    fn isolation_is_applied_to_the_spawn() {
+        let d = TempDir::new().unwrap();
+        let (plain, args) = spawn_argv(IsolationMode::Worktree, d.path(), "cargo test");
+        let plain = plain.to_string_lossy().to_string();
+        assert!(plain.ends_with("bash") || plain.ends_with("sh"), "{plain}");
+        assert_eq!(args.last().unwrap(), "cargo test");
+
+        if !crate::sandbox::bwrap_available() {
+            return;
+        }
+        let (wrapped, args) = spawn_argv(IsolationMode::WorktreeBwrap, d.path(), "cargo test");
+        assert!(
+            wrapped.to_string_lossy().ends_with("bwrap"),
+            "{}",
+            wrapped.display()
+        );
+        assert!(args.iter().any(|a| a == "--ro-bind"), "{args:?}");
+        assert_eq!(args.last().unwrap(), "cargo test");
+    }
+
+    /// An inconclusive report has to name its own cause: "ran out of wall clock" over a
+    /// run the operator stopped points the next round at a timeout that never happened.
+    #[test]
+    fn an_inconclusive_summary_names_the_real_cause() {
+        let d = TempDir::new().unwrap();
+        let log = d.path().join("suite.log");
+        let cmds = vec!["sleep 30".to_string()];
+        let stop = || true;
+        let mut o = opts(d.path(), &cmds, &log, Duration::from_secs(60));
+        o.stop = &stop;
+        let rep = run(&o);
+        assert_eq!(rep.outcome, SuiteOutcome::Inconclusive);
+        assert!(rep.body.contains("run stopped"), "{}", rep.body);
     }
 
     #[test]

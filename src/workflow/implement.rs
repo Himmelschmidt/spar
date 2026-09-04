@@ -375,13 +375,23 @@ fn ensure_suite_slot(
 ) -> Result<()> {
     if cfg.suite.is_builtin() {
         // A run that had an agent tester before `[suite].command` was added (or before a
-        // `--reload-config`) would otherwise carry a slot nothing ever dispatches. A
-        // *live* one is kept: its slot id is the only key `live_slot_pids` has for the
-        // agent still burning tokens behind it, and dropping the record is how an orphan
-        // becomes unreapable (O28).
-        state
-            .slots
-            .retain(|s| s.role != SlotRole::Tester || s.status == SlotStatus::Running);
+        // `--reload-config`) carries a slot nothing will ever dispatch again. Reap before
+        // dropping: the slot id is the only key its pid marker is filed under, so
+        // removing the record first is how a still-running agent becomes an orphan
+        // nothing can find (O28). Keeping the slot instead is worse — nothing in the
+        // built-in round settles it, so it reads `Running` forever, trips the stall
+        // check every round, and goes on writing the same `suite.md` spar writes.
+        // Killing it is this command's call: it holds the run lock, the slot is its own,
+        // and the channel that slot belonged to no longer exists.
+        for slot in state.slots.iter().filter(|s| s.role == SlotRole::Tester) {
+            if let Some(token) = crate::markers::read_pid(paths, &state.id, &slot.id) {
+                if token.alive() {
+                    crate::process::terminate_tree(token.pid, true);
+                }
+            }
+            crate::markers::clear_pid(paths, &state.id, &slot.id);
+        }
+        state.slots.retain(|s| s.role != SlotRole::Tester);
         return Ok(());
     }
     if !cfg.suite.enabled {

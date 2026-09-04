@@ -947,6 +947,31 @@ mod tests {
     use crate::paths::SparPaths;
     use tempfile::tempdir;
 
+    /// The built-in suite child has no slot, so this reserved marker is the only thing
+    /// standing between a live two-hour `cargo test` and `stop --abandoned` reporting
+    /// "reaped 0" (O54).
+    #[test]
+    fn live_slot_pids_sees_the_builtin_suite_child() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let state = RunState::new("r-suite", WorkflowKind::Loop, tmp.path().to_path_buf());
+        std::fs::create_dir_all(paths.markers_dir(&state.id)).unwrap();
+        assert!(live_slot_pids(&paths, &state).is_empty());
+
+        let me = std::process::id();
+        crate::markers::write_pid(
+            &paths,
+            &state.id,
+            BUILTIN_SUITE_PID_ID,
+            crate::process::PidToken::capture(me),
+        )
+        .unwrap();
+        assert_eq!(live_slot_pids(&paths, &state), vec![me]);
+
+        crate::markers::clear_pid(&paths, &state.id, BUILTIN_SUITE_PID_ID);
+        assert!(live_slot_pids(&paths, &state).is_empty());
+    }
+
     #[test]
     fn slot_role_config_key_matches_serde() {
         let all = [

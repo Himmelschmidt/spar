@@ -3017,14 +3017,24 @@ fn run_steps(st: &RunState, abandoned: bool) -> Vec<(&'static str, StepState)> {
             .iter()
             .position(|(_, role)| *role == Some(SlotRole::Tester))
         {
-            if let Some(outcome) = st.suite_outcome {
-                out[i].1 = match outcome {
-                    crate::state::SuiteOutcome::Pass => StepState::Done,
-                    _ => StepState::Failed,
-                };
-            } else if st.phase == Phase::Suite {
-                out[i].1 = StepState::Active;
-            }
+            // Phase first, verdict second. `suite_outcome` is never cleared between
+            // rounds, so reading it first would paint round 2's live suite with round 1's
+            // red and the step could only ever show `Active` on the first round.
+            out[i].1 = if st.phase == Phase::Suite {
+                if broken {
+                    StepState::Failed
+                } else if halted {
+                    StepState::Halted
+                } else {
+                    StepState::Active
+                }
+            } else {
+                match st.suite_outcome {
+                    Some(crate::state::SuiteOutcome::Pass) => StepState::Done,
+                    Some(_) => StepState::Failed,
+                    None => out[i].1,
+                }
+            };
         }
     }
 
