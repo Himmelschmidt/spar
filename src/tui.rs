@@ -572,6 +572,12 @@ struct App {
     /// Set by `rail_enter` on a Home run row so the one-tick snapshot handoff into
     /// `Agents` selects the row's own run, not whatever the rail happened to have.
     home_target_run: Option<String>,
+    /// Snapshots since `home_target_run` was set without finding it — the target's
+    /// project may still be one refresh behind (R2), but a run that never reappears
+    /// (archived, dir removed, folded into a different loudest leg) must eventually
+    /// release the pin rather than leave Main/Agents permanently empty (round-7
+    /// review finding: a ghost target used to stick forever).
+    home_target_ticks: u32,
     /// Phase D's new-run modal. `Some` = open and capturing keys.
     new_run: Option<NewRun>,
     /// Bumped every time the new-run modal opens; tags `NewRun::gen` and
@@ -731,6 +737,7 @@ impl App {
             home_watermark: read_watermark(&watermark_path()),
             home_key: None,
             home_target_run: None,
+            home_target_ticks: 0,
             new_run,
             new_run_gen,
             rect_new_run: Rect::default(),
@@ -1071,6 +1078,9 @@ struct Snapshot {
     heartbeats: std::collections::HashMap<String, DateTime<Utc>>,
     /// Home's bands and the per-project roll-up, built off-thread (U13/B).
     home: HomeData,
+    /// The selected slot's log stats (U13): `StreamStats::load` reads a file, so it
+    /// is computed here rather than in `draw_log_body`.
+    log_stats: Option<process::StreamStats>,
 }
 
 enum Msg {
@@ -1352,6 +1362,31 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
         })
         .unwrap_or_default();
     let activity = activity_feed(&swarm, full.as_ref(), &quota, &alerts, &heartbeats, cfg);
+    let log_stats = full
+        .as_ref()
+        .and_then(|st| st.slots.get(sel.slot_idx))
+        .and_then(|s| {
+            s.log_path
+                .as_ref()
+                .and_then(|p| process::StreamStats::load(p))
+                .or_else(|| {
+                    s.usage.as_ref().map(|u| process::StreamStats {
+                        tools: u.tools,
+                        tool_errors: 0,
+                        input_tokens: u.input_tokens,
+                        output_tokens: u.output_tokens,
+                        cache_read_tokens: u.cache_read_tokens,
+                        cache_write_tokens: 0,
+                        context_tokens: u.context_tokens,
+                        billed_tokens: u.billed_tokens,
+                        model: u.model.clone(),
+                        session_id: None,
+                        lines_in: 0,
+                        chars_out: 0,
+                        last_log_at: None,
+                    })
+                })
+        });
     Snapshot {
         swarm,
         projects,
@@ -1364,6 +1399,7 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
         abandoned,
         heartbeats,
         home,
+        log_stats,
     }
 }
 
@@ -2136,17 +2172,8 @@ fn run_loop(
         }
         if snap.runs.is_empty() {
             app.selected_run = 0;
-        } else if let Some(target) = app.home_target_run.as_deref() {
-            // A Home Enter carries a run id ahead of the snapshot that actually
-            // contains it (R2/AC-27): the snapshot in hand may still be Home's
-            // (cross-project, `snap.runs` empty) or a stale project's. Hold the
-            // target and only clear it once a snapshot arrives whose `runs`
-            // actually contains it; until then the id-glue clamp below is
-            // skipped so a stale `sel.run_id` cannot steal the selection.
-            if let Some(pos) = snap.runs.iter().position(|r| r.id == target) {
-                app.selected_run = pos;
-                app.home_target_run = None;
-            }
+        } else if app.home_target_run.is_some() {
+            resolve_home_target(&mut app, &snap.runs);
         } else {
             // The attention sort reorders the rail as runs change state; keep the
             // cursor glued to the same run id rather than the same row.
@@ -2212,6 +2239,7 @@ fn run_loop(
                     &snap.activity,
                     &snap.diff_text,
                     &snap.home,
+                    snap.log_stats.as_ref(),
                     &mut app,
                     &mut rail_state,
                 );
@@ -2568,7 +2596,17 @@ fn open_new_run(
             })
             .or_else(|| local_root.map(Path::to_path_buf)),
     };
-    let all_projects: Vec<PathBuf> = projects.iter().map(|p| p.root.clone()).collect();
+    let mut all_projects: Vec<PathBuf> = projects.iter().map(|p| p.root.clone()).collect();
+    // A scoped Home's target may be one refresh ahead of the registry (a project
+    // just entered but not yet registered) — without this, `←`/`→` cycling can't
+    // find the target in `nr.projects`, falls back to index 0, and silently
+    // retargets the launch away from what the operator scoped to (round-7 review
+    // finding). Keep it reachable even if the registry hasn't caught up yet.
+    if let Some(t) = &target {
+        if !all_projects.contains(t) {
+            all_projects.insert(0, t.clone());
+        }
+    }
     let project = target.or_else(|| all_projects.first().cloned());
     begin_new_run(app, project, all_projects, String::new(), NewRunField::Task);
 }
@@ -2638,19 +2676,37 @@ fn compute_new_run_roster(cfg: &Config) -> Vec<RosterEntry> {
         .into_iter()
         .map(|r| (r.name, r.available))
         .collect();
-    let recent_fleet: Option<(String, Vec<String>)> = registry::projects()
+    // Registry order is `last_seen` — when a project was last *opened*, not when any
+    // run last progressed — so the first entry with a `last_run_id` is not
+    // necessarily the actual most recent run across the roster (round-7 review
+    // finding). Load every candidate and let `most_recent_fleet` pick by `updated_at`.
+    let candidates: Vec<(DateTime<Utc>, String, Vec<String>)> = registry::projects()
         .into_iter()
-        .find_map(|p| p.last_run_id.map(|id| (p.root, id)))
-        .and_then(|(root, id)| {
+        .filter_map(|p| p.last_run_id.map(|id| (p.root, id)))
+        .filter_map(|(root, id)| {
             let paths = SparPaths::new(&root);
             RunState::load(&paths, &id)
                 .ok()
-                .map(|st| (id, st.providers))
-        });
+                .map(|st| (st.updated_at, id, st.providers))
+        })
+        .collect();
+    let recent_fleet = most_recent_fleet(candidates);
     let recent_ref = recent_fleet
         .as_ref()
         .map(|(id, v)| (id.as_str(), v.as_slice()));
     build_roster(cfg, &detected, recent_ref)
+}
+
+/// Pure half of the recent-fleet lookup (round-7 review finding): picks the
+/// candidate with the latest `updated_at`, independent of the order the caller
+/// gathered them in (registry order is `last_seen`, not run recency).
+fn most_recent_fleet(
+    candidates: Vec<(DateTime<Utc>, String, Vec<String>)>,
+) -> Option<(String, Vec<String>)> {
+    candidates
+        .into_iter()
+        .max_by_key(|(updated_at, _, _)| *updated_at)
+        .map(|(_, id, providers)| (id, providers))
 }
 
 /// Apply a background roster probe's result (D2) if the modal it was built for is
@@ -3272,8 +3328,11 @@ fn first_project_match(projects: &[registry::ProjectEntry], f: &str, cur: usize)
 /// Step the Home rail by `delta`, skipping header rows entirely — the cursor must
 /// never land on one, at either end of the list (AC-26).
 fn step_home(rows: &[HomeRow], cur: usize, delta: i32) -> usize {
+    // `More` is informational ("… N more"), not a row `Enter` can act on
+    // (`rail_enter`'s Home arm no-ops it) — selectable-but-inert reads as broken
+    // (round-7 review finding), so it is excluded the same way a header is.
     let selectable: Vec<usize> = (0..rows.len())
-        .filter(|&i| !matches!(rows[i], HomeRow::Header(_)))
+        .filter(|&i| !matches!(rows[i], HomeRow::Header(_) | HomeRow::More { .. }))
         .collect();
     if selectable.is_empty() {
         return cur;
@@ -3357,6 +3416,43 @@ fn step_matched(matched: &[usize], cur: usize, delta: i32) -> usize {
     matched[next]
 }
 
+/// Snapshots to wait for a Home `Enter` target before giving up on it (round-7
+/// review finding). Generous relative to R2's one-tick lag and Home's own
+/// `CROSS_PROJECT_REFRESH` cadence, so a normal drill-down never trips it.
+const HOME_TARGET_GIVE_UP: u32 = 25;
+
+/// A Home `Enter` carries a run id ahead of the snapshot that actually contains it
+/// (R2/AC-27): the snapshot in hand may still be Home's (cross-project, `runs`
+/// empty) or a stale project's. Hold the target and only clear it once a snapshot
+/// arrives whose `runs` actually contains it. If it never reappears — archived,
+/// its directory removed, or folded into a different loudest leg — give up after
+/// `HOME_TARGET_GIVE_UP` snapshots and return to Home rather than leaving
+/// Main/Agents pinned to a ghost run forever (round-7 review finding). Returns
+/// `true` when the target was found and selected this call.
+fn resolve_home_target(app: &mut App, runs: &[state::RunSummary]) -> bool {
+    let Some(target) = app.home_target_run.clone() else {
+        return false;
+    };
+    if let Some(pos) = runs.iter().position(|r| r.id == target) {
+        app.selected_run = pos;
+        app.home_target_run = None;
+        app.home_target_ticks = 0;
+        true
+    } else {
+        app.home_target_ticks += 1;
+        if app.home_target_ticks > HOME_TARGET_GIVE_UP {
+            app.flash(
+                format!("run {target} is gone — back to Home"),
+                Color::Yellow,
+            );
+            app.home_target_run = None;
+            app.home_target_ticks = 0;
+            app.browse = BrowseLevel::Home;
+        }
+        false
+    }
+}
+
 /// `Enter` in the rail: push one level. On a slot (the deepest level) there is
 /// nothing left to push into, so it takes the agent over — point the passthrough
 /// terminal at that run's tmux pane and open it in Main's Shell tab. Only runs
@@ -3378,6 +3474,7 @@ fn rail_enter(
                     *active_root = root;
                 }
                 app.home_target_run = Some(run.id.clone());
+                app.home_target_ticks = 0;
                 app.browse = BrowseLevel::Agents;
                 app.selected_slot = 0;
                 app.reset_stream_view();
@@ -3747,7 +3844,10 @@ fn rail_select(
 ) {
     match app.browse {
         BrowseLevel::Home => {
-            if matches!(home_rows.get(row), Some(HomeRow::Header(_))) {
+            if matches!(
+                home_rows.get(row),
+                Some(HomeRow::Header(_)) | Some(HomeRow::More { .. })
+            ) {
                 return;
             }
             if row < home_rows.len() {
@@ -3924,6 +4024,7 @@ fn draw(
     activity: &[String],
     diff_text: &str,
     home: &HomeData,
+    log_stats: Option<&process::StreamStats>,
     app: &mut App,
     rail_state: &mut ListState,
 ) {
@@ -4000,6 +4101,7 @@ fn draw(
             activity,
             diff_text,
             home,
+            log_stats,
             app,
         );
     }
@@ -4667,9 +4769,10 @@ fn draw_context_band(
         let need = runs_needing_attention(runs);
         let running = runs.iter().filter(|r| is_active_phase(r.phase)).count();
         let line = if runs.is_empty() {
-            // `n` from Home opens the new-run surface and its fleet picker (Phase D);
-            // this level just states what it has.
-            Line::from(Span::styled("no runs yet", muted()))
+            Line::from(Span::styled(
+                "no runs yet — n from Home starts one",
+                muted(),
+            ))
         } else {
             Line::from(vec![
                 Span::styled(format!("{} runs", runs.len()), dim()),
@@ -4975,16 +5078,25 @@ fn draw_header(
         f.render_widget(Paragraph::new("").style(Style::default().bg(w)), area);
     }
 
-    let project = swarm
-        .project_root
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(".");
+    // At Home scoped to every project, `swarm`/`active_root` still names whichever
+    // project the rail happens to be sitting on internally — showing it here would
+    // claim a scope the context band right below (`draw_context_band`) does not
+    // honour (round-7 review finding). Name the scope instead.
+    let project = if app.browse == BrowseLevel::Home && app.home_scope == HomeScope::All {
+        "all projects".to_string()
+    } else {
+        swarm
+            .project_root
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(".")
+            .to_string()
+    };
 
     let mut spans = vec![
         Span::styled(" spar ", chip(ACCENT)),
         Span::styled(
-            format!("  {}", truncate(project, 20)),
+            format!("  {}", truncate(&project, 20)),
             Style::default().fg(FG).bold(),
         ),
     ];
@@ -5204,9 +5316,10 @@ fn rail_title(
     }
 }
 
-/// The rail: one drill-down tree (`projects ▸ runs ▸ agents`), never a stack of
-/// co-equal panels. `Enter` pushes a level, `Esc` pops one. No border: its title
-/// rides the labels row and the seam separates it from Main.
+/// The rail: one drill-down tree (`Home ▸ runs ▸ agents`, with `Projects` reachable
+/// from Home for a specific-project jump), never a stack of co-equal panels. `Enter`
+/// pushes a level, `Esc` pops one. No border: its title rides the labels row and the
+/// seam separates it from Main.
 #[allow(clippy::too_many_arguments)]
 fn draw_rail(
     f: &mut Frame,
@@ -5568,6 +5681,7 @@ fn draw_main(
     activity: &[String],
     diff_text: &str,
     home: &HomeData,
+    log_stats: Option<&process::StreamStats>,
     app: &mut App,
 ) {
     if area.width == 0 || area.height == 0 {
@@ -5603,10 +5717,14 @@ fn draw_main(
     // run-scoped (see `manage_terminal`), so it always shows the real workspace
     // terminal regardless of run count.
     match app.main_tab {
-        MainTab::Log => draw_log_body(f, inner, full, stream_text, app),
-        MainTab::Activity if full.is_none() => draw_log_body(f, inner, full, stream_text, app),
+        MainTab::Log => draw_log_body(f, inner, full, stream_text, log_stats, app),
+        MainTab::Activity if full.is_none() => {
+            draw_log_body(f, inner, full, stream_text, log_stats, app)
+        }
         MainTab::Activity => draw_activity_body(f, inner, activity, app),
-        MainTab::Diff if full.is_none() => draw_log_body(f, inner, full, stream_text, app),
+        MainTab::Diff if full.is_none() => {
+            draw_log_body(f, inner, full, stream_text, log_stats, app)
+        }
         MainTab::Diff => draw_diff_body(f, inner, diff_text, app),
         MainTab::Shell => draw_shell_body(f, inner, app),
     }
@@ -5684,6 +5802,7 @@ fn draw_log_body(
     inner: Rect,
     full: Option<&RunState>,
     stream_text: &str,
+    stats: Option<&process::StreamStats>,
     app: &mut App,
 ) {
     // No run selected (Projects level): the body is an overview, not a stream — no
@@ -5727,32 +5846,10 @@ fn draw_log_body(
         .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(inner);
 
-    let stats = slot.and_then(|s| {
-        s.log_path
-            .as_ref()
-            .and_then(|p| process::StreamStats::load(p))
-            .or_else(|| {
-                s.usage.as_ref().map(|u| process::StreamStats {
-                    tools: u.tools,
-                    tool_errors: 0,
-                    input_tokens: u.input_tokens,
-                    output_tokens: u.output_tokens,
-                    cache_read_tokens: u.cache_read_tokens,
-                    cache_write_tokens: 0,
-                    context_tokens: u.context_tokens,
-                    billed_tokens: u.billed_tokens,
-                    model: u.model.clone(),
-                    session_id: None,
-                    lines_in: 0,
-                    chars_out: 0,
-                    last_log_at: None,
-                })
-            })
-    });
     draw_stream_stats(
         f,
         chunks[0],
-        stats.as_ref(),
+        stats,
         slot.map(|s| s.status),
         &silent_hint,
         app.abandoned,
@@ -6785,8 +6882,17 @@ fn draw_new_run(f: &mut Frame, area: Rect, projects: &[registry::ProjectEntry], 
     let project_label = nr
         .project
         .as_ref()
-        .and_then(|p| p.file_name())
-        .map(|s| s.to_string_lossy().into_owned())
+        .map(|p| {
+            // Prefer the registry's own name (what the rail shows) over the raw
+            // directory basename, so the same project reads identically in the
+            // rail and in this modal (round-7 review finding).
+            projects
+                .iter()
+                .find(|e| &e.root == p)
+                .and_then(|e| e.name.clone())
+                .or_else(|| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| p.display().to_string())
+        })
         .unwrap_or_else(|| "none — open spar in a project or choose one".to_string());
     let cycle_hint = if nr.projects.len() > 1 {
         "  ←/→"
@@ -6938,7 +7044,6 @@ fn draw_new_run(f: &mut Frame, area: Rect, projects: &[registry::ProjectEntry], 
             )),
     );
     f.render_widget(p, rect);
-    let _ = projects;
 }
 
 /// Rows/cols available to the embedded terminal, falling back to a standard 80x24
@@ -8801,6 +8906,7 @@ mod render_stability {
                 &["§Timeline".into(), " 19:04 impl done".into()],
                 "diff",
                 &HomeData::default(),
+                None,
                 &mut app,
                 &mut rail,
             )
@@ -8879,6 +8985,7 @@ mod render_stability {
                 &[],
                 "",
                 &HomeData::default(),
+                None,
                 &mut app,
                 &mut rail,
             )
@@ -8954,6 +9061,7 @@ mod render_stability {
                     &[],
                     "",
                     &HomeData::default(),
+                    None,
                     &mut app,
                     &mut rail,
                 )
@@ -9374,6 +9482,7 @@ mod render_stability {
                 &[],
                 "",
                 &HomeData::default(),
+                None,
                 &mut app,
                 &mut rail,
             )
@@ -9598,6 +9707,7 @@ mod render_stability {
                     &[],
                     text,
                     &HomeData::default(),
+                    None,
                     &mut app,
                     &mut rail,
                 )
@@ -10042,6 +10152,7 @@ mod render_stability {
                     &[],
                     "",
                     &HomeData::default(),
+                    None,
                     &mut app,
                     &mut rail,
                 )
@@ -10134,6 +10245,7 @@ mod render_stability {
                     &[],
                     "",
                     &HomeData::default(),
+                    None,
                     &mut app,
                     &mut rail,
                 )
@@ -10186,6 +10298,7 @@ mod render_stability {
                 &[],
                 "",
                 &HomeData::default(),
+                None,
                 &mut app,
                 &mut rail,
             )
@@ -10243,6 +10356,7 @@ mod render_stability {
                     &[],
                     "",
                     &HomeData::default(),
+                    None,
                     &mut app,
                     &mut rail,
                 )
@@ -10386,6 +10500,7 @@ mod render_stability {
                 &[],
                 "",
                 home,
+                None,
                 &mut app,
                 &mut rail,
             )
@@ -10726,6 +10841,7 @@ mod render_stability {
                     &[],
                     "",
                     &home,
+                    None,
                     &mut app,
                     &mut rail,
                 )
@@ -10773,6 +10889,7 @@ mod render_stability {
                     &[],
                     "",
                     &empty,
+                    None,
                     &mut app,
                     &mut rail,
                 )
@@ -10836,6 +10953,68 @@ mod render_stability {
         });
     }
 
+    /// U13, round-7 review finding (review-0-cli-codex): `draw_log_body` used to call
+    /// `process::StreamStats::load`, a synchronous file read, on every repaint of a
+    /// selected run's Log tab. It now only reads the `stats` snapshot already computed
+    /// off-thread in `build_snapshot`, so painting a run whose log file does not exist
+    /// on disk must still succeed and the log-loading call must not survive inside
+    /// `draw_log_body`'s own source.
+    #[test]
+    fn draw_log_body_does_not_read_the_log_file_itself() {
+        let src = include_str!("tui.rs");
+        let start = src
+            .find("fn draw_log_body(")
+            .expect("draw_log_body must exist");
+        let body_start = src[start..].find('{').unwrap() + start;
+        let mut depth = 0i32;
+        let mut end = body_start;
+        for (i, c) in src[body_start..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = body_start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &src[body_start..=end];
+        assert!(
+            !body.contains(concat!("StreamStats", "::load")),
+            "draw_log_body must not read the log file itself (U13) — the value must \
+             come from the Snapshot built off-thread in build_snapshot"
+        );
+
+        // A run whose slot log_path points nowhere must still paint the Log tab
+        // without panicking or touching disk during draw.
+        let mut st = run_with(Phase::Review, 1);
+        st.slots[0].log_path = Some(PathBuf::from("/nonexistent/does/not/exist.log"));
+        let swarm = SparPaths::new("/x");
+        let mut app = test_app();
+        let mut rail = ListState::default();
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                &swarm,
+                &[],
+                &[],
+                Some(&st),
+                "",
+                &[],
+                "",
+                &HomeData::default(),
+                None,
+                &mut app,
+                &mut rail,
+            )
+        })
+        .unwrap();
+    }
+
     /// AC-10. Phase A: the tmux session name is an implementation detail of
     /// the tmux backend and must never reach the screen, in the Shell tab's
     /// caption or in its hint body.
@@ -10876,6 +11055,7 @@ mod render_stability {
                 &[],
                 "",
                 &HomeData::default(),
+                None,
                 &mut app,
                 &mut rail,
             )
@@ -11699,7 +11879,13 @@ mod home_ia {
     fn the_finished_band_is_stable_while_the_session_is_open() {
         let root = PathBuf::from("/nonexistent/spar");
         let projects = [project_at(&root, "spar")];
-        let app = App::new(None, Config::default(), Some(root.as_path()));
+        let mut app = App::new(None, Config::default(), Some(root.as_path()));
+        // `App::new` reads whatever watermark happens to be at `watermark_path()`
+        // under this process's `spar_home()` — a round-7 review finding noted that
+        // the ambient file (real under a caller-set `SPAR_HOME`, a fresh per-process
+        // temp dir otherwise) makes this assertion depend on state outside the test.
+        // Pin it explicitly so the assertion holds regardless of the environment.
+        app.home_watermark = Utc::now() - chrono::Duration::hours(1);
         let folded = vec![vec![run_in("justdone", Phase::Done, 1, &root)]];
         let first = build_home_rows(
             &projects,
@@ -11839,6 +12025,53 @@ mod home_ia {
         rail_enter(&mut app, &projects, &rows, &[], None, &mut active, None);
         assert_eq!(app.browse, before, "Enter on a header does nothing");
         assert!(app.new_run.is_none());
+    }
+
+    /// Round-7 review finding (review-1-cli-claude, major): a Home `Enter` target
+    /// that never reappears in the snapshot (archived, its dir removed, or a
+    /// different leg becomes the fold's loudest member) used to pin
+    /// `home_target_run` forever, leaving Main/Agents empty with no way out short
+    /// of manually picking a different row. `resolve_home_target` must give up
+    /// after `HOME_TARGET_GIVE_UP` snapshots, release the pin, flash, and return to
+    /// Home — while a target that is merely one snapshot behind (R2) still resolves
+    /// normally and does not trip the give-up path early.
+    #[test]
+    fn a_ghost_home_target_eventually_releases_the_pin() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let runs = vec![run_in("keep0001", Phase::Review, 5, &root)];
+
+        // The target is present: resolves immediately, no ticks spent.
+        let mut app = App::new(None, Config::default(), None);
+        app.home_target_run = Some("keep0001".into());
+        app.browse = BrowseLevel::Agents;
+        assert!(resolve_home_target(&mut app, &runs));
+        assert!(app.home_target_run.is_none());
+        assert_eq!(app.home_target_ticks, 0);
+        assert_eq!(app.selected_run, 0);
+
+        // The target is missing (R2's one-tick lag, or a run that is truly gone):
+        // ticks accrue but the pin holds under the give-up threshold.
+        let mut app = App::new(None, Config::default(), None);
+        app.home_target_run = Some("ghost0001".into());
+        app.browse = BrowseLevel::Agents;
+        for _ in 0..HOME_TARGET_GIVE_UP {
+            assert!(!resolve_home_target(&mut app, &runs));
+            assert!(
+                app.home_target_run.is_some(),
+                "must not give up before the threshold"
+            );
+        }
+        assert_eq!(app.browse, BrowseLevel::Agents);
+
+        // One more tick past the threshold: the pin releases and Home reclaims focus.
+        assert!(!resolve_home_target(&mut app, &runs));
+        assert!(app.home_target_run.is_none(), "the ghost pin must release");
+        assert_eq!(app.home_target_ticks, 0);
+        assert_eq!(app.browse, BrowseLevel::Home);
+        assert!(
+            app.flash.is_some(),
+            "the operator must be told the run went away"
+        );
     }
 
     /// AC-28. R3: Home re-ranks every snapshot (wait time changes every
@@ -12008,6 +12241,76 @@ mod home_ia {
         assert!(
             bare.iter().all(|e| !e.available),
             "nothing usable must be nothing selectable: {bare:?}"
+        );
+    }
+
+    /// Round-7 review finding (review-0-cli-codex, minor): the registry lists
+    /// projects by `last_seen` (last *opened*, not last progressed), so picking the
+    /// first project with a `last_run_id` could offer a stale fleet from a project
+    /// the operator merely glanced at, instead of the run that actually moved most
+    /// recently anywhere in the roster.
+    #[test]
+    fn most_recent_fleet_ignores_input_order() {
+        let old = Utc::now() - chrono::Duration::hours(2);
+        let newer = Utc::now() - chrono::Duration::minutes(5);
+        // The registry-order-first candidate is the *older* run; the true most
+        // recent one comes later in the input order.
+        let candidates = vec![
+            (old, "stale0001".to_string(), vec!["cli:codex".to_string()]),
+            (
+                newer,
+                "fresh0002".to_string(),
+                vec!["cli:claude".to_string()],
+            ),
+        ];
+        let (id, providers) = most_recent_fleet(candidates).expect("a candidate exists");
+        assert_eq!(
+            id, "fresh0002",
+            "the actually-latest run must win, not the first listed"
+        );
+        assert_eq!(providers, vec!["cli:claude".to_string()]);
+
+        assert!(most_recent_fleet(Vec::new()).is_none());
+    }
+
+    /// Round-7 review finding (review-1-cli-claude, minor): a scoped Home target
+    /// that has not yet reached the registry (e.g. a project just entered, one
+    /// refresh behind `registry::ensure_known`) used to be absent from
+    /// `nr.projects`, so `←`/`→` fell back to `unwrap_or(0)` and silently jumped
+    /// to an unrelated registered project with no way back to the original scope.
+    #[test]
+    fn open_new_run_keeps_an_unregistered_scope_target_reachable() {
+        let root = PathBuf::from("/nonexistent/unregistered");
+        let mut app = App::new(None, Config::default(), Some(root.as_path()));
+        assert_eq!(app.home_scope, HomeScope::Project(root.clone()));
+
+        let other = project_at(&PathBuf::from("/nonexistent/acme-api"), "acme-api");
+        open_new_run(
+            &mut app,
+            std::slice::from_ref(&other),
+            &[],
+            Some(root.as_path()),
+        );
+        let nr = app.new_run.as_ref().unwrap();
+        assert_eq!(nr.project.as_deref(), Some(root.as_path()));
+        assert!(
+            nr.projects.contains(&root),
+            "the scoped target must be cycleable even if the registry hasn't caught \
+             up yet: {:?}",
+            nr.projects
+        );
+
+        // Cycling all the way around must return to the original target, not strand
+        // it: this is what the `unwrap_or(0)` fallback used to break.
+        let n = app.new_run.as_ref().unwrap().projects.len();
+        app.new_run.as_mut().unwrap().field = NewRunField::Project;
+        for _ in 0..n {
+            handle_new_run_key(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        }
+        assert_eq!(
+            app.new_run.as_ref().unwrap().project.as_deref(),
+            Some(root.as_path()),
+            "a full cycle must land back on the original scope target"
         );
     }
 
