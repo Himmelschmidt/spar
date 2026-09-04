@@ -325,6 +325,19 @@ pub(crate) fn scrape_claude_stated_reset(
     } else {
         "rate"
     };
+    // A stated reset carries a wall-clock time and no calendar day. For a five-hour
+    // window the next occurrence of that time is a sound inference. For a weekly one it
+    // is a fabrication — the true reset can be six days out — and it fails in the
+    // expensive direction: spar re-probes at a time it asserted, walks into the same
+    // wall, and burns a round telling the operator a specific wrong time. A missing
+    // cooldown is merely re-probed on the generic timer, which claims nothing.
+    if period == "weekly" {
+        return Some((
+            "cli:claude".into(),
+            None,
+            format!("claude {period} limit (reset day unknown, default cooldown)"),
+        ));
+    }
     match parse_stated_reset(log, Utc::now()) {
         Some(until) => Some((
             "cli:claude".into(),
@@ -505,6 +518,34 @@ pub fn ensure_usable(paths: &SparPaths, names: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A stated reset gives a wall-clock time and no calendar day. Inferring the next
+    /// occurrence is sound for a five-hour window and a fabrication for a weekly one,
+    /// where the true reset can be days out. Guessing there fails expensively: spar
+    /// re-probes at a time it asserted and walks into the same wall. Both real captured
+    /// messages, one per window.
+    #[test]
+    fn a_weekly_limit_yields_no_inferred_cooldown_and_a_five_hour_one_does() {
+        let weekly = "! rate limit  seven_day  rejected\n\
+                      You've hit your weekly limit \u{b7} resets 12am (America/New_York)\n";
+        let (_, until, hint) = scrape_claude_stated_reset(weekly).expect("weekly must be a hit");
+        assert!(
+            until.is_none(),
+            "a weekly window must not invent a reset day, got {until:?}"
+        );
+        assert!(
+            hint.contains("weekly"),
+            "hint should name the window: {hint}"
+        );
+
+        let five_hour = "! rate limit  five_hour  rejected\n\
+                         You've hit your session limit \u{b7} resets 12:40pm (America/New_York)\n";
+        let (_, until, _) = scrape_claude_stated_reset(five_hour).expect("five-hour must be a hit");
+        assert!(
+            until.is_some(),
+            "a five-hour window's next occurrence is a sound inference and must be kept"
+        );
+    }
     use super::*;
     use tempfile::tempdir;
 
@@ -616,27 +657,31 @@ mod tests {
     const WEEKLY_LIMIT_LOG: &str = "! rate limit  seven_day  rejected\n\
         You've hit your weekly limit \u{b7} resets 12am (America/New_York)\n";
 
+    /// Inverted deliberately. This test previously asserted that a weekly reset parses
+    /// into a cooldown "within ~25h". That was the fabrication: the message carries a
+    /// wall-clock time and no calendar day, so for a seven-day window the next
+    /// occurrence of midnight is a guess that can be wrong by six days, and spar acts
+    /// on it by re-probing and walking into the same wall. The generic timer re-probes
+    /// cheaply and asserts nothing, so no inferred cooldown beats a wrong one.
     #[test]
-    fn scrape_claude_rate_limits_parses_stated_weekly_reset() {
+    fn scrape_claude_rate_limits_refuses_to_invent_a_weekly_reset_day() {
         let (name, until, hint) =
             scrape_claude_rate_limits("cli:claude", WEEKLY_LIMIT_LOG).unwrap();
         assert_eq!(name, "cli:claude");
-        let until = until.expect("stated reset must parse into a cooldown");
-        // "12am America/New_York" is midnight Eastern, which is 04:00 or 05:00 UTC
-        // depending on DST; either way it must be within a day, not the ~30min default.
-        let now = Utc::now();
-        assert!(until > now, "reset must be in the future");
         assert!(
-            until <= now + chrono::Duration::hours(25),
-            "midnight ET is at most ~25h out, got {until}"
+            until.is_none(),
+            "a weekly window states a time but not a day; inferring one is a guess: {until:?}"
         );
-        assert!(hint.contains("weekly"), "hint: {hint}");
+        assert!(hint.contains("weekly"), "hint must name the window: {hint}");
     }
 
+    /// The unparseable-reset fallback is exercised on a *five-hour* window, because
+    /// that is the only window whose reset spar infers at all now; a weekly one returns
+    /// early without consulting the clause.
     #[test]
     fn scrape_claude_rate_limits_falls_back_when_reset_unparseable() {
-        let log = "! rate limit  seven_day  rejected\n\
-            You've hit your weekly limit \u{b7} resets whenever (Nowhere/Fake)\n";
+        let log = "! rate limit  five_hour  rejected\n\
+            You've hit your session limit \u{b7} resets whenever (Nowhere/Fake)\n";
         let (name, until, hint) = scrape_claude_rate_limits("cli:claude", log).unwrap();
         assert_eq!(name, "cli:claude");
         assert!(

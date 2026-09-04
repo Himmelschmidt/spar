@@ -381,6 +381,7 @@ fn execute_prepared(
                 error: None,
                 usage: Some(slot_usage),
                 agy_quota_hit: false,
+                quota_rejected: None,
             }
         } else {
             SlotOutcome {
@@ -391,6 +392,7 @@ fn execute_prepared(
                 error: err,
                 usage: Some(slot_usage),
                 agy_quota_hit: false,
+                quota_rejected: None,
             }
         });
     }
@@ -487,6 +489,7 @@ fn execute_prepared(
         &prep.paths,
     );
     enrich_muse_stats(&mut res.stats, &prep.job.provider, &prep.log_path);
+    let quota_rejected = res.stats.quota_rejected.clone();
     let usage = usage_from_stream(&prep.job.slot_id, &prep.job.provider, &res.stats);
     if res.timed_out {
         let error = crate::nudge::ceiling_error(timeout, soft, timeout_label(prep.job.role));
@@ -503,6 +506,7 @@ fn execute_prepared(
             error: Some(error),
             usage: Some(usage),
             agy_quota_hit,
+            quota_rejected: quota_rejected.clone(),
         });
     }
     if res.exit_code != Some(0) {
@@ -514,6 +518,7 @@ fn execute_prepared(
             error: Some(describe_exit(res.exit_code, res.signal)),
             usage: Some(usage),
             agy_quota_hit,
+            quota_rejected: quota_rejected.clone(),
         });
     }
     // A clean exit is not success on its own: a slot that produced no artifact (e.g. an
@@ -559,6 +564,7 @@ fn execute_prepared(
                 error: Some(error),
                 usage: Some(usage),
                 agy_quota_hit,
+                quota_rejected: quota_rejected.clone(),
             });
         }
     }
@@ -570,6 +576,7 @@ fn execute_prepared(
         error: None,
         usage: Some(usage),
         agy_quota_hit,
+        quota_rejected: quota_rejected.clone(),
     })
 }
 
@@ -917,6 +924,7 @@ fn apply_parallel_outcome(
         }
         Ok(result) => {
             let agy_quota_hit = result.agy_quota_hit;
+            let quota_rejected = result.quota_rejected.clone();
             let err = result.error.unwrap_or_else(|| "failed".into());
             salvage_expected_artifact(paths, &state.id, &prep.job, &prep.log_path, &err);
             if let Some(u) = result.usage {
@@ -933,8 +941,12 @@ fn apply_parallel_outcome(
             // own stdout is ~empty, so the log scrape alone never sees its rejection;
             // `enrich_agy_stats`'s telemetry-driven verdict is ORed in instead.
             let log_text = process::tail_log(&prep.log_path, 8000);
-            let quota_hit =
-                detect_and_pause_quota(paths, &prep.job.provider, &log_text) || agy_quota_hit;
+            let quota_hit = detect_and_pause_quota(
+                paths,
+                &prep.job.provider,
+                &log_text,
+                quota_rejected.as_deref(),
+            ) || agy_quota_hit;
             if let Some(s) = state.slot_mut(slot_id) {
                 s.quota_hit = quota_hit;
             }
@@ -954,11 +966,15 @@ fn apply_parallel_outcome(
             // `Err` without ever reaching `prep.log_path`, so the error text itself is
             // scraped alongside the log tail.
             let log_text = process::tail_log(&prep.log_path, 8000);
+            // No outcome exists on this path, so no typed verdict: the stream never
+            // produced a rate_limit_event. The text fallback is what catches an
+            // api-sdk 429 here.
             let quota_hit = detect_and_pause_quota_with_err(
                 paths,
                 &prep.job.provider,
                 &log_text,
                 &e.to_string(),
+                None,
             );
             if let Some(s) = state.slot_mut(slot_id) {
                 s.quota_hit = quota_hit;
@@ -1145,7 +1161,8 @@ pub fn run_slot(
     let quota_on_early_err =
         |state: &mut RunState, log_path: &Path, provider: &str, slot_id: &str, err_text: &str| {
             let log_text = process::tail_log(log_path, 8000);
-            let quota_hit = detect_and_pause_quota_with_err(paths, provider, &log_text, err_text);
+            let quota_hit =
+                detect_and_pause_quota_with_err(paths, provider, &log_text, err_text, None);
             if let Some(s) = state.slot_mut(slot_id) {
                 s.quota_hit = quota_hit;
             }
@@ -1310,8 +1327,12 @@ pub fn run_slot(
         let log_text = process::tail_log(&log_path, 8000);
         // agy's own stdout is ~empty, so the log scrape alone never sees its rejection;
         // `enrich_agy_stats`'s telemetry-driven verdict is ORed in instead.
-        let quota_hit =
-            detect_and_pause_quota(paths, &job.provider, &log_text) || result.agy_quota_hit;
+        let quota_hit = detect_and_pause_quota(
+            paths,
+            &job.provider,
+            &log_text,
+            result.quota_rejected.as_deref(),
+        ) || result.agy_quota_hit;
         if let Some(s) = state.slot_mut(&job.slot_id) {
             s.quota_hit = quota_hit;
         }
@@ -1352,7 +1373,19 @@ pub fn run_slot(
 /// was a quota hit. The real incident line ("! rate limit  seven_day  rejected") is
 /// itself line-scoped rejection text and matches `scrape_strong_quota_signal` on its
 /// own, so this exclusion does not weaken detection of the case this was built for.
-fn detect_and_pause_quota(paths: &SparPaths, provider: &str, log_text: &str) -> bool {
+/// `structured` is the adapter's own typed verdict on this request, when it has one:
+/// `StreamStats::quota_rejected`, carrying the `rateLimitType` from a `rate_limit_event`
+/// whose status was `rejected`. When present it decides routing on its own and the text
+/// heuristics are not consulted, because a typed rejection cannot be produced by source
+/// code, documentation or a task brief that merely discusses limits — which is what every
+/// false positive in this change's review history turned out to be. The prose scrape stays
+/// as the fallback for adapters that emit no such event.
+fn detect_and_pause_quota(
+    paths: &SparPaths,
+    provider: &str,
+    log_text: &str,
+    structured: Option<&str>,
+) -> bool {
     let key = crate::quota::normalize_key(provider);
     if let Some(hint) = crate::quota::QuotaStore::scrape_log_hint(log_text) {
         let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
@@ -1363,6 +1396,9 @@ fn detect_and_pause_quota(paths: &SparPaths, provider: &str, log_text: &str) -> 
         let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
         store.pause_quota_until(&name, until, hint);
         let _ = store.save(paths);
+    }
+    if structured.is_some() {
+        return true;
     }
     crate::quota::QuotaStore::scrape_strong_quota_signal(log_text).is_some()
 }
@@ -1378,8 +1414,9 @@ fn detect_and_pause_quota_with_err(
     provider: &str,
     log_text: &str,
     extra: &str,
+    structured: Option<&str>,
 ) -> bool {
-    detect_and_pause_quota(paths, provider, &format!("{log_text}\n{extra}"))
+    detect_and_pause_quota(paths, provider, &format!("{log_text}\n{extra}"), structured)
 }
 
 /// `state.slots` lookup used by every caller that maps a `run_slot` failure onto
@@ -1404,6 +1441,11 @@ struct SlotOutcome {
     /// dispatch. agy's own stdout is ~empty, so the log-based quota scrape
     /// (`detect_and_pause_quota`) never sees it; callers OR this in instead.
     agy_quota_hit: bool,
+    /// The adapter's own typed rate-limit rejection (its `rateLimitType`), set when it
+    /// emitted a `rate_limit_event` with status `rejected`. Routing prefers this over
+    /// any text heuristic: a typed verdict about *this request* cannot be produced by
+    /// source code, docs or a task brief that merely discusses limits.
+    quota_rejected: Option<String>,
 }
 
 impl SlotOutcome {
@@ -1416,6 +1458,7 @@ impl SlotOutcome {
             error: Some(msg.into()),
             usage: None,
             agy_quota_hit: false,
+            quota_rejected: None,
         }
     }
 }
@@ -1794,6 +1837,7 @@ fn run_api(
             error: None,
             usage: Some(slot_usage),
             agy_quota_hit: false,
+            quota_rejected: None,
         })
     } else {
         Ok(SlotOutcome {
@@ -1804,6 +1848,7 @@ fn run_api(
             error: err,
             usage: Some(slot_usage),
             agy_quota_hit: false,
+            quota_rejected: None,
         })
     }
 }
@@ -1906,6 +1951,7 @@ fn run_headless(
     let _ = markers::write_dispatch_verdict(paths, &state.id, &job.slot_id, &verdict);
     let agy_quota_hit = enrich_agy_stats(&mut res.stats, &job.provider, cwd, log_path, paths);
     enrich_muse_stats(&mut res.stats, &job.provider, log_path);
+    let quota_rejected = res.stats.quota_rejected.clone();
     let usage = usage_from_stream(&job.slot_id, &job.provider, &res.stats);
     if res.timed_out {
         let error = crate::nudge::ceiling_error(timeout, soft, timeout_label(job.role));
@@ -1922,6 +1968,7 @@ fn run_headless(
             error: Some(error),
             usage: Some(usage),
             agy_quota_hit,
+            quota_rejected: quota_rejected.clone(),
         });
     }
     let code = res.exit_code;
@@ -1934,6 +1981,7 @@ fn run_headless(
             error: Some(describe_exit(code, res.signal)),
             usage: Some(usage),
             agy_quota_hit,
+            quota_rejected: quota_rejected.clone(),
         });
     }
     if let Some(name) = &job.expected_artifact {
@@ -1972,6 +2020,7 @@ fn run_headless(
                     error: Some(error),
                     usage: Some(usage),
                     agy_quota_hit,
+                    quota_rejected: quota_rejected.clone(),
                 });
             }
         }
@@ -1984,6 +2033,7 @@ fn run_headless(
         error: None,
         usage: Some(usage),
         agy_quota_hit,
+        quota_rejected: quota_rejected.clone(),
     })
 }
 
@@ -2099,6 +2149,7 @@ fn run_tmux(
                     error: None,
                     usage: None,
                     agy_quota_hit: false,
+                    quota_rejected: None,
                 })
             }
             TmuxDecision::Failed => {
@@ -2110,6 +2161,7 @@ fn run_tmux(
                     error: Some("marker failed".into()),
                     usage: None,
                     agy_quota_hit: false,
+                    quota_rejected: None,
                 })
             }
             TmuxDecision::DoneButAlive => {
@@ -2121,6 +2173,7 @@ fn run_tmux(
                     error: Some("agent reported done but its process is still running".into()),
                     usage: None,
                     agy_quota_hit: false,
+                    quota_rejected: None,
                 })
             }
             TmuxDecision::Wait => {
@@ -2386,14 +2439,16 @@ mod tests {
         assert!(detect_and_pause_quota(
             &paths,
             "cli:claude",
-            WEEKLY_LIMIT_LOG
+            WEEKLY_LIMIT_LOG,
+            None
         ));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         assert!(!store.is_usable("cli:claude"));
         let q = store.get("cli:claude");
         assert!(
-            q.cooldown_until.is_some(),
-            "the stated weekly reset must carry a real cooldown, not the generic timer"
+            q.cooldown_until.is_none(),
+            "a weekly window states a time but no day, so spar must fall back to the \
+             generic timer rather than assert a reset instant it cannot know"
         );
     }
 
@@ -2404,7 +2459,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         let log = "thread 'main' panicked at src/main.rs:42:\nindex out of bounds\n";
-        assert!(!detect_and_pause_quota(&paths, "cli:claude", log));
+        assert!(!detect_and_pause_quota(&paths, "cli:claude", log, None));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         assert!(store.is_usable("cli:claude"));
     }
@@ -2418,7 +2473,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         let log = "thread 'main' panicked at src/state.rs:429:\nindex out of bounds\n";
-        assert!(!detect_and_pause_quota(&paths, "cli:claude", log));
+        assert!(!detect_and_pause_quota(&paths, "cli:claude", log, None));
     }
 
     /// On the api-sdk backend a 429 propagates as a `Result::Err` whose text never
@@ -2431,7 +2486,7 @@ mod tests {
         let paths = SparPaths::new(tmp.path());
         let log = "--- api step 0 model=gpt-5 ---\n";
         assert!(
-            !detect_and_pause_quota(&paths, "api:openai", log),
+            !detect_and_pause_quota(&paths, "api:openai", log, None),
             "the log alone carries no rate-limit signal"
         );
         let err_text = "api openai status 429: rate limit exceeded, too many requests";
@@ -2439,7 +2494,8 @@ mod tests {
             &paths,
             "api:openai",
             log,
-            err_text
+            err_text,
+            None
         ));
     }
 
@@ -2450,7 +2506,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         let log = "error: usage limit reached for this account\n";
-        assert!(detect_and_pause_quota(&paths, "cli:codex", log));
+        assert!(detect_and_pause_quota(&paths, "cli:codex", log, None));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         assert!(!store.is_usable("cli:codex"));
     }
@@ -2468,7 +2524,8 @@ mod tests {
         assert!(detect_and_pause_quota(
             &paths,
             "cli:codex@gpt-5.6-terra",
-            log
+            log,
+            None
         ));
         let err = crate::quota::ensure_usable(&paths, &["cli:codex@gpt-5.6-terra".to_string()])
             .unwrap_err();
@@ -2489,7 +2546,7 @@ mod tests {
         let paths = SparPaths::new(tmp.path());
         let log = r#"{"rate_limits":{"five_hour":{"used_percentage":96.5}}}"#;
         assert!(
-            !detect_and_pause_quota(&paths, "cli:claude", log),
+            !detect_and_pause_quota(&paths, "cli:claude", log, None),
             "bare usage telemetry with no rejection must not route to Phase::Quota"
         );
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
@@ -2518,7 +2575,7 @@ mod tests {
             thread 'main' panicked at src/main.rs:42\n";
         for log in [doc_comment_edit, unrelated_test_desc] {
             assert!(
-                !detect_and_pause_quota(&paths, "cli:claude", log),
+                !detect_and_pause_quota(&paths, "cli:claude", log, None),
                 "false positive on: {log}"
             );
         }

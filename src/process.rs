@@ -36,6 +36,13 @@ pub struct StreamStats {
     /// never interchangeable.
     #[serde(default)]
     pub billed_tokens: u64,
+    /// The provider's own structured rate-limit rejection, when it emitted one:
+    /// the `rateLimitType` (`five_hour`, `seven_day`, …) from a `rate_limit_event`
+    /// whose status was `rejected`. This is a typed fact from the adapter, not a
+    /// phrase recovered from rendered log text, so it cannot be produced by source
+    /// code, documentation or a task brief that merely discusses limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_rejected: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Provider-side session id, when the stream names one. muse's usage lives outside
@@ -654,6 +661,8 @@ fn stream_to_log(
 
 struct StreamCoalescer {
     is_err: bool,
+    /// Set from the provider's `rate_limit_event` when its status is `rejected`.
+    quota_rejected: Option<String>,
     buf: String,
     kind: CoalesceKind,
     tools: u32,
@@ -696,6 +705,7 @@ impl StreamCoalescer {
     fn new(is_err: bool) -> Self {
         Self {
             is_err,
+            quota_rejected: None,
             buf: String::new(),
             kind: CoalesceKind::None,
             tools: 0,
@@ -819,6 +829,17 @@ impl StreamCoalescer {
                         .pointer("/rate_limit_info/rateLimitType")
                         .and_then(|x| x.as_str())
                         .unwrap_or("");
+                    if status == "rejected" {
+                        // Captured here, typed, rather than recovered downstream from
+                        // the rendered line: `status` is the provider's own verdict on
+                        // this request, so routing on it cannot false-positive on prose
+                        // that merely mentions limits.
+                        self.quota_rejected = Some(if kind.is_empty() {
+                            "unknown".to_string()
+                        } else {
+                            kind.to_string()
+                        });
+                    }
                     if status != "allowed" {
                         return Some(format!("! rate limit  {kind}  {status}\n"));
                     }
@@ -1357,6 +1378,9 @@ impl StreamCoalescer {
         s.cache_write_tokens = self.cache_write;
         s.context_tokens = self.context_tokens();
         s.billed_tokens = self.billed_tokens();
+        if self.quota_rejected.is_some() {
+            s.quota_rejected = self.quota_rejected.clone();
+        }
         if self.model.is_some() {
             s.model = self.model.clone();
         }
@@ -1602,6 +1626,42 @@ pub fn run_mock(req: &SpawnRequest, mock_output: &str) -> Result<SpawnResult> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The provider states its own verdict on the request in a typed field. Routing on
+    /// that fact is what makes prose incapable of faking a quota stop: this whole change
+    /// oscillated for seven rounds tuning substring rules against log text that spar
+    /// itself had rendered from these very fields.
+    #[test]
+    fn a_rejected_rate_limit_event_is_captured_typed() {
+        let mut c = StreamCoalescer::new(false);
+        c.feed(r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"seven_day"}}"#);
+        assert_eq!(c.quota_rejected.as_deref(), Some("seven_day"));
+
+        // An allowed event, and a warning short of rejection, are not rejections.
+        for status in ["allowed", "warning"] {
+            let mut c = StreamCoalescer::new(false);
+            c.feed(&format!(
+                r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"{status}","rateLimitType":"five_hour"}}}}"#
+            ));
+            assert_eq!(c.quota_rejected, None, "status {status} must not route");
+        }
+    }
+
+    /// Prose cannot manufacture the typed verdict, however exactly it quotes a real
+    /// rejection — including spar's own rendered form of one, which is what the text
+    /// scrape used to match and what cargo prints back when a test asserting on it fails.
+    #[test]
+    fn prose_never_produces_a_typed_rate_limit_rejection() {
+        for line in [
+            "! rate limit  seven_day  rejected",
+            "You've hit your weekly limit \u{b7} resets 12am (America/New_York)",
+            "implementer: editing src/quota.rs, the rate limit rejected path",
+        ] {
+            let mut c = StreamCoalescer::new(false);
+            c.feed(line);
+            assert_eq!(c.quota_rejected, None, "prose must not route: {line}");
+        }
+    }
     use super::*;
     use tempfile::tempdir;
 
