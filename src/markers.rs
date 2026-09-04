@@ -112,6 +112,10 @@ pub fn write_pid(
     write_marker(paths, run_id, &format!("{slot_id}.pid"), &token.encode())
 }
 
+pub fn clear_pid(paths: &SparPaths, run_id: &str, slot_id: &str) {
+    let _ = std::fs::remove_file(paths.marker(run_id, &format!("{slot_id}.pid")));
+}
+
 pub fn read_pid(
     paths: &SparPaths,
     run_id: &str,

@@ -1023,6 +1023,14 @@ impl Config {
                 }
                 self.suite.command = v.clone();
             }
+            // A zero budget spends itself before the first command, so every command is
+            // "not run", the gate is inconclusive, and the run can never go green. Caught
+            // here rather than surfacing as an unexplained stuck run three rounds later.
+            if !self.suite.command.is_empty() && self.suite.timeout_secs == 0 {
+                anyhow::bail!(
+                    "[suite].timeout_secs is 0 with [suite].command set: the suite would never run (set [suite].enabled = false to turn the channel off)"
+                );
+            }
         }
         if let Some(r) = &file.roles {
             if let Some(v) = &r.planner {

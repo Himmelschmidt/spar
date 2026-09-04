@@ -87,8 +87,11 @@ fn planned_run(dir: &Path) -> String {
     run_id
 }
 
+/// Asserts the ship gate (exit 2). Without checking the code, a scenario that looks for
+/// the *absence* of a tester slot passes just as well when `implement` died before it
+/// created any slots at all.
 fn implement(dir: &Path, run_id: &str) {
-    let _ = spar_cmd()
+    spar_cmd()
         .current_dir(dir)
         .args([
             "implement",
@@ -99,7 +102,13 @@ fn implement(dir: &Path, run_id: &str) {
             "--dry-run",
             "--json",
         ])
-        .assert();
+        .assert()
+        .code(2);
+}
+
+fn state_json(dir: &Path, run_id: &str) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(run_dir(dir, run_id).join("state.json")).unwrap())
+        .unwrap()
 }
 
 fn run_dir(dir: &Path, run_id: &str) -> PathBuf {
@@ -107,11 +116,7 @@ fn run_dir(dir: &Path, run_id: &str) -> PathBuf {
 }
 
 fn roles(dir: &Path, run_id: &str) -> Vec<String> {
-    let state: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(run_dir(dir, run_id).join("state.json")).unwrap(),
-    )
-    .unwrap();
-    state["slots"]
+    state_json(dir, run_id)["slots"]
         .as_array()
         .unwrap()
         .iter()
@@ -165,7 +170,52 @@ fn spar_writes_the_suite_report_itself() {
         .expect("suite.md");
     assert!(body.contains("## Result"), "{body}");
     assert!(body.contains("`echo ok`"), "{body}");
-    assert!(body.contains("[suite].command"), "{body}");
+    // The gate value, not the prose: this is what `suite_blocks_ship` reads.
+    assert_eq!(state_json(dir, &run_id)["suite_outcome"], "pass");
+}
+
+/// `--dry-run` must not execute a project's suite, and must not claim it did: this body
+/// is interpolated verbatim into every reviewer's prompt.
+#[test]
+fn a_dry_run_neither_executes_nor_claims_to_have() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    let canary = dir.join("EXECUTED");
+    project(
+        dir,
+        &format!("[suite]\ncommand = [\"touch {}\"]\n", canary.display()),
+    );
+    let run_id = planned_run(dir);
+    implement(dir, &run_id);
+
+    assert!(!canary.exists(), "dry-run executed the suite command");
+    let body = std::fs::read_to_string(run_dir(dir, &run_id).join("artifacts/suite.md"))
+        .expect("suite.md");
+    assert!(body.contains("executed none of"), "{body}");
+    assert!(!body.contains("All exited 0"), "{body}");
+}
+
+/// A zero budget would spend itself before the first command and wedge the run at a gate
+/// nothing can clear, so it is refused at config load instead.
+#[test]
+fn a_zero_timeout_with_commands_is_refused() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    project(dir, "[suite]\ntimeout_secs = 0\ncommand = [\"true\"]\n");
+    spar_cmd()
+        .current_dir(dir)
+        .args([
+            "plan",
+            "--task",
+            "add a hello function",
+            "--providers",
+            "cli:claude",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("[suite].timeout_secs is 0"));
 }
 
 /// A blank entry is a config error at load, not a command that silently runs `sh -c ""`

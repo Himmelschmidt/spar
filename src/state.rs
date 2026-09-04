@@ -775,6 +775,10 @@ pub fn sweep_skip_reason(
     ))
 }
 
+/// Reap key for the built-in suite child. The orchestrator owns that process but no slot
+/// does, so its pid marker is keyed by a reserved id instead of a slot id (O54).
+pub const BUILTIN_SUITE_PID_ID: &str = "suite-builtin";
+
 /// Slot processes of `state` that are still alive.
 ///
 /// Start-time checked: a terminal slot's recorded pid may since have been recycled onto
@@ -782,6 +786,15 @@ pub fn sweep_skip_reason(
 /// an orphan.
 pub fn live_slot_pids(paths: &SparPaths, state: &RunState) -> Vec<u32> {
     let mut out = Vec::new();
+    // The built-in suite channel (O54) runs under the orchestrator with no slot of its
+    // own, so without this its `cargo test` is invisible to `stop --abandoned` and to
+    // every "orphan pids" report — the operator is told nothing is running while a suite
+    // holds the worktree.
+    if let Some(token) = crate::markers::read_pid(paths, &state.id, BUILTIN_SUITE_PID_ID) {
+        if token.alive() {
+            out.push(token.pid);
+        }
+    }
     for slot in &state.slots {
         if matches!(
             slot.status,
