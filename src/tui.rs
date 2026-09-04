@@ -2367,7 +2367,7 @@ fn handle_key(
     // (complete), and Esc (close). It can only open when not in the Shell tab, so it
     // never contends with the agent pane.
     if app.palette.is_some() {
-        return handle_palette_key(app, code, mods, swarm, runs, full);
+        return handle_palette_key(app, code, mods, swarm, projects, local_root, runs, full);
     }
 
     // The `/` rail filter captures keys while it is being edited.
@@ -2788,11 +2788,14 @@ fn palette_completions(pal: &Palette, runs: &[state::RunSummary]) -> Vec<String>
 }
 
 /// Keys while the `:` palette is open. Returns `Ok(true)` only when a command quits.
+#[allow(clippy::too_many_arguments)]
 fn handle_palette_key(
     app: &mut App,
     code: KeyCode,
     mods: KeyModifiers,
     swarm: &SparPaths,
+    projects: &[registry::ProjectEntry],
+    local_root: Option<&Path>,
     runs: &[state::RunSummary],
     full: Option<&RunState>,
 ) -> Result<bool> {
@@ -2810,7 +2813,7 @@ fn handle_palette_key(
                 app.palette = None;
                 return Ok(false);
             }
-            match run_palette(app, swarm, runs, full, &input) {
+            match run_palette(app, swarm, projects, local_root, runs, full, &input) {
                 Ok(PaletteResult::Quit) => return Ok(true),
                 Ok(PaletteResult::Help) => {
                     app.palette = None;
@@ -2909,9 +2912,12 @@ fn split_run_arg<'a>(
 }
 
 /// Execute one palette line. The verb table is the whole surface; `@…` is chat.
+#[allow(clippy::too_many_arguments)]
 fn run_palette(
     app: &mut App,
     swarm: &SparPaths,
+    projects: &[registry::ProjectEntry],
+    local_root: Option<&Path>,
     runs: &[state::RunSummary],
     full: Option<&RunState>,
     input: &str,
@@ -2990,10 +2996,23 @@ fn run_palette(
                 // to the CLI (U21). Same background probe as `n` (D2), not a
                 // hand-rolled roster build, so this path also gets the recent-fleet
                 // row `open_new_run` offers.
+                //
+                // `swarm.project_root` is `active_root`, which falls back to an
+                // arbitrary cwd when there is no local repo and the registry is
+                // empty (`run_loop`'s init). Only offer it as the target when it is
+                // actually a known project — the local repo or a registered one —
+                // so the no-target refusal in `new_run_launch` cannot be bypassed by
+                // an unregistered directory.
+                let all_projects: Vec<PathBuf> = projects.iter().map(|p| p.root.clone()).collect();
+                let is_known_project = local_root == Some(swarm.project_root.as_path())
+                    || all_projects.iter().any(|r| r == &swarm.project_root);
+                let target = is_known_project
+                    .then(|| swarm.project_root.clone())
+                    .or_else(|| all_projects.first().cloned());
                 begin_new_run(
                     app,
-                    Some(swarm.project_root.clone()),
-                    vec![swarm.project_root.clone()],
+                    target,
+                    all_projects,
                     arg.to_string(),
                     NewRunField::Fleet,
                 );
