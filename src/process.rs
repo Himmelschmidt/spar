@@ -859,6 +859,15 @@ impl StreamCoalescer {
                                 v.pointer("/rate_limit_info/resetsAt")
                                     .and_then(|x| x.as_i64())
                             });
+                    } else {
+                        // A `rejected` status does not latch: a stream can be rejected,
+                        // fall back to another window, and keep going. A later
+                        // allowed/allowed_warning event means this dispatch is not
+                        // (or is no longer) blocked, so it must clear the verdict rather
+                        // than let an earlier rejection outlive its own recovery and
+                        // misroute an unrelated later failure onto `Phase::Quota`.
+                        self.quota_rejected = None;
+                        self.quota_resets_at = None;
                     }
                     if status != "allowed" {
                         return Some(format!("! rate limit  {kind}  {status}\n"));
@@ -1666,6 +1675,26 @@ mod tests {
             ));
             assert_eq!(c.quota_rejected, None, "status {status} must not route");
         }
+    }
+
+    /// A `rejected` status must not latch for the rest of the stream: a slot can be
+    /// rejected, fall back to another window, and keep going. A later `allowed` event
+    /// clears the verdict so an unrelated failure later in the same stream is not
+    /// misrouted as a quota hit.
+    #[test]
+    fn a_later_allowed_event_clears_an_earlier_rejection() {
+        let mut c = StreamCoalescer::new(false);
+        c.feed(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":1788000000}}"#,
+        );
+        assert_eq!(c.quota_rejected.as_deref(), Some("five_hour"));
+        assert_eq!(c.quota_resets_at, Some(1788000000));
+
+        c.feed(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour"}}"#,
+        );
+        assert_eq!(c.quota_rejected, None);
+        assert_eq!(c.quota_resets_at, None);
     }
 
     /// Prose cannot manufacture the typed verdict, however exactly it quotes a real

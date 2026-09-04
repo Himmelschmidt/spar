@@ -987,6 +987,7 @@ fn apply_parallel_outcome(
                 &log_text,
                 &e.to_string(),
                 None,
+                None,
             );
             if let Some(s) = state.slot_mut(slot_id) {
                 s.quota_hit = quota_hit;
@@ -1173,8 +1174,11 @@ pub fn run_slot(
     let quota_on_early_err =
         |state: &mut RunState, log_path: &Path, provider: &str, slot_id: &str, err_text: &str| {
             let log_text = process::tail_log(log_path, 8000);
+            // No outcome exists on this path either: the backend never produced a
+            // stream to have parsed a `rate_limit_event` out of, so there is no typed
+            // reset instant to thread through.
             let quota_hit =
-                detect_and_pause_quota_with_err(paths, provider, &log_text, err_text, None);
+                detect_and_pause_quota_with_err(paths, provider, &log_text, err_text, None, None);
             if let Some(s) = state.slot_mut(slot_id) {
                 s.quota_hit = quota_hit;
             }
@@ -1386,6 +1390,26 @@ pub fn run_slot(
 /// was a quota hit. The real incident line ("! rate limit  seven_day  rejected") is
 /// itself line-scoped rejection text and matches `scrape_strong_quota_signal` on its
 /// own, so this exclusion does not weaken detection of the case this was built for.
+/// The longest real Claude window is `seven_day`; a stated instant further out than
+/// this cannot be that window reopening (it is either a unit mismatch, e.g. epoch
+/// milliseconds read as seconds, or otherwise malformed) and must not be trusted.
+const MAX_PLAUSIBLE_RESET_HORIZON_DAYS: i64 = 8;
+
+/// A stated reset instant is only usable if it actually lies ahead of us. A non-future
+/// instant (clock skew, or a rejection whose reset elapsed before spar got to it) would
+/// write an already-expired `Cooldown`, which `QuotaStore::is_usable` reads as
+/// immediately available — worse than no cooldown at all, since it also overwrites the
+/// generic auto-recovering pause. An instant further out than any real window can be
+/// (unit mismatch, e.g. milliseconds read as seconds) would do the opposite: brick the
+/// provider for decades with no auto-recovery. Deliberately refusing rather than trying
+/// to detect and convert milliseconds: the CLI's own schema states epoch seconds, so a
+/// value outside plausible bounds means the payload isn't in the shape assumed, and
+/// guessing at a fix-up would hide that instead of falling back safely.
+fn plausible_reset_instant(until: chrono::DateTime<chrono::Utc>) -> bool {
+    let now = chrono::Utc::now();
+    until > now && until < now + chrono::Duration::days(MAX_PLAUSIBLE_RESET_HORIZON_DAYS)
+}
+
 /// `structured` is the adapter's own typed verdict on this request, when it has one:
 /// `StreamStats::quota_rejected`, carrying the `rateLimitType` from a `rate_limit_event`
 /// whose status was `rejected`. When present it decides routing on its own and the text
@@ -1415,17 +1439,29 @@ fn detect_and_pause_quota(
         // The adapter stated when the window reopens, so pause until exactly then rather
         // than leaving the generic timer to re-probe. This is the answer the text path
         // cannot produce: an absolute instant, no wall-clock inference and no timezone.
-        if let Some(until) = resets_at {
-            let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-            store.pause_quota_until(
-                &key,
-                Some(until),
-                format!(
-                    "{key} {window} limit rejected, resets {}",
-                    until.to_rfc3339()
-                ),
-            );
-            let _ = store.save(paths);
+        // Only when that instant is plausible, though (see `plausible_reset_instant`):
+        // otherwise leave whatever generic pause the scrapes above already wrote alone
+        // rather than overwrite it with a `Cooldown` that is wrong in either direction.
+        match resets_at.filter(|&until| plausible_reset_instant(until)) {
+            Some(until) => {
+                let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+                store.pause_quota_until(
+                    &key,
+                    Some(until),
+                    format!(
+                        "{key} {window} limit rejected, resets {}",
+                        until.to_rfc3339()
+                    ),
+                );
+                let _ = store.save(paths);
+            }
+            None if resets_at.is_some() => {
+                eprintln!(
+                    "spar: {key} stated a reset instant outside the plausible window; \
+                     falling back to the generic pause"
+                );
+            }
+            None => {}
         }
         return true;
     }
@@ -1444,13 +1480,14 @@ fn detect_and_pause_quota_with_err(
     log_text: &str,
     extra: &str,
     structured: Option<&str>,
+    resets_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> bool {
     detect_and_pause_quota(
         paths,
         provider,
         &format!("{log_text}\n{extra}"),
         structured,
-        None,
+        resets_at,
     )
 }
 
@@ -1476,10 +1513,11 @@ struct SlotOutcome {
     /// dispatch. agy's own stdout is ~empty, so the log-based quota scrape
     /// (`detect_and_pause_quota`) never sees it; callers OR this in instead.
     agy_quota_hit: bool,
-    /// The adapter's own typed rate-limit rejection (its `rateLimitType`), set when it
-    /// emitted a `rate_limit_event` with status `rejected`. Routing prefers this over
-    /// any text heuristic: a typed verdict about *this request* cannot be produced by
-    /// source code, docs or a task brief that merely discusses limits.
+    /// The adapter's own typed rate-limit rejection (its `rateLimitType`), reflecting
+    /// the *last* `rate_limit_event` in the stream: a later `allowed`/`allowed_warning`
+    /// event clears it, since a stream can be rejected, fall back to another window and
+    /// keep going. Routing prefers this over any text heuristic: a typed verdict cannot
+    /// be produced by source code, docs or a task brief that merely discusses limits.
     quota_rejected: Option<String>,
     /// When that window reopens, as the adapter stated it.
     quota_resets_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -2483,6 +2521,11 @@ mod tests {
     const WEEKLY_LIMIT_LOG: &str = "! rate limit  seven_day  rejected\n\
         You've hit your weekly limit \u{b7} resets 12am (America/New_York)\n";
 
+    /// What the coalescer actually renders into the log alongside a structured
+    /// rejection (`src/process.rs`'s `rate_limit_event` handler): the two always land
+    /// together, so a realistic `structured` test also carries this line.
+    const FIVE_HOUR_REJECTION_LOG: &str = "! rate limit  five_hour  rejected\n";
+
     #[test]
     fn detect_and_pause_quota_flags_a_rate_limit_log() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2501,6 +2544,83 @@ mod tests {
             q.cooldown_until.is_none(),
             "a weekly window states a time but no day, so spar must fall back to the \
              generic timer rather than assert a reset instant it cannot know"
+        );
+    }
+
+    /// The executor path end to end: a typed rejection carrying a future stated instant
+    /// must pause the store until exactly that instant, not the generic timer.
+    #[test]
+    fn detect_and_pause_quota_with_a_future_typed_reset_pauses_until_exactly_then() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let until = chrono::Utc::now() + chrono::Duration::hours(2);
+        assert!(detect_and_pause_quota(
+            &paths,
+            "cli:claude",
+            FIVE_HOUR_REJECTION_LOG,
+            Some("five_hour"),
+            Some(until)
+        ));
+        let store = crate::quota::QuotaStore::load(&paths).unwrap();
+        let q = store.get("cli:claude");
+        assert_eq!(q.status, crate::quota::ProviderStatus::Cooldown);
+        assert_eq!(q.cooldown_until, Some(until));
+        assert!(!store.is_usable("cli:claude"));
+    }
+
+    /// A stated instant already in the past must not be written as a `Cooldown` — that
+    /// reads as immediately usable, worse than no cooldown. It must fall back to the
+    /// generic auto-recovering pause instead.
+    #[test]
+    fn detect_and_pause_quota_with_a_past_typed_reset_falls_back_to_the_generic_pause() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let past = chrono::Utc::now() - chrono::Duration::hours(1);
+        assert!(detect_and_pause_quota(
+            &paths,
+            "cli:claude",
+            FIVE_HOUR_REJECTION_LOG,
+            Some("five_hour"),
+            Some(past)
+        ));
+        let store = crate::quota::QuotaStore::load(&paths).unwrap();
+        let q = store.get("cli:claude");
+        assert_ne!(
+            q.status,
+            crate::quota::ProviderStatus::Cooldown,
+            "a past stated instant must not be written as a cooldown"
+        );
+        assert!(
+            !store.is_usable("cli:claude"),
+            "the generic fallback pause must still apply"
+        );
+    }
+
+    /// A stated instant further out than any real Claude window (e.g. a millisecond
+    /// timestamp misread as seconds, landing decades away) must not be trusted either:
+    /// it would brick the provider with no auto-recovery.
+    #[test]
+    fn detect_and_pause_quota_with_an_implausible_typed_reset_falls_back_to_the_generic_pause() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let absurd = chrono::Utc::now() + chrono::Duration::days(365 * 100);
+        assert!(detect_and_pause_quota(
+            &paths,
+            "cli:claude",
+            FIVE_HOUR_REJECTION_LOG,
+            Some("five_hour"),
+            Some(absurd)
+        ));
+        let store = crate::quota::QuotaStore::load(&paths).unwrap();
+        let q = store.get("cli:claude");
+        assert_ne!(
+            q.status,
+            crate::quota::ProviderStatus::Cooldown,
+            "an implausible stated instant must not be written as a cooldown"
+        );
+        assert!(
+            !store.is_usable("cli:claude"),
+            "the generic fallback pause must still apply"
         );
     }
 
@@ -2559,6 +2679,7 @@ mod tests {
             "api:openai",
             log,
             err_text,
+            None,
             None
         ));
     }
@@ -2629,19 +2750,20 @@ mod tests {
     /// rejection, so neither may route today.
     #[test]
     fn detect_and_pause_quota_ignores_a_stray_resets_mention_without_a_rejection() {
+        const FIXTURES: [&str; 2] = [
+            "implementer: editing src/quota.rs\n\
+             /// Parses \"resets 12am (America/New_York)\" into a cooldown.\n\
+             scanning for rate limit needles\n\
+             thread 'main' panicked at src/quota.rs:210: index out of bounds\n",
+            "reviewer: the token bucket rate limit test resets between cases\n\
+             thread 'main' panicked at src/main.rs:42\n",
+        ];
         let tmp = tempfile::tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
-        let doc_comment_edit = "implementer: editing src/quota.rs\n\
-            /// Parses \"resets 12am (America/New_York)\" into a cooldown.\n\
-            scanning for rate limit needles\n\
-            thread 'main' panicked at src/quota.rs:210: index out of bounds\n";
-        let unrelated_test_desc =
-            "reviewer: the token bucket rate limit test resets between cases\n\
-            thread 'main' panicked at src/main.rs:42\n";
-        for log in [doc_comment_edit, unrelated_test_desc] {
+        for (i, log) in FIXTURES.iter().enumerate() {
             assert!(
                 !detect_and_pause_quota(&paths, "cli:claude", log, None, None),
-                "false positive on: {log}"
+                "FIXTURES[{i}] must not route"
             );
         }
     }
