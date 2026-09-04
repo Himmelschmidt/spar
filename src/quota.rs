@@ -184,8 +184,10 @@ impl QuotaStore {
     }
 }
 
-/// Parse Claude-style `rate_limits.five_hour` JSON fragments from logs/statusline.
-/// Returns (provider_name, cooldown_until, hint).
+/// Parse Claude-style `rate_limits.five_hour` JSON fragments from logs/statusline, or
+/// (failing that) the CLI's plain-text weekly/five-hour rejection line, e.g. `! rate
+/// limit  seven_day  rejected` followed by "You've hit your weekly limit · resets 12am
+/// (America/New_York)". Returns (provider_name, cooldown_until, hint).
 pub fn scrape_claude_rate_limits(log: &str) -> Option<(String, Option<DateTime<Utc>>, String)> {
     // Look for embedded JSON objects containing rate_limits
     for line in log.lines() {
@@ -212,7 +214,95 @@ pub fn scrape_claude_rate_limits(log: &str) -> Option<(String, Option<DateTime<U
             }
         }
     }
-    None
+    scrape_claude_stated_reset(log)
+}
+
+/// The CLI's plain-text rejection states its own reset ("resets 12am
+/// (America/New_York)") rather than emitting the `five_hour` JSON shape above. Only
+/// fires when the log both names a rate/usage limit and states a reset, so it never
+/// fires on an unrelated log that happens to mention "rate limit" in passing. When the
+/// stated reset can be found but not parsed (unknown tz, unexpected format), still
+/// reports the hit so the caller pauses the provider — the fallback is the generic
+/// default-cooldown pause, made visible on stderr rather than silently guessed.
+fn scrape_claude_stated_reset(log: &str) -> Option<(String, Option<DateTime<Utc>>, String)> {
+    let lower = log.to_ascii_lowercase();
+    if !lower.contains("resets ") {
+        return None;
+    }
+    if !(lower.contains("rate limit")
+        || lower.contains("weekly limit")
+        || lower.contains("usage limit"))
+    {
+        return None;
+    }
+    let period = if lower.contains("seven_day") || lower.contains("weekly") {
+        "weekly"
+    } else {
+        "rate"
+    };
+    match parse_stated_reset(log, Utc::now()) {
+        Some(until) => Some((
+            "cli:claude".into(),
+            Some(until),
+            format!("claude {period} limit, resets {}", until.to_rfc3339()),
+        )),
+        None => {
+            eprintln!(
+                "warning: claude {period} limit stated a reset time spar could not parse; \
+                 falling back to the default cooldown window"
+            );
+            Some((
+                "cli:claude".into(),
+                None,
+                format!("claude {period} limit (stated reset unparseable, default cooldown)"),
+            ))
+        }
+    }
+}
+
+/// Parses "resets 12am (America/New_York)" / "resets 3:30pm (UTC)" into the next
+/// occurrence of that local time, in UTC. `now` is threaded through for tests.
+fn parse_stated_reset(text: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let lower = text.to_ascii_lowercase();
+    let after_resets = &text[lower.find("resets ")? + "resets ".len()..];
+    let paren_start = after_resets.find('(')?;
+    let paren_end = after_resets[paren_start..].find(')')? + paren_start;
+    let time_part = after_resets[..paren_start].trim();
+    let tz_name = after_resets[paren_start + 1..paren_end].trim();
+    let tz: chrono_tz::Tz = tz_name.parse().ok()?;
+
+    let time_lower = time_part.to_ascii_lowercase();
+    let (digits, is_pm) = if let Some(d) = time_lower.strip_suffix("am") {
+        (d.trim(), false)
+    } else {
+        (time_lower.strip_suffix("pm")?.trim(), true)
+    };
+    let mut parts = digits.splitn(2, ':');
+    let hour_raw: u32 = parts.next()?.trim().parse().ok()?;
+    let minute: u32 = match parts.next() {
+        Some(m) => m.trim().parse().ok()?,
+        None => 0,
+    };
+    if !(1..=12).contains(&hour_raw) || minute > 59 {
+        return None;
+    }
+    let hour = match (hour_raw, is_pm) {
+        (12, false) => 0,
+        (12, true) => 12,
+        (h, false) => h,
+        (h, true) => h + 12,
+    };
+
+    let now_local = now.with_timezone(&tz);
+    let mut candidate = now_local
+        .date_naive()
+        .and_hms_opt(hour, minute, 0)?
+        .and_local_timezone(tz)
+        .single()?;
+    if candidate <= now_local {
+        candidate += chrono::Duration::days(1);
+    }
+    Some(candidate.with_timezone(&Utc))
 }
 
 fn parse_rate_limits_value(
@@ -411,5 +501,61 @@ mod tests {
         assert_eq!(normalize_key("cli:claude"), "cli:claude");
         assert_eq!(normalize_key("cli:claude@opus"), "cli:claude");
         assert_eq!(normalize_key("api:openai"), "api:openai");
+    }
+
+    /// The real captured log text from the dogfooding incident (roadmap/BACKLOG.md).
+    const WEEKLY_LIMIT_LOG: &str = "! rate limit  seven_day  rejected\n\
+        You've hit your weekly limit \u{b7} resets 12am (America/New_York)\n";
+
+    #[test]
+    fn scrape_claude_rate_limits_parses_stated_weekly_reset() {
+        let (name, until, hint) = scrape_claude_rate_limits(WEEKLY_LIMIT_LOG).unwrap();
+        assert_eq!(name, "cli:claude");
+        let until = until.expect("stated reset must parse into a cooldown");
+        // "12am America/New_York" is midnight Eastern, which is 04:00 or 05:00 UTC
+        // depending on DST; either way it must be within a day, not the ~30min default.
+        let now = Utc::now();
+        assert!(until > now, "reset must be in the future");
+        assert!(
+            until <= now + chrono::Duration::hours(25),
+            "midnight ET is at most ~25h out, got {until}"
+        );
+        assert!(hint.contains("weekly"), "hint: {hint}");
+    }
+
+    #[test]
+    fn scrape_claude_rate_limits_falls_back_when_reset_unparseable() {
+        let log = "! rate limit  seven_day  rejected\n\
+            You've hit your weekly limit \u{b7} resets whenever (Nowhere/Fake)\n";
+        let (name, until, hint) = scrape_claude_rate_limits(log).unwrap();
+        assert_eq!(name, "cli:claude");
+        assert!(
+            until.is_none(),
+            "unparseable reset must fall back to the generic default cooldown, not guess"
+        );
+        assert!(hint.contains("unparseable"), "hint: {hint}");
+    }
+
+    #[test]
+    fn scrape_claude_rate_limits_ignores_unrelated_logs() {
+        // Must not fire on an ordinary log that happens to contain "resets" or
+        // "rate limit" out of context — that would misroute a genuine failure.
+        assert!(scrape_claude_rate_limits("build succeeded, resets are fine").is_none());
+        assert!(scrape_claude_rate_limits("connection rate limited by nginx").is_none());
+    }
+
+    #[test]
+    fn parse_stated_reset_rolls_to_next_day_when_already_past() {
+        // Fixed "now" well past midnight ET: the next weekly reset is tomorrow, not today.
+        let now = DateTime::parse_from_rfc3339("2026-09-04T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let until = parse_stated_reset(
+            "You've hit your weekly limit \u{b7} resets 12am (America/New_York)",
+            now,
+        )
+        .unwrap();
+        assert!(until > now);
+        assert!(until - now < chrono::Duration::hours(9));
     }
 }

@@ -369,9 +369,17 @@ signals the orchestrator then the slot process groups (SIGTERM → grace → SIG
 and sets `phase=stopped` (JSON `exit_code: 1`). It never removes the branch or the
 worktree — that is `spar cleanup`'s job. A stopped run is **resumable**: rerun
 `spar implement --run <id> --providers …` and it clears the marker and continues.
-A **failed/stuck** run is resumable the same way (its approved plan still counts):
+A **failed/stuck/quota** run is resumable the same way (its approved plan still counts):
 resume resets the failed slots to pending and re-dispatches, so `status` reflects the
-new attempt rather than the dead one's `failed` verdict.
+new attempt rather than the dead one's `failed` verdict. A provider that dies mid-dispatch
+from a rate limit parks the run at `quota` (exit `4`), not `failed` (exit `1`) — the
+discriminator is whether the dying slot's own log matched a quota/rate-limit signal;
+resuming picks the same run back up, and if the provider is still on cooldown it re-parks
+at `quota` immediately rather than dispatching into the same wall. Claude's CLI states its
+own weekly-limit reset time in the rejection line; spar parses that into the cooldown
+instead of using the generic ~30-minute default, so a weekly-window pause does not get
+re-probed for days. The other adapters (codex, opencode, muse, grok) have no
+provider-specific reset parser, so their rate limits fall back to the generic cooldown.
 Use `stop` (not killing pids directly) so the orchestrator can't re-dispatch a slot
 you just killed.
 

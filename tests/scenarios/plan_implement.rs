@@ -1140,6 +1140,43 @@ fn quota_partial_pause_fails_loud_without_collapse() {
     }
 }
 
+/// Verified broken on `bf7770ae`: a run parked at `Phase::Quota` (what a mid-dispatch
+/// rate limit now produces, via `fail`'s quota_hit branch in workflow/implement.rs)
+/// used to be indistinguishable from `Failed`, and `implement --run` refused with
+/// "plan is not approved". `Quota` must resume the same way `Stopped` already does.
+#[test]
+fn implement_resumes_from_quota_phase() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let run_id = planned_run(tmp.path());
+
+    let state_path = tmp
+        .path()
+        .join(".spar/runs")
+        .join(&run_id)
+        .join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    state["phase"] = serde_json::json!("quota");
+    std::fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--providers",
+            "cli:claude,cli:grok,cli:agy",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("awaiting_ship_confirm"))
+        .stdout(predicate::str::contains("plan is not approved").not());
+}
+
 #[test]
 fn arena_dry_run() {
     let tmp = tempdir().unwrap();

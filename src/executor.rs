@@ -269,6 +269,7 @@ fn prepare_slot_execution(
         s.pid = None;
         s.error = None;
         s.usage = None;
+        s.quota_hit = false;
         // Stamp the round at dispatch: slot ids are stable across re-dispatch (the
         // implementer keeps its worktree through fix rounds), so this is where a slot
         // joins the round that is running now (O45).
@@ -1055,6 +1056,7 @@ pub fn run_slot(
         s.pid = None;
         s.error = None;
         s.usage = None;
+        s.quota_hit = false;
         // Stamp the round at dispatch: slot ids are stable across re-dispatch (the
         // implementer keeps its worktree through fix rounds), so this is where a slot
         // joins the round that is running now (O45).
@@ -1223,15 +1225,9 @@ pub fn run_slot(
             &crate::events::Event::slot(&job.slot_id, SlotStatus::Failed),
         );
         let log_text = process::tail_log(&log_path, 8000);
-        if let Some(hint) = crate::quota::QuotaStore::scrape_log_hint(&log_text) {
-            let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-            store.pause_quota(&job.provider, hint);
-            let _ = store.save(paths);
-        }
-        if let Some((name, until, hint)) = crate::quota::scrape_claude_rate_limits(&log_text) {
-            let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-            store.pause_quota_until(&name, until, hint);
-            let _ = store.save(paths);
+        let quota_hit = detect_and_pause_quota(paths, &job.provider, &log_text);
+        if let Some(s) = state.slot_mut(&job.slot_id) {
+            s.quota_hit = quota_hit;
         }
     }
     let _ = crate::bus::heartbeat(
@@ -1249,6 +1245,28 @@ pub fn run_slot(
         );
     }
     Ok(())
+}
+
+/// Best-effort quota detection on a failed dispatch's log: pauses the provider in the
+/// quota store and reports whether this failure looks like a rate limit rather than a
+/// genuine defect. This is the discriminator callers route `Phase::Quota` vs
+/// `Phase::Failed` on — a real bug's log matches none of these needles and stays
+/// `Failed`, so a false positive here would misroute one as the other.
+fn detect_and_pause_quota(paths: &SparPaths, provider: &str, log_text: &str) -> bool {
+    let mut hit = false;
+    if let Some(hint) = crate::quota::QuotaStore::scrape_log_hint(log_text) {
+        let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+        store.pause_quota(provider, hint);
+        let _ = store.save(paths);
+        hit = true;
+    }
+    if let Some((name, until, hint)) = crate::quota::scrape_claude_rate_limits(log_text) {
+        let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+        store.pause_quota_until(&name, until, hint);
+        let _ = store.save(paths);
+        hit = true;
+    }
+    hit
 }
 
 struct SlotOutcome {
@@ -2023,6 +2041,7 @@ pub fn init_slot_model(
         // model chosen by `--select`'s model-select artifact (the `model` arg).
         model: pref.model.clone().or(model),
         round: 1,
+        quota_hit: false,
     }
 }
 
@@ -2215,6 +2234,42 @@ pub fn wait_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The real captured log text from the dogfooding incident (roadmap/BACKLOG.md):
+    /// a rate-limited slot that died mid-dispatch. This is the discriminator `run_slot`
+    /// routes `Phase::Quota` on.
+    const WEEKLY_LIMIT_LOG: &str = "! rate limit  seven_day  rejected\n\
+        You've hit your weekly limit \u{b7} resets 12am (America/New_York)\n";
+
+    #[test]
+    fn detect_and_pause_quota_flags_a_rate_limit_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        assert!(detect_and_pause_quota(
+            &paths,
+            "cli:claude",
+            WEEKLY_LIMIT_LOG
+        ));
+        let store = crate::quota::QuotaStore::load(&paths).unwrap();
+        assert!(!store.is_usable("cli:claude"));
+        let q = store.get("cli:claude");
+        assert!(
+            q.cooldown_until.is_some(),
+            "the stated weekly reset must carry a real cooldown, not the generic timer"
+        );
+    }
+
+    /// The discriminator must not fire for an ordinary defect — a false positive here
+    /// would swallow a real failure as "quota", which is worse than the bug being fixed.
+    #[test]
+    fn detect_and_pause_quota_ignores_an_ordinary_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log = "thread 'main' panicked at src/main.rs:42:\nindex out of bounds\n";
+        assert!(!detect_and_pause_quota(&paths, "cli:claude", log));
+        let store = crate::quota::QuotaStore::load(&paths).unwrap();
+        assert!(store.is_usable("cli:claude"));
+    }
 
     /// Recovery must fire only for a slot that actually produced something. A slot that
     /// exited clean having written nothing is a genuine failure and still fails.
