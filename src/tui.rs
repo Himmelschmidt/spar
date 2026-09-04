@@ -1807,14 +1807,17 @@ fn build_roster(
         });
     }
     for (name, avail) in detected {
+        if !avail {
+            continue;
+        }
         if configured_native.iter().any(|n| n == name) {
             continue;
         }
         roster.push(RosterEntry {
             choice: RosterChoice::Provider(format!("cli:{name}")),
             label: format!("cli:{name}"),
-            available: *avail,
-            reason: (!avail).then(|| "not on PATH".to_string()),
+            available: true,
+            reason: None,
             source: RosterSource::Detected,
         });
     }
@@ -12296,11 +12299,11 @@ mod home_ia {
         assert_eq!(codex.source, RosterSource::Detected);
 
         // R7: nothing configured, nothing on PATH — an explanatory empty
-        // roster, not an empty selectable list.
+        // roster (so the `spar doctor` pointer fires), not disabled rows.
         let bare = build_roster(&cfg_with(&[]), &[("claude".into(), false)], None);
         assert!(
-            bare.iter().all(|e| !e.available),
-            "nothing usable must be nothing selectable: {bare:?}"
+            bare.is_empty(),
+            "nothing usable must be an empty roster, not disabled rows: {bare:?}"
         );
     }
 
