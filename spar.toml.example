@@ -80,10 +80,18 @@ other = 12000000     # ranker / peer / reconciler: no measured distribution of t
 # tester = "cli:agy"          # cheap suite runner (was [suite].provider)
 # test_author = "cli:grok"    # pre-coding test author (was [spec].provider)
 
-# Full test suite channel (cheap/dumb model). Implementers/reviewers must not run multi-hour suites.
+# Full test suite channel. Implementers/reviewers must not run multi-hour suites.
 [suite]
 enabled = true
+# Soft clock for the `tester` slot; the built-in runner below runs to this number times
+# `hard_ceiling_multiple`.
 timeout_secs = 7200
+# Set `command` and spar runs the suite itself: no `tester` slot, no tokens, and the
+# verdict is the exit codes rather than a model's reading of them. Leave it empty and a
+# cheap `tester` agent discovers and runs the suite instead. Every entry runs even after
+# one fails. Keep each command one the whole project collects: the list is frozen, so a
+# narrow one (`pytest tests/unit`) will miss an acceptance test added elsewhere.
+# command = ["cargo fmt --check", "cargo clippy --all-targets -- -D warnings", "cargo test"]
 
 # Reviewer verdict / acceptance gate. Review timeouts live under [timeouts].
 [review]

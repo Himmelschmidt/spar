@@ -3009,6 +3009,35 @@ fn run_steps(st: &RunState, abandoned: bool) -> Vec<(&'static str, StepState)> {
         })
         .collect();
 
+    // The built-in suite channel (`[suite].command`, O54) runs under the orchestrator and
+    // fills no slot, so the honest record for that step is the run's own verdict. Without
+    // this the rail marks a suite that ran and gated the ship as `Skipped`.
+    if !st.slots.iter().any(|s| s.role == SlotRole::Tester) {
+        if let Some(i) = steps_for(st.workflow)
+            .iter()
+            .position(|(_, role)| *role == Some(SlotRole::Tester))
+        {
+            // Phase first, verdict second. `suite_outcome` is never cleared between
+            // rounds, so reading it first would paint round 2's live suite with round 1's
+            // red and the step could only ever show `Active` on the first round.
+            out[i].1 = if st.phase == Phase::Suite {
+                if broken {
+                    StepState::Failed
+                } else if halted {
+                    StepState::Halted
+                } else {
+                    StepState::Active
+                }
+            } else {
+                match st.suite_outcome {
+                    Some(crate::state::SuiteOutcome::Pass) => StepState::Done,
+                    Some(_) => StepState::Failed,
+                    None => out[i].1,
+                }
+            };
+        }
+    }
+
     // A step nothing ever filled, on a run that has already moved past it, did not
     // happen: a disabled channel (`[spec]`, `[suite]`) or an unused optional role.
     // Saying "pending" there promises work that is never coming.

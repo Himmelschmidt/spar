@@ -477,6 +477,12 @@ pub struct SuiteConfig {
     pub enabled: bool,
     #[serde(default = "default_suite_timeout_secs")]
     pub timeout_secs: u64,
+    /// Shell commands spar runs itself, in order, instead of dispatching a `tester`
+    /// slot. Non-empty means the gate is decided by exit codes rather than by a model
+    /// reading its own log. Empty keeps the agent tester, which is what discovers the
+    /// commands in a repo that has not declared them.
+    #[serde(default)]
+    pub command: Vec<String>,
 }
 
 impl Default for SuiteConfig {
@@ -484,7 +490,15 @@ impl Default for SuiteConfig {
         Self {
             enabled: true,
             timeout_secs: default_suite_timeout_secs(),
+            command: Vec::new(),
         }
+    }
+}
+
+impl SuiteConfig {
+    /// Deterministic gate: spar runs the commands, no tester slot is spawned.
+    pub fn is_builtin(&self) -> bool {
+        self.enabled && !self.command.is_empty()
     }
 }
 
@@ -809,6 +823,7 @@ struct TimeoutConfigFile {
 struct SuiteConfigFile {
     enabled: Option<bool>,
     timeout_secs: Option<u64>,
+    command: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1001,6 +1016,20 @@ impl Config {
             }
             if let Some(v) = s.timeout_secs {
                 self.suite.timeout_secs = v;
+            }
+            if let Some(v) = &s.command {
+                if let Some(bad) = v.iter().position(|c| c.trim().is_empty()) {
+                    anyhow::bail!("[suite].command[{bad}] is empty");
+                }
+                self.suite.command = v.clone();
+            }
+            // A zero budget spends itself before the first command, so every command is
+            // "not run", the gate is inconclusive, and the run can never go green. Caught
+            // here rather than surfacing as an unexplained stuck run three rounds later.
+            if !self.suite.command.is_empty() && self.suite.timeout_secs == 0 {
+                anyhow::bail!(
+                    "[suite].timeout_secs is 0 with [suite].command set: the suite would never run (set [suite].enabled = false to turn the channel off)"
+                );
             }
         }
         if let Some(r) = &file.roles {
@@ -1352,6 +1381,48 @@ test_author = "cli:agy"
         assert_eq!(cfg.spec.timeout_secs, 900);
         assert_eq!(cfg.roles.tester.as_deref(), Some("cli:grok"));
         assert_eq!(cfg.roles.test_author.as_deref(), Some("cli:agy"));
+    }
+
+    /// `[suite].command` is what turns the gate deterministic (O54). Empty by default, so
+    /// a project that has not declared its suite keeps the agent tester.
+    #[test]
+    fn suite_command_opts_into_the_builtin_gate() {
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+        assert!(!Config::default().suite.is_builtin());
+        std::fs::write(
+            project.join("spar.toml"),
+            "[suite]\ncommand = [\"cargo fmt --check\", \"cargo test\"]\n",
+        )
+        .unwrap();
+        let cfg = Config::load(project).unwrap();
+        assert_eq!(cfg.suite.command, vec!["cargo fmt --check", "cargo test"]);
+        assert!(cfg.suite.is_builtin());
+    }
+
+    /// `enabled = false` turns the channel off whatever the command list says, so one
+    /// knob still means one thing.
+    #[test]
+    fn a_disabled_suite_is_not_builtin() {
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+        std::fs::write(
+            project.join("spar.toml"),
+            "[suite]\nenabled = false\ncommand = [\"cargo test\"]\n",
+        )
+        .unwrap();
+        let cfg = Config::load(project).unwrap();
+        assert!(!cfg.suite.is_builtin());
+    }
+
+    /// A blank entry would run `sh -c \"\"`, exit 0, and green-light the gate.
+    #[test]
+    fn a_blank_suite_command_is_a_load_error() {
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+        std::fs::write(project.join("spar.toml"), "[suite]\ncommand = [\"\"]\n").unwrap();
+        let err = Config::load(project).unwrap_err().to_string();
+        assert!(err.contains("[suite].command[0] is empty"), "{err}");
     }
 
     #[test]

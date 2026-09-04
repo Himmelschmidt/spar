@@ -23,6 +23,7 @@ mod sandbox;
 mod ship;
 mod skills;
 mod state;
+mod suite;
 mod tasks;
 mod templates;
 mod terminal;

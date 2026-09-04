@@ -168,7 +168,7 @@ positions.
 | `plan_critic` | yes | `plan` | 1 | Reads the draft, edits `plan.md` directly, names gaps and the scenarios the test-author must cover (it writes no tests). Its failure is tolerated: the run keeps the plan. | `plan.md`, `plan-critique-<slot>.md` |
 | `test_author` | yes | `plan`, if `[spec] enabled` | 1 | Freezes acceptance criteria (`AC-n`) and real test files **before** the plan gate. | `test-contract.md` |
 | `implementer` | yes | `loop`, `arena` | 1 (`loop`), `max_agents` (`arena`) | Writes the code in its own worktree. Smoke/diff tests only while the suite channel runs. | `summary-<slot>.md`, `carry-forward-<slot>.md` |
-| `tester` | yes | `loop`, if `[suite] enabled` | 1 | Runs the **full** suite and nothing else. Deliberately a cheap model: it runs tests, it does not judge them. | `suite.md` |
+| `tester` | yes | `loop`, if `[suite] enabled` **and `[suite].command` is empty** | 1 | Runs the **full** suite and nothing else. Deliberately a cheap model: it runs tests, it does not judge them. With `[suite].command` set, spar runs the suite itself and this slot is never created. | `suite.md` |
 | `reviewer` | yes | `loop` (2), `review` (N), `reconcile` (2) | see left | Adversarial review of the diff against `plan.md` and every `AC-n`. Verdict is `approve` or `request_changes`. | `review-<slot>.md` |
 | `ranker` | no | `arena` | 1 | Reads every implementer summary and picks a winner. Runs in the project root, not a worktree. | `ranking.md` |
 | `reconciler` | no | `spar reconcile` | 1 | Merges the best parts of the candidate worktrees into one implementation in its own worktree. | `summary-reconcile.md` |
@@ -198,7 +198,7 @@ positions.
 | `--workflow` | Slots | Ends at |
 |---|---|---|
 | `plan` | `planner` + `plan_critic`, then `test_author` when `[spec] enabled` | plan gate (`awaiting_plan_approval`, exit 2) |
-| `loop` | `implementer` ×1, `tester` ×1 when `[suite] enabled`, `reviewer` ×2; up to 3 fix rounds, then rotate/widen/`stuck` | ship gate (`awaiting_ship_confirm`) |
+| `loop` | `implementer` ×1, `tester` ×1 when `[suite] enabled` and `[suite].command` is empty, `reviewer` ×2; up to 3 fix rounds, then rotate/widen/`stuck` | ship gate (`awaiting_ship_confirm`) |
 | `arena` | `implementer` ×`max_agents` in waves, then `ranker` ×1 | winner gate (`awaiting_winner_confirm`) |
 | `roles` | `peer` ×2, frontend/backend split, dispatched one after the other | `done` (no review, no gate) |
 | `peer` | `peer` ×2, symmetric, dispatched in parallel over the bus | `done` (no review, no gate) |
@@ -454,7 +454,8 @@ as a backstop against a genuinely hung process. **The default also moved, 1800 �
 project had already overridden it.
 
 **Not every role draws `slot_secs`, which is the easy thing to get wrong.** `tester` draws
-`[suite] timeout_secs` (7200) and `test_author` draws `[spec] timeout_secs` (**3600**,
+`[suite] timeout_secs` (7200) — and so does the built-in suite runner, which has no turns to
+nudge and so simply runs to that knob's hard ceiling — `test_author` draws `[spec] timeout_secs` (**3600**,
 also raised from 1800 in this change); `reviewer` draws `[timeouts] review_secs`, which
 falls back to `slot_secs`. `hard_ceiling_multiple` multiplies whichever of those the role
 actually drew, so raising `slot_secs` alone does not move the tester or the test author.
@@ -784,11 +785,12 @@ rail's selection.
   so "has work" is always true for them and a recovered `suite.md` could set the
   authoritative gate green with no suite having run; a recovered `test-contract.md` would
   carry no `AC-n` and make the ship gate vacuous. Those roles fail closed, as before.
-- **The suite gate is checked for coverage.** When the tester's commands select specific
+- **The suite gate is checked for coverage.** When the suite's commands select specific
   targets (`--test foo`, `--lib`, `mod::case`, a named test file) and the implementer
   committed test files none of them name, spar appends a `## Coverage warning` to
   `suite.md` and broadcasts it on the bus. spar never edits the command list — a harness
-  that rewrites its own gate is not a gate. Silent when the suite runs the project default
+  that rewrites its own gate is not a gate, and that holds for a `[suite].command` list
+  it ran itself just as it does for one a `tester` wrote. Silent when the suite runs the project default
   (`cargo test`, `cargo test -p pkg`, `pytest tests/`, `go test ./...`), all of which
   compile or collect new test files on their own.
 
@@ -870,10 +872,19 @@ other = 12000000       # ranker / peer / reconciler
 # reviewer = ["cli:grok", "cli:agy", "cli:claude"]
 # tester = "cli:agy"
 # test_author = "cli:grok"
-# Full suite channel (cheap/dumb model). Implementers/reviewers: smoke/diff only.
+# Full suite channel. Implementers/reviewers: smoke/diff only.
 [suite]
 enabled = true
 timeout_secs = 7200
+# Set `command` and spar runs the suite itself: no tester slot, no tokens, and the
+# verdict is the exit codes. Leave it empty and a cheap `tester` agent discovers and
+# runs the suite instead. Prefer `command` in any repo whose test commands are known.
+# One entry per command; they all run even after one fails. `timeout_secs` is shared
+# across the list and multiplied by `hard_ceiling_multiple` for the kill, same as the
+# tester slot draws it. Write the bare command: spar runs it under `bash -o pipefail`
+# where bash exists, but a command whose real result is swallowed by its own `|| true`
+# is a gate that cannot fail.
+# command = ["cargo fmt --check", "cargo clippy --all-targets -- -D warnings", "cargo test"]
 # Reviewer verdict / acceptance gate (review timeouts stay under [timeouts]).
 [review]
 require_all_criteria = true   # false ⇒ an `unverified` AC no longer blocks the ship
@@ -918,7 +929,12 @@ timeout_secs = 3600    # test_author's SOFT clock; hard_ceiling_multiple applies
 - **Reviewer context:** reviewers get the full `plan.md` and `test-contract.md` in their prompt, so they can check the change against the agreed plan and each `AC-n` criterion rather than guessing intent.
 - **Review artifact schema (enforced):** each `artifacts/review-<slot>.md` is `## Verdict` / `## Acceptance` / `## Findings` / `## Tests`. The verdict is read as an **anchored header** — the first non-blank line under the first `## Verdict` must be `approve` or `request_changes`; missing or unparseable is treated as `request_changes`. `## Acceptance` carries one `AC-n: pass|fail|unverified — evidence` line per criterion in `test-contract.md`.
 - **Acceptance gate:** a run cannot reach `awaiting_ship_confirm` while any contract `AC-n` is `fail`, is `unverified` (default; relax with `[review] require_all_criteria = false`), or is simply **absent** from a review — an unmentioned criterion always blocks. With no contract at all (`[spec] enabled = false`) the verdict alone gates.
-- **Suite channel (implement/loop):** a dedicated `tester` slot runs full test suites; impl/review stay smoke/diff-only when it runs. Its provider comes from `[roles].tester` (falls through to model-select/fleet if unset/unusable). Artifact: `artifacts/suite.md`. Independent `review` workflow does not spawn a tester by default.
+- **Suite channel (implement/loop):** the authoritative full-suite run; impl/review stay smoke/diff-only when it runs. Artifact: `artifacts/suite.md`, either way. Two forms:
+  - **Built-in (preferred).** With `[suite].command` set, spar runs those commands itself in the implementer's worktree, in order, all of them even after one fails, output to `artifacts/suite.log`. **No `tester` slot is created and no tokens are spent.** The verdict is the exit codes: a non-zero exit **or a signal death** (a crash, an abort, the OOM killer) is `fail`; only a command that never reached a status at all — budget spent, or killed by `spar stop` — is `inconclusive`. A definite failure outranks an incomplete one, so a suite that really failed is never reported to reviewers as one that never ran. The whole list shares one budget, `[suite].timeout_secs` × `hard_ceiling_multiple` — the same wall the `tester` slot draws, so the knob means the same thing either way. It runs under the run's `isolation` setting, `bash -o pipefail -c` where bash exists (`sh -c` otherwise), and its child is reapable by `spar stop --abandoned` like any slot.
+    **Your list is frozen, so check it against new tests.** A `tester` rewrote its commands every round; a static list does not. `pytest tests/unit` or `go test ./internal/...` will not collect an acceptance test the implementer adds elsewhere, and the coverage warning below reads a directory argument as a full suite and stays silent. Prefer a command that collects the whole project.
+  - **Agent tester.** With `[suite].command` empty, a cheap `tester` slot discovers how the repo runs its tests and reports. Its provider comes from `[roles].tester` (falls through to model-select/fleet if unset/unusable). This is the fallback for a repo that has not declared its commands, and the one path where the gate depends on a model reporting its own result honestly.
+
+  Independent `review` workflow does not spawn a tester by default.
 - **Round ceiling:** `state.round` is bounded by `[rounds] max` (default 8). Hitting it is a **gate** (exit 2, phase `awaiting_round_extension`), lifted with `implement --run <id> --max-rounds <N>` (>= 1; sticky; clears `error`). The rotate/widen/`stuck` ladder resolves **first**, so exit 3 always beats the gate, and a lift preserves the ladder's progress rather than re-buying it.
 - **Contract re-freeze is guarded:** a re-entry that would adopt a `test-contract.md` spar saw drift mid-round refuses with exit `1` unless `--accept-contract` is passed. Re-freezes are announced on stderr, not just in `events.jsonl`.
 - **Carry-forward:** the implementer writes `artifacts/carry-forward-<slot>.md`, which seeds the next round's implementer prompt (blockers first, capped at `[rounds] carry_forward_chars`, consumed on read). It never reaches a reviewer or the acceptance gate.

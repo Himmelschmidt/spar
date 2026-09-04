@@ -373,6 +373,27 @@ fn ensure_suite_slot(
     cfg: &Config,
     paths: &SparPaths,
 ) -> Result<()> {
+    if cfg.suite.is_builtin() {
+        // A run that had an agent tester before `[suite].command` was added (or before a
+        // `--reload-config`) carries a slot nothing will ever dispatch again. Reap before
+        // dropping: the slot id is the only key its pid marker is filed under, so
+        // removing the record first is how a still-running agent becomes an orphan
+        // nothing can find (O28). Keeping the slot instead is worse — nothing in the
+        // built-in round settles it, so it reads `Running` forever, trips the stall
+        // check every round, and goes on writing the same `suite.md` spar writes.
+        // Killing it is this command's call: it holds the run lock, the slot is its own,
+        // and the channel that slot belonged to no longer exists.
+        for slot in state.slots.iter().filter(|s| s.role == SlotRole::Tester) {
+            if let Some(token) = crate::markers::read_pid(paths, &state.id, &slot.id) {
+                if token.alive() {
+                    crate::process::terminate_tree(token.pid, true);
+                }
+            }
+            crate::markers::clear_pid(paths, &state.id, &slot.id);
+        }
+        state.slots.retain(|s| s.role != SlotRole::Tester);
+        return Ok(());
+    }
     if !cfg.suite.enabled {
         return Ok(());
     }
@@ -756,7 +777,7 @@ fn command_names(cmd: &str, path: &str) -> bool {
 
 fn suite_guidance(outcome: SuiteOutcome) -> String {
     let header = "## Suite channel (do not re-run full suites)\n\
-         A dedicated cheap tester slot runs the full suite; its output is the `## Suite report` section above.\n\n";
+         A dedicated channel runs the full suite — spar's own configured commands, or a cheap tester slot; its output is the `## Suite report` section above.\n\n";
     match outcome {
         SuiteOutcome::Pass => format!(
             "{header}\
@@ -1169,7 +1190,69 @@ pub fn execute_loop(
                 .iter()
                 .find(|s| s.role == SlotRole::Tester)
                 .cloned();
-            if let Some(tester) = tester {
+            if cfg.suite.is_builtin() {
+                state.set_phase(Phase::Suite);
+                state.save(paths)?;
+                let report = if state.dry_run {
+                    crate::suite::dry(&cfg.suite.command)
+                } else {
+                    let run_id = state.id.clone();
+                    crate::suite::run(&crate::suite::Options {
+                        cwd: &review_cwd,
+                        commands: &cfg.suite.command,
+                        log_path: &paths.artifact(&state.id, "suite.log"),
+                        // The ceiling, not the soft number: `suite.timeout_secs` is the
+                        // tester slot's nudge threshold and its kill sits at
+                        // `hard_ceiling_multiple` past it (O50/O51). There is nothing to
+                        // nudge here, so the knob keeps its meaning by running to the
+                        // same wall.
+                        budget: executor::hard_ceiling_for_role(cfg, SlotRole::Tester),
+                        // These commands compile and run code a model just wrote, so they
+                        // get the run's confinement like every other spawn in the tree.
+                        isolation: state.isolation,
+                        on_pid: &|pid| match pid {
+                            Some(pid) => {
+                                let _ = crate::markers::write_pid(
+                                    paths,
+                                    &run_id,
+                                    crate::state::BUILTIN_SUITE_PID_ID,
+                                    crate::process::PidToken::capture(pid),
+                                );
+                            }
+                            None => crate::markers::clear_pid(
+                                paths,
+                                &run_id,
+                                crate::state::BUILTIN_SUITE_PID_ID,
+                            ),
+                        },
+                        stop: &|| should_stop(paths, &run_id),
+                    })
+                };
+                suite_outcome = report.outcome;
+                suite_body = report.body;
+                std::fs::write(paths.artifact(&state.id, "suite.md"), &suite_body)?;
+                let msg = format!(
+                    "suite channel {} (built-in, {} command(s))",
+                    match suite_outcome {
+                        SuiteOutcome::Pass => "green",
+                        SuiteOutcome::Fail => "red",
+                        SuiteOutcome::Inconclusive => "inconclusive",
+                    },
+                    report.runs.len()
+                );
+                let _ = crate::events::append(
+                    paths,
+                    &state.id,
+                    &crate::events::Event::info(msg.clone()),
+                );
+                let _ = crate::bus::broadcast(
+                    paths,
+                    Some(&state.id),
+                    "orchestrator",
+                    msg,
+                    state.message_budget,
+                );
+            } else if let Some(tester) = tester {
                 state.set_phase(Phase::Suite);
                 state.save(paths)?;
                 if let Some(s) = state.slot_mut(&tester.id) {
@@ -2175,6 +2258,65 @@ mod suite_parse_tests {
         assert!(suite_blocks_ship(SuiteOutcome::Fail));
         assert!(suite_blocks_ship(SuiteOutcome::Inconclusive));
         assert!(!suite_blocks_ship(SuiteOutcome::Pass));
+    }
+
+    /// `suite.md` is what the reviewers and the operator read; `report.outcome` is what
+    /// the gate holds. The built-in path sets the gate from exit codes and renders the
+    /// body separately, so nothing but this test stops the two from drifting apart and
+    /// telling a reviewer the suite passed on a run that blocked.
+    #[test]
+    fn a_builtin_report_reads_back_as_the_verdict_the_gate_holds() {
+        let d = tempfile::tempdir().unwrap();
+        let log = d.path().join("suite.log");
+        let cases = [
+            (vec!["true".to_string()], std::time::Duration::from_secs(30)),
+            (
+                vec!["exit 1".to_string()],
+                std::time::Duration::from_secs(30),
+            ),
+            (
+                vec!["sleep 30".to_string()],
+                std::time::Duration::from_millis(300),
+            ),
+        ];
+        for (cmds, budget) in cases {
+            let rep = crate::suite::run(&crate::suite::Options {
+                cwd: d.path(),
+                commands: &cmds,
+                log_path: &log,
+                budget,
+                isolation: crate::config::IsolationMode::Worktree,
+                on_pid: &|_| {},
+                stop: &|| false,
+            });
+            assert_eq!(
+                derive_suite_outcome(true, Some(0), Some(&rep.body)),
+                rep.outcome,
+                "{}",
+                rep.body
+            );
+        }
+        let rep = crate::suite::dry(&["cargo test".to_string()]);
+        assert_eq!(
+            derive_suite_outcome(true, Some(0), Some(&rep.body)),
+            rep.outcome
+        );
+    }
+
+    /// The coverage check (O32) parses `## Commands` back out of `suite.md`. That is a
+    /// contract between two modules with no compiler between them: a format change on
+    /// either side silently disables the warning rather than breaking anything.
+    #[test]
+    fn the_coverage_check_can_still_read_a_builtin_command_list() {
+        let body = crate::suite::dry(&[
+            "cargo test --test foo".to_string(),
+            "pytest tests/unit".to_string(),
+        ])
+        .body;
+        assert_eq!(
+            suite_commands(&body),
+            vec!["cargo test --test foo", "pytest tests/unit"]
+        );
     }
 
     #[test]
