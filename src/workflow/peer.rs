@@ -195,9 +195,26 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
         ));
     }
     std::fs::write(paths.artifact(&state.id, "summary.md"), body)?;
-    state.set_phase(Phase::Done);
+    // Peer has no failure-to-phase mapping at all beyond this (a genuine failure on
+    // either half still reads `Done` — a pre-existing, larger gap left untouched, see
+    // DECISIONS.md O54). This only closes the quota-specific case: both peers dying on
+    // the same rate limit must not report success.
+    let failed: Vec<_> = state
+        .slots
+        .iter()
+        .filter(|s| s.status == crate::state::SlotStatus::Failed)
+        .collect();
+    if !state.slots.is_empty()
+        && failed.len() == state.slots.len()
+        && failed.iter().all(|s| s.quota_hit)
+    {
+        state.set_phase(Phase::Quota);
+        state.error = Some("all peer slots failed: rate limit".into());
+    } else {
+        state.set_phase(Phase::Done);
+    }
     state.save(paths)?;
-    if cfg.auto_cleanup {
+    if cfg.auto_cleanup && state.phase == Phase::Done {
         let _ = worktree::cleanup_run(state, false);
     }
     Ok(())

@@ -907,9 +907,9 @@ fn apply_parallel_outcome(
             }
             // True-parallel dispatch (`run_slots_parallel`, e.g. `--workflow review`)
             // had no quota detection at all before this: a rate-limited slot here left
-            // its provider unpaused. This only pauses/records the hit on the slot;
-            // callers of this path have no `fail()`-style terminal-phase mapping, so
-            // it does not by itself route the run to `Phase::Quota`.
+            // its provider unpaused. This only pauses/records the hit on the slot; it
+            // is `review`/`peer`/`roles`'s own terminal-phase mapping that reads
+            // `quota_hit` back off the slot to route the run to `Phase::Quota`.
             let log_text = process::tail_log(&prep.log_path, 8000);
             let quota_hit = detect_and_pause_quota(paths, &prep.job.provider, &log_text);
             if let Some(s) = state.slot_mut(slot_id) {
@@ -1103,11 +1103,24 @@ pub fn run_slot(
 
     let presence_env = wire_slot_presence(state, paths, job, &cwd, &pref);
 
+    // A backend `Err` (spawn/setup failure, not a completed dispatch) still writes a
+    // log a rate-limit rejection could land in on some adapters, so it gets the same
+    // quota scrape as the `!result.ok` branch below rather than silently skipping
+    // detection because this failure surfaced a step earlier.
+    let quota_on_early_err =
+        |state: &mut RunState, log_path: &Path, provider: &str, slot_id: &str| {
+            let log_text = process::tail_log(log_path, 8000);
+            let quota_hit = detect_and_pause_quota(paths, provider, &log_text);
+            if let Some(s) = state.slot_mut(slot_id) {
+                s.quota_hit = quota_hit;
+            }
+        };
     let result = if pref.is_api() {
         match run_api(state, paths, job, &pref, &cwd, &log_path, &prompt, timeout) {
             Ok(r) => r,
             Err(e) => {
                 salvage_expected_artifact(paths, &state.id, job, &log_path, &e.to_string());
+                quota_on_early_err(state, &log_path, &job.provider, &job.slot_id);
                 mark_slot_failed(state, paths, &job.slot_id, &e.to_string(), None, None, None)?;
                 return Err(e);
             }
@@ -1129,6 +1142,7 @@ pub fn run_slot(
                     Ok(r) => r,
                     Err(e) => {
                         salvage_expected_artifact(paths, &state.id, job, &log_path, &e.to_string());
+                        quota_on_early_err(state, &log_path, &job.provider, &job.slot_id);
                         mark_slot_failed(
                             state,
                             paths,
@@ -1158,6 +1172,7 @@ pub fn run_slot(
                     Ok(r) => r,
                     Err(e) => {
                         salvage_expected_artifact(paths, &state.id, job, &log_path, &e.to_string());
+                        quota_on_early_err(state, &log_path, &job.provider, &job.slot_id);
                         mark_slot_failed(
                             state,
                             paths,

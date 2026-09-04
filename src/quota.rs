@@ -305,16 +305,26 @@ pub(crate) fn scrape_claude_stated_reset(
 /// Parses "resets 12am (America/New_York)" / "resets 3:30pm (UTC)" into the next
 /// occurrence of that local time, in UTC. `now` is threaded through for tests.
 ///
-/// The `(tz)` search is bounded to the line containing "resets " so an unrelated
-/// parenthesis elsewhere in a multi-KB tail log can't be picked up as the timezone.
+/// Scans every line containing "resets " (not just the first occurrence in the whole
+/// tail log) and returns the first one that parses as a complete `<time> (<tz>)`
+/// clause. An earlier, unrelated "resets " elsewhere in an 8000-byte tail must not
+/// make a real reset line downstream go unparsed and silently degrade to the generic
+/// cooldown.
 fn parse_stated_reset(text: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    let lower = text.to_ascii_lowercase();
+    for line in text.lines() {
+        if line.to_ascii_lowercase().contains("resets ") {
+            if let Some(until) = parse_reset_clause_in_line(line, now) {
+                return Some(until);
+            }
+        }
+    }
+    None
+}
+
+fn parse_reset_clause_in_line(line: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let lower = line.to_ascii_lowercase();
     let resets_at = lower.find("resets ")? + "resets ".len();
-    let line_end = text[resets_at..]
-        .find('\n')
-        .map(|i| resets_at + i)
-        .unwrap_or(text.len());
-    let after_resets = &text[resets_at..line_end];
+    let after_resets = &line[resets_at..];
     let paren_start = after_resets.find('(')?;
     let paren_end = after_resets[paren_start..].find(')')? + paren_start;
     let time_part = after_resets[..paren_start].trim();
@@ -612,6 +622,22 @@ mod tests {
         // `cli:claude`, a provider that has nothing to do with the failure.
         assert!(scrape_claude_rate_limits("cli:codex", WEEKLY_LIMIT_LOG).is_none());
         assert!(scrape_claude_rate_limits("cli:grok", WEEKLY_LIMIT_LOG).is_none());
+    }
+
+    #[test]
+    fn parse_stated_reset_skips_an_earlier_unrelated_resets_line() {
+        // A noisy real log can mention "resets " once before the actual limit line
+        // (e.g. an unrelated cache/session message). The anchor must not lock onto
+        // that first occurrence and give up — it has to keep scanning to the real one.
+        let log = "cache resets every 10 minutes during warmup\n\
+            ! rate limit  seven_day  rejected\n\
+            You've hit your weekly limit \u{b7} resets 12am (America/New_York)\n";
+        let now = DateTime::parse_from_rfc3339("2026-09-04T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let until = parse_stated_reset(log, now).expect("must find the real reset line");
+        assert!(until > now);
+        assert!(until - now < chrono::Duration::hours(9));
     }
 
     #[test]

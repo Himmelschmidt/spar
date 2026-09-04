@@ -193,14 +193,15 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
     // (executor.rs) writes a synthetic `request_changes` verdict for every interrupted
     // reviewer, so `changes == 0` never holds once any reviewer fails and the tally
     // alone can't tell a real review panel from one where every slot died on a rate
-    // limit. Only routes to `Phase::Quota` when *every* slot failed and every one of
-    // those failures was independently quota-detected (not just one of several) — a
-    // mixed panel (one genuine defect, one rate limit) still surfaces as `Failed`
-    // rather than hiding the real failure behind the quota gate.
+    // limit — a `changes == 0` guard on the `Failed` branch below would be dead code
+    // for every all-failed panel, quota or not. Branch on `all_failed` directly instead:
+    // every slot quota-hit parks at `Phase::Quota`; every slot failed for any other (or
+    // mixed) reason still fails the run at `Phase::Failed` rather than falling through
+    // to `Done` on the strength of two fabricated `request_changes` votes.
     if all_failed && failed.iter().all(|s| s.quota_hit) {
         state.set_phase(Phase::Quota);
         state.error = Some("all review slots failed: rate limit".into());
-    } else if !failed.is_empty() && approve == 0 && changes == 0 {
+    } else if all_failed {
         state.set_phase(Phase::Failed);
         state.error = Some("all review slots failed".into());
     } else {

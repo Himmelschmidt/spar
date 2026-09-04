@@ -146,7 +146,15 @@ fn run_from_approved(
         // A slot that died mid-dispatch from a rate limit parks here (executor::run_slot
         // via `fail`'s quota_hit branch); re-entering must pick the run back up rather
         // than forcing `--new` and abandoning the frozen contract and round history.
-        || state.phase == Phase::Quota;
+        // But `Phase::Quota` is also where `workflow/plan.rs` parks a *plan* run that
+        // never got approved (its own pre-dispatch gate, or a paused planner/test-author
+        // mid-plan) — accepting that unconditionally would walk straight past the
+        // `plan_approved` gate below and let `implement --run` drive an unapproved plan
+        // through to ship on a salvaged placeholder plan.md. A `Loop` run has no
+        // approval step at all (`--workflow loop` is `implement -t` directly), so its
+        // own quota park is legitimately resumable without the gate.
+        || (state.phase == Phase::Quota
+            && (state.gates.plan_approved || state.workflow == crate::cli::WorkflowKind::Loop));
     if !resumable {
         bail!(
             "run {run_id} plan is not approved (phase={:?})",

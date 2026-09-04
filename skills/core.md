@@ -373,7 +373,12 @@ A **failed/stuck/quota** run is resumable the same way (its approved plan still 
 resume resets the failed slots to pending and re-dispatches, so `status` reflects the
 new attempt rather than the dead one's `failed` verdict. A slot that dies mid-dispatch
 from a rate limit parks the run at `quota` (exit `4`), not `failed` (exit `1`) — for the
-planner, test-author, implementer, tester, reviewer, and the arena reconciler. The
+planner, test-author, implementer, tester, reviewer, and the arena reconciler. `quota`
+is not always an `implement --run` case, though: a plan run that hits it *before* being
+approved (its own pre-dispatch gate, or a paused planner/test-author) resumes with
+`spar plan --run <id>` instead — `implement --run` still refuses it with "plan is not
+approved", the same as it would `failed`, so an unapproved plan can't walk past its
+human gate through the quota park. The
 discriminator requires a genuine rejection, not a bare word or bare usage telemetry: a
 log with a stray `429` in a stack trace, a mention of "capacity", code that edits spar's
 own quota module, or a `rate_limits.five_hour` usage-percentage reading with no failure
@@ -390,12 +395,14 @@ line carries no date. The other adapters (codex, opencode, muse, grok) have no
 provider-specific reset parser, so a mid-dispatch limit on them falls back to the
 generic-rejection-phrase match (untested against any real captured output from those
 CLIs — treat as unverified, not confirmed) and the generic cooldown; agy has its own,
-separate telemetry-based cooldown unrelated to this mechanism. `--workflow review`
-routes a rate limit hit by every reviewer in a live parallel panel to `quota` the same
-way (a mixed panel — some reviewers genuinely failed, one rate-limited — still surfaces
-as `failed` rather than hiding the real failure behind the quota gate); `--workflow peer`
-does not yet map failure to a terminal phase at all (it always finishes `done`), which is
-a pre-existing gap this fix did not touch.
+separate telemetry-based cooldown unrelated to this mechanism. `--workflow review`,
+`--workflow peer`, and `--workflow roles` each route a rate limit hit by *every* slot in
+their panel to `quota` the same way. `review` also maps an all-slots failure that is
+*not* a quota hit (a mixed panel, or every reviewer failing for an ordinary reason) to
+`failed` rather than `done` — a fabricated per-slot `request_changes` salvage used to
+make that read as a passing review. `peer` and `roles` only close the quota-specific
+case: any other all-slots failure still finishes `done`, a larger, pre-existing gap in
+those two workflows' failure handling generally, left untouched.
 Use `stop` (not killing pids directly) so the orchestrator can't re-dispatch a slot
 you just killed.
 
