@@ -49,8 +49,10 @@
 - [ ] **Durable run ownership** (setsid detach, per-project daemon, lifecycle notifications, brief on disk, concurrency cap) - see `features/003-durable-run-ownership.md`  
 - [ ] **TUI information architecture** (noun set, Home landing view, new-run flow, off-thread snapshot scans) - see `features/004-tui-information-architecture.md`  
 - [~] **One run per unit of work** (rounds, attach-by-default, `spar link`, folded listings, bulk archive) - see `features/007-one-run-per-unit-of-work.md`  
-- [ ] **Gate evidence** (Plan tab, Review tab with AC-n status, diff and review verdicts) - see `features/005-gate-evidence.md`  
+- [~] **Gate evidence** (Plan tab, Review tab with AC-n status, diff and review verdicts) - see `features/005-gate-evidence.md` — stopped at run `abd35a54` round 11 (13/17, 14/17). The criteria still open are Main-content rendering, which feature 010 rebuilds; remainder folded there rather than patched onto the string log viewer  
 - [ ] **Orchestrator conversation** (resident conversation surface, native-cli turn loop, intake to brief + fleet + launch, gate consultation) - see `features/008-orchestrator-conversation.md`  
+- [ ] **Run composition** (workflow choice, role-by-role fleet with models and backups, operator defaults, the conversation completes the form) - see `features/009-run-composition.md`  
+- [ ] **Structured views** (records not lines: columns, timestamps, folding, navigation by structure) - see `features/010-structured-views.md`  
 - [~] **Motion and visual identity** — chrome rebuild, token system and the snapshot/stability harness landed early (phases C+D, out of order, decision U14); time-based motion and reserved-space layout (phases A+B) still queued behind 005 - see `features/006-motion-and-identity.md`  
 
 ## Later
