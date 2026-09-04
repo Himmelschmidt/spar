@@ -10782,34 +10782,34 @@ mod render_stability {
 
     /// AC-6. The `start something new` action row is always present and is the
     /// first row of the last band, so `n` has a visible home no matter what
-    /// the other three bands hold.
+    /// the other three bands hold. Round-7 review finding: this used to assert
+    /// over hand-built `HomeRow` fixtures rather than the real builder, so a
+    /// regression in `build_home_rows` itself could not fail it — now it calls
+    /// `build_home_rows` directly, once over an empty registry and once over a
+    /// populated one covering all three other bands.
     #[test]
     fn home_start_something_new_is_always_present() {
-        for home in [
-            home_data(&[]),
-            HomeData {
-                rows: vec![
-                    HomeRow::Header(HomeBand::NeedsMe),
-                    HomeRow::Header(HomeBand::Running),
-                    HomeRow::Header(HomeBand::Finished),
-                    HomeRow::Header(HomeBand::StartNew),
-                    HomeRow::NewRun,
-                ],
-                project_stats: Vec::new(),
-            },
-        ] {
-            let i = home
-                .rows
+        let projects = [home_project("spar")];
+        let empty: Vec<Vec<state::RunSummary>> = vec![Vec::new()];
+        let populated = vec![vec![
+            home_run("gate0001", Phase::AwaitingShipConfirm, 90, "spar"),
+            home_run("work0001", Phase::Review, 4, "spar"),
+            home_run("done0001", Phase::Done, 20, "spar"),
+        ]];
+        let watermark = Utc::now() - chrono::Duration::hours(1);
+        for folded in [empty, populated] {
+            let rows = build_home_rows(&projects, &folded, &HomeScope::All, watermark, Utc::now());
+            let i = rows
                 .iter()
                 .position(|r| matches!(r, HomeRow::Header(HomeBand::StartNew)))
                 .expect("band 4 header");
             assert!(
-                matches!(home.rows.get(i + 1), Some(HomeRow::NewRun)),
+                matches!(rows.get(i + 1), Some(HomeRow::NewRun)),
                 "the new-run action row must follow band 4's header: {:?}",
-                &home.rows[i..]
+                &rows[i..]
             );
             assert!(
-                home.rows[i + 1..]
+                rows[i + 1..]
                     .iter()
                     .all(|r| matches!(r, HomeRow::NewRun | HomeRow::Project(_))),
                 "band 4 holds only the action row and the project list"
@@ -11220,6 +11220,66 @@ mod folding {
             "an orphan leg stands on its own in its project"
         );
         assert_eq!(runs_needing_attention(&r2), 1);
+    }
+
+    /// AC-34, round-7 review finding: the collision-avoidance half of
+    /// `home_folds_per_project_and_keeps_every_gate` called `fold_units` by hand
+    /// per project rather than exercising `gather_home`'s own per-project loop, so
+    /// a regression there (e.g. accidentally folding across the whole registry)
+    /// could not fail it. This drives `gather_home` itself over two real project
+    /// directories that each happen to have a run named `a`.
+    #[test]
+    fn gather_home_folds_per_project_and_avoids_id_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let one = tmp.path().join("one");
+        let two = tmp.path().join("two");
+        std::fs::create_dir_all(one.join(".spar/runs")).unwrap();
+        std::fs::create_dir_all(two.join(".spar/runs")).unwrap();
+
+        let save = |root: &Path, id: &str, phase: Phase, parent: Option<&str>| {
+            let paths = SparPaths::new(root);
+            paths.ensure_run_dirs(id).unwrap();
+            let mut st = RunState::new(id, WorkflowKind::Loop, root.to_path_buf());
+            st.phase = phase;
+            st.parent_run = parent.map(str::to_string);
+            st.save(&paths).unwrap();
+        };
+        // Project "one" has a real, unrelated run "a". Project "two" has no run
+        // named "a" of its own, only a leg "b" whose `parent_run` happens to name
+        // the same id. If folding ever crossed project boundaries, "b" would
+        // wrongly merge into project "one"'s "a" instead of standing alone.
+        save(&one, "a", Phase::Review, None);
+        save(&two, "b", Phase::AwaitingPlanApproval, Some("a"));
+
+        let projects = [
+            registry::ProjectEntry {
+                root: one.clone(),
+                name: Some("one".into()),
+                last_seen: Utc::now(),
+                last_run_id: None,
+            },
+            registry::ProjectEntry {
+                root: two.clone(),
+                name: Some("two".into()),
+                last_seen: Utc::now(),
+                last_run_id: None,
+            },
+        ];
+        let folded = gather_home(&projects);
+        assert_eq!(folded[0].len(), 1);
+        assert_eq!(folded[0][0].id, "a", "project one's own run, untouched");
+        assert_eq!(
+            folded[1].len(),
+            1,
+            "project two's orphan leg must not merge into project one's \"a\": {:?}",
+            folded[1]
+        );
+        assert_eq!(folded[1][0].id, "b");
+        assert_eq!(
+            runs_needing_attention(&folded[1]),
+            1,
+            "the orphan leg's own gate must still count"
+        );
     }
 
     #[test]
