@@ -1352,6 +1352,48 @@ pub fn run_slot(
     Ok(())
 }
 
+/// The longest real Claude window is `seven_day`; a stated instant further out than
+/// this cannot be that window reopening (it is either a unit mismatch, e.g. epoch
+/// milliseconds read as seconds, or otherwise malformed) and must not be trusted.
+/// Provider-generic today because only the Claude adapter emits a typed reset instant
+/// at all; an adapter with a longer real window would need this raised, not gated.
+const MAX_PLAUSIBLE_RESET_HORIZON_DAYS: i64 = 8;
+
+/// A reset instant seconds away is practically "now", not a real reopening: treating
+/// it as usable would write a `Cooldown` that reads as available on the very next
+/// poll. See `plausible_reset_instant`'s doc for the failure this floor prevents.
+const MIN_PLAUSIBLE_RESET_HORIZON_SECS: i64 = 30;
+
+/// A stated reset instant is only usable if it actually lies ahead of us. A non-future
+/// instant (clock skew, or a rejection whose reset elapsed before spar got to it) would
+/// write an already-expired `Cooldown`, which `QuotaStore::is_usable` reads as
+/// immediately available — worse than no cooldown at all, since it also overwrites the
+/// generic auto-recovering pause. An instant further out than any real window can be
+/// (unit mismatch, e.g. milliseconds read as seconds) would do the opposite: brick the
+/// provider for decades with no auto-recovery. Deliberately refusing rather than trying
+/// to detect and convert milliseconds: the CLI's own schema states epoch seconds, so a
+/// value outside plausible bounds means the payload isn't in the shape assumed, and
+/// guessing at a fix-up would hide that instead of falling back safely.
+///
+/// The lower bound has a floor rather than a bare `until > now`: an instant a few
+/// hundred milliseconds out would still write a `Cooldown` that `is_usable` reads as
+/// available on the very next poll, the same "expired cooldown is worse than none"
+/// failure this function exists to prevent, just displaced by epsilon.
+fn plausible_reset_instant(until: chrono::DateTime<chrono::Utc>) -> bool {
+    let now = chrono::Utc::now();
+    until > now + chrono::Duration::seconds(MIN_PLAUSIBLE_RESET_HORIZON_SECS)
+        && until < now + chrono::Duration::days(MAX_PLAUSIBLE_RESET_HORIZON_DAYS)
+}
+
+/// `StreamStats::quota_resets_at` is epoch **seconds**, per the adapter's own schema.
+/// `chrono::DateTime::from_timestamp_secs` does not reject an out-of-range value on its
+/// own — a millisecond timestamp misread as seconds still parses, just to a date
+/// decades out — so this conversion alone must never be trusted as "plausible"; that
+/// judgment is `plausible_reset_instant`'s, applied by every caller of this function.
+fn resets_at_from_epoch_secs(secs: Option<i64>) -> Option<chrono::DateTime<chrono::Utc>> {
+    secs.and_then(chrono::DateTime::from_timestamp_secs)
+}
+
 /// Best-effort quota detection on a failed dispatch's log: pauses the provider in the
 /// quota store (cheap, auto-recovering, driven by `scrape_log_hint`'s broad needles)
 /// and reports whether this failure looks like a rate limit rather than a genuine
@@ -1371,35 +1413,7 @@ pub fn run_slot(
 /// was a quota hit. The real incident line ("! rate limit  seven_day  rejected") is
 /// itself line-scoped rejection text and matches `scrape_strong_quota_signal` on its
 /// own, so this exclusion does not weaken detection of the case this was built for.
-/// The longest real Claude window is `seven_day`; a stated instant further out than
-/// this cannot be that window reopening (it is either a unit mismatch, e.g. epoch
-/// milliseconds read as seconds, or otherwise malformed) and must not be trusted.
-const MAX_PLAUSIBLE_RESET_HORIZON_DAYS: i64 = 8;
-
-/// A stated reset instant is only usable if it actually lies ahead of us. A non-future
-/// instant (clock skew, or a rejection whose reset elapsed before spar got to it) would
-/// write an already-expired `Cooldown`, which `QuotaStore::is_usable` reads as
-/// immediately available — worse than no cooldown at all, since it also overwrites the
-/// generic auto-recovering pause. An instant further out than any real window can be
-/// (unit mismatch, e.g. milliseconds read as seconds) would do the opposite: brick the
-/// provider for decades with no auto-recovery. Deliberately refusing rather than trying
-/// to detect and convert milliseconds: the CLI's own schema states epoch seconds, so a
-/// value outside plausible bounds means the payload isn't in the shape assumed, and
-/// guessing at a fix-up would hide that instead of falling back safely.
-fn plausible_reset_instant(until: chrono::DateTime<chrono::Utc>) -> bool {
-    let now = chrono::Utc::now();
-    until > now && until < now + chrono::Duration::days(MAX_PLAUSIBLE_RESET_HORIZON_DAYS)
-}
-
-/// `StreamStats::quota_resets_at` is epoch **seconds**, per the adapter's own schema.
-/// `chrono::DateTime::from_timestamp_secs` does not reject an out-of-range value on its
-/// own — a millisecond timestamp misread as seconds still parses, just to a date
-/// decades out — so this conversion alone must never be trusted as "plausible"; that
-/// judgment is `plausible_reset_instant`'s, applied by every caller of this function.
-fn resets_at_from_epoch_secs(secs: Option<i64>) -> Option<chrono::DateTime<chrono::Utc>> {
-    secs.and_then(chrono::DateTime::from_timestamp_secs)
-}
-
+///
 /// `structured` is the adapter's own typed verdict on this request, when it has one:
 /// `StreamStats::quota_rejected`, carrying the `rateLimitType` from a `rate_limit_event`
 /// whose status was `rejected`. When present it decides routing on its own and the text
@@ -1446,10 +1460,11 @@ fn detect_and_pause_quota(
                 let _ = store.save(paths);
             }
             None => {
-                if resets_at.is_some() {
+                if let Some(until) = resets_at {
                     eprintln!(
-                        "spar: {key} stated a reset instant outside the plausible window; \
-                         falling back to the generic pause"
+                        "warning: {key} stated an implausible reset instant ({}); \
+                         falling back to the generic pause",
+                        until.to_rfc3339()
                     );
                 }
                 // The scrapes above only pause if `log_text` happens to carry rate-limit

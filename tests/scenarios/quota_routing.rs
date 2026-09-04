@@ -160,6 +160,132 @@ fn implementer_rate_limited_mid_dispatch_parks_on_quota_and_exits_4() {
         .stdout(predicate::str::contains("plan is not approved").not());
 }
 
+/// The seam `WEEKLY_LIMIT_LOG` above never crosses: that fixture is plain prose, so it
+/// only ever drives `scrape_strong_quota_signal`, never the typed `rate_limit_event`
+/// path (`StreamCoalescer` -> `StreamStats` -> `SlotOutcome` -> `quota_hit_for_outcome`).
+/// A real Claude CLI emits that event as one NDJSON line on stdout; this fakes exactly
+/// that line, with a `resetsAt` 2 hours out, and checks both that the run parks on
+/// quota *and* that the store's `cooldown_until` is that exact stated instant, not a
+/// generic auto-recovering pause — the flagship behaviour a mutation neutering
+/// `run_headless`'s `res.stats -> SlotOutcome` extraction (the sequential `implement`
+/// dispatch path this test drives) could silently drop with every other test in this
+/// file still green. `execute_prepared` has its own, identically-shaped extraction for
+/// the parallel path (`run_slots_parallel`); see
+/// `structured_rate_limit_event_on_a_parallel_dispatch_pauses_until_the_stated_instant`
+/// below for that seam.
+#[test]
+fn structured_rate_limit_event_pauses_until_the_stated_instant() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    let proj = dir.join("proj");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&proj).unwrap();
+    init_repo(&proj);
+    let until = chrono::Utc::now() + chrono::Duration::hours(2);
+    let body = format!(
+        r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"rejected","rateLimitType":"five_hour","resetsAt":{}}}}}"#,
+        until.timestamp()
+    );
+    let path_env = fake_claude_binary(&bin, &body);
+
+    spar_cmd()
+        .current_dir(&proj)
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--providers",
+            "cli:claude",
+        ])
+        .env("PATH", &path_env)
+        .assert()
+        .code(4);
+
+    let run_id = only_run_id(&proj);
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(proj.join(".spar/runs").join(&run_id).join("state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["phase"], "quota");
+
+    let quota: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(proj.join(".spar/quota.json")).unwrap())
+            .unwrap();
+    let provider = &quota["providers"]["cli:claude"];
+    assert_eq!(provider["status"], "cooldown");
+    let cooldown_until: chrono::DateTime<chrono::Utc> = provider["cooldown_until"]
+        .as_str()
+        .expect("cooldown_until present")
+        .parse()
+        .unwrap();
+    assert_eq!(
+        cooldown_until.timestamp(),
+        until.timestamp(),
+        "cooldown_until must be the adapter's own stated instant, not a generic pause"
+    );
+}
+
+/// Same seam as `structured_rate_limit_event_pauses_until_the_stated_instant`, but
+/// through `run_slots_parallel` -> `execute_prepared`, not `run_slot` -> `run_headless`:
+/// two providers dispatch concurrently whenever more than one job is passed, and
+/// `execute_prepared` has its own copy of the `res.stats -> SlotOutcome` extraction
+/// (`quota_rejected`/`quota_resets_at` locals) that `run_headless`'s copy cannot cover.
+/// Mutating either copy alone to drop the typed reset must fail exactly one of these
+/// two tests.
+#[test]
+fn structured_rate_limit_event_on_a_parallel_dispatch_pauses_until_the_stated_instant() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    let proj = dir.join("proj");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&proj).unwrap();
+    init_repo(&proj);
+    let until = chrono::Utc::now() + chrono::Duration::hours(2);
+    let body = format!(
+        r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"rejected","rateLimitType":"five_hour","resetsAt":{}}}}}"#,
+        until.timestamp()
+    );
+    let path_env = fake_claude_binary(&bin, &body);
+
+    spar_cmd()
+        .current_dir(&proj)
+        .args([
+            "run",
+            "--workflow",
+            "peer",
+            "-t",
+            "split stack",
+            "--providers",
+            "cli:claude,cli:claude",
+        ])
+        .env("PATH", &path_env)
+        .assert()
+        .code(4);
+
+    let run_id = only_run_id(&proj);
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(proj.join(".spar/runs").join(&run_id).join("state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["phase"], "quota");
+
+    let quota: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(proj.join(".spar/quota.json")).unwrap())
+            .unwrap();
+    let provider = &quota["providers"]["cli:claude"];
+    assert_eq!(provider["status"], "cooldown");
+    let cooldown_until: chrono::DateTime<chrono::Utc> = provider["cooldown_until"]
+        .as_str()
+        .expect("cooldown_until present")
+        .parse()
+        .unwrap();
+    assert_eq!(
+        cooldown_until.timestamp(),
+        until.timestamp(),
+        "cooldown_until must be the adapter's own stated instant, not a generic pause"
+    );
+}
+
 /// `--workflow review` dispatches its N reviewers concurrently through
 /// `run_slots_parallel`, a different code path from `implement`'s `run_slot` ->
 /// `bail!`. Both reviewers hitting the same rate limit must still park the run at
