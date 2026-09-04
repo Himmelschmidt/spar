@@ -559,6 +559,12 @@ struct App {
     /// Per-run attention level from the previous snapshot, for toast edge-detection.
     /// `None` until the first snapshot primes it (so we never toast the initial fleet).
     prev_attention: Option<Vec<(String, Attention)>>,
+    /// Which population `prev_attention` was built from — Home's cross-project rows or
+    /// a project's `snap.runs`. Home and a project alternate as the operator navigates;
+    /// a run absent from the *other* population's baseline is not a transition, just a
+    /// population swap, so a swap re-primes silently instead of toasting every run the
+    /// new population happens to already have at Gate/Broken (round-9 review).
+    prev_attention_home: Option<bool>,
     /// Hit rect of the fleet roll-up token on the status line; a tap jumps to the next
     /// run that needs you (same as `a`). Zero-sized when nothing needs attention.
     rect_attention: Rect,
@@ -735,6 +741,7 @@ impl App {
             takeover_target: None,
             bg_tx: None,
             prev_attention: None,
+            prev_attention_home: None,
             rect_attention: Rect::default(),
             selected_home: 0,
             home_scope,
@@ -824,6 +831,13 @@ impl App {
         self.reset_stream_view();
         self.reset_bus_view();
         self.focus = Focus::Rail;
+        // Explicit navigation away from a run-scoped level abandons any pending Home
+        // `Enter` target (round-9 review): left set, it would either resolve against
+        // whatever project is entered next (wrong run) or silently tick toward the
+        // "run is gone" flash 25 snapshots later, out of a project the operator chose
+        // on purpose.
+        self.home_target_run = None;
+        self.home_target_ticks = 0;
     }
 
     /// Back to the landing view. `Projects`/`Runs`/`Agents` all pop here eventually.
@@ -833,6 +847,8 @@ impl App {
         self.reset_stream_view();
         self.reset_bus_view();
         self.focus = Focus::Rail;
+        self.home_target_run = None;
+        self.home_target_ticks = 0;
     }
 
     /// `Esc` in the rail: pop one level. At `Home` this is a no-op — the rail root
@@ -1250,10 +1266,7 @@ fn fold_units(
         let ids: Vec<String> = group.iter().map(|r| r.id.clone()).collect();
         // Every leg that wants the operator still counts. Two gates folded into one
         // row must read as two in the roll-up, or folding hides one of them.
-        let wants = group
-            .iter()
-            .filter(|r| run_attention(r).needs_you())
-            .count() as u32;
+        let wants = group.iter().filter(|r| wants_operator(r)).count() as u32;
         let brief = group
             .iter()
             .find(|r| r.id == root)
@@ -1495,12 +1508,10 @@ fn build_home_rows(
             }
         }
         for r in runs {
-            // `run_attention` already folds `r.abandoned` into `Broken` (needs_you).
-            // `PlanApproved` is `is_terminal()` but not a gate and not broken, so
-            // `run_attention` alone would drop the plan->implement handoff off Home
-            // entirely; it is declared into NeedsMe here rather than left to fall
-            // through (AC-18 review finding).
-            if run_attention(r).needs_you() || r.phase == Phase::PlanApproved {
+            // `wants_operator` folds `run_attention`'s Gate/Broken together with the
+            // PlanApproved handoff, so this band agrees with `runs_needing_attention`
+            // and the rail flag rather than drifting from them (AC-18; round-9 review).
+            if wants_operator(r) {
                 needs_me.push(r.clone());
             } else if is_active_phase(r.phase) {
                 running.push(r.clone());
@@ -1879,7 +1890,9 @@ fn provider_ref_available(raw: &str, detected: &[(String, bool)]) -> bool {
 
 /// Expand `picked` roster indices into provider refs, in pick order, deduplicated
 /// keeping the first occurrence — a `Fleet` choice can repeat a provider a `Provider`
-/// choice already picked.
+/// choice already picked. Dedup keys on `storage_key()` (X8: model-free), not the raw
+/// string, or `cli:claude` (detected) and `cli:claude@opus` (configured) pick as two
+/// dispatches of the same CLI (round-9 review).
 fn new_run_providers(nr: &NewRun) -> Vec<String> {
     let mut out = Vec::new();
     for &idx in &nr.picked {
@@ -1892,7 +1905,12 @@ fn new_run_providers(nr: &NewRun) -> Vec<String> {
         }
     }
     let mut seen = std::collections::HashSet::new();
-    out.retain(|p| seen.insert(p.clone()));
+    out.retain(|p| {
+        let key = crate::provider_ref::ProviderRef::parse(p)
+            .map(|r| r.storage_key())
+            .unwrap_or_else(|_| p.clone());
+        seen.insert(key)
+    });
     out
 }
 
@@ -2224,9 +2242,9 @@ fn run_loop(
                     _ => None,
                 })
                 .collect();
-            emit_attention_toasts(&mut app, &home_runs);
+            emit_attention_toasts(&mut app, &home_runs, true);
         } else {
-            emit_attention_toasts(&mut app, &snap.runs);
+            emit_attention_toasts(&mut app, &snap.runs, false);
         }
         let n_slots = snap.full.as_ref().map(|s| s.slots.len()).unwrap_or(0);
         app.selected_slot = if n_slots == 0 {
@@ -2428,7 +2446,9 @@ fn handle_key(
     // (complete), and Esc (close). It can only open when not in the Shell tab, so it
     // never contends with the agent pane.
     if app.palette.is_some() {
-        return handle_palette_key(app, code, mods, swarm, projects, local_root, runs, full);
+        return handle_palette_key(
+            app, code, mods, swarm, projects, home_rows, local_root, runs, full,
+        );
     }
 
     // The `/` rail filter captures keys while it is being edited.
@@ -2605,12 +2625,17 @@ fn handle_key(
 /// (D2): a scoped Home defaults to its project, an all-project Home defaults to the
 /// selected row's project (falling back to the local repo), and the picker offers
 /// every registered project to cycle through.
-fn open_new_run(
-    app: &mut App,
+/// The new-run surface's target project and its cycle list, from the same rule
+/// regardless of who is opening the surface: `n` on Home, and the `:plan <task>`
+/// palette fallback when nothing is selected to reuse a fleet from. Both must agree,
+/// or `:plan` in cross-project Home can silently target a different project than the
+/// one the operator is looking at (round-9 review finding).
+fn new_run_target(
+    app: &App,
     projects: &[registry::ProjectEntry],
     home_rows: &[HomeRow],
     local_root: Option<&Path>,
-) {
+) -> (Option<PathBuf>, Vec<PathBuf>) {
     let target = match &app.home_scope {
         HomeScope::Project(root) => Some(root.clone()),
         HomeScope::All => home_rows
@@ -2641,6 +2666,16 @@ fn open_new_run(
         }
     }
     let project = target.or_else(|| all_projects.first().cloned());
+    (project, all_projects)
+}
+
+fn open_new_run(
+    app: &mut App,
+    projects: &[registry::ProjectEntry],
+    home_rows: &[HomeRow],
+    local_root: Option<&Path>,
+) {
+    let (project, all_projects) = new_run_target(app, projects, home_rows, local_root);
     begin_new_run(app, project, all_projects, String::new(), NewRunField::Task);
 }
 
@@ -2891,6 +2926,7 @@ fn handle_palette_key(
     mods: KeyModifiers,
     swarm: &SparPaths,
     projects: &[registry::ProjectEntry],
+    home_rows: &[HomeRow],
     local_root: Option<&Path>,
     runs: &[state::RunSummary],
     full: Option<&RunState>,
@@ -2909,7 +2945,9 @@ fn handle_palette_key(
                 app.palette = None;
                 return Ok(false);
             }
-            match run_palette(app, swarm, projects, local_root, runs, full, &input) {
+            match run_palette(
+                app, swarm, projects, home_rows, local_root, runs, full, &input,
+            ) {
                 Ok(PaletteResult::Quit) => return Ok(true),
                 Ok(PaletteResult::Help) => {
                     app.palette = None;
@@ -3013,6 +3051,7 @@ fn run_palette(
     app: &mut App,
     swarm: &SparPaths,
     projects: &[registry::ProjectEntry],
+    home_rows: &[HomeRow],
     local_root: Option<&Path>,
     runs: &[state::RunSummary],
     full: Option<&RunState>,
@@ -3093,18 +3132,11 @@ fn run_palette(
                 // hand-rolled roster build, so this path also gets the recent-fleet
                 // row `open_new_run` offers.
                 //
-                // `swarm.project_root` is `active_root`, which falls back to an
-                // arbitrary cwd when there is no local repo and the registry is
-                // empty (`run_loop`'s init). Only offer it as the target when it is
-                // actually a known project — the local repo or a registered one —
-                // so the no-target refusal in `new_run_launch` cannot be bypassed by
-                // an unregistered directory.
-                let all_projects: Vec<PathBuf> = projects.iter().map(|p| p.root.clone()).collect();
-                let is_known_project = local_root == Some(swarm.project_root.as_path())
-                    || all_projects.iter().any(|r| r == &swarm.project_root);
-                let target = is_known_project
-                    .then(|| swarm.project_root.clone())
-                    .or_else(|| all_projects.first().cloned());
+                // Target selection goes through `new_run_target`, the same rule `n`
+                // uses: the highlighted Home run/project in cross-project Home, not
+                // `swarm.project_root` (`active_root`, stale while browsing Home and
+                // can point at whichever project was entered first — round-9 review).
+                let (target, all_projects) = new_run_target(app, projects, home_rows, local_root);
                 begin_new_run(
                     app,
                     target,
@@ -3803,9 +3835,12 @@ fn handle_mouse(
             if contains(app.rect_rail, x, y) {
                 app.focus = Focus::Rail;
                 if let Some(row) = list_row_at(app.rect_rail, y, n_rail, rail_offset) {
-                    rail_select(app, row, projects.len(), home_rows, runs.len(), n_slots);
+                    let landed =
+                        rail_select(app, row, projects.len(), home_rows, runs.len(), n_slots);
                     // Double-click = Enter: drill one level (and take over on a slot).
-                    if dbl {
+                    // Only when the click actually landed on content — a double-tap on
+                    // a Home header/`More` row must not act on the stale selection.
+                    if dbl && landed {
                         rail_enter(
                             app,
                             projects,
@@ -3867,6 +3902,10 @@ fn rail_len(
 /// header is not content — and a landed selection glues `home_key` to the row's
 /// identity, the same as every other Home cursor mover (`rail_move`,
 /// `jump_to_attention`), or the very next snapshot yanks the cursor back (AC-28).
+///
+/// Returns whether the click actually landed on a selectable row. A double-click on a
+/// header or a `More` row must not fall through to `rail_enter` against whatever the
+/// cursor happened to be on before — the caller gates on this (round-9 review).
 fn rail_select(
     app: &mut App,
     row: usize,
@@ -3874,23 +3913,35 @@ fn rail_select(
     home_rows: &[HomeRow],
     n_runs: usize,
     n_slots: usize,
-) {
+) -> bool {
     match app.browse {
         BrowseLevel::Home => {
             if matches!(
                 home_rows.get(row),
                 Some(HomeRow::Header(_)) | Some(HomeRow::More { .. })
             ) {
-                return;
+                return false;
             }
             if row < home_rows.len() {
                 app.selected_home = row;
                 app.home_key = home_rows.get(row).map(home_row_key);
+                true
+            } else {
+                false
             }
         }
-        BrowseLevel::Projects => app.select_project(row, n_projects),
-        BrowseLevel::Runs => app.select_run(row, n_runs),
-        BrowseLevel::Agents => app.select_slot(row, n_slots),
+        BrowseLevel::Projects => {
+            app.select_project(row, n_projects);
+            true
+        }
+        BrowseLevel::Runs => {
+            app.select_run(row, n_runs);
+            true
+        }
+        BrowseLevel::Agents => {
+            app.select_slot(row, n_slots);
+            true
+        }
     }
 }
 
@@ -5515,15 +5566,7 @@ fn rail_home_items(
                     muted().bold(),
                 )),
                 HomeRow::Run { run, .. } => {
-                    let flag = if run.wants > 1 || run_attention(run).needs_you() {
-                        Some(if run_attention(run) == Attention::Gate {
-                            WARN
-                        } else {
-                            ALERT
-                        })
-                    } else {
-                        None
-                    };
+                    let flag = attention_flag(run, run.wants > 1);
                     let more = if run.wants > 1 {
                         format!(" ⚑{}", run.wants)
                     } else {
@@ -5625,11 +5668,7 @@ fn rail_run_items(
                     phase_color(r.phase)
                 },
             );
-            let flag = match run_attention(r) {
-                Attention::Gate => Some(WARN),
-                Attention::Broken => Some(ALERT),
-                _ => None,
-            };
+            let flag = attention_flag(r, false);
             let body = vec![
                 Span::styled(
                     format!("{:<8}", truncate(&r.id, 8)),
@@ -6992,7 +7031,9 @@ fn draw_new_run(f: &mut Frame, area: Rect, projects: &[registry::ProjectEntry], 
         let mark = match picked_n {
             Some(n) => format!("{}.", n + 1),
             None if e.available => "[ ]".to_string(),
-            None => "[x]".to_string(),
+            // Not `[x]`: next to numbered picks and an empty `[ ]`, an `x` reads as
+            // *checked*, the opposite of disabled (round-9 review).
+            None => "[-]".to_string(),
         };
         let cursor = if nr.field == NewRunField::Fleet && nr.sel == i {
             ">"
@@ -7321,7 +7362,7 @@ fn spawn_agent_command(
 
     // Give the agent its own worktree (never the primary checkout) so presence hooks
     // install and it can run FullAuto safely. Done on this thread so a git failure
-    // surfaces synchronously as a composer error rather than a silent background drop.
+    // surfaces synchronously as a palette error rather than a silent background drop.
     let paths = SparPaths::new(&project_root);
     let base = state::RunState::load(&paths, &run.id)
         .ok()
@@ -7792,6 +7833,33 @@ fn run_attention(r: &state::RunSummary) -> Attention {
     }
 }
 
+/// Whether a run currently wants the operator: a live `Attention::Gate`/`Broken`, or
+/// `PlanApproved` — terminal and colored `OK` like `Done` (round-9 review: changing
+/// `run_attention` itself would have re-litigated `phase_color`/`sort_runs_by_attention`
+/// for behaviour no review flagged), but still a handoff nothing else will complete.
+/// Every roll-up, rail flag, and cycle key that decides "does this run need the
+/// operator" goes through this one predicate, so they cannot disagree with each other
+/// the way Home's band and the fleet roll-up did.
+fn wants_operator(r: &state::RunSummary) -> bool {
+    run_attention(r).needs_you() || r.phase == Phase::PlanApproved
+}
+
+/// The rail lead flag color for a run row, shared by the Runs level and Home so a run
+/// that counts toward `runs_needing_attention` always shows the same flag it is
+/// counted for. `force` additionally flags a folded row with more than one leg wanting
+/// the operator, even if the active leg itself does not.
+fn attention_flag(r: &state::RunSummary, force: bool) -> Option<Color> {
+    if force || wants_operator(r) {
+        Some(if run_attention(r) == Attention::Gate {
+            WARN
+        } else {
+            ALERT
+        })
+    } else {
+        None
+    }
+}
+
 /// Order runs for the rail: loudest attention first, then most-recently updated. The
 /// sort is applied at the data layer (in the snapshot) so navigation, selection, and
 /// rendering all see one order.
@@ -7803,17 +7871,17 @@ fn sort_runs_by_attention(runs: &mut [state::RunSummary]) {
     });
 }
 
-/// How many runs currently want the operator (gate or broken) — the fleet roll-up.
-/// How many runs want the operator. A folded row (U15) stands for several runs, so it
-/// contributes each leg that wants you — otherwise a unit with two gates would read as
-/// one and folding would become a way to hide a gate.
+/// How many runs want the operator (gate, broken, or PlanApproved — see
+/// `wants_operator`). A folded row (U15) stands for several runs, so it contributes
+/// each leg that wants you — otherwise a unit with two gates would read as one and
+/// folding would become a way to hide a gate.
 fn runs_needing_attention(runs: &[state::RunSummary]) -> usize {
     runs.iter()
         .map(|r| {
             if r.legs > 1 {
                 r.wants as usize
             } else {
-                usize::from(run_attention(r).needs_you())
+                usize::from(wants_operator(r))
             }
         })
         .sum()
@@ -7821,33 +7889,40 @@ fn runs_needing_attention(runs: &[state::RunSummary]) -> usize {
 
 /// Flash a toast when a run first crosses into wanting the operator (Working/Idle →
 /// Gate/Broken) since the last snapshot. The first snapshot only primes the baseline
-/// so the existing fleet is never announced.
-fn emit_attention_toasts(app: &mut App, runs: &[state::RunSummary]) {
+/// so the existing fleet is never announced. `is_home` names which population `runs`
+/// is — Home's cross-project rows or a project's `snap.runs` — so a navigation that
+/// swaps the population re-primes instead of diffing against the other population's
+/// baseline (which would re-announce every unchanged gate/broken run the swap newly
+/// exposes).
+fn emit_attention_toasts(app: &mut App, runs: &[state::RunSummary], is_home: bool) {
     let now: Vec<(String, Attention)> = runs
         .iter()
         .map(|r| (r.id.clone(), run_attention(r)))
         .collect();
-    if let Some(prev) = app.prev_attention.take() {
-        for (id, att) in &now {
-            let was = prev
-                .iter()
-                .find(|(pid, _)| pid == id)
-                .map(|(_, a)| *a)
-                .unwrap_or(Attention::Idle);
-            if att.needs_you() && !was.needs_you() {
-                let (what, color) = match att {
-                    Attention::Gate => ("needs your decision", WARN),
-                    _ => ("needs attention", ALERT),
-                };
-                app.flash_for(
-                    format!("⚠ {} {what} — a to jump", truncate(id, 8)),
-                    color,
-                    Duration::from_secs(6),
-                );
+    if app.prev_attention_home == Some(is_home) {
+        if let Some(prev) = app.prev_attention.take() {
+            for (id, att) in &now {
+                let was = prev
+                    .iter()
+                    .find(|(pid, _)| pid == id)
+                    .map(|(_, a)| *a)
+                    .unwrap_or(Attention::Idle);
+                if att.needs_you() && !was.needs_you() {
+                    let (what, color) = match att {
+                        Attention::Gate => ("needs your decision", WARN),
+                        _ => ("needs attention", ALERT),
+                    };
+                    app.flash_for(
+                        format!("⚠ {} {what} — a to jump", truncate(id, 8)),
+                        color,
+                        Duration::from_secs(6),
+                    );
+                }
             }
         }
     }
     app.prev_attention = Some(now);
+    app.prev_attention_home = Some(is_home);
 }
 
 /// `a`: jump the rail selection to the next run that wants the operator, cycling from
@@ -7890,11 +7965,9 @@ fn jump_to_attention(app: &mut App, runs: &[state::RunSummary], home_rows: &[Hom
         return;
     }
     let n = runs.len();
-    let next = (1..=n).map(|off| (app.selected_run + off) % n).find(|&i| {
-        runs.get(i)
-            .map(|r| run_attention(r).needs_you())
-            .unwrap_or(false)
-    });
+    let next = (1..=n)
+        .map(|off| (app.selected_run + off) % n)
+        .find(|&i| runs.get(i).map(wants_operator).unwrap_or(false));
     match next {
         Some(i) => {
             app.selected_run = i;
@@ -8859,16 +8932,51 @@ mod labels {
         let mut app = test_app();
         // First snapshot only primes: an existing gate is NOT toasted.
         let runs = vec![summary_phase("r0", Phase::AwaitingPlanApproval)];
-        emit_attention_toasts(&mut app, &runs);
+        emit_attention_toasts(&mut app, &runs, false);
         assert!(app.flash.is_none(), "initial fleet is never toasted");
         // A run that was working and is now working: still silent.
         let runs = vec![summary_phase("r0", Phase::Review)];
-        emit_attention_toasts(&mut app, &runs);
+        emit_attention_toasts(&mut app, &runs, false);
         assert!(app.flash.is_none());
         // Now it crosses into a gate: toast fires.
         let runs = vec![summary_phase("r0", Phase::AwaitingPlanApproval)];
-        emit_attention_toasts(&mut app, &runs);
+        emit_attention_toasts(&mut app, &runs, false);
         assert!(app.flash.is_some(), "gate transition toasts");
+    }
+
+    /// A population swap (project runs <-> Home's cross-project rows) is not a
+    /// transition: a gated run that was simply absent from the other population's
+    /// baseline must not be re-announced on every Home <-> project navigation
+    /// (round-9 review).
+    #[test]
+    fn toasts_reprime_silently_across_a_population_swap() {
+        let mut app = test_app();
+        let project_runs = vec![summary_phase("r0", Phase::AwaitingPlanApproval)];
+        emit_attention_toasts(&mut app, &project_runs, false);
+        app.flash = None;
+        // Home's population includes the same already-gated run: swapping population
+        // must not re-fire the toast.
+        let home_runs = vec![summary_phase("r0", Phase::AwaitingPlanApproval)];
+        emit_attention_toasts(&mut app, &home_runs, true);
+        assert!(
+            app.flash.is_none(),
+            "population swap must not re-announce a gate"
+        );
+        // Swapping back to the project population is likewise silent.
+        emit_attention_toasts(&mut app, &project_runs, false);
+        assert!(
+            app.flash.is_none(),
+            "swapping back must not re-announce either"
+        );
+        // A real transition within one population still fires.
+        let now_idle = vec![summary_phase("r0", Phase::Review)];
+        emit_attention_toasts(&mut app, &now_idle, false);
+        app.flash = None;
+        emit_attention_toasts(&mut app, &project_runs, false);
+        assert!(
+            app.flash.is_some(),
+            "a real transition within one population still toasts"
+        );
     }
 }
 
@@ -11490,6 +11598,7 @@ mod home_ia {
             concat!("composer ", "mention"),
             concat!("or the composer ", "still changes focus"),
             concat!("the composer ", "cursor"),
+            concat!("as a composer ", "error"),
         ] {
             assert!(
                 !src.contains(needle),
@@ -11619,10 +11728,16 @@ mod home_ia {
         );
         assert!(folded[1].is_empty(), "a missing project root reads as zero");
 
-        // And the stats derived from that same pass agree with it.
+        // And the stats derived from that same pass agree with it. The root is
+        // PlanApproved (a handoff `wants_operator` counts, round-9 review) and the leg
+        // is a live gate — both legs want the operator, so the folded row's `wants`
+        // is 2, not 1.
         let stats = project_stats_of(&folded);
         assert_eq!(stats[0].n_runs, 2);
-        assert_eq!(stats[0].needs_you, 1, "one gate in the unit");
+        assert_eq!(
+            stats[0].needs_you, 2,
+            "the PlanApproved root and the gated leg both want the operator"
+        );
         assert_eq!(stats[1].n_runs, 0);
     }
 
@@ -11974,6 +12089,60 @@ mod home_ia {
             )
             .contains("⚑2"),
             "a multi-gate unit says so on screen"
+        );
+    }
+
+    /// Round-9 review: `build_home_rows` banded `PlanApproved` into NeedsMe, but
+    /// `runs_needing_attention`/`home_needs_you`/the rail flag did not agree, so a
+    /// single PlanApproved run showed a NEEDS YOU band with `0 need you` above it.
+    /// `wants_operator` is the one predicate every one of those goes through now, so
+    /// they cannot disagree with each other.
+    #[test]
+    fn plan_approved_agrees_across_every_needs_you_roll_up() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let now = Utc::now();
+        let run = run_in("plap0001", Phase::PlanApproved, 20, &root);
+
+        assert_eq!(
+            runs_needing_attention(std::slice::from_ref(&run)),
+            1,
+            "the fleet roll-up must count the PlanApproved handoff"
+        );
+
+        let folded = vec![vec![run]];
+        let stats = project_stats_of(&folded);
+        assert_eq!(
+            stats[0].needs_you, 1,
+            "the Projects-level flag must agree with the fleet roll-up"
+        );
+
+        let rows = build_home_rows(
+            &projects,
+            &folded,
+            &HomeScope::All,
+            now - chrono::Duration::hours(6),
+            now,
+        );
+        assert_eq!(
+            home_needs_you(&rows),
+            1,
+            "Home's own header must agree with the band it renders"
+        );
+        let row = rows
+            .iter()
+            .find_map(|r| match r {
+                HomeRow::Run {
+                    band: HomeBand::NeedsMe,
+                    run,
+                    ..
+                } => Some(run),
+                _ => None,
+            })
+            .expect("PlanApproved lands in NeedsMe");
+        assert!(
+            attention_flag(row, row.wants > 1).is_some(),
+            "the rail flag must fire for the row Home says needs you"
         );
     }
 
@@ -12566,6 +12735,52 @@ mod home_ia {
         );
     }
 
+    /// Round-9 review (review-0-cli-codex, major): `:plan <task>` with no run
+    /// selected used to target `swarm.project_root` (`active_root`, stale while
+    /// browsing Home) instead of the highlighted Home row. In cross-project Home with
+    /// project A first in the registry and the cursor on a run in project B, the
+    /// palette must open the new-run surface targeting B — the same target `n` (via
+    /// `open_new_run`) would pick — not silently fall back to A.
+    #[test]
+    fn plan_palette_fallback_targets_the_selected_home_row_not_active_root() {
+        let a = PathBuf::from("/nonexistent/acme-api");
+        let b = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&a, "acme-api"), project_at(&b, "spar")];
+        let run_b = run_in("bbbb0001", Phase::Review, 5, &b);
+        let home_rows = vec![
+            HomeRow::Header(HomeBand::Running),
+            HomeRow::Run {
+                band: HomeBand::Running,
+                run: run_b,
+                waited: Duration::ZERO,
+            },
+        ];
+        let mut app = App::new(None, Config::default(), None);
+        app.home_scope = HomeScope::All;
+        app.selected_home = 1; // the row in project B
+
+        // `swarm` stands for `active_root` — deliberately project A, the way it lags
+        // behind while the operator is looking at Home rather than a project.
+        let swarm = SparPaths::new(&a);
+        let runs: Vec<state::RunSummary> = Vec::new();
+        run_palette(
+            &mut app,
+            &swarm,
+            &projects,
+            &home_rows,
+            None,
+            &runs,
+            None,
+            "plan do the thing",
+        )
+        .unwrap();
+        assert_eq!(
+            app.new_run.as_ref().unwrap().project.as_deref(),
+            Some(b.as_path()),
+            "the fallback must target the selected Home row's project, not active_root"
+        );
+    }
+
     /// AC-31. A recent fleet is one roster row standing for several providers.
     /// Picking it expands, and expansion deduplicates in first-picked order —
     /// a comma-joined string is not a provider reference.
@@ -12610,6 +12825,37 @@ mod home_ia {
                 "cli:muse@muse-spark-1.2-contributor".to_string(),
             ],
             "expanded, deduplicated, in the order they were picked"
+        );
+    }
+
+    /// Round-9 review (minor): dedup used to key on the exact ref string, so a
+    /// detected `cli:claude` row and a configured `cli:claude@opus` row picked
+    /// together dispatched the same CLI twice. Dedup keys on `storage_key()` (X8,
+    /// model-free) instead, keeping the first-picked ref's `@model` pin.
+    #[test]
+    fn new_run_providers_dedupes_a_pinned_ref_against_its_bare_form() {
+        let mut nr = new_run_fixture();
+        nr.roster = vec![
+            RosterEntry {
+                choice: RosterChoice::Provider("cli:claude".to_string()),
+                label: "cli:claude".to_string(),
+                available: true,
+                reason: None,
+                source: RosterSource::Detected,
+            },
+            RosterEntry {
+                choice: RosterChoice::Provider("cli:claude@opus".to_string()),
+                label: "cli:claude@opus".to_string(),
+                available: true,
+                reason: None,
+                source: RosterSource::Configured,
+            },
+        ];
+        nr.picked = vec![1, 0]; // the pinned ref picked first
+        assert_eq!(
+            new_run_providers(&nr),
+            vec!["cli:claude@opus".to_string()],
+            "the same CLI picked twice (pinned and bare) must dispatch once"
         );
     }
 
