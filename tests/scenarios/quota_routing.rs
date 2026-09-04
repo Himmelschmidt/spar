@@ -135,6 +135,45 @@ fn implementer_rate_limited_mid_dispatch_parks_on_quota_and_exits_4() {
         .stdout(predicate::str::contains("plan is not approved").not());
 }
 
+/// `--workflow review` dispatches its N reviewers concurrently through
+/// `run_slots_parallel`, a different code path from `implement`'s `run_slot` ->
+/// `bail!`. Both reviewers hitting the same rate limit must still park the run at
+/// `Phase::Quota`/exit `4`, not `Phase::Failed`/exit `1` — the terminal-phase mapping
+/// in `workflow/review.rs` has its own `any_failed` check that must consult
+/// `quota_hit` rather than defaulting straight to `Failed`.
+#[test]
+fn review_workflow_rate_limited_on_every_reviewer_parks_on_quota_and_exits_4() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    let proj = dir.join("proj");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&proj).unwrap();
+    init_repo(&proj);
+    let path_env = fake_claude_binary(&bin, WEEKLY_LIMIT_LOG);
+
+    spar_cmd()
+        .current_dir(&proj)
+        .args([
+            "run",
+            "--workflow",
+            "review",
+            "-t",
+            "review this",
+            "--providers",
+            "cli:claude,cli:claude",
+        ])
+        .env("PATH", &path_env)
+        .assert()
+        .code(4);
+
+    let run_id = only_run_id(&proj);
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(proj.join(".spar/runs").join(&run_id).join("state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["phase"], "quota");
+}
+
 #[test]
 fn implementer_ordinary_failure_still_fails_the_run_at_exit_1() {
     let tmp = tempdir().unwrap();

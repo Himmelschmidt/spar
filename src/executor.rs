@@ -1267,25 +1267,29 @@ pub fn run_slot(
 /// and reports whether this failure looks like a rate limit rather than a genuine
 /// defect. The `bool` returned is the discriminator callers route `Phase::Quota` vs
 /// `Phase::Failed` on, so it is deliberately narrower than the pause: it only fires on
-/// `scrape_claude_rate_limits` (Claude's own structured/stated-reset shapes) or
-/// `scrape_strong_quota_signal` (a rejection phrase, not a bare word, for every other
-/// adapter). A false positive on the pause is harmless — the provider re-probes after
-/// its cooldown; a false positive on the returned bool would park a real failure on
-/// the quota gate instead of failing the run, which is worse than the bug this exists
-/// to fix.
+/// `scrape_strong_quota_signal` (a rejection phrase, not a bare word, for every
+/// adapter) or Claude's plain-text stated-reset line ("You've hit your weekly
+/// limit..."), which is itself an unambiguous rejection statement. It deliberately
+/// excludes `scrape_claude_rate_limits`'s `rate_limits`/`five_hour` JSON telemetry
+/// branch: that fires on `used_percentage >= 95` alone, with no failure of any kind in
+/// the log, so it still drives the pause below (harmless, auto-recovering) but must
+/// not alone decide that *this* failure was a quota hit — a false positive on the
+/// returned bool would park a real failure on the quota gate instead of failing the
+/// run, which is worse than the bug this exists to fix.
 fn detect_and_pause_quota(paths: &SparPaths, provider: &str, log_text: &str) -> bool {
+    let key = crate::quota::normalize_key(provider);
     if let Some(hint) = crate::quota::QuotaStore::scrape_log_hint(log_text) {
         let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-        store.pause_quota(provider, hint);
+        store.pause_quota(&key, hint);
         let _ = store.save(paths);
     }
     if let Some((name, until, hint)) = crate::quota::scrape_claude_rate_limits(provider, log_text) {
         let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
         store.pause_quota_until(&name, until, hint);
         let _ = store.save(paths);
-        return true;
     }
     crate::quota::QuotaStore::scrape_strong_quota_signal(log_text).is_some()
+        || (key == "cli:claude" && crate::quota::scrape_claude_stated_reset(log_text).is_some())
 }
 
 /// `state.slots` lookup used by every caller that maps a `run_slot` failure onto
@@ -2323,6 +2327,50 @@ mod tests {
         assert!(detect_and_pause_quota(&paths, "cli:codex", log));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         assert!(!store.is_usable("cli:codex"));
+    }
+
+    /// A pinned model ref (`cli:codex@gpt-5.6-terra`, the fleet's normal shape per the
+    /// operator's "pin the model on every role" rule) must pause under the same
+    /// normalized bucket readers look up — writing the raw ref key left the pause
+    /// inert for every non-claude adapter, since `is_usable`/`ensure_usable` always
+    /// query `normalize_key(name)`.
+    #[test]
+    fn detect_and_pause_quota_pauses_a_pinned_provider_under_its_normalized_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log = "error: usage limit reached for this account\n";
+        assert!(detect_and_pause_quota(
+            &paths,
+            "cli:codex@gpt-5.6-terra",
+            log
+        ));
+        let err = crate::quota::ensure_usable(&paths, &["cli:codex@gpt-5.6-terra".to_string()])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("paused"),
+            "pinned ref must resolve unusable via the same normalized bucket ensure_usable reads: {err}"
+        );
+    }
+
+    /// The `rate_limits.five_hour` JSON telemetry shape carries no rejection or failure
+    /// of any kind — just a usage percentage. It may still drive the (cheap,
+    /// auto-recovering) pause, but must not alone decide that *this* dispatch failure
+    /// was a quota hit: an implementer that panics while the window happens to read 96%
+    /// used would otherwise park a real defect on the quota gate.
+    #[test]
+    fn detect_and_pause_quota_does_not_route_on_bare_five_hour_telemetry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log = r#"{"rate_limits":{"five_hour":{"used_percentage":96.5}}}"#;
+        assert!(
+            !detect_and_pause_quota(&paths, "cli:claude", log),
+            "bare usage telemetry with no rejection must not route to Phase::Quota"
+        );
+        let store = crate::quota::QuotaStore::load(&paths).unwrap();
+        assert!(
+            !store.is_usable("cli:claude"),
+            "the telemetry may still drive the harmless, auto-recovering pause"
+        );
     }
 
     /// Recovery must fire only for a slot that actually produced something. A slot that

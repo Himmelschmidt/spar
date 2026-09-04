@@ -374,21 +374,28 @@ resume resets the failed slots to pending and re-dispatches, so `status` reflect
 new attempt rather than the dead one's `failed` verdict. A slot that dies mid-dispatch
 from a rate limit parks the run at `quota` (exit `4`), not `failed` (exit `1`) — for the
 planner, test-author, implementer, tester, reviewer, and the arena reconciler. The
-discriminator requires a rejection phrase, not a bare word: a log with a stray `429` in a
-stack trace, a mention of "capacity", or code that edits spar's own quota module does not
-misroute a genuine defect onto the quota gate. Resuming picks the same run back up, and if
-the provider is still on cooldown it re-parks at `quota` immediately rather than
-dispatching into the same wall. Claude's CLI states its own weekly-limit reset time in the
-rejection line; spar parses that (local time + IANA zone) into the cooldown instead of
-using the generic ~30-minute default. That parsed cooldown is capped at the *next
-occurrence* of the stated time-of-day (~24h out), not the actual weekly rollover — a big
-improvement over the default, but a weekly pause is still re-probed daily rather than left
-alone for the full week, since Claude's line carries no date. The other adapters (codex,
-opencode, muse, grok) have no provider-specific reset parser, so their rate limits are
-still detected (a generic rejection-phrase match) but fall back to the generic cooldown. A
-rate limit hit by a live parallel panel (`--workflow review`/`peer`) is paused the same
-way; it does not yet route that run to `quota` since those workflows have no run-level
-failure-to-phase mapping today.
+discriminator requires a genuine rejection, not a bare word or bare usage telemetry: a
+log with a stray `429` in a stack trace, a mention of "capacity", code that edits spar's
+own quota module, or a `rate_limits.five_hour` usage-percentage reading with no failure
+in the log does not misroute a genuine defect onto the quota gate (the last of those can
+still drive the harmless, auto-recovering pause — just not the routing decision).
+Resuming picks the same run back up, and if the provider is still on cooldown it
+re-parks at `quota` immediately rather than dispatching into the same wall. Claude's CLI
+states its own weekly-limit reset time in the rejection line; spar parses that (local
+time + IANA zone) into the cooldown instead of using the generic ~30-minute default.
+That parsed cooldown is capped at the *next occurrence* of the stated time-of-day (~24h
+out), not the actual weekly rollover — a big improvement over the default, but a weekly
+pause is still re-probed daily rather than left alone for the full week, since Claude's
+line carries no date. The other adapters (codex, opencode, muse, grok) have no
+provider-specific reset parser, so a mid-dispatch limit on them falls back to the
+generic-rejection-phrase match (untested against any real captured output from those
+CLIs — treat as unverified, not confirmed) and the generic cooldown; agy has its own,
+separate telemetry-based cooldown unrelated to this mechanism. `--workflow review`
+routes a rate limit hit by every reviewer in a live parallel panel to `quota` the same
+way (a mixed panel — some reviewers genuinely failed, one rate-limited — still surfaces
+as `failed` rather than hiding the real failure behind the quota gate); `--workflow peer`
+does not yet map failure to a terminal phase at all (it always finishes `done`), which is
+a pre-existing gap this fix did not touch.
 Use `stop` (not killing pids directly) so the orchestrator can't re-dispatch a slot
 you just killed.
 

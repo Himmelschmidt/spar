@@ -264,7 +264,9 @@ pub fn scrape_claude_rate_limits(
 /// stated reset can be found but not parsed (unknown tz, unexpected format), still
 /// reports the hit so the caller pauses the provider — the fallback is the generic
 /// default-cooldown pause, made visible on stderr rather than silently guessed.
-fn scrape_claude_stated_reset(log: &str) -> Option<(String, Option<DateTime<Utc>>, String)> {
+pub(crate) fn scrape_claude_stated_reset(
+    log: &str,
+) -> Option<(String, Option<DateTime<Utc>>, String)> {
     let lower = log.to_ascii_lowercase();
     if !lower.contains("resets ") {
         return None;
@@ -302,9 +304,17 @@ fn scrape_claude_stated_reset(log: &str) -> Option<(String, Option<DateTime<Utc>
 
 /// Parses "resets 12am (America/New_York)" / "resets 3:30pm (UTC)" into the next
 /// occurrence of that local time, in UTC. `now` is threaded through for tests.
+///
+/// The `(tz)` search is bounded to the line containing "resets " so an unrelated
+/// parenthesis elsewhere in a multi-KB tail log can't be picked up as the timezone.
 fn parse_stated_reset(text: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let lower = text.to_ascii_lowercase();
-    let after_resets = &text[lower.find("resets ")? + "resets ".len()..];
+    let resets_at = lower.find("resets ")? + "resets ".len();
+    let line_end = text[resets_at..]
+        .find('\n')
+        .map(|i| resets_at + i)
+        .unwrap_or(text.len());
+    let after_resets = &text[resets_at..line_end];
     let paren_start = after_resets.find('(')?;
     let paren_end = after_resets[paren_start..].find(')')? + paren_start;
     let time_part = after_resets[..paren_start].trim();
@@ -333,14 +343,20 @@ fn parse_stated_reset(text: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         (h, true) => h + 12,
     };
 
+    // Calendar-day roll-forward (not `+= Duration::days(1)` on the zoned instant,
+    // which adds a flat 24h and drifts by an hour across a DST transition).
     let now_local = now.with_timezone(&tz);
-    let mut candidate = now_local
-        .date_naive()
+    let mut date = now_local.date_naive();
+    let mut candidate = date
         .and_hms_opt(hour, minute, 0)?
         .and_local_timezone(tz)
         .single()?;
     if candidate <= now_local {
-        candidate += chrono::Duration::days(1);
+        date += chrono::Duration::days(1);
+        candidate = date
+            .and_hms_opt(hour, minute, 0)?
+            .and_local_timezone(tz)
+            .single()?;
     }
     Some(candidate.with_timezone(&Utc))
 }

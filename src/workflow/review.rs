@@ -183,8 +183,24 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
     ));
     std::fs::write(paths.artifact(&state.id, "summary.md"), body)?;
 
-    let any_failed = state.slots.iter().any(|s| s.status == SlotStatus::Failed);
-    if any_failed && approve == 0 && changes == 0 {
+    let failed: Vec<&crate::state::SlotState> = state
+        .slots
+        .iter()
+        .filter(|s| s.status == SlotStatus::Failed)
+        .collect();
+    let all_failed = !state.slots.is_empty() && failed.len() == state.slots.len();
+    // Checked ahead of the approve/request_changes tally: `salvage_expected_artifact`
+    // (executor.rs) writes a synthetic `request_changes` verdict for every interrupted
+    // reviewer, so `changes == 0` never holds once any reviewer fails and the tally
+    // alone can't tell a real review panel from one where every slot died on a rate
+    // limit. Only routes to `Phase::Quota` when *every* slot failed and every one of
+    // those failures was independently quota-detected (not just one of several) — a
+    // mixed panel (one genuine defect, one rate limit) still surfaces as `Failed`
+    // rather than hiding the real failure behind the quota gate.
+    if all_failed && failed.iter().all(|s| s.quota_hit) {
+        state.set_phase(Phase::Quota);
+        state.error = Some("all review slots failed: rate limit".into());
+    } else if !failed.is_empty() && approve == 0 && changes == 0 {
         state.set_phase(Phase::Failed);
         state.error = Some("all review slots failed".into());
     } else {
