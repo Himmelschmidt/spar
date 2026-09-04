@@ -1363,16 +1363,6 @@ pub fn run_slot(
 /// at all; an adapter with a longer real window would need this raised, not gated.
 const MAX_PLAUSIBLE_RESET_HORIZON_DAYS: i64 = 8;
 
-/// A stated instant that is strictly future but only by a sliver (clock skew between
-/// the adapter and this process, or the time spent between the event arriving and this
-/// function running) would write a `Cooldown` that reads as expired on the very next
-/// poll — the same "worse than no cooldown" failure `implausible_reset` rejects for a
-/// non-future instant, displaced by an epsilon instead of eliminated. The stated instant
-/// is still what gets reported in the pause reason; only the value actually written to
-/// the store is floored, so a genuine near-future reset degrades to a short real pause
-/// rather than to nothing.
-const MIN_WRITTEN_COOLDOWN_SECS: i64 = 5;
-
 /// Why a stated reset instant cannot be trusted as a `Cooldown`. Kept as two variants,
 /// not one boolean, because the two directions are opposite failures needing different
 /// operator-facing words: one is a stale-but-sane value, the other means the payload
@@ -1515,12 +1505,10 @@ fn detect_and_pause_quota(
         });
         match usable {
             Some(until) => {
-                let write_until = until
-                    .max(chrono::Utc::now() + chrono::Duration::seconds(MIN_WRITTEN_COOLDOWN_SECS));
                 let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
                 store.pause_quota_until(
                     &key,
-                    Some(write_until),
+                    Some(until),
                     format!(
                         "{key} {window} limit rejected, resets {}",
                         until.to_rfc3339()
@@ -2722,15 +2710,14 @@ mod tests {
     }
 
     /// A stated instant only an epsilon in the future (clock skew, or the gap between
-    /// the event arriving and this function running) must not be written as-is: reading
-    /// it back a moment later would find it already expired, which is the same "worse
-    /// than no cooldown" failure a non-future instant produces — displaced, not
-    /// eliminated. The value actually written to the store must be floored to at least
-    /// `MIN_WRITTEN_COOLDOWN_SECS`, even though the stated instant itself is still
-    /// honored as real (not rejected the way `implausible_reset` rejects a non-future
-    /// value).
+    /// the event arriving and this function running) must be written exactly as stated,
+    /// not extended: `implausible_reset` already rejects a non-future instant in favor
+    /// of the generic fallback, so anything that reaches here passed as strictly future
+    /// and must be honored as such, even if that future is only milliseconds away. If
+    /// the window really does reopen that soon, pausing briefly and then being usable
+    /// again is correct, not a case to guard against by padding the write.
     #[test]
-    fn detect_and_pause_quota_with_an_epsilon_future_typed_reset_floors_the_written_cooldown() {
+    fn detect_and_pause_quota_with_an_epsilon_future_typed_reset_writes_it_exactly() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         let until = chrono::Utc::now() + chrono::Duration::milliseconds(50);
@@ -2745,16 +2732,10 @@ mod tests {
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         let q = store.get("cli:claude");
         assert_eq!(q.status, crate::quota::ProviderStatus::Cooldown);
-        let written = q.cooldown_until.expect("cooldown_until present");
-        assert!(
-            written
-                >= chrono::Utc::now() + chrono::Duration::seconds(MIN_WRITTEN_COOLDOWN_SECS - 1),
-            "written cooldown {written} must be floored, not the near-instant stated value {until}"
-        );
-        assert!(
-            !store.is_usable("cli:claude"),
-            "an epsilon-future instant must still leave the provider paused, not \
-             immediately usable"
+        assert_eq!(
+            q.cooldown_until,
+            Some(until),
+            "the written cooldown must match the stated instant exactly, not be extended"
         );
     }
 
