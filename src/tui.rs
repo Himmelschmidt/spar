@@ -590,7 +590,7 @@ struct App {
     /// (archived, dir removed, folded into a different loudest leg) must eventually
     /// release the pin rather than leave Main/Agents permanently empty (round-7
     /// review finding: a ghost target used to stick forever).
-    home_target_ticks: u32,
+    home_target_since: Option<Instant>,
     /// Phase D's new-run modal. `Some` = open and capturing keys.
     new_run: Option<NewRun>,
     /// Bumped every time the new-run modal opens; tags `NewRun::gen` and
@@ -751,7 +751,7 @@ impl App {
             home_watermark: read_watermark(&watermark_path()),
             home_key: None,
             home_target_run: None,
-            home_target_ticks: 0,
+            home_target_since: None,
             new_run,
             new_run_gen,
             rect_new_run: Rect::default(),
@@ -840,7 +840,7 @@ impl App {
         // "run is gone" flash 25 snapshots later, out of a project the operator chose
         // on purpose.
         self.home_target_run = None;
-        self.home_target_ticks = 0;
+        self.home_target_since = None;
     }
 
     /// Back to the landing view. `Projects`/`Runs`/`Agents` all pop here eventually.
@@ -851,7 +851,7 @@ impl App {
         self.reset_bus_view();
         self.focus = Focus::Rail;
         self.home_target_run = None;
-        self.home_target_ticks = 0;
+        self.home_target_since = None;
     }
 
     /// `Esc` in the rail: pop one level. At `Home` this is a no-op — the rail root
@@ -1301,17 +1301,16 @@ fn fold_units(
             out.push(r);
             continue;
         }
-        // A leg that wants the operator outranks everything, then loudest attention,
-        // then most recent. `wants_operator` is not a function of `run_attention`:
-        // `PlanApproved` is `Idle` there, so ordering by attention alone folds a unit
-        // with an approved plan and a busy child down to the child, and the handoff
-        // vanishes from Home while the `wants` roll-up below still counts it — the two
-        // then disagree. U15 is explicit that folding must never hide a gate, which is
-        // the exact failure O36 exists to prevent.
+        // Loudest attention first, then most recent: the active member is whatever the
+        // operator would want the row to be about. Deliberately NOT ordered by
+        // `wants_operator`: the row's id and phase are what gate buttons, `:approve`
+        // and drill-down act on, and `PlanApproved` scores `Idle`, so promoting a
+        // wanting leg here would both retarget those actions and sink the whole unit
+        // below every working run in the attention-sorted rail. Whether the *unit*
+        // wants the operator is `unit_wants_operator`, which reads `wants`.
         group.sort_by(|a, b| {
-            wants_operator(b)
-                .cmp(&wants_operator(a))
-                .then(run_attention(b).cmp(&run_attention(a)))
+            run_attention(b)
+                .cmp(&run_attention(a))
                 .then(b.updated_at.cmp(&a.updated_at))
         });
         let ids: Vec<String> = group.iter().map(|r| r.id.clone()).collect();
@@ -1569,10 +1568,12 @@ fn build_home_rows(
             }
         }
         for r in runs {
-            // `wants_operator` folds `run_attention`'s Gate/Broken together with the
-            // PlanApproved handoff, so this band agrees with `runs_needing_attention`
-            // and the rail flag rather than drifting from them (AC-18; round-9 review).
-            if wants_operator(r) {
+            // `unit_wants_operator` folds `run_attention`'s Gate/Broken together with
+            // the PlanApproved handoff AND accounts for a folded row whose active leg
+            // is not the one waiting, so this band agrees with `runs_needing_attention`
+            // and the rail flag rather than drifting from them (AC-18; round-9 review,
+            // and the round-12 roll-up disagreement).
+            if unit_wants_operator(r) {
                 needs_me.push(r.clone());
             } else if is_active_phase(r.phase) {
                 running.push(r.clone());
@@ -2273,20 +2274,9 @@ fn run_loop(
     }
 
     let mut dirty = true;
-    // `home_target_ticks` counts *snapshots*, not render wakes. The loop re-reads the
-    // shared snapshot every 100ms whether or not the refresher has installed a new one,
-    // so ticking per wake burns HOME_TARGET_GIVE_UP in 2.5s and abandons a live target
-    // during a slow project scan.
-    let mut last_snap: Option<Arc<Snapshot>> = None;
     let mut last_home_clock = Instant::now();
     loop {
         let snap = Arc::clone(&*snapshot.lock().unwrap());
-        let fresh_snapshot = last_snap
-            .as_ref()
-            .is_none_or(|prev| !Arc::ptr_eq(prev, &snap));
-        if fresh_snapshot {
-            last_snap = Some(Arc::clone(&snap));
-        }
 
         if let Some((t, _, _, dur)) = &app.flash {
             if t.elapsed() > *dur {
@@ -2307,13 +2297,11 @@ fn run_loop(
         if app.home_target_run.is_some() {
             // Must run even with an empty `snap.runs` — a Home Enter into a project
             // whose Runs listing has not landed yet (R2's one-tick lag) would
-            // otherwise never tick `home_target_ticks` and pin `home_target_run`
+            // otherwise never start the give-up clock and pin `home_target_run`
             // forever, leaving Main/Agents blank with no way out (round-11 review,
             // major). Gated on a *new* snapshot so the give-up budget is measured in
             // refreshes rather than in 100ms render wakes.
-            if fresh_snapshot {
-                resolve_home_target(&mut app, &snap.runs);
-            }
+            resolve_home_target(&mut app, &snap.runs);
             if !snap.runs.is_empty() {
                 app.selected_run = app.selected_run.min(snap.runs.len() - 1);
             }
@@ -2658,13 +2646,20 @@ fn handle_key(
             app.flash("Projects (general view)", ACCENT);
         }
         KeyCode::Char('n') => {
-            // At Projects the highlighted row *is* the operator's chosen target: the
-            // loop sets `active_root` from `selected_project` on that level. Keying off
-            // `in_project()` alone (false there) left `n` with no target on the one
-            // level whose entire purpose is picking a project (round-12 review, major).
-            let browsed = (app.browse.in_project()
-                || (app.browse == BrowseLevel::Projects && !projects.is_empty()))
-            .then_some(active_root.as_path());
+            // At Projects the highlighted row *is* the operator's chosen target, but it
+            // must be read from `selected_project` here rather than from `active_root`:
+            // the loop refreshes `active_root` only in the pre-input clamp, while a
+            // queued burst (`j` then `n`, or a click then `n`) is drained against the
+            // same frame, so `active_root` is one selection stale (review e72f434e,
+            // major). Keying off `in_project()` alone (false at Projects) also left `n`
+            // with no target at all on the one level whose purpose is picking a project.
+            let browsed = if app.browse == BrowseLevel::Projects {
+                projects.get(app.selected_project).map(|p| p.root.as_path())
+            } else if app.browse.in_project() {
+                Some(active_root.as_path())
+            } else {
+                None
+            };
             open_new_run(app, projects, home_rows, local_root, browsed);
         }
         KeyCode::Char('P') => {
@@ -3618,10 +3613,15 @@ fn step_matched(matched: &[usize], cur: usize, delta: i32) -> usize {
     matched[next]
 }
 
-/// Snapshots to wait for a Home `Enter` target before giving up on it (round-7
-/// review finding). Generous relative to R2's one-tick lag and Home's own
-/// `CROSS_PROJECT_REFRESH` cadence, so a normal drill-down never trips it.
-const HOME_TARGET_GIVE_UP: u32 = 25;
+/// How long to wait for a Home `Enter` target before giving up on it (round-7 review
+/// finding). Wall clock, not a counter: ticking per render wake burned the budget in
+/// 2.5s during a slow project scan, and ticking per *installed snapshot* starved the
+/// escape completely, because the refresher deliberately retains the current `Arc` when
+/// nothing on disk changed — a removed run gets one forced empty snapshot and then
+/// silence, pinning Main forever (review e72f434e, major). Generous relative to R2's
+/// one-tick lag and Home's `CROSS_PROJECT_REFRESH` cadence, so a normal drill-down
+/// never trips it.
+const HOME_TARGET_GIVE_UP: Duration = Duration::from_secs(10);
 
 /// A Home `Enter` carries a run's fold-stable `unit_id` ahead of the snapshot that
 /// actually contains it (R2/AC-27): the snapshot in hand may still be Home's
@@ -3646,21 +3646,20 @@ fn resolve_home_target(app: &mut App, runs: &[state::RunSummary]) -> bool {
     if let Some(pos) = found {
         app.selected_run = pos;
         app.home_target_run = None;
-        app.home_target_ticks = 0;
-        true
-    } else {
-        app.home_target_ticks += 1;
-        if app.home_target_ticks > HOME_TARGET_GIVE_UP {
-            app.flash(
-                format!("run {target} is gone — back to Home"),
-                Color::Yellow,
-            );
-            app.home_target_run = None;
-            app.home_target_ticks = 0;
-            app.browse = BrowseLevel::Home;
-        }
-        false
+        app.home_target_since = None;
+        return true;
     }
+    let since = *app.home_target_since.get_or_insert_with(Instant::now);
+    if since.elapsed() > HOME_TARGET_GIVE_UP {
+        app.flash(
+            format!("run {target} is gone — back to Home"),
+            Color::Yellow,
+        );
+        app.home_target_run = None;
+        app.home_target_since = None;
+        app.browse = BrowseLevel::Home;
+    }
+    false
 }
 
 /// `Enter` in the rail: push one level. On a slot (the deepest level) there is
@@ -3688,7 +3687,7 @@ fn rail_enter(
                 // project's own snapshot lands, stranding the pin on a leg that no
                 // longer exists under that name (round-11 review, major; AC-28).
                 app.home_target_run = Some(run.unit_id.clone().unwrap_or_else(|| run.id.clone()));
-                app.home_target_ticks = 0;
+                app.home_target_since = None;
                 app.browse = BrowseLevel::Agents;
                 app.selected_slot = 0;
                 app.reset_stream_view();
@@ -5715,7 +5714,7 @@ fn rail_home_items(
                     muted().bold(),
                 )),
                 HomeRow::Run { run, .. } => {
-                    let flag = attention_flag(run, run.wants > 1);
+                    let flag = attention_flag(run, unit_wants_operator(run));
                     let more = if run.wants > 1 {
                         format!(" ⚑{}", run.wants)
                     } else {
@@ -5817,7 +5816,7 @@ fn rail_run_items(
                     phase_color(r.phase)
                 },
             );
-            let flag = attention_flag(r, false);
+            let flag = attention_flag(r, unit_wants_operator(r));
             let body = vec![
                 Span::styled(
                     format!("{:<8}", truncate(&r.id, 8)),
@@ -7993,6 +7992,21 @@ fn wants_operator(r: &state::RunSummary) -> bool {
     run_attention(r).needs_you() || r.phase == Phase::PlanApproved
 }
 
+/// Whether the *unit* a row stands for wants the operator. A folded row (U15) carries
+/// its active leg's id and phase, so `wants_operator` on the row alone answers for that
+/// leg and not for the group: a unit whose plan is approved (`Idle`) while a child is
+/// working folds to the child, and the handoff disappears from every surface that asks
+/// the row instead of the count. `wants` is computed per leg in `fold_units`, so this is
+/// the predicate Home's bands, the rail flag and the attention cycle must use — the same
+/// rule `runs_needing_attention` already applies to the roll-up.
+fn unit_wants_operator(r: &state::RunSummary) -> bool {
+    if r.legs > 1 {
+        r.wants > 0
+    } else {
+        wants_operator(r)
+    }
+}
+
 /// The rail lead flag color for a run row, shared by the Runs level and Home so a run
 /// that counts toward `runs_needing_attention` always shows the same flag it is
 /// counted for. `force` additionally flags a folded row with more than one leg wanting
@@ -8119,7 +8133,7 @@ fn jump_to_attention(app: &mut App, runs: &[state::RunSummary], home_rows: &[Hom
     let n = runs.len();
     let next = (1..=n)
         .map(|off| (app.selected_run + off) % n)
-        .find(|&i| runs.get(i).map(wants_operator).unwrap_or(false));
+        .find(|&i| runs.get(i).map(unit_wants_operator).unwrap_or(false));
     match next {
         Some(i) => {
             app.selected_run = i;
@@ -8909,6 +8923,57 @@ mod labels {
         assert_eq!(step_matched(&matched, 1, -1), 1);
         // Selection not in the matched set starts at the first match.
         assert_eq!(step_matched(&matched, 0, 1), 3);
+    }
+
+    /// `n` at the Projects level must target the row highlighted *now*, not the one
+    /// `active_root` was clamped to at the top of the frame. The loop drains a queued
+    /// input burst against one mutable `active_root`, so `j` then `n` arriving together
+    /// used to open the modal on the previously highlighted project (review e72f434e,
+    /// major). Driven through `handle_key` without a frame in between, which is exactly
+    /// the shape that broke.
+    #[test]
+    fn n_at_projects_targets_the_row_selected_in_the_same_input_burst() {
+        let projects: Vec<registry::ProjectEntry> = ["alpha", "bravo"]
+            .iter()
+            .map(|n| registry::ProjectEntry {
+                root: PathBuf::from("/nonexistent").join(n),
+                name: Some((*n).to_string()),
+                last_seen: Utc::now(),
+                last_run_id: None,
+            })
+            .collect();
+        let mut app = test_app();
+        app.open_projects_view();
+        let sw = SparPaths::new(std::path::Path::new("/nonexistent/alpha"));
+        // Stale on purpose: this is what the pre-input clamp left behind for `alpha`.
+        let mut root = PathBuf::from("/nonexistent/alpha");
+
+        for code in [KeyCode::Char('j'), KeyCode::Char('n')] {
+            handle_key(
+                &mut app,
+                code,
+                KeyModifiers::empty(),
+                &sw,
+                &projects,
+                &[],
+                &[],
+                None,
+                &mut root,
+                None,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(app.selected_project, 1, "`j` moved to bravo");
+        let nr = app
+            .new_run
+            .as_ref()
+            .expect("`n` opened the new-run surface");
+        assert_eq!(
+            nr.project.as_deref(),
+            Some(std::path::Path::new("/nonexistent/bravo")),
+            "the modal must target the row `j` just selected, not the stale active_root"
+        );
     }
 
     #[test]
@@ -11519,13 +11584,14 @@ mod folding {
     }
 
     /// `wants_operator` is not a function of `run_attention`: `PlanApproved` is a
-    /// handoff nothing else will complete, but it scores `Idle`. Ordering the group by
-    /// attention alone therefore folded a unit with an approved plan and a busy child
-    /// down to the child, so Home showed no handoff while `wants` still counted one and
-    /// the two roll-ups disagreed. Twelve review rounds passed the 36-criterion contract
-    /// with this live, because no criterion paired a wanting leg with a louder one.
+    /// handoff nothing else will complete, but it scores `Idle`. A unit whose plan is
+    /// approved while a child works therefore folds to the *child* — correctly, because
+    /// the row's id and phase are what gate buttons and drill-down act on — and every
+    /// surface that then asked `wants_operator(row)` instead of the `wants` count lost
+    /// the handoff. Twelve review rounds passed the 36-criterion contract with this
+    /// live, because no criterion paired a wanting leg with a louder one.
     #[test]
-    fn folding_prefers_a_leg_that_wants_the_operator_over_a_louder_one() {
+    fn a_folded_unit_reports_a_wanting_leg_even_when_a_louder_one_represents_it() {
         let runs = vec![
             summary("plan1", Phase::PlanApproved, None, 90),
             summary("impl1", Phase::Review, Some("plan1"), 5),
@@ -11533,18 +11599,32 @@ mod folding {
         let (rows, _) = fold_units(runs);
         assert_eq!(rows.len(), 1, "one unit of work");
         let unit = &rows[0];
-        assert_eq!(
-            unit.phase,
-            Phase::PlanApproved,
-            "the folded row must represent the leg waiting on the operator, not the \
-             louder working leg: {unit:?}"
-        );
-        assert_eq!(unit.id, "plan1");
-        assert_eq!(unit.wants, 1, "the roll-up and the row must agree");
+
+        // The row still acts on the active leg: retargeting it would send gate buttons
+        // and `:approve` at the wrong run, and sink the unit in the attention sort.
+        assert_eq!(unit.id, "impl1");
+        assert_eq!(unit.phase, Phase::Review);
+
+        // But the unit is reported as wanting the operator, by the one predicate every
+        // band, flag and cycle key goes through.
+        assert_eq!(unit.wants, 1);
         assert!(
-            wants_operator(unit),
-            "the row itself must read as wanting the operator, or Home's band and the \
-             fleet roll-up disagree"
+            unit_wants_operator(unit),
+            "the folded unit must read as wanting the operator: {unit:?}"
+        );
+        assert!(
+            !wants_operator(unit),
+            "the representative leg itself does not want the operator — that gap is \
+             exactly what `unit_wants_operator` exists to close"
+        );
+        assert_eq!(
+            runs_needing_attention(&rows),
+            1,
+            "the roll-up and the row must agree"
+        );
+        assert!(
+            attention_flag(unit, unit_wants_operator(unit)).is_some(),
+            "the rail must fly a flag for it"
         );
     }
 
@@ -12664,27 +12744,31 @@ mod home_ia {
         app.browse = BrowseLevel::Agents;
         assert!(resolve_home_target(&mut app, &runs));
         assert!(app.home_target_run.is_none());
-        assert_eq!(app.home_target_ticks, 0);
+        assert!(app.home_target_since.is_none());
         assert_eq!(app.selected_run, 0);
 
-        // The target is missing (R2's one-tick lag, or a run that is truly gone):
-        // ticks accrue but the pin holds under the give-up threshold.
+        // The target is missing (R2's one-tick lag, or a run that is truly gone): the
+        // clock starts but the pin holds while inside the budget. Called many times to
+        // prove the budget is wall clock, not call count — the previous counter gave up
+        // after a fixed number of calls regardless of elapsed time.
         let mut app = App::new(None, Config::default(), None);
         app.home_target_run = Some("ghost0001".into());
         app.browse = BrowseLevel::Agents;
-        for _ in 0..HOME_TARGET_GIVE_UP {
+        for _ in 0..200 {
             assert!(!resolve_home_target(&mut app, &runs));
             assert!(
                 app.home_target_run.is_some(),
-                "must not give up before the threshold"
+                "must not give up while inside the budget"
             );
         }
         assert_eq!(app.browse, BrowseLevel::Agents);
 
-        // One more tick past the threshold: the pin releases and Home reclaims focus.
+        // Past the deadline: the pin releases and Home reclaims focus. Backdating the
+        // start beats sleeping for the budget.
+        app.home_target_since = Instant::now().checked_sub(HOME_TARGET_GIVE_UP * 2);
         assert!(!resolve_home_target(&mut app, &runs));
         assert!(app.home_target_run.is_none(), "the ghost pin must release");
-        assert_eq!(app.home_target_ticks, 0);
+        assert!(app.home_target_since.is_none());
         assert_eq!(app.browse, BrowseLevel::Home);
         assert!(
             app.flash.is_some(),
