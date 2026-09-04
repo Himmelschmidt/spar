@@ -1093,6 +1093,12 @@ struct Selection {
 /// An immutable view of the world, produced off-thread and rendered as-is.
 struct Snapshot {
     swarm: SparPaths,
+    /// The browse level this snapshot was actually built for. `runs` is only
+    /// populated `if sel.browse.in_project()` (`build_snapshot`), so a Home-level
+    /// snapshot whose `swarm.project_root` happens to already equal the browsing
+    /// root carries no real per-project scan — root equality alone cannot tell
+    /// that apart from a genuine target-project snapshot (round-2 review, major).
+    browse: BrowseLevel,
     projects: Vec<registry::ProjectEntry>,
     runs: Vec<state::RunSummary>,
     full: Option<RunState>,
@@ -1130,6 +1136,7 @@ impl Snapshot {
         let now = Utc::now();
         Self {
             swarm: SparPaths::new(root),
+            browse: BrowseLevel::Home,
             projects: Vec::new(),
             runs: Vec::new(),
             full: None,
@@ -1302,12 +1309,12 @@ fn fold_units(
             out.push(r);
             continue;
         }
-        // Loudest attention first (U18): a working leg must outrank an idle one so the
+        // Loudest attention first (U28): a working leg must outrank an idle one so the
         // row's id and phase, which gate buttons, `:approve` and drill-down all act on,
         // never come from a leg that isn't actually holding the state. Reordering by
         // `wants_operator` first (instead of as a tiebreak) sank a `PlanApproved` unit
         // with a live child below every working run and retargeted those actions onto
-        // the idle leg — see U18. `wants_operator` only breaks a tie *within* one
+        // the idle leg — see U28. `wants_operator` only breaks a tie *within* one
         // attention level: an idle `PlanApproved` leg and an idle `Done` leg sort
         // equally on attention alone, and picking the `Done` one as representative
         // would leave a NEEDS YOU row with nothing to act on. Attention can never tie
@@ -1322,20 +1329,24 @@ fn fold_units(
         });
         let ids: Vec<String> = group.iter().map(|r| r.id.clone()).collect();
         // Every leg that wants the operator still counts, so two gates folded into one
-        // row read as two in the roll-up rather than one. But `PlanApproved` (U18) is a
+        // row read as two in the roll-up rather than one. But `PlanApproved` (U28) is a
         // handoff only while nothing in the unit is running: once a sibling leg has
         // taken it up, the approval is stale bookkeeping, not a second thing waiting on
         // the operator, so it must not inflate `wants` (and, via `unit_wants_operator`,
         // must not raise a NEEDS YOU nobody can act on for the unit's live leg).
+        // Transcribed straight from U28's two rules rather than gated off
+        // `wants_operator` (round-2 review, minor): `wants_operator`'s own
+        // `PlanApproved` branch fires on phase alone, so filtering on
+        // `phase == PlanApproved` first would drop an *abandoned* PlanApproved leg
+        // too — U28 says `Gate`/`Broken` want the operator unconditionally, and this
+        // form can never suppress one even if `PlanApproved` and `abandoned` ever
+        // become reachable together.
         let unit_has_active_leg = group.iter().any(|r| is_active_phase(r.phase));
         let wants = group
             .iter()
             .filter(|r| {
-                if r.phase == Phase::PlanApproved && unit_has_active_leg {
-                    false
-                } else {
-                    wants_operator(r)
-                }
+                run_attention(r).needs_you()
+                    || (r.phase == Phase::PlanApproved && !unit_has_active_leg)
             })
             .count() as u32;
         let brief = group
@@ -1482,6 +1493,7 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
         });
     Snapshot {
         swarm,
+        browse: sel.browse,
         projects,
         runs,
         full,
@@ -2324,7 +2336,7 @@ fn run_loop(
             // itself withholds the give-up clock until `snap` is actually a scan of the
             // target's project (below), so this being unconditional does not start the
             // budget early.
-            let snapshot_for_target = snap.swarm.project_root == active_root;
+            let snapshot_for_target = snapshot_covers_target(&snap, &active_root);
             resolve_home_target(&mut app, &snap.runs, snapshot_for_target);
             if !snap.runs.is_empty() {
                 app.selected_run = app.selected_run.min(snap.runs.len() - 1);
@@ -3657,6 +3669,17 @@ fn step_matched(matched: &[usize], cur: usize, delta: i32) -> usize {
 /// scan has actually started, so a normal drill-down never trips it.
 const HOME_TARGET_GIVE_UP: Duration = Duration::from_secs(10);
 
+/// Whether `snap` is actually a scan of `active_root`'s own runs, not merely a
+/// snapshot whose root happens to equal it. Root equality alone is not sufficient
+/// (round-2 review, major): `build_snapshot` only populates `runs` when the snapshot
+/// was built `in_project()`, so entering a run whose project is already
+/// `active_root` leaves the still-displayed Home snapshot's root matching trivially
+/// on the very first post-`Enter` frame, even though that snapshot never scanned any
+/// project's runs.
+fn snapshot_covers_target(snap: &Snapshot, active_root: &Path) -> bool {
+    snap.browse.in_project() && snap.swarm.project_root == active_root
+}
+
 /// A Home `Enter` carries a run's fold-stable `unit_id` ahead of the snapshot that
 /// actually contains it (R2/AC-27): the snapshot in hand may still be Home's
 /// (cross-project, `runs` empty) or a stale project's. Hold the target and only
@@ -3668,12 +3691,13 @@ const HOME_TARGET_GIVE_UP: Duration = Duration::from_secs(10);
 /// AC-28). If it never reappears — archived, its directory removed, or the whole
 /// unit gone — give up after `HOME_TARGET_GIVE_UP` and return to Home rather than
 /// leaving Main/Agents pinned to a ghost run forever (round-7 review finding).
-/// `snapshot_for_target` tells the give-up clock whether `runs` actually came from a
-/// scan of the target's own project: the first post-`Enter` frame is normally still
-/// Home's snapshot (cross-project, `runs` empty), and that project's own scan is
-/// unbounded (thousands of run dirs), so starting the clock before the target project
-/// has even been scanned once could time out a legitimate Enter before its snapshot
-/// ever lands (review 3be317b2, major). The clock only starts once a snapshot for the
+/// `snapshot_for_target` (`snapshot_covers_target` at the call site) tells the
+/// give-up clock whether `runs` actually came from a scan of the target's own
+/// project: the first post-`Enter` frame is normally still Home's snapshot
+/// (cross-project, `runs` empty), and that project's own scan is unbounded
+/// (thousands of run dirs), so starting the clock before the target project has even
+/// been scanned once could time out a legitimate Enter before its snapshot ever
+/// lands (review 3be317b2, major). The clock only starts once a snapshot for the
 /// right project has actually been seen; once started it does not reset. Returns
 /// `true` when the target was found and selected this call.
 fn resolve_home_target(
@@ -8033,9 +8057,12 @@ fn run_attention(r: &state::RunSummary) -> Attention {
 /// `PlanApproved` — terminal and colored `OK` like `Done` (round-9 review: changing
 /// `run_attention` itself would have re-litigated `phase_color`/`sort_runs_by_attention`
 /// for behaviour no review flagged), but still a handoff nothing else will complete.
-/// Every roll-up, rail flag, and cycle key that decides "does this run need the
-/// operator" goes through this one predicate, so they cannot disagree with each other
-/// the way Home's band and the fleet roll-up did.
+/// `fold_units`' `wants`/`unit_wants_operator`, the Home band, both rail flags and the
+/// attention cycle key all go through this one predicate (via `unit_wants_operator` once
+/// folding is involved), so they cannot disagree with each other the way Home's band and
+/// the fleet roll-up did (round-9 review). `emit_attention_toasts` does not: it diffs
+/// `run_attention` directly and so never toasts a `PlanApproved` handoff or a folded
+/// unit's wanting leg (pre-existing, flagged by review 3be317b2, not fixed here).
 fn wants_operator(r: &state::RunSummary) -> bool {
     run_attention(r).needs_you() || r.phase == Phase::PlanApproved
 }
@@ -11631,7 +11658,7 @@ mod folding {
         assert_eq!(members, vec!["impl1".to_string(), "plan1".to_string()]);
     }
 
-    /// U18, first rule: `PlanApproved` is a handoff only while nothing in the unit is
+    /// U28, first rule: `PlanApproved` is a handoff only while nothing in the unit is
     /// running. A unit whose plan is approved *and* which has an active leg has
     /// already been dispatched, so the approval is stale bookkeeping and nobody is
     /// waiting. Two rejected operator fixes (runs `e72f434e`, `3be317b2`) got this
@@ -11676,7 +11703,7 @@ mod folding {
         );
     }
 
-    /// U18's other half: once the active leg finishes, the approval is a live handoff
+    /// U28's other half: once the active leg finishes, the approval is a live handoff
     /// again, and the row must fold to the *approvable* leg (`plan1`), not the
     /// finished one (`impl1`) — `plan1` is the only leg with a real action
     /// (`:implement`) to take. This is `fold_units`' `wants_operator` tiebreak: both
@@ -11915,6 +11942,90 @@ mod folding {
             (Utc::now() - rows[0].updated_at).num_minutes() < 10,
             "a unit is as old as its newest activity"
         );
+    }
+
+    /// Round-1 review (major): `unit_wants_operator` and `wants_operator` are
+    /// structurally equal on every row `fold_units` can produce, once rule 2's
+    /// tiebreak (attention first, `wants_operator` only within a tied level) holds —
+    /// a `Gate`/`Broken` leg always outranks every other attention level, so it is
+    /// always the representative when one exists; a counted `PlanApproved` leg means
+    /// no leg is active, so every leg is `Idle` and the tiebreak makes the
+    /// `PlanApproved` leg the representative. That equality is *why* the four call
+    /// sites that read `unit_wants_operator` (Home's band, both rail flags, the `a`
+    /// cycle key) can share one predicate with the per-leg `wants_operator` used
+    /// inside `fold_units` itself — reverting any one of those call sites back to
+    /// `wants_operator` cannot fail a test built on real `fold_units` output, because
+    /// on every row `fold_units` emits the two predicates already agree. This is the
+    /// invariant that makes that true, checked exhaustively over every reachable
+    /// (phase, abandoned) pair for a two-leg unit; it fails the moment rule 2's
+    /// tiebreak regresses (verified by temporarily deleting the tiebreak: 3
+    /// divergences, all the `PlanApproved`-vs-idle-sibling case attempt two got
+    /// wrong).
+    #[test]
+    fn unit_wants_operator_matches_wants_operator_on_every_fold_units_row() {
+        const ALL_PHASES: [Phase; 26] = [
+            Phase::Init,
+            Phase::PrepareIsolation,
+            Phase::SpawnSlots,
+            Phase::Dispatch,
+            Phase::WaitCompletion,
+            Phase::PlanReady,
+            Phase::Spec,
+            Phase::AwaitingPlanApproval,
+            Phase::PlanApproved,
+            Phase::PlanRejected,
+            Phase::Review,
+            Phase::Suite,
+            Phase::Rank,
+            Phase::Fix,
+            Phase::PeerRelay,
+            Phase::AwaitingWinnerConfirm,
+            Phase::AwaitingReconcile,
+            Phase::AwaitingShipConfirm,
+            Phase::AwaitingRoundExtension,
+            Phase::Shipping,
+            Phase::Done,
+            Phase::Escalated,
+            Phase::Failed,
+            Phase::Stuck,
+            Phase::Quota,
+            Phase::Stopped,
+        ];
+
+        let mut checked = 0u32;
+        for &root_phase in &ALL_PHASES {
+            for &leg_phase in &ALL_PHASES {
+                for root_abandoned in [false, true] {
+                    for leg_abandoned in [false, true] {
+                        // `is_abandoned` (state.rs) never sets `abandoned` true on a
+                        // waitable-stop phase, so those (phase, abandoned) pairs
+                        // cannot occur in practice — skip rather than assert on
+                        // unreachable input.
+                        if root_abandoned && root_phase.is_waitable_stop() {
+                            continue;
+                        }
+                        if leg_abandoned && leg_phase.is_waitable_stop() {
+                            continue;
+                        }
+                        let mut root = summary("root", root_phase, None, 10);
+                        root.abandoned = root_abandoned;
+                        let mut leg = summary("leg", leg_phase, Some("root"), 5);
+                        leg.abandoned = leg_abandoned;
+                        let (rows, _) = fold_units(vec![root, leg]);
+                        for row in &rows {
+                            assert_eq!(
+                                unit_wants_operator(row),
+                                wants_operator(row),
+                                "diverged for root={root_phase:?}/{root_abandoned} \
+                                 leg={leg_phase:?}/{leg_abandoned}: {row:?}"
+                            );
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 100, "the phase matrix must actually run");
     }
 }
 
@@ -12552,7 +12663,7 @@ mod home_ia {
         );
     }
 
-    /// U18, driven through the real pipeline (`fold_units` then `build_home_rows`)
+    /// U28, driven through the real pipeline (`fold_units` then `build_home_rows`)
     /// rather than a hand-built row: a `PlanApproved` unit with a live sibling has
     /// already been dispatched, so it must not appear in NEEDS YOU, and the roll-up
     /// Home's header reads (`home_needs_you`) must agree with the fleet-wide one
@@ -12590,7 +12701,7 @@ mod home_ia {
         );
     }
 
-    /// U18's other half, through the same real pipeline: once the active leg
+    /// U28's other half, through the same real pipeline: once the active leg
     /// finishes, the unit is a live handoff again, and the row Home renders must be
     /// the approvable leg — the one a NEEDS YOU alert can actually be acted on.
     #[test]
@@ -12639,10 +12750,10 @@ mod home_ia {
     }
 
     /// The `a` cycle key (`jump_to_attention`) goes through `unit_wants_operator` at
-    /// the Runs level too — a folded unit stuck on U18's stale-approval case must not
+    /// the Runs level too — a folded unit stuck on U28's stale-approval case must not
     /// be a cycle target, and must become one again once it is genuinely actionable.
     #[test]
-    fn jump_to_attention_follows_the_u18_conditional() {
+    fn jump_to_attention_follows_the_u28_conditional() {
         let root = PathBuf::from("/nonexistent/spar");
         let plan1 = run_in("plan0001", Phase::PlanApproved, 90, &root);
         let mut impl1 = run_in("impl0001", Phase::Review, 5, &root);
@@ -13026,6 +13137,42 @@ mod home_ia {
         assert!(!resolve_home_target(&mut app, &runs, true));
         assert!(app.home_target_run.is_none(), "the ghost pin must release");
         assert_eq!(app.browse, BrowseLevel::Home);
+    }
+
+    /// Round-2 review (major, both reviewers): the give-up clock's classification of
+    /// "does this snapshot actually cover the target project" used to be root
+    /// equality alone (`snap.swarm.project_root == active_root`), which is trivially
+    /// true for the still-displayed Home snapshot when the operator enters a run
+    /// whose project is already `active_root` — that snapshot never scanned any
+    /// project's runs (`build_snapshot` only populates `runs` `if
+    /// sel.browse.in_project()`), so the clock could start before any real
+    /// per-project snapshot had landed. `snapshot_covers_target` must additionally
+    /// require the snapshot to have been built at an in-project browse level.
+    #[test]
+    fn snapshot_covers_target_requires_an_in_project_snapshot_not_just_a_matching_root() {
+        let root = PathBuf::from("/nonexistent/spar");
+
+        let mut home_snap = Snapshot::loading(&root);
+        home_snap.browse = BrowseLevel::Home;
+        assert!(
+            !snapshot_covers_target(&home_snap, &root),
+            "a Home-level snapshot never scanned this project's runs, even with a \
+             matching root"
+        );
+
+        let mut runs_snap = Snapshot::loading(&root);
+        runs_snap.browse = BrowseLevel::Runs;
+        assert!(
+            snapshot_covers_target(&runs_snap, &root),
+            "an in-project snapshot with a matching root is the real thing"
+        );
+
+        let mut other_project_snap = Snapshot::loading(&PathBuf::from("/nonexistent/elsewhere"));
+        other_project_snap.browse = BrowseLevel::Agents;
+        assert!(
+            !snapshot_covers_target(&other_project_snap, &root),
+            "an in-project snapshot for a different project must not count"
+        );
     }
 
     /// AC-28. R3: Home re-ranks every snapshot (wait time changes every
