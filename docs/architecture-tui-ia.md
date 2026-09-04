@@ -105,6 +105,16 @@ fleet picker over the roster. This supersedes U3's punt ("a fresh fleet needs a 
 picker a text palette can't offer, so those error to the CLI") by building the picker rather
 than continuing to error to the CLI.
 
+**Amended (U16).** The text field becomes a conversation. `n` opens the resident
+orchestrator, which interviews the operator, writes the same brief to the same path, and
+proposes a fleet; the picker survives as the manual path that costs no tokens. This settles
+X10 yes: the TUI hosts a conversation. It does not disturb the operator model, because the
+conversation *is* the disposable session P7 already describes — its prompt is the embedded
+core skill, it gets current by reading `.spar/runs/<id>/`, and killing it loses nothing. The
+orchestrator is an **Agent** under U6, not a fifth noun, and its surface is a fifth Main tab
+whose content is `f(rail selection)` like every other tab. Its authority is bounded by U17:
+it proposes, the operator disposes. See `roadmap/features/008-orchestrator-conversation.md`.
+
 ---
 
 ## Gate evidence (U9)
@@ -138,14 +148,14 @@ width breakpoint. The rule: reserve space from the layout, never from the conten
 clips into fixed slots; skeleton placeholders hold space before data lands; reorder becomes
 an animated transition.
 
-**Off-thread `Snapshot` scans (U13).** `rail_project_items` calls
+**Off-thread `Snapshot` scans (U13). Done.** `rail_project_items` used to call
 `registry::list_visible_project_runs(&p.root)` once per project per redraw to compute the
-flag roll-up (`src/tui.rs:2830`). That is a directory scan inside `draw`, the one real
-render-path offender. `project_overview`'s call at `src/tui.rs:1312` is not: it runs inside
+flag roll-up, a directory scan inside `draw`, the one real render-path offender.
+`project_overview`'s call at `src/tui.rs:1312` was never the problem: it runs inside
 `build_snapshot` (`src/tui.rs:869`), the refresher thread's off-thread builder, alongside the
-correct call at `src/tui.rs:873`. `rail_project_items` moves onto `Snapshot` so `draw` never
-touches disk. This bites at the scale already hit once, when run dirs accumulated into the
-thousands.
+correct call at `src/tui.rs:873`. 004 Phase B moved `rail_project_items` onto `Snapshot`'s
+off-thread `HomeData`, so `draw` now consumes per-project stats instead of scanning. This
+bites at the scale already hit once, when run dirs accumulated into the thousands.
 
 **Design tokens and stability assertions.** A token set replaces scattered color consts,
 held to one accent and one alert colour, a consistent border and weight language, and
@@ -185,4 +195,5 @@ U12's braille/half-block clause: no density glyph earned its place in this pass.
 the four layout-shift sources are fixed (width-summed gate buttons, growing lists); the
 attention re-sort needs the motion engine, and the narrow tab strip still flips mode at
 the 80-column breakpoint. `rail_project_items`' render-path directory scan (U13) is
-untouched and remains 004 Phase B's job.
+done: 004 Phase B moved it onto `Snapshot`'s off-thread `HomeData`, so `draw` consumes
+per-project stats instead of scanning.

@@ -1035,9 +1035,55 @@ fn quota_partial_pause_fails_loud_without_collapse() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
 
+    // The paused ref has to be one that actually resolves on this box. `pick_providers`
+    // filters by presence before the quota gate, so pausing a provider that is not on
+    // PATH pauses nothing the gate can see: the fleet stays live, the run proceeds, and
+    // the guard tests nothing. Pausing whichever of the three is present keeps it honest
+    // on a box with any subset installed.
+    let listing = spar_cmd()
+        .current_dir(tmp.path())
+        .args(["provider", "list", "--json"])
+        .output()
+        .unwrap();
+    let entries: Vec<serde_json::Value> =
+        serde_json::from_slice(&listing.stdout).expect("provider list json");
+    let present: Vec<String> = ["claude", "grok", "agy"]
+        .iter()
+        .filter(|n| {
+            entries
+                .iter()
+                .any(|e| e["name"].as_str() == Some(**n) && !e["path"].is_null())
+        })
+        .map(|n| format!("cli:{n}"))
+        .collect();
+
+    let Some(paused) = present.first().cloned() else {
+        // No vendor CLIs on PATH: presence filtering empties the fleet before the quota
+        // gate, which is `quota_exit_when_all_paused`'s offline path, not this one.
+        let r = spar_cmd()
+            .current_dir(tmp.path())
+            .args([
+                "plan",
+                "--task",
+                "x",
+                "--providers",
+                "cli:claude,cli:grok,cli:agy",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            r.status.code().unwrap_or(1),
+            1,
+            "offline: expected exit 1, stderr={}",
+            String::from_utf8_lossy(&r.stderr)
+        );
+        return;
+    };
+
     spar_cmd()
         .current_dir(tmp.path())
-        .args(["provider", "pause", "cli:grok"])
+        .args(["provider", "pause", &paused])
         .assert()
         .success();
 
@@ -1060,7 +1106,7 @@ fn quota_partial_pause_fails_loud_without_collapse() {
         assert_eq!(v["phase"], "quota");
         // Names the paused provider, not a silent swap.
         assert!(
-            v["error"].as_str().unwrap_or_default().contains("cli:grok"),
+            v["error"].as_str().unwrap_or_default().contains(&paused),
             "error must name the paused provider, got {}",
             v["error"]
         );
@@ -1071,17 +1117,24 @@ fn quota_partial_pause_fails_loud_without_collapse() {
             .iter()
             .map(|p| p.as_str().unwrap())
             .collect();
-        assert_eq!(
-            provs,
-            ["cli:claude", "cli:grok", "cli:agy"],
-            "paused provider must not be dropped/reindexed"
+        // The discriminator against the collapse bug: the quota filter must leave the
+        // paused entry in place. Presence filtering is a *separate* mechanism and does
+        // legitimately reshape the fleet on a box missing one of the three, so the
+        // literal requested list is only the expected fleet when all three resolve.
+        assert!(
+            provs.contains(&paused.as_str()),
+            "paused provider must not be dropped/reindexed, got {provs:?}"
         );
+        if present.len() == 3 {
+            assert_eq!(
+                provs,
+                ["cli:claude", "cli:grok", "cli:agy"],
+                "paused provider must not be dropped/reindexed"
+            );
+        }
     } else {
-        // Offline / no binaries on PATH: pick_providers filters by presence first.
-        assert_eq!(
-            code,
-            1,
-            "expected quota(4) when providers exist, got {code} stderr={}",
+        panic!(
+            "expected quota(4) with {paused} paused and present, got {code} stderr={}",
             String::from_utf8_lossy(&r.stderr)
         );
     }

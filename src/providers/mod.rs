@@ -241,13 +241,15 @@ pub fn is_provider_usable(raw: &str, allow_missing: bool) -> bool {
             if allow_missing {
                 return true;
             }
-            // Live: accept named API providers; slot fails later if keys missing.
-            matches!(
-                pref.name.as_str(),
-                "openai" | "xai" | "anthropic" | "google" | "meta"
-            )
+            api_provider_supported(&pref.name)
         }
     }
+}
+
+/// Named API providers the api-sdk backend actually has an adapter for.
+/// Slot dispatch fails later if keys are missing; this only screens the name itself.
+pub fn api_provider_supported(name: &str) -> bool {
+    matches!(name, "openai" | "xai" | "anthropic" | "google" | "meta")
 }
 
 /// Providers that are on PATH, as `cli:name` keys, optionally filtered by `order`.

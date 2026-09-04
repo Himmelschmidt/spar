@@ -16,7 +16,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub cwd: Option<PathBuf>,
 
-    /// Seed the TUI composer with a task (TUI mode only)
+    /// Pre-fill the TUI's new-run surface with a task (TUI mode only)
     #[arg(long = "task", global = true)]
     pub task: Option<String>,
 

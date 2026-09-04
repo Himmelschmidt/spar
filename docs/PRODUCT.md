@@ -40,7 +40,7 @@ The TUI is not `dashboard` as an afterthought. It **is** the app (like `claude` 
 
 ### TUI pillars (parity with best-in-class agents)
 
-1. **Session / run home** — active run, phase, gates, one run id end-to-end  
+1. **Home** — cross-project landing view, four bands: what needs me, running, finished since last look, start something new  
 2. **Fleet panel** — every slot: role, provider, backend (cli|api), status, model, quota, worktree/branch  
 3. **Stream** — live agent output (all slots); follow one or multiplex  
 4. **Bus / chat** — swarm bus feed, DMs, broadcast, human as peer (Pi-messenger UX, better protocol)  

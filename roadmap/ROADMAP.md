@@ -50,6 +50,7 @@
 - [ ] **TUI information architecture** (noun set, Home landing view, new-run flow, off-thread snapshot scans) - see `features/004-tui-information-architecture.md`  
 - [~] **One run per unit of work** (rounds, attach-by-default, `spar link`, folded listings, bulk archive) - see `features/007-one-run-per-unit-of-work.md`  
 - [ ] **Gate evidence** (Plan tab, Review tab with AC-n status, diff and review verdicts) - see `features/005-gate-evidence.md`  
+- [ ] **Orchestrator conversation** (resident conversation surface, native-cli turn loop, intake to brief + fleet + launch, gate consultation) - see `features/008-orchestrator-conversation.md`  
 - [~] **Motion and visual identity** — chrome rebuild, token system and the snapshot/stability harness landed early (phases C+D, out of order, decision U14); time-based motion and reserved-space layout (phases A+B) still queued behind 005 - see `features/006-motion-and-identity.md`  
 
 ## Later

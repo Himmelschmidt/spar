@@ -171,7 +171,7 @@ pub fn note_run(project_root: &Path, run_id: &str) {
     let _ = reg.touch_project(project_root, Some(run_id));
 }
 
-fn canonicalize_best_effort(p: &Path) -> PathBuf {
+pub(crate) fn canonicalize_best_effort(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 

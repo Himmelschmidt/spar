@@ -50,8 +50,9 @@ const TAB_MARK: &str = "━";
 /// needed a page background to sit on.
 const SEL_BAR: &str = "▌";
 
-/// Three focus targets, not an N-way ring: the drill-down rail, the one main
-/// area, and the composer. `1` / `2` / `3` jump straight to one (see U1).
+/// Two focus targets, not an N-way ring: the drill-down rail and the one main
+/// area. `1` / `2` jump straight to one; `Tab` / `BackTab` cycles between them
+/// (see U1). The `:` palette is a transient overlay, not a third ring member.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Rail,
@@ -165,7 +166,7 @@ const PALETTE_CMDS: &[PaletteCmd] = &[
     PaletteCmd {
         name: "plan",
         arg_hint: "<task>",
-        help: "start a plan (reuses the selected run's fleet)",
+        help: "start a plan (fleet picker, or the selected run's fleet)",
         needs_run: false,
     },
     PaletteCmd {
@@ -231,7 +232,15 @@ pub fn run_with(opts: TuiOpts) -> Result<crate::exit_codes::ExitCode> {
         std::env::set_current_dir(cwd)?;
     }
     // Optional: cwd may not be a git project — global home still works.
-    let local_root = paths::find_project_root().ok();
+    // Canonicalized to match how the registry stores project roots
+    // (`registry::register`): `find_project_root` returns `SPAR_PROJECT_ROOT`
+    // verbatim when set, which spar exports to every agent it spawns, so an agent
+    // running the TUI is the likely path that would otherwise mismatch and leave
+    // `HomeScope::Project` filtering every row out (Home renders empty with no
+    // explanation why).
+    let local_root = paths::find_project_root()
+        .ok()
+        .map(|r| registry::canonicalize_best_effort(&r));
     if let Some(root) = &local_root {
         let _ = registry::ensure_known(Some(root));
     } else {
@@ -287,10 +296,13 @@ impl Drop for TerminalGuard {
 /// Bytes of slot log kept in the live-log viewport (tail window).
 const LOG_TAIL_BYTES: usize = 256_000;
 
-/// The rail is one drill-down tree: `projects ▸ runs ▸ agents`. `Enter` pushes a
-/// level, `Esc` pops one (and never exits the app at the root).
+/// The rail is one drill-down tree, rooted at Home: `Home ▸ runs ▸ agents`, with
+/// `Projects` reachable as navigation (`p`, or a Home row) rather than the root.
+/// `Enter` pushes a level, `Esc` pops one (and never exits the app at the root).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BrowseLevel {
+    /// The cross-project landing view — the rail root (U7/U18).
+    Home,
     /// General view — registered projects only (not a wall of runs).
     Projects,
     /// Per-project view — runs for `active_root` only.
@@ -302,14 +314,151 @@ enum BrowseLevel {
 impl BrowseLevel {
     /// Levels that need this project's runs (and the selected run) loaded.
     fn in_project(self) -> bool {
-        !matches!(self, BrowseLevel::Projects)
+        matches!(self, BrowseLevel::Runs | BrowseLevel::Agents)
     }
     fn pop(self) -> Self {
         match self {
             BrowseLevel::Agents => BrowseLevel::Runs,
-            _ => BrowseLevel::Projects,
+            BrowseLevel::Runs => BrowseLevel::Home,
+            BrowseLevel::Projects => BrowseLevel::Home,
+            BrowseLevel::Home => BrowseLevel::Home,
         }
     }
+}
+
+/// Home's four bands, in fixed display order (U7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HomeBand {
+    NeedsMe,
+    Running,
+    Finished,
+    StartNew,
+}
+
+/// Home's four bands flattened into one list, headers included so they are always
+/// present even when a band is empty (U14: reserve space from the layout, never the
+/// content). Built off-thread in `build_snapshot` — `draw` only ever consumes this.
+// `run: state::RunSummary` makes `Run` the largest variant by a wide margin, but
+// boxing it would break the test contract's direct-construction call sites — Home
+// rows never number in the thousands per frame (`HOME_BAND_CAP`), so the copy cost
+// is not worth that.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+enum HomeRow {
+    Header(HomeBand),
+    Run {
+        band: HomeBand,
+        run: state::RunSummary,
+        // Ranking-time snapshot of the wait, kept for AC-19/AC-20's monotonicity
+        // assertions; both renderers recompute a live wait from `run.updated_at`
+        // at paint time instead of reading this, so it is unread outside tests.
+        #[allow(dead_code)]
+        waited: Duration,
+    },
+    /// A capped band's tail: how many more rows it is not showing.
+    More {
+        band: HomeBand,
+        n: usize,
+    },
+    /// Band 4's project switcher: an index into the snapshot's `projects` (for the
+    /// lookups that need the full entry) plus that project's root, carried alongside
+    /// so `home_row_key` has a stable identity that does not move when the registry
+    /// gains or loses an earlier project (AC-28) — the index alone would.
+    Project(usize, PathBuf),
+    /// Band 4's action row — opens the Phase D new-run surface.
+    NewRun,
+}
+
+/// Home's scope: everything registered, or one project. Filters which rows land in
+/// the bands; it never changes the bands themselves (U20).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HomeScope {
+    All,
+    Project(PathBuf),
+}
+
+/// Per-project roll-up for the rail's Projects level and Home's project rows,
+/// index-aligned with `Snapshot::projects`. Computed off-thread because `draw`
+/// never scans (U13).
+#[derive(Debug, Clone, Copy, Default)]
+struct ProjectStat {
+    n_runs: usize,
+    needs_you: usize,
+}
+
+/// Home's off-thread roll-up: the flattened band rows plus the per-project stats the
+/// Projects level and Home's project rows both need. One `Snapshot` field.
+#[derive(Default)]
+struct HomeData {
+    rows: Vec<HomeRow>,
+    project_stats: Vec<ProjectStat>,
+}
+
+/// Per-band cap on rendered rows, so a thousand-run workspace does not build a
+/// thousand `ListItem`s a frame. Band 1 (`NeedsMe`) is exempt — the cap must never
+/// hide something that wants the operator.
+const HOME_BAND_CAP: usize = 50;
+
+/// Field the Phase D new-run modal is currently editing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewRunField {
+    Project,
+    Task,
+    Fleet,
+}
+
+/// Where a roster entry came from — shown so the operator knows why it is (or is
+/// not) selectable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RosterSource {
+    /// Listed in `spar.toml`'s `[providers] order`.
+    Configured,
+    /// Found on `PATH` by `providers::detect_all()` but not configured.
+    Detected,
+    /// The most recently run's recorded fleet, offered as one row.
+    RecentFleet,
+}
+
+/// What picking a roster row adds to the fleet: one provider, or (for a recent-fleet
+/// row) several at once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RosterChoice {
+    Provider(String),
+    Fleet(Vec<String>),
+}
+
+/// One row in the fleet picker.
+#[derive(Debug, Clone)]
+struct RosterEntry {
+    choice: RosterChoice,
+    label: String,
+    available: bool,
+    reason: Option<String>,
+    source: RosterSource,
+}
+
+/// Phase D's new-run modal: a one-line task (U16's manual seam — the brief file is
+/// 008's half) plus a fleet picker over the provider roster (U8/U21/U22).
+struct NewRun {
+    /// The target project. `None` means no launchable target (R5/AC-32).
+    project: Option<PathBuf>,
+    /// Cycleable project choices when Home's scope is `All`.
+    projects: Vec<PathBuf>,
+    task: String,
+    /// Snapshotted once, when the modal opens (U22) — never touched again in `draw`.
+    roster: Vec<RosterEntry>,
+    /// Indices into `roster`, in the order they were picked.
+    picked: Vec<usize>,
+    field: NewRunField,
+    /// Cursor row within the roster list.
+    sel: usize,
+    /// True while the background roster probe (`detect_all`, a registry read) is
+    /// still in flight — `draw` shows "checking roster" instead of an empty list.
+    loading: bool,
+    /// Tags which `open_new_run`/`begin_new_run` call this modal belongs to, so a
+    /// slow probe from a cancelled or reopened modal cannot clobber a later one
+    /// (D2 — the `Msg::RosterReady` guard).
+    gen: u64,
 }
 
 struct App {
@@ -359,6 +508,8 @@ struct App {
     log_expand: bool,
     last_click: Option<(u16, u16, Instant)>,
     show_help: bool,
+    /// Scroll offset into the help overlay; reset whenever help is (re)opened.
+    help_scroll: u16,
     /// Whether the current frame is part of an animation; drives the spinner so
     /// it shows a static glyph when idle instead of a frame frozen mid-spin.
     animated: bool,
@@ -374,7 +525,13 @@ struct App {
     /// The `:` palette overlay rect (for click-to-dismiss); zero-sized when closed.
     rect_palette: Rect,
     /// Per-tab hit rects for the Main tab strip (wide: in Main's top border; narrow: its own row).
+    /// Padded for touch in narrow (half of each neighboring gap), so not the same as
+    /// the painted glyph span — `main_tab_glyphs` below is the one to underline.
     main_tabs: Vec<(Rect, MainTab)>,
+    /// Per-tab painted glyph rects for the Main tab strip, unpadded. `draw_rule` reads
+    /// this for the active-tab underline; using `main_tabs` there would stretch the
+    /// accent into the touch-target padding on either side of the label (narrow band).
+    main_tab_glyphs: Vec<(Rect, MainTab)>,
     /// One-shot: on first narrow render with an active run, jump to Main's Log tab.
     narrow_autofocus_done: bool,
     /// Tappable gate buttons painted this frame, for touch/mouse hit-testing.
@@ -405,9 +562,48 @@ struct App {
     /// Per-run attention level from the previous snapshot, for toast edge-detection.
     /// `None` until the first snapshot primes it (so we never toast the initial fleet).
     prev_attention: Option<Vec<(String, Attention)>>,
+    /// Which population `prev_attention` was built from — Home's cross-project rows or
+    /// a project's `snap.runs`. Home and a project alternate as the operator navigates;
+    /// a run absent from the *other* population's baseline is not a transition, just a
+    /// population swap, so a swap re-primes silently instead of toasting every run the
+    /// new population happens to already have at Gate/Broken (round-9 review).
+    prev_attention_home: Option<bool>,
     /// Hit rect of the fleet roll-up token on the status line; a tap jumps to the next
     /// run that needs you (same as `a`). Zero-sized when nothing needs attention.
     rect_attention: Rect,
+    /// Rail cursor at the Home level. Rebuilt every snapshot; see `home_key`.
+    selected_home: usize,
+    /// Whether Home shows every registered project's rows or one project's. `P` toggles.
+    home_scope: HomeScope,
+    /// "Finished since last look" boundary — read once at startup, held for the whole
+    /// session so band 3 does not empty under the operator while they are looking (U19).
+    home_watermark: DateTime<Utc>,
+    /// Identity of the row `selected_home` points at (not its index — Home re-ranks
+    /// every snapshot). `resync_home_selection` uses this to follow the row across
+    /// rebuilds instead of a position that can slide out from under the cursor (R3).
+    home_key: Option<String>,
+    /// Set by `rail_enter` on a Home run row so the one-tick snapshot handoff into
+    /// `Agents` selects the row's own run, not whatever the rail happened to have.
+    home_target_run: Option<String>,
+    /// Wall-clock start of the give-up budget (`HOME_TARGET_GIVE_UP`) once a snapshot
+    /// of the target's own project has been seen without finding it — the target's
+    /// project may still be one refresh behind (R2), but a run that never reappears
+    /// (archived, dir removed, folded into a different loudest leg) must eventually
+    /// release the pin rather than leave Main/Agents permanently empty (round-7
+    /// review finding: a ghost target used to stick forever).
+    home_target_since: Option<Instant>,
+    /// Phase D's new-run modal. `Some` = open and capturing keys.
+    new_run: Option<NewRun>,
+    /// Bumped every time the new-run modal opens; tags `NewRun::gen` and
+    /// `Msg::RosterReady` so a stale background probe cannot land in a later modal.
+    new_run_gen: u64,
+    /// The new-run overlay's outer rect (for click-outside-to-cancel); zero-sized when
+    /// closed. Mirrors `rect_palette`.
+    rect_new_run: Rect,
+    /// Painted roster row rects this frame as `(roster_index, rect)`, for
+    /// click-to-toggle. Only as many entries as were actually rendered (post-cap,
+    /// post-scroll).
+    rect_new_run_roster: Vec<(usize, Rect)>,
 }
 
 /// A gate action reachable by both a key and a tappable button.
@@ -474,25 +670,38 @@ impl LogCache {
 }
 
 impl App {
-    fn new(task_seed: Option<String>, cfg: Config, start_in_project: bool) -> Self {
+    fn new(task_seed: Option<String>, cfg: Config, local_root: Option<&Path>) -> Self {
+        let home_scope = match local_root {
+            Some(root) => HomeScope::Project(root.to_path_buf()),
+            None => HomeScope::All,
+        };
+        // A launch task seed opens the new-run surface pre-filled (U3/U21) — it no
+        // longer opens the palette, which had no way to offer a fresh fleet. The
+        // roster itself is *not* built here: `bg_tx` doesn't exist yet at this point
+        // in startup, and `detect_all()` spawns every provider with `--version` (D2)
+        // — that cannot sit on the startup path. `run_loop` kicks off the probe once
+        // the channel is wired, or a `spar --task` launch opens a surface with
+        // nothing to pick and no key that can populate it (AC-33).
+        let new_run = task_seed.map(|t| {
+            let all_projects: Vec<PathBuf> =
+                registry::projects().into_iter().map(|p| p.root).collect();
+            let project = local_root
+                .map(Path::to_path_buf)
+                .or_else(|| all_projects.first().cloned());
+            pending_new_run(project, all_projects, t, NewRunField::Task, 1)
+        });
+        let new_run_gen = if new_run.is_some() { 1 } else { 0 };
         Self {
             selected_run: 0,
             selected_project: 0,
             selected_slot: 0,
             focus: Focus::Rail,
-            // Inside a project → that project's runs. Outside → project picker.
-            browse: if start_in_project {
-                BrowseLevel::Runs
-            } else {
-                BrowseLevel::Projects
-            },
+            // Home is always the landing view (U7/U18); Projects survives as
+            // navigation, reachable with `p` or a Home row.
+            browse: BrowseLevel::Home,
             main_tab: MainTab::Log,
             zoom: false,
-            // A launch task seed opens the palette pre-filled with a `plan` command.
-            palette: task_seed.map(|t| Palette {
-                input: format!("plan {t}"),
-                sel: 0,
-            }),
+            palette: None,
             filter: None,
             filter_committed: false,
             status_line: String::new(),
@@ -516,6 +725,7 @@ impl App {
             log_expand: false,
             last_click: None,
             show_help: false,
+            help_scroll: 0,
             animated: false,
             rect_status: Rect::default(),
             rect_rail: Rect::default(),
@@ -523,6 +733,7 @@ impl App {
             rect_main_inner: Rect::default(),
             rect_palette: Rect::default(),
             main_tabs: Vec::new(),
+            main_tab_glyphs: Vec::new(),
             narrow_autofocus_done: false,
             gate_buttons: Vec::new(),
             rect_help: Rect::default(),
@@ -534,7 +745,18 @@ impl App {
             takeover_target: None,
             bg_tx: None,
             prev_attention: None,
+            prev_attention_home: None,
             rect_attention: Rect::default(),
+            selected_home: 0,
+            home_scope,
+            home_watermark: read_watermark(&watermark_path()),
+            home_key: None,
+            home_target_run: None,
+            home_target_since: None,
+            new_run,
+            new_run_gen,
+            rect_new_run: Rect::default(),
+            rect_new_run_roster: Vec::new(),
         }
     }
 
@@ -613,17 +835,35 @@ impl App {
         self.reset_stream_view();
         self.reset_bus_view();
         self.focus = Focus::Rail;
+        // Explicit navigation away from a run-scoped level abandons any pending Home
+        // `Enter` target (round-9 review): left set, it would either resolve against
+        // whatever project is entered next (wrong run) or silently tick toward the
+        // "run is gone" flash 25 snapshots later, out of a project the operator chose
+        // on purpose.
+        self.home_target_run = None;
+        self.home_target_since = None;
     }
 
-    /// `Esc` in the rail: pop one level. At `Projects` this is a no-op — the rail
-    /// root is never an exit.
+    /// Back to the landing view. `Projects`/`Runs`/`Agents` all pop here eventually.
+    fn open_home(&mut self) {
+        self.browse = BrowseLevel::Home;
+        self.selected_slot = 0;
+        self.reset_stream_view();
+        self.reset_bus_view();
+        self.focus = Focus::Rail;
+        self.home_target_run = None;
+        self.home_target_since = None;
+    }
+
+    /// `Esc` in the rail: pop one level. At `Home` this is a no-op — the rail root
+    /// is never an exit (U18).
     fn rail_pop(&mut self) {
-        if self.browse == BrowseLevel::Projects {
+        if self.browse == BrowseLevel::Home {
             return;
         }
         let next = self.browse.pop();
-        if next == BrowseLevel::Projects {
-            self.open_projects_view();
+        if next == BrowseLevel::Home {
+            self.open_home();
         } else {
             self.browse = next;
             self.selected_slot = 0;
@@ -677,31 +917,36 @@ impl App {
     }
 
     /// Scroll whichever view Main is showing. The Shell tab is a live tmux client:
-    /// it never scrolls from here (its input is forwarded raw).
-    fn scroll_main_by(&mut self, delta: i32) {
+    /// it never scrolls from here (its input is forwarded raw). Without a run
+    /// selected, Activity and Diff fall back to the same overview body Log uses
+    /// (`draw_log_body`), so scrolling must follow that body — `stream_*` — rather
+    /// than the run-scoped `bus_*`/`diff_*` state those tabs normally own.
+    fn scroll_main_by(&mut self, delta: i32, has_full: bool) {
         match self.main_tab {
             MainTab::Log => self.scroll_stream_by(delta),
-            MainTab::Activity => self.scroll_bus_by(delta),
-            MainTab::Diff => self.scroll_diff_by(delta),
+            MainTab::Activity if has_full => self.scroll_bus_by(delta),
+            MainTab::Activity => self.scroll_stream_by(delta),
+            MainTab::Diff if has_full => self.scroll_diff_by(delta),
+            MainTab::Diff => self.scroll_stream_by(delta),
             MainTab::Shell => {}
         }
     }
 
-    fn main_page(&self) -> u16 {
+    fn main_page(&self, has_full: bool) -> u16 {
         match self.main_tab {
-            MainTab::Activity => self.bus_page(),
-            MainTab::Diff => self.diff_page(),
+            MainTab::Activity if has_full => self.bus_page(),
+            MainTab::Diff if has_full => self.diff_page(),
             _ => self.stream_page(),
         }
     }
 
-    fn home_for_main(&mut self) {
+    fn home_for_main(&mut self, has_full: bool) {
         match self.main_tab {
-            MainTab::Activity => {
+            MainTab::Activity if has_full => {
                 self.bus_follow = false;
                 self.bus_scroll = 0;
             }
-            MainTab::Diff => {
+            MainTab::Diff if has_full => {
                 self.diff_follow = false;
                 self.diff_scroll = 0;
             }
@@ -712,13 +957,13 @@ impl App {
         }
     }
 
-    fn end_for_main(&mut self) {
+    fn end_for_main(&mut self, has_full: bool) {
         match self.main_tab {
-            MainTab::Activity => {
+            MainTab::Activity if has_full => {
                 self.bus_follow = true;
                 self.bus_scroll = self.bus_max;
             }
-            MainTab::Diff => {
+            MainTab::Diff if has_full => {
                 self.diff_follow = true;
                 self.diff_scroll = self.diff_max;
             }
@@ -776,10 +1021,62 @@ fn clamp_scroll(scroll: &mut u16, follow: &mut bool, max: u16) {
     }
 }
 
+/// Test fixture: an `App` pinned to the **Runs** level, which is where every
+/// pre-Home render test means to be. `App::new` now always lands on `Home`
+/// (feature 004 Phase C), so a test that wants a project's run list has to say so.
+#[cfg(test)]
+fn test_app() -> App {
+    let mut app = App::new(None, Config::default(), Some(Path::new("/x")));
+    app.browse = BrowseLevel::Runs;
+    app
+}
+
+/// Test fixture: the Phase D new-run modal, open on a real target project with a
+/// two-entry roster and one provider picked. Shared by `render_stability` (overlay
+/// sweep) and `home_ia` (picker semantics).
+#[cfg(test)]
+fn new_run_fixture() -> NewRun {
+    NewRun {
+        project: Some(PathBuf::from("/nonexistent/spar")),
+        projects: vec![
+            PathBuf::from("/nonexistent/spar"),
+            PathBuf::from("/nonexistent/acme-api"),
+        ],
+        task: "stop prose mentions creating phantom criteria".into(),
+        roster: vec![
+            RosterEntry {
+                choice: RosterChoice::Provider("cli:claude@opus".into()),
+                label: "cli:claude@opus".into(),
+                available: true,
+                reason: None,
+                source: RosterSource::Configured,
+            },
+            RosterEntry {
+                choice: RosterChoice::Provider("cli:codex".into()),
+                label: "cli:codex".into(),
+                available: true,
+                reason: None,
+                source: RosterSource::Detected,
+            },
+        ],
+        picked: vec![0],
+        field: NewRunField::Fleet,
+        sel: 0,
+        loading: false,
+        gen: 1,
+    }
+}
+
 /// How often the background thread re-reads the run state from disk.
 const REFRESH: Duration = Duration::from_millis(200);
 /// Upper bound on how long the render thread sleeps; also the animation rate.
 const FRAME: Duration = Duration::from_millis(100);
+/// How often Home repaints purely to age its wait/age columns forward when nothing
+/// on disk moved. Home has no selected `full` run, so `animating()` never fires for
+/// it; without this a static Home (only gates/broken/finished rows) freezes its
+/// `relative_wait`/`relative_age` labels at whatever they read at the last real
+/// rebuild instead of counting up (round-11 review finding).
+const HOME_CLOCK_TICK: Duration = Duration::from_secs(5);
 
 /// What the refresher needs in order to know which run/slot to read.
 #[derive(Clone, PartialEq, Eq)]
@@ -789,11 +1086,19 @@ struct Selection {
     run_id: Option<String>,
     slot_idx: usize,
     project_idx: usize,
+    home_scope: HomeScope,
+    home_watermark: DateTime<Utc>,
 }
 
 /// An immutable view of the world, produced off-thread and rendered as-is.
 struct Snapshot {
     swarm: SparPaths,
+    /// The browse level this snapshot was actually built for. `runs` is only
+    /// populated `if sel.browse.in_project()` (`build_snapshot`), so a Home-level
+    /// snapshot whose `swarm.project_root` happens to already equal the browsing
+    /// root carries no real per-project scan — root equality alone cannot tell
+    /// that apart from a genuine target-project snapshot (round-2 review, major).
+    browse: BrowseLevel,
     projects: Vec<registry::ProjectEntry>,
     runs: Vec<state::RunSummary>,
     full: Option<RunState>,
@@ -807,6 +1112,47 @@ struct Snapshot {
     abandoned: bool,
     /// Freshest process heartbeat per slot id for the selected run.
     heartbeats: std::collections::HashMap<String, DateTime<Utc>>,
+    /// Home's bands and the per-project roll-up, built off-thread (U13/B).
+    home: HomeData,
+    /// The selected slot's log stats (U13): `StreamStats::load` reads a file, so it
+    /// is computed here rather than in `draw_log_body`.
+    log_stats: Option<process::StreamStats>,
+}
+
+impl Snapshot {
+    /// The frame painted before the refresher thread's first real build lands.
+    /// Landing on Home means the first snapshot is cross-project (U13/B); building it
+    /// synchronously on the UI thread blocks the very first paint on a scan across
+    /// every registered project's run directory, which is the "thousands of run
+    /// dirs" scale the IA doc names as the thing that already bit once (round-11
+    /// review finding). `SparPaths::new` only joins paths, so this touches no disk.
+    ///
+    /// `home.rows` is seeded with `build_home_rows` over an empty project/run
+    /// listing rather than left empty: that is a pure function over no data, so it
+    /// still touches no disk, but it means the four band headers and the `n` CTA are
+    /// present on frame one instead of Home looking blank for a `REFRESH` tick
+    /// (round-11 review, minor).
+    fn loading(root: &Path) -> Self {
+        let now = Utc::now();
+        Self {
+            swarm: SparPaths::new(root),
+            browse: BrowseLevel::Home,
+            projects: Vec::new(),
+            runs: Vec::new(),
+            full: None,
+            stream_text: String::new(),
+            activity: Vec::new(),
+            diff_text: String::new(),
+            human_alerts: 0,
+            abandoned: false,
+            heartbeats: std::collections::HashMap::new(),
+            home: HomeData {
+                rows: build_home_rows(&[], &[], &HomeScope::All, now, now),
+                project_stats: Vec::new(),
+            },
+            log_stats: None,
+        }
+    }
 }
 
 enum Msg {
@@ -815,6 +1161,10 @@ enum Msg {
     /// A status line pushed from a background task (e.g. `/spawn`'s deferred
     /// spawn+deliver), flashed on the next render tick.
     Flash(String, Color),
+    /// The new-run modal's background roster probe landed (D2). The `u64` is the
+    /// `NewRun::gen` it was built for — applied only if the open modal is still on
+    /// that generation, so a cancelled or reopened modal can't be clobbered.
+    RosterReady(u64, Vec<RosterEntry>),
 }
 
 /// Size+mtime of everything a snapshot is derived from. Comparing these is a
@@ -872,6 +1222,45 @@ fn marks_for(sel: &Selection, prev: Option<&Snapshot>) -> Marks {
     out
 }
 
+/// How often the refresher is allowed to sweep every registered project's run dirs
+/// for Home/Projects. Far coarser than `REFRESH`: at "thousands of run dirs" scale
+/// (the scale that has already bitten once, per the IA doc) a per-200ms sweep across
+/// every project is a permanent stat storm (U23).
+const CROSS_PROJECT_REFRESH: Duration = Duration::from_secs(2);
+
+/// Whether the refresher should re-sweep every registered project's marks right now.
+/// Only Home and Projects are cross-project; `Runs`/`Agents` are scoped to one
+/// project and must never trigger the sweep, no matter how long it has been.
+fn cross_project_due(browse: BrowseLevel, since_last: Duration, forced: bool) -> bool {
+    if !matches!(browse, BrowseLevel::Home | BrowseLevel::Projects) {
+        return false;
+    }
+    forced || since_last >= CROSS_PROJECT_REFRESH
+}
+
+/// Marks for every registered project's run listing — the cross-project half of
+/// `marks_for`, called at `CROSS_PROJECT_REFRESH` cadence rather than every tick.
+fn cross_project_marks(projects: &[registry::ProjectEntry]) -> Marks {
+    let mut out = Vec::new();
+    for p in projects {
+        let swarm = SparPaths::new(&p.root);
+        let runs_dir = swarm.runs_dir();
+        out.push(stamp(&runs_dir));
+        if let Ok(entries) = std::fs::read_dir(&runs_dir) {
+            let mut ids: Vec<String> = entries
+                .flatten()
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            ids.sort();
+            for id in ids {
+                out.push(stamp(&swarm.state_file(&id)));
+            }
+        }
+    }
+    out
+}
+
 /// One row per unit of work (U15). A run with `parent_run` set is a **leg**: it folds
 /// into its root's row. The row keeps the root's brief — that is the human-readable
 /// identity of the work — but takes the id, phase and age of the group's *active*
@@ -914,24 +1303,57 @@ fn fold_units(
     for root in order {
         let mut group = groups.remove(&root).unwrap_or_default();
         if group.len() == 1 {
-            let r = group.pop().expect("len 1");
+            let mut r = group.pop().expect("len 1");
+            r.unit_id = Some(root.clone());
             members.insert(r.id.clone(), vec![r.id.clone()]);
             out.push(r);
             continue;
         }
-        // Loudest attention first, then most recent: the active member is whatever the
-        // operator would want the row to be about.
+        // Loudest attention first (U28): a working leg must outrank an idle one so the
+        // row's id and phase, which gate buttons, `:approve` and drill-down all act on,
+        // never come from a leg that isn't actually holding the state. Reordering by
+        // `wants_operator` first (instead of as a tiebreak) sank a `PlanApproved` unit
+        // with a live child below every working run and retargeted those actions onto
+        // the idle leg — see U28. `wants_operator` only breaks a tie *within* one
+        // attention level: an idle `PlanApproved` leg and an idle `Done` leg sort
+        // equally on attention alone, and picking the `Done` one as representative
+        // would leave a NEEDS YOU row with nothing to act on. Attention can never tie
+        // across a Working leg, since every active phase scores `Working`, so this
+        // tiebreak can only ever reorder among idle (or among gate, or among broken)
+        // legs — it never overrides the active leg attention already selected.
         group.sort_by(|a, b| {
             run_attention(b)
                 .cmp(&run_attention(a))
+                .then_with(|| wants_operator(b).cmp(&wants_operator(a)))
                 .then(b.updated_at.cmp(&a.updated_at))
         });
         let ids: Vec<String> = group.iter().map(|r| r.id.clone()).collect();
-        // Every leg that wants the operator still counts. Two gates folded into one
-        // row must read as two in the roll-up, or folding hides one of them.
+        // Every leg that wants the operator still counts, so two gates folded into one
+        // row read as two in the roll-up rather than one. But `PlanApproved` (U28) is a
+        // handoff only while nothing in the unit is running: once a sibling leg has
+        // taken it up, the approval is stale bookkeeping, not a second thing waiting on
+        // the operator, so it must not inflate `wants` (and, via `unit_wants_operator`,
+        // must not raise a NEEDS YOU nobody can act on for the unit's live leg).
+        // Transcribed straight from U28's two rules rather than gated off
+        // `wants_operator` (round-2 review, minor): `wants_operator`'s own
+        // `PlanApproved` branch fires on phase alone, so filtering on
+        // `phase == PlanApproved` first would drop an *abandoned* PlanApproved leg
+        // too — U28 says `Gate`/`Broken` want the operator unconditionally, and this
+        // form can never suppress one even if `PlanApproved` and `abandoned` ever
+        // become reachable together.
+        // An abandoned leg is not actually running (no live orchestrator, see
+        // `state.rs`'s `abandoned` check) even though its phase reads as active, so it
+        // must not suppress a sibling `PlanApproved` leg's handoff — that approval is
+        // live again, not stale bookkeeping (round-2 review, minor).
+        let unit_has_active_leg = group
+            .iter()
+            .any(|r| is_active_phase(r.phase) && !r.abandoned);
         let wants = group
             .iter()
-            .filter(|r| run_attention(r).needs_you())
+            .filter(|r| {
+                run_attention(r).needs_you()
+                    || (r.phase == Phase::PlanApproved && !unit_has_active_leg)
+            })
             .count() as u32;
         let brief = group
             .iter()
@@ -948,6 +1370,7 @@ fn fold_units(
         row.abandoned = group.iter().any(|r| r.abandoned) || row.abandoned;
         row.legs = ids.len() as u32;
         row.wants = wants;
+        row.unit_id = Some(root.clone());
         members.insert(row.id.clone(), ids);
         out.push(row);
     }
@@ -985,8 +1408,38 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
         .map(|st| st.abandoned(&swarm))
         .unwrap_or(false);
     let quota = QuotaStore::load(&swarm).unwrap_or_default();
+    // Home and Projects both need the per-project roll-up (U13/B); only Home needs
+    // the flattened band rows, which Projects has no use for.
+    let home = if matches!(sel.browse, BrowseLevel::Home | BrowseLevel::Projects) {
+        let folded = gather_home(&projects);
+        let project_stats = project_stats_of(&folded);
+        let rows = if sel.browse == BrowseLevel::Home {
+            build_home_rows(
+                &projects,
+                &folded,
+                &sel.home_scope,
+                sel.home_watermark,
+                Utc::now(),
+            )
+        } else {
+            Vec::new()
+        };
+        HomeData {
+            rows,
+            project_stats,
+        }
+    } else {
+        HomeData::default()
+    };
     let stream_text = if sel.browse.in_project() {
-        stream_content(&swarm, full.as_ref(), sel.slot_idx, cache)
+        stream_content(&swarm, full.as_ref(), sel.slot_idx, cache, !runs.is_empty())
+    } else if sel.browse == BrowseLevel::Home {
+        // `draw_home_body` renders Home's body straight from `HomeData` with a
+        // freshly read clock (so the wait column doesn't freeze between snapshot
+        // rebuilds); a `home_overview` built here off a snapshot-time clock would
+        // never be read.
+        cache.clear();
+        String::new()
     } else {
         cache.clear();
         project_overview(&projects, sel.project_idx)
@@ -1019,8 +1472,34 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
         })
         .unwrap_or_default();
     let activity = activity_feed(&swarm, full.as_ref(), &quota, &alerts, &heartbeats, cfg);
+    let log_stats = full
+        .as_ref()
+        .and_then(|st| st.slots.get(sel.slot_idx))
+        .and_then(|s| {
+            s.log_path
+                .as_ref()
+                .and_then(|p| process::StreamStats::load(p))
+                .or_else(|| {
+                    s.usage.as_ref().map(|u| process::StreamStats {
+                        tools: u.tools,
+                        tool_errors: 0,
+                        input_tokens: u.input_tokens,
+                        output_tokens: u.output_tokens,
+                        cache_read_tokens: u.cache_read_tokens,
+                        cache_write_tokens: 0,
+                        context_tokens: u.context_tokens,
+                        billed_tokens: u.billed_tokens,
+                        model: u.model.clone(),
+                        session_id: None,
+                        lines_in: 0,
+                        chars_out: 0,
+                        last_log_at: None,
+                    })
+                })
+        });
     Snapshot {
         swarm,
+        browse: sel.browse,
         projects,
         runs,
         full,
@@ -1030,7 +1509,567 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
         human_alerts: alerts.len(),
         abandoned,
         heartbeats,
+        home,
+        log_stats,
     }
+}
+
+/// Disk half of U13/B: one folded, archived-filtered run listing per registered
+/// project, index-aligned with `projects`. A missing project root degrades to an
+/// empty listing rather than panicking. Called off-thread only.
+fn gather_home(projects: &[registry::ProjectEntry]) -> Vec<Vec<state::RunSummary>> {
+    projects
+        .iter()
+        .map(|p| {
+            let listed = registry::list_visible_project_runs(&p.root).unwrap_or_default();
+            let (folded, _) = fold_units(listed);
+            folded
+        })
+        .collect()
+}
+
+/// Pure roll-up over an already-folded, per-project listing: run count and how many
+/// legs want the operator (U15's `wants`, not the row count).
+fn project_stats_of(folded: &[Vec<state::RunSummary>]) -> Vec<ProjectStat> {
+    folded
+        .iter()
+        .map(|runs| ProjectStat {
+            n_runs: runs.len(),
+            needs_you: runs_needing_attention(runs),
+        })
+        .collect()
+}
+
+/// A run's wait — how long it has sat since its last update, clamped to zero for a
+/// clock that ran backwards rather than sorting a skewed timestamp to the top forever.
+fn home_wait(updated_at: DateTime<Utc>, now: DateTime<Utc>) -> Duration {
+    (now - updated_at).to_std().unwrap_or(Duration::ZERO)
+}
+
+fn push_home_band(
+    rows: &mut Vec<HomeRow>,
+    band: HomeBand,
+    runs: &[state::RunSummary],
+    now: DateTime<Utc>,
+    cap: Option<usize>,
+) {
+    let shown = match cap {
+        Some(c) => runs.len().min(c),
+        None => runs.len(),
+    };
+    for r in &runs[..shown] {
+        rows.push(HomeRow::Run {
+            band,
+            run: r.clone(),
+            waited: home_wait(r.updated_at, now),
+        });
+    }
+    if let Some(c) = cap {
+        if runs.len() > c {
+            rows.push(HomeRow::More {
+                band,
+                n: runs.len() - c,
+            });
+        }
+    }
+}
+
+/// The identity Home shows and drills into: `unit_id` when folded (stable across a
+/// loudest-leg swap), else `id`. Never `id` alone — it follows whichever leg
+/// `fold_units` currently picks as loudest and can visibly change between snapshots,
+/// which used to make a Home run row change its displayed identity out from under
+/// the operator (round-11 review, major; AC-28).
+fn home_display_id(run: &state::RunSummary) -> &str {
+    run.unit_id.as_deref().unwrap_or(&run.id)
+}
+
+/// Pure banding/ranking/capping (C): first match wins, so a run lands in exactly one
+/// band. `NeedsMe` is never capped (U5/AC-21); `Finished` is bounded by `watermark`
+/// (U19); band membership is declared per phase, not a fallthrough (AC-18).
+fn build_home_rows(
+    projects: &[registry::ProjectEntry],
+    folded: &[Vec<state::RunSummary>],
+    scope: &HomeScope,
+    watermark: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Vec<HomeRow> {
+    let mut needs_me: Vec<state::RunSummary> = Vec::new();
+    let mut running: Vec<state::RunSummary> = Vec::new();
+    let mut finished: Vec<state::RunSummary> = Vec::new();
+
+    for (i, runs) in folded.iter().enumerate() {
+        let Some(proj) = projects.get(i) else {
+            continue;
+        };
+        if let HomeScope::Project(root) = scope {
+            if &proj.root != root {
+                continue;
+            }
+        }
+        for r in runs {
+            // `unit_wants_operator` folds `run_attention`'s Gate/Broken together with
+            // the PlanApproved handoff AND accounts for a folded row whose active leg
+            // is not the one waiting, so this band agrees with `runs_needing_attention`
+            // and the rail flag rather than drifting from them (AC-18; round-9 review,
+            // and the round-12 roll-up disagreement).
+            if unit_wants_operator(r) {
+                needs_me.push(r.clone());
+            } else if is_active_phase(r.phase) {
+                running.push(r.clone());
+            } else if matches!(r.phase, Phase::Done | Phase::Stopped | Phase::PlanRejected)
+                && r.updated_at > watermark
+            {
+                finished.push(r.clone());
+            }
+        }
+    }
+
+    // Band 1: longest wait first, then Gate above Broken (above the PlanApproved
+    // handoff, which carries no `Attention` of its own) as the tiebreak on equal wait.
+    needs_me.sort_by(|a, b| {
+        home_wait(b.updated_at, now)
+            .cmp(&home_wait(a.updated_at, now))
+            .then_with(|| run_attention(b).cmp(&run_attention(a)))
+    });
+    running.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
+    finished.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
+
+    let mut rows = Vec::new();
+    rows.push(HomeRow::Header(HomeBand::NeedsMe));
+    push_home_band(&mut rows, HomeBand::NeedsMe, &needs_me, now, None);
+    rows.push(HomeRow::Header(HomeBand::Running));
+    push_home_band(
+        &mut rows,
+        HomeBand::Running,
+        &running,
+        now,
+        Some(HOME_BAND_CAP),
+    );
+    rows.push(HomeRow::Header(HomeBand::Finished));
+    push_home_band(
+        &mut rows,
+        HomeBand::Finished,
+        &finished,
+        now,
+        Some(HOME_BAND_CAP),
+    );
+    rows.push(HomeRow::Header(HomeBand::StartNew));
+    rows.push(HomeRow::NewRun);
+    for (i, proj) in projects.iter().enumerate() {
+        if let HomeScope::Project(root) = scope {
+            if &proj.root != root {
+                continue;
+            }
+        }
+        rows.push(HomeRow::Project(i, proj.root.clone()));
+    }
+    rows
+}
+
+fn home_band_label(b: HomeBand) -> &'static str {
+    match b {
+        HomeBand::NeedsMe => "NEEDS YOU",
+        HomeBand::Running => "RUNNING",
+        HomeBand::Finished => "FINISHED SINCE YOUR LAST LOOK",
+        HomeBand::StartNew => "START SOMETHING NEW",
+    }
+}
+
+fn home_band_empty_text(b: HomeBand) -> &'static str {
+    match b {
+        HomeBand::NeedsMe => "nothing needs you",
+        HomeBand::Running => "nothing running",
+        HomeBand::Finished => "nothing finished since your last look",
+        HomeBand::StartNew => "",
+    }
+}
+
+fn home_scope_label(scope: &HomeScope) -> String {
+    match scope {
+        HomeScope::All => "all projects".to_string(),
+        HomeScope::Project(p) => p
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "project".to_string()),
+    }
+}
+
+/// How many runs need the operator at Home — a folded row with `legs > 1` still
+/// counts every leg that wants attention (U15), matching `runs_needing_attention`.
+fn home_needs_you(rows: &[HomeRow]) -> usize {
+    rows.iter()
+        .filter_map(|r| match r {
+            HomeRow::Run {
+                band: HomeBand::NeedsMe,
+                run,
+                ..
+            } => Some(if run.legs > 1 { run.wants as usize } else { 1 }),
+            _ => None,
+        })
+        .sum()
+}
+
+/// Total rows in `band`, including what a per-band cap trimmed (`HomeRow::More`'s
+/// `n`) — otherwise the context band's count undercounts a capped band while
+/// `home_needs_you` (uncapped) reads exact, mixing exact and truncated numbers on
+/// the same line.
+fn home_band_count(rows: &[HomeRow], band: HomeBand) -> usize {
+    rows.iter()
+        .filter_map(|r| match r {
+            HomeRow::Run { band: b, .. } if *b == band => Some(1),
+            HomeRow::More { band: b, n } if *b == band => Some(*n),
+            _ => None,
+        })
+        .sum()
+}
+
+/// Main's Home body: the four bands, headers always present, each empty band saying
+/// so on its own line (U14's reserved-space rule applied to Home). `now` is read
+/// fresh at render time rather than trusting each row's stored `waited` (which is
+/// only as fresh as the last snapshot rebuild, and a gated run with nothing else
+/// changing can go a long time between rebuilds) — a review finding.
+fn home_overview(
+    rows: &[HomeRow],
+    scope: &HomeScope,
+    watermark: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> String {
+    let mut out = format!("\n  Home · {}\n\n", home_scope_label(scope));
+    let mut i = 0;
+    while i < rows.len() {
+        let HomeRow::Header(band) = rows[i] else {
+            i += 1;
+            continue;
+        };
+        // The Finished band's header names the watermark it is bounded by, so the
+        // operator knows what "last look" means without opening a project (AC-25).
+        let suffix = if band == HomeBand::Finished {
+            format!(" (since {})", relative_age(watermark))
+        } else {
+            String::new()
+        };
+        out.push_str(&format!("  {}{suffix}\n", home_band_label(band)));
+        let mut j = i + 1;
+        let mut any = false;
+        while j < rows.len() && !matches!(rows[j], HomeRow::Header(_)) {
+            match &rows[j] {
+                HomeRow::Run { run, .. } => {
+                    any = true;
+                    let flag = if run.wants > 1 {
+                        format!(" ⚑{}", run.wants)
+                    } else {
+                        String::new()
+                    };
+                    out.push_str(&format!(
+                        "    {} · {} · {} · waited {}{flag}\n",
+                        run.project_name.as_deref().unwrap_or("?"),
+                        truncate(home_display_id(run), 8),
+                        rail_phase(run.phase),
+                        relative_wait(home_wait(run.updated_at, now)),
+                    ));
+                }
+                HomeRow::More { n, .. } => {
+                    any = true;
+                    out.push_str(&format!("    … {n} more\n"));
+                }
+                HomeRow::NewRun => {
+                    any = true;
+                    out.push_str("    n — start something new\n");
+                }
+                HomeRow::Project(..) => {}
+                HomeRow::Header(_) => unreachable!(),
+            }
+            j += 1;
+        }
+        if !any {
+            let t = home_band_empty_text(band);
+            if !t.is_empty() {
+                out.push_str(&format!("    {t}\n"));
+            }
+        }
+        out.push('\n');
+        i = j;
+    }
+    out
+}
+
+fn relative_wait(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86400)
+    }
+}
+
+/// Identity of a Home row, for `resync_home_selection` to follow the cursor across a
+/// re-ranked snapshot instead of a position (R3).
+fn home_row_key(row: &HomeRow) -> String {
+    match row {
+        HomeRow::Header(b) => format!("hdr:{b:?}"),
+        // `run.id` follows whichever leg `fold_units` currently judges loudest, which
+        // can change between snapshots. `unit_id` is the fold root and does not move
+        // (AC-28); a row that was never folded has no `unit_id`, so `id` is stable.
+        // Home is cross-project by definition, and folding is per project (round-11
+        // review, AC-34), so the project root is part of the identity too — without
+        // it, two projects whose 8-hex ids happen to collide would glue the cursor to
+        // the wrong project's row (round-11 review, minor).
+        HomeRow::Run { run, .. } => {
+            format!(
+                "run:{}:{}",
+                run.project_root
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                run.unit_id.as_deref().unwrap_or(&run.id)
+            )
+        }
+        HomeRow::More { band, .. } => format!("more:{band:?}"),
+        HomeRow::Project(_, root) => format!("proj:{}", root.display()),
+        HomeRow::NewRun => "newrun".to_string(),
+    }
+}
+
+/// Re-glue the Home cursor to the row it was on, by identity, after a rebuild (R3).
+/// A row that vanished clamps to the nearest non-header row rather than indexing out
+/// of bounds or landing on a header.
+fn resync_home_selection(app: &mut App, rows: &[HomeRow]) {
+    if rows.is_empty() {
+        app.selected_home = 0;
+        app.home_key = None;
+        return;
+    }
+    if let Some(key) = app.home_key.clone() {
+        if let Some(i) = rows.iter().position(|r| home_row_key(r) == key) {
+            app.selected_home = i;
+            return;
+        }
+    }
+    let mut i = app.selected_home.min(rows.len() - 1);
+    let unselectable = |r: &HomeRow| matches!(r, HomeRow::Header(_) | HomeRow::More { .. });
+    if unselectable(&rows[i]) {
+        if let Some(f) = (i..rows.len()).find(|&j| !unselectable(&rows[j])) {
+            i = f;
+        } else if let Some(b) = (0..i).rev().find(|&j| !unselectable(&rows[j])) {
+            i = b;
+        }
+    }
+    app.selected_home = i;
+    app.home_key = rows.get(i).map(home_row_key);
+}
+
+/// `P`: toggle Home's scope between "everything" and the local project.
+fn toggle_home_scope(app: &mut App, local_root: Option<&Path>) {
+    app.home_scope = match &app.home_scope {
+        HomeScope::All => match local_root {
+            Some(root) => HomeScope::Project(root.to_path_buf()),
+            None => HomeScope::All,
+        },
+        HomeScope::Project(_) => HomeScope::All,
+    };
+}
+
+/// Where the "finished since last look" watermark lives. Cross-project state cannot
+/// live in a per-project `.spar/` (U19).
+fn watermark_path() -> PathBuf {
+    registry::spar_home().join("home_watermark.json")
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WatermarkFile {
+    seen_at: DateTime<Utc>,
+}
+
+/// A missing or corrupt watermark reads as a day ago — nonfatal, and it only ever
+/// makes band 3 show *more*, never fewer.
+fn read_watermark(path: &Path) -> DateTime<Utc> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<WatermarkFile>(&s).ok())
+        .map(|w| w.seen_at)
+        .unwrap_or_else(|| Utc::now() - chrono::Duration::hours(24))
+}
+
+fn write_watermark(path: &Path, at: DateTime<Utc>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let text = serde_json::to_string(&WatermarkFile { seen_at: at })?;
+    std::fs::write(path, text)?;
+    Ok(())
+}
+
+/// Build the fleet picker's roster (D2). Pure: `detected` is the result of
+/// `providers::detect_all()` already resolved by the caller — this never touches
+/// `PATH` itself (U22, U13). Parse failures are listed first (so a broken config
+/// entry is not lost among usable ones), then configured entries in their
+/// `spar.toml` order, then whatever `detect_all` found that config did not already
+/// list, then the most recent run's fleet as one row.
+fn build_roster(
+    cfg: &Config,
+    detected: &[(String, bool)],
+    recent: Option<(&str, &[String])>,
+) -> Vec<RosterEntry> {
+    let mut invalid = Vec::new();
+    let mut valid: Vec<crate::provider_ref::ProviderRef> = Vec::new();
+    for raw in &cfg.providers.order {
+        match crate::provider_ref::ProviderRef::parse(raw) {
+            Ok(r) => valid.push(r),
+            Err(e) => invalid.push(RosterEntry {
+                choice: RosterChoice::Provider(raw.clone()),
+                label: raw.clone(),
+                available: false,
+                reason: Some(e.to_string()),
+                source: RosterSource::Configured,
+            }),
+        }
+    }
+    let mut roster = invalid;
+    let mut configured_native: Vec<String> = Vec::new();
+    for r in &valid {
+        let (available, reason) = if r.is_api() {
+            if crate::providers::api_provider_supported(&r.name) {
+                (true, None)
+            } else {
+                (
+                    false,
+                    Some(format!("unsupported api provider '{}'", r.name)),
+                )
+            }
+        } else {
+            match detected.iter().find(|(n, _)| n == &r.name) {
+                Some((_, true)) => (true, None),
+                _ => (false, Some("not on PATH".to_string())),
+            }
+        };
+        if let Some(name) = r.cli_name() {
+            configured_native.push(name.to_string());
+        }
+        roster.push(RosterEntry {
+            choice: RosterChoice::Provider(r.display()),
+            label: r.display(),
+            available,
+            reason,
+            source: RosterSource::Configured,
+        });
+    }
+    for (name, avail) in detected {
+        if !avail {
+            continue;
+        }
+        if configured_native.iter().any(|n| n == name) {
+            continue;
+        }
+        roster.push(RosterEntry {
+            choice: RosterChoice::Provider(format!("cli:{name}")),
+            label: format!("cli:{name}"),
+            available: true,
+            reason: None,
+            source: RosterSource::Detected,
+        });
+    }
+    if let Some((run_id, providers)) = recent {
+        // A recent fleet is only as launchable as its least available member — the
+        // same rule a directly-picked ref already gets (AC-30); otherwise picking
+        // this row could build a `--providers` argv with a ref that isn't on PATH.
+        let missing = providers
+            .iter()
+            .find(|p| !provider_ref_available(p, detected));
+        let (available, reason) = match missing {
+            None => (true, None),
+            Some(p) => (false, Some(format!("{p} not on PATH"))),
+        };
+        roster.push(RosterEntry {
+            choice: RosterChoice::Fleet(providers.to_vec()),
+            label: format!("reuse {}'s fleet", truncate(run_id, 8)),
+            available,
+            reason,
+            source: RosterSource::RecentFleet,
+        });
+    }
+    roster
+}
+
+/// Whether a provider ref (as recorded in a run's `providers` list) is currently
+/// usable, by the same rule a configured roster entry gets: `api:` refs need no
+/// PATH lookup, native refs need to be in `detected` and available.
+fn provider_ref_available(raw: &str, detected: &[(String, bool)]) -> bool {
+    match crate::provider_ref::ProviderRef::parse(raw) {
+        Ok(r) if r.is_api() => crate::providers::api_provider_supported(&r.name),
+        Ok(r) => detected.iter().any(|(n, avail)| *n == r.name && *avail),
+        Err(_) => false,
+    }
+}
+
+/// Expand `picked` roster indices into provider refs, in pick order, deduplicated
+/// keeping the first occurrence — a `Fleet` choice can repeat a provider a `Provider`
+/// choice already picked. Dedup keys on `storage_key()` (X8: model-free), not the raw
+/// string, or `cli:claude` (detected) and `cli:claude@opus` (configured) pick as two
+/// dispatches of the same CLI (round-9 review).
+fn new_run_providers(nr: &NewRun) -> Vec<String> {
+    let mut out = Vec::new();
+    for &idx in &nr.picked {
+        let Some(entry) = nr.roster.get(idx) else {
+            continue;
+        };
+        match &entry.choice {
+            RosterChoice::Provider(p) => out.push(p.clone()),
+            RosterChoice::Fleet(v) => out.extend(v.iter().cloned()),
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|p| {
+        let key = crate::provider_ref::ProviderRef::parse(p)
+            .map(|r| r.storage_key())
+            .unwrap_or_else(|_| p.clone());
+        seen.insert(key)
+    });
+    out
+}
+
+/// Validate the new-run surface, then build the argv `run_palette`'s `plan` arm
+/// already sends. The `--base` resolution stays at the call site (it needs the
+/// operator's actual cwd, which this pure function does not have).
+fn new_run_launch(nr: &NewRun) -> std::result::Result<(PathBuf, Vec<String>), String> {
+    let target = nr.project.clone().ok_or_else(|| {
+        "no project to launch into — open spar in a project or choose a registered project"
+            .to_string()
+    })?;
+    if nr.task.trim().is_empty() {
+        return Err("task cannot be empty".to_string());
+    }
+    if nr.picked.is_empty() {
+        return Err("pick at least one provider".to_string());
+    }
+    for &idx in &nr.picked {
+        match nr.roster.get(idx) {
+            Some(e) if e.available => {}
+            Some(e) => {
+                return Err(format!(
+                    "{} is not available: {}",
+                    e.label,
+                    e.reason.as_deref().unwrap_or("unavailable")
+                ))
+            }
+            None => return Err("invalid roster selection".to_string()),
+        }
+    }
+    let providers = new_run_providers(nr);
+    if providers.is_empty() {
+        return Err("no providers resolved".to_string());
+    }
+    let argv = vec![
+        "plan".to_string(),
+        "-t".to_string(),
+        nr.task.trim().to_string(),
+        "--providers".to_string(),
+        providers.join(","),
+    ];
+    Ok((target, argv))
 }
 
 /// The real `git diff` of a slot's worktree against HEAD (Stage B): staged + unstaged,
@@ -1144,7 +2183,7 @@ fn diff_content(swarm: &SparPaths, full: Option<&RunState>, slot_idx: usize) -> 
 }
 
 /// Redraw is only worth it while something is moving on screen: a flash timer,
-/// the composer cursor, or a run that is actively working (active phase or a
+/// the palette/filter cursor, or a run that is actively working (active phase or a
 /// running slot). An active phase with no running slot — Suite, Review,
 /// Shipping — still animates so the header spinner keeps turning.
 fn animating(app: &App, snap: &Snapshot) -> bool {
@@ -1166,7 +2205,7 @@ fn run_loop(
     task_seed: Option<String>,
     cfg: Config,
 ) -> Result<crate::exit_codes::ExitCode> {
-    let mut app = App::new(task_seed, cfg.clone(), local_root.is_some());
+    let mut app = App::new(task_seed, cfg.clone(), local_root.as_deref());
     let mut rail_state = ListState::default();
     let mut active_root: PathBuf = local_root.clone().unwrap_or_else(|| {
         registry::projects()
@@ -1182,15 +2221,32 @@ fn run_loop(
         run_id: None,
         slot_idx: 0,
         project_idx: 0,
+        home_scope: app.home_scope.clone(),
+        home_watermark: app.home_watermark,
     };
 
-    // First paint needs data, so build one snapshot synchronously.
+    // The first paint must not block on a scan (U13): the refresher thread below
+    // builds the real first snapshot off-thread, forced on its very first iteration.
     let mut cache = LogCache::empty();
-    let snapshot = Arc::new(Mutex::new(Arc::new(build_snapshot(&sel, &mut cache, &cfg))));
+    let snapshot = Arc::new(Mutex::new(Arc::new(Snapshot::loading(&active_root))));
 
     let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
     let (sel_tx, sel_rx) = mpsc::channel::<Selection>();
     app.bg_tx = Some(msg_tx.clone());
+
+    // `App::new`'s `--task` seed opened the modal before `bg_tx` existed, so its
+    // roster probe was deferred (D2) — kick it off now that the channel is wired.
+    if let Some(nr) = app.new_run.as_ref() {
+        if nr.loading {
+            let gen = nr.gen;
+            let cfg = app.cfg.clone();
+            let tx = msg_tx.clone();
+            thread::spawn(move || {
+                let roster = compute_new_run_roster(&cfg);
+                let _ = tx.send(Msg::RosterReady(gen, roster));
+            });
+        }
+    }
 
     {
         let tx = msg_tx.clone();
@@ -1207,6 +2263,10 @@ fn run_loop(
         let slot = Arc::clone(&snapshot);
         let mut sel = sel.clone();
         let mut marks = Marks::new();
+        let mut cross_marks = Marks::new();
+        // Fire the cross-project sweep on the very first loop iteration.
+        let mut last_cross = Instant::now() - CROSS_PROJECT_REFRESH;
+        let mut prev_cross_key = (sel.browse, sel.home_scope.clone());
         let cfg = cfg.clone();
         thread::spawn(move || loop {
             let mut forced = false;
@@ -1222,12 +2282,27 @@ fn run_loop(
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
 
+            let cross_key = (sel.browse, sel.home_scope.clone());
+            let forced_cross = forced && cross_key != prev_cross_key;
+            prev_cross_key = cross_key;
+
             let prev = Arc::clone(&*slot.lock().unwrap());
             let next_marks = marks_for(&sel, Some(&prev));
-            if !forced && next_marks == marks {
+            let mut rebuild = forced || next_marks != marks;
+            marks = next_marks;
+
+            if cross_project_due(sel.browse, last_cross.elapsed(), forced_cross) {
+                let next_cross = cross_project_marks(&registry::projects());
+                if forced_cross || next_cross != cross_marks {
+                    rebuild = true;
+                }
+                cross_marks = next_cross;
+                last_cross = Instant::now();
+            }
+
+            if !rebuild {
                 continue; // nothing on disk moved; don't rebuild, don't repaint
             }
-            marks = next_marks;
 
             let next = Arc::new(build_snapshot(&sel, &mut cache, &cfg));
             *slot.lock().unwrap() = next;
@@ -1238,6 +2313,7 @@ fn run_loop(
     }
 
     let mut dirty = true;
+    let mut last_home_clock = Instant::now();
     loop {
         let snap = Arc::clone(&*snapshot.lock().unwrap());
 
@@ -1257,7 +2333,21 @@ fn run_loop(
                 active_root = snap.projects[app.selected_project].root.clone();
             }
         }
-        if snap.runs.is_empty() {
+        if app.home_target_run.is_some() {
+            // Must run even with an empty `snap.runs` — a Home Enter into a project
+            // whose Runs listing has not landed yet (R2's one-tick lag) would
+            // otherwise never start the give-up clock and pin `home_target_run`
+            // forever, leaving Main/Agents blank with no way out (round-11 review,
+            // major). Called unconditionally, every loop iteration: `resolve_home_target`
+            // itself withholds the give-up clock until `snap` is actually a scan of the
+            // target's project (below), so this being unconditional does not start the
+            // budget early.
+            let snapshot_for_target = snapshot_covers_target(&snap, &active_root);
+            resolve_home_target(&mut app, &snap.runs, snapshot_for_target);
+            if !snap.runs.is_empty() {
+                app.selected_run = app.selected_run.min(snap.runs.len() - 1);
+            }
+        } else if snap.runs.is_empty() {
             app.selected_run = 0;
         } else {
             // The attention sort reorders the rail as runs change state; keep the
@@ -1270,16 +2360,35 @@ fn run_loop(
             app.selected_run = app.selected_run.min(snap.runs.len() - 1);
         }
         // Toast a run the moment it starts wanting the operator (gate/broken), so a
-        // fleet transition is noticed even while looking at another run.
-        emit_attention_toasts(&mut app, &snap.runs);
+        // fleet transition is noticed even while looking at another run. At Home
+        // there is no `snap.runs` (it is cross-project) — feed it Home's rows instead
+        // so the toast still fires there.
+        if app.browse == BrowseLevel::Home {
+            let home_runs: Vec<state::RunSummary> = snap
+                .home
+                .rows
+                .iter()
+                .filter_map(|r| match r {
+                    HomeRow::Run { run, .. } => Some(run.clone()),
+                    _ => None,
+                })
+                .collect();
+            emit_attention_toasts(&mut app, &home_runs, true);
+        } else {
+            emit_attention_toasts(&mut app, &snap.runs, false);
+        }
         let n_slots = snap.full.as_ref().map(|s| s.slots.len()).unwrap_or(0);
         app.selected_slot = if n_slots == 0 {
             0
         } else {
             app.selected_slot.min(n_slots - 1)
         };
+        if app.browse == BrowseLevel::Home {
+            resync_home_selection(&mut app, &snap.home.rows);
+        }
 
         rail_state.select(match app.browse {
+            BrowseLevel::Home if !snap.home.rows.is_empty() => Some(app.selected_home),
             BrowseLevel::Projects if !snap.projects.is_empty() => Some(app.selected_project),
             BrowseLevel::Runs if !snap.runs.is_empty() => Some(app.selected_run),
             BrowseLevel::Agents if n_slots > 0 => Some(app.selected_slot),
@@ -1304,6 +2413,8 @@ fn run_loop(
                     &snap.stream_text,
                     &snap.activity,
                     &snap.diff_text,
+                    &snap.home,
+                    snap.log_stats.as_ref(),
                     &mut app,
                     &mut rail_state,
                 );
@@ -1315,6 +2426,10 @@ fn run_loop(
             Ok(Msg::Data) => dirty = true,
             Ok(Msg::Flash(msg, color)) => {
                 app.flash(msg, color);
+                dirty = true;
+            }
+            Ok(Msg::RosterReady(gen, roster)) => {
+                apply_roster_ready(&mut app, gen, roster);
                 dirty = true;
             }
             Ok(Msg::Input(ev)) => {
@@ -1330,11 +2445,13 @@ fn run_loop(
                                 key.modifiers,
                                 &snap.swarm,
                                 &snap.projects,
+                                &snap.home.rows,
                                 &snap.runs,
                                 snap.full.as_ref(),
                                 &mut active_root,
                                 local_root.as_deref(),
                             )? {
+                                let _ = write_watermark(&watermark_path(), Utc::now());
                                 return Ok(crate::exit_codes::ExitCode::Success);
                             }
                         }
@@ -1343,6 +2460,7 @@ fn run_loop(
                             m,
                             &snap.swarm,
                             &snap.projects,
+                            &snap.home.rows,
                             &snap.runs,
                             snap.full.as_ref(),
                             &mut active_root,
@@ -1367,6 +2485,10 @@ fn run_loop(
                             app.flash(msg, color);
                             None
                         }
+                        Ok(Msg::RosterReady(gen, roster)) => {
+                            apply_roster_ready(&mut app, gen, roster);
+                            None
+                        }
                         Ok(Msg::Data) => None,
                         Err(_) => None,
                     };
@@ -1375,19 +2497,36 @@ fn run_loop(
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if app.animated {
                     dirty = true;
+                } else if app.browse == BrowseLevel::Home
+                    && last_home_clock.elapsed() >= HOME_CLOCK_TICK
+                {
+                    dirty = true;
+                    last_home_clock = Instant::now();
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Ok(crate::exit_codes::ExitCode::Success)
+                let _ = write_watermark(&watermark_path(), Utc::now());
+                return Ok(crate::exit_codes::ExitCode::Success);
             }
         }
 
         let next_sel = Selection {
             browse: app.browse,
             root: active_root.clone(),
-            run_id: snap.runs.get(app.selected_run).map(|r| r.id.clone()),
+            // A Home Enter carries the run by id (`home_target_run`), because the
+            // outgoing snapshot's `snap.runs`/`app.selected_run` still describe the
+            // *previous* project. Keep resending it (not `take()`) until the clamp
+            // above observes a snapshot that actually contains it and clears it —
+            // otherwise this send races that clamp and can overwrite the target
+            // with `None` a tick early (R2/AC-27).
+            run_id: app
+                .home_target_run
+                .clone()
+                .or_else(|| snap.runs.get(app.selected_run).map(|r| r.id.clone())),
             slot_idx: app.selected_slot,
             project_idx: app.selected_project,
+            home_scope: app.home_scope.clone(),
+            home_watermark: app.home_watermark,
         };
         if next_sel != sel {
             sel = next_sel.clone();
@@ -1423,6 +2562,7 @@ fn handle_key(
     mods: KeyModifiers,
     swarm: &SparPaths,
     projects: &[registry::ProjectEntry],
+    home_rows: &[HomeRow],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
     active_root: &mut PathBuf,
@@ -1431,11 +2571,29 @@ fn handle_key(
     let selected_id = runs.get(app.selected_run).map(|r| r.id.as_str());
     let n_slots = full.map(|s| s.slots.len()).unwrap_or(0);
 
+    // The Phase D new-run modal owns every key while it is open, same precedence as
+    // the `:` palette.
+    if app.new_run.is_some() {
+        handle_new_run_key(app, code, mods);
+        return Ok(false);
+    }
+
     // The `:` palette owns every key while it is open — including Enter (run), Tab
     // (complete), and Esc (close). It can only open when not in the Shell tab, so it
     // never contends with the agent pane.
     if app.palette.is_some() {
-        return handle_palette_key(app, code, mods, swarm, runs, full);
+        return handle_palette_key(
+            app,
+            code,
+            mods,
+            swarm,
+            projects,
+            home_rows,
+            local_root,
+            runs,
+            full,
+            active_root.as_path(),
+        );
     }
 
     // The `/` rail filter captures keys while it is being edited.
@@ -1448,6 +2606,12 @@ fn handle_key(
         match code {
             KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter => {
                 app.show_help = false;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                app.help_scroll = app.help_scroll.saturating_add(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                app.help_scroll = app.help_scroll.saturating_sub(1);
             }
             _ => {}
         }
@@ -1478,7 +2642,7 @@ fn handle_key(
         // — it belongs to the agent pane.
         KeyCode::Char('q') => return Ok(true),
         // Esc pops one rail level; from Main it returns to the rail. It never exits the
-        // app (at Projects it does nothing).
+        // app (at Home, the root, it does nothing).
         KeyCode::Esc => {
             if app.filter.is_some() {
                 app.filter = None;
@@ -1511,7 +2675,15 @@ fn handle_key(
         KeyCode::Char('_') => app.zoom = false,
         KeyCode::Enter => {
             if app.focus == Focus::Rail {
-                rail_enter(app, projects, runs, full, active_root);
+                rail_enter(
+                    app,
+                    projects,
+                    home_rows,
+                    runs,
+                    full,
+                    active_root,
+                    local_root,
+                );
             }
         }
         KeyCode::Char('p') => {
@@ -1524,25 +2696,40 @@ fn handle_key(
             }
             app.flash("Projects (general view)", ACCENT);
         }
+        KeyCode::Char('n') => {
+            let browsed = browsed_project_target(app, projects, active_root.as_path());
+            open_new_run(app, projects, home_rows, local_root, browsed);
+        }
+        KeyCode::Char('P') => {
+            toggle_home_scope(app, local_root);
+            app.flash(
+                format!("Home scope: {}", home_scope_label(&app.home_scope)),
+                ACCENT,
+            );
+        }
         KeyCode::Char('j') | KeyCode::Down => match app.focus {
-            Focus::Rail => rail_move(app, projects, runs, n_slots, 1),
-            Focus::Main => app.scroll_main_by(3),
+            Focus::Rail => rail_move(app, projects, home_rows, runs, n_slots, 1),
+            Focus::Main => app.scroll_main_by(3, full.is_some()),
         },
         KeyCode::Char('k') | KeyCode::Up => match app.focus {
-            Focus::Rail => rail_move(app, projects, runs, n_slots, -1),
-            Focus::Main => app.scroll_main_by(-3),
+            Focus::Rail => rail_move(app, projects, home_rows, runs, n_slots, -1),
+            Focus::Main => app.scroll_main_by(-3, full.is_some()),
         },
         KeyCode::PageDown => match app.focus {
-            Focus::Rail => rail_move(app, projects, runs, n_slots, 5),
-            Focus::Main => app.scroll_main_by(i32::from(app.main_page())),
+            Focus::Rail => rail_move(app, projects, home_rows, runs, n_slots, 5),
+            Focus::Main => {
+                app.scroll_main_by(i32::from(app.main_page(full.is_some())), full.is_some())
+            }
         },
         KeyCode::PageUp => match app.focus {
-            Focus::Rail => rail_move(app, projects, runs, n_slots, -5),
-            Focus::Main => app.scroll_main_by(-i32::from(app.main_page())),
+            Focus::Rail => rail_move(app, projects, home_rows, runs, n_slots, -5),
+            Focus::Main => {
+                app.scroll_main_by(-i32::from(app.main_page(full.is_some())), full.is_some())
+            }
         },
         // a jumps to the next run that wants you (Stage C). Approve moved to the gate
         // button / `:approve` when `a` became the fleet-wide attention binding.
-        KeyCode::Char('a') => jump_to_attention(app, runs),
+        KeyCode::Char('a') => jump_to_attention(app, runs, home_rows),
         KeyCode::Char('r') => {
             if let Some(id) = selected_id {
                 run_gate_action(app, swarm, id, GateAction::Reject);
@@ -1554,13 +2741,14 @@ fn handle_key(
             }
         }
         KeyCode::Char('g') | KeyCode::Home => {
-            app.home_for_main();
+            app.home_for_main(full.is_some());
         }
         KeyCode::Char('G') | KeyCode::End => {
-            app.end_for_main();
+            app.end_for_main(full.is_some());
         }
         KeyCode::Char('?') => {
             app.show_help = true;
+            app.help_scroll = 0;
         }
         KeyCode::Char('w') => {
             app.log_expand = !app.log_expand;
@@ -1577,6 +2765,313 @@ fn handle_key(
         _ => {}
     }
     Ok(false)
+}
+
+/// The project the operator is browsing right now, for surfaces (`n`, `:plan`) that
+/// resolve their target at handling time rather than from a snapshot. At `Projects`
+/// the highlighted row is the target and must come from `selected_project`:
+/// `active_root` is refreshed only in the pre-input clamp, so a queued burst (`j`
+/// then the command, or a click then the command) leaves it one selection stale
+/// (review e72f434e). Inside a project (`in_project()`, i.e. Runs/Agents) `active_root`
+/// is live and correct; `swarm.project_root` is not, since `swarm` is the snapshot
+/// handed to `handle_key` and lags the instant `rail_enter` updates `active_root`
+/// (review 3be317b2). Outside a project view there is no browsed target.
+fn browsed_project_target<'a>(
+    app: &App,
+    projects: &'a [registry::ProjectEntry],
+    active_root: &'a Path,
+) -> Option<&'a Path> {
+    if app.browse == BrowseLevel::Projects {
+        projects.get(app.selected_project).map(|p| p.root.as_path())
+    } else if app.browse.in_project() {
+        Some(active_root)
+    } else {
+        None
+    }
+}
+
+/// `n`: open the Phase D new-run surface. The target project follows the scope
+/// (D2): a scoped Home defaults to its project, an all-project Home defaults to the
+/// selected row's project (falling back to the local repo), and the picker offers
+/// every registered project to cycle through.
+/// The new-run surface's target project and its cycle list, from the same rule
+/// regardless of who is opening the surface: `n` on Home, and the `:plan <task>`
+/// palette fallback when nothing is selected to reuse a fleet from. Both must agree,
+/// or `:plan` in cross-project Home can silently target a different project than the
+/// one the operator is looking at (round-9 review finding).
+///
+/// `browsed_project` is `Some` whenever the caller is inside a project view
+/// (`BrowseLevel::in_project()` — Runs or Agents), and always wins: the operator has
+/// drilled into that project, so it is never stale the way `active_root` can be while
+/// still browsing Home. Without this, `n`/`:plan` pressed after `Enter`-ing a Home run
+/// row for project B (which sets `active_root = B` but leaves `home_scope`/`home_rows`
+/// pointed at A) would target A — the wrong project — with no way to correct it,
+/// since a scoped Home offers only its own root to cycle through (round-11 review
+/// finding).
+fn new_run_target(
+    app: &App,
+    projects: &[registry::ProjectEntry],
+    home_rows: &[HomeRow],
+    local_root: Option<&Path>,
+    browsed_project: Option<&Path>,
+) -> (Option<PathBuf>, Vec<PathBuf>) {
+    let scoped = browsed_project.is_some() || matches!(app.home_scope, HomeScope::Project(_));
+    let target = browsed_project
+        .map(Path::to_path_buf)
+        .or_else(|| match &app.home_scope {
+            HomeScope::Project(root) => Some(root.clone()),
+            HomeScope::All => home_rows
+                .get(app.selected_home)
+                .and_then(|r| match r {
+                    HomeRow::Run { run, .. } => run.project_root.clone(),
+                    HomeRow::Project(_, root) => Some(root.clone()),
+                    _ => None,
+                })
+                .or_else(|| local_root.map(Path::to_path_buf)),
+        });
+    // A scoped target (whether from `home_scope` or from browsing inside a project)
+    // only offers itself to cycle through — every other registered project is out of
+    // scope, and offering them let `←`/`→` launch a plan against a project the
+    // operator was not looking at (review finding). Cycling is only meaningful at an
+    // unscoped, all-project Home.
+    let mut all_projects: Vec<PathBuf> = if scoped {
+        Vec::new()
+    } else {
+        projects.iter().map(|p| p.root.clone()).collect()
+    };
+    // A scoped Home's target may be one refresh ahead of the registry (a project
+    // just entered but not yet registered) — without this, `←`/`→` cycling can't
+    // find the target in `nr.projects`, falls back to index 0, and silently
+    // retargets the launch away from what the operator scoped to (round-7 review
+    // finding). Keep it reachable even if the registry hasn't caught up yet.
+    if let Some(t) = &target {
+        if !all_projects.contains(t) {
+            all_projects.insert(0, t.clone());
+        }
+    }
+    let project = target.or_else(|| all_projects.first().cloned());
+    (project, all_projects)
+}
+
+fn open_new_run(
+    app: &mut App,
+    projects: &[registry::ProjectEntry],
+    home_rows: &[HomeRow],
+    local_root: Option<&Path>,
+    browsed_project: Option<&Path>,
+) {
+    let (project, all_projects) =
+        new_run_target(app, projects, home_rows, local_root, browsed_project);
+    begin_new_run(app, project, all_projects, String::new(), NewRunField::Task);
+}
+
+/// A `NewRun` in its initial "checking roster" state — no disk or process I/O, so
+/// this is safe to call before the background channel exists (`App::new`'s task
+/// seed, before `run_loop` wires `bg_tx`).
+fn pending_new_run(
+    project: Option<PathBuf>,
+    projects: Vec<PathBuf>,
+    task: String,
+    field: NewRunField,
+    gen: u64,
+) -> NewRun {
+    NewRun {
+        project,
+        projects,
+        task,
+        roster: Vec::new(),
+        picked: Vec::new(),
+        field,
+        sel: 0,
+        loading: true,
+        gen,
+    }
+}
+
+/// Open the modal in its "checking roster" state, then hand the disk/process work
+/// (`detect_all`, a registry read) to a background thread so `n`, `:plan` and startup
+/// never block on a slow or stuck provider probe (D2). The probe is tagged with a
+/// fresh `gen`; `Msg::RosterReady` only applies if the modal it was built for is still
+/// open and still on that generation, so a cancelled or reopened modal can't be
+/// clobbered by a stale result. With no `bg_tx` (before the channel is wired, or in a
+/// test) the probe runs inline instead of being silently lost.
+fn begin_new_run(
+    app: &mut App,
+    project: Option<PathBuf>,
+    all_projects: Vec<PathBuf>,
+    task: String,
+    field: NewRunField,
+) {
+    app.new_run_gen += 1;
+    let gen = app.new_run_gen;
+    app.new_run = Some(pending_new_run(project, all_projects, task, field, gen));
+    match app.bg_tx.clone() {
+        Some(tx) => {
+            let cfg = app.cfg.clone();
+            thread::spawn(move || {
+                let roster = compute_new_run_roster(&cfg);
+                let _ = tx.send(Msg::RosterReady(gen, roster));
+            });
+        }
+        None => {
+            let roster = compute_new_run_roster(&app.cfg);
+            if let Some(nr) = app.new_run.as_mut() {
+                nr.roster = roster;
+                nr.loading = false;
+            }
+        }
+    }
+}
+
+/// The roster and recent-fleet lookup: disk/process work (`detect_all`, a registry
+/// read) that must never run on the input thread (U13/D2) — see `begin_new_run`.
+fn compute_new_run_roster(cfg: &Config) -> Vec<RosterEntry> {
+    let detected: Vec<(String, bool)> = crate::providers::detect_all()
+        .into_iter()
+        .map(|r| (r.name, r.available))
+        .collect();
+    // Registry order is `last_seen` — when a project was last *opened*, not when any
+    // run last progressed — so the first entry with a `last_run_id` is not
+    // necessarily the actual most recent run across the roster (round-7 review
+    // finding). Load every candidate and let `most_recent_fleet` pick by `updated_at`.
+    let candidates: Vec<(DateTime<Utc>, String, Vec<String>)> = registry::projects()
+        .into_iter()
+        .filter_map(|p| p.last_run_id.map(|id| (p.root, id)))
+        .filter_map(|(root, id)| {
+            let paths = SparPaths::new(&root);
+            RunState::load(&paths, &id)
+                .ok()
+                .map(|st| (st.updated_at, id, st.providers))
+        })
+        .collect();
+    let recent_fleet = most_recent_fleet(candidates);
+    let recent_ref = recent_fleet
+        .as_ref()
+        .map(|(id, v)| (id.as_str(), v.as_slice()));
+    build_roster(cfg, &detected, recent_ref)
+}
+
+/// Pure half of the recent-fleet lookup (round-7 review finding): picks the
+/// candidate with the latest `updated_at`, independent of the order the caller
+/// gathered them in (registry order is `last_seen`, not run recency).
+fn most_recent_fleet(
+    candidates: Vec<(DateTime<Utc>, String, Vec<String>)>,
+) -> Option<(String, Vec<String>)> {
+    candidates
+        .into_iter()
+        .max_by_key(|(updated_at, _, _)| *updated_at)
+        .map(|(_, id, providers)| (id, providers))
+}
+
+/// Apply a background roster probe's result (D2) if the modal it was built for is
+/// still open on the same generation; a stale result from a cancelled or reopened
+/// modal is dropped.
+fn apply_roster_ready(app: &mut App, gen: u64, roster: Vec<RosterEntry>) {
+    if let Some(nr) = app.new_run.as_mut() {
+        if nr.gen == gen {
+            nr.roster = roster;
+            nr.loading = false;
+        }
+    }
+}
+
+/// Toggle roster entry `i`'s pick, same rule for the `space` key and a roster-row
+/// click: picked → unpicked, unavailable → no-op, else picked.
+fn toggle_roster_pick(nr: &mut NewRun, i: usize) {
+    if let Some(pos) = nr.picked.iter().position(|&p| p == i) {
+        nr.picked.remove(pos);
+    } else if nr.roster.get(i).map(|e| e.available).unwrap_or(false) {
+        nr.picked.push(i);
+    }
+}
+
+/// Keys while the Phase D new-run modal is open.
+fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+    if code == KeyCode::Esc {
+        app.new_run = None;
+        return;
+    }
+    if code == KeyCode::Enter {
+        let Some(nr) = app.new_run.as_ref() else {
+            return;
+        };
+        match new_run_launch(nr) {
+            Ok((target, mut args)) => {
+                let target_swarm = SparPaths::new(&target);
+                if let Ok(cwd) = std::env::current_dir() {
+                    if let Ok(Some(base)) =
+                        crate::worktree::resolve_base(&target_swarm.project_root, &cwd, None)
+                    {
+                        args.push("--base".to_string());
+                        args.push(base.reference);
+                    }
+                }
+                match spawn_detached_workflow(&target_swarm, &args, "Plan started") {
+                    Ok(PaletteResult::Flash(msg, color)) => app.flash(msg, color),
+                    Ok(_) => {}
+                    Err(e) => app.flash(format!("Plan failed to start: {e:#}"), ALERT),
+                }
+                app.new_run = None;
+            }
+            Err(e) => app.flash(e, ALERT),
+        }
+        return;
+    }
+    let Some(nr) = app.new_run.as_mut() else {
+        return;
+    };
+    match code {
+        KeyCode::Tab => {
+            nr.field = match nr.field {
+                NewRunField::Project => NewRunField::Task,
+                NewRunField::Task => NewRunField::Fleet,
+                NewRunField::Fleet => NewRunField::Project,
+            };
+        }
+        KeyCode::BackTab => {
+            nr.field = match nr.field {
+                NewRunField::Project => NewRunField::Fleet,
+                NewRunField::Task => NewRunField::Project,
+                NewRunField::Fleet => NewRunField::Task,
+            };
+        }
+        KeyCode::Left if nr.field == NewRunField::Project && !nr.projects.is_empty() => {
+            let i = nr
+                .project
+                .as_ref()
+                .and_then(|p| nr.projects.iter().position(|q| q == p))
+                .unwrap_or(0);
+            let i = if i == 0 { nr.projects.len() - 1 } else { i - 1 };
+            nr.project = nr.projects.get(i).cloned();
+        }
+        KeyCode::Right if nr.field == NewRunField::Project && !nr.projects.is_empty() => {
+            let i = nr
+                .project
+                .as_ref()
+                .and_then(|p| nr.projects.iter().position(|q| q == p))
+                .unwrap_or(0);
+            let i = (i + 1) % nr.projects.len();
+            nr.project = nr.projects.get(i).cloned();
+        }
+        KeyCode::Char(' ') if nr.field == NewRunField::Fleet => toggle_roster_pick(nr, nr.sel),
+        KeyCode::Char('j') | KeyCode::Down if nr.field == NewRunField::Fleet => {
+            if !nr.roster.is_empty() {
+                nr.sel = (nr.sel + 1).min(nr.roster.len() - 1);
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up if nr.field == NewRunField::Fleet => {
+            nr.sel = nr.sel.saturating_sub(1);
+        }
+        KeyCode::Backspace if nr.field == NewRunField::Task => {
+            nr.task.pop();
+        }
+        KeyCode::Char(c)
+            if nr.field == NewRunField::Task && !mods.contains(KeyModifiers::CONTROL) =>
+        {
+            nr.task.push(c);
+        }
+        _ => {}
+    }
 }
 
 /// What running a palette command produced.
@@ -1610,13 +3105,18 @@ fn palette_completions(pal: &Palette, runs: &[state::RunSummary]) -> Vec<String>
 }
 
 /// Keys while the `:` palette is open. Returns `Ok(true)` only when a command quits.
+#[allow(clippy::too_many_arguments)]
 fn handle_palette_key(
     app: &mut App,
     code: KeyCode,
     mods: KeyModifiers,
     swarm: &SparPaths,
+    projects: &[registry::ProjectEntry],
+    home_rows: &[HomeRow],
+    local_root: Option<&Path>,
     runs: &[state::RunSummary],
     full: Option<&RunState>,
+    active_root: &Path,
 ) -> Result<bool> {
     match code {
         KeyCode::Esc => {
@@ -1632,11 +3132,22 @@ fn handle_palette_key(
                 app.palette = None;
                 return Ok(false);
             }
-            match run_palette(app, swarm, runs, full, &input) {
+            match run_palette(
+                app,
+                swarm,
+                projects,
+                home_rows,
+                local_root,
+                runs,
+                full,
+                active_root,
+                &input,
+            ) {
                 Ok(PaletteResult::Quit) => return Ok(true),
                 Ok(PaletteResult::Help) => {
                     app.palette = None;
                     app.show_help = true;
+                    app.help_scroll = 0;
                 }
                 Ok(PaletteResult::Flash(msg, color)) => {
                     app.palette = None;
@@ -1730,11 +3241,16 @@ fn split_run_arg<'a>(
 }
 
 /// Execute one palette line. The verb table is the whole surface; `@…` is chat.
+#[allow(clippy::too_many_arguments)]
 fn run_palette(
     app: &mut App,
     swarm: &SparPaths,
+    projects: &[registry::ProjectEntry],
+    home_rows: &[HomeRow],
+    local_root: Option<&Path>,
     runs: &[state::RunSummary],
     full: Option<&RunState>,
+    active_root: &Path,
     input: &str,
 ) -> Result<PaletteResult> {
     let line = input.trim();
@@ -1805,12 +3321,34 @@ fn run_palette(
             if arg.is_empty() {
                 anyhow::bail!("usage: plan <task>");
             }
-            let st = full.ok_or_else(|| {
-                anyhow::anyhow!("select a run to reuse its fleet, or use the CLI")
-            })?;
-            if st.providers.is_empty() {
-                anyhow::bail!("selected run has no providers — use the CLI");
-            }
+            let Some(st) = full.filter(|st| !st.providers.is_empty()) else {
+                // No run to reuse a fleet from — U3's punt is retired: open the
+                // new-run surface pre-filled with the typed task instead of erroring
+                // to the CLI (U21). Same background probe as `n` (D2), not a
+                // hand-rolled roster build, so this path also gets the recent-fleet
+                // row `open_new_run` offers.
+                //
+                // Target selection goes through `browsed_project_target`, the same
+                // helper `n` uses. It must be that helper and not a copy: this arm
+                // previously read `swarm.project_root`, which is the *snapshot's*
+                // root and lags the instant `rail_enter` updates `active_root`, so
+                // `:plan` and `n` disagreed in the window before the snapshot landed
+                // (review 3be317b2, after `n` was already fixed here).
+                let browsed = browsed_project_target(app, projects, active_root);
+                let (target, all_projects) =
+                    new_run_target(app, projects, home_rows, local_root, browsed);
+                begin_new_run(
+                    app,
+                    target,
+                    all_projects,
+                    arg.to_string(),
+                    NewRunField::Fleet,
+                );
+                return Ok(PaletteResult::Flash(
+                    "Pick a fleet to start".to_string(),
+                    ACCENT,
+                ));
+            };
             let mut args = vec![
                 "plan".to_string(),
                 "-t".to_string(),
@@ -1984,6 +3522,9 @@ fn snap_selection_to_filter(
         return;
     }
     match app.browse {
+        // Home has no `/` filter of its own — the rail filter is a Projects/Runs
+        // concept and does not reach the landing view.
+        BrowseLevel::Home => {}
         BrowseLevel::Projects => {
             let cur = app.selected_project;
             if let Some(i) = first_project_match(projects, f, cur) {
@@ -2049,9 +3590,31 @@ fn first_project_match(projects: &[registry::ProjectEntry], f: &str, cur: usize)
 }
 
 /// Move the rail selection by `delta` rows at whatever level it is on.
+/// Step the Home rail by `delta`, skipping header rows entirely — the cursor must
+/// never land on one, at either end of the list (AC-26).
+fn step_home(rows: &[HomeRow], cur: usize, delta: i32) -> usize {
+    // `More` is informational ("… N more"), not a row `Enter` can act on
+    // (`rail_enter`'s Home arm no-ops it) — selectable-but-inert reads as broken
+    // (round-7 review finding), so it is excluded the same way a header is.
+    let selectable: Vec<usize> = (0..rows.len())
+        .filter(|&i| !matches!(rows[i], HomeRow::Header(_) | HomeRow::More { .. }))
+        .collect();
+    if selectable.is_empty() {
+        return cur;
+    }
+    let pos = selectable.iter().position(|&i| i == cur).unwrap_or(0);
+    let next = if delta < 0 {
+        pos.saturating_sub((-delta) as usize)
+    } else {
+        (pos + delta as usize).min(selectable.len() - 1)
+    };
+    selectable[next]
+}
+
 fn rail_move(
     app: &mut App,
     projects: &[registry::ProjectEntry],
+    home_rows: &[HomeRow],
     runs: &[state::RunSummary],
     n_slots: usize,
     delta: i32,
@@ -2067,6 +3630,11 @@ fn rail_move(
     // matching indices only. `stepv` maps a source index to its next matching one.
     let filter = app.filter.clone().filter(|f| !f.is_empty());
     match app.browse {
+        BrowseLevel::Home if !home_rows.is_empty() => {
+            let next = step_home(home_rows, app.selected_home, delta);
+            app.selected_home = next;
+            app.home_key = home_rows.get(next).map(home_row_key);
+        }
         BrowseLevel::Projects if !projects.is_empty() => {
             let next = match &filter {
                 Some(f) => {
@@ -2113,6 +3681,86 @@ fn step_matched(matched: &[usize], cur: usize, delta: i32) -> usize {
     matched[next]
 }
 
+/// How long to wait for a Home `Enter` target before giving up on it (round-7 review
+/// finding). Wall clock, not a counter: ticking per render wake burned the budget in
+/// 2.5s during a slow project scan, and ticking per *installed snapshot* starved the
+/// escape completely, because the refresher deliberately retains the current `Arc` when
+/// nothing on disk changed — a removed run gets one forced empty snapshot and then
+/// silence, pinning Main forever (review e72f434e, major). The clock itself only starts
+/// once `resolve_home_target` has actually been handed a snapshot of the target's own
+/// project (`resolve_home_target`'s `snapshot_for_target`): starting it on the first
+/// post-`Enter` frame, whose snapshot is normally still Home's, let an unbounded
+/// cross-project scan (thousands of run dirs) burn the whole budget before the target
+/// project's snapshot ever landed (review 3be317b2, major). 10s is still generous
+/// relative to R2's one-tick lag and Home's `CROSS_PROJECT_REFRESH` cadence once the
+/// scan has actually started, so a normal drill-down never trips it.
+const HOME_TARGET_GIVE_UP: Duration = Duration::from_secs(10);
+
+/// Whether `snap` is actually a scan of `active_root`'s own runs, not merely a
+/// snapshot whose root happens to equal it. Root equality alone is not sufficient
+/// (round-2 review, major): `build_snapshot` only populates `runs` when the snapshot
+/// was built `in_project()`, so entering a run whose project is already
+/// `active_root` leaves the still-displayed Home snapshot's root matching trivially
+/// on the very first post-`Enter` frame, even though that snapshot never scanned any
+/// project's runs.
+fn snapshot_covers_target(snap: &Snapshot, active_root: &Path) -> bool {
+    snap.browse.in_project() && snap.swarm.project_root == active_root
+}
+
+/// A Home `Enter` carries a run's fold-stable `unit_id` ahead of the snapshot that
+/// actually contains it (R2/AC-27): the snapshot in hand may still be Home's
+/// (cross-project, `runs` empty) or a stale project's. Hold the target and only
+/// clear it once a snapshot arrives whose `runs` actually contains it. Matching on
+/// `unit_id` first (falling back to `id` for a row that was never folded) means a
+/// unit whose loudest leg changes between the Home snapshot and the target
+/// project's own snapshot is still found — matching on `id` alone would miss it,
+/// since `id` follows whichever leg is currently loudest (round-11 review, major;
+/// AC-28). If it never reappears — archived, its directory removed, or the whole
+/// unit gone — give up after `HOME_TARGET_GIVE_UP` and return to Home rather than
+/// leaving Main/Agents pinned to a ghost run forever (round-7 review finding).
+/// `snapshot_for_target` (`snapshot_covers_target` at the call site) tells the
+/// give-up clock whether `runs` actually came from a scan of the target's own
+/// project: the first post-`Enter` frame is normally still Home's snapshot
+/// (cross-project, `runs` empty), and that project's own scan is unbounded
+/// (thousands of run dirs), so starting the clock before the target project has even
+/// been scanned once could time out a legitimate Enter before its snapshot ever
+/// lands (review 3be317b2, major). The clock only starts once a snapshot for the
+/// right project has actually been seen; once started it does not reset. Returns
+/// `true` when the target was found and selected this call.
+fn resolve_home_target(
+    app: &mut App,
+    runs: &[state::RunSummary],
+    snapshot_for_target: bool,
+) -> bool {
+    let Some(target) = app.home_target_run.clone() else {
+        return false;
+    };
+    let found = runs
+        .iter()
+        .position(|r| r.unit_id.as_deref() == Some(target.as_str()))
+        .or_else(|| runs.iter().position(|r| r.id == target));
+    if let Some(pos) = found {
+        app.selected_run = pos;
+        app.home_target_run = None;
+        app.home_target_since = None;
+        return true;
+    }
+    if !snapshot_for_target && app.home_target_since.is_none() {
+        return false;
+    }
+    let since = *app.home_target_since.get_or_insert_with(Instant::now);
+    if since.elapsed() > HOME_TARGET_GIVE_UP {
+        app.flash(
+            format!("run {target} is gone — back to Home"),
+            Color::Yellow,
+        );
+        app.home_target_run = None;
+        app.home_target_since = None;
+        app.browse = BrowseLevel::Home;
+    }
+    false
+}
+
 /// `Enter` in the rail: push one level. On a slot (the deepest level) there is
 /// nothing left to push into, so it takes the agent over — point the passthrough
 /// terminal at that run's tmux pane and open it in Main's Shell tab. Only runs
@@ -2121,11 +3769,45 @@ fn step_matched(matched: &[usize], cur: usize, delta: i32) -> usize {
 fn rail_enter(
     app: &mut App,
     projects: &[registry::ProjectEntry],
+    home_rows: &[HomeRow],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
     active_root: &mut PathBuf,
+    local_root: Option<&Path>,
 ) {
     match app.browse {
+        BrowseLevel::Home => match home_rows.get(app.selected_home) {
+            Some(HomeRow::Run { run, .. }) => {
+                if let Some(root) = run.project_root.clone() {
+                    *active_root = root;
+                }
+                // Pin the fold-stable `unit_id`, not `id` — `id` follows whichever
+                // leg is loudest and can pick a different leg by the time the target
+                // project's own snapshot lands, stranding the pin on a leg that no
+                // longer exists under that name (round-11 review, major; AC-28).
+                app.home_target_run = Some(run.unit_id.clone().unwrap_or_else(|| run.id.clone()));
+                app.home_target_since = None;
+                app.browse = BrowseLevel::Agents;
+                app.selected_slot = 0;
+                app.reset_stream_view();
+            }
+            Some(HomeRow::Project(i, root)) => {
+                *active_root = projects
+                    .get(*i)
+                    .map_or_else(|| root.clone(), |p| p.root.clone());
+                app.open_project_runs();
+            }
+            Some(HomeRow::NewRun) => {
+                // `active_root` is the rail's current browsing root, not a verified
+                // project — outside a repo with an empty registry it degrades to an
+                // arbitrary cwd (`run_loop`'s `active_root` init). Route through the
+                // same verified `local_root` the `n` key and `open_new_run`'s own
+                // `HomeScope::All` fallback use, or the no-target refusal never fires
+                // (AC-32).
+                open_new_run(app, projects, home_rows, local_root, None);
+            }
+            Some(HomeRow::Header(_)) | Some(HomeRow::More { .. }) | None => {}
+        },
         BrowseLevel::Projects => {
             if let Some(p) = projects.get(app.selected_project) {
                 *active_root = p.root.clone();
@@ -2265,6 +3947,7 @@ fn handle_mouse(
     m: crossterm::event::MouseEvent,
     swarm: &SparPaths,
     projects: &[registry::ProjectEntry],
+    home_rows: &[HomeRow],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
     active_root: &mut PathBuf,
@@ -2273,7 +3956,54 @@ fn handle_mouse(
 ) {
     let (x, y) = (m.column, m.row);
     let n_slots = full.map(|s| s.slots.len()).unwrap_or(0);
-    let n_rail = rail_len(app.browse, projects.len(), runs.len(), n_slots);
+    let n_rail = rail_len(
+        app.browse,
+        projects.len(),
+        home_rows.len(),
+        runs.len(),
+        n_slots,
+    );
+
+    // The help overlay can grow tall enough to sit on top of the tab strip (it sizes
+    // to its content, not a fixed box), so it must be hit-tested before the strip or
+    // a tap meant to dismiss help silently changes the tab underneath instead.
+    if app.show_help {
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => app.show_help = false,
+            MouseEventKind::ScrollDown => {
+                app.help_scroll = app.help_scroll.saturating_add(1);
+            }
+            MouseEventKind::ScrollUp => {
+                app.help_scroll = app.help_scroll.saturating_sub(1);
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // The Phase D new-run modal owns every click while it is open, same precedence as
+    // the `:` palette (D4): a click on a roster row toggles it, a click outside cancels,
+    // and everything else underneath (rail, tabs, gate buttons) is swallowed rather
+    // than reached through the overlay.
+    if app.new_run.is_some() {
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if !contains(app.rect_new_run, x, y) {
+                app.new_run = None;
+            } else if let Some(i) = app
+                .rect_new_run_roster
+                .iter()
+                .find(|(_, r)| contains(*r, x, y))
+                .map(|(i, _)| *i)
+            {
+                if let Some(nr) = app.new_run.as_mut() {
+                    nr.field = NewRunField::Fleet;
+                    nr.sel = i;
+                    toggle_roster_pick(nr, i);
+                }
+            }
+        }
+        return;
+    }
 
     // The tab strip is chrome, never the agent's — it is the escape hatch out of the
     // Shell tab on a touch screen, so it is hit-tested BEFORE the terminal forward.
@@ -2287,7 +4017,7 @@ fn handle_mouse(
     // Shell tab with a live pane: mouse over the terminal body is tmux's (wheel scroll
     // into copy-mode, click-select). Translate to pane-relative coords inside the border
     // and forward as SGR mouse. Events outside it fall through so clicking the rail or
-    // the composer still changes focus.
+    // Main still changes focus.
     if app.shell_active() {
         if let Some(pane) = app.terminal_pane.as_ref() {
             let r = app.rect_main_inner;
@@ -2313,11 +4043,6 @@ fn handle_mouse(
                 .unwrap_or(false);
             app.last_click = Some((x, y, now));
 
-            // A tap anywhere dismisses the help overlay first.
-            if app.show_help {
-                app.show_help = false;
-                return;
-            }
             // With the palette open, a tap outside it closes it; inside is swallowed.
             if app.palette.is_some() {
                 if !contains(app.rect_palette, x, y) {
@@ -2336,11 +4061,12 @@ fn handle_mouse(
             }
             // Tapping the fleet roll-up token jumps to the next run that needs you.
             if contains(app.rect_attention, x, y) {
-                jump_to_attention(app, runs);
+                jump_to_attention(app, runs, home_rows);
                 return;
             }
             if contains(app.rect_help, x, y) {
                 app.show_help = true;
+                app.help_scroll = 0;
                 return;
             }
             if contains(app.rect_projects, x, y) {
@@ -2356,10 +4082,21 @@ fn handle_mouse(
             if contains(app.rect_rail, x, y) {
                 app.focus = Focus::Rail;
                 if let Some(row) = list_row_at(app.rect_rail, y, n_rail, rail_offset) {
-                    rail_select(app, row, projects.len(), runs.len(), n_slots);
+                    let landed =
+                        rail_select(app, row, projects.len(), home_rows, runs.len(), n_slots);
                     // Double-click = Enter: drill one level (and take over on a slot).
-                    if dbl {
-                        rail_enter(app, projects, runs, full, active_root);
+                    // Only when the click actually landed on content — a double-tap on
+                    // a Home header/`More` row must not act on the stale selection.
+                    if dbl && landed {
+                        rail_enter(
+                            app,
+                            projects,
+                            home_rows,
+                            runs,
+                            full,
+                            active_root,
+                            local_root,
+                        );
                     }
                 }
             } else if contains(app.rect_main, x, y) {
@@ -2372,19 +4109,19 @@ fn handle_mouse(
         MouseEventKind::ScrollDown => {
             if contains(app.rect_main, x, y) {
                 app.focus = Focus::Main;
-                app.scroll_main_by(3);
+                app.scroll_main_by(3, full.is_some());
             } else if contains(app.rect_rail, x, y) {
                 app.focus = Focus::Rail;
-                rail_move(app, projects, runs, n_slots, 1);
+                rail_move(app, projects, home_rows, runs, n_slots, 1);
             }
         }
         MouseEventKind::ScrollUp => {
             if contains(app.rect_main, x, y) {
                 app.focus = Focus::Main;
-                app.scroll_main_by(-3);
+                app.scroll_main_by(-3, full.is_some());
             } else if contains(app.rect_rail, x, y) {
                 app.focus = Focus::Rail;
-                rail_move(app, projects, runs, n_slots, -1);
+                rail_move(app, projects, home_rows, runs, n_slots, -1);
             }
         }
         _ => {}
@@ -2392,20 +4129,66 @@ fn handle_mouse(
 }
 
 /// Row count of the rail at its current level — the list the mouse hit-tests against.
-fn rail_len(browse: BrowseLevel, n_projects: usize, n_runs: usize, n_slots: usize) -> usize {
+fn rail_len(
+    browse: BrowseLevel,
+    n_projects: usize,
+    n_home: usize,
+    n_runs: usize,
+    n_slots: usize,
+) -> usize {
     match browse {
+        BrowseLevel::Home => n_home,
         BrowseLevel::Projects => n_projects,
         BrowseLevel::Runs => n_runs,
         BrowseLevel::Agents => n_slots,
     }
 }
 
-/// Select rail row `row` at whatever level the rail is on.
-fn rail_select(app: &mut App, row: usize, n_projects: usize, n_runs: usize, n_slots: usize) {
+/// Select rail row `row` at whatever level the rail is on. At Home a click on any
+/// header row (not just row 0) is ignored — a click is a pointer at content, and a
+/// header is not content — and a landed selection glues `home_key` to the row's
+/// identity, the same as every other Home cursor mover (`rail_move`,
+/// `jump_to_attention`), or the very next snapshot yanks the cursor back (AC-28).
+///
+/// Returns whether the click actually landed on a selectable row. A double-click on a
+/// header or a `More` row must not fall through to `rail_enter` against whatever the
+/// cursor happened to be on before — the caller gates on this (round-9 review).
+fn rail_select(
+    app: &mut App,
+    row: usize,
+    n_projects: usize,
+    home_rows: &[HomeRow],
+    n_runs: usize,
+    n_slots: usize,
+) -> bool {
     match app.browse {
-        BrowseLevel::Projects => app.select_project(row, n_projects),
-        BrowseLevel::Runs => app.select_run(row, n_runs),
-        BrowseLevel::Agents => app.select_slot(row, n_slots),
+        BrowseLevel::Home => {
+            if matches!(
+                home_rows.get(row),
+                Some(HomeRow::Header(_)) | Some(HomeRow::More { .. })
+            ) {
+                return false;
+            }
+            if row < home_rows.len() {
+                app.selected_home = row;
+                app.home_key = home_rows.get(row).map(home_row_key);
+                true
+            } else {
+                false
+            }
+        }
+        BrowseLevel::Projects => {
+            app.select_project(row, n_projects);
+            true
+        }
+        BrowseLevel::Runs => {
+            app.select_run(row, n_runs);
+            true
+        }
+        BrowseLevel::Agents => {
+            app.select_slot(row, n_slots);
+            true
+        }
     }
 }
 
@@ -2571,6 +4354,8 @@ fn draw(
     stream_text: &str,
     activity: &[String],
     diff_text: &str,
+    home: &HomeData,
+    log_stats: Option<&process::StreamStats>,
     app: &mut App,
     rail_state: &mut ListState,
 ) {
@@ -2582,11 +4367,22 @@ fn draw(
 
     // On the first narrow render with an active run, land on the live log so a
     // phone glance shows progress — but only once, and never over a manual move.
+    // Zero runs gets the same treatment: the rail's "(no runs)" row has no CTA of its
+    // own, so leaving focus on it would strand the phone view on a blank pane with
+    // the coherent empty-state message (Main) never shown (AC-5). An empty Home (no
+    // actual Run/Project rows, only its headers and the action row) gets the same
+    // treatment, or the phone view strands the operator on a rail with no CTA (R9).
     if area.width < NARROW_WIDTH && !app.narrow_autofocus_done {
         let active = full.map(|s| {
             is_active_phase(s.phase) || s.slots.iter().any(|sl| sl.status == SlotStatus::Running)
         });
-        if active == Some(true) {
+        let no_runs = app.browse == BrowseLevel::Runs && full.is_none() && runs.is_empty();
+        let empty_home = app.browse == BrowseLevel::Home
+            && !home
+                .rows
+                .iter()
+                .any(|r| matches!(r, HomeRow::Run { .. } | HomeRow::Project(..)));
+        if active == Some(true) || no_runs || empty_home {
             if app.focus == Focus::Rail {
                 app.open_main(MainTab::Log);
             }
@@ -2607,16 +4403,17 @@ fn draw(
     app.rect_attention = Rect::default();
     app.gate_buttons.clear();
     app.main_tabs.clear();
+    app.main_tab_glyphs.clear();
 
     if driving {
         draw_driving_banner(f, lay.header, app);
     } else {
-        draw_header(f, lay.header, swarm, projects, runs, full, app);
+        draw_header(f, lay.header, swarm, projects, runs, full, home, app);
         if lay.context.height > 0 {
-            draw_context_band(f, lay.context, projects, runs, full, app);
+            draw_context_band(f, lay.context, projects, runs, full, home, app);
         }
         if lay.labels.height > 0 {
-            draw_labels(f, &lay, swarm, projects, runs, full, app);
+            draw_labels(f, &lay, swarm, projects, runs, full, home, app);
             draw_rule(f, &lay, app);
         }
     }
@@ -2624,10 +4421,20 @@ fn draw(
         draw_seam(f, lay.seam);
     }
     if lay.rail.width > 0 {
-        draw_rail(f, lay.rail, projects, runs, full, app, rail_state);
+        draw_rail(f, lay.rail, projects, runs, full, home, app, rail_state);
     }
     if lay.main.width > 0 {
-        draw_main(f, lay.main, full, stream_text, activity, diff_text, app);
+        draw_main(
+            f,
+            lay.main,
+            full,
+            stream_text,
+            activity,
+            diff_text,
+            home,
+            log_stats,
+            app,
+        );
     }
     draw_footer(f, lay.footer, app, full);
 
@@ -2637,7 +4444,10 @@ fn draw(
     }
 
     if app.show_help {
-        draw_help_overlay(f, area);
+        draw_help_overlay(f, area, app);
+    }
+    if app.new_run.is_some() {
+        draw_new_run(f, area, projects, app);
     }
 }
 
@@ -2647,16 +4457,18 @@ fn main_tab_spans(app: &App) -> Vec<(MainTab, String, Style)> {
     MAIN_TABS
         .iter()
         .map(|t| {
-            // Activity's alert badge lives in a fixed 4-column slot, blank when there
-            // is nothing to say: Activity is second of four, so a badge that changed
-            // width would shift Diff and Shell out from under a click (U11).
+            // Every tab reserves the same 4-column badge slot, blank unless it is
+            // Activity with something to say: Activity is second of four, so a badge
+            // that changed width would shift Diff and Shell out from under a click
+            // (U11) — and a slot reserved on one tab only would make the gap either
+            // side of it uneven with every other tab-to-tab gap.
             let badge = if *t == MainTab::Activity {
                 match app.human_alerts_n {
                     0 => "    ".to_string(),
                     n => format!(" ⚠{:<2}", n.min(99)),
                 }
             } else {
-                String::new()
+                "    ".to_string()
             };
             let text = format!("  {}{badge}  ", t.label());
             let style = if *t == app.main_tab {
@@ -2683,6 +4495,7 @@ fn draw_labels(
     projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
+    home: &HomeData,
     app: &mut App,
 ) {
     let area = lay.labels;
@@ -2691,36 +4504,129 @@ fn draw_labels(
     }
 
     if lay.narrow {
-        let tabs = main_tab_spans(app);
-        let n = tabs.len() as u16;
-        let cell = (area.width / n).max(1);
+        // The wide strip's fixed per-tab padding (badge slot on every tab, U11) exists
+        // to keep tabs from shifting under the rail's columns. Narrow has no rail row
+        // to stay aligned with, so it would rather spend the width on an even gap —
+        // but a badge glued onto Activity alone grows only the gap next to it (AC-4:
+        // measured [18, 22, 18] at 79 cols with alerts present). So narrow reserves
+        // the same fixed-width slot on every tab too, same as wide, whenever the
+        // width can afford it; only once that reservation would starve a tab off the
+        // strip entirely does it fall back to gluing the badge onto Activity alone,
+        // trading gap uniformity for keeping all four tabs on screen.
+        let badge_w: u16 = if app.human_alerts_n > 0 { 4 } else { 0 };
+        let raw: Vec<(MainTab, &str, Style)> = MAIN_TABS
+            .iter()
+            .map(|t| {
+                let style = if *t == app.main_tab {
+                    Style::default().fg(ACCENT).bold()
+                } else if *t == MainTab::Activity && app.human_alerts_n > 0 {
+                    Style::default().fg(ALERT).bold()
+                } else {
+                    dim()
+                };
+                (*t, t.label(), style)
+            })
+            .collect();
+        let n = raw.len() as u16;
+        let plain_total: u16 = raw.iter().map(|(_, l, _)| l.chars().count() as u16).sum();
+        let reserved = plain_total + badge_w * n;
+        let reserve_all = n > 1 && reserved <= area.width;
+        let gap = if n <= 1 {
+            0
+        } else if reserve_all {
+            (area.width - reserved) / (n - 1)
+        } else {
+            let label_total = plain_total + badge_w;
+            area.width.saturating_sub(label_total) / (n - 1)
+        };
+        let tabs: Vec<(MainTab, String, Style)> = raw
+            .into_iter()
+            .map(|(t, label, style)| {
+                let is_alert_tab = t == MainTab::Activity && app.human_alerts_n > 0;
+                let badge = if is_alert_tab {
+                    format!(" ⚠{:<2}", app.human_alerts_n.min(99))
+                } else if reserve_all {
+                    " ".repeat(badge_w as usize)
+                } else {
+                    String::new()
+                };
+                (t, format!("{label}{badge}"), style)
+            })
+            .collect();
+        let label_total: u16 = tabs.iter().map(|(_, t, _)| t.chars().count() as u16).sum();
+        let total_w = (label_total + gap * n.saturating_sub(1)).min(area.width);
+        let start_x = area.x + area.width.saturating_sub(total_w) / 2;
         let mut spans: Vec<Span> = Vec::with_capacity(tabs.len());
-        let mut x = area.x;
+        // Label glyph rects first, `gap` columns of dead space between each pair —
+        // then a second pass below pads each hit rect out into half of each
+        // neighboring gap, so a tap anywhere on the strip lands on a tab (U11's touch
+        // requirement) rather than only on the glyphs themselves.
+        let mut glyphs: Vec<(MainTab, u16, u16)> = Vec::with_capacity(tabs.len());
+        let mut x = start_x;
+        let n_tabs = tabs.len();
         for (i, (tab, text, style)) in tabs.into_iter().enumerate() {
-            let w = if i as u16 == n - 1 {
-                area.width.saturating_sub(cell * (n - 1))
+            let avail = area.right().saturating_sub(x);
+            let raw_w = text.chars().count() as u16;
+            let (text, w) = if raw_w > avail {
+                (truncate(&text, avail as usize), avail)
             } else {
-                cell
+                (text, raw_w)
             };
-            let label = truncate(text.trim(), w as usize);
-            spans.push(Span::styled(format!("{label:^w$}", w = w as usize), style));
+            if w == 0 {
+                break;
+            }
+            glyphs.push((tab, x, w));
+            spans.push(Span::styled(text, style));
+            x = x.saturating_add(w);
+            if i + 1 < n_tabs {
+                x = x.saturating_add(gap);
+                if gap > 0 {
+                    spans.push(Span::raw(" ".repeat(gap as usize)));
+                }
+            }
+        }
+        let n_glyphs = glyphs.len();
+        for (i, (tab, gx, gw)) in glyphs.into_iter().enumerate() {
+            let left = if i == 0 {
+                area.x
+            } else {
+                gx.saturating_sub(gap / 2)
+            };
+            let right = if i + 1 == n_glyphs {
+                area.right()
+            } else {
+                gx + gw + gap.saturating_sub(gap / 2)
+            };
             app.main_tabs.push((
                 Rect {
-                    x,
+                    x: left,
                     y: area.y,
-                    width: w,
+                    width: right.saturating_sub(left),
                     height: 1,
                 },
                 tab,
             ));
-            x = x.saturating_add(w);
+            app.main_tab_glyphs.push((
+                Rect {
+                    x: gx,
+                    y: area.y,
+                    width: gw,
+                    height: 1,
+                },
+                tab,
+            ));
         }
-        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        let line = Rect {
+            x: start_x,
+            width: area.right().saturating_sub(start_x),
+            ..area
+        };
+        f.render_widget(Paragraph::new(Line::from(spans)), line);
         return;
     }
 
     if lay.rail.width > 0 {
-        let title = rail_title(projects, runs, full, app);
+        let title = rail_title(projects, runs, full, home, app);
         let rail_row = Rect {
             x: lay.rail.x.saturating_add(1),
             width: lay.rail.width.saturating_sub(1),
@@ -2756,15 +4662,14 @@ fn draw_labels(
         if x.saturating_add(w) > main.right() {
             break;
         }
-        app.main_tabs.push((
-            Rect {
-                x,
-                y: area.y,
-                width: w,
-                height: 1,
-            },
-            tab,
-        ));
+        let rect = Rect {
+            x,
+            y: area.y,
+            width: w,
+            height: 1,
+        };
+        app.main_tabs.push((rect, tab));
+        app.main_tab_glyphs.push((rect, tab));
         x = x.saturating_add(w);
         spans.push(Span::styled(text, style));
     }
@@ -2839,7 +4744,7 @@ fn draw_rule(f: &mut Frame, lay: &LayoutRects, app: &App) {
             },
         );
     }
-    if let Some((r, _)) = app.main_tabs.iter().find(|(_, t)| *t == app.main_tab) {
+    if let Some((r, _)) = app.main_tab_glyphs.iter().find(|(_, t)| *t == app.main_tab) {
         let w = r.width.min(area.right().saturating_sub(r.x));
         if w > 0 {
             f.render_widget(
@@ -3164,6 +5069,7 @@ fn draw_context_band(
     projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
+    home: &HomeData,
     app: &App,
 ) {
     if area.width == 0 || area.height == 0 {
@@ -3175,6 +5081,29 @@ fn draw_context_band(
         ..area
     };
     if pad.width == 0 {
+        return;
+    }
+
+    if app.browse == BrowseLevel::Home {
+        let need = home_needs_you(&home.rows);
+        let running = home_band_count(&home.rows, HomeBand::Running);
+        let finished = home_band_count(&home.rows, HomeBand::Finished);
+        let line = Line::from(vec![
+            Span::styled(
+                format!("{need} need you"),
+                Style::default().fg(if need > 0 { WARN } else { FG_MUTED }),
+            ),
+            Span::styled(" · ", muted()),
+            Span::styled(
+                format!("{running} running"),
+                Style::default().fg(if running > 0 { INFO } else { FG_MUTED }),
+            ),
+            Span::styled(" · ", muted()),
+            Span::styled(format!("{finished} finished"), dim()),
+            Span::styled(" · ", muted()),
+            Span::styled(home_scope_label(&app.home_scope), muted()),
+        ]);
+        f.render_widget(Paragraph::new(line), pad);
         return;
     }
 
@@ -3201,7 +5130,7 @@ fn draw_context_band(
         let running = runs.iter().filter(|r| is_active_phase(r.phase)).count();
         let line = if runs.is_empty() {
             Line::from(Span::styled(
-                "no runs here yet — press : for the command palette",
+                "no runs yet — n from Home starts one",
                 muted(),
             ))
         } else {
@@ -3373,8 +5302,27 @@ fn status_cue(
     projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
+    home: &HomeData,
     app: &App,
 ) -> (String, Color, Option<Color>) {
+    if app.browse == BrowseLevel::Home {
+        if projects.is_empty() {
+            return (
+                format!(
+                    "no projects yet — run spar in a repo · {}",
+                    registry::spar_home().display()
+                ),
+                FG_DIM,
+                None,
+            );
+        }
+        let need = home_needs_you(&home.rows);
+        return if need > 0 {
+            (format!("⚑{need} need you"), WARN, None)
+        } else {
+            ("nothing needs you · n starts a run".into(), FG_MUTED, None)
+        };
+    }
     if app.browse == BrowseLevel::Projects {
         if projects.is_empty() {
             return (
@@ -3391,7 +5339,7 @@ fn status_cue(
     let Some(st) = full else {
         return if runs.is_empty() {
             (
-                "no runs — spar plan -t \"…\" --providers cli:claude".into(),
+                "no runs — spar plan -t \"describe the change\" --providers cli:claude".into(),
                 FG_DIM,
                 None,
             )
@@ -3469,6 +5417,7 @@ fn gate_zone(area: Rect) -> Option<Rect> {
 ///
 /// Brand + breadcrumb + phase on the left, attention chips on the right, gate buttons
 /// in their reserved zone. Counts and progress live one row below, in the stepper.
+#[allow(clippy::too_many_arguments)]
 fn draw_header(
     f: &mut Frame,
     area: Rect,
@@ -3476,41 +5425,54 @@ fn draw_header(
     projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
+    home: &HomeData,
     app: &mut App,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let (cue, cue_fg, wash) = status_cue(projects, runs, full, app);
+    let (cue, cue_fg, wash) = status_cue(projects, runs, full, home, app);
     let buttons = gate_buttons_for(full);
     // The only full-row fill in the product, and only for states worth shouting about.
     if let Some(w) = wash {
         f.render_widget(Paragraph::new("").style(Style::default().bg(w)), area);
     }
 
-    let project = swarm
-        .project_root
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(".");
+    // At Home scoped to every project, `swarm`/`active_root` still names whichever
+    // project the rail happens to be sitting on internally — showing it here would
+    // claim a scope the context band right below (`draw_context_band`) does not
+    // honour (round-7 review finding). Name the scope instead.
+    let project = if app.browse == BrowseLevel::Home && app.home_scope == HomeScope::All {
+        "all projects".to_string()
+    } else {
+        swarm
+            .project_root
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(".")
+            .to_string()
+    };
 
     let mut spans = vec![
         Span::styled(" spar ", chip(ACCENT)),
         Span::styled(
-            format!("  {}", truncate(project, 20)),
+            format!("  {}", truncate(&project, 20)),
             Style::default().fg(FG).bold(),
         ),
     ];
+    // No fallback to "—": with no run in hand (and none selected), the breadcrumb
+    // omits itself rather than sitting next to the "no runs" cue and contradicting it.
     if app.browse.in_project() {
         let run = full
             .map(|s| s.id.clone())
-            .or_else(|| runs.get(app.selected_run).map(|r| r.id.clone()))
-            .unwrap_or_else(|| "—".into());
-        spans.push(Span::styled(" ▸ ", muted()));
-        spans.push(Span::styled(
-            format!("run {run}"),
-            Style::default().fg(INFO),
-        ));
+            .or_else(|| runs.get(app.selected_run).map(|r| r.id.clone()));
+        if let Some(run) = run {
+            spans.push(Span::styled(" ▸ ", muted()));
+            spans.push(Span::styled(
+                format!("run {run}"),
+                Style::default().fg(INFO),
+            ));
+        }
     }
     if app.browse == BrowseLevel::Agents {
         let slot = full
@@ -3541,25 +5503,15 @@ fn draw_header(
             spans.push(Span::styled(" dry-run ", chip(WARN)));
         }
     }
-    // At a gate the buttons on the right and the footer already say what to press;
-    // repeating it here only crowds the breadcrumb.
-    if !cue.is_empty() && buttons.is_empty() {
-        spans.push(Span::styled(" · ", muted()));
-        spans.push(Span::styled(
-            cue,
-            Style::default().fg(cue_fg).add_modifier(if wash.is_some() {
-                Modifier::BOLD
-            } else {
-                Modifier::empty()
-            }),
-        ));
-    }
-
     // Right cluster: the fleet roll-up ("what needs me?", independent of the rail
     // selection) and the unread human-alert count.
     let mut right: Vec<Span> = Vec::new();
     let need = if app.browse.in_project() {
         runs_needing_attention(runs)
+    } else if app.browse == BrowseLevel::Home {
+        // Home is the one view that is organised around this roll-up (U7); it must
+        // not be the only view that never shows it.
+        home_needs_you(&home.rows)
     } else {
         0
     };
@@ -3588,6 +5540,27 @@ fn draw_header(
     let right_x = right_limit.saturating_sub(right_w + 1).max(area.x);
 
     let left_w = right_x.saturating_sub(area.x);
+
+    // At a gate the buttons on the right and the footer already say what to press;
+    // repeating it here only crowds the breadcrumb. And like the run breadcrumb
+    // above, a cue that cannot fit whole is omitted rather than shown truncated —
+    // Main renders the same wording in full, so a clipped fragment here would just
+    // be a second, disagreeing spelling of it (round-4 review finding).
+    if !cue.is_empty() && buttons.is_empty() {
+        let base_w: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+        let cue_w = 3 + cue.chars().count() as u16; // " · " + cue
+        if base_w + cue_w <= left_w {
+            spans.push(Span::styled(" · ", muted()));
+            spans.push(Span::styled(
+                cue,
+                Style::default().fg(cue_fg).add_modifier(if wash.is_some() {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+            ));
+        }
+    }
     f.render_widget(
         Paragraph::new(Line::from(fit_spans(spans, left_w))),
         Rect {
@@ -3679,9 +5652,11 @@ fn rail_title(
     projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
+    home: &HomeData,
     app: &App,
 ) -> String {
     let base = match app.browse {
+        BrowseLevel::Home => format!("HOME  {} need you", home_needs_you(&home.rows)),
         BrowseLevel::Projects => format!("PROJECTS  {}", projects.len()),
         BrowseLevel::Runs => format!("RUNS  {}", runs.len()),
         BrowseLevel::Agents => {
@@ -3701,22 +5676,26 @@ fn rail_title(
     }
 }
 
-/// The rail: one drill-down tree (`projects ▸ runs ▸ agents`), never a stack of
-/// co-equal panels. `Enter` pushes a level, `Esc` pops one. No border: its title
-/// rides the labels row and the seam separates it from Main.
+/// The rail: one drill-down tree (`Home ▸ runs ▸ agents`, with `Projects` reachable
+/// from Home for a specific-project jump), never a stack of co-equal panels. `Enter`
+/// pushes a level, `Esc` pops one. No border: its title rides the labels row and the
+/// seam separates it from Main.
+#[allow(clippy::too_many_arguments)]
 fn draw_rail(
     f: &mut Frame,
     area: Rect,
     projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
+    home: &HomeData,
     app: &App,
     state: &mut ListState,
 ) {
     let focused = app.focus == Focus::Rail;
     let w = area.width;
     let items = match app.browse {
-        BrowseLevel::Projects => rail_project_items(projects, app, w, focused),
+        BrowseLevel::Home => rail_home_items(&home.rows, projects, app, w, focused),
+        BrowseLevel::Projects => rail_project_items(projects, &home.project_stats, app, w, focused),
         BrowseLevel::Runs => rail_run_items(runs, app, w, focused),
         BrowseLevel::Agents => {
             let slots = full.map(|s| s.slots.as_slice()).unwrap_or(&[]);
@@ -3787,8 +5766,12 @@ fn rail_row(
     ListItem::new(Line::from(spans))
 }
 
+/// Projects-level rows read their counts off `stats` (U13/B) rather than scanning
+/// disk. `stats` can lag `projects` by one snapshot right after a new project
+/// registers — that degrades to a blank count, never a panic.
 fn rail_project_items(
     projects: &[registry::ProjectEntry],
+    stats: &[ProjectStat],
     app: &App,
     w: u16,
     focused: bool,
@@ -3809,9 +5792,8 @@ fn rail_project_items(
                     return rail_filtered_row(name, w);
                 }
             }
-            let project_runs = registry::list_visible_project_runs(&p.root).unwrap_or_default();
+            let stat = stats.get(i).copied().unwrap_or_default();
             // Roll-up: a run that wants the operator makes its whole project fly a ⚑.
-            let need = runs_needing_attention(&project_runs);
             let mut body = vec![Span::styled(
                 truncate(name, name_w),
                 if sel {
@@ -3820,19 +5802,105 @@ fn rail_project_items(
                     Style::default().fg(INFO)
                 },
             )];
-            body.push(Span::styled(format!("  {}r", project_runs.len()), muted()));
-            if need > 0 {
+            body.push(Span::styled(format!("  {}r", stat.n_runs), muted()));
+            if stat.needs_you > 0 {
                 body.push(Span::styled(
-                    format!(" ⚑{need}"),
+                    format!(" ⚑{}", stat.needs_you),
                     Style::default().fg(WARN).bold(),
                 ));
             }
             rail_row(
-                rail_lead(sel, focused, (need > 0).then_some(WARN)),
+                rail_lead(sel, focused, (stat.needs_you > 0).then_some(WARN)),
                 body,
                 Span::styled(relative_age(p.last_seen), muted()),
                 w,
             )
+        })
+        .collect()
+}
+
+/// Home's rail rows: band headers dim and uppercase, run rows sharing `rail_row`'s
+/// two fixed lead columns and right-aligned wait column with every other level, the
+/// action row and project switcher closing out band 4.
+fn rail_home_items(
+    rows: &[HomeRow],
+    projects: &[registry::ProjectEntry],
+    app: &App,
+    w: u16,
+    focused: bool,
+) -> Vec<ListItem<'static>> {
+    if rows.is_empty() {
+        return rail_empty("(loading)");
+    }
+    rows.iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let sel = i == app.selected_home;
+            match row {
+                HomeRow::Header(b) => ListItem::new(Span::styled(
+                    format!("  {}", home_band_label(*b)),
+                    muted().bold(),
+                )),
+                HomeRow::Run { run, .. } => {
+                    let flag = attention_flag(run, unit_wants_operator(run));
+                    let more = if run.wants > 1 {
+                        format!(" ⚑{}", run.wants)
+                    } else {
+                        String::new()
+                    };
+                    let phase_w = w.saturating_sub(17).clamp(6, 16) as usize;
+                    let body = vec![
+                        Span::styled(
+                            format!("{:<8}", truncate(home_display_id(run), 8)),
+                            if sel { selected(focused) } else { dim() },
+                        ),
+                        Span::styled(
+                            format!("  {}", truncate(&rail_phase(run.phase), phase_w)),
+                            Style::default().fg(phase_color(run.phase)),
+                        ),
+                        Span::styled(more, Style::default().fg(WARN).bold()),
+                    ];
+                    rail_row(
+                        rail_lead(sel, focused, flag),
+                        body,
+                        Span::styled(
+                            relative_wait(home_wait(run.updated_at, Utc::now())),
+                            muted(),
+                        ),
+                        w,
+                    )
+                }
+                HomeRow::More { n, .. } => ListItem::new(Span::styled(
+                    format!("  … {n} more"),
+                    Style::default().fg(FG_MUTED).italic(),
+                )),
+                HomeRow::Project(idx, _) => {
+                    let name = projects
+                        .get(*idx)
+                        .and_then(|p| p.name.as_deref())
+                        .unwrap_or("·");
+                    let body = vec![Span::styled(
+                        truncate(name, w.saturating_sub(4) as usize),
+                        if sel {
+                            selected(focused)
+                        } else {
+                            Style::default().fg(INFO)
+                        },
+                    )];
+                    rail_row(rail_lead(sel, focused, None), body, Span::raw(""), w)
+                }
+                HomeRow::NewRun => {
+                    let body = vec![Span::styled(
+                        "n · start something new",
+                        if sel {
+                            selected(focused)
+                        } else {
+                            Style::default().fg(ACCENT)
+                        },
+                    )];
+                    rail_row(rail_lead(sel, focused, None), body, Span::raw(""), w)
+                }
+            }
         })
         .collect()
 }
@@ -3876,11 +5944,7 @@ fn rail_run_items(
                     phase_color(r.phase)
                 },
             );
-            let flag = match run_attention(r) {
-                Attention::Gate => Some(WARN),
-                Attention::Broken => Some(ALERT),
-                _ => None,
-            };
+            let flag = attention_flag(r, unit_wants_operator(r));
             let body = vec![
                 Span::styled(
                     format!("{:<8}", truncate(&r.id, 8)),
@@ -3959,6 +6023,7 @@ fn rail_slot_items(
 /// Main: ONE area, content = f(rail selection × tab). Its tabs live on the labels
 /// row above, so nothing relocates when the tab changes and the pane itself carries
 /// no border — one column of padding, then content.
+#[allow(clippy::too_many_arguments)]
 fn draw_main(
     f: &mut Frame,
     area: Rect,
@@ -3966,6 +6031,8 @@ fn draw_main(
     stream_text: &str,
     activity: &[String],
     diff_text: &str,
+    home: &HomeData,
+    log_stats: Option<&process::StreamStats>,
     app: &mut App,
 ) {
     if area.width == 0 || area.height == 0 {
@@ -3987,17 +6054,55 @@ fn draw_main(
         return;
     }
 
+    // At Home every tab but Shell shows the same four-band overview — there is no
+    // per-run Activity/Diff to show at a cross-project landing view. Shell stays the
+    // real project-scoped workspace terminal regardless (see `manage_terminal`).
+    if app.browse == BrowseLevel::Home && app.main_tab != MainTab::Shell {
+        draw_home_body(f, inner, home, app);
+        return;
+    }
+
+    // With no run selected, Log/Activity/Diff have nothing real to show — Log's
+    // already-coherent empty message is the one story all three tell instead of each
+    // inventing its own. Shell never joins that story: it is project-scoped, not
+    // run-scoped (see `manage_terminal`), so it always shows the real workspace
+    // terminal regardless of run count.
     match app.main_tab {
-        MainTab::Log => draw_log_body(f, inner, full, stream_text, app),
+        MainTab::Log => draw_log_body(f, inner, full, stream_text, log_stats, app),
+        MainTab::Activity if full.is_none() => {
+            draw_log_body(f, inner, full, stream_text, log_stats, app)
+        }
         MainTab::Activity => draw_activity_body(f, inner, activity, app),
+        MainTab::Diff if full.is_none() => {
+            draw_log_body(f, inner, full, stream_text, log_stats, app)
+        }
         MainTab::Diff => draw_diff_body(f, inner, diff_text, app),
         MainTab::Shell => draw_shell_body(f, inner, app),
     }
 }
 
+/// Main's Home body: the four bands (C7). Reuses the same scrollable-log viewport as
+/// the other no-run bodies.
+fn draw_home_body(f: &mut Frame, inner: Rect, home: &HomeData, app: &mut App) {
+    let text = home_overview(&home.rows, &app.home_scope, app.home_watermark, Utc::now());
+    app.stream_view_h = inner.height;
+    app.stream_max = render_scrollable_log(
+        f,
+        inner,
+        &text,
+        &mut app.stream_scroll,
+        &mut app.stream_follow,
+        false,
+        app.log_expand,
+    );
+}
+
 /// The subtitle that rides after the tab strip: what the active tab is showing.
 fn main_context(swarm: &SparPaths, full: Option<&RunState>, app: &App) -> String {
     match app.main_tab {
+        // No run: there is no slot to name and nothing live streaming, so the caption
+        // would just be a placeholder contradicting the empty state one row up.
+        MainTab::Log if full.is_none() => String::new(),
         MainTab::Log => {
             let slot = full
                 .map(|st| slot_short(&st.slots, app.selected_slot))
@@ -4006,10 +6111,29 @@ fn main_context(swarm: &SparPaths, full: Option<&RunState>, app: &App) -> String
             let follow = if app.stream_follow { " · live" } else { "" };
             format!("{slot} · {mode}{follow}")
         }
+        MainTab::Activity if full.is_none() => String::new(),
         MainTab::Activity => "run timeline + bus".into(),
+        MainTab::Diff if full.is_none() => String::new(),
         MainTab::Diff => "artifacts".into(),
         MainTab::Shell => match app.takeover_target.as_deref() {
-            Some(session) => format!("agent · {session}"),
+            Some(_) => {
+                let run_id = full
+                    .map(|st| truncate(&st.id, 8))
+                    .unwrap_or_else(|| "agent".into());
+                // The tmux pane is attached (`terminal_pane`) once the window is
+                // actually resolvable, at which point the slot it names is worth
+                // showing; before that (still resolving, or a run with no slots)
+                // the shorter run-only form is all there is to say.
+                match (full, app.terminal_pane.is_some()) {
+                    (Some(st), true) => {
+                        format!(
+                            "agent · {run_id} ▸ {}",
+                            slot_short(&st.slots, app.selected_slot)
+                        )
+                    }
+                    _ => format!("agent · {run_id}"),
+                }
+            }
             None => {
                 let base = swarm
                     .project_root
@@ -4029,6 +6153,7 @@ fn draw_log_body(
     inner: Rect,
     full: Option<&RunState>,
     stream_text: &str,
+    stats: Option<&process::StreamStats>,
     app: &mut App,
 ) {
     // No run selected (Projects level): the body is an overview, not a stream — no
@@ -4072,32 +6197,10 @@ fn draw_log_body(
         .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(inner);
 
-    let stats = slot.and_then(|s| {
-        s.log_path
-            .as_ref()
-            .and_then(|p| process::StreamStats::load(p))
-            .or_else(|| {
-                s.usage.as_ref().map(|u| process::StreamStats {
-                    tools: u.tools,
-                    tool_errors: 0,
-                    input_tokens: u.input_tokens,
-                    output_tokens: u.output_tokens,
-                    cache_read_tokens: u.cache_read_tokens,
-                    cache_write_tokens: 0,
-                    context_tokens: u.context_tokens,
-                    billed_tokens: u.billed_tokens,
-                    model: u.model.clone(),
-                    session_id: None,
-                    lines_in: 0,
-                    chars_out: 0,
-                    last_log_at: None,
-                })
-            })
-    });
     draw_stream_stats(
         f,
         chunks[0],
-        stats.as_ref(),
+        stats,
         slot.map(|s| s.status),
         &silent_hint,
         app.abandoned,
@@ -4281,25 +6384,28 @@ fn render_scrollable_log(
         text_area,
     );
 
-    // Map our tail-scroll model (position in [0, max_scroll], last screenful
-    // pinned to the bottom) onto ratatui's scrollbar, whose thumb only reaches
-    // the track bottom when position == content_length - 1. content_length is
-    // the number of scroll positions, not content rows, so the thumb lands flush
-    // at the bottom when start == max_scroll and its length stays height/total.
-    let mut sb = ScrollbarState::new(max_scroll as usize + 1)
-        .position(start)
-        .viewport_content_length(height);
-    f.render_stateful_widget(
-        Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None)
-            .track_symbol(Some("│"))
-            .thumb_symbol("┃")
-            .style(Style::default().fg(RULE))
-            .thumb_style(Style::default().fg(ACCENT_SOFT)),
-        area,
-        &mut sb,
-    );
+    // Nothing to scroll to: don't paint a thumb that implies otherwise.
+    if max_scroll > 0 {
+        // Map our tail-scroll model (position in [0, max_scroll], last screenful
+        // pinned to the bottom) onto ratatui's scrollbar, whose thumb only reaches
+        // the track bottom when position == content_length - 1. content_length is
+        // the number of scroll positions, not content rows, so the thumb lands flush
+        // at the bottom when start == max_scroll and its length stays height/total.
+        let mut sb = ScrollbarState::new(max_scroll as usize + 1)
+            .position(start)
+            .viewport_content_length(height);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some("│"))
+                .thumb_symbol("┃")
+                .style(Style::default().fg(RULE))
+                .thumb_style(Style::default().fg(ACCENT_SOFT)),
+            area,
+            &mut sb,
+        );
+    }
     max_scroll
 }
 
@@ -4698,9 +6804,21 @@ fn draw_palette(f: &mut Frame, area: Rect, runs: &[state::RunSummary], app: &mut
         return;
     };
     let comps = palette_completions(pal, runs);
-    // Show up to 8 completions, plus the input row and borders.
-    let menu_n = comps.len().min(8) as u16;
-    let h = menu_n + 3; // input row + top/bottom border + a hint row
+    // Show up to 8 completions at a time, scrolled to keep the selection in view —
+    // PALETTE_CMDS has 12 verbs, so a hard cap here would make the last four
+    // unreachable by browsing. On a short frame, shrink the menu first so the
+    // input and hint rows (the frame's edges) are always the last thing cut.
+    let max_menu_n = area.height.saturating_sub(4); // borders(2) + input(1) + hint(1)
+    let menu_n = comps.len().min(8).min(max_menu_n as usize) as u16;
+    let win_start = if menu_n == 0 {
+        0
+    } else if pal.sel >= menu_n as usize {
+        (pal.sel + 1 - menu_n as usize).min(comps.len().saturating_sub(menu_n as usize))
+    } else {
+        0
+    };
+    // input row + completion rows + hint row + top/bottom border.
+    let h = menu_n + 2 + 2;
     let w = area.width.clamp(30, 76);
     let x = area.x + 2;
     let y = area.bottom().saturating_sub(h + 1);
@@ -4741,7 +6859,12 @@ fn draw_palette(f: &mut Frame, area: Rect, runs: &[state::RunSummary], app: &mut
     // The completion menu: verb + hint/help when on the command, run id list on the arg.
     let on_arg = pal.on_arg();
     let mut rows: Vec<Line> = vec![input_line];
-    for (i, c) in comps.iter().take(menu_n as usize).enumerate() {
+    for (i, c) in comps
+        .iter()
+        .enumerate()
+        .skip(win_start)
+        .take(menu_n as usize)
+    {
         let selected = i == pal.sel;
         let mark = if selected { "▸ " } else { "  " };
         let base = if selected {
@@ -4764,9 +6887,17 @@ fn draw_palette(f: &mut Frame, area: Rect, runs: &[state::RunSummary], app: &mut
         ]));
     }
     let hint = if on_arg {
-        "Tab complete run · Enter run · Esc close"
+        "Tab complete run · Enter run · Esc close".to_string()
     } else {
-        "Tab complete · ↑↓ pick · Enter run · Esc close"
+        "Tab complete · ↑↓ pick · Enter run · Esc close".to_string()
+    };
+    // The menu scrolls rather than hard-capping at 8 (AC-2), but an 8-row window
+    // alone still looks like the whole list — nothing said `spawn`/`chat`/`help`/
+    // `quit` exist below the fold. A position counter makes the overflow visible.
+    let hint = if comps.len() > menu_n as usize {
+        format!("{hint}  ({}/{})", pal.sel + 1, comps.len())
+    } else {
+        hint
     };
     rows.push(Line::from(Span::styled(
         hint,
@@ -4930,6 +7061,7 @@ fn situational_footer(
     }
     match focus {
         Focus::Rail => match browse {
+            BrowseLevel::Home => "j/k · Enter open · n new run · P scope · p projects · a next-alert · : cmd · ? help",
             BrowseLevel::Projects => "j/k · Enter open · / filter · : cmd · 2 main · ? help",
             BrowseLevel::Runs => "j/k · Enter agents · a next-alert · / filter · : cmd · ? help",
             BrowseLevel::Agents => "j/k · Enter take over · a next-alert · Esc runs · : cmd",
@@ -4943,39 +7075,62 @@ fn situational_footer(
     }
 }
 
-fn draw_help_overlay(f: &mut Frame, area: Rect) {
-    // `clamp(40, ..)` returns 40 on a 30-column terminal, i.e. a rect outside the
-    // buffer, and ratatui panics on the first cell. Never grow past the frame.
-    let w = area.width.min(72);
-    let h = area.height.min(32);
-    if w == 0 || h == 0 {
-        return;
+/// Word-wrap a single line to `width` columns without collapsing internal
+/// whitespace runs (unlike `soft_wrap`, which rejoins on a single space) — a
+/// key and its description stay aligned by their run of spaces as long as the
+/// line fits on one row; a row that has to wrap restarts at column 0 and does
+/// not carry that indent forward.
+fn wrap_line_preserve(line: &str, width: usize) -> Vec<String> {
+    let chars: Vec<char> = line.chars().collect();
+    if width == 0 || chars.len() <= width {
+        return vec![line.to_string()];
     }
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let rect = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
-    f.render_widget(Clear, rect);
-    let body = r#" spar — rail + one main area
- 
+    let mut rows = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        let mut end = (start + width).min(chars.len());
+        if end < chars.len() {
+            if let Some(brk) = (start..end).rev().find(|&i| chars[i] == ' ') {
+                if brk > start {
+                    end = brk;
+                }
+            }
+        }
+        let row: String = chars[start..end].iter().collect();
+        // A break search that lands inside leading indentation (width small enough
+        // that the nearest space behind `end` is part of the indent, not a word gap)
+        // produces a row of pure whitespace — drop it rather than growing the overlay
+        // with a blank line indentation alone accounts for.
+        if !row.is_empty() && !row.chars().all(|c| c == ' ') {
+            rows.push(row);
+        }
+        start = end;
+        while start < chars.len() && chars[start] == ' ' {
+            start += 1;
+        }
+    }
+    rows
+}
+
+const HELP_BODY: &str = r#" spar — rail + one main area
+
   Shape
-    Rail   projects ▸ runs ▸ agents  (Enter pushes, Esc pops)
-           attention-sorted: gates and broken runs float to the top.
+    Rail   Home ▸ runs ▸ agents  (Enter pushes, Esc pops)
+           p opens the project list; Home bands: needs you, running,
+           finished since last look, start something new.
     Main   one area · tabs: Log · Activity · Diff · Shell
     Main always shows the rail's selection — nothing else moves.
- 
+
   Keyboard
     1 / 2                focus Rail · Main
     Tab / Shift-Tab      cycle Rail ↔ Main
-    j k  or  ↑ ↓         move in the rail · scroll Main
+    j k  or  ↑ ↓         move in the rail · scroll Main · scroll this help
     Enter                push a rail level (on an agent: take it over)
     Esc                  pop a rail level · clear filter (never quits)
     [ ]                  previous / next Main tab
     + / _                zoom Main fullscreen / restore
+    n                    new run + fleet picker
+    P                    toggle Home scope (this project ↔ all)
     p                    jump to Projects
     a                    jump to the next run that needs you
     r / s                reject · ship (when gated; approve = tap / :approve)
@@ -4985,21 +7140,265 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
     g / G                top / bottom of Main
     ?                    this help · Esc closes help
     q                    quit
- 
+
   Shell tab = a real tmux client: every key goes to the agent (incl.
     Ctrl+C). prefix C-a · Ctrl+a d or F12 hands focus back to spar.
     Focusing it full-screen is Driving mode (green banner, bands collapsed).
- 
+
   Mouse / touch: tap a tab, a rail row (double-tap = Enter), a gate
   button, or the breadcrumb (back to the rail). Scroll to scroll.
- 
+
   Esc, ?, or tap to close help"#;
-    let p = Paragraph::new(body).style(Style::default().fg(FG)).block(
+
+/// Sized to its content, up to the frame — never a fixed box that hard-clips a
+/// line mid-word. Wraps at word boundaries when the frame is narrower than the
+/// longest line, and scrolls with j/k when it is shorter than the content.
+fn draw_help_overlay(f: &mut Frame, area: Rect, app: &mut App) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    const BORDER: u16 = 2;
+    let lines: Vec<&str> = HELP_BODY.lines().collect();
+    let content_w = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
+    let w = (content_w + BORDER).min(area.width);
+    if w <= BORDER {
+        return;
+    }
+    let inner_w = (w - BORDER) as usize;
+    let wrapped: Vec<String> = lines
+        .iter()
+        .flat_map(|l| wrap_line_preserve(l, inner_w))
+        .collect();
+    let content_h = wrapped.len() as u16;
+    let h = (content_h + BORDER).min(area.height);
+    if h <= BORDER {
+        return;
+    }
+    let inner_h = h - BORDER;
+    let max_scroll = content_h.saturating_sub(inner_h);
+    app.help_scroll = app.help_scroll.min(max_scroll);
+
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let title = if max_scroll > 0 {
+        " Help · j/k scroll "
+    } else {
+        " Help "
+    };
+    let p = Paragraph::new(wrapped.join("\n"))
+        .style(Style::default().fg(FG))
+        .scroll((app.help_scroll, 0))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(ACCENT))
+                .title(Span::styled(title, Style::default().fg(ACCENT).bold())),
+        );
+    f.render_widget(p, rect);
+}
+
+/// Phase D's new-run overlay: Project / Task / Fleet, sized to content and clamped
+/// to the frame exactly like `draw_help_overlay` — reusing its clamp/centre
+/// arithmetic so the 30-column panic class it already fixed cannot come back.
+fn draw_new_run(f: &mut Frame, area: Rect, projects: &[registry::ProjectEntry], app: &mut App) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let Some(nr) = app.new_run.as_ref() else {
+        return;
+    };
+    const BORDER: u16 = 2;
+    let content_w: u16 = 64;
+    let w = (content_w + BORDER).min(area.width);
+    if w <= BORDER {
+        return;
+    }
+    let inner_w = (w - BORDER) as usize;
+
+    let field_style = |f: NewRunField| {
+        if nr.field == f {
+            Style::default().fg(ACCENT).bold()
+        } else {
+            Style::default().fg(FG)
+        }
+    };
+    let project_label = nr
+        .project
+        .as_ref()
+        .map(|p| {
+            // Prefer the registry's own name (what the rail shows) over the raw
+            // directory basename, so the same project reads identically in the
+            // rail and in this modal (round-7 review finding).
+            projects
+                .iter()
+                .find(|e| &e.root == p)
+                .and_then(|e| e.name.clone())
+                .or_else(|| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| p.display().to_string())
+        })
+        .unwrap_or_else(|| "none — open spar in a project or choose one".to_string());
+    let cycle_hint = if nr.projects.len() > 1 {
+        "  ←/→"
+    } else {
+        ""
+    };
+
+    let mut lines: Vec<(String, Style)> = Vec::new();
+    lines.push((
+        format!("Project: {project_label}{cycle_hint}"),
+        field_style(NewRunField::Project),
+    ));
+    lines.push((String::new(), Style::default()));
+    lines.push((
+        format!("Task: {}▌", nr.task),
+        field_style(NewRunField::Task),
+    ));
+    lines.push((String::new(), Style::default()));
+    lines.push(("Fleet:".to_string(), field_style(NewRunField::Fleet)));
+    if nr.loading {
+        lines.push((
+            "  checking roster…".to_string(),
+            Style::default().fg(FG_MUTED),
+        ));
+    } else if nr.roster.iter().all(|e| !e.available) {
+        // Not just "empty": the shipped default `providers.order` still emits one
+        // configured, unavailable row per entry when nothing is on PATH, so the
+        // roster is rarely literally empty — it is a roster with nothing usable
+        // (R7 review finding).
+        lines.push((
+            "  nothing usable — spar doctor".to_string(),
+            Style::default().fg(FG_MUTED),
+        ));
+    }
+    const MAX_ROSTER_ROWS: usize = 8;
+    // Keep `nr.sel` inside the painted window — otherwise a roster past the cap
+    // has rows the keyboard can select but neither paint nor a click can reach.
+    let roster_scroll = if nr.roster.len() <= MAX_ROSTER_ROWS {
+        0
+    } else {
+        nr.sel
+            .saturating_sub(MAX_ROSTER_ROWS - 1)
+            .min(nr.roster.len() - MAX_ROSTER_ROWS)
+    };
+    let roster_window: Vec<(usize, &RosterEntry)> = nr
+        .roster
+        .iter()
+        .enumerate()
+        .skip(roster_scroll)
+        .take(MAX_ROSTER_ROWS)
+        .collect();
+    if roster_scroll > 0 {
+        lines.push((
+            format!("  ↑ {roster_scroll} more"),
+            Style::default().fg(FG_MUTED),
+        ));
+    }
+    let roster_line_start = lines.len();
+    for (i, e) in roster_window.iter().copied() {
+        let picked_n = nr.picked.iter().position(|&p| p == i);
+        let mark = match picked_n {
+            Some(n) => format!("{}.", n + 1),
+            None if e.available => "[ ]".to_string(),
+            // Not `[x]`: next to numbered picks and an empty `[ ]`, an `x` reads as
+            // *checked*, the opposite of disabled (round-9 review).
+            None => "[-]".to_string(),
+        };
+        let cursor = if nr.field == NewRunField::Fleet && nr.sel == i {
+            ">"
+        } else {
+            " "
+        };
+        let style = if !e.available {
+            Style::default().fg(FG_DIM)
+        } else if picked_n.is_some() {
+            Style::default().fg(OK)
+        } else {
+            Style::default().fg(FG)
+        };
+        let reason = e
+            .reason
+            .as_deref()
+            .map(|r| format!("  ({r})"))
+            .unwrap_or_default();
+        let source = match e.source {
+            RosterSource::Configured => "",
+            RosterSource::Detected => "  detected",
+            RosterSource::RecentFleet => "",
+        };
+        lines.push((
+            format!("{cursor} {mark} {}{source}{reason}", e.label),
+            style,
+        ));
+    }
+    let below = nr.roster.len() - roster_scroll - roster_window.len();
+    if below > 0 {
+        lines.push((format!("  ↓ {below} more"), Style::default().fg(FG_MUTED)));
+    }
+    lines.push((String::new(), Style::default()));
+    lines.push((
+        "Tab field · space pick · Enter start · Esc cancel".to_string(),
+        Style::default().fg(FG_MUTED),
+    ));
+
+    let content_h = lines.len() as u16;
+    let h = (content_h + BORDER).min(area.height);
+    if h <= BORDER {
+        return;
+    }
+    let inner_h = (h - BORDER) as usize;
+
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    // Click-outside-to-cancel / click-a-roster-row-to-toggle (D4), mirroring
+    // `rect_palette`. Only rows actually painted (post-truncation, post-scroll)
+    // are hit-testable, keyed by the roster's real index so a click on a
+    // scrolled-into-view row toggles the right entry.
+    app.rect_new_run_roster = roster_window
+        .iter()
+        .enumerate()
+        .filter(|(row, _)| roster_line_start + row < inner_h)
+        .map(|(row, (i, _))| {
+            (
+                *i,
+                Rect {
+                    x: rect.x + 1,
+                    y: rect.y + 1 + (roster_line_start + row) as u16,
+                    width: inner_w as u16,
+                    height: 1,
+                },
+            )
+        })
+        .collect();
+    app.rect_new_run = rect;
+    f.render_widget(Clear, rect);
+    let text: Vec<Line> = lines
+        .into_iter()
+        .take(inner_h)
+        .map(|(s, style)| Line::from(Span::styled(truncate(&s, inner_w), style)))
+        .collect();
+    let p = Paragraph::new(text).block(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(ACCENT))
-            .title(Span::styled(" Help ", Style::default().fg(ACCENT).bold())),
+            .title(Span::styled(
+                " New run ",
+                Style::default().fg(ACCENT).bold(),
+            )),
     );
     f.render_widget(p, rect);
 }
@@ -5094,9 +7493,9 @@ fn draw_shell_body(f: &mut Frame, inner: Rect, app: &mut App) {
     let Some(pane) = app.terminal_pane.as_mut() else {
         let hint = Paragraph::new(
             "Opening a real tmux client for the project's workspace shell — \
-             run a dev server, cargo, poke around; the session stays alive across TUI restarts.\n\n\
+             run a dev server, cargo, poke around; the shell stays alive across TUI restarts.\n\n\
              Or select an agent in the rail (Enter on a run, then Enter on a slot) to take over its live pane.\n\n\
-             Full tmux: prefix C-a, copy-mode/scroll, splits, session switch. Ctrl+a d / F12 → spar.\n\n\
+             Full tmux underneath: prefix C-a, copy-mode/scroll, splits. Ctrl+a d / F12 → spar.\n\n\
              (No tmux on PATH? The Shell tab needs it.)",
         )
         .style(Style::default().fg(FG_DIM))
@@ -5123,7 +7522,7 @@ fn draw_shell_body(f: &mut Frame, inner: Rect, app: &mut App) {
             ..inner
         };
         let hint = Paragraph::new(
-            "Ctrl+a d / F12 / tap a tab → spar · C-a [ scroll/copy · ] paste · % / \" split · s session",
+            "Ctrl+a d / F12 / tap a tab → spar · C-a [ scroll/copy · ] paste · % / \" split · C-a s tmux picker",
         )
         .style(Style::default().fg(FG_DIM));
         f.render_widget(hint, footer);
@@ -5159,7 +7558,8 @@ fn send_mention(swarm: &SparPaths, run_id: Option<&str>, rest: &str) -> Result<S
     Ok(format!("sent to {to}"))
 }
 
-/// Resolve a composer mention to a unique bus id. An already-qualified id (`run:slot`)
+/// Resolve an `@mention` (from the `:` palette's `@`/`chat` form) to a unique bus id.
+/// An already-qualified id (`run:slot`)
 /// or reserved sink (`broadcast`/`@human`) passes through. A short id resolves against
 /// the workspace roster: the selected run's slot (`run:slot`) and any bare agent of that
 /// id are candidates — exactly one resolves, several error (listing them), and none
@@ -5238,7 +7638,7 @@ fn spawn_agent_command(
 
     // Give the agent its own worktree (never the primary checkout) so presence hooks
     // install and it can run FullAuto safely. Done on this thread so a git failure
-    // surfaces synchronously as a composer error rather than a silent background drop.
+    // surfaces synchronously as a palette error rather than a silent background drop.
     let paths = SparPaths::new(&project_root);
     let base = state::RunState::load(&paths, &run.id)
         .ok()
@@ -5299,10 +7699,17 @@ fn stream_content(
     full: Option<&RunState>,
     slot_idx: usize,
     cache: &mut LogCache,
+    has_runs: bool,
 ) -> String {
     let Some(st) = full else {
         cache.clear();
-        return "\n  Select a run on the left.\n\n  New work:\n    spar plan -t \"describe the change\" --providers cli:claude\n".into();
+        // Distinct from "pick one of these" — there is nothing to pick yet, so the
+        // empty state doesn't tell the operator to do something that isn't possible.
+        return if has_runs {
+            "\n  Select a run on the left.\n".into()
+        } else {
+            "\n  No runs yet.\n\n  New work:\n    spar plan -t \"describe the change\" --providers cli:claude\n".into()
+        };
     };
     if st.slots.is_empty() {
         cache.clear();
@@ -5702,6 +8109,57 @@ fn run_attention(r: &state::RunSummary) -> Attention {
     }
 }
 
+/// Whether a single, unfolded run currently wants the operator: a live
+/// `Attention::Gate`/`Broken`, or `PlanApproved` — terminal and colored `OK` like `Done`
+/// (round-9 review: changing `run_attention` itself would have re-litigated
+/// `phase_color`/`sort_runs_by_attention` for behaviour no review flagged), but still a
+/// handoff nothing else will complete. This is the per-leg predicate `fold_units` counts
+/// into `wants`; Home's band, both rail flags and the attention cycle key read a folded
+/// row through `unit_wants_operator` instead, since `PlanApproved` is conditional on the
+/// *unit* having no active leg (U28), not on this one leg's phase alone —
+/// `unit_wants_operator_matches_wants_operator_on_every_fold_units_row` is what keeps the
+/// two predicates from disagreeing on any row `fold_units` can actually produce.
+/// `emit_attention_toasts` does not go through either: it diffs `run_attention` directly
+/// and so never toasts a `PlanApproved` handoff or a folded unit's wanting leg
+/// (pre-existing, flagged by review 3be317b2, not fixed here).
+fn wants_operator(r: &state::RunSummary) -> bool {
+    run_attention(r).needs_you() || r.phase == Phase::PlanApproved
+}
+
+/// Whether the *unit* a row stands for wants the operator (U28). A folded row (U15)
+/// carries its active leg's id and phase, so `wants_operator` on the row alone answers
+/// for that leg, not the group — reading `r.wants` (each leg that itself wants the
+/// operator, `PlanApproved` counted only when no leg in the unit is active) instead is
+/// what keeps a unit's `PlanApproved` leg from being reported as a handoff while a sibling
+/// is still working it, and what keeps two gates folded into one row from reading as
+/// only one. `wants` is computed per leg in `fold_units`, so this is the predicate Home's
+/// bands, the rail flag and the attention cycle must use — the same rule
+/// `runs_needing_attention` already applies to the roll-up.
+fn unit_wants_operator(r: &state::RunSummary) -> bool {
+    if r.legs > 1 {
+        r.wants > 0
+    } else {
+        wants_operator(r)
+    }
+}
+
+/// The rail lead flag color for a run row, shared by the Runs level and Home so a run
+/// that counts toward `runs_needing_attention` always shows the same flag it is
+/// counted for. `force` is the row's own `unit_wants_operator` — it flags a folded row
+/// whenever any leg wants the operator (U28), even if the active leg shown in `r` itself
+/// does not.
+fn attention_flag(r: &state::RunSummary, force: bool) -> Option<Color> {
+    if force || wants_operator(r) {
+        Some(if run_attention(r) == Attention::Gate {
+            WARN
+        } else {
+            ALERT
+        })
+    } else {
+        None
+    }
+}
+
 /// Order runs for the rail: loudest attention first, then most-recently updated. The
 /// sort is applied at the data layer (in the snapshot) so navigation, selection, and
 /// rendering all see one order.
@@ -5713,17 +8171,17 @@ fn sort_runs_by_attention(runs: &mut [state::RunSummary]) {
     });
 }
 
-/// How many runs currently want the operator (gate or broken) — the fleet roll-up.
-/// How many runs want the operator. A folded row (U15) stands for several runs, so it
-/// contributes each leg that wants you — otherwise a unit with two gates would read as
-/// one and folding would become a way to hide a gate.
+/// How many runs want the operator (gate, broken, or PlanApproved — see
+/// `wants_operator`). A folded row (U15) stands for several runs, so it contributes
+/// each leg that wants you — otherwise a unit with two gates would read as one and
+/// folding would become a way to hide a gate.
 fn runs_needing_attention(runs: &[state::RunSummary]) -> usize {
     runs.iter()
         .map(|r| {
             if r.legs > 1 {
                 r.wants as usize
             } else {
-                usize::from(run_attention(r).needs_you())
+                usize::from(wants_operator(r))
             }
         })
         .sum()
@@ -5731,49 +8189,88 @@ fn runs_needing_attention(runs: &[state::RunSummary]) -> usize {
 
 /// Flash a toast when a run first crosses into wanting the operator (Working/Idle →
 /// Gate/Broken) since the last snapshot. The first snapshot only primes the baseline
-/// so the existing fleet is never announced.
-fn emit_attention_toasts(app: &mut App, runs: &[state::RunSummary]) {
+/// so the existing fleet is never announced. `is_home` names which population `runs`
+/// is — Home's cross-project rows or a project's `snap.runs` — so a navigation that
+/// swaps the population re-primes instead of diffing against the other population's
+/// baseline (which would re-announce every unchanged gate/broken run the swap newly
+/// exposes).
+fn emit_attention_toasts(app: &mut App, runs: &[state::RunSummary], is_home: bool) {
     let now: Vec<(String, Attention)> = runs
         .iter()
         .map(|r| (r.id.clone(), run_attention(r)))
         .collect();
-    if let Some(prev) = app.prev_attention.take() {
-        for (id, att) in &now {
-            let was = prev
-                .iter()
-                .find(|(pid, _)| pid == id)
-                .map(|(_, a)| *a)
-                .unwrap_or(Attention::Idle);
-            if att.needs_you() && !was.needs_you() {
-                let (what, color) = match att {
-                    Attention::Gate => ("needs your decision", WARN),
-                    _ => ("needs attention", ALERT),
-                };
-                app.flash_for(
-                    format!("⚠ {} {what} — a to jump", truncate(id, 8)),
-                    color,
-                    Duration::from_secs(6),
-                );
+    if app.prev_attention_home == Some(is_home) {
+        if let Some(prev) = app.prev_attention.take() {
+            for (id, att) in &now {
+                let was = prev
+                    .iter()
+                    .find(|(pid, _)| pid == id)
+                    .map(|(_, a)| *a)
+                    .unwrap_or(Attention::Idle);
+                if att.needs_you() && !was.needs_you() {
+                    let (what, color) = match att {
+                        Attention::Gate => ("needs your decision", WARN),
+                        _ => ("needs attention", ALERT),
+                    };
+                    app.flash_for(
+                        format!("⚠ {} {what} — a to jump", truncate(id, 8)),
+                        color,
+                        Duration::from_secs(6),
+                    );
+                }
             }
         }
     }
     app.prev_attention = Some(now);
+    app.prev_attention_home = Some(is_home);
 }
 
 /// `a`: jump the rail selection to the next run that wants the operator, cycling from
 /// just after the current selection. Lands on the run (rail at the Runs level) so the
-/// status line shows its gate/breakage.
-fn jump_to_attention(app: &mut App, runs: &[state::RunSummary]) {
+/// status line shows its gate/breakage. At Home it cycles through band 1 instead —
+/// Home is not a place where `a` is dead (AC-29).
+fn jump_to_attention(app: &mut App, runs: &[state::RunSummary], home_rows: &[HomeRow]) {
+    if app.browse == BrowseLevel::Home {
+        let candidates: Vec<usize> = home_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| {
+                matches!(
+                    r,
+                    HomeRow::Run {
+                        band: HomeBand::NeedsMe,
+                        ..
+                    }
+                )
+                .then_some(i)
+            })
+            .collect();
+        if candidates.is_empty() {
+            app.flash("nothing needs you", OK);
+            return;
+        }
+        let next = match candidates.iter().position(|&i| i == app.selected_home) {
+            Some(p) => candidates[(p + 1) % candidates.len()],
+            None => candidates[0],
+        };
+        app.selected_home = next;
+        app.home_key = home_rows.get(next).map(home_row_key);
+        if let Some(HomeRow::Run { run, .. }) = home_rows.get(next) {
+            app.flash(
+                format!("→ {} needs you", truncate(home_display_id(run), 8)),
+                WARN,
+            );
+        }
+        return;
+    }
     if !app.browse.in_project() {
         app.flash("open a project first", FG_MUTED);
         return;
     }
     let n = runs.len();
-    let next = (1..=n).map(|off| (app.selected_run + off) % n).find(|&i| {
-        runs.get(i)
-            .map(|r| run_attention(r).needs_you())
-            .unwrap_or(false)
-    });
+    let next = (1..=n)
+        .map(|off| (app.selected_run + off) % n)
+        .find(|&i| runs.get(i).map(unit_wants_operator).unwrap_or(false));
     match next {
         Some(i) => {
             app.selected_run = i;
@@ -5953,7 +8450,7 @@ mod labels {
     fn clicking_a_tab_escapes_the_shell() {
         use crossterm::event::{MouseEvent, MouseEventKind};
         let swarm = SparPaths::new("/x");
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         app.open_main(MainTab::Shell);
         app.main_tabs = vec![
             (
@@ -5993,6 +8490,7 @@ mod labels {
             &swarm,
             &[],
             &[],
+            &[],
             None,
             &mut root,
             None,
@@ -6003,23 +8501,78 @@ mod labels {
         assert!(!app.shell_active());
     }
 
+    /// The help overlay sizes to its content, so on a tall enough terminal it covers
+    /// the tab strip underneath it. A tap meant to dismiss help must not fall through
+    /// to the strip's hit-test and silently change the active tab instead.
     #[test]
-    fn rail_pop_never_leaves_projects() {
-        let mut app = App::new(None, Config::default(), true);
+    fn tapping_help_over_the_tab_strip_dismisses_help_not_the_tab() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let swarm = SparPaths::new("/x");
+        let mut app = test_app();
+        app.open_main(MainTab::Log);
+        app.show_help = true;
+        // A tab-strip rect that would normally win the hit-test if help were not
+        // checked first.
+        app.main_tabs = vec![(
+            Rect {
+                x: 1,
+                y: 2,
+                width: 5,
+                height: 1,
+            },
+            MainTab::Activity,
+        )];
+        let mut root = PathBuf::from("/x");
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            &swarm,
+            &[],
+            &[],
+            &[],
+            None,
+            &mut root,
+            None,
+            0,
+        );
+        assert!(!app.show_help, "tap on the overlay must dismiss it");
+        assert_eq!(
+            app.main_tab,
+            MainTab::Log,
+            "tap on the overlay must not fall through to the tab strip underneath it"
+        );
+    }
+
+    #[test]
+    fn rail_pop_never_leaves_home() {
+        let mut app = test_app();
         app.browse = BrowseLevel::Agents;
         app.rail_pop();
         assert_eq!(app.browse, BrowseLevel::Runs);
         app.rail_pop();
-        assert_eq!(app.browse, BrowseLevel::Projects);
+        assert_eq!(
+            app.browse,
+            BrowseLevel::Home,
+            "Runs pops to Home, not Projects"
+        );
         // Root: Esc is a no-op, never an exit.
         app.rail_pop();
-        assert_eq!(app.browse, BrowseLevel::Projects);
+        assert_eq!(app.browse, BrowseLevel::Home);
         assert_eq!(app.focus, Focus::Rail);
+        // Projects survives as navigation reachable from Home, and pops back to it.
+        app.browse = BrowseLevel::Projects;
+        app.rail_pop();
+        assert_eq!(app.browse, BrowseLevel::Home);
     }
 
     #[test]
     fn shell_active_only_on_focused_main_shell_tab() {
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         assert!(!app.shell_active());
         app.main_tab = MainTab::Shell;
         assert!(!app.shell_active(), "rail focus keeps keys in spar");
@@ -6032,7 +8585,7 @@ mod labels {
     #[test]
     fn takeover_opens_the_shell_tab() {
         use crate::cli::WorkflowKind;
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         app.open_main(MainTab::Shell);
         assert_eq!(app.focus, Focus::Main);
         assert_eq!(app.main_tab, MainTab::Shell);
@@ -6043,10 +8596,10 @@ mod labels {
             "cli:claude",
             crate::state::SlotRole::Implementer,
         ));
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         app.browse = BrowseLevel::Agents;
         let mut root = PathBuf::from("/x");
-        rail_enter(&mut app, &[], &[], Some(&st), &mut root);
+        rail_enter(&mut app, &[], &[], &[], Some(&st), &mut root, None);
         assert!(app.takeover_target.is_none());
         assert_eq!(app.focus, Focus::Rail, "headless run: nothing to take over");
     }
@@ -6110,7 +8663,7 @@ mod labels {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let mut term = Terminal::new(TestBackend::new(90, 3)).unwrap();
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         let buttons = vec![
             ("Approve", GateAction::Approve),
             ("Reject", GateAction::Reject),
@@ -6147,7 +8700,7 @@ mod labels {
         };
         let first_x = |buttons: Vec<(&str, GateAction)>| {
             let mut term = Terminal::new(TestBackend::new(120, 1)).unwrap();
-            let mut app = App::new(None, Config::default(), true);
+            let mut app = test_app();
             term.draw(|f| render_gate_buttons(f, area, &mut app, &buttons))
                 .unwrap();
             app.gate_buttons[0].0.x
@@ -6186,11 +8739,20 @@ mod labels {
         let swarm = SparPaths::new("/x/a-project-with-a-long-name");
         for w in 30..=140u16 {
             let mut term = Terminal::new(TestBackend::new(w, 1)).unwrap();
-            let mut app = App::new(None, Config::default(), true);
+            let mut app = test_app();
             app.human_alerts_n = 7;
             term.draw(|f| {
                 let area = f.area();
-                draw_header(f, area, &swarm, &[], &[], Some(&st), &mut app);
+                draw_header(
+                    f,
+                    area,
+                    &swarm,
+                    &[],
+                    &[],
+                    Some(&st),
+                    &HomeData::default(),
+                    &mut app,
+                );
             })
             .unwrap();
             let Some((first, _)) = app.gate_buttons.first().copied() else {
@@ -6215,11 +8777,20 @@ mod labels {
         st.phase = Phase::AwaitingWinnerConfirm;
         let swarm = SparPaths::new("/x");
         let mut term = Terminal::new(TestBackend::new(120, 1)).unwrap();
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         app.human_alerts_n = 2;
         term.draw(|f| {
             let area = f.area();
-            draw_header(f, area, &swarm, &[], &[], Some(&st), &mut app);
+            draw_header(
+                f,
+                area,
+                &swarm,
+                &[],
+                &[],
+                Some(&st),
+                &HomeData::default(),
+                &mut app,
+            );
         })
         .unwrap();
         let row: String = {
@@ -6244,7 +8815,7 @@ mod labels {
         let st = RunState::new("run1", WorkflowKind::Loop, std::path::PathBuf::from("/x"));
         let swarm = SparPaths::new("/x");
         let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         app.human_alerts_n = 3;
         app.open_main(MainTab::Activity);
         let lay = layout_rects(
@@ -6259,7 +8830,16 @@ mod labels {
             false,
         );
         term.draw(|f| {
-            draw_labels(f, &lay, &swarm, &[], &[], Some(&st), &mut app);
+            draw_labels(
+                f,
+                &lay,
+                &swarm,
+                &[],
+                &[],
+                Some(&st),
+                &HomeData::default(),
+                &mut app,
+            );
             draw_rule(f, &lay, &app);
         })
         .unwrap();
@@ -6414,6 +8994,7 @@ mod labels {
             round: 1,
             legs: 1,
             wants: 0,
+            unit_id: None,
             base_ref: None,
             base_commit: None,
             project_root: None,
@@ -6481,9 +9062,60 @@ mod labels {
         assert_eq!(step_matched(&matched, 0, 1), 3);
     }
 
+    /// `n` at the Projects level must target the row highlighted *now*, not the one
+    /// `active_root` was clamped to at the top of the frame. The loop drains a queued
+    /// input burst against one mutable `active_root`, so `j` then `n` arriving together
+    /// used to open the modal on the previously highlighted project (review e72f434e,
+    /// major). Driven through `handle_key` without a frame in between, which is exactly
+    /// the shape that broke.
+    #[test]
+    fn n_at_projects_targets_the_row_selected_in_the_same_input_burst() {
+        let projects: Vec<registry::ProjectEntry> = ["alpha", "bravo"]
+            .iter()
+            .map(|n| registry::ProjectEntry {
+                root: PathBuf::from("/nonexistent").join(n),
+                name: Some((*n).to_string()),
+                last_seen: Utc::now(),
+                last_run_id: None,
+            })
+            .collect();
+        let mut app = test_app();
+        app.open_projects_view();
+        let sw = SparPaths::new(std::path::Path::new("/nonexistent/alpha"));
+        // Stale on purpose: this is what the pre-input clamp left behind for `alpha`.
+        let mut root = PathBuf::from("/nonexistent/alpha");
+
+        for code in [KeyCode::Char('j'), KeyCode::Char('n')] {
+            handle_key(
+                &mut app,
+                code,
+                KeyModifiers::empty(),
+                &sw,
+                &projects,
+                &[],
+                &[],
+                None,
+                &mut root,
+                None,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(app.selected_project, 1, "`j` moved to bravo");
+        let nr = app
+            .new_run
+            .as_ref()
+            .expect("`n` opened the new-run surface");
+        assert_eq!(
+            nr.project.as_deref(),
+            Some(std::path::Path::new("/nonexistent/bravo")),
+            "the modal must target the row `j` just selected, not the stale active_root"
+        );
+    }
+
     #[test]
     fn slash_opens_filter_and_esc_clears_it() {
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         let sw = SparPaths::new(std::path::Path::new("/x"));
         let mut root = PathBuf::from("/x");
         // `/` opens the filter editor with focus on the rail.
@@ -6492,6 +9124,7 @@ mod labels {
             KeyCode::Char('/'),
             KeyModifiers::empty(),
             &sw,
+            &[],
             &[],
             &[],
             None,
@@ -6510,6 +9143,7 @@ mod labels {
             &sw,
             &[],
             &[],
+            &[],
             None,
             &mut root,
             None,
@@ -6523,6 +9157,7 @@ mod labels {
             &sw,
             &[],
             &[],
+            &[],
             None,
             &mut root,
             None,
@@ -6533,7 +9168,7 @@ mod labels {
 
     #[test]
     fn colon_opens_palette_and_q_quits() {
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         let sw = SparPaths::new(std::path::Path::new("/x"));
         let mut root = PathBuf::from("/x");
         // q quits from a normal context.
@@ -6542,6 +9177,7 @@ mod labels {
             KeyCode::Char('q'),
             KeyModifiers::empty(),
             &sw,
+            &[],
             &[],
             &[],
             None,
@@ -6558,6 +9194,7 @@ mod labels {
             &sw,
             &[],
             &[],
+            &[],
             None,
             &mut root,
             None,
@@ -6569,6 +9206,7 @@ mod labels {
             KeyCode::Char('q'),
             KeyModifiers::empty(),
             &sw,
+            &[],
             &[],
             &[],
             None,
@@ -6634,31 +9272,66 @@ mod labels {
             summary_phase("r1", Phase::Review),
             summary_phase("r2", Phase::AwaitingPlanApproval),
         ];
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         app.browse = BrowseLevel::Runs;
         app.selected_run = 0;
-        jump_to_attention(&mut app, &runs);
+        jump_to_attention(&mut app, &runs, &[]);
         assert_eq!(app.selected_run, 2, "lands on the gated run");
         // From the gate it wraps and, finding no other, stays put.
-        jump_to_attention(&mut app, &runs);
+        jump_to_attention(&mut app, &runs, &[]);
         assert_eq!(app.selected_run, 2);
     }
 
     #[test]
     fn toasts_prime_silently_then_fire_on_transition() {
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         // First snapshot only primes: an existing gate is NOT toasted.
         let runs = vec![summary_phase("r0", Phase::AwaitingPlanApproval)];
-        emit_attention_toasts(&mut app, &runs);
+        emit_attention_toasts(&mut app, &runs, false);
         assert!(app.flash.is_none(), "initial fleet is never toasted");
         // A run that was working and is now working: still silent.
         let runs = vec![summary_phase("r0", Phase::Review)];
-        emit_attention_toasts(&mut app, &runs);
+        emit_attention_toasts(&mut app, &runs, false);
         assert!(app.flash.is_none());
         // Now it crosses into a gate: toast fires.
         let runs = vec![summary_phase("r0", Phase::AwaitingPlanApproval)];
-        emit_attention_toasts(&mut app, &runs);
+        emit_attention_toasts(&mut app, &runs, false);
         assert!(app.flash.is_some(), "gate transition toasts");
+    }
+
+    /// A population swap (project runs <-> Home's cross-project rows) is not a
+    /// transition: a gated run that was simply absent from the other population's
+    /// baseline must not be re-announced on every Home <-> project navigation
+    /// (round-9 review).
+    #[test]
+    fn toasts_reprime_silently_across_a_population_swap() {
+        let mut app = test_app();
+        let project_runs = vec![summary_phase("r0", Phase::AwaitingPlanApproval)];
+        emit_attention_toasts(&mut app, &project_runs, false);
+        app.flash = None;
+        // Home's population includes the same already-gated run: swapping population
+        // must not re-fire the toast.
+        let home_runs = vec![summary_phase("r0", Phase::AwaitingPlanApproval)];
+        emit_attention_toasts(&mut app, &home_runs, true);
+        assert!(
+            app.flash.is_none(),
+            "population swap must not re-announce a gate"
+        );
+        // Swapping back to the project population is likewise silent.
+        emit_attention_toasts(&mut app, &project_runs, false);
+        assert!(
+            app.flash.is_none(),
+            "swapping back must not re-announce either"
+        );
+        // A real transition within one population still fires.
+        let now_idle = vec![summary_phase("r0", Phase::Review)];
+        emit_attention_toasts(&mut app, &now_idle, false);
+        app.flash = None;
+        emit_attention_toasts(&mut app, &project_runs, false);
+        assert!(
+            app.flash.is_some(),
+            "a real transition within one population still toasts"
+        );
     }
 }
 
@@ -6722,7 +9395,7 @@ mod render_stability {
     ) -> Terminal<TestBackend> {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         let swarm = SparPaths::new("/x");
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         tweak(&mut app);
         let mut rail = ListState::default();
         term.draw(|f| {
@@ -6735,6 +9408,8 @@ mod render_stability {
                 "→ Bash  read the contract\n← ✓ toolu_01HqnTTSQH5m7ZWYJVAtA7Vj ok\n",
                 &["§Timeline".into(), " 19:04 impl done".into()],
                 "diff",
+                &HomeData::default(),
+                None,
                 &mut app,
                 &mut rail,
             )
@@ -6799,7 +9474,7 @@ mod render_stability {
                 .collect();
         let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
         let swarm = SparPaths::new("/x");
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         app.open_projects_view();
         let mut rail = ListState::default();
         term.draw(|f| {
@@ -6812,6 +9487,8 @@ mod render_stability {
                 "",
                 &[],
                 "",
+                &HomeData::default(),
+                None,
                 &mut app,
                 &mut rail,
             )
@@ -6853,6 +9530,7 @@ mod render_stability {
                 round: 1,
                 legs: 1,
                 wants: 0,
+                unit_id: None,
                 base_ref: None,
                 base_commit: None,
                 project_root: None,
@@ -6872,7 +9550,7 @@ mod render_stability {
         let tabs_x = |tab: MainTab, alerts: usize| {
             let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
             let swarm = SparPaths::new("/x");
-            let mut app = App::new(None, Config::default(), true);
+            let mut app = test_app();
             app.open_main(tab);
             app.human_alerts_n = alerts;
             let mut rail = ListState::default();
@@ -6886,6 +9564,8 @@ mod render_stability {
                     "",
                     &[],
                     "",
+                    &HomeData::default(),
+                    None,
                     &mut app,
                     &mut rail,
                 )
@@ -7293,7 +9973,7 @@ mod render_stability {
 
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
         let swarm = SparPaths::new("/x");
-        let mut app = App::new(None, Config::default(), true);
+        let mut app = test_app();
         let mut rail = ListState::default();
         term.draw(|f| {
             draw(
@@ -7305,6 +9985,8 @@ mod render_stability {
                 "",
                 &[],
                 "",
+                &HomeData::default(),
+                None,
                 &mut app,
                 &mut rail,
             )
@@ -7315,6 +9997,1676 @@ mod render_stability {
             (0..120).map(|x| buf[(x, 1)].symbol()).collect()
         };
         assert!(band.contains("billed 6.0k"), "band was: {band:?}");
+    }
+
+    /// The help overlay used to hard-clip at a fixed 72 columns, cutting words like
+    /// "approve" and "collapsed" mid-word. It must now size to its longest line (up
+    /// to the frame) so every line renders whole.
+    #[test]
+    fn wrap_line_preserve_breaks_only_at_spaces() {
+        let line = "Rail   projects ▸ runs ▸ agents  (Enter pushes, Esc pops)";
+        let rows = wrap_line_preserve(line, 20);
+        for w in &rows {
+            assert!(w.chars().count() <= 20, "row too wide: {w:?}");
+        }
+        // Rejoining the wrapped rows on a space and re-splitting on whitespace must
+        // reproduce the original word sequence: no word was cut mid-token.
+        assert_eq!(
+            rows.join(" ").split_whitespace().collect::<Vec<_>>(),
+            line.split_whitespace().collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn wrap_line_preserve_force_splits_a_token_longer_than_width() {
+        let rows = wrap_line_preserve("supercalifragilisticexpialidocious", 10);
+        assert!(rows.iter().all(|w| w.chars().count() <= 10), "{rows:?}");
+        assert_eq!(rows.concat(), "supercalifragilisticexpialidocious");
+    }
+
+    #[test]
+    fn wrap_line_preserve_handles_zero_width() {
+        assert_eq!(wrap_line_preserve("abc", 0), vec!["abc".to_string()]);
+    }
+
+    /// A narrow enough width can put the break search's nearest space inside the
+    /// line's own leading indentation rather than a word gap — that used to emit a
+    /// whitespace-only row ahead of the real content, inflating the overlay's height
+    /// with a blank line indentation alone accounted for.
+    #[test]
+    fn wrap_line_preserve_never_emits_a_whitespace_only_row() {
+        let rows = wrap_line_preserve("    Rail   projects", 5);
+        for row in &rows {
+            assert!(
+                !row.chars().all(|c| c == ' '),
+                "blank row from indentation alone: {rows:?}"
+            );
+        }
+        let rejoined: String = rows.concat();
+        assert_eq!(
+            rejoined.chars().filter(|c| *c != ' ').collect::<String>(),
+            "Railprojects",
+            "no non-space character was dropped along with the indentation: {rows:?}"
+        );
+    }
+
+    /// AC-1's wrap path: the original lock only ran at a width wide enough that the
+    /// longest `HELP_BODY` line never took the wrapping branch. Scan both the
+    /// unscrolled top and the scrolled-to-max bottom so every wrapped row is checked.
+    #[test]
+    fn help_overlay_wraps_narrow_lines_without_cutting_a_word() {
+        let st = run_with(Phase::Review, 3);
+        let top = paint_with(50, 12, &[], &[], Some(&st), |a| a.show_help = true);
+        let bottom = paint_with(50, 12, &[], &[], Some(&st), |a| {
+            a.show_help = true;
+            a.help_scroll = 9999;
+        });
+        let joined: String = (0..12)
+            .map(|y| row(&top, y))
+            .chain((0..12).map(|y| row(&bottom, y)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for phrase in ["pushes,", "Esc pops)", "bands collapsed)."] {
+            assert!(
+                joined.contains(phrase),
+                "word split by the wrap: {joined:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_overlay_never_hard_clips_a_line() {
+        let st = run_with(Phase::Review, 3);
+        let term = paint_with(100, 40, &[], &[], Some(&st), |a| a.show_help = true);
+        let rows: Vec<String> = (0..40).map(|y| row(&term, y)).collect();
+        let joined = rows.join("\n");
+        assert!(
+            joined.contains("reject · ship (when gated; approve = tap / :approve)"),
+            "line was cut: {joined:?}"
+        );
+        assert!(
+            joined.contains("Driving mode (green banner, bands collapsed)."),
+            "line was cut: {joined:?}"
+        );
+    }
+
+    /// On a terminal too short for the whole body, the overlay must scroll rather
+    /// than silently hiding the tail — and the scroll offset must clamp instead of
+    /// running past the last line.
+    #[test]
+    fn help_overlay_scrolls_and_clamps_on_a_short_terminal() {
+        let st = run_with(Phase::Review, 3);
+        let top = paint_with(100, 12, &[], &[], Some(&st), |a| a.show_help = true);
+        let top_text = (0..12).map(|y| row(&top, y)).collect::<Vec<_>>().join("\n");
+        assert!(
+            top_text.contains("Shape"),
+            "top of the body should be visible unscrolled: {top_text:?}"
+        );
+        assert!(
+            !top_text.contains("Esc, ?, or tap to close help"),
+            "the last line shouldn't fit an unscrolled 12-row overlay: {top_text:?}"
+        );
+
+        let scrolled = paint_with(100, 12, &[], &[], Some(&st), |a| {
+            a.show_help = true;
+            a.help_scroll = 9999; // clamps to the true max instead of panicking
+        });
+        let bottom_text = (0..12)
+            .map(|y| row(&scrolled, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            bottom_text.contains("Esc, ?, or tap to close help"),
+            "scrolling to the max should reach the last line: {bottom_text:?}"
+        );
+    }
+
+    /// The palette used to under-count its own height by one row, clipping the hint
+    /// line every time it opened. It also hard-capped the menu at 8 of the 12 verbs,
+    /// so `spawn`/`chat`/`help`/`quit` could never be reached by browsing.
+    #[test]
+    fn palette_hint_is_never_clipped_and_every_verb_is_reachable() {
+        let term = paint_with(120, 40, &[], &[], None, |a| {
+            a.palette = Some(Palette::default());
+        });
+        let buf: String = (0..40)
+            .map(|y| row(&term, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            buf.contains("Tab complete · ↑↓ pick · Enter run · Esc close"),
+            "hint row was clipped: {buf:?}"
+        );
+
+        // `quit` is PALETTE_CMDS[11] — unreachable under the old hard cap of 8. The
+        // footer also has a permanent "q quit" hint, so the assertion has to target
+        // the menu's own selected-row marker or it would pass even with the window
+        // never scrolled at all.
+        let unscrolled = paint_with(120, 40, &[], &[], None, |a| {
+            a.palette = Some(Palette {
+                input: String::new(),
+                sel: 0,
+            });
+        });
+        let unscrolled_buf: String = (0..40)
+            .map(|y| row(&unscrolled, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !unscrolled_buf.contains("▸ quit"),
+            "quit should not be selected/visible at the top of the menu: {unscrolled_buf:?}"
+        );
+
+        let term = paint_with(120, 40, &[], &[], None, |a| {
+            a.palette = Some(Palette {
+                input: String::new(),
+                sel: PALETTE_CMDS.len() - 1,
+            });
+        });
+        let buf: String = (0..40)
+            .map(|y| row(&term, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            buf.contains("▸ quit"),
+            "scrolled menu should reach quit: {buf:?}"
+        );
+    }
+
+    /// The hint row must survive a short frame too, not just a tall one: shrinking
+    /// the completion menu is what has to give, not the hint at the frame's own edge.
+    #[test]
+    fn palette_hint_survives_a_short_frame() {
+        for h in [10u16, 12, 14] {
+            let term = paint_with(120, h, &[], &[], None, |a| {
+                a.palette = Some(Palette::default());
+            });
+            let buf: String = (0..h).map(|y| row(&term, y)).collect::<Vec<_>>().join("\n");
+            assert!(
+                buf.contains("Tab complete · ↑↓ pick · Enter run · Esc close"),
+                "hint row was clipped at height {h}: {buf:?}"
+            );
+        }
+    }
+
+    /// A scrollbar thumb implies there is more to see. It must not paint when the
+    /// content already fits the viewport.
+    #[test]
+    fn scrollbar_only_paints_when_content_overflows() {
+        let st = run_with(Phase::Review, 1);
+        let has_scrollbar = |text: &str| {
+            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let swarm = SparPaths::new("/x");
+            let mut app = test_app();
+            app.open_main(MainTab::Diff);
+            let mut rail = ListState::default();
+            term.draw(|f| {
+                draw(
+                    f,
+                    &swarm,
+                    &[],
+                    &[],
+                    Some(&st),
+                    "",
+                    &[],
+                    text,
+                    &HomeData::default(),
+                    None,
+                    &mut app,
+                    &mut rail,
+                )
+            })
+            .unwrap();
+            let inner = app.rect_main_inner;
+            let x = inner.right().saturating_sub(1);
+            let buf = term.backend().buffer();
+            (inner.top()..inner.bottom()).any(|y| {
+                let sym = buf[(x, y)].symbol();
+                sym == "┃" || sym == "│"
+            })
+        };
+        assert!(!has_scrollbar("one short line"), "no overflow, no thumb");
+        let long: String = (0..200)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(has_scrollbar(&long), "content overflows, thumb expected");
+    }
+
+    /// Without a run selected, Activity and Diff fall back to the same overview body
+    /// Log uses (`draw_main`'s `full.is_none()` branch, which paints `stream_*` via
+    /// `draw_log_body`). Scroll input has to follow that body — `stream_scroll` —
+    /// instead of the run-scoped `bus_scroll`/`diff_scroll` those tabs normally own,
+    /// or the rendered scrollbar silently stops responding to j/k/G once a run is
+    /// deselected (a scrollbar promising an affordance that isn't wired).
+    #[test]
+    fn overview_tabs_scroll_the_overview_body_not_run_scoped_state() {
+        let mut app = test_app();
+        app.stream_max = 50;
+        app.bus_max = 50;
+        app.diff_max = 50;
+
+        app.main_tab = MainTab::Activity;
+        app.scroll_main_by(10, false);
+        assert_eq!(
+            app.stream_scroll, 10,
+            "Activity's overview body must scroll stream_scroll"
+        );
+        assert_eq!(
+            app.bus_scroll, 0,
+            "Activity's overview body must not touch bus_scroll"
+        );
+
+        app.main_tab = MainTab::Diff;
+        app.scroll_main_by(10, false);
+        assert_eq!(
+            app.stream_scroll, 20,
+            "Diff's overview body must scroll stream_scroll"
+        );
+        assert_eq!(
+            app.diff_scroll, 0,
+            "Diff's overview body must not touch diff_scroll"
+        );
+
+        // Once a run is selected, Activity/Diff render their own bodies again and own
+        // their own run-scoped scroll state.
+        app.main_tab = MainTab::Activity;
+        app.scroll_main_by(10, true);
+        assert_eq!(
+            app.bus_scroll, 10,
+            "Activity with a run selected must scroll bus_scroll"
+        );
+        assert_eq!(
+            app.stream_scroll, 20,
+            "must not touch stream_scroll once a run is selected"
+        );
+    }
+
+    /// The gap between adjacent Main tab labels must be the same everywhere — it used
+    /// to jump from 4 to 8 columns around Activity's alert-badge slot, and the narrow
+    /// strip had its own, differently uneven spacing.
+    #[test]
+    fn tab_strip_gaps_are_uniform() {
+        let st = run_with(Phase::Review, 3);
+        // Returns (gaps between labels, painted-start-x per label, recorded hit-rect
+        // x per label) so the test can catch not just uneven gaps but a strip that
+        // paints contiguous text while its click rects sit elsewhere (the round-2
+        // regression: `[0, 0, 0]` gaps read as "uniform" even though nothing painted
+        // agreed with where clicks landed).
+        let labels = ["Log", "Activity", "Diff", "Shell"];
+        // Returns (glyph-to-glyph gaps, cell-to-cell/rect gaps, painted-start-x per
+        // label, recorded hit rects). Two different gap metrics because the two bands
+        // use two different layouts: wide bakes a fixed-width badge slot into each
+        // label's own padded text, so adjacent rects legitimately abut (rect gap 0)
+        // and the badge never widens the visible run between labels (glyph gap
+        // constant); narrow has no baked-in padding and a badge that really does grow
+        // the cell, so its uniformity lives in the rects, not the glyphs.
+        struct Probe {
+            glyph_gaps: Vec<usize>,
+            rect_gaps: Vec<usize>,
+            starts: Vec<usize>,
+            rects: Vec<Rect>,
+        }
+        let probe = |width: u16, human_alerts_n: usize| -> Probe {
+            let mut term = Terminal::new(TestBackend::new(width, 30)).unwrap();
+            let swarm = SparPaths::new("/x");
+            let mut app = test_app();
+            app.human_alerts_n = human_alerts_n;
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: 30,
+            };
+            let lay = layout_rects(area, Focus::Main, false, false);
+            term.draw(|f| {
+                draw_labels(
+                    f,
+                    &lay,
+                    &swarm,
+                    &[],
+                    &[],
+                    Some(&st),
+                    &HomeData::default(),
+                    &mut app,
+                )
+            })
+            .unwrap();
+            // Column positions, not byte offsets: the Activity badge's `⚠` is a
+            // multi-byte char, so a `str::find`-based byte offset silently drifts out
+            // of alignment with the terminal columns `app.main_tabs` records.
+            let cols: Vec<char> = (0..width)
+                .map(|x| {
+                    term.backend().buffer()[(x, lay.labels.y)]
+                        .symbol()
+                        .chars()
+                        .next()
+                        .unwrap_or(' ')
+                })
+                .collect();
+            let find_at = |label: &str, from: usize| -> usize {
+                let needle: Vec<char> = label.chars().collect();
+                (from..=cols.len().saturating_sub(needle.len()))
+                    .find(|&i| cols[i..i + needle.len()] == needle[..])
+                    .unwrap()
+            };
+            let mut cursor = 0usize;
+            let mut starts = Vec::new();
+            let mut ends = Vec::new();
+            for label in labels {
+                let start = find_at(label, cursor);
+                starts.push(start);
+                cursor = start + label.chars().count();
+                ends.push(cursor);
+            }
+            let glyph_gaps = (0..labels.len() - 1)
+                .map(|i| starts[i + 1] - ends[i])
+                .collect();
+            let rects: Vec<Rect> = app.main_tabs.iter().map(|(r, _)| *r).collect();
+            let rect_gaps = (0..rects.len() - 1)
+                .map(|i| (rects[i + 1].x - (rects[i].x + rects[i].width)) as usize)
+                .collect();
+            Probe {
+                glyph_gaps,
+                rect_gaps,
+                starts,
+                rects,
+            }
+        };
+        // A recorded hit rect can legitimately be wider than the glyphs it labels (the
+        // wide strip pads each cell for a bigger touch target) but it must still cover
+        // the text it claims to hit — the round-2 regression left the narrow strip's
+        // rects pointing at blank columns entirely disjoint from the painted labels.
+        let assert_rects_cover_labels = |band: &str, starts: &[usize], rects: &[Rect], n: usize| {
+            for (i, (&start, rect)) in starts.iter().zip(rects).enumerate() {
+                let label_end = start + labels[i].len();
+                assert!(
+                    (rect.x as usize) <= start && label_end <= (rect.x + rect.width) as usize,
+                    "{band} rect for {:?} (x={}, w={}) does not cover painted label at {start} (human_alerts_n={n})",
+                    labels[i],
+                    rect.x,
+                    rect.width
+                );
+            }
+        };
+        for &n in &[0usize, 3, 12] {
+            let wide = probe(120, n);
+            assert!(
+                wide.glyph_gaps.windows(2).all(|w| w[0] == w[1]) && wide.glyph_gaps[0] > 0,
+                "wide tab gaps not uniform (human_alerts_n={n}): {:?}",
+                wide.glyph_gaps
+            );
+            assert_rects_cover_labels("wide", &wide.starts, &wide.rects, n);
+
+            let narrow = probe(79, n);
+            // Narrow has no baked-in padding to reserve for a bigger touch target, so
+            // its hit rects are instead padded out to split each glyph gap with the
+            // neighbor on either side — the strip tiles edge to edge with zero dead
+            // columns between rects, rather than a uniform *nonzero* rect gap.
+            assert!(
+                narrow.rect_gaps.iter().all(|&g| g == 0),
+                "narrow tab strip has dead columns between rects (human_alerts_n={n}): {:?}",
+                narrow.rect_gaps
+            );
+            // The visible glyph gaps must be uniform too, alert badge or not — it used
+            // to grow only the Activity-Diff gap (18, 22, 18) whenever an alert badge
+            // was glued onto Activity alone with no matching reservation on its
+            // neighbors.
+            assert!(
+                narrow.glyph_gaps.windows(2).all(|w| w[0] == w[1]) && narrow.glyph_gaps[0] > 0,
+                "narrow tab gaps not uniform (human_alerts_n={n}): {:?}",
+                narrow.glyph_gaps
+            );
+            assert_rects_cover_labels("narrow", &narrow.starts, &narrow.rects, n);
+        }
+    }
+
+    /// `draw_rule`'s active-tab underline used to read `app.main_tabs`, the touch-target
+    /// hit rect — in the narrow band that rect is padded out to split each neighboring
+    /// gap for a bigger tap zone, so the accent underline ballooned to 14-27 columns and
+    /// sat detached from the 3-8 column label it was meant to mark. The underline must
+    /// track the painted glyph span (`main_tab_glyphs`) instead, at both bands.
+    #[test]
+    fn active_tab_underline_matches_the_painted_label_not_the_touch_target() {
+        let st = run_with(Phase::Review, 3);
+        for width in [35u16, 60, 79, 120] {
+            for &n in &[0usize, 3] {
+                let mut term = Terminal::new(TestBackend::new(width, 30)).unwrap();
+                let swarm = SparPaths::new("/x");
+                let mut app = test_app();
+                app.human_alerts_n = n;
+                app.main_tab = MainTab::Log;
+                let area = Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height: 30,
+                };
+                let lay = layout_rects(area, Focus::Main, false, false);
+                term.draw(|f| {
+                    draw_labels(
+                        f,
+                        &lay,
+                        &swarm,
+                        &[],
+                        &[],
+                        Some(&st),
+                        &HomeData::default(),
+                        &mut app,
+                    );
+                    draw_rule(f, &lay, &app);
+                })
+                .unwrap();
+
+                let (glyph_rect, _) = app
+                    .main_tab_glyphs
+                    .iter()
+                    .find(|(_, t)| *t == MainTab::Log)
+                    .unwrap();
+                let underline_w = (0..width)
+                    .filter(|&x| term.backend().buffer()[(x, lay.rule.y)].symbol() == TAB_MARK)
+                    .count() as u16;
+                assert_eq!(
+                    underline_w, glyph_rect.width,
+                    "width {width} human_alerts_n={n}: underline is {underline_w} cols wide, \
+                     label glyph span is {} cols",
+                    glyph_rect.width
+                );
+            }
+        }
+    }
+
+    /// The uniform-gap fix for the narrow strip used to buy its spacing by silently
+    /// dropping Shell (and, at the narrowest widths, Diff too) once the wide strip's
+    /// fixed per-tab padding stopped fitting — invisible and untappable, with no
+    /// ellipsis to say a tab existed. Every width in the narrow band must keep all
+    /// four — with an alert badge in play too: below ~36 columns the badge-reservation
+    /// fallback glues the badge onto Activity alone (trading gap uniformity, covered by
+    /// `tab_strip_gaps_are_uniform`'s 79-column probe, for keeping every tab on
+    /// screen), and that fallback path was only ever swept with zero alerts.
+    #[test]
+    fn narrow_tab_strip_never_drops_a_tab() {
+        let st = run_with(Phase::Review, 3);
+        let labels = ["Log", "Activity", "Diff", "Shell"];
+        for width in 24..80u16 {
+            for &alerts in &[0usize, 3] {
+                let mut term = Terminal::new(TestBackend::new(width, 30)).unwrap();
+                let swarm = SparPaths::new("/x");
+                let mut app = test_app();
+                app.human_alerts_n = alerts;
+                let area = Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height: 30,
+                };
+                let lay = layout_rects(area, Focus::Main, false, false);
+                term.draw(|f| {
+                    draw_labels(
+                        f,
+                        &lay,
+                        &swarm,
+                        &[],
+                        &[],
+                        Some(&st),
+                        &HomeData::default(),
+                        &mut app,
+                    )
+                })
+                .unwrap();
+                assert_eq!(
+                    app.main_tabs.len(),
+                    4,
+                    "width {width} (alerts={alerts}) dropped a tab: {:?}",
+                    app.main_tabs
+                );
+                // A recorded rect is not enough on its own: it must also point at a
+                // painted glyph, not a blank column the label never reached (the
+                // round-2 regression, where rects and paint disagreed).
+                let row: String = {
+                    let buf = term.backend().buffer();
+                    (0..width)
+                        .map(|x| buf[(x, lay.labels.y)].symbol())
+                        .collect()
+                };
+                let row_chars: Vec<char> = row.chars().collect();
+                for (i, (rect, tab)) in app.main_tabs.iter().enumerate() {
+                    let expected = labels[i];
+                    let window: String = row_chars
+                        .iter()
+                        .skip(rect.x as usize)
+                        .take(rect.width as usize)
+                        .collect();
+                    assert!(
+                        window.contains(expected),
+                        "width {width} (alerts={alerts}): rect for {tab:?} (x={}, w={}) does not \
+                         cover painted label {expected:?} (row: {row:?})",
+                        rect.x,
+                        rect.width
+                    );
+                }
+            }
+        }
+    }
+
+    /// The wide strip's per-tab badge slot (AC-4) grew the strip from 40 to 52
+    /// columns, leaving only a one-column margin at width 80 — the narrowest the
+    /// wide band ever renders at (`NARROW_WIDTH`). Nothing caught a future badge or
+    /// label change eating that margin, so lock it directly.
+    #[test]
+    fn wide_tab_strip_never_drops_a_tab_at_the_tightest_widths() {
+        let st = run_with(Phase::Review, 3);
+        for width in [80u16, 81] {
+            for &alerts in &[0usize, 3, 12] {
+                let mut term = Terminal::new(TestBackend::new(width, 30)).unwrap();
+                let swarm = SparPaths::new("/x");
+                let mut app = test_app();
+                app.human_alerts_n = alerts;
+                let area = Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height: 30,
+                };
+                let lay = layout_rects(area, Focus::Main, false, false);
+                assert!(
+                    !lay.narrow,
+                    "width {width} unexpectedly took the narrow band"
+                );
+                term.draw(|f| {
+                    draw_labels(
+                        f,
+                        &lay,
+                        &swarm,
+                        &[],
+                        &[],
+                        Some(&st),
+                        &HomeData::default(),
+                        &mut app,
+                    )
+                })
+                .unwrap();
+                assert_eq!(
+                    app.main_tabs.len(),
+                    4,
+                    "width {width} (alerts={alerts}) dropped a tab: {:?}",
+                    app.main_tabs
+                );
+            }
+        }
+    }
+
+    /// With no runs at all, the header, rail and Main must agree on a single story —
+    /// not a header offering a run breadcrumb ("run —") next to "no runs", nor a Main
+    /// pane still painting stale log content or a scrollbar behind it.
+    #[test]
+    fn empty_state_is_coherent_with_no_stale_chrome() {
+        // Prove the "no stale content" guarantee against a real stale scenario rather
+        // than one the test builds for itself: load a run's log that genuinely
+        // contains a stream line, then drop to no-run on the same cache and confirm
+        // it does not survive the transition.
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("slot.log");
+        std::fs::write(&log_path, "→ Bash  read the contract\n← ✓ ok\n").unwrap();
+        let mut st = run_with(Phase::Review, 1);
+        st.slots[0].log_path = Some(log_path);
+
+        let mut cache = LogCache::empty();
+        let live = stream_content(&SparPaths::new("/x"), Some(&st), 0, &mut cache, true);
+        assert!(
+            live.contains("Bash"),
+            "fixture should carry real stream content: {live:?}"
+        );
+
+        let text = stream_content(&SparPaths::new("/x"), None, 0, &mut cache, false);
+        assert!(
+            !text.contains("Bash"),
+            "stale log content survived the drop to no-run: {text:?}"
+        );
+        assert!(
+            !text.to_lowercase().contains("select a run"),
+            "nothing to select with zero runs: {text:?}"
+        );
+
+        // Swept across widths, not just 120: a round-4 review finding was that the
+        // "identical wording" invariant below only held at 120 columns — the header's
+        // cue is long enough (`describe the change`) that the gate zone at 90 columns
+        // used to truncate it with an ellipsis while Main showed the same command in
+        // full, i.e. two different renderings of the same CTA on screen at once. The
+        // header must now omit a cue it cannot show whole rather than truncate it
+        // (same "omit rather than contradict" rule the run breadcrumb already follows
+        // a few lines up in `draw_header`). Below 90, Main's own pane column is
+        // narrow enough that its body starts trimming the long CTA line on its own
+        // (the pre-existing, unrelated "trim" log mode) — nothing to compare the
+        // header against there, so that band is excluded rather than asserting
+        // Main's line wrapping never trims, which is out of this fix's scope.
+        for width in [90u16, 120] {
+            let mut term = Terminal::new(TestBackend::new(width, 30)).unwrap();
+            let swarm = SparPaths::new("/x");
+            let mut app = test_app();
+            let mut rail = ListState::default();
+            term.draw(|f| {
+                draw(
+                    f,
+                    &swarm,
+                    &[],
+                    &[],
+                    None,
+                    &text,
+                    &[],
+                    "",
+                    &HomeData::default(),
+                    None,
+                    &mut app,
+                    &mut rail,
+                )
+            })
+            .unwrap();
+
+            let header = row(&term, 0);
+            assert!(
+                !header.contains("run —"),
+                "width {width}: incoherent breadcrumb: {header:?}"
+            );
+
+            let whole: String = {
+                let buf = term.backend().buffer();
+                (0..30)
+                    .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            assert!(
+                whole.contains("(no runs)"),
+                "width {width}: rail: {whole:?}"
+            );
+            assert!(
+                !whole.contains("Bash"),
+                "width {width}: stale log content: {whole:?}"
+            );
+
+            // One coherent call to action. Header and Main both surface the same plan
+            // command (reinforcement, not incoherence) — but they used to phrase it
+            // two different ways (`"…"` vs `"describe the change"`, a round-2
+            // regression), and the context band offered a second, contradictory one:
+            // the palette's `plan` command needs an existing run to reuse a fleet
+            // from, so "press :" cannot bootstrap the very first run.
+            let cta = "spar plan -t \"describe the change\" --providers cli:claude";
+            assert_eq!(
+                whole.matches(cta).count(),
+                whole.matches("spar plan -t").count(),
+                "width {width}: every occurrence of the plan CTA must use identical wording: {whole:?}"
+            );
+            assert!(
+                !whole.contains("press :"),
+                "width {width}: the command palette cannot start a first run with zero runs to reuse a fleet from: {whole:?}"
+            );
+
+            let inner = app.rect_main_inner;
+            let x = inner.right().saturating_sub(1);
+            let buf = term.backend().buffer();
+            let scrollbar = (inner.top()..inner.bottom()).any(|y| {
+                let sym = buf[(x, y)].symbol();
+                sym == "┃" || sym == "│"
+            });
+            assert!(
+                !scrollbar,
+                "width {width}: no content to scroll in the empty state"
+            );
+        }
+    }
+
+    /// The same coherent empty-state text (not a tab-specific message, and not stale
+    /// chrome) must show on Log, Activity and Diff when there are no runs at all —
+    /// they used to each tell their own, different story. Shell is the one deliberate
+    /// exception: it is project-scoped, not run-scoped (`manage_terminal`'s doc
+    /// comment), so it keeps showing its own real workspace-shell body regardless of
+    /// run count — that is a live surface, not stale content, and its caption must
+    /// agree with what it shows rather than claim "no runs" over a working shell.
+    #[test]
+    fn empty_state_is_uniform_across_every_main_tab() {
+        let text = stream_content(
+            &SparPaths::new("/x"),
+            None,
+            0,
+            &mut LogCache::empty(),
+            false,
+        );
+        for tab in [MainTab::Log, MainTab::Activity, MainTab::Diff] {
+            let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+            let swarm = SparPaths::new("/x");
+            let mut app = test_app();
+            app.open_main(tab);
+            let mut rail = ListState::default();
+            term.draw(|f| {
+                draw(
+                    f,
+                    &swarm,
+                    &[],
+                    &[],
+                    None,
+                    &text,
+                    &[],
+                    "",
+                    &HomeData::default(),
+                    None,
+                    &mut app,
+                    &mut rail,
+                )
+            })
+            .unwrap();
+            let whole: String = {
+                let buf = term.backend().buffer();
+                (0..30)
+                    .map(|y| (0..120).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            assert!(
+                whole.contains("No runs yet"),
+                "{tab:?} did not show the unified empty state: {whole:?}"
+            );
+            assert!(
+                !whole.contains("No run selected"),
+                "{tab:?} fell back to its own stale message instead of the unified one: {whole:?}"
+            );
+
+            let inner = app.rect_main_inner;
+            let x = inner.right().saturating_sub(1);
+            let buf = term.backend().buffer();
+            let scrollbar = (inner.top()..inner.bottom()).any(|y| {
+                let sym = buf[(x, y)].symbol();
+                sym == "┃" || sym == "│"
+            });
+            assert!(
+                !scrollbar,
+                "{tab:?}: no content to scroll in the empty state"
+            );
+        }
+
+        // Shell: real workspace-shell hint body, unconditionally, with a caption that
+        // agrees with it — never the unified "no runs" message behind it.
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let swarm = SparPaths::new("/x");
+        let mut app = test_app();
+        app.open_main(MainTab::Shell);
+        let mut rail = ListState::default();
+        term.draw(|f| {
+            draw(
+                f,
+                &swarm,
+                &[],
+                &[],
+                None,
+                &text,
+                &[],
+                "",
+                &HomeData::default(),
+                None,
+                &mut app,
+                &mut rail,
+            )
+        })
+        .unwrap();
+        let whole: String = {
+            let buf = term.backend().buffer();
+            (0..30)
+                .map(|y| (0..120).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            whole.contains("Opening a real tmux client"),
+            "Shell must keep showing its own workspace-shell body with zero runs: {whole:?}"
+        );
+        assert!(
+            !whole.contains("No runs yet"),
+            "Shell must not show the Log/Activity/Diff empty state behind its own body: {whole:?}"
+        );
+        assert!(
+            whole.contains("shell ·"),
+            "Shell's caption must agree with its body, not the unified empty state: {whole:?}"
+        );
+    }
+
+    /// With zero runs, default focus (`Focus::Rail`) left Main's rect zero-width in the
+    /// narrow band (`layout_rects`), so the coherent empty-state CTA above never
+    /// painted — the phone screen showed only the rail's bare `(no runs)` row, or
+    /// nothing at all once the context band folded too. The no-run case must land on
+    /// Main just like the "active run" narrow autofocus already does, so the CTA is
+    /// the one thing on screen rather than unreachable behind a dead rail.
+    #[test]
+    fn empty_state_is_reachable_at_narrow_width() {
+        let text = stream_content(
+            &SparPaths::new("/x"),
+            None,
+            0,
+            &mut LogCache::empty(),
+            false,
+        );
+        for width in [50u16, 79] {
+            let mut term = Terminal::new(TestBackend::new(width, 20)).unwrap();
+            let swarm = SparPaths::new("/x");
+            let mut app = test_app();
+            let mut rail = ListState::default();
+            term.draw(|f| {
+                draw(
+                    f,
+                    &swarm,
+                    &[],
+                    &[],
+                    None,
+                    &text,
+                    &[],
+                    "",
+                    &HomeData::default(),
+                    None,
+                    &mut app,
+                    &mut rail,
+                )
+            })
+            .unwrap();
+
+            assert_eq!(
+                app.focus,
+                Focus::Main,
+                "width {width}: zero runs must autofocus Main so the empty state is reachable"
+            );
+
+            let whole: String = {
+                let buf = term.backend().buffer();
+                (0..20)
+                    .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            assert!(
+                whole.contains("No runs yet"),
+                "width {width}: empty-state CTA unreachable: {whole:?}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Feature 004 Phase C — Home landing view.
+    //
+    // Every test below paints at `BrowseLevel::Home` with `HomeData` supplied
+    // by hand: that *is* the U13 assertion. `draw` gets its rows and its
+    // per-project counts from the snapshot the refresher built off-thread, so
+    // these fixtures point at project roots that do not exist on disk and the
+    // paint still has to be correct.
+    // ---------------------------------------------------------------------
+
+    fn home_project(name: &str) -> registry::ProjectEntry {
+        registry::ProjectEntry {
+            root: PathBuf::from("/nonexistent").join(name),
+            name: Some(name.to_string()),
+            last_seen: Utc::now(),
+            last_run_id: None,
+        }
+    }
+
+    fn home_run(id: &str, phase: Phase, mins_ago: i64, project: &str) -> state::RunSummary {
+        state::RunSummary {
+            id: id.into(),
+            workflow: WorkflowKind::Loop,
+            archived: false,
+            phase,
+            updated_at: Utc::now() - chrono::Duration::minutes(mins_ago),
+            task: Some(format!("brief for {id}")),
+            dry_run: false,
+            abandoned: false,
+            parent_run: None,
+            round: 1,
+            legs: 1,
+            wants: 0,
+            unit_id: None,
+            base_ref: None,
+            base_commit: None,
+            project_root: Some(PathBuf::from("/nonexistent").join(project)),
+            project_name: Some(project.to_string()),
+        }
+    }
+
+    fn home_row(band: HomeBand, run: state::RunSummary, waited_mins: u64) -> HomeRow {
+        HomeRow::Run {
+            band,
+            run,
+            waited: Duration::from_secs(waited_mins * 60),
+        }
+    }
+
+    /// A Home fixture with one row in each of the first three bands.
+    fn home_data(projects: &[registry::ProjectEntry]) -> HomeData {
+        HomeData {
+            rows: vec![
+                HomeRow::Header(HomeBand::NeedsMe),
+                home_row(
+                    HomeBand::NeedsMe,
+                    home_run("gate0001", Phase::AwaitingShipConfirm, 90, "acme-api"),
+                    90,
+                ),
+                HomeRow::Header(HomeBand::Running),
+                home_row(
+                    HomeBand::Running,
+                    home_run("work0001", Phase::Review, 4, "spar"),
+                    4,
+                ),
+                HomeRow::Header(HomeBand::Finished),
+                home_row(
+                    HomeBand::Finished,
+                    home_run("done0001", Phase::Done, 20, "spar"),
+                    20,
+                ),
+                HomeRow::Header(HomeBand::StartNew),
+                HomeRow::NewRun,
+            ],
+            project_stats: projects
+                .iter()
+                .map(|_| ProjectStat {
+                    n_runs: 3,
+                    needs_you: 1,
+                })
+                .collect(),
+        }
+    }
+
+    fn paint_home(
+        w: u16,
+        h: u16,
+        projects: &[registry::ProjectEntry],
+        home: &HomeData,
+        tweak: impl Fn(&mut App),
+    ) -> Terminal<TestBackend> {
+        paint_home_app(w, h, projects, home, tweak).0
+    }
+
+    fn paint_home_app(
+        w: u16,
+        h: u16,
+        projects: &[registry::ProjectEntry],
+        home: &HomeData,
+        tweak: impl Fn(&mut App),
+    ) -> (Terminal<TestBackend>, App) {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let swarm = SparPaths::new("/x");
+        let mut app = App::new(None, Config::default(), None);
+        assert_eq!(app.browse, BrowseLevel::Home, "App::new must land on Home");
+        tweak(&mut app);
+        let mut rail = ListState::default();
+        term.draw(|f| {
+            draw(
+                f,
+                &swarm,
+                projects,
+                &[],
+                None,
+                "",
+                &[],
+                "",
+                home,
+                None,
+                &mut app,
+                &mut rail,
+            )
+        })
+        .unwrap();
+        (term, app)
+    }
+
+    fn whole(term: &Terminal<TestBackend>) -> String {
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// AC-1. The same swept grid the pre-Home levels get, at the new landing
+    /// view, with the two self-sizing overlays (help, and Phase D's new-run
+    /// surface) opened at the cadence that caught the 30-column help panic.
+    #[test]
+    fn renders_home_at_every_size_without_panicking() {
+        let projects = [home_project("acme-api"), home_project("spar")];
+        let home = home_data(&projects);
+        for w in (1..=200).step_by(3) {
+            for h in (1..=60).step_by(2) {
+                paint_home(w, h, &projects, &home, |_| {});
+                if w % 9 == 1 {
+                    paint_home(w, h, &projects, &home, |a| a.show_help = true);
+                    paint_home(w, h, &projects, &home, |a| {
+                        a.palette = Some(Palette::default())
+                    });
+                    paint_home(w, h, &projects, &home, |a| {
+                        a.new_run = Some(new_run_fixture());
+                    });
+                }
+            }
+        }
+        for (w, h) in [
+            (1, 1),
+            (20, 5),
+            (79, 24),
+            (80, 24),
+            (89, 24),
+            (90, 24),
+            (119, 40),
+            (120, 40),
+            (200, 60),
+        ] {
+            paint_home(w, h, &projects, &home, |_| {});
+            paint_home(w, h, &[], &HomeData::default(), |_| {});
+        }
+    }
+
+    /// R7 review finding: the doctor pointer must fire on the realistic shape a
+    /// default install produces — every entry in `providers.order` configured but
+    /// unavailable (nothing on PATH), which is a non-empty roster, not the empty
+    /// one an explicit `order = []` produces.
+    #[test]
+    fn new_run_shows_the_doctor_pointer_when_nothing_is_usable() {
+        let projects = [home_project("spar")];
+        let home = home_data(&projects);
+        let term = paint_home(120, 30, &projects, &home, |a| {
+            let mut nr = new_run_fixture();
+            nr.roster = vec![
+                RosterEntry {
+                    choice: RosterChoice::Provider("cli:claude".into()),
+                    label: "cli:claude".into(),
+                    available: false,
+                    reason: Some("not on PATH".into()),
+                    source: RosterSource::Configured,
+                },
+                RosterEntry {
+                    choice: RosterChoice::Provider("cli:grok".into()),
+                    label: "cli:grok".into(),
+                    available: false,
+                    reason: Some("not on PATH".into()),
+                    source: RosterSource::Configured,
+                },
+            ];
+            nr.picked.clear();
+            a.new_run = Some(nr);
+        });
+        assert!(
+            whole(&term).contains("spar doctor"),
+            "a non-empty but all-unavailable roster must still point at spar doctor"
+        );
+    }
+
+    /// Review finding: the wait column must read from the run's own `updated_at`
+    /// at paint time, not from `HomeRow::Run.waited`, which is only as fresh as
+    /// the last snapshot rebuild and can go stale on an idle fleet. A row whose
+    /// `updated_at` is fresh but whose stored `waited` is hours old must still
+    /// paint a fresh wait.
+    #[test]
+    fn home_wait_column_reads_live_not_the_stale_stored_value() {
+        let projects = [home_project("spar")];
+        let run = home_run("gate0001", Phase::AwaitingPlanApproval, 0, "spar");
+        let home = HomeData {
+            rows: vec![
+                HomeRow::Header(HomeBand::NeedsMe),
+                HomeRow::Run {
+                    band: HomeBand::NeedsMe,
+                    run,
+                    waited: Duration::from_secs(6 * 3600),
+                },
+                HomeRow::Header(HomeBand::Running),
+                HomeRow::Header(HomeBand::Finished),
+                HomeRow::Header(HomeBand::StartNew),
+                HomeRow::NewRun,
+            ],
+            project_stats: Vec::new(),
+        };
+        let term = paint_home(120, 30, &projects, &home, |_| {});
+        let screen = whole(&term);
+        assert!(
+            !screen.contains("6h"),
+            "the rail must not paint the stale stored wait: {screen:?}"
+        );
+    }
+
+    /// AC-2. Nothing registered, nothing run, no watermark: Home is still a
+    /// coherent screen. All four band headers, each band's own empty line, and
+    /// the `n` call to action reachable — including on the phone-width band
+    /// where the rail and Main do not coexist.
+    #[test]
+    fn home_renders_with_an_empty_everything() {
+        let empty = HomeData {
+            rows: vec![
+                HomeRow::Header(HomeBand::NeedsMe),
+                HomeRow::Header(HomeBand::Running),
+                HomeRow::Header(HomeBand::Finished),
+                HomeRow::Header(HomeBand::StartNew),
+                HomeRow::NewRun,
+            ],
+            project_stats: Vec::new(),
+        };
+        for (w, h) in [(120u16, 30u16), (90, 24), (79, 20), (50, 20), (20, 5)] {
+            let term = paint_home(w, h, &[], &empty, |_| {});
+            let text = whole(&term).to_lowercase();
+            if w >= 50 {
+                assert!(
+                    text.contains("needs you") || text.contains("needs me"),
+                    "{w}x{h}: band 1 header missing: {text:?}"
+                );
+                assert!(
+                    text.contains("new run") || text.contains("start something new"),
+                    "{w}x{h}: the `n` CTA must be reachable on an empty Home: {text:?}"
+                );
+            }
+            assert!(
+                !text.contains("no run selected"),
+                "{w}x{h}: stale pre-Home empty state: {text:?}"
+            );
+        }
+    }
+
+    /// AC-3. Scale: hundreds of folded units across several projects. The
+    /// paint completes, `NeedsMe` is never truncated, and a capped band says
+    /// so rather than silently dropping rows.
+    #[test]
+    fn home_renders_a_large_run_count() {
+        let projects = [
+            home_project("acme-api"),
+            home_project("spar"),
+            home_project("biddesk"),
+        ];
+        let mut rows = vec![HomeRow::Header(HomeBand::NeedsMe)];
+        for i in 0..(HOME_BAND_CAP + 12) {
+            rows.push(home_row(
+                HomeBand::NeedsMe,
+                home_run(
+                    &format!("gate{i:04}"),
+                    Phase::AwaitingPlanApproval,
+                    i as i64,
+                    "acme-api",
+                ),
+                i as u64,
+            ));
+        }
+        rows.push(HomeRow::Header(HomeBand::Running));
+        for i in 0..HOME_BAND_CAP {
+            rows.push(home_row(
+                HomeBand::Running,
+                home_run(&format!("work{i:04}"), Phase::Review, i as i64, "spar"),
+                i as u64,
+            ));
+        }
+        rows.push(HomeRow::More {
+            band: HomeBand::Running,
+            n: 300,
+        });
+        rows.push(HomeRow::Header(HomeBand::Finished));
+        rows.push(HomeRow::Header(HomeBand::StartNew));
+        rows.push(HomeRow::NewRun);
+
+        let needs_me = rows
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    HomeRow::Run {
+                        band: HomeBand::NeedsMe,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            needs_me > HOME_BAND_CAP,
+            "the NeedsMe band must not be capped: {needs_me} <= {HOME_BAND_CAP}"
+        );
+        let home = HomeData {
+            rows,
+            project_stats: projects
+                .iter()
+                .map(|_| ProjectStat {
+                    n_runs: 400,
+                    needs_you: 61,
+                })
+                .collect(),
+        };
+        let term = paint_home(120, 40, &projects, &home, |_| {});
+        let text = whole(&term);
+        assert!(text.contains("more"), "a capped band must say so: {text:?}");
+    }
+
+    /// AC-4. Layout stability: the four band headers are present, in band
+    /// order, whether or not their band has rows — so band 4 does not slide up
+    /// under the cursor when band 1 empties.
+    #[test]
+    fn home_band_headers_hold_their_order_and_never_disappear() {
+        let full = HomeData {
+            rows: vec![
+                HomeRow::Header(HomeBand::NeedsMe),
+                home_row(
+                    HomeBand::NeedsMe,
+                    home_run("gate0001", Phase::AwaitingShipConfirm, 90, "spar"),
+                    90,
+                ),
+                HomeRow::Header(HomeBand::Running),
+                home_row(
+                    HomeBand::Running,
+                    home_run("work0001", Phase::Review, 2, "spar"),
+                    2,
+                ),
+                HomeRow::Header(HomeBand::Finished),
+                home_row(
+                    HomeBand::Finished,
+                    home_run("done0001", Phase::Done, 8, "spar"),
+                    8,
+                ),
+                HomeRow::Header(HomeBand::StartNew),
+                HomeRow::NewRun,
+            ],
+            project_stats: Vec::new(),
+        };
+        let drained = HomeData {
+            rows: vec![
+                HomeRow::Header(HomeBand::NeedsMe),
+                HomeRow::Header(HomeBand::Running),
+                HomeRow::Header(HomeBand::Finished),
+                HomeRow::Header(HomeBand::StartNew),
+                HomeRow::NewRun,
+            ],
+            project_stats: Vec::new(),
+        };
+        // Main's body carries the four headers; assert on it directly so the
+        // ordering claim does not depend on the rail's viewport height.
+        for home in [&full, &drained] {
+            let body =
+                home_overview(&home.rows, &HomeScope::All, Utc::now(), Utc::now()).to_lowercase();
+            let idx = |needle: &str| {
+                body.find(needle)
+                    .unwrap_or_else(|| panic!("band header {needle:?} missing from: {body:?}"))
+            };
+            let a = idx("needs");
+            let b = idx("running");
+            let c = idx("finished");
+            let d = idx("start something new");
+            assert!(a < b && b < c && c < d, "bands out of order: {body:?}");
+        }
+        // Each empty band still says what is empty, on its own line.
+        let body =
+            home_overview(&drained.rows, &HomeScope::All, Utc::now(), Utc::now()).to_lowercase();
+        for phrase in [
+            "nothing needs you",
+            "nothing running",
+            "nothing finished since your last look",
+        ] {
+            assert!(body.contains(phrase), "missing {phrase:?} in: {body:?}");
+        }
+    }
+
+    /// AC-5. The rail's right-hand wait/age column does not move when the run
+    /// id next to it changes length.
+    #[test]
+    fn home_wait_column_does_not_move_with_row_content() {
+        let ts = Utc::now() - chrono::Duration::minutes(7);
+        let mut short = home_run("bb22", Phase::AwaitingPlanApproval, 0, "spar");
+        short.updated_at = ts;
+        short.task = Some("s".into());
+        let mut long = home_run("aaaa1111", Phase::AwaitingPlanApproval, 0, "spar");
+        long.updated_at = ts;
+        long.task = Some("a considerably longer brief for this unit of work".into());
+        let home = HomeData {
+            rows: vec![
+                HomeRow::Header(HomeBand::NeedsMe),
+                home_row(HomeBand::NeedsMe, short, 7 * 60),
+                home_row(HomeBand::NeedsMe, long, 7 * 60),
+                HomeRow::Header(HomeBand::Running),
+                HomeRow::Header(HomeBand::Finished),
+                HomeRow::Header(HomeBand::StartNew),
+                HomeRow::NewRun,
+            ],
+            project_stats: Vec::new(),
+        };
+        let (term, app) = paint_home_app(120, 30, &[], &home, |_| {});
+        let rail = app.rect_rail;
+        assert!(rail.width > 0, "the rail must be visible at 120 columns");
+        let buf = term.backend().buffer();
+        let last_glyph_x = |y: u16| -> Option<u16> {
+            (rail.x..rail.right())
+                .rev()
+                .find(|&x| buf[(x, y)].symbol().trim() != "")
+        };
+        let ends: Vec<u16> = (rail.y..rail.bottom())
+            .filter_map(|y| {
+                let line: String = (rail.x..rail.right())
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect();
+                if line.contains("bb22") || line.contains("aaaa1111") {
+                    last_glyph_x(y)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(ends.len(), 2, "both run rows must paint in the rail");
+        assert_eq!(
+            ends[0], ends[1],
+            "the wait column moved with the row's content"
+        );
+    }
+
+    /// AC-6. The `start something new` action row is always present and is the
+    /// first row of the last band, so `n` has a visible home no matter what
+    /// the other three bands hold. Round-7 review finding: this used to assert
+    /// over hand-built `HomeRow` fixtures rather than the real builder, so a
+    /// regression in `build_home_rows` itself could not fail it — now it calls
+    /// `build_home_rows` directly, once over an empty registry and once over a
+    /// populated one covering all three other bands.
+    #[test]
+    fn home_start_something_new_is_always_present() {
+        let projects = [home_project("spar")];
+        let empty: Vec<Vec<state::RunSummary>> = vec![Vec::new()];
+        let populated = vec![vec![
+            home_run("gate0001", Phase::AwaitingShipConfirm, 90, "spar"),
+            home_run("work0001", Phase::Review, 4, "spar"),
+            home_run("done0001", Phase::Done, 20, "spar"),
+        ]];
+        let watermark = Utc::now() - chrono::Duration::hours(1);
+        for folded in [empty, populated] {
+            let rows = build_home_rows(&projects, &folded, &HomeScope::All, watermark, Utc::now());
+            let i = rows
+                .iter()
+                .position(|r| matches!(r, HomeRow::Header(HomeBand::StartNew)))
+                .expect("band 4 header");
+            assert!(
+                matches!(rows.get(i + 1), Some(HomeRow::NewRun)),
+                "the new-run action row must follow band 4's header: {:?}",
+                &rows[i..]
+            );
+            assert!(
+                rows[i + 1..]
+                    .iter()
+                    .all(|r| matches!(r, HomeRow::NewRun | HomeRow::Project(..))),
+                "band 4 holds only the action row and the project list"
+            );
+        }
+    }
+
+    /// AC-7. U14's reserved chrome zones still hold at the new landing view:
+    /// painting the same run at Home and at the Runs level must not move the
+    /// gate-button zone or the Main tab strip.
+    #[test]
+    fn home_does_not_move_the_reserved_chrome_zones() {
+        let st = run_with(Phase::AwaitingShipConfirm, 7);
+        let probe = |level: BrowseLevel| -> (Vec<Rect>, Vec<Rect>) {
+            let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+            let swarm = SparPaths::new("/x");
+            let mut app = App::new(None, Config::default(), None);
+            app.browse = level;
+            let mut rail = ListState::default();
+            let home = home_data(&[]);
+            term.draw(|f| {
+                draw(
+                    f,
+                    &swarm,
+                    &[],
+                    &[],
+                    Some(&st),
+                    "",
+                    &[],
+                    "",
+                    &home,
+                    None,
+                    &mut app,
+                    &mut rail,
+                )
+            })
+            .unwrap();
+            (
+                app.gate_buttons.iter().map(|(r, _)| *r).collect(),
+                app.main_tabs.iter().map(|(r, _)| *r).collect(),
+            )
+        };
+        let (home_gates, home_tabs) = probe(BrowseLevel::Home);
+        let (runs_gates, runs_tabs) = probe(BrowseLevel::Runs);
+        assert_eq!(home_tabs, runs_tabs, "the tab strip moved at Home");
+        assert_eq!(home_gates, runs_gates, "the gate zone moved at Home");
+    }
+
+    /// AC-8. R9: at phone width the rail and Main do not coexist. Home must
+    /// autofocus Main the way the zero-run Runs level already does, or the
+    /// operator is stranded on a rail with no call to action.
+    #[test]
+    fn home_is_reachable_at_narrow_width() {
+        let empty = HomeData {
+            rows: vec![
+                HomeRow::Header(HomeBand::NeedsMe),
+                HomeRow::Header(HomeBand::Running),
+                HomeRow::Header(HomeBand::Finished),
+                HomeRow::Header(HomeBand::StartNew),
+                HomeRow::NewRun,
+            ],
+            project_stats: Vec::new(),
+        };
+        for width in [50u16, 79] {
+            let mut term = Terminal::new(TestBackend::new(width, 20)).unwrap();
+            let swarm = SparPaths::new("/x");
+            let mut app = App::new(None, Config::default(), None);
+            let mut rail = ListState::default();
+            term.draw(|f| {
+                draw(
+                    f,
+                    &swarm,
+                    &[],
+                    &[],
+                    None,
+                    "",
+                    &[],
+                    "",
+                    &empty,
+                    None,
+                    &mut app,
+                    &mut rail,
+                )
+            })
+            .unwrap();
+            assert_eq!(
+                app.focus,
+                Focus::Main,
+                "width {width}: an empty Home must land on Main so its CTA is reachable"
+            );
+            let text = whole(&term).to_lowercase();
+            assert!(
+                text.contains("start something new") || text.contains("new run"),
+                "width {width}: no CTA on screen: {text:?}"
+            );
+        }
+    }
+
+    /// AC-9. U13, the rendering half: the Projects level's per-project run and
+    /// attention counts come off the snapshot. Every root here is a path that
+    /// does not exist, so a `draw` that still scanned would paint zeroes.
+    #[test]
+    fn projects_level_counts_come_from_the_snapshot_not_the_disk() {
+        let projects = [home_project("acme-api"), home_project("spar")];
+        let home = HomeData {
+            rows: Vec::new(),
+            project_stats: vec![
+                ProjectStat {
+                    n_runs: 17,
+                    needs_you: 3,
+                },
+                ProjectStat {
+                    n_runs: 4,
+                    needs_you: 0,
+                },
+            ],
+        };
+        let term = paint_home(120, 30, &projects, &home, |a| a.open_projects_view());
+        let text = whole(&term);
+        assert!(
+            text.contains("17"),
+            "supplied run count not painted: {text:?}"
+        );
+        assert!(
+            text.contains("⚑3"),
+            "supplied attention roll-up not painted: {text:?}"
+        );
+
+        // A stat slice shorter than the project list is one snapshot of lag
+        // after a project registers. It must degrade, never index-panic.
+        let short = HomeData {
+            rows: Vec::new(),
+            project_stats: vec![ProjectStat {
+                n_runs: 1,
+                needs_you: 0,
+            }],
+        };
+        paint_home(120, 30, &projects, &short, |a| a.open_projects_view());
+        paint_home(120, 30, &projects, &HomeData::default(), |a| {
+            a.open_projects_view()
+        });
+    }
+
+    /// U13, startup half — round-11 review finding. Landing on Home makes the very
+    /// first snapshot cross-project; building it synchronously before the first
+    /// paint would block startup on the same scan U13 already keeps out of `draw`.
+    /// `Snapshot::loading` is what the first frame paints instead: it must come back
+    /// instantly and must not need its root to exist, proving it does no disk I/O to
+    /// construct. `home.rows` is *not* empty — it is seeded with `build_home_rows`
+    /// over no projects/runs, a pure function, so the four band headers and the `n`
+    /// CTA are present on frame one instead of Home looking blank for a `REFRESH`
+    /// tick (round-11 review, minor).
+    #[test]
+    fn snapshot_loading_needs_no_disk_and_paints_empty() {
+        let root = PathBuf::from("/nonexistent/definitely-not-here");
+        let snap = Snapshot::loading(&root);
+        assert!(snap.projects.is_empty());
+        assert!(snap.runs.is_empty());
+        assert!(
+            snap.home
+                .rows
+                .iter()
+                .all(|r| matches!(r, HomeRow::Header(_) | HomeRow::NewRun)),
+            "no disk-backed rows, but the static chrome is present: {:?}",
+            snap.home.rows
+        );
+        assert!(snap.home.project_stats.is_empty());
+        assert!(snap.full.is_none());
+    }
+
+    /// U13, round-7 review finding (review-0-cli-codex): `draw_log_body` used to call
+    /// `process::StreamStats::load`, a synchronous file read, on every repaint of a
+    /// selected run's Log tab. It now only reads the `stats` snapshot already computed
+    /// off-thread in `build_snapshot`, so painting a run whose log file does not exist
+    /// on disk must still succeed and the log-loading call must not survive inside
+    /// `draw_log_body`'s own source.
+    #[test]
+    fn draw_log_body_does_not_read_the_log_file_itself() {
+        let src = include_str!("tui.rs");
+        let start = src
+            .find("fn draw_log_body(")
+            .expect("draw_log_body must exist");
+        let body_start = src[start..].find('{').unwrap() + start;
+        let mut depth = 0i32;
+        let mut end = body_start;
+        for (i, c) in src[body_start..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = body_start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &src[body_start..=end];
+        assert!(
+            !body.contains(concat!("StreamStats", "::load")),
+            "draw_log_body must not read the log file itself (U13) — the value must \
+             come from the Snapshot built off-thread in build_snapshot"
+        );
+
+        // A run whose slot log_path points nowhere must still paint the Log tab
+        // without panicking or touching disk during draw.
+        let mut st = run_with(Phase::Review, 1);
+        st.slots[0].log_path = Some(PathBuf::from("/nonexistent/does/not/exist.log"));
+        let swarm = SparPaths::new("/x");
+        let mut app = test_app();
+        let mut rail = ListState::default();
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                &swarm,
+                &[],
+                &[],
+                Some(&st),
+                "",
+                &[],
+                "",
+                &HomeData::default(),
+                None,
+                &mut app,
+                &mut rail,
+            )
+        })
+        .unwrap();
+    }
+
+    /// AC-10. Phase A: the tmux session name is an implementation detail of
+    /// the tmux backend and must never reach the screen, in the Shell tab's
+    /// caption or in its hint body.
+    #[test]
+    fn the_shell_tab_never_prints_a_tmux_session_name() {
+        let st = run_with(Phase::Review, 7);
+        let swarm = SparPaths::new("/x");
+        let mut app = test_app();
+        app.open_main(MainTab::Shell);
+        app.takeover_target = Some(tmux::session_name(&st.id));
+        let caption = main_context(&swarm, Some(&st), &app);
+        assert!(
+            caption.contains(&st.id[..8]),
+            "the caption must name the run: {caption:?}"
+        );
+        assert!(
+            !caption.contains("spar-"),
+            "the tmux session name leaked into the caption: {caption:?}"
+        );
+        assert!(
+            !caption.to_lowercase().contains("session"),
+            "retired noun in the caption: {caption:?}"
+        );
+
+        // The Shell body's own hint text is the other place the noun lived.
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let mut app = test_app();
+        app.open_main(MainTab::Shell);
+        let mut rail = ListState::default();
+        term.draw(|f| {
+            draw(
+                f,
+                &swarm,
+                &[],
+                &[],
+                None,
+                "",
+                &[],
+                "",
+                &HomeData::default(),
+                None,
+                &mut app,
+                &mut rail,
+            )
+        })
+        .unwrap();
+        let text = whole(&term).to_lowercase();
+        assert!(
+            !text.contains("session"),
+            "retired noun on screen in the Shell tab: {text:?}"
+        );
     }
 }
 
@@ -7338,6 +11690,7 @@ mod folding {
             round: 1,
             legs: 1,
             wants: 0,
+            unit_id: None,
             base_ref: None,
             base_commit: None,
             project_root: None,
@@ -7365,6 +11718,140 @@ mod folding {
         let mut members = units.get("impl1").cloned().unwrap_or_default();
         members.sort();
         assert_eq!(members, vec!["impl1".to_string(), "plan1".to_string()]);
+    }
+
+    /// U28, first rule: `PlanApproved` is a handoff only while nothing in the unit is
+    /// running. A unit whose plan is approved *and* which has an active leg has
+    /// already been dispatched, so the approval is stale bookkeeping and nobody is
+    /// waiting. Two rejected operator fixes (runs `e72f434e`, `3be317b2`) got this
+    /// scenario wrong in opposite directions: one retargeted the row onto the idle
+    /// `PlanApproved` leg and sank the unit in the attention sort; the other left the
+    /// row on the active leg but still reported the unit as wanting the operator,
+    /// producing a permanent NEEDS YOU with no action to take (`Review` has no gate
+    /// button, and nothing else can act on the stale approval). Neither may happen:
+    /// the row acts on the active leg, and the unit must not claim to want you.
+    /// `:plan` and `n` must resolve the same browsed project. `:plan` used to read
+    /// `swarm.project_root`, the *snapshot's* root, while `n` read the live
+    /// `active_root` that `rail_enter` updates the instant the operator drills in — so
+    /// in the window before the target project's snapshot lands they disagreed (review
+    /// 3be317b2, found after `n` had already been fixed). Both now go through
+    /// `browsed_project_target`. The fixture makes the two roots differ on purpose: a
+    /// test that passes `swarm.project_root` as `active_root` cannot see this at all.
+    #[test]
+    fn plan_and_n_agree_on_the_browsed_project_when_the_snapshot_lags() {
+        let stale = PathBuf::from("/nonexistent/stale-snapshot-root");
+        let live = PathBuf::from("/nonexistent/live-drilled-into");
+        let projects: Vec<registry::ProjectEntry> = [&stale, &live]
+            .iter()
+            .map(|root| registry::ProjectEntry {
+                root: (*root).clone(),
+                name: root
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_string),
+                last_seen: Utc::now(),
+                last_run_id: None,
+            })
+            .collect();
+
+        let mut app = App::new(None, Config::default(), None);
+        app.browse = BrowseLevel::Runs; // drilled in: `in_project()` holds
+        assert!(app.browse.in_project());
+
+        assert_eq!(
+            browsed_project_target(&app, &projects, live.as_path()),
+            Some(live.as_path()),
+            "inside a project the live active_root wins, not the lagging snapshot root"
+        );
+
+        // And the palette reaches the same answer through the same helper.
+        let swarm = SparPaths::new(&stale);
+        let runs: Vec<state::RunSummary> = Vec::new();
+        run_palette(
+            &mut app,
+            &swarm,
+            &projects,
+            &[],
+            None,
+            &runs,
+            None,
+            live.as_path(),
+            "plan do the thing",
+        )
+        .unwrap();
+        assert_eq!(
+            app.new_run.as_ref().unwrap().project.as_deref(),
+            Some(live.as_path()),
+            "`:plan` must target the project the operator drilled into, not the stale \
+             snapshot root"
+        );
+    }
+
+    #[test]
+    fn a_plan_approved_leg_with_an_active_sibling_does_not_want_the_operator() {
+        let runs = vec![
+            summary("plan1", Phase::PlanApproved, None, 90),
+            summary("impl1", Phase::Review, Some("plan1"), 5),
+        ];
+        let (rows, _) = fold_units(runs);
+        assert_eq!(rows.len(), 1, "one unit of work");
+        let unit = &rows[0];
+
+        assert_eq!(unit.id, "impl1", "the row still acts on the active leg");
+        assert_eq!(unit.phase, Phase::Review);
+        assert_eq!(
+            unit.wants, 0,
+            "impl1 is live, so plan1's approval is not a live handoff"
+        );
+        assert!(
+            !unit_wants_operator(unit),
+            "a working sibling means nobody is actually waiting: {unit:?}"
+        );
+        assert!(
+            !wants_operator(unit),
+            "the representative leg agrees — this is the only self-consistent answer"
+        );
+        assert_eq!(
+            runs_needing_attention(&rows),
+            0,
+            "the roll-up and the row must agree"
+        );
+        assert!(
+            attention_flag(unit, unit_wants_operator(unit)).is_none(),
+            "no flag on a row with nothing to act on"
+        );
+    }
+
+    /// U28's other half: once the active leg finishes, the approval is a live handoff
+    /// again, and the row must fold to the *approvable* leg (`plan1`), not the
+    /// finished one (`impl1`) — `plan1` is the only leg with a real action
+    /// (`:implement`) to take. This is `fold_units`' `wants_operator` tiebreak: both
+    /// legs are `Attention::Idle`, so attention alone cannot pick between them, and
+    /// picking `impl1` by recency alone would reproduce the unactionable-alert bug
+    /// with a `Done` leg standing in for `Review`.
+    #[test]
+    fn a_plan_approved_leg_wants_the_operator_once_its_sibling_finishes() {
+        let runs = vec![
+            summary("plan1", Phase::PlanApproved, None, 90),
+            summary("impl1", Phase::Done, Some("plan1"), 5),
+        ];
+        let (rows, _) = fold_units(runs);
+        assert_eq!(rows.len(), 1, "one unit of work");
+        let unit = &rows[0];
+
+        assert_eq!(
+            unit.id, "plan1",
+            "the approvable leg must represent the row, not the finished one"
+        );
+        assert_eq!(unit.phase, Phase::PlanApproved);
+        assert_eq!(unit.wants, 1);
+        assert!(unit_wants_operator(unit), "{unit:?}");
+        assert!(
+            wants_operator(unit),
+            "the representative leg agrees — this is the only self-consistent answer"
+        );
+        assert_eq!(runs_needing_attention(&rows), 1);
+        assert!(attention_flag(unit, unit_wants_operator(unit)).is_some());
     }
 
     /// Folding must never hide a run that wants the operator — the failure O36 exists
@@ -7401,6 +11888,64 @@ mod folding {
         );
     }
 
+    /// Round-2 review (minor): an abandoned leg is not actually running (no live
+    /// orchestrator), so it must not suppress a sibling `PlanApproved` leg's handoff
+    /// the way a genuinely active leg does. Before the fix, `unit_has_active_leg`
+    /// checked phase alone, so `plan1`'s approval went uncounted here even though
+    /// `impl1` was not really running it — an undercount in the `⚑n` roll-up (the
+    /// unit itself still read NEEDS YOU, since `impl1`'s own abandonment already
+    /// makes it `Attention::Broken` and the representative).
+    #[test]
+    fn an_abandoned_leg_does_not_suppress_a_siblings_planapproved_handoff() {
+        let mut impl1 = summary("impl1", Phase::Review, Some("plan1"), 5);
+        impl1.abandoned = true;
+        let runs = vec![summary("plan1", Phase::PlanApproved, None, 90), impl1];
+        let (rows, _) = fold_units(runs);
+        assert_eq!(rows.len(), 1, "one unit of work");
+        let unit = &rows[0];
+        assert_eq!(
+            unit.id, "impl1",
+            "the broken leg is still the representative"
+        );
+        assert_eq!(
+            unit.wants, 2,
+            "the abandoned leg does not cancel plan1's live approval"
+        );
+        assert_eq!(runs_needing_attention(&rows), 2);
+    }
+
+    /// AC-28. `fold_units`'s `id` follows whichever leg is loudest, which can change
+    /// between snapshots as attention shifts within a unit — but `unit_id` (what a
+    /// Home cursor keys on) must not, or the cursor jumps every time the loudest leg
+    /// changes (round-11 review finding).
+    #[test]
+    fn unit_id_is_stable_across_a_change_in_the_loudest_leg() {
+        let runs = vec![
+            summary("root", Phase::Review, None, 30),
+            summary("legA", Phase::AwaitingPlanApproval, Some("root"), 20),
+            summary("legB", Phase::Review, Some("root"), 10),
+        ];
+        let (rows, _) = fold_units(runs);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "legA", "legA is loudest: it holds the gate");
+        assert_eq!(rows[0].unit_id.as_deref(), Some("root"));
+
+        // Next snapshot: legB is now the gate instead of legA, so the displayed id
+        // moves to it — but it is still the same unit of work.
+        let runs2 = vec![
+            summary("root", Phase::Review, None, 30),
+            summary("legA", Phase::Review, Some("root"), 20),
+            summary("legB", Phase::AwaitingPlanApproval, Some("root"), 10),
+        ];
+        let (rows2, _) = fold_units(runs2);
+        assert_eq!(rows2.len(), 1);
+        assert_eq!(rows2[0].id, "legB", "the loudest leg moved");
+        assert_eq!(
+            rows2[0].unit_id, rows[0].unit_id,
+            "the unit's identity does not move just because a different leg got loud"
+        );
+    }
+
     #[test]
     fn an_orphan_leg_stands_on_its_own() {
         // The parent is archived or purged, so it is not in the listing.
@@ -7431,6 +11976,106 @@ mod folding {
         assert!(!rows.is_empty());
     }
 
+    /// AC-34. Home ranks the same units the rail folds, so the two roll-ups
+    /// must agree: folding across a whole registry must never turn N gates into
+    /// fewer than N. Legs are folded **per project** — two projects can hold
+    /// two different runs whose 8-hex ids collide, and folding them together
+    /// would merge unrelated work.
+    #[test]
+    fn home_folds_per_project_and_keeps_every_gate() {
+        let unfolded = vec![
+            summary("root", Phase::AwaitingShipConfirm, None, 30),
+            summary("leg", Phase::AwaitingPlanApproval, Some("root"), 10),
+            summary("solo", Phase::Failed, None, 5),
+        ];
+        let before = unfolded
+            .iter()
+            .filter(|r| run_attention(r).needs_you())
+            .count();
+        let (rows, _) = fold_units(unfolded);
+        assert_eq!(
+            runs_needing_attention(&rows),
+            before,
+            "folding lost a gate on the way to Home"
+        );
+
+        // Same id in two projects: folding is per project, so `b`'s parent
+        // reference must not reach across into the other project's `a`.
+        let mut p1 = summary("a", Phase::Review, None, 5);
+        p1.project_root = Some(PathBuf::from("/nonexistent/one"));
+        let mut p2 = summary("b", Phase::AwaitingPlanApproval, Some("a"), 5);
+        p2.project_root = Some(PathBuf::from("/nonexistent/two"));
+        let (r1, _) = fold_units(vec![p1]);
+        let (r2, _) = fold_units(vec![p2]);
+        assert_eq!(r1.len(), 1);
+        assert_eq!(
+            r2.len(),
+            1,
+            "an orphan leg stands on its own in its project"
+        );
+        assert_eq!(runs_needing_attention(&r2), 1);
+    }
+
+    /// AC-34, round-7 review finding: the collision-avoidance half of
+    /// `home_folds_per_project_and_keeps_every_gate` called `fold_units` by hand
+    /// per project rather than exercising `gather_home`'s own per-project loop, so
+    /// a regression there (e.g. accidentally folding across the whole registry)
+    /// could not fail it. This drives `gather_home` itself over two real project
+    /// directories that each happen to have a run named `a`.
+    #[test]
+    fn gather_home_folds_per_project_and_avoids_id_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let one = tmp.path().join("one");
+        let two = tmp.path().join("two");
+        std::fs::create_dir_all(one.join(".spar/runs")).unwrap();
+        std::fs::create_dir_all(two.join(".spar/runs")).unwrap();
+
+        let save = |root: &Path, id: &str, phase: Phase, parent: Option<&str>| {
+            let paths = SparPaths::new(root);
+            paths.ensure_run_dirs(id).unwrap();
+            let mut st = RunState::new(id, WorkflowKind::Loop, root.to_path_buf());
+            st.phase = phase;
+            st.parent_run = parent.map(str::to_string);
+            st.save(&paths).unwrap();
+        };
+        // Project "one" has a real, unrelated run "a". Project "two" has no run
+        // named "a" of its own, only a leg "b" whose `parent_run` happens to name
+        // the same id. If folding ever crossed project boundaries, "b" would
+        // wrongly merge into project "one"'s "a" instead of standing alone.
+        save(&one, "a", Phase::Review, None);
+        save(&two, "b", Phase::AwaitingPlanApproval, Some("a"));
+
+        let projects = [
+            registry::ProjectEntry {
+                root: one.clone(),
+                name: Some("one".into()),
+                last_seen: Utc::now(),
+                last_run_id: None,
+            },
+            registry::ProjectEntry {
+                root: two.clone(),
+                name: Some("two".into()),
+                last_seen: Utc::now(),
+                last_run_id: None,
+            },
+        ];
+        let folded = gather_home(&projects);
+        assert_eq!(folded[0].len(), 1);
+        assert_eq!(folded[0][0].id, "a", "project one's own run, untouched");
+        assert_eq!(
+            folded[1].len(),
+            1,
+            "project two's orphan leg must not merge into project one's \"a\": {:?}",
+            folded[1]
+        );
+        assert_eq!(folded[1][0].id, "b");
+        assert_eq!(
+            runs_needing_attention(&folded[1]),
+            1,
+            "the orphan leg's own gate must still count"
+        );
+    }
+
     #[test]
     fn the_age_shown_is_the_freshest_leg() {
         let runs = vec![
@@ -7441,6 +12086,1976 @@ mod folding {
         assert!(
             (Utc::now() - rows[0].updated_at).num_minutes() < 10,
             "a unit is as old as its newest activity"
+        );
+    }
+
+    /// Round-1 review (major): `unit_wants_operator` and `wants_operator` are
+    /// structurally equal on every row `fold_units` can produce, once rule 2's
+    /// tiebreak (attention first, `wants_operator` only within a tied level) holds —
+    /// a `Gate`/`Broken` leg always outranks every other attention level, so it is
+    /// always the representative when one exists; a counted `PlanApproved` leg means
+    /// no leg is active, so every leg is `Idle` and the tiebreak makes the
+    /// `PlanApproved` leg the representative. That equality is *why* the four call
+    /// sites that read `unit_wants_operator` (Home's band, both rail flags, the `a`
+    /// cycle key) can share one predicate with the per-leg `wants_operator` used
+    /// inside `fold_units` itself — reverting any one of those call sites back to
+    /// `wants_operator` cannot fail a test built on real `fold_units` output, because
+    /// on every row `fold_units` emits the two predicates already agree. This is the
+    /// invariant that makes that true, checked exhaustively over every reachable
+    /// (phase, abandoned) pair for a two-leg unit; it fails the moment rule 2's
+    /// tiebreak regresses (verified by temporarily deleting the tiebreak: 3
+    /// divergences, all the `PlanApproved`-vs-idle-sibling case attempt two got
+    /// wrong).
+    #[test]
+    fn unit_wants_operator_matches_wants_operator_on_every_fold_units_row() {
+        const ALL_PHASES: [Phase; 26] = [
+            Phase::Init,
+            Phase::PrepareIsolation,
+            Phase::SpawnSlots,
+            Phase::Dispatch,
+            Phase::WaitCompletion,
+            Phase::PlanReady,
+            Phase::Spec,
+            Phase::AwaitingPlanApproval,
+            Phase::PlanApproved,
+            Phase::PlanRejected,
+            Phase::Review,
+            Phase::Suite,
+            Phase::Rank,
+            Phase::Fix,
+            Phase::PeerRelay,
+            Phase::AwaitingWinnerConfirm,
+            Phase::AwaitingReconcile,
+            Phase::AwaitingShipConfirm,
+            Phase::AwaitingRoundExtension,
+            Phase::Shipping,
+            Phase::Done,
+            Phase::Escalated,
+            Phase::Failed,
+            Phase::Stuck,
+            Phase::Quota,
+            Phase::Stopped,
+        ];
+
+        let mut checked = 0u32;
+        for &root_phase in &ALL_PHASES {
+            for &leg_phase in &ALL_PHASES {
+                for root_abandoned in [false, true] {
+                    for leg_abandoned in [false, true] {
+                        // `is_abandoned` (state.rs) never sets `abandoned` true on a
+                        // waitable-stop phase, so those (phase, abandoned) pairs
+                        // cannot occur in practice — skip rather than assert on
+                        // unreachable input.
+                        if root_abandoned && root_phase.is_waitable_stop() {
+                            continue;
+                        }
+                        if leg_abandoned && leg_phase.is_waitable_stop() {
+                            continue;
+                        }
+                        let mut root = summary("root", root_phase, None, 10);
+                        root.abandoned = root_abandoned;
+                        let mut leg = summary("leg", leg_phase, Some("root"), 5);
+                        leg.abandoned = leg_abandoned;
+                        let (rows, _) = fold_units(vec![root, leg]);
+                        for row in &rows {
+                            assert_eq!(
+                                unit_wants_operator(row),
+                                wants_operator(row),
+                                "diverged for root={root_phase:?}/{root_abandoned} \
+                                 leg={leg_phase:?}/{leg_abandoned}: {row:?}"
+                            );
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 100, "the phase matrix must actually run");
+    }
+}
+
+/// Feature 004's acceptance suite: the information-architecture behaviour that
+/// sits under the paint (`mod render_stability` covers the paint itself).
+///
+/// **Seams this contract binds to.** The assertions are the contract; the names
+/// below are the agreed surface the plan (`artifacts/plan.md`) already fixes. If
+/// an implementation renames one, rename it here too — do not weaken an
+/// assertion to fit a different shape.
+///
+/// | Seam | Phase | What it must be |
+/// |---|---|---|
+/// | `BrowseLevel::Home` | C | the rail root; `pop()` lands here from Runs and Projects |
+/// | `App::new(seed, cfg, local_root: Option<&Path>)` | C | always starts at Home; `local_root` sets the scope |
+/// | `HomeData { rows, project_stats }` on `Snapshot`, passed to `draw` | B/C | the off-thread roll-up `draw` consumes |
+/// | `gather_home(&[ProjectEntry]) -> Vec<Vec<RunSummary>>` | B/C | one folded, archived-filtered listing per project; disk, off-thread |
+/// | `project_stats_of(&[Vec<RunSummary>]) -> Vec<ProjectStat>` | B | pure; counts folded rows |
+/// | `build_home_rows(projects, folded, scope, watermark, now)` | C | pure; banding, ranking, capping |
+/// | `home_overview(rows, scope, watermark, now) -> String` | C | Main's Home body |
+/// | `read_watermark` / `write_watermark` / `watermark_path` | C | the "finished since last look" clock |
+/// | `cross_project_due(browse, since_last, forced)` | B | bounded cross-project invalidation |
+/// | `build_roster(cfg, detected, recent)` / `new_run_providers` / `new_run_launch` | D | the fleet picker, with no disk in `draw` |
+#[cfg(test)]
+mod home_ia {
+    use super::*;
+    use crate::cli::WorkflowKind;
+    use std::path::Path;
+
+    fn project_at(root: &Path, name: &str) -> registry::ProjectEntry {
+        registry::ProjectEntry {
+            root: root.to_path_buf(),
+            name: Some(name.to_string()),
+            last_seen: Utc::now(),
+            last_run_id: None,
+        }
+    }
+
+    fn run_in(id: &str, phase: Phase, mins_ago: i64, root: &Path) -> state::RunSummary {
+        state::RunSummary {
+            id: id.into(),
+            workflow: WorkflowKind::Loop,
+            archived: false,
+            phase,
+            updated_at: Utc::now() - chrono::Duration::minutes(mins_ago),
+            task: Some(format!("brief for {id}")),
+            dry_run: false,
+            abandoned: false,
+            parent_run: None,
+            round: 1,
+            legs: 1,
+            wants: 0,
+            unit_id: None,
+            base_ref: None,
+            base_commit: None,
+            project_root: Some(root.to_path_buf()),
+            project_name: root.file_name().map(|s| s.to_string_lossy().into_owned()),
+        }
+    }
+
+    fn band_of(rows: &[HomeRow], id: &str) -> Option<HomeBand> {
+        rows.iter().find_map(|r| match r {
+            HomeRow::Run { band, run, .. } if run.id == id => Some(*band),
+            _ => None,
+        })
+    }
+
+    fn ids_in(rows: &[HomeRow], want: HomeBand) -> Vec<String> {
+        rows.iter()
+            .filter_map(|r| match r {
+                HomeRow::Run { band, run, .. } if *band == want => Some(run.id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // -- Phase A: the retired noun and the comments that describe a dead model --
+
+    /// AC-11. The four comments the feature file names describe a focus model
+    /// that no longer exists. Needles are assembled from fragments so this
+    /// test's own source cannot satisfy the search it performs.
+    #[test]
+    fn retired_focus_and_composer_comments_are_gone() {
+        let src = include_str!("tui.rs");
+        for needle in [
+            concat!("Three focus ", "targets"),
+            concat!("composer ", "mention"),
+            concat!("or the composer ", "still changes focus"),
+            concat!("the composer ", "cursor"),
+            concat!("as a composer ", "error"),
+        ] {
+            assert!(
+                !src.contains(needle),
+                "src/tui.rs still documents a focus model that does not exist: {needle:?}"
+            );
+        }
+        // `1`/`2` are the two real direct-focus keys; `3` was never bound.
+        assert!(
+            !src.contains(concat!("`1` / `2` / ", "`3` jump")),
+            "the focus doc still offers a third target"
+        );
+    }
+
+    /// AC-12. The product doc bakes the run/Home conflation in at the pillar
+    /// level; U6 retires it.
+    #[test]
+    fn the_product_doc_no_longer_conflates_home_with_a_session() {
+        let doc = include_str!("../docs/PRODUCT.md");
+        assert!(
+            !doc.contains(concat!("Session / ", "run home")),
+            "docs/PRODUCT.md still names the retired noun in pillar 1"
+        );
+        assert!(
+            doc.contains("Home"),
+            "pillar 1 must name the landing view it describes"
+        );
+    }
+
+    /// AC-13. Discoverability (R6): `n` and `P` are new bindings, so they have
+    /// to appear in the help body, and the help body's rail shape has to
+    /// describe the tree that actually exists.
+    #[test]
+    fn home_keys_are_documented_in_the_help_body() {
+        let help = HELP_BODY;
+        assert!(help.contains(" n "), "`n` is undiscoverable: {help}");
+        assert!(help.contains(" P "), "`P` is undiscoverable: {help}");
+        assert!(
+            help.contains("Home"),
+            "the help body's rail shape must start at Home"
+        );
+        assert!(
+            !help.contains(concat!("projects ▸ runs", " ▸ agents")),
+            "the help body still describes Projects as the rail root"
+        );
+        // The Shape line keeps its parenthetical: `help_overlay_wraps_narrow_lines_
+        // without_cutting_a_word` is the only long-line wrap probe in the suite and
+        // it reads its phrases off this line.
+        assert!(
+            help.contains("(Enter pushes, Esc pops)"),
+            "the Shape line must keep the parenthetical the wrap test probes"
+        );
+    }
+
+    // -- Phase B: the render-path scan moves off-thread (U13) ------------------
+
+    /// AC-14. `project_stats_of` counts **folded** rows, so the `⚑N` on the
+    /// Projects level agrees with the roll-up the Runs level shows. Today's
+    /// `rail_project_items` counts unfolded runs and can disagree.
+    #[test]
+    fn project_stats_count_folded_units_not_invocations() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let mut parent = run_in("root0001", Phase::AwaitingShipConfirm, 30, &root);
+        parent.legs = 2;
+        parent.wants = 2; // the unit holds two gates
+        let plain = run_in("solo0001", Phase::Review, 5, &root);
+        let stats = project_stats_of(&[vec![parent, plain]]);
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].n_runs, 2, "one row per unit of work");
+        assert_eq!(
+            stats[0].needs_you, 2,
+            "a two-gate unit contributes both gates (U15)"
+        );
+    }
+
+    /// AC-15. The other half of U13: `gather_home` really reads disk, drops
+    /// archived runs, folds legs into their parent, and degrades a project root
+    /// that is not there to an empty listing instead of panicking.
+    #[test]
+    fn gather_home_lists_visible_folded_runs_and_survives_a_missing_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(root.join(".spar/runs")).unwrap();
+        let paths = SparPaths::new(&root);
+
+        let save = |id: &str, phase: Phase, parent: Option<&str>, archived: bool| {
+            paths.ensure_run_dirs(id).unwrap();
+            let mut st = RunState::new(id, WorkflowKind::Loop, root.clone());
+            st.phase = phase;
+            st.parent_run = parent.map(str::to_string);
+            if archived {
+                st.archived_at = Some(Utc::now());
+            }
+            st.save(&paths).unwrap();
+        };
+        save("aaaa0001", Phase::PlanApproved, None, false);
+        save(
+            "bbbb0002",
+            Phase::AwaitingShipConfirm,
+            Some("aaaa0001"),
+            false,
+        );
+        save("cccc0003", Phase::Review, None, false);
+        save("dddd0004", Phase::Done, None, true);
+        // cccc0003 is mid-flight, not abandoned: hold its lock like a live orchestrator
+        // would, or `is_abandoned` reads a lockless active phase as Broken (state.rs:684)
+        // and this fixture would assert something other than what it names.
+        let _cccc_lock = crate::runlock::RunLock::acquire(&paths, "cccc0003").unwrap();
+
+        let missing = tmp.path().join("gone");
+        let projects = [project_at(&root, "proj"), project_at(&missing, "gone")];
+        let folded = gather_home(&projects);
+        assert_eq!(folded.len(), projects.len(), "index-aligned with projects");
+
+        let ids: Vec<&str> = folded[0].iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            folded[0].len(),
+            2,
+            "archived dropped, the leg folded into its parent: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"dddd0004"),
+            "an archived run must not reach Home: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"aaaa0001") || !ids.contains(&"bbbb0002"),
+            "the leg and its parent must be one row: {ids:?}"
+        );
+        assert!(folded[1].is_empty(), "a missing project root reads as zero");
+
+        // And the stats derived from that same pass agree with it. The root is
+        // PlanApproved (a handoff `wants_operator` counts, round-9 review) and the leg
+        // is a live gate — both legs want the operator, so the folded row's `wants`
+        // is 2, not 1.
+        let stats = project_stats_of(&folded);
+        assert_eq!(stats[0].n_runs, 2);
+        assert_eq!(
+            stats[0].needs_you, 2,
+            "the PlanApproved root and the gated leg both want the operator"
+        );
+        assert_eq!(stats[1].n_runs, 0);
+    }
+
+    /// AC-16. The cross-project sweep Home needs is bounded: a Home that has
+    /// not changed does not re-list every registered project on every 200ms
+    /// refresh tick, entering Home forces one immediate build, and levels that
+    /// are not cross-project never trigger it at all.
+    #[test]
+    fn cross_project_refresh_is_bounded_and_forced_on_entry() {
+        assert!(
+            CROSS_PROJECT_REFRESH > REFRESH,
+            "a per-tick cross-project sweep is the scale failure this moves off draw"
+        );
+        assert!(
+            !cross_project_due(BrowseLevel::Home, REFRESH, false),
+            "one refresh tick is not a cross-project rebuild"
+        );
+        assert!(
+            cross_project_due(BrowseLevel::Home, CROSS_PROJECT_REFRESH, false),
+            "the cadence must eventually fire"
+        );
+        assert!(
+            cross_project_due(BrowseLevel::Home, Duration::from_millis(0), true),
+            "entering Home or toggling scope forces one build"
+        );
+        assert!(
+            cross_project_due(BrowseLevel::Projects, CROSS_PROJECT_REFRESH, false),
+            "the Projects level needs the same per-project stats"
+        );
+        for level in [BrowseLevel::Runs, BrowseLevel::Agents] {
+            assert!(
+                !cross_project_due(level, CROSS_PROJECT_REFRESH * 10, false),
+                "{level:?} is scoped to one project and must not sweep the registry"
+            );
+        }
+    }
+
+    // -- Phase C: bands, ranking, scope, watermark ----------------------------
+
+    /// AC-17. Four bands, in order, headers always emitted, first match wins so
+    /// a run is in exactly one band.
+    #[test]
+    fn home_emits_four_bands_in_order_with_headers_always_present() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let watermark = Utc::now() - chrono::Duration::hours(1);
+        let now = Utc::now();
+        for folded in [
+            vec![vec![]],
+            vec![vec![
+                run_in("gate0001", Phase::AwaitingPlanApproval, 30, &root),
+                run_in("work0001", Phase::Review, 2, &root),
+                run_in("done0001", Phase::Done, 10, &root),
+            ]],
+        ] {
+            let rows = build_home_rows(&projects, &folded, &HomeScope::All, watermark, now);
+            let headers: Vec<HomeBand> = rows
+                .iter()
+                .filter_map(|r| match r {
+                    HomeRow::Header(b) => Some(*b),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                headers,
+                vec![
+                    HomeBand::NeedsMe,
+                    HomeBand::Running,
+                    HomeBand::Finished,
+                    HomeBand::StartNew
+                ],
+                "band headers must be present and in order even when empty"
+            );
+            assert!(
+                rows.iter().any(|r| matches!(r, HomeRow::NewRun)),
+                "band 4's action row is always there"
+            );
+            // Exactly one band per run.
+            let mut seen: Vec<&str> = Vec::new();
+            for r in &rows {
+                if let HomeRow::Run { run, .. } = r {
+                    assert!(!seen.contains(&run.id.as_str()), "{} in two bands", run.id);
+                    seen.push(&run.id);
+                }
+            }
+        }
+    }
+
+    /// AC-18. Band membership is declared, not a fallthrough: gates and broken
+    /// runs are band 1 (U5's `needs_you`, so a broken run is never dropped),
+    /// active runs are band 2, and only genuinely-finished runs newer than the
+    /// watermark are band 3. `Stopped` and `PlanRejected` must not be quietly
+    /// filed as "finished".
+    #[test]
+    fn phases_land_in_their_declared_bands() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let watermark = Utc::now() - chrono::Duration::hours(6);
+        let now = Utc::now();
+        let cases: Vec<(&str, Phase, Option<HomeBand>)> = vec![
+            ("gate", Phase::AwaitingPlanApproval, Some(HomeBand::NeedsMe)),
+            ("ship", Phase::AwaitingShipConfirm, Some(HomeBand::NeedsMe)),
+            ("fail", Phase::Failed, Some(HomeBand::NeedsMe)),
+            ("stuk", Phase::Stuck, Some(HomeBand::NeedsMe)),
+            ("quot", Phase::Quota, Some(HomeBand::NeedsMe)),
+            ("esca", Phase::Escalated, Some(HomeBand::NeedsMe)),
+            ("plap", Phase::PlanApproved, Some(HomeBand::NeedsMe)),
+            ("revw", Phase::Review, Some(HomeBand::Running)),
+            ("disp", Phase::Dispatch, Some(HomeBand::Running)),
+            ("done", Phase::Done, Some(HomeBand::Finished)),
+            ("stop", Phase::Stopped, Some(HomeBand::Finished)),
+            ("rejd", Phase::PlanRejected, Some(HomeBand::Finished)),
+        ];
+        let runs: Vec<state::RunSummary> = cases
+            .iter()
+            .map(|(id, phase, _)| run_in(id, *phase, 1, &root))
+            .collect();
+        let rows = build_home_rows(&projects, &[runs], &HomeScope::All, watermark, now);
+        for (id, phase, want) in &cases {
+            assert_eq!(
+                band_of(&rows, id),
+                *want,
+                "{phase:?} landed in the wrong band"
+            );
+        }
+        // An abandoned run is broken, not running.
+        let mut abandoned = run_in("aban", Phase::Review, 1, &root);
+        abandoned.abandoned = true;
+        let rows = build_home_rows(
+            &projects,
+            &[vec![abandoned]],
+            &HomeScope::All,
+            watermark,
+            now,
+        );
+        assert_eq!(band_of(&rows, "aban"), Some(HomeBand::NeedsMe));
+    }
+
+    /// AC-19. Band 1 is ranked by wait time descending — the longest-waiting
+    /// gate first. That is deliberately *not* the rail's recency-first
+    /// attention sort.
+    #[test]
+    fn needs_me_ranks_by_wait_time_descending() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let now = Utc::now();
+        let folded = vec![vec![
+            run_in("recent01", Phase::AwaitingShipConfirm, 1, &root),
+            run_in("oldest01", Phase::AwaitingPlanApproval, 60, &root),
+            run_in("middle01", Phase::AwaitingShipConfirm, 15, &root),
+        ]];
+        let rows = build_home_rows(
+            &projects,
+            &folded,
+            &HomeScope::All,
+            now - chrono::Duration::hours(6),
+            now,
+        );
+        assert_eq!(
+            ids_in(&rows, HomeBand::NeedsMe),
+            vec!["oldest01", "middle01", "recent01"],
+            "band 1 is longest-waiting first"
+        );
+        // The recorded wait is what the row renders, and it is monotonic with
+        // the ranking.
+        let waits: Vec<Duration> = rows
+            .iter()
+            .filter_map(|r| match r {
+                HomeRow::Run {
+                    band: HomeBand::NeedsMe,
+                    waited,
+                    ..
+                } => Some(*waited),
+                _ => None,
+            })
+            .collect();
+        assert!(waits.windows(2).all(|w| w[0] >= w[1]), "{waits:?}");
+
+        // Bands 2 and 3 are recency-first instead.
+        let folded = vec![vec![
+            run_in("old_work", Phase::Review, 60, &root),
+            run_in("new_work", Phase::Review, 1, &root),
+        ]];
+        let rows = build_home_rows(
+            &projects,
+            &folded,
+            &HomeScope::All,
+            now - chrono::Duration::hours(6),
+            now,
+        );
+        assert_eq!(
+            ids_in(&rows, HomeBand::Running),
+            vec!["new_work", "old_work"]
+        );
+    }
+
+    /// AC-19/review finding: on an equal wait, a Gate outranks a Broken run —
+    /// the plan's stated tiebreak, not registry/listing order.
+    #[test]
+    fn needs_me_ties_break_gate_above_broken() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let now = Utc::now();
+        let same_updated = now - chrono::Duration::minutes(30);
+        let mut broken = run_in("broken01", Phase::Failed, 30, &root);
+        broken.updated_at = same_updated;
+        let mut gate = run_in("gate0001", Phase::AwaitingPlanApproval, 30, &root);
+        gate.updated_at = same_updated;
+        let folded = vec![vec![broken, gate]];
+        let rows = build_home_rows(
+            &projects,
+            &folded,
+            &HomeScope::All,
+            now - chrono::Duration::hours(6),
+            now,
+        );
+        assert_eq!(
+            ids_in(&rows, HomeBand::NeedsMe),
+            vec!["gate0001", "broken01"],
+            "equal wait: Gate ranks above Broken"
+        );
+    }
+
+    /// AC-20. A clock that ran backwards (a future `updated_at` from a skewed
+    /// host or a hand-edited state file) must produce a zero wait, not a panic
+    /// and not a row that sorts to the top forever.
+    #[test]
+    fn a_future_updated_at_is_zero_wait_not_a_panic() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let now = Utc::now();
+        let folded = vec![vec![
+            run_in("future01", Phase::AwaitingShipConfirm, -600, &root),
+            run_in("normal01", Phase::AwaitingShipConfirm, 30, &root),
+        ]];
+        let rows = build_home_rows(
+            &projects,
+            &folded,
+            &HomeScope::All,
+            now - chrono::Duration::hours(6),
+            now,
+        );
+        let waited = |id: &str| {
+            rows.iter()
+                .find_map(|r| match r {
+                    HomeRow::Run { run, waited, .. } if run.id == id => Some(*waited),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(waited("future01"), Duration::from_secs(0));
+        assert_eq!(
+            ids_in(&rows, HomeBand::NeedsMe),
+            vec!["normal01", "future01"],
+            "a future timestamp must not outrank a real wait"
+        );
+    }
+
+    /// AC-21. The band cap keeps a thousand-run workspace from building a
+    /// thousand rows a frame — but it must never truncate band 1, and a band it
+    /// does cap has to say how many it dropped.
+    #[test]
+    fn the_band_cap_never_truncates_what_needs_you() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let now = Utc::now();
+        let n = HOME_BAND_CAP + 25;
+        let mut runs: Vec<state::RunSummary> = (0..n)
+            .map(|i| {
+                run_in(
+                    &format!("gate{i:04}"),
+                    Phase::AwaitingPlanApproval,
+                    i as i64,
+                    &root,
+                )
+            })
+            .collect();
+        runs.extend((0..n).map(|i| run_in(&format!("work{i:04}"), Phase::Review, i as i64, &root)));
+        let rows = build_home_rows(
+            &projects,
+            &[runs],
+            &HomeScope::All,
+            now - chrono::Duration::hours(6),
+            now,
+        );
+        assert_eq!(
+            ids_in(&rows, HomeBand::NeedsMe).len(),
+            n,
+            "band 1 must never be capped"
+        );
+        assert_eq!(
+            ids_in(&rows, HomeBand::Running).len(),
+            HOME_BAND_CAP,
+            "band 2 caps"
+        );
+        let more = rows.iter().find_map(|r| match r {
+            HomeRow::More { band, n } => Some((*band, *n)),
+            _ => None,
+        });
+        assert_eq!(
+            more,
+            Some((HomeBand::Running, n - HOME_BAND_CAP)),
+            "a capped band must account for what it dropped"
+        );
+    }
+
+    /// AC-22. U15 at Home: folding is a display choice, never a way to lose a
+    /// gate. A two-leg unit with two gates is one row that says `⚑2` and
+    /// contributes 2 to the roll-up.
+    #[test]
+    fn folding_never_hides_a_gate_from_home() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let now = Utc::now();
+        let mut unit = run_in("legb0002", Phase::AwaitingPlanApproval, 20, &root);
+        unit.legs = 2;
+        unit.wants = 2;
+        let rows = build_home_rows(
+            &projects,
+            &[vec![unit]],
+            &HomeScope::All,
+            now - chrono::Duration::hours(6),
+            now,
+        );
+        let band1: Vec<state::RunSummary> = rows
+            .iter()
+            .filter_map(|r| match r {
+                HomeRow::Run {
+                    band: HomeBand::NeedsMe,
+                    run,
+                    ..
+                } => Some(run.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(band1.len(), 1, "one unit of work, one row");
+        assert_eq!(band1[0].wants, 2, "the row must carry both gates");
+        assert_eq!(
+            runs_needing_attention(&band1),
+            2,
+            "the roll-up counts legs, not rows"
+        );
+        assert!(
+            home_overview(
+                &rows,
+                &HomeScope::All,
+                now - chrono::Duration::hours(6),
+                now
+            )
+            .contains("⚑2"),
+            "a multi-gate unit says so on screen"
+        );
+    }
+
+    /// Round-9 review: `build_home_rows` banded `PlanApproved` into NeedsMe, but
+    /// `runs_needing_attention`/`home_needs_you`/the rail flag did not agree, so a
+    /// single PlanApproved run showed a NEEDS YOU band with `0 need you` above it.
+    /// `wants_operator` is the one predicate every one of those goes through now, so
+    /// they cannot disagree with each other.
+    #[test]
+    fn plan_approved_agrees_across_every_needs_you_roll_up() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let now = Utc::now();
+        let run = run_in("plap0001", Phase::PlanApproved, 20, &root);
+
+        assert_eq!(
+            runs_needing_attention(std::slice::from_ref(&run)),
+            1,
+            "the fleet roll-up must count the PlanApproved handoff"
+        );
+
+        let folded = vec![vec![run]];
+        let stats = project_stats_of(&folded);
+        assert_eq!(
+            stats[0].needs_you, 1,
+            "the Projects-level flag must agree with the fleet roll-up"
+        );
+
+        let rows = build_home_rows(
+            &projects,
+            &folded,
+            &HomeScope::All,
+            now - chrono::Duration::hours(6),
+            now,
+        );
+        assert_eq!(
+            home_needs_you(&rows),
+            1,
+            "Home's own header must agree with the band it renders"
+        );
+        let row = rows
+            .iter()
+            .find_map(|r| match r {
+                HomeRow::Run {
+                    band: HomeBand::NeedsMe,
+                    run,
+                    ..
+                } => Some(run),
+                _ => None,
+            })
+            .expect("PlanApproved lands in NeedsMe");
+        assert!(
+            attention_flag(row, unit_wants_operator(row)).is_some(),
+            "the rail flag must fire for the row Home says needs you"
+        );
+    }
+
+    /// U28, driven through the real pipeline (`fold_units` then `build_home_rows`)
+    /// rather than a hand-built row: a `PlanApproved` unit with a live sibling has
+    /// already been dispatched, so it must not appear in NEEDS YOU, and the roll-up
+    /// Home's header reads (`home_needs_you`) must agree with the fleet-wide one
+    /// (`runs_needing_attention`) that a Runs-level view over the same folded data
+    /// would compute.
+    #[test]
+    fn a_plan_approved_unit_with_an_active_leg_is_not_needs_you() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let now = Utc::now();
+        let plan1 = run_in("plan0001", Phase::PlanApproved, 90, &root);
+        let mut impl1 = run_in("impl0001", Phase::Review, 5, &root);
+        impl1.parent_run = Some("plan0001".to_string());
+
+        let (folded, _) = fold_units(vec![plan1, impl1]);
+        assert_eq!(folded.len(), 1, "one unit of work");
+
+        let rows = build_home_rows(
+            &projects,
+            std::slice::from_ref(&folded),
+            &HomeScope::All,
+            now - chrono::Duration::hours(6),
+            now,
+        );
+        assert_eq!(
+            band_of(&rows, "impl0001"),
+            Some(HomeBand::Running),
+            "impl0001 is live and there is nothing to act on"
+        );
+        assert_eq!(home_needs_you(&rows), 0);
+        assert_eq!(
+            runs_needing_attention(&folded),
+            0,
+            "Home's header and the fleet roll-up must agree"
+        );
+    }
+
+    /// U28's other half, through the same real pipeline: once the active leg
+    /// finishes, the unit is a live handoff again, and the row Home renders must be
+    /// the approvable leg — the one a NEEDS YOU alert can actually be acted on.
+    #[test]
+    fn a_plan_approved_unit_wants_you_and_is_actionable_once_its_leg_finishes() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let now = Utc::now();
+        let plan1 = run_in("plan0001", Phase::PlanApproved, 90, &root);
+        let mut impl1 = run_in("impl0001", Phase::Done, 5, &root);
+        impl1.parent_run = Some("plan0001".to_string());
+
+        let (folded, _) = fold_units(vec![plan1, impl1]);
+        assert_eq!(folded.len(), 1, "one unit of work");
+
+        let rows = build_home_rows(
+            &projects,
+            std::slice::from_ref(&folded),
+            &HomeScope::All,
+            now - chrono::Duration::hours(6),
+            now,
+        );
+        assert_eq!(
+            band_of(&rows, "plan0001"),
+            Some(HomeBand::NeedsMe),
+            "the approvable leg, not the finished one, must be the row that's flagged"
+        );
+        assert_eq!(home_needs_you(&rows), 1);
+        assert_eq!(runs_needing_attention(&folded), 1);
+        let row = rows
+            .iter()
+            .find_map(|r| match r {
+                HomeRow::Run {
+                    band: HomeBand::NeedsMe,
+                    run,
+                    ..
+                } => Some(run),
+                _ => None,
+            })
+            .expect("the row lands in NeedsMe");
+        assert_eq!(
+            row.id, "plan0001",
+            "Home's row must act on the leg that has something to do"
+        );
+        assert_eq!(row.phase, Phase::PlanApproved);
+        assert!(attention_flag(row, unit_wants_operator(row)).is_some());
+    }
+
+    /// The `a` cycle key (`jump_to_attention`) goes through `unit_wants_operator` at
+    /// the Runs level too — a folded unit stuck on U28's stale-approval case must not
+    /// be a cycle target, and must become one again once it is genuinely actionable.
+    #[test]
+    fn jump_to_attention_follows_the_u28_conditional() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let plan1 = run_in("plan0001", Phase::PlanApproved, 90, &root);
+        let mut impl1 = run_in("impl0001", Phase::Review, 5, &root);
+        impl1.parent_run = Some("plan0001".to_string());
+        let (stale, _) = fold_units(vec![plan1.clone(), impl1]);
+        assert_eq!(stale.len(), 1);
+
+        let mut app = App::new(None, Config::default(), None);
+        app.browse = BrowseLevel::Runs;
+        app.selected_run = 0;
+        jump_to_attention(&mut app, &stale, &[]);
+        assert_eq!(
+            app.flash.as_ref().map(|(_, msg, ..)| msg.clone()),
+            Some("nothing needs you".to_string()),
+            "no cycle target while impl0001 is still live"
+        );
+
+        let mut impl1_done = run_in("impl0001", Phase::Done, 5, &root);
+        impl1_done.parent_run = Some("plan0001".to_string());
+        let (live, _) = fold_units(vec![plan1, impl1_done]);
+        assert_eq!(live.len(), 1);
+
+        let mut app = App::new(None, Config::default(), None);
+        app.browse = BrowseLevel::Runs;
+        app.selected_run = 0;
+        jump_to_attention(&mut app, &live, &[]);
+        assert_eq!(
+            app.selected_run, 0,
+            "the sole run in the list is the target"
+        );
+        assert_eq!(
+            app.flash.as_ref().map(|(_, msg, ..)| msg.clone()),
+            Some("→ plan0001 needs you".to_string())
+        );
+    }
+
+    /// A row shape `fold_units` can never itself produce
+    /// (`unit_wants_operator_matches_wants_operator_on_every_fold_units_row`, `folding`
+    /// module, proves the two predicates agree on every row `fold_units` can emit): a
+    /// folded unit (`legs > 1`) whose representative leg is merely `Working` (`Review`
+    /// — neither a gate, a breakage, nor `PlanApproved`) while `wants` still counts a
+    /// sibling. Real `fold_units` output can never disagree with `wants_operator` this
+    /// way, so every test that only drives `build_home_rows`, the rail flags, or
+    /// `jump_to_attention` through real `fold_units` output cannot tell
+    /// `unit_wants_operator` and `wants_operator` apart at those call sites — reverting
+    /// any one of them back to `wants_operator` stays green (round-2 review, major).
+    /// This row makes the difference observable directly at each site:
+    /// `unit_wants_operator` says true (`wants > 0`), `wants_operator` says false.
+    fn folded_but_representative_alone_does_not_want_you(
+        id: &str,
+        root: &Path,
+    ) -> state::RunSummary {
+        let mut r = run_in(id, Phase::Review, 5, root);
+        r.legs = 2;
+        r.wants = 1;
+        r
+    }
+
+    /// Independent coverage of the Home-band call site (`build_home_rows`, U28):
+    /// reverting its `unit_wants_operator(r)` check back to `wants_operator(r)` sinks
+    /// this row into RUNNING, since `Review` is an active phase and `wants_operator`
+    /// alone says false. Driven through the real builder with a hand-set `legs`/
+    /// `wants`, the same pattern `folding_never_hides_a_gate_from_home` already uses
+    /// to get a row `fold_units` itself would not emit.
+    #[test]
+    fn home_band_membership_uses_unit_wants_operator() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let now = Utc::now();
+        let row = folded_but_representative_alone_does_not_want_you("legb0003", &root);
+
+        let rows = build_home_rows(
+            &projects,
+            &[vec![row.clone()]],
+            &HomeScope::All,
+            now - chrono::Duration::hours(6),
+            now,
+        );
+        assert_eq!(
+            band_of(&rows, "legb0003"),
+            Some(HomeBand::NeedsMe),
+            "wants > 0 must land in NeedsMe even though the representative leg's own \
+             phase (Review) is neither a gate, a breakage, nor PlanApproved"
+        );
+        assert_eq!(
+            home_needs_you(&rows),
+            1,
+            "Home's own header must agree with the band it just rendered"
+        );
+        assert_eq!(
+            runs_needing_attention(std::slice::from_ref(&row)),
+            1,
+            "the fleet roll-up must agree with the band too"
+        );
+    }
+
+    /// Independent coverage of both rail-flag call sites (`rail_home_items` at the
+    /// Home level, `rail_run_items` at the Runs level): each renders its `force`
+    /// argument as a `⚑` in the lead column, so this exercises the actual painted
+    /// row rather than a bare `attention_flag` call — reverting `unit_wants_operator`
+    /// back to `wants_operator` at either site drops the flag from the screen.
+    #[test]
+    fn rail_flags_fire_on_a_row_only_unit_wants_operator_flags() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        fn rendered(items: Vec<ListItem<'static>>, w: u16) -> String {
+            let mut term = Terminal::new(TestBackend::new(w, 1)).unwrap();
+            term.draw(|f| f.render_widget(List::new(items), f.area()))
+                .unwrap();
+            let buf = term.backend().buffer();
+            (0..w).map(|x| buf[(x, 0)].symbol()).collect()
+        }
+
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let now = Utc::now();
+        let row = folded_but_representative_alone_does_not_want_you("legb0004", &root);
+
+        let home_rows = build_home_rows(
+            &projects,
+            &[vec![row.clone()]],
+            &HomeScope::All,
+            now - chrono::Duration::hours(6),
+            now,
+        );
+        let app = App::new(None, Config::default(), None);
+        let home_run_item = rail_home_items(&home_rows, &projects, &app, 40, false)
+            .into_iter()
+            .nth(1)
+            .expect("the NeedsMe header, then the run row");
+        assert!(
+            rendered(vec![home_run_item], 40).contains('⚑'),
+            "the Home rail must flag a row unit_wants_operator flags, even though \
+             wants_operator alone would not"
+        );
+
+        let runs_items = rail_run_items(std::slice::from_ref(&row), &app, 40, false);
+        assert!(
+            rendered(runs_items, 40).contains('⚑'),
+            "the Runs rail must flag the same row"
+        );
+    }
+
+    /// Independent coverage of the `a` cycle key's Runs-level call site
+    /// (`jump_to_attention`): reverting its `unit_wants_operator` check back to
+    /// `wants_operator` makes this row invisible to the cycle, since `wants_operator`
+    /// alone says false for a `Review` representative even though the unit's `wants`
+    /// is nonzero.
+    #[test]
+    fn jump_to_attention_targets_a_row_only_unit_wants_operator_flags() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let row = folded_but_representative_alone_does_not_want_you("legb0005", &root);
+
+        let mut app = App::new(None, Config::default(), None);
+        app.browse = BrowseLevel::Runs;
+        app.selected_run = 0;
+        jump_to_attention(&mut app, std::slice::from_ref(&row), &[]);
+        assert_eq!(
+            app.flash.as_ref().map(|(_, msg, ..)| msg.clone()),
+            Some("→ legb0005 needs you".to_string()),
+            "the cycle must land on the row, not report \"nothing needs you\""
+        );
+    }
+
+    /// AC-23. Scope filters rows; it does not change the view. Both scopes emit
+    /// the same four headers in the same order (U20).
+    #[test]
+    fn home_scope_filters_rows_without_changing_the_bands() {
+        let a = PathBuf::from("/nonexistent/acme-api");
+        let b = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&a, "acme-api"), project_at(&b, "spar")];
+        let now = Utc::now();
+        let folded = vec![
+            vec![run_in("acme0001", Phase::AwaitingShipConfirm, 10, &a)],
+            vec![run_in("spar0001", Phase::AwaitingShipConfirm, 10, &b)],
+        ];
+        let watermark = now - chrono::Duration::hours(6);
+        let all = build_home_rows(&projects, &folded, &HomeScope::All, watermark, now);
+        let scoped = build_home_rows(
+            &projects,
+            &folded,
+            &HomeScope::Project(b.clone()),
+            watermark,
+            now,
+        );
+        let headers = |rows: &[HomeRow]| -> Vec<HomeBand> {
+            rows.iter()
+                .filter_map(|r| match r {
+                    HomeRow::Header(x) => Some(*x),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(headers(&all), headers(&scoped), "scope changed the bands");
+        assert_eq!(ids_in(&all, HomeBand::NeedsMe).len(), 2);
+        assert_eq!(ids_in(&scoped, HomeBand::NeedsMe), vec!["spar0001"]);
+
+        // `spar` inside a repo lands on Home scoped to that repo, not on the
+        // project's raw run list.
+        let app = App::new(None, Config::default(), Some(b.as_path()));
+        assert_eq!(app.browse, BrowseLevel::Home);
+        assert_eq!(app.home_scope, HomeScope::Project(b.clone()));
+        // Outside a repo it is every registered project.
+        let app = App::new(None, Config::default(), None);
+        assert_eq!(app.home_scope, HomeScope::All);
+        // `P` toggles between the two and back.
+        let mut app = App::new(None, Config::default(), Some(b.as_path()));
+        toggle_home_scope(&mut app, Some(b.as_path()));
+        assert_eq!(app.home_scope, HomeScope::All);
+        toggle_home_scope(&mut app, Some(b.as_path()));
+        assert_eq!(app.home_scope, HomeScope::Project(b));
+    }
+
+    /// AC-24. The watermark: a run that finished before the operator's last
+    /// look is not in band 3; one that finished after it is. A missing or
+    /// corrupt file reads as a day ago, so a first run shows a useful band
+    /// rather than an empty one, and it lives under the global spar home
+    /// because Home is cross-project and `.spar/` is not.
+    #[test]
+    fn the_finished_band_is_bounded_by_the_watermark() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let now = Utc::now();
+        let watermark = now - chrono::Duration::hours(2);
+        let folded = vec![vec![
+            run_in("recentdn", Phase::Done, 30, &root),
+            run_in("olderdne", Phase::Done, 600, &root),
+        ]];
+        let rows = build_home_rows(&projects, &folded, &HomeScope::All, watermark, now);
+        assert_eq!(
+            ids_in(&rows, HomeBand::Finished),
+            vec!["recentdn"],
+            "only what landed since the last look"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("home_watermark.json");
+        let missing = read_watermark(&path);
+        assert!(
+            (now - missing).num_hours() >= 23 && (now - missing).num_hours() <= 25,
+            "a missing watermark reads as a day ago, not the epoch: {missing}"
+        );
+        std::fs::write(&path, "{ not json").unwrap();
+        let corrupt = read_watermark(&path);
+        assert!(
+            (now - corrupt).num_hours() >= 23,
+            "a corrupt watermark must be nonfatal: {corrupt}"
+        );
+        let at = now - chrono::Duration::minutes(5);
+        write_watermark(&path, at).unwrap();
+        assert!(
+            (read_watermark(&path) - at).num_seconds().abs() <= 1,
+            "watermark round-trip"
+        );
+        // Writing into a directory that does not exist must not take the app down.
+        let _ = write_watermark(&tmp.path().join("nope/deeper/w.json"), at);
+        assert!(
+            watermark_path().starts_with(registry::spar_home()),
+            "a cross-project watermark cannot live in a per-project .spar/"
+        );
+    }
+
+    /// AC-25. The band the operator is looking at must not empty underneath
+    /// them: the watermark is read once and held for the session, so re-deriving
+    /// Home from the same `App` gives the same band 3.
+    #[test]
+    fn the_finished_band_is_stable_while_the_session_is_open() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let mut app = App::new(None, Config::default(), Some(root.as_path()));
+        // `App::new` reads whatever watermark happens to be at `watermark_path()`
+        // under this process's `spar_home()` — a round-7 review finding noted that
+        // the ambient file (real under a caller-set `SPAR_HOME`, a fresh per-process
+        // temp dir otherwise) makes this assertion depend on state outside the test.
+        // Pin it explicitly so the assertion holds regardless of the environment.
+        app.home_watermark = Utc::now() - chrono::Duration::hours(1);
+        let folded = vec![vec![run_in("justdone", Phase::Done, 1, &root)]];
+        let first = build_home_rows(
+            &projects,
+            &folded,
+            &app.home_scope,
+            app.home_watermark,
+            Utc::now(),
+        );
+        let later = build_home_rows(
+            &projects,
+            &folded,
+            &app.home_scope,
+            app.home_watermark,
+            Utc::now() + chrono::Duration::minutes(30),
+        );
+        assert_eq!(
+            ids_in(&first, HomeBand::Finished),
+            ids_in(&later, HomeBand::Finished),
+            "the watermark must not advance while the operator is looking at it"
+        );
+        assert!(!ids_in(&first, HomeBand::Finished).is_empty());
+    }
+
+    // -- Phase C: navigation --------------------------------------------------
+
+    fn nav_rows(root: &Path) -> Vec<HomeRow> {
+        vec![
+            HomeRow::Header(HomeBand::NeedsMe),
+            HomeRow::Run {
+                band: HomeBand::NeedsMe,
+                run: run_in("gate0001", Phase::AwaitingShipConfirm, 90, root),
+                waited: Duration::from_secs(5400),
+            },
+            HomeRow::Header(HomeBand::Running),
+            HomeRow::Run {
+                band: HomeBand::Running,
+                run: run_in("work0001", Phase::Review, 2, root),
+                waited: Duration::from_secs(120),
+            },
+            HomeRow::Header(HomeBand::Finished),
+            HomeRow::Header(HomeBand::StartNew),
+            HomeRow::NewRun,
+        ]
+    }
+
+    /// AC-26. Navigation steps over headers, and never lands on one — including
+    /// at both ends of the list, where a naive clamp puts the cursor on the
+    /// band-1 header or the band-4 header.
+    #[test]
+    fn home_navigation_never_lands_on_a_header() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let rows = nav_rows(&root);
+        let mut app = App::new(None, Config::default(), None);
+        assert_eq!(rail_len(BrowseLevel::Home, 0, rows.len(), 0, 0), rows.len());
+        // Sweep the whole list in both directions, plus the paging deltas.
+        for delta in [1i32, -1, 5, -5] {
+            let mut app = App::new(None, Config::default(), None);
+            for _ in 0..(rows.len() * 2) {
+                rail_move(&mut app, &[], &rows, &[], 0, delta);
+                assert!(
+                    !matches!(rows.get(app.selected_home), Some(HomeRow::Header(_))),
+                    "delta {delta} landed the cursor on a header at {}",
+                    app.selected_home
+                );
+                assert!(app.selected_home < rows.len(), "cursor left the list");
+            }
+        }
+        // A mouse click on a header is ignored rather than selecting it.
+        app.selected_home = 1;
+        rail_select(&mut app, 0, 0, &rows, 0, 0);
+        assert_eq!(
+            app.selected_home, 1,
+            "a click on a header must not move the cursor"
+        );
+        rail_select(&mut app, 3, 0, &rows, 0, 0);
+        assert_eq!(app.selected_home, 3, "a click on a run row selects it");
+    }
+
+    /// AC-27. `Enter` on a Home run row opens **that run's agents** (the
+    /// feature's navigation rule), switching the active project to the row's
+    /// own project. `Esc` then exposes that project's runs, and the next `Esc`
+    /// returns to Home. `Esc` at Home is a no-op and never quits.
+    #[test]
+    fn enter_on_a_home_run_row_opens_that_runs_agents() {
+        let root = PathBuf::from("/nonexistent/acme-api");
+        let rows = nav_rows(&root);
+        let mut app = App::new(None, Config::default(), None);
+        app.selected_home = 1; // the gated run
+        let mut active = PathBuf::from("/nonexistent/elsewhere");
+        rail_enter(&mut app, &[], &rows, &[], None, &mut active, None);
+        assert_eq!(
+            app.browse,
+            BrowseLevel::Agents,
+            "Enter opens the run's agents"
+        );
+        assert_eq!(active, root, "the active project follows the row");
+        assert_eq!(
+            app.home_target_run.as_deref(),
+            Some("gate0001"),
+            "the run is carried by identity across the snapshot handoff"
+        );
+        app.rail_pop();
+        assert_eq!(app.browse, BrowseLevel::Runs);
+        app.rail_pop();
+        assert_eq!(app.browse, BrowseLevel::Home);
+        app.rail_pop();
+        assert_eq!(app.browse, BrowseLevel::Home, "Esc at the root is a no-op");
+
+        // A project row takes the project route instead; the action row opens
+        // the Phase D surface.
+        let projects = [project_at(&root, "acme-api")];
+        let rows = vec![
+            HomeRow::Header(HomeBand::StartNew),
+            HomeRow::NewRun,
+            HomeRow::Project(0, root.clone()),
+        ];
+        let mut app = App::new(None, Config::default(), None);
+        app.selected_home = 2;
+        let mut active = PathBuf::from("/nonexistent/elsewhere");
+        rail_enter(&mut app, &projects, &rows, &[], None, &mut active, None);
+        assert_eq!(app.browse, BrowseLevel::Runs);
+        assert_eq!(active, root);
+
+        let mut app = App::new(None, Config::default(), None);
+        app.selected_home = 1;
+        let mut active = PathBuf::from("/nonexistent/elsewhere");
+        rail_enter(&mut app, &projects, &rows, &[], None, &mut active, None);
+        assert!(
+            app.new_run.is_some(),
+            "the action row opens the new-run surface"
+        );
+
+        // A header is inert.
+        let mut app = App::new(None, Config::default(), None);
+        app.selected_home = 0;
+        let before = app.browse;
+        rail_enter(&mut app, &projects, &rows, &[], None, &mut active, None);
+        assert_eq!(app.browse, before, "Enter on a header does nothing");
+        assert!(app.new_run.is_none());
+    }
+
+    /// Round-7 review finding (review-1-cli-claude, major): a Home `Enter` target
+    /// that never reappears in the snapshot (archived, its dir removed, or a
+    /// different leg becomes the fold's loudest member) used to pin
+    /// `home_target_run` forever, leaving Main/Agents empty with no way out short
+    /// of manually picking a different row. `resolve_home_target` must give up once
+    /// the wall-clock `HOME_TARGET_GIVE_UP` budget elapses, release the pin, flash,
+    /// and return to Home — while a target that is merely one snapshot behind (R2)
+    /// still resolves normally and does not trip the give-up path early.
+    #[test]
+    fn a_ghost_home_target_eventually_releases_the_pin() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let runs = vec![run_in("keep0001", Phase::Review, 5, &root)];
+
+        // The target is present: resolves immediately, no ticks spent.
+        let mut app = App::new(None, Config::default(), None);
+        app.home_target_run = Some("keep0001".into());
+        app.browse = BrowseLevel::Agents;
+        assert!(resolve_home_target(&mut app, &runs, true));
+        assert!(app.home_target_run.is_none());
+        assert!(app.home_target_since.is_none());
+        assert_eq!(app.selected_run, 0);
+
+        // The target is missing (R2's one-tick lag, or a run that is truly gone): the
+        // clock starts but the pin holds while inside the budget. Called many times to
+        // prove the budget is wall clock, not call count — the previous counter gave up
+        // after a fixed number of calls regardless of elapsed time.
+        let mut app = App::new(None, Config::default(), None);
+        app.home_target_run = Some("ghost0001".into());
+        app.browse = BrowseLevel::Agents;
+        for _ in 0..200 {
+            assert!(!resolve_home_target(&mut app, &runs, true));
+            assert!(
+                app.home_target_run.is_some(),
+                "must not give up while inside the budget"
+            );
+        }
+        assert_eq!(app.browse, BrowseLevel::Agents);
+
+        // Past the deadline: the pin releases and Home reclaims focus. Backdating the
+        // start beats sleeping for the budget.
+        app.home_target_since = Some(
+            Instant::now()
+                .checked_sub(HOME_TARGET_GIVE_UP * 2)
+                .expect("monotonic clock is older than the give-up budget"),
+        );
+        assert!(!resolve_home_target(&mut app, &runs, true));
+        assert!(app.home_target_run.is_none(), "the ghost pin must release");
+        assert!(app.home_target_since.is_none());
+        assert_eq!(app.browse, BrowseLevel::Home);
+        assert!(
+            app.flash.is_some(),
+            "the operator must be told the run went away"
+        );
+    }
+
+    /// Review 3be317b2 (major): the give-up clock used to start on the very first
+    /// post-`Enter` frame, whose snapshot is normally still Home's own (cross-project,
+    /// `runs` empty) rather than the target project's. A slow scan of the target
+    /// project (the "thousands of run dirs" scale the give-up budget exists at) could
+    /// then exceed `HOME_TARGET_GIVE_UP` before that project's snapshot ever landed,
+    /// discarding a perfectly legitimate Home `Enter`. The clock must not start until
+    /// `resolve_home_target` has actually been handed a snapshot for the target's own
+    /// project — an arbitrary number of misses against a snapshot for some *other*
+    /// project must not burn the budget at all.
+    #[test]
+    fn the_give_up_clock_does_not_start_before_the_target_projects_own_snapshot() {
+        let runs: Vec<state::RunSummary> = Vec::new();
+
+        let mut app = App::new(None, Config::default(), None);
+        app.home_target_run = Some("ghost0001".into());
+        app.browse = BrowseLevel::Agents;
+
+        // Home's own (cross-project) snapshot keeps arriving instead of the target
+        // project's — none of these may start the clock.
+        for _ in 0..50 {
+            assert!(!resolve_home_target(&mut app, &runs, false));
+            assert!(app.home_target_since.is_none(), "clock must not start yet");
+        }
+
+        // The target project's own snapshot finally lands (still without the run):
+        // only now does the clock start.
+        assert!(!resolve_home_target(&mut app, &runs, true));
+        assert!(app.home_target_since.is_some(), "clock starts here");
+        assert_eq!(app.browse, BrowseLevel::Agents, "still inside the budget");
+
+        // Backdate past the deadline and confirm the give-up still fires from here.
+        app.home_target_since = Some(
+            Instant::now()
+                .checked_sub(HOME_TARGET_GIVE_UP * 2)
+                .expect("monotonic clock is older than the give-up budget"),
+        );
+        assert!(!resolve_home_target(&mut app, &runs, true));
+        assert!(app.home_target_run.is_none(), "the ghost pin must release");
+        assert_eq!(app.browse, BrowseLevel::Home);
+    }
+
+    /// Round-2 review (major, both reviewers): the give-up clock's classification of
+    /// "does this snapshot actually cover the target project" used to be root
+    /// equality alone (`snap.swarm.project_root == active_root`), which is trivially
+    /// true for the still-displayed Home snapshot when the operator enters a run
+    /// whose project is already `active_root` — that snapshot never scanned any
+    /// project's runs (`build_snapshot` only populates `runs` `if
+    /// sel.browse.in_project()`), so the clock could start before any real
+    /// per-project snapshot had landed. `snapshot_covers_target` must additionally
+    /// require the snapshot to have been built at an in-project browse level.
+    #[test]
+    fn snapshot_covers_target_requires_an_in_project_snapshot_not_just_a_matching_root() {
+        let root = PathBuf::from("/nonexistent/spar");
+
+        let mut home_snap = Snapshot::loading(&root);
+        home_snap.browse = BrowseLevel::Home;
+        assert!(
+            !snapshot_covers_target(&home_snap, &root),
+            "a Home-level snapshot never scanned this project's runs, even with a \
+             matching root"
+        );
+
+        let mut runs_snap = Snapshot::loading(&root);
+        runs_snap.browse = BrowseLevel::Runs;
+        assert!(
+            snapshot_covers_target(&runs_snap, &root),
+            "an in-project snapshot with a matching root is the real thing"
+        );
+
+        let mut other_project_snap = Snapshot::loading(&PathBuf::from("/nonexistent/elsewhere"));
+        other_project_snap.browse = BrowseLevel::Agents;
+        assert!(
+            !snapshot_covers_target(&other_project_snap, &root),
+            "an in-project snapshot for a different project must not count"
+        );
+    }
+
+    /// AC-28. R3: Home re-ranks every snapshot (wait time changes every
+    /// minute), so the cursor is glued to the row's identity, not its index.
+    #[test]
+    fn the_home_cursor_follows_the_row_not_the_index() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let rows = nav_rows(&root);
+        let mut app = App::new(None, Config::default(), None);
+        rail_select(&mut app, 3, 0, &rows, 0, 0); // the running run
+        assert_eq!(
+            app.home_key.as_deref(),
+            Some("run:/nonexistent/spar:work0001")
+        );
+
+        // Next snapshot: a new gate arrives and pushes everything down.
+        let mut reordered = vec![
+            HomeRow::Header(HomeBand::NeedsMe),
+            HomeRow::Run {
+                band: HomeBand::NeedsMe,
+                run: run_in("newgate1", Phase::AwaitingPlanApproval, 120, &root),
+                waited: Duration::from_secs(7200),
+            },
+        ];
+        reordered.extend(rows.iter().skip(1).cloned());
+        resync_home_selection(&mut app, &reordered);
+        match reordered.get(app.selected_home) {
+            Some(HomeRow::Run { run, .. }) => assert_eq!(run.id, "work0001"),
+            other => panic!("cursor jumped to {other:?}"),
+        }
+
+        // The row it was on disappearing must clamp, not index out of bounds.
+        let shrunk = vec![HomeRow::Header(HomeBand::StartNew), HomeRow::NewRun];
+        resync_home_selection(&mut app, &shrunk);
+        assert!(app.selected_home < shrunk.len());
+        assert!(!matches!(shrunk[app.selected_home], HomeRow::Header(_)));
+    }
+
+    /// AC-29. `a` still works at the landing view: it cycles the Home cursor
+    /// through band 1 instead of telling the operator to open a project first.
+    #[test]
+    fn a_cycles_the_needs_me_band_at_home() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let rows = vec![
+            HomeRow::Header(HomeBand::NeedsMe),
+            HomeRow::Run {
+                band: HomeBand::NeedsMe,
+                run: run_in("gate0001", Phase::AwaitingShipConfirm, 90, &root),
+                waited: Duration::from_secs(5400),
+            },
+            HomeRow::Run {
+                band: HomeBand::NeedsMe,
+                run: run_in("gate0002", Phase::AwaitingPlanApproval, 30, &root),
+                waited: Duration::from_secs(1800),
+            },
+            HomeRow::Header(HomeBand::Running),
+            HomeRow::Run {
+                band: HomeBand::Running,
+                run: run_in("work0001", Phase::Review, 2, &root),
+                waited: Duration::from_secs(120),
+            },
+            HomeRow::Header(HomeBand::Finished),
+            HomeRow::Header(HomeBand::StartNew),
+            HomeRow::NewRun,
+        ];
+        let mut app = App::new(None, Config::default(), None);
+        app.selected_home = 1;
+        jump_to_attention(&mut app, &[], &rows);
+        assert_eq!(app.selected_home, 2, "next gate");
+        jump_to_attention(&mut app, &[], &rows);
+        assert_eq!(app.selected_home, 1, "wraps within band 1");
+        let flashed = app
+            .flash
+            .as_ref()
+            .map(|(_, m, _, _)| m.clone())
+            .unwrap_or_default();
+        assert!(
+            !flashed.contains("open a project first"),
+            "Home is not a place where `a` is dead: {flashed:?}"
+        );
+    }
+
+    // -- Phase D: the new-run surface and the fleet picker --------------------
+
+    fn cfg_with(order: &[&str]) -> Config {
+        Config {
+            providers: crate::config::ProviderConfig {
+                order: order.iter().map(|s| s.to_string()).collect(),
+            },
+            ..Config::default()
+        }
+    }
+
+    /// AC-30. The roster is built from configured refs, detected CLIs and the
+    /// most recent fleet. A configured `api:` ref stays selectable even though
+    /// CLI detection knows nothing about it; a configured native ref whose
+    /// binary is not on PATH is disabled **with a reason**; a malformed ref is
+    /// disabled and says why.
+    #[test]
+    fn the_roster_keeps_api_refs_selectable_and_explains_what_it_disables() {
+        let cfg = cfg_with(&[
+            "api:openai@gpt-5.6",
+            "api:notreal",
+            "cli:claude@opus",
+            "cli:nosuchcli",
+            "claude",
+        ]);
+        let detected = [
+            ("claude".to_string(), true),
+            ("codex".to_string(), true),
+            ("nosuchcli".to_string(), false),
+        ];
+        let roster = build_roster(&cfg, &detected, None);
+        let by = |label: &str| {
+            roster
+                .iter()
+                .find(|e| e.label.contains(label))
+                .unwrap_or_else(|| panic!("{label} missing from roster: {roster:?}"))
+        };
+        let api = by("api:openai");
+        assert!(api.available, "a supported api: ref must stay selectable");
+        assert_eq!(api.source, RosterSource::Configured);
+
+        let unsupported = by("api:notreal");
+        assert!(
+            !unsupported.available,
+            "an unsupported api: provider must not be launchable"
+        );
+        assert!(
+            unsupported.reason.as_deref().is_some_and(|r| !r.is_empty()),
+            "a disabled unsupported api: ref must say why"
+        );
+
+        let claude = by("cli:claude@opus");
+        assert!(claude.available);
+        assert!(
+            claude.label.contains("@opus"),
+            "a configured model pin must survive into the picker: {:?}",
+            claude.label
+        );
+
+        let missing = by("cli:nosuchcli");
+        assert!(!missing.available);
+        assert!(
+            missing.reason.as_deref().is_some_and(|r| !r.is_empty()),
+            "a disabled row must say why"
+        );
+
+        let malformed = by("claude");
+        assert!(
+            !malformed.available && malformed.reason.is_some(),
+            "a bare name is not a provider ref and must explain itself: {malformed:?}"
+        );
+
+        // Detection adds what config did not list, and never duplicates it.
+        assert_eq!(
+            roster
+                .iter()
+                .filter(|e| matches!(&e.choice, RosterChoice::Provider(p) if p.starts_with("cli:claude")))
+                .count(),
+            1,
+            "a detected CLI must not duplicate its configured entry: {roster:?}"
+        );
+        let codex = by("cli:codex");
+        assert_eq!(codex.source, RosterSource::Detected);
+
+        // R7: nothing configured, nothing on PATH — an explanatory empty
+        // roster (so the `spar doctor` pointer fires), not disabled rows.
+        let bare = build_roster(&cfg_with(&[]), &[("claude".into(), false)], None);
+        assert!(
+            bare.is_empty(),
+            "nothing usable must be an empty roster, not disabled rows: {bare:?}"
+        );
+
+        // R7, the realistic shape: an untouched `Config::default()` still carries
+        // `default_provider_order()`, so with nothing on PATH the roster is three
+        // *configured*, unavailable rows, not empty. `draw_new_run` gates the
+        // doctor pointer on "nothing available", not "nothing present" — see the
+        // render-level assertion in `render_stability`.
+        let default_roster = build_roster(&Config::default(), &[], None);
+        assert!(
+            !default_roster.is_empty(),
+            "the default provider order must still emit configured rows: {default_roster:?}"
+        );
+        assert!(
+            default_roster.iter().all(|e| !e.available),
+            "with nothing on PATH every default-order row must be unavailable: {default_roster:?}"
+        );
+    }
+
+    /// Round-7 review finding (review-0-cli-codex, minor): the registry lists
+    /// projects by `last_seen` (last *opened*, not last progressed), so picking the
+    /// first project with a `last_run_id` could offer a stale fleet from a project
+    /// the operator merely glanced at, instead of the run that actually moved most
+    /// recently anywhere in the roster.
+    #[test]
+    fn most_recent_fleet_ignores_input_order() {
+        let old = Utc::now() - chrono::Duration::hours(2);
+        let newer = Utc::now() - chrono::Duration::minutes(5);
+        // The registry-order-first candidate is the *older* run; the true most
+        // recent one comes later in the input order.
+        let candidates = vec![
+            (old, "stale0001".to_string(), vec!["cli:codex".to_string()]),
+            (
+                newer,
+                "fresh0002".to_string(),
+                vec!["cli:claude".to_string()],
+            ),
+        ];
+        let (id, providers) = most_recent_fleet(candidates).expect("a candidate exists");
+        assert_eq!(
+            id, "fresh0002",
+            "the actually-latest run must win, not the first listed"
+        );
+        assert_eq!(providers, vec!["cli:claude".to_string()]);
+
+        assert!(most_recent_fleet(Vec::new()).is_none());
+    }
+
+    /// Round-7 review finding (review-1-cli-claude, minor): a scoped Home target
+    /// that has not yet reached the registry (e.g. a project just entered, one
+    /// refresh behind `registry::ensure_known`) used to be absent from
+    /// `nr.projects`, so `←`/`→` fell back to `unwrap_or(0)` and silently jumped
+    /// to an unrelated registered project with no way back to the original scope.
+    #[test]
+    fn open_new_run_keeps_an_unregistered_scope_target_reachable() {
+        let root = PathBuf::from("/nonexistent/unregistered");
+        let mut app = App::new(None, Config::default(), Some(root.as_path()));
+        assert_eq!(app.home_scope, HomeScope::Project(root.clone()));
+
+        let other = project_at(&PathBuf::from("/nonexistent/acme-api"), "acme-api");
+        open_new_run(
+            &mut app,
+            std::slice::from_ref(&other),
+            &[],
+            Some(root.as_path()),
+            None,
+        );
+        let nr = app.new_run.as_ref().unwrap();
+        assert_eq!(nr.project.as_deref(), Some(root.as_path()));
+        assert!(
+            nr.projects.contains(&root),
+            "the scoped target must be cycleable even if the registry hasn't caught \
+             up yet: {:?}",
+            nr.projects
+        );
+
+        // Cycling all the way around must return to the original target, not strand
+        // it: this is what the `unwrap_or(0)` fallback used to break.
+        let n = app.new_run.as_ref().unwrap().projects.len();
+        app.new_run.as_mut().unwrap().field = NewRunField::Project;
+        for _ in 0..n {
+            handle_new_run_key(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        }
+        assert_eq!(
+            app.new_run.as_ref().unwrap().project.as_deref(),
+            Some(root.as_path()),
+            "a full cycle must land back on the original scope target"
+        );
+    }
+
+    /// Review finding (review-0-cli-codex, major): a scoped Home used to offer
+    /// every registered project to cycle through even though it is scoped to
+    /// one, so `→` could silently launch the plan against a project the
+    /// operator was not looking at. With two other registered projects in the
+    /// registry, the scoped target must be the *only* entry in `nr.projects`.
+    #[test]
+    fn open_new_run_cannot_cycle_out_of_a_scoped_home() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let mut app = App::new(None, Config::default(), Some(root.as_path()));
+        assert_eq!(app.home_scope, HomeScope::Project(root.clone()));
+
+        let projects = [
+            project_at(&root, "spar"),
+            project_at(&PathBuf::from("/nonexistent/acme-api"), "acme-api"),
+            project_at(&PathBuf::from("/nonexistent/other"), "other"),
+        ];
+        open_new_run(&mut app, &projects, &[], Some(root.as_path()), None);
+        let nr = app.new_run.as_ref().unwrap();
+        assert_eq!(
+            nr.projects,
+            vec![root.clone()],
+            "a scoped Home must not offer projects outside its scope: {:?}",
+            nr.projects
+        );
+
+        app.new_run.as_mut().unwrap().field = NewRunField::Project;
+        handle_new_run_key(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(
+            app.new_run.as_ref().unwrap().project.as_deref(),
+            Some(root.as_path()),
+            "→ must not be able to leave the scoped target"
+        );
+    }
+
+    /// Round-9 review (review-0-cli-codex, major): `:plan <task>` with no run
+    /// selected used to target `swarm.project_root` (`active_root`, stale while
+    /// browsing Home) instead of the highlighted Home row. In cross-project Home with
+    /// project A first in the registry and the cursor on a run in project B, the
+    /// palette must open the new-run surface targeting B — the same target `n` (via
+    /// `open_new_run`) would pick — not silently fall back to A.
+    #[test]
+    fn plan_palette_fallback_targets_the_selected_home_row_not_active_root() {
+        let a = PathBuf::from("/nonexistent/acme-api");
+        let b = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&a, "acme-api"), project_at(&b, "spar")];
+        let run_b = run_in("bbbb0001", Phase::Review, 5, &b);
+        let home_rows = vec![
+            HomeRow::Header(HomeBand::Running),
+            HomeRow::Run {
+                band: HomeBand::Running,
+                run: run_b,
+                waited: Duration::ZERO,
+            },
+        ];
+        let mut app = App::new(None, Config::default(), None);
+        app.home_scope = HomeScope::All;
+        app.selected_home = 1; // the row in project B
+
+        // `swarm` stands for `active_root` — deliberately project A, the way it lags
+        // behind while the operator is looking at Home rather than a project.
+        let swarm = SparPaths::new(&a);
+        let runs: Vec<state::RunSummary> = Vec::new();
+        run_palette(
+            &mut app,
+            &swarm,
+            &projects,
+            &home_rows,
+            None,
+            &runs,
+            None,
+            swarm.project_root.as_path(),
+            "plan do the thing",
+        )
+        .unwrap();
+        assert_eq!(
+            app.new_run.as_ref().unwrap().project.as_deref(),
+            Some(b.as_path()),
+            "the fallback must target the selected Home row's project, not active_root"
+        );
+    }
+
+    /// Review 3be317b2 (major): `:plan <task>` at `BrowseLevel::Projects` had the
+    /// identical bug `n` was fixed for — it read `swarm.project_root`, which the run
+    /// loop only refreshes in the pre-input clamp, so a queued `j` (or a click)
+    /// followed by `:plan` in the same input burst targeted the previously
+    /// highlighted project. The fix reads `projects[app.selected_project]` directly,
+    /// same as `n`.
+    #[test]
+    fn plan_palette_at_projects_targets_the_row_selected_in_the_same_input_burst() {
+        let a = PathBuf::from("/nonexistent/alpha");
+        let b = PathBuf::from("/nonexistent/bravo");
+        let projects = [project_at(&a, "alpha"), project_at(&b, "bravo")];
+        let mut app = App::new(None, Config::default(), None);
+        app.open_projects_view();
+        app.selected_project = 1; // `j` already moved the highlight to bravo
+
+        // Stale on purpose: this is what the pre-input clamp left behind for `alpha`,
+        // exactly as `run_loop` would hand it to `run_palette` mid-burst.
+        let swarm = SparPaths::new(&a);
+        let runs: Vec<state::RunSummary> = Vec::new();
+        run_palette(
+            &mut app,
+            &swarm,
+            &projects,
+            &[],
+            None,
+            &runs,
+            None,
+            swarm.project_root.as_path(),
+            "plan do the thing",
+        )
+        .unwrap();
+        assert_eq!(
+            app.new_run.as_ref().unwrap().project.as_deref(),
+            Some(b.as_path()),
+            "the modal must target the row `j` just selected, not the stale swarm.project_root"
+        );
+    }
+
+    /// Round-11 review (review-1-cli-claude, major): `n` used to target the wrong
+    /// project whenever the operator had drilled into a project other than their
+    /// Home scope, with no way to correct it. `spar` inside repo A scopes Home to A;
+    /// `Enter` on a Home run row in project B sets `active_root = B` and opens
+    /// `Agents`, at which point `home_rows` is empty (only populated at Home/Projects)
+    /// and `home_scope` still reads `Project(A)`. `n` pressed there must target B, the
+    /// project actually being browsed, not the stale scope.
+    #[test]
+    fn open_new_run_targets_the_browsed_project_not_a_stale_home_scope() {
+        let a = PathBuf::from("/nonexistent/repo-a");
+        let b = PathBuf::from("/nonexistent/repo-b");
+        let mut app = App::new(None, Config::default(), Some(a.as_path()));
+        assert_eq!(app.home_scope, HomeScope::Project(a.clone()));
+        app.browse = BrowseLevel::Agents;
+
+        let projects = [project_at(&a, "repo-a"), project_at(&b, "repo-b")];
+        open_new_run(&mut app, &projects, &[], None, Some(b.as_path()));
+        let nr = app.new_run.as_ref().unwrap();
+        assert_eq!(
+            nr.project.as_deref(),
+            Some(b.as_path()),
+            "n must target the project actually being browsed, not the Home scope"
+        );
+        assert_eq!(
+            nr.projects,
+            vec![b.clone()],
+            "browsing inside a project is scoped exactly like a scoped Home: no \
+             cycling to an unrelated project: {:?}",
+            nr.projects
+        );
+    }
+
+    /// AC-31. A recent fleet is one roster row standing for several providers.
+    /// Picking it expands, and expansion deduplicates in first-picked order —
+    /// a comma-joined string is not a provider reference.
+    #[test]
+    fn a_recent_fleet_expands_and_dedupes_in_pick_order() {
+        let cfg = cfg_with(&["cli:claude@opus", "cli:codex@gpt-5.6-terra"]);
+        let fleet = vec![
+            "cli:codex@gpt-5.6-terra".to_string(),
+            "cli:muse@muse-spark-1.2-contributor".to_string(),
+        ];
+        let roster = build_roster(&cfg, &[("claude".into(), true)], Some(("ab12cd34", &fleet)));
+        let fleet_idx = roster
+            .iter()
+            .position(|e| matches!(e.choice, RosterChoice::Fleet(_)))
+            .expect("the recent fleet is a roster choice");
+        assert_eq!(roster[fleet_idx].source, RosterSource::RecentFleet);
+        assert!(
+            roster[fleet_idx].label.contains("ab12cd34"),
+            "the fleet row names the run it came from: {:?}",
+            roster[fleet_idx].label
+        );
+
+        let claude_idx = roster
+            .iter()
+            .position(|e| matches!(&e.choice, RosterChoice::Provider(p) if p == "cli:claude@opus"))
+            .unwrap();
+        let codex_idx = roster
+            .iter()
+            .position(
+                |e| matches!(&e.choice, RosterChoice::Provider(p) if p == "cli:codex@gpt-5.6-terra"),
+            )
+            .unwrap();
+
+        let mut nr = new_run_fixture();
+        nr.roster = roster;
+        nr.picked = vec![claude_idx, fleet_idx, codex_idx];
+        assert_eq!(
+            new_run_providers(&nr),
+            vec![
+                "cli:claude@opus".to_string(),
+                "cli:codex@gpt-5.6-terra".to_string(),
+                "cli:muse@muse-spark-1.2-contributor".to_string(),
+            ],
+            "expanded, deduplicated, in the order they were picked"
+        );
+    }
+
+    /// Round-9 review (minor): dedup used to key on the exact ref string, so a
+    /// detected `cli:claude` row and a configured `cli:claude@opus` row picked
+    /// together dispatched the same CLI twice. Dedup keys on `storage_key()` (X8,
+    /// model-free) instead, keeping the first-picked ref's `@model` pin.
+    #[test]
+    fn new_run_providers_dedupes_a_pinned_ref_against_its_bare_form() {
+        let mut nr = new_run_fixture();
+        nr.roster = vec![
+            RosterEntry {
+                choice: RosterChoice::Provider("cli:claude".to_string()),
+                label: "cli:claude".to_string(),
+                available: true,
+                reason: None,
+                source: RosterSource::Detected,
+            },
+            RosterEntry {
+                choice: RosterChoice::Provider("cli:claude@opus".to_string()),
+                label: "cli:claude@opus".to_string(),
+                available: true,
+                reason: None,
+                source: RosterSource::Configured,
+            },
+        ];
+        nr.picked = vec![1, 0]; // the pinned ref picked first
+        assert_eq!(
+            new_run_providers(&nr),
+            vec!["cli:claude@opus".to_string()],
+            "the same CLI picked twice (pinned and bare) must dispatch once"
+        );
+    }
+
+    /// AC-32. R8/O-invariant: `--providers` is required on `plan`, so the
+    /// surface refuses rather than building a malformed argv. It also refuses
+    /// without a task and without a target project — the empty-registry case,
+    /// where an arbitrary cwd must never be treated as a project.
+    #[test]
+    fn the_new_run_surface_refuses_before_it_spawns() {
+        let mut nr = new_run_fixture();
+        nr.picked.clear();
+        assert!(
+            new_run_launch(&nr).is_err(),
+            "zero providers must not dispatch a fleet-less plan"
+        );
+
+        let mut nr = new_run_fixture();
+        nr.task = "   ".into();
+        assert!(
+            new_run_launch(&nr).is_err(),
+            "an empty task must not dispatch"
+        );
+
+        let mut nr = new_run_fixture();
+        nr.project = None;
+        nr.projects.clear();
+        let err = new_run_launch(&nr).unwrap_err();
+        assert!(
+            !err.is_empty(),
+            "no target project must be an explained refusal, not a launch against the cwd"
+        );
+
+        // A disabled roster row cannot be picked into a fleet.
+        let mut nr = new_run_fixture();
+        nr.roster[1].available = false;
+        nr.roster[1].reason = Some("not on PATH".into());
+        nr.picked = vec![1];
+        assert!(
+            new_run_launch(&nr).is_err(),
+            "an unavailable provider must not reach argv"
+        );
+
+        // The happy path: the target project comes from the surface, not from
+        // whatever the active root happens to be, and the argv is the same
+        // `plan -t … --providers …` the palette already sends.
+        let nr = new_run_fixture();
+        let (target, argv) = new_run_launch(&nr).expect("a valid surface launches");
+        assert_eq!(target, PathBuf::from("/nonexistent/spar"));
+        assert_eq!(argv[0], "plan");
+        let t = argv.iter().position(|a| a == "-t").expect("-t");
+        assert_eq!(argv[t + 1], nr.task);
+        let p = argv
+            .iter()
+            .position(|a| a == "--providers")
+            .expect("--providers is required on plan");
+        assert_eq!(argv[p + 1], "cli:claude@opus");
+    }
+
+    /// AC-35. The docs and decision rows are part of this change, not a
+    /// follow-up: the embedded operator skill describes a rail root that will
+    /// no longer exist, the IA doc still lists the Phase B scan as outstanding,
+    /// and the calls a future agent could reverse need rows.
+    #[test]
+    fn the_agent_facing_docs_move_with_the_feature() {
+        let core = include_str!("../skills/core.md");
+        assert!(
+            !core.contains(concat!("projects ▸ runs", " ▸ agents")),
+            "skills/core.md still calls Projects the rail root"
+        );
+        assert!(
+            core.contains("Home"),
+            "skills/core.md must describe the landing view"
+        );
+        for key in ["`n`", "`P`"] {
+            assert!(
+                core.contains(key),
+                "skills/core.md must document the new key {key}"
+            );
+        }
+
+        let ia = include_str!("../docs/architecture-tui-ia.md");
+        assert!(
+            !ia.contains(concat!("remains 004 ", "Phase B's job")),
+            "the IA doc still lists the render-path scan as outstanding"
+        );
+
+        let decisions = include_str!("../DECISIONS.md");
+        for row in [
+            "| U18 |", "| U19 |", "| U20 |", "| U21 |", "| U22 |", "| U23 |",
+        ] {
+            assert!(
+                decisions.contains(row),
+                "DECISIONS.md is missing {row} — a reversible call went unrecorded"
+            );
+        }
+    }
+
+    /// AC-33. U3's punt is retired where it is spoken: with no run selected the
+    /// palette's `plan` opens the surface pre-filled instead of erroring to the
+    /// CLI, `spar --task` seeds the surface rather than the palette, and the
+    /// palette's own help text no longer promises only a reused fleet.
+    #[test]
+    fn the_fresh_fleet_punt_is_retired() {
+        let app = App::new(Some("describe the change".into()), Config::default(), None);
+        let nr = app
+            .new_run
+            .as_ref()
+            .expect("`spar --task` must open the new-run surface");
+        assert_eq!(nr.task, "describe the change");
+        assert!(
+            app.palette.is_none(),
+            "the task seed no longer opens a pre-filled palette"
+        );
+
+        let plan_help = PALETTE_CMDS
+            .iter()
+            .find(|c| c.name == "plan")
+            .map(|c| c.help)
+            .expect("a plan verb");
+        assert!(
+            !plan_help.contains("reuses the selected run's fleet"),
+            "the palette still says a fresh fleet is impossible: {plan_help:?}"
         );
     }
 }
