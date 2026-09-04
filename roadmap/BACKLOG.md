@@ -151,3 +151,18 @@ that for finished runs. These two reduce how much gets created in the first plac
   running session. O50 gave muse `DeliveryStrategy::PollFile` instead, which only lands at
   the agent's next major step. Wiring the socket would make muse first-class for delivery
   and would let a nudge interrupt an in-progress turn rather than waiting for one.
+
+- **A `seven_day` Claude rate limit is classified as a failure, not quota.** Observed
+  dogfooding on 2026-09-04: two concurrent runs (`bf7770ae`, `abd35a54`) both died with
+  `slot impl failed: exit 1` and `phase = failed`, when the actual cause was in the slot
+  log as `! rate limit  seven_day  rejected` / "You've hit your weekly limit". The quota
+  scrape recognises Claude's `five_hour` JSON and its log phrases; the weekly limit's
+  phrasing is not among them. Three consequences, all bad: the run reports a terminal
+  failure for something that is not broken, `spar provider list` continues to report
+  `claude quota=available` so nothing is paused and the next run walks straight into the
+  same wall, and the exit code is `1` where the contract says a quota stop is `4`. An
+  outer agent driving spar therefore cannot tell "your code failed" from "your account is
+  out of tokens until the window rolls" — the one distinction exit code 4 exists to make.
+  Fix is to add the weekly phrasing to the scrape and route it through the existing quota
+  path, including the provider pause, so a `--detach`ed fleet parks instead of burning a
+  round per run. Worth checking the other adapters for the same gap at the same time.
