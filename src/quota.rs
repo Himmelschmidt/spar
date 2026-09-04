@@ -9,6 +9,38 @@ use std::collections::HashMap;
 /// If it is still rate-limited the run re-pauses it with a fresh window.
 const DEFAULT_COOLDOWN_MINS: i64 = 30;
 
+/// `lower.contains(phrase)` but only accepts a word boundary immediately after the
+/// match, or the plural/past-tense inflections "s"/"ed" followed by a word boundary
+/// ("rate limits", "rate limited"). Rejects "er"/"ing" continuations ("rate limiter",
+/// "rate limiting") and anything else — an ordinary implementer building or testing a
+/// rate limiter must not trip the same discriminator that routes a run to
+/// `Phase::Quota`, but a provider reporting "rate limits exceeded" must.
+fn contains_phrase(lower: &str, phrase: &str) -> bool {
+    let mut start = 0;
+    while let Some(pos) = lower[start..].find(phrase) {
+        let idx = start + pos;
+        let after = &lower[idx + phrase.len()..];
+        if word_boundary_after_phrase(after) {
+            return true;
+        }
+        start = idx + phrase.len();
+    }
+    false
+}
+
+fn word_boundary_after_phrase(after: &str) -> bool {
+    let mut chars = after.chars();
+    match chars.next() {
+        None => true,
+        Some(c) if !c.is_ascii_alphabetic() => true,
+        Some('s') => chars.next().is_none_or(|c| !c.is_ascii_alphabetic()),
+        Some('e') => {
+            chars.next() == Some('d') && chars.next().is_none_or(|c| !c.is_ascii_alphabetic())
+        }
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderStatus {
@@ -160,7 +192,12 @@ impl QuotaStore {
         );
     }
 
-    /// Best-effort scan of log text for quota / rate-limit language.
+    /// Best-effort scan of log text for quota / rate-limit language. Deliberately
+    /// broad: a false positive here only pauses a provider, which is cheap and
+    /// auto-recovers (see `is_usable`). This alone must never decide whether a run
+    /// routes to `Phase::Quota` — that decision needs [`scrape_strong_quota_signal`]
+    /// or [`scrape_claude_rate_limits`], which require a rejection phrase rather than
+    /// a single bare word like "quota" or "capacity" or "429".
     pub fn scrape_log_hint(log: &str) -> Option<String> {
         let lower = log.to_ascii_lowercase();
         let needles = [
@@ -182,11 +219,59 @@ impl QuotaStore {
         }
         None
     }
+
+    /// Narrow, line-scoped signal used only to decide whether a failed dispatch
+    /// routes the *run* to `Phase::Quota`. Each pattern pairs the limit phrase with a
+    /// rejection word on the same line, so a stack trace with a `429` in a line
+    /// number, a test file that mentions "rate limiter", or an implementer editing
+    /// this very module's "quota" code do not misroute a genuine defect as a quota
+    /// hit — the failure mode a broad single-word match (`scrape_log_hint`) is prone
+    /// to and that a routing decision cannot afford.
+    pub fn scrape_strong_quota_signal(log: &str) -> Option<String> {
+        for line in log.lines() {
+            let lower = line.to_ascii_lowercase();
+            let hit = (contains_phrase(&lower, "rate limit")
+                && (lower.contains("rejected")
+                    || lower.contains("exceeded")
+                    || lower.contains("reached")))
+                || (contains_phrase(&lower, "usage limit")
+                    && (lower.contains("reached") || lower.contains("exceeded")))
+                || lower.contains("too many requests")
+                || lower.contains("out of credits")
+                || lower.contains("quota exceeded")
+                // Claude's and codex's own rejection sentences ("You've hit your weekly
+                // limit", "You've hit your usage limit.") are complete, one-line rejection
+                // statements in the same class as the bare "out of credits" above — no
+                // separate rejection word needed, since "hit your ... limit" already is
+                // one. Matched as exact phrases, not "hit your" and "limit" appearing
+                // anywhere on the line: that looser form also matched unrelated prose
+                // ("hit your retry limit") and this crate's own test assertion text.
+                || contains_phrase(&lower, "hit your weekly limit")
+                || contains_phrase(&lower, "hit your usage limit");
+            if hit {
+                return Some(line.trim().to_string());
+            }
+        }
+        None
+    }
 }
 
-/// Parse Claude-style `rate_limits.five_hour` JSON fragments from logs/statusline.
-/// Returns (provider_name, cooldown_until, hint).
-pub fn scrape_claude_rate_limits(log: &str) -> Option<(String, Option<DateTime<Utc>>, String)> {
+/// Parse Claude-style `rate_limits.five_hour` JSON fragments from logs/statusline, or
+/// (failing that) the CLI's plain-text weekly/five-hour rejection line, e.g. `! rate
+/// limit  seven_day  rejected` followed by "You've hit your weekly limit · resets 12am
+/// (America/New_York)". Returns (provider_name, cooldown_until, hint).
+///
+/// Gated on `provider` actually being a claude adapter: both shapes are specific to
+/// the Claude CLI's own output, and a codex/grok/opencode log that happens to contain
+/// "resets " next to a limit phrase must not pause `cli:claude` (a provider that is
+/// fine) instead of, or in addition to, the one that actually failed.
+pub fn scrape_claude_rate_limits(
+    provider: &str,
+    log: &str,
+) -> Option<(String, Option<DateTime<Utc>>, String)> {
+    if normalize_key(provider) != "cli:claude" {
+        return None;
+    }
     // Look for embedded JSON objects containing rate_limits
     for line in log.lines() {
         let t = line.trim();
@@ -212,7 +297,134 @@ pub fn scrape_claude_rate_limits(log: &str) -> Option<(String, Option<DateTime<U
             }
         }
     }
+    scrape_claude_stated_reset(log)
+}
+
+/// The CLI's plain-text rejection states its own reset ("resets 12am
+/// (America/New_York)") rather than emitting the `five_hour` JSON shape above. Only
+/// fires when the log both names a rate/usage limit and states a reset, so it never
+/// fires on an unrelated log that happens to mention "rate limit" in passing. When the
+/// stated reset can be found but not parsed (unknown tz, unexpected format), still
+/// reports the hit so the caller pauses the provider — the fallback is the generic
+/// default-cooldown pause, made visible on stderr rather than silently guessed.
+pub(crate) fn scrape_claude_stated_reset(
+    log: &str,
+) -> Option<(String, Option<DateTime<Utc>>, String)> {
+    let lower = log.to_ascii_lowercase();
+    if !lower.contains("resets ") {
+        return None;
+    }
+    if !(lower.contains("rate limit")
+        || lower.contains("weekly limit")
+        || lower.contains("usage limit"))
+    {
+        return None;
+    }
+    let period = if lower.contains("seven_day") || lower.contains("weekly") {
+        "weekly"
+    } else {
+        "rate"
+    };
+    // The *rendered* sentence carries a wall-clock time and no calendar day, so inferring
+    // the next occurrence of it is sound for a five-hour window and a guess for a weekly
+    // one. That is why this text path never infers a weekly reset. It is not the whole
+    // story though: the structured `rate_limit_event` states the reopening instant
+    // outright (`StreamStats::quota_resets_at`), and when a caller has that it must be
+    // preferred over anything derived here — see `detect_and_pause_quota`.
+    if period == "weekly" {
+        return Some((
+            "cli:claude".into(),
+            None,
+            format!("claude {period} limit (no stated reset instant, default cooldown)"),
+        ));
+    }
+    match parse_stated_reset(log, Utc::now()) {
+        Some(until) => Some((
+            "cli:claude".into(),
+            Some(until),
+            format!("claude {period} limit, resets {}", until.to_rfc3339()),
+        )),
+        None => {
+            eprintln!(
+                "warning: claude {period} limit stated a reset time spar could not parse; \
+                 falling back to the default cooldown window"
+            );
+            Some((
+                "cli:claude".into(),
+                None,
+                format!("claude {period} limit (stated reset unparseable, default cooldown)"),
+            ))
+        }
+    }
+}
+
+/// Parses "resets 12am (America/New_York)" / "resets 3:30pm (UTC)" into the next
+/// occurrence of that local time, in UTC. `now` is threaded through for tests.
+///
+/// Scans every line containing "resets " (not just the first occurrence in the whole
+/// tail log) and returns the first one that parses as a complete `<time> (<tz>)`
+/// clause. An earlier, unrelated "resets " elsewhere in an 8000-byte tail must not
+/// make a real reset line downstream go unparsed and silently degrade to the generic
+/// cooldown.
+fn parse_stated_reset(text: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    for line in text.lines() {
+        if line.to_ascii_lowercase().contains("resets ") {
+            if let Some(until) = parse_reset_clause_in_line(line, now) {
+                return Some(until);
+            }
+        }
+    }
     None
+}
+
+fn parse_reset_clause_in_line(line: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let lower = line.to_ascii_lowercase();
+    let resets_at = lower.find("resets ")? + "resets ".len();
+    let after_resets = &line[resets_at..];
+    let paren_start = after_resets.find('(')?;
+    let paren_end = after_resets[paren_start..].find(')')? + paren_start;
+    let time_part = after_resets[..paren_start].trim();
+    let tz_name = after_resets[paren_start + 1..paren_end].trim();
+    let tz: chrono_tz::Tz = tz_name.parse().ok()?;
+
+    let time_lower = time_part.to_ascii_lowercase();
+    let (digits, is_pm) = if let Some(d) = time_lower.strip_suffix("am") {
+        (d.trim(), false)
+    } else {
+        (time_lower.strip_suffix("pm")?.trim(), true)
+    };
+    let mut parts = digits.splitn(2, ':');
+    let hour_raw: u32 = parts.next()?.trim().parse().ok()?;
+    let minute: u32 = match parts.next() {
+        Some(m) => m.trim().parse().ok()?,
+        None => 0,
+    };
+    if !(1..=12).contains(&hour_raw) || minute > 59 {
+        return None;
+    }
+    let hour = match (hour_raw, is_pm) {
+        (12, false) => 0,
+        (12, true) => 12,
+        (h, false) => h,
+        (h, true) => h + 12,
+    };
+
+    // Calendar-day roll-forward (not `+= Duration::days(1)` on the zoned instant,
+    // which adds a flat 24h and drifts by an hour across a DST transition).
+    let now_local = now.with_timezone(&tz);
+    let mut date = now_local.date_naive();
+    let mut candidate = date
+        .and_hms_opt(hour, minute, 0)?
+        .and_local_timezone(tz)
+        .single()?;
+    if candidate <= now_local {
+        date += chrono::Duration::days(1);
+        candidate = date
+            .and_hms_opt(hour, minute, 0)?
+            .and_local_timezone(tz)
+            .single()?;
+    }
+    Some(candidate.with_timezone(&Utc))
 }
 
 fn parse_rate_limits_value(
@@ -306,6 +518,34 @@ pub fn ensure_usable(paths: &SparPaths, names: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A stated reset gives a wall-clock time and no calendar day. Inferring the next
+    /// occurrence is sound for a five-hour window and a fabrication for a weekly one,
+    /// where the true reset can be days out. Guessing there fails expensively: spar
+    /// re-probes at a time it asserted and walks into the same wall. Both real captured
+    /// messages, one per window.
+    #[test]
+    fn a_weekly_limit_yields_no_inferred_cooldown_and_a_five_hour_one_does() {
+        let weekly = "! rate limit  seven_day  rejected\n\
+                      You've hit your weekly limit \u{b7} resets 12am (America/New_York)\n";
+        let (_, until, hint) = scrape_claude_stated_reset(weekly).expect("weekly must be a hit");
+        assert!(
+            until.is_none(),
+            "a weekly window must not invent a reset day, got {until:?}"
+        );
+        assert!(
+            hint.contains("weekly"),
+            "hint should name the window: {hint}"
+        );
+
+        let five_hour = "! rate limit  five_hour  rejected\n\
+                         You've hit your session limit \u{b7} resets 12:40pm (America/New_York)\n";
+        let (_, until, _) = scrape_claude_stated_reset(five_hour).expect("five-hour must be a hit");
+        assert!(
+            until.is_some(),
+            "a five-hour window's next occurrence is a sound inference and must be kept"
+        );
+    }
     use super::*;
     use tempfile::tempdir;
 
@@ -411,5 +651,199 @@ mod tests {
         assert_eq!(normalize_key("cli:claude"), "cli:claude");
         assert_eq!(normalize_key("cli:claude@opus"), "cli:claude");
         assert_eq!(normalize_key("api:openai"), "api:openai");
+    }
+
+    /// The real captured log text from the dogfooding incident (roadmap/BACKLOG.md).
+    const WEEKLY_LIMIT_LOG: &str = "! rate limit  seven_day  rejected\n\
+        You've hit your weekly limit \u{b7} resets 12am (America/New_York)\n";
+
+    /// Inverted deliberately. This test previously asserted that a weekly reset parses
+    /// into a cooldown "within ~25h". That was the fabrication: the message carries a
+    /// wall-clock time and no calendar day, so for a seven-day window the next
+    /// occurrence of midnight is a guess that can be wrong by six days, and spar acts
+    /// on it by re-probing and walking into the same wall. The generic timer re-probes
+    /// cheaply and asserts nothing, so no inferred cooldown beats a wrong one.
+    #[test]
+    fn scrape_claude_rate_limits_refuses_to_invent_a_weekly_reset_day() {
+        let (name, until, hint) =
+            scrape_claude_rate_limits("cli:claude", WEEKLY_LIMIT_LOG).unwrap();
+        assert_eq!(name, "cli:claude");
+        assert!(
+            until.is_none(),
+            "a weekly window states a time but not a day; inferring one is a guess: {until:?}"
+        );
+        assert!(hint.contains("weekly"), "hint must name the window: {hint}");
+    }
+
+    /// The unparseable-reset fallback is exercised on a *five-hour* window, because
+    /// that is the only window whose reset spar infers at all now; a weekly one returns
+    /// early without consulting the clause.
+    #[test]
+    fn scrape_claude_rate_limits_falls_back_when_reset_unparseable() {
+        let log = "! rate limit  five_hour  rejected\n\
+            You've hit your session limit \u{b7} resets whenever (Nowhere/Fake)\n";
+        let (name, until, hint) = scrape_claude_rate_limits("cli:claude", log).unwrap();
+        assert_eq!(name, "cli:claude");
+        assert!(
+            until.is_none(),
+            "unparseable reset must fall back to the generic default cooldown, not guess"
+        );
+        assert!(hint.contains("unparseable"), "hint: {hint}");
+    }
+
+    #[test]
+    fn scrape_claude_rate_limits_ignores_unrelated_logs() {
+        // Must not fire on an ordinary log that happens to contain "resets" or
+        // "rate limit" out of context — that would misroute a genuine failure.
+        assert!(
+            scrape_claude_rate_limits("cli:claude", "build succeeded, resets are fine").is_none()
+        );
+        assert!(
+            scrape_claude_rate_limits("cli:claude", "connection rate limited by nginx").is_none()
+        );
+    }
+
+    #[test]
+    fn scrape_claude_rate_limits_ignores_non_claude_providers() {
+        // The plain-text stated-reset shape is Claude-specific output; a codex/grok
+        // log that happens to say "resets " next to a limit phrase must not pause
+        // `cli:claude`, a provider that has nothing to do with the failure.
+        assert!(scrape_claude_rate_limits("cli:codex", WEEKLY_LIMIT_LOG).is_none());
+        assert!(scrape_claude_rate_limits("cli:grok", WEEKLY_LIMIT_LOG).is_none());
+    }
+
+    #[test]
+    fn parse_stated_reset_skips_an_earlier_unrelated_resets_line() {
+        // A noisy real log can mention "resets " once before the actual limit line
+        // (e.g. an unrelated cache/session message). The anchor must not lock onto
+        // that first occurrence and give up — it has to keep scanning to the real one.
+        let log = "cache resets every 10 minutes during warmup\n\
+            ! rate limit  seven_day  rejected\n\
+            You've hit your weekly limit \u{b7} resets 12am (America/New_York)\n";
+        let now = DateTime::parse_from_rfc3339("2026-09-04T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let until = parse_stated_reset(log, now).expect("must find the real reset line");
+        assert!(until > now);
+        assert!(until - now < chrono::Duration::hours(9));
+    }
+
+    #[test]
+    fn parse_stated_reset_rolls_to_next_day_when_already_past() {
+        // Fixed "now" well past midnight ET: the next weekly reset is tomorrow, not today.
+        let now = DateTime::parse_from_rfc3339("2026-09-04T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let until = parse_stated_reset(
+            "You've hit your weekly limit \u{b7} resets 12am (America/New_York)",
+            now,
+        )
+        .unwrap();
+        assert!(until > now);
+        assert!(until - now < chrono::Duration::hours(9));
+    }
+
+    #[test]
+    fn strong_quota_signal_matches_the_real_incident_line() {
+        assert!(QuotaStore::scrape_strong_quota_signal(WEEKLY_LIMIT_LOG).is_some());
+        assert!(
+            QuotaStore::scrape_strong_quota_signal("429 Too Many Requests from upstream").is_some()
+        );
+        assert!(QuotaStore::scrape_strong_quota_signal("usage limit reached, try later").is_some());
+        assert!(QuotaStore::scrape_strong_quota_signal("account is out of credits").is_some());
+    }
+
+    /// Claude's stated-reset sentence is a separate line from "! rate limit ...
+    /// rejected". Before this fix, an output mode that printed only the sentence (no
+    /// separate rejection line) fell through to `Phase::Failed` while the provider was
+    /// simultaneously paused for hours — the worst of both outcomes.
+    #[test]
+    fn strong_quota_signal_matches_claudes_sentence_alone() {
+        assert!(QuotaStore::scrape_strong_quota_signal(
+            "You've hit your weekly limit \u{b7} resets 12am (America/New_York)"
+        )
+        .is_some());
+    }
+
+    /// codex's own wordings: a "hit your ... limit" rejection sentence, and a "rate
+    /// limit reached" line the "rejected"/"exceeded" arm didn't cover.
+    #[test]
+    fn strong_quota_signal_matches_codexs_wordings() {
+        assert!(QuotaStore::scrape_strong_quota_signal(
+            "You've hit your usage limit. Try again later."
+        )
+        .is_some());
+        assert!(QuotaStore::scrape_strong_quota_signal(
+            "Rate limit reached for gpt-5 in organization org-abc on requests per min. Limit: 3/min."
+        )
+        .is_some());
+    }
+
+    /// Round 6's `"hit your" && "limit"` disjunct required neither adjacency nor a
+    /// rejection word, so ordinary prose that happens to contain both substrings
+    /// anywhere on the same line matched — swallowing a real failure as quota, worse
+    /// than the bug this whole fix exists to close. Fixed by matching the two known
+    /// exact phrases instead of the loose pair.
+    #[test]
+    fn strong_quota_signal_ignores_unrelated_hit_your_limit_prose() {
+        assert!(QuotaStore::scrape_strong_quota_signal(
+            "you must not have hit your retry limit before this point"
+        )
+        .is_none());
+    }
+
+    /// `contains_phrase`'s word-boundary guard rejected any letter following the
+    /// phrase, which excluded the plural/past-tense forms providers actually use.
+    #[test]
+    fn strong_quota_signal_matches_plural_and_past_tense_rate_limit() {
+        assert!(QuotaStore::scrape_strong_quota_signal(
+            "Error: rate limits exceeded for model claude-opus"
+        )
+        .is_some());
+        assert!(QuotaStore::scrape_strong_quota_signal(
+            "you have been rate limited; limit reached, retry after 60s"
+        )
+        .is_some());
+    }
+
+    /// "too many requests" alone is already an unambiguous rejection sentence; the
+    /// prior `&& "429"` pairing missed common JSON error-body shapes that carry no
+    /// numeric status text.
+    #[test]
+    fn strong_quota_signal_matches_too_many_requests_without_a_429() {
+        assert!(QuotaStore::scrape_strong_quota_signal(
+            r#"{"error":{"message":"Too many requests"}}"#
+        )
+        .is_some());
+    }
+
+    /// Four realistic non-quota failures that each contain one of `scrape_log_hint`'s
+    /// broad needles. Driven, not read: before this fix each of these misrouted a real
+    /// defect onto the quota gate.
+    #[test]
+    fn strong_quota_signal_ignores_realistic_false_positives() {
+        let panic_with_429 = "thread 'main' panicked at src/state.rs:429:\nindex out of bounds";
+        let quota_module_edit = "implementer: refactoring QuotaStore::pause_quota in src/quota.rs";
+        let rate_limiter_under_test =
+            "test: app rate limiter rejects requests after threshold ... FAILED\nassertion failed";
+        // "rate limiter rejected" contains both "rate limit" (as a prefix of "rate
+        // limiter") and "rejected" — without the word-boundary guard in
+        // `contains_phrase`, this line alone would match and misroute an ordinary
+        // implementer building a rate limiter as a quota hit.
+        let rate_limiter_rejected =
+            "test: the rate limiter rejected the request as expected ... FAILED";
+        let capacity_doc_edit = "updated docs/capacity-planning.md with Q3 projections";
+        for log in [
+            panic_with_429,
+            quota_module_edit,
+            rate_limiter_under_test,
+            rate_limiter_rejected,
+            capacity_doc_edit,
+        ] {
+            assert!(
+                QuotaStore::scrape_strong_quota_signal(log).is_none(),
+                "false positive on: {log}"
+            );
+        }
     }
 }

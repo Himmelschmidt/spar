@@ -195,9 +195,28 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
         ));
     }
     std::fs::write(paths.artifact(&state.id, "summary.md"), body)?;
-    state.set_phase(Phase::Done);
+    // Peer has no failure-to-phase mapping at all beyond this (a genuine failure on
+    // either half still reads `Done` — a pre-existing, larger gap left untouched, see
+    // DECISIONS.md O54). This only closes the quota-specific case: any peer slot dying
+    // on a rate limit, whether or not its sibling completed, must not report success —
+    // `any_quota_failed && !any_plain_failed` subsumes the old both-failed case (1 of 2
+    // quota-hit is already `!any_plain_failed`) while a genuine failure on either half
+    // still falls through to `Done`, unchanged.
+    let failed: Vec<_> = state
+        .slots
+        .iter()
+        .filter(|s| s.status == crate::state::SlotStatus::Failed)
+        .collect();
+    let any_quota_failed = failed.iter().any(|s| s.quota_hit);
+    let any_plain_failed = failed.iter().any(|s| !s.quota_hit);
+    if !state.slots.is_empty() && any_quota_failed && !any_plain_failed {
+        state.set_phase(Phase::Quota);
+        state.error = Some("a peer slot failed: rate limit".into());
+    } else {
+        state.set_phase(Phase::Done);
+    }
     state.save(paths)?;
-    if cfg.auto_cleanup {
+    if cfg.auto_cleanup && state.phase == Phase::Done {
         let _ = worktree::cleanup_run(state, false);
     }
     Ok(())

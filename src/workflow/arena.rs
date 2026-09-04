@@ -193,6 +193,33 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
         }
     }
 
+    // If every implementer died, ranking a wave of nothing but "(missing summary)"
+    // placeholders and still reaching `AwaitingWinnerConfirm` would hand the caller a
+    // fabricated winner and exit `2` (human gate) instead of surfacing that nothing
+    // ran. Route the same way a single mid-dispatch slot does: quota-detected across
+    // the board parks resumably at `Phase::Quota`/exit `4`; any genuine failure among
+    // them still fails the run at `Phase::Failed`/exit `1` rather than being read as a
+    // rate limit. A wave with at least one surviving implementer proceeds to rank as
+    // before — arena's whole point is tolerating partial implementer loss.
+    let failed_implementers: Vec<_> = state
+        .slots
+        .iter()
+        .filter(|s| s.role == SlotRole::Implementer && s.status == SlotStatus::Failed)
+        .cloned()
+        .collect();
+    if !implementers.is_empty() && failed_implementers.len() == implementers.len() {
+        let any_plain_failed = failed_implementers.iter().any(|s| !s.quota_hit);
+        if any_plain_failed {
+            state.set_phase(Phase::Failed);
+            state.error = Some("all arena implementers failed".into());
+        } else {
+            state.set_phase(Phase::Quota);
+            state.error = Some("all arena implementers failed: rate limit".into());
+        }
+        state.save(paths)?;
+        return Ok(());
+    }
+
     state.set_phase(Phase::Rank);
     state.save(paths)?;
     let mut candidates = String::new();
@@ -222,7 +249,20 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
             expected_artifact: Some("ranking.md".into()),
             model: None,
         };
-        let _ = executor::run_slot(state, paths, cfg, &job);
+        if let Err(e) = executor::run_slot(state, paths, cfg, &job) {
+            // Quota-detected only: a genuine ranker defect keeps the existing
+            // best-effort behavior (fall through to `parse_winner`'s fallback of the
+            // first implementer) rather than failing the whole arena over an advisory
+            // ranking step — that tolerance predates this fix and is out of scope. A
+            // rate limit is different: it isn't a bad ranking, it's no ranking at all,
+            // and silently presenting a fallback winner as if ranked would hide that.
+            if executor::slot_quota_hit(state, &ranker.id) {
+                state.error = Some(e.to_string());
+                state.set_phase(Phase::Quota);
+                state.save(paths)?;
+                return Ok(());
+            }
+        }
     }
 
     let winner = parse_winner(paths, &state.id, &implementers);
@@ -359,10 +399,19 @@ pub fn reconcile(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> R
         model: None,
     };
     if let Err(e) = executor::run_slot(&mut state, paths, cfg, &job) {
-        state.set_phase(Phase::Failed);
+        let quota_hit = executor::slot_quota_hit(&state, &recon_id);
+        state.set_phase(if quota_hit {
+            Phase::Quota
+        } else {
+            Phase::Failed
+        });
         state.error = Some(e.to_string());
         state.save(paths)?;
-        return Ok(ExitCode::Failure);
+        return Ok(if quota_hit {
+            ExitCode::Quota
+        } else {
+            ExitCode::Failure
+        });
     }
 
     // dual review on reconcile result
@@ -392,10 +441,19 @@ pub fn reconcile(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> R
             model: None,
         };
         if let Err(e) = executor::run_slot(&mut state, paths, cfg, &job) {
-            state.set_phase(Phase::Failed);
+            let quota_hit = executor::slot_quota_hit(&state, &job.slot_id);
+            state.set_phase(if quota_hit {
+                Phase::Quota
+            } else {
+                Phase::Failed
+            });
             state.error = Some(format!("reconcile review failed: {e:#}"));
             state.save(paths)?;
-            return Ok(ExitCode::Failure);
+            return Ok(if quota_hit {
+                ExitCode::Quota
+            } else {
+                ExitCode::Failure
+            });
         }
         let review_path = paths.artifact(&state.id, &format!("review-reconcile-{i}.md"));
         let text = std::fs::read_to_string(&review_path).unwrap_or_default();
