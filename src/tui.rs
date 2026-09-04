@@ -1341,7 +1341,13 @@ fn fold_units(
         // too — U28 says `Gate`/`Broken` want the operator unconditionally, and this
         // form can never suppress one even if `PlanApproved` and `abandoned` ever
         // become reachable together.
-        let unit_has_active_leg = group.iter().any(|r| is_active_phase(r.phase));
+        // An abandoned leg is not actually running (no live orchestrator, see
+        // `state.rs`'s `abandoned` check) even though its phase reads as active, so it
+        // must not suppress a sibling `PlanApproved` leg's handoff — that approval is
+        // live again, not stale bookkeeping (round-2 review, minor).
+        let unit_has_active_leg = group
+            .iter()
+            .any(|r| is_active_phase(r.phase) && !r.abandoned);
         let wants = group
             .iter()
             .filter(|r| {
@@ -8053,27 +8059,32 @@ fn run_attention(r: &state::RunSummary) -> Attention {
     }
 }
 
-/// Whether a run currently wants the operator: a live `Attention::Gate`/`Broken`, or
-/// `PlanApproved` — terminal and colored `OK` like `Done` (round-9 review: changing
-/// `run_attention` itself would have re-litigated `phase_color`/`sort_runs_by_attention`
-/// for behaviour no review flagged), but still a handoff nothing else will complete.
-/// `fold_units`' `wants`/`unit_wants_operator`, the Home band, both rail flags and the
-/// attention cycle key all go through this one predicate (via `unit_wants_operator` once
-/// folding is involved), so they cannot disagree with each other the way Home's band and
-/// the fleet roll-up did (round-9 review). `emit_attention_toasts` does not: it diffs
-/// `run_attention` directly and so never toasts a `PlanApproved` handoff or a folded
-/// unit's wanting leg (pre-existing, flagged by review 3be317b2, not fixed here).
+/// Whether a single, unfolded run currently wants the operator: a live
+/// `Attention::Gate`/`Broken`, or `PlanApproved` — terminal and colored `OK` like `Done`
+/// (round-9 review: changing `run_attention` itself would have re-litigated
+/// `phase_color`/`sort_runs_by_attention` for behaviour no review flagged), but still a
+/// handoff nothing else will complete. This is the per-leg predicate `fold_units` counts
+/// into `wants`; Home's band, both rail flags and the attention cycle key read a folded
+/// row through `unit_wants_operator` instead, since `PlanApproved` is conditional on the
+/// *unit* having no active leg (U28), not on this one leg's phase alone —
+/// `unit_wants_operator_matches_wants_operator_on_every_fold_units_row` is what keeps the
+/// two predicates from disagreeing on any row `fold_units` can actually produce.
+/// `emit_attention_toasts` does not go through either: it diffs `run_attention` directly
+/// and so never toasts a `PlanApproved` handoff or a folded unit's wanting leg
+/// (pre-existing, flagged by review 3be317b2, not fixed here).
 fn wants_operator(r: &state::RunSummary) -> bool {
     run_attention(r).needs_you() || r.phase == Phase::PlanApproved
 }
 
-/// Whether the *unit* a row stands for wants the operator. A folded row (U15) carries
-/// its active leg's id and phase, so `wants_operator` on the row alone answers for that
-/// leg and not for the group: a unit whose plan is approved (`Idle`) while a child is
-/// working folds to the child, and the handoff disappears from every surface that asks
-/// the row instead of the count. `wants` is computed per leg in `fold_units`, so this is
-/// the predicate Home's bands, the rail flag and the attention cycle must use — the same
-/// rule `runs_needing_attention` already applies to the roll-up.
+/// Whether the *unit* a row stands for wants the operator (U28). A folded row (U15)
+/// carries its active leg's id and phase, so `wants_operator` on the row alone answers
+/// for that leg, not the group — reading `r.wants` (each leg that itself wants the
+/// operator, `PlanApproved` counted only when no leg in the unit is active) instead is
+/// what keeps a unit's `PlanApproved` leg from being reported as a handoff while a sibling
+/// is still working it, and what keeps two gates folded into one row from reading as
+/// only one. `wants` is computed per leg in `fold_units`, so this is the predicate Home's
+/// bands, the rail flag and the attention cycle must use — the same rule
+/// `runs_needing_attention` already applies to the roll-up.
 fn unit_wants_operator(r: &state::RunSummary) -> bool {
     if r.legs > 1 {
         r.wants > 0
@@ -8084,8 +8095,9 @@ fn unit_wants_operator(r: &state::RunSummary) -> bool {
 
 /// The rail lead flag color for a run row, shared by the Runs level and Home so a run
 /// that counts toward `runs_needing_attention` always shows the same flag it is
-/// counted for. `force` additionally flags a folded row with more than one leg wanting
-/// the operator, even if the active leg itself does not.
+/// counted for. `force` is the row's own `unit_wants_operator` — it flags a folded row
+/// whenever any leg wants the operator (U28), even if the active leg shown in `r` itself
+/// does not.
 fn attention_flag(r: &state::RunSummary, force: bool) -> Option<Color> {
     if force || wants_operator(r) {
         Some(if run_attention(r) == Attention::Gate {
@@ -11769,6 +11781,32 @@ mod folding {
         );
     }
 
+    /// Round-2 review (minor): an abandoned leg is not actually running (no live
+    /// orchestrator), so it must not suppress a sibling `PlanApproved` leg's handoff
+    /// the way a genuinely active leg does. Before the fix, `unit_has_active_leg`
+    /// checked phase alone, so `plan1`'s approval went uncounted here even though
+    /// `impl1` was not really running it — an undercount in the `⚑n` roll-up (the
+    /// unit itself still read NEEDS YOU, since `impl1`'s own abandonment already
+    /// makes it `Attention::Broken` and the representative).
+    #[test]
+    fn an_abandoned_leg_does_not_suppress_a_siblings_planapproved_handoff() {
+        let mut impl1 = summary("impl1", Phase::Review, Some("plan1"), 5);
+        impl1.abandoned = true;
+        let runs = vec![summary("plan1", Phase::PlanApproved, None, 90), impl1];
+        let (rows, _) = fold_units(runs);
+        assert_eq!(rows.len(), 1, "one unit of work");
+        let unit = &rows[0];
+        assert_eq!(
+            unit.id, "impl1",
+            "the broken leg is still the representative"
+        );
+        assert_eq!(
+            unit.wants, 2,
+            "the abandoned leg does not cancel plan1's live approval"
+        );
+        assert_eq!(runs_needing_attention(&rows), 2);
+    }
+
     /// AC-28. `fold_units`'s `id` follows whichever leg is loudest, which can change
     /// between snapshots as attention shifts within a unit — but `unit_id` (what a
     /// Home cursor keys on) must not, or the cursor jumps every time the loudest leg
@@ -12790,6 +12828,135 @@ mod home_ia {
         );
     }
 
+    /// A row shape `fold_units` can never itself produce
+    /// (`unit_wants_operator_matches_wants_operator_on_every_fold_units_row`, `folding`
+    /// module, proves the two predicates agree on every row `fold_units` can emit): a
+    /// folded unit (`legs > 1`) whose representative leg is merely `Working` (`Review`
+    /// — neither a gate, a breakage, nor `PlanApproved`) while `wants` still counts a
+    /// sibling. Real `fold_units` output can never disagree with `wants_operator` this
+    /// way, so every test that only drives `build_home_rows`, the rail flags, or
+    /// `jump_to_attention` through real `fold_units` output cannot tell
+    /// `unit_wants_operator` and `wants_operator` apart at those call sites — reverting
+    /// any one of them back to `wants_operator` stays green (round-2 review, major).
+    /// This row makes the difference observable directly at each site:
+    /// `unit_wants_operator` says true (`wants > 0`), `wants_operator` says false.
+    fn folded_but_representative_alone_does_not_want_you(
+        id: &str,
+        root: &Path,
+    ) -> state::RunSummary {
+        let mut r = run_in(id, Phase::Review, 5, root);
+        r.legs = 2;
+        r.wants = 1;
+        r
+    }
+
+    /// Independent coverage of the Home-band call site (`build_home_rows`, U28):
+    /// reverting its `unit_wants_operator(r)` check back to `wants_operator(r)` sinks
+    /// this row into RUNNING, since `Review` is an active phase and `wants_operator`
+    /// alone says false. Driven through the real builder with a hand-set `legs`/
+    /// `wants`, the same pattern `folding_never_hides_a_gate_from_home` already uses
+    /// to get a row `fold_units` itself would not emit.
+    #[test]
+    fn home_band_membership_uses_unit_wants_operator() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let now = Utc::now();
+        let row = folded_but_representative_alone_does_not_want_you("legb0003", &root);
+
+        let rows = build_home_rows(
+            &projects,
+            &[vec![row.clone()]],
+            &HomeScope::All,
+            now - chrono::Duration::hours(6),
+            now,
+        );
+        assert_eq!(
+            band_of(&rows, "legb0003"),
+            Some(HomeBand::NeedsMe),
+            "wants > 0 must land in NeedsMe even though the representative leg's own \
+             phase (Review) is neither a gate, a breakage, nor PlanApproved"
+        );
+        assert_eq!(
+            home_needs_you(&rows),
+            1,
+            "Home's own header must agree with the band it just rendered"
+        );
+        assert_eq!(
+            runs_needing_attention(std::slice::from_ref(&row)),
+            1,
+            "the fleet roll-up must agree with the band too"
+        );
+    }
+
+    /// Independent coverage of both rail-flag call sites (`rail_home_items` at the
+    /// Home level, `rail_run_items` at the Runs level): each renders its `force`
+    /// argument as a `⚑` in the lead column, so this exercises the actual painted
+    /// row rather than a bare `attention_flag` call — reverting `unit_wants_operator`
+    /// back to `wants_operator` at either site drops the flag from the screen.
+    #[test]
+    fn rail_flags_fire_on_a_row_only_unit_wants_operator_flags() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        fn rendered(items: Vec<ListItem<'static>>, w: u16) -> String {
+            let mut term = Terminal::new(TestBackend::new(w, 1)).unwrap();
+            term.draw(|f| f.render_widget(List::new(items), f.area()))
+                .unwrap();
+            let buf = term.backend().buffer();
+            (0..w).map(|x| buf[(x, 0)].symbol()).collect()
+        }
+
+        let root = PathBuf::from("/nonexistent/spar");
+        let projects = [project_at(&root, "spar")];
+        let now = Utc::now();
+        let row = folded_but_representative_alone_does_not_want_you("legb0004", &root);
+
+        let home_rows = build_home_rows(
+            &projects,
+            &[vec![row.clone()]],
+            &HomeScope::All,
+            now - chrono::Duration::hours(6),
+            now,
+        );
+        let app = App::new(None, Config::default(), None);
+        let home_run_item = rail_home_items(&home_rows, &projects, &app, 40, false)
+            .into_iter()
+            .nth(1)
+            .expect("the NeedsMe header, then the run row");
+        assert!(
+            rendered(vec![home_run_item], 40).contains('⚑'),
+            "the Home rail must flag a row unit_wants_operator flags, even though \
+             wants_operator alone would not"
+        );
+
+        let runs_items = rail_run_items(std::slice::from_ref(&row), &app, 40, false);
+        assert!(
+            rendered(runs_items, 40).contains('⚑'),
+            "the Runs rail must flag the same row"
+        );
+    }
+
+    /// Independent coverage of the `a` cycle key's Runs-level call site
+    /// (`jump_to_attention`): reverting its `unit_wants_operator` check back to
+    /// `wants_operator` makes this row invisible to the cycle, since `wants_operator`
+    /// alone says false for a `Review` representative even though the unit's `wants`
+    /// is nonzero.
+    #[test]
+    fn jump_to_attention_targets_a_row_only_unit_wants_operator_flags() {
+        let root = PathBuf::from("/nonexistent/spar");
+        let row = folded_but_representative_alone_does_not_want_you("legb0005", &root);
+
+        let mut app = App::new(None, Config::default(), None);
+        app.browse = BrowseLevel::Runs;
+        app.selected_run = 0;
+        jump_to_attention(&mut app, std::slice::from_ref(&row), &[]);
+        assert_eq!(
+            app.flash.as_ref().map(|(_, msg, ..)| msg.clone()),
+            Some("→ legb0005 needs you".to_string()),
+            "the cycle must land on the row, not report \"nothing needs you\""
+        );
+    }
+
     /// AC-23. Scope filters rows; it does not change the view. Both scopes emit
     /// the same four headers in the same order (U20).
     #[test]
@@ -13047,10 +13214,10 @@ mod home_ia {
     /// that never reappears in the snapshot (archived, its dir removed, or a
     /// different leg becomes the fold's loudest member) used to pin
     /// `home_target_run` forever, leaving Main/Agents empty with no way out short
-    /// of manually picking a different row. `resolve_home_target` must give up
-    /// after `HOME_TARGET_GIVE_UP` snapshots, release the pin, flash, and return to
-    /// Home — while a target that is merely one snapshot behind (R2) still resolves
-    /// normally and does not trip the give-up path early.
+    /// of manually picking a different row. `resolve_home_target` must give up once
+    /// the wall-clock `HOME_TARGET_GIVE_UP` budget elapses, release the pin, flash,
+    /// and return to Home — while a target that is merely one snapshot behind (R2)
+    /// still resolves normally and does not trip the give-up path early.
     #[test]
     fn a_ghost_home_target_eventually_releases_the_pin() {
         let root = PathBuf::from("/nonexistent/spar");
