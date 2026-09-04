@@ -325,17 +325,17 @@ pub(crate) fn scrape_claude_stated_reset(
     } else {
         "rate"
     };
-    // A stated reset carries a wall-clock time and no calendar day. For a five-hour
-    // window the next occurrence of that time is a sound inference. For a weekly one it
-    // is a fabrication — the true reset can be six days out — and it fails in the
-    // expensive direction: spar re-probes at a time it asserted, walks into the same
-    // wall, and burns a round telling the operator a specific wrong time. A missing
-    // cooldown is merely re-probed on the generic timer, which claims nothing.
+    // The *rendered* sentence carries a wall-clock time and no calendar day, so inferring
+    // the next occurrence of it is sound for a five-hour window and a guess for a weekly
+    // one. That is why this text path never infers a weekly reset. It is not the whole
+    // story though: the structured `rate_limit_event` states the reopening instant
+    // outright (`StreamStats::quota_resets_at`), and when a caller has that it must be
+    // preferred over anything derived here — see `detect_and_pause_quota`.
     if period == "weekly" {
         return Some((
             "cli:claude".into(),
             None,
-            format!("claude {period} limit (reset day unknown, default cooldown)"),
+            format!("claude {period} limit (no stated reset instant, default cooldown)"),
         ));
     }
     match parse_stated_reset(log, Utc::now()) {

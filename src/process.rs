@@ -43,6 +43,10 @@ pub struct StreamStats {
     /// code, documentation or a task brief that merely discusses limits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_rejected: Option<String>,
+    /// When that window reopens, epoch seconds, as the provider stated it. An absolute
+    /// instant, so it needs no inference from a wall-clock time and no timezone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_resets_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Provider-side session id, when the stream names one. muse's usage lives outside
@@ -663,6 +667,8 @@ struct StreamCoalescer {
     is_err: bool,
     /// Set from the provider's `rate_limit_event` when its status is `rejected`.
     quota_rejected: Option<String>,
+    /// The instant that window reopens, epoch seconds, straight from the same event.
+    quota_resets_at: Option<i64>,
     buf: String,
     kind: CoalesceKind,
     tools: u32,
@@ -706,6 +712,7 @@ impl StreamCoalescer {
         Self {
             is_err,
             quota_rejected: None,
+            quota_resets_at: None,
             buf: String::new(),
             kind: CoalesceKind::None,
             tools: 0,
@@ -839,6 +846,19 @@ impl StreamCoalescer {
                         } else {
                             kind.to_string()
                         });
+                        // The same object states when the window reopens, as an absolute
+                        // instant in epoch seconds — day included, no timezone, nothing
+                        // inferred. Prefer the window-specific entry when the payload
+                        // carries `unifiedWindows`, else the top-level one. Reading the
+                        // rendered sentence's wall-clock time instead is what made the
+                        // weekly reset look unknowable when it never was.
+                        self.quota_resets_at = v
+                            .pointer(&format!("/rate_limit_info/unifiedWindows/{kind}/resetsAt"))
+                            .and_then(|x| x.as_i64())
+                            .or_else(|| {
+                                v.pointer("/rate_limit_info/resetsAt")
+                                    .and_then(|x| x.as_i64())
+                            });
                     }
                     if status != "allowed" {
                         return Some(format!("! rate limit  {kind}  {status}\n"));
@@ -1380,6 +1400,7 @@ impl StreamCoalescer {
         s.billed_tokens = self.billed_tokens();
         if self.quota_rejected.is_some() {
             s.quota_rejected = self.quota_rejected.clone();
+            s.quota_resets_at = self.quota_resets_at;
         }
         if self.model.is_some() {
             s.model = self.model.clone();
@@ -1638,7 +1659,7 @@ mod tests {
         assert_eq!(c.quota_rejected.as_deref(), Some("seven_day"));
 
         // An allowed event, and a warning short of rejection, are not rejections.
-        for status in ["allowed", "warning"] {
+        for status in ["allowed", "allowed_warning"] {
             let mut c = StreamCoalescer::new(false);
             c.feed(&format!(
                 r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"{status}","rateLimitType":"five_hour"}}}}"#
@@ -1648,19 +1669,57 @@ mod tests {
     }
 
     /// Prose cannot manufacture the typed verdict, however exactly it quotes a real
-    /// rejection — including spar's own rendered form of one, which is what the text
-    /// scrape used to match and what cargo prints back when a test asserting on it fails.
+    /// rejection — including spar's own rendered form of one.
+    ///
+    /// The fixtures are deliberately NOT interpolated into the assertion messages. Cargo
+    /// prints a failing assert's message verbatim into the slot log, and these strings are
+    /// live rejection text: a slot that broke this very test would have its own cargo
+    /// output match the prose fallback and route its genuine defect to `Phase::Quota`.
+    /// That trap is what `dc22bf7` narrowed the phrase matcher to close, and it would have
+    /// been reintroduced here from the other side, in the file anyone working on this
+    /// feature is most likely to break. Print the index instead.
     #[test]
     fn prose_never_produces_a_typed_rate_limit_rejection() {
-        for line in [
+        const FIXTURES: [&str; 3] = [
             "! rate limit  seven_day  rejected",
             "You've hit your weekly limit \u{b7} resets 12am (America/New_York)",
             "implementer: editing src/quota.rs, the rate limit rejected path",
-        ] {
+        ];
+        for (i, line) in FIXTURES.iter().enumerate() {
             let mut c = StreamCoalescer::new(false);
             c.feed(line);
-            assert_eq!(c.quota_rejected, None, "prose must not route: {line}");
+            assert_eq!(c.quota_rejected, None, "FIXTURES[{i}] must not route");
         }
+    }
+
+    /// The whole data path, end to end: a rejection event fed to the coalescer must reach
+    /// `StreamStats`, carrying both the window and the stated reopening instant. Deleting
+    /// either the capture in the event handler or the propagation in `merge_counters_into`
+    /// must fail this.
+    #[test]
+    fn a_rejection_reaches_stream_stats_with_its_reset_instant() {
+        let mut c = StreamCoalescer::new(false);
+        c.feed(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"seven_day","resetsAt":1788000000}}"#,
+        );
+        let mut stats = StreamStats::default();
+        c.merge_counters_into(&mut stats);
+        assert_eq!(stats.quota_rejected.as_deref(), Some("seven_day"));
+        assert_eq!(
+            stats.quota_resets_at,
+            Some(1788000000),
+            "the stated instant must survive to the stats the executor reads"
+        );
+    }
+
+    /// A window-specific `unifiedWindows` entry outranks the top-level one.
+    #[test]
+    fn the_window_specific_reset_instant_wins() {
+        let mut c = StreamCoalescer::new(false);
+        c.feed(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"seven_day","resetsAt":1,"unifiedWindows":{"seven_day":{"resetsAt":1788000000}}}}"#,
+        );
+        assert_eq!(c.quota_resets_at, Some(1788000000));
     }
     use super::*;
     use tempfile::tempdir;
