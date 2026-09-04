@@ -1483,6 +1483,9 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
                     s.usage.as_ref().map(|u| process::StreamStats {
                         tools: u.tools,
                         tool_errors: 0,
+                        quota_rejected: None,
+                        quota_resets_at: None,
+                        quota_recovered: false,
                         input_tokens: u.input_tokens,
                         output_tokens: u.output_tokens,
                         cache_read_tokens: u.cache_read_tokens,

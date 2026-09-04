@@ -270,6 +270,12 @@ pub struct SlotState {
     /// The run round this slot last ran in (O45). `1` for pre-rounds runs.
     #[serde(default = "one_round")]
     pub round: u32,
+    /// Set when this dispatch's own failure ended with a quota/rate-limit signal in its
+    /// log (the discriminator `executor::run_slot` computes, not a guess from status
+    /// alone) — lets the caller route the run to `Phase::Quota` instead of `Failed`.
+    /// Reset at the start of every dispatch, so a re-dispatch never carries a stale hit.
+    #[serde(default)]
+    pub quota_hit: bool,
 }
 
 fn one_round() -> u32 {

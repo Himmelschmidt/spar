@@ -183,10 +183,40 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
     ));
     std::fs::write(paths.artifact(&state.id, "summary.md"), body)?;
 
-    let any_failed = state.slots.iter().any(|s| s.status == SlotStatus::Failed);
-    if any_failed && approve == 0 && changes == 0 {
+    let failed: Vec<&crate::state::SlotState> = state
+        .slots
+        .iter()
+        .filter(|s| s.status == SlotStatus::Failed)
+        .collect();
+    let all_failed = !state.slots.is_empty() && failed.len() == state.slots.len();
+    let any_quota_failed = failed.iter().any(|s| s.quota_hit);
+    let any_plain_failed = failed.iter().any(|s| !s.quota_hit);
+    // Checked ahead of the approve/request_changes tally: `salvage_expected_artifact`
+    // (executor.rs) writes a synthetic `request_changes` verdict for every interrupted
+    // reviewer, so `changes == 0` never holds once any reviewer fails and the tally
+    // alone can't tell a real review panel from one where every slot died on a rate
+    // limit — a `changes == 0` guard on the `Failed` branch below would be dead code
+    // for every all-failed panel, quota or not. Branch on `all_failed` directly instead:
+    // every slot quota-hit parks at `Phase::Quota`; every slot failed for any other (or
+    // mixed) reason still fails the run at `Phase::Failed` rather than falling through
+    // to `Done` on the strength of two fabricated `request_changes` votes.
+    //
+    // A panel that is not all-failed can still have a quota-hit slot among successful
+    // siblings (e.g. one of two reviewers rate-limited, the other completed): that
+    // slot's absence from the vote is a resource block, not a vote, so it must still
+    // park the run rather than silently tallying a partial review as `Done`. Only
+    // fires when *every* failure in the panel is quota-detected — a mix of a quota hit
+    // and a genuine defect still falls through to `Done` on its live tally, the same
+    // pre-existing gap named above for an all-genuine-failure panel with a survivor.
+    if all_failed && !any_plain_failed {
+        state.set_phase(Phase::Quota);
+        state.error = Some("all review slots failed: rate limit".into());
+    } else if all_failed {
         state.set_phase(Phase::Failed);
         state.error = Some("all review slots failed".into());
+    } else if any_quota_failed && !any_plain_failed {
+        state.set_phase(Phase::Quota);
+        state.error = Some("a review slot failed: rate limit".into());
     } else {
         state.set_phase(Phase::Done);
     }

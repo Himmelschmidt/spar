@@ -185,9 +185,21 @@ pub fn execute_plan(
 
     for job in jobs {
         if let Err(e) = executor::run_slot(state, paths, cfg, job) {
-            if job.role == SlotRole::Planner {
-                state.set_phase(Phase::Failed);
+            // A quota-detected failure parks the run regardless of role: the critic is
+            // best-effort feedback for the planner (a genuine critic defect still just
+            // marks the slot Failed and the plan proceeds without it, unchanged), but a
+            // rate limit is not a defect to shrug off — it must surface on the quota
+            // gate the same way the planner's own dispatch already does, not silently
+            // finish a plan with the critic's rate limit invisible to the caller.
+            if executor::slot_quota_hit(state, &job.slot_id) {
                 state.error = Some(e.to_string());
+                state.set_phase(Phase::Quota);
+                state.save(paths)?;
+                return Ok(());
+            }
+            if job.role == SlotRole::Planner {
+                state.error = Some(e.to_string());
+                state.set_phase(Phase::Failed);
                 state.save(paths)?;
                 return Err(e);
             }
@@ -235,6 +247,12 @@ pub fn execute_plan(
                 let _ = state.save(paths);
             }
             return Err(e);
+        }
+        // `run_test_author` parks quota-detected failures itself (returning `Ok`, not
+        // `Err`), so this must be checked separately from the `Err` arm above or the
+        // `auto_plan()` branch below would immediately clobber `Phase::Quota`.
+        if state.phase == Phase::Quota {
+            return Ok(());
         }
     }
 
@@ -320,8 +338,13 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
     };
 
     if let Err(e) = executor::run_slot(state, paths, cfg, &job) {
-        state.set_phase(Phase::Failed);
         state.error = Some(format!("test-author failed: {e}"));
+        if executor::slot_quota_hit(state, &id) {
+            state.set_phase(Phase::Quota);
+            state.save(paths)?;
+            return Ok(());
+        }
+        state.set_phase(Phase::Failed);
         state.save(paths)?;
         return Err(e);
     }

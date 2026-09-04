@@ -164,7 +164,24 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
             state.slots.len()
         ),
     )?;
-    state.set_phase(Phase::Done);
+    // Same pre-existing gap as `peer` (see DECISIONS.md O54): roles has no
+    // failure-to-phase mapping beyond this. Only the quota-specific case is closed
+    // here — any role slot dying on a rate limit, whether or not its sibling
+    // completed, must not report success; a genuine failure on either half still
+    // falls through to `Done`, unchanged.
+    let failed: Vec<_> = state
+        .slots
+        .iter()
+        .filter(|s| s.status == crate::state::SlotStatus::Failed)
+        .collect();
+    let any_quota_failed = failed.iter().any(|s| s.quota_hit);
+    let any_plain_failed = failed.iter().any(|s| !s.quota_hit);
+    if !state.slots.is_empty() && any_quota_failed && !any_plain_failed {
+        state.set_phase(Phase::Quota);
+        state.error = Some("a role slot failed: rate limit".into());
+    } else {
+        state.set_phase(Phase::Done);
+    }
     state.save(paths)?;
     Ok(())
 }
