@@ -9,6 +9,27 @@ use std::collections::HashMap;
 /// If it is still rate-limited the run re-pauses it with a fresh window.
 const DEFAULT_COOLDOWN_MINS: i64 = 30;
 
+/// `lower.contains(phrase)` but rejects a match immediately followed by another
+/// ASCII letter, so "rate limit" does not match inside "rate limiter" / "rate
+/// limiting" — an ordinary implementer building or testing a rate limiter must not
+/// trip the same discriminator that routes a run to `Phase::Quota`.
+fn contains_phrase(lower: &str, phrase: &str) -> bool {
+    let mut start = 0;
+    while let Some(pos) = lower[start..].find(phrase) {
+        let idx = start + pos;
+        let after = &lower[idx + phrase.len()..];
+        if !after
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+        {
+            return true;
+        }
+        start = idx + phrase.len();
+    }
+    false
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderStatus {
@@ -198,9 +219,9 @@ impl QuotaStore {
     pub fn scrape_strong_quota_signal(log: &str) -> Option<String> {
         for line in log.lines() {
             let lower = line.to_ascii_lowercase();
-            let hit = (lower.contains("rate limit")
+            let hit = (contains_phrase(&lower, "rate limit")
                 && (lower.contains("rejected") || lower.contains("exceeded")))
-                || (lower.contains("usage limit")
+                || (contains_phrase(&lower, "usage limit")
                     && (lower.contains("reached") || lower.contains("exceeded")))
                 || (lower.contains("too many requests") && lower.contains("429"))
                 || lower.contains("out of credits")
@@ -674,11 +695,18 @@ mod tests {
         let quota_module_edit = "implementer: refactoring QuotaStore::pause_quota in src/quota.rs";
         let rate_limiter_under_test =
             "test: app rate limiter rejects requests after threshold ... FAILED\nassertion failed";
+        // "rate limiter rejected" contains both "rate limit" (as a prefix of "rate
+        // limiter") and "rejected" — without the word-boundary guard in
+        // `contains_phrase`, this line alone would match and misroute an ordinary
+        // implementer building a rate limiter as a quota hit.
+        let rate_limiter_rejected =
+            "test: the rate limiter rejected the request as expected ... FAILED";
         let capacity_doc_edit = "updated docs/capacity-planning.md with Q3 projections";
         for log in [
             panic_with_429,
             quota_module_edit,
             rate_limiter_under_test,
+            rate_limiter_rejected,
             capacity_doc_edit,
         ] {
             assert!(

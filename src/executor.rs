@@ -1281,16 +1281,21 @@ pub fn run_slot(
 /// quota store (cheap, auto-recovering, driven by `scrape_log_hint`'s broad needles)
 /// and reports whether this failure looks like a rate limit rather than a genuine
 /// defect. The `bool` returned is the discriminator callers route `Phase::Quota` vs
-/// `Phase::Failed` on, so it is deliberately narrower than the pause: it only fires on
-/// `scrape_strong_quota_signal` (a rejection phrase, not a bare word, for every
-/// adapter) or Claude's plain-text stated-reset line ("You've hit your weekly
-/// limit..."), which is itself an unambiguous rejection statement. It deliberately
-/// excludes `scrape_claude_rate_limits`'s `rate_limits`/`five_hour` JSON telemetry
-/// branch: that fires on `used_percentage >= 95` alone, with no failure of any kind in
-/// the log, so it still drives the pause below (harmless, auto-recovering) but must
-/// not alone decide that *this* failure was a quota hit — a false positive on the
-/// returned bool would park a real failure on the quota gate instead of failing the
-/// run, which is worse than the bug this exists to fix.
+/// `Phase::Failed` on, so it is deliberately narrower than the pause: it fires only on
+/// `scrape_strong_quota_signal` — line-scoped, requires a limit phrase *and* a
+/// rejection word together, for every adapter including Claude. It deliberately
+/// excludes `scrape_claude_rate_limits`/`scrape_claude_stated_reset`: the `five_hour`
+/// JSON branch fires on `used_percentage >= 95` alone with no failure in the log, and
+/// the plain-text stated-reset scan matches "resets " plus a limit phrase *anywhere in
+/// the whole tail log*, not on one line, with no rejection word required — an
+/// implementer editing this very module's doc comments, or a reviewer quoting the
+/// BACKLOG entry into its log, contains both and would otherwise misroute a genuine
+/// defect onto the quota gate, which is worse than the bug this exists to fix. Both
+/// still drive the pause below (harmless, auto-recovering) and still compute
+/// `cooldown_until` for the store; they just must not alone decide that *this* failure
+/// was a quota hit. The real incident line ("! rate limit  seven_day  rejected") is
+/// itself line-scoped rejection text and matches `scrape_strong_quota_signal` on its
+/// own, so this exclusion does not weaken detection of the case this was built for.
 fn detect_and_pause_quota(paths: &SparPaths, provider: &str, log_text: &str) -> bool {
     let key = crate::quota::normalize_key(provider);
     if let Some(hint) = crate::quota::QuotaStore::scrape_log_hint(log_text) {
@@ -1304,7 +1309,6 @@ fn detect_and_pause_quota(paths: &SparPaths, provider: &str, log_text: &str) -> 
         let _ = store.save(paths);
     }
     crate::quota::QuotaStore::scrape_strong_quota_signal(log_text).is_some()
-        || (key == "cli:claude" && crate::quota::scrape_claude_stated_reset(log_text).is_some())
 }
 
 /// `state.slots` lookup used by every caller that maps a `run_slot` failure onto
@@ -2386,6 +2390,31 @@ mod tests {
             !store.is_usable("cli:claude"),
             "the telemetry may still drive the harmless, auto-recovering pause"
         );
+    }
+
+    /// The stated-reset scan ("resets " + a limit phrase, anywhere in the tail log)
+    /// used to be part of the routing bool: it is not line-scoped and requires no
+    /// rejection word, so an ordinary defect whose log happens to mention both — a
+    /// doc comment being edited, a test description — misrouted onto `Phase::Quota`.
+    /// Both logs below would have matched the old disjunct; neither is a line-scoped
+    /// rejection, so neither may route today.
+    #[test]
+    fn detect_and_pause_quota_ignores_a_stray_resets_mention_without_a_rejection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let doc_comment_edit = "implementer: editing src/quota.rs\n\
+            /// Parses \"resets 12am (America/New_York)\" into a cooldown.\n\
+            scanning for rate limit needles\n\
+            thread 'main' panicked at src/quota.rs:210: index out of bounds\n";
+        let unrelated_test_desc =
+            "reviewer: the token bucket rate limit test resets between cases\n\
+            thread 'main' panicked at src/main.rs:42\n";
+        for log in [doc_comment_edit, unrelated_test_desc] {
+            assert!(
+                !detect_and_pause_quota(&paths, "cli:claude", log),
+                "false positive on: {log}"
+            );
+        }
     }
 
     /// Recovery must fire only for a slot that actually produced something. A slot that

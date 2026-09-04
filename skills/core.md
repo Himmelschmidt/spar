@@ -373,21 +373,28 @@ A **failed/stuck/quota** run is resumable the same way (its approved plan still 
 resume resets the failed slots to pending and re-dispatches, so `status` reflects the
 new attempt rather than the dead one's `failed` verdict. A slot that dies mid-dispatch
 from a rate limit parks the run at `quota` (exit `4`), not `failed` (exit `1`) — for the
-planner, test-author, implementer, tester, reviewer, and the arena reconciler. `quota`
+planner, plan critic, test-author, implementer, tester, reviewer, arena implementer,
+arena ranker, and the arena reconciler. `quota`
 is not always an `implement --run` case, though: a plan run that hits it *before* being
-approved (its own pre-dispatch gate, or a paused planner/test-author) resumes with
-`spar plan --run <id>` instead — `implement --run` still refuses it with "plan is not
-approved", the same as it would `failed`, so an unapproved plan can't walk past its
+approved (its own pre-dispatch gate, or a paused planner/critic/test-author) resumes
+with `spar plan --run <id>` instead — `implement --run` still refuses it with "plan is
+not approved", the same as it would `failed`, so an unapproved plan can't walk past its
 human gate through the quota park. The
-discriminator requires a genuine rejection, not a bare word or bare usage telemetry: a
-log with a stray `429` in a stack trace, a mention of "capacity", code that edits spar's
-own quota module, or a `rate_limits.five_hour` usage-percentage reading with no failure
-in the log does not misroute a genuine defect onto the quota gate (the last of those can
-still drive the harmless, auto-recovering pause — just not the routing decision).
+discriminator requires a genuine rejection *on one line*, not a bare word, bare usage
+telemetry, or a limit phrase and "resets " each landing anywhere in an 8000-byte tail
+log: a stray `429` in a stack trace, a mention of "capacity", code that edits spar's own
+quota module (including a doc comment quoting a stated-reset line), or a
+`rate_limits.five_hour` usage-percentage reading with no failure in the log does not
+misroute a genuine defect onto the quota gate (all of those can still drive the
+harmless, auto-recovering pause — just not the routing decision). A rate limiter under
+test ("the rate limiter rejected the request") doesn't trip it either — the phrase match
+requires a word boundary, so "rate limiter" doesn't read as "rate limit".
 Resuming picks the same run back up, and if the provider is still on cooldown it
 re-parks at `quota` immediately rather than dispatching into the same wall. Claude's CLI
 states its own weekly-limit reset time in the rejection line; spar parses that (local
-time + IANA zone) into the cooldown instead of using the generic ~30-minute default.
+time + IANA zone) into the cooldown instead of using the generic ~30-minute default,
+though only the pause/cooldown computation reads that stated-reset text now — the
+run-routing decision above never does, for the false-positive reason just described.
 That parsed cooldown is capped at the *next occurrence* of the stated time-of-day (~24h
 out), not the actual weekly rollover — a big improvement over the default, but a weekly
 pause is still re-probed daily rather than left alone for the full week, since Claude's
@@ -396,13 +403,22 @@ provider-specific reset parser, so a mid-dispatch limit on them falls back to th
 generic-rejection-phrase match (untested against any real captured output from those
 CLIs — treat as unverified, not confirmed) and the generic cooldown; agy has its own,
 separate telemetry-based cooldown unrelated to this mechanism. `--workflow review`,
-`--workflow peer`, and `--workflow roles` each route a rate limit hit by *every* slot in
-their panel to `quota` the same way. `review` also maps an all-slots failure that is
+`--workflow peer`, and `--workflow roles` each route to `quota` when every *failed* slot
+in the panel is quota-detected, whether or not a sibling slot succeeded — one rate-limited
+reviewer alongside one that completed still parks the run rather than quietly finishing
+on half a panel. `review` also maps an all-slots failure that is
 *not* a quota hit (a mixed panel, or every reviewer failing for an ordinary reason) to
 `failed` rather than `done` — a fabricated per-slot `request_changes` salvage used to
 make that read as a passing review. `peer` and `roles` only close the quota-specific
-case: any other all-slots failure still finishes `done`, a larger, pre-existing gap in
-those two workflows' failure handling generally, left untouched.
+case: a genuine (non-quota) failure alongside a successful sibling still finishes `done`,
+a larger, pre-existing gap in those two workflows' failure handling generally, left
+untouched. `--workflow arena`'s main dispatch parks at `quota` when every implementer in
+a wave is quota-hit (skipping ranking rather than handing a caller a fabricated winner
+at exit `2`) and when the ranker itself is quota-hit; a *non-quota* implementer or
+ranker failure keeps arena's existing tolerance (rank whoever survived; fall back to the
+first implementer if ranking failed outright) unchanged — arena's whole point is
+surviving partial loss, and that tolerance is a separate, pre-existing design choice
+from the quota routing fixed here.
 Use `stop` (not killing pids directly) so the orchestrator can't re-dispatch a slot
 you just killed.
 

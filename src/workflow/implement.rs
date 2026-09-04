@@ -149,12 +149,12 @@ fn run_from_approved(
         // But `Phase::Quota` is also where `workflow/plan.rs` parks a *plan* run that
         // never got approved (its own pre-dispatch gate, or a paused planner/test-author
         // mid-plan) — accepting that unconditionally would walk straight past the
-        // `plan_approved` gate below and let `implement --run` drive an unapproved plan
-        // through to ship on a salvaged placeholder plan.md. A `Loop` run has no
-        // approval step at all (`--workflow loop` is `implement -t` directly), so its
-        // own quota park is legitimately resumable without the gate.
-        || (state.phase == Phase::Quota
-            && (state.gates.plan_approved || state.workflow == crate::cli::WorkflowKind::Loop));
+        // `plan_approved` gate above and let `implement --run` drive an unapproved plan
+        // through to ship on a salvaged placeholder plan.md. An *approved* run's own
+        // `Phase::Quota` park is already covered by the `plan_approved` disjunct above,
+        // so the only case this clause needs to add is `--workflow loop` (`implement -t`
+        // directly), which has no approval step at all.
+        || (state.phase == Phase::Quota && state.workflow == crate::cli::WorkflowKind::Loop);
     if !resumable {
         bail!(
             "run {run_id} plan is not approved (phase={:?})",

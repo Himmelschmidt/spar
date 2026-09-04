@@ -67,6 +67,21 @@ fn fake_binary(bin_dir: &std::path::Path, name: &str, body: &str) {
     }
 }
 
+/// Drops a fake CLI named `name` that runs `script` (a full shell body) and returns
+/// whatever exit code the script itself chooses, unlike `fake_binary`'s canned
+/// print-and-`exit 1`. Used to fabricate a slot that genuinely succeeds and produces
+/// its own expected artifact, which `fake_binary` alone cannot do.
+fn fake_binary_script(bin_dir: &std::path::Path, name: &str, script: &str) {
+    std::fs::create_dir_all(bin_dir).unwrap();
+    let fake = bin_dir.join(name);
+    std::fs::write(&fake, format!("#!/bin/sh\n{script}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
 fn prefixed_path(bin_dir: &std::path::Path) -> String {
     format!(
         "{}:{}",
@@ -433,4 +448,148 @@ fn implementer_ordinary_failure_still_fails_the_run_at_exit_1() {
         .assert()
         .code(1)
         .stderr(predicate::str::contains("plan is not approved"));
+}
+
+/// A single quota-hit reviewer with a successful sibling used to tally as `Done`/exit
+/// `0` — the surviving reviewer's real "approve" vote buried the fact that the other
+/// half of the panel never ran at all. That slot's absence is a resource block, not a
+/// vote, so it must still park the run rather than silently finishing on half a panel.
+#[test]
+fn review_workflow_one_quota_hit_reviewer_with_a_successful_sibling_parks_on_quota() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    let proj = dir.join("proj");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&proj).unwrap();
+    init_repo(&proj);
+    fake_binary(&bin, "claude", WEEKLY_LIMIT_LOG);
+    // Discovers the run's artifacts dir at runtime (the run id is not known until
+    // `spar` mints it) via `FAKE_PROJECT_ROOT`, inherited from the outer test process,
+    // and writes exactly the artifact `run_slot` expects from `review-1-cli-grok`
+    // (`--providers cli:claude,cli:grok` assigns index 1 to the second provider).
+    fake_binary_script(
+        &bin,
+        "grok",
+        r#"run_dir=$(ls -d "$FAKE_PROJECT_ROOT"/.spar/runs/*/ | head -1)
+mkdir -p "$run_dir/artifacts"
+printf '## Verdict\napprove\n' > "$run_dir/artifacts/review-review-1-cli-grok.md"
+exit 0"#,
+    );
+    let path_env = prefixed_path(&bin);
+
+    spar_cmd()
+        .current_dir(&proj)
+        .env("PATH", &path_env)
+        .env("FAKE_PROJECT_ROOT", &proj)
+        .args([
+            "run",
+            "--workflow",
+            "review",
+            "-t",
+            "review this",
+            "--providers",
+            "cli:claude,cli:grok",
+        ])
+        .assert()
+        .code(4);
+
+    let run_id = only_run_id(&proj);
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(proj.join(".spar/runs").join(&run_id).join("state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["phase"], "quota");
+}
+
+/// The plan critic is dispatched every plan run but was never checked for `quota_hit`
+/// — a rate-limited critic just marked its own slot `Failed` and the plan proceeded to
+/// approval as if nothing happened, silently losing the critic's feedback to a rate
+/// limit rather than surfacing it on the quota gate the way the planner's own dispatch
+/// already does.
+#[test]
+fn plan_workflow_rate_limited_critic_parks_on_quota_and_exits_4() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    let proj = dir.join("proj");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&proj).unwrap();
+    init_repo(&proj);
+    // `[spec]` defaults on, which would ask for a third (test-author) fleet slot; keep
+    // this test to exactly the two explicit `--providers` below.
+    std::fs::write(proj.join("spar.toml"), "[spec]\nenabled = false\n").unwrap();
+    // Both the planner and critic jobs share the same `expected_artifact: "plan.md"`
+    // (`workflow/plan.rs`), so the planner (dispatched first, sequentially) must write
+    // that exact name for its own dispatch to read as `ok` before the critic ever runs.
+    fake_binary_script(
+        &bin,
+        "claude",
+        r#"run_dir=$(ls -d "$FAKE_PROJECT_ROOT"/.spar/runs/*/ | head -1)
+mkdir -p "$run_dir/artifacts"
+printf '# Plan\n\ndone\n' > "$run_dir/artifacts/plan.md"
+exit 0"#,
+    );
+    fake_binary(&bin, "grok", WEEKLY_LIMIT_LOG);
+    let path_env = prefixed_path(&bin);
+
+    spar_cmd()
+        .current_dir(&proj)
+        .env("PATH", &path_env)
+        .env("FAKE_PROJECT_ROOT", &proj)
+        .args([
+            "plan",
+            "-t",
+            "add a feature",
+            "--providers",
+            "cli:claude,cli:grok",
+        ])
+        .assert()
+        .code(4);
+
+    let run_id = only_run_id(&proj);
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(proj.join(".spar/runs").join(&run_id).join("state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["phase"], "quota");
+}
+
+/// `--workflow arena`'s main dispatch discarded every implementer's `run_slot` error
+/// (marking the slot `Failed` but never checking `quota_hit`) and the ranker's result
+/// outright (`let _ = ...`), so an all-rate-limited wave still walked through to
+/// `Phase::AwaitingWinnerConfirm`/exit `2` with a fabricated winner rather than parking
+/// on the quota gate.
+#[test]
+fn arena_workflow_all_implementers_rate_limited_parks_on_quota_and_exits_4() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    let proj = dir.join("proj");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&proj).unwrap();
+    init_repo(&proj);
+    // Cap the fleet to exactly the 2 explicit providers below; the default
+    // `max_agents` (4) would otherwise reuse/pad the fleet past what's asserted here.
+    std::fs::write(proj.join("spar.toml"), "max_agents = 2\n").unwrap();
+    let path_env = fake_claude_binary(&bin, WEEKLY_LIMIT_LOG);
+
+    spar_cmd()
+        .current_dir(&proj)
+        .env("PATH", &path_env)
+        .args([
+            "run",
+            "--workflow",
+            "arena",
+            "-t",
+            "add a feature",
+            "--providers",
+            "cli:claude,cli:claude",
+        ])
+        .assert()
+        .code(4);
+
+    let run_id = only_run_id(&proj);
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(proj.join(".spar/runs").join(&run_id).join("state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["phase"], "quota");
 }

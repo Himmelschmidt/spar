@@ -185,13 +185,20 @@ pub fn execute_plan(
 
     for job in jobs {
         if let Err(e) = executor::run_slot(state, paths, cfg, job) {
+            // A quota-detected failure parks the run regardless of role: the critic is
+            // best-effort feedback for the planner (a genuine critic defect still just
+            // marks the slot Failed and the plan proceeds without it, unchanged), but a
+            // rate limit is not a defect to shrug off — it must surface on the quota
+            // gate the same way the planner's own dispatch already does, not silently
+            // finish a plan with the critic's rate limit invisible to the caller.
+            if executor::slot_quota_hit(state, &job.slot_id) {
+                state.error = Some(e.to_string());
+                state.set_phase(Phase::Quota);
+                state.save(paths)?;
+                return Ok(());
+            }
             if job.role == SlotRole::Planner {
                 state.error = Some(e.to_string());
-                if executor::slot_quota_hit(state, &job.slot_id) {
-                    state.set_phase(Phase::Quota);
-                    state.save(paths)?;
-                    return Ok(());
-                }
                 state.set_phase(Phase::Failed);
                 state.save(paths)?;
                 return Err(e);
