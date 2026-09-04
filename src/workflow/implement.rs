@@ -373,6 +373,12 @@ fn ensure_suite_slot(
     cfg: &Config,
     paths: &SparPaths,
 ) -> Result<()> {
+    if cfg.suite.is_builtin() {
+        // A run that had an agent tester before `[suite].command` was added (or before a
+        // `--reload-config`) would otherwise carry a slot nothing ever dispatches.
+        state.slots.retain(|s| s.role != SlotRole::Tester);
+        return Ok(());
+    }
     if !cfg.suite.enabled {
         return Ok(());
     }
@@ -756,7 +762,7 @@ fn command_names(cmd: &str, path: &str) -> bool {
 
 fn suite_guidance(outcome: SuiteOutcome) -> String {
     let header = "## Suite channel (do not re-run full suites)\n\
-         A dedicated cheap tester slot runs the full suite; its output is the `## Suite report` section above.\n\n";
+         A dedicated channel runs the full suite — spar's own configured commands, or a cheap tester slot; its output is the `## Suite report` section above.\n\n";
     match outcome {
         SuiteOutcome::Pass => format!(
             "{header}\
@@ -1169,7 +1175,44 @@ pub fn execute_loop(
                 .iter()
                 .find(|s| s.role == SlotRole::Tester)
                 .cloned();
-            if let Some(tester) = tester {
+            if cfg.suite.is_builtin() {
+                state.set_phase(Phase::Suite);
+                state.save(paths)?;
+                let report = if state.dry_run {
+                    crate::suite::dry(&cfg.suite.command)
+                } else {
+                    crate::suite::run(
+                        &review_cwd,
+                        &cfg.suite.command,
+                        &paths.artifact(&state.id, "suite.log"),
+                        std::time::Duration::from_secs(cfg.suite.timeout_secs),
+                    )
+                };
+                suite_outcome = report.outcome;
+                suite_body = report.body;
+                std::fs::write(paths.artifact(&state.id, "suite.md"), &suite_body)?;
+                let msg = format!(
+                    "suite channel {} (built-in, {} command(s))",
+                    match suite_outcome {
+                        SuiteOutcome::Pass => "green",
+                        SuiteOutcome::Fail => "red",
+                        SuiteOutcome::Inconclusive => "inconclusive",
+                    },
+                    report.runs.len()
+                );
+                let _ = crate::events::append(
+                    paths,
+                    &state.id,
+                    &crate::events::Event::info(msg.clone()),
+                );
+                let _ = crate::bus::broadcast(
+                    paths,
+                    Some(&state.id),
+                    "orchestrator",
+                    msg,
+                    state.message_budget,
+                );
+            } else if let Some(tester) = tester {
                 state.set_phase(Phase::Suite);
                 state.save(paths)?;
                 if let Some(s) = state.slot_mut(&tester.id) {
@@ -2175,6 +2218,41 @@ mod suite_parse_tests {
         assert!(suite_blocks_ship(SuiteOutcome::Fail));
         assert!(suite_blocks_ship(SuiteOutcome::Inconclusive));
         assert!(!suite_blocks_ship(SuiteOutcome::Pass));
+    }
+
+    /// The built-in runner sets the gate from exit codes and *also* writes `suite.md` for
+    /// the reviewers. If the two ever disagree, the panel is reading a verdict the gate
+    /// does not hold, which is the whole failure mode O54 exists to remove.
+    #[test]
+    fn a_builtin_report_parses_back_to_its_own_verdict() {
+        let d = std::env::temp_dir().join(format!("spar-builtin-rt-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let log = d.join("suite.log");
+        let cases = [
+            (vec!["true".to_string()], std::time::Duration::from_secs(30)),
+            (
+                vec!["exit 1".to_string()],
+                std::time::Duration::from_secs(30),
+            ),
+            (
+                vec!["sleep 30".to_string()],
+                std::time::Duration::from_millis(300),
+            ),
+        ];
+        for (cmds, budget) in cases {
+            let rep = crate::suite::run(&d, &cmds, &log, budget);
+            assert_eq!(
+                derive_suite_outcome(true, Some(0), Some(&rep.body)),
+                rep.outcome,
+                "{}",
+                rep.body
+            );
+        }
+        let rep = crate::suite::dry(&["cargo test".to_string()]);
+        assert_eq!(
+            derive_suite_outcome(true, Some(0), Some(&rep.body)),
+            rep.outcome
+        );
     }
 
     #[test]

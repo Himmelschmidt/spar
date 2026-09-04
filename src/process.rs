@@ -362,7 +362,7 @@ fn kill_process_group(child: &mut std::process::Child) -> Result<std::process::E
 /// SIGKILL cannot be caught, so this covers the polite kill only; `spar stop --abandoned`
 /// and `spar wait`'s abandonment check exist for the rest.
 #[cfg(unix)]
-mod shutdown {
+pub(crate) mod shutdown {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     /// Slot groups to signal from the handler. A fixed array, not a Vec behind a lock:

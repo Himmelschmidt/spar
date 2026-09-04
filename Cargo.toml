@@ -101,3 +101,7 @@ path = "tests/scenarios/contract_gate.rs"
 [[test]]
 name = "round_loop"
 path = "tests/scenarios/round_loop.rs"
+
+[[test]]
+name = "builtin_suite"
+path = "tests/scenarios/builtin_suite.rs"
