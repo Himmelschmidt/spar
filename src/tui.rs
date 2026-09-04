@@ -360,8 +360,11 @@ enum HomeRow {
         band: HomeBand,
         n: usize,
     },
-    /// Index into the snapshot's `projects` — band 4's project switcher.
-    Project(usize),
+    /// Band 4's project switcher: an index into the snapshot's `projects` (for the
+    /// lookups that need the full entry) plus that project's root, carried alongside
+    /// so `home_row_key` has a stable identity that does not move when the registry
+    /// gains or loses an earlier project (AC-28) — the index alone would.
+    Project(usize, PathBuf),
     /// Band 4's action row — opens the Phase D new-run surface.
     NewRun,
 }
@@ -1067,6 +1070,12 @@ fn new_run_fixture() -> NewRun {
 const REFRESH: Duration = Duration::from_millis(200);
 /// Upper bound on how long the render thread sleeps; also the animation rate.
 const FRAME: Duration = Duration::from_millis(100);
+/// How often Home repaints purely to age its wait/age columns forward when nothing
+/// on disk moved. Home has no selected `full` run, so `animating()` never fires for
+/// it; without this a static Home (only gates/broken/finished rows) freezes its
+/// `relative_wait`/`relative_age` labels at whatever they read at the last real
+/// rebuild instead of counting up (round-11 review finding).
+const HOME_CLOCK_TICK: Duration = Duration::from_secs(5);
 
 /// What the refresher needs in order to know which run/slot to read.
 #[derive(Clone, PartialEq, Eq)]
@@ -1101,6 +1110,31 @@ struct Snapshot {
     /// The selected slot's log stats (U13): `StreamStats::load` reads a file, so it
     /// is computed here rather than in `draw_log_body`.
     log_stats: Option<process::StreamStats>,
+}
+
+impl Snapshot {
+    /// The frame painted before the refresher thread's first real build lands.
+    /// Landing on Home means the first snapshot is cross-project (U13/B); building it
+    /// synchronously on the UI thread blocks the very first paint on a scan across
+    /// every registered project's run directory, which is the "thousands of run
+    /// dirs" scale the IA doc names as the thing that already bit once (round-11
+    /// review finding). `SparPaths::new` only joins paths, so this touches no disk.
+    fn loading(root: &Path) -> Self {
+        Self {
+            swarm: SparPaths::new(root),
+            projects: Vec::new(),
+            runs: Vec::new(),
+            full: None,
+            stream_text: String::new(),
+            activity: Vec::new(),
+            diff_text: String::new(),
+            human_alerts: 0,
+            abandoned: false,
+            heartbeats: std::collections::HashMap::new(),
+            home: HomeData::default(),
+            log_stats: None,
+        }
+    }
 }
 
 enum Msg {
@@ -1251,7 +1285,8 @@ fn fold_units(
     for root in order {
         let mut group = groups.remove(&root).unwrap_or_default();
         if group.len() == 1 {
-            let r = group.pop().expect("len 1");
+            let mut r = group.pop().expect("len 1");
+            r.unit_id = Some(root.clone());
             members.insert(r.id.clone(), vec![r.id.clone()]);
             out.push(r);
             continue;
@@ -1282,6 +1317,7 @@ fn fold_units(
         row.abandoned = group.iter().any(|r| r.abandoned) || row.abandoned;
         row.legs = ids.len() as u32;
         row.wants = wants;
+        row.unit_id = Some(root.clone());
         members.insert(row.id.clone(), ids);
         out.push(row);
     }
@@ -1560,7 +1596,7 @@ fn build_home_rows(
                 continue;
             }
         }
-        rows.push(HomeRow::Project(i));
+        rows.push(HomeRow::Project(i, proj.root.clone()));
     }
     rows
 }
@@ -1675,7 +1711,7 @@ fn home_overview(
                     any = true;
                     out.push_str("    n — start something new\n");
                 }
-                HomeRow::Project(_) => {}
+                HomeRow::Project(..) => {}
                 HomeRow::Header(_) => unreachable!(),
             }
             j += 1;
@@ -1710,9 +1746,14 @@ fn relative_wait(d: Duration) -> String {
 fn home_row_key(row: &HomeRow) -> String {
     match row {
         HomeRow::Header(b) => format!("hdr:{b:?}"),
-        HomeRow::Run { run, .. } => format!("run:{}", run.id),
+        // `run.id` follows whichever leg `fold_units` currently judges loudest, which
+        // can change between snapshots. `unit_id` is the fold root and does not move
+        // (AC-28); a row that was never folded has no `unit_id`, so `id` is stable.
+        HomeRow::Run { run, .. } => {
+            format!("run:{}", run.unit_id.as_deref().unwrap_or(&run.id))
+        }
         HomeRow::More { band, .. } => format!("more:{band:?}"),
-        HomeRow::Project(i) => format!("proj:{i}"),
+        HomeRow::Project(_, root) => format!("proj:{}", root.display()),
         HomeRow::NewRun => "newrun".to_string(),
     }
 }
@@ -2108,9 +2149,10 @@ fn run_loop(
         home_watermark: app.home_watermark,
     };
 
-    // First paint needs data, so build one snapshot synchronously.
+    // The first paint must not block on a scan (U13): the refresher thread below
+    // builds the real first snapshot off-thread, forced on its very first iteration.
     let mut cache = LogCache::empty();
-    let snapshot = Arc::new(Mutex::new(Arc::new(build_snapshot(&sel, &mut cache, &cfg))));
+    let snapshot = Arc::new(Mutex::new(Arc::new(Snapshot::loading(&active_root))));
 
     let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
     let (sel_tx, sel_rx) = mpsc::channel::<Selection>();
@@ -2195,6 +2237,7 @@ fn run_loop(
     }
 
     let mut dirty = true;
+    let mut last_home_clock = Instant::now();
     loop {
         let snap = Arc::clone(&*snapshot.lock().unwrap());
 
@@ -2366,6 +2409,11 @@ fn run_loop(
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if app.animated {
                     dirty = true;
+                } else if app.browse == BrowseLevel::Home
+                    && last_home_clock.elapsed() >= HOME_CLOCK_TICK
+                {
+                    dirty = true;
+                    last_home_clock = Instant::now();
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -2642,7 +2690,7 @@ fn new_run_target(
             .get(app.selected_home)
             .and_then(|r| match r {
                 HomeRow::Run { run, .. } => run.project_root.clone(),
-                HomeRow::Project(i) => projects.get(*i).map(|p| p.root.clone()),
+                HomeRow::Project(_, root) => Some(root.clone()),
                 _ => None,
             })
             .or_else(|| local_root.map(Path::to_path_buf)),
@@ -3544,11 +3592,11 @@ fn rail_enter(
                 app.selected_slot = 0;
                 app.reset_stream_view();
             }
-            Some(HomeRow::Project(i)) => {
-                if let Some(p) = projects.get(*i) {
-                    *active_root = p.root.clone();
-                    app.open_project_runs();
-                }
+            Some(HomeRow::Project(i, root)) => {
+                *active_root = projects
+                    .get(*i)
+                    .map_or_else(|| root.clone(), |p| p.root.clone());
+                app.open_project_runs();
             }
             Some(HomeRow::NewRun) => {
                 // `active_root` is the rail's current browsing root, not a verified
@@ -4134,7 +4182,7 @@ fn draw(
             && !home
                 .rows
                 .iter()
-                .any(|r| matches!(r, HomeRow::Run { .. } | HomeRow::Project(_)));
+                .any(|r| matches!(r, HomeRow::Run { .. } | HomeRow::Project(..)));
         if active == Some(true) || no_runs || empty_home {
             if app.focus == Focus::Rail {
                 app.open_main(MainTab::Log);
@@ -5598,7 +5646,7 @@ fn rail_home_items(
                     format!("  … {n} more"),
                     Style::default().fg(FG_MUTED).italic(),
                 )),
-                HomeRow::Project(idx) => {
+                HomeRow::Project(idx, _) => {
                     let name = projects
                         .get(*idx)
                         .and_then(|p| p.name.as_deref())
@@ -8691,6 +8739,7 @@ mod labels {
             round: 1,
             legs: 1,
             wants: 0,
+            unit_id: None,
             base_ref: None,
             base_commit: None,
             project_root: None,
@@ -9175,6 +9224,7 @@ mod render_stability {
                 round: 1,
                 legs: 1,
                 wants: 0,
+                unit_id: None,
                 base_ref: None,
                 base_commit: None,
                 project_root: None,
@@ -10564,6 +10614,7 @@ mod render_stability {
             round: 1,
             legs: 1,
             wants: 0,
+            unit_id: None,
             base_ref: None,
             base_commit: None,
             project_root: Some(PathBuf::from("/nonexistent").join(project)),
@@ -11028,7 +11079,7 @@ mod render_stability {
             assert!(
                 rows[i + 1..]
                     .iter()
-                    .all(|r| matches!(r, HomeRow::NewRun | HomeRow::Project(_))),
+                    .all(|r| matches!(r, HomeRow::NewRun | HomeRow::Project(..))),
                 "band 4 holds only the action row and the project list"
             );
         }
@@ -11170,6 +11221,23 @@ mod render_stability {
         });
     }
 
+    /// U13, startup half — round-11 review finding. Landing on Home makes the very
+    /// first snapshot cross-project; building it synchronously before the first
+    /// paint would block startup on the same scan U13 already keeps out of `draw`.
+    /// `Snapshot::loading` is what the first frame paints instead: it must come back
+    /// empty and instantly, and must not need its root to exist, proving it does no
+    /// disk I/O to construct.
+    #[test]
+    fn snapshot_loading_needs_no_disk_and_paints_empty() {
+        let root = PathBuf::from("/nonexistent/definitely-not-here");
+        let snap = Snapshot::loading(&root);
+        assert!(snap.projects.is_empty());
+        assert!(snap.runs.is_empty());
+        assert!(snap.home.rows.is_empty());
+        assert!(snap.home.project_stats.is_empty());
+        assert!(snap.full.is_none());
+    }
+
     /// U13, round-7 review finding (review-0-cli-codex): `draw_log_body` used to call
     /// `process::StreamStats::load`, a synchronous file read, on every repaint of a
     /// selected run's Log tab. It now only reads the `stats` snapshot already computed
@@ -11306,6 +11374,7 @@ mod folding {
             round: 1,
             legs: 1,
             wants: 0,
+            unit_id: None,
             base_ref: None,
             base_commit: None,
             project_root: None,
@@ -11366,6 +11435,38 @@ mod folding {
             runs_needing_attention(&rows),
             2,
             "both gates are still counted"
+        );
+    }
+
+    /// AC-28. `fold_units`'s `id` follows whichever leg is loudest, which can change
+    /// between snapshots as attention shifts within a unit — but `unit_id` (what a
+    /// Home cursor keys on) must not, or the cursor jumps every time the loudest leg
+    /// changes (round-11 review finding).
+    #[test]
+    fn unit_id_is_stable_across_a_change_in_the_loudest_leg() {
+        let runs = vec![
+            summary("root", Phase::Review, None, 30),
+            summary("legA", Phase::AwaitingPlanApproval, Some("root"), 20),
+            summary("legB", Phase::Review, Some("root"), 10),
+        ];
+        let (rows, _) = fold_units(runs);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "legA", "legA is loudest: it holds the gate");
+        assert_eq!(rows[0].unit_id.as_deref(), Some("root"));
+
+        // Next snapshot: legB is now the gate instead of legA, so the displayed id
+        // moves to it — but it is still the same unit of work.
+        let runs2 = vec![
+            summary("root", Phase::Review, None, 30),
+            summary("legA", Phase::Review, Some("root"), 20),
+            summary("legB", Phase::AwaitingPlanApproval, Some("root"), 10),
+        ];
+        let (rows2, _) = fold_units(runs2);
+        assert_eq!(rows2.len(), 1);
+        assert_eq!(rows2[0].id, "legB", "the loudest leg moved");
+        assert_eq!(
+            rows2[0].unit_id, rows[0].unit_id,
+            "the unit's identity does not move just because a different leg got loud"
         );
     }
 
@@ -11562,6 +11663,7 @@ mod home_ia {
             round: 1,
             legs: 1,
             wants: 0,
+            unit_id: None,
             base_ref: None,
             base_commit: None,
             project_root: Some(root.to_path_buf()),
@@ -12372,7 +12474,7 @@ mod home_ia {
         let rows = vec![
             HomeRow::Header(HomeBand::StartNew),
             HomeRow::NewRun,
-            HomeRow::Project(0),
+            HomeRow::Project(0, root.clone()),
         ];
         let mut app = App::new(None, Config::default(), None);
         app.selected_home = 2;

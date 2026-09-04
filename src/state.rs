@@ -381,6 +381,13 @@ pub struct RunSummary {
     /// `legs`.
     #[serde(skip)]
     pub wants: u32,
+    /// Identity of the folded unit this row stands for (U15), stable regardless of
+    /// which leg `fold_units` picks as the loudest representative from one snapshot
+    /// to the next. `None` for a row that was never folded. A cursor or cache keyed
+    /// on a folded row must use this, not `id` — `id` follows whichever leg is
+    /// currently loudest and can change between snapshots (AC-28).
+    #[serde(skip)]
+    pub unit_id: Option<String>,
     /// Filled when listing across projects (global home).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_root: Option<PathBuf>,
@@ -916,6 +923,7 @@ pub fn list_runs(paths: &SparPaths) -> Result<Vec<RunSummary>> {
                 round: state.round,
                 legs: 1,
                 wants: 0,
+                unit_id: None,
                 base_ref: state.base_ref,
                 base_commit: state.base_commit,
                 project_root: None,
