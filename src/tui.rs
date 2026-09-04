@@ -1301,11 +1301,17 @@ fn fold_units(
             out.push(r);
             continue;
         }
-        // Loudest attention first, then most recent: the active member is whatever the
-        // operator would want the row to be about.
+        // A leg that wants the operator outranks everything, then loudest attention,
+        // then most recent. `wants_operator` is not a function of `run_attention`:
+        // `PlanApproved` is `Idle` there, so ordering by attention alone folds a unit
+        // with an approved plan and a busy child down to the child, and the handoff
+        // vanishes from Home while the `wants` roll-up below still counts it — the two
+        // then disagree. U15 is explicit that folding must never hide a gate, which is
+        // the exact failure O36 exists to prevent.
         group.sort_by(|a, b| {
-            run_attention(b)
-                .cmp(&run_attention(a))
+            wants_operator(b)
+                .cmp(&wants_operator(a))
+                .then(run_attention(b).cmp(&run_attention(a)))
                 .then(b.updated_at.cmp(&a.updated_at))
         });
         let ids: Vec<String> = group.iter().map(|r| r.id.clone()).collect();
@@ -2267,9 +2273,20 @@ fn run_loop(
     }
 
     let mut dirty = true;
+    // `home_target_ticks` counts *snapshots*, not render wakes. The loop re-reads the
+    // shared snapshot every 100ms whether or not the refresher has installed a new one,
+    // so ticking per wake burns HOME_TARGET_GIVE_UP in 2.5s and abandons a live target
+    // during a slow project scan.
+    let mut last_snap: Option<Arc<Snapshot>> = None;
     let mut last_home_clock = Instant::now();
     loop {
         let snap = Arc::clone(&*snapshot.lock().unwrap());
+        let fresh_snapshot = last_snap
+            .as_ref()
+            .is_none_or(|prev| !Arc::ptr_eq(prev, &snap));
+        if fresh_snapshot {
+            last_snap = Some(Arc::clone(&snap));
+        }
 
         if let Some((t, _, _, dur)) = &app.flash {
             if t.elapsed() > *dur {
@@ -2292,8 +2309,11 @@ fn run_loop(
             // whose Runs listing has not landed yet (R2's one-tick lag) would
             // otherwise never tick `home_target_ticks` and pin `home_target_run`
             // forever, leaving Main/Agents blank with no way out (round-11 review,
-            // major).
-            resolve_home_target(&mut app, &snap.runs);
+            // major). Gated on a *new* snapshot so the give-up budget is measured in
+            // refreshes rather than in 100ms render wakes.
+            if fresh_snapshot {
+                resolve_home_target(&mut app, &snap.runs);
+            }
             if !snap.runs.is_empty() {
                 app.selected_run = app.selected_run.min(snap.runs.len() - 1);
             }
@@ -2638,7 +2658,13 @@ fn handle_key(
             app.flash("Projects (general view)", ACCENT);
         }
         KeyCode::Char('n') => {
-            let browsed = app.browse.in_project().then_some(active_root.as_path());
+            // At Projects the highlighted row *is* the operator's chosen target: the
+            // loop sets `active_root` from `selected_project` on that level. Keying off
+            // `in_project()` alone (false there) left `n` with no target on the one
+            // level whose entire purpose is picking a project (round-12 review, major).
+            let browsed = (app.browse.in_project()
+                || (app.browse == BrowseLevel::Projects && !projects.is_empty()))
+            .then_some(active_root.as_path());
             open_new_run(app, projects, home_rows, local_root, browsed);
         }
         KeyCode::Char('P') => {
@@ -11490,6 +11516,36 @@ mod folding {
         let mut members = units.get("impl1").cloned().unwrap_or_default();
         members.sort();
         assert_eq!(members, vec!["impl1".to_string(), "plan1".to_string()]);
+    }
+
+    /// `wants_operator` is not a function of `run_attention`: `PlanApproved` is a
+    /// handoff nothing else will complete, but it scores `Idle`. Ordering the group by
+    /// attention alone therefore folded a unit with an approved plan and a busy child
+    /// down to the child, so Home showed no handoff while `wants` still counted one and
+    /// the two roll-ups disagreed. Twelve review rounds passed the 36-criterion contract
+    /// with this live, because no criterion paired a wanting leg with a louder one.
+    #[test]
+    fn folding_prefers_a_leg_that_wants_the_operator_over_a_louder_one() {
+        let runs = vec![
+            summary("plan1", Phase::PlanApproved, None, 90),
+            summary("impl1", Phase::Review, Some("plan1"), 5),
+        ];
+        let (rows, _) = fold_units(runs);
+        assert_eq!(rows.len(), 1, "one unit of work");
+        let unit = &rows[0];
+        assert_eq!(
+            unit.phase,
+            Phase::PlanApproved,
+            "the folded row must represent the leg waiting on the operator, not the \
+             louder working leg: {unit:?}"
+        );
+        assert_eq!(unit.id, "plan1");
+        assert_eq!(unit.wants, 1, "the roll-up and the row must agree");
+        assert!(
+            wants_operator(unit),
+            "the row itself must read as wanting the operator, or Home's band and the \
+             fleet roll-up disagree"
+        );
     }
 
     /// Folding must never hide a run that wants the operator — the failure O36 exists
