@@ -388,7 +388,12 @@ quota module (including a doc comment quoting a stated-reset line), or a
 misroute a genuine defect onto the quota gate (all of those can still drive the
 harmless, auto-recovering pause — just not the routing decision). A rate limiter under
 test ("the rate limiter rejected the request") doesn't trip it either — the phrase match
-requires a word boundary, so "rate limiter" doesn't read as "rate limit".
+requires a word boundary, so "rate limiter" doesn't read as "rate limit". The discriminator
+also recognizes a rejection sentence standing alone on one line with no separate "rate
+limit ... rejected" line beside it — "You've hit your weekly/usage limit" (Claude,
+codex) and "rate limit reached" (the wording several adapters use, previously only
+"rejected"/"exceeded" routed) are each treated as complete one-line rejection
+statements, the same class as the bare `"out of credits"` match.
 Resuming picks the same run back up, and if the provider is still on cooldown it
 re-parks at `quota` immediately rather than dispatching into the same wall. Claude's CLI
 states its own weekly-limit reset time in the rejection line; spar parses that (local
@@ -398,11 +403,15 @@ run-routing decision above never does, for the false-positive reason just descri
 That parsed cooldown is capped at the *next occurrence* of the stated time-of-day (~24h
 out), not the actual weekly rollover — a big improvement over the default, but a weekly
 pause is still re-probed daily rather than left alone for the full week, since Claude's
-line carries no date. The other adapters (codex, opencode, muse, grok) have no
-provider-specific reset parser, so a mid-dispatch limit on them falls back to the
-generic-rejection-phrase match (untested against any real captured output from those
-CLIs — treat as unverified, not confirmed) and the generic cooldown; agy has its own,
-separate telemetry-based cooldown unrelated to this mechanism. `--workflow review`,
+line carries no date. codex and opencode have no provider-specific reset parser, so a
+mid-dispatch limit on them falls back to the generic-rejection-phrase match (untested
+against any real captured output from those CLIs — treat as unverified, not confirmed)
+and the generic cooldown; muse and grok are the same, also unverified. agy is the one
+adapter with its own adapter-specific signal: near-exhausted quota is read from its
+statusline telemetry (not its log, which is ~empty) and both the cooldown *and* the
+quota-routing decision come from that telemetry directly, independent of the log-based
+discriminator above — a rate-limited agy dispatch parks at `quota` even though its own
+log never says so. `--workflow review`,
 `--workflow peer`, and `--workflow roles` each route to `quota` when every *failed* slot
 in the panel is quota-detected, whether or not a sibling slot succeeded — one rate-limited
 reviewer alongside one that completed still parks the run rather than quietly finishing

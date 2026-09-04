@@ -220,12 +220,19 @@ impl QuotaStore {
         for line in log.lines() {
             let lower = line.to_ascii_lowercase();
             let hit = (contains_phrase(&lower, "rate limit")
-                && (lower.contains("rejected") || lower.contains("exceeded")))
+                && (lower.contains("rejected")
+                    || lower.contains("exceeded")
+                    || lower.contains("reached")))
                 || (contains_phrase(&lower, "usage limit")
                     && (lower.contains("reached") || lower.contains("exceeded")))
                 || (lower.contains("too many requests") && lower.contains("429"))
                 || lower.contains("out of credits")
-                || lower.contains("quota exceeded");
+                || lower.contains("quota exceeded")
+                // Claude's and codex's own rejection sentences ("You've hit your weekly
+                // limit", "You've hit your usage limit.") are complete, one-line rejection
+                // statements in the same class as the bare "out of credits" above — no
+                // separate rejection word needed, since "hit your ... limit" already is one.
+                || (lower.contains("hit your") && lower.contains("limit"));
             if hit {
                 return Some(line.trim().to_string());
             }
@@ -684,6 +691,32 @@ mod tests {
         );
         assert!(QuotaStore::scrape_strong_quota_signal("usage limit reached, try later").is_some());
         assert!(QuotaStore::scrape_strong_quota_signal("account is out of credits").is_some());
+    }
+
+    /// Claude's stated-reset sentence is a separate line from "! rate limit ...
+    /// rejected". Before this fix, an output mode that printed only the sentence (no
+    /// separate rejection line) fell through to `Phase::Failed` while the provider was
+    /// simultaneously paused for hours — the worst of both outcomes.
+    #[test]
+    fn strong_quota_signal_matches_claudes_sentence_alone() {
+        assert!(QuotaStore::scrape_strong_quota_signal(
+            "You've hit your weekly limit \u{b7} resets 12am (America/New_York)"
+        )
+        .is_some());
+    }
+
+    /// codex's own wordings: a "hit your ... limit" rejection sentence, and a "rate
+    /// limit reached" line the "rejected"/"exceeded" arm didn't cover.
+    #[test]
+    fn strong_quota_signal_matches_codexs_wordings() {
+        assert!(QuotaStore::scrape_strong_quota_signal(
+            "You've hit your usage limit. Try again later."
+        )
+        .is_some());
+        assert!(QuotaStore::scrape_strong_quota_signal(
+            "Rate limit reached for gpt-5 in organization org-abc on requests per min. Limit: 3/min."
+        )
+        .is_some());
     }
 
     /// Four realistic non-quota failures that each contain one of `scrape_log_hint`'s

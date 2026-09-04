@@ -72,6 +72,14 @@ pub fn run_slots_parallel(
         match prepare_slot_execution(state, paths, cfg, job) {
             Ok(p) => prepared.push(p),
             Err(e) => {
+                // `prepare_slot_execution`'s own `quota_hit = false` reset sits after its
+                // fallible steps (template render, prompt write, provider parse), so a
+                // slot that hit quota last round and fails one of those *this* round
+                // would otherwise carry a stale `true` into a terminal-phase mapping —
+                // routing a template bug to `Phase::Quota` instead of `Phase::Failed`.
+                if let Some(s) = state.slot_mut(&job.slot_id) {
+                    s.quota_hit = false;
+                }
                 let _ =
                     mark_slot_failed(state, paths, &job.slot_id, &e.to_string(), None, None, None);
             }
@@ -372,6 +380,7 @@ fn execute_prepared(
                 signal: None,
                 error: None,
                 usage: Some(slot_usage),
+                agy_quota_hit: false,
             }
         } else {
             SlotOutcome {
@@ -381,6 +390,7 @@ fn execute_prepared(
                 signal: None,
                 error: err,
                 usage: Some(slot_usage),
+                agy_quota_hit: false,
             }
         });
     }
@@ -469,7 +479,7 @@ fn execute_prepared(
         reason: None,
     };
     let _ = markers::write_dispatch_verdict(&prep.paths, &prep.run_id, &prep.job.slot_id, &verdict);
-    enrich_agy_stats(
+    let agy_quota_hit = enrich_agy_stats(
         &mut res.stats,
         &prep.job.provider,
         &prep.cwd,
@@ -492,6 +502,7 @@ fn execute_prepared(
             signal: res.signal,
             error: Some(error),
             usage: Some(usage),
+            agy_quota_hit,
         });
     }
     if res.exit_code != Some(0) {
@@ -502,6 +513,7 @@ fn execute_prepared(
             signal: res.signal,
             error: Some(describe_exit(res.exit_code, res.signal)),
             usage: Some(usage),
+            agy_quota_hit,
         });
     }
     // A clean exit is not success on its own: a slot that produced no artifact (e.g. an
@@ -546,6 +558,7 @@ fn execute_prepared(
                 signal: None,
                 error: Some(error),
                 usage: Some(usage),
+                agy_quota_hit,
             });
         }
     }
@@ -556,6 +569,7 @@ fn execute_prepared(
         signal: None,
         error: None,
         usage: Some(usage),
+        agy_quota_hit,
     })
 }
 
@@ -772,22 +786,25 @@ fn enrich_muse_stats(stats: &mut process::StreamStats, provider: &str, log_path:
 /// agy emits ~nothing to stdout, so the stream stats are all zero. Recover the real
 /// tool/token/activity counts from agy's transcript + statusline sink and rewrite the
 /// slot's stats sidecar so `stats.json` and the TUI reflect what actually happened.
-/// Also drives a real agy quota cooldown from the payload's reset horizon (finding #3).
+/// Also drives a real agy quota cooldown from the payload's reset horizon (finding #3),
+/// and returns whether it did: agy's statusline is the *only* place that shows up (its
+/// own stdout is ~empty, so the log-based `detect_and_pause_quota` scrape never fires
+/// for it), so callers OR this into a failed dispatch's `quota_hit` themselves.
 fn enrich_agy_stats(
     stats: &mut process::StreamStats,
     provider: &str,
     cwd: &Path,
     log_path: &Path,
     paths: &SparPaths,
-) {
+) -> bool {
     if !provider_is_agy(provider) {
-        return;
+        return false;
     }
     let Some(root) = providers::agy_telemetry::root() else {
-        return;
+        return false;
     };
     let Some(t) = providers::agy_telemetry::collect(&root, cwd) else {
-        return;
+        return false;
     };
     if t.tools > 0 {
         stats.tools = t.tools;
@@ -832,8 +849,10 @@ fn enrich_agy_stats(
                     .unwrap_or_else(|| "agy quota exhausted".into()),
             );
             let _ = store.save(paths);
+            return true;
         }
     }
+    false
 }
 
 fn usage_from_stream(slot_id: &str, provider: &str, s: &process::StreamStats) -> SlotUsage {
@@ -897,6 +916,7 @@ fn apply_parallel_outcome(
             );
         }
         Ok(result) => {
+            let agy_quota_hit = result.agy_quota_hit;
             let err = result.error.unwrap_or_else(|| "failed".into());
             salvage_expected_artifact(paths, &state.id, &prep.job, &prep.log_path, &err);
             if let Some(u) = result.usage {
@@ -909,9 +929,12 @@ fn apply_parallel_outcome(
             // had no quota detection at all before this: a rate-limited slot here left
             // its provider unpaused. This only pauses/records the hit on the slot; it
             // is `review`/`peer`/`roles`'s own terminal-phase mapping that reads
-            // `quota_hit` back off the slot to route the run to `Phase::Quota`.
+            // `quota_hit` back off the slot to route the run to `Phase::Quota`. agy's
+            // own stdout is ~empty, so the log scrape alone never sees its rejection;
+            // `enrich_agy_stats`'s telemetry-driven verdict is ORed in instead.
             let log_text = process::tail_log(&prep.log_path, 8000);
-            let quota_hit = detect_and_pause_quota(paths, &prep.job.provider, &log_text);
+            let quota_hit =
+                detect_and_pause_quota(paths, &prep.job.provider, &log_text) || agy_quota_hit;
             if let Some(s) = state.slot_mut(slot_id) {
                 s.quota_hit = quota_hit;
             }
@@ -1255,7 +1278,10 @@ pub fn run_slot(
             &crate::events::Event::slot(&job.slot_id, SlotStatus::Failed),
         );
         let log_text = process::tail_log(&log_path, 8000);
-        let quota_hit = detect_and_pause_quota(paths, &job.provider, &log_text);
+        // agy's own stdout is ~empty, so the log scrape alone never sees its rejection;
+        // `enrich_agy_stats`'s telemetry-driven verdict is ORed in instead.
+        let quota_hit =
+            detect_and_pause_quota(paths, &job.provider, &log_text) || result.agy_quota_hit;
         if let Some(s) = state.slot_mut(&job.slot_id) {
             s.quota_hit = quota_hit;
         }
@@ -1329,6 +1355,10 @@ struct SlotOutcome {
     signal: Option<i32>,
     error: Option<String>,
     usage: Option<SlotUsage>,
+    /// Set when `enrich_agy_stats` detected exhausted agy quota telemetry during *this*
+    /// dispatch. agy's own stdout is ~empty, so the log-based quota scrape
+    /// (`detect_and_pause_quota`) never sees it; callers OR this in instead.
+    agy_quota_hit: bool,
 }
 
 impl SlotOutcome {
@@ -1340,6 +1370,7 @@ impl SlotOutcome {
             signal: None,
             error: Some(msg.into()),
             usage: None,
+            agy_quota_hit: false,
         }
     }
 }
@@ -1717,6 +1748,7 @@ fn run_api(
             signal: None,
             error: None,
             usage: Some(slot_usage),
+            agy_quota_hit: false,
         })
     } else {
         Ok(SlotOutcome {
@@ -1726,6 +1758,7 @@ fn run_api(
             signal: None,
             error: err,
             usage: Some(slot_usage),
+            agy_quota_hit: false,
         })
     }
 }
@@ -1826,7 +1859,7 @@ fn run_headless(
         reason: None,
     };
     let _ = markers::write_dispatch_verdict(paths, &state.id, &job.slot_id, &verdict);
-    enrich_agy_stats(&mut res.stats, &job.provider, cwd, log_path, paths);
+    let agy_quota_hit = enrich_agy_stats(&mut res.stats, &job.provider, cwd, log_path, paths);
     enrich_muse_stats(&mut res.stats, &job.provider, log_path);
     let usage = usage_from_stream(&job.slot_id, &job.provider, &res.stats);
     if res.timed_out {
@@ -1843,6 +1876,7 @@ fn run_headless(
             signal: res.signal,
             error: Some(error),
             usage: Some(usage),
+            agy_quota_hit,
         });
     }
     let code = res.exit_code;
@@ -1854,6 +1888,7 @@ fn run_headless(
             signal: res.signal,
             error: Some(describe_exit(code, res.signal)),
             usage: Some(usage),
+            agy_quota_hit,
         });
     }
     if let Some(name) = &job.expected_artifact {
@@ -1891,6 +1926,7 @@ fn run_headless(
                     signal: None,
                     error: Some(error),
                     usage: Some(usage),
+                    agy_quota_hit,
                 });
             }
         }
@@ -1902,6 +1938,7 @@ fn run_headless(
         signal: None,
         error: None,
         usage: Some(usage),
+        agy_quota_hit,
     })
 }
 
@@ -2016,6 +2053,7 @@ fn run_tmux(
                     signal: None,
                     error: None,
                     usage: None,
+                    agy_quota_hit: false,
                 })
             }
             TmuxDecision::Failed => {
@@ -2026,6 +2064,7 @@ fn run_tmux(
                     signal: None,
                     error: Some("marker failed".into()),
                     usage: None,
+                    agy_quota_hit: false,
                 })
             }
             TmuxDecision::DoneButAlive => {
@@ -2036,6 +2075,7 @@ fn run_tmux(
                     signal: None,
                     error: Some("agent reported done but its process is still running".into()),
                     usage: None,
+                    agy_quota_hit: false,
                 })
             }
             TmuxDecision::Wait => {
@@ -2544,6 +2584,58 @@ mod tests {
         assert_eq!(s.status, SlotStatus::Done);
         assert_eq!(s.error, None, "a done slot must not carry a prior failure");
         assert_eq!(s.signal, None);
+    }
+
+    /// `prepare_slot_execution`'s own `quota_hit = false` reset sits after its fallible
+    /// steps (template render, prompt write, provider parse), so a slot re-dispatched
+    /// after a prior round's real quota hit that then fails one of those *this* round
+    /// must not carry the stale `true` into `mark_slot_failed` — that would route a
+    /// template bug onto `Phase::Quota` instead of `Phase::Failed`. `run_slots_parallel`
+    /// (not `run_slot`) is the caller responsible for the reset in that arm.
+    #[test]
+    fn run_slots_parallel_clears_a_stale_quota_hit_when_prepare_itself_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let cfg = Config::default();
+        let mut state = RunState::new(
+            "r-stale-quota",
+            crate::cli::WorkflowKind::Review,
+            tmp.path().to_path_buf(),
+        );
+        // Not dry-run and >1 job: the branch that reaches `prepare_slot_execution`
+        // directly rather than falling back to sequential `run_slot`.
+        state.dry_run = false;
+        for id in ["r1", "r2"] {
+            let mut slot = init_slot_model(id, "cli:claude", SlotRole::Reviewer, None);
+            slot.quota_hit = true;
+            state.slots.push(slot);
+        }
+        state.save(&paths).unwrap();
+        let jobs: Vec<SlotJob> = ["r1", "r2"]
+            .iter()
+            .map(|id| SlotJob {
+                slot_id: (*id).into(),
+                provider: "cli:claude".into(),
+                role: SlotRole::Reviewer,
+                // Unknown template: `templates::render` errors before any process is
+                // spawned, so this never touches the network/PATH.
+                template: "does-not-exist".into(),
+                extra_vars: HashMap::new(),
+                expected_artifact: None,
+                model: None,
+            })
+            .collect();
+
+        run_slots_parallel(&mut state, &paths, &cfg, &jobs).unwrap();
+
+        for id in ["r1", "r2"] {
+            let s = state.slot_mut(id).unwrap();
+            assert_eq!(s.status, SlotStatus::Failed);
+            assert!(
+                !s.quota_hit,
+                "a template-render failure must not carry a stale quota_hit from a prior round"
+            );
+        }
     }
 
     #[test]

@@ -401,6 +401,52 @@ fn non_claude_provider_generic_rate_limit_phrase_still_parks_on_quota() {
     assert_eq!(state["phase"], "quota");
 }
 
+/// agy emits ~nothing to stdout, so `detect_and_pause_quota`'s log scrape can never see
+/// its rejection there — the only place exhausted quota shows up is the statusline
+/// telemetry sink `enrich_agy_stats` reads. Before this fix that telemetry paused the
+/// provider but never flowed into `slot.quota_hit`, so a failed agy dispatch still fell
+/// through to `Phase::Failed`/exit `1` despite spar having correctly identified (and
+/// paused on) the real cause.
+#[test]
+fn agy_exhausted_quota_telemetry_parks_on_quota_and_exits_4() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    let proj = dir.join("proj");
+    let bin = dir.join("bin");
+    let home = dir.join("home");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    init_repo(&proj);
+    // Writes the near-exhausted-quota statusline payload for its own cwd (the slot's
+    // worktree, discovered via `pwd` since the run id isn't known ahead of time) under
+    // agy's telemetry root ($HOME/.gemini/antigravity-cli), then exits non-zero with no
+    // rate-limit wording anywhere in its own stdout/log.
+    fake_binary_script(
+        &bin,
+        "agy",
+        r#"root="$HOME/.gemini/antigravity-cli/.spar"
+mkdir -p "$root"
+printf '{"cwd": "%s", "quota": {"gemini-5h": {"remaining_fraction": 0.01, "reset_in_seconds": 1800}}}\n' "$(pwd)" >> "$root/statusline.jsonl"
+exit 1"#,
+    );
+    let path_env = prefixed_path(&bin);
+
+    spar_cmd()
+        .current_dir(&proj)
+        .env("PATH", &path_env)
+        .env("HOME", &home)
+        .args(["implement", "-t", "add a feature", "--providers", "cli:agy"])
+        .assert()
+        .code(4);
+
+    let run_id = only_run_id(&proj);
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(proj.join(".spar/runs").join(&run_id).join("state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["phase"], "quota");
+}
+
 #[test]
 fn implementer_ordinary_failure_still_fails_the_run_at_exit_1() {
     let tmp = tempdir().unwrap();
