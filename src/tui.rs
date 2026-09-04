@@ -2583,7 +2583,16 @@ fn handle_key(
     // never contends with the agent pane.
     if app.palette.is_some() {
         return handle_palette_key(
-            app, code, mods, swarm, projects, home_rows, local_root, runs, full,
+            app,
+            code,
+            mods,
+            swarm,
+            projects,
+            home_rows,
+            local_root,
+            runs,
+            full,
+            active_root.as_path(),
         );
     }
 
@@ -2688,20 +2697,7 @@ fn handle_key(
             app.flash("Projects (general view)", ACCENT);
         }
         KeyCode::Char('n') => {
-            // At Projects the highlighted row *is* the operator's chosen target, but it
-            // must be read from `selected_project` here rather than from `active_root`:
-            // the loop refreshes `active_root` only in the pre-input clamp, while a
-            // queued burst (`j` then `n`, or a click then `n`) is drained against the
-            // same frame, so `active_root` is one selection stale (review e72f434e,
-            // major). Keying off `in_project()` alone (false at Projects) also left `n`
-            // with no target at all on the one level whose purpose is picking a project.
-            let browsed = if app.browse == BrowseLevel::Projects {
-                projects.get(app.selected_project).map(|p| p.root.as_path())
-            } else if app.browse.in_project() {
-                Some(active_root.as_path())
-            } else {
-                None
-            };
+            let browsed = browsed_project_target(app, projects, active_root.as_path());
             open_new_run(app, projects, home_rows, local_root, browsed);
         }
         KeyCode::Char('P') => {
@@ -2769,6 +2765,29 @@ fn handle_key(
         _ => {}
     }
     Ok(false)
+}
+
+/// The project the operator is browsing right now, for surfaces (`n`, `:plan`) that
+/// resolve their target at handling time rather than from a snapshot. At `Projects`
+/// the highlighted row is the target and must come from `selected_project`:
+/// `active_root` is refreshed only in the pre-input clamp, so a queued burst (`j`
+/// then the command, or a click then the command) leaves it one selection stale
+/// (review e72f434e). Inside a project (`in_project()`, i.e. Runs/Agents) `active_root`
+/// is live and correct; `swarm.project_root` is not, since `swarm` is the snapshot
+/// handed to `handle_key` and lags the instant `rail_enter` updates `active_root`
+/// (review 3be317b2). Outside a project view there is no browsed target.
+fn browsed_project_target<'a>(
+    app: &App,
+    projects: &'a [registry::ProjectEntry],
+    active_root: &'a Path,
+) -> Option<&'a Path> {
+    if app.browse == BrowseLevel::Projects {
+        projects.get(app.selected_project).map(|p| p.root.as_path())
+    } else if app.browse.in_project() {
+        Some(active_root)
+    } else {
+        None
+    }
 }
 
 /// `n`: open the Phase D new-run surface. The target project follows the scope
@@ -3097,6 +3116,7 @@ fn handle_palette_key(
     local_root: Option<&Path>,
     runs: &[state::RunSummary],
     full: Option<&RunState>,
+    active_root: &Path,
 ) -> Result<bool> {
     match code {
         KeyCode::Esc => {
@@ -3113,7 +3133,15 @@ fn handle_palette_key(
                 return Ok(false);
             }
             match run_palette(
-                app, swarm, projects, home_rows, local_root, runs, full, &input,
+                app,
+                swarm,
+                projects,
+                home_rows,
+                local_root,
+                runs,
+                full,
+                active_root,
+                &input,
             ) {
                 Ok(PaletteResult::Quit) => return Ok(true),
                 Ok(PaletteResult::Help) => {
@@ -3222,6 +3250,7 @@ fn run_palette(
     local_root: Option<&Path>,
     runs: &[state::RunSummary],
     full: Option<&RunState>,
+    active_root: &Path,
     input: &str,
 ) -> Result<PaletteResult> {
     let line = input.trim();
@@ -3299,21 +3328,13 @@ fn run_palette(
                 // hand-rolled roster build, so this path also gets the recent-fleet
                 // row `open_new_run` offers.
                 //
-                // Target selection goes through `new_run_target`, the same rule `n`
-                // uses: `swarm.project_root` when a project is actually being
-                // browsed (Runs/Agents — never stale there); the highlighted row
-                // read directly from `projects`, not from `swarm.project_root`, at
-                // Projects, since a queued `j`/click followed by `:plan` in the same
-                // input burst leaves `swarm.project_root` one selection stale (the
-                // same bug review 3be317b2 found here after `n` was already fixed);
-                // else the highlighted Home run/project in cross-project Home.
-                let browsed = if app.browse == BrowseLevel::Projects {
-                    projects.get(app.selected_project).map(|p| p.root.as_path())
-                } else if app.browse.in_project() {
-                    Some(swarm.project_root.as_path())
-                } else {
-                    None
-                };
+                // Target selection goes through `browsed_project_target`, the same
+                // helper `n` uses. It must be that helper and not a copy: this arm
+                // previously read `swarm.project_root`, which is the *snapshot's*
+                // root and lags the instant `rail_enter` updates `active_root`, so
+                // `:plan` and `n` disagreed in the window before the snapshot landed
+                // (review 3be317b2, after `n` was already fixed here).
+                let browsed = browsed_project_target(app, projects, active_root);
                 let (target, all_projects) =
                     new_run_target(app, projects, home_rows, local_root, browsed);
                 begin_new_run(
@@ -11680,6 +11701,63 @@ mod folding {
     /// producing a permanent NEEDS YOU with no action to take (`Review` has no gate
     /// button, and nothing else can act on the stale approval). Neither may happen:
     /// the row acts on the active leg, and the unit must not claim to want you.
+    /// `:plan` and `n` must resolve the same browsed project. `:plan` used to read
+    /// `swarm.project_root`, the *snapshot's* root, while `n` read the live
+    /// `active_root` that `rail_enter` updates the instant the operator drills in — so
+    /// in the window before the target project's snapshot lands they disagreed (review
+    /// 3be317b2, found after `n` had already been fixed). Both now go through
+    /// `browsed_project_target`. The fixture makes the two roots differ on purpose: a
+    /// test that passes `swarm.project_root` as `active_root` cannot see this at all.
+    #[test]
+    fn plan_and_n_agree_on_the_browsed_project_when_the_snapshot_lags() {
+        let stale = PathBuf::from("/nonexistent/stale-snapshot-root");
+        let live = PathBuf::from("/nonexistent/live-drilled-into");
+        let projects: Vec<registry::ProjectEntry> = [&stale, &live]
+            .iter()
+            .map(|root| registry::ProjectEntry {
+                root: (*root).clone(),
+                name: root
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_string),
+                last_seen: Utc::now(),
+                last_run_id: None,
+            })
+            .collect();
+
+        let mut app = App::new(None, Config::default(), None);
+        app.browse = BrowseLevel::Runs; // drilled in: `in_project()` holds
+        assert!(app.browse.in_project());
+
+        assert_eq!(
+            browsed_project_target(&app, &projects, live.as_path()),
+            Some(live.as_path()),
+            "inside a project the live active_root wins, not the lagging snapshot root"
+        );
+
+        // And the palette reaches the same answer through the same helper.
+        let swarm = SparPaths::new(&stale);
+        let runs: Vec<state::RunSummary> = Vec::new();
+        run_palette(
+            &mut app,
+            &swarm,
+            &projects,
+            &[],
+            None,
+            &runs,
+            None,
+            live.as_path(),
+            "plan do the thing",
+        )
+        .unwrap();
+        assert_eq!(
+            app.new_run.as_ref().unwrap().project.as_deref(),
+            Some(live.as_path()),
+            "`:plan` must target the project the operator drilled into, not the stale \
+             snapshot root"
+        );
+    }
+
     #[test]
     fn a_plan_approved_leg_with_an_active_sibling_does_not_want_the_operator() {
         let runs = vec![
@@ -13671,6 +13749,7 @@ mod home_ia {
             None,
             &runs,
             None,
+            swarm.project_root.as_path(),
             "plan do the thing",
         )
         .unwrap();
@@ -13708,6 +13787,7 @@ mod home_ia {
             None,
             &runs,
             None,
+            swarm.project_root.as_path(),
             "plan do the thing",
         )
         .unwrap();
