@@ -152,17 +152,33 @@ that for finished runs. These two reduce how much gets created in the first plac
   the agent's next major step. Wiring the socket would make muse first-class for delivery
   and would let a nudge interrupt an in-progress turn rather than waiting for one.
 
-- **A `seven_day` Claude rate limit is classified as a failure, not quota.** Observed
+- **A rate-limited slot fails the run instead of parking it on the quota gate.** Observed
   dogfooding on 2026-09-04: two concurrent runs (`bf7770ae`, `abd35a54`) both died with
-  `slot impl failed: exit 1` and `phase = failed`, when the actual cause was in the slot
-  log as `! rate limit  seven_day  rejected` / "You've hit your weekly limit". The quota
-  scrape recognises Claude's `five_hour` JSON and its log phrases; the weekly limit's
-  phrasing is not among them. Three consequences, all bad: the run reports a terminal
-  failure for something that is not broken, `spar provider list` continues to report
-  `claude quota=available` so nothing is paused and the next run walks straight into the
-  same wall, and the exit code is `1` where the contract says a quota stop is `4`. An
-  outer agent driving spar therefore cannot tell "your code failed" from "your account is
-  out of tokens until the window rolls" — the one distinction exit code 4 exists to make.
-  Fix is to add the weekly phrasing to the scrape and route it through the existing quota
-  path, including the provider pause, so a `--detach`ed fleet parks instead of burning a
-  round per run. Worth checking the other adapters for the same gap at the same time.
+  `slot impl failed: exit 1` and `phase = failed`, when the cause was in the slot log as
+  `! rate limit  seven_day  rejected` / "You've hit your weekly limit · resets 12am".
+  Detection is not the problem: `QuotaStore::scrape_log_hint` is wired in at
+  `executor.rs:1226` and `"rate limit"` is one of its needles, so the provider *was*
+  paused. The problem is the three lines after it — `run_slot` pauses the provider and
+  then `bail!`s anyway, so the run is classified as a failure. `Phase::Quota` is only ever
+  set in `workflow/plan.rs:59`, the *pre-dispatch* check for an already-paused provider;
+  nothing maps a slot that dies mid-dispatch from a rate limit onto it. Three
+  consequences:
+  - The exit code is `1` where the contract says a quota stop is `4`, so an outer agent
+    cannot tell "your code failed" from "your account is out of tokens until the window
+    rolls" — the one distinction exit code 4 exists to make.
+  - **The run becomes unrecoverable.** `Phase::Failed` is terminal, so `spar stop` refuses
+    ("already at Failed; nothing to stop") and `spar implement --run <id>` refuses ("plan
+    is not approved (phase=Failed)"). The only way back is `--new`, which forks a second
+    run for work that is already a run and throws away the frozen contract and the round
+    history. Verified on `bf7770ae`.
+  - The pause auto-recovers on the generic ~30-minute timer, which is right for a
+    five-hour window and wrong for a weekly one: the provider is re-probed and the next
+    dispatch walks into the same wall, for days. Claude states the reset in the same line
+    ("resets 12am (America/New_York)"); `scrape_claude_rate_limits` already knows how to
+    carry a `cooldown_until`, but only parses the `rate_limits` / `five_hour` JSON shape,
+    not this plain-text form.
+
+  Fix is to route a quota-detected slot failure onto `Phase::Quota` with exit `4`, let
+  `implement --run` re-enter from it the way it does from `Stopped`, and parse the stated
+  reset into the cooldown instead of falling back to the generic timer. Worth checking the
+  other adapters for the same gap at the same time.

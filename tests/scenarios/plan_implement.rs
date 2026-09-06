@@ -1140,6 +1140,100 @@ fn quota_partial_pause_fails_loud_without_collapse() {
     }
 }
 
+/// Verified broken on `bf7770ae`: a run parked at `Phase::Quota` (what a mid-dispatch
+/// rate limit now produces, via `fail`'s quota_hit branch in workflow/implement.rs)
+/// used to be indistinguishable from `Failed`, and `implement --run` refused with
+/// "plan is not approved". `Quota` must resume the same way `Stopped` already does.
+#[test]
+fn implement_resumes_from_quota_phase() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let run_id = planned_run(tmp.path());
+
+    let state_path = tmp
+        .path()
+        .join(".spar/runs")
+        .join(&run_id)
+        .join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    state["phase"] = serde_json::json!("quota");
+    std::fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--providers",
+            "cli:claude,cli:grok,cli:agy",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("awaiting_ship_confirm"))
+        .stdout(predicate::str::contains("plan is not approved").not());
+}
+
+/// The critical regression a round-3 review caught: `Phase::Quota` is also where a
+/// *plan* run parks (its own pre-dispatch gate, or a paused planner/test-author) before
+/// it was ever approved. Making `Quota` unconditionally resumable let `implement --run`
+/// walk an unapproved plan straight past the `plan_approved` gate. An unapproved plan
+/// run parked at `Quota` must still refuse, the same way it would at `Phase::Failed`.
+#[test]
+fn implement_refuses_a_quota_parked_plan_that_was_never_approved() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+
+    let plan = spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "plan",
+            "--task",
+            "add a hello function",
+            "--providers",
+            "cli:claude,cli:grok",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2);
+    let stdout = String::from_utf8_lossy(plan.get_output().stdout.as_slice());
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("plan json");
+    let run_id = v["run_id"].as_str().expect("run_id").to_string();
+
+    let state_path = tmp
+        .path()
+        .join(".spar/runs")
+        .join(&run_id)
+        .join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    assert_eq!(
+        state["gates"]["plan_approved"], false,
+        "never approved this run"
+    );
+    state["phase"] = serde_json::json!("quota");
+    std::fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--providers",
+            "cli:claude,cli:grok",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("plan is not approved"));
+}
+
 #[test]
 fn arena_dry_run() {
     let tmp = tempdir().unwrap();

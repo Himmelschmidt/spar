@@ -234,6 +234,7 @@ mod tests {
             usage: None,
             model: None,
             round: 1,
+            quota_hit: false,
         }
     }
 

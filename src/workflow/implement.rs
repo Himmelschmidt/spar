@@ -91,6 +91,7 @@ fn unlinked_plan_error(plan: &std::path::Path, paths: &SparPaths) -> String {
                     | Phase::AwaitingPlanApproval
                     | Phase::PlanReady
                     | Phase::Stopped
+                    | Phase::Quota
             )
         })
         .collect();
@@ -142,7 +143,19 @@ fn run_from_approved(
         || state.phase == Phase::Stopped
         // The round-ceiling gate is lifted by re-entering implement, so a run parked
         // there has to be resumable even when no plan gate ever ran (`--workflow loop`).
-        || state.phase == Phase::AwaitingRoundExtension;
+        || state.phase == Phase::AwaitingRoundExtension
+        // A slot that died mid-dispatch from a rate limit parks here (executor::run_slot
+        // via `fail`'s quota_hit branch); re-entering must pick the run back up rather
+        // than forcing `--new` and abandoning the frozen contract and round history.
+        // But `Phase::Quota` is also where `workflow/plan.rs` parks a *plan* run that
+        // never got approved (its own pre-dispatch gate, or a paused planner/test-author
+        // mid-plan) — accepting that unconditionally would walk straight past the
+        // `plan_approved` gate above and let `implement --run` drive an unapproved plan
+        // through to ship on a salvaged placeholder plan.md. An *approved* run's own
+        // `Phase::Quota` park is already covered by the `plan_approved` disjunct above,
+        // so the only case this clause needs to add is `--workflow loop` (`implement -t`
+        // directly), which has no approval step at all.
+        || (state.phase == Phase::Quota && state.workflow == crate::cli::WorkflowKind::Loop);
     if !resumable {
         bail!(
             "run {run_id} plan is not approved (phase={:?})",
@@ -154,12 +167,15 @@ fn run_from_approved(
     if state.phase == Phase::Stopped {
         let _ = std::fs::remove_file(paths.marker(run_id, "stopped"));
     }
-    // Resuming a terminal run (a failed/stuck attempt): clear the dead verdict so the detach
-    // snapshot reads as a fresh re-dispatch, not `failed` with `exit_code: 1` (which reads as
-    // a refusal). This is purely for snapshot coherence — `execute_loop` re-dispatches the
-    // coding slots regardless of their incoming status; here we just make the persisted state
-    // it briefly emits honest. Per-slot terminal markers are cleared at dispatch by the executor.
-    if matches!(state.phase, Phase::Failed | Phase::Stuck) {
+    // Resuming a terminal run (a failed/stuck/quota-parked attempt): clear the dead
+    // verdict so the detach snapshot reads as a fresh re-dispatch, not `failed` with
+    // `exit_code: 1` (which reads as a refusal). This is purely for snapshot coherence —
+    // `execute_loop` re-dispatches the coding slots regardless of their incoming status;
+    // here we just make the persisted state it briefly emits honest. Per-slot terminal
+    // markers are cleared at dispatch by the executor. A still-paused provider is caught
+    // again by the `ensure_usable` gate below, which re-parks at `Quota` with a fresh
+    // error rather than silently retrying into the same wall.
+    if matches!(state.phase, Phase::Failed | Phase::Stuck | Phase::Quota) {
         for s in &mut state.slots {
             if matches!(s.status, SlotStatus::Failed | SlotStatus::Stuck) {
                 s.status = SlotStatus::Pending;
@@ -167,6 +183,7 @@ fn run_from_approved(
                 s.exit_code = None;
                 s.signal = None;
                 s.pid = None;
+                s.quota_hit = false;
             }
         }
         state.error = None;
@@ -1052,6 +1069,7 @@ pub fn execute_loop(
                     state,
                     paths,
                     anyhow::anyhow!("failed to apply acceptance tests from {author}: {e}"),
+                    false,
                 );
             }
             // Said out loud on every channel: the overlay carries git-visible files only,
@@ -1153,7 +1171,8 @@ pub fn execute_loop(
             model: impl_model,
         };
         if let Err(e) = executor::run_slot(state, paths, cfg, &impl_job) {
-            return fail(state, paths, e);
+            let quota_hit = executor::slot_quota_hit(state, &impl_job.slot_id);
+            return fail(state, paths, e, quota_hit);
         }
 
         // Refresh implementer cwd after run (worktree may have been set at prepare).
@@ -1282,6 +1301,17 @@ pub fn execute_loop(
                     model: tester.model.clone(),
                 };
                 let suite_ok = executor::run_slot(state, paths, cfg, &suite_job).is_ok();
+                if !suite_ok && executor::slot_quota_hit(state, &tester.id) {
+                    // A rate-limited tester must park the run, not read as an
+                    // inconclusive suite that burns a fix round against the same
+                    // paused provider.
+                    return fail(
+                        state,
+                        paths,
+                        anyhow::anyhow!("tester slot `{}` rate-limited", tester.id),
+                        true,
+                    );
+                }
                 // Absence is meaningful: a missing suite.md is Inconclusive, never a synthesized fail.
                 let body_opt = std::fs::read_to_string(&suite_path).ok();
                 let (exit_code, signal) = state
@@ -1478,6 +1508,18 @@ pub fn execute_loop(
                     }
                     review_ok = executor::run_slot(state, paths, cfg, &job).is_ok();
                 }
+            }
+            if !review_ok && executor::slot_quota_hit(state, &rev.id) {
+                // Both the original provider and (if rotation found one) its
+                // replacement are rate-limited: park the run rather than reading
+                // this as "request changes" and burning a fix round against a
+                // panel that cannot currently answer.
+                return fail(
+                    state,
+                    paths,
+                    anyhow::anyhow!("review slot `{}` rate-limited", rev.id),
+                    true,
+                );
             }
 
             let review_path = paths.artifact(&state.id, &format!("review-{}.md", rev.id));
@@ -1762,11 +1804,75 @@ fn try_rotate_reviewer_provider(
     Ok(true)
 }
 
-fn fail(state: &mut RunState, paths: &SparPaths, e: anyhow::Error) -> Result<()> {
-    state.set_phase(Phase::Failed);
+/// `quota_hit` is the discriminator: only a dispatch whose own log matched the quota
+/// scrape (`executor::detect_and_pause_quota`) parks here instead of failing outright,
+/// so a genuine defect never gets misread as "wait and retry".
+///
+/// A quota park returns `Ok`, not `Err`: `execute_loop`'s callers propagate an `Err`
+/// straight past `finish_out`/`state.exit_code()` to `main`'s catch-all, which always
+/// exits `1` — the same shortcut the pre-dispatch quota gate in `run_from_approved`
+/// avoids by returning `Ok(ExitCode::Quota)` directly. Ending the round loop with `Ok`
+/// here lets the normal tail read the just-set `Phase::Quota` and exit `4`.
+fn fail(state: &mut RunState, paths: &SparPaths, e: anyhow::Error, quota_hit: bool) -> Result<()> {
+    state.set_phase(if quota_hit {
+        Phase::Quota
+    } else {
+        Phase::Failed
+    });
     state.error = Some(e.to_string());
     state.save(paths)?;
-    Err(e)
+    if quota_hit {
+        Ok(())
+    } else {
+        Err(e)
+    }
+}
+
+#[cfg(test)]
+mod fail_quota_routing_tests {
+    use super::*;
+    use crate::exit_codes::ExitCode as ProcessExitCode;
+    use tempfile::tempdir;
+
+    fn state() -> RunState {
+        RunState::new(
+            "r-quota",
+            crate::cli::WorkflowKind::Loop,
+            PathBuf::from("/tmp/x"),
+        )
+    }
+
+    /// A quota-detected dispatch failure must park at `Phase::Quota` and exit `4`, and
+    /// must not propagate `Err` — that would skip `finish_out`/`state.exit_code()` and
+    /// fall through to `main`'s catch-all, which always exits `1`.
+    #[test]
+    fn quota_hit_parks_at_quota_and_does_not_propagate_err() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = state();
+        let res = fail(&mut st, &paths, anyhow::anyhow!("rate limited"), true);
+        assert!(res.is_ok(), "quota park must return Ok, not Err");
+        assert_eq!(st.phase, Phase::Quota);
+        assert_eq!(st.exit_code(), ProcessExitCode::Quota);
+    }
+
+    /// An ordinary dispatch failure (no quota signal in the log) must still fail the
+    /// run outright at exit `1` — the discriminator must never swallow a real defect.
+    #[test]
+    fn ordinary_failure_stays_failed_and_propagates_err() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = state();
+        let res = fail(
+            &mut st,
+            &paths,
+            anyhow::anyhow!("panic: index out of bounds"),
+            false,
+        );
+        assert!(res.is_err(), "an ordinary failure must still propagate Err");
+        assert_eq!(st.phase, Phase::Failed);
+        assert_eq!(st.exit_code(), ProcessExitCode::Failure);
+    }
 }
 
 fn write_impl_summary(state: &RunState, paths: &SparPaths) -> Result<()> {
