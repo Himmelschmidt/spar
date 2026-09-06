@@ -2,6 +2,22 @@
 
 All notable changes to spar are recorded here.
 
+## [Unreleased]
+
+### Fixed
+
+- **A run stopped by your provider's rate limit is no longer reported as a failure.**
+  It now stops with the status that means "out of tokens for now" rather than the one
+  that means "the work broke", so anything reading that status can tell the two apart.
+- **A run stopped that way can be picked up again.** Previously it was stuck: the only
+  way forward was to start a second run for the same work, which threw away its plan,
+  its agreed test criteria and everything it had already done.
+- **Waiting now lasts as long as the provider says it will.** When the provider states
+  when your access comes back, spar waits until then instead of guessing, and stops
+  retrying into the same wall in the meantime.
+- **Rate limits are noticed everywhere runs happen.** Reviews and paired runs, which run
+  several agents at once, previously missed them entirely.
+
 ## [0.0.3] - 2026-09-04
 
 ### Added
