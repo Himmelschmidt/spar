@@ -66,21 +66,25 @@ fn data_dir() -> Option<PathBuf> {
 ///
 /// Honours `OPENCODE_DB` the same way opencode's own binary resolves it: `:memory:`
 /// means there is nothing on disk to read, an absolute path is used as-is, and a
-/// relative one joins the data dir. Unset, asks a real `opencode` binary via its own
-/// `opencode db path` subcommand rather than guessing: which channel maps to
-/// `opencode.db` versus `opencode-<channel>.db` is a rule inside opencode's own bundle
-/// (`latest`/`beta`/`prod`/`OPENCODE_DISABLE_CHANNEL_DB` all resolve to the former,
-/// everything else to the latter), not something spar can read from outside without
-/// re-deriving it by hand and drifting the day opencode changes it.
+/// relative one joins the data dir. Unset (or set to the empty string, which
+/// opencode's own resolver treats as unset rather than a relative path to `.`), asks a
+/// real `opencode` binary via its own `opencode db path` subcommand rather than
+/// guessing: which channel maps to `opencode.db` versus `opencode-<channel>.db` is a
+/// rule inside opencode's own bundle (`latest`/`beta`/`prod`/
+/// `OPENCODE_DISABLE_CHANNEL_DB` all resolve to the former, everything else to the
+/// latter), not something spar can read from outside without re-deriving it by hand and
+/// drifting the day opencode changes it.
 pub fn db_path() -> Option<PathBuf> {
     if let Some(over) = std::env::var_os("OPENCODE_DB") {
-        if over == ":memory:" {
-            return None;
+        if !over.is_empty() {
+            if over == ":memory:" {
+                return None;
+            }
+            let dir = data_dir()?;
+            let p = PathBuf::from(over);
+            let p = if p.is_absolute() { p } else { dir.join(p) };
+            return p.is_file().then_some(p);
         }
-        let dir = data_dir()?;
-        let p = PathBuf::from(over);
-        let p = if p.is_absolute() { p } else { dir.join(p) };
-        return p.is_file().then_some(p);
     }
     let bin = crate::providers::adapter_named("opencode")?.resolve_binary()?;
     resolve_via_binary(&bin)
@@ -607,6 +611,23 @@ mod tests {
         std::fs::create_dir_all(&bindir).unwrap();
         write_fake_opencode(&bindir, &format!("echo '{}'", real_db.display()));
         let _path = PathGuard::prepend(&bindir);
+
+        assert_eq!(db_path(), Some(real_db));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn db_path_asks_a_real_opencode_binary_when_opencode_db_is_empty() {
+        let _env = EnvGuard::acquire();
+        let tmp = tempdir().unwrap();
+        std::env::set_var("XDG_DATA_HOME", tmp.path());
+        let real_db = tmp.path().join("resolved-by-opencode.db");
+        std::fs::write(&real_db, b"x").unwrap();
+        let bindir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        write_fake_opencode(&bindir, &format!("echo '{}'", real_db.display()));
+        let _path = PathGuard::prepend(&bindir);
+        std::env::set_var("OPENCODE_DB", "");
 
         assert_eq!(db_path(), Some(real_db));
     }
