@@ -932,8 +932,10 @@ touching `spar.toml`, on `plan`, `implement` and `run`. Composition order: prese
 **Run JSON carries a `fleet` array**, one entry per seat: `{seat, role, provider, model,
 source, projected}`. `source` names the precedence rung the provider came from —
 `cli-role`, `cli-providers`, `roles-file`, `providers-order`, `model-select`, or
-`suite-preferences` — or `unknown` for a slot with no recorded provenance (state written
-before feature 011). `projected: true` marks a seat the run will dispatch later but has not
+`suite-preferences` — or `unknown` where no rung can honestly be named: a slot from state
+written before feature 011, or a seat a workflow found by scanning a synthesized pool
+rather than by position (the tester's last-resort scan, a reviewer rotation's pool pick),
+where `[roles]` and `[providers].order` both fed that pool and neither can be claimed. `projected: true` marks a seat the run will dispatch later but has not
 created yet — at the plan gate this is the whole implement panel (implementer, reviewer
 panel, and a non-built-in suite's `tester`), resolved through the same functions slot
 creation uses (`roles_resolve::build_implement_seats`, `implement::project_tester_seat`), so

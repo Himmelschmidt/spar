@@ -343,11 +343,17 @@ impl PoolOrigin {
     /// The honest `SeatSource` for a seat drawn straight from this pool, with no more
     /// specific rung (CLI role, `[roles]`) applying. Keeps every workflow that builds
     /// slots from `state.providers` off a hardcoded `SeatSource::ProvidersOrder` guess.
+    ///
+    /// `Synth` has no single answer: that pool was built per position from `[roles]` *and*
+    /// `[providers].order`, so one entry can be `RolesFile` and the next `ProvidersOrder`.
+    /// A caller holding the seat's pool position should ask
+    /// `roles_resolve::resolve_seat_sources` instead of this; the ones that cannot report
+    /// `Unknown` rather than claim a rung the seat may never have taken.
     pub fn as_seat_source(self) -> SeatSource {
         match self {
             PoolOrigin::CliProviders => SeatSource::CliProviders,
             PoolOrigin::Selected => SeatSource::ModelSelect,
-            PoolOrigin::Synth => SeatSource::ProvidersOrder,
+            PoolOrigin::Synth => SeatSource::Unknown,
         }
     }
 }

@@ -1371,3 +1371,51 @@ fn ac34_help_documents_the_pool_mapping_and_the_new_flags() {
         );
     }
 }
+
+/// Not one of the 34 frozen criteria: this closes a review finding on a path the contract
+/// does not reach. `spar reconcile` builds the reconciler and its review panel straight
+/// out of `state.providers`, and stamped both with the pool's origin. A `Synth` pool is
+/// built per position from `[roles]` *and* `[providers].order`, so that reported
+/// `providers-order` for a seat whose provider came from `[roles].implementer`.
+#[test]
+fn reconcile_seats_report_the_rung_their_pool_came_from() {
+    let tmp = project("[roles]\nimplementer = \"cli:codex\"\n");
+    let v = run_json(
+        tmp.path(),
+        &[
+            "run",
+            "--workflow",
+            "arena",
+            "--task",
+            "add a hello function",
+            "--dry-run",
+            "--json",
+        ],
+        2,
+    );
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+
+    let done = run_json(tmp.path(), &["reconcile", &run_id, "--json"], 2);
+    let seats: Vec<Value> = fleet(&done)
+        .into_iter()
+        .filter(|s| seat_field(s, "seat").starts_with("reconcile"))
+        .collect();
+    assert!(
+        seats.len() >= 2,
+        "expected a reconciler and its review panel in the fleet: {:?}",
+        fleet(&done)
+    );
+    for seat in &seats {
+        assert_eq!(
+            seat_field(seat, "provider"),
+            "cli:codex",
+            "reconcile seat drew from the [roles]-synthesized pool: {seat}"
+        );
+        assert_eq!(
+            seat_field(seat, "source"),
+            "roles-file",
+            "reconcile seat must name the rung its pool entry came from, not the pool \
+             origin: {seat}"
+        );
+    }
+}

@@ -382,6 +382,19 @@ pub fn reconcile(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> R
         ));
     }
 
+    // The reconciler and its reviewers are drawn out of `state.providers` by position, so
+    // each one's rung is the rung that put that entry in the pool. Resolved the same way
+    // the arena's own implementer slots were, since the pool was built from one repeated
+    // `implementer` label: stamping `pool_origin` instead reported `providers-order` for a
+    // seat a `Synth` pool had actually taken from `[roles]`.
+    let pool_sources = crate::workflow::roles_resolve::resolve_seat_sources(
+        SlotRole::Implementer,
+        state.providers.len(),
+        &state.providers,
+        state.pool_origin,
+        cfg,
+    );
+
     let recon_prov = state
         .providers
         .first()
@@ -390,7 +403,7 @@ pub fn reconcile(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> R
     let recon_id = format!("reconcile-{}", sanitize_slot(&recon_prov));
     if state.slots.iter().all(|s| s.id != recon_id) {
         let mut slot = executor::init_slot(&recon_id, &recon_prov, SlotRole::Reconciler);
-        slot.source = Some(state.pool_origin.as_seat_source());
+        slot.source = pool_sources.first().copied();
         state.slots.push(slot);
     }
     worktree::prepare_isolation(&mut state, paths, std::slice::from_ref(&recon_id))?;
@@ -435,7 +448,7 @@ pub fn reconcile(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> R
         if state.slots.iter().all(|s| s.id != id) {
             let mut slot = executor::init_slot(&id, prov, SlotRole::Reviewer);
             slot.cwd = Some(recon_cwd.clone());
-            slot.source = Some(state.pool_origin.as_seat_source());
+            slot.source = pool_sources.get(i).copied();
             state.slots.push(slot);
         }
         let mut extra = HashMap::new();
