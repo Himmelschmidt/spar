@@ -57,6 +57,12 @@ All notable changes to spar are recorded here.
 - **Applying the "today's defaults" fleet size to a run already in progress no longer
   fails.** It changes nothing, so it no longer needs the flag that reloads settings
   from disk.
+- **The plan approval screen no longer hides reviewer seats when you gave it a shorter
+  provider list than the review panel needs.** It now shows the full panel implementation
+  will actually dispatch, cycled from the providers you gave it, instead of silently
+  dropping the seats past your list's own length.
+- **The "where did this seat come from" label is accurate for paired and competing-agent
+  runs given a shorter provider list than they need**, not just their first seat.
 
 ## [0.0.3] - 2026-09-04
 
