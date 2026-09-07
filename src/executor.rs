@@ -2465,7 +2465,10 @@ fn run_tmux(
             TmuxDecision::Wait => {
                 if !budget_left {
                     // Never success-on-timeout-alone (plan completion contract).
-                    return Ok(SlotOutcome::err("tmux marker wait timed out"));
+                    return Ok(SlotOutcome {
+                        usage: tmux_recovered_usage(is_opencode, paths, &state.id, job, log_path),
+                        ..SlotOutcome::err("tmux marker wait timed out")
+                    });
                 }
                 std::thread::sleep(Duration::from_millis(200));
             }
@@ -3634,6 +3637,12 @@ mod tests {
         // all — not even its own, let alone the child spend this feature exists to
         // recover. `run_tmux`'s pane tees the same `run --format json` stream headless
         // mode parses live straight to `log_path`; this reconstructs it after the fact.
+        //
+        // `OPENCODE_DB=:memory:` under the shared env lock keeps this test from
+        // resolving (and read-write-opening) the developer's real opencode ledger via a
+        // spawned `opencode db path` (round-6 review finding).
+        let _env = crate::providers::opencode_telemetry::test_support::EnvGuard::acquire();
+        std::env::set_var("OPENCODE_DB", ":memory:");
         let tmp = tempfile::tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         paths.ensure_run_dirs("r1").unwrap();
@@ -3668,6 +3677,43 @@ mod tests {
         // Every other provider's pane runs a real interactive TUI, not this JSON stream,
         // so the gate must keep returning `None` for them rather than mis-parsing garbage.
         assert!(tmux_recovered_usage(false, &paths, "r1", &job, &log_path).is_none());
+    }
+
+    #[test]
+    fn enrich_opencode_stats_logs_a_slot_note_when_the_ledger_cannot_be_read() {
+        // Round-6 review: the only coverage of `enrich_opencode_stats` was via the tmux
+        // helper's happy path; the note-to-event-log branch (a ledger that resolves but
+        // fails to read) was never exercised end to end.
+        let _env = crate::providers::opencode_telemetry::test_support::EnvGuard::acquire();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_DATA_HOME", tmp.path());
+        let db = tmp.path().join("broken.db");
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch("CREATE TABLE not_session (id TEXT);")
+            .unwrap();
+        std::env::set_var("OPENCODE_DB", &db);
+
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("r1").unwrap();
+        let log_path = paths.log_file("r1", "impl");
+        let mut stats = process::StreamStats {
+            session_id: Some("parent".to_string()),
+            ..Default::default()
+        };
+
+        enrich_opencode_stats(&mut stats, "cli:opencode", &log_path, &paths, "r1", "impl");
+
+        let events = crate::events::read_all(&paths, "r1").unwrap();
+        let note = events
+            .iter()
+            .find(|e| e.slot.as_deref() == Some("impl") && e.message.is_some())
+            .and_then(|e| e.message.clone())
+            .expect("a broken ledger must land a slot_note in the run's event log");
+        assert!(
+            note.contains("descendant-subtree query failed to prepare"),
+            "note was: {note}"
+        );
     }
 
     #[test]

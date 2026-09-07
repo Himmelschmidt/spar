@@ -45,6 +45,16 @@
 //! recovery read that lands right at exit can see a child session's row before
 //! opencode has finished incrementing it. Same class of gap as the grandchild case
 //! before this change: real spend that the ledger has not caught up to yet.
+//!
+//! **Known limitations, not fixed by this module:** resolving the ledger path with no
+//! `OPENCODE_DB` override spawns `opencode db path` on every opencode slot's exit, with
+//! no cross-call cache — each call costs a subprocess round trip (roughly a second on a
+//! warm binary) and, since `opencode db path` itself opens the ledger read-write,
+//! briefly write-locks the very file this module only ever reads. A resolution that
+//! times out, exits non-zero, or finds no `opencode` binary at all is also silently
+//! indistinguishable from "resolved fine, nothing to recover": `db_path` returns `None`
+//! either way, so [`enrich`] emits no note for a broken *resolution*, only for a broken
+//! *read* of an already-resolved path ([`CollectError`]).
 
 use crate::process::StreamStats;
 use serde::Serialize;
@@ -91,9 +101,13 @@ pub fn db_path() -> Option<PathBuf> {
 }
 
 /// Ask a real `opencode` binary where its own ledger lives, via `opencode db path`.
+///
+/// Takes the last non-empty line rather than the whole trimmed capture: opencode's own
+/// contract is a single path on stdout, but a stray update notice or migration message
+/// ahead of it must not be folded into the path itself.
 fn resolve_via_binary(bin: &Path) -> Option<PathBuf> {
     let out = run_with_timeout(bin, &["db", "path"], Duration::from_secs(5))?;
-    let out = out.trim();
+    let out = out.lines().rev().find(|l| !l.trim().is_empty())?.trim();
     (!out.is_empty() && out != ":memory:").then(|| PathBuf::from(out))
 }
 
@@ -180,7 +194,10 @@ impl Usage {
 ///
 /// The recursive CTE's `UNION` (not `UNION ALL`) dedupes visited ids, so a cycle in
 /// `parent_id` (which should never happen, but the ledger is an external file spar does
-/// not control) terminates instead of looping.
+/// not control) terminates instead of looping. The outer `WHERE ... AND id != ?1`
+/// excludes the root session itself: a cycle back to `session_id` would otherwise put it
+/// in `descendants` and double-count its own tokens on top of the stream-parsed totals
+/// that already contain them.
 ///
 /// Returns `Err` when the ledger could not be read at all — a real anomaly, since
 /// [`db_path`] only returns a path it believes is opencode's own — as opposed to `Ok`
@@ -200,7 +217,8 @@ pub fn collect(db: &Path, session_id: &str) -> Result<Usage, CollectError> {
                  SELECT s.id FROM session s JOIN descendants d ON s.parent_id = d.id \
              ) \
              SELECT tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, \
-             tokens_cache_write FROM session WHERE id IN (SELECT id FROM descendants)",
+             tokens_cache_write FROM session \
+             WHERE id IN (SELECT id FROM descendants) AND id != ?1",
         )
         .map_err(|_| CollectError::Prepare)?;
     let rows = stmt
@@ -278,8 +296,39 @@ pub fn enrich(stats: &mut StreamStats) -> Option<String> {
     }
 }
 
+/// Shared with `executor`'s tmux tests, which also poke `OPENCODE_DB` /
+/// `XDG_DATA_HOME` and must serialize against this module's own env-mutating tests
+/// rather than race them.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    pub(crate) struct EnvGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        pub(crate) fn acquire() -> Self {
+            let guard = ENV_LOCK.lock().unwrap();
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("OPENCODE_DB");
+            EnvGuard { _guard: guard }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("OPENCODE_DB");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::EnvGuard;
     use super::*;
     use tempfile::tempdir;
 
@@ -363,6 +412,27 @@ mod tests {
         assert_eq!(usage.reasoning_tokens, 5_000 + 3);
         assert_eq!(usage.cache_read_tokens, 500_000 + 4);
         assert_eq!(usage.cache_write_tokens, 10_000 + 5);
+    }
+
+    #[test]
+    fn a_cycle_back_to_the_root_does_not_double_count_the_root() {
+        // Round-6 review: `parent_id` forming a cycle back to `session_id` used to land
+        // the root itself in `descendants`, adding its own tokens on top of the
+        // stream-parsed totals that already contain them.
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join("opencode.db");
+        let conn = make_db(&db);
+        insert(&conn, "root", Some("child"), (1_000, 0, 0, 0, 0));
+        insert(&conn, "child", Some("root"), (10, 20, 0, 5, 1));
+        drop(conn);
+
+        let usage = collect(&db, "root").unwrap();
+        assert_eq!(
+            usage.descendants, 1,
+            "only the child, never the root itself"
+        );
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 20);
     }
 
     #[test]
@@ -473,33 +543,9 @@ mod tests {
         );
     }
 
-    // The remaining tests mutate process env (`XDG_DATA_HOME`, `OPENCODE_DB`), which
-    // only needs to be serialized against other tests in *this* module: nothing else in
-    // the binary reads those two vars from a test today, muse_telemetry's
-    // `sessions_root()` included (it reads `XDG_DATA_HOME` in production code, but no
-    // muse test calls it).
-    use std::sync::Mutex;
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvGuard {
-        _guard: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl EnvGuard {
-        fn acquire() -> Self {
-            let guard = ENV_LOCK.lock().unwrap();
-            std::env::remove_var("XDG_DATA_HOME");
-            std::env::remove_var("OPENCODE_DB");
-            EnvGuard { _guard: guard }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            std::env::remove_var("XDG_DATA_HOME");
-            std::env::remove_var("OPENCODE_DB");
-        }
-    }
+    // The remaining tests mutate process env (`XDG_DATA_HOME`, `OPENCODE_DB`), so they
+    // share `test_support::EnvGuard`'s lock with `executor`'s tmux tests, which also
+    // touch those two vars.
 
     #[test]
     fn db_path_honours_an_absolute_opencode_db_override() {
@@ -610,6 +656,28 @@ mod tests {
         let bindir = tmp.path().join("bin");
         std::fs::create_dir_all(&bindir).unwrap();
         write_fake_opencode(&bindir, &format!("echo '{}'", real_db.display()));
+        let _path = PathGuard::prepend(&bindir);
+
+        assert_eq!(db_path(), Some(real_db));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn db_path_takes_the_last_line_when_the_binary_prints_a_stray_notice_first() {
+        let _env = EnvGuard::acquire();
+        let tmp = tempdir().unwrap();
+        std::env::set_var("XDG_DATA_HOME", tmp.path());
+        let real_db = tmp.path().join("resolved-by-opencode.db");
+        std::fs::write(&real_db, b"x").unwrap();
+        let bindir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        write_fake_opencode(
+            &bindir,
+            &format!(
+                "echo 'a new version of opencode is available'\necho '{}'",
+                real_db.display()
+            ),
+        );
         let _path = PathGuard::prepend(&bindir);
 
         assert_eq!(db_path(), Some(real_db));
