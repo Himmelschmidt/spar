@@ -812,6 +812,13 @@ fn enrich_muse_stats(stats: &mut process::StreamStats, provider: &str, log_path:
     let _ = stats.save(log_path);
 }
 
+fn is_opencode_provider(provider: &str) -> bool {
+    ProviderRef::parse(provider)
+        .ok()
+        .and_then(|p| p.cli_name().map(|n| n == "opencode"))
+        .unwrap_or(provider == "opencode")
+}
+
 /// opencode's own stream filters a `task` subagent's usage out before it ever reaches
 /// stdout, so a slot that fanned out reports only its own step deltas. Add the missing
 /// child spend from opencode's sqlite ledger and rewrite the slot's stats sidecar. When
@@ -825,11 +832,7 @@ fn enrich_opencode_stats(
     run_id: &str,
     slot_id: &str,
 ) {
-    let is_opencode = ProviderRef::parse(provider)
-        .ok()
-        .and_then(|p| p.cli_name().map(|n| n == "opencode"))
-        .unwrap_or(provider == "opencode");
-    if !is_opencode {
+    if !is_opencode_provider(provider) {
         return;
     }
     if let Some(note) = providers::opencode_telemetry::enrich(stats) {
@@ -2308,6 +2311,37 @@ fn tmux_outcome(marker: MarkerState, pane_alive: bool, budget_left: bool) -> Tmu
     }
 }
 
+/// tmux's pane runs `build_interactive`, which for opencode is the same
+/// `run --format json` stream headless mode parses live (`opencode.rs`'s
+/// `build_interactive` falls back to `build_headless` for exactly this reason) — but
+/// `run_tmux` only tees it to `log_path`, never through a live coalescer, so without this
+/// every tmux-backed opencode slot reported no spend at all, parent or child. Reconstruct
+/// the parent's own stats from the completed log, then run the same descendant recovery
+/// `enrich_opencode_stats` does for the headless backends. A no-op (`None`) for every
+/// other provider: their tmux panes render real terminal/TUI output, not a JSON stream,
+/// so there is nothing here to recover.
+fn tmux_recovered_usage(
+    is_opencode: bool,
+    paths: &SparPaths,
+    run_id: &str,
+    job: &SlotJob,
+    log_path: &Path,
+) -> Option<SlotUsage> {
+    if !is_opencode {
+        return None;
+    }
+    let mut stats = process::stats_from_log(log_path);
+    enrich_opencode_stats(
+        &mut stats,
+        &job.provider,
+        log_path,
+        paths,
+        run_id,
+        &job.slot_id,
+    );
+    Some(usage_from_stream(&job.slot_id, &job.provider, &stats))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_tmux(
     state: &mut RunState,
@@ -2354,6 +2388,7 @@ fn run_tmux(
     let (program, args) = providers::command_to_parts(&cmd);
     let shell = tmux::shell_wrap(&program, &args, log_path);
     tmux::spawn_window(&session, &job.slot_id, cwd, &shell, env)?;
+    let is_opencode = is_opencode_provider(&job.provider);
 
     // `done` means the agent's own process has exited — not just that it wrote its marker.
     let done = format!("{}.done", job.slot_id);
@@ -2392,7 +2427,7 @@ fn run_tmux(
                     exit_code: Some(0),
                     signal: None,
                     error: None,
-                    usage: None,
+                    usage: tmux_recovered_usage(is_opencode, paths, &state.id, job, log_path),
                     agy_quota_hit: false,
                     quota_rejected: None,
                     quota_resets_at: None,
@@ -2406,7 +2441,7 @@ fn run_tmux(
                     exit_code: Some(1),
                     signal: None,
                     error: Some("marker failed".into()),
-                    usage: None,
+                    usage: tmux_recovered_usage(is_opencode, paths, &state.id, job, log_path),
                     agy_quota_hit: false,
                     quota_rejected: None,
                     quota_resets_at: None,
@@ -2420,7 +2455,7 @@ fn run_tmux(
                     exit_code: None,
                     signal: None,
                     error: Some("agent reported done but its process is still running".into()),
-                    usage: None,
+                    usage: tmux_recovered_usage(is_opencode, paths, &state.id, job, log_path),
                     agy_quota_hit: false,
                     quota_rejected: None,
                     quota_resets_at: None,
@@ -3577,6 +3612,62 @@ mod tests {
             tmux_outcome(MarkerState::None, false, true),
             TmuxDecision::Wait
         );
+    }
+
+    #[test]
+    fn is_opencode_provider_recognizes_forms() {
+        // This gate decides whether `run_tmux` bothers reconstructing stats from the
+        // completed log at all, and whether `enrich_opencode_stats` runs descendant
+        // recovery on top of them.
+        assert!(is_opencode_provider("cli:opencode"));
+        assert!(is_opencode_provider("cli:opencode@google/gemini-3.7-flash"));
+        assert!(is_opencode_provider("opencode"));
+        assert!(!is_opencode_provider("cli:grok"));
+        assert!(!is_opencode_provider("cli:claude"));
+        assert!(!is_opencode_provider("api:google"));
+    }
+
+    #[test]
+    fn tmux_recovered_usage_reconstructs_opencode_spend_from_the_teed_log() {
+        // Round-5 review: `run_tmux` returned `usage: None` unconditionally, so a valid
+        // single-slot opencode run dispatched with `--backend tmux` reported no spend at
+        // all — not even its own, let alone the child spend this feature exists to
+        // recover. `run_tmux`'s pane tees the same `run --format json` stream headless
+        // mode parses live straight to `log_path`; this reconstructs it after the fact.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("r1").unwrap();
+        let log_path = paths.log_file("r1", "impl");
+        std::fs::write(
+            &log_path,
+            concat!(
+                r#"{"type":"text","sessionID":"ses_1","part":{"id":"prt_t","type":"text","text":"DONE"}}"#,
+                "\n",
+                r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_f","type":"step-finish","tokens":{"input":100,"output":20,"cache":{"read":5,"write":0}}}}"#,
+                "\n",
+                "EXIT:0\n",
+            ),
+        )
+        .unwrap();
+        let job = SlotJob {
+            slot_id: "impl".into(),
+            provider: "cli:opencode".into(),
+            role: SlotRole::Implementer,
+            template: "implementer".into(),
+            extra_vars: HashMap::new(),
+            expected_artifact: None,
+            model: None,
+        };
+
+        let usage = tmux_recovered_usage(true, &paths, "r1", &job, &log_path)
+            .expect("opencode tmux usage must be recovered, not None");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.cache_read_tokens, 5);
+
+        // Every other provider's pane runs a real interactive TUI, not this JSON stream,
+        // so the gate must keep returning `None` for them rather than mis-parsing garbage.
+        assert!(tmux_recovered_usage(false, &paths, "r1", &job, &log_path).is_none());
     }
 
     #[test]
