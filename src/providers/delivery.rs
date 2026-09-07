@@ -14,7 +14,7 @@ use crate::process::StreamStats;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -130,19 +130,17 @@ pub fn deliver(
                     &body,
                     dry_run,
                     MUSE_SESSION_MESSAGE_TIMEOUT,
-                )?,
+                ),
                 None => false,
             };
-            // Nobody has observed a real muse session surface a pushed message — this
-            // box's `external_agent_ingress` gate is closed, so the send's own exit 0
-            // only proves the ingress accepted it, not that the running session read it.
-            // The poll file is therefore always written too, push or no push: a
-            // duplicate nudge costs the agent a few tokens, a dropped one costs the
-            // message.
-            append_poll_file(paths, run, agent, &body, dry_run)?;
+            // The poll file is the fallback, not a belt-and-suspenders copy: a confirmed
+            // push (`--json`'s own `status` field said `"ok"`, not just a zero exit) is
+            // the one channel `render_reason`'s "delivered once" header can promise; a
+            // second copy in the poll file would make that a lie.
             let action = if sent {
                 DeliveryAction::SessionMessaged
             } else {
+                append_poll_file(paths, run, agent, &body, dry_run)?;
                 DeliveryAction::PolledFile
             };
             (action, None)
@@ -293,39 +291,51 @@ fn resolve_muse_bin() -> Option<std::path::PathBuf> {
 
 /// Push `body` into a running muse session via its cross-session inject channel
 /// (`muse session-message send --target <session-uuid>`, message body on stdin).
-/// `bin` is the resolved `muse` binary (`None` means it wasn't found). Returns `Ok(true)`
-/// only on a clean, successful exit. Every other outcome — `muse` missing, a spawn
-/// failure, a nonzero exit (e.g. muse's `external_agent_ingress` feature gate off, which
-/// fails closed with `external_agent_ingress_closed`), or a hang past `timeout` in either
-/// the stdin write or the exit wait — returns `Ok(false)` so the caller falls back to the
-/// poll file instead of reporting a delivery that never landed anywhere.
+/// `bin` is the resolved `muse` binary (`None` means it wasn't found). Returns `true`
+/// only when the exit is clean *and* the `--json` reply's own `status` field (when
+/// present) says `"ok"` — a zero exit alone is not proof the ingress accepted the
+/// message, only that the process didn't crash. Every other outcome — `muse` missing, a
+/// spawn failure, a nonzero exit (e.g. muse's `external_agent_ingress` feature gate off,
+/// which fails closed with `external_agent_ingress_closed`), a JSON `status` other than
+/// `"ok"`, or a hang past `timeout` in either the stdin write or the exit wait — returns
+/// `false` so the caller falls back to the poll file instead of reporting a delivery that
+/// never landed anywhere. There is no `Err` path: every failure mode here is an expected
+/// outcome of talking to an external process, not a bug in spar.
 ///
 /// The write happens on a detached thread so a body larger than the pipe buffer can never
 /// block this call past `timeout`: if muse hasn't started draining stdin by the deadline,
-/// the child is killed, which unblocks the writer with a broken pipe.
+/// the child is killed, which unblocks the writer with a broken pipe. Reading stdout runs
+/// on its own detached thread for the same reason: the child's stdout pipe can fill while
+/// its stdin write is still in flight, and this call must stay bounded by one deadline
+/// covering the whole exchange, not the sum of independent reads and writes.
+///
+/// Spawned with no `current_dir` override, so it inherits the orchestrator's own cwd
+/// rather than the target slot's worktree — deliberately: `target` is a session id, not a
+/// path, and `session-message send` addresses muse's own session registry, which is not
+/// scoped to any one workspace.
 fn send_muse_session_message(
     bin: Option<&Path>,
     target: &str,
     body: &str,
     dry_run: bool,
     timeout: Duration,
-) -> Result<bool> {
+) -> bool {
     if dry_run {
-        return Ok(true);
+        return true;
     }
     let Some(bin) = bin else {
-        return Ok(false);
+        return false;
     };
     let mut child = match Command::new(bin)
         .args(["session-message", "send", "--target", target, "--json"])
         .env("MUSE_NO_AUTO_UPDATE", "1")
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
     {
         Ok(child) => child,
-        Err(_) => return Ok(false),
+        Err(_) => return false,
     };
 
     let deadline = Instant::now() + timeout;
@@ -336,6 +346,15 @@ fn send_muse_session_message(
     std::thread::spawn(move || {
         let _ = tx.send(stdin.write_all(body.as_bytes()).is_ok());
     });
+
+    let mut stdout = child.stdout.take().expect("stdout piped above");
+    let (out_tx, out_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stdout.read_to_string(&mut buf);
+        let _ = out_tx.send(buf);
+    });
+
     let write_ok = loop {
         match rx.try_recv() {
             Ok(ok) => break ok,
@@ -347,7 +366,7 @@ fn send_muse_session_message(
                     // thread is left to finish on its own rather than joined here.
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Ok(false);
+                    return false;
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -356,22 +375,47 @@ fn send_muse_session_message(
     if !write_ok {
         let _ = child.kill();
         let _ = child.wait();
-        return Ok(false);
+        return false;
     }
 
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return Ok(status.success()),
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return false;
+                }
+                let out = out_rx
+                    .recv_timeout(Duration::from_millis(500))
+                    .unwrap_or_default();
+                return muse_send_reply_ok(&out);
+            }
             Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(50));
             }
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Ok(false);
+                return false;
             }
-            Err(_) => return Ok(false),
+            Err(_) => return false,
         }
+    }
+}
+
+/// Read `muse session-message send --json`'s reply as spar's confirmation that the
+/// message actually landed, not just that the process exited zero. A missing or
+/// unparseable `status` field is treated as success (a zero exit plus no stated
+/// objection): the exact reply shape on a real successful send has never been observed
+/// (every box this ran on had `external_agent_ingress` closed), so refusing to trust an
+/// unrecognized-but-successful reply would risk permanently falling back to the poll file
+/// against a muse version whose schema doesn't match this guess.
+fn muse_send_reply_ok(stdout: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+        Ok(v) => v
+            .get("status")
+            .and_then(|s| s.as_str())
+            .is_none_or(|s| s == "ok"),
+        Err(_) => true,
     }
 }
 
@@ -465,17 +509,17 @@ pub fn nudge(
                     text,
                     dry_run,
                     MUSE_SESSION_MESSAGE_TIMEOUT,
-                )?,
+                ),
                 None => false,
             };
-            // Same belt-and-suspenders as `deliver`: always leave the poll-file trail.
-            let path = append_poll_file(paths, run, agent, text, dry_run)?;
-            let action = if sent {
-                DeliveryAction::SessionMessaged
+            // Same as `deliver`: the poll file is only the fallback for an unconfirmed
+            // push, not a standing duplicate of a confirmed one.
+            if sent {
+                (DeliveryAction::SessionMessaged, None)
             } else {
-                DeliveryAction::PolledFile
-            };
-            (action, Some(path))
+                let path = append_poll_file(paths, run, agent, text, dry_run)?;
+                (DeliveryAction::PolledFile, Some(path))
+            }
         }
         DeliveryStrategy::NativeQueue | DeliveryStrategy::SdkPrompt => {
             let path = queue_path(paths, run, agent);
@@ -813,6 +857,28 @@ mod tests {
         fake_muse_exit(dir, capture, 0)
     }
 
+    /// A `muse` that exits 0 but whose `--json` reply states a non-`"ok"` status — the
+    /// case a bare exit-code check cannot see: the process didn't crash, but the ingress
+    /// itself says nothing landed.
+    fn fake_muse_unconfirmed(
+        dir: &std::path::Path,
+        capture: &std::path::Path,
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("muse");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$@\" > {args:?}\ncat > {stdin:?}\necho '{{\"status\":\"unavailable\",\"error_code\":\"external_agent_ingress_closed\"}}'\nexit 0\n",
+                args = capture.with_extension("args"),
+                stdin = capture.with_extension("stdin"),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
     /// Writes a fake `muse` binary at `dir/muse` running raw shell `body` instead of the
     /// capture-and-exit script — for tests that need to control stdin draining / timing
     /// directly (the write-bound and wait-bound regression tests below).
@@ -918,11 +984,11 @@ mod tests {
         .unwrap();
         assert_eq!(d.action, DeliveryAction::SessionMessaged);
         assert_eq!(d.delivered, 1);
-        // The push has never been observed landing in a live muse session on any box this
-        // ran on, so the poll-file trail is always left too — a belt-and-suspenders copy,
-        // not proof the push itself was redundant.
-        let poll_body = fs::read_to_string(poll_file(&paths, Some("r1"), &ub)).unwrap();
-        assert!(poll_body.contains("msg 0"), "{poll_body}");
+        // A confirmed push is the only channel: no duplicate poll-file copy.
+        assert!(
+            !poll_file(&paths, Some("r1"), &ub).exists(),
+            "confirmed push must not also write the poll file"
+        );
 
         let args = fs::read_to_string(capture.with_extension("args")).unwrap();
         assert!(args.contains("--target sess-123"), "{args}");
@@ -968,9 +1034,11 @@ mod tests {
         assert!(args.contains("--target sess-456"), "{args}");
         let stdin = fs::read_to_string(capture.with_extension("stdin")).unwrap();
         assert!(stdin.contains("land your artifact"), "{stdin}");
-        // Belt-and-suspenders trail here too.
-        let poll_body = fs::read_to_string(poll_file(&paths, Some("r1"), &ub)).unwrap();
-        assert!(poll_body.contains("land your artifact"), "{poll_body}");
+        // A confirmed push is the only channel here too: no duplicate poll-file copy.
+        assert!(
+            !poll_file(&paths, Some("r1"), &ub).exists(),
+            "confirmed push must not also write the poll file"
+        );
     }
 
     /// muse's own `external_agent_ingress` feature gate fails closed with a nonzero exit
@@ -1009,6 +1077,44 @@ mod tests {
         .unwrap();
         assert_eq!(d.action, DeliveryAction::PolledFile);
         assert_eq!(d.delivered, 1);
+        let body = fs::read_to_string(poll_file(&paths, Some("r1"), &ub)).unwrap();
+        assert!(body.contains("msg 0"), "{body}");
+    }
+
+    /// A zero exit is not proof of delivery: when the `--json` reply's own `status` field
+    /// says the send was not accepted, that must fall back to the poll file exactly like
+    /// a nonzero exit would — otherwise a rejected send gets reported `SessionMessaged`.
+    #[test]
+    fn muse_session_message_falls_back_to_poll_file_on_unconfirmed_status() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        muse_seed(&paths, 1);
+        mark_alive(&paths, "r1", "b");
+
+        let log_path = paths.log_file("r1", "b");
+        fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        StreamStats {
+            session_id: Some("sess-unconfirmed".into()),
+            ..Default::default()
+        }
+        .save(&log_path)
+        .unwrap();
+
+        let capture = tmp.path().join("capture");
+        let bin = fake_muse_unconfirmed(tmp.path(), &capture);
+
+        let ub = agent_ref(Some("r1"), "b");
+        let d = with_muse_bin(Some(bin), || {
+            deliver(
+                &paths,
+                Some("r1"),
+                &ub,
+                DeliveryStrategy::MuseSessionMessage,
+                false,
+            )
+        })
+        .unwrap();
+        assert_eq!(d.action, DeliveryAction::PolledFile);
         let body = fs::read_to_string(poll_file(&paths, Some("r1"), &ub)).unwrap();
         assert!(body.contains("msg 0"), "{body}");
     }
@@ -1140,8 +1246,7 @@ mod tests {
             &big_body,
             false,
             Duration::from_millis(200),
-        )
-        .unwrap();
+        );
         assert!(!ok);
         assert!(
             start.elapsed() < Duration::from_secs(3),
@@ -1164,8 +1269,7 @@ mod tests {
             "hello",
             false,
             Duration::from_millis(200),
-        )
-        .unwrap();
+        );
         assert!(!ok);
         assert!(
             start.elapsed() < Duration::from_secs(3),
@@ -1189,8 +1293,7 @@ mod tests {
             &big_body,
             false,
             Duration::from_secs(5),
-        )
-        .unwrap();
+        );
         assert!(ok);
     }
 }

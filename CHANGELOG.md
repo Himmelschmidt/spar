@@ -18,9 +18,10 @@ All notable changes to spar are recorded here.
   tester — while still running your project's own test command if you've configured one.
 
 - **`cli:muse` slots now also receive nudges and swarm messages pushed directly into the
-  running session**, on top of the file the agent's role prompt already tells it to
-  check. If the push itself can't reach the session (muse not installed, its ingress
-  rejects the send, or it hangs), spar still writes that same file, same as always.
+  running session**, instead of only the file the agent's role prompt tells it to check.
+  If the push itself can't reach the session (muse not installed, its ingress rejects the
+  send, it hangs, or there's no session to target yet), spar falls back to writing that
+  same file, same as always.
 
 ### Fixed
 

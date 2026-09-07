@@ -620,6 +620,30 @@ fn pid_parent(pid: u32) -> Option<u32> {
     after_comm.split_whitespace().nth(1)?.parse().ok()
 }
 
+/// Extract the muse session id from one raw `muse exec --json` event line, if it is the
+/// `run.model.configured` line that carries one — the same match [`StreamCoalescer`]'s
+/// `handle_muse` makes, but standalone and stateless. The forced-tmux backend never runs
+/// its output through the coalescer at all (tmux's own `tee` writes the raw JSONL
+/// straight to the log file, bypassing `stream_to_log`), so this is what lets a
+/// background tailer recover the same id the native backend gets from the coalescer for
+/// free.
+pub fn extract_muse_session_id(line: &str) -> Option<String> {
+    let t = line.trim();
+    if !t.starts_with('{') {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(t).ok()?;
+    if v.get("payload_type").and_then(|x| x.as_str()) != Some("run.model.configured") {
+        return None;
+    }
+    if v.pointer("/stream/kind").and_then(|x| x.as_str()) != Some("session") {
+        return None;
+    }
+    v.pointer("/stream/id")
+        .and_then(|x| x.as_str())
+        .map(String::from)
+}
+
 fn stream_to_log(
     pipe: impl Read,
     log_path: &Path,
@@ -2219,6 +2243,36 @@ mod tests {
         // muse reports no usage on stdout; muse_telemetry fills these in post-exit.
         assert_eq!(c.input_tokens, 0);
         assert_eq!(c.output_tokens, 0);
+    }
+
+    /// Same real event line as `muse_jsonl_renders_session_tools_and_text`, but read the
+    /// way the forced-tmux tailer reads it: standalone, with no coalescer state at all.
+    #[test]
+    fn extract_muse_session_id_reads_the_configured_line() {
+        let line = r#"{"schema_version":1,"stream":{"kind":"session","id":"11111111-2222-3333-4444-555555555555"},"record_type":"event","payload_type":"run.model.configured","payload":{"display_label":"muse-spark-1.2-contributor","kind":"run_model_configured","model_id":"muse-spark-1.2-contributor","provider_id":"meta","source":"startup"}}"#;
+        assert_eq!(
+            extract_muse_session_id(line).as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+    }
+
+    #[test]
+    fn extract_muse_session_id_ignores_other_lines() {
+        assert_eq!(extract_muse_session_id("not json"), None);
+        assert_eq!(
+            extract_muse_session_id(
+                r#"{"stream":{"kind":"session","id":"s1"},"payload_type":"tool.result"}"#
+            ),
+            None,
+            "only the run.model.configured line carries the id"
+        );
+        assert_eq!(
+            extract_muse_session_id(
+                r#"{"stream":{"kind":"other","id":"s1"},"payload_type":"run.model.configured"}"#
+            ),
+            None,
+            "must be the session-kind stream, not e.g. a sub-task stream"
+        );
     }
 
     #[test]

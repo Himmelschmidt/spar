@@ -44,10 +44,11 @@ impl ProviderAdapter for MuseAdapter {
     // <session-uuid>` injects into the running session, keyed off the session id
     // `StreamCoalescer` captures from the exec JSONL's first `/stream/id` line, guarded on
     // the slot's pid still being alive (a sidecar outlives its process). The delivery seam
-    // (`providers::delivery`) always writes the poll file too — before the id is known, if
-    // the push fails (muse missing, a rejected send, or a hang past its bound), and even
-    // on a reported-successful push, since nothing has verified a real muse session
-    // surfacing an injected message end to end.
+    // (`providers::delivery`) falls back to the poll file only when the push is not
+    // confirmed: before the id is known, when the send fails (muse missing, a rejected
+    // send, a hang past its bound), or when a zero exit's own `--json` reply says the
+    // ingress didn't accept it. A confirmed push is the only channel — it is not
+    // duplicated into the poll file too.
     fn delivery_strategy(&self) -> DeliveryStrategy {
         DeliveryStrategy::MuseSessionMessage
     }
@@ -273,6 +274,17 @@ mod tests {
             command_to_parts(&MuseAdapter.build_headless(Path::new("muse"), &opts("x", None)));
         assert_eq!(dash_val(&a, "--reasoning-effort").as_deref(), Some("xhigh"));
         clear_env();
+    }
+
+    /// Every delivery-seam test constructs `DeliveryStrategy::MuseSessionMessage` as a
+    /// literal, so nothing else pins the one line that actually routes muse onto it —
+    /// reverting `delivery_strategy` to `PollFile` would leave every other test green.
+    #[test]
+    fn delivery_strategy_is_muse_session_message() {
+        assert_eq!(
+            MuseAdapter.delivery_strategy(),
+            DeliveryStrategy::MuseSessionMessage
+        );
     }
 
     #[test]
