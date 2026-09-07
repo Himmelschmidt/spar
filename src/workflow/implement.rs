@@ -1827,6 +1827,17 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
     } else {
         SeatSource::RolesFile
     };
+    // The live-fleet leg resolves each pool position honestly through `resolve_seat`
+    // instead of stamping every position with `state.pool_origin.as_seat_source()`: a
+    // `Synth` pool mixes `[roles]` and `[providers].order` seats, and the blanket guess
+    // mislabels whichever positions did not actually take that rung.
+    let pool_sources = crate::workflow::roles_resolve::resolve_seat_sources(
+        SlotRole::Implementer,
+        state.providers.len(),
+        &state.providers,
+        state.pool_origin,
+        cfg,
+    );
     let next = cfg
         .roles
         .implementer
@@ -1842,7 +1853,8 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
             state
                 .providers
                 .iter()
-                .map(|s| (s.as_str(), state.pool_origin.as_seat_source())),
+                .map(|s| s.as_str())
+                .zip(pool_sources.iter().copied()),
         )
         .find(|(p, _)| *p != cur.as_str() && !used.iter().any(|u| u == p))
         .map(|(p, src)| (p.to_string(), src));
@@ -1933,12 +1945,30 @@ fn try_widen_reviewers(
         .collect();
     // Unpinned: draw the next reviewer from the run's own pool first — an explicit
     // --providers/--select still outranks [providers].order (O56) even on the widen
-    // path — then fall to [providers].order once the pool is exhausted.
+    // path — then fall to [providers].order once the pool is exhausted. Each pool
+    // position resolves its honest source through `resolve_seat` rather than a blanket
+    // `pool_origin.as_seat_source()` guess, since a `Synth` pool mixes `[roles]` and
+    // `[providers].order` seats. Compare by storage key: a pool entry may still carry an
+    // `@model` suffix while `existing`/`slot.provider` are always model-free, so a raw
+    // string comparison would miss a provider that is already reviewing and add a third
+    // seat on it instead of moving on.
+    let normalize = |p: &str| {
+        crate::provider_ref::ProviderRef::parse(p)
+            .map(|r| r.storage_key())
+            .unwrap_or_else(|_| p.to_string())
+    };
+    let pool_sources = crate::workflow::roles_resolve::resolve_seat_sources(
+        SlotRole::Reviewer,
+        state.providers.len(),
+        &state.providers,
+        state.pool_origin,
+        cfg,
+    );
     let candidate = state
         .providers
         .iter()
         .cloned()
-        .map(|p| (p, state.pool_origin.as_seat_source()))
+        .zip(pool_sources)
         .chain(
             cfg.providers
                 .order
@@ -1946,7 +1976,7 @@ fn try_widen_reviewers(
                 .cloned()
                 .map(|p| (p, SeatSource::ProvidersOrder)),
         )
-        .find(|(p, _)| !existing.contains(p));
+        .find(|(p, _)| !existing.contains(&normalize(p)));
     let Some((prov, source)) = candidate else {
         // still widen with a synthetic extra reviewer on a repeated provider
         let dispatched = state
