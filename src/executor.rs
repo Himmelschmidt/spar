@@ -2438,6 +2438,7 @@ pub fn init_slot_model(
         model: pref.model.clone().or(model),
         round: 1,
         quota_hit: false,
+        source: None,
     }
 }
 
