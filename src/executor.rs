@@ -143,6 +143,9 @@ struct PreparedSlot {
     /// (`markers::read_session_id`), if any. `execute_prepared` passes it to the
     /// adapter's `build_resume`; adapters that don't support resume just ignore it.
     prior_session_id: Option<String>,
+    /// The adapter's bare name (e.g. `"codex"`), used to scope the session-id marker so a
+    /// provider rotation on this slot id never resumes a different provider's session.
+    session_provider: String,
     /// The run's frozen config (O27), carried across the thread boundary so a worker
     /// sizes its budgets and nudge cadence off the same document every other phase reads.
     cfg: Config,
@@ -306,7 +309,9 @@ fn prepare_slot_execution(
     let _ = crate::bus::heartbeat(paths, Some(&state.id), &job.slot_id, "running");
     let env = wire_slot_presence(state, paths, &job, &cwd, &pref);
     let owns_cwd = owns_cwd(state, &job.slot_id, &cwd);
-    let prior_session_id = markers::read_session_id(paths, &state.id, &job.slot_id);
+    let session_provider = pref.cli_name().unwrap_or(job.provider.as_str()).to_string();
+    let prior_session_id =
+        markers::read_session_id(paths, &state.id, &job.slot_id, &session_provider);
 
     Ok(PreparedSlot {
         job,
@@ -322,6 +327,7 @@ fn prepare_slot_execution(
         owns_cwd,
         round,
         prior_session_id,
+        session_provider,
         cfg: cfg.clone(),
         dry_run: state.dry_run,
     })
@@ -344,18 +350,35 @@ fn owns_cwd(state: &RunState, slot_id: &str, cwd: &Path) -> bool {
 /// `build_headless` dispatch, when the adapter supports it (see `ProviderAdapter::build_resume`).
 /// Adapters that don't implement `build_resume`, or that decline for this call, fall back
 /// to `build_headless` — the only path before this round's codex resume wiring (O63).
+///
+/// The `bool` reports whether the resume path was taken, so the caller can tell a lost
+/// rollout (resume attempted, no session ever established) from an ordinary cold-dispatch
+/// failure and retry cold instead of just failing the round — see `resume_lost_its_session`.
 fn build_dispatch_command(
     adapter: &dyn providers::ProviderAdapter,
     bin: &Path,
     opts: &SpawnOpts,
     prior_session_id: Option<&str>,
-) -> std::process::Command {
+) -> (std::process::Command, bool) {
     if let Some(sid) = prior_session_id {
         if let Some(cmd) = adapter.build_resume(bin, opts, sid) {
-            return cmd;
+            return (cmd, true);
         }
     }
-    adapter.build_headless(bin, opts)
+    (adapter.build_headless(bin, opts), false)
+}
+
+/// True when a resume dispatch exited without ever establishing a session (no
+/// `thread.started` captured) — the vendor's rollout is gone (pruned, a different
+/// `CODEX_HOME`, a moved box), not a transient failure of an otherwise-live thread. Codex
+/// emits `thread.started` as its very first line, so a real resume announces the session
+/// before doing any work; its absence at exit means the resume never got underway.
+///
+/// Excludes a timeout: a resume that ran the full ceiling without answering is a genuine
+/// hang, and retrying cold there would just double the wall-clock cost for the slot's
+/// budget instead of recovering anything.
+fn resume_lost_its_session(used_resume: bool, res: &process::SpawnResult) -> bool {
+    used_resume && !res.timed_out && res.exit_code != Some(0) && res.stats.session_id.is_none()
 }
 
 fn execute_prepared(
@@ -446,7 +469,7 @@ fn execute_prepared(
         model: prep.job.model.clone(),
         timeout_secs: Some(timeout.as_secs()),
     };
-    let cmd = build_dispatch_command(
+    let (cmd, used_resume) = build_dispatch_command(
         adapter.as_ref(),
         &bin,
         &opts,
@@ -502,6 +525,37 @@ fn execute_prepared(
         watch.tick();
     };
     let mut res = process::run_captured(&req, Some(&sink), Some(&tick))?;
+    if resume_lost_its_session(used_resume, &res) {
+        // The rollout this slot's marker pointed at is gone (pruned, a different
+        // CODEX_HOME, a moved box): clear it so the *next* round doesn't repeat the same
+        // failure, and retry this round cold, once, rather than losing it outright.
+        markers::clear_session_id(
+            &prep.paths,
+            &prep.run_id,
+            &prep.job.slot_id,
+            &prep.session_provider,
+        );
+        let _ = crate::events::append(
+            &prep.paths,
+            &prep.run_id,
+            &crate::events::Event::slot_note(
+                &prep.job.slot_id,
+                "resume lost its session (no thread.started); retrying cold dispatch once",
+            ),
+        );
+        let cold = adapter.build_headless(&bin, &opts);
+        let (program, args) = providers::command_to_parts(&cold);
+        let (program, args) = sandbox::maybe_wrap(isolation, &prep.cwd, &program, &args);
+        let cold_req = SpawnRequest {
+            program,
+            args,
+            cwd: prep.cwd.clone(),
+            log_path: prep.log_path.clone(),
+            env: prep.env.clone(),
+            timeout,
+        };
+        res = process::run_captured(&cold_req, Some(&sink), Some(&tick))?;
+    }
     let pid = load_pid(&pid_cell);
     // Before the gates below, and before any state save: markers outlive an orchestrator
     // that dies between here and the save, `state.json` does not (O49).
@@ -518,7 +572,13 @@ fn execute_prepared(
     // lets the *next* round resume instead of a cold dispatch (O63), and that is worth
     // keeping even off a failed attempt — a resumed thread still holds real progress.
     if let Some(sid) = &res.stats.session_id {
-        let _ = markers::write_session_id(&prep.paths, &prep.run_id, &prep.job.slot_id, sid);
+        let _ = markers::write_session_id(
+            &prep.paths,
+            &prep.run_id,
+            &prep.job.slot_id,
+            &prep.session_provider,
+            sid,
+        );
     }
     let agy_quota_hit = enrich_agy_stats(
         &mut res.stats,
@@ -2112,8 +2172,9 @@ fn run_headless(
         model: slot_model_for(Some(state), job),
         timeout_secs: Some(timeout.as_secs()),
     };
-    let prior_session_id = markers::read_session_id(paths, &state.id, &job.slot_id);
-    let cmd = build_dispatch_command(adapter.as_ref(), &bin, &opts, prior_session_id.as_deref());
+    let prior_session_id = markers::read_session_id(paths, &state.id, &job.slot_id, cli_name);
+    let (cmd, used_resume) =
+        build_dispatch_command(adapter.as_ref(), &bin, &opts, prior_session_id.as_deref());
     let (program, args) = providers::command_to_parts(&cmd);
     let (program, args) = sandbox::maybe_wrap(state.isolation, cwd, &program, &args);
 
@@ -2161,6 +2222,31 @@ fn run_headless(
         watch.tick();
     };
     let mut res = process::run_captured(&req, Some(&sink), Some(&tick))?;
+    if resume_lost_its_session(used_resume, &res) {
+        // See `execute_prepared`: the rollout this marker pointed at is gone, so clear it
+        // and retry this round cold, once, instead of losing the round outright.
+        markers::clear_session_id(paths, &state.id, &job.slot_id, cli_name);
+        let _ = crate::events::append(
+            paths,
+            &state.id,
+            &crate::events::Event::slot_note(
+                &job.slot_id,
+                "resume lost its session (no thread.started); retrying cold dispatch once",
+            ),
+        );
+        let cold = adapter.build_headless(&bin, &opts);
+        let (program, args) = providers::command_to_parts(&cold);
+        let (program, args) = sandbox::maybe_wrap(state.isolation, cwd, &program, &args);
+        let cold_req = SpawnRequest {
+            program,
+            args,
+            cwd: cwd.to_path_buf(),
+            log_path: log_path.to_path_buf(),
+            env: env.to_vec(),
+            timeout,
+        };
+        res = process::run_captured(&cold_req, Some(&sink), Some(&tick))?;
+    }
     let pid = load_pid(&pid_cell);
     // See `execute_prepared`: the verdict lands on disk before the gates and before any
     // state save, so an orchestrator that dies from here on still leaves a terminal
@@ -2175,7 +2261,7 @@ fn run_headless(
     };
     let _ = markers::write_dispatch_verdict(paths, &state.id, &job.slot_id, &verdict);
     if let Some(sid) = &res.stats.session_id {
-        let _ = markers::write_session_id(paths, &state.id, &job.slot_id, sid);
+        let _ = markers::write_session_id(paths, &state.id, &job.slot_id, cli_name, sid);
     }
     let agy_quota_hit = enrich_agy_stats(&mut res.stats, &job.provider, cwd, log_path, paths);
     enrich_muse_stats(&mut res.stats, &job.provider, log_path);
@@ -2761,12 +2847,13 @@ mod tests {
     #[test]
     fn build_dispatch_command_resumes_codex_when_a_prior_session_id_is_known() {
         let opts = dispatch_opts("go");
-        let cmd = build_dispatch_command(
+        let (cmd, used_resume) = build_dispatch_command(
             &providers::CodexAdapter,
             Path::new("codex"),
             &opts,
             Some("thread-123"),
         );
+        assert!(used_resume);
         let (_, args) = providers::command_to_parts(&cmd);
         assert_eq!(&args[..2], ["exec", "resume"]);
         assert!(args.iter().any(|a| a == "thread-123"));
@@ -2775,7 +2862,9 @@ mod tests {
     #[test]
     fn build_dispatch_command_is_cold_without_a_prior_session_id() {
         let opts = dispatch_opts("go");
-        let cmd = build_dispatch_command(&providers::CodexAdapter, Path::new("codex"), &opts, None);
+        let (cmd, used_resume) =
+            build_dispatch_command(&providers::CodexAdapter, Path::new("codex"), &opts, None);
+        assert!(!used_resume);
         let (_, args) = providers::command_to_parts(&cmd);
         assert_eq!(args.first().map(String::as_str), Some("exec"));
         assert!(!args.iter().any(|a| a == "resume"));
@@ -2786,18 +2875,54 @@ mod tests {
         // Grok's `build_resume` is the trait default (`None`), so a prior session id
         // must not change its dispatch shape even when one is present.
         let opts = dispatch_opts("go");
-        let with_prior = build_dispatch_command(
+        let (with_prior, used_resume) = build_dispatch_command(
             &providers::GrokAdapter,
             Path::new("grok"),
             &opts,
             Some("some-id"),
         );
-        let without_prior =
+        assert!(!used_resume);
+        let (without_prior, _) =
             build_dispatch_command(&providers::GrokAdapter, Path::new("grok"), &opts, None);
         assert_eq!(
             providers::command_to_parts(&with_prior).1,
             providers::command_to_parts(&without_prior).1
         );
+    }
+
+    #[test]
+    fn resume_lost_its_session_is_true_only_for_a_resume_that_never_started() {
+        use process::SpawnResult;
+        let mut res = SpawnResult {
+            exit_code: Some(1),
+            signal: None,
+            timed_out: false,
+            log_path: PathBuf::from("/tmp/x"),
+            stdout_tail: String::new(),
+            stats: process::StreamStats::default(),
+        };
+        // Resume, exited non-zero, no session id ever captured: the rollout is gone.
+        assert!(resume_lost_its_session(true, &res));
+
+        // Not a resume at all: an ordinary cold-dispatch failure is not this case.
+        assert!(!resume_lost_its_session(false, &res));
+
+        // Resume did establish a thread before failing later: a real error, not a lost
+        // rollout, so no retry.
+        res.stats.session_id = Some("thread-123".into());
+        assert!(!resume_lost_its_session(true, &res));
+
+        // Resume timed out rather than exiting: retrying cold would double the wall-clock
+        // cost for what looks like a genuine hang, not a missing rollout.
+        res.stats.session_id = None;
+        res.timed_out = true;
+        res.exit_code = None;
+        assert!(!resume_lost_its_session(true, &res));
+
+        // Resume exited clean: nothing to retry.
+        res.timed_out = false;
+        res.exit_code = Some(0);
+        assert!(!resume_lost_its_session(true, &res));
     }
 
     /// The real captured log text from the dogfooding incident (roadmap/BACKLOG.md):
