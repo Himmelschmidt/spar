@@ -549,10 +549,13 @@ slot is stuck on.**
   native queue. **muse** takes them through `muse session-message send --target
   <session-uuid>`, once its session id is known (captured from the exec JSONL's first
   `/stream/id` line) and its slot is still alive; the poll file below is only the fallback
-  for when that push isn't confirmed (id unknown yet, send failed, or the `--json` reply's
-  `status` isn't `"ok"` or `"accepted"`) — a confirmed push has never been observed to
-  actually surface inside a real muse session, so this fallback is exercised in practice,
-  but a confirmed push is not also duplicated into the poll file. **opencode and codex**
+  for when that push isn't confirmed (id unknown yet, send failed, the `--json` reply's
+  `status` isn't `"ok"` or `"accepted"`, or `status` is confirmed but the reply's own
+  `receipts` array is empty — `"accepted"` is muse's weakest rung and can mean the
+  transport took the write with nothing downstream confirming it) — a confirmed push has
+  never been observed to actually surface inside a real muse session, so this fallback is
+  exercised in practice, but a confirmed push is not also duplicated into the poll file.
+  **opencode and codex**
   have no push channel at all, so
   spar writes to `.spar/runs/<id>/logs/nudges-<slot>.md` and their role prompt tells them to
   read it before starting any new major step. Thresholds are checked every 30 seconds, so a

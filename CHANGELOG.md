@@ -17,9 +17,9 @@ All notable changes to spar are recorded here.
   you the smallest useful setup — one reviewer, no critic, no test writer, no automatic
   tester — while still running your project's own test command if you've configured one.
 
-- **`cli:muse` slots now also receive nudges and swarm messages pushed directly into the
-  running session**, falling back to the file the agent's role prompt already tells it to
-  check only when that push isn't confirmed.
+- **`cli:muse` slots now also receive spar's own nudges (budget and time warnings) pushed
+  directly into the running session**, falling back to the file the agent's role prompt
+  already tells it to check only when that push isn't confirmed.
 - **A slot running in a forced-tmux pane can now be stopped.** Its process id is recorded
   as soon as the pane starts, not only once it finishes, so `spar stop` can reach it while
   it's still running instead of only after the fact.

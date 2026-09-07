@@ -415,20 +415,34 @@ fn send_muse_session_message(
 }
 
 /// Read `muse session-message send --json`'s reply as spar's confirmation that the
-/// message actually landed, not just that the process exited zero. Success requires an
-/// explicit `"status":"ok"` or `"status":"accepted"` in a reply that parses as JSON —
-/// `"accepted"` is the literal the installed muse binary itself carries for a confirmed
-/// intake (`strings` on `~/.local/bin/muse-bin-*` turns up `{"status":"accepted",...}` as
-/// the shape muse's own wire protocol uses for an accepted push); anything else — output
-/// that doesn't parse at all (a banner, a login notice, or any other line sharing stdout
-/// with the reply on a zero exit), valid JSON missing `status`, or a `status` naming
-/// anything else — reports failure so the caller falls back to the poll file instead of
-/// reporting a delivery that never landed.
+/// message actually landed, not just that the process exited zero. `"status":"accepted"`
+/// alone is not enough: `strings` on `~/.local/bin/muse-bin-*` shows `"accepted"` is
+/// muse's *weakest* rung — the transport took the write, rendered as "Accepted (receipt
+/// unavailable)" — and a live probe against this box's installed binary confirms a reply
+/// can carry `"status":"accepted"` (or the `unavailable`/`external_agent_ingress_closed`
+/// rejection) alongside an empty `"receipts":[]`, meaning no target admission and no
+/// delivery at all. So confirmation requires both an explicit `"status":"ok"` or
+/// `"status":"accepted"` *and* a non-empty `"receipts"` array proving at least one
+/// delivery rung (`ReceiptTransportAccepted`, `ReceiptTargetAdmission`,
+/// `ReceiptDurableDelivery`, ... per the binary's own receipt-kind enum) was actually
+/// reached. Anything else — output that doesn't parse at all (a banner, a login notice, or
+/// any other line sharing stdout with the reply on a zero exit), valid JSON missing
+/// `status` or `receipts`, a `status` naming anything else, or an empty `receipts` array —
+/// reports failure so the caller falls back to the poll file instead of reporting a
+/// delivery that never landed.
 fn muse_send_reply_ok(stdout: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(stdout.trim())
-        .ok()
-        .and_then(|v| v.get("status").and_then(|s| s.as_str().map(str::to_string)))
-        .is_some_and(|s| s == "ok" || s == "accepted")
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
+        return false;
+    };
+    let status_ok = v
+        .get("status")
+        .and_then(|s| s.as_str())
+        .is_some_and(|s| s == "ok" || s == "accepted");
+    let has_receipt = v
+        .get("receipts")
+        .and_then(|r| r.as_array())
+        .is_some_and(|a| !a.is_empty());
+    status_ok && has_receipt
 }
 
 fn append_poll_file(
@@ -856,7 +870,7 @@ mod tests {
         fs::write(
             &script,
             format!(
-                "#!/bin/sh\necho \"$@\" > {args:?}\ncat > {stdin:?}\necho '{{\"schema_version\":1,\"status\":\"ok\"}}'\nexit {code}\n",
+                "#!/bin/sh\necho \"$@\" > {args:?}\ncat > {stdin:?}\necho '{{\"schema_version\":1,\"status\":\"ok\",\"receipts\":[\"target_admission\"]}}'\nexit {code}\n",
                 args = capture.with_extension("args"),
                 stdin = capture.with_extension("stdin"),
             ),
@@ -1194,12 +1208,14 @@ mod tests {
 
     #[test]
     fn muse_send_reply_ok_requires_explicit_ok_status() {
-        assert!(muse_send_reply_ok(r#"{"status":"ok"}"#));
+        assert!(muse_send_reply_ok(
+            r#"{"status":"ok","receipts":["target_admission"]}"#
+        ));
         assert!(!muse_send_reply_ok(r#"{"status":"unavailable"}"#));
         assert!(!muse_send_reply_ok("{}"));
         assert!(!muse_send_reply_ok(""));
         assert!(!muse_send_reply_ok(
-            "a new version of muse is available\n{\"status\":\"ok\"}"
+            "a new version of muse is available\n{\"status\":\"ok\",\"receipts\":[\"target_admission\"]}"
         ));
     }
 
@@ -1211,8 +1227,22 @@ mod tests {
     #[test]
     fn muse_send_reply_ok_accepts_the_real_binarys_accepted_status() {
         assert!(muse_send_reply_ok(
-            r#"{"status":"accepted","authority":"none"}"#
+            r#"{"status":"accepted","authority":"none","receipts":["transport_accepted"]}"#
         ));
+    }
+
+    /// `"accepted"` is muse's weakest rung: a live probe against the installed binary
+    /// (`external_agent_ingress_closed`, this box's ingress gate) shows a reply can carry
+    /// `"status":"accepted"` with an empty `"receipts":[]` — the transport took the write
+    /// but nothing downstream (target admission, durable delivery, ...) confirmed it. That
+    /// must fall back to the poll file exactly like a rejection, not be read as delivered.
+    #[test]
+    fn muse_send_reply_ok_rejects_accepted_status_with_no_receipts() {
+        assert!(!muse_send_reply_ok(
+            r#"{"status":"accepted","receipts":[]}"#
+        ));
+        assert!(!muse_send_reply_ok(r#"{"status":"accepted"}"#));
+        assert!(!muse_send_reply_ok(r#"{"status":"ok","receipts":[]}"#));
     }
 
     /// The nudge path takes the same fallback on a rejected send — a nudge is spar's own
@@ -1451,7 +1481,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let bin = fake_muse_script(
             tmp.path(),
-            "sleep 0.2\ncat > /dev/null\necho '{\"status\":\"ok\"}'\nexit 0",
+            "sleep 0.2\ncat > /dev/null\necho '{\"status\":\"ok\",\"receipts\":[\"target_admission\"]}'\nexit 0",
         );
         let big_body = "y".repeat(256 * 1024);
 

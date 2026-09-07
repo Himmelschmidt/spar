@@ -2356,8 +2356,15 @@ fn run_tmux(
     // latching a prior round's session id (or transcript) onto this round's live pid.
     // Reset both here, synchronously, before the pane exists at all: the same guarantee
     // `run_captured` gives the native backend at spawn (`process.rs`'s `File::create` +
-    // fresh `StreamStats`).
-    reset_tmux_slot_log(log_path);
+    // fresh `StreamStats`). Gated on the same strategy check the tailer below uses: a
+    // non-muse tmux slot has no tailer to protect and gets no benefit from the reset, only
+    // the cost of losing the previous round's transcript for `salvage_expected_artifact` if
+    // `spawn_window` below fails.
+    let is_muse_session_message =
+        adapter.delivery_strategy() == providers::DeliveryStrategy::MuseSessionMessage;
+    if is_muse_session_message {
+        reset_tmux_slot_log(log_path);
+    }
 
     tmux::spawn_window(&session, &job.slot_id, cwd, &shell, env)?;
 
@@ -2378,8 +2385,14 @@ fn run_tmux(
     // isn't silently poll-file-only for its entire run.
     let stop_tailer = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let _tailer_guard = TailerGuard(stop_tailer.clone());
-    if adapter.delivery_strategy() == providers::DeliveryStrategy::MuseSessionMessage {
-        spawn_muse_session_id_tailer(log_path.to_path_buf(), stop_tailer);
+    if is_muse_session_message {
+        spawn_muse_session_id_tailer(
+            paths.clone(),
+            state.id.clone(),
+            job.slot_id.clone(),
+            log_path.to_path_buf(),
+            stop_tailer,
+        );
     }
 
     // `done` means the agent's own process has exited — not just that it wrote its marker.
@@ -2479,8 +2492,14 @@ impl Drop for TailerGuard {
 /// polling because `tee` (not spar) owns the writes and there is no pipe to block on.
 /// Gives up after `GIVE_UP_AFTER`: the id is emitted once, near the very start of the
 /// stream, so if it hasn't shown up by then it isn't coming and there is no reason to
-/// keep re-scanning a transcript that can run for hours.
+/// keep re-scanning a transcript that can run for hours. Give-up (but not the ordinary
+/// stop-on-return case) writes an `Info` event so the push channel silently degrading to
+/// poll-file-only for the rest of a multi-hour run is visible in `wait --follow` and the
+/// TUI instead of only inferable after the fact.
 fn spawn_muse_session_id_tailer(
+    paths: SparPaths,
+    run_id: String,
+    slot_id: String,
     log_path: PathBuf,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
@@ -2498,6 +2517,17 @@ fn spawn_muse_session_id_tailer(
                 return;
             }
             std::thread::sleep(POLL);
+        }
+        if !stop.load(Ordering::Relaxed) {
+            let _ = crate::events::append(
+                &paths,
+                &run_id,
+                &crate::events::Event::slot_note(
+                    &slot_id,
+                    "muse session id not seen within 180s: session-message push channel \
+                     stays poll-file-only for the rest of this round",
+                ),
+            );
         }
     });
 }
