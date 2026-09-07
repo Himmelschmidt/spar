@@ -107,7 +107,6 @@ that for finished runs. These two reduce how much gets created in the first plac
     matches `cache_read` today so stdout evidently uses different keys from the stored
     JSON-RPC form. Do not rewrite the parser without that capture.
 
-
 - **`worktree+bwrap` cannot write artifacts or markers.** `src/sandbox/bwrap.rs` binds `/`
   read-only and makes only the slot's `cwd` writable, but `artifacts_dir` and `markers_dir`
   both live under `.spar/runs/<id>/`, outside the worktree. Under that isolation mode a

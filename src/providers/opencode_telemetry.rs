@@ -9,11 +9,14 @@
 //! spend is simply gone from `stats.json`.
 //!
 //! opencode keeps its own ledger in a sqlite database
-//! (`${XDG_DATA_HOME:-~/.local/share}/opencode/opencode.db`), and the `session` table
-//! already carries **per-session totals**, not per-step deltas: `tokens_input`,
-//! `tokens_output`, `tokens_reasoning`, `tokens_cache_read`, `tokens_cache_write`, keyed
-//! by `id` with a `parent_id` pointing at the session that spawned it. So recovering a
-//! child's spend needs no event replay, just `SELECT ... WHERE parent_id = ?`.
+//! (`${XDG_DATA_HOME:-~/.local/share}/opencode/opencode.db`, or wherever `OPENCODE_DB`
+//! points), and the `session` table already carries **per-session totals**, not
+//! per-step deltas: `tokens_input`, `tokens_output`, `tokens_reasoning`,
+//! `tokens_cache_read`, `tokens_cache_write`, keyed by `id` with a `parent_id` pointing
+//! at the session that spawned it. `parent_id` is a single edge, but the tree it forms
+//! is not depth-bounded: a `task` subagent granted its own `task` permission can fan out
+//! again, so [`collect`] walks the full descendant subtree (a recursive CTE), not just
+//! direct children.
 //!
 //! Measured on a real corpus: the top parent by child spend books 1,384,565 tokens on
 //! its own stream against 6,605,838 across 4 children (4.8x what the stream alone
@@ -26,19 +29,62 @@
 //! already reports the parent session's tokens correctly — only the children are
 //! missing. [`apply`] therefore adds recovered child usage onto the stream-parsed
 //! totals rather than replacing them.
+//!
+//! **Known undercount, not fixed by this module:** a `task` subagent launched with
+//! `background=true` keeps running after the parent session's stream closes, so a
+//! recovery read that lands right at exit can see a child session's row before
+//! opencode has finished incrementing it. Same class of gap as the grandchild case
+//! before this change: real spend that the ledger has not caught up to yet.
 
 use crate::process::StreamStats;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
-/// `${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db`, if it exists.
-pub fn db_path() -> Option<PathBuf> {
+/// `${XDG_DATA_HOME:-$HOME/.local/share}/opencode`.
+fn data_dir() -> Option<PathBuf> {
     let base = match std::env::var_os("XDG_DATA_HOME") {
         Some(x) if !x.is_empty() => PathBuf::from(x),
         _ => PathBuf::from(std::env::var_os("HOME")?).join(".local/share"),
     };
-    let p = base.join("opencode/opencode.db");
-    p.is_file().then_some(p)
+    Some(base.join("opencode"))
+}
+
+/// The sqlite ledger opencode is actually writing to.
+///
+/// Honours `OPENCODE_DB` the same way opencode's own binary resolves it: `:memory:`
+/// means there is nothing on disk to read, an absolute path is used as-is, and a
+/// relative one joins the data dir. Unset, falls back to the newest `opencode*.db` in
+/// the data dir, which covers the non-default channel databases (`opencode-beta.db`,
+/// `opencode-<channel>.db`) without hardcoding the channel list.
+pub fn db_path() -> Option<PathBuf> {
+    let dir = data_dir()?;
+    if let Some(over) = std::env::var_os("OPENCODE_DB") {
+        if over == ":memory:" {
+            return None;
+        }
+        let p = PathBuf::from(over);
+        let p = if p.is_absolute() { p } else { dir.join(p) };
+        return p.is_file().then_some(p);
+    }
+    newest_db(&dir)
+}
+
+fn newest_db(dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("opencode") && name.ends_with(".db")
+        })
+        .filter(|e| e.path().is_file())
+        .max_by_key(|e| {
+            e.metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        })
+        .map(|e| e.path())
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -48,7 +94,8 @@ pub struct Usage {
     pub reasoning_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
-    /// Number of child sessions found; zero means nothing was recovered.
+    /// Number of descendant sessions found (children and their own descendants);
+    /// zero means nothing was recovered.
     pub children: u32,
 }
 
@@ -64,12 +111,12 @@ impl Usage {
     }
 }
 
-/// Sum token usage across every direct child of `session_id` in opencode's own ledger.
+/// Sum token usage across every descendant of `session_id` in opencode's own ledger —
+/// direct children and any subagent they themselves fanned out to, transitively.
 ///
-/// Grandchildren (a subagent that itself fans out) are out of scope: `task` subagents
-/// observed on this box are one level deep, and `parent_id` is a single hop by design
-/// in opencode's schema, so a second pass would need to walk the tree explicitly if
-/// that ever changes.
+/// The recursive CTE's `UNION` (not `UNION ALL`) dedupes visited ids, so a cycle in
+/// `parent_id` (which should never happen, but the ledger is an external file spar does
+/// not control) terminates instead of looping.
 pub fn collect(db: &Path, session_id: &str) -> Usage {
     let mut usage = Usage::default();
     let Ok(conn) = rusqlite::Connection::open_with_flags(
@@ -79,8 +126,13 @@ pub fn collect(db: &Path, session_id: &str) -> Usage {
         return usage;
     };
     let Ok(mut stmt) = conn.prepare(
-        "SELECT tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, \
-         tokens_cache_write FROM session WHERE parent_id = ?1",
+        "WITH RECURSIVE descendants(id) AS ( \
+             SELECT id FROM session WHERE parent_id = ?1 \
+             UNION \
+             SELECT s.id FROM session s JOIN descendants d ON s.parent_id = d.id \
+         ) \
+         SELECT tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, \
+         tokens_cache_write FROM session WHERE id IN (SELECT id FROM descendants)",
     ) else {
         return usage;
     };
@@ -197,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn sums_direct_children_only() {
+    fn sums_the_whole_descendant_subtree() {
         let tmp = tempdir().unwrap();
         let db = tmp.path().join("opencode.db");
         let conn = make_db(&db);
@@ -214,18 +266,25 @@ mod tests {
             Some("parent"),
             (3_000_000, 90_838, 0, 0, 0),
         );
-        // A grandchild, and an unrelated sibling tree, must not be swept in.
+        // A grandchild (a subagent that itself fanned out) and a great-grandchild must
+        // be swept in; an unrelated sibling tree must not.
         insert(&conn, "grandchild", Some("child-a"), (999_999, 0, 0, 0, 0));
+        insert(
+            &conn,
+            "great-grandchild",
+            Some("grandchild"),
+            (1, 2, 3, 4, 5),
+        );
         insert(&conn, "unrelated", None, (42, 0, 0, 0, 0));
         drop(conn);
 
         let usage = collect(&db, "parent");
-        assert_eq!(usage.children, 2);
-        assert_eq!(usage.input_tokens, 2_000_000 + 3_000_000);
-        assert_eq!(usage.output_tokens, 100_000 + 90_838);
-        assert_eq!(usage.reasoning_tokens, 5_000);
-        assert_eq!(usage.cache_read_tokens, 500_000);
-        assert_eq!(usage.cache_write_tokens, 10_000);
+        assert_eq!(usage.children, 4);
+        assert_eq!(usage.input_tokens, 2_000_000 + 3_000_000 + 999_999 + 1);
+        assert_eq!(usage.output_tokens, 100_000 + 90_838 + 2);
+        assert_eq!(usage.reasoning_tokens, 5_000 + 3);
+        assert_eq!(usage.cache_read_tokens, 500_000 + 4);
+        assert_eq!(usage.cache_write_tokens, 10_000 + 5);
     }
 
     #[test]
@@ -297,5 +356,107 @@ mod tests {
         let mut stats = StreamStats::default();
         enrich(&mut stats);
         assert_eq!(stats.billed_tokens, 0);
+    }
+
+    // The remaining tests mutate process env (`XDG_DATA_HOME`, `OPENCODE_DB`), so they
+    // share this lock the way `opencode.rs`'s own env-mutating tests do.
+    use std::sync::Mutex;
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn acquire() -> Self {
+            let guard = ENV_LOCK.lock().unwrap();
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("OPENCODE_DB");
+            EnvGuard { _guard: guard }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("OPENCODE_DB");
+        }
+    }
+
+    #[test]
+    fn db_path_picks_the_newest_opencode_db_in_the_data_dir() {
+        let _env = EnvGuard::acquire();
+        let tmp = tempdir().unwrap();
+        let data_home = tmp.path();
+        std::env::set_var("XDG_DATA_HOME", data_home);
+        let dir = data_home.join("opencode");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let old = dir.join("opencode.db");
+        std::fs::write(&old, b"old").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let newer = dir.join("opencode-beta.db");
+        std::fs::write(&newer, b"newer").unwrap();
+
+        assert_eq!(db_path(), Some(newer));
+    }
+
+    #[test]
+    fn db_path_honours_an_absolute_opencode_db_override() {
+        let _env = EnvGuard::acquire();
+        let tmp = tempdir().unwrap();
+        std::env::set_var("XDG_DATA_HOME", tmp.path());
+        let elsewhere = tmp.path().join("elsewhere.db");
+        std::fs::write(&elsewhere, b"x").unwrap();
+        std::env::set_var("OPENCODE_DB", &elsewhere);
+        assert_eq!(db_path(), Some(elsewhere));
+    }
+
+    #[test]
+    fn db_path_honours_a_relative_opencode_db_override() {
+        let _env = EnvGuard::acquire();
+        let tmp = tempdir().unwrap();
+        std::env::set_var("XDG_DATA_HOME", tmp.path());
+        let dir = tmp.path().join("opencode");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("opencode-prod.db"), b"x").unwrap();
+        std::env::set_var("OPENCODE_DB", "opencode-prod.db");
+        assert_eq!(db_path(), Some(dir.join("opencode-prod.db")));
+    }
+
+    #[test]
+    fn db_path_is_none_when_opencode_db_is_memory() {
+        let _env = EnvGuard::acquire();
+        let tmp = tempdir().unwrap();
+        std::env::set_var("XDG_DATA_HOME", tmp.path());
+        std::env::set_var("OPENCODE_DB", ":memory:");
+        assert_eq!(db_path(), None);
+    }
+
+    #[test]
+    fn enrich_resolves_the_real_db_path_and_recovers_child_spend_end_to_end() {
+        let _env = EnvGuard::acquire();
+        let tmp = tempdir().unwrap();
+        std::env::set_var("XDG_DATA_HOME", tmp.path());
+        let dir = tmp.path().join("opencode");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("opencode.db");
+        let conn = make_db(&db);
+        insert(&conn, "parent", None, (100, 0, 0, 0, 0));
+        insert(&conn, "child", Some("parent"), (10, 20, 0, 5, 1));
+        drop(conn);
+
+        let mut stats = StreamStats {
+            session_id: Some("parent".to_string()),
+            input_tokens: 100,
+            billed_tokens: 100,
+            ..Default::default()
+        };
+        enrich(&mut stats);
+        assert_eq!(stats.input_tokens, 110);
+        assert_eq!(stats.output_tokens, 20);
+        assert_eq!(stats.cache_read_tokens, 5);
+        assert_eq!(stats.cache_write_tokens, 1);
+        assert_eq!(stats.billed_tokens, 100 + 10 + 20 + 5 + 1);
     }
 }

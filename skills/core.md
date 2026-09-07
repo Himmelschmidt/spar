@@ -551,9 +551,13 @@ slot is stuck on.**
   read it before starting any new major step. Thresholds are checked every 30 seconds, so a
   nudge lands at the next 30s boundary rather than the instant a budget is crossed.
 - **Live token visibility differs by adapter**, so token nudges are not uniformly prompt.
-  **opencode** reports usage per step and is exact live. **muse** carries no tokens on
+  **opencode** reports usage per step and is exact live for the slot's own session, but a
+  `task` subagent's spend lands only after exit (opencode's json emitter never puts a
+  child session's steps on stdout at all), so a live nudge undercounts a fanned-out slot
+  until then, by up to 16.3x on a real corpus. **muse** carries no tokens on
   stdout at all, so spar tails its session log (`~/.local/share/muse/sessions/…`), which is
-  appended as the turn runs; that is exact live too. **claude** reports per-message usage
+  appended as the turn runs, including its own subagent sessions; that is exact live too.
+  **claude** reports per-message usage
   whose input and cache-read arms are `max`ed until its terminal `result` lands, so a live
   reading runs low and its token nudge fires late rather than early. Not a categorical
   guarantee: the same live path *sums* `output_tokens` across the repeated per-content-block
@@ -820,8 +824,9 @@ rail's selection.
     reconcile against the provider's own session-level ledger, at the session level: a
     codex slot's `billed_tokens` equals its `token_count` `total_tokens`, a muse slot's
     equals the sum of its billed `goal_usage_attribution` records, an opencode slot's
-    equals its own `tokens.total` summed plus every child session's totals in
-    `opencode.db` (`session.parent_id`). opencode's json emitter filters child sessions
+    equals its own `tokens.total` summed plus every descendant session's totals in
+    `opencode.db` (walked transitively through `session.parent_id`, since a subagent can
+    itself fan out). opencode's json emitter filters child sessions
     out of the stream it prints, so a subagent's usage never reaches stdout at all; spar
     recovers it after the slot exits by summing `tokens_input + output + reasoning +
     cache_read + cache_write` over every session row whose `parent_id` is the slot's own
