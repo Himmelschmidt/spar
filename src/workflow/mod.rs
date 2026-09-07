@@ -62,7 +62,7 @@ impl CommonOpts {
     }
 
     /// Explicit providers or `--select` resolution. Writes `model-select.json` when selecting.
-    pub fn resolve_fleet(
+    pub fn resolve_pool(
         &self,
         n: usize,
         roles: &[&str],

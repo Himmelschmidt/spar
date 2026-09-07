@@ -5,7 +5,7 @@ use crate::executor::{self, SlotJob};
 use crate::exit_codes::ExitCode;
 use crate::paths::SparPaths;
 use crate::providers;
-use crate::state::{Phase, PoolOrigin, RunState, SeatSource, SlotRole};
+use crate::state::{Phase, RunState, SeatSource, SlotRole};
 use crate::util::{self, sanitize_slot};
 use crate::worktree;
 use anyhow::Result;
@@ -42,14 +42,8 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
         roles.push(SlotRole::TestAuthor.as_config_key());
     }
     let n_slots = roles.len();
-    let requested = opts.resolve_fleet(n_slots, &roles, paths, cfg, &state.id)?;
-    let pool_origin = if !opts.providers.is_empty() {
-        PoolOrigin::CliProviders
-    } else if !opts.select.is_empty() {
-        PoolOrigin::Selected
-    } else {
-        PoolOrigin::Synth
-    };
+    let requested = opts.resolve_pool(n_slots, &roles, paths, cfg, &state.id)?;
+    let pool_origin = crate::workflow::roles_resolve::pool_origin_for(&opts);
     state.pool_origin = pool_origin;
     state.providers = providers::pick_providers(&requested, n_slots, Some(&requested), dry);
     // `state.providers` is positional: `resolve_seat(role, idx, …)` maps each slot by
@@ -270,8 +264,11 @@ pub fn execute_plan(
     // The implement panel this run will dispatch, projected from the frozen config so
     // the plan gate shows it before it exists (feature 011, item C): the human deciding
     // whether to approve is exactly the one who needs to see what it will cost.
-    state.projected_fleet =
-        crate::workflow::roles_resolve::project_implement_fleet(cfg, state.dry_run);
+    state.projected_fleet = crate::workflow::roles_resolve::project_implement_fleet(
+        cfg,
+        &state.providers,
+        state.pool_origin,
+    );
 
     if cfg.auto_plan() {
         state.gates.plan_approved = true;
@@ -324,11 +321,7 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
     } else if cfg.roles.test_author.is_some() {
         SeatSource::RolesFile
     } else {
-        match state.pool_origin {
-            PoolOrigin::CliProviders => SeatSource::CliProviders,
-            PoolOrigin::Selected => SeatSource::ModelSelect,
-            PoolOrigin::Synth => SeatSource::ProvidersOrder,
-        }
+        state.pool_origin.as_seat_source()
     };
     let test_author_idx = 1 + usize::from(cfg.critic.enabled);
     let model = crate::model_select::load_select_artifact(paths, &state.id)

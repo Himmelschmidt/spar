@@ -9,10 +9,24 @@
 //! (Bug A). `[providers].order` is the last resort, and only for a role nothing else
 //! named: for `Reviewer` that means an *unpinned* panel, keyed by reviewer ordinal, not
 //! by pool position.
+use super::CommonOpts;
 use crate::config::Config;
 use crate::provider_ref::ProviderRef;
 use crate::state::{FleetSeat, PoolOrigin, SeatSource, SlotRole};
 use crate::util::sanitize_slot;
+
+/// A run's positional pool provenance for one invocation, from the flags actually
+/// passed: an explicit `--providers` or `--select` is a real override; absent both, the
+/// pool was (or will be) synthesized from `[roles]` / `[providers].order`.
+pub fn pool_origin_for(opts: &CommonOpts) -> PoolOrigin {
+    if !opts.providers.is_empty() {
+        PoolOrigin::CliProviders
+    } else if !opts.select.is_empty() {
+        PoolOrigin::Selected
+    } else {
+        PoolOrigin::Synth
+    }
+}
 
 /// Reviewer panel width when nothing pins it (Bug A: this is a floor for an *unpinned*
 /// panel, never a target the pinned case gets padded up to).
@@ -46,13 +60,16 @@ pub fn pool_width(cfg: &Config) -> usize {
     1 + panel_size(cfg)
 }
 
-/// Whether the reviewer panel is pinned (by CLI `--role` or by `[roles].reviewer`), i.e.
-/// an exclusion list rather than a floor. Widening a pinned panel must duplicate a pin,
-/// never draw from `[providers].order` (Bug A).
+/// Whether the reviewer panel is pinned (by CLI `--role`, by `[roles].reviewer`, or
+/// narrowed by `--fleet small`), i.e. an exclusion list rather than a floor. Widening a
+/// pinned panel must duplicate an already-dispatched seat, never draw from
+/// `[providers].order` (Bug A) — including the unpinned-but-narrowed `small` panel, or
+/// widening would silently re-add the seat the preset was asked to drop.
 pub fn reviewer_panel_pinned(cfg: &Config) -> bool {
     cfg.cli_role_keys
         .contains(SlotRole::Reviewer.as_config_key())
         || !cfg.roles.reviewer.is_empty()
+        || cfg.fleet_reviewer_override.is_some()
 }
 
 fn singleton_role_value(role: SlotRole, cfg: &Config) -> Option<String> {
@@ -190,30 +207,25 @@ pub fn build_implement_seats(
     out
 }
 
-/// Best-effort projection of the implement panel a plan run has not dispatched yet,
-/// shown at the plan gate (feature 011, item C) so the human deciding whether to pay for
-/// it can actually see it. Simulates a bare `implement --run <id>` (no flags): the
-/// honest answer for what a later round with no `--providers`/`--select` will resolve.
-/// Empty when that simulation cannot resolve a pool (e.g. no `[roles]` configured) —
-/// a real invocation would need an explicit flag then too.
-pub fn project_implement_fleet(cfg: &Config, dry: bool) -> Vec<FleetSeat> {
-    let n = pool_width(cfg);
-    let labels: Vec<&str> = std::iter::once(SlotRole::Implementer.as_config_key())
-        .chain(std::iter::repeat(SlotRole::Reviewer.as_config_key()))
-        .take(n)
-        .collect();
-    let Ok(resolved) = crate::model_select::resolve_providers(
-        &[],
-        None,
-        crate::model_select::Urgency::Normal,
-        n,
-        &labels,
-        cfg,
-        dry,
-    ) else {
-        return Vec::new();
-    };
-    build_implement_seats(cfg, &resolved.providers, PoolOrigin::Synth, true, &|_| None)
+/// Projection of the implement panel a plan run has not dispatched yet, shown at the
+/// plan gate (feature 011, item C) so the human deciding whether to pay for it can
+/// actually see it. Simulates the exact pool a bare `implement --run <id>` (no flags)
+/// resolves: `run_from_approved` reuses the run's frozen `pool`/`pool_origin` when
+/// `[roles]` is empty (there is nothing else to synthesize a pool from), and otherwise
+/// resolves fresh from `cfg` alone. Mirroring that branch here, instead of independently
+/// re-deriving a pool via `model_select::resolve_providers`, is what keeps the two from
+/// drifting — `resolve_seat`'s `Synth` rung never reads `pool` anyway, so re-deriving one
+/// only risked a wrong answer when `cfg` alone could not resolve one.
+pub fn project_implement_fleet(
+    cfg: &Config,
+    pool: &[String],
+    pool_origin: PoolOrigin,
+) -> Vec<FleetSeat> {
+    if cfg.roles.is_empty() && !pool.is_empty() {
+        build_implement_seats(cfg, pool, pool_origin, true, &|_| None)
+    } else {
+        build_implement_seats(cfg, &[], PoolOrigin::Synth, true, &|_| None)
+    }
 }
 
 #[cfg(test)]

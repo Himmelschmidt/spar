@@ -324,6 +324,19 @@ pub enum PoolOrigin {
     Synth,
 }
 
+impl PoolOrigin {
+    /// The honest `SeatSource` for a seat drawn straight from this pool, with no more
+    /// specific rung (CLI role, `[roles]`) applying. Keeps every workflow that builds
+    /// slots from `state.providers` off a hardcoded `SeatSource::ProvidersOrder` guess.
+    pub fn as_seat_source(self) -> SeatSource {
+        match self {
+            PoolOrigin::CliProviders => SeatSource::CliProviders,
+            PoolOrigin::Selected => SeatSource::ModelSelect,
+            PoolOrigin::Synth => SeatSource::ProvidersOrder,
+        }
+    }
+}
+
 /// One seat in the resolved fleet — actual (a slot already exists) or projected (the run
 /// will dispatch it later, e.g. the implement panel seen from the plan gate). Feature 011.
 #[derive(Debug, Clone, Serialize, Deserialize)]
