@@ -210,22 +210,18 @@ pub fn build_implement_seats(
 /// Projection of the implement panel a plan run has not dispatched yet, shown at the
 /// plan gate (feature 011, item C) so the human deciding whether to pay for it can
 /// actually see it. Simulates the exact pool a bare `implement --run <id>` (no flags)
-/// resolves: `run_from_approved` reuses the run's frozen `pool`/`pool_origin` when
-/// `[roles]` is empty (there is nothing else to synthesize a pool from), and otherwise
-/// resolves fresh from `cfg` alone. Mirroring that branch here, instead of independently
-/// re-deriving a pool via `model_select::resolve_providers`, is what keeps the two from
-/// drifting — `resolve_seat`'s `Synth` rung never reads `pool` anyway, so re-deriving one
-/// only risked a wrong answer when `cfg` alone could not resolve one.
+/// resolves: a straight call into `build_implement_seats` with the run's own `pool` /
+/// `pool_origin`, the same two `resolve_seat` already uses to decide whether the pool
+/// even applies (rung 2, only for an explicit `CliProviders`/`Selected` origin) — no
+/// separate branch is needed here to mirror that decision, and one previously caused the
+/// projection to silently drop the pool whenever `[roles]` held anything at all (e.g. a
+/// single CLI-pinned reviewer alongside an explicit `--providers` pool).
 pub fn project_implement_fleet(
     cfg: &Config,
     pool: &[String],
     pool_origin: PoolOrigin,
 ) -> Vec<FleetSeat> {
-    if cfg.roles.is_empty() && !pool.is_empty() {
-        build_implement_seats(cfg, pool, pool_origin, true, &|_| None)
-    } else {
-        build_implement_seats(cfg, &[], PoolOrigin::Synth, true, &|_| None)
-    }
+    build_implement_seats(cfg, pool, pool_origin, true, &|_| None)
 }
 
 #[cfg(test)]

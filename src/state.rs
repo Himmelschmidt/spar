@@ -123,6 +123,17 @@ pub struct RunState {
     /// site and needs this without re-threading `CommonOpts` through all of them.
     #[serde(default)]
     pub pool_origin: PoolOrigin,
+    /// The raw pool the operator asked for at plan time, before it was narrowed to the
+    /// plan phase's own slot count. `providers` is cycled/truncated to fit whichever
+    /// phase resolved it last (`providers::pick_providers`), so a plan with fewer plan
+    /// roles than the implement panel needs (`--fleet small`, `--without critic`) would
+    /// otherwise lose reviewer positions past the plan's own width. Both the plan gate's
+    /// implement-panel projection and a bare `implement --run` continuation read this
+    /// instead of `providers` so neither drifts narrower than what the operator actually
+    /// supplied. Empty for a run with no explicit `--providers`/`--select` (there is
+    /// nothing narrower to lose).
+    #[serde(default)]
+    pub pool_intent: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -308,6 +319,10 @@ pub enum SeatSource {
     ProvidersOrder,
     ModelSelect,
     SuitePreferences,
+    /// A slot with no recorded provenance — pre-011 `state.json`, or a code path that has
+    /// not been threaded onto a real `SeatSource` yet. Never guess `ProvidersOrder`: that
+    /// claims a specific rung the seat may never have taken.
+    Unknown,
 }
 
 /// Provenance of the positional pool a run resolved, at the moment a phase's seats were
@@ -517,6 +532,7 @@ impl RunState {
             round: 1,
             projected_fleet: Vec::new(),
             pool_origin: PoolOrigin::default(),
+            pool_intent: Vec::new(),
         }
     }
 

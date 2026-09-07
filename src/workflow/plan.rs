@@ -45,6 +45,17 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
     let requested = opts.resolve_pool(n_slots, &roles, paths, cfg, &state.id)?;
     let pool_origin = crate::workflow::roles_resolve::pool_origin_for(&opts);
     state.pool_origin = pool_origin;
+    // The raw, un-narrowed pool: `state.providers` below is cycled/truncated to the plan
+    // phase's own slot count, which is narrower than the implement panel whenever
+    // `--fleet small` or `--without critic`/`spec` drops a plan-phase seat. The plan gate
+    // projection and a later bare `implement --run` continuation both need the width the
+    // operator actually asked for, not the plan phase's.
+    if matches!(
+        pool_origin,
+        crate::state::PoolOrigin::CliProviders | crate::state::PoolOrigin::Selected
+    ) {
+        state.pool_intent = requested.clone();
+    }
     state.providers = providers::pick_providers(&requested, n_slots, Some(&requested), dry);
     // `state.providers` is positional: `resolve_seat(role, idx, …)` maps each slot by
     // index, so quota must gate the pool in place, never compact it — dropping a paused
@@ -264,11 +275,27 @@ pub fn execute_plan(
     // The implement panel this run will dispatch, projected from the frozen config so
     // the plan gate shows it before it exists (feature 011, item C): the human deciding
     // whether to approve is exactly the one who needs to see what it will cost.
+    // `pool_intent` is the un-narrowed operator pool when there is one — the plan
+    // phase's own `state.providers` is truncated to the plan's slot count and would drop
+    // reviewer positions the implement panel still needs.
+    let projection_pool = if state.pool_intent.is_empty() {
+        &state.providers
+    } else {
+        &state.pool_intent
+    };
     state.projected_fleet = crate::workflow::roles_resolve::project_implement_fleet(
         cfg,
-        &state.providers,
+        projection_pool,
         state.pool_origin,
     );
+    if let Some(seat) = crate::workflow::implement::project_tester_seat(
+        cfg,
+        state.dry_run,
+        projection_pool,
+        state.pool_origin,
+    ) {
+        state.projected_fleet.push(seat);
+    }
 
     if cfg.auto_plan() {
         state.gates.plan_approved = true;

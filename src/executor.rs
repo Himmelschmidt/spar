@@ -2455,7 +2455,7 @@ pub fn run_fleet_seats(state: &RunState) -> Vec<FleetSeat> {
             role: s.role,
             provider: s.provider.clone(),
             model: s.model.clone(),
-            source: s.source.unwrap_or(SeatSource::ProvidersOrder),
+            source: s.source.unwrap_or(SeatSource::Unknown),
             projected: false,
         })
         .collect();
@@ -2599,6 +2599,7 @@ fn source_label(source: SeatSource) -> &'static str {
         SeatSource::ProvidersOrder => "providers-order",
         SeatSource::ModelSelect => "model-select",
         SeatSource::SuitePreferences => "suite-preferences",
+        SeatSource::Unknown => "unknown",
     }
 }
 
