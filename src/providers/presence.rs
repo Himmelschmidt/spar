@@ -30,7 +30,8 @@ pub struct SlotIdentity<'a> {
 pub struct PresenceWiring {
     /// Env vars to attach to the spawned agent process.
     pub env: Vec<(String, String)>,
-    /// A line to log when presence is degraded (e.g. agy has no event stream).
+    /// A line to log when presence is degraded (e.g. agy has no presence/injection
+    /// channel).
     pub note: Option<String>,
 }
 
@@ -74,7 +75,7 @@ pub fn wire(adapter: &dyn ProviderAdapter, id: &SlotIdentity) -> PresenceWiring 
             id.agent_id
         )),
         PresenceSource::None => Some(format!(
-            "{}: no event stream — inbox-on-next-turn, degraded presence",
+            "{}: no presence/injection channel — inbox-on-next-turn, degraded presence",
             id.agent_id
         )),
     };
@@ -414,7 +415,7 @@ mod tests {
         let w = wire(&AgyAdapter, &id(&wt, &root, &exe));
         assert_eq!(
             w.note.as_deref(),
-            Some("impl-1: no event stream — inbox-on-next-turn, degraded presence")
+            Some("impl-1: no presence/injection channel — inbox-on-next-turn, degraded presence")
         );
         assert!(!settings_path(&wt).exists(), "agy must not write hooks");
     }

@@ -969,6 +969,16 @@ impl StreamCoalescer {
             }
         }
 
+        // agy `--output-format stream-json` (verified against agy 1.1.26). Every line
+        // carries a top-level `event` naming one of three envelopes (`init`, `step_update`,
+        // `result`); gated off before the `type`-matched branches below since agy lines
+        // carry no top-level `type` at all.
+        if let Some(event) = v.get("event").and_then(|x| x.as_str()) {
+            if matches!(event, "init" | "step_update" | "result") {
+                return self.handle_agy(event, &v);
+            }
+        }
+
         // Grok token stream
         if let Some(ty) = v.get("type").and_then(|x| x.as_str()) {
             if matches!(ty, "text" | "thought" | "output" | "response") {
@@ -1136,7 +1146,7 @@ impl StreamCoalescer {
                         self.tools,
                         format_tokens(
                             self.input_tokens,
-                            self.output_tokens.max(self.est_output_tokens),
+                            self.effective_output_tokens(),
                             self.cache_read
                         )
                     ));
@@ -1175,7 +1185,7 @@ impl StreamCoalescer {
                         self.tools,
                         format_tokens(
                             self.input_tokens,
-                            self.output_tokens.max(self.est_output_tokens),
+                            self.effective_output_tokens(),
                             self.cache_read
                         )
                     ));
@@ -1363,6 +1373,144 @@ impl StreamCoalescer {
             }
             _ => None,
         }
+    }
+
+    /// agy's three `stream-json` envelopes. `result.usage.total_tokens` is the exact sum
+    /// of the per-step usages (verified on a live multi-step run), confirming each
+    /// `step_update.usage` is that step's own delta, not a running total — so, unlike
+    /// claude's Request-scope usage, input/output are summed here rather than maxed,
+    /// the same shape as opencode's `step_finish`.
+    ///
+    /// Known gaps, not fixed here:
+    /// * a `step_type: "subagent"` step carries no usage of its own, and the `result`
+    ///   total reconciles exactly against the parent's own steps, so a subagent's spend
+    ///   is never attributed to it.
+    /// * a failing tool step carries no status/exit field on the wire — the failure text
+    ///   lives only inside `tool_info.output` — so `tool_errors` stays 0 for agy.
+    fn handle_agy(&mut self, event: &str, v: &serde_json::Value) -> Option<String> {
+        match event {
+            "init" => {
+                let mut out = self.flush_buf();
+                if let Some(cid) = v.get("conversation_id").and_then(|x| x.as_str()) {
+                    self.session_id = Some(cid.to_string());
+                }
+                // "agy" here names the provider, not a model (agy's `init` carries none) —
+                // filled into the model slot every other adapter's `· session  {model}`
+                // line uses, to keep the column shape consistent.
+                out.push_str("· session  agy\n");
+                Some(out)
+            }
+            "step_update" => {
+                let su = v.get("step_update")?;
+                if self.session_id.is_none() {
+                    if let Some(cid) = su.get("conversation_id").and_then(|x| x.as_str()) {
+                        self.session_id = Some(cid.to_string());
+                    }
+                }
+                let state = su.get("state").and_then(|x| x.as_str()).unwrap_or("");
+                let step_type = su.get("step_type").and_then(|x| x.as_str()).unwrap_or("");
+                if state == "DONE" {
+                    self.absorb_agy_usage(su.get("usage"), UsageScope::Request);
+                }
+                match step_type {
+                    "agent_response" => {
+                        let text = su.get("text_delta").and_then(|x| x.as_str())?;
+                        if text.is_empty() {
+                            return None;
+                        }
+                        self.push_token(CoalesceKind::Text, text)
+                    }
+                    "tool" if state == "DONE" => {
+                        self.tools += 1;
+                        let mut out = self.flush_buf();
+                        let name = su
+                            .get("tool_name")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("tool");
+                        out.push_str(&format!("→ {name}\n"));
+                        Some(out)
+                    }
+                    _ => None,
+                }
+            }
+            "result" => {
+                let r = v.get("result")?;
+                self.absorb_agy_usage(r.get("usage"), UsageScope::Terminal);
+                let mut out = self.flush_buf();
+                let status = r.get("status").and_then(|x| x.as_str()).unwrap_or("?");
+                // The coalesced log is the only surviving diagnostic text for agy (the
+                // transcript scrape is gone): a failure's `error` must land in it so quota
+                // detection and artifact salvage still have something to read, and a
+                // success whose `agent_response` never streamed still needs its text.
+                // `scrape_strong_quota_signal` / `scrape_log_hint` match per line, so a
+                // multi-line rejection is emitted as one `! ` line per source line
+                // (each capped, not just the first) rather than truncated to line one.
+                if let Some(err) = r
+                    .get("error")
+                    .and_then(|x| x.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    for line in err.lines().take(20) {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        out.push_str(&format!("! {}\n", first_line(line, 200)));
+                    }
+                } else if self.text_chars == 0 {
+                    if let Some(resp) = r
+                        .get("response")
+                        .and_then(|x| x.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        out.push_str(resp);
+                        if !resp.ends_with('\n') {
+                            out.push('\n');
+                        }
+                    }
+                }
+                out.push_str(&format!(
+                    "· done  {status}  ·  {} tools  ·  {}\n",
+                    self.tools,
+                    format_tokens(
+                        self.input_tokens,
+                        self.effective_output_tokens(),
+                        self.cache_read
+                    )
+                ));
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    /// agy's field names (`cache_read_tokens`, `thinking_tokens`) differ from the
+    /// Anthropic/codex shapes `absorb_usage` normalizes, so this stays separate rather
+    /// than bolting more field-name fallbacks onto that function. `thinking_tokens` is a
+    /// breakdown *of* `output_tokens`, not additional to it — every live envelope
+    /// satisfies `total_tokens == input_tokens + output_tokens` exactly, thinking and
+    /// cache_read excluded — so it is not added here.
+    fn absorb_agy_usage(&mut self, usage: Option<&serde_json::Value>, scope: UsageScope) {
+        let Some(u) = usage else { return };
+        let get = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or_default();
+        let input = get("input_tokens");
+        let output = get("output_tokens");
+        let cache_read = get("cache_read_tokens");
+
+        if scope == UsageScope::Terminal {
+            self.input_tokens = input;
+            self.output_tokens = output;
+            self.cache_read = cache_read;
+            self.saw_terminal_usage = true;
+            return;
+        }
+
+        self.context_peak = self.context_peak.max(input.saturating_add(cache_read));
+        if self.saw_terminal_usage {
+            return;
+        }
+        self.input_tokens = self.input_tokens.saturating_add(input);
+        self.output_tokens = self.output_tokens.saturating_add(output);
+        self.cache_read = self.cache_read.saturating_add(cache_read);
     }
 
     fn handle_codex_item(&mut self, v: &serde_json::Value) -> Option<String> {
@@ -1619,11 +1767,23 @@ impl StreamCoalescer {
             .saturating_add(self.cache_write)
     }
 
+    /// The char-count estimate exists only to cover providers that never report exact
+    /// output tokens. Once a terminal usage record has settled `output_tokens`, that
+    /// exact value must win outright — maxing it against the estimate can only inflate
+    /// an already-exact total for a token-efficient response.
+    fn effective_output_tokens(&self) -> u64 {
+        if self.saw_terminal_usage {
+            self.output_tokens
+        } else {
+            self.output_tokens.max(self.est_output_tokens)
+        }
+    }
+
     /// Cumulative billed tokens: exactly the sum of the four component counters this
     /// coalescer writes into `StreamStats`, so the sidecar's own numbers always add up.
     fn billed_tokens(&self) -> u64 {
         self.input_tokens
-            .saturating_add(self.output_tokens.max(self.est_output_tokens))
+            .saturating_add(self.effective_output_tokens())
             .saturating_add(self.cache_read)
             .saturating_add(self.cache_write)
     }
@@ -1641,7 +1801,7 @@ impl StreamCoalescer {
         s.tools = self.tools;
         s.tool_errors = self.tool_errors;
         s.input_tokens = self.input_tokens;
-        s.output_tokens = self.output_tokens.max(self.est_output_tokens);
+        s.output_tokens = self.effective_output_tokens();
         s.cache_read_tokens = self.cache_read;
         s.cache_write_tokens = self.cache_write;
         s.context_tokens = self.context_tokens();
@@ -2608,6 +2768,125 @@ mod tests {
         assert_eq!(c.tools, 1);
         assert_eq!(c.tool_errors, 1);
         assert!(out.contains("→ shell  error"));
+    }
+
+    #[test]
+    fn agy_stream_json_renders_session_tools_text_and_sums_step_usage() {
+        // Shape per agy `--output-format stream-json`, re-seeded from two live captures
+        // against the installed agy 1.1.27 (`--print-timeout 150s --output-format
+        // stream-json --dangerously-skip-permissions --print`). Live invariant pinned
+        // here: tool steps carry no `usage` at all, and every envelope satisfies
+        // `total_tokens == input_tokens + output_tokens` exactly, `thinking_tokens` and
+        // `cache_read_tokens` excluded from that sum. This fixture uses a single DONE
+        // `agent_response` frame for brevity; the dominant production shape — several
+        // ACTIVE partials followed by a DONE tail fragment — is covered separately by
+        // `agy_agent_response_streams_active_partials_before_a_done_tail`.
+        let lines = [
+            r#"{"event":"init","conversation_id":"agy-conv-1","init":{"cwd":"/wt","tools":["run_command"],"permission_mode":"always-proceed"}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"agy-conv-1","step_index":0,"state":"DONE","step_type":"agent_response","text_delta":"Hello","usage":{"input_tokens":100,"output_tokens":6,"thinking_tokens":4,"cache_read_tokens":10,"total_tokens":106}}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"agy-conv-1","step_index":1,"state":"ACTIVE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"echo hi"}}}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"agy-conv-1","step_index":1,"state":"DONE","step_type":"tool","tool_name":"run_command"}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"agy-conv-1","step_index":2,"state":"DONE","step_type":"agent_response","text_delta":"World","usage":{"input_tokens":50,"output_tokens":2,"thinking_tokens":1,"cache_read_tokens":0,"total_tokens":52}}}"#,
+            r#"{"event":"result","result":{"conversation_id":"agy-conv-1","status":"SUCCESS","response":"Hello World","duration_seconds":1.5,"num_turns":2,"usage":{"input_tokens":150,"output_tokens":8,"thinking_tokens":5,"cache_read_tokens":10,"total_tokens":158}}}"#,
+        ];
+        let mut c = StreamCoalescer::new(false);
+        let mut out = String::new();
+        for l in lines {
+            if let Some(chunk) = c.feed(l) {
+                out.push_str(&chunk);
+            }
+        }
+        assert_eq!(c.session_id.as_deref(), Some("agy-conv-1"));
+        assert!(out.contains("Hello"), "first DONE agent_response: {out:?}");
+        assert!(out.contains("World"), "second DONE agent_response: {out:?}");
+        assert_eq!(
+            c.tools, 1,
+            "only the DONE tool step counts, not its ACTIVE start"
+        );
+        assert!(out.contains("→ run_command"), "tool name in log: {out:?}");
+        // Per-step usage sums to the same total agy's own `result.usage` reports
+        // (input 100+50=150, output 6+2=8), and the terminal record settles to that same
+        // total rather than correcting it. thinking_tokens is never added to output.
+        assert_eq!(c.input_tokens, 150);
+        assert_eq!(c.output_tokens, 8);
+        assert_eq!(c.cache_read, 10);
+        assert!(out.contains("· done  SUCCESS  ·  1 tools"));
+    }
+
+    #[test]
+    fn agy_agent_response_streams_active_partials_before_a_done_tail() {
+        // Live capture against agy 1.1.27: a real answer arrives as several ACTIVE
+        // `agent_response` frames carrying `text_delta`, then a DONE frame whose own
+        // `text_delta` is only the trailing fragment, not the full text. The DONE
+        // frame is also where `usage` lands. Concatenating every delta must reproduce
+        // `result.response` exactly, and that response must not be appended again on
+        // top of the streamed text.
+        let lines = [
+            r#"{"event":"init","conversation_id":"c1","init":{"cwd":"/wt","tools":[],"permission_mode":"always-proceed"}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"c1","step_index":0,"state":"ACTIVE","step_type":"agent_response","text_delta":"Hello "}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"c1","step_index":0,"state":"ACTIVE","step_type":"agent_response","text_delta":"brave "}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"c1","step_index":0,"state":"ACTIVE","step_type":"agent_response","text_delta":"new "}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"c1","step_index":0,"state":"DONE","step_type":"agent_response","text_delta":"world","usage":{"input_tokens":10,"output_tokens":4,"cache_read_tokens":0,"total_tokens":14}}}"#,
+            r#"{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","response":"Hello brave new world","usage":{"input_tokens":10,"output_tokens":4,"cache_read_tokens":0,"total_tokens":14}}}"#,
+        ];
+        let mut c = StreamCoalescer::new(false);
+        let mut out = String::new();
+        for l in lines {
+            if let Some(chunk) = c.feed(l) {
+                out.push_str(&chunk);
+            }
+        }
+        assert_eq!(
+            out.matches("Hello brave new world").count(),
+            1,
+            "streamed deltas must concatenate to the full response exactly once, \
+             not duplicate it via the result.response fallback: {out:?}"
+        );
+    }
+
+    #[test]
+    fn agy_result_usage_settles_the_terminal_total() {
+        // If the terminal total does not match the per-step sum, `result` wins: it is
+        // Terminal-scoped and supersedes, same as claude's `result` / codex's
+        // `turn.completed`.
+        let mut c = StreamCoalescer::new(false);
+        c.feed(
+            r#"{"event":"step_update","step_update":{"conversation_id":"c1","step_index":0,"state":"DONE","step_type":"agent_response","text_delta":"hi","usage":{"input_tokens":10,"output_tokens":1,"cache_read_tokens":0,"total_tokens":11}}}"#,
+        );
+        c.feed(
+            r#"{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","response":"hi","usage":{"input_tokens":999,"output_tokens":42,"cache_read_tokens":5,"total_tokens":1046}}}"#,
+        );
+        assert_eq!(c.input_tokens, 999);
+        assert_eq!(c.output_tokens, 42);
+        assert_eq!(c.cache_read, 5);
+    }
+
+    #[test]
+    fn agy_result_error_lands_in_the_log() {
+        // With the transcript scrape gone, `result.error` is the only surviving
+        // diagnostic text for a failed agy slot; quota detection and artifact salvage
+        // both read the coalesced log, so it must be in there.
+        let mut c = StreamCoalescer::new(false);
+        let out = c
+            .feed(
+                r#"{"event":"result","result":{"conversation_id":"c1","status":"ERROR","error":"rate limit exceeded","usage":{"input_tokens":10,"output_tokens":1,"cache_read_tokens":0,"total_tokens":11}}}"#,
+            )
+            .unwrap_or_default();
+        assert!(out.contains("rate limit exceeded"), "error text: {out:?}");
+        assert!(out.contains("· done  ERROR"));
+    }
+
+    #[test]
+    fn agy_result_response_fills_in_when_no_agent_response_streamed() {
+        // A run that never emitted an `agent_response` step_update (e.g. a tool-only
+        // turn) must still surface its answer from `result.response`.
+        let mut c = StreamCoalescer::new(false);
+        let out = c
+            .feed(
+                r#"{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","response":"final answer","usage":{"input_tokens":10,"output_tokens":2,"cache_read_tokens":0,"total_tokens":12}}}"#,
+            )
+            .unwrap_or_default();
+        assert!(out.contains("final answer"), "fallback response: {out:?}");
     }
 
     #[test]

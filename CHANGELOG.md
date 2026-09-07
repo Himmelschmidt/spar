@@ -25,6 +25,10 @@ All notable changes to spar are recorded here.
 
 ### Fixed
 
+- **An agy slot's tool count and token usage are now exact instead of best-effort.**
+  Previously they were recovered from disk after the fact (or read as zero when nothing
+  was there to recover); they now come straight from agy's own structured output as the
+  slot runs.
 - **Watching or checking on a run no longer fails at random while the run is writing.**
   A run's status file was rewritten in place, so anything reading it at the wrong moment
   could see half a file and give up with a parse error mid-run.
