@@ -585,7 +585,10 @@ fn implement_ctx(
                  pass --reload-config to apply --without to it"
             );
         }
-        if fleet.is_some() {
+        if let Some(preset) = fleet {
+            // Validate before refusing: an unknown preset name is its own error, not
+            // one the `--reload-config` refusal should swallow.
+            config::FleetPreset::parse(preset)?;
             anyhow::bail!(
                 "run {run_id} is bound to the config it was created with; \
                  pass --reload-config to apply --fleet to it"
