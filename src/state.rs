@@ -179,6 +179,10 @@ pub struct SlotUsage {
     /// `process::StreamStats::subagent_stats`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_stats: Option<crate::process::SubagentStats>,
+    /// claude's per-model cost/token breakdown for this dispatch. See
+    /// `process::StreamStats::model_usage`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub model_usage: std::collections::BTreeMap<String, crate::process::ModelUsage>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

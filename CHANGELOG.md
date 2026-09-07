@@ -16,6 +16,12 @@ All notable changes to spar are recorded here.
 - **Two ready-made fleet sizes.** One option gives you today's defaults; the other gives
   you the smallest useful setup — one reviewer, no critic, no test writer, no automatic
   tester — while still running your project's own test command if you've configured one.
+- **A slot's own resume handle, per-dispatch dollar cost, and subagent counts are now
+  recorded alongside its token usage**, when the provider reports them. Claude and
+  OpenCode dispatches carry a session id you can check against the provider's own
+  transcript; Claude dispatches additionally carry the run's actual USD spend, a
+  per-model cost/token breakdown for dispatches that used more than one model, and
+  how many Task-tool subagents ran and how they ended.
 
 ### Fixed
 

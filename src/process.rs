@@ -69,16 +69,46 @@ pub struct StreamStats {
     /// RFC3339 of last successful log append (for stall detection).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_log_at: Option<String>,
-    /// Whole-run USD spend, as the provider itself computed it: claude's terminal
-    /// `result.total_cost_usd` (an absolute overwrite) or opencode's per-step
-    /// `part.cost` (summed the same way its token deltas are). One field for both so
-    /// a caller never needs to know which adapter produced it.
+    /// Whole-dispatch USD spend (this one spawned process, one `stats.json`), as the
+    /// provider itself computed it: claude's terminal `result.total_cost_usd` (an
+    /// absolute overwrite) or opencode's per-step `part.cost` (summed the same way
+    /// its token deltas are). One field for both so a caller never needs to know
+    /// which adapter produced it. A run's total is the sum over its dispatches; see
+    /// `state::SlotUsage::cost_usd`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
     /// claude's terminal `result.subagent_stats`: how many Task-tool subagents this
     /// dispatch spawned and how they ended. No other adapter reports this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_stats: Option<SubagentStats>,
+    /// claude's terminal `result.modelUsage`: per-model cost/token/context breakdown,
+    /// keyed by the model id as claude names it (e.g. a main-agent model and a
+    /// cheaper subagent model appear as separate entries). No other adapter reports
+    /// this.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub model_usage: std::collections::BTreeMap<String, ModelUsage>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ModelUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -129,6 +159,84 @@ pub struct SubagentStats {
     pub max_depth: u32,
     #[serde(default)]
     pub by_type: std::collections::BTreeMap<String, u32>,
+}
+
+/// Field-by-field, not `serde_json::from_value::<SubagentStats>`: a rigid struct
+/// deserialize fails the whole object on one unexpected type (e.g. a counter
+/// arriving as a float, or `by_type` values shaped as objects instead of bare
+/// counts), silently dropping every counter that *did* parse. Reading each field
+/// on its own means a shape drift in one corner degrades that corner to zero
+/// instead of erasing the capture.
+fn parse_subagent_stats(v: &serde_json::Value) -> SubagentStats {
+    fn u32_field(v: &serde_json::Value, key: &str) -> u32 {
+        v.get(key)
+            .and_then(|x| x.as_u64())
+            .map(|n| n as u32)
+            .unwrap_or(0)
+    }
+    let requested = v.get("requested");
+    let killed = v.get("killed");
+    let refused = v.get("refused");
+    SubagentStats {
+        spawned: u32_field(v, "spawned"),
+        completed: u32_field(v, "completed"),
+        failed: u32_field(v, "failed"),
+        requested: SubagentRequested {
+            background: requested.map(|r| u32_field(r, "background")).unwrap_or(0),
+            foreground: requested.map(|r| u32_field(r, "foreground")).unwrap_or(0),
+            unset: requested.map(|r| u32_field(r, "unset")).unwrap_or(0),
+        },
+        killed: SubagentKilled {
+            parent: killed.map(|k| u32_field(k, "parent")).unwrap_or(0),
+            user: killed.map(|k| u32_field(k, "user")).unwrap_or(0),
+            system: killed.map(|k| u32_field(k, "system")).unwrap_or(0),
+        },
+        refused: SubagentRefused {
+            depth_limit: refused.map(|r| u32_field(r, "depth_limit")).unwrap_or(0),
+            concurrency_limit: refused
+                .map(|r| u32_field(r, "concurrency_limit"))
+                .unwrap_or(0),
+            budget: refused.map(|r| u32_field(r, "budget")).unwrap_or(0),
+        },
+        max_depth: u32_field(v, "max_depth"),
+        by_type: v
+            .get("by_type")
+            .and_then(|x| x.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, val)| val.as_u64().map(|n| (k.clone(), n as u32)))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// Same field-by-field approach as `parse_subagent_stats`, and for the same reason:
+/// one model entry with an unexpected type must not cost the whole `modelUsage` map.
+fn parse_model_usage(v: &serde_json::Value) -> ModelUsage {
+    ModelUsage {
+        cost_usd: v.get("costUSD").and_then(|x| x.as_f64()),
+        context_window: v.get("contextWindow").and_then(|x| x.as_u64()),
+        max_output_tokens: v.get("maxOutputTokens").and_then(|x| x.as_u64()),
+        input_tokens: v.get("inputTokens").and_then(|x| x.as_u64()).unwrap_or(0),
+        output_tokens: v.get("outputTokens").and_then(|x| x.as_u64()).unwrap_or(0),
+        cache_read_input_tokens: v
+            .get("cacheReadInputTokens")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
+        cache_creation_input_tokens: v
+            .get("cacheCreationInputTokens")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
+        canonical_model: v
+            .get("canonicalModel")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+        provider: v
+            .get("provider")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+    }
 }
 
 impl StreamStats {
@@ -762,6 +870,7 @@ struct StreamCoalescer {
     session_id: Option<String>,
     cost_usd: Option<f64>,
     subagent_stats: Option<SubagentStats>,
+    model_usage: std::collections::BTreeMap<String, ModelUsage>,
     text_chars: u64,
     /// opencode double-emits every event in dash and underscore spellings with the
     /// same `part.id`; keyed by `(normalized type, part.id)` to count each once.
@@ -806,6 +915,7 @@ impl StreamCoalescer {
             session_id: None,
             cost_usd: None,
             subagent_stats: None,
+            model_usage: std::collections::BTreeMap::new(),
             text_chars: 0,
             seen_opencode: std::collections::HashSet::new(),
         }
@@ -902,8 +1012,9 @@ impl StreamCoalescer {
                         let mut out = self.flush_buf();
                         let model = v.get("model").and_then(|x| x.as_str()).unwrap_or("claude");
                         self.model = Some(model.to_string());
-                        // claude's resume handle: `spar link` and any later `--resume`
-                        // need this the same way muse's and opencode's session ids do.
+                        // claude's resume handle, captured for parity with muse's and
+                        // opencode's session ids: makes a claude slot checkable against
+                        // its own transcript, same as the other two adapters already are.
                         if let Some(id) = v.get("session_id").and_then(|x| x.as_str()) {
                             self.session_id = Some(id.to_string());
                         }
@@ -1006,8 +1117,12 @@ impl StreamCoalescer {
                         self.cost_usd = Some(cost);
                     }
                     if let Some(stats) = v.get("subagent_stats") {
-                        if let Ok(parsed) = serde_json::from_value::<SubagentStats>(stats.clone()) {
-                            self.subagent_stats = Some(parsed);
+                        self.subagent_stats = Some(parse_subagent_stats(stats));
+                    }
+                    if let Some(models) = v.get("modelUsage").and_then(|x| x.as_object()) {
+                        for (model, usage) in models {
+                            self.model_usage
+                                .insert(model.clone(), parse_model_usage(usage));
                         }
                     }
                     let sub = v.get("subtype").and_then(|x| x.as_str()).unwrap_or("ok");
@@ -1551,6 +1666,9 @@ impl StreamCoalescer {
         }
         if self.subagent_stats.is_some() {
             s.subagent_stats = self.subagent_stats.clone();
+        }
+        for (model, usage) in &self.model_usage {
+            s.model_usage.insert(model.clone(), usage.clone());
         }
     }
 
@@ -2212,12 +2330,29 @@ mod tests {
 
     #[test]
     fn claude_result_captures_cost_and_subagent_stats() {
+        // Field values and shape taken from a real `claude -p ... --output-format
+        // stream-json --verbose` terminal `result` line (captured 2026-09-07,
+        // claude-code 2.1.248): `subagent_stats` carries extra fields spar doesn't
+        // model (`started_in_background`, `spawned_by_subagents`) that the lenient
+        // parser below must ignore without failing the rest of the object, and
+        // `modelUsage` carries extra fields (`webSearchRequests`, `costBasis`) with
+        // the same requirement.
         let mut c = StreamCoalescer::new(false);
         c.feed(
             r#"{"type":"result","subtype":"success","total_cost_usd":0.4521,
                "usage":{"input_tokens":49,"output_tokens":241},
+               "modelUsage":{"claude-opus-5":{"inputTokens":6,"outputTokens":294,
+                 "cacheReadInputTokens":40232,"cacheCreationInputTokens":32020,
+                 "webSearchRequests":0,"costUSD":0.2848,"contextWindow":1000000,
+                 "maxOutputTokens":64000,"canonicalModel":"claude-opus-5",
+                 "provider":"firstParty","costBasis":"list"},
+                 "claude-haiku-4-5-20251001":{"inputTokens":921,"outputTokens":16,
+                 "cacheReadInputTokens":0,"cacheCreationInputTokens":0,
+                 "costUSD":0.0010,"contextWindow":200000,"maxOutputTokens":32000,
+                 "canonicalModel":"claude-haiku-4-5","provider":"firstParty"}},
                "subagent_stats":{"spawned":3,"completed":2,"failed":1,
                  "requested":{"background":1,"foreground":2,"unset":0},
+                 "started_in_background":0,"spawned_by_subagents":0,
                  "killed":{"parent":0,"user":1,"system":0},
                  "refused":{"depth_limit":0,"concurrency_limit":0,"budget":1},
                  "max_depth":2,"by_type":{"Explore":2,"general-purpose":1}}}"#,
@@ -2234,10 +2369,82 @@ mod tests {
         assert_eq!(stats.max_depth, 2);
         assert_eq!(stats.by_type.get("Explore"), Some(&2));
 
+        let opus = c
+            .model_usage
+            .get("claude-opus-5")
+            .expect("opus model usage captured");
+        assert_eq!(opus.cost_usd, Some(0.2848));
+        assert_eq!(opus.context_window, Some(1_000_000));
+        assert_eq!(opus.max_output_tokens, Some(64_000));
+        assert_eq!(opus.input_tokens, 6);
+        assert_eq!(opus.output_tokens, 294);
+        assert_eq!(opus.cache_read_input_tokens, 40232);
+        assert_eq!(opus.cache_creation_input_tokens, 32020);
+        assert_eq!(opus.canonical_model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(opus.provider.as_deref(), Some("firstParty"));
+        assert!(c.model_usage.contains_key("claude-haiku-4-5-20251001"));
+
         let mut s = StreamStats::default();
         c.merge_counters_into(&mut s);
         assert_eq!(s.cost_usd, Some(0.4521));
-        assert_eq!(s.subagent_stats.unwrap().spawned, 3);
+        assert_eq!(s.subagent_stats.as_ref().unwrap().spawned, 3);
+        assert_eq!(s.model_usage.len(), 2);
+
+        // Round-trip through the sidecar file: `stats.json` is what a run record
+        // and a later TUI repaint actually read back, not the coalescer's own state.
+        let dir =
+            std::env::temp_dir().join(format!("spar-streamstats-roundtrip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("slot.log");
+        s.save(&log_path).unwrap();
+        let loaded = StreamStats::load(&log_path).expect("stats.json round-trips");
+        assert_eq!(loaded.cost_usd, Some(0.4521));
+        assert_eq!(loaded.subagent_stats.as_ref().unwrap().spawned, 3);
+        assert_eq!(
+            loaded
+                .subagent_stats
+                .as_ref()
+                .unwrap()
+                .by_type
+                .get("Explore"),
+            Some(&2)
+        );
+        assert_eq!(
+            loaded.model_usage.get("claude-opus-5").unwrap().cost_usd,
+            Some(0.2848)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn subagent_stats_degrades_field_by_field_instead_of_losing_everything() {
+        // A rigid `serde_json::from_value::<SubagentStats>` fails the whole object
+        // on one unexpected type. `by_type` values shaped as nested objects (instead
+        // of bare counts) is exactly that kind of drift; `spawned` still parses fine
+        // and must not be lost along with it.
+        let mut c = StreamCoalescer::new(false);
+        c.feed(
+            r#"{"type":"result","subtype":"success",
+               "subagent_stats":{"spawned":3,"completed":2,
+                 "requested":null,
+                 "by_type":{"Explore":{"count":2},"general-purpose":1}}}"#,
+        );
+        let stats = c.subagent_stats.clone().expect("stats still captured");
+        assert_eq!(
+            stats.spawned, 3,
+            "well-typed sibling field must not be lost"
+        );
+        assert_eq!(stats.completed, 2);
+        assert_eq!(stats.requested.background, 0, "null nested object defaults");
+        assert_eq!(
+            stats.by_type.get("general-purpose"),
+            Some(&1),
+            "well-typed by_type entry must not be lost"
+        );
+        assert!(
+            !stats.by_type.contains_key("Explore"),
+            "malformed entry is dropped, not the whole map"
+        );
     }
 
     #[test]
@@ -2381,7 +2588,7 @@ mod tests {
         // output 19, cache.read 1920.
         let mut c = StreamCoalescer::new(false);
         let mut out = String::new();
-        let finish = r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_f1","type":"step-finish","tokens":{"total":14677,"input":12738,"output":19,"reasoning":0,"cache":{"write":0,"read":1920}}}}"#;
+        let finish = r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_f1","type":"step-finish","tokens":{"total":14677,"input":12738,"output":19,"reasoning":0,"cache":{"write":0,"read":1920}},"cost":0.07}}"#;
         for line in [
             r#"{"type":"step_start","sessionID":"ses_1","part":{"id":"prt_s1","type":"step-start"}}"#,
             r#"{"type":"tool_use","sessionID":"ses_1","part":{"type":"tool","tool":"write","callID":"call_1","state":{"status":"completed"}}}"#,
@@ -2402,6 +2609,11 @@ mod tests {
         assert_eq!(c.output_tokens, 19, "output must count once, not double");
         assert_eq!(c.input_tokens, 12738, "input must count once, not double");
         assert_eq!(c.cache_read, 1920, "cache.read must count once, not double");
+        assert_eq!(
+            c.cost_usd,
+            Some(0.07),
+            "cost must count once too, not double-billed like tokens would be"
+        );
         assert_eq!(
             c.session_id.as_deref(),
             Some("ses_1"),

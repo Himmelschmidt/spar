@@ -373,6 +373,7 @@ fn execute_prepared(
             model: usage.model.or(model),
             cost_usd: None,
             subagent_stats: None,
+            model_usage: Default::default(),
         };
         return Ok(if ok {
             SlotOutcome {
@@ -891,6 +892,7 @@ fn usage_from_stream(slot_id: &str, provider: &str, s: &process::StreamStats) ->
         model: s.model.clone(),
         cost_usd: s.cost_usd,
         subagent_stats: s.subagent_stats.clone(),
+        model_usage: s.model_usage.clone(),
     }
 }
 
@@ -2018,6 +2020,7 @@ fn run_api(
         model: usage.model.or(model),
         cost_usd: None,
         subagent_stats: None,
+        model_usage: Default::default(),
     };
     if ok {
         Ok(SlotOutcome {
@@ -3373,6 +3376,7 @@ mod tests {
                 model: None,
                 cost_usd: None,
                 subagent_stats: None,
+                model_usage: Default::default(),
             });
         }
 
