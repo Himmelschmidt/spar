@@ -843,6 +843,34 @@ rail's selection.
     never resolve tool *names* (the tool *count* is exact). Known defect, tracked
     separately (`DECISIONS.md` O48); do not budget tightly against a grok slot until it is
     fixed.
+- **Cost and subagent accounting** ride the same `"usage"` entries and
+  `logs/<slot>.stats.json` as the token fields above, additive alongside them:
+  - **`cost_usd`**: whole-dispatch USD spend, as the provider itself computed it.
+    claude sets it once from its terminal `result.total_cost_usd`; opencode sums
+    it from each step's own `part.cost`, the same way it sums tokens. `None` for
+    codex, muse and grok — they don't report a cost. A run's total is the sum of
+    `cost_usd` over its `usage[]` entries (skip entries where it's absent).
+  - **`subagent_stats`**: claude-only. How many Task-tool subagents this dispatch
+    spawned and how they ended — `spawned`, `completed`, `failed`, `requested`
+    (`background`/`foreground`/`unset`), `killed` (`parent`/`user`/`system`),
+    `refused` (`depth_limit`/`concurrency_limit`/`budget`), `max_depth`, and
+    `by_type` (a count per subagent type name). `None` for every other adapter.
+  - **`model_usage`**: claude-only, from the terminal `result.modelUsage`. A map
+    keyed by model id, one entry per distinct model claude actually billed in the
+    dispatch (its own model and, when it spawned subagents on a different model,
+    theirs too) — `cost_usd`, `context_window`, `max_output_tokens`,
+    `input_tokens`, `output_tokens`, `cache_read_input_tokens`,
+    `cache_creation_input_tokens`, `canonical_model`, `provider`. Empty map for
+    every other adapter. Only `cost_usd` reconciles against this map (it sums
+    `model_usage`'s `cost_usd` entries) — the token fields above come from the
+    terminal `result.usage` instead, a different accounting that does **not**
+    reconcile with `model_usage`'s token counts (a probe run saw `result.usage`
+    report `input_tokens: 10` for the same dispatch `model_usage` billed at
+    `inputTokens: 907`). Read `model_usage` when a mixed-model claude dispatch
+    needs attributing spend, not for token reconciliation.
+  - **`session_id`**: the provider's own resume/session handle, when the stream
+    names one. All three of muse, opencode and claude set it; claude reads it off
+    the same `system`/`init` line the `model` field comes from.
 - Run state: `.spar/runs/<id>/state.json`
 - Events (orchestrator): `.spar/runs/<id>/events.jsonl`
 - Logs: `.spar/runs/<id>/logs/<slot>.log`

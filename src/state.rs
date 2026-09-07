@@ -171,6 +171,18 @@ pub struct SlotUsage {
     pub tools: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Whole-dispatch USD spend, as the provider itself computed it. See
+    /// `process::StreamStats::cost_usd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    /// claude's Task-tool subagent counts for this dispatch. See
+    /// `process::StreamStats::subagent_stats`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_stats: Option<crate::process::SubagentStats>,
+    /// claude's per-model cost/token breakdown for this dispatch. See
+    /// `process::StreamStats::model_usage`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub model_usage: std::collections::BTreeMap<String, crate::process::ModelUsage>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
