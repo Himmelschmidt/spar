@@ -80,6 +80,10 @@ All notable changes to spar are recorded here.
   the case where the earlier conversation was genuinely gone — was treated as if the
   conversation itself were lost, so the agent started over from scratch for every later
   round too, even once the real cause had cleared up.
+- **A codex agent using a custom model provider can now continue its own conversation
+  at all.** Previously, continuing a round only restored the model name, not the rest of
+  the settings that named it (a custom provider's address and credentials among them),
+  so a custom-provider agent's every later round failed outright and never recovered.
 
 ## [0.0.3] - 2026-09-04
 

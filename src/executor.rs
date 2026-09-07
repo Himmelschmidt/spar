@@ -391,6 +391,75 @@ fn resume_lost_its_session(used_resume: bool, res: &process::SpawnResult) -> boo
     used_resume && !res.timed_out && res.stats.session_id.is_none()
 }
 
+/// Runs `req`, recovers from a lost-rollout resume (clears the marker, retries cold once
+/// — see `resume_lost_its_session` and `ProviderAdapter::resume_failure_is_missing_session`),
+/// and persists whatever session id the (possibly retried) dispatch captured. Shared by
+/// `execute_prepared` and `run_headless`, which differ only in how they build `req`/`opts`
+/// and their pid-capture `sink` — the recovery-and-persist sequence itself must not drift
+/// between the two, since a real bug here silently disables resume for the affected path
+/// (see `dispatch_records_session_id_and_recovers_from_lost_resume`'s test coverage).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_with_resume_recovery(
+    adapter: &dyn providers::ProviderAdapter,
+    bin: &Path,
+    opts: &SpawnOpts,
+    used_resume: bool,
+    isolation: crate::config::IsolationMode,
+    req: SpawnRequest,
+    paths: &SparPaths,
+    run_id: &str,
+    slot_id: &str,
+    session_provider: &str,
+    sink: &dyn Fn(u32),
+    tick: &dyn Fn(),
+) -> Result<process::SpawnResult> {
+    let cwd = req.cwd.clone();
+    let log_path = req.log_path.clone();
+    let env = req.env.clone();
+    let timeout = req.timeout;
+    let mut res = process::run_captured(&req, Some(sink), Some(tick))?;
+    if resume_lost_its_session(used_resume, &res)
+        && adapter.resume_failure_is_missing_session(
+            &std::fs::read_to_string(&log_path).unwrap_or_default(),
+        )
+    {
+        // The rollout this slot's marker pointed at is gone (pruned, a different
+        // CODEX_HOME, a moved box): clear it so the *next* round doesn't repeat the same
+        // failure, and retry this round cold, once, rather than losing it outright.
+        markers::clear_session_id(paths, run_id, slot_id, session_provider);
+        let _ = crate::events::append(
+            paths,
+            run_id,
+            &crate::events::Event::slot_note(
+                slot_id,
+                "resume lost its session (no thread.started); retrying cold dispatch once",
+            ),
+        );
+        // `run_captured` truncates `log_path`; preserve the failed resume's own log
+        // (e.g. codex's "no rollout found") before the cold retry overwrites it.
+        let _ = std::fs::copy(&log_path, lost_resume_log_path(&log_path));
+        let cold = adapter.build_headless(bin, opts);
+        let (program, args) = providers::command_to_parts(&cold);
+        let (program, args) = sandbox::maybe_wrap(isolation, &cwd, &program, &args);
+        let cold_req = SpawnRequest {
+            program,
+            args,
+            cwd: cwd.clone(),
+            log_path: log_path.clone(),
+            env: env.clone(),
+            timeout,
+        };
+        res = process::run_captured(&cold_req, Some(sink), Some(tick))?;
+    }
+    // Persisted regardless of this dispatch's own outcome: a captured thread id is what
+    // lets the *next* round resume instead of a cold dispatch (O63), and that is worth
+    // keeping even off a failed attempt — a resumed thread still holds real progress.
+    if let Some(sid) = &res.stats.session_id {
+        let _ = markers::write_session_id(paths, run_id, slot_id, session_provider, sid);
+    }
+    Ok(res)
+}
+
 fn execute_prepared(
     prep: &PreparedSlot,
     isolation: crate::config::IsolationMode,
@@ -534,45 +603,20 @@ fn execute_prepared(
         beat.tick();
         watch.tick();
     };
-    let mut res = process::run_captured(&req, Some(&sink), Some(&tick))?;
-    if resume_lost_its_session(used_resume, &res)
-        && adapter.resume_failure_is_missing_session(
-            &std::fs::read_to_string(&prep.log_path).unwrap_or_default(),
-        )
-    {
-        // The rollout this slot's marker pointed at is gone (pruned, a different
-        // CODEX_HOME, a moved box): clear it so the *next* round doesn't repeat the same
-        // failure, and retry this round cold, once, rather than losing it outright.
-        markers::clear_session_id(
-            &prep.paths,
-            &prep.run_id,
-            &prep.job.slot_id,
-            &prep.session_provider,
-        );
-        let _ = crate::events::append(
-            &prep.paths,
-            &prep.run_id,
-            &crate::events::Event::slot_note(
-                &prep.job.slot_id,
-                "resume lost its session (no thread.started); retrying cold dispatch once",
-            ),
-        );
-        // `run_captured` truncates `log_path`; preserve the failed resume's own log
-        // (e.g. codex's "no rollout found") before the cold retry overwrites it.
-        let _ = std::fs::copy(&prep.log_path, lost_resume_log_path(&prep.log_path));
-        let cold = adapter.build_headless(&bin, &opts);
-        let (program, args) = providers::command_to_parts(&cold);
-        let (program, args) = sandbox::maybe_wrap(isolation, &prep.cwd, &program, &args);
-        let cold_req = SpawnRequest {
-            program,
-            args,
-            cwd: prep.cwd.clone(),
-            log_path: prep.log_path.clone(),
-            env: prep.env.clone(),
-            timeout,
-        };
-        res = process::run_captured(&cold_req, Some(&sink), Some(&tick))?;
-    }
+    let mut res = dispatch_with_resume_recovery(
+        adapter.as_ref(),
+        &bin,
+        &opts,
+        used_resume,
+        isolation,
+        req,
+        &prep.paths,
+        &prep.run_id,
+        &prep.job.slot_id,
+        &prep.session_provider,
+        &sink,
+        &tick,
+    )?;
     let pid = load_pid(&pid_cell);
     // Before the gates below, and before any state save: markers outlive an orchestrator
     // that dies between here and the save, `state.json` does not (O49).
@@ -585,18 +629,6 @@ fn execute_prepared(
         reason: None,
     };
     let _ = markers::write_dispatch_verdict(&prep.paths, &prep.run_id, &prep.job.slot_id, &verdict);
-    // Persisted regardless of this dispatch's own outcome: a captured thread id is what
-    // lets the *next* round resume instead of a cold dispatch (O63), and that is worth
-    // keeping even off a failed attempt — a resumed thread still holds real progress.
-    if let Some(sid) = &res.stats.session_id {
-        let _ = markers::write_session_id(
-            &prep.paths,
-            &prep.run_id,
-            &prep.job.slot_id,
-            &prep.session_provider,
-            sid,
-        );
-    }
     let agy_quota_hit = enrich_agy_stats(
         &mut res.stats,
         &prep.job.provider,
@@ -2251,39 +2283,20 @@ fn run_headless(
         beat.tick();
         watch.tick();
     };
-    let mut res = process::run_captured(&req, Some(&sink), Some(&tick))?;
-    if resume_lost_its_session(used_resume, &res)
-        && adapter.resume_failure_is_missing_session(
-            &std::fs::read_to_string(log_path).unwrap_or_default(),
-        )
-    {
-        // See `execute_prepared`: the rollout this marker pointed at is gone, so clear it
-        // and retry this round cold, once, instead of losing the round outright.
-        markers::clear_session_id(paths, &state.id, &job.slot_id, cli_name);
-        let _ = crate::events::append(
-            paths,
-            &state.id,
-            &crate::events::Event::slot_note(
-                &job.slot_id,
-                "resume lost its session (no thread.started); retrying cold dispatch once",
-            ),
-        );
-        // See `execute_prepared`: preserve the failed resume's log before the cold
-        // retry truncates the shared path.
-        let _ = std::fs::copy(log_path, lost_resume_log_path(log_path));
-        let cold = adapter.build_headless(&bin, &opts);
-        let (program, args) = providers::command_to_parts(&cold);
-        let (program, args) = sandbox::maybe_wrap(state.isolation, cwd, &program, &args);
-        let cold_req = SpawnRequest {
-            program,
-            args,
-            cwd: cwd.to_path_buf(),
-            log_path: log_path.to_path_buf(),
-            env: env.to_vec(),
-            timeout,
-        };
-        res = process::run_captured(&cold_req, Some(&sink), Some(&tick))?;
-    }
+    let mut res = dispatch_with_resume_recovery(
+        adapter.as_ref(),
+        &bin,
+        &opts,
+        used_resume,
+        state.isolation,
+        req,
+        paths,
+        &state.id,
+        &job.slot_id,
+        cli_name,
+        &sink,
+        &tick,
+    )?;
     let pid = load_pid(&pid_cell);
     // See `execute_prepared`: the verdict lands on disk before the gates and before any
     // state save, so an orchestrator that dies from here on still leaves a terminal
@@ -2297,9 +2310,6 @@ fn run_headless(
         reason: None,
     };
     let _ = markers::write_dispatch_verdict(paths, &state.id, &job.slot_id, &verdict);
-    if let Some(sid) = &res.stats.session_id {
-        let _ = markers::write_session_id(paths, &state.id, &job.slot_id, cli_name, sid);
-    }
     let agy_quota_hit = enrich_agy_stats(&mut res.stats, &job.provider, cwd, log_path, paths);
     enrich_muse_stats(&mut res.stats, &job.provider, log_path);
     let quota_rejected = res.stats.quota_rejected.clone();
@@ -2973,6 +2983,170 @@ mod tests {
         // Session id captured, even on a clean exit: no retry.
         res.stats.session_id = Some("thread-123".into());
         assert!(!resume_lost_its_session(true, &res));
+    }
+
+    /// A test-only adapter whose `build_headless` runs an arbitrary shell script instead
+    /// of a real provider binary, so `dispatch_with_resume_recovery`'s recovery-and-
+    /// persist sequence can be exercised end to end (real `process::run_captured`, real
+    /// marker files) without spawning `codex`/`grok`/etc.
+    struct ShellAdapter {
+        script: String,
+    }
+
+    impl providers::ProviderAdapter for ShellAdapter {
+        fn name(&self) -> &'static str {
+            "shell"
+        }
+        fn binary_names(&self) -> &[&'static str] {
+            &["sh"]
+        }
+        fn capabilities(&self) -> providers::Capabilities {
+            providers::Capabilities::default()
+        }
+        fn permission_args(&self, _policy: TrustPolicy) -> Vec<String> {
+            vec![]
+        }
+        fn build_headless(&self, _bin: &Path, _opts: &SpawnOpts) -> std::process::Command {
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.arg("-c").arg(&self.script);
+            cmd
+        }
+        fn build_interactive(&self, bin: &Path, opts: &SpawnOpts) -> std::process::Command {
+            self.build_headless(bin, opts)
+        }
+        fn resume_failure_is_missing_session(&self, log_text: &str) -> bool {
+            log_text.contains("no rollout found")
+        }
+    }
+
+    fn shell_req(script: &str, log_path: &Path) -> SpawnRequest {
+        SpawnRequest {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), script.to_string()],
+            cwd: PathBuf::from("/tmp"),
+            log_path: log_path.to_path_buf(),
+            env: vec![],
+            timeout: Duration::from_secs(10),
+        }
+    }
+
+    #[test]
+    fn dispatch_with_resume_recovery_persists_a_captured_session_id() {
+        // Directly guards against the regression review-1 flagged: this is what breaks
+        // silently (resume never engages on a later round) if either call site's
+        // `markers::write_session_id` call is ever dropped again.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log_path = tmp.path().join("slot.log");
+        let adapter = ShellAdapter {
+            script: r#"echo '{"type":"thread.started","thread_id":"cold-id-1"}'"#.into(),
+        };
+        let opts = dispatch_opts("go");
+        let req = shell_req(&adapter.script, &log_path);
+        let res = dispatch_with_resume_recovery(
+            &adapter,
+            Path::new("/bin/sh"),
+            &opts,
+            false,
+            crate::config::IsolationMode::None,
+            req,
+            &paths,
+            "run1",
+            "slotA",
+            "shell",
+            &|_pid| {},
+            &|| {},
+        )
+        .unwrap();
+        assert_eq!(res.stats.session_id.as_deref(), Some("cold-id-1"));
+        assert_eq!(
+            markers::read_session_id(&paths, "run1", "slotA", "shell").as_deref(),
+            Some("cold-id-1")
+        );
+    }
+
+    #[test]
+    fn dispatch_with_resume_recovery_clears_marker_and_retries_cold_on_a_lost_rollout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log_path = tmp.path().join("slot.log");
+        markers::write_session_id(&paths, "run1", "slotB", "shell", "stale-id").unwrap();
+
+        // build_headless (the cold retry) succeeds and captures a fresh session id;
+        // the initial `req` simulates a resume dispatch that died before thread.started
+        // with codex's own missing-rollout text.
+        let adapter = ShellAdapter {
+            script: r#"echo '{"type":"thread.started","thread_id":"fresh-id"}'"#.into(),
+        };
+        let opts = dispatch_opts("go");
+        let lost_req = shell_req(
+            "echo 'no rollout found for thread id stale-id' >&2; exit 1",
+            &log_path,
+        );
+        let res = dispatch_with_resume_recovery(
+            &adapter,
+            Path::new("/bin/sh"),
+            &opts,
+            true,
+            crate::config::IsolationMode::None,
+            lost_req,
+            &paths,
+            "run1",
+            "slotB",
+            "shell",
+            &|_pid| {},
+            &|| {},
+        )
+        .unwrap();
+        // The cold retry ran and its captured id is what gets persisted — the marker
+        // was cleared, then rewritten by the retry's own success, not left stale.
+        assert_eq!(res.stats.session_id.as_deref(), Some("fresh-id"));
+        assert_eq!(
+            markers::read_session_id(&paths, "run1", "slotB", "shell").as_deref(),
+            Some("fresh-id")
+        );
+    }
+
+    #[test]
+    fn dispatch_with_resume_recovery_leaves_marker_intact_on_an_unrelated_resume_failure() {
+        // A pre-session failure that is not the rollout-missing signature must not clear
+        // the marker or retry cold — see `resume_failure_is_missing_session`'s doc
+        // comment. `ShellAdapter::build_headless` would succeed if called, so a passing
+        // assertion here that the marker survives is also proof the cold path never ran.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log_path = tmp.path().join("slot.log");
+        markers::write_session_id(&paths, "run1", "slotC", "shell", "still-valid-id").unwrap();
+
+        let adapter = ShellAdapter {
+            script: r#"echo '{"type":"thread.started","thread_id":"should-not-run"}'"#.into(),
+        };
+        let opts = dispatch_opts("go");
+        let broken_req = shell_req(
+            "echo 'Model provider `openrouter` not found' >&2; exit 1",
+            &log_path,
+        );
+        let res = dispatch_with_resume_recovery(
+            &adapter,
+            Path::new("/bin/sh"),
+            &opts,
+            true,
+            crate::config::IsolationMode::None,
+            broken_req,
+            &paths,
+            "run1",
+            "slotC",
+            "shell",
+            &|_pid| {},
+            &|| {},
+        )
+        .unwrap();
+        assert!(res.stats.session_id.is_none());
+        assert_eq!(
+            markers::read_session_id(&paths, "run1", "slotC", "shell").as_deref(),
+            Some("still-valid-id"),
+            "an unrelated pre-session failure must not destroy a still-valid marker"
+        );
     }
 
     /// The real captured log text from the dogfooding incident (roadmap/BACKLOG.md):

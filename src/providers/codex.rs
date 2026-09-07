@@ -62,29 +62,60 @@ fn codex_home() -> Option<PathBuf> {
         .map(|h| PathBuf::from(h).join(".codex"))
 }
 
-/// A profile's `(model_provider, model)`, read straight from the same
-/// `$CODEX_HOME/<profile>.config.toml` that `-p <profile>` layers over `config.toml` (see
-/// `DEFAULT_CODEX_PROFILE`'s doc comment). `codex exec resume` has no `-p/--profile` (it
-/// is rejected as an unknown flag, and so is the `-c profile=` config route), so this is
-/// how a resumed thread keeps the same model instead of silently sliding onto whatever
-/// `config.toml`'s bare default resolves to. Verified against codex 0.152.0: a resume
-/// with neither `-m` nor `-p` runs under the *current* config default, not the rollout's
-/// own model, and the rollout's `session_meta` never records a `model` field to restore
-/// from. Returns `None` (no override emitted) when the file is missing or has no
-/// `model` key — e.g. a plain profile that only sets an approval policy.
+/// The whole profile, read straight from the same `$CODEX_HOME/<profile>.config.toml`
+/// that `-p <profile>` layers over `config.toml` (see `DEFAULT_CODEX_PROFILE`'s doc
+/// comment) and reconstructed as `-c`/`-m` overrides. `codex exec resume` has no
+/// `-p/--profile` (it is rejected as an unknown flag, and so is the `-c profile=` config
+/// route), so this is how a resumed thread keeps the profile's settings instead of
+/// silently sliding onto whatever `config.toml`'s bare default resolves to. Verified
+/// against codex 0.152.0: a resume with neither `-m` nor `-p` runs under the *current*
+/// config default, not the rollout's own model, and the rollout's `session_meta` never
+/// records a `model` field to restore from.
+///
+/// Every key is carried, not just `model`/`model_provider`: a profile that names its own
+/// `[model_providers.<name>]` table (a custom OpenRouter-alike, its own `base_url` /
+/// `env_key` / `wire_api`) is otherwise invisible to `config.toml`, and reconstructing
+/// only the two scalar keys pointed a resume's `-c model_provider=<name>` at a provider
+/// `config.toml` never defines — reproduced live against codex 0.152.0 as
+/// `Error: Model provider \`<name>\` not found`, an unrecoverable failure since it never
+/// reaches `thread.started` and carries none of `resume_failure_is_missing_session`'s
+/// "no rollout found" signature. `model` is still emitted as `-m` rather than
+/// `-c model=`, matching `build_headless`'s own flags. Returns `None` (no override
+/// emitted) when the file is missing or empty.
 fn profile_model_args(profile: &str) -> Option<Vec<String>> {
     let path = codex_home()?.join(format!("{profile}.config.toml"));
     let text = std::fs::read_to_string(path).ok()?;
     let value: toml::Value = text.parse().ok()?;
-    let model = value.get("model")?.as_str()?.to_string();
+    let table = value.as_table()?;
     let mut args = Vec::new();
-    if let Some(provider) = value.get("model_provider").and_then(|v| v.as_str()) {
-        args.push("-c".into());
-        args.push(format!("model_provider={provider}"));
+    for (key, val) in table {
+        if key != "model" {
+            flatten_toml_override(key, val, &mut args);
+        }
     }
-    args.push("-m".into());
-    args.push(model);
-    Some(args)
+    if let Some(model) = table.get("model").and_then(|v| v.as_str()) {
+        args.push("-m".into());
+        args.push(model.to_string());
+    }
+    (!args.is_empty()).then_some(args)
+}
+
+/// Recursively lowers a TOML value into `codex exec ... -c <dotted.path>=<value>`
+/// overrides — a table becomes one override per leaf, dotted by key
+/// (`model_providers.openrouter.base_url=...`), matching codex's own `-c` addressing.
+fn flatten_toml_override(path: &str, value: &toml::Value, out: &mut Vec<String>) {
+    if let toml::Value::Table(t) = value {
+        for (k, v) in t {
+            flatten_toml_override(&format!("{path}.{k}"), v, out);
+        }
+        return;
+    }
+    out.push("-c".into());
+    let rendered = match value {
+        toml::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    out.push(format!("{path}={rendered}"));
 }
 
 /// The trailing prompt positional: inline `opts.prompt` if set, else the prompt file's
@@ -541,9 +572,9 @@ mod tests {
     }
 
     #[test]
-    fn build_resume_omits_model_override_when_profile_has_no_model() {
-        // A profile that only sets e.g. an approval policy has nothing to restore, so
-        // resume must not fabricate a model flag.
+    fn build_resume_omits_model_flag_but_carries_other_profile_keys() {
+        // A profile with no `model` key must not fabricate a `-m`, but its other
+        // settings (e.g. an approval policy) are still restored as `-c` overrides.
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("SPAR_CODEX_PROFILE", "plain");
         std::env::remove_var("SPAR_CODEX_MODEL");
@@ -561,6 +592,60 @@ mod tests {
 
         assert!(!args.iter().any(|a| a == "-m"));
         assert!(!args.iter().any(|a| a == "-p"));
+        let ci = args.iter().position(|a| a == "-c").expect("-c present");
+        assert_eq!(
+            args.get(ci + 1).map(String::as_str),
+            Some("approval_policy=never")
+        );
+    }
+
+    #[test]
+    fn build_resume_carries_a_profiles_own_model_provider_table() {
+        // Reproduces the failure a bare model_provider/model reconstruction cannot
+        // recover from: a profile naming its own `[model_providers.<name>]` table (a
+        // custom OpenRouter-alike) must have that whole table restored on resume, or
+        // `-c model_provider=<name>` points at a provider `config.toml` never defines
+        // and codex exits `Model provider \`<name>\` not found` before `thread.started`
+        // — a failure `resume_failure_is_missing_session` cannot recognise (it does not
+        // carry "no rollout found"), so the slot would be wedged on every later round.
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("SPAR_CODEX_PROFILE", "myprof");
+        std::env::remove_var("SPAR_CODEX_MODEL");
+        let home = tempdir().unwrap();
+        std::fs::write(
+            home.path().join("myprof.config.toml"),
+            "model_provider = \"openrouter\"\n\
+             model = \"meta/muse-spark-1.1\"\n\
+             \n\
+             [model_providers.openrouter]\n\
+             name = \"OpenRouter\"\n\
+             base_url = \"https://openrouter.ai/api/v1\"\n\
+             env_key = \"OPENROUTER_API_KEY\"\n\
+             wire_api = \"responses\"\n",
+        )
+        .unwrap();
+        std::env::set_var("CODEX_HOME", home.path());
+        let cmd = CodexAdapter.build_resume(Path::new("codex"), &opts("go", None), "thread-1");
+        let (_, args) = command_to_parts(&cmd.unwrap());
+        std::env::remove_var("CODEX_HOME");
+        std::env::remove_var("SPAR_CODEX_PROFILE");
+
+        let has = |kv: &str| {
+            args.iter().position(|a| a == "-c").map(|_| ()).is_some()
+                && args.windows(2).any(|w| w[0] == "-c" && w[1] == kv)
+        };
+        assert!(has("model_provider=openrouter"));
+        assert!(has(
+            "model_providers.openrouter.base_url=https://openrouter.ai/api/v1"
+        ));
+        assert!(has("model_providers.openrouter.env_key=OPENROUTER_API_KEY"));
+        assert!(has("model_providers.openrouter.wire_api=responses"));
+        assert!(has("model_providers.openrouter.name=OpenRouter"));
+        let mi = args.iter().position(|a| a == "-m").expect("-m present");
+        assert_eq!(
+            args.get(mi + 1).map(String::as_str),
+            Some("meta/muse-spark-1.1")
+        );
     }
 
     #[test]
