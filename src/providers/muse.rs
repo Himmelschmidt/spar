@@ -39,13 +39,14 @@ impl ProviderAdapter for MuseAdapter {
     // `muse exec --json` emits an event-envelope JSONL (`payload_type` + `stream`) which
     // the stream coalescer renders, but it carries **no** token usage. Usage lands only
     // in muse's session log, which `muse_telemetry` sums after the slot exits. No
-    // push channel into the running process and no presence stream are wired, so delivery
-    // falls back to the poll file and presence degrades to the process/output heuristic.
-    // muse does ship
-    // `session-message send|serve` over a unix socket, which is a real turn-boundary
-    // channel; wiring it would make this adapter first-class later.
+    // presence stream is wired, so presence still degrades to the process/output
+    // heuristic. Delivery, though, is a real push: `muse session-message send --target
+    // <session-uuid>` injects into the running session, keyed off the session id
+    // `StreamCoalescer` captures from the exec JSONL's first `/stream/id` line. The
+    // delivery seam (`providers::delivery`) falls back to the poll file for the window
+    // before that id is known.
     fn delivery_strategy(&self) -> DeliveryStrategy {
-        DeliveryStrategy::PollFile
+        DeliveryStrategy::MuseSessionMessage
     }
 
     fn presence_source(&self) -> PresenceSource {

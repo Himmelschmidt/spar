@@ -9,10 +9,12 @@
 use super::DeliveryStrategy;
 use crate::bus::{self, BusMessage};
 use crate::paths::SparPaths;
+use crate::process::StreamStats;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::process::{Command, Stdio};
 
 /// What the seam actually did with the claimed messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -27,6 +29,8 @@ pub enum DeliveryAction {
     /// Written to the slot's poll file, which its role prompt tells it to read before
     /// starting any new major step.
     PolledFile,
+    /// muse: pushed into the running session via `muse session-message send`.
+    SessionMessaged,
     /// No injection channel (agy / unknown provider): the inbox is left untouched so
     /// the agent claims it itself on its next turn.
     LeftForInbox,
@@ -114,6 +118,16 @@ pub fn deliver(
             append_poll_file(paths, run, agent, &render_reason(&msgs), dry_run)?;
             (DeliveryAction::PolledFile, None)
         }
+        DeliveryStrategy::MuseSessionMessage => match muse_session_id(paths, run, agent) {
+            Some(target) => {
+                send_muse_session_message(&target, &render_reason(&msgs), dry_run)?;
+                (DeliveryAction::SessionMessaged, None)
+            }
+            None => {
+                append_poll_file(paths, run, agent, &render_reason(&msgs), dry_run)?;
+                (DeliveryAction::PolledFile, None)
+            }
+        },
         DeliveryStrategy::None => unreachable!("None handled above"),
     };
 
@@ -218,6 +232,42 @@ fn slot_part<'a>(run: &str, agent: &'a str) -> &'a str {
     agent.strip_prefix(&format!("{run}:")).unwrap_or(agent)
 }
 
+/// The muse session id for `agent`'s slot, once muse has emitted its first session line
+/// (`StreamCoalescer::session_id`, persisted to the slot's log sidecar). `None` before
+/// that line arrives, and always `None` for a bare agent (`run` is `None`), which has no
+/// slot log to read — either way the caller falls back to the poll file.
+fn muse_session_id(paths: &SparPaths, run: Option<&str>, agent: &str) -> Option<String> {
+    let run = run?;
+    let log_path = paths.log_file(run, slot_part(run, agent));
+    StreamStats::load(&log_path)?.session_id
+}
+
+/// Push `body` into a running muse session via its cross-session inject channel
+/// (`muse session-message send --target <session-uuid>`, message body on stdin). `--json`
+/// keeps stdout machine-readable; spar does not need to parse it here, since a nonzero
+/// exit already surfaces as an error and the file-based delivery this replaces had no
+/// stronger delivery guarantee either.
+fn send_muse_session_message(target: &str, body: &str, dry_run: bool) -> Result<()> {
+    if dry_run {
+        return Ok(());
+    }
+    let mut child = Command::new("muse")
+        .args(["session-message", "send", "--target", target, "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("spawn muse session-message send")?;
+    child
+        .stdin
+        .take()
+        .expect("stdin piped above")
+        .write_all(body.as_bytes())
+        .context("write muse session-message body")?;
+    child.wait().context("wait on muse session-message send")?;
+    Ok(())
+}
+
 fn append_poll_file(
     paths: &SparPaths,
     run: Option<&str>,
@@ -300,6 +350,16 @@ pub fn nudge(
             }
             (DeliveryAction::StopHookBlock, None)
         }
+        DeliveryStrategy::MuseSessionMessage => match muse_session_id(paths, run, agent) {
+            Some(target) => {
+                send_muse_session_message(&target, text, dry_run)?;
+                (DeliveryAction::SessionMessaged, None)
+            }
+            None => (
+                DeliveryAction::PolledFile,
+                Some(append_poll_file(paths, run, agent, text, dry_run)?),
+            ),
+        },
         DeliveryStrategy::NativeQueue | DeliveryStrategy::SdkPrompt => {
             let path = queue_path(paths, run, agent);
             if !dry_run {
@@ -586,5 +646,167 @@ mod tests {
         .unwrap();
         assert_eq!(to_bare.delivered, 1);
         assert!(to_bare.payload.unwrap().contains("hi bare"));
+    }
+
+    /// Guards against test bleed on `PATH`, which the fake-`muse` tests below mutate
+    /// process-wide; cargo runs tests in this file on multiple threads.
+    static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Installs a fake `muse` binary at the front of `PATH` that records its invocation
+    /// (args on one line, stdin body on the next) to `capture` and restores the original
+    /// `PATH` when the returned guard drops.
+    fn fake_muse(dir: &std::path::Path, capture: &std::path::Path) -> impl Drop {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = dir.join("muse");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$@\" > {args:?}\ncat > {stdin:?}\necho '{{\"schema_version\":1,\"status\":\"ok\"}}'\n",
+                args = capture.with_extension("args"),
+                stdin = capture.with_extension("stdin"),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let guard = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let original = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{original}", dir.display()));
+
+        struct Restore(
+            #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+            String,
+        );
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                std::env::set_var("PATH", &self.1);
+            }
+        }
+        Restore(guard, original)
+    }
+
+    fn muse_seed(paths: &SparPaths, n: usize) {
+        join(
+            paths,
+            Some("r1"),
+            "a",
+            Some("cli:claude"),
+            Some("native-cli"),
+        )
+        .unwrap();
+        join(paths, Some("r1"), "b", Some("cli:muse"), Some("native-cli")).unwrap();
+        for i in 0..n {
+            chat(
+                paths,
+                Some("r1"),
+                "a",
+                "b",
+                format!("msg {i}"),
+                MessageBudget::Chatty,
+            )
+            .unwrap();
+        }
+    }
+
+    /// The window `muse.rs`'s doc comment calls out: a nudge can be queued before muse has
+    /// emitted its first session line, so with no sidecar session id yet the strategy must
+    /// still land somewhere the slot reads, not silently drop the message.
+    #[test]
+    fn muse_session_message_falls_back_to_poll_file_before_session_id_known() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        muse_seed(&paths, 1);
+
+        let ub = agent_ref(Some("r1"), "b");
+        let d = deliver(
+            &paths,
+            Some("r1"),
+            &ub,
+            DeliveryStrategy::MuseSessionMessage,
+            false,
+        )
+        .unwrap();
+        assert_eq!(d.action, DeliveryAction::PolledFile);
+        assert_eq!(d.delivered, 1);
+        let body = fs::read_to_string(poll_file(&paths, Some("r1"), &ub)).unwrap();
+        assert!(body.contains("msg 0"), "{body}");
+    }
+
+    /// Once the sidecar has a session id (`StreamCoalescer` captured it from the exec
+    /// JSONL's first `/stream/id` line), delivery must use the real push channel — not
+    /// the poll file — via `muse session-message send --target <id>`.
+    #[test]
+    fn muse_session_message_pushes_into_the_running_session_once_known() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        muse_seed(&paths, 1);
+
+        let log_path = paths.log_file("r1", "b");
+        fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        StreamStats {
+            session_id: Some("sess-123".into()),
+            ..Default::default()
+        }
+        .save(&log_path)
+        .unwrap();
+
+        let capture = tmp.path().join("capture");
+        let _guard = fake_muse(tmp.path(), &capture);
+
+        let ub = agent_ref(Some("r1"), "b");
+        let d = deliver(
+            &paths,
+            Some("r1"),
+            &ub,
+            DeliveryStrategy::MuseSessionMessage,
+            false,
+        )
+        .unwrap();
+        assert_eq!(d.action, DeliveryAction::SessionMessaged);
+        assert_eq!(d.delivered, 1);
+        assert!(!poll_file(&paths, Some("r1"), &ub).exists());
+
+        let args = fs::read_to_string(capture.with_extension("args")).unwrap();
+        assert!(args.contains("--target sess-123"), "{args}");
+        let stdin = fs::read_to_string(capture.with_extension("stdin")).unwrap();
+        assert!(stdin.contains("msg 0"), "{stdin}");
+    }
+
+    /// The nudge path (spar's own control messages, not claimed bus traffic) must take the
+    /// same fork: real channel once the id is known.
+    #[test]
+    fn muse_nudge_pushes_into_the_running_session_once_known() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        muse_seed(&paths, 0);
+
+        let log_path = paths.log_file("r1", "b");
+        fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        StreamStats {
+            session_id: Some("sess-456".into()),
+            ..Default::default()
+        }
+        .save(&log_path)
+        .unwrap();
+
+        let capture = tmp.path().join("capture");
+        let _guard = fake_muse(tmp.path(), &capture);
+
+        let ub = agent_ref(Some("r1"), "b");
+        let d = nudge(
+            &paths,
+            Some("r1"),
+            &ub,
+            DeliveryStrategy::MuseSessionMessage,
+            "land your artifact",
+            false,
+        )
+        .unwrap();
+        assert_eq!(d.action, DeliveryAction::SessionMessaged);
+        let args = fs::read_to_string(capture.with_extension("args")).unwrap();
+        assert!(args.contains("--target sess-456"), "{args}");
+        let stdin = fs::read_to_string(capture.with_extension("stdin")).unwrap();
+        assert!(stdin.contains("land your artifact"), "{stdin}");
     }
 }

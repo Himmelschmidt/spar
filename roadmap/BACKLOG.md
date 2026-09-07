@@ -146,12 +146,6 @@ that for finished runs. These two reduce how much gets created in the first plac
     claude's per-message `input_tokens` / `cache_read_input_tokens` are per-call or
     cumulative, from one instrumented run, not from the shape of the JSON.
 
-- **muse's turn-boundary socket is still unwired.** muse ships
-  `session-message send|serve` over a unix socket, which is a real inject channel into a
-  running session. O50 gave muse `DeliveryStrategy::PollFile` instead, which only lands at
-  the agent's next major step. Wiring the socket would make muse first-class for delivery
-  and would let a nudge interrupt an in-progress turn rather than waiting for one.
-
 - **A rate-limited slot fails the run instead of parking it on the quota gate.** Observed
   dogfooding on 2026-09-04: two concurrent runs (`bf7770ae`, `abd35a54`) both died with
   `slot impl failed: exit 1` and `phase = failed`, when the cause was in the slot log as

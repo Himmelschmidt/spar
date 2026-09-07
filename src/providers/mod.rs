@@ -36,6 +36,12 @@ pub enum DeliveryStrategy {
     /// Declared for matrix completeness; constructed once the opencode adapter lands.
     #[allow(dead_code)]
     SdkPrompt,
+    /// muse: `muse session-message send --target <session-uuid>` pushes directly into
+    /// the running session. The target is the session id `StreamCoalescer` captures off
+    /// the exec JSONL's first `/stream/id` line, so it is unknown until that line
+    /// arrives; the delivery seam falls back to the poll file for anything queued before
+    /// then.
+    MuseSessionMessage,
     /// No push channel into the running process, so spar writes to a slot-scoped file
     /// and the role prompt tells the agent to read it before it starts any new major
     /// step. That is the only moment a nudge is actionable anyway, so it needs no polling
