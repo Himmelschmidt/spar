@@ -861,9 +861,13 @@ rail's selection.
     theirs too) — `cost_usd`, `context_window`, `max_output_tokens`,
     `input_tokens`, `output_tokens`, `cache_read_input_tokens`,
     `cache_creation_input_tokens`, `canonical_model`, `provider`. Empty map for
-    every other adapter. This is the per-model breakdown that `cost_usd` and the
-    token fields above sum to; read it when a mixed-model claude dispatch needs
-    attributing.
+    every other adapter. Only `cost_usd` reconciles against this map (it sums
+    `model_usage`'s `cost_usd` entries) — the token fields above come from the
+    terminal `result.usage` instead, a different accounting that does **not**
+    reconcile with `model_usage`'s token counts (a probe run saw `result.usage`
+    report `input_tokens: 10` for the same dispatch `model_usage` billed at
+    `inputTokens: 907`). Read `model_usage` when a mixed-model claude dispatch
+    needs attributing spend, not for token reconciliation.
   - **`session_id`**: the provider's own resume/session handle, when the stream
     names one. All three of muse, opencode and claude set it; claude reads it off
     the same `system`/`init` line the `model` field comes from.

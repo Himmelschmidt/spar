@@ -2716,6 +2716,66 @@ pub fn wait_run(
 mod tests {
     use super::*;
 
+    /// `usage_from_stream` is the only place `StreamStats`'s cost/subagent/model
+    /// fields reach `SlotUsage`, the run record. This exercises it end to end,
+    /// including a `state.json` round-trip, so deleting the carry-through lines
+    /// would fail here rather than only failing to show up in a real run.
+    #[test]
+    fn usage_from_stream_carries_cost_and_subagent_fields_into_state_json() {
+        let mut stats = process::StreamStats {
+            input_tokens: 10,
+            output_tokens: 20,
+            cost_usd: Some(0.4521),
+            ..Default::default()
+        };
+        stats.subagent_stats = Some(process::SubagentStats {
+            spawned: 3,
+            completed: 2,
+            failed: 1,
+            ..Default::default()
+        });
+        stats.model_usage.insert(
+            "claude-opus-5".to_string(),
+            process::ModelUsage {
+                cost_usd: Some(0.2848),
+                input_tokens: 6,
+                output_tokens: 294,
+                ..Default::default()
+            },
+        );
+
+        let usage = usage_from_stream("impl", "cli:claude", &stats);
+        assert_eq!(usage.cost_usd, Some(0.4521));
+        assert_eq!(usage.subagent_stats.as_ref().unwrap().spawned, 3);
+        assert_eq!(
+            usage.model_usage.get("claude-opus-5").unwrap().cost_usd,
+            Some(0.2848)
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new(
+            "r-usage",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.usage.push(usage);
+        state.save(&paths).unwrap();
+
+        let loaded = RunState::load(&paths, "r-usage").unwrap();
+        let loaded_usage = &loaded.usage[0];
+        assert_eq!(loaded_usage.cost_usd, Some(0.4521));
+        assert_eq!(loaded_usage.subagent_stats.as_ref().unwrap().spawned, 3);
+        assert_eq!(
+            loaded_usage
+                .model_usage
+                .get("claude-opus-5")
+                .unwrap()
+                .cost_usd,
+            Some(0.2848)
+        );
+    }
+
     /// The real captured log text from the dogfooding incident (roadmap/BACKLOG.md):
     /// a rate-limited slot that died mid-dispatch. This is the discriminator `run_slot`
     /// routes `Phase::Quota` on.

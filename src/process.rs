@@ -1117,12 +1117,17 @@ impl StreamCoalescer {
                         self.cost_usd = Some(cost);
                     }
                     if let Some(stats) = v.get("subagent_stats") {
-                        self.subagent_stats = Some(parse_subagent_stats(stats));
+                        let parsed = parse_subagent_stats(stats);
+                        if parsed != SubagentStats::default() {
+                            self.subagent_stats = Some(parsed);
+                        }
                     }
                     if let Some(models) = v.get("modelUsage").and_then(|x| x.as_object()) {
                         for (model, usage) in models {
-                            self.model_usage
-                                .insert(model.clone(), parse_model_usage(usage));
+                            if usage.is_object() {
+                                self.model_usage
+                                    .insert(model.clone(), parse_model_usage(usage));
+                            }
                         }
                     }
                     let sub = v.get("subtype").and_then(|x| x.as_str()).unwrap_or("ok");
@@ -2392,10 +2397,8 @@ mod tests {
 
         // Round-trip through the sidecar file: `stats.json` is what a run record
         // and a later TUI repaint actually read back, not the coalescer's own state.
-        let dir =
-            std::env::temp_dir().join(format!("spar-streamstats-roundtrip-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let log_path = dir.join("slot.log");
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("slot.log");
         s.save(&log_path).unwrap();
         let loaded = StreamStats::load(&log_path).expect("stats.json round-trips");
         assert_eq!(loaded.cost_usd, Some(0.4521));
@@ -2413,7 +2416,36 @@ mod tests {
             loaded.model_usage.get("claude-opus-5").unwrap().cost_usd,
             Some(0.2848)
         );
-        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn all_zero_subagent_stats_is_not_captured() {
+        // claude emits `subagent_stats` unconditionally, every counter at 0, on a
+        // dispatch that never spawned a subagent. Capturing that verbatim would put
+        // ~20 lines of zeros into `stats.json`/`state.json` on every claude dispatch,
+        // so an all-default block must stay `None` rather than `Some(zeros)`.
+        let mut c = StreamCoalescer::new(false);
+        c.feed(
+            r#"{"type":"result","subtype":"success",
+               "subagent_stats":{"spawned":0,"completed":0,"failed":0,
+                 "requested":{"background":0,"foreground":0,"unset":0},
+                 "killed":{"parent":0,"user":0,"system":0},
+                 "refused":{"depth_limit":0,"concurrency_limit":0,"budget":0},
+                 "max_depth":0,"by_type":{}}}"#,
+        );
+        assert!(c.subagent_stats.is_none());
+    }
+
+    #[test]
+    fn model_usage_skips_non_object_entries() {
+        // A `null` or scalar `modelUsage` entry must be skipped, not inserted as a
+        // phantom model with all-zero/None fields.
+        let mut c = StreamCoalescer::new(false);
+        c.feed(
+            r#"{"type":"result","subtype":"success",
+               "modelUsage":{"claude-opus-5":null,"claude-haiku-4-5":"weird"}}"#,
+        );
+        assert!(c.model_usage.is_empty());
     }
 
     #[test]
