@@ -40,9 +40,9 @@ pub enum DeliveryStrategy {
     /// the running session. The target is the session id `StreamCoalescer` captures off
     /// the exec JSONL's first `/stream/id` line, so it is unknown until that line
     /// arrives, and gated on the slot's pid still being alive (the sidecar outlives the
-    /// process). The delivery seam always writes the poll file too — nothing has verified
-    /// a real muse session surfacing a pushed message end to end, so the push is treated
-    /// as an accelerator on top of the poll file, never a replacement for it.
+    /// process). The delivery seam falls back to the poll file only when the push is not
+    /// confirmed (id unknown yet, send failed, or the `--json` reply didn't say `"ok"`);
+    /// a confirmed push is the only channel and is never duplicated into the poll file.
     MuseSessionMessage,
     /// No push channel into the running process, so spar writes to a slot-scoped file
     /// and the role prompt tells the agent to read it before it starts any new major

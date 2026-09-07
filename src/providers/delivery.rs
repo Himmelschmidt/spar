@@ -292,15 +292,16 @@ fn resolve_muse_bin() -> Option<std::path::PathBuf> {
 /// Push `body` into a running muse session via its cross-session inject channel
 /// (`muse session-message send --target <session-uuid>`, message body on stdin).
 /// `bin` is the resolved `muse` binary (`None` means it wasn't found). Returns `true`
-/// only when the exit is clean *and* the `--json` reply's own `status` field (when
-/// present) says `"ok"` — a zero exit alone is not proof the ingress accepted the
-/// message, only that the process didn't crash. Every other outcome — `muse` missing, a
-/// spawn failure, a nonzero exit (e.g. muse's `external_agent_ingress` feature gate off,
-/// which fails closed with `external_agent_ingress_closed`), a JSON `status` other than
-/// `"ok"`, or a hang past `timeout` in either the stdin write or the exit wait — returns
-/// `false` so the caller falls back to the poll file instead of reporting a delivery that
-/// never landed anywhere. There is no `Err` path: every failure mode here is an expected
-/// outcome of talking to an external process, not a bug in spar.
+/// only when the exit is clean *and* the `--json` reply explicitly says `"status":"ok"`
+/// — a zero exit alone is not proof the ingress accepted the message, only that the
+/// process didn't crash. Every other outcome — `muse` missing, a spawn failure, a
+/// nonzero exit (e.g. muse's `external_agent_ingress` feature gate off, which fails
+/// closed with `external_agent_ingress_closed`), a reply that doesn't parse as JSON at
+/// all, a JSON reply missing `status` or naming anything other than `"ok"`, or a hang
+/// past `timeout` in either the stdin write or the exit wait — returns `false` so the
+/// caller falls back to the poll file instead of reporting a delivery that never landed
+/// anywhere. There is no `Err` path: every failure mode here is an expected outcome of
+/// talking to an external process, not a bug in spar.
 ///
 /// The write happens on a detached thread so a body larger than the pipe buffer can never
 /// block this call past `timeout`: if muse hasn't started draining stdin by the deadline,
@@ -355,10 +356,15 @@ fn send_muse_session_message(
         let _ = out_tx.send(buf);
     });
 
-    let write_ok = loop {
+    loop {
         match rx.try_recv() {
-            Ok(ok) => break ok,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => break false,
+            // A write failure (broken pipe) is not proof the send was rejected: muse may
+            // have read enough of stdin to accept the message and closed its end before
+            // the writer drained the rest of the buffer. Either outcome falls through to
+            // the same exit-and-reply check below rather than killing outright here — an
+            // accepted send that happens to fail the write is reported once instead of
+            // being duplicated into the poll-file fallback.
+            Ok(_) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 if Instant::now() >= deadline {
                     // Killing the child drops its stdin reader, so a writer blocked on a
@@ -371,11 +377,6 @@ fn send_muse_session_message(
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
-    };
-    if !write_ok {
-        let _ = child.kill();
-        let _ = child.wait();
-        return false;
     }
 
     loop {
@@ -403,20 +404,20 @@ fn send_muse_session_message(
 }
 
 /// Read `muse session-message send --json`'s reply as spar's confirmation that the
-/// message actually landed, not just that the process exited zero. A missing or
-/// unparseable `status` field is treated as success (a zero exit plus no stated
-/// objection): the exact reply shape on a real successful send has never been observed
-/// (every box this ran on had `external_agent_ingress` closed), so refusing to trust an
-/// unrecognized-but-successful reply would risk permanently falling back to the poll file
-/// against a muse version whose schema doesn't match this guess.
+/// message actually landed, not just that the process exited zero. Success requires an
+/// explicit `"status":"ok"` in a reply that parses as JSON; anything else — output that
+/// doesn't parse at all (a banner, a login notice, or any other line sharing stdout with
+/// the reply on a zero exit), valid JSON missing `status`, or a `status` naming anything
+/// but `"ok"` — reports failure so the caller falls back to the poll file. The exact
+/// reply shape on a real successful send has never been observed (every box this ran on
+/// had `external_agent_ingress` closed): failing toward the fallback on anything
+/// unrecognized only costs an extra poll-file copy, while trusting it risks reporting a
+/// claimed message delivered when it never landed.
 fn muse_send_reply_ok(stdout: &str) -> bool {
-    match serde_json::from_str::<serde_json::Value>(stdout.trim()) {
-        Ok(v) => v
-            .get("status")
-            .and_then(|s| s.as_str())
-            .is_none_or(|s| s == "ok"),
-        Err(_) => true,
-    }
+    serde_json::from_str::<serde_json::Value>(stdout.trim())
+        .ok()
+        .and_then(|v| v.get("status").and_then(|s| s.as_str().map(str::to_string)))
+        .is_some_and(|s| s == "ok")
 }
 
 fn append_poll_file(
@@ -879,6 +880,28 @@ mod tests {
         script
     }
 
+    /// A `muse` that exits 0 but prints a banner ahead of the `--json` reply on the same
+    /// stdout — the shape that made a lenient "unparseable means success" reading unsafe:
+    /// the combined buffer is not valid JSON at all, even though a real reply is in there.
+    fn fake_muse_banner_before_reply(
+        dir: &std::path::Path,
+        capture: &std::path::Path,
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("muse");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$@\" > {args:?}\ncat > {stdin:?}\necho 'a new version of muse is available'\necho '{{\"status\":\"ok\"}}'\nexit 0\n",
+                args = capture.with_extension("args"),
+                stdin = capture.with_extension("stdin"),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
     /// Writes a fake `muse` binary at `dir/muse` running raw shell `body` instead of the
     /// capture-and-exit script — for tests that need to control stdin draining / timing
     /// directly (the write-bound and wait-bound regression tests below).
@@ -1119,6 +1142,55 @@ mod tests {
         assert!(body.contains("msg 0"), "{body}");
     }
 
+    /// A zero exit with a reply that doesn't parse as JSON at all (a banner ahead of the
+    /// real reply on the same stdout) must also fall back — treating unparseable output as
+    /// success would report a delivery no one can prove landed.
+    #[test]
+    fn muse_session_message_falls_back_to_poll_file_on_unparseable_reply() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        muse_seed(&paths, 1);
+        mark_alive(&paths, "r1", "b");
+
+        let log_path = paths.log_file("r1", "b");
+        fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        StreamStats {
+            session_id: Some("sess-banner".into()),
+            ..Default::default()
+        }
+        .save(&log_path)
+        .unwrap();
+
+        let capture = tmp.path().join("capture");
+        let bin = fake_muse_banner_before_reply(tmp.path(), &capture);
+
+        let ub = agent_ref(Some("r1"), "b");
+        let d = with_muse_bin(Some(bin), || {
+            deliver(
+                &paths,
+                Some("r1"),
+                &ub,
+                DeliveryStrategy::MuseSessionMessage,
+                false,
+            )
+        })
+        .unwrap();
+        assert_eq!(d.action, DeliveryAction::PolledFile);
+        let body = fs::read_to_string(poll_file(&paths, Some("r1"), &ub)).unwrap();
+        assert!(body.contains("msg 0"), "{body}");
+    }
+
+    #[test]
+    fn muse_send_reply_ok_requires_explicit_ok_status() {
+        assert!(muse_send_reply_ok(r#"{"status":"ok"}"#));
+        assert!(!muse_send_reply_ok(r#"{"status":"unavailable"}"#));
+        assert!(!muse_send_reply_ok("{}"));
+        assert!(!muse_send_reply_ok(""));
+        assert!(!muse_send_reply_ok(
+            "a new version of muse is available\n{\"status\":\"ok\"}"
+        ));
+    }
+
     /// The nudge path takes the same fallback on a rejected send — a nudge is spar's own
     /// control message, and it must not be silently dropped either.
     #[test]
@@ -1284,7 +1356,10 @@ mod tests {
     #[test]
     fn send_succeeds_with_large_body_and_slow_reader() {
         let tmp = tempdir().unwrap();
-        let bin = fake_muse_script(tmp.path(), "sleep 0.2\ncat > /dev/null\nexit 0");
+        let bin = fake_muse_script(
+            tmp.path(),
+            "sleep 0.2\ncat > /dev/null\necho '{\"status\":\"ok\"}'\nexit 0",
+        );
         let big_body = "y".repeat(256 * 1024);
 
         let ok = send_muse_session_message(

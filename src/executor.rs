@@ -2316,6 +2316,22 @@ fn run_tmux(
     let cmd = adapter.build_interactive(&bin, &opts);
     let (program, args) = providers::command_to_parts(&cmd);
     let shell = tmux::shell_wrap(&program, &args, log_path);
+
+    // `log_path` and its `.stats.json` sidecar are the same paths on every round
+    // (paths.rs), and `tee`'s own truncate-on-open doesn't happen until the pane's shell
+    // actually starts — a gap the muse session-id tailer below would otherwise read
+    // straight through, latching a prior round's session id (or transcript) onto this
+    // round's live pid. Reset both here, synchronously, before the pane exists at all:
+    // the same guarantee `run_captured` gives the native backend at spawn
+    // (`process.rs`'s `File::create` + fresh `StreamStats`).
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::File::create(log_path);
+    let mut initial = process::StreamStats::default();
+    initial.touch_log();
+    let _ = initial.save(log_path);
+
     tmux::spawn_window(&session, &job.slot_id, cwd, &shell, env)?;
 
     // The pane's shell pid exists as soon as `new-window` returns — tmux creates the pane
@@ -2468,9 +2484,18 @@ fn spawn_muse_session_id_tailer(
 /// `*pos` past them, and return the muse session id if one of them carried it. Only
 /// complete lines are consumed (the last `\n` in the chunk is the boundary) so a write
 /// caught mid-line is picked up whole on the next poll rather than parsed truncated.
+///
+/// Defends against the file having shrunk since `*pos` was last advanced (a fresh `tee`
+/// truncating on open): if the current length is behind `*pos`, that offset belongs to
+/// a transcript that no longer exists, so scanning resumes from the top instead of
+/// seeking past EOF and reading nothing for the rest of the run.
 fn scan_new_lines_for_muse_session_id(log_path: &Path, pos: &mut u64) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(log_path).ok()?;
+    let len = f.metadata().ok()?.len();
+    if len < *pos {
+        *pos = 0;
+    }
     f.seek(SeekFrom::Start(*pos)).ok()?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf).ok()?;
@@ -2849,6 +2874,30 @@ mod tests {
             None
         );
         assert_eq!(pos2, pos, "an incomplete line must not advance pos");
+    }
+
+    /// A re-dispatched tmux slot reuses the same log path; if the tailer's saved `pos`
+    /// still points past the fresh (truncated) file's length, it must resume from the
+    /// top instead of seeking past EOF and reading nothing for the rest of the run.
+    #[test]
+    fn scan_new_lines_for_muse_session_id_resets_pos_when_file_shrinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("slot.log");
+        std::fs::write(&log_path, "x".repeat(200)).unwrap();
+        let mut pos = 150u64;
+
+        // Simulate `tee` truncating on the new round's open, then writing the new
+        // session's configured line.
+        std::fs::write(
+            &log_path,
+            "{\"payload_type\":\"run.model.configured\",\"stream\":{\"kind\":\"session\",\"id\":\"sess-new\"}}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            scan_new_lines_for_muse_session_id(&log_path, &mut pos).as_deref(),
+            Some("sess-new")
+        );
     }
 
     /// The real captured log text from the dogfooding incident (roadmap/BACKLOG.md):

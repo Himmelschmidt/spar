@@ -22,6 +22,9 @@ All notable changes to spar are recorded here.
   If the push itself can't reach the session (muse not installed, its ingress rejects the
   send, it hangs, or there's no session to target yet), spar falls back to writing that
   same file, same as always.
+- **A slot running in a forced-tmux pane can now be stopped.** Its process id is recorded
+  as soon as the pane starts, not only once it finishes, so `spar stop` can reach it while
+  it's still running instead of only after the fact.
 
 ### Fixed
 
