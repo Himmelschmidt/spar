@@ -27,7 +27,10 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     } else if opts.select.len() > 1 {
         opts.select.len()
     } else {
-        2
+        // No explicit pool: honour a pinned `[roles].reviewer` panel's exact size
+        // (Bug A) instead of always asking for two — a one-entry pin must not exhaust
+        // `[providers].order` trying to fill a second seat nobody asked for.
+        crate::workflow::roles_resolve::panel_size(cfg)
     };
     let run_id = util::short_run_id();
     let mut state = RunState::new(
@@ -60,13 +63,22 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         return Ok(ExitCode::Failure);
     }
 
-    // The independent-review workflow bypasses `roles_resolve` entirely (no panel
-    // pinning), so every reviewer's source is simply wherever this run's pool came from.
-    let source = crate::workflow::roles_resolve::pool_origin_for(&opts).as_seat_source();
+    // The independent-review workflow bypasses `build_implement_seats` (no panel
+    // pinning), but each reviewer's source is still resolved per position so a `Synth`
+    // pool mixing `[roles]` and `[providers].order` seats reports each honestly.
+    let pool_origin = crate::workflow::roles_resolve::pool_origin_for(&opts);
+    state.pool_origin = pool_origin;
+    let sources = crate::workflow::roles_resolve::resolve_seat_sources(
+        SlotRole::Reviewer,
+        state.providers.len(),
+        &requested,
+        pool_origin,
+        cfg,
+    );
     for (i, prov) in state.providers.iter().enumerate() {
         let id = format!("review-{}-{}", i, sanitize_slot(prov));
         let mut slot = executor::init_slot(&id, prov, SlotRole::Reviewer);
-        slot.source = Some(source);
+        slot.source = sources.get(i).copied();
         state.slots.push(slot);
     }
 

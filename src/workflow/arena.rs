@@ -54,11 +54,17 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         }
     }
 
-    let source = Some(state.pool_origin.as_seat_source());
+    let sources = crate::workflow::roles_resolve::resolve_seat_sources(
+        SlotRole::Implementer,
+        state.providers.len(),
+        &requested,
+        state.pool_origin,
+        cfg,
+    );
     for (i, prov) in state.providers.iter().enumerate() {
         let id = format!("arena-{i}-{}", sanitize_slot(prov));
         let mut slot = executor::init_slot(id, prov, SlotRole::Implementer);
-        slot.source = source;
+        slot.source = sources.get(i).copied();
         state.slots.push(slot);
     }
     let rank_p = state
@@ -72,7 +78,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         rank_p,
         SlotRole::Ranker,
     );
-    ranker.source = source;
+    ranker.source = sources.last().copied();
     state.slots.push(ranker);
 
     paths.ensure_run_dirs(&state.id)?;

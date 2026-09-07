@@ -207,6 +207,28 @@ pub fn build_implement_seats(
     out
 }
 
+/// Per-seat `SeatSource` for a workflow that dispatches `count` uniform-role slots
+/// (review, peer, roles, arena) directly, without going through `build_implement_seats`.
+/// Resolves each position through `resolve_seat` instead of stamping every seat with
+/// `pool_origin.as_seat_source()`: a `Synth` pool can be a mix of `[roles]` and
+/// `[providers].order` seats, and a single blanket guess mislabels whichever positions
+/// did not actually take that rung.
+pub fn resolve_seat_sources(
+    role: SlotRole,
+    count: usize,
+    pool: &[String],
+    pool_origin: PoolOrigin,
+    cfg: &Config,
+) -> Vec<SeatSource> {
+    (0..count)
+        .map(|i| {
+            resolve_seat(role, i, i, pool, pool_origin, cfg)
+                .map(|(_, s)| s)
+                .unwrap_or(SeatSource::Unknown)
+        })
+        .collect()
+}
+
 /// Projection of the implement panel a plan run has not dispatched yet, shown at the
 /// plan gate (feature 011, item C) so the human deciding whether to pay for it can
 /// actually see it. Simulates the exact pool a bare `implement --run <id>` (no flags)

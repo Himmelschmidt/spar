@@ -252,17 +252,11 @@ fn run_from_approved(
     let n = crate::workflow::roles_resolve::pool_width(cfg);
     if reuses_frozen_pool {
         // The frozen pool may be narrower than this round's panel — e.g. a plan phase
-        // that ran with `--without critic,spec` only ever needed one provider. Padding
-        // that back up to `n` by repeating it would silently put the same model in every
-        // reviewer seat; refuse instead, the same way an empty pool already refuses.
-        if frozen_pool.len() < n {
-            bail!(
-                "run {run_id}'s frozen pool ({} provider{}) is narrower than this round's \
-                 panel ({n} needed) — pass --providers explicitly to continue",
-                frozen_pool.len(),
-                if frozen_pool.len() == 1 { "" } else { "s" }
-            );
-        }
+        // that ran with `--without critic,spec` only ever needed one provider. Refusing
+        // here regressed the documented `plan -> approve -> implement --run` flow itself
+        // (any plan pool narrower than the implement panel broke its own continuation);
+        // `pick_providers` below already cycles a short explicit pool to fill `n`, the
+        // same fallback an unpinned panel already relies on, so let it.
         opts.providers = frozen_pool.clone();
     }
     let roles: Vec<&str> = std::iter::once(SlotRole::Implementer.as_config_key())
@@ -2008,29 +2002,41 @@ fn try_rotate_reviewer_provider(
     } else {
         SeatSource::RolesFile
     };
-    let next = cfg
-        .roles
-        .reviewer
-        .iter()
-        .find(|p| **p != cur)
-        .cloned()
-        .map(|p| (p, reviewer_role_source))
-        .or_else(|| {
-            state
-                .providers
-                .iter()
-                .find(|p| **p != cur)
-                .cloned()
-                .map(|p| (p, state.pool_origin.as_seat_source()))
-        })
-        .or_else(|| {
-            cfg.providers
-                .order
-                .iter()
-                .find(|p| **p != cur)
-                .cloned()
-                .map(|p| (p, SeatSource::ProvidersOrder))
-        });
+    // A pinned panel is an exclusion list (Bug A): rotation must stay inside
+    // `[roles].reviewer` and never reach into the run's pool or `[providers].order` for a
+    // replacement, even when the pin list has only one entry and offers none. Only an
+    // unpinned panel may draw a substitute from the pool, then `[providers].order`.
+    let next = if crate::workflow::roles_resolve::reviewer_panel_pinned(cfg) {
+        cfg.roles
+            .reviewer
+            .iter()
+            .find(|p| **p != cur)
+            .cloned()
+            .map(|p| (p, reviewer_role_source))
+    } else {
+        cfg.roles
+            .reviewer
+            .iter()
+            .find(|p| **p != cur)
+            .cloned()
+            .map(|p| (p, reviewer_role_source))
+            .or_else(|| {
+                state
+                    .providers
+                    .iter()
+                    .find(|p| **p != cur)
+                    .cloned()
+                    .map(|p| (p, state.pool_origin.as_seat_source()))
+            })
+            .or_else(|| {
+                cfg.providers
+                    .order
+                    .iter()
+                    .find(|p| **p != cur)
+                    .cloned()
+                    .map(|p| (p, SeatSource::ProvidersOrder))
+            })
+    };
     let Some((next, source)) = next else {
         return Ok(false);
     };
@@ -2043,6 +2049,58 @@ fn try_rotate_reviewer_provider(
     }
     state.save(paths)?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod rotate_reviewer_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn state_with_reviewer(provider: &str) -> RunState {
+        let mut st = RunState::new(
+            "r-rotate",
+            crate::cli::WorkflowKind::Loop,
+            PathBuf::from("/tmp/x"),
+        );
+        let mut slot = executor::init_slot("review-0", provider, SlotRole::Reviewer);
+        slot.source = Some(SeatSource::RolesFile);
+        st.slots.push(slot);
+        st
+    }
+
+    /// A one-entry pinned panel offers no alternate provider: rotation must refuse
+    /// rather than reach into `state.providers`/`[providers].order` for a substitute
+    /// nobody pinned (Bug A, also reachable through this escalation path).
+    #[test]
+    fn single_pin_panel_never_falls_through_to_pool_or_order() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = state_with_reviewer("cli:codex");
+        st.providers = vec!["cli:claude".into(), "cli:grok".into()];
+        st.pool_origin = PoolOrigin::CliProviders;
+        let mut cfg = Config::default();
+        cfg.roles.reviewer = vec!["cli:codex".into()];
+        let changed =
+            try_rotate_reviewer_provider(&mut st, &paths, "review-0", tmp.path(), &cfg).unwrap();
+        assert!(!changed, "single-pin panel has no alternate to rotate to");
+        assert_eq!(st.slots[0].provider, "cli:codex");
+    }
+
+    /// A two-entry pinned panel rotates within the pins, never past them.
+    #[test]
+    fn two_pin_panel_rotates_to_the_other_pin_only() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = state_with_reviewer("cli:codex");
+        st.providers = vec!["cli:claude".into(), "cli:grok".into()];
+        st.pool_origin = PoolOrigin::CliProviders;
+        let mut cfg = Config::default();
+        cfg.roles.reviewer = vec!["cli:codex".into(), "api:openai".into()];
+        let changed =
+            try_rotate_reviewer_provider(&mut st, &paths, "review-0", tmp.path(), &cfg).unwrap();
+        assert!(changed);
+        assert_eq!(st.slots[0].provider, "api:openai");
+    }
 }
 
 /// `quota_hit` is the discriminator: only a dispatch whose own log matched the quota

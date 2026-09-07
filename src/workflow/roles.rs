@@ -56,12 +56,18 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
 
     let fe = state.providers[0].clone();
     let be = state.providers[1].clone();
-    let source = Some(state.pool_origin.as_seat_source());
+    let sources = crate::workflow::roles_resolve::resolve_seat_sources(
+        SlotRole::Implementer,
+        2,
+        &requested,
+        state.pool_origin,
+        cfg,
+    );
     let mut fe_slot = executor::init_slot(format!("role-frontend-{fe}"), &fe, SlotRole::Peer);
-    fe_slot.source = source;
+    fe_slot.source = sources.first().copied();
     state.slots.push(fe_slot);
     let mut be_slot = executor::init_slot(format!("role-backend-{be}"), &be, SlotRole::Peer);
-    be_slot.source = source;
+    be_slot.source = sources.get(1).copied();
     state.slots.push(be_slot);
 
     paths.ensure_run_dirs(&state.id)?;

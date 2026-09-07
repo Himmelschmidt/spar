@@ -58,12 +58,21 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     let b = state.providers[1].clone();
     let id_a = format!("peer-a-{}", sanitize_slot(&a));
     let id_b = format!("peer-b-{}", sanitize_slot(&b));
-    let source = Some(state.pool_origin.as_seat_source());
+    // Provider resolution keyed both seats off `SlotRole::Implementer` (`resolve_pool`'s
+    // "implementer","implementer" labels), so source lookup must use the same role, even
+    // though the dispatched slot role is `Peer`.
+    let sources = crate::workflow::roles_resolve::resolve_seat_sources(
+        SlotRole::Implementer,
+        2,
+        &requested,
+        state.pool_origin,
+        cfg,
+    );
     let mut slot_a = executor::init_slot(&id_a, &a, SlotRole::Peer);
-    slot_a.source = source;
+    slot_a.source = sources.first().copied();
     state.slots.push(slot_a);
     let mut slot_b = executor::init_slot(&id_b, &b, SlotRole::Peer);
-    slot_b.source = source;
+    slot_b.source = sources.get(1).copied();
     state.slots.push(slot_b);
 
     paths.ensure_run_dirs(&state.id)?;
