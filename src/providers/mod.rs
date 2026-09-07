@@ -1,7 +1,7 @@
 mod agy;
 pub mod agy_telemetry;
 mod claude;
-mod codex;
+pub(crate) mod codex;
 pub mod delivery;
 mod grok;
 mod muse;
@@ -180,6 +180,20 @@ pub trait ProviderAdapter: Send + Sync {
         None
     }
 
+    /// Whether a resume dispatch that never established a session (no native session id
+    /// captured) failed because the vendor session itself is gone, as opposed to some
+    /// other failure that happened to occur before the session announced itself. Given
+    /// the failed dispatch's raw log text. The caller (`executor::resume_lost_its_session`
+    /// call sites) only clears the slot's session marker and retries cold when this
+    /// returns `true` — otherwise the marker is left alone and the failure is reported
+    /// like any other, since the vendor session may still be resumable once whatever
+    /// else went wrong clears up. Default `true`: adapters with no session-loss signature
+    /// of their own keep the pre-existing behavior (any pre-session failure was assumed
+    /// to be a lost session).
+    fn resume_failure_is_missing_session(&self, _log_text: &str) -> bool {
+        true
+    }
+
     /// Turn-boundary delivery channel for this adapter (see `DeliveryStrategy`).
     /// Defaults to inbox-on-next-turn; adapters with a live channel override.
     fn delivery_strategy(&self) -> DeliveryStrategy {
@@ -342,6 +356,15 @@ pub fn command_to_parts(cmd: &Command) -> (PathBuf, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_failure_is_missing_session_defaults_true() {
+        // Adapters with no session-loss signature of their own (i.e. everyone but
+        // codex) keep the pre-existing behavior: any pre-session resume failure is
+        // treated as a lost session, since they have no better signal to distinguish.
+        assert!(GrokAdapter.resume_failure_is_missing_session("anything, or nothing"));
+        assert!(GrokAdapter.resume_failure_is_missing_session(""));
+    }
 
     #[test]
     fn dry_run_keeps_api_and_cli_prefix() {

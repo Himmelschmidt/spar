@@ -75,6 +75,11 @@ All notable changes to spar are recorded here.
   dropping the seats past your list's own length.
 - **The "where did this seat come from" label is accurate for paired and competing-agent
   runs given a shorter provider list than they need**, not just their first seat.
+- **A codex agent that continues its own conversation no longer loses that ability over
+  an unrelated hiccup.** Previously, any failure early in a continued round — not just
+  the case where the earlier conversation was genuinely gone — was treated as if the
+  conversation itself were lost, so the agent started over from scratch for every later
+  round too, even once the real cause had cleared up.
 
 ## [0.0.3] - 2026-09-04
 

@@ -369,10 +369,13 @@ fn build_dispatch_command(
 }
 
 /// True when a resume dispatch exited without ever establishing a session (no
-/// `thread.started` captured) — the vendor's rollout is gone (pruned, a different
-/// `CODEX_HOME`, a moved box), not a transient failure of an otherwise-live thread. Codex
-/// emits `thread.started` as its very first line, so a real resume announces the session
-/// before doing any work; its absence at exit means the resume never got underway.
+/// `thread.started` captured). Necessary but not sufficient evidence that the vendor's
+/// rollout is gone (pruned, a different `CODEX_HOME`, a moved box) — plenty of other
+/// pre-session failures (a bad model override, an expired `auth.json`, a transient
+/// network error) also exit with no session id captured. Callers must additionally
+/// consult `ProviderAdapter::resume_failure_is_missing_session` on the dispatch's log
+/// before treating this as a lost rollout; this predicate alone only narrows to "did no
+/// work", not "why".
 ///
 /// Excludes a timeout: a resume that ran the full ceiling without answering is a genuine
 /// hang, and retrying cold there would just double the wall-clock cost for the slot's
@@ -532,7 +535,11 @@ fn execute_prepared(
         watch.tick();
     };
     let mut res = process::run_captured(&req, Some(&sink), Some(&tick))?;
-    if resume_lost_its_session(used_resume, &res) {
+    if resume_lost_its_session(used_resume, &res)
+        && adapter.resume_failure_is_missing_session(
+            &std::fs::read_to_string(&prep.log_path).unwrap_or_default(),
+        )
+    {
         // The rollout this slot's marker pointed at is gone (pruned, a different
         // CODEX_HOME, a moved box): clear it so the *next* round doesn't repeat the same
         // failure, and retry this round cold, once, rather than losing it outright.
@@ -2245,7 +2252,11 @@ fn run_headless(
         watch.tick();
     };
     let mut res = process::run_captured(&req, Some(&sink), Some(&tick))?;
-    if resume_lost_its_session(used_resume, &res) {
+    if resume_lost_its_session(used_resume, &res)
+        && adapter.resume_failure_is_missing_session(
+            &std::fs::read_to_string(log_path).unwrap_or_default(),
+        )
+    {
         // See `execute_prepared`: the rollout this marker pointed at is gone, so clear it
         // and retry this round cold, once, instead of losing the round outright.
         markers::clear_session_id(paths, &state.id, &job.slot_id, cli_name);
@@ -2872,6 +2883,13 @@ mod tests {
 
     #[test]
     fn build_dispatch_command_resumes_codex_when_a_prior_session_id_is_known() {
+        // build_resume (opts.model: None) falls through to profile_model_args, which
+        // reads $CODEX_HOME/<profile>.config.toml — lock and isolate CODEX_HOME so this
+        // doesn't read the machine's real ~/.codex or race codex.rs's own env-mutating
+        // tests, matching neither of which this test's assertions depend on.
+        let _guard = providers::codex::ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CODEX_HOME", home.path());
         let opts = dispatch_opts("go");
         let (cmd, used_resume) = build_dispatch_command(
             &providers::CodexAdapter,
@@ -2879,6 +2897,7 @@ mod tests {
             &opts,
             Some("thread-123"),
         );
+        std::env::remove_var("CODEX_HOME");
         assert!(used_resume);
         let (_, args) = providers::command_to_parts(&cmd);
         assert_eq!(&args[..2], ["exec", "resume"]);

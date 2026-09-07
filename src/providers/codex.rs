@@ -101,6 +101,13 @@ fn resolved_prompt(opts: &SpawnOpts) -> String {
     }
 }
 
+/// Serializes tests (in this module and `executor::tests`) that mutate the
+/// `SPAR_CODEX_*`/`CODEX_HOME` process env this adapter reads. Shared rather than
+/// module-local so `executor.rs`'s dispatch-command tests, which also exercise
+/// `build_resume` and therefore also read this env, cannot race a test here.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub struct CodexAdapter;
 
 impl ProviderAdapter for CodexAdapter {
@@ -261,6 +268,19 @@ impl ProviderAdapter for CodexAdapter {
         // never captured.
         self.build_headless(bin, opts)
     }
+
+    // Verified against codex 0.152.0: a resume against a rollout that no longer exists
+    // (pruned `~/.codex/sessions`, a different `CODEX_HOME`, a moved box) prints
+    // "no rollout found for thread id ... (code -3260x)" and exits non-zero having never
+    // emitted `thread.started`. Other pre-session failures (a bad `-c model_provider=`,
+    // an expired `auth.json`, a transient network error) also exit non-zero with no
+    // `thread.started` but do not carry this text — those are not evidence the session
+    // itself is gone, so the caller must not treat them the same way (see the trait
+    // doc comment: misclassifying them destroyed the marker for a session that might
+    // still be fine once the unrelated failure clears).
+    fn resume_failure_is_missing_session(&self, log_text: &str) -> bool {
+        log_text.to_ascii_lowercase().contains("no rollout found")
+    }
 }
 
 #[cfg(test)]
@@ -268,11 +288,7 @@ mod tests {
     use super::*;
     use crate::providers::command_to_parts;
     use std::path::PathBuf;
-    use std::sync::Mutex;
     use tempfile::tempdir;
-
-    // Serializes the tests that mutate SPAR_CODEX_* process env.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn opts(prompt: &str, model: Option<&str>) -> SpawnOpts {
         SpawnOpts {
@@ -545,5 +561,19 @@ mod tests {
 
         assert!(!args.iter().any(|a| a == "-m"));
         assert!(!args.iter().any(|a| a == "-p"));
+    }
+
+    #[test]
+    fn resume_failure_is_missing_session_matches_only_the_rollout_signature() {
+        assert!(CodexAdapter.resume_failure_is_missing_session(
+            "Error: no rollout found for thread id 01a0... (code -32600)"
+        ));
+        // Case-insensitive: codex's own casing is not a contract.
+        assert!(CodexAdapter.resume_failure_is_missing_session("No Rollout Found for thread"));
+        // A pre-session failure with a different cause must not be treated as a lost
+        // rollout — clearing the marker for these would destroy a still-valid session.
+        assert!(!CodexAdapter
+            .resume_failure_is_missing_session("Error: Model provider 'openrouter' not found"));
+        assert!(!CodexAdapter.resume_failure_is_missing_session(""));
     }
 }
