@@ -454,11 +454,12 @@ mod tests {
         assert!(body.contains("hard ceiling is 3m"), "{body}");
     }
 
-    /// Once a thread id has been captured, codex's nudge must go through its native
-    /// queue push (dry-run here, so no real `codex` invocation) and *not* to the poll
-    /// file its role prompt no longer needs to read for this.
+    /// Once a thread id has been captured, codex's nudge attempts its native queue push
+    /// (dry-run here, so no real `codex` invocation, hence `PolledFile` — a dry run
+    /// never claims a push it did not attempt) alongside its guaranteed poll-file drop.
+    /// `dry_run` stubs the file write too, same as every other provider's dry-run nudge.
     #[test]
-    fn codex_nudges_reach_the_running_thread_via_native_queue() {
+    fn codex_nudges_attempt_the_running_thread_via_native_queue() {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         let log = tmp.path().join("logs").join("impl.log");
@@ -468,7 +469,7 @@ mod tests {
         let mut s = spec(&paths, &log, SlotRole::Implementer, "cli:codex");
         s.dry_run = true;
         let w = NudgeWatch::new(s, &cfg);
-        assert_eq!(w.strategy, DeliveryStrategy::NativeQueue);
+        assert_eq!(w.strategy, DeliveryStrategy::NativeQueuePollFallback);
         StreamStats {
             billed_tokens: 50,
             session_id: Some("thread-xyz".into()),
@@ -479,7 +480,7 @@ mod tests {
         w.last_poll
             .set(Instant::now() - Duration::from_secs(POLL_SECS + 1));
         w.tick();
-        assert_eq!(poll_body(&paths), "", "codex has a channel; no file drop");
+        assert_eq!(poll_body(&paths), "", "dry run stubs the write");
 
         let evs = events::read_all(&paths, "r1").unwrap();
         let note = evs
@@ -488,7 +489,7 @@ mod tests {
             .and_then(|e| e.message.as_deref())
             .unwrap()
             .to_string();
-        assert!(note.contains("NativePushed"), "{note}");
+        assert!(note.contains("PolledFile"), "{note}");
     }
 
     /// claude has a real push channel, so its nudge must go through it and *not* to a file

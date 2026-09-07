@@ -19,6 +19,11 @@ All notable changes to spar are recorded here.
 
 ### Fixed
 
+- **A message sent to a codex agent while it's running no longer gets silently dropped.**
+  Previously, a message sent before the agent had identified itself to spar landed
+  somewhere nothing ever reads it. It now always lands in the file the agent is told to
+  check before starting its next task, and spar also makes a best-effort attempt to
+  reach the agent immediately.
 - **Watching or checking on a run no longer fails at random while the run is writing.**
   A run's status file was rewritten in place, so anything reading it at the wrong moment
   could see half a file and give up with a parse error mid-run.

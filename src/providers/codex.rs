@@ -78,10 +78,11 @@ impl ProviderAdapter for CodexAdapter {
     // right after its one assigned task, so a queued follow-up turn is aborted before
     // the model sees it (verified against codex 0.152.0; see `codex_queue_push`'s doc
     // comment in `delivery.rs`) — so the seam always also writes the poll file, same as
-    // an adapter with no push channel at all. Codex still has no presence stream, so
-    // presence still degrades to the process/output heuristic.
+    // an adapter with no push channel at all, whether or not a thread id has been
+    // captured yet (W10). Codex still has no presence stream, so presence still degrades
+    // to the process/output heuristic.
     fn delivery_strategy(&self) -> DeliveryStrategy {
-        DeliveryStrategy::NativeQueue
+        DeliveryStrategy::NativeQueuePollFallback
     }
 
     fn presence_source(&self) -> PresenceSource {
@@ -97,12 +98,14 @@ impl ProviderAdapter for CodexAdapter {
             headless: true,
             // Only `codex exec` (headless) is verified; interactive TUI takeover is not.
             interactive: false,
-            // `codex exec resume <SESSION_ID> [PROMPT]` (also `--last`) continues a
-            // captured thread — a real CLI capability. Round dispatch does not call it:
-            // DECISIONS.md O52 chose a cold re-dispatch + carry-forward brief over
-            // vendor session resume for the fix-round loop, so there is no adapter
-            // method here for it to call into (would need a policy revisit first).
-            resume: true,
+            // `codex exec resume <SESSION_ID> [PROMPT]` (also `--last`) is a real CLI
+            // capability, but spar's round dispatch never calls it: DECISIONS.md O52
+            // already rejected vendor session resume for the fix-round loop (full
+            // transcript replay is a large, quadratic-ish context cost versus the
+            // compact carry-forward brief), and O62 closes this out explicitly for the
+            // same call sites. `false` here reports what spar actually does, not what
+            // the CLI can do in isolation.
+            resume: false,
             skip_permissions: true,
             // FullAuto bypasses codex's own sandbox (the worktree is the boundary,
             // matching the other adapters), so we do not rely on a native sandbox.
@@ -325,13 +328,13 @@ mod tests {
     }
 
     #[test]
-    fn native_queue_delivery_and_resume_capability() {
+    fn native_queue_poll_fallback_delivery_and_no_resume_capability() {
         assert_eq!(
             CodexAdapter.delivery_strategy(),
-            DeliveryStrategy::NativeQueue
+            DeliveryStrategy::NativeQueuePollFallback
         );
-        // The CLI capability is real (`codex exec resume`); nothing wires it into round
-        // dispatch (DECISIONS.md O52).
-        assert!(CodexAdapter.capabilities().resume);
+        // Nothing in spar calls `codex exec resume` (DECISIONS.md O52/O62), so the
+        // reported capability must not claim otherwise.
+        assert!(!CodexAdapter.capabilities().resume);
     }
 }

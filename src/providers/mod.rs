@@ -31,7 +31,15 @@ pub enum DeliveryStrategy {
     /// (`{"decision":"block","reason":…}` / `additionalContext`). Headless, no pane.
     StopHookInject,
     /// Grok: push to the native `/queue`; applied at the turn boundary even mid-turn.
+    /// Grok never captures a session id, so every delivery falls through to the durable
+    /// queue file (unread until its live push channel lands — see the file's own doc).
     NativeQueue,
+    /// Codex: same native-push shape as `NativeQueue`, but the *guaranteed* fallback is
+    /// the poll file, not the durable queue file — nothing reads the queue file for
+    /// codex, while a codex role prompt is told to check its poll file. Used whenever no
+    /// session id is captured yet (thread id not seen) as well as whenever a push with
+    /// one fails; see W10.
+    NativeQueuePollFallback,
     /// opencode: `client.session.prompt()` / `prompt_async` into the live session.
     /// Declared for matrix completeness; constructed once the opencode adapter lands.
     #[allow(dead_code)]

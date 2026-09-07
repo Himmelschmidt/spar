@@ -363,7 +363,8 @@ on — never a restatement of the plan or contract, which the next round is hand
   failed `AC-n` past the acceptance gate.
 - **Not session resume.** Resuming the vendor CLI session was considered and rejected:
   it carries the whole failed attempt's transcript, so round N+1 starts its context climb
-  from a huge base. See DECISIONS O52.
+  from a huge base. See DECISIONS O52; O62 closes the same question specifically for
+  codex's `codex exec resume`, which spar captures a thread id for but does not call.
 
 For legs that already exist, `spar link <leg> --to <run>` records the grouping
 (`parent_run`). spar never infers it — pairing runs by task text would merge unrelated
@@ -553,15 +554,15 @@ slot is stuck on.**
   thread opens a follow-up turn that gets aborted mid-start when the process shuts down
   (verified against codex 0.152.0), and a success exit code from `codex queue` is not
   proof the model ever saw it (it reports success against a thread whose process has
-  already exited, too). So a codex dispatch that has captured a thread id always also
-  writes the same poll file **opencode and muse** use — they have no way to interrupt a
-  working agent at all, so spar writes to `.spar/runs/<id>/logs/nudges-<slot>.md` and
-  their role prompt tells them to read it before starting any new major step; that file
-  is what actually reaches a codex dispatch, at the start of its *next* round, not the
-  one currently running. A codex dispatch that has not emitted `thread.started` yet
-  falls back to the same durable queue file grok always uses. Thresholds are checked
-  every 30 seconds, so a nudge
-  lands at the next 30s boundary rather than the instant a budget is crossed.
+  already exited, too). So a codex dispatch always also writes the same poll file
+  **opencode and muse** use — they have no way to interrupt a working agent at all, so
+  spar writes to `.spar/runs/<id>/logs/nudges-<slot>.md` and their role prompt tells them
+  to read it before starting any new major step — regardless of whether a thread id has
+  been captured yet; that file is what actually reaches a codex dispatch, at the start of
+  its *next* round, not the one currently running (not the same round: see O52/O62 for
+  why spar does not use `codex exec resume` to make that round continuation instead).
+  Thresholds are checked every 30 seconds, so a nudge lands at the next 30s boundary
+  rather than the instant a budget is crossed.
 - **Live token visibility differs by adapter**, so token nudges are not uniformly prompt.
   **opencode** reports usage per step and is exact live. **muse** carries no tokens on
   stdout at all, so spar tails its session log (`~/.local/share/muse/sessions/…`), which is
