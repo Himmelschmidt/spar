@@ -548,9 +548,10 @@ slot is stuck on.**
   inbox, which its `Stop` hook drains at the turn boundary. **grok** takes them on its
   native queue. **muse** takes them through `muse session-message send --target
   <session-uuid>`, once its session id is known (captured from the exec JSONL's first
-  `/stream/id` line) and its slot is still alive; the poll file below is only the
-  fallback for an unconfirmed push (id not known yet, send failed, or the `--json` reply
-  didn't say `"ok"`) — a confirmed push is never duplicated into it. **opencode and codex**
+  `/stream/id` line) and its slot is still alive, but the poll file below is written
+  unconditionally alongside it — a confirmed push (`"status":"ok"` or `"accepted"` in the
+  `--json` reply) has never been observed to actually surface inside a real muse session,
+  so it is a bonus delivery, not a replacement. **opencode and codex**
   have no push channel at all, so
   spar writes to `.spar/runs/<id>/logs/nudges-<slot>.md` and their role prompt tells them to
   read it before starting any new major step. Thresholds are checked every 30 seconds, so a

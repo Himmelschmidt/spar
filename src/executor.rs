@@ -686,11 +686,17 @@ fn recover_artifact(r: &ArtifactRecovery) -> bool {
     // `<slot>.log` `muse_session_id` reads — so a stale session id left over from the
     // turn being recovered would otherwise pair with the recovery process's own (live)
     // pid marker and pass the liveness guard, targeting a session that already exited.
-    if let Some(mut stats) = process::StreamStats::load(r.log_path) {
-        if stats.session_id.take().is_some() {
+    // Cleared only for the duration of the recovery spawn below and restored once it
+    // returns (see the bottom of this function): the sidecar is `muse_telemetry`'s and
+    // `nudge.rs`'s only durable record of which muse session this slot ran, so losing it
+    // permanently would silently break both after every recovery.
+    let recovered_session_id = process::StreamStats::load(r.log_path).and_then(|mut stats| {
+        let id = stats.session_id.take();
+        if id.is_some() {
             let _ = stats.save(r.log_path);
         }
-    }
+        id
+    });
     let prompt = format!(
         "Your previous turn ended without writing `{}`, but your work is still in this \
          worktree ({}).\n\nWrite that file now, and nothing else. Read your own changes \
@@ -743,7 +749,14 @@ fn recover_artifact(r: &ArtifactRecovery) -> bool {
         last: std::cell::Cell::new(std::time::Instant::now()),
     };
     let tick = || beat.tick();
-    if process::run_captured(&req, Some(&sink), Some(&tick)).is_err() {
+    let spawned = process::run_captured(&req, Some(&sink), Some(&tick));
+    if let Some(id) = recovered_session_id {
+        if let Some(mut stats) = process::StreamStats::load(r.log_path) {
+            stats.session_id = Some(id);
+            let _ = stats.save(r.log_path);
+        }
+    }
+    if spawned.is_err() {
         return false;
     }
     artifact_written(r.artifact)
@@ -2260,6 +2273,20 @@ enum TmuxDecision {
     Failed,
 }
 
+/// Truncate `log_path` and reset its `.stats.json` sidecar (`paths.rs` derives both from
+/// the same slot id) to a fresh, freshly-touched `StreamStats`, before the tmux pane that
+/// will write to them exists. Extracted so the reset itself — not just `run_tmux`'s tmux
+/// plumbing around it — is directly testable.
+fn reset_tmux_slot_log(log_path: &Path) {
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::File::create(log_path);
+    let mut initial = process::StreamStats::default();
+    initial.touch_log();
+    let _ = initial.save(log_path);
+}
+
 /// A `done` marker only means success once the agent's pane process has exited.
 fn tmux_outcome(marker: MarkerState, pane_alive: bool, budget_left: bool) -> TmuxDecision {
     match marker {
@@ -2317,20 +2344,13 @@ fn run_tmux(
     let (program, args) = providers::command_to_parts(&cmd);
     let shell = tmux::shell_wrap(&program, &args, log_path);
 
-    // `log_path` and its `.stats.json` sidecar are the same paths on every round
-    // (paths.rs), and `tee`'s own truncate-on-open doesn't happen until the pane's shell
-    // actually starts — a gap the muse session-id tailer below would otherwise read
-    // straight through, latching a prior round's session id (or transcript) onto this
-    // round's live pid. Reset both here, synchronously, before the pane exists at all:
-    // the same guarantee `run_captured` gives the native backend at spawn
-    // (`process.rs`'s `File::create` + fresh `StreamStats`).
-    if let Some(parent) = log_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::File::create(log_path);
-    let mut initial = process::StreamStats::default();
-    initial.touch_log();
-    let _ = initial.save(log_path);
+    // `tee`'s own truncate-on-open doesn't happen until the pane's shell actually starts
+    // — a gap the muse session-id tailer below would otherwise read straight through,
+    // latching a prior round's session id (or transcript) onto this round's live pid.
+    // Reset both here, synchronously, before the pane exists at all: the same guarantee
+    // `run_captured` gives the native backend at spawn (`process.rs`'s `File::create` +
+    // fresh `StreamStats`).
+    reset_tmux_slot_log(log_path);
 
     tmux::spawn_window(&session, &job.slot_id, cwd, &shell, env)?;
 
@@ -2339,14 +2359,9 @@ fn run_tmux(
     // marker shows up (the old behavior), is what lets a liveness guard like
     // `muse_session_id`'s ever see this slot as alive *while it is running* instead of
     // only in the instant between it finishing and this function returning.
-    let mut pane_pid = tmux::pane_pid(&session, &job.slot_id);
-    if let Some(p) = pane_pid {
-        let _ = markers::write_pid(
-            paths,
-            &state.id,
-            &job.slot_id,
-            process::PidToken::capture(p),
-        );
+    let mut pane_pid = tmux::pane_pid(&session, &job.slot_id).map(process::PidToken::capture);
+    if let Some(token) = pane_pid {
+        let _ = markers::write_pid(paths, &state.id, &job.slot_id, token);
     }
 
     // muse has no wired push channel on this backend otherwise: `tee` writes the raw
@@ -2374,17 +2389,17 @@ fn run_tmux(
         };
         if marker == MarkerState::Done && pane_pid.is_none() {
             if let Some(p) = tmux::pane_pid(&session, &job.slot_id) {
-                pane_pid = Some(p);
-                let _ = markers::write_pid(
-                    paths,
-                    &state.id,
-                    &job.slot_id,
-                    process::PidToken::capture(p),
-                );
+                let token = process::PidToken::capture(p);
+                pane_pid = Some(token);
+                let _ = markers::write_pid(paths, &state.id, &job.slot_id, token);
             }
         }
+        // `.alive()` checks the recorded start time, not just bare liveness — a plain
+        // `pid_alive` here would let a pid the OS recycled onto an unrelated process
+        // after the pane's shell exited count as "still running," spinning the slot to
+        // its full budget instead of reporting `DoneButAlive`.
         let pane_alive = match pane_pid {
-            Some(p) => process::pid_alive(p),
+            Some(token) => token.alive(),
             None => tmux::pane_pid(&session, &job.slot_id).is_some(),
         };
         let budget_left = start.elapsed() < timeout;
@@ -2392,7 +2407,7 @@ fn run_tmux(
             TmuxDecision::Ok => {
                 return Ok(SlotOutcome {
                     ok: true,
-                    pid: pane_pid,
+                    pid: pane_pid.map(|t| t.pid),
                     exit_code: Some(0),
                     signal: None,
                     error: None,
@@ -2406,7 +2421,7 @@ fn run_tmux(
             TmuxDecision::Failed => {
                 return Ok(SlotOutcome {
                     ok: false,
-                    pid: pane_pid,
+                    pid: pane_pid.map(|t| t.pid),
                     exit_code: Some(1),
                     signal: None,
                     error: Some("marker failed".into()),
@@ -2420,7 +2435,7 @@ fn run_tmux(
             TmuxDecision::DoneButAlive => {
                 return Ok(SlotOutcome {
                     ok: false,
-                    pid: pane_pid,
+                    pid: pane_pid.map(|t| t.pid),
                     exit_code: None,
                     signal: None,
                     error: Some("agent reported done but its process is still running".into()),
@@ -2898,6 +2913,28 @@ mod tests {
             scan_new_lines_for_muse_session_id(&log_path, &mut pos).as_deref(),
             Some("sess-new")
         );
+    }
+
+    /// A prior round's transcript and stale session id must not survive into the next
+    /// round's tmux pane — the exact gap the muse session-id tailer would otherwise read
+    /// straight through, latching a finished session's id onto the new round's live pid.
+    #[test]
+    fn reset_tmux_slot_log_truncates_transcript_and_clears_stale_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("slot.log");
+        std::fs::write(&log_path, "leftover transcript from a prior round\n").unwrap();
+        process::StreamStats {
+            session_id: Some("sess-stale".into()),
+            ..Default::default()
+        }
+        .save(&log_path)
+        .unwrap();
+
+        reset_tmux_slot_log(&log_path);
+
+        assert_eq!(std::fs::read_to_string(&log_path).unwrap(), "");
+        let stats = process::StreamStats::load(&log_path).expect("sidecar written");
+        assert_eq!(stats.session_id, None);
     }
 
     /// The real captured log text from the dogfooding incident (roadmap/BACKLOG.md):

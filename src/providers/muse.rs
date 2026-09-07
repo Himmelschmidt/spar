@@ -44,11 +44,12 @@ impl ProviderAdapter for MuseAdapter {
     // <session-uuid>` injects into the running session, keyed off the session id
     // `StreamCoalescer` captures from the exec JSONL's first `/stream/id` line, guarded on
     // the slot's pid still being alive (a sidecar outlives its process). The delivery seam
-    // (`providers::delivery`) falls back to the poll file only when the push is not
-    // confirmed: before the id is known, when the send fails (muse missing, a rejected
-    // send, a hang past its bound), or when a zero exit's own `--json` reply says the
-    // ingress didn't accept it. A confirmed push is the only channel — it is not
-    // duplicated into the poll file too.
+    // (`providers::delivery`) always also writes the poll file, even when the push's own
+    // `--json` reply confirms intake (`"status":"ok"` or `"accepted"`): every box this has
+    // run on has muse's `external_agent_ingress` gate closed, so a confirmed push actually
+    // surfacing inside a *headless* `muse exec` run has never been observed end to end.
+    // The poll file is the one channel proven to work; the push is a bonus delivery once
+    // its reply can be trusted for real.
     fn delivery_strategy(&self) -> DeliveryStrategy {
         DeliveryStrategy::MuseSessionMessage
     }
