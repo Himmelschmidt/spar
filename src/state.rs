@@ -171,12 +171,6 @@ pub struct SlotUsage {
     pub tools: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Provider-side session id this dispatch ran under (`StreamStats::session_id`).
-    /// Since a slot's own `usage` survives on `SlotState` until the next dispatch resets
-    /// it, this is how a later round finds the id to resume instead of cold-redispatching
-    /// (codex's thread id today; unset for adapters that never report one).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

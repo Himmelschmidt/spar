@@ -9940,7 +9940,6 @@ mod render_stability {
             billed_tokens: 0,
             tools: 0,
             model: Some("x-ai/grok-4.5".into()),
-            session_id: None,
         });
         assert_eq!(slot_model(&s, 12), "grok-4.5");
     }
@@ -9960,7 +9959,6 @@ mod render_stability {
             billed_tokens: billed,
             tools: 0,
             model: None,
-            session_id: None,
         };
         // Three dispatches of one slot: the ledger keeps all three, the slot field
         // only the last.

@@ -546,14 +546,21 @@ slot is stuck on.**
   (`exit 143`, a signal) without parsing prose. Exit codes are unchanged.
 - Delivery is per-adapter and you never choose it. **claude** takes nudges through its
   inbox, which its `Stop` hook drains at the turn boundary. **grok** takes them on its
-  native queue. **codex** does too, once it has captured a thread id (its `codex exec
-  --json` stream names one on its very first line): `codex queue --thread <id> --message
-  <text>` pushes straight into the running session, landing at its next turn boundary; a
-  codex dispatch that has not emitted `thread.started` yet (essentially never, in
-  practice) falls back to the same durable queue file grok always uses. **opencode and
-  muse** have no way to interrupt a working agent, so spar writes to
-  `.spar/runs/<id>/logs/nudges-<slot>.md` and their role prompt tells them to read it
-  before starting any new major step. Thresholds are checked every 30 seconds, so a nudge
+  native queue. **codex** attempts one too, once it has captured a thread id (its `codex
+  exec --json` stream names one on its very first line): `codex queue --thread <id>
+  --message <text>`. This rarely lands — `codex exec` is single-turn and exits right
+  after completing its one assigned task, so a message queued against a still-running
+  thread opens a follow-up turn that gets aborted mid-start when the process shuts down
+  (verified against codex 0.152.0), and a success exit code from `codex queue` is not
+  proof the model ever saw it (it reports success against a thread whose process has
+  already exited, too). So a codex dispatch that has captured a thread id always also
+  writes the same poll file **opencode and muse** use — they have no way to interrupt a
+  working agent at all, so spar writes to `.spar/runs/<id>/logs/nudges-<slot>.md` and
+  their role prompt tells them to read it before starting any new major step; that file
+  is what actually reaches a codex dispatch, at the start of its *next* round, not the
+  one currently running. A codex dispatch that has not emitted `thread.started` yet
+  falls back to the same durable queue file grok always uses. Thresholds are checked
+  every 30 seconds, so a nudge
   lands at the next 30s boundary rather than the instant a budget is crossed.
 - **Live token visibility differs by adapter**, so token nudges are not uniformly prompt.
   **opencode** reports usage per step and is exact live. **muse** carries no tokens on
