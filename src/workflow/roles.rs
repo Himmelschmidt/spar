@@ -59,7 +59,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     let sources = crate::workflow::roles_resolve::resolve_seat_sources(
         SlotRole::Implementer,
         2,
-        &requested,
+        &state.providers,
         state.pool_origin,
         cfg,
     );

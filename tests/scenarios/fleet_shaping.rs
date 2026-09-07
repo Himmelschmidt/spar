@@ -747,6 +747,74 @@ fn ac14_seat_source_names_the_precedence_rung() {
     }
 }
 
+/// Regression: review round 7 found `peer`, `roles`, and `arena` labelling a seat drawn
+/// from a cycled short pool as `unknown`, because they resolved sources against the raw
+/// un-cycled `requested` pool while the dispatched provider came from `state.providers`
+/// (already cycled by `pick_providers` to the workflow's slot count). A one-entry pool
+/// must still label every seat `cli-providers`, not just the first.
+#[test]
+fn peer_roles_arena_label_a_cycled_short_pool_honestly() {
+    let tmp = project("");
+    let v = run_json(
+        tmp.path(),
+        &[
+            "run",
+            "--workflow",
+            "peer",
+            "-t",
+            "p",
+            "--providers",
+            "cli:codex",
+            "--dry-run",
+            "--json",
+        ],
+        0,
+    );
+    for seat in fleet(&v) {
+        assert_eq!(seat_field(&seat, "source"), "cli-providers", "{seat}");
+    }
+
+    let tmp2 = project("");
+    let v2 = run_json(
+        tmp2.path(),
+        &[
+            "run",
+            "--workflow",
+            "roles",
+            "-t",
+            "p",
+            "--providers",
+            "cli:codex",
+            "--dry-run",
+            "--json",
+        ],
+        0,
+    );
+    for seat in fleet(&v2) {
+        assert_eq!(seat_field(&seat, "source"), "cli-providers", "{seat}");
+    }
+
+    let tmp3 = project("max_agents = 4\n");
+    let v3 = run_json(
+        tmp3.path(),
+        &[
+            "run",
+            "--workflow",
+            "arena",
+            "-t",
+            "p",
+            "--providers",
+            "cli:codex,api:openai",
+            "--dry-run",
+            "--json",
+        ],
+        2,
+    );
+    for seat in fleet(&v3) {
+        assert_eq!(seat_field(&seat, "source"), "cli-providers", "{seat}");
+    }
+}
+
 /// AC-15: a projected seat id equals the id of the slot the run later creates, so the
 /// projection cannot drift from what gets dispatched.
 #[test]
