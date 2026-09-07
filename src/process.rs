@@ -1193,9 +1193,9 @@ impl StreamCoalescer {
                     self.session_id = Some(cid.to_string());
                 }
                 // "agy" here names the provider, not a model (agy's `init` carries none) —
-                // spelled out so it doesn't read like the model slot every other adapter
-                // fills in on this line.
-                out.push_str("· agy session\n");
+                // filled into the model slot every other adapter's `· session  {model}`
+                // line uses, to keep the column shape consistent.
+                out.push_str("· session  agy\n");
                 Some(out)
             }
             "step_update" => {
@@ -1240,12 +1240,20 @@ impl StreamCoalescer {
                 // transcript scrape is gone): a failure's `error` must land in it so quota
                 // detection and artifact salvage still have something to read, and a
                 // success whose `agent_response` never streamed still needs its text.
+                // `scrape_strong_quota_signal` / `scrape_log_hint` match per line, so a
+                // multi-line rejection is emitted as one `! ` line per source line
+                // (each capped, not just the first) rather than truncated to line one.
                 if let Some(err) = r
                     .get("error")
                     .and_then(|x| x.as_str())
                     .filter(|s| !s.is_empty())
                 {
-                    out.push_str(&format!("! {}\n", first_line(err, 200)));
+                    for line in err.lines().take(20) {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        out.push_str(&format!("! {}\n", first_line(line, 200)));
+                    }
                 } else if self.text_chars == 0 {
                     if let Some(resp) = r
                         .get("response")
@@ -2389,12 +2397,14 @@ mod tests {
     #[test]
     fn agy_stream_json_renders_session_tools_text_and_sums_step_usage() {
         // Shape per agy `--output-format stream-json`, re-seeded from two live captures
-        // against the installed agy 1.1.26 (`--print-timeout 150s --output-format
-        // stream-json --dangerously-skip-permissions --print`). Live invariants pinned
-        // here: tool steps carry no `usage` at all; `agent_response` only ever arrived as
-        // a complete `state: "DONE"` frame, never a streamed `ACTIVE` partial; and every
-        // envelope satisfies `total_tokens == input_tokens + output_tokens` exactly,
-        // `thinking_tokens` and `cache_read_tokens` excluded from that sum.
+        // against the installed agy 1.1.27 (`--print-timeout 150s --output-format
+        // stream-json --dangerously-skip-permissions --print`). Live invariant pinned
+        // here: tool steps carry no `usage` at all, and every envelope satisfies
+        // `total_tokens == input_tokens + output_tokens` exactly, `thinking_tokens` and
+        // `cache_read_tokens` excluded from that sum. This fixture uses a single DONE
+        // `agent_response` frame for brevity; the dominant production shape — several
+        // ACTIVE partials followed by a DONE tail fragment — is covered separately by
+        // `agy_agent_response_streams_active_partials_before_a_done_tail`.
         let lines = [
             r#"{"event":"init","conversation_id":"agy-conv-1","init":{"cwd":"/wt","tools":["run_command"],"permission_mode":"always-proceed"}}"#,
             r#"{"event":"step_update","step_update":{"conversation_id":"agy-conv-1","step_index":0,"state":"DONE","step_type":"agent_response","text_delta":"Hello","usage":{"input_tokens":100,"output_tokens":6,"thinking_tokens":4,"cache_read_tokens":10,"total_tokens":106}}}"#,
@@ -2425,6 +2435,37 @@ mod tests {
         assert_eq!(c.output_tokens, 8);
         assert_eq!(c.cache_read, 10);
         assert!(out.contains("· done  SUCCESS  ·  1 tools"));
+    }
+
+    #[test]
+    fn agy_agent_response_streams_active_partials_before_a_done_tail() {
+        // Live capture against agy 1.1.27: a real answer arrives as several ACTIVE
+        // `agent_response` frames carrying `text_delta`, then a DONE frame whose own
+        // `text_delta` is only the trailing fragment, not the full text. The DONE
+        // frame is also where `usage` lands. Concatenating every delta must reproduce
+        // `result.response` exactly, and that response must not be appended again on
+        // top of the streamed text.
+        let lines = [
+            r#"{"event":"init","conversation_id":"c1","init":{"cwd":"/wt","tools":[],"permission_mode":"always-proceed"}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"c1","step_index":0,"state":"ACTIVE","step_type":"agent_response","text_delta":"Hello "}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"c1","step_index":0,"state":"ACTIVE","step_type":"agent_response","text_delta":"brave "}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"c1","step_index":0,"state":"ACTIVE","step_type":"agent_response","text_delta":"new "}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"c1","step_index":0,"state":"DONE","step_type":"agent_response","text_delta":"world","usage":{"input_tokens":10,"output_tokens":4,"cache_read_tokens":0,"total_tokens":14}}}"#,
+            r#"{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","response":"Hello brave new world","usage":{"input_tokens":10,"output_tokens":4,"cache_read_tokens":0,"total_tokens":14}}}"#,
+        ];
+        let mut c = StreamCoalescer::new(false);
+        let mut out = String::new();
+        for l in lines {
+            if let Some(chunk) = c.feed(l) {
+                out.push_str(&chunk);
+            }
+        }
+        assert_eq!(
+            out.matches("Hello brave new world").count(),
+            1,
+            "streamed deltas must concatenate to the full response exactly once, \
+             not duplicate it via the result.response fallback: {out:?}"
+        );
     }
 
     #[test]

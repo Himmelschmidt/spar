@@ -219,15 +219,15 @@ fi
 
 /// A statusline payload we care about (tolerant to missing fields).
 #[derive(Debug, Default, Clone)]
-pub struct Payload {
+struct Payload {
     /// The resident context (`context_window.current_usage`) the model processed for the
     /// latest call: a window gauge, not a spend counter, so it is not summed across calls.
-    pub context_tokens: u64,
+    context_tokens: u64,
     /// Smallest remaining fraction across the account's `gemini-*` quota buckets, with the
     /// bucket name and its reset horizon — the binding constraint for an agy cooldown.
-    pub quota_hint: Option<String>,
-    pub quota_reset_secs: Option<i64>,
-    pub quota_remaining_fraction: Option<f64>,
+    quota_hint: Option<String>,
+    quota_reset_secs: Option<i64>,
+    quota_remaining_fraction: Option<f64>,
 }
 
 fn parse_payload(v: &Value) -> Payload {
@@ -283,7 +283,7 @@ fn parse_payload(v: &Value) -> Payload {
 /// that: a teardown frame can carry a zeroed context window and still be the freshest
 /// quota reading (e.g. the account went exhausted on the final call), so quota is taken
 /// from the last cwd-matching payload that has *any* quota bucket, not gated on context.
-pub fn latest_payload_for_cwd(root: &Path, cwd: &Path) -> Option<Payload> {
+fn latest_payload_for_cwd(root: &Path, cwd: &Path) -> Option<Payload> {
     let text = std::fs::read_to_string(sink_path(root)).ok()?;
     let want = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let mut last_any: Option<Payload> = None;
