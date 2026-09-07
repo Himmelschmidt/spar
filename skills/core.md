@@ -1006,6 +1006,7 @@ timeout_secs = 7200
 # where bash exists, but a command whose real result is swallowed by its own `|| true`
 # is a gate that cannot fail.
 # command = ["cargo fmt --check", "cargo clippy --all-targets -- -D warnings", "cargo test"]
+# One entry: command = "cargo test" also works, no array needed.
 # Reviewer verdict / acceptance gate (review timeouts stay under [timeouts]).
 [review]
 require_all_criteria = true   # false ⇒ an `unverified` AC no longer blocks the ship
