@@ -19,6 +19,9 @@ All notable changes to spar are recorded here.
 
 ### Fixed
 
+- **Watching or checking on a run no longer fails at random while the run is writing.**
+  A run's status file was rewritten in place, so anything reading it at the wrong moment
+  could see half a file and give up with a parse error mid-run.
 - **Pinning a single reviewer no longer quietly adds a second one you didn't ask for.**
   Naming exactly one reviewer now means exactly one reviewer, instead of getting padded
   out with an extra, unrequested provider.

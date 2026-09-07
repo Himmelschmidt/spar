@@ -669,7 +669,14 @@ impl RunState {
         };
         let file = paths.state_file(&self.id);
         let text = serde_json::to_string_pretty(self)?;
-        std::fs::write(&file, text).with_context(|| format!("write {}", file.display()))?;
+        // Written through a temp file in the same directory, then renamed: `state.json`
+        // has no lock on the read side (`status`, `wait`, the TUI, every slot's own
+        // `SPAR_RUN_ID` lookup), so a plain truncate-and-write hands any concurrent
+        // reader a half-written file. `spar wait` died on exactly that mid-run, on
+        // `parse run state …: EOF while parsing a value at line 1 column 0`.
+        let tmp = file.with_extension(format!("tmp.{}", std::process::id()));
+        std::fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &file).with_context(|| format!("replace {}", file.display()))?;
 
         if prev_phase != Some(self.phase) {
             let _ = crate::events::append(
@@ -1080,6 +1087,46 @@ mod tests {
 
         crate::markers::clear_pid(&paths, &state.id, BUILTIN_SUITE_PID_ID);
         assert!(live_slot_pids(&paths, &state).is_empty());
+    }
+
+    /// `state.json` is read without a lock by `status`, `wait` and the TUI while an
+    /// orchestrator is writing it. A truncate-and-write save hands those readers a
+    /// half-written file; this reads the run flat out while it is saved 300 times and
+    /// insists every read that lands is a whole run.
+    #[test]
+    fn concurrent_readers_never_see_a_half_written_state() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new("r-atomic", WorkflowKind::Loop, tmp.path().to_path_buf());
+        state.task = Some("x".repeat(64 * 1024));
+        state.save(&paths).unwrap();
+
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let paths = SparPaths::new(tmp.path());
+            let done = done.clone();
+            std::thread::spawn(move || {
+                let mut reads = 0u32;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    RunState::load(&paths, "r-atomic").expect("torn read of state.json");
+                    reads += 1;
+                }
+                reads
+            })
+        };
+        for i in 0..300 {
+            state.round = i;
+            state.save(&paths).unwrap();
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(reader.join().unwrap() > 0, "reader never got a read in");
+        assert!(
+            std::fs::read_dir(paths.run_dir("r-atomic"))
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .all(|e| !e.file_name().to_string_lossy().starts_with("state.tmp")),
+            "save left a temp file behind"
+        );
     }
 
     #[test]
