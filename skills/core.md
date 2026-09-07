@@ -936,9 +936,11 @@ before feature 011). `projected: true` marks a seat the run will dispatch later 
 created yet — at the plan gate this is the whole implement panel (implementer, reviewer
 panel, and a non-built-in suite's `tester`), resolved through the same functions slot
 creation uses (`roles_resolve::build_implement_seats`, `implement::project_tester_seat`), so
-a projected seat's id always equals the id the implement phase later creates. The human gate
-output prints the same data as a `fleet:` table, alongside the existing one-line `roles:`
-summary.
+a projected seat's id always equals the id the implement phase later creates. Human output
+prints the same data as a `fleet:` table at gate phases only (`awaiting_plan_approval`,
+`awaiting_ship_confirm`, `awaiting_winner_confirm`, `awaiting_round_extension`), alongside
+the existing one-line `roles:` summary — the point at which a human is deciding whether to
+pay for the panel, not every status print.
 
 The plan phase's own pool is narrowed to however many plan-phase seats it needs
 (`planner` [+ `plan_critic`] [+ `test_author`]), which can be fewer than the implement
@@ -946,7 +948,10 @@ panel — e.g. `--fleet small` or `--without critic` narrow the plan phase to on
 seats while the implement panel still wants an implementer plus reviewers. `state.pool_intent`
 carries the operator's un-narrowed `--providers`/`--select` pool so both the plan gate's
 projection and a later bare `implement --run <id>` continuation see the full pool, not the
-plan phase's truncated one.
+plan phase's truncated one. A continuation reuses this frozen pool even when it is narrower
+than the round's panel (e.g. a plan run that dropped `critic`/`spec` only ever froze one or
+two providers): `pick_providers` cycles the short pool to fill the panel width rather than
+refusing, the same fallback an unpinned panel already relies on.
 
 ## A run is bound to the config it was created with
 
@@ -1060,7 +1065,7 @@ timeout_secs = 3600    # test_author's SOFT clock; hard_ceiling_multiple applies
 - Coding slots always use git worktrees; never check out feature branches on the primary tree.
 - Ship is draft PR only — never merge.
 - State lives under `.spar/` in the project root.
-- **Spec channel (plan):** after planner+critic, a `test-author` freezes acceptance tests (`artifacts/test-contract.md` + worktree tests) from plan/critique (bus is audit trail), **before** the plan approval gate. Implement brings those tests into the impl worktree (fail closed if author ran) by **merging the author branch**, then overlaying only the author's **uncommitted** work — tracked-but-modified plus untracked-not-ignored — on top. Committed author work is the merge's job, so the overlay never copies the author branch's revision of a file the implementer is working on, and build output never crosses between worktrees. A merge that fails is aborted **and fails the dispatch** (exit 1), because it is the only path committed acceptance tests take. Anything git ignores stays behind and is named on stderr, in the event log, on the bus, and in the implementer's own prompt, with the author worktree path: if an acceptance test needs an ignored fixture (`.env.test`, an ignored `tests/data/`), the implementer copies it across itself. Its provider comes from `[roles].test_author` (falls through to the fleet if unset/unusable). Disable with `[spec] enabled = false`.
+- **Spec channel (plan):** after planner+critic, a `test-author` freezes acceptance tests (`artifacts/test-contract.md` + worktree tests) from plan/critique (bus is audit trail), **before** the plan approval gate. Implement brings those tests into the impl worktree (fail closed if author ran) by **merging the author branch**, then overlaying only the author's **uncommitted** work — tracked-but-modified plus untracked-not-ignored — on top. Committed author work is the merge's job, so the overlay never copies the author branch's revision of a file the implementer is working on, and build output never crosses between worktrees. A merge that fails is aborted **and fails the dispatch** (exit 1), because it is the only path committed acceptance tests take. Anything git ignores stays behind and is named on stderr, in the event log, on the bus, and in the implementer's own prompt, with the author worktree path: if an acceptance test needs an ignored fixture (`.env.test`, an ignored `tests/data/`), the implementer copies it across itself. Its provider follows the same precedence as every other role: CLI `--role test_author=…`, then an explicit `--providers`/`--select` pool, then `[roles].test_author`, then the run's own pool as a last resort. Disable with `[spec] enabled = false`.
 - **Criterion ids:** scenarios in `artifacts/test-contract.md` carry stable `AC-<n>` ids (numbered from 1, contiguous, never renumbered) plus a `verify:` hint naming a command, `file:line` + assertion, or observable behavior.
 - **What declares a criterion:** only a checklist/bare item (`- [ ] AC-1: ...`, `AC-1: ...`, `**AC-1:**` / `**AC-1**:`, bullet or ordered markers, with the colon required) or a heading (`### AC-1`, `### AC-1: text`, `### AC-1 - text`) counts. A mention anywhere else — prose in Notes/Non-goals, mid-sentence, or inside a fenced code block — never becomes a criterion, so an aside like "later rounds append AC-17 onward" cannot wedge the ship gate on an id no reviewer can report. If a contract mentions `AC-n` ids but declares none, spar warns loudly (stderr + event log, "declares no criteria") rather than silently disarming the gate.
 - **Frozen at round-loop entry:** `implement` reads `test-contract.md` once, when it starts the round loop, and every round for that `implement` invocation judges reviewers against that frozen list. An edit to the file mid-run does **not** take effect — it is not silently ignored either: it is detected each round and reported (`contract_modified: true` in `state.json` / `status --json`, an event, a bus broadcast, stderr, and a note in the reviewer prompt), but the gate still judges the frozen version. This is deliberate: the contract lives outside the repo (`.spar/runs/<id>/artifacts/`, invisible to `git status`/diff), and re-reading it live would let the slot under test edit the gate that bounds it. **To amend a contract, stop the run, edit `test-contract.md`, and re-run `spar implement --run <id>`** — re-entering `implement` re-reads and re-freezes against the file on disk, moving `contract_fingerprint` and clearing `contract_modified`. There is no separate amend command.

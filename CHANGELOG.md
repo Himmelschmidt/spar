@@ -36,6 +36,15 @@ All notable changes to spar are recorded here.
   retrying into the same wall in the meantime.
 - **Rate limits are noticed everywhere runs happen.** Reviews and paired runs, which run
   several agents at once, previously missed them entirely.
+- **A quick review run with one pinned reviewer no longer tries to fill a second seat
+  from your default provider list.** It now runs exactly the panel you pinned.
+- **Continuing an approved plan into implementation no longer refuses when the plan
+  itself only ever needed one or two providers.** It picks up where the plan left off
+  instead of demanding you repeat the provider list.
+- **A pinned test writer no longer wins over a provider list you passed for this run.**
+  The provider list now wins for that seat too, matching every other role.
+- **The "where did this seat come from" label is accurate for review, paired, and
+  competing-agent runs**, not just the main implement flow.
 
 ## [0.0.3] - 2026-09-04
 
