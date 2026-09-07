@@ -287,6 +287,7 @@ pub fn execute_plan(
         cfg,
         projection_pool,
         state.pool_origin,
+        state.dry_run,
         Some(paths),
         Some(&state.id),
     );

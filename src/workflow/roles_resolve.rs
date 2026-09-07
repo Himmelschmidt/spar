@@ -257,13 +257,23 @@ pub fn resolve_seat_sources(
 /// pool positions (e.g. a prior round's `implement --select` preserved across a re-plan)
 /// shows up here too instead of always reporting `model: null`. `paths`/`run_id` are
 /// `None` only where no run is bound yet; this never writes the artifact.
+///
+/// `pool` is expanded to `pool_width(cfg)` with `providers::pick_providers` before
+/// resolution, the same cycling `prepare_implement_slots` applies to `state.providers` —
+/// otherwise a pool shorter than the panel (e.g. one explicit `--providers` entry with the
+/// two-reviewer default) resolves `None` past its own length and the projection silently
+/// drops reviewer seats the implement panel still dispatches, cycled from that same entry.
 pub fn project_implement_fleet(
     cfg: &Config,
     pool: &[String],
     pool_origin: PoolOrigin,
+    dry: bool,
     paths: Option<&crate::paths::SparPaths>,
     run_id: Option<&str>,
 ) -> Vec<FleetSeat> {
+    let width = pool_width(cfg);
+    let expanded = crate::providers::pick_providers(pool, width, Some(pool), dry);
+    let pool = if expanded.is_empty() { pool } else { &expanded };
     let art = match (paths, run_id) {
         (Some(paths), Some(run_id)) => crate::model_select::load_select_artifact(paths, run_id)
             .ok()

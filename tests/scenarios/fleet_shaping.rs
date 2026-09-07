@@ -614,6 +614,55 @@ reviewer = ["cli:codex"]
     assert_eq!(reviewers[0]["projected"], Value::Bool(true));
 }
 
+/// Regression: review round 7 found the plan gate reporting a pool narrower than the
+/// panel (one explicit `--providers` entry, default two-reviewer panel) as having no
+/// reviewer seats at all, because the projection read the raw un-cycled pool directly.
+/// `prepare_implement_slots` cycles a short explicit pool with `pick_providers` to fill
+/// `pool_width(cfg)` before dispatch, so the projection must apply the same cycling before
+/// resolving seats, or it silently omits reviewer seats the run will actually create.
+#[test]
+fn plan_gate_projection_expands_short_pool_to_panel_width() {
+    let tmp = project("");
+    let v = plan_json(
+        tmp.path(),
+        &["--providers", "cli:codex", "--without", "critic,spec"],
+    );
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+
+    let implementer = fleet_seats(&v, "implementer");
+    assert_eq!(implementer.len(), 1);
+    assert_eq!(seat_field(&implementer[0], "provider"), "cli:codex");
+
+    let reviewers = fleet_seats(&v, "reviewer");
+    assert_eq!(
+        reviewers.len(),
+        2,
+        "the default two-reviewer panel must be projected even though the pool has only \
+         one explicit entry: {reviewers:?}"
+    );
+    for r in &reviewers {
+        assert_eq!(seat_field(r, "provider"), "cli:codex");
+        assert_eq!(r["projected"], Value::Bool(true));
+    }
+
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    run_json(
+        tmp.path(),
+        &["implement", "--run", &run_id, "--dry-run", "--json"],
+        2,
+    );
+    let state = read_state(tmp.path(), &run_id);
+    assert_eq!(
+        providers_for(&state, "reviewer"),
+        vec!["cli:codex".to_string(), "cli:codex".to_string()],
+        "the projection must match what implement actually dispatches"
+    );
+}
+
 /// AC-14: `source` names where each seat's provider came from, one value per rung of the
 /// precedence ladder. A provider synthesized from `[roles]` or `[providers].order` must
 /// not be relabelled `cli-providers` just because it reached the resolver as a pool.
