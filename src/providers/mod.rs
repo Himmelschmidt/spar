@@ -171,6 +171,15 @@ pub trait ProviderAdapter: Send + Sync {
     fn build_headless(&self, bin: &Path, opts: &SpawnOpts) -> Command;
     fn build_interactive(&self, bin: &Path, opts: &SpawnOpts) -> Command;
 
+    /// Build a command that resumes a previously captured native session (e.g. codex's
+    /// `thread.started` id) instead of a cold `build_headless` dispatch. `session_id` is
+    /// the value this adapter itself reported (`StreamStats::session_id`) on an earlier
+    /// round of the same slot. Returns `None` when the adapter has no such capability, or
+    /// declines to use it here; the caller falls back to `build_headless`.
+    fn build_resume(&self, _bin: &Path, _opts: &SpawnOpts, _session_id: &str) -> Option<Command> {
+        None
+    }
+
     /// Turn-boundary delivery channel for this adapter (see `DeliveryStrategy`).
     /// Defaults to inbox-on-next-turn; adapters with a live channel override.
     fn delivery_strategy(&self) -> DeliveryStrategy {

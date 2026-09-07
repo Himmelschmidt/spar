@@ -16,6 +16,10 @@ All notable changes to spar are recorded here.
 - **Two ready-made fleet sizes.** One option gives you today's defaults; the other gives
   you the smallest useful setup — one reviewer, no critic, no test writer, no automatic
   tester — while still running your project's own test command if you've configured one.
+- **A codex implementer's next round now continues its own conversation instead of
+  starting over from scratch.** When a fix round re-dispatches the same codex agent,
+  spar picks up where that agent's own session left off rather than opening a brand new
+  one, so a message queued for it while it was between rounds is now actually read.
 
 ### Fixed
 

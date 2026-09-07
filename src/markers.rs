@@ -125,6 +125,26 @@ pub fn read_pid(
     crate::process::PidToken::parse(&std::fs::read_to_string(p).ok()?)
 }
 
+/// Record the native session/thread id a dispatch captured (e.g. codex's `thread.started`
+/// id), so a later round of the *same* slot can resume it instead of a cold dispatch.
+/// Unlike `.pid`, this is never cleared by `clear_slot`: it is meant to outlive the
+/// dispatch that wrote it, across every round the slot id survives.
+pub fn write_session_id(
+    paths: &SparPaths,
+    run_id: &str,
+    slot_id: &str,
+    session_id: &str,
+) -> Result<()> {
+    write_marker(paths, run_id, &format!("{slot_id}.session_id"), session_id)
+}
+
+pub fn read_session_id(paths: &SparPaths, run_id: &str, slot_id: &str) -> Option<String> {
+    let p = paths.marker(run_id, &format!("{slot_id}.session_id"));
+    let s = std::fs::read_to_string(p).ok()?;
+    let s = s.trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
 /// Wait until an artifact file is non-empty.
 #[allow(dead_code)]
 pub fn wait_for_artifact(
@@ -160,6 +180,27 @@ mod tests {
         let paths = SparPaths::new(tmp.path());
         write_done(&paths, "r1", "slot-a").unwrap();
         assert!(marker_exists(&paths, "r1", "slot-a.done"));
+    }
+
+    #[test]
+    fn session_id_roundtrips_and_survives_clear_slot() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        assert_eq!(read_session_id(&paths, "r1", "slot-a"), None);
+
+        write_session_id(&paths, "r1", "slot-a", "thread-abc").unwrap();
+        assert_eq!(
+            read_session_id(&paths, "r1", "slot-a"),
+            Some("thread-abc".to_string())
+        );
+
+        // A re-dispatch clears the terminal markers, but a thread id must outlive it —
+        // that is the whole point of resuming instead of a cold dispatch next round.
+        clear_slot(&paths, "r1", "slot-a");
+        assert_eq!(
+            read_session_id(&paths, "r1", "slot-a"),
+            Some("thread-abc".to_string())
+        );
     }
 
     #[test]

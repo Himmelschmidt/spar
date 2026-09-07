@@ -73,14 +73,18 @@ impl ProviderAdapter for CodexAdapter {
     // `codex exec --json` emits JSONL (thread/turn/item events with turn.completed
     // usage) which the stream coalescer parses for tokens, and its first line names the
     // thread id (`thread.started`), captured into `StreamStats::session_id`. That id is
-    // spar's handle for a best-effort `codex queue --thread <id> --message <text>` push.
-    // It is not a reliable channel on its own — `codex exec` is single-turn and exits
-    // right after its one assigned task, so a queued follow-up turn is aborted before
-    // the model sees it (verified against codex 0.152.0; see `codex_queue_push`'s doc
-    // comment in `delivery.rs`) — so the seam always also writes the poll file, same as
-    // an adapter with no push channel at all, whether or not a thread id has been
-    // captured yet (W10). Codex still has no presence stream, so presence still degrades
-    // to the process/output heuristic.
+    // spar's handle for a `codex queue --thread <id> --message <text>` push. It does not
+    // land inside the dispatch it was pushed against — `codex exec` is single-turn and
+    // exits right after its one assigned task, so a queued follow-up turn is aborted
+    // before the model sees it (verified against codex 0.152.0; see `codex_queue_push`'s
+    // doc comment in `delivery.rs`) — so the seam always also writes the poll file. What
+    // makes the push a real channel rather than a no-op is `build_resume` below: a
+    // message queued against a thread *is* delivered, folded into the same turn as the
+    // next prompt, the next time that thread is resumed (verified live: a message queued
+    // to an idle thread surfaced in the model's reply on the following `codex exec resume`
+    // call). So the push's payoff is at the *next round's* turn boundary, not the current
+    // one. Codex still has no presence stream, so presence still degrades to the
+    // process/output heuristic.
     fn delivery_strategy(&self) -> DeliveryStrategy {
         DeliveryStrategy::NativeQueuePollFallback
     }
@@ -98,14 +102,14 @@ impl ProviderAdapter for CodexAdapter {
             headless: true,
             // Only `codex exec` (headless) is verified; interactive TUI takeover is not.
             interactive: false,
-            // `codex exec resume <SESSION_ID> [PROMPT]` (also `--last`) is a real CLI
-            // capability, but spar's round dispatch never calls it: DECISIONS.md O52
-            // already rejected vendor session resume for the fix-round loop (full
-            // transcript replay is a large, quadratic-ish context cost versus the
-            // compact carry-forward brief), and O62 closes this out explicitly for the
-            // same call sites. `false` here reports what spar actually does, not what
-            // the CLI can do in isolation.
-            resume: false,
+            // `codex exec resume <SESSION_ID> [PROMPT]` (also `--last`) is wired: see
+            // `build_resume`. `executor::execute_prepared` calls it in place of a cold
+            // `build_headless` dispatch whenever a prior round of the same slot captured
+            // a thread id (DECISIONS.md O63). This reopens the vendor's own transcript for
+            // the resumed thread, which is exactly the cost O52 measured and chose a
+            // compact carry-forward brief over for the general fix-round case; O63 records
+            // the tradeoff for codex specifically rather than reversing O52's default.
+            resume: true,
             skip_permissions: true,
             // FullAuto bypasses codex's own sandbox (the worktree is the boundary,
             // matching the other adapters), so we do not rely on a native sandbox.
@@ -155,6 +159,37 @@ impl ProviderAdapter for CodexAdapter {
         cmd.arg(resolved_prompt(opts));
         cmd.current_dir(&opts.cwd);
         cmd
+    }
+
+    // `codex exec resume [OPTIONS] [SESSION_ID] [PROMPT]` (verified against codex
+    // 0.152.0 — `codex exec resume --help`). It takes the same `--json` /
+    // `--skip-git-repo-check` / permission / `-m` flags as `exec`, but has no
+    // `-p/--profile`: a resumed thread already carries whatever profile started it, so
+    // `codex_profile()` is not applied here (it would also be rejected as an unknown
+    // flag). `session_id` is the thread id a prior round's `build_headless` (or an
+    // earlier resume) captured for this same slot.
+    fn build_resume(&self, bin: &Path, opts: &SpawnOpts, session_id: &str) -> Option<Command> {
+        let mut cmd = Command::new(bin);
+        cmd.arg("exec");
+        cmd.arg("resume");
+        cmd.arg("--json");
+        cmd.arg("--skip-git-repo-check");
+        for a in self.permission_args(opts.trust) {
+            cmd.arg(a);
+        }
+        if let Some(m) = codex_model(opts) {
+            for a in model_args(&m) {
+                cmd.arg(a);
+            }
+        }
+        for a in &opts.extra_args {
+            cmd.arg(a);
+        }
+        cmd.arg(session_id);
+        cmd.arg("--");
+        cmd.arg(resolved_prompt(opts));
+        cmd.current_dir(&opts.cwd);
+        Some(cmd)
     }
 
     fn build_interactive(&self, bin: &Path, opts: &SpawnOpts) -> Command {
@@ -328,13 +363,61 @@ mod tests {
     }
 
     #[test]
-    fn native_queue_poll_fallback_delivery_and_no_resume_capability() {
+    fn native_queue_poll_fallback_delivery_and_resume_capability() {
         assert_eq!(
             CodexAdapter.delivery_strategy(),
             DeliveryStrategy::NativeQueuePollFallback
         );
-        // Nothing in spar calls `codex exec resume` (DECISIONS.md O52/O62), so the
-        // reported capability must not claim otherwise.
-        assert!(!CodexAdapter.capabilities().resume);
+        // `build_resume` is wired (DECISIONS.md O63), so the reported capability must
+        // say so.
+        assert!(CodexAdapter.capabilities().resume);
+    }
+
+    #[test]
+    fn build_resume_shape() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SPAR_CODEX_PROFILE");
+        std::env::remove_var("SPAR_CODEX_MODEL");
+        let cmd = CodexAdapter
+            .build_resume(
+                Path::new("codex"),
+                &opts("keep going", None),
+                "01a07c85-9f8e-7ee1-b429-4fc000e90add",
+            )
+            .expect("codex supports resume");
+        let (_, args) = command_to_parts(&cmd);
+        assert_eq!(&args[..2], ["exec", "resume"]);
+        assert!(args.iter().any(|a| a == "--json"));
+        assert!(args
+            .iter()
+            .any(|a| a == "01a07c85-9f8e-7ee1-b429-4fc000e90add"));
+        // No profile flag: `codex exec resume` has no `-p/--profile`.
+        assert!(!args.iter().any(|a| a == "-p"));
+        // Prompt is still the final positional, preceded by `--`.
+        assert_eq!(args.last().map(String::as_str), Some("keep going"));
+        let di = args.iter().position(|a| a == "--").expect("-- separator");
+        assert_eq!(di, args.len() - 2);
+        // Session id precedes the `--` / prompt.
+        let si = args
+            .iter()
+            .position(|a| a == "01a07c85-9f8e-7ee1-b429-4fc000e90add")
+            .unwrap();
+        assert!(si < di);
+    }
+
+    #[test]
+    fn build_resume_carries_model_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let cmd = CodexAdapter.build_resume(
+            Path::new("codex"),
+            &opts("x", Some("meta/muse-spark-1.1")),
+            "thread-1",
+        );
+        let (_, args) = command_to_parts(&cmd.unwrap());
+        let mi = args.iter().position(|a| a == "-m").expect("-m present");
+        assert_eq!(
+            args.get(mi + 1).map(String::as_str),
+            Some("meta/muse-spark-1.1")
+        );
     }
 }

@@ -361,10 +361,13 @@ on — never a restatement of the plan or contract, which the next round is hand
   the id and worktree), so a slot always reads back its own last round.
 - **Context, never a verdict.** No reviewer and no gate reads it. It cannot argue a
   failed `AC-n` past the acceptance gate.
-- **Not session resume.** Resuming the vendor CLI session was considered and rejected:
-  it carries the whole failed attempt's transcript, so round N+1 starts its context climb
-  from a huge base. See DECISIONS O52; O62 closes the same question specifically for
-  codex's `codex exec resume`, which spar captures a thread id for but does not call.
+- **Not session resume, in general.** Resuming the vendor CLI session was considered and
+  rejected for the general case: it carries the whole failed attempt's transcript, so
+  round N+1 starts its context climb from a huge base (DECISIONS O52). **codex is a
+  scoped exception (O63):** when a slot's earlier round captured a thread id, its next
+  round calls `codex exec resume <id>` instead of a cold dispatch, on top of the same
+  carry-forward brief every provider gets. A task brief specifically asked for this
+  tradeoff for codex; O52's general default is unchanged for every other provider.
 
 For legs that already exist, `spar link <leg> --to <run>` records the grouping
 (`parent_run`). spar never infers it — pairing runs by task text would merge unrelated
@@ -549,20 +552,22 @@ slot is stuck on.**
   inbox, which its `Stop` hook drains at the turn boundary. **grok** takes them on its
   native queue. **codex** attempts one too, once it has captured a thread id (its `codex
   exec --json` stream names one on its very first line): `codex queue --thread <id>
-  --message <text>`. This rarely lands — `codex exec` is single-turn and exits right
-  after completing its one assigned task, so a message queued against a still-running
-  thread opens a follow-up turn that gets aborted mid-start when the process shuts down
-  (verified against codex 0.152.0), and a success exit code from `codex queue` is not
-  proof the model ever saw it (it reports success against a thread whose process has
-  already exited, too). So a codex dispatch always also writes the same poll file
-  **opencode and muse** use — they have no way to interrupt a working agent at all, so
-  spar writes to `.spar/runs/<id>/logs/nudges-<slot>.md` and their role prompt tells them
-  to read it before starting any new major step — regardless of whether a thread id has
-  been captured yet; that file is what actually reaches a codex dispatch, at the start of
-  its *next* round, not the one currently running (not the same round: see O52/O62 for
-  why spar does not use `codex exec resume` to make that round continuation instead).
-  Thresholds are checked every 30 seconds, so a nudge lands at the next 30s boundary
-  rather than the instant a budget is crossed.
+  --message <text>`. This does not land in the dispatch it was queued against — `codex
+  exec` is single-turn and exits right after completing its one assigned task, and a
+  message queued mid-turn never surfaces in that turn's stream at all (verified against
+  codex 0.152.0), while a success exit code from `codex queue` is not proof of anything
+  either (it reports success against a thread whose process exited days ago). So a codex
+  dispatch always also writes the same poll file **opencode and muse** use — they have no
+  way to interrupt a working agent at all, so spar writes to
+  `.spar/runs/<id>/logs/nudges-<slot>.md` and their role prompt tells them to read it
+  before starting any new major step — regardless of whether a thread id has been
+  captured yet. What makes the queue push a real channel rather than a no-op: a message
+  queued to an idle thread *does* land the next time that thread is resumed, folded into
+  the same turn as the resume prompt (also verified live), and `codex exec resume <id>`
+  is exactly what a codex slot's next round now calls when a thread id was captured
+  (O63) — so the push's payoff arrives at that round's turn boundary, not the currently
+  running one. Thresholds are checked every 30 seconds, so a nudge lands at the next 30s
+  boundary rather than the instant a budget is crossed.
 - **Live token visibility differs by adapter**, so token nudges are not uniformly prompt.
   **opencode** reports usage per step and is exact live. **muse** carries no tokens on
   stdout at all, so spar tails its session log (`~/.local/share/muse/sessions/…`), which is

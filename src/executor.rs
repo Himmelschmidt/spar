@@ -139,6 +139,10 @@ struct PreparedSlot {
     /// The run's base, for deciding whether a slot missing its artifact left work behind.
     base_commit: Option<String>,
     round: u32,
+    /// The native session/thread id an earlier round of this same slot captured
+    /// (`markers::read_session_id`), if any. `execute_prepared` passes it to the
+    /// adapter's `build_resume`; adapters that don't support resume just ignore it.
+    prior_session_id: Option<String>,
     /// The run's frozen config (O27), carried across the thread boundary so a worker
     /// sizes its budgets and nudge cadence off the same document every other phase reads.
     cfg: Config,
@@ -302,6 +306,7 @@ fn prepare_slot_execution(
     let _ = crate::bus::heartbeat(paths, Some(&state.id), &job.slot_id, "running");
     let env = wire_slot_presence(state, paths, &job, &cwd, &pref);
     let owns_cwd = owns_cwd(state, &job.slot_id, &cwd);
+    let prior_session_id = markers::read_session_id(paths, &state.id, &job.slot_id);
 
     Ok(PreparedSlot {
         job,
@@ -316,6 +321,7 @@ fn prepare_slot_execution(
         base_commit: state.base_commit.clone(),
         owns_cwd,
         round,
+        prior_session_id,
         cfg: cfg.clone(),
         dry_run: state.dry_run,
     })
@@ -332,6 +338,24 @@ fn owns_cwd(state: &RunState, slot_id: &str, cwd: &Path) -> bool {
         .worktrees
         .iter()
         .any(|w| w.slot_id == slot_id && w.path == cwd)
+}
+
+/// Resume a previously captured native session (`prior_session_id`) instead of a cold
+/// `build_headless` dispatch, when the adapter supports it (see `ProviderAdapter::build_resume`).
+/// Adapters that don't implement `build_resume`, or that decline for this call, fall back
+/// to `build_headless` — the only path before this round's codex resume wiring (O63).
+fn build_dispatch_command(
+    adapter: &dyn providers::ProviderAdapter,
+    bin: &Path,
+    opts: &SpawnOpts,
+    prior_session_id: Option<&str>,
+) -> std::process::Command {
+    if let Some(sid) = prior_session_id {
+        if let Some(cmd) = adapter.build_resume(bin, opts, sid) {
+            return cmd;
+        }
+    }
+    adapter.build_headless(bin, opts)
 }
 
 fn execute_prepared(
@@ -422,7 +446,12 @@ fn execute_prepared(
         model: prep.job.model.clone(),
         timeout_secs: Some(timeout.as_secs()),
     };
-    let cmd = adapter.build_headless(&bin, &opts);
+    let cmd = build_dispatch_command(
+        adapter.as_ref(),
+        &bin,
+        &opts,
+        prep.prior_session_id.as_deref(),
+    );
     let (program, args) = providers::command_to_parts(&cmd);
     let (program, args) = sandbox::maybe_wrap(isolation, &prep.cwd, &program, &args);
     let req = SpawnRequest {
@@ -485,6 +514,12 @@ fn execute_prepared(
         reason: None,
     };
     let _ = markers::write_dispatch_verdict(&prep.paths, &prep.run_id, &prep.job.slot_id, &verdict);
+    // Persisted regardless of this dispatch's own outcome: a captured thread id is what
+    // lets the *next* round resume instead of a cold dispatch (O63), and that is worth
+    // keeping even off a failed attempt — a resumed thread still holds real progress.
+    if let Some(sid) = &res.stats.session_id {
+        let _ = markers::write_session_id(&prep.paths, &prep.run_id, &prep.job.slot_id, sid);
+    }
     let agy_quota_hit = enrich_agy_stats(
         &mut res.stats,
         &prep.job.provider,
@@ -2077,7 +2112,8 @@ fn run_headless(
         model: slot_model_for(Some(state), job),
         timeout_secs: Some(timeout.as_secs()),
     };
-    let cmd = adapter.build_headless(&bin, &opts);
+    let prior_session_id = markers::read_session_id(paths, &state.id, &job.slot_id);
+    let cmd = build_dispatch_command(adapter.as_ref(), &bin, &opts, prior_session_id.as_deref());
     let (program, args) = providers::command_to_parts(&cmd);
     let (program, args) = sandbox::maybe_wrap(state.isolation, cwd, &program, &args);
 
@@ -2138,6 +2174,9 @@ fn run_headless(
         reason: None,
     };
     let _ = markers::write_dispatch_verdict(paths, &state.id, &job.slot_id, &verdict);
+    if let Some(sid) = &res.stats.session_id {
+        let _ = markers::write_session_id(paths, &state.id, &job.slot_id, sid);
+    }
     let agy_quota_hit = enrich_agy_stats(&mut res.stats, &job.provider, cwd, log_path, paths);
     enrich_muse_stats(&mut res.stats, &job.provider, log_path);
     let quota_rejected = res.stats.quota_rejected.clone();
@@ -2706,6 +2745,60 @@ pub fn wait_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dispatch_opts(prompt: &str) -> SpawnOpts {
+        SpawnOpts {
+            prompt: prompt.into(),
+            prompt_file: None,
+            cwd: PathBuf::from("/tmp"),
+            trust: TrustPolicy::FullAuto,
+            extra_args: vec![],
+            model: None,
+            timeout_secs: None,
+        }
+    }
+
+    #[test]
+    fn build_dispatch_command_resumes_codex_when_a_prior_session_id_is_known() {
+        let opts = dispatch_opts("go");
+        let cmd = build_dispatch_command(
+            &providers::CodexAdapter,
+            Path::new("codex"),
+            &opts,
+            Some("thread-123"),
+        );
+        let (_, args) = providers::command_to_parts(&cmd);
+        assert_eq!(&args[..2], ["exec", "resume"]);
+        assert!(args.iter().any(|a| a == "thread-123"));
+    }
+
+    #[test]
+    fn build_dispatch_command_is_cold_without_a_prior_session_id() {
+        let opts = dispatch_opts("go");
+        let cmd = build_dispatch_command(&providers::CodexAdapter, Path::new("codex"), &opts, None);
+        let (_, args) = providers::command_to_parts(&cmd);
+        assert_eq!(args.first().map(String::as_str), Some("exec"));
+        assert!(!args.iter().any(|a| a == "resume"));
+    }
+
+    #[test]
+    fn build_dispatch_command_ignores_prior_session_id_for_an_adapter_without_resume() {
+        // Grok's `build_resume` is the trait default (`None`), so a prior session id
+        // must not change its dispatch shape even when one is present.
+        let opts = dispatch_opts("go");
+        let with_prior = build_dispatch_command(
+            &providers::GrokAdapter,
+            Path::new("grok"),
+            &opts,
+            Some("some-id"),
+        );
+        let without_prior =
+            build_dispatch_command(&providers::GrokAdapter, Path::new("grok"), &opts, None);
+        assert_eq!(
+            providers::command_to_parts(&with_prior).1,
+            providers::command_to_parts(&without_prior).1
+        );
+    }
 
     /// The real captured log text from the dogfooding incident (roadmap/BACKLOG.md):
     /// a rate-limited slot that died mid-dispatch. This is the discriminator `run_slot`

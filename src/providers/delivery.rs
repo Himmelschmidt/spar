@@ -23,9 +23,10 @@ use std::time::{Duration, Instant};
 pub enum DeliveryAction {
     /// Claude: a Stop-hook `block` payload was built for the hook to relay into the model.
     StopHookBlock,
-    /// Codex: `codex queue --thread` reported success. Not itself proof the model saw
-    /// the message (see `codex_queue_push`'s doc comment) — the poll file was written
-    /// too, same as `PolledFile`, this is just which of the two the push also hit.
+    /// Codex: `codex queue --thread` reported success. Not proof the *current* dispatch
+    /// saw the message — it does not, see `codex_queue_push`'s doc comment — but it does
+    /// mean this thread's *next* `build_resume` dispatch will. The poll file was written
+    /// too, same as `PolledFile`; this is just which of the two the push also hit.
     NativePushed,
     /// Grok: claimed messages appended to the durable turn-boundary queue (unread until
     /// its live push channel lands).
@@ -192,16 +193,21 @@ pub fn queue_path(paths: &SparPaths, run: Option<&str>, agent: &str) -> std::pat
 }
 
 /// Push `text` into the codex thread `session_id`. Best-effort and *not* a delivery
-/// guarantee — the caller always also writes the poll file:
+/// guarantee for *this* dispatch — the caller always also writes the poll file:
 ///
 /// - Exit 0 is not proof the model saw the message. Verified against codex 0.152.0:
 ///   `codex queue --thread <id>` against a two-day-dead thread's rollout still exits 0
 ///   with `Queued message ... for thread ...` on stdout.
-/// - Even against a genuinely running thread, `codex exec` is single-turn: it exits
-///   right after completing its one assigned task, so a message queued mid-turn opens a
-///   follow-up turn that gets aborted before the model sees it. A live probe (queued 15s
-///   into a ~70s turn) showed `task_complete`, then a new `task_started` 43ms later
-///   carrying the queued text, then `turn_aborted` (`interrupted`) 44ms after that.
+/// - A message queued against a genuinely running thread does not land in that same
+///   turn. Live probe against codex 0.152.0: pushing ~6s into a live `codex exec` turn
+///   produced exactly one `turn.completed` for the whole dispatch and the queued text
+///   never appeared anywhere in the stream — no aborted follow-up turn, nothing.
+/// - It does land at that thread's *next* dispatch. Live probe: queuing a message to an
+///   already-exited thread, then `codex exec resume <id>` on it, produced a single turn
+///   whose reply addressed both the queued message and the new resume prompt. This is
+///   what `build_resume` (DECISIONS.md O63) turns into a real channel: a nudge queued
+///   here surfaces the next time `executor::build_dispatch_command` resumes this slot's
+///   thread, not mid-flight in the dispatch it was queued against.
 ///
 /// stdio is nulled: `codex queue` writes its own status line to stdout and its error to
 /// stderr, which would otherwise land inside spar's own `--json` output stream.
@@ -212,8 +218,12 @@ pub fn queue_path(paths: &SparPaths, run: Option<&str>, agent: &str) -> std::pat
 /// wedged `codex queue` process stall that entire loop — no hard-ceiling kill, no
 /// liveness beat — for as long as the hang lasts. Ordinary cost is well under a second
 /// (measured ~0.46s against a rejected thread id on codex 0.152.0); the bound only
-/// matters for the unresponsive tail.
-const CODEX_QUEUE_PUSH_TIMEOUT: Duration = Duration::from_secs(15);
+/// matters for the unresponsive tail. Halved from an initial 15s: `NudgeWatch::tick`
+/// can call `send` twice in one tick (`check_time` then `check_tokens`, both crossed at
+/// once), so two wedged pushes at the old bound cost 30s against the 30s poll cadence
+/// (`nudge::POLL_SECS`) that timeout was reasoned against; at 7s the same worst case is
+/// 14s.
+const CODEX_QUEUE_PUSH_TIMEOUT: Duration = Duration::from_secs(7);
 
 fn codex_queue_push(session_id: &str, text: &str) -> bool {
     let bin = crate::providers::adapter_named("codex")
