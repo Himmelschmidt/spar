@@ -1497,6 +1497,8 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
                         lines_in: 0,
                         chars_out: 0,
                         last_log_at: None,
+                        cost_usd: u.cost_usd,
+                        subagent_stats: u.subagent_stats.clone(),
                     })
                 })
         });
@@ -9940,6 +9942,8 @@ mod render_stability {
             billed_tokens: 0,
             tools: 0,
             model: Some("x-ai/grok-4.5".into()),
+            cost_usd: None,
+            subagent_stats: None,
         });
         assert_eq!(slot_model(&s, 12), "grok-4.5");
     }
@@ -9959,6 +9963,8 @@ mod render_stability {
             billed_tokens: billed,
             tools: 0,
             model: None,
+            cost_usd: None,
+            subagent_stats: None,
         };
         // Three dispatches of one slot: the ledger keeps all three, the slot field
         // only the last.

@@ -69,6 +69,66 @@ pub struct StreamStats {
     /// RFC3339 of last successful log append (for stall detection).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_log_at: Option<String>,
+    /// Whole-run USD spend, as the provider itself computed it: claude's terminal
+    /// `result.total_cost_usd` (an absolute overwrite) or opencode's per-step
+    /// `part.cost` (summed the same way its token deltas are). One field for both so
+    /// a caller never needs to know which adapter produced it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    /// claude's terminal `result.subagent_stats`: how many Task-tool subagents this
+    /// dispatch spawned and how they ended. No other adapter reports this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_stats: Option<SubagentStats>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SubagentRequested {
+    #[serde(default)]
+    pub background: u32,
+    #[serde(default)]
+    pub foreground: u32,
+    #[serde(default)]
+    pub unset: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SubagentKilled {
+    #[serde(default)]
+    pub parent: u32,
+    #[serde(default)]
+    pub user: u32,
+    #[serde(default)]
+    pub system: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SubagentRefused {
+    #[serde(default)]
+    pub depth_limit: u32,
+    #[serde(default)]
+    pub concurrency_limit: u32,
+    #[serde(default)]
+    pub budget: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SubagentStats {
+    #[serde(default)]
+    pub spawned: u32,
+    #[serde(default)]
+    pub completed: u32,
+    #[serde(default)]
+    pub failed: u32,
+    #[serde(default)]
+    pub requested: SubagentRequested,
+    #[serde(default)]
+    pub killed: SubagentKilled,
+    #[serde(default)]
+    pub refused: SubagentRefused,
+    #[serde(default)]
+    pub max_depth: u32,
+    #[serde(default)]
+    pub by_type: std::collections::BTreeMap<String, u32>,
 }
 
 impl StreamStats {
@@ -700,6 +760,8 @@ struct StreamCoalescer {
     saw_terminal_usage: bool,
     model: Option<String>,
     session_id: Option<String>,
+    cost_usd: Option<f64>,
+    subagent_stats: Option<SubagentStats>,
     text_chars: u64,
     /// opencode double-emits every event in dash and underscore spellings with the
     /// same `part.id`; keyed by `(normalized type, part.id)` to count each once.
@@ -742,6 +804,8 @@ impl StreamCoalescer {
             saw_terminal_usage: false,
             model: None,
             session_id: None,
+            cost_usd: None,
+            subagent_stats: None,
             text_chars: 0,
             seen_opencode: std::collections::HashSet::new(),
         }
@@ -838,6 +902,11 @@ impl StreamCoalescer {
                         let mut out = self.flush_buf();
                         let model = v.get("model").and_then(|x| x.as_str()).unwrap_or("claude");
                         self.model = Some(model.to_string());
+                        // claude's resume handle: `spar link` and any later `--resume`
+                        // need this the same way muse's and opencode's session ids do.
+                        if let Some(id) = v.get("session_id").and_then(|x| x.as_str()) {
+                            self.session_id = Some(id.to_string());
+                        }
                         out.push_str(&format!("· session  {model}\n"));
                         return Some(out);
                     }
@@ -933,6 +1002,14 @@ impl StreamCoalescer {
                 "user" => return self.handle_claude_user(&v),
                 "result" => {
                     let mut out = self.flush_buf();
+                    if let Some(cost) = v.get("total_cost_usd").and_then(|x| x.as_f64()) {
+                        self.cost_usd = Some(cost);
+                    }
+                    if let Some(stats) = v.get("subagent_stats") {
+                        if let Ok(parsed) = serde_json::from_value::<SubagentStats>(stats.clone()) {
+                            self.subagent_stats = Some(parsed);
+                        }
+                    }
                     let sub = v.get("subtype").and_then(|x| x.as_str()).unwrap_or("ok");
                     out.push_str(&format!(
                         "· done  {sub}  ·  {} tools  ·  {}\n",
@@ -1128,6 +1205,11 @@ impl StreamCoalescer {
                     self.context_peak = self
                         .context_peak
                         .max(input.saturating_add(cache_read).saturating_add(cache_write));
+                }
+                // Each step's `cost` is that call's own delta, like its `tokens` — sum
+                // rather than overwrite, same as opencode's other billed components.
+                if let Some(cost) = part.get("cost").and_then(|x| x.as_f64()) {
+                    self.cost_usd = Some(self.cost_usd.unwrap_or(0.0) + cost);
                 }
                 None
             }
@@ -1463,6 +1545,12 @@ impl StreamCoalescer {
         }
         if self.session_id.is_some() {
             s.session_id = self.session_id.clone();
+        }
+        if self.cost_usd.is_some() {
+            s.cost_usd = self.cost_usd;
+        }
+        if self.subagent_stats.is_some() {
+            s.subagent_stats = self.subagent_stats.clone();
         }
     }
 
@@ -2113,6 +2201,55 @@ mod tests {
         assert_eq!(c.input_tokens, 100);
         assert!(c.cache_read >= 50);
         assert_eq!(c.model.as_deref(), Some("claude-opus"));
+    }
+
+    #[test]
+    fn claude_init_captures_session_id() {
+        let mut c = StreamCoalescer::new(false);
+        c.feed(r#"{"type":"system","subtype":"init","model":"claude-opus","session_id":"sess-abc-123"}"#);
+        assert_eq!(c.session_id.as_deref(), Some("sess-abc-123"));
+    }
+
+    #[test]
+    fn claude_result_captures_cost_and_subagent_stats() {
+        let mut c = StreamCoalescer::new(false);
+        c.feed(
+            r#"{"type":"result","subtype":"success","total_cost_usd":0.4521,
+               "usage":{"input_tokens":49,"output_tokens":241},
+               "subagent_stats":{"spawned":3,"completed":2,"failed":1,
+                 "requested":{"background":1,"foreground":2,"unset":0},
+                 "killed":{"parent":0,"user":1,"system":0},
+                 "refused":{"depth_limit":0,"concurrency_limit":0,"budget":1},
+                 "max_depth":2,"by_type":{"Explore":2,"general-purpose":1}}}"#,
+        );
+        assert_eq!(c.cost_usd, Some(0.4521));
+        let stats = c.subagent_stats.clone().expect("subagent_stats captured");
+        assert_eq!(stats.spawned, 3);
+        assert_eq!(stats.completed, 2);
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.requested.background, 1);
+        assert_eq!(stats.requested.foreground, 2);
+        assert_eq!(stats.killed.user, 1);
+        assert_eq!(stats.refused.budget, 1);
+        assert_eq!(stats.max_depth, 2);
+        assert_eq!(stats.by_type.get("Explore"), Some(&2));
+
+        let mut s = StreamStats::default();
+        c.merge_counters_into(&mut s);
+        assert_eq!(s.cost_usd, Some(0.4521));
+        assert_eq!(s.subagent_stats.unwrap().spawned, 3);
+    }
+
+    #[test]
+    fn opencode_sums_per_step_cost_into_one_field() {
+        let mut c = StreamCoalescer::new(false);
+        c.feed(
+            r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_a","type":"step-finish","cost":0.01,"tokens":{"input":10,"output":2,"cache":{"read":0,"write":0}}}}"#,
+        );
+        c.feed(
+            r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_b","type":"step-finish","cost":0.02,"tokens":{"input":5,"output":1,"cache":{"read":0,"write":0}}}}"#,
+        );
+        assert!((c.cost_usd.unwrap() - 0.03).abs() < 1e-9);
     }
 
     #[test]
