@@ -123,12 +123,19 @@ fn synthesize_from_roles(n: usize, roles: &[&str], cfg: &Config) -> Result<Resol
         } else {
             i
         };
-        let p = crate::workflow::roles_resolve::provider_for(role, ridx, &[], cfg)
-            .with_context(|| {
-                format!(
-                    "slot {i} (role '{label}'): no provider in [roles] and [providers].order is exhausted"
-                )
-            })?;
+        let (p, _source) = crate::workflow::roles_resolve::resolve_seat(
+            role,
+            i,
+            ridx,
+            &[],
+            crate::state::PoolOrigin::Synth,
+            cfg,
+        )
+        .with_context(|| {
+            format!(
+                "slot {i} (role '{label}'): no provider in [roles] and [providers].order is exhausted"
+            )
+        })?;
         out.push(p);
     }
     Ok(ResolvedProviders {

@@ -110,6 +110,19 @@ pub struct RunState {
     /// explicitly rather than infer it from the field's absence.
     #[serde(default)]
     pub contract_modified: bool,
+    /// The implement panel this run will dispatch, as best projected from the frozen
+    /// config at the moment the plan gate was reached (feature 011). Cleared once the
+    /// implement phase creates its real slots — `executor::run_fleet_seats` reads real
+    /// slots first and only falls back to this for seats with no matching slot id yet, so
+    /// a projection can never outlive or contradict what actually got dispatched.
+    #[serde(default)]
+    pub projected_fleet: Vec<FleetSeat>,
+    /// Provenance of `providers` (the pool) as last resolved for the *plan* phase
+    /// (planner/critic/test_author), from the flags that invocation actually passed.
+    /// Feature 011. Read by `plan::plan_slot_specs`, which is called from more than one
+    /// site and needs this without re-threading `CommonOpts` through all of them.
+    #[serde(default)]
+    pub pool_origin: PoolOrigin,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,6 +289,52 @@ pub struct SlotState {
     /// Reset at the start of every dispatch, so a re-dispatch never carries a stale hit.
     #[serde(default)]
     pub quota_hit: bool,
+    /// Which precedence rung this seat's provider was resolved from (feature 011).
+    /// `None` for slots created outside the fleet resolver (arena/peer/roles/review) or
+    /// for state written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SeatSource>,
+}
+
+/// Where a seat's provider was resolved from, in precedence order. Feature 011: the
+/// resolved fleet is honest about which rung of `CLI --role > CLI --providers/--select >
+/// [roles] > [providers].order` produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SeatSource {
+    CliRole,
+    CliProviders,
+    RolesFile,
+    ProvidersOrder,
+    ModelSelect,
+    SuitePreferences,
+}
+
+/// Provenance of the positional pool a run resolved, at the moment a phase's seats were
+/// built. `CliProviders`/`Selected` are real overrides (an operator-supplied `--providers`
+/// list, or a `--select` result); `Synth` means the pool itself was synthesized from
+/// `[roles]` / `[providers].order` and so must not be read back as an override — every
+/// seat drawn from a `Synth` pool is resolved fresh from `cfg`, not from the pool array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PoolOrigin {
+    CliProviders,
+    Selected,
+    #[default]
+    Synth,
+}
+
+/// One seat in the resolved fleet — actual (a slot already exists) or projected (the run
+/// will dispatch it later, e.g. the implement panel seen from the plan gate). Feature 011.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetSeat {
+    pub seat: String,
+    pub role: SlotRole,
+    pub provider: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    pub source: SeatSource,
+    pub projected: bool,
 }
 
 fn one_round() -> u32 {
@@ -443,6 +502,8 @@ impl RunState {
             contract_fingerprint: None,
             contract_modified: false,
             round: 1,
+            projected_fleet: Vec::new(),
+            pool_origin: PoolOrigin::default(),
         }
     }
 

@@ -4,7 +4,7 @@ use crate::executor::{self, SlotJob};
 use crate::exit_codes::ExitCode;
 use crate::paths::SparPaths;
 use crate::providers;
-use crate::state::{Phase, RunState, SlotRole, SlotState, SlotStatus, SuiteOutcome};
+use crate::state::{Phase, PoolOrigin, RunState, SlotRole, SlotState, SlotStatus, SuiteOutcome};
 use crate::util::{self, sanitize_slot};
 use crate::workflow::review_result::{self, AcStatus, ReviewResult};
 use crate::worktree;
@@ -133,7 +133,7 @@ pub fn run_loop(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<Exi
 fn run_from_approved(
     run_id: &str,
     amendment: Option<String>,
-    opts: CommonOpts,
+    mut opts: CommonOpts,
     paths: &SparPaths,
     cfg: &Config,
 ) -> Result<ExitCode> {
@@ -223,14 +223,23 @@ fn run_from_approved(
     if state.dry_run {
         std::env::set_var("SPAR_DRY_RUN", "1");
     }
-    let n = cfg.max_agents.max(3) as usize;
+    // A bare `implement --run <id>` (no flags at all) is a continuation, not a fresh
+    // request: with nothing new to resolve from and no `[roles]` to synthesize a pool
+    // from, the operator's own earlier `--providers`/`--select` is what this run has —
+    // reuse the pool it already froze rather than refusing the one invocation shape
+    // (no flags) that resuming an already-approved run is supposed to look like.
+    if opts.providers.is_empty() && opts.select.is_empty() && cfg.roles.is_empty() {
+        opts.providers = state.providers.clone();
+    }
+    let n = crate::workflow::roles_resolve::pool_width(cfg);
     let roles: Vec<&str> = std::iter::once(SlotRole::Implementer.as_config_key())
         .chain(std::iter::repeat(SlotRole::Reviewer.as_config_key()))
         .take(n)
         .collect();
     let requested = opts.resolve_fleet(n, &roles, paths, cfg, &state.id)?;
+    let pool_origin = pool_origin_for(&opts);
     state.providers = providers::pick_providers(&requested, n, Some(&requested), state.dry_run);
-    // Gate the positional fleet in place — never compact it, or a paused provider would
+    // Gate the positional pool in place — never compact it, or a paused provider would
     // slide a different model into a role's slot (silent single-model collapse). Paused
     // providers fail loud so the review panel stays exactly what was specified.
     if !state.dry_run {
@@ -275,6 +284,7 @@ fn run_from_approved(
     prepare_implement_slots(
         &mut state,
         Some(&requested),
+        pool_origin,
         dry,
         cfg,
         paths,
@@ -295,14 +305,24 @@ fn run_from_approved(
     Ok(state.exit_code())
 }
 
-/// Reviewer slots spawned alongside the implementer. The fleet width (`max_agents.max(3)`)
-/// still bounds provider resolution; this names the review-panel size once instead of the
-/// three unrelated coincidences (the old `while` pad, two literal pushes, `.max(3)`).
-const DEFAULT_REVIEWERS: usize = 2;
+/// A run's positional pool provenance for THIS invocation, from the flags actually
+/// passed: an explicit `--providers` or `--select` is a real override; absent both, the
+/// pool was synthesized from `[roles]` / `[providers].order` and must be re-resolved from
+/// `cfg` rather than read back positionally (`roles_resolve::resolve_seat`).
+fn pool_origin_for(opts: &CommonOpts) -> PoolOrigin {
+    if !opts.providers.is_empty() {
+        PoolOrigin::CliProviders
+    } else if !opts.select.is_empty() {
+        PoolOrigin::Selected
+    } else {
+        PoolOrigin::Synth
+    }
+}
 
 fn prepare_implement_slots(
     state: &mut RunState,
     requested: Option<&[String]>,
+    pool_origin: PoolOrigin,
     dry: bool,
     cfg: &Config,
     paths: &SparPaths,
@@ -329,12 +349,12 @@ fn prepare_implement_slots(
     }
 
     let req = requested.unwrap_or_default();
-    let n = cfg.max_agents.max(3) as usize;
+    let n = crate::workflow::roles_resolve::pool_width(cfg);
     state.providers = providers::pick_providers(req, n, Some(req), dry);
     if state.providers.is_empty() {
         bail!("no usable providers (pass --providers, set a [roles] block, or --select)");
     }
-    let fleet = state.providers.clone();
+    let pool = state.providers.clone();
 
     // Apply model-select choices onto slots when artifact exists.
     let art = crate::model_select::load_select_artifact(paths, &state.id)
@@ -349,37 +369,28 @@ fn prepare_implement_slots(
         })
     };
 
-    // Implementer at fleet index 0; a fixed number of reviewers follow it positionally.
-    // `provider_for` keys each slot: explicit --providers wins, else [roles], else order.
-    let impl_prov =
-        crate::workflow::roles_resolve::provider_for(SlotRole::Implementer, 0, &fleet, cfg)
-            .ok_or_else(|| anyhow::anyhow!("no provider resolved for implementer"))?;
-    state.slots.push(executor::init_slot_model(
-        "impl",
-        &impl_prov,
-        SlotRole::Implementer,
-        model_for(0),
-    ));
-    ensure_suite_slot(state, dry, cfg, paths)?;
-    for r in 0..DEFAULT_REVIEWERS {
-        let idx = r + 1;
-        let Some(prov) =
-            crate::workflow::roles_resolve::provider_for(SlotRole::Reviewer, idx, &fleet, cfg)
-        else {
-            continue;
-        };
-        // Id: reviewer index + the model-free provider name (storage_key drops `@model`),
-        // so two slots on `cli:codex@a` / `cli:codex@b` still get distinct ids.
-        let name = crate::provider_ref::ProviderRef::parse(&prov)
-            .map(|p| p.storage_key())
-            .unwrap_or_else(|_| prov.clone());
-        state.slots.push(executor::init_slot_model(
-            format!("review-{r}-{}", sanitize_slot(&name)),
-            &prov,
-            SlotRole::Reviewer,
-            model_for(idx),
-        ));
+    // One resolver for slot creation and for the plan gate's projection of this same
+    // panel (feature 011, item C): the id formula cannot drift between the two.
+    let seats = crate::workflow::roles_resolve::build_implement_seats(
+        cfg,
+        &pool,
+        pool_origin,
+        false,
+        &model_for,
+    );
+    if seats.iter().all(|s| s.role != SlotRole::Implementer) {
+        anyhow::bail!("no provider resolved for implementer");
     }
+    for seat in seats {
+        let mut slot =
+            executor::init_slot_model(&seat.seat, &seat.provider, seat.role, seat.model.clone());
+        slot.source = Some(seat.source);
+        state.slots.push(slot);
+    }
+    // The projected panel has graduated into real slots; a stale projection would only
+    // risk drifting from what was actually just resolved above.
+    state.projected_fleet.clear();
+    ensure_suite_slot(state, dry, cfg, paths)?;
     Ok(())
 }
 
@@ -847,14 +858,15 @@ fn run_with_task(
     state.big = opts.big;
     state.max_fix_rounds = 3;
     state.max_rounds = opts.max_rounds.unwrap_or(cfg.rounds.max);
-    let n = cfg.max_agents.max(3) as usize;
+    let n = crate::workflow::roles_resolve::pool_width(cfg);
     let roles: Vec<&str> = std::iter::once(SlotRole::Implementer.as_config_key())
         .chain(std::iter::repeat(SlotRole::Reviewer.as_config_key()))
         .take(n)
         .collect();
     let requested = opts.resolve_fleet(n, &roles, paths, cfg, &state.id)?;
+    let pool_origin = pool_origin_for(&opts);
     state.providers = providers::pick_providers(&requested, n, Some(&requested), dry);
-    // Gate the positional fleet in place — never compact it (see the sibling entry point).
+    // Gate the positional pool in place — never compact it (see the sibling entry point).
     if !dry {
         if let Err(e) = crate::quota::ensure_usable(paths, &state.providers) {
             state.error = Some(e.to_string());
@@ -869,7 +881,15 @@ fn run_with_task(
             return Ok(ExitCode::Quota);
         }
     }
-    prepare_implement_slots(&mut state, Some(&requested), dry, cfg, paths, false)?;
+    prepare_implement_slots(
+        &mut state,
+        Some(&requested),
+        pool_origin,
+        dry,
+        cfg,
+        paths,
+        false,
+    )?;
 
     paths.ensure_run_dirs(&state.id)?;
     let _ = crate::bus::ensure_bus(paths);
@@ -1728,19 +1748,51 @@ fn try_widen_reviewers(
     review_cwd: &std::path::Path,
     cfg: &Config,
 ) -> Result<bool> {
+    // A pinned panel (CLI `--role reviewer=…` or file `[roles].reviewer`) is an
+    // exclusion list, not a floor: widening it must duplicate a pin the run actually
+    // dispatched, never import a provider from `[providers].order` the operator
+    // deliberately left out (Bug A). Compare by storage key so a `cli:codex@terra` pin
+    // recognises the slot it created (`provider=cli:codex, model=terra`) as itself.
+    if crate::workflow::roles_resolve::reviewer_panel_pinned(cfg) {
+        let pins: Vec<String> = cfg
+            .roles
+            .reviewer
+            .iter()
+            .map(|p| {
+                crate::provider_ref::ProviderRef::parse(p)
+                    .map(|r| r.storage_key())
+                    .unwrap_or_else(|_| p.clone())
+            })
+            .collect();
+        let dispatched = state
+            .slots
+            .iter()
+            .find(|s| s.role == SlotRole::Reviewer && pins.iter().any(|p| p == &s.provider))
+            .or_else(|| state.slots.iter().find(|s| s.role == SlotRole::Reviewer));
+        let Some(src) = dispatched else {
+            return Ok(false);
+        };
+        let (provider, model, source) = (src.provider.clone(), src.model.clone(), src.source);
+        let id = format!("review-{}-wide", state.slots.len());
+        let mut slot = executor::init_slot_model(&id, &provider, SlotRole::Reviewer, model);
+        slot.cwd = Some(review_cwd.to_path_buf());
+        slot.source = source;
+        state.slots.push(slot);
+        state.save(paths)?;
+        return Ok(true);
+    }
     let existing: Vec<String> = state
         .slots
         .iter()
         .filter(|s| s.role == SlotRole::Reviewer)
         .map(|s| s.provider.clone())
         .collect();
-    // Draw the next reviewer from [roles].reviewer, then [providers].order, then the fleet.
+    // Unpinned: draw the next reviewer from [providers].order, then the pool.
     let candidate = cfg
-        .roles
-        .reviewer
+        .providers
+        .order
         .iter()
         .cloned()
-        .chain(cfg.providers.order.iter().cloned())
         .chain(state.providers.iter().cloned())
         .find(|p| !existing.contains(p));
     let Some(prov) = candidate else {

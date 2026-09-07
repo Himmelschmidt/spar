@@ -5,7 +5,7 @@ use crate::executor::{self, SlotJob};
 use crate::exit_codes::ExitCode;
 use crate::paths::SparPaths;
 use crate::providers;
-use crate::state::{Phase, RunState, SlotRole};
+use crate::state::{Phase, PoolOrigin, RunState, SeatSource, SlotRole};
 use crate::util::{self, sanitize_slot};
 use crate::worktree;
 use anyhow::Result;
@@ -34,24 +34,27 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
     // Frozen here because a plan run is where most units of work are created, and the
     // ceiling has to be the one the project set when the work started (O27/O52).
     state.max_rounds = cfg.rounds.max;
-    let n_slots = if cfg.spec.enabled { 3 } else { 2 };
-    let roles: &[&str] = if cfg.spec.enabled {
-        &[
-            SlotRole::Planner.as_config_key(),
-            SlotRole::PlanCritic.as_config_key(),
-            SlotRole::TestAuthor.as_config_key(),
-        ]
+    let mut roles: Vec<&str> = vec![SlotRole::Planner.as_config_key()];
+    if cfg.critic.enabled {
+        roles.push(SlotRole::PlanCritic.as_config_key());
+    }
+    if cfg.spec.enabled {
+        roles.push(SlotRole::TestAuthor.as_config_key());
+    }
+    let n_slots = roles.len();
+    let requested = opts.resolve_fleet(n_slots, &roles, paths, cfg, &state.id)?;
+    let pool_origin = if !opts.providers.is_empty() {
+        PoolOrigin::CliProviders
+    } else if !opts.select.is_empty() {
+        PoolOrigin::Selected
     } else {
-        &[
-            SlotRole::Planner.as_config_key(),
-            SlotRole::PlanCritic.as_config_key(),
-        ]
+        PoolOrigin::Synth
     };
-    let requested = opts.resolve_fleet(n_slots, roles, paths, cfg, &state.id)?;
+    state.pool_origin = pool_origin;
     state.providers = providers::pick_providers(&requested, n_slots, Some(&requested), dry);
-    // `state.providers` is positional: `provider_for(role, idx, …)` maps each slot by
-    // index, so quota must gate the fleet in place, never compact it — dropping a paused
-    // entry would slide another model into a role's slot and silently collapse the fleet
+    // `state.providers` is positional: `resolve_seat(role, idx, …)` maps each slot by
+    // index, so quota must gate the pool in place, never compact it — dropping a paused
+    // entry would slide another model into a role's slot and silently collapse the pool
     // onto one model (identical assignment to --dry-run is the contract).
     if !dry {
         if let Err(e) = crate::quota::ensure_usable(paths, &state.providers) {
@@ -89,16 +92,18 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
         .ok()
         .flatten();
     let mut jobs = Vec::new();
-    for (idx, (id, role, template, prov)) in plan_slot_specs(&state, cfg).into_iter().enumerate() {
+    for (idx, (id, role, template, prov, source)) in
+        plan_slot_specs(&state, cfg).into_iter().enumerate()
+    {
         let model = art.as_ref().and_then(|a| {
             a.choices
                 .iter()
                 .find(|c| c.role.as_deref() == Some(role.as_config_key()) || c.slot == idx)
                 .and_then(|c| c.model.clone())
         });
-        state
-            .slots
-            .push(executor::init_slot_model(&id, &prov, role, model.clone()));
+        let mut slot = executor::init_slot_model(&id, &prov, role, model.clone());
+        slot.source = Some(source);
+        state.slots.push(slot);
         jobs.push(SlotJob {
             slot_id: id,
             provider: prov,
@@ -145,26 +150,32 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
     Ok(state.exit_code())
 }
 
-/// The planner + critic slot specs `(id, role, template, provider)`, drawn from the
-/// resolved fleet via `provider_for` so both the first-pass and re-plan paths key the
-/// two slots identically (explicit `--providers` positional > `[roles]` > order).
+/// The planner + critic slot specs `(id, role, template, provider, source)`, drawn from
+/// the resolved pool via `resolve_seat` so both the first-pass and re-plan paths key the
+/// slots identically. `plan_critic` is omitted entirely when `[critic].enabled` is false
+/// (`--without critic`) — not resolved-then-discarded, so it never touches the bus.
 fn plan_slot_specs(
     state: &RunState,
     cfg: &Config,
-) -> Vec<(String, SlotRole, &'static str, String)> {
-    let specs = [
-        (SlotRole::Planner, "planner", "planner"),
-        (SlotRole::PlanCritic, "critic", "plan_critic"),
-    ];
+) -> Vec<(String, SlotRole, &'static str, String, SeatSource)> {
+    let mut specs = vec![(SlotRole::Planner, "planner", "planner")];
+    if cfg.critic.enabled {
+        specs.push((SlotRole::PlanCritic, "critic", "plan_critic"));
+    }
     let mut out = Vec::with_capacity(specs.len());
     for (idx, (role, prefix, template)) in specs.into_iter().enumerate() {
-        let Some(prov) =
-            crate::workflow::roles_resolve::provider_for(role, idx, &state.providers, cfg)
-        else {
+        let Some((prov, source)) = crate::workflow::roles_resolve::resolve_seat(
+            role,
+            idx,
+            idx,
+            &state.providers,
+            state.pool_origin,
+            cfg,
+        ) else {
             continue;
         };
         let id = format!("{prefix}-{}", sanitize_slot(&prov));
-        out.push((id, role, template, prov));
+        out.push((id, role, template, prov, source));
     }
     out
 }
@@ -256,6 +267,12 @@ pub fn execute_plan(
         }
     }
 
+    // The implement panel this run will dispatch, projected from the frozen config so
+    // the plan gate shows it before it exists (feature 011, item C): the human deciding
+    // whether to approve is exactly the one who needs to see what it will cost.
+    state.projected_fleet =
+        crate::workflow::roles_resolve::project_implement_fleet(cfg, state.dry_run);
+
     if cfg.auto_plan() {
         state.gates.plan_approved = true;
         state.set_phase(Phase::PlanApproved);
@@ -280,12 +297,14 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
         .find(|s| s.role == SlotRole::Planner)
         .map(|s| s.id.clone())
         .unwrap_or_else(|| "planner".into());
+    // `None` when `--without critic` dropped the seat entirely — the spec protocol must
+    // not invent a placeholder id to coordinate with (Bug AC-19: nothing on the bus may
+    // be addressed to a critic that does not exist).
     let critic_slot = state
         .slots
         .iter()
         .find(|s| s.role == SlotRole::PlanCritic)
-        .map(|s| s.id.clone())
-        .unwrap_or_else(|| "critic".into());
+        .map(|s| s.id.clone());
 
     let used: Vec<String> = state
         .slots
@@ -294,6 +313,17 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
         .map(|s| s.provider.clone())
         .collect();
     let provider = resolve_spec_provider(cfg, state.dry_run, &state.providers, &used)?;
+    let source = if cfg
+        .cli_role_keys
+        .contains(SlotRole::TestAuthor.as_config_key())
+    {
+        SeatSource::CliRole
+    } else if cfg.roles.test_author.is_some() {
+        SeatSource::RolesFile
+    } else {
+        SeatSource::ProvidersOrder
+    };
+    let test_author_idx = 1 + usize::from(cfg.critic.enabled);
     let model = crate::model_select::load_select_artifact(paths, &state.id)
         .ok()
         .flatten()
@@ -301,7 +331,8 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
             a.choices
                 .iter()
                 .find(|c| {
-                    c.role.as_deref() == Some(SlotRole::TestAuthor.as_config_key()) || c.slot == 2
+                    c.role.as_deref() == Some(SlotRole::TestAuthor.as_config_key())
+                        || c.slot == test_author_idx
                 })
                 .and_then(|c| c.model.clone())
         });
@@ -309,12 +340,10 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
     let id = format!("test-author-{safe}");
 
     if state.slots.iter().all(|s| s.id != id) {
-        state.slots.push(executor::init_slot_model(
-            &id,
-            &provider,
-            SlotRole::TestAuthor,
-            model.clone(),
-        ));
+        let mut slot =
+            executor::init_slot_model(&id, &provider, SlotRole::TestAuthor, model.clone());
+        slot.source = Some(source);
+        state.slots.push(slot);
     }
     worktree::prepare_isolation(state, paths, std::slice::from_ref(&id))?;
     // After isolation so status/TUI show Spec for the author wall-clock, not PrepareIsolation.
@@ -322,11 +351,13 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
     state.save(paths)?;
 
     let _ = bus::join(paths, Some(&state.id), &id, Some(&provider), None);
-    seed_spec_bus(state, paths, &id, &planner_slot, &critic_slot)?;
+    seed_spec_bus(state, paths, &id, &planner_slot, critic_slot.as_deref())?;
 
     let mut extra = HashMap::new();
     extra.insert("planner_slot".into(), planner_slot);
-    extra.insert("critic_slot".into(), critic_slot);
+    if let Some(c) = &critic_slot {
+        extra.insert("critic_slot".into(), c.clone());
+    }
     let job = SlotJob {
         slot_id: id.clone(),
         provider,
@@ -377,32 +408,41 @@ fn seed_spec_bus(
     paths: &SparPaths,
     author_id: &str,
     planner_slot: &str,
-    critic_slot: &str,
+    critic_slot: Option<&str>,
 ) -> Result<()> {
     let budget = state.message_budget;
+    let critic_clause = critic_slot
+        .map(|c| format!(" and critic `{c}`"))
+        .unwrap_or_default();
     let body = format!(
         "Spec phase: `{author_id}` will freeze acceptance tests from plan.md. \
-         Planner `{planner_slot}` and critic `{critic_slot}`: reply on bus if still available; \
+         Planner `{planner_slot}`{critic_clause}: reply on bus if still available; \
          otherwise the author uses plan + critique artifacts."
     );
     let _ = bus::broadcast(paths, Some(&state.id), "orchestrator", &body, budget);
 
-    for (to, note) in [
+    let coordinate_with = critic_slot
+        .map(|c| format!(" and `{c}`"))
+        .unwrap_or_default();
+    let mut recipients = vec![
         (
             author_id,
             format!(
-                "You are the test author. Coordinate with `{planner_slot}` and `{critic_slot}` via bus, then write tests + test-contract.md."
+                "You are the test author. Coordinate with `{planner_slot}`{coordinate_with} via bus, then write tests + test-contract.md."
             ),
         ),
         (
             planner_slot,
             format!("Test author `{author_id}` is writing acceptance tests. Answer bus questions if you can."),
         ),
-        (
-            critic_slot,
+    ];
+    if let Some(c) = critic_slot {
+        recipients.push((
+            c,
             format!("Test author `{author_id}` is freezing the test bar. Challenge weak scenarios on the bus if you can."),
-        ),
-    ] {
+        ));
+    }
+    for (to, note) in recipients {
         let _ = bus::send(
             paths,
             bus::BusMessage {
@@ -705,9 +745,11 @@ fn continue_locked(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exit
         });
     }
     if jobs.is_empty() {
-        for (id, role, template, prov) in plan_slot_specs(&state, cfg) {
+        for (id, role, template, prov, source) in plan_slot_specs(&state, cfg) {
             if state.slots.iter().all(|s| s.id != id) {
-                state.slots.push(executor::init_slot(&id, &prov, role));
+                let mut slot = executor::init_slot(&id, &prov, role);
+                slot.source = Some(source);
+                state.slots.push(slot);
             }
             jobs.push(SlotJob {
                 slot_id: id,
