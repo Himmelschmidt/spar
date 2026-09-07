@@ -64,6 +64,14 @@ pub struct StreamStats {
     /// its stdout stream, so this is how the slot's session log is found afterwards.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Where `recover_artifact` (executor.rs) stashes `session_id` while it is cleared
+    /// for the duration of a recovery spawn, so the liveness guard in
+    /// `providers::delivery::muse_session_id` (which reads only `session_id`) cannot
+    /// target the turn being recovered, while telemetry consumers that fall back to this
+    /// field don't lose the id for good if spar is killed before the recovery spawn
+    /// returns and restores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id_recovery_stash: Option<String>,
     pub lines_in: u64,
     pub chars_out: u64,
     /// RFC3339 of last successful log append (for stall detection).

@@ -222,8 +222,10 @@ impl<'a> NudgeWatch<'a> {
         }
         // muse's stdout carries no token counts, so its sidecar reads zero until
         // `enrich` runs post-exit. Its session log is appended live and is the only
-        // mid-dispatch source there is.
-        let Some(session_id) = stats.session_id else {
+        // mid-dispatch source there is. Falls back to the recovery stash for the same
+        // reason `muse_telemetry::enrich` does: a crash mid-`recover_artifact` can leave
+        // `session_id` cleared with no restore ever run.
+        let Some(session_id) = stats.session_id.or(stats.session_id_recovery_stash) else {
             return 0;
         };
         let mut live = self.live_muse.borrow_mut();

@@ -687,11 +687,17 @@ fn recover_artifact(r: &ArtifactRecovery) -> bool {
     // turn being recovered would otherwise pair with the recovery process's own (live)
     // pid marker and pass the liveness guard, targeting a session that already exited.
     // Cleared only for the duration of the recovery spawn below and restored once it
-    // returns (see the bottom of this function): the sidecar is `muse_telemetry`'s and
-    // `nudge.rs`'s only durable record of which muse session this slot ran, so losing it
-    // permanently would silently break both after every recovery.
+    // returns (see the bottom of this function). The value also gets stashed into
+    // `session_id_recovery_stash` before the clear, not just held in this local — spar
+    // getting killed mid-recovery (`spar stop`, SIGKILL, a panic) never returns here to
+    // restore it, and `muse_telemetry::enrich` / `nudge.rs`'s `live_billed` both fall back
+    // to the stash field, so a crash loses only the delivery seam's ability to target this
+    // (by then long-finished) session, not the durable usage record.
     let recovered_session_id = process::StreamStats::load(r.log_path).and_then(|mut stats| {
         let id = stats.session_id.take();
+        if let Some(id) = &id {
+            stats.session_id_recovery_stash = Some(id.clone());
+        }
         if id.is_some() {
             let _ = stats.save(r.log_path);
         }
@@ -753,6 +759,7 @@ fn recover_artifact(r: &ArtifactRecovery) -> bool {
     if let Some(id) = recovered_session_id {
         if let Some(mut stats) = process::StreamStats::load(r.log_path) {
             stats.session_id = Some(id);
+            stats.session_id_recovery_stash = None;
             let _ = stats.save(r.log_path);
         }
     }

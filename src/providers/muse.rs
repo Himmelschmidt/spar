@@ -40,16 +40,17 @@ impl ProviderAdapter for MuseAdapter {
     // the stream coalescer renders, but it carries **no** token usage. Usage lands only
     // in muse's session log, which `muse_telemetry` sums after the slot exits. No
     // presence stream is wired, so presence still degrades to the process/output
-    // heuristic. Delivery pushes as well as polls: `muse session-message send --target
-    // <session-uuid>` injects into the running session, keyed off the session id
+    // heuristic. Delivery pushes into the running session: `muse session-message send
+    // --target <session-uuid>` injects directly, keyed off the session id
     // `StreamCoalescer` captures from the exec JSONL's first `/stream/id` line, guarded on
     // the slot's pid still being alive (a sidecar outlives its process). The delivery seam
-    // (`providers::delivery`) always also writes the poll file, even when the push's own
-    // `--json` reply confirms intake (`"status":"ok"` or `"accepted"`): every box this has
-    // run on has muse's `external_agent_ingress` gate closed, so a confirmed push actually
-    // surfacing inside a *headless* `muse exec` run has never been observed end to end.
-    // The poll file is the one channel proven to work; the push is a bonus delivery once
-    // its reply can be trusted for real.
+    // (`providers::delivery`) falls back to the poll file only when the push is not
+    // confirmed — id unknown yet, send failed, or the `--json` reply's own `status` field
+    // didn't say `"ok"` or `"accepted"`; a confirmed push is never also duplicated into
+    // the poll file. No box this has run on has ever had muse's `external_agent_ingress`
+    // gate open, so a confirmed push actually surfacing inside a *headless* `muse exec`
+    // run has never been observed end to end — the poll file is the one channel proven to
+    // work, and the push is a bonus delivery once its reply can be trusted for real.
     fn delivery_strategy(&self) -> DeliveryStrategy {
         DeliveryStrategy::MuseSessionMessage
     }

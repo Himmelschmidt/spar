@@ -1494,6 +1494,7 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
                         billed_tokens: u.billed_tokens,
                         model: u.model.clone(),
                         session_id: None,
+                        session_id_recovery_stash: None,
                         lines_in: 0,
                         chars_out: 0,
                         last_log_at: None,
