@@ -107,21 +107,6 @@ that for finished runs. These two reduce how much gets created in the first plac
     matches `cache_read` today so stdout evidently uses different keys from the stored
     JSON-RPC form. Do not rewrite the parser without that capture.
 
-- **opencode `task` subagent spend is structurally invisible.** opencode's json emitter
-  filters child sessions out of the stream it prints: the one `process.stdout.write` call
-  site sits behind `if (A.sessionID !== e) continue`, so a subagent's `step_finish` never
-  reaches `handle_opencode` and never reaches `billed_tokens`. Unlike muse, which walks
-  `subagent/*/session.jsonl` post-exit, there is no recovery pass. Measured against
-  `opencode.db` (`session.parent_id`, summing
-  `tokens_input + output + reasoning + cache_read + cache_write`): the top parent by child
-  spend books 1,384,565 against 6,605,838 across 4 children (4.8x), the next 1,234,061
-  against 6,106,099 (4.9x), and one 197,553 against 3,226,622 (16.3x). Latent under spar
-  today only because no spar role prompt tells an opencode slot to fan out. **The O48
-  verification cannot detect this**: it reconciles a slot against the provider's ledger for
-  the session spar named, so spend booked to a child session is out of frame by
-  construction. The fix is a post-exit pass in the shape of `muse_telemetry::collect`,
-  walking `session.parent_id` in `opencode.db` from the `sessionID` spar already records.
-
 - **`worktree+bwrap` cannot write artifacts or markers.** `src/sandbox/bwrap.rs` binds `/`
   read-only and makes only the slot's `cwd` writable, but `artifacts_dir` and `markers_dir`
   both live under `.spar/runs/<id>/`, outside the worktree. Under that isolation mode a

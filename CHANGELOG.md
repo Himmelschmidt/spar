@@ -29,6 +29,10 @@ All notable changes to spar are recorded here.
   Previously they were recovered from disk after the fact (or read as zero when nothing
   was there to recover); they now come straight from agy's own structured output as the
   slot runs.
+- **A slot that fans out subagents no longer has its real spend hidden.** Some slots can
+  spawn their own child workers to split up a task; that child spend was previously
+  omitted from the token counts shown for the slot, understating usage by several times
+  over. It's now added back in after the slot finishes.
 - **Watching or checking on a run no longer fails at random while the run is writing.**
   A run's status file was rewritten in place, so anything reading it at the wrong moment
   could see half a file and give up with a parse error mid-run.

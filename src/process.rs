@@ -271,6 +271,26 @@ impl StreamStats {
     }
 }
 
+/// Reconstruct `StreamStats` from a completed log file by feeding it through the same
+/// coalescer `run_captured` feeds live. `run_captured` merges counters as the stream is
+/// read, so a caller that only has the finished file (tmux's `tee`d pane output, which
+/// `run_tmux` never pipes through a live coalescer) can recover the same numbers after
+/// the fact. Only meaningful for a provider whose pane runs the same structured stream as
+/// headless (opencode's `run --format json`); other adapters' interactive TUI output is
+/// not JSON, so the coalescer degrades every line to inert text and this returns zeros.
+pub fn stats_from_log(log_path: &Path) -> StreamStats {
+    let mut stats = StreamStats::default();
+    let Ok(text) = std::fs::read_to_string(log_path) else {
+        return stats;
+    };
+    let mut c = StreamCoalescer::new(false);
+    for line in text.lines() {
+        c.feed(line);
+    }
+    c.merge_counters_into(&mut stats);
+    stats
+}
+
 #[derive(Debug)]
 pub struct SpawnResult {
     pub exit_code: Option<i32>,
@@ -3079,6 +3099,38 @@ mod tests {
         assert_eq!(s.cache_read_tokens, 1920);
         assert_eq!(s.billed_tokens, 12738 + 1920 + s.output_tokens);
         assert_eq!(s.session_id.as_deref(), Some("ses_1"));
+    }
+
+    #[test]
+    fn stats_from_log_recovers_a_tmuxd_opencode_stream() {
+        // `run_tmux` never runs a live coalescer over the pane's output; it only tees the
+        // raw stream to `log_path` (plus a trailing `tee`-added `EXIT:$?` line). This is
+        // the post-hoc reconstruction that closes that gap, fed the same shape of file.
+        let tmp = tempdir().unwrap();
+        let log = tmp.path().join("slot.log");
+        std::fs::write(
+            &log,
+            concat!(
+                r#"{"type":"text","sessionID":"ses_1","part":{"id":"prt_t","type":"text","text":"DONE"}}"#,
+                "\n",
+                r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_f","type":"step-finish","tokens":{"input":12738,"output":19,"cache":{"read":1920,"write":0}}}}"#,
+                "\n",
+                "EXIT:0\n",
+            ),
+        )
+        .unwrap();
+        let s = stats_from_log(&log);
+        assert_eq!(s.input_tokens, 12738);
+        assert_eq!(s.cache_read_tokens, 1920);
+        assert_eq!(s.billed_tokens, 12738 + 1920 + s.output_tokens);
+        assert_eq!(s.session_id.as_deref(), Some("ses_1"));
+    }
+
+    #[test]
+    fn stats_from_log_is_zero_for_a_missing_file() {
+        let s = stats_from_log(Path::new("/nonexistent/spar-test-slot.log"));
+        assert_eq!(s.billed_tokens, 0);
+        assert!(s.session_id.is_none());
     }
 
     #[test]
