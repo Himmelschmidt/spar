@@ -914,7 +914,8 @@ touching `spar.toml`, on `plan`, `implement` and `run`. Composition order: prese
 `--without`, then `--role` — explicit flags always win over the preset.
 
 - **`--fleet standard`** is a no-op over the file: it never re-enables a channel the
-  project already disabled.
+  project already disabled. Because it changes nothing, it is the one `--fleet`/`--without`/
+  `--role` value that does *not* need `--reload-config` on an existing `--run <id>`.
 - **`--fleet small`** is one reviewer (the first pin if the panel is pinned, else the same
   provider the unpinned panel's first seat would get), no `plan_critic`, no `test_author`,
   and no agent `tester` — a configured deterministic `[suite].command` still runs, since it
@@ -936,7 +937,10 @@ before feature 011). `projected: true` marks a seat the run will dispatch later 
 created yet — at the plan gate this is the whole implement panel (implementer, reviewer
 panel, and a non-built-in suite's `tester`), resolved through the same functions slot
 creation uses (`roles_resolve::build_implement_seats`, `implement::project_tester_seat`), so
-a projected seat's id always equals the id the implement phase later creates. Human output
+a projected seat's id always equals the id the implement phase later creates. The projection
+reads `model-select.json` read-only, so a model already chosen by an earlier `--select`
+shows up at the gate instead of always reporting `model: null` — it never triggers a fresh
+pick or writes the artifact itself. Human output
 prints the same data as a `fleet:` table at gate phases only (`awaiting_plan_approval`,
 `awaiting_ship_confirm`, `awaiting_winner_confirm`, `awaiting_round_extension`), alongside
 the existing one-line `roles:` summary — the point at which a human is deciding whether to

@@ -45,6 +45,18 @@ All notable changes to spar are recorded here.
   The provider list now wins for that seat too, matching every other role.
 - **The "where did this seat come from" label is accurate for review, paired, and
   competing-agent runs**, not just the main implement flow.
+- **The smallest fleet size no longer disables retrying a failed reviewer.** Narrowing
+  the review panel to one seat still lets that seat be retried on a different provider
+  if it fails, the same as it would with the default panel size.
+- **The "where did this seat come from" label is also accurate when a failed
+  implementer or reviewer gets rotated or an extra reviewer gets added**, not just on
+  first dispatch.
+- **The plan approval screen now shows the model an already-chosen provider will
+  actually use**, when one was picked earlier in the run, instead of always showing
+  none until after you approved.
+- **Applying the "today's defaults" fleet size to a run already in progress no longer
+  fails.** It changes nothing, so it no longer needs the flag that reloads settings
+  from disk.
 
 ## [0.0.3] - 2026-09-04
 
