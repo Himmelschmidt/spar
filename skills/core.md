@@ -931,11 +931,22 @@ touching `spar.toml`, on `plan`, `implement` and `run`. Composition order: prese
 **Run JSON carries a `fleet` array**, one entry per seat: `{seat, role, provider, model,
 source, projected}`. `source` names the precedence rung the provider came from —
 `cli-role`, `cli-providers`, `roles-file`, `providers-order`, `model-select`, or
-`suite-preferences`. `projected: true` marks a seat the run will dispatch later but has not
-created yet — at the plan gate this is the whole implement panel, resolved through the same
-function slot creation uses (`roles_resolve::build_implement_seats`), so a projected seat's
-id always equals the id the implement phase later creates. The human gate output prints the
-same data as a `fleet:` table, alongside the existing one-line `roles:` summary.
+`suite-preferences` — or `unknown` for a slot with no recorded provenance (state written
+before feature 011). `projected: true` marks a seat the run will dispatch later but has not
+created yet — at the plan gate this is the whole implement panel (implementer, reviewer
+panel, and a non-built-in suite's `tester`), resolved through the same functions slot
+creation uses (`roles_resolve::build_implement_seats`, `implement::project_tester_seat`), so
+a projected seat's id always equals the id the implement phase later creates. The human gate
+output prints the same data as a `fleet:` table, alongside the existing one-line `roles:`
+summary.
+
+The plan phase's own pool is narrowed to however many plan-phase seats it needs
+(`planner` [+ `plan_critic`] [+ `test_author`]), which can be fewer than the implement
+panel — e.g. `--fleet small` or `--without critic` narrow the plan phase to one or two
+seats while the implement panel still wants an implementer plus reviewers. `state.pool_intent`
+carries the operator's un-narrowed `--providers`/`--select` pool so both the plan gate's
+projection and a later bare `implement --run <id>` continuation see the full pool, not the
+plan phase's truncated one.
 
 ## A run is bound to the config it was created with
 
@@ -1010,6 +1021,11 @@ timeout_secs = 7200
 # Reviewer verdict / acceptance gate (review timeouts stay under [timeouts]).
 [review]
 require_all_criteria = true   # false ⇒ an `unverified` AC no longer blocks the ship
+# Plan-phase critic seat. `--without critic` is the per-run way to drop just this one;
+# this is the persistent file knob (there is no "absent [roles].plan_critic" signal for
+# it — that silently fell back to [providers].order instead of dropping the seat).
+[critic]
+enabled = true
 # Round-loop economy. A round is a cold re-dispatch; measured, one fix round is 6.6x the
 # median run cost. `max` is the highest round a run may reach before it parks at the
 # awaiting_round_extension gate (exit 2); 0 disables. `carry_forward_chars` caps the brief

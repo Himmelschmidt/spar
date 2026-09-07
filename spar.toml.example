@@ -111,6 +111,10 @@ require_all_criteria = true
 max = 8
 carry_forward_chars = 4000
 
+# Plan-phase critic. `--without critic` is the per-run way to drop just this seat.
+[critic]
+enabled = true
+
 # Pre-coding acceptance tests (plan flow). Separate agent freezes tests before implement.
 [spec]
 enabled = true

@@ -50,7 +50,7 @@ pub enum Command {
         /// Overrides `[roles]` for the positions it covers.
         #[arg(long, value_delimiter = ',')]
         providers: Vec<String>,
-        /// Resolve fleet from vals benchmarks + profile (`value`, `best`, `fast`, `auto`, or list)
+        /// Resolve the provider pool from vals benchmarks + profile (`value`, `best`, `fast`, `auto`, or list)
         #[arg(long, value_delimiter = ',')]
         select: Vec<String>,
         /// Urgency for `--select`: low | normal | high | critical
@@ -175,7 +175,7 @@ pub enum Command {
         /// Overrides `[roles]` for the positions it covers.
         #[arg(long, value_delimiter = ',')]
         providers: Vec<String>,
-        /// Resolve fleet from vals benchmarks + profile
+        /// Resolve the provider pool from vals benchmarks + profile
         #[arg(long, value_delimiter = ',')]
         select: Vec<String>,
         #[arg(long, default_value = "normal")]
@@ -223,7 +223,7 @@ pub enum Command {
         /// Overrides `[roles]` for the positions it covers.
         #[arg(long, value_delimiter = ',')]
         providers: Vec<String>,
-        /// Resolve fleet from vals benchmarks + profile
+        /// Resolve the provider pool from vals benchmarks + profile
         #[arg(long, value_delimiter = ',')]
         select: Vec<String>,
         #[arg(long, default_value = "normal")]
