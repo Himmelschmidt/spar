@@ -96,6 +96,8 @@ fn run() -> Result<ExitCode> {
             select,
             urgency,
             role,
+            fleet,
+            without,
             base,
             detach,
             json,
@@ -111,6 +113,8 @@ fn run() -> Result<ExitCode> {
                     (!providers.is_empty(), "--providers"),
                     (!select.is_empty(), "--select"),
                     (!role.is_empty(), "--role"),
+                    (fleet.is_some(), "--fleet"),
+                    (!without.is_empty(), "--without"),
                     (base.is_some(), "--base"),
                     (big, "--big"),
                     (detach, "--detach"),
@@ -122,7 +126,7 @@ fn run() -> Result<ExitCode> {
                 .collect::<Vec<_>>();
                 if !ignored.is_empty() {
                     anyhow::bail!(
-                        "`plan --run` replans an existing run and inherits its fleet, base and config; \
+                        "`plan --run` replans an existing run and inherits its pool, base and config; \
                          {} cannot apply. Drop them, or start new work with `spar plan -t \"…\"`.",
                         ignored.join(", ")
                     );
@@ -132,6 +136,10 @@ fn run() -> Result<ExitCode> {
                 return workflow::plan::replan(&paths, &cfg, &id, task, json);
             }
             let (paths, mut cfg) = project_ctx()?;
+            if let Some(preset) = &fleet {
+                cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
+            }
+            cfg.apply_without(&without)?;
             cfg.apply_role_overrides(&role)?;
             let opts = CommonOpts {
                 task: Some(task.clone()),
@@ -167,6 +175,8 @@ fn run() -> Result<ExitCode> {
             plan,
             task,
             role,
+            fleet,
+            without,
             reload_config,
             max_rounds,
             accept_contract,
@@ -180,7 +190,13 @@ fn run() -> Result<ExitCode> {
             urgency,
             big,
         } => {
-            let (paths, cfg) = implement_ctx(run_id.as_deref(), &role, reload_config)?;
+            let (paths, cfg) = implement_ctx(
+                run_id.as_deref(),
+                &role,
+                &without,
+                fleet.as_deref(),
+                reload_config,
+            )?;
             let opts = CommonOpts {
                 task: task.clone(),
                 providers,
@@ -201,6 +217,8 @@ fn run() -> Result<ExitCode> {
             workflow,
             task,
             role,
+            fleet,
+            without,
             base,
             detach,
             json,
@@ -212,6 +230,10 @@ fn run() -> Result<ExitCode> {
             big,
         } => {
             let (paths, mut cfg) = project_ctx()?;
+            if let Some(preset) = &fleet {
+                cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
+            }
+            cfg.apply_without(&without)?;
             cfg.apply_role_overrides(&role)?;
             let opts = CommonOpts {
                 task,
@@ -537,10 +559,16 @@ fn bus_deliver(
 fn implement_ctx(
     run_id: Option<&str>,
     role: &[String],
+    without: &[String],
+    fleet: Option<&str>,
     reload_config: bool,
 ) -> Result<(paths::SparPaths, Config)> {
     let (paths, mut cfg) = project_ctx()?;
     let Some(run_id) = run_id else {
+        if let Some(preset) = fleet {
+            cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
+        }
+        cfg.apply_without(without)?;
         cfg.apply_role_overrides(role)?;
         return Ok((paths, cfg));
     };
@@ -551,9 +579,32 @@ fn implement_ctx(
                  pass --reload-config to apply --role to it"
             );
         }
+        if !without.is_empty() {
+            anyhow::bail!(
+                "run {run_id} is bound to the config it was created with; \
+                 pass --reload-config to apply --without to it"
+            );
+        }
+        if let Some(preset) = fleet {
+            // Validate before refusing: an unknown preset name is its own error, not
+            // one the `--reload-config` refusal should swallow. `standard` is a
+            // documented no-op over the file (never re-enables a channel the file
+            // already disabled), so it never needs to change a bound run's frozen
+            // config and must not be refused just for being spelled out.
+            if config::FleetPreset::parse(preset)? != config::FleetPreset::Standard {
+                anyhow::bail!(
+                    "run {run_id} is bound to the config it was created with; \
+                     pass --reload-config to apply --fleet to it"
+                );
+            }
+        }
         let cfg = Config::for_run(&paths, run_id)?;
         return Ok((paths, cfg));
     }
+    if let Some(preset) = fleet {
+        cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
+    }
+    cfg.apply_without(without)?;
     cfg.apply_role_overrides(role)?;
     cfg.save_snapshot(&paths, run_id)?;
     eprintln!("config: re-read spar.toml for run {run_id}");

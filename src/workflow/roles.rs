@@ -35,8 +35,8 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     if dry {
         std::env::set_var("SPAR_DRY_RUN", "1");
     }
-    let requested =
-        opts.resolve_fleet(2, &["implementer", "implementer"], paths, cfg, &state.id)?;
+    let requested = opts.resolve_pool(2, &["implementer", "implementer"], paths, cfg, &state.id)?;
+    state.pool_origin = crate::workflow::roles_resolve::pool_origin_for(&opts);
     state.providers = providers::pick_providers(&requested, 2, Some(&requested), dry);
     if state.providers.is_empty() {
         state.error = Some("no usable providers".into());
@@ -56,16 +56,19 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
 
     let fe = state.providers[0].clone();
     let be = state.providers[1].clone();
-    state.slots.push(executor::init_slot(
-        format!("role-frontend-{fe}"),
-        &fe,
-        SlotRole::Peer,
-    ));
-    state.slots.push(executor::init_slot(
-        format!("role-backend-{be}"),
-        &be,
-        SlotRole::Peer,
-    ));
+    let sources = crate::workflow::roles_resolve::resolve_seat_sources(
+        SlotRole::Implementer,
+        2,
+        &state.providers,
+        state.pool_origin,
+        cfg,
+    );
+    let mut fe_slot = executor::init_slot(format!("role-frontend-{fe}"), &fe, SlotRole::Peer);
+    fe_slot.source = sources.first().copied();
+    state.slots.push(fe_slot);
+    let mut be_slot = executor::init_slot(format!("role-backend-{be}"), &be, SlotRole::Peer);
+    be_slot.source = sources.get(1).copied();
+    state.slots.push(be_slot);
 
     paths.ensure_run_dirs(&state.id)?;
     bus::ensure_bus(paths)?;

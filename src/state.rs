@@ -110,6 +110,30 @@ pub struct RunState {
     /// explicitly rather than infer it from the field's absence.
     #[serde(default)]
     pub contract_modified: bool,
+    /// The implement panel this run will dispatch, as best projected from the frozen
+    /// config at the moment the plan gate was reached (feature 011). Cleared once the
+    /// implement phase creates its real slots — `executor::run_fleet_seats` reads real
+    /// slots first and only falls back to this for seats with no matching slot id yet, so
+    /// a projection can never outlive or contradict what actually got dispatched.
+    #[serde(default)]
+    pub projected_fleet: Vec<FleetSeat>,
+    /// Provenance of `providers` (the pool) as last resolved for the *plan* phase
+    /// (planner/critic/test_author), from the flags that invocation actually passed.
+    /// Feature 011. Read by `plan::plan_slot_specs`, which is called from more than one
+    /// site and needs this without re-threading `CommonOpts` through all of them.
+    #[serde(default)]
+    pub pool_origin: PoolOrigin,
+    /// The raw pool the operator asked for at plan time, before it was narrowed to the
+    /// plan phase's own slot count. `providers` is cycled/truncated to fit whichever
+    /// phase resolved it last (`providers::pick_providers`), so a plan with fewer plan
+    /// roles than the implement panel needs (`--fleet small`, `--without critic`) would
+    /// otherwise lose reviewer positions past the plan's own width. Both the plan gate's
+    /// implement-panel projection and a bare `implement --run` continuation read this
+    /// instead of `providers` so neither drifts narrower than what the operator actually
+    /// supplied. Empty for a run with no explicit `--providers`/`--select` (there is
+    /// nothing narrower to lose).
+    #[serde(default)]
+    pub pool_intent: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,6 +300,75 @@ pub struct SlotState {
     /// Reset at the start of every dispatch, so a re-dispatch never carries a stale hit.
     #[serde(default)]
     pub quota_hit: bool,
+    /// Which precedence rung this seat's provider was resolved from (feature 011).
+    /// `None` for slots created outside the fleet resolver (arena/peer/roles/review) or
+    /// for state written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SeatSource>,
+}
+
+/// Where a seat's provider was resolved from, in precedence order. Feature 011: the
+/// resolved fleet is honest about which rung of `CLI --role > CLI --providers/--select >
+/// [roles] > [providers].order` produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SeatSource {
+    CliRole,
+    CliProviders,
+    RolesFile,
+    ProvidersOrder,
+    ModelSelect,
+    SuitePreferences,
+    /// A slot with no recorded provenance — pre-011 `state.json`, or a code path that has
+    /// not been threaded onto a real `SeatSource` yet. Never guess `ProvidersOrder`: that
+    /// claims a specific rung the seat may never have taken.
+    Unknown,
+}
+
+/// Provenance of the positional pool a run resolved, at the moment a phase's seats were
+/// built. `CliProviders`/`Selected` are real overrides (an operator-supplied `--providers`
+/// list, or a `--select` result); `Synth` means the pool itself was synthesized from
+/// `[roles]` / `[providers].order` and so must not be read back as an override — every
+/// seat drawn from a `Synth` pool is resolved fresh from `cfg`, not from the pool array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PoolOrigin {
+    CliProviders,
+    Selected,
+    #[default]
+    Synth,
+}
+
+impl PoolOrigin {
+    /// The honest `SeatSource` for a seat drawn straight from this pool, with no more
+    /// specific rung (CLI role, `[roles]`) applying. Keeps every workflow that builds
+    /// slots from `state.providers` off a hardcoded `SeatSource::ProvidersOrder` guess.
+    ///
+    /// `Synth` has no single answer: that pool was built per position from `[roles]` *and*
+    /// `[providers].order`, so one entry can be `RolesFile` and the next `ProvidersOrder`.
+    /// A caller holding the seat's pool position should ask
+    /// `roles_resolve::resolve_seat_sources` instead of this; the ones that cannot report
+    /// `Unknown` rather than claim a rung the seat may never have taken.
+    pub fn as_seat_source(self) -> SeatSource {
+        match self {
+            PoolOrigin::CliProviders => SeatSource::CliProviders,
+            PoolOrigin::Selected => SeatSource::ModelSelect,
+            PoolOrigin::Synth => SeatSource::Unknown,
+        }
+    }
+}
+
+/// One seat in the resolved fleet — actual (a slot already exists) or projected (the run
+/// will dispatch it later, e.g. the implement panel seen from the plan gate). Feature 011.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetSeat {
+    pub seat: String,
+    pub role: SlotRole,
+    pub provider: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    pub source: SeatSource,
+    pub projected: bool,
 }
 
 fn one_round() -> u32 {
@@ -443,6 +536,9 @@ impl RunState {
             contract_fingerprint: None,
             contract_modified: false,
             round: 1,
+            projected_fleet: Vec::new(),
+            pool_origin: PoolOrigin::default(),
+            pool_intent: Vec::new(),
         }
     }
 
@@ -573,7 +669,14 @@ impl RunState {
         };
         let file = paths.state_file(&self.id);
         let text = serde_json::to_string_pretty(self)?;
-        std::fs::write(&file, text).with_context(|| format!("write {}", file.display()))?;
+        // Written through a temp file in the same directory, then renamed: `state.json`
+        // has no lock on the read side (`status`, `wait`, the TUI, every slot's own
+        // `SPAR_RUN_ID` lookup), so a plain truncate-and-write hands any concurrent
+        // reader a half-written file. `spar wait` died on exactly that mid-run, on
+        // `parse run state …: EOF while parsing a value at line 1 column 0`.
+        let tmp = file.with_extension(format!("tmp.{}", std::process::id()));
+        std::fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &file).with_context(|| format!("replace {}", file.display()))?;
 
         if prev_phase != Some(self.phase) {
             let _ = crate::events::append(
@@ -984,6 +1087,46 @@ mod tests {
 
         crate::markers::clear_pid(&paths, &state.id, BUILTIN_SUITE_PID_ID);
         assert!(live_slot_pids(&paths, &state).is_empty());
+    }
+
+    /// `state.json` is read without a lock by `status`, `wait` and the TUI while an
+    /// orchestrator is writing it. A truncate-and-write save hands those readers a
+    /// half-written file; this reads the run flat out while it is saved 300 times and
+    /// insists every read that lands is a whole run.
+    #[test]
+    fn concurrent_readers_never_see_a_half_written_state() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new("r-atomic", WorkflowKind::Loop, tmp.path().to_path_buf());
+        state.task = Some("x".repeat(64 * 1024));
+        state.save(&paths).unwrap();
+
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let paths = SparPaths::new(tmp.path());
+            let done = done.clone();
+            std::thread::spawn(move || {
+                let mut reads = 0u32;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    RunState::load(&paths, "r-atomic").expect("torn read of state.json");
+                    reads += 1;
+                }
+                reads
+            })
+        };
+        for i in 0..300 {
+            state.round = i;
+            state.save(&paths).unwrap();
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(reader.join().unwrap() > 0, "reader never got a read in");
+        assert!(
+            std::fs::read_dir(paths.run_dir("r-atomic"))
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .all(|e| !e.file_name().to_string_lossy().starts_with("state.tmp")),
+            "save left a temp file behind"
+        );
     }
 
     #[test]

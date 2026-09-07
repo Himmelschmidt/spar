@@ -4,7 +4,10 @@ use crate::executor::{self, SlotJob};
 use crate::exit_codes::ExitCode;
 use crate::paths::SparPaths;
 use crate::providers;
-use crate::state::{Phase, RunState, SlotRole, SlotState, SlotStatus, SuiteOutcome};
+use crate::state::{
+    FleetSeat, Phase, PoolOrigin, RunState, SeatSource, SlotRole, SlotState, SlotStatus,
+    SuiteOutcome,
+};
 use crate::util::{self, sanitize_slot};
 use crate::workflow::review_result::{self, AcStatus, ReviewResult};
 use crate::worktree;
@@ -133,7 +136,7 @@ pub fn run_loop(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<Exi
 fn run_from_approved(
     run_id: &str,
     amendment: Option<String>,
-    opts: CommonOpts,
+    mut opts: CommonOpts,
     paths: &SparPaths,
     cfg: &Config,
 ) -> Result<ExitCode> {
@@ -223,14 +226,67 @@ fn run_from_approved(
     if state.dry_run {
         std::env::set_var("SPAR_DRY_RUN", "1");
     }
-    let n = cfg.max_agents.max(3) as usize;
+    // A bare `implement --run <id>` (no flags at all) is a continuation, not a fresh
+    // request. Reuse the run's frozen pool only when it was a genuine operator override
+    // (`--providers`/`--select`) — `pool_intent` when the plan phase captured one wider
+    // than its own slot count needed, else `providers`. When the frozen pool was itself
+    // synthesized from `[roles]`/`[providers].order` (`PoolOrigin::Synth`), there is
+    // nothing of the operator's to preserve, so this resolves fresh from `cfg` instead —
+    // the only way a `--reload-config` continuation can pick up an edited `[roles]`.
+    // Reusing unconditionally (ignoring `pool_origin`) would silently drop an earlier
+    // `--providers`/`--select` the moment any `[roles]` entry (e.g. a CLI-pinned
+    // reviewer) also happens to be frozen — the opposite bug.
+    let is_explicit_frozen_pool = matches!(
+        state.pool_origin,
+        PoolOrigin::CliProviders | PoolOrigin::Selected
+    );
+    let frozen_pool: Vec<String> = if !state.pool_intent.is_empty() {
+        state.pool_intent.clone()
+    } else {
+        state.providers.clone()
+    };
+    let reuses_frozen_pool = opts.providers.is_empty()
+        && opts.select.is_empty()
+        && is_explicit_frozen_pool
+        && !frozen_pool.is_empty();
+    let n = crate::workflow::roles_resolve::pool_width(cfg);
+    if reuses_frozen_pool {
+        // The frozen pool may be narrower than this round's panel — e.g. a plan phase
+        // that ran with `--without critic,spec` only ever needed one provider. Refusing
+        // here regressed the documented `plan -> approve -> implement --run` flow itself
+        // (any plan pool narrower than the implement panel broke its own continuation);
+        // `pick_providers` below already cycles a short explicit pool to fill `n`, the
+        // same fallback an unpinned panel already relies on, so let it.
+        opts.providers = frozen_pool.clone();
+    }
     let roles: Vec<&str> = std::iter::once(SlotRole::Implementer.as_config_key())
         .chain(std::iter::repeat(SlotRole::Reviewer.as_config_key()))
         .take(n)
         .collect();
-    let requested = opts.resolve_fleet(n, &roles, paths, cfg, &state.id)?;
+    let requested = opts.resolve_pool(n, &roles, paths, cfg, &state.id)?;
+    // `opts.providers` was just filled from the frozen pool above when reusing a
+    // continuation's pool — that is not a fresh CLI `--providers`, so the source it
+    // reports has to stay whatever the run already froze (`state.pool_origin`), not get
+    // relabelled `cli-providers` for having reached the resolver as a non-empty pool.
+    let pool_origin = if reuses_frozen_pool {
+        state.pool_origin
+    } else {
+        crate::workflow::roles_resolve::pool_origin_for(&opts)
+    };
+    state.pool_origin = pool_origin;
+    // A replacement pool this round (an explicit `--providers`/`--select` on the
+    // continuation) becomes the new frozen intent for any later round; a reused one
+    // needs no change, and a fresh non-explicit resolution has no intent to freeze.
+    if !reuses_frozen_pool {
+        state.pool_intent =
+            if matches!(pool_origin, PoolOrigin::CliProviders | PoolOrigin::Selected) {
+                requested.clone()
+            } else {
+                Vec::new()
+            };
+    }
     state.providers = providers::pick_providers(&requested, n, Some(&requested), state.dry_run);
-    // Gate the positional fleet in place — never compact it, or a paused provider would
+    // Gate the positional pool in place — never compact it, or a paused provider would
     // slide a different model into a role's slot (silent single-model collapse). Paused
     // providers fail loud so the review panel stays exactly what was specified.
     if !state.dry_run {
@@ -275,6 +331,7 @@ fn run_from_approved(
     prepare_implement_slots(
         &mut state,
         Some(&requested),
+        pool_origin,
         dry,
         cfg,
         paths,
@@ -295,14 +352,10 @@ fn run_from_approved(
     Ok(state.exit_code())
 }
 
-/// Reviewer slots spawned alongside the implementer. The fleet width (`max_agents.max(3)`)
-/// still bounds provider resolution; this names the review-panel size once instead of the
-/// three unrelated coincidences (the old `while` pad, two literal pushes, `.max(3)`).
-const DEFAULT_REVIEWERS: usize = 2;
-
 fn prepare_implement_slots(
     state: &mut RunState,
     requested: Option<&[String]>,
+    pool_origin: PoolOrigin,
     dry: bool,
     cfg: &Config,
     paths: &SparPaths,
@@ -329,12 +382,12 @@ fn prepare_implement_slots(
     }
 
     let req = requested.unwrap_or_default();
-    let n = cfg.max_agents.max(3) as usize;
+    let n = crate::workflow::roles_resolve::pool_width(cfg);
     state.providers = providers::pick_providers(req, n, Some(req), dry);
     if state.providers.is_empty() {
         bail!("no usable providers (pass --providers, set a [roles] block, or --select)");
     }
-    let fleet = state.providers.clone();
+    let pool = state.providers.clone();
 
     // Apply model-select choices onto slots when artifact exists.
     let art = crate::model_select::load_select_artifact(paths, &state.id)
@@ -349,38 +402,44 @@ fn prepare_implement_slots(
         })
     };
 
-    // Implementer at fleet index 0; a fixed number of reviewers follow it positionally.
-    // `provider_for` keys each slot: explicit --providers wins, else [roles], else order.
-    let impl_prov =
-        crate::workflow::roles_resolve::provider_for(SlotRole::Implementer, 0, &fleet, cfg)
-            .ok_or_else(|| anyhow::anyhow!("no provider resolved for implementer"))?;
-    state.slots.push(executor::init_slot_model(
-        "impl",
-        &impl_prov,
-        SlotRole::Implementer,
-        model_for(0),
-    ));
-    ensure_suite_slot(state, dry, cfg, paths)?;
-    for r in 0..DEFAULT_REVIEWERS {
-        let idx = r + 1;
-        let Some(prov) =
-            crate::workflow::roles_resolve::provider_for(SlotRole::Reviewer, idx, &fleet, cfg)
-        else {
-            continue;
-        };
-        // Id: reviewer index + the model-free provider name (storage_key drops `@model`),
-        // so two slots on `cli:codex@a` / `cli:codex@b` still get distinct ids.
-        let name = crate::provider_ref::ProviderRef::parse(&prov)
-            .map(|p| p.storage_key())
-            .unwrap_or_else(|_| prov.clone());
-        state.slots.push(executor::init_slot_model(
-            format!("review-{r}-{}", sanitize_slot(&name)),
-            &prov,
-            SlotRole::Reviewer,
-            model_for(idx),
-        ));
+    // One resolver for slot creation and for the plan gate's projection of this same
+    // panel (feature 011, item C): the id formula cannot drift between the two.
+    let seats = crate::workflow::roles_resolve::build_implement_seats(
+        cfg,
+        &pool,
+        pool_origin,
+        false,
+        &model_for,
+    );
+    if seats.iter().all(|s| s.role != SlotRole::Implementer) {
+        anyhow::bail!("no provider resolved for implementer");
     }
+    for seat in seats {
+        let mut slot =
+            executor::init_slot_model(&seat.seat, &seat.provider, seat.role, seat.model.clone());
+        slot.source = Some(seat.source);
+        state.slots.push(slot);
+    }
+    // The projected panel has graduated into real slots; a stale projection would only
+    // risk drifting from what was actually just resolved above.
+    state.projected_fleet.clear();
+    ensure_suite_slot(state, dry, cfg, paths)?;
     Ok(())
+}
+
+/// Kill and drop every tester slot: the pid marker is filed under the slot id, so it
+/// must be reaped before the slot record disappears or a still-running agent becomes an
+/// orphan nothing can find (O28).
+fn reap_tester_slots(state: &mut RunState, paths: &SparPaths) {
+    for slot in state.slots.iter().filter(|s| s.role == SlotRole::Tester) {
+        if let Some(token) = crate::markers::read_pid(paths, &state.id, &slot.id) {
+            if token.alive() {
+                crate::process::terminate_tree(token.pid, true);
+            }
+        }
+        crate::markers::clear_pid(paths, &state.id, &slot.id);
+    }
+    state.slots.retain(|s| s.role != SlotRole::Tester);
 }
 
 /// Ensure a tester slot exists when suite is enabled. Fail closed if no provider.
@@ -400,47 +459,114 @@ fn ensure_suite_slot(
         // check every round, and goes on writing the same `suite.md` spar writes.
         // Killing it is this command's call: it holds the run lock, the slot is its own,
         // and the channel that slot belonged to no longer exists.
-        for slot in state.slots.iter().filter(|s| s.role == SlotRole::Tester) {
-            if let Some(token) = crate::markers::read_pid(paths, &state.id, &slot.id) {
-                if token.alive() {
-                    crate::process::terminate_tree(token.pid, true);
-                }
-            }
-            crate::markers::clear_pid(paths, &state.id, &slot.id);
-        }
-        state.slots.retain(|s| s.role != SlotRole::Tester);
+        reap_tester_slots(state, paths);
         return Ok(());
     }
     if !cfg.suite.enabled {
+        // `--without suite` on a run that already has a live tester slot (a resumed
+        // round) must not leave it in place for the next dispatch to pick back up —
+        // same reap as the built-in-suite branch above, for the same reason (O28).
+        reap_tester_slots(state, paths);
         return Ok(());
     }
     if state.slots.iter().any(|s| s.role == SlotRole::Tester) {
         return Ok(());
     }
-    let (suite_prov, suite_model) =
-        resolve_suite_provider(cfg, dry, &state.providers, Some(paths), Some(&state.id))?;
-    state.slots.push(executor::init_slot_model(
+    let (suite_prov, suite_model, source) = resolve_suite_provider(
+        cfg,
+        dry,
+        &state.providers,
+        state.pool_origin,
+        Some(paths),
+        Some(&state.id),
+    )?;
+    let mut slot = executor::init_slot_model(
         format!("suite-{}", sanitize_slot(&suite_prov)),
         &suite_prov,
         SlotRole::Tester,
         suite_model,
-    ));
+    );
+    slot.source = Some(source);
+    state.slots.push(slot);
     Ok(())
 }
 
+/// The tester seat a plan gate has not dispatched yet, projected the same way the
+/// implementer/reviewer panel is (feature 011, item C). A built-in `[suite].command` or
+/// `--without suite` never spawns an agent seat, so neither projects one — the plan
+/// gate's `fleet` array must not promise a paid seat the run will never create.
+///
+/// `paths`/`run_id`, when given, are read-only: if a `tester`-role choice is already
+/// recorded in `model-select.json` (e.g. from an earlier `--select`), the projection
+/// reports that exact provider/model/`ModelSelect` source, matching what
+/// `ensure_suite_slot`'s own artifact lookup will find at dispatch. Never calls
+/// `pick_one_for_role` / `write_select_artifact` here — a projection must not choose a
+/// model or mutate the artifact as a side effect of showing a gate, so a run with no
+/// prior tester choice still reports the same `SuitePreferences` guess dispatch would
+/// fall back to, honestly labelled as not yet decided.
+pub fn project_tester_seat(
+    cfg: &Config,
+    dry: bool,
+    pool: &[String],
+    pool_origin: PoolOrigin,
+    paths: Option<&SparPaths>,
+    run_id: Option<&str>,
+) -> Option<FleetSeat> {
+    if cfg.suite.is_builtin() || !cfg.suite.enabled {
+        return None;
+    }
+    if let (Some(paths), Some(run_id)) = (paths, run_id) {
+        if let Ok(Some(art)) = crate::model_select::load_select_artifact(paths, run_id) {
+            if let Some(c) = art
+                .choices
+                .iter()
+                .find(|c| c.role.as_deref() == Some("tester"))
+            {
+                return Some(FleetSeat {
+                    seat: format!("suite-{}", sanitize_slot(&c.provider)),
+                    role: SlotRole::Tester,
+                    provider: c.provider.clone(),
+                    model: c.model.clone(),
+                    source: SeatSource::ModelSelect,
+                    projected: true,
+                });
+            }
+        }
+    }
+    let (provider, model, source) =
+        resolve_suite_provider(cfg, dry, pool, pool_origin, None, None).ok()?;
+    Some(FleetSeat {
+        seat: format!("suite-{}", sanitize_slot(&provider)),
+        role: SlotRole::Tester,
+        provider,
+        model,
+        source,
+        projected: true,
+    })
+}
+
 /// Cheap suite-channel provider: config override, model-select (tester/fast), prefs, fleet.
+/// Returns the provider, an optional explicit model, and the honest source of the pick —
+/// the fleet fallback is `state.providers`, so its source follows `pool_origin` rather
+/// than an unconditional `ProvidersOrder`.
 fn resolve_suite_provider(
     cfg: &Config,
     dry: bool,
     fleet: &[String],
+    pool_origin: PoolOrigin,
     paths: Option<&SparPaths>,
     run_id: Option<&str>,
-) -> Result<(String, Option<String>)> {
+) -> Result<(String, Option<String>, SeatSource)> {
     if let Some(p) = &cfg.roles.tester {
         crate::provider_ref::ProviderRef::parse(p)
             .map_err(|e| anyhow::anyhow!("invalid [roles].tester {p:?}: {e}"))?;
         if dry || providers::is_provider_usable(p, false) {
-            return Ok((p.clone(), None));
+            let source = if cfg.cli_role_keys.contains(SlotRole::Tester.as_config_key()) {
+                SeatSource::CliRole
+            } else {
+                SeatSource::RolesFile
+            };
+            return Ok((p.clone(), None, source));
         }
         // Fall through to model-select / prefs / fleet if the override is unusable
         // (missing CLI / paused).
@@ -453,7 +579,7 @@ fn resolve_suite_provider(
                 .iter()
                 .find(|c| c.role.as_deref() == Some("tester"))
             {
-                return Ok((c.provider.clone(), c.model.clone()));
+                return Ok((c.provider.clone(), c.model.clone(), SeatSource::ModelSelect));
             }
             let exclude: Vec<String> = art.choices.iter().map(|c| c.vals_id.clone()).collect();
             let urgency = crate::model_select::Urgency::parse(&art.urgency)
@@ -467,29 +593,60 @@ fn resolve_suite_provider(
                 c.slot = art.choices.len();
                 art.choices.push(c.clone());
                 let _ = crate::model_select::write_select_artifact(paths, run_id, &art);
-                return Ok((c.provider, c.model));
+                return Ok((c.provider, c.model, SeatSource::ModelSelect));
             }
         }
     }
     const PREFS: &[&str] = &["cli:claude", "cli:grok", "cli:agy", "api:xai", "api:openai"];
     if dry {
-        return Ok((PREFS[0].into(), None));
+        return Ok((PREFS[0].into(), None, SeatSource::SuitePreferences));
     }
     if let Some(p) = PREFS
         .iter()
         .find(|p| providers::is_provider_usable(p, false))
         .map(|s| (*s).to_string())
     {
-        return Ok((p, None));
+        return Ok((p, None, SeatSource::SuitePreferences));
     }
     if let Some(p) = fleet
         .iter()
         .find(|p| providers::is_provider_usable(p, false))
         .cloned()
     {
-        return Ok((p, None));
+        return Ok((p, None, pool_origin.as_seat_source()));
     }
     bail!("suite.enabled but no usable suite provider (set [roles].tester or install a CLI)")
+}
+
+#[cfg(test)]
+mod suite_reap_tests {
+    use super::*;
+
+    /// `--without suite --reload-config` on a run whose earlier round already dispatched
+    /// an agent tester must reap that slot, not leave it for the next round to
+    /// re-dispatch (review `review-0-cli-claude`, finding 5).
+    #[test]
+    fn disabling_suite_reaps_an_existing_tester_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("r1").unwrap();
+        let mut state = RunState::new("r1", crate::cli::WorkflowKind::Loop, tmp.path().into());
+        state.slots.push(executor::init_slot(
+            "suite-cli-claude",
+            "cli:claude",
+            SlotRole::Tester,
+        ));
+        let mut cfg = Config::default();
+        cfg.suite.enabled = false;
+
+        ensure_suite_slot(&mut state, true, &cfg, &paths).unwrap();
+
+        assert!(
+            state.slots.iter().all(|s| s.role != SlotRole::Tester),
+            "a resumed run with --without suite must not keep dispatching its old tester: {:?}",
+            state.slots
+        );
+    }
 }
 
 enum SuiteResult {
@@ -847,14 +1004,19 @@ fn run_with_task(
     state.big = opts.big;
     state.max_fix_rounds = 3;
     state.max_rounds = opts.max_rounds.unwrap_or(cfg.rounds.max);
-    let n = cfg.max_agents.max(3) as usize;
+    let n = crate::workflow::roles_resolve::pool_width(cfg);
     let roles: Vec<&str> = std::iter::once(SlotRole::Implementer.as_config_key())
         .chain(std::iter::repeat(SlotRole::Reviewer.as_config_key()))
         .take(n)
         .collect();
-    let requested = opts.resolve_fleet(n, &roles, paths, cfg, &state.id)?;
+    let requested = opts.resolve_pool(n, &roles, paths, cfg, &state.id)?;
+    let pool_origin = crate::workflow::roles_resolve::pool_origin_for(&opts);
+    // A later round resuming this run without `--reload-config` (O27) reads this back
+    // via `run_from_approved`'s frozen-pool reuse, so it has to be recorded here too, not
+    // just at the plan phase.
+    state.pool_origin = pool_origin;
     state.providers = providers::pick_providers(&requested, n, Some(&requested), dry);
-    // Gate the positional fleet in place — never compact it (see the sibling entry point).
+    // Gate the positional pool in place — never compact it (see the sibling entry point).
     if !dry {
         if let Err(e) = crate::quota::ensure_usable(paths, &state.providers) {
             state.error = Some(e.to_string());
@@ -869,7 +1031,15 @@ fn run_with_task(
             return Ok(ExitCode::Quota);
         }
     }
-    prepare_implement_slots(&mut state, Some(&requested), dry, cfg, paths, false)?;
+    prepare_implement_slots(
+        &mut state,
+        Some(&requested),
+        pool_origin,
+        dry,
+        cfg,
+        paths,
+        false,
+    )?;
 
     paths.ensure_run_dirs(&state.id)?;
     let _ = crate::bus::ensure_bus(paths);
@@ -1674,16 +1844,48 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
         .map(|s| s.provider.clone())
         .collect();
     // Candidate order: [roles].implementer, then [providers].order, then the live fleet.
+    // Rotation must report the rung it actually drew from (`set_slot_provider` only
+    // touches provider/model), not leave the slot claiming its original source.
+    let implementer_role_source = if cfg
+        .cli_role_keys
+        .contains(SlotRole::Implementer.as_config_key())
+    {
+        SeatSource::CliRole
+    } else {
+        SeatSource::RolesFile
+    };
+    // The live-fleet leg resolves each pool position honestly through `resolve_seat`
+    // instead of stamping every position with `state.pool_origin.as_seat_source()`: a
+    // `Synth` pool mixes `[roles]` and `[providers].order` seats, and the blanket guess
+    // mislabels whichever positions did not actually take that rung.
+    let pool_sources = crate::workflow::roles_resolve::resolve_seat_sources(
+        SlotRole::Implementer,
+        state.providers.len(),
+        &state.providers,
+        state.pool_origin,
+        cfg,
+    );
     let next = cfg
         .roles
         .implementer
         .iter()
-        .map(|s| s.as_str())
-        .chain(cfg.providers.order.iter().map(|s| s.as_str()))
-        .chain(state.providers.iter().map(|s| s.as_str()))
-        .find(|p| *p != cur.as_str() && !used.iter().any(|u| u == p))
-        .map(|s| s.to_string());
-    let Some(next) = next else {
+        .map(|s| (s.as_str(), implementer_role_source))
+        .chain(
+            cfg.providers
+                .order
+                .iter()
+                .map(|s| (s.as_str(), SeatSource::ProvidersOrder)),
+        )
+        .chain(
+            state
+                .providers
+                .iter()
+                .map(|s| s.as_str())
+                .zip(pool_sources.iter().copied()),
+        )
+        .find(|(p, _)| *p != cur.as_str() && !used.iter().any(|u| u == p))
+        .map(|(p, src)| (p.to_string(), src));
+    let Some((next, source)) = next else {
         return Ok(false);
     };
     let impl_id = state
@@ -1694,6 +1896,7 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
         .unwrap();
     if let Some(s) = state.slot_mut(&impl_id) {
         set_slot_provider(s, next);
+        s.source = Some(source);
         s.status = SlotStatus::Pending;
         s.error = None;
     }
@@ -1728,30 +1931,94 @@ fn try_widen_reviewers(
     review_cwd: &std::path::Path,
     cfg: &Config,
 ) -> Result<bool> {
+    // A pinned panel (CLI `--role reviewer=…` or file `[roles].reviewer`) is an
+    // exclusion list, not a floor: widening it must duplicate a pin the run actually
+    // dispatched, never import a provider from `[providers].order` the operator
+    // deliberately left out (Bug A). Compare by storage key so a `cli:codex@terra` pin
+    // recognises the slot it created (`provider=cli:codex, model=terra`) as itself.
+    if crate::workflow::roles_resolve::reviewer_panel_pinned(cfg) {
+        let pins: Vec<String> = cfg
+            .roles
+            .reviewer
+            .iter()
+            .map(|p| {
+                crate::provider_ref::ProviderRef::parse(p)
+                    .map(|r| r.storage_key())
+                    .unwrap_or_else(|_| p.clone())
+            })
+            .collect();
+        let dispatched = state
+            .slots
+            .iter()
+            .find(|s| s.role == SlotRole::Reviewer && pins.iter().any(|p| p == &s.provider))
+            .or_else(|| state.slots.iter().find(|s| s.role == SlotRole::Reviewer));
+        let Some(src) = dispatched else {
+            return Ok(false);
+        };
+        let (provider, model, source) = (src.provider.clone(), src.model.clone(), src.source);
+        let id = format!("review-{}-wide", state.slots.len());
+        let mut slot = executor::init_slot_model(&id, &provider, SlotRole::Reviewer, model);
+        slot.cwd = Some(review_cwd.to_path_buf());
+        slot.source = source;
+        state.slots.push(slot);
+        state.save(paths)?;
+        return Ok(true);
+    }
     let existing: Vec<String> = state
         .slots
         .iter()
         .filter(|s| s.role == SlotRole::Reviewer)
         .map(|s| s.provider.clone())
         .collect();
-    // Draw the next reviewer from [roles].reviewer, then [providers].order, then the fleet.
-    let candidate = cfg
-        .roles
-        .reviewer
+    // Unpinned: draw the next reviewer from the run's own pool first — an explicit
+    // --providers/--select still outranks [providers].order (O56) even on the widen
+    // path — then fall to [providers].order once the pool is exhausted. Each pool
+    // position resolves its honest source through `resolve_seat` rather than a blanket
+    // `pool_origin.as_seat_source()` guess, since a `Synth` pool mixes `[roles]` and
+    // `[providers].order` seats. Compare by storage key: a pool entry may still carry an
+    // `@model` suffix while `existing`/`slot.provider` are always model-free, so a raw
+    // string comparison would miss a provider that is already reviewing and add a third
+    // seat on it instead of moving on.
+    let normalize = |p: &str| {
+        crate::provider_ref::ProviderRef::parse(p)
+            .map(|r| r.storage_key())
+            .unwrap_or_else(|_| p.to_string())
+    };
+    let pool_sources = crate::workflow::roles_resolve::resolve_seat_sources(
+        SlotRole::Reviewer,
+        state.providers.len(),
+        &state.providers,
+        state.pool_origin,
+        cfg,
+    );
+    let candidate = state
+        .providers
         .iter()
         .cloned()
-        .chain(cfg.providers.order.iter().cloned())
-        .chain(state.providers.iter().cloned())
-        .find(|p| !existing.contains(p));
-    let Some(prov) = candidate else {
+        .zip(pool_sources)
+        .chain(
+            cfg.providers
+                .order
+                .iter()
+                .cloned()
+                .map(|p| (p, SeatSource::ProvidersOrder)),
+        )
+        .find(|(p, _)| !existing.contains(&normalize(p)));
+    let Some((prov, source)) = candidate else {
         // still widen with a synthetic extra reviewer on a repeated provider
+        let dispatched = state
+            .slots
+            .iter()
+            .find(|s| s.role == SlotRole::Reviewer && existing.first() == Some(&s.provider));
         let prov = existing
             .first()
             .cloned()
             .unwrap_or_else(|| "cli:claude".into());
+        let source = dispatched.and_then(|s| s.source);
         let id = format!("review-{}-wide", state.slots.len());
         let mut slot = executor::init_slot(&id, &prov, SlotRole::Reviewer);
         slot.cwd = Some(review_cwd.to_path_buf());
+        slot.source = source;
         state.slots.push(slot);
         state.save(paths)?;
         return Ok(true);
@@ -1762,6 +2029,7 @@ fn try_widen_reviewers(
     }
     let mut slot = executor::init_slot(&id, &prov, SlotRole::Reviewer);
     slot.cwd = Some(review_cwd.to_path_buf());
+    slot.source = Some(source);
     state.slots.push(slot);
     state.save(paths)?;
     Ok(true)
@@ -1783,25 +2051,162 @@ fn try_rotate_reviewer_provider(
     let Some(cur) = cur else {
         return Ok(false);
     };
-    let next = cfg
-        .roles
-        .reviewer
-        .iter()
-        .find(|p| **p != cur)
-        .cloned()
-        .or_else(|| state.providers.iter().find(|p| **p != cur).cloned())
-        .or_else(|| cfg.providers.order.iter().find(|p| **p != cur).cloned());
-    let Some(next) = next else {
+    let reviewer_role_source = if cfg
+        .cli_role_keys
+        .contains(SlotRole::Reviewer.as_config_key())
+    {
+        SeatSource::CliRole
+    } else {
+        SeatSource::RolesFile
+    };
+    // A pinned panel is an exclusion list (Bug A): rotation must stay inside
+    // `[roles].reviewer` and never reach into the run's pool or `[providers].order` for a
+    // replacement, even when the pin list has only one entry and offers none. Only a real
+    // pin list counts here (`reviewer_panel_has_pins`, not `reviewer_panel_pinned`): a
+    // `--fleet small` narrowing with no underlying pins has nothing to rotate within and
+    // must fall through like an unpinned panel. Bound the pin candidates to `panel_size`
+    // too, so rotating a `small`-truncated two-pin panel duplicates the dispatched pin
+    // rather than restoring the pin the preset dropped.
+    let next = if crate::workflow::roles_resolve::reviewer_panel_has_pins(cfg) {
+        cfg.roles
+            .reviewer
+            .iter()
+            .take(crate::workflow::roles_resolve::panel_size(cfg))
+            .find(|p| **p != cur)
+            .cloned()
+            .map(|p| (p, reviewer_role_source))
+    } else {
+        cfg.roles
+            .reviewer
+            .iter()
+            .find(|p| **p != cur)
+            .cloned()
+            .map(|p| (p, reviewer_role_source))
+            .or_else(|| {
+                state
+                    .providers
+                    .iter()
+                    .find(|p| **p != cur)
+                    .cloned()
+                    .map(|p| (p, state.pool_origin.as_seat_source()))
+            })
+            .or_else(|| {
+                cfg.providers
+                    .order
+                    .iter()
+                    .find(|p| **p != cur)
+                    .cloned()
+                    .map(|p| (p, SeatSource::ProvidersOrder))
+            })
+    };
+    let Some((next, source)) = next else {
         return Ok(false);
     };
     if let Some(s) = state.slot_mut(rev_id) {
         set_slot_provider(s, next);
+        s.source = Some(source);
         s.cwd = Some(review_cwd.to_path_buf());
         s.status = SlotStatus::Pending;
         s.error = None;
     }
     state.save(paths)?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod rotate_reviewer_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn state_with_reviewer(provider: &str) -> RunState {
+        let mut st = RunState::new(
+            "r-rotate",
+            crate::cli::WorkflowKind::Loop,
+            PathBuf::from("/tmp/x"),
+        );
+        let mut slot = executor::init_slot("review-0", provider, SlotRole::Reviewer);
+        slot.source = Some(SeatSource::RolesFile);
+        st.slots.push(slot);
+        st
+    }
+
+    /// A one-entry pinned panel offers no alternate provider: rotation must refuse
+    /// rather than reach into `state.providers`/`[providers].order` for a substitute
+    /// nobody pinned (Bug A, also reachable through this escalation path).
+    #[test]
+    fn single_pin_panel_never_falls_through_to_pool_or_order() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = state_with_reviewer("cli:codex");
+        st.providers = vec!["cli:claude".into(), "cli:grok".into()];
+        st.pool_origin = PoolOrigin::CliProviders;
+        let mut cfg = Config::default();
+        cfg.roles.reviewer = vec!["cli:codex".into()];
+        let changed =
+            try_rotate_reviewer_provider(&mut st, &paths, "review-0", tmp.path(), &cfg).unwrap();
+        assert!(!changed, "single-pin panel has no alternate to rotate to");
+        assert_eq!(st.slots[0].provider, "cli:codex");
+    }
+
+    /// A two-entry pinned panel rotates within the pins, never past them.
+    #[test]
+    fn two_pin_panel_rotates_to_the_other_pin_only() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = state_with_reviewer("cli:codex");
+        st.providers = vec!["cli:claude".into(), "cli:grok".into()];
+        st.pool_origin = PoolOrigin::CliProviders;
+        let mut cfg = Config::default();
+        cfg.roles.reviewer = vec!["cli:codex".into(), "api:openai".into()];
+        let changed =
+            try_rotate_reviewer_provider(&mut st, &paths, "review-0", tmp.path(), &cfg).unwrap();
+        assert!(changed);
+        assert_eq!(st.slots[0].provider, "api:openai");
+    }
+
+    /// `--fleet small` (a preset-only panel narrowing, no `[roles].reviewer` pin) must not
+    /// disable failure-recovery rotation: with nothing actually pinned, rotation falls
+    /// through to the run's own pool the same way an ordinary unpinned panel does
+    /// (review-0-cli-claude, major finding 1).
+    #[test]
+    fn preset_only_narrowing_still_rotates_through_the_pool() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = state_with_reviewer("cli:grok");
+        st.providers = vec!["cli:claude".into(), "cli:grok".into()];
+        st.pool_origin = PoolOrigin::CliProviders;
+        let cfg = Config {
+            fleet_reviewer_override: Some(1),
+            ..Config::default()
+        };
+        let changed =
+            try_rotate_reviewer_provider(&mut st, &paths, "review-0", tmp.path(), &cfg).unwrap();
+        assert!(changed, "narrowed-but-unpinned panel must still retry");
+        assert_eq!(st.slots[0].provider, "cli:claude");
+    }
+
+    /// Rotating a `--fleet small`-truncated two-pin panel must not restore the pin
+    /// `small` dropped: candidates are bound to `panel_size`, so the truncated panel has
+    /// no alternate to rotate to and refuses, exactly like a genuine one-pin panel
+    /// (review-0-cli-claude, minor finding 2).
+    #[test]
+    fn small_truncated_two_pin_panel_does_not_restore_the_dropped_pin() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = state_with_reviewer("cli:codex");
+        let cfg = Config {
+            fleet_reviewer_override: Some(1),
+            roles: crate::config::RolesConfig {
+                reviewer: vec!["cli:codex".into(), "api:openai".into()],
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let changed =
+            try_rotate_reviewer_provider(&mut st, &paths, "review-0", tmp.path(), &cfg).unwrap();
+        assert!(!changed, "truncated panel has no alternate within its size");
+        assert_eq!(st.slots[0].provider, "cli:codex");
+    }
 }
 
 /// `quota_hit` is the discriminator: only a dispatch whose own log matched the quota

@@ -35,6 +35,21 @@ pub struct Config {
     /// Pre-coding acceptance tests (plan flow). Separate from suite channel.
     #[serde(default)]
     pub spec: SpecConfig,
+    /// Whether the plan phase runs a critic seat at all (feature 011). Separate from
+    /// `[roles].plan_critic`, which only says *which provider* if it runs.
+    #[serde(default)]
+    pub critic: CriticConfig,
+    /// Role config keys assigned via CLI `--role` for this run (feature 011). A role in
+    /// this set outranks even an explicit `--providers`/`--select` pool for that role,
+    /// and — because it lives on `Config`, which every run snapshots — the precedence
+    /// survives a later round with no `--reload-config` (O27).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub cli_role_keys: std::collections::BTreeSet<String>,
+    /// `--fleet small`'s reviewer panel width override (feature 011). `None` leaves
+    /// panel sizing to `[roles].reviewer` / `DEFAULT_REVIEWERS` as usual. A CLI `--role
+    /// reviewer=…` panel always outranks this — see `roles_resolve::panel_size`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_reviewer_override: Option<usize>,
     /// Round-loop economy: the ceiling on re-dispatch and the carry-forward budget.
     #[serde(default)]
     pub rounds: RoundsConfig,
@@ -572,6 +587,26 @@ struct RolesConfigFile {
     test_author: Option<String>,
 }
 
+/// `--fleet <preset>` (feature 011). `Standard` is today's defaults; `Small` is one
+/// reviewer, no critic, no spec test-author, and no agent tester (a configured
+/// deterministic suite still runs). No other presets — an unknown name is a hard error
+/// naming both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FleetPreset {
+    Standard,
+    Small,
+}
+
+impl FleetPreset {
+    pub fn parse(s: &str) -> Result<Self> {
+        match s.trim() {
+            "standard" => Ok(Self::Standard),
+            "small" => Ok(Self::Small),
+            other => anyhow::bail!("--fleet {other:?}: unknown preset (valid: small, standard)"),
+        }
+    }
+}
+
 /// Acceptance gate policy. Review *timeouts* stay at `[timeouts].review_secs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewConfig {
@@ -605,6 +640,23 @@ impl Default for SpecConfig {
             enabled: true,
             timeout_secs: default_spec_timeout_secs(),
         }
+    }
+}
+
+/// Plan-phase critic channel. Separate from `[roles].plan_critic` (which one provider
+/// runs it): this is whether it runs at all. `--without critic` is the per-run way to
+/// turn it off; before feature 011 there was no config knob, only an absent
+/// `[roles].plan_critic`, which silently fell back to `[providers].order` instead of
+/// actually dropping the seat.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CriticConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for CriticConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -707,6 +759,9 @@ impl Default for Config {
             roles: RolesConfig::default(),
             review: ReviewConfig::default(),
             spec: SpecConfig::default(),
+            critic: CriticConfig::default(),
+            cli_role_keys: std::collections::BTreeSet::new(),
+            fleet_reviewer_override: None,
             rounds: RoundsConfig::default(),
             gates: GatesConfig::default(),
             autonomy: AutonomyLevel::default(),
@@ -753,6 +808,7 @@ struct ConfigFile {
     roles: Option<RolesConfigFile>,
     review: Option<ReviewConfigFile>,
     spec: Option<SpecConfigFile>,
+    critic: Option<CriticConfigFile>,
     rounds: Option<RoundsConfigFile>,
     gates: Option<GatesConfigFile>,
     autonomy: Option<AutonomyLevel>,
@@ -823,7 +879,28 @@ struct TimeoutConfigFile {
 struct SuiteConfigFile {
     enabled: Option<bool>,
     timeout_secs: Option<u64>,
+    #[serde(default, deserialize_with = "de_suite_command")]
     command: Option<Vec<String>>,
+}
+
+/// `[suite].command` accepts either a single shell command string or a list, so a
+/// one-command deterministic suite doesn't need TOML array syntax for one element.
+fn de_suite_command<'de, D>(deserializer: D) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(
+        Option::<StringOrVec>::deserialize(deserializer)?.map(|v| match v {
+            StringOrVec::One(s) => vec![s],
+            StringOrVec::Many(v) => v,
+        }),
+    )
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -835,6 +912,11 @@ struct ReviewConfigFile {
 struct SpecConfigFile {
     enabled: Option<bool>,
     timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct CriticConfigFile {
+    enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -929,11 +1011,56 @@ impl Config {
                     other.as_config_key()
                 ),
             }
+            // Recorded on `Config` itself, so it snapshots with the run (O27): a later
+            // round with no `--reload-config` must still know this role was a CLI pin,
+            // not just a value that happens to match what `[roles]` says.
+            self.cli_role_keys.insert(slot.as_config_key().to_string());
         }
         if !reviewers.is_empty() {
             self.roles.reviewer = reviewers;
         }
         self.roles.validate()
+    }
+
+    /// `--without <critic,spec,suite>`: drop seats for this run only, without touching
+    /// `spar.toml`. Unlike `[roles]` overrides, dropping the plan critic has no config
+    /// knob before feature 011 (an absent `[roles].plan_critic` still falls back to
+    /// `[providers].order`), which is why `[critic].enabled` exists at all.
+    pub fn apply_without(&mut self, names: &[String]) -> Result<()> {
+        const VALID: [&str; 3] = ["critic", "spec", "suite"];
+        for raw in names {
+            match raw.trim() {
+                "critic" => self.critic.enabled = false,
+                "spec" => self.spec.enabled = false,
+                "suite" => self.suite.enabled = false,
+                other => anyhow::bail!(
+                    "--without {other:?}: unknown seat (valid: {})",
+                    VALID.join(", ")
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply `--fleet <preset>` as the *base*: `--without` and `--role` are applied after
+    /// this and win over it (composition order, feature 011).
+    pub fn apply_fleet_preset(&mut self, preset: FleetPreset) {
+        match preset {
+            // A no-op over the file: it must never re-enable a channel the project
+            // deliberately disabled.
+            FleetPreset::Standard => {}
+            FleetPreset::Small => {
+                self.critic.enabled = false;
+                self.spec.enabled = false;
+                self.fleet_reviewer_override = Some(1);
+                // A configured deterministic `[suite].command` is free and stays on —
+                // `SuiteConfig::is_builtin` already never spawns a tester slot for it.
+                // Only the agent tester (no command configured) is worth dropping.
+                if self.suite.command.is_empty() {
+                    self.suite.enabled = false;
+                }
+            }
+        }
     }
 
     fn apply_file(&mut self, file: &ConfigFile, trust: Trust) -> Result<()> {
@@ -1056,6 +1183,11 @@ impl Config {
         if let Some(r) = &file.review {
             if let Some(v) = r.require_all_criteria {
                 self.review.require_all_criteria = v;
+            }
+        }
+        if let Some(c) = &file.critic {
+            if let Some(v) = c.enabled {
+                self.critic.enabled = v;
             }
         }
         if let Some(s) = &file.spec {

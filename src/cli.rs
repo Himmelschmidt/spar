@@ -45,10 +45,12 @@ pub enum Command {
         /// base and config. `-t` is the directive for the round, not a new task (O45).
         #[arg(long = "run")]
         run_id: Option<String>,
-        /// Comma-separated `cli:…` or `api:…` (required unless `--select`)
+        /// Comma-separated `cli:…` or `api:…` (required unless `--select` or `[roles]` is
+        /// set). positional: index 0 is the planner/implementer, the rest are reviewers.
+        /// Overrides `[roles]` for the positions it covers.
         #[arg(long, value_delimiter = ',')]
         providers: Vec<String>,
-        /// Resolve fleet from vals benchmarks + profile (`value`, `best`, `fast`, `auto`, or list)
+        /// Resolve the provider pool from vals benchmarks + profile (`value`, `best`, `fast`, `auto`, or list)
         #[arg(long, value_delimiter = ',')]
         select: Vec<String>,
         /// Urgency for `--select`: low | normal | high | critical
@@ -56,9 +58,20 @@ pub enum Command {
         urgency: String,
         /// Assign a provider to a role for THIS run, without touching `spar.toml`:
         /// `--role planner=cli:grok --role reviewer=cli:claude@opus`. Repeatable;
-        /// repeating `reviewer` builds the panel. Overrides the file's `[roles]`.
+        /// a `reviewer` list sets the panel size exactly, and outranks even an explicit
+        /// `--providers` pool.
         #[arg(long = "role", value_name = "ROLE=PROVIDER")]
         role: Vec<String>,
+        /// Fleet preset for THIS run: `small` (one reviewer, no critic, no spec
+        /// test-author, no agent tester — a configured deterministic `[suite].command`
+        /// still runs) or `standard` (today's defaults; never re-enables a channel the
+        /// file disabled). Composes with `--without` and `--role`: explicit flags win.
+        #[arg(long, value_name = "PRESET")]
+        fleet: Option<String>,
+        /// Drop seats for THIS run only, comma-separated: `critic`, `spec`, `suite`.
+        /// Applied before `--role`, so an explicit role flag still wins.
+        #[arg(long, value_delimiter = ',')]
+        without: Vec<String>,
         /// Ref to cut every slot worktree from (branch, tag or sha).
         /// Default: the HEAD of the directory spar was invoked from.
         #[arg(long)]
@@ -108,9 +121,21 @@ pub enum Command {
         task: Option<String>,
         /// Assign a provider to a role for THIS run, without touching `spar.toml`:
         /// `--role planner=cli:grok --role reviewer=cli:claude@opus`. Repeatable;
-        /// repeating `reviewer` builds the panel. Overrides the file's `[roles]`.
+        /// a `reviewer` list sets the panel size exactly, and outranks even an explicit
+        /// `--providers` pool.
         #[arg(long = "role", value_name = "ROLE=PROVIDER")]
         role: Vec<String>,
+        /// Fleet preset for THIS run: `small` (one reviewer, no critic, no spec
+        /// test-author, no agent tester — a configured deterministic `[suite].command`
+        /// still runs) or `standard` (today's defaults; never re-enables a channel the
+        /// file disabled). Composes with `--without` and `--role`: explicit flags win.
+        #[arg(long, value_name = "PRESET")]
+        fleet: Option<String>,
+        /// Drop seats for THIS run only, comma-separated: `critic`, `spec`, `suite`.
+        /// Applied before `--role`, so an explicit role flag still wins. On an existing
+        /// `--run <id>` this needs `--reload-config`, exactly like `--role`.
+        #[arg(long, value_delimiter = ',')]
+        without: Vec<String>,
         /// Re-read `spar.toml` for an existing run and replace its frozen config.
         /// Without this, `--run <id>` uses the config the run was created with, whatever
         /// the project file says now.
@@ -145,10 +170,12 @@ pub enum Command {
         /// Stub agents only; still writes `.spar/` state. Does **not** create real git worktrees.
         #[arg(long)]
         dry_run: bool,
-        /// Comma-separated `cli:…` or `api:…` (required unless `--select`)
+        /// Comma-separated `cli:…` or `api:…` (required unless `--select` or `[roles]` is
+        /// set). positional: index 0 is the planner/implementer, the rest are reviewers.
+        /// Overrides `[roles]` for the positions it covers.
         #[arg(long, value_delimiter = ',')]
         providers: Vec<String>,
-        /// Resolve fleet from vals benchmarks + profile
+        /// Resolve the provider pool from vals benchmarks + profile
         #[arg(long, value_delimiter = ',')]
         select: Vec<String>,
         #[arg(long, default_value = "normal")]
@@ -165,9 +192,20 @@ pub enum Command {
         task: Option<String>,
         /// Assign a provider to a role for THIS run, without touching `spar.toml`:
         /// `--role planner=cli:grok --role reviewer=cli:claude@opus`. Repeatable;
-        /// repeating `reviewer` builds the panel. Overrides the file's `[roles]`.
+        /// a `reviewer` list sets the panel size exactly, and outranks even an explicit
+        /// `--providers` pool.
         #[arg(long = "role", value_name = "ROLE=PROVIDER")]
         role: Vec<String>,
+        /// Fleet preset for THIS run: `small` (one reviewer, no critic, no spec
+        /// test-author, no agent tester — a configured deterministic `[suite].command`
+        /// still runs) or `standard` (today's defaults; never re-enables a channel the
+        /// file disabled). Composes with `--without` and `--role`: explicit flags win.
+        #[arg(long, value_name = "PRESET")]
+        fleet: Option<String>,
+        /// Drop seats for THIS run only, comma-separated: `critic`, `spec`, `suite`.
+        /// Applied before `--role`, so an explicit role flag still wins.
+        #[arg(long, value_delimiter = ',')]
+        without: Vec<String>,
         /// Ref to cut every slot worktree from (branch, tag or sha).
         /// Default: the HEAD of the directory spar was invoked from.
         #[arg(long)]
@@ -180,10 +218,12 @@ pub enum Command {
         backend: Backend,
         #[arg(long)]
         dry_run: bool,
-        /// Comma-separated `cli:…` or `api:…` (required unless `--select`)
+        /// Comma-separated `cli:…` or `api:…` (required unless `--select` or `[roles]` is
+        /// set). positional: index 0 is the planner/implementer, the rest are reviewers.
+        /// Overrides `[roles]` for the positions it covers.
         #[arg(long, value_delimiter = ',')]
         providers: Vec<String>,
-        /// Resolve fleet from vals benchmarks + profile
+        /// Resolve the provider pool from vals benchmarks + profile
         #[arg(long, value_delimiter = ',')]
         select: Vec<String>,
         #[arg(long, default_value = "normal")]

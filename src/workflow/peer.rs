@@ -35,8 +35,8 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     if dry {
         std::env::set_var("SPAR_DRY_RUN", "1");
     }
-    let requested =
-        opts.resolve_fleet(2, &["implementer", "implementer"], paths, cfg, &state.id)?;
+    let requested = opts.resolve_pool(2, &["implementer", "implementer"], paths, cfg, &state.id)?;
+    state.pool_origin = crate::workflow::roles_resolve::pool_origin_for(&opts);
     state.providers = providers::pick_providers(&requested, 2, Some(&requested), dry);
     if state.providers.is_empty() {
         state.error = Some("no usable providers".into());
@@ -58,12 +58,22 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     let b = state.providers[1].clone();
     let id_a = format!("peer-a-{}", sanitize_slot(&a));
     let id_b = format!("peer-b-{}", sanitize_slot(&b));
-    state
-        .slots
-        .push(executor::init_slot(&id_a, &a, SlotRole::Peer));
-    state
-        .slots
-        .push(executor::init_slot(&id_b, &b, SlotRole::Peer));
+    // Provider resolution keyed both seats off `SlotRole::Implementer` (`resolve_pool`'s
+    // "implementer","implementer" labels), so source lookup must use the same role, even
+    // though the dispatched slot role is `Peer`.
+    let sources = crate::workflow::roles_resolve::resolve_seat_sources(
+        SlotRole::Implementer,
+        2,
+        &state.providers,
+        state.pool_origin,
+        cfg,
+    );
+    let mut slot_a = executor::init_slot(&id_a, &a, SlotRole::Peer);
+    slot_a.source = sources.first().copied();
+    state.slots.push(slot_a);
+    let mut slot_b = executor::init_slot(&id_b, &b, SlotRole::Peer);
+    slot_b.source = sources.get(1).copied();
+    state.slots.push(slot_b);
 
     paths.ensure_run_dirs(&state.id)?;
     bus::ensure_bus(paths)?;

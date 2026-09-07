@@ -110,3 +110,7 @@ path = "tests/scenarios/builtin_suite.rs"
 [[test]]
 name = "quota_routing"
 path = "tests/scenarios/quota_routing.rs"
+
+[[test]]
+name = "fleet_shaping"
+path = "tests/scenarios/fleet_shaping.rs"

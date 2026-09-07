@@ -92,6 +92,7 @@ timeout_secs = 7200
 # one fails. Keep each command one the whole project collects: the list is frozen, so a
 # narrow one (`pytest tests/unit`) will miss an acceptance test added elsewhere.
 # command = ["cargo fmt --check", "cargo clippy --all-targets -- -D warnings", "cargo test"]
+# A single command also accepts a bare string: command = "cargo test"
 
 # Reviewer verdict / acceptance gate. Review timeouts live under [timeouts].
 [review]
@@ -109,6 +110,10 @@ require_all_criteria = true
 [rounds]
 max = 8
 carry_forward_chars = 4000
+
+# Plan-phase critic. `--without critic` is the per-run way to drop just this seat.
+[critic]
+enabled = true
 
 # Pre-coding acceptance tests (plan flow). Separate agent freezes tests before implement.
 [spec]

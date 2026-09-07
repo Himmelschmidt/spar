@@ -7,7 +7,7 @@ use crate::process::{self, SpawnRequest};
 use crate::provider_ref::ProviderRef;
 use crate::providers::{self, SpawnOpts, TrustPolicy};
 use crate::sandbox;
-use crate::state::{RunState, SlotRole, SlotState, SlotStatus, SlotUsage};
+use crate::state::{FleetSeat, RunState, SeatSource, SlotRole, SlotState, SlotStatus, SlotUsage};
 use crate::templates;
 use crate::tmux;
 use anyhow::{bail, Context, Result};
@@ -2438,7 +2438,34 @@ pub fn init_slot_model(
         model: pref.model.clone().or(model),
         round: 1,
         quota_hit: false,
+        source: None,
     }
+}
+
+/// The resolved fleet (feature 011): one entry per seat, actual slots first, then any
+/// still-projected seat (the plan gate's view of the implement panel it has not
+/// dispatched yet) whose id does not already belong to a real slot — a real slot always
+/// wins, so a projection can never contradict what actually got created.
+pub fn run_fleet_seats(state: &RunState) -> Vec<FleetSeat> {
+    let mut out: Vec<FleetSeat> = state
+        .slots
+        .iter()
+        .map(|s| FleetSeat {
+            seat: s.id.clone(),
+            role: s.role,
+            provider: s.provider.clone(),
+            model: s.model.clone(),
+            source: s.source.unwrap_or(SeatSource::Unknown),
+            projected: false,
+        })
+        .collect();
+    for seat in &state.projected_fleet {
+        if out.iter().any(|s| s.seat == seat.seat) {
+            continue;
+        }
+        out.push(seat.clone());
+    }
+    out
 }
 
 pub fn emit_run_json(state: &RunState) -> Result<()> {
@@ -2460,6 +2487,9 @@ pub fn emit_run_json(state: &RunState) -> Result<()> {
         "project_root": state.project_root,
         // `providers` is the pool; this is what each role actually drew from it.
         "roles": role_assignments(state),
+        // One entry per seat, actual and projected, with where its provider came from
+        // (feature 011). See `run_fleet_seats`.
+        "fleet": run_fleet_seats(state),
         "base_ref": state.base_ref,
         "base_commit": state.base_commit,
         "parent_run": state.parent_run,
@@ -2528,6 +2558,52 @@ pub fn print_run_human(state: &RunState) {
     }
     if state.dry_run {
         println!("dry_run: true  (no git worktrees; agent processes stubbed only)");
+    }
+    // Gate phases only (feature 011, item C): that is where a human decides whether to
+    // pay for the panel, and a table on every status print would just be noise.
+    if state.phase.is_gate() {
+        print_fleet_table(state);
+    }
+}
+
+/// The resolved fleet, one row per seat: what a `roles:` line cannot show, because a
+/// role can carry more than one reviewer and `roles:` collapses them, and because it
+/// says nothing about a seat the run has not dispatched yet (feature 011, item C).
+fn print_fleet_table(state: &RunState) {
+    let seats = run_fleet_seats(state);
+    if seats.is_empty() {
+        return;
+    }
+    println!("fleet:");
+    println!(
+        "  {:<22} {:<12} {:<28} {:<16} projected",
+        "seat", "role", "provider", "source"
+    );
+    for seat in &seats {
+        let provider = match &seat.model {
+            Some(m) if !seat.provider.contains('@') => format!("{}@{m}", seat.provider),
+            _ => seat.provider.clone(),
+        };
+        println!(
+            "  {:<22} {:<12} {:<28} {:<16} {}",
+            seat.seat,
+            seat.role.as_config_key(),
+            provider,
+            source_label(seat.source),
+            seat.projected,
+        );
+    }
+}
+
+fn source_label(source: SeatSource) -> &'static str {
+    match source {
+        SeatSource::CliRole => "cli-role",
+        SeatSource::CliProviders => "cli-providers",
+        SeatSource::RolesFile => "roles-file",
+        SeatSource::ProvidersOrder => "providers-order",
+        SeatSource::ModelSelect => "model-select",
+        SeatSource::SuitePreferences => "suite-preferences",
+        SeatSource::Unknown => "unknown",
     }
 }
 

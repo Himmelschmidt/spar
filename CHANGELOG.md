@@ -4,8 +4,30 @@ All notable changes to spar are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- **You can see the reviewers, planner and other seats a run will actually use before
+  it spends anything on them.** The run's status now lists every seat, where each one's
+  provider came from, and marks the ones that haven't been dispatched yet — including the
+  review panel, visible at the point you're deciding whether to approve a plan.
+- **You can drop seats for a single run without editing shared settings.** A new option
+  turns off the plan critic, the pre-coding test writer, or the automatic test runner for
+  just the run you're starting.
+- **Two ready-made fleet sizes.** One option gives you today's defaults; the other gives
+  you the smallest useful setup — one reviewer, no critic, no test writer, no automatic
+  tester — while still running your project's own test command if you've configured one.
+
 ### Fixed
 
+- **Watching or checking on a run no longer fails at random while the run is writing.**
+  A run's status file was rewritten in place, so anything reading it at the wrong moment
+  could see half a file and give up with a parse error mid-run.
+- **Pinning a single reviewer no longer quietly adds a second one you didn't ask for.**
+  Naming exactly one reviewer now means exactly one reviewer, instead of getting padded
+  out with an extra, unrequested provider.
+- **Assigning a role to a specific provider no longer gets silently overridden** when you
+  also pass a general provider list. The specific assignment now wins, and it keeps
+  winning if you come back to the same run later without repeating yourself.
 - **A run stopped by your provider's rate limit is no longer reported as a failure.**
   It now stops with the status that means "out of tokens for now" rather than the one
   that means "the work broke", so anything reading that status can tell the two apart.
@@ -17,6 +39,33 @@ All notable changes to spar are recorded here.
   retrying into the same wall in the meantime.
 - **Rate limits are noticed everywhere runs happen.** Reviews and paired runs, which run
   several agents at once, previously missed them entirely.
+- **A quick review run with one pinned reviewer no longer tries to fill a second seat
+  from your default provider list.** It now runs exactly the panel you pinned.
+- **Continuing an approved plan into implementation no longer refuses when the plan
+  itself only ever needed one or two providers.** It picks up where the plan left off
+  instead of demanding you repeat the provider list.
+- **A pinned test writer no longer wins over a provider list you passed for this run.**
+  The provider list now wins for that seat too, matching every other role.
+- **The "where did this seat come from" label is accurate for review, paired, and
+  competing-agent runs**, not just the main implement flow.
+- **The smallest fleet size no longer disables retrying a failed reviewer.** Narrowing
+  the review panel to one seat still lets that seat be retried on a different provider
+  if it fails, the same as it would with the default panel size.
+- **The "where did this seat come from" label is also accurate when a failed
+  implementer or reviewer gets rotated or an extra reviewer gets added**, not just on
+  first dispatch.
+- **The plan approval screen now shows the model an already-chosen provider will
+  actually use**, when one was picked earlier in the run, instead of always showing
+  none until after you approved.
+- **Applying the "today's defaults" fleet size to a run already in progress no longer
+  fails.** It changes nothing, so it no longer needs the flag that reloads settings
+  from disk.
+- **The plan approval screen no longer hides reviewer seats when you gave it a shorter
+  provider list than the review panel needs.** It now shows the full panel implementation
+  will actually dispatch, cycled from the providers you gave it, instead of silently
+  dropping the seats past your list's own length.
+- **The "where did this seat come from" label is accurate for paired and competing-agent
+  runs given a shorter provider list than they need**, not just their first seat.
 
 ## [0.0.3] - 2026-09-04
 

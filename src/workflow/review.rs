@@ -27,7 +27,10 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     } else if opts.select.len() > 1 {
         opts.select.len()
     } else {
-        2
+        // No explicit pool: honour a pinned `[roles].reviewer` panel's exact size
+        // (Bug A) instead of always asking for two — a one-entry pin must not exhaust
+        // `[providers].order` trying to fill a second seat nobody asked for.
+        crate::workflow::roles_resolve::panel_size(cfg)
     };
     let run_id = util::short_run_id();
     let mut state = RunState::new(
@@ -45,7 +48,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     state.message_budget = cfg.message_budget;
     state.autonomy = cfg.autonomy;
     let roles: Vec<&str> = (0..n).map(|_| "reviewer").collect();
-    let requested = opts.resolve_fleet(n, &roles, paths, cfg, &state.id)?;
+    let requested = opts.resolve_pool(n, &roles, paths, cfg, &state.id)?;
     state.providers = providers::pick_providers(&requested, n, Some(&requested), dry);
     if state.providers.is_empty() {
         state.error = Some("no usable providers".into());
@@ -60,11 +63,23 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         return Ok(ExitCode::Failure);
     }
 
+    // The independent-review workflow bypasses `build_implement_seats` (no panel
+    // pinning), but each reviewer's source is still resolved per position so a `Synth`
+    // pool mixing `[roles]` and `[providers].order` seats reports each honestly.
+    let pool_origin = crate::workflow::roles_resolve::pool_origin_for(&opts);
+    state.pool_origin = pool_origin;
+    let sources = crate::workflow::roles_resolve::resolve_seat_sources(
+        SlotRole::Reviewer,
+        state.providers.len(),
+        &requested,
+        pool_origin,
+        cfg,
+    );
     for (i, prov) in state.providers.iter().enumerate() {
         let id = format!("review-{}-{}", i, sanitize_slot(prov));
-        state
-            .slots
-            .push(executor::init_slot(&id, prov, SlotRole::Reviewer));
+        let mut slot = executor::init_slot(&id, prov, SlotRole::Reviewer);
+        slot.source = sources.get(i).copied();
+        state.slots.push(slot);
     }
 
     paths.ensure_run_dirs(&state.id)?;

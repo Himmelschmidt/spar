@@ -33,7 +33,8 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     state.isolation = cfg.isolation;
     state.dry_run = dry;
     let roles: Vec<&str> = (0..n).map(|_| "implementer").collect();
-    let requested = opts.resolve_fleet(n, &roles, paths, cfg, &state.id)?;
+    let requested = opts.resolve_pool(n, &roles, paths, cfg, &state.id)?;
+    state.pool_origin = crate::workflow::roles_resolve::pool_origin_for(&opts);
     state.providers = providers::pick_providers(&requested, n, Some(&requested), dry);
     if !dry {
         match crate::quota::apply_quota_filter(paths, &state.providers) {
@@ -53,11 +54,18 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         }
     }
 
+    let sources = crate::workflow::roles_resolve::resolve_seat_sources(
+        SlotRole::Implementer,
+        state.providers.len(),
+        &state.providers,
+        state.pool_origin,
+        cfg,
+    );
     for (i, prov) in state.providers.iter().enumerate() {
         let id = format!("arena-{i}-{}", sanitize_slot(prov));
-        state
-            .slots
-            .push(executor::init_slot(id, prov, SlotRole::Implementer));
+        let mut slot = executor::init_slot(id, prov, SlotRole::Implementer);
+        slot.source = sources.get(i).copied();
+        state.slots.push(slot);
     }
     let rank_p = state
         .providers
@@ -65,11 +73,13 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         .next_back()
         .cloned()
         .unwrap_or_else(|| "cli:claude".into());
-    state.slots.push(executor::init_slot(
+    let mut ranker = executor::init_slot(
         format!("ranker-{}", sanitize_slot(&rank_p)),
         rank_p,
         SlotRole::Ranker,
-    ));
+    );
+    ranker.source = sources.last().copied();
+    state.slots.push(ranker);
 
     paths.ensure_run_dirs(&state.id)?;
     state.save(paths)?;
@@ -372,6 +382,19 @@ pub fn reconcile(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> R
         ));
     }
 
+    // The reconciler and its reviewers are drawn out of `state.providers` by position, so
+    // each one's rung is the rung that put that entry in the pool. Resolved the same way
+    // the arena's own implementer slots were, since the pool was built from one repeated
+    // `implementer` label: stamping `pool_origin` instead reported `providers-order` for a
+    // seat a `Synth` pool had actually taken from `[roles]`.
+    let pool_sources = crate::workflow::roles_resolve::resolve_seat_sources(
+        SlotRole::Implementer,
+        state.providers.len(),
+        &state.providers,
+        state.pool_origin,
+        cfg,
+    );
+
     let recon_prov = state
         .providers
         .first()
@@ -379,11 +402,9 @@ pub fn reconcile(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> R
         .unwrap_or_else(|| "cli:claude".into());
     let recon_id = format!("reconcile-{}", sanitize_slot(&recon_prov));
     if state.slots.iter().all(|s| s.id != recon_id) {
-        state.slots.push(executor::init_slot(
-            &recon_id,
-            &recon_prov,
-            SlotRole::Reconciler,
-        ));
+        let mut slot = executor::init_slot(&recon_id, &recon_prov, SlotRole::Reconciler);
+        slot.source = pool_sources.first().copied();
+        state.slots.push(slot);
     }
     worktree::prepare_isolation(&mut state, paths, std::slice::from_ref(&recon_id))?;
 
@@ -427,6 +448,7 @@ pub fn reconcile(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> R
         if state.slots.iter().all(|s| s.id != id) {
             let mut slot = executor::init_slot(&id, prov, SlotRole::Reviewer);
             slot.cwd = Some(recon_cwd.clone());
+            slot.source = pool_sources.get(i).copied();
             state.slots.push(slot);
         }
         let mut extra = HashMap::new();
