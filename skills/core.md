@@ -815,14 +815,17 @@ rail's selection.
   - Conventions per adapter, since the wire formats differ: **claude** is settled by the
     terminal `result` record, which supersedes the per-message ones; **codex** by
     `turn.completed` (its only usage record, so it also stands in for the gauge);
-    **opencode** by summing its per-step deltas; **muse** from its session log after the
-    slot exits. Those four reconcile against the provider's own session-level ledger, at
-    the session level: a codex slot's `billed_tokens` equals its `token_count`
-    `total_tokens`, a muse slot's equals the sum of its billed
-    `goal_usage_attribution` records, an opencode slot's equals `opencode.db`'s per-step
-    `tokens.total` summed. That verification is session-scoped and therefore cannot see
-    spend that never appears in the session it checked; the known instance is opencode's
-    `task` subagents (`roadmap/BACKLOG.md`).
+    **opencode** by summing its per-step deltas, plus a post-exit pass that adds in any
+    `task` subagent spend; **muse** from its session log after the slot exits. Those four
+    reconcile against the provider's own session-level ledger, at the session level: a
+    codex slot's `billed_tokens` equals its `token_count` `total_tokens`, a muse slot's
+    equals the sum of its billed `goal_usage_attribution` records, an opencode slot's
+    equals its own `tokens.total` summed plus every child session's totals in
+    `opencode.db` (`session.parent_id`). opencode's json emitter filters child sessions
+    out of the stream it prints, so a subagent's usage never reaches stdout at all; spar
+    recovers it after the slot exits by summing `tokens_input + output + reasoning +
+    cache_read + cache_write` over every session row whose `parent_id` is the slot's own
+    session id, additively on top of the stream-parsed parent totals.
   - **Two adapters report a cached prompt as a slice of `input_tokens` rather than a
     sibling of it**, the opposite of Anthropic's convention: codex's `cached_input_tokens`
     and muse's `cached_tokens`. spar normalizes both on the way in, storing the uncached
