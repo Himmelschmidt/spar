@@ -287,12 +287,16 @@ pub fn execute_plan(
         cfg,
         projection_pool,
         state.pool_origin,
+        Some(paths),
+        Some(&state.id),
     );
     if let Some(seat) = crate::workflow::implement::project_tester_seat(
         cfg,
         state.dry_run,
         projection_pool,
         state.pool_origin,
+        Some(paths),
+        Some(&state.id),
     ) {
         state.projected_fleet.push(seat);
     }

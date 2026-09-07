@@ -251,12 +251,34 @@ pub fn resolve_seat_sources(
 /// separate branch is needed here to mirror that decision, and one previously caused the
 /// projection to silently drop the pool whenever `[roles]` held anything at all (e.g. a
 /// single CLI-pinned reviewer alongside an explicit `--providers` pool).
+///
+/// Reads `model-select.json` read-only, the same `c.slot == idx` lookup
+/// `run_from_approved`'s own `model_for` uses, so a model already chosen for one of these
+/// pool positions (e.g. a prior round's `implement --select` preserved across a re-plan)
+/// shows up here too instead of always reporting `model: null`. `paths`/`run_id` are
+/// `None` only where no run is bound yet; this never writes the artifact.
 pub fn project_implement_fleet(
     cfg: &Config,
     pool: &[String],
     pool_origin: PoolOrigin,
+    paths: Option<&crate::paths::SparPaths>,
+    run_id: Option<&str>,
 ) -> Vec<FleetSeat> {
-    build_implement_seats(cfg, pool, pool_origin, true, &|_| None)
+    let art = match (paths, run_id) {
+        (Some(paths), Some(run_id)) => crate::model_select::load_select_artifact(paths, run_id)
+            .ok()
+            .flatten(),
+        _ => None,
+    };
+    let model_for = |idx: usize| -> Option<String> {
+        art.as_ref().and_then(|a| {
+            a.choices
+                .iter()
+                .find(|c| c.slot == idx)
+                .and_then(|c| c.model.clone())
+        })
+    };
+    build_implement_seats(cfg, pool, pool_origin, true, &model_for)
 }
 
 #[cfg(test)]

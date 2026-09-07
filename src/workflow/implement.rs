@@ -494,17 +494,44 @@ fn ensure_suite_slot(
 /// The tester seat a plan gate has not dispatched yet, projected the same way the
 /// implementer/reviewer panel is (feature 011, item C). A built-in `[suite].command` or
 /// `--without suite` never spawns an agent seat, so neither projects one — the plan
-/// gate's `fleet` array must not promise a paid seat the run will never create. No
-/// `paths`/`run_id` (`None`): a projection must not write a model-select artifact as a
-/// side effect of showing a gate.
+/// gate's `fleet` array must not promise a paid seat the run will never create.
+///
+/// `paths`/`run_id`, when given, are read-only: if a `tester`-role choice is already
+/// recorded in `model-select.json` (e.g. from an earlier `--select`), the projection
+/// reports that exact provider/model/`ModelSelect` source, matching what
+/// `ensure_suite_slot`'s own artifact lookup will find at dispatch. Never calls
+/// `pick_one_for_role` / `write_select_artifact` here — a projection must not choose a
+/// model or mutate the artifact as a side effect of showing a gate, so a run with no
+/// prior tester choice still reports the same `SuitePreferences` guess dispatch would
+/// fall back to, honestly labelled as not yet decided.
 pub fn project_tester_seat(
     cfg: &Config,
     dry: bool,
     pool: &[String],
     pool_origin: PoolOrigin,
+    paths: Option<&SparPaths>,
+    run_id: Option<&str>,
 ) -> Option<FleetSeat> {
     if cfg.suite.is_builtin() || !cfg.suite.enabled {
         return None;
+    }
+    if let (Some(paths), Some(run_id)) = (paths, run_id) {
+        if let Ok(Some(art)) = crate::model_select::load_select_artifact(paths, run_id) {
+            if let Some(c) = art
+                .choices
+                .iter()
+                .find(|c| c.role.as_deref() == Some("tester"))
+            {
+                return Some(FleetSeat {
+                    seat: format!("suite-{}", sanitize_slot(&c.provider)),
+                    role: SlotRole::Tester,
+                    provider: c.provider.clone(),
+                    model: c.model.clone(),
+                    source: SeatSource::ModelSelect,
+                    projected: true,
+                });
+            }
+        }
     }
     let (provider, model, source) =
         resolve_suite_provider(cfg, dry, pool, pool_origin, None, None).ok()?;
