@@ -4,8 +4,27 @@ All notable changes to spar are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- **You can see the reviewers, planner and other seats a run will actually use before
+  it spends anything on them.** The run's status now lists every seat, where each one's
+  provider came from, and marks the ones that haven't been dispatched yet — including the
+  review panel, visible at the point you're deciding whether to approve a plan.
+- **You can drop seats for a single run without editing shared settings.** A new option
+  turns off the plan critic, the pre-coding test writer, or the automatic test runner for
+  just the run you're starting.
+- **Two ready-made fleet sizes.** One option gives you today's defaults; the other gives
+  you the smallest useful setup — one reviewer, no critic, no test writer, no automatic
+  tester — while still running your project's own test command if you've configured one.
+
 ### Fixed
 
+- **Pinning a single reviewer no longer quietly adds a second one you didn't ask for.**
+  Naming exactly one reviewer now means exactly one reviewer, instead of getting padded
+  out with an extra, unrequested provider.
+- **Assigning a role to a specific provider no longer gets silently overridden** when you
+  also pass a general provider list. The specific assignment now wins, and it keeps
+  winning if you come back to the same run later without repeating yourself.
 - **A run stopped by your provider's rate limit is no longer reported as a failure.**
   It now stops with the status that means "out of tokens for now" rather than the one
   that means "the work broke", so anything reading that status can tell the two apart.

@@ -178,15 +178,19 @@ positions.
   `peer` take fleet positions instead: the ranker gets the **last** provider in the fleet,
   the reconciler the **first**, the peers the first two. All three bill against
   `[budget] other`, not a role budget.
-- **The reviewer panel in `loop` is fixed at 2** and is not a config knob. A `[roles].reviewer`
-  list longer than two still only fills two slots there; the extra entries matter in
-  `--workflow review`, which sizes itself from `--providers`. A shorter list falls through to
-  `[providers].order` for the remaining position rather than shrinking the panel.
-- **The fleet is positional and cycles.** `loop` resolves `max(max_agents, 3)` providers as
-  `implementer, reviewer, reviewer, …`; `arena` resolves `max(max_agents, 2)`, all
-  implementers. A fleet shorter than the slot count repeats from the start, so an arena
-  driven from a single-entry `[roles].implementer` runs N slots on the **same** provider.
-  Pass explicit `--providers` when you want a diverse field.
+- **The reviewer panel in `loop` is exactly `[roles].reviewer`'s length when it is
+  non-empty** (a CLI `--role reviewer=…` list included) — an exclusion list, not a floor:
+  past its end the answer is nothing, never the next `[providers].order` entry. Only an
+  **unpinned** panel (no `[roles].reviewer`, no `--role reviewer`) falls back to
+  `DEFAULT_REVIEWERS` (2) from `[providers].order`. `--fleet small` narrows the panel to 1
+  without touching `[roles].reviewer` itself, so widening after `small` still duplicates
+  whichever pin actually got dispatched.
+- **`loop`'s pool is positional and exactly `1 + panel_size` wide** — implementer, then the
+  resolved reviewer panel — independent of `max_agents` (which used to size it and could
+  manufacture phantom reviewer seats out of `[providers].order`). `arena` still resolves
+  `max(max_agents, 2)`, all implementers, and repeats a pool shorter than the slot count
+  from the start, so an arena driven from a single-entry `[roles].implementer` runs N slots
+  on the **same** provider. Pass explicit `--providers` when you want a diverse field.
 - **Templates are per role**, embedded in the binary (`templates/`): `planner`, `plan_critic`,
   `test_author`, `implementer`, `tester`, `reviewer_adversarial`, `ranker`, `reconciler`,
   `peer_half` (+ `role_frontend` / `role_backend` notes appended for `--workflow roles`).
@@ -194,11 +198,13 @@ positions.
 ## Workflows
 
 **`--providers` or `--select`** is required for `plan`, `implement`, and `run` (no silent default fleet).
+`--fleet small|standard` and `--without critic,spec,suite` shape the seats for one run without
+touching `spar.toml`; see "Fleet shaping" below.
 
 | `--workflow` | Slots | Ends at |
 |---|---|---|
-| `plan` | `planner` + `plan_critic`, then `test_author` when `[spec] enabled` | plan gate (`awaiting_plan_approval`, exit 2) |
-| `loop` | `implementer` ×1, `tester` ×1 when `[suite] enabled` and `[suite].command` is empty, `reviewer` ×2; up to 3 fix rounds, then rotate/widen/`stuck` | ship gate (`awaiting_ship_confirm`) |
+| `plan` | `planner` + `plan_critic` (unless `--without critic`), then `test_author` when `[spec] enabled` | plan gate (`awaiting_plan_approval`, exit 2) |
+| `loop` | `implementer` ×1, `tester` ×1 when `[suite] enabled` and `[suite].command` is empty, `reviewer` ×panel size (2 unpinned); up to 3 fix rounds, then rotate/widen/`stuck` | ship gate (`awaiting_ship_confirm`) |
 | `arena` | `implementer` ×`max_agents` in waves, then `ranker` ×1 | winner gate (`awaiting_winner_confirm`) |
 | `roles` | `peer` ×2, frontend/backend split, dispatched one after the other | `done` (no review, no gate) |
 | `peer` | `peer` ×2, symmetric, dispatched in parallel over the bus | `done` (no review, no gate) |
@@ -281,10 +287,10 @@ So `implement` will not silently mint a second id for work that is already a run
 - `-t "..."` with no run and no plan is a fresh brief and creates a run, as before.
 - `--new` always forks, including from a plan spar could have traced.
 
-`spar plan --run <id>` **refuses** `--providers` / `--select` / `--role` / `--base` /
-`--big` / `--detach` / `--dry-run`: a replan inherits the run's fleet, base and frozen
-config, so a flag that could only apply to a new run is an error rather than a silent
-no-op. It also refuses a run that is mid-flight, and it moves the previous round's
+`spar plan --run <id>` **refuses** `--providers` / `--select` / `--role` / `--fleet` /
+`--without` / `--base` / `--big` / `--detach` / `--dry-run`: a replan inherits the run's
+pool, base and frozen config, so a flag that could only apply to a new run is an error
+rather than a silent no-op. It also refuses a run that is mid-flight, and it moves the previous round's
 `plan.md` and `test-contract.md` to `plan-round<N>.md` / `test-contract-round<N>.md` so a
 round that writes nothing cannot present the old plan (or the old frozen contract) at the
 approval gate.
@@ -880,13 +886,56 @@ rail's selection.
 
 **`--dry-run`:** stubs agent processes only; writes `.spar/runs/<id>/`. Does **not** create real git worktrees (cwd under `.spar/…/cwd-*`). Live runs create sibling worktrees.
 
-**Providers (four-tier precedence):** each slot's provider is resolved **explicit `--providers` (positional one-off) > `--role` > `[roles]` > `[providers].order`**. `--providers` still works exactly as before — a single name fills every slot, multiple names map positionally (impl at 0, then reviewers). If you set a `[roles]` block (see config knobs), it satisfies the requirement on its own: `spar plan`/`implement` run with **no** `--providers`, drawing planner/critic/implementer/tester/test_author and the reviewer list from `[roles]`. `--select <profile>` is another option. Explicit `--providers` always overrides `[roles]` positionally.
+**Providers (four-rung precedence):** each slot's provider is resolved **CLI `--role` for
+that role > CLI `--providers` (positional) / `--select` pool > `[roles]` > `[providers].order`**.
+`--providers` is **positional** — index 0 is the planner/implementer, the rest are
+reviewers — and overrides `[roles]` for the positions it covers, but a `--role` for that
+same role still outranks it. If you set a `[roles]` block (see config knobs), it satisfies
+the requirement on its own: `spar plan`/`implement` run with **no** `--providers`, drawing
+planner/critic/implementer/tester/test_author and the reviewer list from `[roles]`.
+`--select <profile>` is another option.
 
-**`--role <role>=<provider>` assigns per role without touching `spar.toml`** — repeatable, and repeating `reviewer` builds the panel (replacing the file's, never appending). Like `[roles]`, it satisfies the "`--providers` or `--select` required" rule on its own. **Prefer it to editing the shared file:** `spar.toml` is one file per project, so parallel agents writing their own `[roles]` into it are writing over each other.
+**`--role <role>=<provider>` assigns per role without touching `spar.toml`** — repeatable,
+and a `reviewer` list this way sets the panel size **exactly** (replacing the file's list,
+never appending, and never falling back to `[providers].order` past its end). Like
+`[roles]`, it satisfies the "`--providers` or `--select` required" rule on its own, and it
+outranks even an explicit `--providers` pool for the role it names. **Prefer it to editing
+the shared file:** `spar.toml` is one file per project, so parallel agents writing their
+own `[roles]` into it are writing over each other.
 
 ```bash
 spar plan -t "…" --role planner=cli:grok --role plan_critic=cli:claude@opus --role reviewer=cli:grok
 ```
+
+## Fleet shaping (`--fleet`, `--without`, run JSON `fleet`)
+
+`--fleet small|standard` and `--without <critic,spec,suite>` shape one run's seats without
+touching `spar.toml`, on `plan`, `implement` and `run`. Composition order: preset, then
+`--without`, then `--role` — explicit flags always win over the preset.
+
+- **`--fleet standard`** is a no-op over the file: it never re-enables a channel the
+  project already disabled.
+- **`--fleet small`** is one reviewer (the first pin if the panel is pinned, else the same
+  provider the unpinned panel's first seat would get), no `plan_critic`, no `test_author`,
+  and no agent `tester` — a configured deterministic `[suite].command` still runs, since it
+  is free and never spawns a tester slot anyway.
+- **`--without critic,spec,suite`** drops seats individually: `critic` -> no `plan_critic`
+  slot (and the spec bus protocol coordinates with the planner alone, addressing nothing to
+  a critic that does not exist); `spec` -> `[spec] enabled = false` for this run (no
+  `test_author`, no `test-contract.md`); `suite` -> `[suite] enabled = false` for this run
+  (no `tester` slot). Unknown names are refused, naming the three valid ones. On an
+  existing `--run <id>` it needs `--reload-config`, exactly like `--role`.
+- Both flags are applied where `--role` is (`main.rs`), so they land in the run's frozen
+  `config.json` and survive a later round with no `--reload-config` (O27).
+
+**Run JSON carries a `fleet` array**, one entry per seat: `{seat, role, provider, model,
+source, projected}`. `source` names the precedence rung the provider came from —
+`cli-role`, `cli-providers`, `roles-file`, `providers-order`, `model-select`, or
+`suite-preferences`. `projected: true` marks a seat the run will dispatch later but has not
+created yet — at the plan gate this is the whole implement panel, resolved through the same
+function slot creation uses (`roles_resolve::build_implement_seats`), so a projected seat's
+id always equals the id the implement phase later creates. The human gate output prints the
+same data as a `fleet:` table, alongside the existing one-line `roles:` summary.
 
 ## A run is bound to the config it was created with
 

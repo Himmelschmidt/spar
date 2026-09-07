@@ -54,6 +54,9 @@
 - [ ] **Run composition** (workflow choice, role-by-role fleet with models and backups, operator defaults, the conversation completes the form) - see `features/009-run-composition.md`  
 - [ ] **Structured views** (records not lines: columns, timestamps, folding, navigation by structure) - see `features/010-structured-views.md`  
 - [~] **Motion and visual identity** — chrome rebuild, token system and the snapshot/stability harness landed early (phases C+D, out of order, decision U14); time-based motion and reserved-space layout (phases A+B) still queued behind 005 - see `features/006-motion-and-identity.md`  
+- [x] **Fleet shaping** (honest provider precedence, a pinned reviewer panel as an exact
+  panel not a padded one, the resolved fleet visible at gates, `--without` and `--fleet`
+  presets) - see `features/011-fleet-shaping.md`  
 
 ## Later
 
