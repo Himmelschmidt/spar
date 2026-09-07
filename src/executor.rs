@@ -377,8 +377,15 @@ fn build_dispatch_command(
 /// Excludes a timeout: a resume that ran the full ceiling without answering is a genuine
 /// hang, and retrying cold there would just double the wall-clock cost for the slot's
 /// budget instead of recovering anything.
+///
+/// Does not condition on the exit code. The discriminator that carries the meaning is
+/// `session_id.is_none()` — a resume that never emitted `thread.started` did no work
+/// regardless of how it exited. Today's codex (0.152.0) always exits non-zero on a
+/// missing rollout, but keying on `session_id` alone means a future version that exits
+/// 0 on the same non-start still gets the retry instead of leaving a marker that dead-
+/// ends every later round of the slot.
 fn resume_lost_its_session(used_resume: bool, res: &process::SpawnResult) -> bool {
-    used_resume && !res.timed_out && res.exit_code != Some(0) && res.stats.session_id.is_none()
+    used_resume && !res.timed_out && res.stats.session_id.is_none()
 }
 
 fn execute_prepared(
@@ -543,6 +550,9 @@ fn execute_prepared(
                 "resume lost its session (no thread.started); retrying cold dispatch once",
             ),
         );
+        // `run_captured` truncates `log_path`; preserve the failed resume's own log
+        // (e.g. codex's "no rollout found") before the cold retry overwrites it.
+        let _ = std::fs::copy(&prep.log_path, lost_resume_log_path(&prep.log_path));
         let cold = adapter.build_headless(&bin, &opts);
         let (program, args) = providers::command_to_parts(&cold);
         let (program, args) = sandbox::maybe_wrap(isolation, &prep.cwd, &program, &args);
@@ -842,6 +852,19 @@ fn recovery_log_path(log_path: &Path) -> PathBuf {
         .and_then(|s| s.to_str())
         .unwrap_or("slot");
     log_path.with_file_name(format!("{stem}.recovery.log"))
+}
+
+/// `<run_dir>/logs/<slot>.lost-resume.log` — a sibling of the shared log path, copied to
+/// just before `resume_lost_its_session`'s cold retry overwrites it (`run_captured`
+/// truncates via `File::create`). Preserves the failed resume's own stderr (e.g. codex's
+/// `no rollout found for thread id …`), which is otherwise gone by the time anyone reads
+/// the log — the retry's own output is all that would remain.
+fn lost_resume_log_path(log_path: &Path) -> PathBuf {
+    let stem = log_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("slot");
+    log_path.with_file_name(format!("{stem}.lost-resume.log"))
 }
 
 fn markers_pid_path(paths: &SparPaths, run_id: &str, slot_id: &str) -> PathBuf {
@@ -2234,6 +2257,9 @@ fn run_headless(
                 "resume lost its session (no thread.started); retrying cold dispatch once",
             ),
         );
+        // See `execute_prepared`: preserve the failed resume's log before the cold
+        // retry truncates the shared path.
+        let _ = std::fs::copy(log_path, lost_resume_log_path(log_path));
         let cold = adapter.build_headless(&bin, &opts);
         let (program, args) = providers::command_to_parts(&cold);
         let (program, args) = sandbox::maybe_wrap(state.isolation, cwd, &program, &args);
@@ -2919,9 +2945,14 @@ mod tests {
         res.exit_code = None;
         assert!(!resume_lost_its_session(true, &res));
 
-        // Resume exited clean: nothing to retry.
+        // Resume exited clean but still never captured a session id: still a lost
+        // rollout, regardless of exit code (see the function's own doc comment).
         res.timed_out = false;
         res.exit_code = Some(0);
+        assert!(resume_lost_its_session(true, &res));
+
+        // Session id captured, even on a clean exit: no retry.
+        res.stats.session_id = Some("thread-123".into());
         assert!(!resume_lost_its_session(true, &res));
     }
 

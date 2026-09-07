@@ -1,7 +1,7 @@
 use super::{
     Capabilities, DeliveryStrategy, PresenceSource, ProviderAdapter, SpawnOpts, TrustPolicy,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Default codex profile: layers the OpenRouter provider + Muse Spark default
@@ -47,6 +47,44 @@ fn model_args(model: &str) -> Vec<String> {
     } else {
         vec!["-m".into(), model.into()]
     }
+}
+
+/// `$CODEX_HOME`, defaulting to `~/.codex` — codex's own resolution order, enough for
+/// spar's purpose since this only ever reads.
+fn codex_home() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("CODEX_HOME") {
+        if !p.trim().is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(".codex"))
+}
+
+/// A profile's `(model_provider, model)`, read straight from the same
+/// `$CODEX_HOME/<profile>.config.toml` that `-p <profile>` layers over `config.toml` (see
+/// `DEFAULT_CODEX_PROFILE`'s doc comment). `codex exec resume` has no `-p/--profile` (it
+/// is rejected as an unknown flag, and so is the `-c profile=` config route), so this is
+/// how a resumed thread keeps the same model instead of silently sliding onto whatever
+/// `config.toml`'s bare default resolves to. Verified against codex 0.152.0: a resume
+/// with neither `-m` nor `-p` runs under the *current* config default, not the rollout's
+/// own model, and the rollout's `session_meta` never records a `model` field to restore
+/// from. Returns `None` (no override emitted) when the file is missing or has no
+/// `model` key — e.g. a plain profile that only sets an approval policy.
+fn profile_model_args(profile: &str) -> Option<Vec<String>> {
+    let path = codex_home()?.join(format!("{profile}.config.toml"));
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: toml::Value = text.parse().ok()?;
+    let model = value.get("model")?.as_str()?.to_string();
+    let mut args = Vec::new();
+    if let Some(provider) = value.get("model_provider").and_then(|v| v.as_str()) {
+        args.push("-c".into());
+        args.push(format!("model_provider={provider}"));
+    }
+    args.push("-m".into());
+    args.push(model);
+    Some(args)
 }
 
 /// The trailing prompt positional: inline `opts.prompt` if set, else the prompt file's
@@ -164,10 +202,13 @@ impl ProviderAdapter for CodexAdapter {
     // `codex exec resume [OPTIONS] [SESSION_ID] [PROMPT]` (verified against codex
     // 0.152.0 — `codex exec resume --help`). It takes the same `--json` /
     // `--skip-git-repo-check` / permission / `-m` flags as `exec`, but has no
-    // `-p/--profile`: a resumed thread already carries whatever profile started it, so
-    // `codex_profile()` is not applied here (it would also be rejected as an unknown
-    // flag). `session_id` is the thread id a prior round's `build_headless` (or an
-    // earlier resume) captured for this same slot.
+    // `-p/--profile` (rejected as an unknown flag, as is the `-c profile=` config
+    // route). An explicit model still wins outright; absent one, `profile_model_args`
+    // resolves the profile's own `(model_provider, model)` from its config file and
+    // emits the equivalent `-c`/`-m` so the resumed thread keeps the same model instead
+    // of sliding onto `config.toml`'s bare default (see its doc comment for why `-p`
+    // itself cannot be used). `session_id` is the thread id a prior round's
+    // `build_headless` (or an earlier resume) captured for this same slot.
     fn build_resume(&self, bin: &Path, opts: &SpawnOpts, session_id: &str) -> Option<Command> {
         let mut cmd = Command::new(bin);
         cmd.arg("exec");
@@ -177,9 +218,20 @@ impl ProviderAdapter for CodexAdapter {
         for a in self.permission_args(opts.trust) {
             cmd.arg(a);
         }
-        if let Some(m) = codex_model(opts) {
-            for a in model_args(&m) {
-                cmd.arg(a);
+        match codex_model(opts) {
+            Some(m) => {
+                for a in model_args(&m) {
+                    cmd.arg(a);
+                }
+            }
+            None => {
+                if let Some(p) = codex_profile() {
+                    if let Some(args) = profile_model_args(&p) {
+                        for a in args {
+                            cmd.arg(a);
+                        }
+                    }
+                }
             }
         }
         for a in &opts.extra_args {
@@ -197,6 +249,16 @@ impl ProviderAdapter for CodexAdapter {
         // tmux backend (`--backend tmux`), run the same headless `exec --json`
         // command in the pane so full-auto + token tracking are preserved — it is
         // watchable, just not takeover-able (capabilities().interactive is false).
+        //
+        // Always cold, deliberately: `run_tmux` never runs the stream through
+        // `StreamCoalescer` (it tees the pane to a log file, not through
+        // `process::run_captured`), so no path ever captures a `thread.started` for a
+        // tmux-forced dispatch and there is nothing here to resume from. This matches
+        // every other adapter on that backend today — the gap is backend-wide, not
+        // codex-specific — so `build_interactive` intentionally never calls
+        // `build_resume`, and a codex slot forced onto `--backend tmux` re-dispatches
+        // cold every round rather than silently pretending to continue a thread it
+        // never captured.
         self.build_headless(bin, opts)
     }
 }
@@ -207,6 +269,7 @@ mod tests {
     use crate::providers::command_to_parts;
     use std::path::PathBuf;
     use std::sync::Mutex;
+    use tempfile::tempdir;
 
     // Serializes the tests that mutate SPAR_CODEX_* process env.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -378,6 +441,10 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("SPAR_CODEX_PROFILE");
         std::env::remove_var("SPAR_CODEX_MODEL");
+        // Point at an empty CODEX_HOME so the default `muse` profile resolves no
+        // model override, keeping this test independent of the real machine's config.
+        let home = tempdir().unwrap();
+        std::env::set_var("CODEX_HOME", home.path());
         let cmd = CodexAdapter
             .build_resume(
                 Path::new("codex"),
@@ -386,6 +453,7 @@ mod tests {
             )
             .expect("codex supports resume");
         let (_, args) = command_to_parts(&cmd);
+        std::env::remove_var("CODEX_HOME");
         assert_eq!(&args[..2], ["exec", "resume"]);
         assert!(args.iter().any(|a| a == "--json"));
         assert!(args
@@ -393,6 +461,8 @@ mod tests {
             .any(|a| a == "01a07c85-9f8e-7ee1-b429-4fc000e90add"));
         // No profile flag: `codex exec resume` has no `-p/--profile`.
         assert!(!args.iter().any(|a| a == "-p"));
+        // No config file for the profile means no model override either.
+        assert!(!args.iter().any(|a| a == "-m"));
         // Prompt is still the final positional, preceded by `--`.
         assert_eq!(args.last().map(String::as_str), Some("keep going"));
         let di = args.iter().position(|a| a == "--").expect("-- separator");
@@ -419,5 +489,61 @@ mod tests {
             args.get(mi + 1).map(String::as_str),
             Some("meta/muse-spark-1.1")
         );
+    }
+
+    #[test]
+    fn build_resume_preserves_profile_model_via_config_file() {
+        // `-p` cannot be passed to `resume` (codex rejects it), so with no explicit
+        // model, build_resume must read the profile's own config file and emit the
+        // equivalent -c/-m rather than silently falling onto config.toml's default.
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("SPAR_CODEX_PROFILE", "muse");
+        std::env::remove_var("SPAR_CODEX_MODEL");
+        let home = tempdir().unwrap();
+        std::fs::write(
+            home.path().join("muse.config.toml"),
+            "model_provider = \"openrouter\"\nmodel = \"meta/muse-spark-1.1\"\n",
+        )
+        .unwrap();
+        std::env::set_var("CODEX_HOME", home.path());
+        let cmd = CodexAdapter.build_resume(Path::new("codex"), &opts("go", None), "thread-1");
+        let (_, args) = command_to_parts(&cmd.unwrap());
+        std::env::remove_var("CODEX_HOME");
+        std::env::remove_var("SPAR_CODEX_PROFILE");
+
+        let ci = args.iter().position(|a| a == "-c").expect("-c present");
+        assert_eq!(
+            args.get(ci + 1).map(String::as_str),
+            Some("model_provider=openrouter")
+        );
+        let mi = args.iter().position(|a| a == "-m").expect("-m present");
+        assert_eq!(
+            args.get(mi + 1).map(String::as_str),
+            Some("meta/muse-spark-1.1")
+        );
+        assert!(!args.iter().any(|a| a == "-p"));
+    }
+
+    #[test]
+    fn build_resume_omits_model_override_when_profile_has_no_model() {
+        // A profile that only sets e.g. an approval policy has nothing to restore, so
+        // resume must not fabricate a model flag.
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("SPAR_CODEX_PROFILE", "plain");
+        std::env::remove_var("SPAR_CODEX_MODEL");
+        let home = tempdir().unwrap();
+        std::fs::write(
+            home.path().join("plain.config.toml"),
+            "approval_policy = \"never\"\n",
+        )
+        .unwrap();
+        std::env::set_var("CODEX_HOME", home.path());
+        let cmd = CodexAdapter.build_resume(Path::new("codex"), &opts("go", None), "thread-1");
+        let (_, args) = command_to_parts(&cmd.unwrap());
+        std::env::remove_var("CODEX_HOME");
+        std::env::remove_var("SPAR_CODEX_PROFILE");
+
+        assert!(!args.iter().any(|a| a == "-m"));
+        assert!(!args.iter().any(|a| a == "-p"));
     }
 }
