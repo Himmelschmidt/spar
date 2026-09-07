@@ -72,6 +72,19 @@ pub fn reviewer_panel_pinned(cfg: &Config) -> bool {
         || cfg.fleet_reviewer_override.is_some()
 }
 
+/// Whether the reviewer panel has an actual pin *list* to rotate within (CLI
+/// `--role reviewer=…` or `[roles].reviewer`), as opposed to `--fleet small`'s panel-size
+/// override alone. `reviewer_panel_pinned` above also counts a preset-only narrowing as
+/// "pinned" so widening never imports from `[providers].order` — but rotation on a panel
+/// with no real pins has nothing to rotate *within*: it must still fall through to the
+/// pool / `[providers].order` the way an ordinary unpinned panel does, or a failed
+/// unpinned-but-narrowed reviewer loses its only retry.
+pub fn reviewer_panel_has_pins(cfg: &Config) -> bool {
+    cfg.cli_role_keys
+        .contains(SlotRole::Reviewer.as_config_key())
+        || !cfg.roles.reviewer.is_empty()
+}
+
 fn singleton_role_value(role: SlotRole, cfg: &Config) -> Option<String> {
     match role {
         SlotRole::Planner => cfg.roles.planner.clone(),
@@ -332,5 +345,26 @@ mod tests {
         cfg.roles.reviewer = vec!["cli:a".into(), "cli:b".into()];
         assert_eq!(panel_size(&cfg), 2);
         assert_eq!(pool_width(&cfg), 3);
+    }
+
+    /// A `--fleet small` narrowing with no underlying `[roles].reviewer` pin is "pinned"
+    /// for widening (never import from `[providers].order`), but has no real pin list to
+    /// rotate within: `reviewer_panel_has_pins` must say `false` so rotation still falls
+    /// through to the pool / order, unlike `reviewer_panel_pinned`.
+    #[test]
+    fn preset_only_narrowing_is_pinned_but_has_no_pins() {
+        let cfg = Config {
+            fleet_reviewer_override: Some(1),
+            ..Config::default()
+        };
+        assert!(reviewer_panel_pinned(&cfg));
+        assert!(!reviewer_panel_has_pins(&cfg));
+    }
+
+    #[test]
+    fn a_real_pin_list_counts_as_has_pins() {
+        let mut cfg = Config::default();
+        cfg.roles.reviewer = vec!["cli:codex".into()];
+        assert!(reviewer_panel_has_pins(&cfg));
     }
 }

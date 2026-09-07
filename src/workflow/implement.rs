@@ -2004,12 +2004,17 @@ fn try_rotate_reviewer_provider(
     };
     // A pinned panel is an exclusion list (Bug A): rotation must stay inside
     // `[roles].reviewer` and never reach into the run's pool or `[providers].order` for a
-    // replacement, even when the pin list has only one entry and offers none. Only an
-    // unpinned panel may draw a substitute from the pool, then `[providers].order`.
-    let next = if crate::workflow::roles_resolve::reviewer_panel_pinned(cfg) {
+    // replacement, even when the pin list has only one entry and offers none. Only a real
+    // pin list counts here (`reviewer_panel_has_pins`, not `reviewer_panel_pinned`): a
+    // `--fleet small` narrowing with no underlying pins has nothing to rotate within and
+    // must fall through like an unpinned panel. Bound the pin candidates to `panel_size`
+    // too, so rotating a `small`-truncated two-pin panel duplicates the dispatched pin
+    // rather than restoring the pin the preset dropped.
+    let next = if crate::workflow::roles_resolve::reviewer_panel_has_pins(cfg) {
         cfg.roles
             .reviewer
             .iter()
+            .take(crate::workflow::roles_resolve::panel_size(cfg))
             .find(|p| **p != cur)
             .cloned()
             .map(|p| (p, reviewer_role_source))
@@ -2100,6 +2105,50 @@ mod rotate_reviewer_tests {
             try_rotate_reviewer_provider(&mut st, &paths, "review-0", tmp.path(), &cfg).unwrap();
         assert!(changed);
         assert_eq!(st.slots[0].provider, "api:openai");
+    }
+
+    /// `--fleet small` (a preset-only panel narrowing, no `[roles].reviewer` pin) must not
+    /// disable failure-recovery rotation: with nothing actually pinned, rotation falls
+    /// through to the run's own pool the same way an ordinary unpinned panel does
+    /// (review-0-cli-claude, major finding 1).
+    #[test]
+    fn preset_only_narrowing_still_rotates_through_the_pool() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = state_with_reviewer("cli:grok");
+        st.providers = vec!["cli:claude".into(), "cli:grok".into()];
+        st.pool_origin = PoolOrigin::CliProviders;
+        let cfg = Config {
+            fleet_reviewer_override: Some(1),
+            ..Config::default()
+        };
+        let changed =
+            try_rotate_reviewer_provider(&mut st, &paths, "review-0", tmp.path(), &cfg).unwrap();
+        assert!(changed, "narrowed-but-unpinned panel must still retry");
+        assert_eq!(st.slots[0].provider, "cli:claude");
+    }
+
+    /// Rotating a `--fleet small`-truncated two-pin panel must not restore the pin
+    /// `small` dropped: candidates are bound to `panel_size`, so the truncated panel has
+    /// no alternate to rotate to and refuses, exactly like a genuine one-pin panel
+    /// (review-0-cli-claude, minor finding 2).
+    #[test]
+    fn small_truncated_two_pin_panel_does_not_restore_the_dropped_pin() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = state_with_reviewer("cli:codex");
+        let cfg = Config {
+            fleet_reviewer_override: Some(1),
+            roles: crate::config::RolesConfig {
+                reviewer: vec!["cli:codex".into(), "api:openai".into()],
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let changed =
+            try_rotate_reviewer_provider(&mut st, &paths, "review-0", tmp.path(), &cfg).unwrap();
+        assert!(!changed, "truncated panel has no alternate within its size");
+        assert_eq!(st.slots[0].provider, "cli:codex");
     }
 }
 
