@@ -6,7 +6,7 @@
 //! the command layer only resolves the strategy (from the slot's adapter) and calls
 //! [`deliver`]. The orchestrator never learns which provider it is talking to.
 
-use super::DeliveryStrategy;
+use super::{DeliveryStrategy, MuseAdapter, ProviderAdapter};
 use crate::bus::{self, BusMessage};
 use crate::paths::SparPaths;
 use crate::process::StreamStats;
@@ -15,6 +15,7 @@ use serde::Serialize;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// What the seam actually did with the claimed messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -118,16 +119,19 @@ pub fn deliver(
             append_poll_file(paths, run, agent, &render_reason(&msgs), dry_run)?;
             (DeliveryAction::PolledFile, None)
         }
-        DeliveryStrategy::MuseSessionMessage => match muse_session_id(paths, run, agent) {
-            Some(target) => {
-                send_muse_session_message(&target, &render_reason(&msgs), dry_run)?;
+        DeliveryStrategy::MuseSessionMessage => {
+            let body = render_reason(&msgs);
+            let sent = match muse_session_id(paths, run, agent) {
+                Some(target) => send_muse_session_message(&target, &body, dry_run)?,
+                None => false,
+            };
+            if sent {
                 (DeliveryAction::SessionMessaged, None)
-            }
-            None => {
-                append_poll_file(paths, run, agent, &render_reason(&msgs), dry_run)?;
+            } else {
+                append_poll_file(paths, run, agent, &body, dry_run)?;
                 (DeliveryAction::PolledFile, None)
             }
-        },
+        }
         DeliveryStrategy::None => unreachable!("None handled above"),
     };
 
@@ -242,30 +246,67 @@ fn muse_session_id(paths: &SparPaths, run: Option<&str>, agent: &str) -> Option<
     StreamStats::load(&log_path)?.session_id
 }
 
+/// Hard ceiling on `muse session-message send` before spar gives up on it. `nudge`'s
+/// caller runs inside `run_captured`'s own poll loop (`process.rs`), the same loop that
+/// enforces the slot's wall-clock ceiling, so an unbounded wait here would stall that
+/// ceiling check for as long as the send hangs (unresponsive session host, ingress stuck
+/// on a lock). Ten seconds is generous for a local IPC call and small next to the
+/// minutes-to-hours a slot actually runs.
+const MUSE_SESSION_MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Push `body` into a running muse session via its cross-session inject channel
-/// (`muse session-message send --target <session-uuid>`, message body on stdin). `--json`
-/// keeps stdout machine-readable; spar does not need to parse it here, since a nonzero
-/// exit already surfaces as an error and the file-based delivery this replaces had no
-/// stronger delivery guarantee either.
-fn send_muse_session_message(target: &str, body: &str, dry_run: bool) -> Result<()> {
+/// (`muse session-message send --target <session-uuid>`, message body on stdin).
+/// Returns `Ok(true)` only on a clean, successful exit. Every other outcome — `muse`
+/// missing from `PATH`, a spawn or stdin-write failure, a nonzero exit (e.g. muse's
+/// `external_agent_ingress` feature gate off, which fails closed with
+/// `external_agent_ingress_closed`), or a hang past `MUSE_SESSION_MESSAGE_TIMEOUT` —
+/// returns `Ok(false)` so the caller falls back to the poll file instead of reporting a
+/// delivery that never landed anywhere.
+fn send_muse_session_message(target: &str, body: &str, dry_run: bool) -> Result<bool> {
     if dry_run {
-        return Ok(());
+        return Ok(true);
     }
-    let mut child = Command::new("muse")
+    let Some(bin) = MuseAdapter.resolve_binary() else {
+        return Ok(false);
+    };
+    let mut child = match Command::new(bin)
         .args(["session-message", "send", "--target", target, "--json"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .context("spawn muse session-message send")?;
-    child
+    {
+        Ok(child) => child,
+        Err(_) => return Ok(false),
+    };
+
+    let write_ok = child
         .stdin
         .take()
         .expect("stdin piped above")
         .write_all(body.as_bytes())
-        .context("write muse session-message body")?;
-    child.wait().context("wait on muse session-message send")?;
-    Ok(())
+        .is_ok();
+    if !write_ok {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(false);
+    }
+
+    let deadline = Instant::now() + MUSE_SESSION_MESSAGE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status.success()),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(false);
+            }
+            Err(_) => return Ok(false),
+        }
+    }
 }
 
 fn append_poll_file(
@@ -350,16 +391,20 @@ pub fn nudge(
             }
             (DeliveryAction::StopHookBlock, None)
         }
-        DeliveryStrategy::MuseSessionMessage => match muse_session_id(paths, run, agent) {
-            Some(target) => {
-                send_muse_session_message(&target, text, dry_run)?;
+        DeliveryStrategy::MuseSessionMessage => {
+            let sent = match muse_session_id(paths, run, agent) {
+                Some(target) => send_muse_session_message(&target, text, dry_run)?,
+                None => false,
+            };
+            if sent {
                 (DeliveryAction::SessionMessaged, None)
+            } else {
+                (
+                    DeliveryAction::PolledFile,
+                    Some(append_poll_file(paths, run, agent, text, dry_run)?),
+                )
             }
-            None => (
-                DeliveryAction::PolledFile,
-                Some(append_poll_file(paths, run, agent, text, dry_run)?),
-            ),
-        },
+        }
         DeliveryStrategy::NativeQueue | DeliveryStrategy::SdkPrompt => {
             let path = queue_path(paths, run, agent);
             if !dry_run {
@@ -656,13 +701,20 @@ mod tests {
     /// (args on one line, stdin body on the next) to `capture` and restores the original
     /// `PATH` when the returned guard drops.
     fn fake_muse(dir: &std::path::Path, capture: &std::path::Path) -> impl Drop {
+        fake_muse_exit(dir, capture, 0)
+    }
+
+    /// Like [`fake_muse`], but the script exits `code` after recording its invocation —
+    /// used to reproduce muse's own failure mode (`external_agent_ingress_closed` exits
+    /// 1 with a JSON body describing why) without a live muse install.
+    fn fake_muse_exit(dir: &std::path::Path, capture: &std::path::Path, code: i32) -> impl Drop {
         use std::os::unix::fs::PermissionsExt;
 
         let script = dir.join("muse");
         fs::write(
             &script,
             format!(
-                "#!/bin/sh\necho \"$@\" > {args:?}\ncat > {stdin:?}\necho '{{\"schema_version\":1,\"status\":\"ok\"}}'\n",
+                "#!/bin/sh\necho \"$@\" > {args:?}\ncat > {stdin:?}\necho '{{\"schema_version\":1,\"status\":\"ok\"}}'\nexit {code}\n",
                 args = capture.with_extension("args"),
                 stdin = capture.with_extension("stdin"),
             ),
@@ -673,6 +725,25 @@ mod tests {
         let guard = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let original = std::env::var("PATH").unwrap_or_default();
         std::env::set_var("PATH", format!("{}:{original}", dir.display()));
+
+        struct Restore(
+            #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+            String,
+        );
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                std::env::set_var("PATH", &self.1);
+            }
+        }
+        Restore(guard, original)
+    }
+
+    /// Points `PATH` at an empty directory (no `muse` binary anywhere on it), guarded by
+    /// the same lock as [`fake_muse`] since both mutate process-wide `PATH`.
+    fn no_muse_on_path(dir: &std::path::Path) -> impl Drop {
+        let guard = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let original = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", dir.display().to_string());
 
         struct Restore(
             #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
@@ -808,5 +879,115 @@ mod tests {
         assert!(args.contains("--target sess-456"), "{args}");
         let stdin = fs::read_to_string(capture.with_extension("stdin")).unwrap();
         assert!(stdin.contains("land your artifact"), "{stdin}");
+    }
+
+    /// muse's own `external_agent_ingress` feature gate fails closed with a nonzero exit
+    /// (`external_agent_ingress_closed`) rather than an `Err` spar can catch structurally.
+    /// A rejected send must fall back to the poll file, not be reported as delivered —
+    /// otherwise the claimed bus message is gone with nowhere it landed.
+    #[test]
+    fn muse_session_message_falls_back_to_poll_file_on_nonzero_exit() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        muse_seed(&paths, 1);
+
+        let log_path = paths.log_file("r1", "b");
+        fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        StreamStats {
+            session_id: Some("sess-789".into()),
+            ..Default::default()
+        }
+        .save(&log_path)
+        .unwrap();
+
+        let capture = tmp.path().join("capture");
+        let _guard = fake_muse_exit(tmp.path(), &capture, 1);
+
+        let ub = agent_ref(Some("r1"), "b");
+        let d = deliver(
+            &paths,
+            Some("r1"),
+            &ub,
+            DeliveryStrategy::MuseSessionMessage,
+            false,
+        )
+        .unwrap();
+        assert_eq!(d.action, DeliveryAction::PolledFile);
+        assert_eq!(d.delivered, 1);
+        let body = fs::read_to_string(poll_file(&paths, Some("r1"), &ub)).unwrap();
+        assert!(body.contains("msg 0"), "{body}");
+    }
+
+    /// The nudge path takes the same fallback on a rejected send — a nudge is spar's own
+    /// control message, and it must not be silently dropped either.
+    #[test]
+    fn muse_nudge_falls_back_to_poll_file_on_nonzero_exit() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        muse_seed(&paths, 0);
+
+        let log_path = paths.log_file("r1", "b");
+        fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        StreamStats {
+            session_id: Some("sess-abc".into()),
+            ..Default::default()
+        }
+        .save(&log_path)
+        .unwrap();
+
+        let capture = tmp.path().join("capture");
+        let _guard = fake_muse_exit(tmp.path(), &capture, 1);
+
+        let ub = agent_ref(Some("r1"), "b");
+        let d = nudge(
+            &paths,
+            Some("r1"),
+            &ub,
+            DeliveryStrategy::MuseSessionMessage,
+            "land your artifact",
+            false,
+        )
+        .unwrap();
+        assert_eq!(d.action, DeliveryAction::PolledFile);
+        let body = fs::read_to_string(poll_file(&paths, Some("r1"), &ub)).unwrap();
+        assert!(body.contains("land your artifact"), "{body}");
+    }
+
+    /// A slot log sidecar can outlive the environment `muse` was reachable from (a stale
+    /// session id from a prior box, or `muse` simply not installed where the delivery seam
+    /// runs). Must fall back cleanly rather than propagate a spawn error and lose the
+    /// message.
+    #[test]
+    fn muse_session_message_falls_back_to_poll_file_when_muse_missing() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        muse_seed(&paths, 1);
+
+        let log_path = paths.log_file("r1", "b");
+        fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        StreamStats {
+            session_id: Some("sess-none".into()),
+            ..Default::default()
+        }
+        .save(&log_path)
+        .unwrap();
+
+        let empty_bin_dir = tmp.path().join("no-muse-here");
+        fs::create_dir_all(&empty_bin_dir).unwrap();
+        let _guard = no_muse_on_path(&empty_bin_dir);
+
+        let ub = agent_ref(Some("r1"), "b");
+        let d = deliver(
+            &paths,
+            Some("r1"),
+            &ub,
+            DeliveryStrategy::MuseSessionMessage,
+            false,
+        )
+        .unwrap();
+        assert_eq!(d.action, DeliveryAction::PolledFile);
+        assert_eq!(d.delivered, 1);
+        let body = fs::read_to_string(poll_file(&paths, Some("r1"), &ub)).unwrap();
+        assert!(body.contains("msg 0"), "{body}");
     }
 }

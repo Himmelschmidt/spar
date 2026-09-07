@@ -43,8 +43,9 @@ impl ProviderAdapter for MuseAdapter {
     // heuristic. Delivery, though, is a real push: `muse session-message send --target
     // <session-uuid>` injects into the running session, keyed off the session id
     // `StreamCoalescer` captures from the exec JSONL's first `/stream/id` line. The
-    // delivery seam (`providers::delivery`) falls back to the poll file for the window
-    // before that id is known.
+    // delivery seam (`providers::delivery`) falls back to the poll file both for the
+    // window before that id is known and if the push itself fails (muse missing, a
+    // rejected send, or a hang).
     fn delivery_strategy(&self) -> DeliveryStrategy {
         DeliveryStrategy::MuseSessionMessage
     }

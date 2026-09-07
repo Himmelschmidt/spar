@@ -17,6 +17,11 @@ All notable changes to spar are recorded here.
   you the smallest useful setup — one reviewer, no critic, no test writer, no automatic
   tester — while still running your project's own test command if you've configured one.
 
+- **`cli:muse` slots now receive nudges and swarm messages inside the running session**,
+  instead of only in a file the agent had to remember to check. If the push itself can't
+  reach the session (muse not installed, its ingress rejects the send, or it hangs), spar
+  falls back to that same file automatically.
+
 ### Fixed
 
 - **Watching or checking on a run no longer fails at random while the run is writing.**

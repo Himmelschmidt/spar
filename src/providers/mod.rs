@@ -40,7 +40,8 @@ pub enum DeliveryStrategy {
     /// the running session. The target is the session id `StreamCoalescer` captures off
     /// the exec JSONL's first `/stream/id` line, so it is unknown until that line
     /// arrives; the delivery seam falls back to the poll file for anything queued before
-    /// then.
+    /// then, and again if the send itself fails (muse missing, a rejected push, or a
+    /// hang) so a claimed message always lands somewhere the slot reads.
     MuseSessionMessage,
     /// No push channel into the running process, so spar writes to a slot-scoped file
     /// and the role prompt tells the agent to read it before it starts any new major

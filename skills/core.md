@@ -548,8 +548,8 @@ slot is stuck on.**
   inbox, which its `Stop` hook drains at the turn boundary. **grok** takes them on its
   native queue. **muse** takes them through `muse session-message send --target
   <session-uuid>`, once its session id is known (captured from the exec JSONL's first
-  `/stream/id` line); before that a nudge falls back to the same poll file as below.
-  **opencode and codex** have no push channel at all, so
+  `/stream/id` line); before that, or if the send itself fails or hangs, a nudge falls
+  back to the same poll file as below. **opencode and codex** have no push channel at all, so
   spar writes to `.spar/runs/<id>/logs/nudges-<slot>.md` and their role prompt tells them to
   read it before starting any new major step. Thresholds are checked every 30 seconds, so a
   nudge lands at the next 30s boundary rather than the instant a budget is crossed.
