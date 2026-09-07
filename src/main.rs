@@ -587,12 +587,16 @@ fn implement_ctx(
         }
         if let Some(preset) = fleet {
             // Validate before refusing: an unknown preset name is its own error, not
-            // one the `--reload-config` refusal should swallow.
-            config::FleetPreset::parse(preset)?;
-            anyhow::bail!(
-                "run {run_id} is bound to the config it was created with; \
-                 pass --reload-config to apply --fleet to it"
-            );
+            // one the `--reload-config` refusal should swallow. `standard` is a
+            // documented no-op over the file (never re-enables a channel the file
+            // already disabled), so it never needs to change a bound run's frozen
+            // config and must not be refused just for being spelled out.
+            if config::FleetPreset::parse(preset)? != config::FleetPreset::Standard {
+                anyhow::bail!(
+                    "run {run_id} is bound to the config it was created with; \
+                     pass --reload-config to apply --fleet to it"
+                );
+            }
         }
         let cfg = Config::for_run(&paths, run_id)?;
         return Ok((paths, cfg));
