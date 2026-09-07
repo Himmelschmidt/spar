@@ -2559,7 +2559,11 @@ pub fn print_run_human(state: &RunState) {
     if state.dry_run {
         println!("dry_run: true  (no git worktrees; agent processes stubbed only)");
     }
-    print_fleet_table(state);
+    // Gate phases only (feature 011, item C): that is where a human decides whether to
+    // pay for the panel, and a table on every status print would just be noise.
+    if state.phase.is_gate() {
+        print_fleet_table(state);
+    }
 }
 
 /// The resolved fleet, one row per seat: what a `roles:` line cannot show, because a
