@@ -493,7 +493,14 @@ fn execute_prepared(
         &prep.paths,
     );
     enrich_muse_stats(&mut res.stats, &prep.job.provider, &prep.log_path);
-    enrich_opencode_stats(&mut res.stats, &prep.job.provider, &prep.log_path);
+    enrich_opencode_stats(
+        &mut res.stats,
+        &prep.job.provider,
+        &prep.log_path,
+        &prep.paths,
+        &prep.run_id,
+        &prep.job.slot_id,
+    );
     let quota_rejected = res.stats.quota_rejected.clone();
     let quota_resets_at = resets_at_from_epoch_secs(res.stats.quota_resets_at);
     let quota_recovered = res.stats.quota_recovered;
@@ -807,8 +814,17 @@ fn enrich_muse_stats(stats: &mut process::StreamStats, provider: &str, log_path:
 
 /// opencode's own stream filters a `task` subagent's usage out before it ever reaches
 /// stdout, so a slot that fanned out reports only its own step deltas. Add the missing
-/// child spend from opencode's sqlite ledger and rewrite the slot's stats sidecar.
-fn enrich_opencode_stats(stats: &mut process::StreamStats, provider: &str, log_path: &Path) {
+/// child spend from opencode's sqlite ledger and rewrite the slot's stats sidecar. When
+/// the ledger was found but could not be read, that is a real anomaly indistinguishable
+/// from "nothing to recover" in `stats.json` alone, so it goes to the run's event log.
+fn enrich_opencode_stats(
+    stats: &mut process::StreamStats,
+    provider: &str,
+    log_path: &Path,
+    paths: &SparPaths,
+    run_id: &str,
+    slot_id: &str,
+) {
     let is_opencode = ProviderRef::parse(provider)
         .ok()
         .and_then(|p| p.cli_name().map(|n| n == "opencode"))
@@ -816,7 +832,13 @@ fn enrich_opencode_stats(stats: &mut process::StreamStats, provider: &str, log_p
     if !is_opencode {
         return;
     }
-    providers::opencode_telemetry::enrich(stats);
+    if let Some(note) = providers::opencode_telemetry::enrich(stats) {
+        let _ = crate::events::append(
+            paths,
+            run_id,
+            &crate::events::Event::slot_note(slot_id, &note),
+        );
+    }
     let _ = stats.save(log_path);
 }
 
@@ -2156,7 +2178,14 @@ fn run_headless(
     let _ = markers::write_dispatch_verdict(paths, &state.id, &job.slot_id, &verdict);
     let agy_quota_hit = enrich_agy_stats(&mut res.stats, &job.provider, cwd, log_path, paths);
     enrich_muse_stats(&mut res.stats, &job.provider, log_path);
-    enrich_opencode_stats(&mut res.stats, &job.provider, log_path);
+    enrich_opencode_stats(
+        &mut res.stats,
+        &job.provider,
+        log_path,
+        paths,
+        &state.id,
+        &job.slot_id,
+    );
     let quota_rejected = res.stats.quota_rejected.clone();
     let quota_resets_at = resets_at_from_epoch_secs(res.stats.quota_resets_at);
     let quota_recovered = res.stats.quota_recovered;

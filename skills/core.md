@@ -554,8 +554,9 @@ slot is stuck on.**
   **opencode** reports usage per step and is exact live for the slot's own session, but a
   `task` subagent's spend lands only after exit (opencode's json emitter never puts a
   child session's steps on stdout at all), so a live nudge undercounts a fanned-out slot
-  until then, by up to 16.3x on a real corpus. **muse** carries no tokens on
-  stdout at all, so spar tails its session log (`~/.local/share/muse/sessions/…`), which is
+  until then — the undercount can be several times the parent's own token count and
+  grows with how many subagents (or how deep a chain of them) ran. **muse** carries no
+  tokens on stdout at all, so spar tails its session log (`~/.local/share/muse/sessions/…`), which is
   appended as the turn runs, including its own subagent sessions; that is exact live too.
   **claude** reports per-message usage
   whose input and cache-read arms are `max`ed until its terminal `result` lands, so a live
@@ -829,8 +830,10 @@ rail's selection.
     itself fan out). opencode's json emitter filters child sessions
     out of the stream it prints, so a subagent's usage never reaches stdout at all; spar
     recovers it after the slot exits by summing `tokens_input + output + reasoning +
-    cache_read + cache_write` over every session row whose `parent_id` is the slot's own
-    session id, additively on top of the stream-parsed parent totals.
+    cache_read + cache_write` over every descendant session row reachable from the
+    slot's own session id, additively on top of the stream-parsed parent totals. Tool
+    counts are not recovered this way, only spend — a fanned-out slot's `tools` still
+    reflects the parent session alone.
   - **Two adapters report a cached prompt as a slice of `input_tokens` rather than a
     sibling of it**, the opposite of Anthropic's convention: codex's `cached_input_tokens`
     and muse's `cached_tokens`. spar normalizes both on the way in, storing the uncached
