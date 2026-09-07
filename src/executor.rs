@@ -1586,8 +1586,10 @@ struct SlotOutcome {
     error: Option<String>,
     usage: Option<SlotUsage>,
     /// Set when `enrich_agy_stats` detected exhausted agy quota telemetry during *this*
-    /// dispatch. agy's own stdout is ~empty, so the log-based quota scrape
-    /// (`detect_and_pause_quota`) never sees it; callers OR this in instead.
+    /// dispatch. The stream's `result.error` can carry rejection prose the log-based
+    /// scrape (`detect_and_pause_quota`) recognizes, but the structured gemini-* quota
+    /// fraction that actually decides exhaustion is only in the statusline sink;
+    /// callers OR this in as a second, more reliable signal.
     agy_quota_hit: bool,
     /// The adapter's own typed rate-limit rejection (its `rateLimitType`), reflecting
     /// the *last* `rate_limit_event` in the stream: a later `allowed`/`allowed_warning`

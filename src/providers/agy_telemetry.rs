@@ -277,14 +277,18 @@ fn parse_payload(v: &Value) -> Payload {
 
 /// Best sink payload for the slot worktree. `cwd` is unique per slot, so matching is
 /// race-free across parallel slots. agy fires many payloads per run — early ones
-/// (`authenticating`/`initializing`) and any teardown frame carry a zeroed context window —
-/// so we return the last cwd-matching payload that has a non-zero snapshot, falling back
-/// to the last match when none do.
+/// (`authenticating`/`initializing`) and any teardown frame carry a zeroed context
+/// window — so the context snapshot comes from the last cwd-matching payload that has a
+/// non-zero one, falling back to the last match when none do. Quota is independent of
+/// that: a teardown frame can carry a zeroed context window and still be the freshest
+/// quota reading (e.g. the account went exhausted on the final call), so quota is taken
+/// from the last cwd-matching payload that has *any* quota bucket, not gated on context.
 pub fn latest_payload_for_cwd(root: &Path, cwd: &Path) -> Option<Payload> {
     let text = std::fs::read_to_string(sink_path(root)).ok()?;
     let want = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    let mut last_any = None;
-    let mut last_with_context = None;
+    let mut last_any: Option<Payload> = None;
+    let mut last_with_context: Option<Payload> = None;
+    let mut last_with_quota: Option<Payload> = None;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -305,12 +309,20 @@ pub fn latest_payload_for_cwd(root: &Path, cwd: &Path) -> Option<Payload> {
         }
         let p = parse_payload(&v);
         if p.context_tokens > 0 {
-            last_with_context = Some(p);
-        } else {
-            last_any = Some(p);
+            last_with_context = Some(p.clone());
         }
+        if p.quota_hint.is_some() {
+            last_with_quota = Some(p.clone());
+        }
+        last_any = Some(p);
     }
-    last_with_context.or(last_any)
+    let mut result = last_with_context.or(last_any)?;
+    if let Some(q) = last_with_quota {
+        result.quota_hint = q.quota_hint;
+        result.quota_reset_secs = q.quota_reset_secs;
+        result.quota_remaining_fraction = q.quota_remaining_fraction;
+    }
+    Some(result)
 }
 
 /// Recovered telemetry for one agy slot: the context-window snapshot and quota, both
@@ -435,6 +447,42 @@ mod tests {
         );
         // Binding gemini quota is the near-exhausted 5h bucket.
         assert_eq!(t.quota_reset_secs, Some(1800));
+        assert!(t.quota_remaining_fraction.unwrap() < 0.01);
+    }
+
+    #[test]
+    fn quota_comes_from_the_freshest_frame_even_when_context_is_zeroed_there() {
+        // The account can go exhausted on the final call: the last frame is a teardown
+        // with a zeroed context window but a fresher (more severe) quota reading than
+        // the earlier snapshot-bearing frame. Quota must not be pinned to whichever
+        // frame won the context snapshot.
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let cwd = tmp.path().join("wt");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd_s = std::fs::canonicalize(&cwd).unwrap();
+        let sink = format!(
+            "{}\n{}\n",
+            serde_json::json!({"cwd": cwd_s,
+                "context_window": {"current_usage": {"input_tokens": 12000, "cache_read_input_tokens": 20}},
+                "quota": {"gemini-5h": {"remaining_fraction": 0.5, "reset_in_seconds": 3600}}}),
+            serde_json::json!({"cwd": cwd_s, "agent_state": "idle",
+                "context_window": {"total_input_tokens": 0, "total_output_tokens": 0},
+                "quota": {"gemini-5h": {"remaining_fraction": 0.005, "reset_in_seconds": 60}}}),
+        );
+        write(&sink_path(root), &sink);
+
+        let t = collect(root, &cwd).expect("telemetry");
+        assert_eq!(
+            t.context_tokens,
+            12000 + 20,
+            "context still comes from the snapshot-bearing frame"
+        );
+        assert_eq!(
+            t.quota_reset_secs,
+            Some(60),
+            "quota must come from the freshest frame, not the context-winning one"
+        );
         assert!(t.quota_remaining_fraction.unwrap() < 0.01);
     }
 
