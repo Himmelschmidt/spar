@@ -5,7 +5,7 @@ use crate::executor::{self, SlotJob};
 use crate::exit_codes::ExitCode;
 use crate::paths::SparPaths;
 use crate::providers;
-use crate::state::{Phase, RunState, SeatSource, SlotRole};
+use crate::state::{Phase, PoolOrigin, RunState, SeatSource, SlotRole};
 use crate::util::{self, sanitize_slot};
 use crate::worktree;
 use anyhow::Result;
@@ -336,20 +336,13 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
         .filter(|s| matches!(s.role, SlotRole::Planner | SlotRole::PlanCritic))
         .map(|s| s.provider.clone())
         .collect();
-    let provider = resolve_spec_provider(cfg, state.dry_run, &state.providers, &used)?;
-    // `resolve_spec_provider` falls through to `state.providers` (the run's pool) once
-    // neither a CLI role nor `[roles].test_author` apply, so the honest source past those
-    // two is wherever that pool itself came from, not an unconditional `ProvidersOrder`.
-    let source = if cfg
-        .cli_role_keys
-        .contains(SlotRole::TestAuthor.as_config_key())
-    {
-        SeatSource::CliRole
-    } else if cfg.roles.test_author.is_some() {
-        SeatSource::RolesFile
-    } else {
-        state.pool_origin.as_seat_source()
-    };
+    let (provider, source) = resolve_spec_provider(
+        cfg,
+        state.dry_run,
+        &state.providers,
+        state.pool_origin,
+        &used,
+    )?;
     let test_author_idx = 1 + usize::from(cfg.critic.enabled);
     let model = crate::model_select::load_select_artifact(paths, &state.id)
         .ok()
@@ -495,45 +488,76 @@ fn seed_spec_bus(
 }
 
 /// Spec provider: config override, then fleet provider not used by planner/critic, then cycle.
+/// Spec provider precedence, matching `roles_resolve::resolve_seat`: CLI `--role
+/// test_author=…`, then an explicit pool (`--providers`/`--select`), then
+/// `[roles].test_author`, then the plan's own resolved pool as a last resort. Before this
+/// fix `[roles].test_author` was checked unconditionally first, so it beat an explicit
+/// pool it should have lost to (Bug B for this one staged seat).
 fn resolve_spec_provider(
     cfg: &Config,
     dry: bool,
     fleet: &[String],
+    pool_origin: PoolOrigin,
     used: &[String],
-) -> Result<String> {
-    if let Some(p) = &cfg.roles.test_author {
-        crate::provider_ref::ProviderRef::parse(p)
-            .map_err(|e| anyhow::anyhow!("invalid [roles].test_author {p:?}: {e}"))?;
-        if dry || providers::is_provider_usable(p, false) {
-            return Ok(p.clone());
+) -> Result<(String, SeatSource)> {
+    let cli_pinned = cfg
+        .cli_role_keys
+        .contains(SlotRole::TestAuthor.as_config_key());
+    if cli_pinned {
+        if let Some(p) = &cfg.roles.test_author {
+            crate::provider_ref::ProviderRef::parse(p)
+                .map_err(|e| anyhow::anyhow!("invalid [roles].test_author {p:?}: {e}"))?;
+            if dry || providers::is_provider_usable(p, false) {
+                return Ok((p.clone(), SeatSource::CliRole));
+            }
         }
-        // Fall through to fleet if override is unusable (missing CLI / paused).
+    }
+    let pool_explicit = matches!(pool_origin, PoolOrigin::CliProviders | PoolOrigin::Selected);
+    let pool_source = pool_origin.as_seat_source();
+    if pool_explicit {
+        if let Some(p) = fleet
+            .iter()
+            .find(|p| !used.contains(p) && (dry || providers::is_provider_usable(p, false)))
+            .cloned()
+        {
+            return Ok((p, pool_source));
+        }
+    }
+    if !cli_pinned {
+        if let Some(p) = &cfg.roles.test_author {
+            crate::provider_ref::ProviderRef::parse(p)
+                .map_err(|e| anyhow::anyhow!("invalid [roles].test_author {p:?}: {e}"))?;
+            if dry || providers::is_provider_usable(p, false) {
+                return Ok((p.clone(), SeatSource::RolesFile));
+            }
+            // Fall through to fleet if override is unusable (missing CLI / paused).
+        }
     }
     if dry {
         if let Some(p) = fleet.iter().find(|p| !used.contains(p)) {
-            return Ok(p.clone());
+            return Ok((p.clone(), pool_source));
         }
         if let Some(p) = fleet.get(2) {
-            return Ok(p.clone());
+            return Ok((p.clone(), pool_source));
         }
         if let Some(p) = fleet.last() {
-            return Ok(p.clone());
+            return Ok((p.clone(), pool_source));
         }
-        return Ok("cli:claude".into());
+        return Ok(("cli:claude".into(), SeatSource::ProvidersOrder));
     }
     if let Some(p) = fleet
         .iter()
         .find(|p| !used.contains(p) && providers::is_provider_usable(p, false))
         .cloned()
     {
-        return Ok(p);
+        return Ok((p, pool_source));
     }
     if let Some(p) = fleet
         .iter()
         .find(|p| providers::is_provider_usable(p, false))
         .cloned()
     {
-        return Ok(p);
+        return Ok((p, pool_source));
     }
     anyhow::bail!(
         "spec.enabled but no usable test-author provider (set [roles].test_author or pass more --providers)"
