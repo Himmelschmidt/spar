@@ -1,24 +1,23 @@
-//! agy (Antigravity CLI) telemetry recovery.
+//! agy (Antigravity CLI) statusline telemetry.
 //!
-//! agy drives in `--print` mode and emits almost nothing to stdout, so the generic
-//! stdout-stream usage parser reports zero tools/tokens for every agy slot. The real
-//! signal lives in two places on disk, both keyed by the run's `conversation_id`:
+//! `--output-format stream-json` (see `providers::agy::AgyAdapter::build_headless` and
+//! `StreamCoalescer::handle_agy` in `process.rs`) now supplies tools and tokens directly,
+//! so this module no longer scrapes agy's on-disk transcript for them. Two things are
+//! still not on the stream and have no other source, both verified by inspection of a
+//! live payload:
 //!
-//! * **transcript** — `<root>/brain/<cid>/.system_generated/logs/transcript.jsonl`,
-//!   one JSON record per step. Tool calls, tool errors, step count, and a real
-//!   last-activity timestamp come from here. Written regardless of TUI/print mode.
-//! * **statusline payload** — agy fires the configured `statusLine.command` on every
-//!   agent state change (verified: it fires in `--print` too), piping a JSON payload
-//!   carrying token counts and quota that are *not* persisted anywhere else. We install
-//!   a wrapper that tees each payload to a sink and chains to the user's own statusline,
-//!   then read the sink back per slot by matching the payload `cwd` to the slot worktree.
+//! * agy's quota buckets (`gemini-5h` / `gemini-weekly`, `remaining_fraction`,
+//!   `reset_in_seconds`)
+//! * the context-window snapshot (`context_window.current_usage`) — the resident context
+//!   (system prompt + history) the model actually processed for the latest call, as
+//!   opposed to a per-step token delta
 //!
-//! Note: the payload's own `transcript_path` field is unreliable in agy 1.1.5 (points at
-//! a non-existent `~/.gemini/antigravity/` root), so the transcript path is derived from
-//! the reliable `conversation_id`, not that field.
+//! agy fires the configured `statusLine.command` on every agent state change (verified:
+//! it fires in `--print` too), piping a JSON payload carrying both. We install a wrapper
+//! that tees each payload to a sink and chains to the user's own statusline, then read
+//! the sink back per slot by matching the payload `cwd` to the slot worktree.
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -43,11 +42,6 @@ fn original_path(root: &Path) -> PathBuf {
 }
 fn settings_path(root: &Path) -> PathBuf {
     root.join("settings.json")
-}
-fn transcript_path(root: &Path, cid: &str) -> PathBuf {
-    root.join("brain")
-        .join(cid)
-        .join(".system_generated/logs/transcript.jsonl")
 }
 
 const WRAPPER_NAME: &str = "statusline-wrapper.sh";
@@ -226,10 +220,9 @@ fi
 /// A statusline payload we care about (tolerant to missing fields).
 #[derive(Debug, Default, Clone)]
 pub struct Payload {
-    pub conversation_id: Option<String>,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_read_tokens: u64,
+    /// The resident context (`context_window.current_usage`) the model processed for the
+    /// latest call: a window gauge, not a spend counter, so it is not summed across calls.
+    pub context_tokens: u64,
     /// Smallest remaining fraction across the account's `gemini-*` quota buckets, with the
     /// bucket name and its reset horizon — the binding constraint for an agy cooldown.
     pub quota_hint: Option<String>,
@@ -238,43 +231,15 @@ pub struct Payload {
 }
 
 fn parse_payload(v: &Value) -> Payload {
-    let cw = v.get("context_window");
-    let get_u64 = |obj: Option<&Value>, k: &str| -> u64 {
-        obj.and_then(|o| o.get(k))
+    let current = v.get("context_window").and_then(|c| c.get("current_usage"));
+    let get_u64 = |k: &str| -> u64 {
+        current
+            .and_then(|o| o.get(k))
             .and_then(|x| x.as_u64())
             .unwrap_or(0)
     };
-    let current = cw.and_then(|c| c.get("current_usage"));
-    // agy's `context_window.total_*` count only *net-new* tokens and exclude the resident
-    // context (system prompt + history), so they undercount ~200x (observed: total_input=169
-    // while current_usage.input=34743 for the same call). `current_usage` is the real context
-    // the model processed, so we use it for input; output is taken cumulatively from `total_*`
-    // (the count of tokens actually generated across the run), falling back to the snapshot.
-    let input = {
-        let cur = get_u64(current, "input_tokens");
-        if cur > 0 {
-            cur
-        } else {
-            get_u64(cw, "total_input_tokens")
-        }
-    };
-    let output = {
-        let tot = get_u64(cw, "total_output_tokens");
-        if tot > 0 {
-            tot
-        } else {
-            get_u64(current, "output_tokens")
-        }
-    };
     let mut p = Payload {
-        conversation_id: v
-            .get("conversation_id")
-            .or_else(|| v.get("session_id"))
-            .and_then(|c| c.as_str())
-            .map(str::to_string),
-        input_tokens: input,
-        output_tokens: output,
-        cache_read_tokens: get_u64(current, "cache_read_input_tokens"),
+        context_tokens: get_u64("input_tokens").saturating_add(get_u64("cache_read_input_tokens")),
         ..Default::default()
     };
     // Quota: the account exposes gemini-5h / gemini-weekly (and 3p-* for other models).
@@ -312,14 +277,14 @@ fn parse_payload(v: &Value) -> Payload {
 
 /// Best sink payload for the slot worktree. `cwd` is unique per slot, so matching is
 /// race-free across parallel slots. agy fires many payloads per run — early ones
-/// (`authenticating`/`initializing`) and any teardown frame carry zeroed tokens — so we
-/// return the last cwd-matching payload that has non-zero tokens, falling back to the last
-/// match (for the `conversation_id`) when none carry usage yet.
+/// (`authenticating`/`initializing`) and any teardown frame carry a zeroed context window —
+/// so we return the last cwd-matching payload that has a non-zero snapshot, falling back
+/// to the last match when none do.
 pub fn latest_payload_for_cwd(root: &Path, cwd: &Path) -> Option<Payload> {
     let text = std::fs::read_to_string(sink_path(root)).ok()?;
     let want = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let mut last_any = None;
-    let mut last_with_tokens = None;
+    let mut last_with_context = None;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -339,106 +304,31 @@ pub fn latest_payload_for_cwd(root: &Path, cwd: &Path) -> Option<Payload> {
             continue;
         }
         let p = parse_payload(&v);
-        if p.input_tokens > 0 || p.output_tokens > 0 {
-            last_with_tokens = Some(p);
+        if p.context_tokens > 0 {
+            last_with_context = Some(p);
         } else {
             last_any = Some(p);
         }
     }
-    last_with_tokens.or(last_any)
+    last_with_context.or(last_any)
 }
 
-/// Tool/activity stats parsed from a conversation transcript.
-#[derive(Debug, Default, Clone)]
-pub struct TranscriptStats {
-    pub tools: u32,
-    pub tool_errors: u32,
-    pub steps: u32,
-    pub last_activity: Option<DateTime<Utc>>,
-}
-
-const TOOL_TYPES: &[&str] = &["RUN_COMMAND", "VIEW_FILE", "CODE_ACTION", "GREP_SEARCH"];
-
-fn is_error_status(status: &str) -> bool {
-    let s = status.to_ascii_uppercase();
-    s.contains("ERROR") || s.contains("FAIL") || s.contains("TIMEOUT") || s.contains("CANCEL")
-}
-
-pub fn transcript_stats(root: &Path, cid: &str) -> Option<TranscriptStats> {
-    let text = std::fs::read_to_string(transcript_path(root, cid)).ok()?;
-    let mut st = TranscriptStats::default();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        st.steps += 1;
-        let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
-        if TOOL_TYPES.contains(&ty) {
-            st.tools += 1;
-            if is_error_status(status) {
-                st.tool_errors += 1;
-            }
-        }
-        if let Some(ts) = v
-            .get("created_at")
-            .and_then(|c| c.as_str())
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-        {
-            let ts = ts.with_timezone(&Utc);
-            if st.last_activity.is_none_or(|prev| ts > prev) {
-                st.last_activity = Some(ts);
-            }
-        }
-    }
-    Some(st)
-}
-
-/// Recovered telemetry for one agy slot: tool counts from the transcript, tokens/quota
-/// from the statusline sink. Any field is best-effort — `None`/0 when the source is absent.
+/// Recovered telemetry for one agy slot: the context-window snapshot and quota, both
+/// only available from the statusline sink. Best-effort — `None`/0 when absent.
 #[derive(Debug, Default, Clone)]
 pub struct AgyTelemetry {
-    pub tools: u32,
-    pub tool_errors: u32,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_read_tokens: u64,
     pub context_tokens: u64,
-    pub last_activity: Option<DateTime<Utc>>,
     pub quota_hint: Option<String>,
     pub quota_reset_secs: Option<i64>,
     pub quota_remaining_fraction: Option<f64>,
 }
 
-/// Collect everything for a slot given its worktree `cwd`. Returns `None` only when no
-/// telemetry could be found at all (no sink payload and no discoverable transcript).
+/// Collect the statusline-only telemetry for a slot given its worktree `cwd`. Returns
+/// `None` when no sink payload for this cwd was found at all.
 pub fn collect(root: &Path, cwd: &Path) -> Option<AgyTelemetry> {
-    let payload = latest_payload_for_cwd(root, cwd);
-    let cid = payload.as_ref().and_then(|p| p.conversation_id.clone());
-    let tstats = cid.as_deref().and_then(|c| transcript_stats(root, c));
-    if payload.is_none() && tstats.is_none() {
-        return None;
-    }
-    let payload = payload.unwrap_or_default();
-    let tstats = tstats.unwrap_or_default();
+    let payload = latest_payload_for_cwd(root, cwd)?;
     Some(AgyTelemetry {
-        tools: tstats.tools,
-        tool_errors: tstats.tool_errors,
-        input_tokens: payload.input_tokens,
-        output_tokens: payload.output_tokens,
-        cache_read_tokens: payload.cache_read_tokens,
-        // Prompt footprint only, matching `StreamStats::context_tokens`, which is a
-        // window gauge and excludes generated output. `current_usage` is a snapshot of
-        // the latest call rather than a peak over all of them, which is the closest the
-        // statusline sink gets: it reports one reading, not a history.
-        context_tokens: payload
-            .input_tokens
-            .saturating_add(payload.cache_read_tokens),
-        last_activity: tstats.last_activity,
+        context_tokens: payload.context_tokens,
         quota_hint: payload.quota_hint,
         quota_reset_secs: payload.quota_reset_secs,
         quota_remaining_fraction: payload.quota_remaining_fraction,
@@ -511,63 +401,37 @@ mod tests {
     }
 
     #[test]
-    fn payload_and_transcript_compose_by_cwd() {
+    fn payload_composes_context_snapshot_and_quota_by_cwd() {
         let tmp = tempdir().unwrap();
         let root = tmp.path();
-        let cid = "conv-123";
         let cwd = tmp.path().join("wt");
         std::fs::create_dir_all(&cwd).unwrap();
         let cwd_s = std::fs::canonicalize(&cwd).unwrap();
-        // Init frame (zeroed) + two token-bearing frames + a decoy cwd + a final zeroed
-        // teardown frame. The last *token-bearing* frame must win, not the teardown.
+        // Init frame (zeroed) + two snapshot-bearing frames + a decoy cwd + a final zeroed
+        // teardown frame. The last *snapshot-bearing* frame must win, not the teardown.
         let sink = format!(
             "{}\n{}\n{}\n{}\n{}\n",
-            serde_json::json!({"cwd": cwd_s, "conversation_id": cid, "agent_state": "initializing",
+            serde_json::json!({"cwd": cwd_s, "agent_state": "initializing",
                 "context_window": {"total_input_tokens": 0, "total_output_tokens": 0}}),
-            serde_json::json!({"cwd": "/other", "conversation_id": "nope",
-                "context_window": {"total_input_tokens": 1, "total_output_tokens": 1}}),
-            serde_json::json!({"cwd": cwd_s, "conversation_id": cid,
-                "context_window": {"total_input_tokens": 100, "total_output_tokens": 50,
-                    "current_usage": {"input_tokens": 12000, "cache_read_input_tokens": 20}},
+            serde_json::json!({"cwd": "/other",
+                "context_window": {"current_usage": {"input_tokens": 1, "cache_read_input_tokens": 1}}}),
+            serde_json::json!({"cwd": cwd_s,
+                "context_window": {"current_usage": {"input_tokens": 12000, "cache_read_input_tokens": 20}},
                 "quota": {"gemini-5h": {"remaining_fraction": 0.01, "reset_in_seconds": 3600},
                           "gemini-weekly": {"remaining_fraction": 0.9, "reset_in_seconds": 99999}}}),
-            serde_json::json!({"cwd": cwd_s, "conversation_id": cid,
-                "context_window": {"total_input_tokens": 200, "total_output_tokens": 90,
-                    "current_usage": {"input_tokens": 34743, "cache_read_input_tokens": 40}},
+            serde_json::json!({"cwd": cwd_s,
+                "context_window": {"current_usage": {"input_tokens": 34743, "cache_read_input_tokens": 40}},
                 "quota": {"gemini-5h": {"remaining_fraction": 0.005, "reset_in_seconds": 1800}}}),
-            serde_json::json!({"cwd": cwd_s, "conversation_id": cid, "agent_state": "idle",
+            serde_json::json!({"cwd": cwd_s, "agent_state": "idle",
                 "context_window": {"total_input_tokens": 0, "total_output_tokens": 0}}),
         );
         write(&sink_path(root), &sink);
-        write(
-            &transcript_path(root, cid),
-            &format!(
-                "{}\n{}\n{}\n{}\n",
-                serde_json::json!({"type": "USER_INPUT", "status": "DONE", "created_at": "2026-07-21T12:00:00Z"}),
-                serde_json::json!({"type": "RUN_COMMAND", "status": "DONE", "created_at": "2026-07-21T12:01:00Z"}),
-                serde_json::json!({"type": "VIEW_FILE", "status": "ERROR", "created_at": "2026-07-21T12:02:00Z"}),
-                serde_json::json!({"type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-07-21T12:03:00Z"}),
-            ),
-        );
 
         let t = collect(root, &cwd).expect("telemetry");
-        assert_eq!(t.tools, 2, "RUN_COMMAND + VIEW_FILE");
-        assert_eq!(t.tool_errors, 1, "the ERROR VIEW_FILE");
-        // Last token-bearing frame wins (not the zeroed teardown); input from current_usage.
-        assert_eq!(
-            t.input_tokens, 34743,
-            "current_usage.input, not total_input (200)"
-        );
-        assert_eq!(t.output_tokens, 90, "cumulative total_output");
-        assert_eq!(t.cache_read_tokens, 40);
         assert_eq!(
             t.context_tokens,
             34743 + 40,
-            "prompt only: the cumulative output is spend, not window"
-        );
-        assert_eq!(
-            t.last_activity.unwrap().to_rfc3339(),
-            "2026-07-21T12:03:00+00:00"
+            "last snapshot-bearing frame wins, not the zeroed teardown"
         );
         // Binding gemini quota is the near-exhausted 5h bucket.
         assert_eq!(t.quota_reset_secs, Some(1800));

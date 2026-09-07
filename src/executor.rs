@@ -804,13 +804,13 @@ fn enrich_muse_stats(stats: &mut process::StreamStats, provider: &str, log_path:
     let _ = stats.save(log_path);
 }
 
-/// agy emits ~nothing to stdout, so the stream stats are all zero. Recover the real
-/// tool/token/activity counts from agy's transcript + statusline sink and rewrite the
-/// slot's stats sidecar so `stats.json` and the TUI reflect what actually happened.
-/// Also drives a real agy quota cooldown from the payload's reset horizon (finding #3),
-/// and returns whether it did: agy's statusline is the *only* place that shows up (its
-/// own stdout is ~empty, so the log-based `detect_and_pause_quota` scrape never fires
-/// for it), so callers OR this into a failed dispatch's `quota_hit` themselves.
+/// agy's `--output-format stream-json` now feeds tools/tokens straight into `stats` via
+/// `StreamCoalescer::handle_agy`. What's left to recover from the statusline sink is what
+/// the stream doesn't carry: the context-window snapshot and quota (see
+/// `providers::agy_telemetry`). Also drives a real agy quota cooldown from the payload's
+/// reset horizon (finding #3), and returns whether it did: agy's statusline is the *only*
+/// place that shows up (its own stdout usage is per-step, not a rejection notice), so
+/// callers OR this into a failed dispatch's `quota_hit` themselves.
 fn enrich_agy_stats(
     stats: &mut process::StreamStats,
     provider: &str,
@@ -827,34 +827,10 @@ fn enrich_agy_stats(
     let Some(t) = providers::agy_telemetry::collect(&root, cwd) else {
         return false;
     };
-    if t.tools > 0 {
-        stats.tools = t.tools;
-    }
-    stats.tool_errors = stats.tool_errors.max(t.tool_errors);
-    if t.input_tokens > 0 {
-        stats.input_tokens = t.input_tokens;
-    }
-    if t.output_tokens > 0 {
-        stats.output_tokens = t.output_tokens;
-    }
-    if t.cache_read_tokens > 0 {
-        stats.cache_read_tokens = t.cache_read_tokens;
-    }
     if t.context_tokens > 0 {
         stats.context_tokens = t.context_tokens;
+        let _ = stats.save(log_path);
     }
-    let billed = stats
-        .input_tokens
-        .saturating_add(stats.output_tokens)
-        .saturating_add(stats.cache_read_tokens)
-        .saturating_add(stats.cache_write_tokens);
-    if billed > 0 {
-        stats.billed_tokens = billed;
-    }
-    if let Some(ts) = t.last_activity {
-        stats.last_log_at = Some(ts.to_rfc3339());
-    }
-    let _ = stats.save(log_path);
 
     // Finding #3: when the account's binding gemini quota is (near) exhausted, cool the
     // provider down until its real reset instead of the fixed heuristic window.

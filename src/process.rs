@@ -795,6 +795,16 @@ impl StreamCoalescer {
             }
         }
 
+        // agy `--output-format stream-json` (verified against agy 1.1.26). Every line
+        // carries a top-level `event` naming one of three envelopes (`init`, `step_update`,
+        // `result`); gated off before the `type`-matched branches below since agy lines
+        // carry no top-level `type` at all.
+        if let Some(event) = v.get("event").and_then(|x| x.as_str()) {
+            if matches!(event, "init" | "step_update" | "result") {
+                return self.handle_agy(event, &v);
+            }
+        }
+
         // Grok token stream
         if let Some(ty) = v.get("type").and_then(|x| x.as_str()) {
             if matches!(ty, "text" | "thought" | "output" | "response") {
@@ -1161,6 +1171,103 @@ impl StreamCoalescer {
             }
             _ => None,
         }
+    }
+
+    /// agy's three `stream-json` envelopes. `result.usage.total_tokens` is the exact sum
+    /// of the per-step usages (verified on a live multi-step run), confirming each
+    /// `step_update.usage` is that step's own delta, not a running total — so, unlike
+    /// claude's Request-scope usage, input/output are summed here rather than maxed,
+    /// the same shape as opencode's `step_finish`.
+    ///
+    /// Known gap, not fixed here: a `step_type: "subagent"` step carries no usage of its
+    /// own, and the `result` total reconciles exactly against the parent's own steps, so
+    /// a subagent's spend is never attributed to it.
+    fn handle_agy(&mut self, event: &str, v: &serde_json::Value) -> Option<String> {
+        match event {
+            "init" => {
+                let mut out = self.flush_buf();
+                if let Some(cid) = v.get("conversation_id").and_then(|x| x.as_str()) {
+                    self.session_id = Some(cid.to_string());
+                }
+                out.push_str("· session  agy\n");
+                Some(out)
+            }
+            "step_update" => {
+                let su = v.get("step_update")?;
+                if self.session_id.is_none() {
+                    if let Some(cid) = su.get("conversation_id").and_then(|x| x.as_str()) {
+                        self.session_id = Some(cid.to_string());
+                    }
+                }
+                let state = su.get("state").and_then(|x| x.as_str()).unwrap_or("");
+                let step_type = su.get("step_type").and_then(|x| x.as_str()).unwrap_or("");
+                if state == "DONE" {
+                    self.absorb_agy_usage(su.get("usage"), UsageScope::Request);
+                }
+                match step_type {
+                    "agent_response" => {
+                        let text = su.get("text_delta").and_then(|x| x.as_str())?;
+                        if text.is_empty() {
+                            return None;
+                        }
+                        self.push_token(CoalesceKind::Text, text)
+                    }
+                    "tool" if state == "DONE" => {
+                        self.tools += 1;
+                        let mut out = self.flush_buf();
+                        out.push_str("→ tool\n");
+                        Some(out)
+                    }
+                    _ => None,
+                }
+            }
+            "result" => {
+                let r = v.get("result")?;
+                self.absorb_agy_usage(r.get("usage"), UsageScope::Terminal);
+                let mut out = self.flush_buf();
+                let status = r.get("status").and_then(|x| x.as_str()).unwrap_or("?");
+                out.push_str(&format!(
+                    "· done  {status}  ·  {} tools  ·  {}\n",
+                    self.tools,
+                    format_tokens(
+                        self.input_tokens,
+                        self.output_tokens.max(self.est_output_tokens),
+                        self.cache_read
+                    )
+                ));
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    /// agy's field names (`cache_read_tokens`, `thinking_tokens`) differ from the
+    /// Anthropic/codex shapes `absorb_usage` normalizes, so this stays separate rather
+    /// than bolting more field-name fallbacks onto that function. Thinking is billed at
+    /// output rates and reported outside `output_tokens`, so it's folded into output here,
+    /// same as opencode's `reasoning`.
+    fn absorb_agy_usage(&mut self, usage: Option<&serde_json::Value>, scope: UsageScope) {
+        let Some(u) = usage else { return };
+        let get = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or_default();
+        let input = get("input_tokens");
+        let output = get("output_tokens").saturating_add(get("thinking_tokens"));
+        let cache_read = get("cache_read_tokens");
+
+        if scope == UsageScope::Terminal {
+            self.input_tokens = input;
+            self.output_tokens = output;
+            self.cache_read = cache_read;
+            self.saw_terminal_usage = true;
+            return;
+        }
+
+        self.context_peak = self.context_peak.max(input.saturating_add(cache_read));
+        if self.saw_terminal_usage {
+            return;
+        }
+        self.input_tokens = self.input_tokens.saturating_add(input);
+        self.output_tokens = self.output_tokens.saturating_add(output);
+        self.cache_read = self.cache_read.saturating_add(cache_read);
     }
 
     fn handle_codex_item(&mut self, v: &serde_json::Value) -> Option<String> {
@@ -2232,6 +2339,59 @@ mod tests {
         assert_eq!(c.tools, 1);
         assert_eq!(c.tool_errors, 1);
         assert!(out.contains("→ shell  error"));
+    }
+
+    #[test]
+    fn agy_stream_json_renders_session_tools_text_and_sums_step_usage() {
+        // Shape per agy `--output-format stream-json` (agy 1.1.26).
+        let lines = [
+            r#"{"event":"init","conversation_id":"agy-conv-1","init":{"cwd":"/wt","tools":["shell"],"permission_mode":"always-proceed"}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"agy-conv-1","step_index":0,"state":"ACTIVE","step_type":"agent_response","text_delta":"He"}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"agy-conv-1","step_index":0,"state":"DONE","step_type":"agent_response","text_delta":"llo","usage":{"input_tokens":100,"output_tokens":5,"thinking_tokens":2,"cache_read_tokens":10,"total_tokens":117}}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"agy-conv-1","step_index":1,"state":"ACTIVE","step_type":"tool"}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"agy-conv-1","step_index":1,"state":"DONE","step_type":"tool","usage":{"input_tokens":50,"output_tokens":1,"cache_read_tokens":0,"total_tokens":51}}}"#,
+            r#"{"event":"result","result":{"conversation_id":"agy-conv-1","status":"SUCCESS","response":"Hello","duration_seconds":1.5,"num_turns":2,"usage":{"input_tokens":150,"output_tokens":8,"thinking_tokens":2,"cache_read_tokens":10,"total_tokens":168}}}"#,
+        ];
+        let mut c = StreamCoalescer::new(false);
+        let mut out = String::new();
+        for l in lines {
+            if let Some(chunk) = c.feed(l) {
+                out.push_str(&chunk);
+            }
+        }
+        assert_eq!(c.session_id.as_deref(), Some("agy-conv-1"));
+        assert!(out.contains("Hello"), "coalesced text_delta: {out:?}");
+        assert!(!out.contains("He\nllo"), "must not break mid-word: {out:?}");
+        assert_eq!(
+            c.tools, 1,
+            "only the DONE tool step counts, not its ACTIVE start"
+        );
+        assert!(out.contains("→ tool"));
+        // Per-step usage sums to the same total agy's own `result.usage` reports
+        // (input 100+50=150, output 5+1 + thinking 2+0=8), so the terminal record settles
+        // to that same total rather than correcting it (result carries its own
+        // thinking_tokens: 8 + 2 = 10).
+        assert_eq!(c.input_tokens, 150);
+        assert_eq!(c.output_tokens, 10);
+        assert_eq!(c.cache_read, 10);
+        assert!(out.contains("· done  SUCCESS  ·  1 tools"));
+    }
+
+    #[test]
+    fn agy_result_usage_settles_the_terminal_total() {
+        // If the terminal total does not match the per-step sum, `result` wins: it is
+        // Terminal-scoped and supersedes, same as claude's `result` / codex's
+        // `turn.completed`.
+        let mut c = StreamCoalescer::new(false);
+        c.feed(
+            r#"{"event":"step_update","step_update":{"conversation_id":"c1","step_index":0,"state":"DONE","step_type":"agent_response","text_delta":"hi","usage":{"input_tokens":10,"output_tokens":1,"cache_read_tokens":0,"total_tokens":11}}}"#,
+        );
+        c.feed(
+            r#"{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","response":"hi","usage":{"input_tokens":999,"output_tokens":42,"cache_read_tokens":5,"total_tokens":1046}}}"#,
+        );
+        assert_eq!(c.input_tokens, 999);
+        assert_eq!(c.output_tokens, 42);
+        assert_eq!(c.cache_read, 5);
     }
 
     #[test]
