@@ -313,6 +313,9 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
         .map(|s| s.provider.clone())
         .collect();
     let provider = resolve_spec_provider(cfg, state.dry_run, &state.providers, &used)?;
+    // `resolve_spec_provider` falls through to `state.providers` (the run's pool) once
+    // neither a CLI role nor `[roles].test_author` apply, so the honest source past those
+    // two is wherever that pool itself came from, not an unconditional `ProvidersOrder`.
     let source = if cfg
         .cli_role_keys
         .contains(SlotRole::TestAuthor.as_config_key())
@@ -321,7 +324,11 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
     } else if cfg.roles.test_author.is_some() {
         SeatSource::RolesFile
     } else {
-        SeatSource::ProvidersOrder
+        match state.pool_origin {
+            PoolOrigin::CliProviders => SeatSource::CliProviders,
+            PoolOrigin::Selected => SeatSource::ModelSelect,
+            PoolOrigin::Synth => SeatSource::ProvidersOrder,
+        }
     };
     let test_author_idx = 1 + usize::from(cfg.critic.enabled);
     let model = crate::model_select::load_select_artifact(paths, &state.id)

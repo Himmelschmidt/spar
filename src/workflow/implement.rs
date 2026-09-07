@@ -4,7 +4,9 @@ use crate::executor::{self, SlotJob};
 use crate::exit_codes::ExitCode;
 use crate::paths::SparPaths;
 use crate::providers;
-use crate::state::{Phase, PoolOrigin, RunState, SlotRole, SlotState, SlotStatus, SuiteOutcome};
+use crate::state::{
+    Phase, PoolOrigin, RunState, SeatSource, SlotRole, SlotState, SlotStatus, SuiteOutcome,
+};
 use crate::util::{self, sanitize_slot};
 use crate::workflow::review_result::{self, AcStatus, ReviewResult};
 use crate::worktree;
@@ -428,30 +430,47 @@ fn ensure_suite_slot(
     if state.slots.iter().any(|s| s.role == SlotRole::Tester) {
         return Ok(());
     }
-    let (suite_prov, suite_model) =
-        resolve_suite_provider(cfg, dry, &state.providers, Some(paths), Some(&state.id))?;
-    state.slots.push(executor::init_slot_model(
+    let (suite_prov, suite_model, source) = resolve_suite_provider(
+        cfg,
+        dry,
+        &state.providers,
+        state.pool_origin,
+        Some(paths),
+        Some(&state.id),
+    )?;
+    let mut slot = executor::init_slot_model(
         format!("suite-{}", sanitize_slot(&suite_prov)),
         &suite_prov,
         SlotRole::Tester,
         suite_model,
-    ));
+    );
+    slot.source = Some(source);
+    state.slots.push(slot);
     Ok(())
 }
 
 /// Cheap suite-channel provider: config override, model-select (tester/fast), prefs, fleet.
+/// Returns the provider, an optional explicit model, and the honest source of the pick —
+/// the fleet fallback is `state.providers`, so its source follows `pool_origin` rather
+/// than an unconditional `ProvidersOrder`.
 fn resolve_suite_provider(
     cfg: &Config,
     dry: bool,
     fleet: &[String],
+    pool_origin: PoolOrigin,
     paths: Option<&SparPaths>,
     run_id: Option<&str>,
-) -> Result<(String, Option<String>)> {
+) -> Result<(String, Option<String>, SeatSource)> {
     if let Some(p) = &cfg.roles.tester {
         crate::provider_ref::ProviderRef::parse(p)
             .map_err(|e| anyhow::anyhow!("invalid [roles].tester {p:?}: {e}"))?;
         if dry || providers::is_provider_usable(p, false) {
-            return Ok((p.clone(), None));
+            let source = if cfg.cli_role_keys.contains(SlotRole::Tester.as_config_key()) {
+                SeatSource::CliRole
+            } else {
+                SeatSource::RolesFile
+            };
+            return Ok((p.clone(), None, source));
         }
         // Fall through to model-select / prefs / fleet if the override is unusable
         // (missing CLI / paused).
@@ -464,7 +483,7 @@ fn resolve_suite_provider(
                 .iter()
                 .find(|c| c.role.as_deref() == Some("tester"))
             {
-                return Ok((c.provider.clone(), c.model.clone()));
+                return Ok((c.provider.clone(), c.model.clone(), SeatSource::ModelSelect));
             }
             let exclude: Vec<String> = art.choices.iter().map(|c| c.vals_id.clone()).collect();
             let urgency = crate::model_select::Urgency::parse(&art.urgency)
@@ -478,27 +497,32 @@ fn resolve_suite_provider(
                 c.slot = art.choices.len();
                 art.choices.push(c.clone());
                 let _ = crate::model_select::write_select_artifact(paths, run_id, &art);
-                return Ok((c.provider, c.model));
+                return Ok((c.provider, c.model, SeatSource::ModelSelect));
             }
         }
     }
     const PREFS: &[&str] = &["cli:claude", "cli:grok", "cli:agy", "api:xai", "api:openai"];
     if dry {
-        return Ok((PREFS[0].into(), None));
+        return Ok((PREFS[0].into(), None, SeatSource::SuitePreferences));
     }
     if let Some(p) = PREFS
         .iter()
         .find(|p| providers::is_provider_usable(p, false))
         .map(|s| (*s).to_string())
     {
-        return Ok((p, None));
+        return Ok((p, None, SeatSource::SuitePreferences));
     }
     if let Some(p) = fleet
         .iter()
         .find(|p| providers::is_provider_usable(p, false))
         .cloned()
     {
-        return Ok((p, None));
+        let source = match pool_origin {
+            PoolOrigin::CliProviders => SeatSource::CliProviders,
+            PoolOrigin::Selected => SeatSource::ModelSelect,
+            PoolOrigin::Synth => SeatSource::ProvidersOrder,
+        };
+        return Ok((p, None, source));
     }
     bail!("suite.enabled but no usable suite provider (set [roles].tester or install a CLI)")
 }

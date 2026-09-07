@@ -6,7 +6,7 @@ use crate::executor::{self, SlotJob};
 use crate::exit_codes::ExitCode;
 use crate::paths::SparPaths;
 use crate::providers;
-use crate::state::{Phase, RunState, SlotRole, SlotStatus};
+use crate::state::{Phase, RunState, SeatSource, SlotRole, SlotStatus};
 use crate::util::{self, sanitize_slot};
 use crate::worktree;
 use anyhow::Result;
@@ -60,11 +60,20 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         return Ok(ExitCode::Failure);
     }
 
+    // The independent-review workflow bypasses `roles_resolve` entirely (no panel
+    // pinning), so every reviewer's source is simply wherever this run's pool came from.
+    let source = if !opts.providers.is_empty() {
+        SeatSource::CliProviders
+    } else if !opts.select.is_empty() {
+        SeatSource::ModelSelect
+    } else {
+        SeatSource::ProvidersOrder
+    };
     for (i, prov) in state.providers.iter().enumerate() {
         let id = format!("review-{}-{}", i, sanitize_slot(prov));
-        state
-            .slots
-            .push(executor::init_slot(&id, prov, SlotRole::Reviewer));
+        let mut slot = executor::init_slot(&id, prov, SlotRole::Reviewer);
+        slot.source = Some(source);
+        state.slots.push(slot);
     }
 
     paths.ensure_run_dirs(&state.id)?;

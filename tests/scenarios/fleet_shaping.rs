@@ -156,6 +156,21 @@ fn implement_json(dir: &std::path::Path, extra: &[&str]) -> Value {
     run_json(dir, &args, 2)
 }
 
+/// `spar run --workflow review --dry-run --json`, which completes synchronously (exit 0).
+fn review_json(dir: &std::path::Path, extra: &[&str]) -> Value {
+    let mut args = vec![
+        "run",
+        "--workflow",
+        "review",
+        "--task",
+        "review this",
+        "--dry-run",
+        "--json",
+    ];
+    args.extend_from_slice(extra);
+    run_json(dir, &args, 0)
+}
+
 /// The `fleet` array from run JSON. Feature C: this key is the contract, so a run JSON
 /// without it is a failure of the feature and not a shape this helper tolerates.
 fn fleet(v: &Value) -> Vec<Value> {
@@ -620,12 +635,48 @@ fn ac14_seat_source_names_the_precedence_rung() {
     assert_eq!(source_of("implementer"), "roles-file");
     assert_eq!(source_of("plan_critic"), "providers-order");
 
-    // An explicit positional pool is the only thing that reports `cli-providers`.
+    // An explicit positional pool is the only thing that reports `cli-providers` — and
+    // that must hold for every seat the pool covers, not just the first one. Regression
+    // guard: `resolve_spec_provider` draws the test-author from `state.providers` once
+    // no CLI role/`[roles].test_author` applies, and used to hardcode `providers-order`
+    // for that fallback regardless of where the pool itself came from.
     let tmp2 = project("");
-    let v2 = plan_json(tmp2.path(), &["--providers", "cli:claude,cli:grok"]);
+    let v2 = plan_json(
+        tmp2.path(),
+        &["--providers", "cli:codex,cli:claude,api:openai"],
+    );
     let planner = fleet_seats(&v2, "planner");
     assert_eq!(planner.len(), 1);
     assert_eq!(seat_field(&planner[0], "source"), "cli-providers");
+    let test_author = fleet_seats(&v2, "test_author");
+    assert_eq!(test_author.len(), 1);
+    assert_eq!(
+        seat_field(&test_author[0], "source"),
+        "cli-providers",
+        "test-author drew from an explicit --providers pool, not [providers].order"
+    );
+
+    // Regression guard: the tester (suite) seat's dry-run fallback picks the first entry
+    // of a hardcoded preference list, not `[providers].order` — it must say so.
+    let tmp4 = project("");
+    let v4 = implement_json(
+        tmp4.path(),
+        &["--providers", "cli:codex,cli:claude,api:openai"],
+    );
+    let tester = fleet_seats(&v4, "tester");
+    assert_eq!(tester.len(), 1);
+    assert_eq!(seat_field(&tester[0], "source"), "suite-preferences");
+
+    // Regression guard: `run --workflow review` builds its reviewer panel outside
+    // `roles_resolve` entirely and used to default every seat's source to
+    // `providers-order` no matter how the pool was actually built.
+    let tmp5 = project("");
+    let v5 = review_json(tmp5.path(), &["--providers", "cli:codex,api:openai"]);
+    let reviewers = fleet_seats(&v5, "reviewer");
+    assert_eq!(reviewers.len(), 2);
+    for r in &reviewers {
+        assert_eq!(seat_field(r, "source"), "cli-providers");
+    }
 
     // Whatever path a seat took, its source is a documented value.
     let tmp3 = project("[suite]\nenabled = false\n");
