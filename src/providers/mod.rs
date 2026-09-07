@@ -163,6 +163,19 @@ pub trait ProviderAdapter: Send + Sync {
     fn build_headless(&self, bin: &Path, opts: &SpawnOpts) -> Command;
     fn build_interactive(&self, bin: &Path, opts: &SpawnOpts) -> Command;
 
+    /// How an adapter whose CLI can resume by session id (`capabilities().resume`) would
+    /// continue a prior session (`session_id` is whatever it captured into
+    /// `StreamStats::session_id` on an earlier dispatch). Declared for matrix
+    /// completeness, not wired into round dispatch: DECISIONS.md O52 measured vendor
+    /// session resume for round continuation and rejected it (a resumed session carries
+    /// the whole failed attempt's transcript, so the next round's context climb starts
+    /// from a huge base) in favor of a cold re-dispatch seeded with a compact
+    /// carry-forward brief. Defaults to a cold `build_headless`.
+    #[allow(dead_code)]
+    fn build_resume(&self, bin: &Path, _session_id: &str, opts: &SpawnOpts) -> Command {
+        self.build_headless(bin, opts)
+    }
+
     /// Turn-boundary delivery channel for this adapter (see `DeliveryStrategy`).
     /// Defaults to inbox-on-next-turn; adapters with a live channel override.
     fn delivery_strategy(&self) -> DeliveryStrategy {

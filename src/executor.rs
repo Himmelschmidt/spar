@@ -371,6 +371,7 @@ fn execute_prepared(
             billed_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
             tools: 0,
             model: usage.model.or(model),
+            session_id: None,
         };
         return Ok(if ok {
             SlotOutcome {
@@ -887,6 +888,7 @@ fn usage_from_stream(slot_id: &str, provider: &str, s: &process::StreamStats) ->
         billed_tokens: s.billed_tokens,
         tools: s.tools,
         model: s.model.clone(),
+        session_id: s.session_id.clone(),
     }
 }
 
@@ -2012,6 +2014,7 @@ fn run_api(
         billed_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
         tools: 0,
         model: usage.model.or(model),
+        session_id: None,
     };
     if ok {
         Ok(SlotOutcome {
@@ -3365,6 +3368,7 @@ mod tests {
                 billed_tokens: 3,
                 tools: 0,
                 model: None,
+                session_id: None,
             });
         }
 

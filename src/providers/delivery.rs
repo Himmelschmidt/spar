@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::process::Command;
 
 /// What the seam actually did with the claimed messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -20,7 +21,10 @@ use std::io::Write;
 pub enum DeliveryAction {
     /// Claude: a Stop-hook `block` payload was built for the hook to relay into the model.
     StopHookBlock,
-    /// Grok: claimed messages appended to the durable turn-boundary queue.
+    /// Codex: pushed straight into the running thread via `codex queue --thread`.
+    NativePushed,
+    /// Grok: claimed messages appended to the durable turn-boundary queue. Also codex's
+    /// fallback, when no thread id has been captured yet for this dispatch.
     Queued,
     /// opencode: claimed messages appended to the durable queue for the session flush.
     Prompted,
@@ -65,6 +69,11 @@ fn is_zero(n: &usize) -> bool {
 /// inbox on its next turn, so claiming here would strand the messages. Every other
 /// strategy claims (exactly-once) and injects; an empty inbox is a no-op.
 ///
+/// `session_id` is the provider session this agent's current dispatch is running under
+/// (`StreamStats::session_id`, e.g. codex's thread id), when the caller found one. It is
+/// what lets the `NativeQueue` arm push straight into a live codex session instead of the
+/// durable queue file; every other strategy ignores it.
+///
 /// `dry_run` stubs the side-effecting injection call (queue append / session prompt) so
 /// the run-lifecycle test backend exercises drain + dispatch without touching a live
 /// agent. Building the Stop-hook payload is pure and runs in either mode.
@@ -73,6 +82,7 @@ pub fn deliver(
     run: Option<&str>,
     agent: &str,
     strategy: DeliveryStrategy,
+    session_id: Option<&str>,
     dry_run: bool,
 ) -> Result<Delivery> {
     if strategy == DeliveryStrategy::None {
@@ -103,8 +113,22 @@ pub fn deliver(
             (DeliveryAction::StopHookBlock, Some(block_payload(&msgs)))
         }
         DeliveryStrategy::NativeQueue => {
-            enqueue(paths, run, agent, &msgs, dry_run)?;
-            (DeliveryAction::Queued, None)
+            let text = render_reason(&msgs);
+            let pushed = match session_id {
+                // Grok never captures a session id (its stream carries none), so this
+                // branch is codex-shaped today: a real one lands only once codex's
+                // `thread.started` has been parsed, so an early call with no id yet
+                // falls through to the durable file, same as grok always does.
+                Some(sid) if !dry_run => codex_queue_push(sid, &text),
+                Some(_) => true,
+                None => false,
+            };
+            if pushed {
+                (DeliveryAction::NativePushed, None)
+            } else {
+                enqueue(paths, run, agent, &msgs, dry_run)?;
+                (DeliveryAction::Queued, None)
+            }
         }
         DeliveryStrategy::SdkPrompt => {
             enqueue(paths, run, agent, &msgs, dry_run)?;
@@ -163,6 +187,18 @@ pub fn queue_path(paths: &SparPaths, run: Option<&str>, agent: &str) -> std::pat
         None => root,
     };
     dir.join(format!("{agent}.jsonl"))
+}
+
+/// Push `text` straight into the codex thread `session_id`, at its next turn boundary.
+/// Best-effort: a spawn error or non-zero exit (bad thread id, codex not on PATH) just
+/// returns `false` so the caller falls back to the durable queue file rather than losing
+/// the message outright.
+fn codex_queue_push(session_id: &str, text: &str) -> bool {
+    Command::new("codex")
+        .args(["queue", "--thread", session_id, "--message", text])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Append claimed messages to the durable queue. `dry_run` stubs the write so the test
@@ -252,6 +288,31 @@ pub struct NudgeDelivery {
     pub path: Option<String>,
 }
 
+/// Append one nudge line to the durable turn-boundary queue file — grok's channel, and
+/// codex's fallback until a thread id is captured. `dry_run` stubs the write.
+fn write_queue_file(
+    paths: &SparPaths,
+    run: Option<&str>,
+    agent: &str,
+    text: &str,
+    dry_run: bool,
+) -> Result<std::path::PathBuf> {
+    let path = queue_path(paths, run, agent);
+    if dry_run {
+        return Ok(path);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    writeln!(f, "{}", serde_json::json!({ "nudge": text }))?;
+    Ok(path)
+}
+
 /// The sender id spar's own nudges carry on the bus. Not a slot, so it can never collide
 /// with one, and readable in an agent's inbox.
 pub const ORCHESTRATOR: &str = "spar";
@@ -268,6 +329,7 @@ pub fn nudge(
     run: Option<&str>,
     agent: &str,
     strategy: DeliveryStrategy,
+    session_id: Option<&str>,
     text: &str,
     dry_run: bool,
 ) -> Result<NudgeDelivery> {
@@ -300,21 +362,25 @@ pub fn nudge(
             }
             (DeliveryAction::StopHookBlock, None)
         }
-        DeliveryStrategy::NativeQueue | DeliveryStrategy::SdkPrompt => {
-            let path = queue_path(paths, run, agent);
-            if !dry_run {
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                let mut f = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                    .with_context(|| format!("open {}", path.display()))?;
-                writeln!(f, "{}", serde_json::json!({ "nudge": text }))?;
+        DeliveryStrategy::NativeQueue => {
+            let pushed = match session_id {
+                Some(sid) if !dry_run => codex_queue_push(sid, text),
+                Some(_) => true,
+                None => false,
+            };
+            if pushed {
+                (DeliveryAction::NativePushed, None)
+            } else {
+                (
+                    DeliveryAction::Queued,
+                    Some(write_queue_file(paths, run, agent, text, dry_run)?),
+                )
             }
-            (DeliveryAction::Queued, Some(path))
         }
+        DeliveryStrategy::SdkPrompt => (
+            DeliveryAction::Queued,
+            Some(write_queue_file(paths, run, agent, text, dry_run)?),
+        ),
         // `None` is agy, which has no channel at all. The poll file is still the best
         // available drop: worst case the agent never reads it, which is where it started.
         DeliveryStrategy::PollFile | DeliveryStrategy::None => (
@@ -370,6 +436,7 @@ mod tests {
             Some("r1"),
             &ub,
             DeliveryStrategy::StopHookInject,
+            None,
             false,
         )
         .unwrap();
@@ -390,6 +457,7 @@ mod tests {
             Some("r1"),
             &ub,
             DeliveryStrategy::StopHookInject,
+            None,
             false,
         )
         .unwrap();
@@ -409,6 +477,7 @@ mod tests {
             Some("r1"),
             &ub,
             DeliveryStrategy::NativeQueue,
+            None,
             false,
         )
         .unwrap();
@@ -426,7 +495,15 @@ mod tests {
         seed(&paths, 1);
 
         let ub = agent_ref(Some("r1"), "b");
-        let d = deliver(&paths, Some("r1"), &ub, DeliveryStrategy::SdkPrompt, false).unwrap();
+        let d = deliver(
+            &paths,
+            Some("r1"),
+            &ub,
+            DeliveryStrategy::SdkPrompt,
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(d.action, DeliveryAction::Prompted);
         assert_eq!(d.delivered, 1);
         assert!(queue_path(&paths, Some("r1"), &ub).is_file());
@@ -439,7 +516,7 @@ mod tests {
         seed(&paths, 2);
 
         let ub = agent_ref(Some("r1"), "b");
-        let d = deliver(&paths, Some("r1"), &ub, DeliveryStrategy::None, false).unwrap();
+        let d = deliver(&paths, Some("r1"), &ub, DeliveryStrategy::None, None, false).unwrap();
         assert_eq!(d.action, DeliveryAction::LeftForInbox);
         assert_eq!(d.delivered, 0);
         assert_eq!(d.pending, 2);
@@ -454,13 +531,44 @@ mod tests {
         seed(&paths, 2);
 
         let ub = agent_ref(Some("r1"), "b");
-        let d = deliver(&paths, Some("r1"), &ub, DeliveryStrategy::NativeQueue, true).unwrap();
+        let d = deliver(
+            &paths,
+            Some("r1"),
+            &ub,
+            DeliveryStrategy::NativeQueue,
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(d.action, DeliveryAction::Queued);
         assert_eq!(d.delivered, 2);
         // Injection call stubbed: no queue file written.
         assert!(!queue_path(&paths, Some("r1"), &ub).exists());
         // But the drain is real (exactly-once): nothing remains to claim.
         assert!(bus::inbox_claim(&paths, &ub).unwrap().is_empty());
+    }
+
+    #[test]
+    fn dry_run_native_push_reports_pushed_without_shelling_out() {
+        // With a session id known, `dry_run` must still never spawn the real `codex`
+        // binary — same contract as the file-queue stub above, one step earlier.
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        seed(&paths, 1);
+
+        let ub = agent_ref(Some("r1"), "b");
+        let d = deliver(
+            &paths,
+            Some("r1"),
+            &ub,
+            DeliveryStrategy::NativeQueue,
+            Some("thread-abc"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(d.action, DeliveryAction::NativePushed);
+        assert_eq!(d.delivered, 1);
+        assert!(!queue_path(&paths, Some("r1"), &ub).exists());
     }
 
     /// Two concurrent runs share a deterministic slot id ("b"), hence one workspace inbox,
@@ -500,6 +608,7 @@ mod tests {
             Some("rB"),
             &ub,
             DeliveryStrategy::NativeQueue,
+            None,
             false,
         )
         .unwrap();
@@ -508,6 +617,7 @@ mod tests {
             Some("rA"),
             &ua,
             DeliveryStrategy::NativeQueue,
+            None,
             false,
         )
         .unwrap();
@@ -569,6 +679,7 @@ mod tests {
             Some("r1"),
             &slot_id,
             DeliveryStrategy::StopHookInject,
+            None,
             false,
         )
         .unwrap();
@@ -581,6 +692,7 @@ mod tests {
             None,
             "bare",
             DeliveryStrategy::StopHookInject,
+            None,
             false,
         )
         .unwrap();

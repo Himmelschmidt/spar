@@ -49,6 +49,20 @@ fn model_args(model: &str) -> Vec<String> {
     }
 }
 
+/// The prompt argument shared by `build_headless` and `build_resume`: inline `opts.prompt`
+/// if set, else the prompt file's contents, else empty. stdin is null (spar spawns
+/// detached), so codex only ever sees the prompt from this trailing positional.
+fn resolved_prompt(opts: &SpawnOpts) -> String {
+    if !opts.prompt.is_empty() {
+        opts.prompt.clone()
+    } else if let Some(pf) = &opts.prompt_file {
+        std::fs::read_to_string(pf)
+            .unwrap_or_else(|_| format!("Read and follow instructions in {}", pf.display()))
+    } else {
+        String::new()
+    }
+}
+
 pub struct CodexAdapter;
 
 impl ProviderAdapter for CodexAdapter {
@@ -57,11 +71,14 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     // `codex exec --json` emits JSONL (thread/turn/item events with turn.completed
-    // usage) which the stream coalescer parses for tokens. No push channel into the
-    // running process and no presence stream, so delivery falls back to the poll file and
-    // presence degrades to the process/output heuristic.
+    // usage) which the stream coalescer parses for tokens, and its first line names the
+    // thread id (`thread.started`), captured into `StreamStats::session_id`. That id is
+    // spar's handle for `codex queue --thread <id> --message <text>`, a real push into
+    // the running session at its next turn boundary, so delivery is a native queue, not
+    // the poll file. Codex still has no presence stream, so presence still degrades to
+    // the process/output heuristic.
     fn delivery_strategy(&self) -> DeliveryStrategy {
-        DeliveryStrategy::PollFile
+        DeliveryStrategy::NativeQueue
     }
 
     fn presence_source(&self) -> PresenceSource {
@@ -77,7 +94,10 @@ impl ProviderAdapter for CodexAdapter {
             headless: true,
             // Only `codex exec` (headless) is verified; interactive TUI takeover is not.
             interactive: false,
-            resume: false,
+            // `codex exec resume <SESSION_ID> [PROMPT]` (also `--last`) continues a
+            // captured thread — a real CLI capability, though round dispatch does not
+            // call it (see `build_resume`'s doc comment / DECISIONS.md O52).
+            resume: true,
             skip_permissions: true,
             // FullAuto bypasses codex's own sandbox (the worktree is the boundary,
             // matching the other adapters), so we do not rely on a native sandbox.
@@ -121,18 +141,37 @@ impl ProviderAdapter for CodexAdapter {
         for a in &opts.extra_args {
             cmd.arg(a);
         }
-        let prompt = if !opts.prompt.is_empty() {
-            opts.prompt.clone()
-        } else if let Some(pf) = &opts.prompt_file {
-            std::fs::read_to_string(pf)
-                .unwrap_or_else(|_| format!("Read and follow instructions in {}", pf.display()))
-        } else {
-            String::new()
-        };
         // `--` ends option parsing so a prompt starting with `-` (or matching a
         // `codex exec` subcommand like `review`/`resume`) is taken literally.
         cmd.arg("--");
-        cmd.arg(prompt);
+        cmd.arg(resolved_prompt(opts));
+        cmd.current_dir(&opts.cwd);
+        cmd
+    }
+
+    // Not wired into round dispatch yet — DECISIONS.md O52 chose a cold re-dispatch +
+    // carry-forward brief over vendor session resume for the fix-round loop. This method
+    // exists so that choice stays a policy call, not a capability gap: `codex exec resume`
+    // is real and works, for whichever future caller (an operator command, a different
+    // loop) actually wants it.
+    fn build_resume(&self, bin: &Path, session_id: &str, opts: &SpawnOpts) -> Command {
+        // `codex exec resume <SESSION_ID> [PROMPT]` continues the thread `session_id`
+        // named at its `thread.started`. The session already has its model/provider
+        // fixed from the first turn, so `-m`/`-p`/`-c` do not apply here the way they do
+        // on a cold `build_headless` — only the flags that shape *this* dispatch's
+        // automation (json output, approvals, sandbox) still do.
+        let mut cmd = Command::new(bin);
+        cmd.arg("exec").arg("resume").arg(session_id);
+        cmd.arg("--json");
+        cmd.arg("--skip-git-repo-check");
+        for a in self.permission_args(opts.trust) {
+            cmd.arg(a);
+        }
+        for a in &opts.extra_args {
+            cmd.arg(a);
+        }
+        cmd.arg("--");
+        cmd.arg(resolved_prompt(opts));
         cmd.current_dir(&opts.cwd);
         cmd
     }
@@ -189,6 +228,32 @@ mod tests {
             args.len() - 2,
             "-- must sit just before the prompt: {args:?}"
         );
+    }
+
+    #[test]
+    fn resume_shape_and_no_model_args() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SPAR_CODEX_PROFILE");
+        std::env::remove_var("SPAR_CODEX_MODEL");
+        let cmd = CodexAdapter.build_resume(
+            Path::new("codex"),
+            "thread-123",
+            &opts("keep going", Some("meta/muse-spark-1.1")),
+        );
+        let (_, args) = command_to_parts(&cmd);
+        assert_eq!(args.first().map(String::as_str), Some("exec"), "{args:?}");
+        assert_eq!(args.get(1).map(String::as_str), Some("resume"), "{args:?}");
+        assert_eq!(args.get(2).map(String::as_str), Some("thread-123"));
+        assert!(args.iter().any(|a| a == "--json"));
+        assert!(args.iter().any(|a| a == "--skip-git-repo-check"));
+        assert!(args
+            .iter()
+            .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
+        // A resumed session already has its model fixed; no -m/-p/-c args.
+        assert!(!args.iter().any(|a| a == "-m" || a == "-p" || a == "-c"));
+        assert_eq!(args.last().map(String::as_str), Some("keep going"));
+        let di = args.iter().position(|a| a == "--").expect("-- separator");
+        assert_eq!(di, args.len() - 2, "-- must sit just before the prompt");
     }
 
     #[test]
@@ -305,5 +370,14 @@ mod tests {
             command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &opts("x", None)));
         assert!(a.windows(2).any(|w| w[0] == "-p" && w[1] == "muse"));
         assert!(!a.iter().any(|x| x == "-m"));
+    }
+
+    #[test]
+    fn native_queue_delivery_and_resume_capability() {
+        assert_eq!(
+            CodexAdapter.delivery_strategy(),
+            DeliveryStrategy::NativeQueue
+        );
+        assert!(CodexAdapter.capabilities().resume);
     }
 }
