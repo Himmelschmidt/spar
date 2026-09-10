@@ -52,6 +52,133 @@ pub fn run_from_cli(
     run_with_task(task, None, opts, paths, cfg, None)
 }
 
+/// Put a resumed run's interrupted slots back to `Pending`.
+///
+/// `spar stop` reconciles every slot it interrupts from `Running` to `Failed`. The
+/// non-plan workflows rebuild their job list from *every* retained slot
+/// (`review.rs`'s `state.slots.iter().map(..)`) and `executor::run_slot` flips each
+/// one back to `Running`, so those slots are about to run — but
+/// `daemon::run_demand` counts only `Pending`/`Running`, so the run reads as needing
+/// nothing and `maybe_enqueue` admits it however full the bucket is. The cap is then
+/// overrun the moment dispatch starts.
+///
+/// This is a rule, not a tidy-up: what the cap reserves has to be what is about to
+/// run.
+fn restore_interrupted_slots(state: &mut RunState) {
+    for slot in &mut state.slots {
+        if slot.status == SlotStatus::Failed {
+            slot.status = SlotStatus::Pending;
+        }
+    }
+}
+
+/// `spar resume <id>`: dispatch on what the run actually is, rather than aliasing
+/// `implement --run`. A gate is refused (a decision is waiting, and resume is not an
+/// operator); a live owner is refused naming its pid; an abandoned in-flight run goes
+/// to `continue_run` in the foreground, or (with `--detach`) through the same
+/// `detach_implement` a fresh `implement --detach` uses, since `continue_run` already
+/// dispatches on `state.workflow` regardless of which process calls it. A stopped
+/// `Plan` run — the one workflow with a plan-approval gate — either refuses (never
+/// approved) or falls through to `run_from_approved` (approved, or `Loop`, which has no
+/// approval step at all). A stopped `Arena`/`Roles`/`Peer`/`Review` run has no approval
+/// gate to check at all, so it is routed straight to `continue_run` instead: those
+/// workflows are not `run_from_approved`'s business, since it only knows approved plans
+/// and `Loop`, and `prepare_implement_slots` would otherwise rewrite the run's workflow
+/// to `Loop`, silently changing what the run is.
+pub fn resume(
+    paths: &SparPaths,
+    cfg: &Config,
+    run_id: &str,
+    detach: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    let mut state = RunState::load(paths, run_id)?;
+    if let Some(owner) = crate::runlock::RunLock::owner(paths, run_id) {
+        if owner.alive() {
+            return Err(crate::runlock::OrchestratorBusy {
+                run_id: run_id.to_string(),
+                owner_pid: owner.pid,
+            }
+            .into());
+        }
+    }
+    if state.phase.is_gate() {
+        bail!(
+            "run {run_id} is waiting on a human ({:?}); resolve it with: {}",
+            state.phase,
+            crate::notify::next_command(&state)
+        );
+    }
+    if matches!(state.phase, Phase::Done | Phase::PlanRejected) {
+        bail!(
+            "run {run_id} is finished ({:?}); nothing to resume. Start a new round with \
+             `spar plan --run {run_id} -t \"…\"`.",
+            state.phase
+        );
+    }
+    // `spar stop` parks a plan run at `Stopped` before it was ever approved just as
+    // readily as it parks an approved run. Resuming that straight into `run_from_approved`
+    // would drive an unapproved plan through to ship — the same hazard `Phase::Quota`
+    // already guards against there. Refuse here, by name, instead of falling through to
+    // `run_from_approved`'s generic "plan is not approved" bail: resume's contract is that
+    // it names the human command for every state it refuses.
+    //
+    // `Plan` is the *only* workflow with an approval gate, so it is the only workflow this
+    // check applies to. `Loop` has none and resumes below via `run_from_approved`'s own
+    // `Stopped`+`Loop` disjunct. `Arena`/`Roles`/`Peer`/`Review` have none either, and are
+    // routed to their own continuation just below — never through `run_from_approved`,
+    // which would treat them as unapproved plans and refuse, or worse, rewrite them.
+    if state.phase == Phase::Stopped
+        && state.workflow == crate::cli::WorkflowKind::Plan
+        && !state.gates.plan_approved
+    {
+        bail!(
+            "run {run_id} is a stopped plan run that was never approved; resuming it would \
+             drive an unapproved plan through to ship. Replan it with \
+             `spar plan --run {run_id} -t \"…\"`, or if a plan is already written and \
+             awaiting a decision, `spar approve {run_id}`."
+        );
+    }
+    if state.phase == Phase::Stopped
+        && !matches!(
+            state.workflow,
+            crate::cli::WorkflowKind::Plan | crate::cli::WorkflowKind::Loop
+        )
+    {
+        let _ = std::fs::remove_file(paths.marker(run_id, "stopped"));
+        restore_interrupted_slots(&mut state);
+        state.save(paths)?;
+        if detach {
+            return detach_implement(&state, paths, json);
+        }
+        return continue_run(paths, cfg, run_id);
+    }
+    if !state.phase.is_waitable_stop() {
+        // `continue_run` has no detach knob of its own: it always runs to completion
+        // in the foreground of whoever calls it. `--detach` here means the same thing
+        // it means for `plan`/`implement`: spawn `__internal_continue` into a session
+        // of its own and hand back once it holds the run's lock, rather than running
+        // it in this process.
+        if detach {
+            return detach_implement(&state, paths, json);
+        }
+        return continue_run(paths, cfg, run_id);
+    }
+    // `run_from_approved` always re-decides `state.dry_run` from `opts.resolve_dry_run()`
+    // (it is not sticky across `implement --run` re-entries, by design, so a test can
+    // force a live run into stub mode). `resume` offers no `--dry-run` flag of its own —
+    // resuming does not get to change what kind of run this is — so it carries the run's
+    // own recorded flag through instead of silently defaulting to `false` and dispatching
+    // a dry-run's later rounds against real providers and real git merges.
+    let opts = CommonOpts {
+        detach,
+        json,
+        dry_run: state.dry_run,
+        ..CommonOpts::default()
+    };
+    run_from_approved(run_id, None, opts, paths, cfg)
+}
+
 /// The run that wrote this plan, if spar wrote it: plan artifacts live at
 /// `.spar/runs/<id>/artifacts/plan*.md`, so the id is in the path.
 fn run_id_for_plan(plan: &std::path::Path, paths: &SparPaths) -> Option<String> {
@@ -143,7 +270,6 @@ fn run_from_approved(
     let mut state = RunState::load(paths, run_id)?;
     let resumable = state.gates.plan_approved
         || state.phase == Phase::PlanApproved
-        || state.phase == Phase::Stopped
         // The round-ceiling gate is lifted by re-entering implement, so a run parked
         // there has to be resumable even when no plan gate ever ran (`--workflow loop`).
         || state.phase == Phase::AwaitingRoundExtension
@@ -158,7 +284,14 @@ fn run_from_approved(
         // `Phase::Quota` park is already covered by the `plan_approved` disjunct above,
         // so the only case this clause needs to add is `--workflow loop` (`implement -t`
         // directly), which has no approval step at all.
-        || (state.phase == Phase::Quota && state.workflow == crate::cli::WorkflowKind::Loop);
+        || (state.phase == Phase::Quota && state.workflow == crate::cli::WorkflowKind::Loop)
+        // `Phase::Stopped` has the identical hazard: `spar stop` parks a plan run here
+        // pre-approval just as readily as it parks an approved or loop-workflow run, and
+        // accepting it unconditionally would let `implement --run` (or `spar resume`)
+        // drive an unapproved plan through to ship. An *approved* stopped run is already
+        // covered by the `plan_approved` disjunct above, so the only case this clause
+        // needs to add is `--workflow loop`, which has no approval step at all.
+        || (state.phase == Phase::Stopped && state.workflow == crate::cli::WorkflowKind::Loop);
     if !resumable {
         bail!(
             "run {run_id} plan is not approved (phase={:?})",
@@ -621,6 +754,47 @@ fn resolve_suite_provider(
 #[cfg(test)]
 mod suite_reap_tests {
     use super::*;
+
+    /// The cap must reserve what is about to run.
+    ///
+    /// `spar stop` leaves every interrupted slot at `Failed`, and
+    /// `daemon::run_demand` counts only `Pending`/`Running` — so a stopped
+    /// Review/Arena/Roles/Peer run read as needing *nothing*, was admitted past a
+    /// full cross-run cap, and then overran it as `executor::run_slot` flipped each
+    /// retained slot back to `Running`.
+    ///
+    /// Asserted against `run_demand` itself, not against slot statuses after a
+    /// resume: a dry-run workflow completes its slots to `done`, so an end-state
+    /// assertion passes with or without the fix and guarantees nothing. (It did.)
+    #[test]
+    fn a_stops_interrupted_slots_are_demand_again_before_admission() {
+        let mut state = RunState::new(
+            "capbypass",
+            crate::cli::WorkflowKind::Review,
+            std::path::PathBuf::from("/x"),
+        );
+        for i in 0..3 {
+            let mut slot =
+                crate::executor::init_slot(format!("review-{i}"), "cli:claude", SlotRole::Reviewer);
+            // The state `stop_one` leaves behind: interrupted, reconciled to `Failed`.
+            slot.status = SlotStatus::Failed;
+            state.slots.push(slot);
+        }
+
+        let before: u32 = crate::daemon::run_demand(&state).values().copied().sum();
+        assert_eq!(
+            before, 0,
+            "precondition: this is exactly why the cap could be bypassed"
+        );
+
+        restore_interrupted_slots(&mut state);
+
+        let after: u32 = crate::daemon::run_demand(&state).values().copied().sum();
+        assert_eq!(
+            after, 3,
+            "every slot the workflow is about to re-dispatch has to count as demand"
+        );
+    }
 
     /// `--without suite --reload-config` on a run whose earlier round already dispatched
     /// an agent tester must reap that slot, not leave it for the next round to
@@ -2542,25 +2716,57 @@ fn detach_implement(state: &RunState, paths: &SparPaths, json: bool) -> Result<E
             .into());
         }
     }
-    #[cfg(unix)]
-    {
-        let mut child_cmd = std::process::Command::new(std::env::current_exe()?);
-        child_cmd
-            .arg("__internal_continue")
-            .arg(&state.id)
-            .env("SPAR_INTERNAL", "1")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        let _ = child_cmd.spawn()?;
+    if let Some(msg) = crate::daemon::maybe_enqueue(paths, state)? {
+        if json {
+            executor::emit_run_json(state)?;
+        } else {
+            executor::print_run_human(state);
+            println!("{msg}");
+        }
+        return Ok(ExitCode::Success);
     }
-    if json {
-        executor::emit_run_json(state)?;
-    } else {
-        executor::print_run_human(state);
-        println!("detached; wait with: spar wait {}", state.id);
+    let detached = match crate::process::spawn_detached_orchestrator(paths, &state.id) {
+        Ok(d) => d,
+        Err(e) => {
+            crate::daemon::release_reservation(paths, &state.id);
+            return Err(e);
+        }
+    };
+    let outcome = match crate::process::await_detached_start(paths, &state.id, detached) {
+        Ok(o) => o,
+        Err(e) => {
+            crate::daemon::release_reservation(paths, &state.id);
+            return Err(e);
+        }
+    };
+    match outcome {
+        crate::process::DetachOutcome::Confirmed { pid } => {
+            if json {
+                executor::emit_run_json(state)?;
+            } else {
+                executor::print_run_human(state);
+                println!(
+                    "detached (pid {pid}, session of its own); wait with: spar wait {}",
+                    state.id
+                );
+            }
+            Ok(ExitCode::Success)
+        }
+        crate::process::DetachOutcome::Completed => {
+            // The run settled inside the handshake window without ever holding a
+            // `Running` slot for `effective_supply` to see, so its admission
+            // reservation (if `maybe_enqueue` granted one) would otherwise squat on
+            // capacity for the full TTL.
+            crate::daemon::release_reservation(paths, &state.id);
+            let state = RunState::load_for_display(paths, &state.id)?;
+            if json {
+                executor::emit_run_json(&state)?;
+            } else {
+                executor::print_run_human(&state);
+            }
+            Ok(state.exit_code())
+        }
     }
-    Ok(ExitCode::Success)
 }
 
 pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<ExitCode> {

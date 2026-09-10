@@ -39,10 +39,17 @@ pub enum Command {
 
     /// Multi-provider planning; ends in awaiting_plan_approval
     Plan {
+        /// The task, inline. Exactly one of `-t` / `--spec` is required.
         #[arg(long, short = 't')]
-        task: String,
+        task: Option<String>,
+        /// Read the task from a file (or `-` for stdin) and keep a durable copy at
+        /// `.spar/briefs/<slug>.md`. On `--run` (a replan) this is the round's
+        /// directive instead of a new task.
+        #[arg(long, value_name = "FILE")]
+        spec: Option<PathBuf>,
         /// Replan an existing run: a new plan round on the same id, keeping its brief,
-        /// base and config. `-t` is the directive for the round, not a new task (O45).
+        /// base and config. `-t`/`--spec` is the directive for the round, not a new
+        /// task (O45).
         #[arg(long = "run")]
         run_id: Option<String>,
         /// Comma-separated `cli:…` or `api:…` (required unless `--select` or `[roles]` is
@@ -102,6 +109,27 @@ pub enum Command {
         run_id: String,
         #[arg(long)]
         reason: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Re-hydrate a fresh session on a run's current state: phase, gates, fleet, brief,
+    /// artifacts and the exact next command. Read-only — never mutates the run.
+    Brief {
+        run_id: String,
+        /// Inline `plan.md` / `test-contract.md` bodies instead of just their paths.
+        #[arg(long)]
+        full: bool,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Pick a stopped or abandoned run back up. Refuses a gate (name the human command
+    /// instead) and a run with a live orchestrator (name its pid).
+    Resume {
+        run_id: String,
+        #[arg(long)]
+        detach: bool,
         #[arg(long)]
         json: bool,
     },
@@ -261,16 +289,16 @@ pub enum Command {
     Archive {
         /// Omit with `--all` to archive every finished run in the project.
         run_id: Option<String>,
-        /// Archive every `done` / `plan_rejected` run in the project.
+        /// Archive every hand-archivable run in the project: `done` / `plan_rejected` plus
+        /// `stopped` / `failed` / `stuck` / `quota`. Never gates unless `--gates` is given.
         #[arg(long)]
         all: bool,
         /// With `--all`, only runs untouched for this long, e.g. `14d`.
         #[arg(long, value_name = "DURATION")]
         older_than: Option<String>,
-        /// With `--all`, also archive the halted phases auto-archiving never touches:
-        /// `stopped` / `failed` / `stuck` / `quota`. Never gates. Reversible.
+        /// With `--all`, also archive gates. `plan_approved` stays excluded either way.
         #[arg(long)]
-        halted: bool,
+        gates: bool,
         /// Un-archive instead: bring the run back into listings.
         #[arg(long)]
         undo: bool,
@@ -446,9 +474,35 @@ pub enum Command {
         action: SkillsCmd,
     },
 
+    /// Per-project supervisor: restarts a dead orchestrator holding resumable work,
+    /// pushes the `abandoned` lifecycle event, and enforces the cross-run concurrency
+    /// cap. Opt-in, never auto-started. It never approves a plan, confirms ship,
+    /// merges, sweeps `cleanup`, or picks a fleet.
+    Daemon {
+        #[command(subcommand)]
+        cmd: DaemonCmd,
+    },
+
     /// Internal: continue a detached run (not for humans)
     #[command(name = "__internal_continue", hide = true)]
     InternalContinue { run_id: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DaemonCmd {
+    /// Start the daemon for this project. Refuses if one is already running.
+    Start {
+        /// Run in this process instead of detaching into a session of its own.
+        #[arg(long)]
+        foreground: bool,
+    },
+    /// Signal a running daemon to stop. It notices within one tick.
+    Stop,
+    /// Pid, uptime, tick, cap, per-bucket usage, the queue, and the runs it watches.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
