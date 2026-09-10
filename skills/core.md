@@ -553,22 +553,29 @@ slot is stuck on.**
   inbox, which its `Stop` hook drains at the turn boundary. **grok** takes them on its
   native queue. **codex** attempts one too, once it has captured a thread id (its `codex
   exec --json` stream names one on its very first line): `codex queue --thread <id>
-  --message <text>`. This does not land in the dispatch it was queued against — `codex
-  exec` is single-turn and exits right after completing its one assigned task, and a
-  message queued mid-turn never surfaces in that turn's stream at all (verified against
-  codex 0.152.0), while a success exit code from `codex queue` is not proof of anything
-  either (it reports success against a thread whose process exited days ago). So a codex
-  dispatch always also writes the same poll file **opencode and muse** use — they have no
-  way to interrupt a working agent at all, so spar writes to
-  `.spar/runs/<id>/logs/nudges-<slot>.md` and their role prompt tells them to read it
-  before starting any new major step — regardless of whether a thread id has been
-  captured yet. What makes the queue push a real channel rather than a no-op: a message
-  queued to an idle thread *does* land the next time that thread is resumed, folded into
-  the same turn as the resume prompt (also verified live), and `codex exec resume <id>`
-  is exactly what a codex slot's next round now calls when a thread id was captured
-  (O63) — so the push's payoff arrives at that round's turn boundary, not the currently
-  running one. Thresholds are checked every 30 seconds, so a nudge lands at the next 30s
-  boundary rather than the instant a budget is crossed.
+  --message <text>`. That does not land in the dispatch it was queued against — `codex
+  exec` is single-turn and exits right after its one assigned task, and a success exit
+  code from `codex queue` is not proof of anything either (it reports success against a
+  thread whose process exited days ago) — so a codex dispatch always also writes the poll
+  file. What makes the push real rather than a no-op: a message queued to an idle thread
+  *does* land the next time that thread is resumed, folded into the same turn as the
+  resume prompt (verified live), and `codex exec resume <id>` is exactly what a codex
+  slot's next round now calls (O63), so the payoff arrives at that round's turn boundary,
+  not the running one. **muse** takes them through `muse session-message send --target
+  <session-uuid>`, once its session id is known (captured from the exec JSONL's first
+  `/stream/id` line) and its slot is still alive; the poll file is the fallback whenever
+  that push isn't confirmed (id unknown yet, send failed, the `--json` reply's `status`
+  isn't `"ok"` or `"accepted"`, or `status` is confirmed but the reply's own `receipts`
+  array is empty — `"accepted"` is muse's weakest rung and can mean the transport took
+  the write with nothing downstream confirming it). A confirmed push has never been
+  observed to actually surface inside a real muse session, so that fallback is exercised
+  in practice; a confirmed push is not also duplicated into the poll file. Under
+  `--backend tmux` muse is poll-file only: the recorded pane pid is the shell running the
+  `muse … | tee` pipeline, not the muse child, so it cannot be trusted as a liveness
+  signal. **opencode** has no push channel at all. Every poll-file case writes
+  `.spar/runs/<id>/logs/nudges-<slot>.md`, and the role prompt tells the agent to read it
+  before starting any new major step. Thresholds are checked every 30 seconds, so a nudge
+  lands at the next 30s boundary rather than the instant a budget is crossed.
 - **Live token visibility differs by adapter**, so token nudges are not uniformly prompt.
   **opencode** reports usage per step and is exact live for the slot's own session, but a
   `task` subagent's spend lands only after exit (opencode's json emitter never puts a

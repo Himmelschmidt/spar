@@ -39,13 +39,20 @@ impl ProviderAdapter for MuseAdapter {
     // `muse exec --json` emits an event-envelope JSONL (`payload_type` + `stream`) which
     // the stream coalescer renders, but it carries **no** token usage. Usage lands only
     // in muse's session log, which `muse_telemetry` sums after the slot exits. No
-    // push channel into the running process and no presence stream are wired, so delivery
-    // falls back to the poll file and presence degrades to the process/output heuristic.
-    // muse does ship
-    // `session-message send|serve` over a unix socket, which is a real turn-boundary
-    // channel; wiring it would make this adapter first-class later.
+    // presence stream is wired, so presence still degrades to the process/output
+    // heuristic. Delivery pushes into the running session: `muse session-message send
+    // --target <session-uuid>` injects directly, keyed off the session id
+    // `StreamCoalescer` captures from the exec JSONL's first `/stream/id` line, guarded on
+    // the slot's pid still being alive (a sidecar outlives its process). The delivery seam
+    // (`providers::delivery`) falls back to the poll file only when the push is not
+    // confirmed — id unknown yet, send failed, or the `--json` reply's own `status` field
+    // didn't say `"ok"` or `"accepted"`; a confirmed push is never also duplicated into
+    // the poll file. No box this has run on has ever had muse's `external_agent_ingress`
+    // gate open, so a confirmed push actually surfacing inside a *headless* `muse exec`
+    // run has never been observed end to end — the poll file is the one channel proven to
+    // work, and the push is a bonus delivery once its reply can be trusted for real.
     fn delivery_strategy(&self) -> DeliveryStrategy {
-        DeliveryStrategy::PollFile
+        DeliveryStrategy::MuseSessionMessage
     }
 
     fn presence_source(&self) -> PresenceSource {
@@ -269,6 +276,17 @@ mod tests {
             command_to_parts(&MuseAdapter.build_headless(Path::new("muse"), &opts("x", None)));
         assert_eq!(dash_val(&a, "--reasoning-effort").as_deref(), Some("xhigh"));
         clear_env();
+    }
+
+    /// Every delivery-seam test constructs `DeliveryStrategy::MuseSessionMessage` as a
+    /// literal, so nothing else pins the one line that actually routes muse onto it —
+    /// reverting `delivery_strategy` to `PollFile` would leave every other test green.
+    #[test]
+    fn delivery_strategy_is_muse_session_message() {
+        assert_eq!(
+            MuseAdapter.delivery_strategy(),
+            DeliveryStrategy::MuseSessionMessage
+        );
     }
 
     #[test]

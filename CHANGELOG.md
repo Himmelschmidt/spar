@@ -23,6 +23,13 @@ All notable changes to spar are recorded here.
   own USD spend, a per-model cost/token breakdown for dispatches that used more
   than one model, and how many Task-tool subagents ran and how they ended.
 
+- **`cli:muse` slots now also receive spar's own nudges (budget and time warnings) pushed
+  directly into the running session**, falling back to the file the agent's role prompt
+  already tells it to check only when that push isn't confirmed.
+- **A slot running in a forced-tmux pane can now be stopped.** Its process id is recorded
+  as soon as the pane starts, not only once it finishes, so `spar stop` can reach it while
+  it's still running instead of only after the fact.
+
 ### Fixed
 
 - **An agy slot's tool count and token usage are now exact instead of best-effort.**

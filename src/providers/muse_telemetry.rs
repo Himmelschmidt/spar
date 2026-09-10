@@ -226,7 +226,14 @@ impl LiveUsage {
 /// Rewrite a muse slot's stats from its session log. The stdout stream has no token
 /// counts at all, so without this every `cli:muse` run reports zero spend.
 pub fn enrich(stats: &mut StreamStats) {
-    let Some(session_id) = stats.session_id.clone() else {
+    // Falls back to the recovery stash: if spar was killed mid-`recover_artifact` before
+    // it could restore `session_id`, that field is still the only durable record telling
+    // this slot's usage apart from a fresh run's.
+    let Some(session_id) = stats
+        .session_id
+        .clone()
+        .or_else(|| stats.session_id_recovery_stash.clone())
+    else {
         return;
     };
     let Some(root) = sessions_root() else { return };

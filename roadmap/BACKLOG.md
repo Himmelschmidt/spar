@@ -131,11 +131,16 @@ that for finished runs. These two reduce how much gets created in the first plac
     claude's per-message `input_tokens` / `cache_read_input_tokens` are per-call or
     cumulative, from one instrumented run, not from the shape of the JSON.
 
-- **muse's turn-boundary socket is still unwired.** muse ships
-  `session-message send|serve` over a unix socket, which is a real inject channel into a
-  running session. O50 gave muse `DeliveryStrategy::PollFile` instead, which only lands at
-  the agent's next major step. Wiring the socket would make muse first-class for delivery
-  and would let a nudge interrupt an in-progress turn rather than waiting for one.
+- **A confirmed `muse session-message send` has never been seen to actually land.** O35
+  wired `DeliveryStrategy::MuseSessionMessage`, so the push is attempted and, when the
+  `--json` reply's `status` says `"ok"` or `"accepted"`, reported delivered without also
+  touching the poll file. But every box this has run on reports
+  `external_agent_ingress_closed` on every attempt, so only the fallback path (poll file)
+  has ever actually been exercised against a live muse — the push side of the seam is
+  unverified end to end. The backlog item is: get `external_agent_ingress` open somewhere
+  (or muse's own team to confirm the `--json` reply schema directly) and watch one real
+  confirmed push actually surface inside a headless `muse exec` run. Until that happens,
+  treat the "nudge interrupts an in-progress turn" payoff as theoretical, not delivered.
 
 - **A rate-limited slot fails the run instead of parking it on the quota gate.** Observed
   dogfooding on 2026-09-04: two concurrent runs (`bf7770ae`, `abd35a54`) both died with

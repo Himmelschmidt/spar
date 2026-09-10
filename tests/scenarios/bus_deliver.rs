@@ -3,9 +3,13 @@
 //!
 //! One scenario per landed strategy, all under `--dry-run` so the side-effecting
 //! injection call is stubbed and only drain + dispatch are exercised:
-//!   - Claude  → `StopHookInject`  (emits a Stop-hook `block` payload)
-//!   - Grok    → `NativeQueue`     (dispatches to the durable turn-boundary queue)
-//!   - agy     → `None`            (inbox left untouched for the agent's next turn)
+//!   - Claude  → `StopHookInject`       (emits a Stop-hook `block` payload)
+//!   - Grok    → `NativeQueue`          (dispatches to the durable turn-boundary queue)
+//!   - agy     → `None`                 (inbox left untouched for the agent's next turn)
+//!   - muse    → `MuseSessionMessage`   (falls back to the poll file: no live session id
+//!     exists in this scenario, so `muse session-message send` is never even attempted —
+//!     the push-confirmed path is covered by the `providers::delivery` unit tests, which
+//!     can fake the `muse` binary and a live session id)
 //!
 //! `SdkPrompt` (opencode) has no adapter yet, so its dispatch is covered by the
 //! `providers::delivery` unit tests rather than end-to-end here.
@@ -63,6 +67,14 @@ fn init_git_repo(dir: &std::path::Path) {
 }
 
 fn plan_and_approve(dir: &std::path::Path) -> String {
+    plan_and_approve_with_providers(dir, "cli:claude,cli:grok,cli:agy")
+}
+
+/// `plan`'s three roles (planner/plan_critic/test_author) zip positionally against
+/// `--providers`, so a fourth entry (e.g. adding `cli:muse` alongside the usual three)
+/// is silently dropped rather than picking up a role — a provider needs its own
+/// three-provider list to actually land a slot.
+fn plan_and_approve_with_providers(dir: &std::path::Path, providers: &str) -> String {
     let plan = spar_cmd()
         .current_dir(dir)
         .args([
@@ -70,7 +82,7 @@ fn plan_and_approve(dir: &std::path::Path) -> String {
             "--task",
             "add a hello world module",
             "--providers",
-            "cli:claude,cli:grok,cli:agy",
+            providers,
             "--dry-run",
             "--json",
         ])
@@ -267,6 +279,32 @@ fn block_reason(deliver: &Value) -> String {
         .and_then(|p| serde_json::from_str::<Value>(p).ok())
         .map(|v| v["reason"].as_str().unwrap_or_default().to_string())
         .unwrap_or_default()
+}
+
+/// muse: resolves `MuseSessionMessage` end to end through the real CLI + adapter lookup
+/// (`main.rs`'s `agent_delivery_strategy`), but no slot ever actually ran here, so there
+/// is no live session id and the send is never attempted — it must fall back to the poll
+/// file, not silently drop the message. The run is `--dry-run` like every scenario here,
+/// so the write itself is stubbed (see the `providers::delivery` unit tests for the write
+/// landing on a real filesystem); this test is what pins the strategy/action resolving
+/// correctly end to end through `agent_delivery_strategy` and the real `muse` adapter.
+#[test]
+fn muse_session_message_falls_back_to_poll_file_with_no_live_session() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let run_id = plan_and_approve_with_providers(tmp.path(), "cli:claude,cli:grok,cli:muse");
+    let agent = slot_for_provider(tmp.path(), &run_id, "cli:muse");
+
+    send(tmp.path(), &run_id, &agent, "keep going");
+
+    let d = deliver_json(tmp.path(), &run_id, &agent);
+    assert_eq!(d["strategy"], "muse_session_message");
+    assert_eq!(d["action"], "polled_file");
+    assert!(d["delivered"].as_u64().unwrap() >= 1, "{d}");
+    assert!(
+        d.get("payload").is_none(),
+        "poll-file strategy emits no stdout payload"
+    );
 }
 
 /// agy: no injection channel, so deliver must NOT consume the inbox — the agent reads

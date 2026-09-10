@@ -114,6 +114,21 @@ pub fn write_pid(
 
 pub fn clear_pid(paths: &SparPaths, run_id: &str, slot_id: &str) {
     let _ = std::fs::remove_file(paths.marker(run_id, &format!("{slot_id}.pid")));
+    let _ = std::fs::remove_file(paths.marker(run_id, &format!("{slot_id}.pid.proxy")));
+}
+
+/// Marks the recorded `.pid` as a **proxy** for the agent process rather than the agent
+/// itself. The tmux backend records the pane's shell (`#{pane_pid}`), which runs a
+/// `<agent> … | tee …; echo` pipeline and stays alive while `tee` drains after the agent
+/// has already exited. Bare "is anything still there" liveness may use that pid; a check
+/// that must prove *a specific session is still running* — `delivery::muse_session_id`,
+/// which authorizes a push into that session — must not.
+pub fn write_pid_is_proxy(paths: &SparPaths, run_id: &str, slot_id: &str) -> Result<()> {
+    write_marker(paths, run_id, &format!("{slot_id}.pid.proxy"), "1\n")
+}
+
+pub fn pid_is_proxy(paths: &SparPaths, run_id: &str, slot_id: &str) -> bool {
+    marker_exists(paths, run_id, &format!("{slot_id}.pid.proxy"))
 }
 
 pub fn read_pid(
