@@ -154,22 +154,27 @@ struct QueueEntry {
     enqueued_at: DateTime<Utc>,
 }
 
-/// How long an admission reservation counts toward supply after being granted, before
-/// it is pruned regardless of whether the run ever actually started a slot. Long
-/// enough to cover `spawn_detached_orchestrator` + the handshake (capped at 10s by
-/// default) plus the time for the child to dispatch and mark a slot `Running`; short
-/// enough that a launch which dies on the way in self-heals instead of wasting
-/// capacity forever.
+/// Two roles, both a fallback rather than the primary rule: (1) TTL for a reservation
+/// whose run has no readable `state.json` at all — the launcher reserved and then
+/// crashed before ever writing one; (2) the minimum age a reservation must reach before
+/// `reservation_still_live` will trust `RunState::abandoned` as *proven* death. Role 2
+/// exists because a run's orchestrator has not yet acquired its `RunLock` for the first
+/// stretch of `spawn_detached_orchestrator` + the handshake (capped at 10s by default),
+/// so `abandoned` reads true for a run that is, in fact, starting up normally; treating
+/// that as proof of death would evict a reservation mid-handshake. Neither role prunes
+/// a live, in-flight run by age alone: planning/prep can legitimately run past this
+/// window, and `reservation_still_live` keeps such a reservation for as long as its
+/// orchestrator holds the lock, however long that takes.
 const RESERVATION_TTL_SECS: i64 = 60;
 
 /// A grant of capacity for a run between the moment it is admitted (a launch, a
 /// restart, a queue release) and the moment its real slots reflect that demand.
 /// `bucket_supply_in_use` cannot see a run's usage until its orchestrator has actually
-/// dispatched a slot to `Running`, and that can lag admission by seconds — long enough
-/// for a second admission decision, in this process or another, to race it. A
-/// reservation closes that window: it is read back into `effective_supply` alongside
-/// the real counts until either the real counts catch up (see `effective_supply`) or
-/// the TTL above prunes it.
+/// dispatched a slot to `Running`, and that can lag admission by seconds to minutes
+/// (planning, worktree prep) — long enough for a second admission decision, in this
+/// process or another, to race it. A reservation closes that window: it is read back
+/// into `effective_supply` alongside the real counts until `reservation_still_live`
+/// says it is no longer needed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Reservation {
     run_id: String,
@@ -184,8 +189,37 @@ fn load_reservations(paths: &SparPaths) -> Vec<Reservation> {
         .and_then(|s| serde_json::from_str::<Vec<Reservation>>(&s).ok())
         .unwrap_or_default()
         .into_iter()
-        .filter(|r| now - r.reserved_at < chrono::Duration::seconds(RESERVATION_TTL_SECS))
+        .filter(|r| reservation_still_live(paths, r, now))
         .collect()
+}
+
+/// A reservation stays live until the run it belongs to has either reflected its full
+/// reserved demand in real `Running` slots, reached a non-running outcome
+/// (`Phase::is_waitable_stop`), or is proven abandoned (`RunState::abandoned`, and only
+/// once the reservation has had time to clear the detach handshake — see
+/// `RESERVATION_TTL_SECS`). Never by age alone otherwise: a run legitimately mid
+/// planning/prep, with a live orchestrator holding its `RunLock`, keeps its reservation
+/// for as long as that takes.
+fn reservation_still_live(paths: &SparPaths, r: &Reservation, now: DateTime<Utc>) -> bool {
+    let age = now - r.reserved_at;
+    let Ok(state) = RunState::load_for_display(paths, &r.run_id) else {
+        return age < chrono::Duration::seconds(RESERVATION_TTL_SECS);
+    };
+    if state.phase.is_waitable_stop() {
+        return false;
+    }
+    let real = running_slot_buckets(&state);
+    let fully_reflected = r
+        .buckets
+        .iter()
+        .all(|(bucket, need)| real.get(bucket).copied().unwrap_or(0) >= *need);
+    if fully_reflected {
+        return false;
+    }
+    if state.abandoned(paths) && age >= chrono::Duration::seconds(RESERVATION_TTL_SECS) {
+        return false;
+    }
+    true
 }
 
 fn save_reservations(paths: &SparPaths, reservations: &[Reservation]) -> Result<()> {
@@ -310,12 +344,18 @@ fn real_supply_by_run(paths: &SparPaths) -> HashMap<String, HashMap<String, u32>
         let Ok(state) = RunState::load_for_display(paths, &summary.id) else {
             continue;
         };
-        let per_bucket = out.entry(summary.id).or_default();
-        for slot in &state.slots {
-            if slot.status == SlotStatus::Running {
-                if let Ok(r) = ProviderRef::parse(&slot.provider) {
-                    *per_bucket.entry(r.storage_key()).or_insert(0) += 1;
-                }
+        out.insert(summary.id, running_slot_buckets(&state));
+    }
+    out
+}
+
+/// Slots at `Running` in `state`, bucketed by `storage_key()`.
+fn running_slot_buckets(state: &RunState) -> HashMap<String, u32> {
+    let mut out = HashMap::new();
+    for slot in &state.slots {
+        if slot.status == SlotStatus::Running {
+            if let Ok(r) = ProviderRef::parse(&slot.provider) {
+                *out.entry(r.storage_key()).or_insert(0) += 1;
             }
         }
     }
@@ -387,7 +427,13 @@ fn fits(demand: &HashMap<String, u32>, in_use: &HashMap<String, u32>, cap: u32) 
 ///
 /// A launch must never block on a service the operator did not start: with no daemon
 /// holding `.spar/daemon.lock`, this always returns `Ok(None)`.
-pub fn maybe_enqueue(paths: &SparPaths, cfg: &Config, state: &RunState) -> Result<Option<String>> {
+///
+/// `[daemon]` is project-service configuration, not run configuration, so this reads
+/// the *live* `spar.toml` rather than the run's frozen `Config::for_run` snapshot —
+/// unlike everything else about a run, which stays bound to O27. A cap enabled or
+/// changed after the run was created must still apply the moment this runs.
+pub fn maybe_enqueue(paths: &SparPaths, state: &RunState) -> Result<Option<String>> {
+    let cfg = Config::load(&paths.project_root).unwrap_or_default();
     let cap = cfg.daemon.max_slots_per_bucket;
     if cap == 0 {
         return Ok(None);
@@ -747,14 +793,17 @@ mod tests {
     fn maybe_enqueue_is_a_noop_with_no_daemon() {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
-        let mut cfg = Config::default();
-        cfg.daemon.max_slots_per_bucket = 1;
+        std::fs::write(
+            tmp.path().join("spar.toml"),
+            "[daemon]\nmax_slots_per_bucket = 1\n",
+        )
+        .unwrap();
         let state = RunState::new(
             "r1",
             crate::cli::WorkflowKind::Loop,
             tmp.path().to_path_buf(),
         );
-        assert!(maybe_enqueue(&paths, &cfg, &state).unwrap().is_none());
+        assert!(maybe_enqueue(&paths, &state).unwrap().is_none());
     }
 
     #[test]
@@ -762,13 +811,12 @@ mod tests {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         let _lock = DaemonLock::acquire(&paths).unwrap();
-        let cfg = Config::default();
         let state = RunState::new(
             "r1",
             crate::cli::WorkflowKind::Loop,
             tmp.path().to_path_buf(),
         );
-        assert!(maybe_enqueue(&paths, &cfg, &state).unwrap().is_none());
+        assert!(maybe_enqueue(&paths, &state).unwrap().is_none());
     }
 
     /// A run with one `Running` slot on `provider`, persisted so `real_supply_by_run`
@@ -884,22 +932,24 @@ mod tests {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         let _lock = DaemonLock::acquire(&paths).unwrap();
-        let mut cfg = Config::default();
-        cfg.daemon.max_slots_per_bucket = 1;
+        std::fs::write(
+            tmp.path().join("spar.toml"),
+            "[daemon]\nmax_slots_per_bucket = 1\n",
+        )
+        .unwrap();
         running_run(&paths, "already-running", "cli:claude");
 
-        let state = RunState::new(
+        let mut state = RunState::new(
             "r2",
             crate::cli::WorkflowKind::Loop,
             tmp.path().to_path_buf(),
         );
-        let mut state = state;
         let mut slot =
             crate::executor::init_slot("impl", "cli:claude", crate::state::SlotRole::Implementer);
         slot.status = SlotStatus::Pending;
         state.slots.push(slot);
 
-        let msg = maybe_enqueue(&paths, &cfg, &state).unwrap();
+        let msg = maybe_enqueue(&paths, &state).unwrap();
         assert!(
             msg.is_some(),
             "a run over the cap must be queued, not spawned"

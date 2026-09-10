@@ -972,8 +972,10 @@ fn brief_cmd(run_id: &str, full: bool, json: bool) -> Result<ExitCode> {
     println!();
     println!("## brief");
     match brief_text {
-        Some(t) if full => println!("{t}"),
-        Some(t) => println!("{}", t.chars().take(400).collect::<String>()),
+        // The brief is the one thing a fresh session cannot cheaply re-derive, so it
+        // is never truncated here — `--full` only controls whether `plan.md` /
+        // `test-contract.md` are inlined below.
+        Some(t) => println!("{t}"),
         None => println!("(none)"),
     }
     println!();

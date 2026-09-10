@@ -99,7 +99,7 @@ pub fn resume(
         // of its own and hand back once it holds the run's lock, rather than running
         // it in this process.
         if detach {
-            return detach_implement(&state, paths, cfg, json);
+            return detach_implement(&state, paths, json);
         }
         return continue_run(paths, cfg, run_id);
     }
@@ -408,7 +408,7 @@ fn run_from_approved(
     }
     if opts.detach {
         state.save(paths)?;
-        return detach_implement(&state, paths, cfg, opts.json);
+        return detach_implement(&state, paths, opts.json);
     }
     let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
     state.save(paths)?;
@@ -1119,7 +1119,7 @@ fn run_with_task(
     state.save(paths)?;
 
     if opts.detach {
-        return detach_implement(&state, paths, cfg, opts.json);
+        return detach_implement(&state, paths, opts.json);
     }
 
     let _lock = crate::runlock::RunLock::acquire(paths, &state.id)?;
@@ -2598,12 +2598,7 @@ fn reclaim_own_cache(state: &RunState, json: bool) {
     }
 }
 
-fn detach_implement(
-    state: &RunState,
-    paths: &SparPaths,
-    cfg: &Config,
-    json: bool,
-) -> Result<ExitCode> {
+fn detach_implement(state: &RunState, paths: &SparPaths, json: bool) -> Result<ExitCode> {
     if let Some(owner) = crate::runlock::RunLock::owner(paths, &state.id) {
         if owner.alive() {
             return Err(crate::runlock::OrchestratorBusy {
@@ -2613,7 +2608,7 @@ fn detach_implement(
             .into());
         }
     }
-    if let Some(msg) = crate::daemon::maybe_enqueue(paths, cfg, state)? {
+    if let Some(msg) = crate::daemon::maybe_enqueue(paths, state)? {
         if json {
             executor::emit_run_json(state)?;
         } else {
@@ -2622,8 +2617,21 @@ fn detach_implement(
         }
         return Ok(ExitCode::Success);
     }
-    let detached = crate::process::spawn_detached_orchestrator(paths, &state.id)?;
-    match crate::process::await_detached_start(paths, &state.id, detached)? {
+    let detached = match crate::process::spawn_detached_orchestrator(paths, &state.id) {
+        Ok(d) => d,
+        Err(e) => {
+            crate::daemon::release_reservation(paths, &state.id);
+            return Err(e);
+        }
+    };
+    let outcome = match crate::process::await_detached_start(paths, &state.id, detached) {
+        Ok(o) => o,
+        Err(e) => {
+            crate::daemon::release_reservation(paths, &state.id);
+            return Err(e);
+        }
+    };
+    match outcome {
         crate::process::DetachOutcome::Confirmed { pid } => {
             if json {
                 executor::emit_run_json(state)?;

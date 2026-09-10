@@ -153,7 +153,7 @@ pub fn run(
     }
 
     if opts.detach {
-        return detach_self(&state, paths, cfg, opts.json);
+        return detach_self(&state, paths, opts.json);
     }
 
     execute_plan(&mut state, paths, cfg, &jobs)?;
@@ -660,7 +660,7 @@ pub fn reject(
     Ok(ExitCode::Failure)
 }
 
-fn detach_self(state: &RunState, paths: &SparPaths, cfg: &Config, json: bool) -> Result<ExitCode> {
+fn detach_self(state: &RunState, paths: &SparPaths, json: bool) -> Result<ExitCode> {
     if let Some(owner) = crate::runlock::RunLock::owner(paths, &state.id) {
         if owner.alive() {
             return Err(crate::runlock::OrchestratorBusy {
@@ -670,7 +670,7 @@ fn detach_self(state: &RunState, paths: &SparPaths, cfg: &Config, json: bool) ->
             .into());
         }
     }
-    if let Some(msg) = crate::daemon::maybe_enqueue(paths, cfg, state)? {
+    if let Some(msg) = crate::daemon::maybe_enqueue(paths, state)? {
         if json {
             executor::emit_run_json(state)?;
         } else {
@@ -679,8 +679,21 @@ fn detach_self(state: &RunState, paths: &SparPaths, cfg: &Config, json: bool) ->
         }
         return Ok(ExitCode::Success);
     }
-    let detached = crate::process::spawn_detached_orchestrator(paths, &state.id)?;
-    match crate::process::await_detached_start(paths, &state.id, detached)? {
+    let detached = match crate::process::spawn_detached_orchestrator(paths, &state.id) {
+        Ok(d) => d,
+        Err(e) => {
+            crate::daemon::release_reservation(paths, &state.id);
+            return Err(e);
+        }
+    };
+    let outcome = match crate::process::await_detached_start(paths, &state.id, detached) {
+        Ok(o) => o,
+        Err(e) => {
+            crate::daemon::release_reservation(paths, &state.id);
+            return Err(e);
+        }
+    };
+    match outcome {
         crate::process::DetachOutcome::Confirmed { pid } => {
             if json {
                 executor::emit_run_json(state)?;
