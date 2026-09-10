@@ -793,6 +793,11 @@ pub fn replan(
             state.phase
         );
     }
+    // Resuming a stopped run: drop the marker so execute_plan dispatches instead of
+    // immediately re-parking at Stopped (see the guard at the top of execute_plan).
+    if state.phase == Phase::Stopped {
+        let _ = std::fs::remove_file(paths.marker(run_id, "stopped"));
+    }
     let round = state.begin_round();
     state.amendment = Some(directive);
     // The gate reopens: whatever was approved or rejected was about the old plan.

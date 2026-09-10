@@ -311,6 +311,59 @@ fn a_stopped_marker_written_after_admission_still_blocks_the_delayed_child() {
     );
 }
 
+/// The guard above must not swallow the CLI's own documented recovery path: an operator
+/// who stops an in-progress plan can still `spar plan --run <id> -t "…"` to replan it.
+/// `replan` admits `Phase::Stopped` explicitly, so it must clear the `stopped` marker
+/// itself before dispatching — otherwise the guard added for the daemon race (above)
+/// re-parks the very run the operator just asked to continue.
+#[test]
+fn replan_clears_the_stopped_marker_and_reaches_a_new_gate() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    init_repo(&proj);
+
+    let plan = spar_cmd()
+        .current_dir(&proj)
+        .args([
+            "plan",
+            "--task",
+            "hello",
+            "--providers",
+            "cli:claude",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2);
+    let run_id = json_of(&plan)["run_id"].as_str().unwrap().to_string();
+
+    // The operator stops the run mid-flight: phase moves to `stopped` and the marker
+    // that gates every workflow's dispatch loop is written, exactly as `spar stop` does.
+    set_phase(&proj, &run_id, "stopped");
+    let marker = proj
+        .join(".spar/runs")
+        .join(&run_id)
+        .join("markers/stopped");
+    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    std::fs::write(&marker, "stopped by operator\n").unwrap();
+
+    let replan = spar_cmd()
+        .current_dir(&proj)
+        .args(["plan", "--run", &run_id, "-t", "try again", "--json"])
+        .assert()
+        .code(2);
+    let state = json_of(&replan);
+    assert_eq!(
+        state["phase"], "awaiting_plan_approval",
+        "replan must reach a new plan gate, not re-park at stopped"
+    );
+    assert!(
+        !marker.exists(),
+        "replan must clear the stopped marker it explicitly admits"
+    );
+}
+
 /// A second `spar daemon start` against a project already holding the lock refuses,
 /// and `daemon status` names the one real pid — not a fabricated lock body.
 #[test]
