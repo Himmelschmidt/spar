@@ -139,6 +139,13 @@ struct PreparedSlot {
     /// The run's base, for deciding whether a slot missing its artifact left work behind.
     base_commit: Option<String>,
     round: u32,
+    /// The native session/thread id an earlier round of this same slot captured
+    /// (`markers::read_session_id`), if any. `execute_prepared` passes it to the
+    /// adapter's `build_resume`; adapters that don't support resume just ignore it.
+    prior_session_id: Option<String>,
+    /// The adapter's bare name (e.g. `"codex"`), used to scope the session-id marker so a
+    /// provider rotation on this slot id never resumes a different provider's session.
+    session_provider: String,
     /// The run's frozen config (O27), carried across the thread boundary so a worker
     /// sizes its budgets and nudge cadence off the same document every other phase reads.
     cfg: Config,
@@ -302,6 +309,9 @@ fn prepare_slot_execution(
     let _ = crate::bus::heartbeat(paths, Some(&state.id), &job.slot_id, "running");
     let env = wire_slot_presence(state, paths, &job, &cwd, &pref);
     let owns_cwd = owns_cwd(state, &job.slot_id, &cwd);
+    let session_provider = pref.cli_name().unwrap_or(job.provider.as_str()).to_string();
+    let prior_session_id =
+        markers::read_session_id(paths, &state.id, &job.slot_id, &session_provider);
 
     Ok(PreparedSlot {
         job,
@@ -316,6 +326,8 @@ fn prepare_slot_execution(
         base_commit: state.base_commit.clone(),
         owns_cwd,
         round,
+        prior_session_id,
+        session_provider,
         cfg: cfg.clone(),
         dry_run: state.dry_run,
     })
@@ -332,6 +344,120 @@ fn owns_cwd(state: &RunState, slot_id: &str, cwd: &Path) -> bool {
         .worktrees
         .iter()
         .any(|w| w.slot_id == slot_id && w.path == cwd)
+}
+
+/// Resume a previously captured native session (`prior_session_id`) instead of a cold
+/// `build_headless` dispatch, when the adapter supports it (see `ProviderAdapter::build_resume`).
+/// Adapters that don't implement `build_resume`, or that decline for this call, fall back
+/// to `build_headless` — the only path before this round's codex resume wiring (O63).
+///
+/// The `bool` reports whether the resume path was taken, so the caller can tell a lost
+/// rollout (resume attempted, no session ever established) from an ordinary cold-dispatch
+/// failure and retry cold instead of just failing the round — see `resume_lost_its_session`.
+fn build_dispatch_command(
+    adapter: &dyn providers::ProviderAdapter,
+    bin: &Path,
+    opts: &SpawnOpts,
+    prior_session_id: Option<&str>,
+) -> (std::process::Command, bool) {
+    if let Some(sid) = prior_session_id {
+        if let Some(cmd) = adapter.build_resume(bin, opts, sid) {
+            return (cmd, true);
+        }
+    }
+    (adapter.build_headless(bin, opts), false)
+}
+
+/// True when a resume dispatch exited without ever establishing a session (no
+/// `thread.started` captured). Necessary but not sufficient evidence that the vendor's
+/// rollout is gone (pruned, a different `CODEX_HOME`, a moved box) — plenty of other
+/// pre-session failures (a bad model override, an expired `auth.json`, a transient
+/// network error) also exit with no session id captured. Callers must additionally
+/// consult `ProviderAdapter::resume_failure_is_missing_session` on the dispatch's log
+/// before treating this as a lost rollout; this predicate alone only narrows to "did no
+/// work", not "why".
+///
+/// Excludes a timeout: a resume that ran the full ceiling without answering is a genuine
+/// hang, and retrying cold there would just double the wall-clock cost for the slot's
+/// budget instead of recovering anything.
+///
+/// Does not condition on the exit code. The discriminator that carries the meaning is
+/// `session_id.is_none()` — a resume that never emitted `thread.started` did no work
+/// regardless of how it exited. Today's codex (0.152.0) always exits non-zero on a
+/// missing rollout, but keying on `session_id` alone means a future version that exits
+/// 0 on the same non-start still gets the retry instead of leaving a marker that dead-
+/// ends every later round of the slot.
+fn resume_lost_its_session(used_resume: bool, res: &process::SpawnResult) -> bool {
+    used_resume && !res.timed_out && res.stats.session_id.is_none()
+}
+
+/// Runs `req`, recovers from a lost-rollout resume (clears the marker, retries cold once
+/// — see `resume_lost_its_session` and `ProviderAdapter::resume_failure_is_missing_session`),
+/// and persists whatever session id the (possibly retried) dispatch captured. Shared by
+/// `execute_prepared` and `run_headless`, which differ only in how they build `req`/`opts`
+/// and their pid-capture `sink` — the recovery-and-persist sequence itself must not drift
+/// between the two, since a real bug here silently disables resume for the affected path
+/// (see `dispatch_records_session_id_and_recovers_from_lost_resume`'s test coverage).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_with_resume_recovery(
+    adapter: &dyn providers::ProviderAdapter,
+    bin: &Path,
+    opts: &SpawnOpts,
+    used_resume: bool,
+    isolation: crate::config::IsolationMode,
+    req: SpawnRequest,
+    paths: &SparPaths,
+    run_id: &str,
+    slot_id: &str,
+    session_provider: &str,
+    sink: &dyn Fn(u32),
+    tick: &dyn Fn(),
+) -> Result<process::SpawnResult> {
+    let cwd = req.cwd.clone();
+    let log_path = req.log_path.clone();
+    let env = req.env.clone();
+    let timeout = req.timeout;
+    let mut res = process::run_captured(&req, Some(sink), Some(tick))?;
+    if resume_lost_its_session(used_resume, &res)
+        && adapter.resume_failure_is_missing_session(
+            &std::fs::read_to_string(&log_path).unwrap_or_default(),
+        )
+    {
+        // The rollout this slot's marker pointed at is gone (pruned, a different
+        // CODEX_HOME, a moved box): clear it so the *next* round doesn't repeat the same
+        // failure, and retry this round cold, once, rather than losing it outright.
+        markers::clear_session_id(paths, run_id, slot_id, session_provider);
+        let _ = crate::events::append(
+            paths,
+            run_id,
+            &crate::events::Event::slot_note(
+                slot_id,
+                "resume lost its session (no thread.started); retrying cold dispatch once",
+            ),
+        );
+        // `run_captured` truncates `log_path`; preserve the failed resume's own log
+        // (e.g. codex's "no rollout found") before the cold retry overwrites it.
+        let _ = std::fs::copy(&log_path, lost_resume_log_path(&log_path));
+        let cold = adapter.build_headless(bin, opts);
+        let (program, args) = providers::command_to_parts(&cold);
+        let (program, args) = sandbox::maybe_wrap(isolation, &cwd, &program, &args);
+        let cold_req = SpawnRequest {
+            program,
+            args,
+            cwd: cwd.clone(),
+            log_path: log_path.clone(),
+            env: env.clone(),
+            timeout,
+        };
+        res = process::run_captured(&cold_req, Some(sink), Some(tick))?;
+    }
+    // Persisted regardless of this dispatch's own outcome: a captured thread id is what
+    // lets the *next* round resume instead of a cold dispatch (O63), and that is worth
+    // keeping even off a failed attempt — a resumed thread still holds real progress.
+    if let Some(sid) = &res.stats.session_id {
+        let _ = markers::write_session_id(paths, run_id, slot_id, session_provider, sid);
+    }
+    Ok(res)
 }
 
 fn execute_prepared(
@@ -371,6 +497,9 @@ fn execute_prepared(
             billed_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
             tools: 0,
             model: usage.model.or(model),
+            cost_usd: None,
+            subagent_stats: None,
+            model_usage: Default::default(),
         };
         return Ok(if ok {
             SlotOutcome {
@@ -422,7 +551,12 @@ fn execute_prepared(
         model: prep.job.model.clone(),
         timeout_secs: Some(timeout.as_secs()),
     };
-    let cmd = adapter.build_headless(&bin, &opts);
+    let (cmd, used_resume) = build_dispatch_command(
+        adapter.as_ref(),
+        &bin,
+        &opts,
+        prep.prior_session_id.as_deref(),
+    );
     let (program, args) = providers::command_to_parts(&cmd);
     let (program, args) = sandbox::maybe_wrap(isolation, &prep.cwd, &program, &args);
     let req = SpawnRequest {
@@ -472,7 +606,20 @@ fn execute_prepared(
         beat.tick();
         watch.tick();
     };
-    let mut res = process::run_captured(&req, Some(&sink), Some(&tick))?;
+    let mut res = dispatch_with_resume_recovery(
+        adapter.as_ref(),
+        &bin,
+        &opts,
+        used_resume,
+        isolation,
+        req,
+        &prep.paths,
+        &prep.run_id,
+        &prep.job.slot_id,
+        &prep.session_provider,
+        &sink,
+        &tick,
+    )?;
     let pid = load_pid(&pid_cell);
     // Before the gates below, and before any state save: markers outlive an orchestrator
     // that dies between here and the save, `state.json` does not (O49).
@@ -493,6 +640,14 @@ fn execute_prepared(
         &prep.paths,
     );
     enrich_muse_stats(&mut res.stats, &prep.job.provider, &prep.log_path);
+    enrich_opencode_stats(
+        &mut res.stats,
+        &prep.job.provider,
+        &prep.log_path,
+        &prep.paths,
+        &prep.run_id,
+        &prep.job.slot_id,
+    );
     let quota_rejected = res.stats.quota_rejected.clone();
     let quota_resets_at = resets_at_from_epoch_secs(res.stats.quota_resets_at);
     let quota_recovered = res.stats.quota_recovered;
@@ -778,6 +933,19 @@ fn recovery_log_path(log_path: &Path) -> PathBuf {
     log_path.with_file_name(format!("{stem}.recovery.log"))
 }
 
+/// `<run_dir>/logs/<slot>.lost-resume.log` — a sibling of the shared log path, copied to
+/// just before `resume_lost_its_session`'s cold retry overwrites it (`run_captured`
+/// truncates via `File::create`). Preserves the failed resume's own stderr (e.g. codex's
+/// `no rollout found for thread id …`), which is otherwise gone by the time anyone reads
+/// the log — the retry's own output is all that would remain.
+fn lost_resume_log_path(log_path: &Path) -> PathBuf {
+    let stem = log_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("slot");
+    log_path.with_file_name(format!("{stem}.lost-resume.log"))
+}
+
 fn markers_pid_path(paths: &SparPaths, run_id: &str, slot_id: &str) -> PathBuf {
     paths.markers_dir(run_id).join(format!("{slot_id}.pid"))
 }
@@ -833,13 +1001,46 @@ fn enrich_muse_stats(stats: &mut process::StreamStats, provider: &str, log_path:
     let _ = stats.save(log_path);
 }
 
-/// agy emits ~nothing to stdout, so the stream stats are all zero. Recover the real
-/// tool/token/activity counts from agy's transcript + statusline sink and rewrite the
-/// slot's stats sidecar so `stats.json` and the TUI reflect what actually happened.
-/// Also drives a real agy quota cooldown from the payload's reset horizon (finding #3),
-/// and returns whether it did: agy's statusline is the *only* place that shows up (its
-/// own stdout is ~empty, so the log-based `detect_and_pause_quota` scrape never fires
-/// for it), so callers OR this into a failed dispatch's `quota_hit` themselves.
+fn is_opencode_provider(provider: &str) -> bool {
+    ProviderRef::parse(provider)
+        .ok()
+        .and_then(|p| p.cli_name().map(|n| n == "opencode"))
+        .unwrap_or(provider == "opencode")
+}
+
+/// opencode's own stream filters a `task` subagent's usage out before it ever reaches
+/// stdout, so a slot that fanned out reports only its own step deltas. Add the missing
+/// child spend from opencode's sqlite ledger and rewrite the slot's stats sidecar. When
+/// the ledger was found but could not be read, that is a real anomaly indistinguishable
+/// from "nothing to recover" in `stats.json` alone, so it goes to the run's event log.
+fn enrich_opencode_stats(
+    stats: &mut process::StreamStats,
+    provider: &str,
+    log_path: &Path,
+    paths: &SparPaths,
+    run_id: &str,
+    slot_id: &str,
+) {
+    if !is_opencode_provider(provider) {
+        return;
+    }
+    if let Some(note) = providers::opencode_telemetry::enrich(stats) {
+        let _ = crate::events::append(
+            paths,
+            run_id,
+            &crate::events::Event::slot_note(slot_id, &note),
+        );
+    }
+    let _ = stats.save(log_path);
+}
+
+/// agy's `--output-format stream-json` now feeds tools/tokens straight into `stats` via
+/// `StreamCoalescer::handle_agy`. What's left to recover from the statusline sink is what
+/// the stream doesn't carry: the context-window snapshot and quota (see
+/// `providers::agy_telemetry`). Also drives a real agy quota cooldown from the payload's
+/// reset horizon (finding #3), and returns whether it did: agy's statusline is the *only*
+/// place that shows up (its own stdout usage is per-step, not a rejection notice), so
+/// callers OR this into a failed dispatch's `quota_hit` themselves.
 fn enrich_agy_stats(
     stats: &mut process::StreamStats,
     provider: &str,
@@ -856,34 +1057,10 @@ fn enrich_agy_stats(
     let Some(t) = providers::agy_telemetry::collect(&root, cwd) else {
         return false;
     };
-    if t.tools > 0 {
-        stats.tools = t.tools;
-    }
-    stats.tool_errors = stats.tool_errors.max(t.tool_errors);
-    if t.input_tokens > 0 {
-        stats.input_tokens = t.input_tokens;
-    }
-    if t.output_tokens > 0 {
-        stats.output_tokens = t.output_tokens;
-    }
-    if t.cache_read_tokens > 0 {
-        stats.cache_read_tokens = t.cache_read_tokens;
-    }
     if t.context_tokens > 0 {
         stats.context_tokens = t.context_tokens;
+        let _ = stats.save(log_path);
     }
-    let billed = stats
-        .input_tokens
-        .saturating_add(stats.output_tokens)
-        .saturating_add(stats.cache_read_tokens)
-        .saturating_add(stats.cache_write_tokens);
-    if billed > 0 {
-        stats.billed_tokens = billed;
-    }
-    if let Some(ts) = t.last_activity {
-        stats.last_log_at = Some(ts.to_rfc3339());
-    }
-    let _ = stats.save(log_path);
 
     // Finding #3: when the account's binding gemini quota is (near) exhausted, cool the
     // provider down until its real reset instead of the fixed heuristic window.
@@ -916,6 +1093,9 @@ fn usage_from_stream(slot_id: &str, provider: &str, s: &process::StreamStats) ->
         billed_tokens: s.billed_tokens,
         tools: s.tools,
         model: s.model.clone(),
+        cost_usd: s.cost_usd,
+        subagent_stats: s.subagent_stats.clone(),
+        model_usage: s.model_usage.clone(),
     }
 }
 
@@ -1639,8 +1819,10 @@ struct SlotOutcome {
     error: Option<String>,
     usage: Option<SlotUsage>,
     /// Set when `enrich_agy_stats` detected exhausted agy quota telemetry during *this*
-    /// dispatch. agy's own stdout is ~empty, so the log-based quota scrape
-    /// (`detect_and_pause_quota`) never sees it; callers OR this in instead.
+    /// dispatch. The stream's `result.error` can carry rejection prose the log-based
+    /// scrape (`detect_and_pause_quota`) recognizes, but the structured gemini-* quota
+    /// fraction that actually decides exhaustion is only in the statusline sink;
+    /// callers OR this in as a second, more reliable signal.
     agy_quota_hit: bool,
     /// The adapter's own typed rate-limit rejection (its `rateLimitType`), reflecting
     /// the *last* `rate_limit_event` in the stream: a later `allowed`/`allowed_warning`
@@ -2041,6 +2223,9 @@ fn run_api(
         billed_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
         tools: 0,
         model: usage.model.or(model),
+        cost_usd: None,
+        subagent_stats: None,
+        model_usage: Default::default(),
     };
     if ok {
         Ok(SlotOutcome {
@@ -2106,7 +2291,9 @@ fn run_headless(
         model: slot_model_for(Some(state), job),
         timeout_secs: Some(timeout.as_secs()),
     };
-    let cmd = adapter.build_headless(&bin, &opts);
+    let prior_session_id = markers::read_session_id(paths, &state.id, &job.slot_id, cli_name);
+    let (cmd, used_resume) =
+        build_dispatch_command(adapter.as_ref(), &bin, &opts, prior_session_id.as_deref());
     let (program, args) = providers::command_to_parts(&cmd);
     let (program, args) = sandbox::maybe_wrap(state.isolation, cwd, &program, &args);
 
@@ -2153,7 +2340,20 @@ fn run_headless(
         beat.tick();
         watch.tick();
     };
-    let mut res = process::run_captured(&req, Some(&sink), Some(&tick))?;
+    let mut res = dispatch_with_resume_recovery(
+        adapter.as_ref(),
+        &bin,
+        &opts,
+        used_resume,
+        state.isolation,
+        req,
+        paths,
+        &state.id,
+        &job.slot_id,
+        cli_name,
+        &sink,
+        &tick,
+    )?;
     let pid = load_pid(&pid_cell);
     // See `execute_prepared`: the verdict lands on disk before the gates and before any
     // state save, so an orchestrator that dies from here on still leaves a terminal
@@ -2169,6 +2369,14 @@ fn run_headless(
     let _ = markers::write_dispatch_verdict(paths, &state.id, &job.slot_id, &verdict);
     let agy_quota_hit = enrich_agy_stats(&mut res.stats, &job.provider, cwd, log_path, paths);
     enrich_muse_stats(&mut res.stats, &job.provider, log_path);
+    enrich_opencode_stats(
+        &mut res.stats,
+        &job.provider,
+        log_path,
+        paths,
+        &state.id,
+        &job.slot_id,
+    );
     let quota_rejected = res.stats.quota_rejected.clone();
     let quota_resets_at = resets_at_from_epoch_secs(res.stats.quota_resets_at);
     let quota_recovered = res.stats.quota_recovered;
@@ -2305,6 +2513,37 @@ fn tmux_outcome(marker: MarkerState, pane_alive: bool, budget_left: bool) -> Tmu
     }
 }
 
+/// tmux's pane runs `build_interactive`, which for opencode is the same
+/// `run --format json` stream headless mode parses live (`opencode.rs`'s
+/// `build_interactive` falls back to `build_headless` for exactly this reason) — but
+/// `run_tmux` only tees it to `log_path`, never through a live coalescer, so without this
+/// every tmux-backed opencode slot reported no spend at all, parent or child. Reconstruct
+/// the parent's own stats from the completed log, then run the same descendant recovery
+/// `enrich_opencode_stats` does for the headless backends. A no-op (`None`) for every
+/// other provider: their tmux panes render real terminal/TUI output, not a JSON stream,
+/// so there is nothing here to recover.
+fn tmux_recovered_usage(
+    is_opencode: bool,
+    paths: &SparPaths,
+    run_id: &str,
+    job: &SlotJob,
+    log_path: &Path,
+) -> Option<SlotUsage> {
+    if !is_opencode {
+        return None;
+    }
+    let mut stats = process::stats_from_log(log_path);
+    enrich_opencode_stats(
+        &mut stats,
+        &job.provider,
+        log_path,
+        paths,
+        run_id,
+        &job.slot_id,
+    );
+    Some(usage_from_stream(&job.slot_id, &job.provider, &stats))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_tmux(
     state: &mut RunState,
@@ -2367,6 +2606,7 @@ fn run_tmux(
     }
 
     tmux::spawn_window(&session, &job.slot_id, cwd, &shell, env)?;
+    let is_opencode = is_opencode_provider(&job.provider);
 
     // The pane's shell pid exists as soon as `new-window` returns — tmux creates the pane
     // synchronously as part of that command. Recording it now, not only once the `done`
@@ -2376,6 +2616,8 @@ fn run_tmux(
     let mut pane_pid = tmux::pane_pid(&session, &job.slot_id).map(process::PidToken::capture);
     if let Some(token) = pane_pid {
         let _ = markers::write_pid(paths, &state.id, &job.slot_id, token);
+        // The pane's shell, not the agent child — see `markers::write_pid_is_proxy`.
+        let _ = markers::write_pid_is_proxy(paths, &state.id, &job.slot_id);
     }
 
     // muse has no wired push channel on this backend otherwise: `tee` writes the raw
@@ -2412,6 +2654,7 @@ fn run_tmux(
                 let token = process::PidToken::capture(p);
                 pane_pid = Some(token);
                 let _ = markers::write_pid(paths, &state.id, &job.slot_id, token);
+                let _ = markers::write_pid_is_proxy(paths, &state.id, &job.slot_id);
             }
         }
         // `.alive()` checks the recorded start time, not just bare liveness — a plain
@@ -2431,7 +2674,7 @@ fn run_tmux(
                     exit_code: Some(0),
                     signal: None,
                     error: None,
-                    usage: None,
+                    usage: tmux_recovered_usage(is_opencode, paths, &state.id, job, log_path),
                     agy_quota_hit: false,
                     quota_rejected: None,
                     quota_resets_at: None,
@@ -2445,7 +2688,7 @@ fn run_tmux(
                     exit_code: Some(1),
                     signal: None,
                     error: Some("marker failed".into()),
-                    usage: None,
+                    usage: tmux_recovered_usage(is_opencode, paths, &state.id, job, log_path),
                     agy_quota_hit: false,
                     quota_rejected: None,
                     quota_resets_at: None,
@@ -2459,7 +2702,7 @@ fn run_tmux(
                     exit_code: None,
                     signal: None,
                     error: Some("agent reported done but its process is still running".into()),
-                    usage: None,
+                    usage: tmux_recovered_usage(is_opencode, paths, &state.id, job, log_path),
                     agy_quota_hit: false,
                     quota_rejected: None,
                     quota_resets_at: None,
@@ -2469,7 +2712,10 @@ fn run_tmux(
             TmuxDecision::Wait => {
                 if !budget_left {
                     // Never success-on-timeout-alone (plan completion contract).
-                    return Ok(SlotOutcome::err("tmux marker wait timed out"));
+                    return Ok(SlotOutcome {
+                        usage: tmux_recovered_usage(is_opencode, paths, &state.id, job, log_path),
+                        ..SlotOutcome::err("tmux marker wait timed out")
+                    });
                 }
                 std::thread::sleep(Duration::from_millis(200));
             }
@@ -2972,6 +3218,336 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&log_path).unwrap(), "");
         let stats = process::StreamStats::load(&log_path).expect("sidecar written");
         assert_eq!(stats.session_id, None);
+    }
+
+    fn dispatch_opts(prompt: &str) -> SpawnOpts {
+        SpawnOpts {
+            prompt: prompt.into(),
+            prompt_file: None,
+            cwd: PathBuf::from("/tmp"),
+            trust: TrustPolicy::FullAuto,
+            extra_args: vec![],
+            model: None,
+            timeout_secs: None,
+        }
+    }
+
+    #[test]
+    fn build_dispatch_command_resumes_codex_when_a_prior_session_id_is_known() {
+        // build_resume (opts.model: None) falls through to profile_model_args, which
+        // reads $CODEX_HOME/<profile>.config.toml — lock and isolate CODEX_HOME so this
+        // doesn't read the machine's real ~/.codex or race codex.rs's own env-mutating
+        // tests, matching neither of which this test's assertions depend on.
+        let _guard = providers::codex::ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CODEX_HOME", home.path());
+        let opts = dispatch_opts("go");
+        let (cmd, used_resume) = build_dispatch_command(
+            &providers::CodexAdapter,
+            Path::new("codex"),
+            &opts,
+            Some("thread-123"),
+        );
+        std::env::remove_var("CODEX_HOME");
+        assert!(used_resume);
+        let (_, args) = providers::command_to_parts(&cmd);
+        assert_eq!(&args[..2], ["exec", "resume"]);
+        assert!(args.iter().any(|a| a == "thread-123"));
+    }
+
+    #[test]
+    fn build_dispatch_command_is_cold_without_a_prior_session_id() {
+        let opts = dispatch_opts("go");
+        let (cmd, used_resume) =
+            build_dispatch_command(&providers::CodexAdapter, Path::new("codex"), &opts, None);
+        assert!(!used_resume);
+        let (_, args) = providers::command_to_parts(&cmd);
+        assert_eq!(args.first().map(String::as_str), Some("exec"));
+        assert!(!args.iter().any(|a| a == "resume"));
+    }
+
+    #[test]
+    fn build_dispatch_command_ignores_prior_session_id_for_an_adapter_without_resume() {
+        // Grok's `build_resume` is the trait default (`None`), so a prior session id
+        // must not change its dispatch shape even when one is present.
+        let opts = dispatch_opts("go");
+        let (with_prior, used_resume) = build_dispatch_command(
+            &providers::GrokAdapter,
+            Path::new("grok"),
+            &opts,
+            Some("some-id"),
+        );
+        assert!(!used_resume);
+        let (without_prior, _) =
+            build_dispatch_command(&providers::GrokAdapter, Path::new("grok"), &opts, None);
+        assert_eq!(
+            providers::command_to_parts(&with_prior).1,
+            providers::command_to_parts(&without_prior).1
+        );
+    }
+
+    #[test]
+    fn resume_lost_its_session_is_true_only_for_a_resume_that_never_started() {
+        use process::SpawnResult;
+        let mut res = SpawnResult {
+            exit_code: Some(1),
+            signal: None,
+            timed_out: false,
+            log_path: PathBuf::from("/tmp/x"),
+            stdout_tail: String::new(),
+            stats: process::StreamStats::default(),
+        };
+        // Resume, exited non-zero, no session id ever captured: the rollout is gone.
+        assert!(resume_lost_its_session(true, &res));
+
+        // Not a resume at all: an ordinary cold-dispatch failure is not this case.
+        assert!(!resume_lost_its_session(false, &res));
+
+        // Resume did establish a thread before failing later: a real error, not a lost
+        // rollout, so no retry.
+        res.stats.session_id = Some("thread-123".into());
+        assert!(!resume_lost_its_session(true, &res));
+
+        // Resume timed out rather than exiting: retrying cold would double the wall-clock
+        // cost for what looks like a genuine hang, not a missing rollout.
+        res.stats.session_id = None;
+        res.timed_out = true;
+        res.exit_code = None;
+        assert!(!resume_lost_its_session(true, &res));
+
+        // Resume exited clean but still never captured a session id: still a lost
+        // rollout, regardless of exit code (see the function's own doc comment).
+        res.timed_out = false;
+        res.exit_code = Some(0);
+        assert!(resume_lost_its_session(true, &res));
+
+        // Session id captured, even on a clean exit: no retry.
+        res.stats.session_id = Some("thread-123".into());
+        assert!(!resume_lost_its_session(true, &res));
+    }
+
+    /// A test-only adapter whose `build_headless` runs an arbitrary shell script instead
+    /// of a real provider binary, so `dispatch_with_resume_recovery`'s recovery-and-
+    /// persist sequence can be exercised end to end (real `process::run_captured`, real
+    /// marker files) without spawning `codex`/`grok`/etc.
+    struct ShellAdapter {
+        script: String,
+    }
+
+    impl providers::ProviderAdapter for ShellAdapter {
+        fn name(&self) -> &'static str {
+            "shell"
+        }
+        fn binary_names(&self) -> &[&'static str] {
+            &["sh"]
+        }
+        fn capabilities(&self) -> providers::Capabilities {
+            providers::Capabilities::default()
+        }
+        fn permission_args(&self, _policy: TrustPolicy) -> Vec<String> {
+            vec![]
+        }
+        fn build_headless(&self, _bin: &Path, _opts: &SpawnOpts) -> std::process::Command {
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.arg("-c").arg(&self.script);
+            cmd
+        }
+        fn build_interactive(&self, bin: &Path, opts: &SpawnOpts) -> std::process::Command {
+            self.build_headless(bin, opts)
+        }
+        fn resume_failure_is_missing_session(&self, log_text: &str) -> bool {
+            log_text.contains("no rollout found")
+        }
+    }
+
+    fn shell_req(script: &str, log_path: &Path) -> SpawnRequest {
+        SpawnRequest {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), script.to_string()],
+            cwd: PathBuf::from("/tmp"),
+            log_path: log_path.to_path_buf(),
+            env: vec![],
+            timeout: Duration::from_secs(10),
+        }
+    }
+
+    #[test]
+    fn dispatch_with_resume_recovery_persists_a_captured_session_id() {
+        // Directly guards against the regression review-1 flagged: this is what breaks
+        // silently (resume never engages on a later round) if either call site's
+        // `markers::write_session_id` call is ever dropped again.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log_path = tmp.path().join("slot.log");
+        let adapter = ShellAdapter {
+            script: r#"echo '{"type":"thread.started","thread_id":"cold-id-1"}'"#.into(),
+        };
+        let opts = dispatch_opts("go");
+        let req = shell_req(&adapter.script, &log_path);
+        let res = dispatch_with_resume_recovery(
+            &adapter,
+            Path::new("/bin/sh"),
+            &opts,
+            false,
+            crate::config::IsolationMode::None,
+            req,
+            &paths,
+            "run1",
+            "slotA",
+            "shell",
+            &|_pid| {},
+            &|| {},
+        )
+        .unwrap();
+        assert_eq!(res.stats.session_id.as_deref(), Some("cold-id-1"));
+        assert_eq!(
+            markers::read_session_id(&paths, "run1", "slotA", "shell").as_deref(),
+            Some("cold-id-1")
+        );
+    }
+
+    #[test]
+    fn dispatch_with_resume_recovery_clears_marker_and_retries_cold_on_a_lost_rollout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log_path = tmp.path().join("slot.log");
+        markers::write_session_id(&paths, "run1", "slotB", "shell", "stale-id").unwrap();
+
+        // build_headless (the cold retry) succeeds and captures a fresh session id;
+        // the initial `req` simulates a resume dispatch that died before thread.started
+        // with codex's own missing-rollout text.
+        let adapter = ShellAdapter {
+            script: r#"echo '{"type":"thread.started","thread_id":"fresh-id"}'"#.into(),
+        };
+        let opts = dispatch_opts("go");
+        let lost_req = shell_req(
+            "echo 'no rollout found for thread id stale-id' >&2; exit 1",
+            &log_path,
+        );
+        let res = dispatch_with_resume_recovery(
+            &adapter,
+            Path::new("/bin/sh"),
+            &opts,
+            true,
+            crate::config::IsolationMode::None,
+            lost_req,
+            &paths,
+            "run1",
+            "slotB",
+            "shell",
+            &|_pid| {},
+            &|| {},
+        )
+        .unwrap();
+        // The cold retry ran and its captured id is what gets persisted — the marker
+        // was cleared, then rewritten by the retry's own success, not left stale.
+        assert_eq!(res.stats.session_id.as_deref(), Some("fresh-id"));
+        assert_eq!(
+            markers::read_session_id(&paths, "run1", "slotB", "shell").as_deref(),
+            Some("fresh-id")
+        );
+    }
+
+    #[test]
+    fn dispatch_with_resume_recovery_leaves_marker_intact_on_an_unrelated_resume_failure() {
+        // A pre-session failure that is not the rollout-missing signature must not clear
+        // the marker or retry cold — see `resume_failure_is_missing_session`'s doc
+        // comment. `ShellAdapter::build_headless` would succeed if called, so a passing
+        // assertion here that the marker survives is also proof the cold path never ran.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log_path = tmp.path().join("slot.log");
+        markers::write_session_id(&paths, "run1", "slotC", "shell", "still-valid-id").unwrap();
+
+        let adapter = ShellAdapter {
+            script: r#"echo '{"type":"thread.started","thread_id":"should-not-run"}'"#.into(),
+        };
+        let opts = dispatch_opts("go");
+        let broken_req = shell_req(
+            "echo 'Model provider `openrouter` not found' >&2; exit 1",
+            &log_path,
+        );
+        let res = dispatch_with_resume_recovery(
+            &adapter,
+            Path::new("/bin/sh"),
+            &opts,
+            true,
+            crate::config::IsolationMode::None,
+            broken_req,
+            &paths,
+            "run1",
+            "slotC",
+            "shell",
+            &|_pid| {},
+            &|| {},
+        )
+        .unwrap();
+        assert!(res.stats.session_id.is_none());
+        assert_eq!(
+            markers::read_session_id(&paths, "run1", "slotC", "shell").as_deref(),
+            Some("still-valid-id"),
+            "an unrelated pre-session failure must not destroy a still-valid marker"
+        );
+    }
+
+    /// `usage_from_stream` is the only place `StreamStats`'s cost/subagent/model
+    /// fields reach `SlotUsage`, the run record. This exercises it end to end,
+    /// including a `state.json` round-trip, so deleting the carry-through lines
+    /// would fail here rather than only failing to show up in a real run.
+    #[test]
+    fn usage_from_stream_carries_cost_and_subagent_fields_into_state_json() {
+        let mut stats = process::StreamStats {
+            input_tokens: 10,
+            output_tokens: 20,
+            cost_usd: Some(0.4521),
+            ..Default::default()
+        };
+        stats.subagent_stats = Some(process::SubagentStats {
+            spawned: 3,
+            completed: 2,
+            failed: 1,
+            ..Default::default()
+        });
+        stats.model_usage.insert(
+            "claude-opus-5".to_string(),
+            process::ModelUsage {
+                cost_usd: Some(0.2848),
+                input_tokens: 6,
+                output_tokens: 294,
+                ..Default::default()
+            },
+        );
+
+        let usage = usage_from_stream("impl", "cli:claude", &stats);
+        assert_eq!(usage.cost_usd, Some(0.4521));
+        assert_eq!(usage.subagent_stats.as_ref().unwrap().spawned, 3);
+        assert_eq!(
+            usage.model_usage.get("claude-opus-5").unwrap().cost_usd,
+            Some(0.2848)
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new(
+            "r-usage",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.usage.push(usage);
+        state.save(&paths).unwrap();
+
+        let loaded = RunState::load(&paths, "r-usage").unwrap();
+        let loaded_usage = &loaded.usage[0];
+        assert_eq!(loaded_usage.cost_usd, Some(0.4521));
+        assert_eq!(loaded_usage.subagent_stats.as_ref().unwrap().spawned, 3);
+        assert_eq!(
+            loaded_usage
+                .model_usage
+                .get("claude-opus-5")
+                .unwrap()
+                .cost_usd,
+            Some(0.2848)
+        );
     }
 
     /// The real captured log text from the dogfooding incident (roadmap/BACKLOG.md):
@@ -3632,6 +4208,9 @@ mod tests {
                 billed_tokens: 3,
                 tools: 0,
                 model: None,
+                cost_usd: None,
+                subagent_stats: None,
+                model_usage: Default::default(),
             });
         }
 
@@ -3797,6 +4376,105 @@ mod tests {
         assert_eq!(
             tmux_outcome(MarkerState::None, false, true),
             TmuxDecision::Wait
+        );
+    }
+
+    #[test]
+    fn is_opencode_provider_recognizes_forms() {
+        // This gate decides whether `run_tmux` bothers reconstructing stats from the
+        // completed log at all, and whether `enrich_opencode_stats` runs descendant
+        // recovery on top of them.
+        assert!(is_opencode_provider("cli:opencode"));
+        assert!(is_opencode_provider("cli:opencode@google/gemini-3.7-flash"));
+        assert!(is_opencode_provider("opencode"));
+        assert!(!is_opencode_provider("cli:grok"));
+        assert!(!is_opencode_provider("cli:claude"));
+        assert!(!is_opencode_provider("api:google"));
+    }
+
+    #[test]
+    fn tmux_recovered_usage_reconstructs_opencode_spend_from_the_teed_log() {
+        // Round-5 review: `run_tmux` returned `usage: None` unconditionally, so a valid
+        // single-slot opencode run dispatched with `--backend tmux` reported no spend at
+        // all — not even its own, let alone the child spend this feature exists to
+        // recover. `run_tmux`'s pane tees the same `run --format json` stream headless
+        // mode parses live straight to `log_path`; this reconstructs it after the fact.
+        //
+        // `OPENCODE_DB=:memory:` under the shared env lock keeps this test from
+        // resolving (and read-write-opening) the developer's real opencode ledger via a
+        // spawned `opencode db path` (round-6 review finding).
+        let _env = crate::providers::opencode_telemetry::test_support::EnvGuard::acquire();
+        std::env::set_var("OPENCODE_DB", ":memory:");
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("r1").unwrap();
+        let log_path = paths.log_file("r1", "impl");
+        std::fs::write(
+            &log_path,
+            concat!(
+                r#"{"type":"text","sessionID":"ses_1","part":{"id":"prt_t","type":"text","text":"DONE"}}"#,
+                "\n",
+                r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_f","type":"step-finish","tokens":{"input":100,"output":20,"cache":{"read":5,"write":0}}}}"#,
+                "\n",
+                "EXIT:0\n",
+            ),
+        )
+        .unwrap();
+        let job = SlotJob {
+            slot_id: "impl".into(),
+            provider: "cli:opencode".into(),
+            role: SlotRole::Implementer,
+            template: "implementer".into(),
+            extra_vars: HashMap::new(),
+            expected_artifact: None,
+            model: None,
+        };
+
+        let usage = tmux_recovered_usage(true, &paths, "r1", &job, &log_path)
+            .expect("opencode tmux usage must be recovered, not None");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.cache_read_tokens, 5);
+
+        // Every other provider's pane runs a real interactive TUI, not this JSON stream,
+        // so the gate must keep returning `None` for them rather than mis-parsing garbage.
+        assert!(tmux_recovered_usage(false, &paths, "r1", &job, &log_path).is_none());
+    }
+
+    #[test]
+    fn enrich_opencode_stats_logs_a_slot_note_when_the_ledger_cannot_be_read() {
+        // Round-6 review: the only coverage of `enrich_opencode_stats` was via the tmux
+        // helper's happy path; the note-to-event-log branch (a ledger that resolves but
+        // fails to read) was never exercised end to end.
+        let _env = crate::providers::opencode_telemetry::test_support::EnvGuard::acquire();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_DATA_HOME", tmp.path());
+        let db = tmp.path().join("broken.db");
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch("CREATE TABLE not_session (id TEXT);")
+            .unwrap();
+        std::env::set_var("OPENCODE_DB", &db);
+
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("r1").unwrap();
+        let log_path = paths.log_file("r1", "impl");
+        let mut stats = process::StreamStats {
+            session_id: Some("parent".to_string()),
+            ..Default::default()
+        };
+
+        enrich_opencode_stats(&mut stats, "cli:opencode", &log_path, &paths, "r1", "impl");
+
+        let events = crate::events::read_all(&paths, "r1").unwrap();
+        let note = events
+            .iter()
+            .find(|e| e.slot.as_deref() == Some("impl") && e.message.is_some())
+            .and_then(|e| e.message.clone())
+            .expect("a broken ledger must land a slot_note in the run's event log");
+        assert!(
+            note.contains("descendant-subtree query failed to prepare"),
+            "note was: {note}"
         );
     }
 

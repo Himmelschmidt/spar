@@ -11,9 +11,11 @@ impl ProviderAdapter for AgyAdapter {
         "agy"
     }
 
-    // No idle-injection and no structured event stream (verified against agy 1.1.1:
-    // no `hooks` subcommand; Stop is notify-only). Messages wait for the next turn and
-    // presence is degraded to the process/output heuristic.
+    // No idle-injection (verified against agy 1.1.26: no `hooks` subcommand; Stop is
+    // notify-only), so messages wait for the next turn and presence is degraded to the
+    // process/output heuristic. `--output-format stream-json` (build_headless below) does
+    // give us a structured event stream, but it's parsed for telemetry
+    // (StreamCoalescer::handle_agy in process.rs), not a channel for mid-turn injection.
     fn delivery_strategy(&self) -> DeliveryStrategy {
         DeliveryStrategy::None
     }
@@ -66,6 +68,9 @@ impl ProviderAdapter for AgyAdapter {
             .map(|s| format!("{}s", if s > 20 { s - 10 } else { s }))
             .unwrap_or_else(|| "1800s".into());
         cmd.arg("--print-timeout").arg(print_timeout);
+        // Structured NDJSON on stdout (verified against agy 1.1.26) so the coalescer can
+        // parse real tools/tokens/session id instead of the ~empty plain-text stream.
+        cmd.arg("--output-format").arg("stream-json");
         for a in self.permission_args(opts.trust) {
             cmd.arg(a);
         }
@@ -184,6 +189,19 @@ mod tests {
             skip < p && model < p,
             "flags must precede --print: {args:?}"
         );
+    }
+
+    #[test]
+    fn headless_requests_stream_json_output() {
+        let cmd = AgyAdapter.build_headless(Path::new("agy"), &opts("hi", None, None));
+        let (_, args) = command_to_parts(&cmd);
+        let i = args
+            .iter()
+            .position(|a| a == "--output-format")
+            .expect("--output-format");
+        assert_eq!(args.get(i + 1).map(String::as_str), Some("stream-json"));
+        let p = args.iter().position(|a| a == "--print").unwrap();
+        assert!(i < p, "--output-format must precede --print: {args:?}");
     }
 
     #[test]

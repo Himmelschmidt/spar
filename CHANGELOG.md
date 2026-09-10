@@ -16,6 +16,12 @@ All notable changes to spar are recorded here.
 - **Two ready-made fleet sizes.** One option gives you today's defaults; the other gives
   you the smallest useful setup — one reviewer, no critic, no test writer, no automatic
   tester — while still running your project's own test command if you've configured one.
+- **A slot's own resume handle, per-dispatch dollar cost, and subagent counts are now
+  recorded alongside its token usage**, when the provider reports them. Claude,
+  OpenCode and Muse dispatches carry a session id you can check against the
+  provider's own transcript; Claude dispatches additionally carry that dispatch's
+  own USD spend, a per-model cost/token breakdown for dispatches that used more
+  than one model, and how many Task-tool subagents ran and how they ended.
 
 - **`cli:muse` slots now also receive spar's own nudges (budget and time warnings) pushed
   directly into the running session**, falling back to the file the agent's role prompt
@@ -26,6 +32,26 @@ All notable changes to spar are recorded here.
 
 ### Fixed
 
+- **An agy slot's tool count and token usage are now exact instead of best-effort.**
+  Previously they were recovered from disk after the fact (or read as zero when nothing
+  was there to recover); they now come straight from agy's own structured output as the
+  slot runs.
+- **A slot that fans out subagents no longer has its real spend hidden.** Some slots can
+  spawn their own child workers to split up a task; that child spend was previously
+  omitted from the token counts shown for the slot, understating usage by several times
+  over. It's now added back in after the slot finishes.
+- **A codex implementer's next round now continues its own conversation instead of
+  starting over from scratch.** When a fix round re-dispatches the same codex agent,
+  spar picks up where that agent's own session left off rather than opening a brand new
+  one, so a message queued for it while it was between rounds is now actually read.
+
+### Fixed
+
+- **A message sent to a codex agent while it's running no longer gets silently dropped.**
+  Previously, a message sent before the agent had identified itself to spar landed
+  somewhere nothing ever reads it. It now always lands in the file the agent is told to
+  check before starting its next task, and spar also makes a best-effort attempt to
+  reach the agent immediately.
 - **Watching or checking on a run no longer fails at random while the run is writing.**
   A run's status file was rewritten in place, so anything reading it at the wrong moment
   could see half a file and give up with a parse error mid-run.
@@ -73,6 +99,15 @@ All notable changes to spar are recorded here.
   dropping the seats past your list's own length.
 - **The "where did this seat come from" label is accurate for paired and competing-agent
   runs given a shorter provider list than they need**, not just their first seat.
+- **A codex agent that continues its own conversation no longer loses that ability over
+  an unrelated hiccup.** Previously, any failure early in a continued round — not just
+  the case where the earlier conversation was genuinely gone — was treated as if the
+  conversation itself were lost, so the agent started over from scratch for every later
+  round too, even once the real cause had cleared up.
+- **A codex agent using a custom model provider can now continue its own conversation
+  at all.** Previously, continuing a round only restored the model name, not the rest of
+  the settings that named it (a custom provider's address and credentials among them),
+  so a custom-provider agent's every later round failed outright and never recovered.
 
 ## [0.0.3] - 2026-09-04
 

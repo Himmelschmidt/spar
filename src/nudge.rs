@@ -237,11 +237,13 @@ impl<'a> NudgeWatch<'a> {
 
     fn send(&self, text: &str) {
         let agent = crate::bus::agent_ref(Some(self.run_id), self.slot_id);
+        let session_id = StreamStats::load(self.log_path).and_then(|s| s.session_id);
         let outcome = providers::delivery::nudge(
             self.paths,
             Some(self.run_id),
             &agent,
             self.strategy,
+            session_id.as_deref(),
             text,
             self.dry_run,
         );
@@ -419,7 +421,9 @@ mod tests {
         std::fs::create_dir_all(log.parent().unwrap()).unwrap();
         let mut cfg = Config::default();
         cfg.timeouts.nudge_every_secs = 600;
-        let mut s = spec(&paths, &log, SlotRole::Implementer, "cli:codex");
+        // Any PollFile-strategy provider does; codex has its own native queue now
+        // (see `codex_nudges_reach_the_running_thread_via_native_queue`).
+        let mut s = spec(&paths, &log, SlotRole::Implementer, "cli:opencode");
         s.soft = Duration::from_secs(60);
         let w = NudgeWatch::new(s, &cfg);
 
@@ -450,6 +454,44 @@ mod tests {
         let body = poll_body(&paths);
         assert_eq!(body.matches("time nudge").count(), 2);
         assert!(body.contains("hard ceiling is 3m"), "{body}");
+    }
+
+    /// Once a thread id has been captured, codex's nudge attempts its native queue push
+    /// (dry-run here, so no real `codex` invocation, hence `PolledFile` — a dry run
+    /// never claims a push it did not attempt) alongside its guaranteed poll-file drop.
+    /// `dry_run` stubs the file write too, same as every other provider's dry-run nudge.
+    #[test]
+    fn codex_nudges_attempt_the_running_thread_via_native_queue() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log = tmp.path().join("logs").join("impl.log");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        let mut cfg = Config::default();
+        cfg.budget.implementer = 10;
+        let mut s = spec(&paths, &log, SlotRole::Implementer, "cli:codex");
+        s.dry_run = true;
+        let w = NudgeWatch::new(s, &cfg);
+        assert_eq!(w.strategy, DeliveryStrategy::NativeQueuePollFallback);
+        StreamStats {
+            billed_tokens: 50,
+            session_id: Some("thread-xyz".into()),
+            ..Default::default()
+        }
+        .save(&log)
+        .unwrap();
+        w.last_poll
+            .set(Instant::now() - Duration::from_secs(POLL_SECS + 1));
+        w.tick();
+        assert_eq!(poll_body(&paths), "", "dry run stubs the write");
+
+        let evs = events::read_all(&paths, "r1").unwrap();
+        let note = evs
+            .iter()
+            .rfind(|e| e.slot.as_deref() == Some("impl"))
+            .and_then(|e| e.message.as_deref())
+            .unwrap()
+            .to_string();
+        assert!(note.contains("PolledFile"), "{note}");
     }
 
     /// claude has a real push channel, so its nudge must go through it and *not* to a file
@@ -485,6 +527,7 @@ mod tests {
             Some("r1"),
             &agent,
             DeliveryStrategy::StopHookInject,
+            None,
             false,
         )
         .unwrap();

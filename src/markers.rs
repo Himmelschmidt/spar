@@ -114,6 +114,21 @@ pub fn write_pid(
 
 pub fn clear_pid(paths: &SparPaths, run_id: &str, slot_id: &str) {
     let _ = std::fs::remove_file(paths.marker(run_id, &format!("{slot_id}.pid")));
+    let _ = std::fs::remove_file(paths.marker(run_id, &format!("{slot_id}.pid.proxy")));
+}
+
+/// Marks the recorded `.pid` as a **proxy** for the agent process rather than the agent
+/// itself. The tmux backend records the pane's shell (`#{pane_pid}`), which runs a
+/// `<agent> … | tee …; echo` pipeline and stays alive while `tee` drains after the agent
+/// has already exited. Bare "is anything still there" liveness may use that pid; a check
+/// that must prove *a specific session is still running* — `delivery::muse_session_id`,
+/// which authorizes a push into that session — must not.
+pub fn write_pid_is_proxy(paths: &SparPaths, run_id: &str, slot_id: &str) -> Result<()> {
+    write_marker(paths, run_id, &format!("{slot_id}.pid.proxy"), "1\n")
+}
+
+pub fn pid_is_proxy(paths: &SparPaths, run_id: &str, slot_id: &str) -> bool {
+    marker_exists(paths, run_id, &format!("{slot_id}.pid.proxy"))
 }
 
 pub fn read_pid(
@@ -123,6 +138,52 @@ pub fn read_pid(
 ) -> Option<crate::process::PidToken> {
     let p = paths.marker(run_id, &format!("{slot_id}.pid"));
     crate::process::PidToken::parse(&std::fs::read_to_string(p).ok()?)
+}
+
+/// Record the native session/thread id a dispatch captured (e.g. codex's `thread.started`
+/// id), so a later round of the *same* slot can resume it instead of a cold dispatch.
+/// Unlike `.pid`, this is never cleared by `clear_slot`: it is meant to outlive the
+/// dispatch that wrote it, across every round the slot id survives.
+///
+/// Scoped by `provider` (the adapter's bare name, e.g. `"codex"`), not just `slot_id`:
+/// slot ids outlive a provider rotation (`try_rotate_implementer` / `try_rotate_reviewer_provider`
+/// reuse the existing slot id under a new provider), and a session id captured under one
+/// provider is meaningless to another — resuming codex with a muse session id is a hard,
+/// immediate failure, not a degradation. One marker file per `(slot, provider)` means a
+/// rotation away and back finds each provider's own thread right where it left it.
+pub fn write_session_id(
+    paths: &SparPaths,
+    run_id: &str,
+    slot_id: &str,
+    provider: &str,
+    session_id: &str,
+) -> Result<()> {
+    write_marker(
+        paths,
+        run_id,
+        &format!("{slot_id}.{provider}.session_id"),
+        session_id,
+    )
+}
+
+pub fn read_session_id(
+    paths: &SparPaths,
+    run_id: &str,
+    slot_id: &str,
+    provider: &str,
+) -> Option<String> {
+    let p = paths.marker(run_id, &format!("{slot_id}.{provider}.session_id"));
+    let s = std::fs::read_to_string(p).ok()?;
+    let s = s.trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+/// Drop a slot/provider's captured session id after a resume attempt finds the vendor's
+/// rollout gone (pruned, a different `CODEX_HOME`, a moved box) — the marker is now a
+/// dead end pointing at a thread that will never resume, so the next dispatch must go
+/// cold instead of repeating the same failure every round.
+pub fn clear_session_id(paths: &SparPaths, run_id: &str, slot_id: &str, provider: &str) {
+    let _ = std::fs::remove_file(paths.marker(run_id, &format!("{slot_id}.{provider}.session_id")));
 }
 
 /// Wait until an artifact file is non-empty.
@@ -160,6 +221,71 @@ mod tests {
         let paths = SparPaths::new(tmp.path());
         write_done(&paths, "r1", "slot-a").unwrap();
         assert!(marker_exists(&paths, "r1", "slot-a.done"));
+    }
+
+    #[test]
+    fn session_id_roundtrips_and_survives_clear_slot() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        assert_eq!(read_session_id(&paths, "r1", "slot-a", "codex"), None);
+
+        write_session_id(&paths, "r1", "slot-a", "codex", "thread-abc").unwrap();
+        assert_eq!(
+            read_session_id(&paths, "r1", "slot-a", "codex"),
+            Some("thread-abc".to_string())
+        );
+
+        // A re-dispatch clears the terminal markers, but a thread id must outlive it —
+        // that is the whole point of resuming instead of a cold dispatch next round.
+        clear_slot(&paths, "r1", "slot-a");
+        assert_eq!(
+            read_session_id(&paths, "r1", "slot-a", "codex"),
+            Some("thread-abc".to_string())
+        );
+    }
+
+    #[test]
+    fn session_id_is_scoped_per_provider() {
+        // A slot id survives a provider rotation (try_rotate_implementer /
+        // try_rotate_reviewer_provider re-dispatch the same slot id under a new
+        // provider). A session id captured under one provider must never surface as the
+        // prior session for a different provider on that same slot: it is a different
+        // vendor's session format entirely, and resuming with it is a hard failure, not a
+        // degradation.
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        write_session_id(&paths, "r1", "slot-a", "muse", "muse-session-1").unwrap();
+        assert_eq!(read_session_id(&paths, "r1", "slot-a", "codex"), None);
+        assert_eq!(
+            read_session_id(&paths, "r1", "slot-a", "muse"),
+            Some("muse-session-1".to_string())
+        );
+
+        write_session_id(&paths, "r1", "slot-a", "codex", "thread-abc").unwrap();
+        assert_eq!(
+            read_session_id(&paths, "r1", "slot-a", "codex"),
+            Some("thread-abc".to_string())
+        );
+        // Rotating away and back finds each provider's own thread untouched.
+        assert_eq!(
+            read_session_id(&paths, "r1", "slot-a", "muse"),
+            Some("muse-session-1".to_string())
+        );
+    }
+
+    #[test]
+    fn clear_session_id_drops_only_that_providers_marker() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        write_session_id(&paths, "r1", "slot-a", "codex", "thread-abc").unwrap();
+        write_session_id(&paths, "r1", "slot-a", "muse", "muse-session-1").unwrap();
+
+        clear_session_id(&paths, "r1", "slot-a", "codex");
+        assert_eq!(read_session_id(&paths, "r1", "slot-a", "codex"), None);
+        assert_eq!(
+            read_session_id(&paths, "r1", "slot-a", "muse"),
+            Some("muse-session-1".to_string())
+        );
     }
 
     #[test]
