@@ -34,13 +34,16 @@ fn log_records_keep_typed_fields_times_and_source_ranges() {
     assert_eq!(record.argument, "ls -la /etc | head -5");
     assert_eq!(record.result.as_deref(), Some("total 1184"));
     assert_eq!(record.elapsed.unwrap().as_millis(), 800);
+    // end=452 is the chunk's real end (start_offset + the whole text's byte length):
+    // it must span the merged record's actual bytes, including the result line and
+    // its newline, not just the head line up to wherever a marker was stripped.
     assert_eq!(
         record.source,
         SourceId::Log {
             run_id: "3d3d6f59".into(),
             slot_id: "implementer".into(),
             start: 400,
-            end: 447,
+            end: 452,
         }
     );
 }
@@ -106,11 +109,7 @@ fn document_parser_preserves_sections_and_reports_missing_documents() {
     let records = parse_document(
         "plan.md",
         "# Plan\nfirst body line\n\n## Risks\nsecond body line\n",
-        SourceId::Document {
-            path: "plan.md".into(),
-            start: 0,
-            end: 52,
-        },
+        "plan.md",
     );
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].kind, RecordKind::Doc);
@@ -120,4 +119,11 @@ fn document_parser_preserves_sections_and_reports_missing_documents() {
         .body
         .iter()
         .any(|line| line == "second body line"));
+    // AC-7: each section is its own immutable identity, not one identity shared by
+    // the whole document — otherwise `Space` expands every section at once and
+    // `J`/`K` cannot move between them.
+    assert_ne!(
+        records[0].source, records[1].source,
+        "each document section must have its own source identity"
+    );
 }

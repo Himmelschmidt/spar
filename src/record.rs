@@ -139,6 +139,10 @@ pub struct LogRecord {
     pub tool: Option<ToolKind>,
     pub argument: String,
     pub result: Option<String>,
+    /// Pass/fail of the attached result, once one has merged in. `None` for a call
+    /// with no result yet (or a shape that never has one) — distinct from `Result`'s
+    /// own `ok`, which only standalone results carry via `kind`.
+    pub ok: Option<bool>,
     pub elapsed: Option<Duration>,
     pub body: Vec<String>,
     pub source: SourceId,
@@ -173,6 +177,7 @@ impl LogRecord {
             time: self.time,
             elapsed: self.elapsed,
             actor: None,
+            ok: self.ok,
             source: self.source.clone(),
             folded_by_default: !self.body.is_empty() || matches!(self.kind, RecordKind::Thought),
         }
@@ -212,6 +217,7 @@ impl ActivityRecord {
             time: self.time,
             elapsed: None,
             actor: Some(self.actor.clone()),
+            ok: None,
             source: self.source.clone(),
             folded_by_default: false,
         }
@@ -231,6 +237,10 @@ pub struct Record {
     pub time: Option<DateTime<Utc>>,
     pub elapsed: Option<Duration>,
     pub actor: Option<String>,
+    /// Pass/fail once a tool call's result has merged in (AC-6/AC-13's "e/E must
+    /// reach a failed tool call" — the merge keeps `kind: Tool(_)` for its glyph, so
+    /// failure has to travel on its own field rather than displacing `kind`).
+    pub ok: Option<bool>,
     pub source: SourceId,
     pub folded_by_default: bool,
 }
@@ -389,16 +399,11 @@ fn scan_lines(text: &str) -> Vec<(&str, usize, usize)> {
     out
 }
 
-/// Header/prompt lines suppressed as a parser rule (correction #3) rather than a
-/// string transform, so every kept line's offset stays exactly where it was in the
-/// original tailed bytes.
-fn is_boilerplate_line(line: &str) -> bool {
-    line.is_empty()
-        || line.starts_with('#')
-        || line == "---"
-        || line.starts_with("cwd=")
-        || line.starts_with("# Role:")
-        || line.starts_with("## Task")
+/// A header/prompt line, suppressed only in the spawn header (correction #3) — not
+/// anywhere a line happens to start with `#`, which is routine in agent markdown
+/// output (`## Result`, `# Verdict`) and must stay visible (AC-6c).
+fn is_header_line(line: &str) -> bool {
+    line.is_empty() || line.starts_with('#') || line == "---" || line.starts_with("cwd=")
 }
 
 fn split_tool_line(rest: &str) -> (&str, &str) {
@@ -409,15 +414,36 @@ fn split_tool_line(rest: &str) -> (&str, &str) {
     }
 }
 
+/// Drops the provider's opaque tool-call id (`toolu_…`, `call_…`, …) from a result
+/// line: it pairs with nothing on screen (the matching call line never carries it)
+/// and only eats column budget.
+fn strip_tool_id(rest: &str) -> &str {
+    let mut it = rest.splitn(2, char::is_whitespace);
+    let Some(first) = it.next() else {
+        return rest;
+    };
+    let opaque = first == "tool"
+        || (first.len() >= 10
+            && ["toolu_", "tooluse_", "call_", "fc_", "msg_"]
+                .iter()
+                .any(|p| first.starts_with(p)));
+    if opaque {
+        it.next().unwrap_or("").trim_start()
+    } else {
+        rest
+    }
+}
+
 fn split_result_line(rest: &str) -> (bool, &str) {
     let rest = rest.trim_start();
-    if let Some(stripped) = rest.strip_prefix('✓') {
+    let (ok, rest) = if let Some(stripped) = rest.strip_prefix('✓') {
         (true, stripped.trim_start())
     } else if let Some(stripped) = rest.strip_prefix('✗') {
         (false, stripped.trim_start())
     } else {
         (true, rest)
-    }
+    };
+    (ok, strip_tool_id(rest))
 }
 
 /// Parses one slot's raw log tail into typed `LogRecord`s. `text` is exactly what was
@@ -428,9 +454,12 @@ fn split_result_line(rest: &str) -> (bool, &str) {
 /// parses with `time: None` rather than a fabricated time (AC-8).
 ///
 /// A tool call and its result merge into one record only when the pairing is
-/// unambiguous — exactly one open call when the result line arrives. Two open calls
-/// (or none) leave the result as its own standalone record rather than guessing
-/// (correction #5's FIFO rule).
+/// unambiguous — exactly one open call when the `←` line arrives. Zero open calls
+/// (an orphan result) or two-or-more (parallel calls in flight) leave the result as
+/// its own standalone record rather than guessing which call it belongs to
+/// (correction #5). Ambiguity also stops tracking every call that was open at that
+/// point: leaving them in the pending queue would silently misattribute every later
+/// result too, since the queue would never drop back to exactly one.
 ///
 /// With a non-empty index, each index entry is one atomic `LogWriter::append` chunk
 /// (correction #2 makes that guarantee), so this parses chunk-by-chunk between
@@ -476,10 +505,14 @@ fn parse_log_records_by_line(
         end,
     };
 
+    let mut in_header = start_offset == 0;
     for (line, rel_start, rel_end) in scan_lines(text) {
-        if is_boilerplate_line(line) {
-            last_idx = None;
-            continue;
+        if in_header {
+            if is_header_line(line) {
+                last_idx = None;
+                continue;
+            }
+            in_header = false;
         }
         let abs_start = start_offset + rel_start as u64;
         let abs_end = start_offset + rel_end as u64;
@@ -507,6 +540,7 @@ fn parse_log_records_by_line(
                 tool: Some(tool),
                 argument,
                 result: None,
+                ok: None,
                 elapsed: None,
                 body: Vec::new(),
                 source: source_of(abs_start, abs_end),
@@ -522,6 +556,10 @@ fn parse_log_records_by_line(
                 let idx = pending.pop_front().expect("checked len == 1");
                 let call_time = records[idx].time;
                 records[idx].result = Some(preview.to_string());
+                records[idx].ok = Some(ok);
+                if !preview.is_empty() {
+                    records[idx].body.push(preview.to_string());
+                }
                 records[idx].elapsed = match (call_time, time) {
                     (Some(a), Some(b)) if b >= a => (b - a).to_std().ok(),
                     _ => None,
@@ -532,6 +570,12 @@ fn parse_log_records_by_line(
                 last_idx = Some(idx);
                 continue;
             }
+            // Zero or ambiguous (2+) open calls: never guess which one a result
+            // belongs to (correction #5, AC-11). On ambiguity, stop tracking every
+            // call currently open rather than leaving them in `pending` forever —
+            // otherwise one ambiguous result permanently blocks every later
+            // single-open merge too, since `pending` never drops back to 1.
+            pending.clear();
             records.push(LogRecord {
                 time,
                 direction: LogDirection::Result,
@@ -539,6 +583,7 @@ fn parse_log_records_by_line(
                 tool: None,
                 argument: String::new(),
                 result: Some(preview.to_string()),
+                ok: Some(ok),
                 elapsed: None,
                 body: Vec::new(),
                 source: source_of(abs_start, abs_end),
@@ -555,6 +600,7 @@ fn parse_log_records_by_line(
                 tool: None,
                 argument: String::new(),
                 result: Some(rest.trim().to_string()),
+                ok: None,
                 elapsed: None,
                 body: Vec::new(),
                 source: source_of(abs_start, abs_end),
@@ -571,6 +617,7 @@ fn parse_log_records_by_line(
                 tool: None,
                 argument: String::new(),
                 result: Some(rest.trim().to_string()),
+                ok: None,
                 elapsed: None,
                 body: Vec::new(),
                 source: source_of(abs_start, abs_end),
@@ -587,6 +634,7 @@ fn parse_log_records_by_line(
                 tool: None,
                 argument: String::new(),
                 result: Some(rest.trim().to_string()),
+                ok: None,
                 elapsed: None,
                 body: Vec::new(),
                 source: source_of(abs_start, abs_end),
@@ -613,6 +661,7 @@ fn parse_log_records_by_line(
             tool: None,
             argument: String::new(),
             result: Some(line.to_string()),
+            ok: None,
             elapsed: None,
             body: Vec::new(),
             source: source_of(abs_start, abs_end),
@@ -641,6 +690,7 @@ fn parse_log_records_by_chunk(
         end,
     };
 
+    let mut in_header = start_offset == 0;
     for (i, (offset, time)) in index.iter().enumerate() {
         let abs_start = *offset;
         if abs_start < start_offset {
@@ -654,10 +704,20 @@ fn parse_log_records_by_chunk(
         if rel_start >= rel_end || rel_end > text.len() {
             continue;
         }
+        // The record's end is the chunk's own boundary (the next write's recorded
+        // offset, or the tail's end) — not wherever a marker line's bytes happen to
+        // stop, which excluded every body line and the closing newline (AC-1).
+        let chunk_end = start_offset + rel_end as u64;
         let raw_chunk = &text[rel_start..rel_end];
         let trimmed = raw_chunk.trim_matches('\n');
-        if trimmed.is_empty() || is_boilerplate_line(trimmed) {
+        if trimmed.is_empty() {
             continue;
+        }
+        if in_header {
+            if is_header_line(trimmed) {
+                continue;
+            }
+            in_header = false;
         }
         let mut lines = trimmed.split('\n');
         let head_line = lines.next().unwrap_or("");
@@ -665,7 +725,6 @@ fn parse_log_records_by_chunk(
         let time = Some(*time);
 
         if let Some(rest) = head_line.strip_prefix('→') {
-            let end = abs_start + rest.len() as u64;
             let (name, detail) = split_tool_line(rest.trim_start());
             let tool = ToolKind::classify(name);
             let argument = if matches!(
@@ -687,31 +746,38 @@ fn parse_log_records_by_chunk(
                 tool: Some(tool),
                 argument,
                 result: None,
+                ok: None,
                 elapsed: None,
                 body: extra,
-                source: source_of(abs_start, end),
+                source: source_of(abs_start, chunk_end),
             });
             pending.push_back(records.len() - 1);
             continue;
         }
 
         if let Some(rest) = head_line.strip_prefix('←') {
-            let end = abs_start + rest.len() as u64;
             let (ok, preview) = split_result_line(rest);
             if pending.len() == 1 {
                 let idx = pending.pop_front().expect("checked len == 1");
                 let call_time = records[idx].time;
                 records[idx].result = Some(preview.to_string());
+                records[idx].ok = Some(ok);
+                if !preview.is_empty() {
+                    records[idx].body.push(preview.to_string());
+                }
                 records[idx].elapsed = match (call_time, time) {
                     (Some(a), Some(b)) if b >= a => (b - a).to_std().ok(),
                     _ => None,
                 };
                 records[idx].body.extend(extra);
-                if let SourceId::Log { end: e, .. } = &mut records[idx].source {
-                    *e = end;
+                if let SourceId::Log { end, .. } = &mut records[idx].source {
+                    *end = chunk_end;
                 }
                 continue;
             }
+            // See the by-line parser's comment: an ambiguous result clears every
+            // currently-open call rather than leaving them stuck in `pending` forever.
+            pending.clear();
             records.push(LogRecord {
                 time,
                 direction: LogDirection::Result,
@@ -719,9 +785,10 @@ fn parse_log_records_by_chunk(
                 tool: None,
                 argument: String::new(),
                 result: Some(preview.to_string()),
+                ok: Some(ok),
                 elapsed: None,
                 body: extra,
-                source: source_of(abs_start, end),
+                source: source_of(abs_start, chunk_end),
             });
             continue;
         }
@@ -734,9 +801,10 @@ fn parse_log_records_by_chunk(
                 tool: None,
                 argument: String::new(),
                 result: Some(rest.trim().to_string()),
+                ok: None,
                 elapsed: None,
                 body: extra,
-                source: source_of(abs_start, abs_start + rest.len() as u64),
+                source: source_of(abs_start, chunk_end),
             });
             continue;
         }
@@ -749,9 +817,10 @@ fn parse_log_records_by_chunk(
                 tool: None,
                 argument: String::new(),
                 result: Some(rest.trim().to_string()),
+                ok: None,
                 elapsed: None,
                 body: extra,
-                source: source_of(abs_start, abs_start + rest.len() as u64),
+                source: source_of(abs_start, chunk_end),
             });
             continue;
         }
@@ -764,9 +833,10 @@ fn parse_log_records_by_chunk(
                 tool: None,
                 argument: String::new(),
                 result: Some(rest.trim().to_string()),
+                ok: None,
                 elapsed: None,
                 body: extra,
-                source: source_of(abs_start, abs_start + rest.len() as u64),
+                source: source_of(abs_start, chunk_end),
             });
             continue;
         }
@@ -778,38 +848,55 @@ fn parse_log_records_by_chunk(
             tool: None,
             argument: String::new(),
             result: Some(head_line.to_string()),
+            ok: None,
             elapsed: None,
             body: extra,
-            source: source_of(abs_start, abs_start + head_line.len() as u64),
+            source: source_of(abs_start, chunk_end),
         });
     }
     records
 }
 
 /// Splits a markdown document into one foldable `Doc` record per `#`/`##` heading.
-/// A document with no headings becomes one record named after `name`.
-pub fn parse_document(name: &str, body: &str, source: SourceId) -> Vec<Record> {
+/// A document with no headings becomes one record named after `name`. Each section
+/// gets its own byte range within `body` as its `SourceId` (AC-7): sharing one
+/// identity across every section of a document made `Space` expand all of them at
+/// once and made `J`/`K` unable to move between them, since the cursor always
+/// re-resolved to the first record with that id.
+pub fn parse_document(name: &str, body: &str, path: &str) -> Vec<Record> {
     let mut records = Vec::new();
-    let mut current: Option<(String, Vec<String>)> = None;
-    for line in body.lines() {
+    let mut current: Option<(String, Vec<String>, usize)> = None;
+    let mut pos = 0usize;
+    for raw in body.split_inclusive('\n') {
+        let line = raw.strip_suffix('\n').unwrap_or(raw);
+        let line_start = pos;
+        pos += raw.len();
         let heading = line.strip_prefix("## ").or_else(|| line.strip_prefix("# "));
         if let Some(heading) = heading {
-            if let Some((head, lines)) = current.take() {
-                records.push(doc_record(head, lines, source.clone()));
+            if let Some((head, lines, start)) = current.take() {
+                records.push(doc_record(head, lines, doc_source(path, start, line_start)));
             }
-            current = Some((heading.trim().to_string(), Vec::new()));
-        } else if let Some((_, lines)) = current.as_mut() {
+            current = Some((heading.trim().to_string(), Vec::new(), line_start));
+        } else if let Some((_, lines, _)) = current.as_mut() {
             if !line.trim().is_empty() {
                 lines.push(line.to_string());
             }
         } else if !line.trim().is_empty() {
-            current = Some((name.to_string(), vec![line.to_string()]));
+            current = Some((name.to_string(), vec![line.to_string()], line_start));
         }
     }
-    if let Some((head, lines)) = current.take() {
-        records.push(doc_record(head, lines, source));
+    if let Some((head, lines, start)) = current.take() {
+        records.push(doc_record(head, lines, doc_source(path, start, pos)));
     }
     records
+}
+
+fn doc_source(path: &str, start: usize, end: usize) -> SourceId {
+    SourceId::Document {
+        path: path.to_string(),
+        start: start as u64,
+        end: end as u64,
+    }
 }
 
 fn doc_record(head: String, body: Vec<String>, source: SourceId) -> Record {
@@ -824,6 +911,7 @@ fn doc_record(head: String, body: Vec<String>, source: SourceId) -> Record {
         time: None,
         elapsed: None,
         actor: None,
+        ok: None,
         source,
         folded_by_default: true,
     }
@@ -887,16 +975,26 @@ pub fn parse_diff(text: &str, worktree: &str) -> Vec<Record> {
             .iter()
             .filter(|l| l.starts_with('-') && !l.starts_with("---"))
             .count();
+        let status = if body.iter().any(|l| l.starts_with("new file mode")) {
+            "A"
+        } else if body.iter().any(|l| l.starts_with("deleted file mode")) {
+            "D"
+        } else if body.iter().any(|l| l.starts_with("rename from")) {
+            "R"
+        } else {
+            "M"
+        };
         out.push(Record {
             kind: RecordKind::FileDiff,
             glyph: "±",
-            verb: "M".to_string(),
+            verb: status.to_string(),
             head: path.clone(),
             summary: format!("{path}  +{added} −{removed}"),
             body,
             time: None,
             elapsed: None,
             actor: None,
+            ok: None,
             source: SourceId::Diff {
                 worktree: worktree.to_string(),
                 path,
@@ -939,6 +1037,7 @@ pub fn parse_diff(text: &str, worktree: &str) -> Vec<Record> {
                 time: None,
                 elapsed: None,
                 actor: None,
+                ok: None,
                 source: SourceId::Diff {
                     worktree: worktree.to_string(),
                     path: "__stat__".to_string(),
@@ -963,6 +1062,7 @@ pub fn missing_document(name: &str, path: &str) -> Record {
         time: None,
         elapsed: None,
         actor: None,
+        ok: None,
         source: SourceId::Document {
             path: path.to_string(),
             start: 0,
@@ -980,6 +1080,70 @@ mod tests {
     fn tool_glyphs_match_ground_truth() {
         assert_eq!(ToolKind::Run.glyph(), "◆");
         assert_eq!(ToolKind::Read.glyph(), "◈");
+    }
+
+    #[test]
+    fn merged_result_preview_survives_into_body_even_when_one_line() {
+        let records = parse_log_records(
+            "→ Bash  ls -la /etc | head -5\n← ✓  total 1184\n",
+            0,
+            &[],
+            &PathShortener::default(),
+            "r",
+            "s",
+        );
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0].body.iter().any(|l| l == "total 1184"),
+            "a one-line result must still surface in the record's body, {:?}",
+            records[0].body
+        );
+        assert_eq!(records[0].ok, Some(true));
+        let rendered = records[0].to_record();
+        assert!(
+            rendered.folded_by_default,
+            "a result-bearing tool call folds by default"
+        );
+    }
+
+    #[test]
+    fn failed_merged_tool_call_is_flagged_ok_false() {
+        let records = parse_log_records(
+            "→ Bash  false\n← ✗  exit 1\n",
+            0,
+            &[],
+            &PathShortener::default(),
+            "r",
+            "s",
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].ok, Some(false));
+    }
+
+    #[test]
+    fn header_hash_lines_are_only_suppressed_at_the_true_head() {
+        let text = "# Role: impl\ncwd=/x\n---\n→ Bash  cargo test\n← ✓  ## Result\nok\n";
+        let records = parse_log_records(text, 0, &[], &PathShortener::default(), "r", "s");
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0].body.iter().any(|l| l == "## Result"),
+            "a `#`-prefixed line after the header must stay visible, {:?}",
+            records[0].body
+        );
+    }
+
+    #[test]
+    fn ambiguous_result_does_not_permanently_wedge_future_merges() {
+        // Two calls open before either result arrives (ambiguous), then a third call
+        // with its own unambiguous result: that third pair must still merge, which
+        // it cannot if the first two calls are left stuck in `pending` forever.
+        let text = "→ Bash  a\n→ Bash  b\n← ✓  r1\n← ✓  r2\n→ Bash  c\n← ✓  r3\n";
+        let records = parse_log_records(text, 0, &[], &PathShortener::default(), "r", "s");
+        // a, b (open, unmerged) + r1, r2 (standalone) + c+r3 (merged) = 5 records.
+        assert_eq!(records.len(), 5, "{records:#?}");
+        let last = records.last().unwrap();
+        assert_eq!(last.argument, "c");
+        assert_eq!(last.result.as_deref(), Some("r3"));
     }
 
     #[test]
@@ -1006,6 +1170,7 @@ mod tests {
             tool: None,
             argument: String::new(),
             result: Some("one".into()),
+            ok: None,
             elapsed: None,
             body: vec!["a".into(), "b".into()],
             source: SourceId::Log {

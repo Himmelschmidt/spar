@@ -1668,7 +1668,13 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
         .map(|w| record::parse_diff(&diff_text, &w.slot_id))
         .unwrap_or_default();
     let plan_docs_v = plan_docs(&swarm, full.as_ref());
-    let review_v = review_records(&swarm, full.as_ref(), cfg);
+    // O27: the Review projection evaluates the *run's own frozen* config, never the
+    // live `spar.toml` the TUI happened to start with — otherwise a browsed run's
+    // displayed blockers can disagree with what the gate actually enforced for it.
+    let run_cfg = full
+        .as_ref()
+        .and_then(|st| Config::for_run(&swarm, &st.id).ok());
+    let review_v = review_records(&swarm, full.as_ref(), run_cfg.as_ref().unwrap_or(cfg));
     // The TUI refresh is a provider-agnostic delivery pulse for the selected run:
     // advance unacked-message redelivery/escalation before reading alerts, so
     // requires_ack works even when no Claude slot's Stop hook is ticking acks.
@@ -3205,7 +3211,7 @@ fn is_error_record(r: &Record) -> bool {
     matches!(
         r.kind,
         RecordKind::Error | RecordKind::Alert | RecordKind::Result { ok: false }
-    )
+    ) || (matches!(r.kind, RecordKind::Tool(_)) && r.ok == Some(false))
 }
 
 fn is_boundary_record(r: &Record) -> bool {
@@ -4977,10 +4983,10 @@ fn main_tab_spans(app: &App) -> Vec<(MainTab, String, Style)> {
         .iter()
         .map(|t| {
             // Every tab reserves the same 4-column badge slot, blank unless it is
-            // Activity with something to say: Activity is second of four, so a badge
-            // that changed width would shift Diff and Shell out from under a click
-            // (U11) — and a slot reserved on one tab only would make the gap either
-            // side of it uneven with every other tab-to-tab gap.
+            // Activity with something to say: Activity is second of six, so a badge
+            // that changed width would shift Diff/Plan/Review/Shell out from under a
+            // click (U11) — and a slot reserved on one tab only would make the gap
+            // either side of it uneven with every other tab-to-tab gap.
             let badge = if *t == MainTab::Activity {
                 match app.human_alerts_n {
                     0 => "    ".to_string(),
@@ -5216,8 +5222,27 @@ fn draw_labels(
     let tab_spans: Vec<(MainTab, String, Style)> = if full_w <= main.width {
         full_tab_spans
     } else {
-        tabs_for(app.browse)
+        let tabs = tabs_for(app.browse);
+        let n = tabs.len() as u16;
+        // Same fixed badge slot on every tab (U11): gluing the badge onto Activity
+        // alone made it the only tab that widened when an alert count changed,
+        // shifting every tab after it under a click. But the slot's width still has
+        // to fit this narrower band (short labels, no rail-sized padding to spare),
+        // so it shrinks in fixed steps — 4 columns, then 1, then none — rather than
+        // reserving a size that would starve a tab off the strip entirely (matches
+        // the narrow strip's own fallback ladder).
+        let plain_total: u16 = tabs
             .iter()
+            .map(|t| t.short_label().chars().count() as u16 + 2)
+            .sum();
+        let badge_w: u16 = if plain_total + 4 * n <= main.width {
+            4
+        } else if plain_total + n <= main.width {
+            1
+        } else {
+            0
+        };
+        tabs.iter()
             .map(|t| {
                 let style = if *t == app.main_tab {
                     Style::default().fg(ACCENT).bold()
@@ -5227,11 +5252,13 @@ fn draw_labels(
                     dim()
                 };
                 let label = t.short_label();
-                let text = if *t == MainTab::Activity && app.human_alerts_n > 0 {
-                    format!(" {label} ⚠{:<2} ", app.human_alerts_n.min(99))
-                } else {
-                    format!(" {label} ")
+                let is_alert_tab = *t == MainTab::Activity && app.human_alerts_n > 0;
+                let badge = match (badge_w, is_alert_tab) {
+                    (4, true) => format!(" ⚠{:<2}", app.human_alerts_n.min(99)),
+                    (1, true) => "!".to_string(),
+                    (w, _) => " ".repeat(w as usize),
                 };
+                let text = format!(" {label}{badge} ");
                 (*t, text, style)
             })
             .collect()
@@ -7231,22 +7258,29 @@ fn is_record_expanded(
 }
 
 /// The meta column's content (AC-3): elapsed when known, else an absolute time, else
-/// the no-data sentinel — never fabricated, matching `record::fmt_elapsed_or_unknown`'s
-/// contract for "no timing data".
-fn record_meta_text(r: &Record) -> String {
+/// the no-data sentinel `·` — never fabricated (AC-8). `meta_width` picks the time
+/// format: the narrow (<100) column only has room for a compact 24h clock, the wide
+/// one for `11:04 AM`.
+fn record_meta_text(r: &Record, meta_width: u16) -> String {
     if let Some(e) = r.elapsed {
         record::fmt_elapsed(e)
     } else if let Some(t) = r.time {
-        t.format("%-I:%M %p").to_string()
+        if meta_width >= 8 {
+            t.format("%-I:%M %p").to_string()
+        } else {
+            t.format("%H:%M").to_string()
+        }
     } else {
-        // No `.idx` sidecar for this record (AC-8): never a fabricated duration,
-        // just the same units' zero value as a "nothing timed" sentinel.
-        "0s".to_string()
+        // No `.idx` sidecar for this record: never a fabricated duration.
+        "·".to_string()
     }
 }
 
-fn record_kind_style(kind: RecordKind) -> Style {
-    match kind {
+fn record_kind_style(r: &Record) -> Style {
+    if matches!(r.kind, RecordKind::Tool(_)) && r.ok == Some(false) {
+        return Style::default().fg(ALERT);
+    }
+    match r.kind {
         RecordKind::Tool(_) => Style::default().fg(CODE),
         RecordKind::Result { ok: true } => Style::default().fg(OK),
         RecordKind::Result { ok: false } => Style::default().fg(ALERT),
@@ -7286,7 +7320,7 @@ fn build_head_row(r: &Record, cols: record::Columns, is_cursor: bool, folded: bo
         fold_mark.to_string(),
         Style::default().fg(FG_DIM),
     ));
-    spans.push((cols.glyph, r.glyph.to_string(), record_kind_style(r.kind)));
+    spans.push((cols.glyph, r.glyph.to_string(), record_kind_style(r)));
     if let Some(actor_x) = cols.actor {
         if let Some(actor) = &r.actor {
             let w = cols.verb.saturating_sub(actor_x).saturating_sub(1) as usize;
@@ -7317,10 +7351,16 @@ fn build_head_row(r: &Record, cols: record::Columns, is_cursor: bool, folded: bo
     spans.push((
         cols.summary,
         truncate_display(&r.summary, summary_w),
-        record_kind_style(r.kind),
+        record_kind_style(r),
     ));
-    let meta_text = record_meta_text(r);
-    let meta_len = (meta_text.chars().count() as u16).min(cols.meta_width);
+    // Right-aligned and never overrunning the row (AC-3): the text pushed must be
+    // no longer than what `meta_len` claims, or the alignment math and the actual
+    // paint disagree and the tail spills past the row's right edge.
+    let meta_text = truncate_display(
+        &record_meta_text(r, cols.meta_width),
+        cols.meta_width as usize,
+    );
+    let meta_len = meta_text.chars().count() as u16;
     let meta_x = cols.meta + cols.meta_width.saturating_sub(meta_len);
     spans.push((meta_x, meta_text, Style::default().fg(FG_DIM)));
     RecordRow {
@@ -8885,24 +8925,41 @@ fn stream_content(
     }
 }
 
+/// Builds one activity record with an identity derived from its own content
+/// (AC-7), not from where it lands in the feed: `activity_feed` prepends alerts and
+/// slides a `take(N)` window over events/bus messages, so a position-keyed identity
+/// (a build-local counter) renumbered every record after a single new alert or
+/// event arrived, moving the cursor and the fold set to different rows underneath
+/// the operator. Two records with genuinely identical content still collide, but
+/// that is a strictly smaller window than "moves whenever anything upstream changes".
 fn activity_record(
-    seq: &mut u64,
     time: Option<DateTime<Utc>>,
     actor: impl Into<String>,
     event: impl Into<String>,
     detail: impl Into<String>,
     kind: RecordKind,
 ) -> record::ActivityRecord {
-    *seq += 1;
+    let actor = actor.into();
+    let event = event.into();
+    let detail = detail.into();
+    let at_millis = time.map(|t| t.timestamp_millis()).unwrap_or(0);
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    at_millis.hash(&mut hasher);
+    std::mem::discriminant(&kind).hash(&mut hasher);
+    actor.hash(&mut hasher);
+    event.hash(&mut hasher);
+    detail.hash(&mut hasher);
+    let sequence = hasher.finish();
     record::ActivityRecord {
         time,
-        actor: actor.into(),
-        event: event.into(),
-        detail: detail.into(),
+        actor,
+        event,
+        detail,
         kind,
         source: SourceId::Activity {
-            at_millis: time.map(|t| t.timestamp_millis()).unwrap_or(0),
-            sequence: *seq,
+            at_millis,
+            sequence,
         },
     }
 }
@@ -8918,11 +8975,9 @@ fn activity_feed(
     heartbeats: &std::collections::HashMap<String, DateTime<Utc>>,
     cfg: &Config,
 ) -> Vec<Record> {
-    let mut seq: u64 = 0;
     let mut out: Vec<record::ActivityRecord> = Vec::new();
     let Some(st) = full else {
         out.push(activity_record(
-            &mut seq,
             None,
             "",
             "No run selected",
@@ -8935,7 +8990,6 @@ fn activity_feed(
     // Loudest first: anything waiting on a human sits at the top of the feed.
     if !alerts.is_empty() {
         out.push(activity_record(
-            &mut seq,
             None,
             "",
             "Needs you",
@@ -8944,7 +8998,6 @@ fn activity_feed(
         ));
         for m in alerts.iter().rev().take(6).rev() {
             out.push(activity_record(
-                &mut seq,
                 Some(m.ts),
                 short_agent(short_in_run(&m.from, &st.id)).to_string(),
                 "alert",
@@ -8959,7 +9012,6 @@ fn activity_feed(
         run_detail.push_str(" · dry-run");
     }
     out.push(activity_record(
-        &mut seq,
         None,
         "",
         format!("Run {}", st.id),
@@ -8968,7 +9020,6 @@ fn activity_feed(
     ));
     if st.task.is_some() {
         out.push(activity_record(
-            &mut seq,
             None,
             "",
             "phase",
@@ -8978,7 +9029,6 @@ fn activity_feed(
     }
 
     out.push(activity_record(
-        &mut seq,
         None,
         "",
         "Agents",
@@ -9003,7 +9053,6 @@ fn activity_feed(
             String::new()
         };
         out.push(activity_record(
-            &mut seq,
             None,
             role_label(s.role).to_string(),
             slot_status_label(s.status).to_string(),
@@ -9017,7 +9066,6 @@ fn activity_feed(
     let evs = events::read_all(swarm, &st.id).unwrap_or_default();
     if !evs.is_empty() {
         out.push(activity_record(
-            &mut seq,
             None,
             "",
             "Timeline",
@@ -9053,14 +9101,7 @@ fn activity_feed(
                     RecordKind::Note,
                 ),
             };
-            out.push(activity_record(
-                &mut seq,
-                Some(e.ts),
-                actor,
-                event,
-                detail,
-                kind,
-            ));
+            out.push(activity_record(Some(e.ts), actor, event, detail, kind));
         }
     }
 
@@ -9077,7 +9118,6 @@ fn activity_feed(
             .collect();
         if !chat.is_empty() {
             out.push(activity_record(
-                &mut seq,
                 None,
                 "",
                 "Bus",
@@ -9086,7 +9126,6 @@ fn activity_feed(
             ));
             for m in chat.iter().rev().take(8).rev() {
                 out.push(activity_record(
-                    &mut seq,
                     Some(m.ts),
                     format!(
                         "{}→{}",
@@ -9112,7 +9151,6 @@ fn activity_feed(
         .collect();
     if !paused.is_empty() {
         out.push(activity_record(
-            &mut seq,
             None,
             "",
             "Quota",
@@ -9121,7 +9159,6 @@ fn activity_feed(
         ));
         for (name, q) in paused {
             out.push(activity_record(
-                &mut seq,
                 None,
                 name.clone(),
                 "paused",
@@ -9173,12 +9210,7 @@ fn push_doc_or_missing(
     let path = swarm.artifact(run_id, artifact);
     match std::fs::read_to_string(&path) {
         Ok(body) if !body.trim().is_empty() => {
-            let source = SourceId::Document {
-                path: path.to_string_lossy().into_owned(),
-                start: 0,
-                end: body.len() as u64,
-            };
-            out.extend(record::parse_document(name, &body, source));
+            out.extend(record::parse_document(name, &body, &path.to_string_lossy()));
         }
         _ => out.push(record::missing_document(name, &path.to_string_lossy())),
     }
@@ -9213,6 +9245,7 @@ fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: &Config) -> V
             time: None,
             elapsed: None,
             actor: None,
+            ok: None,
             source: SourceId::Document {
                 path: contract_path.to_string_lossy().into_owned(),
                 start: 0,
@@ -9221,8 +9254,15 @@ fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: &Config) -> V
             folded_by_default: false,
         });
     } else {
+        // One fixed-width cell per reviewer (AC-17): padded/truncated to a constant
+        // width regardless of content, so a longer slot id or verdict word cannot
+        // shift the cells after it — each reviewer holds its own column on its own
+        // body line rather than a single joined-and-truncated summary string.
+        const CELL_NAME_W: usize = 12;
+        const CELL_STATUS_W: usize = 12;
         for id in &criteria {
             let mut cells: Vec<String> = Vec::new();
+            let mut compact: Vec<String> = Vec::new();
             for s in &reviewers {
                 let artifact = s
                     .artifact
@@ -9239,18 +9279,26 @@ fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: &Config) -> V
                     }
                     Err(_) => "missing".to_string(),
                 };
-                cells.push(format!("{}: {cell}", s.id));
+                compact.push(format!("{}: {cell}", short_agent(&s.id)));
+                cells.push(format!(
+                    "{:<name_w$} {:<status_w$}",
+                    truncate_display(short_agent(&s.id), CELL_NAME_W),
+                    truncate_display(&cell, CELL_STATUS_W),
+                    name_w = CELL_NAME_W,
+                    status_w = CELL_STATUS_W,
+                ));
             }
             out.push(Record {
                 kind: RecordKind::Criterion,
                 glyph: "▤",
                 verb: id.clone(),
                 head: id.clone(),
-                summary: cells.join("  ·  "),
-                body: Vec::new(),
+                summary: compact.join("  ·  "),
+                body: cells,
                 time: None,
                 elapsed: None,
                 actor: None,
+                ok: None,
                 source: SourceId::Document {
                     path: format!("{}#{}", contract_path.display(), id),
                     start: 0,
@@ -9303,6 +9351,7 @@ fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: &Config) -> V
                     time: None,
                     elapsed: None,
                     actor: None,
+                    ok: None,
                     source,
                     folded_by_default: true,
                 });
@@ -10920,6 +10969,7 @@ mod render_stability {
                 time: None,
                 elapsed: None,
                 actor: None,
+                ok: None,
                 source: SourceId::Activity {
                     at_millis: 0,
                     sequence: 1,
@@ -10936,6 +10986,7 @@ mod render_stability {
                 time: None,
                 elapsed: None,
                 actor: Some("impl".to_string()),
+                ok: None,
                 source: SourceId::Activity {
                     at_millis: 0,
                     sequence: 2,
@@ -10943,6 +10994,31 @@ mod render_stability {
                 folded_by_default: false,
             },
         ];
+        let diff_text = "diff --git a/src/a.rs b/src/a.rs\n@@ -1,2 +1,3 @@\n+new line\n-old line\n";
+        let diff_records = record::parse_diff(diff_text, "wt");
+        let plan_docs_v = record::parse_document(
+            "plan.md",
+            "# Plan\nDo the thing.\n\n## Risks\nWatch out for X.\n",
+            "plan.md",
+        );
+        let review_v = vec![Record {
+            kind: RecordKind::Criterion,
+            glyph: "▤",
+            verb: "AC-1".to_string(),
+            head: "AC-1".to_string(),
+            summary: "impl: pass".to_string(),
+            body: vec!["impl: pass".to_string()],
+            time: None,
+            elapsed: None,
+            actor: None,
+            ok: None,
+            source: SourceId::Document {
+                path: "contract#AC-1".to_string(),
+                start: 0,
+                end: 0,
+            },
+            folded_by_default: false,
+        }];
         term.draw(|f| {
             draw(
                 f,
@@ -10953,10 +11029,10 @@ mod render_stability {
                 "→ Bash  read the contract\n← ✓ toolu_01HqnTTSQH5m7ZWYJVAtA7Vj ok\n",
                 &[],
                 &activity,
-                "diff",
-                &[],
-                &[],
-                &[],
+                diff_text,
+                &diff_records,
+                &plan_docs_v,
+                &review_v,
                 &HomeData::default(),
                 None,
                 &mut app,
@@ -11004,6 +11080,41 @@ mod render_stability {
         ] {
             paint(w, h, &[], &[], Some(&st));
             paint(w, h, &[], &[], None);
+        }
+    }
+
+    /// AC-20: every new record view — not just whatever tab the default sweep
+    /// happens to leave the app on — must survive the width/height sweep, folded,
+    /// expanded (`A`), and raw (`R`, where available). `renders_at_every_size_...`
+    /// above never switched `main_tab`, so Activity/Diff/Plan/Review were never
+    /// actually painted by it.
+    #[test]
+    fn structured_views_survive_every_tab_fold_and_raw_state() {
+        let st = run_with(Phase::AwaitingShipConfirm, 7);
+        let widths = [1u16, 20, 53, 79, 80, 87, 99, 100, 119, 120, 200];
+        let heights = [1u16, 5, 12, 30, 60];
+        for tab in [
+            MainTab::Log,
+            MainTab::Activity,
+            MainTab::Diff,
+            MainTab::Plan,
+            MainTab::Review,
+            MainTab::Shell,
+        ] {
+            for fold_all in [false, true] {
+                for raw_mode in [false, true] {
+                    for &w in &widths {
+                        for &h in &heights {
+                            paint_with(w, h, &[], &[], Some(&st), |a| {
+                                a.open_main(tab);
+                                a.fold_all = fold_all;
+                                a.raw_mode =
+                                    raw_mode && matches!(tab, MainTab::Log | MainTab::Diff);
+                            });
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -11218,13 +11329,151 @@ mod render_stability {
             .join("\n");
         assert!(painted.contains("◆ Run"), "tool head: {painted:?}");
         assert!(painted.contains("◈ Read"), "read head: {painted:?}");
-        assert!(
-            painted.contains("0.8s") || painted.contains("0s"),
-            "elapsed: {painted:?}"
-        );
+        // No `.idx` sidecar here, so no record has a time or an elapsed: the record
+        // rows' own meta column must show the no-data sentinel, never a fabricated
+        // "0s" (AC-8) — checked per-row, since the header/stepper band legitimately
+        // shows an unrelated real "0s" run-duration elsewhere on the same screen.
+        for line in painted.lines() {
+            if line.contains("◆ Run") || line.contains("◈ Read") {
+                assert!(
+                    !line.contains("0s"),
+                    "fabricated elapsed on record row: {line:?}"
+                );
+            }
+        }
         assert!(
             !painted.contains("drwxr-xr-x 139"),
             "tool output must be folded on first paint: {painted:?}"
+        );
+    }
+
+    /// AC-3: the meta column's text must end exactly at the row's right edge — not
+    /// past it, which is what happened when a narrow-width time format (8 chars)
+    /// exceeded `meta_width` (6): `build_head_row` clamped the *alignment* math but
+    /// still pushed the untruncated text, so it overran into the row's own edge.
+    #[test]
+    fn meta_column_is_right_aligned_and_never_overflows_at_narrow_width() {
+        for width in [79u16, 87, 99] {
+            let cols = record::Columns::for_width(width);
+            let r = Record {
+                kind: RecordKind::Note,
+                glyph: "·",
+                verb: "Note".to_string(),
+                head: "note".to_string(),
+                summary: "a summary long enough to reach the meta column".to_string(),
+                body: Vec::new(),
+                time: Some(Utc::now()),
+                elapsed: None,
+                actor: None,
+                ok: None,
+                source: SourceId::Activity {
+                    at_millis: 0,
+                    sequence: 0,
+                },
+                folded_by_default: false,
+            };
+            let row = build_head_row(&r, cols, false, true);
+            let (meta_x, meta_text, _) = row.spans.last().unwrap();
+            let meta_len = meta_text.chars().count() as u16;
+            assert_eq!(
+                *meta_x + meta_len,
+                cols.meta + cols.meta_width,
+                "width {width}: meta must end exactly at the reserved column's right edge"
+            );
+            assert!(
+                meta_len <= cols.meta_width,
+                "width {width}: meta text {meta_text:?} overflows its {}-wide column",
+                cols.meta_width
+            );
+        }
+    }
+
+    /// AC-2: Activity carries phase boundaries and alerts as typed records — never
+    /// a joined string — sourced through the same `activity_feed` the tab paints.
+    #[test]
+    fn activity_feed_includes_alert_and_phase_boundary_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let swarm = SparPaths::new(dir.path());
+        let mut st = run_with(Phase::Review, 2);
+        events::append(
+            &swarm,
+            &st.id,
+            &events::Event::phase(Phase::Review, Some(Phase::Dispatch)),
+        )
+        .unwrap();
+        st.phase = Phase::Review;
+        let alert = crate::bus::BusMessage {
+            id: "m1".to_string(),
+            ts: Utc::now(),
+            from: "reviewer-0".to_string(),
+            to: "operator".to_string(),
+            kind: crate::bus::MsgKind::Blocked,
+            body: "needs a decision".to_string(),
+            run: Some(st.id.clone()),
+            subject: None,
+            refs: crate::bus::MsgRefs::default(),
+            requires_ack: true,
+            meta: std::collections::HashMap::new(),
+        };
+        let records = activity_feed(
+            &swarm,
+            Some(&st),
+            &QuotaStore::default(),
+            &[alert],
+            &std::collections::HashMap::new(),
+            &Config::default(),
+        );
+        assert!(
+            records.iter().any(|r| r.kind == RecordKind::Alert),
+            "no alert record: {records:#?}"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| r.kind == RecordKind::Section && r.verb == "phase"),
+            "no phase boundary record: {records:#?}"
+        );
+    }
+
+    /// AC-7/AC-13: `J`/`K` must be able to move between a document's own sections.
+    /// This was impossible before the per-section `SourceId` fix — every section
+    /// shared one identity, so the cursor always re-resolved to the first one.
+    #[test]
+    fn record_cursor_moves_between_document_sections() {
+        let records = record::parse_document(
+            "plan.md",
+            "# Plan\nfirst\n\n## Risks\nsecond\n\n## Rollout\nthird\n",
+            "plan.md",
+        );
+        assert_eq!(records.len(), 3);
+        let first = move_cursor(&records, None, 1, |_| true).expect("first section");
+        assert_eq!(first, records[0].source);
+        let second = move_cursor(&records, Some(&first), 1, |_| true).expect("second section");
+        assert_eq!(second, records[1].source);
+        assert_ne!(second, first, "each section must be its own cursor stop");
+        let third = move_cursor(&records, Some(&second), 1, |_| true).expect("third section");
+        assert_eq!(third, records[2].source);
+        // And back.
+        let back = move_cursor(&records, Some(&third), -1, |_| true).expect("back to second");
+        assert_eq!(back, second);
+    }
+
+    /// AC-7: an activity record's identity comes from its own content, not from
+    /// where it lands in the feed. Two builds of the same event content, at
+    /// different positions, must resolve to the same `SourceId` so fold state and
+    /// the cursor survive a rebuild that inserts something ahead of them.
+    #[test]
+    fn activity_record_identity_is_content_derived_not_positional() {
+        let a = activity_record(None, "impl", "phase", "review", RecordKind::Note).to_record();
+        let b = activity_record(None, "impl", "phase", "review", RecordKind::Note).to_record();
+        assert_eq!(
+            a.source, b.source,
+            "identical activity content must produce the same identity regardless of build order"
+        );
+        let c = activity_record(None, "impl", "phase", "ship", RecordKind::Note).to_record();
+        assert_ne!(
+            a.source, c.source,
+            "different content must not collide onto the same identity"
         );
     }
 
