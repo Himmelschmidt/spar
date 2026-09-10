@@ -4,6 +4,8 @@ All notable changes to spar are recorded here.
 
 ## [Unreleased]
 
+## [0.0.4] - 2026-09-10
+
 ### Added
 
 - **You can see the reviewers, planner and other seats a run will actually use before
@@ -52,6 +54,10 @@ All notable changes to spar are recorded here.
   somewhere nothing ever reads it. It now always lands in the file the agent is told to
   check before starting its next task, and spar also makes a best-effort attempt to
   reach the agent immediately.
+- **A message to a muse agent running in a pane is no longer reported as delivered after
+  that agent has already exited.** spar could mistake the pane's shell for the agent
+  itself, report the message pushed into a session that was already gone, and consume it
+  on the way. Those messages now go to the file the agent checks before its next task.
 - **Watching or checking on a run no longer fails at random while the run is writing.**
   A run's status file was rewritten in place, so anything reading it at the wrong moment
   could see half a file and give up with a parse error mid-run.
