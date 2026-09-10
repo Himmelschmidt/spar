@@ -4,6 +4,38 @@ All notable changes to spar are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- **The dashboard has a look of its own.** It now paints its own background rather
+  than borrowing the terminal's, which lets panels, quoted output and highlights sit
+  on distinct surfaces instead of all running together. The accent colour moved off a
+  generic blue. If you run a transparent or light-coloured terminal, this is a visible
+  change: the dashboard no longer adapts to it.
+- **Work in flight is visible without reading anything.** A run or agent that is
+  actually working shows a slowly pulsing bar beside it; one that has been handed its
+  task but hasn't started yet has a highlight that travels across its name. A run
+  waiting on you keeps its flag, which always wins — a run that both wants you and is
+  moving shows the flag, not the pulse.
+- **Animation is smooth, keeps its own timing, and stops when you look away.** Motion
+  runs at up to 60 frames a second while something is moving and idles the rest of the
+  time; each effect keeps its own pace regardless of the frame rate, frames are drawn
+  in one piece so nothing tears, and nothing animates while the window is in the
+  background.
+- **The landing view stopped repeating itself.** The count of runs waiting on you was
+  shown four times, three of them in consecutive rows. It now appears once, and the
+  rows beside it carry your project and run totals and which projects you're looking
+  at instead.
+- **The right-hand pane on the landing view now shows the thing you've selected** —
+  its brief, how long it has waited, which workflow and which round — rather than
+  reprinting the list already on the left.
+- **A band with nothing in it now says so** instead of leaving a gap under its
+  heading, which didn't distinguish "nothing running" from "still loading".
+- **The landing view only offers the tabs that mean something there.** Three of the
+  four showed identical content, since they describe a run and the landing view has
+  none selected.
+- **Text that arrives already lined up into columns stays lined up.** The log view was
+  collapsing runs of spaces, which turned aligned output into prose.
+
 ## [0.0.4] - 2026-09-10
 
 ### Added

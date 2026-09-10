@@ -10,6 +10,7 @@ mod liveness;
 mod mailbox;
 mod markers;
 mod model_select;
+mod motion;
 mod notify;
 mod nudge;
 mod paths;

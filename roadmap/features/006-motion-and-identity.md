@@ -56,16 +56,34 @@ scattered across consts rather than held to strictly.
 
 ## Phases
 
-### Phase A: time-based motion engine
+### Phase A: time-based motion engine — DONE
 
-`Instant`-based motion module with easing curves and `Tween<T>`; frame clock ramps to
-~16ms while animating, idles low otherwise. Replaces the tick-modulo spinner and cursor
-blink (`src/tui.rs:3746`).
+`src/motion.rs`: one `Clock` (an `Instant` origin on `App`), `cycle`, `breathe`,
+`sweep`, `frame`. The frame clock ramps between `FRAME_ANIMATING` (16ms) and
+`FRAME_IDLE` (250ms); the spinner and the palette cursor blink both moved off
+tick-modulo. Frames are wrapped in DECSET 2026 so a wide repaint at 60fps cannot
+tear, and DECSET 1004 gates `animating()` so an unfocused window costs nothing.
+
+The motion *vocabulary* landed with it, measured off grok and muse frame by frame
+(U30): a breathing gutter for work in flight, a travelling sweep for work
+dispatched but not yet producing, ranked under the attention flag.
+
+`Tween` and its easing curves are deliberately **not** here. They have no caller
+until phase B's reorder transitions, and a helper with no caller is a guess about
+its caller.
+
+Landed alongside: spar's own page and retuned palette (U29), and the Home chrome
+de-duplication and detail pane (U31), which are not in this feature's original
+scope but were the visible defects blocking any judgement of the motion work.
 
 ### Phase B: reserved-space layout widgets
 
 Fixed-slot layout primitives and skeleton placeholders that fix the gate-button
 (`src/tui.rs:2740-2745`), attention-resort, list-growth and tab-breakpoint shift sources.
+Brings `Tween` and the easing curves with it.
+
+Now queued behind **010** rather than 005: 010 rebuilds what Main renders, and
+animating a reorder inside a string log viewer would be written twice.
 
 ### Phase C: design tokens and density pass — DONE
 
