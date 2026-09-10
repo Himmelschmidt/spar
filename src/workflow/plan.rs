@@ -206,6 +206,17 @@ pub fn execute_plan(
     cfg: &Config,
     jobs: &[SlotJob],
 ) -> Result<()> {
+    // A queued run's admission and an operator's `spar stop` race: the daemon can decide
+    // to admit before `stop_one` removes the spool file, and the admitted child can still
+    // reach here after the stop already wrote the `stopped` marker. Refuse to dispatch
+    // rather than requiring dequeue and cancellation to be mutually exclusive — the same
+    // marker `implement::should_stop` already gates every other workflow's dispatch loop
+    // on, and only an explicit resume clears it.
+    if crate::workflow::implement::should_stop(paths, &state.id) {
+        state.set_phase(Phase::Stopped);
+        state.save(paths)?;
+        return Ok(());
+    }
     let slot_ids: Vec<String> = jobs.iter().map(|j| j.slot_id.clone()).collect();
     worktree::prepare_isolation(state, paths, &slot_ids)?;
     state.set_phase(Phase::SpawnSlots);

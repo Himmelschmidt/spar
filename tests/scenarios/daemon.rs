@@ -240,6 +240,77 @@ fn stopping_a_queued_run_cancels_its_spool_entry() {
     assert_eq!(state["phase"], "stopped");
 }
 
+/// The race the spool-cancellation fix above cannot close by itself: a daemon tick can
+/// decide to admit a queued run (read `Init`, no live owner, capacity free) a moment
+/// before `spar stop` removes its spool entry. The admitted `__internal_continue` child
+/// can still reach the run after the stop's `reap_run` has already written the `stopped`
+/// marker. It must refuse to dispatch rather than silently implementing a stopped run —
+/// this exercises the interleaving directly, without depending on real scheduling
+/// timing, by writing the marker before invoking the child the daemon would have
+/// spawned.
+#[test]
+fn a_stopped_marker_written_after_admission_still_blocks_the_delayed_child() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    init_repo(&proj);
+
+    let plan = spar_cmd()
+        .current_dir(&proj)
+        .args([
+            "plan",
+            "--task",
+            "hello",
+            "--providers",
+            "cli:claude",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2);
+    let run_id = json_of(&plan)["run_id"].as_str().unwrap().to_string();
+
+    // Reproduce a queued run the daemon has just decided to admit: back at `Init`,
+    // spool entry present (about to be deleted by the daemon on admission).
+    set_phase(&proj, &run_id, "init");
+
+    // The operator's `spar stop` runs concurrently and wins: its `reap_run` has
+    // already dropped the `stopped` marker before the admitted child gets scheduled.
+    let markers_dir = proj.join(".spar/runs").join(&run_id).join("markers");
+    std::fs::create_dir_all(&markers_dir).unwrap();
+    std::fs::write(markers_dir.join("stopped"), "stopped by operator\n").unwrap();
+
+    // The run's first (real, non-queued) dispatch already drafted a plan before this
+    // test forced it back to `Init`; capture that so a re-dispatch (the bug) is caught
+    // even though the artifact already exists.
+    let plan_artifact = proj
+        .join(".spar/runs")
+        .join(&run_id)
+        .join("artifacts/plan.md");
+    let plan_before = std::fs::read_to_string(&plan_artifact).unwrap();
+
+    // The delayed child the daemon already spawned, reaching the run after the marker.
+    spar_cmd()
+        .current_dir(&proj)
+        .env("SPAR_DRY_RUN", "1")
+        .args(["__internal_continue", &run_id])
+        .assert()
+        .code(1);
+
+    let plan_after = std::fs::read_to_string(&plan_artifact).unwrap();
+    assert_eq!(
+        plan_before, plan_after,
+        "a delayed child racing a stop must not redispatch a plan"
+    );
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(state_path(&proj, &run_id)).unwrap())
+            .unwrap();
+    assert_eq!(
+        state["phase"], "stopped",
+        "the marker must settle the run at Stopped, not silently dispatch it"
+    );
+}
+
 /// A second `spar daemon start` against a project already holding the lock refuses,
 /// and `daemon status` names the one real pid — not a fabricated lock body.
 #[test]
