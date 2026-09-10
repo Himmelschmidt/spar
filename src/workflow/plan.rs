@@ -10,8 +10,15 @@ use crate::util::{self, sanitize_slot};
 use crate::worktree;
 use anyhow::Result;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
-pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode> {
+pub fn run(
+    task: String,
+    brief: Option<PathBuf>,
+    opts: CommonOpts,
+    paths: &SparPaths,
+    cfg: &Config,
+) -> Result<ExitCode> {
     let dry = opts.resolve_dry_run();
     if dry {
         std::env::set_var("SPAR_DRY_RUN", "1");
@@ -23,6 +30,7 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
         paths.project_root.clone(),
     );
     state.task = Some(task.clone());
+    state.brief = brief;
     state.backend = opts.backend;
     worktree::apply_run_base(&mut state, opts.base.as_deref(), opts.json)?;
     cfg.save_snapshot(paths, &state.id)?;
@@ -138,7 +146,7 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
     }
 
     if opts.detach {
-        return detach_self(&state, opts.json);
+        return detach_self(&state, paths, cfg, opts.json);
     }
 
     execute_plan(&mut state, paths, cfg, &jobs)?;
@@ -645,31 +653,49 @@ pub fn reject(
     Ok(ExitCode::Failure)
 }
 
-fn detach_self(state: &RunState, json: bool) -> Result<ExitCode> {
-    #[cfg(unix)]
-    {
-        let mut child_cmd = std::process::Command::new(std::env::current_exe()?);
-        child_cmd
-            .arg("__internal_continue")
-            .arg(&state.id)
-            .env("SPAR_INTERNAL", "1")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        let _ = child_cmd.spawn()?;
+fn detach_self(state: &RunState, paths: &SparPaths, cfg: &Config, json: bool) -> Result<ExitCode> {
+    if let Some(owner) = crate::runlock::RunLock::owner(paths, &state.id) {
+        if owner.alive() {
+            return Err(crate::runlock::OrchestratorBusy {
+                run_id: state.id.clone(),
+                owner_pid: owner.pid,
+            }
+            .into());
+        }
     }
-    #[cfg(not(unix))]
-    {
-        anyhow::bail!("detach not supported on this platform yet");
+    if let Some(msg) = crate::daemon::maybe_enqueue(paths, cfg, state)? {
+        if json {
+            executor::emit_run_json(state)?;
+        } else {
+            executor::print_run_human(state);
+            println!("{msg}");
+        }
+        return Ok(ExitCode::Success);
     }
-
-    if json {
-        executor::emit_run_json(state)?;
-    } else {
-        executor::print_run_human(state);
-        println!("detached; poll with: spar wait {}", state.id);
+    let detached = crate::process::spawn_detached_orchestrator(paths, &state.id)?;
+    match crate::process::await_detached_start(paths, &state.id, detached)? {
+        crate::process::DetachOutcome::Confirmed { pid } => {
+            if json {
+                executor::emit_run_json(state)?;
+            } else {
+                executor::print_run_human(state);
+                println!(
+                    "detached (pid {pid}, session of its own); poll with: spar wait {}",
+                    state.id
+                );
+            }
+            Ok(ExitCode::Success)
+        }
+        crate::process::DetachOutcome::Completed => {
+            let state = RunState::load_for_display(paths, &state.id)?;
+            if json {
+                executor::emit_run_json(&state)?;
+            } else {
+                executor::print_run_human(&state);
+            }
+            Ok(state.exit_code())
+        }
     }
-    Ok(ExitCode::Success)
 }
 
 /// The directive for this plan round, rendered for the planner and critic prompts.

@@ -52,6 +52,65 @@ pub fn run_from_cli(
     run_with_task(task, None, opts, paths, cfg, None)
 }
 
+/// `spar resume <id>`: dispatch on what the run actually is, rather than aliasing
+/// `implement --run`. A gate is refused (a decision is waiting, and resume is not an
+/// operator); a live owner is refused naming its pid; an abandoned in-flight run goes
+/// to `continue_run`, which already dispatches on `state.workflow`; an at-rest run
+/// goes to `run_from_approved`, which already knows how to clear a `stopped` marker,
+/// reset failed slots and re-check quota — the same path a bare `implement --run <id>`
+/// takes, so this mints no provider pool of its own.
+pub fn resume(
+    paths: &SparPaths,
+    cfg: &Config,
+    run_id: &str,
+    detach: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    let state = RunState::load(paths, run_id)?;
+    if let Some(owner) = crate::runlock::RunLock::owner(paths, run_id) {
+        if owner.alive() {
+            return Err(crate::runlock::OrchestratorBusy {
+                run_id: run_id.to_string(),
+                owner_pid: owner.pid,
+            }
+            .into());
+        }
+    }
+    if state.phase.is_gate() {
+        bail!(
+            "run {run_id} is waiting on a human ({:?}); resolve it with: {}",
+            state.phase,
+            crate::notify::next_command(&state)
+        );
+    }
+    if matches!(state.phase, Phase::Done | Phase::PlanRejected) {
+        bail!(
+            "run {run_id} is finished ({:?}); nothing to resume. Start a new round with \
+             `spar plan --run {run_id} -t \"…\"`.",
+            state.phase
+        );
+    }
+    if !state.phase.is_waitable_stop() {
+        // `continue_run` has no detach knob of its own: it is the path an already
+        // in-flight, abandoned orchestrator's replacement takes, and it always runs
+        // to completion in the foreground of whoever calls it.
+        return continue_run(paths, cfg, run_id);
+    }
+    // `run_from_approved` always re-decides `state.dry_run` from `opts.resolve_dry_run()`
+    // (it is not sticky across `implement --run` re-entries, by design, so a test can
+    // force a live run into stub mode). `resume` offers no `--dry-run` flag of its own —
+    // resuming does not get to change what kind of run this is — so it carries the run's
+    // own recorded flag through instead of silently defaulting to `false` and dispatching
+    // a dry-run's later rounds against real providers and real git merges.
+    let opts = CommonOpts {
+        detach,
+        json,
+        dry_run: state.dry_run,
+        ..CommonOpts::default()
+    };
+    run_from_approved(run_id, None, opts, paths, cfg)
+}
+
 /// The run that wrote this plan, if spar wrote it: plan artifacts live at
 /// `.spar/runs/<id>/artifacts/plan*.md`, so the id is in the path.
 fn run_id_for_plan(plan: &std::path::Path, paths: &SparPaths) -> Option<String> {
@@ -342,7 +401,7 @@ fn run_from_approved(
     }
     if opts.detach {
         state.save(paths)?;
-        return detach_implement(&state, paths, opts.json);
+        return detach_implement(&state, paths, cfg, opts.json);
     }
     let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
     state.save(paths)?;
@@ -1053,7 +1112,7 @@ fn run_with_task(
     state.save(paths)?;
 
     if opts.detach {
-        return detach_implement(&state, paths, opts.json);
+        return detach_implement(&state, paths, cfg, opts.json);
     }
 
     let _lock = crate::runlock::RunLock::acquire(paths, &state.id)?;
@@ -2532,7 +2591,12 @@ fn reclaim_own_cache(state: &RunState, json: bool) {
     }
 }
 
-fn detach_implement(state: &RunState, paths: &SparPaths, json: bool) -> Result<ExitCode> {
+fn detach_implement(
+    state: &RunState,
+    paths: &SparPaths,
+    cfg: &Config,
+    json: bool,
+) -> Result<ExitCode> {
     if let Some(owner) = crate::runlock::RunLock::owner(paths, &state.id) {
         if owner.alive() {
             return Err(crate::runlock::OrchestratorBusy {
@@ -2542,25 +2606,39 @@ fn detach_implement(state: &RunState, paths: &SparPaths, json: bool) -> Result<E
             .into());
         }
     }
-    #[cfg(unix)]
-    {
-        let mut child_cmd = std::process::Command::new(std::env::current_exe()?);
-        child_cmd
-            .arg("__internal_continue")
-            .arg(&state.id)
-            .env("SPAR_INTERNAL", "1")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        let _ = child_cmd.spawn()?;
+    if let Some(msg) = crate::daemon::maybe_enqueue(paths, cfg, state)? {
+        if json {
+            executor::emit_run_json(state)?;
+        } else {
+            executor::print_run_human(state);
+            println!("{msg}");
+        }
+        return Ok(ExitCode::Success);
     }
-    if json {
-        executor::emit_run_json(state)?;
-    } else {
-        executor::print_run_human(state);
-        println!("detached; wait with: spar wait {}", state.id);
+    let detached = crate::process::spawn_detached_orchestrator(paths, &state.id)?;
+    match crate::process::await_detached_start(paths, &state.id, detached)? {
+        crate::process::DetachOutcome::Confirmed { pid } => {
+            if json {
+                executor::emit_run_json(state)?;
+            } else {
+                executor::print_run_human(state);
+                println!(
+                    "detached (pid {pid}, session of its own); wait with: spar wait {}",
+                    state.id
+                );
+            }
+            Ok(ExitCode::Success)
+        }
+        crate::process::DetachOutcome::Completed => {
+            let state = RunState::load_for_display(paths, &state.id)?;
+            if json {
+                executor::emit_run_json(&state)?;
+            } else {
+                executor::print_run_human(&state);
+            }
+            Ok(state.exit_code())
+        }
     }
-    Ok(ExitCode::Success)
 }
 
 pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<ExitCode> {

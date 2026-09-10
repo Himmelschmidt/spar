@@ -135,7 +135,7 @@ pub fn run_named(
                 .task
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("--task required for plan"))?;
-            plan::run(task, opts, paths, cfg)
+            plan::run(task, None, opts, paths, cfg)
         }
         WorkflowKind::Loop => implement::run_loop(opts, paths, cfg),
         WorkflowKind::Arena => arena::run(opts, paths, cfg),

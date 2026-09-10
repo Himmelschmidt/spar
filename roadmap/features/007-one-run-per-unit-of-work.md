@@ -1,7 +1,7 @@
 ---
 id: 7
 title: One run per unit of work
-status: in-progress
+status: done
 milestone: 6
 effort: L
 priority: high

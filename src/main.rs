@@ -1,7 +1,9 @@
 mod api;
+mod brief;
 mod bus;
 mod cli;
 mod config;
+mod daemon;
 mod doctor;
 mod events;
 mod executor;
@@ -47,13 +49,22 @@ use std::time::Duration;
 use workflow::CommonOpts;
 
 fn main() -> StdExitCode {
-    match run() {
+    let code = match run() {
         Ok(code) => code.into(),
         Err(err) => {
             eprintln!("error: {err:#}");
             ExitCode::Failure.into()
         }
-    }
+    };
+    // A one-shot CLI invocation (the common case: `spar plan`, `spar implement --run`
+    // without `--detach`) often has nothing left to do after the phase transition that
+    // just fired a lifecycle or human alert — main() returns and the process exits
+    // within microseconds, which a bare `thread::spawn` cannot outrace. Fire-and-forget
+    // must still mean *delivered*, so give in-flight notify threads a bounded window to
+    // finish before the process actually dies; a broken sink still cannot fail this
+    // exit code, since notify errors are only ever logged to stderr, never propagated.
+    notify::drain_before_exit();
+    code
 }
 
 fn run() -> Result<ExitCode> {
@@ -92,6 +103,7 @@ fn run() -> Result<ExitCode> {
         Command::Doctor { json } => doctor::run(json),
         Command::Plan {
             task,
+            spec,
             run_id,
             providers,
             select,
@@ -106,9 +118,16 @@ fn run() -> Result<ExitCode> {
             dry_run,
             big,
         } => {
+            match (&task, &spec) {
+                (Some(_), Some(_)) => anyhow::bail!("pass one of -t / --spec, not both"),
+                (None, None) => anyhow::bail!("pass one of -t / --spec"),
+                _ => {}
+            }
             // A replan reads the run's own frozen config (O27), never the live file,
             // and re-dispatches the run's existing planner and critic slots. Flags that
-            // could only apply to a NEW run are refused, not silently dropped.
+            // could only apply to a NEW run are refused, not silently dropped. `--spec`
+            // is accepted here too: it is the natural way to hand a replan a long
+            // directive, same as `-t`.
             if let Some(id) = run_id {
                 let ignored = [
                     (!providers.is_empty(), "--providers"),
@@ -132,9 +151,13 @@ fn run() -> Result<ExitCode> {
                         ignored.join(", ")
                     );
                 }
+                let directive = match spec {
+                    Some(path) => brief::read_spec_text(&path)?,
+                    None => task.expect("checked above: exactly one of task/spec is set"),
+                };
                 let (paths, _) = project_ctx()?;
                 let cfg = Config::for_run(&paths, &id)?;
-                return workflow::plan::replan(&paths, &cfg, &id, task, json);
+                return workflow::plan::replan(&paths, &cfg, &id, directive, json);
             }
             let (paths, mut cfg) = project_ctx()?;
             if let Some(preset) = &fleet {
@@ -142,8 +165,21 @@ fn run() -> Result<ExitCode> {
             }
             cfg.apply_without(&without)?;
             cfg.apply_role_overrides(&role)?;
+            let (task_text, brief_path) = match spec {
+                Some(path) => {
+                    let b = brief::intake(&paths, &path)?;
+                    if !json {
+                        eprintln!("brief {} written to {}", b.slug, b.path.display());
+                    }
+                    (b.body, Some(b.path))
+                }
+                None => (
+                    task.expect("checked above: exactly one of task/spec is set"),
+                    None,
+                ),
+            };
             let opts = CommonOpts {
-                task: Some(task.clone()),
+                task: Some(task_text.clone()),
                 providers,
                 select,
                 urgency,
@@ -156,7 +192,7 @@ fn run() -> Result<ExitCode> {
                 max_rounds: None,
                 accept_contract: false,
             };
-            workflow::plan::run(task, opts, &paths, &cfg)
+            workflow::plan::run(task_text, brief_path, opts, &paths, &cfg)
         }
         Command::Approve { run_id, json } => {
             let (paths, _) = project_ctx()?;
@@ -169,6 +205,16 @@ fn run() -> Result<ExitCode> {
         } => {
             let (paths, _) = project_ctx()?;
             workflow::plan::reject(&paths, &run_id, reason, json)
+        }
+        Command::Brief { run_id, full, json } => brief_cmd(&run_id, full, json),
+        Command::Resume {
+            run_id,
+            detach,
+            json,
+        } => {
+            let (paths, _) = project_ctx()?;
+            let cfg = Config::for_run(&paths, &run_id)?;
+            workflow::implement::resume(&paths, &cfg, &run_id, detach, json)
         }
         Command::Implement {
             run_id,
@@ -352,14 +398,14 @@ fn run() -> Result<ExitCode> {
             run_id,
             all,
             older_than,
-            halted,
+            gates,
             undo,
             json,
         } => archive_cmd(
             run_id.as_deref(),
             all,
             older_than.as_deref(),
-            halted,
+            gates,
             undo,
             json,
         ),
@@ -373,6 +419,14 @@ fn run() -> Result<ExitCode> {
             SkillsCmd::List { json } => skills::run(skills::SkillsAction::List { json }),
             SkillsCmd::Get { name } => skills::run(skills::SkillsAction::Get { name }),
         },
+        Command::Daemon { cmd } => {
+            let (paths, _) = project_ctx()?;
+            match cmd {
+                cli::DaemonCmd::Start { foreground } => daemon::start(&paths, foreground),
+                cli::DaemonCmd::Stop => daemon::stop(&paths),
+                cli::DaemonCmd::Status { json } => daemon::status(&paths, json),
+            }
+        }
         Command::InternalContinue { run_id } => {
             let (paths, _) = project_ctx()?;
             let cfg = Config::for_run(&paths, &run_id)?;
@@ -705,7 +759,7 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> 
             }
             if state.abandoned(&swarm) {
                 println!(
-                    "abandoned: no live orchestrator (resume with `spar implement --run {} --providers <…>` or `spar stop {}`)",
+                    "abandoned: no live orchestrator (resume with `spar resume {}` or `spar stop {}`)",
                     state.id, state.id
                 );
             }
@@ -817,6 +871,154 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> 
             println!("  ({hidden} archived hidden — spar status --archived)");
         }
     }
+    Ok(ExitCode::Success)
+}
+
+/// `spar brief <id>`: re-hydrate a fresh session on a run's own state, in one call.
+/// Read-only — uses `load_for_display`, same as `status`, and never writes.
+fn brief_cmd(run_id: &str, full: bool, json: bool) -> Result<ExitCode> {
+    let local_root = paths::find_project_root().ok();
+    let (paths, _cfg, state) = load_run_anywhere(run_id, local_root.as_deref())?;
+
+    let brief_body: Option<String> = match &state.brief {
+        Some(path) => std::fs::read_to_string(path).ok(),
+        None => None,
+    };
+    let brief_text = brief_body.as_deref().or(state.task.as_deref());
+
+    let artifact_names = [
+        "plan.md",
+        "test-contract.md",
+        "suite.md",
+        "ranking.md",
+        "ship.md",
+    ];
+    let mut artifacts: Vec<(String, std::path::PathBuf)> = artifact_names
+        .iter()
+        .map(|n| (n.to_string(), paths.artifact(&state.id, n)))
+        .filter(|(_, p)| p.is_file())
+        .collect();
+    for slot in &state.slots {
+        let p = paths.artifact(&state.id, &format!("review-{}.md", slot.id));
+        if p.is_file() {
+            artifacts.push((format!("review-{}.md", slot.id), p));
+        }
+    }
+
+    let ac_ids: Vec<String> = {
+        let contract_path = paths.artifact(&state.id, "test-contract.md");
+        let mut ids: Vec<String> = std::fs::read_to_string(&contract_path)
+            .unwrap_or_default()
+            .split(|c: char| !c.is_alphanumeric() && c != '-')
+            .filter(|tok| tok.starts_with("AC-") && tok.len() > 3)
+            .map(|tok| tok.to_string())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    };
+
+    let events: Vec<crate::events::Event> = events::read_all(&paths, &state.id)
+        .unwrap_or_default()
+        .into_iter()
+        .rev()
+        .take(15)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    let next = notify::next_command(&state);
+
+    if json {
+        let v = serde_json::json!({
+            "run": state.id,
+            "workflow": state.workflow,
+            "phase": state.phase,
+            "run_exit_code": state.status_exit_code(),
+            "round": state.round,
+            "max_rounds": state.max_rounds,
+            "abandoned": state.abandoned(&paths),
+            "archived": state.archived_at,
+            "brief": brief_text,
+            "base_ref": state.base_ref,
+            "base_commit": state.base_commit,
+            "worktrees": state.worktrees,
+            "fleet": executor::role_assignments(&state),
+            "gates": state.gates,
+            "contract_modified": state.contract_modified,
+            "suite_outcome": state.suite_outcome,
+            "error": state.error,
+            "artifacts": artifacts.iter().map(|(n, p)| serde_json::json!({"name": n, "path": p})).collect::<Vec<_>>(),
+            "ac_ids": ac_ids,
+            "recent_events": events,
+            "next_command": next,
+        });
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(ExitCode::Success);
+    }
+
+    println!("# run {} ({:?})", state.id, state.workflow);
+    println!(
+        "phase: {:?}  round: {}/{}",
+        state.phase, state.round, state.max_rounds
+    );
+    println!("abandoned: {}", state.abandoned(&paths));
+    if let Some(at) = state.archived_at {
+        println!("archived: {}", at.to_rfc3339());
+    }
+    println!();
+    println!("## brief");
+    match brief_text {
+        Some(t) if full => println!("{t}"),
+        Some(t) => println!("{}", t.chars().take(400).collect::<String>()),
+        None => println!("(none)"),
+    }
+    println!();
+    if let (Some(r), Some(c)) = (&state.base_ref, &state.base_commit) {
+        println!("base: {r} ({})", c.chars().take(8).collect::<String>());
+    }
+    println!("worktrees:");
+    for w in &state.worktrees {
+        println!("  - {} {} ({})", w.slot_id, w.path.display(), w.branch);
+    }
+    println!("fleet:");
+    for r in executor::role_assignments(&state) {
+        println!("  - {r}");
+    }
+    println!(
+        "gates: plan_approved={} ship_confirmed={}",
+        state.gates.plan_approved, state.gates.ship_confirmed
+    );
+    if state.contract_modified {
+        println!("contract_modified: true");
+    }
+    if let Some(o) = state.suite_outcome {
+        println!("suite_outcome: {o:?}");
+    }
+    if let Some(err) = &state.error {
+        println!("error: {err}");
+    }
+    println!("artifacts:");
+    for (name, path) in &artifacts {
+        if full && (name == "plan.md" || name == "test-contract.md") {
+            println!("  - {name}:");
+            if let Ok(body) = std::fs::read_to_string(path) {
+                println!("{body}");
+            }
+        } else {
+            println!("  - {} ({})", name, path.display());
+        }
+    }
+    if !ac_ids.is_empty() {
+        println!("acceptance criteria: {}", ac_ids.join(", "));
+    }
+    println!("recent events:");
+    for e in &events {
+        println!("  - {} {:?}", e.ts.to_rfc3339(), e.kind);
+    }
+    println!();
+    println!("next: {next}");
     Ok(ExitCode::Success)
 }
 
@@ -1488,7 +1690,7 @@ fn archive_cmd(
     run_id: Option<&str>,
     all: bool,
     older_than: Option<&str>,
-    halted: bool,
+    gates: bool,
     undo: bool,
     json: bool,
 ) -> Result<ExitCode> {
@@ -1496,8 +1698,8 @@ fn archive_cmd(
     let now = chrono::Utc::now();
     // Flags that cannot apply are refused, not ignored: a silently dropped `--older-than`
     // reads as "nothing qualified" and hides the fact that the filter never ran.
-    if halted && (run_id.is_some() || undo || !all) {
-        anyhow::bail!("--halted only applies to `spar archive --all`");
+    if gates && (run_id.is_some() || undo || !all) {
+        anyhow::bail!("--gates only applies to `spar archive --all`");
     }
     if older_than.is_some() && (run_id.is_some() || undo) {
         anyhow::bail!("--older-than only applies to `spar archive --all`");
@@ -1542,7 +1744,7 @@ fn archive_cmd(
                 .map(util::parse_duration)
                 .transpose()?
                 .unwrap_or_default();
-            state::archive_sweep(&paths, min_idle, now, halted)?
+            state::archive_sweep(&paths, min_idle, now, true, gates)?
         }
     };
     let verb = if undo { "unarchived" } else { "archived" };

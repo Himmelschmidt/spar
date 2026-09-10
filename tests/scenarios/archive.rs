@@ -146,9 +146,10 @@ fn archiving_hides_a_run_from_listings_without_deleting_it() {
     );
 }
 
-/// The whole point: finished work goes quiet, gates stay in your face.
+/// The whole point: finished *and* halted work goes quiet by default, gates stay in
+/// your face unless `--gates` is given, and `plan_approved` never goes quiet at all.
 #[test]
-fn archive_all_takes_finished_runs_and_spares_gates() {
+fn archive_all_reaches_hand_archivable_phases_and_spares_gates() {
     let tmp = tempdir().unwrap();
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
@@ -162,6 +163,10 @@ fn archive_all_takes_finished_runs_and_spares_gates() {
     let fresh_done = run_in(&proj, "done", 1);
     let gate = run_in(&proj, "awaiting_plan_approval", 30);
     let stopped = run_in(&proj, "stopped", 30);
+    let failed = run_in(&proj, "failed", 30);
+    let stuck = run_in(&proj, "stuck", 30);
+    let quota = run_in(&proj, "quota", 30);
+    let plan_approved = run_in(&proj, "plan_approved", 30);
 
     let out = spar_cmd()
         .current_dir(&proj)
@@ -175,18 +180,92 @@ fn archive_all_takes_finished_runs_and_spares_gates() {
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
 
-    assert_eq!(archived, vec![old_done.clone()]);
+    for id in [&old_done, &stopped, &failed, &stuck, &quota] {
+        assert!(archived.contains(id), "{id} must be archived by --all");
+    }
     let visible = listed_ids(&proj, false);
     assert!(!visible.contains(&old_done));
+    assert!(
+        !visible.contains(&stopped),
+        "stopped is now hand-archivable by default"
+    );
+    assert!(!visible.contains(&failed));
+    assert!(!visible.contains(&stuck));
+    assert!(!visible.contains(&quota));
     assert!(visible.contains(&fresh_done), "younger than --older-than");
     assert!(
         visible.contains(&gate),
-        "a run waiting on a human must never be auto-archived"
+        "a run waiting on a human must never be archived without --gates"
     );
     assert!(
-        visible.contains(&stopped),
-        "stopped is ambiguous, not finished"
+        visible.contains(&plan_approved),
+        "plan_approved is terminal but not a gate — an unlinked plan must stay visible"
     );
+}
+
+/// `--gates` additionally reaches gates, but `plan_approved` stays excluded even then.
+#[test]
+fn archive_all_gates_reaches_gates_but_never_plan_approved() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    init_repo(&proj);
+    std::fs::write(proj.join("spar.toml"), "auto_archive_after = \"off\"\n").unwrap();
+
+    let gate = run_in(&proj, "awaiting_plan_approval", 30);
+    let plan_approved = run_in(&proj, "plan_approved", 30);
+
+    spar_cmd()
+        .current_dir(&proj)
+        .args([
+            "archive",
+            "--all",
+            "--older-than",
+            "14d",
+            "--gates",
+            "--json",
+        ])
+        .assert()
+        .code(0);
+
+    let visible = listed_ids(&proj, false);
+    assert!(!visible.contains(&gate), "--gates must reach a gate");
+    assert!(
+        visible.contains(&plan_approved),
+        "plan_approved is excluded even under --all --gates"
+    );
+}
+
+/// `--gates` is refused outside `--all`, the same shape as `--older-than`.
+#[test]
+fn gates_flag_only_applies_to_archive_all() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    init_repo(&proj);
+
+    let done = run_in(&proj, "done", 0);
+    spar_cmd()
+        .current_dir(&proj)
+        .args(["archive", &done, "--gates"])
+        .assert()
+        .failure();
+}
+
+/// `--halted` is gone outright — no deprecated alias, this repo carries no back-compat
+/// shims and it was three weeks old.
+#[test]
+fn halted_flag_no_longer_exists() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    init_repo(&proj);
+
+    spar_cmd()
+        .current_dir(&proj)
+        .args(["archive", "--all", "--halted"])
+        .assert()
+        .failure();
 }
 
 /// An in-flight run cannot be hidden, and a resumed one comes back on its own.

@@ -755,6 +755,183 @@ pub fn terminate_all(pids: &[u32]) {
 #[cfg(not(unix))]
 pub fn terminate_all(_pids: &[u32]) {}
 
+/// A `current_exe()` child spawned into its own session (`setsid`), stdout/stderr
+/// appended to a log file rather than discarded. The `Child` handle is kept so the
+/// handshake in [`await_detached_start`] can `try_wait` it without a second spawn.
+pub struct DetachedChild {
+    pub child: std::process::Child,
+    pub pid: u32,
+    pub log: PathBuf,
+}
+
+/// Spawn `current_exe() <args>` detached into a session of its own.
+///
+/// `setsid(2)`, not `process_group(0)`: a new process group alone leaves the
+/// launching session's controlling terminal attached, so a `SIGHUP` on tty hangup
+/// still reaches the child. `setsid` gives a new session, a new process group and no
+/// controlling terminal in one syscall, and it is async-signal-safe, so it is legal
+/// inside `pre_exec`. Declared as a raw `extern "C"` the same way `kill(2)` already is
+/// above — spar has no `libc` dependency and this must not add one.
+///
+/// stdout/stderr append to `log` instead of `/dev/null`: a detached child that dies at
+/// startup used to leave no trace at all, and the handshake needs something to quote.
+pub fn spawn_detached(
+    args: &[&str],
+    log: &Path,
+    extra_env: &[(&str, &str)],
+) -> Result<DetachedChild> {
+    spawn_detached_program(std::env::current_exe()?, args, log, extra_env)
+}
+
+/// `spawn_detached`, parameterised on the program rather than hardcoded to
+/// `current_exe()`, so the `setsid` / logging / handshake mechanics are testable
+/// against an arbitrary short-lived binary without going through the real CLI.
+fn spawn_detached_program(
+    program: PathBuf,
+    args: &[&str],
+    log: &Path,
+    extra_env: &[(&str, &str)],
+) -> Result<DetachedChild> {
+    if let Some(parent) = log.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create log dir {}", parent.display()))?;
+    }
+    let out_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .with_context(|| format!("open log {}", log.display()))?;
+    let err_file = out_file
+        .try_clone()
+        .with_context(|| format!("clone log handle {}", log.display()))?;
+
+    #[cfg(unix)]
+    {
+        let mut cmd = Command::new(program);
+        cmd.args(args)
+            .env("SPAR_INTERNAL", "1")
+            .stdin(Stdio::null())
+            .stdout(out_file)
+            .stderr(err_file);
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            cmd.pre_exec(|| {
+                extern "C" {
+                    fn setsid() -> i32;
+                }
+                if setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = cmd
+            .spawn()
+            .with_context(|| format!("spawn detached {}", args.join(" ")))?;
+        let pid = child.id();
+        Ok(DetachedChild {
+            child,
+            pid,
+            log: log.to_path_buf(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (program, args, extra_env, out_file, err_file);
+        anyhow::bail!("detach not supported on this platform yet")
+    }
+}
+
+/// `spawn_detached` specialised for `__internal_continue <run_id>`, logging to
+/// `.spar/runs/<id>/logs/orchestrator.log`.
+pub fn spawn_detached_orchestrator(
+    paths: &crate::paths::SparPaths,
+    run_id: &str,
+) -> Result<DetachedChild> {
+    let log = paths.logs_dir(run_id).join("orchestrator.log");
+    spawn_detached(&["__internal_continue", run_id], &log, &[])
+}
+
+/// What the handshake in [`await_detached_start`] settled on.
+#[derive(Debug)]
+pub enum DetachOutcome {
+    /// The child now holds the run's lock: it is alive and driving the run.
+    Confirmed { pid: u32 },
+    /// The run reached a waitable stop before the first poll even landed (the normal
+    /// `--dry-run --detach` case) — there was never anything to detach from.
+    Completed,
+}
+
+fn detach_handshake_timeout() -> Duration {
+    std::env::var("SPAR_DETACH_HANDSHAKE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_secs)
+        // Deliberately under `abandon_grace`'s 15s default so a handshake failure is
+        // always the first thing anyone hears about, not a 15s silence.
+        .unwrap_or(Duration::from_secs(10))
+}
+
+/// Block until a detached orchestrator either takes `run_id`'s lock, exits, or times
+/// out. Matching on `owner.pid == pid` (not "some live owner") is what stops a stale
+/// lock body left by a *previous* crashed orchestrator from satisfying the handshake
+/// for a child that never actually started.
+pub fn await_detached_start(
+    paths: &crate::paths::SparPaths,
+    run_id: &str,
+    detached: DetachedChild,
+) -> Result<DetachOutcome> {
+    let DetachedChild {
+        mut child,
+        pid,
+        log,
+    } = detached;
+    let deadline = detach_handshake_timeout();
+    let start = Instant::now();
+    let poll = Duration::from_millis(50);
+    loop {
+        if let Some(owner) = crate::runlock::RunLock::owner(paths, run_id) {
+            if owner.pid == pid && owner.alive() {
+                return Ok(DetachOutcome::Confirmed { pid });
+            }
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Whether this is the honest end of a fast run (dry-run finishing
+                // inside one poll tick) or a genuine crash cannot be read off the raw
+                // exit code alone: reaching a gate/stuck/quota stop exits non-zero by
+                // the public exit-code contract (0/1/2/3/4) and is not a failed
+                // detach. What matters is whether the run's own state settled at a
+                // waitable stop — completion is process exit plus expected artifacts,
+                // never the exit code alone.
+                return match crate::state::RunState::load(paths, run_id) {
+                    Ok(s) if s.phase.is_waitable_stop() => Ok(DetachOutcome::Completed),
+                    _ => anyhow::bail!(
+                        "detached orchestrator (pid {pid}) exited {status} before taking the run lock; see {}\n{}",
+                        log.display(),
+                        tail_log(&log, 2000)
+                    ),
+                };
+            }
+            Ok(None) => {}
+            Err(e) => return Err(e).context("wait on detached orchestrator"),
+        }
+        if start.elapsed() >= deadline {
+            terminate_tree(pid, true);
+            let _ = child.wait();
+            anyhow::bail!(
+                "detached orchestrator (pid {pid}) did not take the run lock within {}s; killed it; see {}",
+                deadline.as_secs(),
+                log.display()
+            );
+        }
+        std::thread::sleep(poll);
+    }
+}
+
 /// Pids whose working directory is inside `dir`, via `/proc/<pid>/cwd`.
 ///
 /// Matching on cwd rather than command line is deliberate: a command-line match
@@ -3313,5 +3490,155 @@ mod tests {
         // Must be valid UTF-8 view (lossless for our content after boundary).
         assert!(t.text.contains("END"));
         assert!(!t.text.chars().any(|c| c == '\u{FFFD}'));
+    }
+
+    /// Session id (field 6 overall / field 4 after `comm`) of a live pid, mirroring
+    /// `pid_starttime`'s parsing. Test-only: production code never needs a bare session
+    /// id, only whether a lock-file pid matches the child it spawned.
+    #[cfg(target_os = "linux")]
+    fn pid_session(pid: u32) -> Option<u32> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let after_comm = &stat[stat.rfind(')')? + 1..];
+        after_comm.split_whitespace().nth(3)?.parse().ok()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn my_session() -> u32 {
+        pid_session(std::process::id()).expect("own session id")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_detached_gives_the_child_its_own_session() {
+        let tmp = tempdir().unwrap();
+        let log = tmp.path().join("child.log");
+        let detached =
+            spawn_detached_program(PathBuf::from("/bin/sleep"), &["1"], &log, &[]).unwrap();
+        let child_sid = pid_session(detached.pid).expect("child session id");
+        assert_eq!(
+            child_sid, detached.pid,
+            "setsid makes the child its own session leader"
+        );
+        assert_ne!(
+            child_sid,
+            my_session(),
+            "child must not share the launching process's session"
+        );
+        let _ = detached.child.wait_with_output();
+    }
+
+    #[test]
+    fn spawn_detached_appends_stdout_and_stderr_to_the_log() {
+        let tmp = tempdir().unwrap();
+        let log = tmp.path().join("child.log");
+        let detached = spawn_detached_program(
+            PathBuf::from("/bin/sh"),
+            &["-c", "echo out-line; echo err-line 1>&2"],
+            &log,
+            &[],
+        )
+        .unwrap();
+        let mut child = detached.child;
+        let status = child.wait().unwrap();
+        assert!(status.success());
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.contains("out-line"));
+        assert!(text.contains("err-line"));
+    }
+
+    #[test]
+    fn await_detached_start_reports_completed_when_child_exits_zero_before_taking_the_lock() {
+        let tmp = tempdir().unwrap();
+        let paths = crate::paths::SparPaths::new(tmp.path());
+        // A dry run that finished inside the first poll tick: the child exits (any
+        // code) having already settled the run at a waitable stop.
+        let mut state = crate::state::RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.phase = crate::state::Phase::Done;
+        state.save(&paths).unwrap();
+        let log = tmp.path().join("child.log");
+        let detached = spawn_detached_program(PathBuf::from("/bin/true"), &[], &log, &[]).unwrap();
+        let outcome = await_detached_start(&paths, "r1", detached).unwrap();
+        assert!(matches!(outcome, DetachOutcome::Completed));
+    }
+
+    /// The public exit-code contract has a run reaching a gate exit non-zero (`2`).
+    /// A detached child that settles the run at a gate before the first poll tick
+    /// must read as `Completed`, not as a failed detach — the exit code alone cannot
+    /// tell the two apart, only `state.json` can.
+    #[test]
+    fn await_detached_start_reports_completed_for_a_nonzero_exit_that_reached_a_gate() {
+        let tmp = tempdir().unwrap();
+        let paths = crate::paths::SparPaths::new(tmp.path());
+        let mut state = crate::state::RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.phase = crate::state::Phase::AwaitingPlanApproval;
+        state.save(&paths).unwrap();
+        let log = tmp.path().join("child.log");
+        // Exit code 2 mirrors ExitCode::HumanGate, the real shape of this outcome.
+        let detached =
+            spawn_detached_program(PathBuf::from("/bin/sh"), &["-c", "exit 2"], &log, &[]).unwrap();
+        let outcome = await_detached_start(&paths, "r1", detached).unwrap();
+        assert!(matches!(outcome, DetachOutcome::Completed));
+    }
+
+    #[test]
+    fn await_detached_start_fails_fast_on_nonzero_exit() {
+        let tmp = tempdir().unwrap();
+        let paths = crate::paths::SparPaths::new(tmp.path());
+        let log = tmp.path().join("child.log");
+        let detached = spawn_detached_program(PathBuf::from("/bin/false"), &[], &log, &[]).unwrap();
+        let start = Instant::now();
+        let err = await_detached_start(&paths, "no-such-run", detached).unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "must fail as soon as the child exits, not after the handshake timeout"
+        );
+        assert!(err.to_string().contains("child.log"));
+    }
+
+    #[test]
+    fn await_detached_start_kills_and_fails_on_timeout() {
+        std::env::set_var("SPAR_DETACH_HANDSHAKE_SECS", "1");
+        let tmp = tempdir().unwrap();
+        let paths = crate::paths::SparPaths::new(tmp.path());
+        let log = tmp.path().join("child.log");
+        let detached =
+            spawn_detached_program(PathBuf::from("/bin/sleep"), &["30"], &log, &[]).unwrap();
+        let pid = detached.pid;
+        let err = await_detached_start(&paths, "no-such-run", detached).unwrap_err();
+        std::env::remove_var("SPAR_DETACH_HANDSHAKE_SECS");
+        assert!(err.to_string().contains("did not take the run lock"));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!pid_alive(pid), "the timed-out child must be killed");
+    }
+
+    #[test]
+    fn await_detached_start_confirms_only_when_the_lock_names_the_spawned_pid() {
+        let tmp = tempdir().unwrap();
+        let paths = crate::paths::SparPaths::new(tmp.path());
+        let run_id = "r1";
+        // A stale lock body from a previous, unrelated orchestrator must not satisfy
+        // the handshake for a child that never actually took the lock.
+        let _stale = crate::runlock::RunLock::acquire(&paths, run_id).unwrap();
+        let log = tmp.path().join("child.log");
+        let detached =
+            spawn_detached_program(PathBuf::from("/bin/sleep"), &["30"], &log, &[]).unwrap();
+        let pid = detached.pid;
+        std::env::set_var("SPAR_DETACH_HANDSHAKE_SECS", "1");
+        let err = await_detached_start(&paths, run_id, detached);
+        std::env::remove_var("SPAR_DETACH_HANDSHAKE_SECS");
+        assert!(
+            err.is_err(),
+            "a lock held by someone else is not a confirmation"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!pid_alive(pid));
     }
 }

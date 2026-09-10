@@ -1,7 +1,7 @@
 ---
 id: 3
 title: Durable run ownership
-status: backlog
+status: done
 milestone: 6
 effort: L
 priority: high

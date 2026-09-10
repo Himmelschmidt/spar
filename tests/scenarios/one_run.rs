@@ -377,9 +377,10 @@ fn replan_refuses_flags_it_cannot_apply() {
     assert_eq!(state(tmp.path(), &run)["round"], 1);
 }
 
-/// `--halted` reaches the phases auto-archiving refuses, and still never a gate.
+/// `--all` reaches the halted phases auto-archiving refuses (O72), and still never a
+/// gate unless `--gates` is given.
 #[test]
-fn halted_archive_sweep_spares_gates() {
+fn all_archive_sweep_reaches_halted_phases_but_spares_gates_without_the_flag() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
     let gated = plan(tmp.path(), "waiting on a human");
@@ -402,20 +403,21 @@ fn halted_archive_sweep_spares_gates() {
         .args(["archive", "--all"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("nothing to archive"));
-
-    spar_cmd()
-        .current_dir(tmp.path())
-        .args(["archive", "--all", "--halted"])
-        .assert()
-        .success()
         .stdout(predicate::str::contains(&stopped));
 
     assert!(!state(tmp.path(), &stopped)["archived_at"].is_null());
     assert!(
         state(tmp.path(), &gated)["archived_at"].is_null(),
-        "a run waiting on a human is never swept"
+        "a run waiting on a human is never swept without --gates"
     );
+
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["archive", "--all", "--gates"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&gated));
+    assert!(!state(tmp.path(), &gated)["archived_at"].is_null());
 
     // `plan_approved` is `is_terminal()` but it is NOT halted: it is the resting state
     // between `approve` and `implement --run`, and the very thing an unlinked-plan
@@ -428,7 +430,7 @@ fn halted_archive_sweep_spares_gates() {
     assert_eq!(state(tmp.path(), &approved)["phase"], "plan_approved");
     let _ = spar_cmd()
         .current_dir(tmp.path())
-        .args(["archive", "--all", "--halted"])
+        .args(["archive", "--all", "--gates"])
         .assert();
     assert!(
         state(tmp.path(), &approved)["archived_at"].is_null(),

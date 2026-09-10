@@ -76,6 +76,12 @@ pub struct Config {
     /// is the always-on baseline; this is the operator's opt-in push sink.
     #[serde(default)]
     pub notify: NotifyConfig,
+    /// `spar daemon`: restart, abandonment push and the cross-run concurrency cap.
+    /// The daemon is opt-in and never auto-started; this block only tunes it once an
+    /// operator has run `spar daemon start`. Read from the *live* `spar.toml` (the
+    /// daemon is a project-level service, not a run, so O27 does not apply to it).
+    #[serde(default)]
+    pub daemon: DaemonConfig,
 }
 
 /// Operator-configured external sink for `@human` / `Blocked` alerts. spar ships no
@@ -89,6 +95,50 @@ pub struct NotifyConfig {
     /// URL spar POSTs the message JSON to on each alert.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook: Option<String>,
+}
+
+/// `[daemon]`. `max_slots_per_bucket = 0` turns the concurrency cap off (default): a
+/// launch must never block on a service the operator did not start, so admission control
+/// only takes effect once this is set *and* a daemon holds `.spar/daemon.lock`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonConfig {
+    #[serde(default = "default_daemon_tick_secs")]
+    pub tick_secs: u64,
+    /// How long a run must read abandoned before the daemon acts. Must exceed the
+    /// detach handshake's own grace window so a just-detached child is never mistaken
+    /// for a corpse.
+    #[serde(default = "default_daemon_abandon_after_secs")]
+    pub abandon_after_secs: u64,
+    #[serde(default = "default_true")]
+    pub restart: bool,
+    #[serde(default = "default_daemon_max_restarts")]
+    pub max_restarts: u32,
+    #[serde(default)]
+    pub max_slots_per_bucket: u32,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            tick_secs: default_daemon_tick_secs(),
+            abandon_after_secs: default_daemon_abandon_after_secs(),
+            restart: true,
+            max_restarts: default_daemon_max_restarts(),
+            max_slots_per_bucket: 0,
+        }
+    }
+}
+
+fn default_daemon_tick_secs() -> u64 {
+    15
+}
+
+fn default_daemon_abandon_after_secs() -> u64 {
+    60
+}
+
+fn default_daemon_max_restarts() -> u32 {
+    2
 }
 
 /// vals-backed dynamic model selection (see DECISIONS MS*).
@@ -771,6 +821,7 @@ impl Default for Config {
             auto_archive_after: default_auto_archive_after(),
             model_select: ModelSelectConfig::default(),
             notify: NotifyConfig::default(),
+            daemon: DaemonConfig::default(),
         }
     }
 }
@@ -818,6 +869,7 @@ struct ConfigFile {
     auto_archive_after: Option<String>,
     model_select: Option<ModelSelectConfigFile>,
     notify: Option<NotifyConfigFile>,
+    daemon: Option<DaemonConfigFile>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -873,6 +925,15 @@ struct TimeoutConfigFile {
     nudge_every_secs: Option<u64>,
     stall_warn_secs: Option<u64>,
     wait: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct DaemonConfigFile {
+    tick_secs: Option<u64>,
+    abandon_after_secs: Option<u64>,
+    restart: Option<bool>,
+    max_restarts: Option<u32>,
+    max_slots_per_bucket: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1279,6 +1340,26 @@ impl Config {
                 if let Some(v) = &n.webhook {
                     self.notify.webhook = Some(v.clone());
                 }
+            }
+        }
+        // `[daemon]` tunes a supervision loop's timing and a numeric concurrency cap —
+        // no command execution, no outbound request — so unlike `[notify]` it is safe
+        // from a project's own `spar.toml`, same trust level as `[timeouts]`.
+        if let Some(d) = &file.daemon {
+            if let Some(v) = d.tick_secs {
+                self.daemon.tick_secs = v;
+            }
+            if let Some(v) = d.abandon_after_secs {
+                self.daemon.abandon_after_secs = v;
+            }
+            if let Some(v) = d.restart {
+                self.daemon.restart = v;
+            }
+            if let Some(v) = d.max_restarts {
+                self.daemon.max_restarts = v;
+            }
+            if let Some(v) = d.max_slots_per_bucket {
+                self.daemon.max_slots_per_bucket = v;
             }
         }
         Ok(())
