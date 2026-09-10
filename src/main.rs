@@ -1198,6 +1198,11 @@ fn stop_one(run_id: &str, json: bool) -> Result<ExitCode> {
         return Ok(ExitCode::Success);
     }
 
+    // A queued run has no orchestrator to reap, just a spool file naming it as wanted.
+    // Clear it first so a capacity-freeing tick can never admit a run the operator just
+    // told to stop.
+    let _ = std::fs::remove_file(paths.queue_file(run_id));
+
     let reason = halt_reason(&paths, run_id);
     reap_run(&paths, run_id)?;
 

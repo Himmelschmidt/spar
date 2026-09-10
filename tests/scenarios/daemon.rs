@@ -162,6 +162,84 @@ fn stop_stops_a_real_running_daemon() {
     );
 }
 
+fn json_of(out: &assert_cmd::assert::Assert) -> serde_json::Value {
+    serde_json::from_str(&String::from_utf8_lossy(out.get_output().stdout.as_slice()))
+        .expect("json")
+}
+
+fn state_path(proj: &std::path::Path, run_id: &str) -> std::path::PathBuf {
+    proj.join(".spar/runs").join(run_id).join("state.json")
+}
+
+fn set_phase(proj: &std::path::Path, run_id: &str, phase: &str) {
+    let path = state_path(proj, run_id);
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    state["phase"] = serde_json::Value::String(phase.into());
+    std::fs::write(&path, state.to_string()).unwrap();
+}
+
+/// `spar stop` on a queued run (`Phase::Init` plus a `.spar/queue/<id>` spool file, no
+/// orchestrator of its own) must cancel the spool entry, not just move the phase to
+/// `stopped`. Left in place, a later capacity-freeing tick would read the stale entry
+/// and dispatch an orchestrator for a run the operator explicitly told to stop.
+#[test]
+fn stopping_a_queued_run_cancels_its_spool_entry() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    init_repo(&proj);
+
+    let plan = spar_cmd()
+        .current_dir(&proj)
+        .args([
+            "plan",
+            "--task",
+            "hello",
+            "--providers",
+            "cli:claude",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2);
+    let run_id = json_of(&plan)["run_id"].as_str().unwrap().to_string();
+
+    // A dry-run plan reaches a gate immediately, not `Init`; force it back to `Init`
+    // and drop a spool file to reproduce what the daemon's own admission queue leaves
+    // behind for a run still waiting on capacity.
+    set_phase(&proj, &run_id, "init");
+    let queue_dir = proj.join(".spar/queue");
+    std::fs::create_dir_all(&queue_dir).unwrap();
+    let queue_file = queue_dir.join(&run_id);
+    std::fs::write(
+        &queue_file,
+        serde_json::json!({
+            "run_id": run_id,
+            "buckets": [],
+            "enqueued_at": chrono::Utc::now().to_rfc3339(),
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    spar_cmd()
+        .current_dir(&proj)
+        .args(["stop", &run_id])
+        .assert()
+        .success();
+
+    assert!(
+        !queue_file.is_file(),
+        "stopping a queued run must cancel its spool entry, or a later tick can restart it"
+    );
+
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(state_path(&proj, &run_id)).unwrap())
+            .unwrap();
+    assert_eq!(state["phase"], "stopped");
+}
+
 /// A second `spar daemon start` against a project already holding the lock refuses,
 /// and `daemon status` names the one real pid — not a fabricated lock body.
 #[test]

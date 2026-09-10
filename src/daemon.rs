@@ -580,6 +580,17 @@ fn drain_queue(paths: &SparPaths, cfg: &Config) {
             let _ = fs::remove_file(&path);
             continue;
         };
+        // The spool file is the only record of "this run wants to launch"; an operator
+        // `spar stop` on a queued run clears it (see `stop_one`), but a stale entry can
+        // still exist if the state moved on some other way. A queued run is always still
+        // `Phase::Init` with nobody holding its lock — anything else means the run is no
+        // longer the daemon's to admit, so discard the entry rather than dispatch it.
+        if state.phase != crate::state::Phase::Init
+            || crate::state::orchestrator_alive(paths, &entry.run_id)
+        {
+            let _ = fs::remove_file(&path);
+            continue;
+        }
         let demand = run_demand(&state);
         if !try_admit(paths, &entry.run_id, &demand, cap) {
             continue;
@@ -1014,6 +1025,47 @@ mod tests {
                 .and_then(|b| b.abandoned_since)
                 .is_none(),
             "a run sitting in the admission queue is owned by the queue, not abandoned"
+        );
+    }
+
+    #[test]
+    fn drain_queue_discards_a_stale_entry_for_a_run_that_left_init() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        // A queue entry the operator's `spar stop` should have cancelled (see
+        // `stop_one` in `src/main.rs`) but, hypothetically, did not: the run itself has
+        // moved off `Init` to `Stopped`, so the spool file is stale and must never be
+        // admitted.
+        let mut state = RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.phase = crate::state::Phase::Stopped;
+        state.save(&paths).unwrap();
+        std::fs::create_dir_all(paths.queue_dir()).unwrap();
+        std::fs::write(
+            paths.queue_file("r1"),
+            serde_json::json!({
+                "run_id": "r1",
+                "buckets": [],
+                "enqueued_at": Utc::now().to_rfc3339(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut cfg = Config::default();
+        cfg.daemon.max_slots_per_bucket = 1;
+        drain_queue(&paths, &cfg);
+
+        assert!(
+            !paths.queue_file("r1").is_file(),
+            "a stale queue entry for a non-Init run must be discarded, not admitted"
+        );
+        assert!(
+            !paths.logs_dir("r1").join("orchestrator.log").is_file(),
+            "a stopped run must never be spawned from the admission queue"
         );
     }
 
