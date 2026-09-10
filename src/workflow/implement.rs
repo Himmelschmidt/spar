@@ -52,6 +52,26 @@ pub fn run_from_cli(
     run_with_task(task, None, opts, paths, cfg, None)
 }
 
+/// Put a resumed run's interrupted slots back to `Pending`.
+///
+/// `spar stop` reconciles every slot it interrupts from `Running` to `Failed`. The
+/// non-plan workflows rebuild their job list from *every* retained slot
+/// (`review.rs`'s `state.slots.iter().map(..)`) and `executor::run_slot` flips each
+/// one back to `Running`, so those slots are about to run — but
+/// `daemon::run_demand` counts only `Pending`/`Running`, so the run reads as needing
+/// nothing and `maybe_enqueue` admits it however full the bucket is. The cap is then
+/// overrun the moment dispatch starts.
+///
+/// This is a rule, not a tidy-up: what the cap reserves has to be what is about to
+/// run.
+fn restore_interrupted_slots(state: &mut RunState) {
+    for slot in &mut state.slots {
+        if slot.status == SlotStatus::Failed {
+            slot.status = SlotStatus::Pending;
+        }
+    }
+}
+
 /// `spar resume <id>`: dispatch on what the run actually is, rather than aliasing
 /// `implement --run`. A gate is refused (a decision is waiting, and resume is not an
 /// operator); a live owner is refused naming its pid; an abandoned in-flight run goes
@@ -72,7 +92,7 @@ pub fn resume(
     detach: bool,
     json: bool,
 ) -> Result<ExitCode> {
-    let state = RunState::load(paths, run_id)?;
+    let mut state = RunState::load(paths, run_id)?;
     if let Some(owner) = crate::runlock::RunLock::owner(paths, run_id) {
         if owner.alive() {
             return Err(crate::runlock::OrchestratorBusy {
@@ -126,6 +146,8 @@ pub fn resume(
         )
     {
         let _ = std::fs::remove_file(paths.marker(run_id, "stopped"));
+        restore_interrupted_slots(&mut state);
+        state.save(paths)?;
         if detach {
             return detach_implement(&state, paths, json);
         }
@@ -732,6 +754,47 @@ fn resolve_suite_provider(
 #[cfg(test)]
 mod suite_reap_tests {
     use super::*;
+
+    /// The cap must reserve what is about to run.
+    ///
+    /// `spar stop` leaves every interrupted slot at `Failed`, and
+    /// `daemon::run_demand` counts only `Pending`/`Running` — so a stopped
+    /// Review/Arena/Roles/Peer run read as needing *nothing*, was admitted past a
+    /// full cross-run cap, and then overran it as `executor::run_slot` flipped each
+    /// retained slot back to `Running`.
+    ///
+    /// Asserted against `run_demand` itself, not against slot statuses after a
+    /// resume: a dry-run workflow completes its slots to `done`, so an end-state
+    /// assertion passes with or without the fix and guarantees nothing. (It did.)
+    #[test]
+    fn a_stops_interrupted_slots_are_demand_again_before_admission() {
+        let mut state = RunState::new(
+            "capbypass",
+            crate::cli::WorkflowKind::Review,
+            std::path::PathBuf::from("/x"),
+        );
+        for i in 0..3 {
+            let mut slot =
+                crate::executor::init_slot(format!("review-{i}"), "cli:claude", SlotRole::Reviewer);
+            // The state `stop_one` leaves behind: interrupted, reconciled to `Failed`.
+            slot.status = SlotStatus::Failed;
+            state.slots.push(slot);
+        }
+
+        let before: u32 = crate::daemon::run_demand(&state).values().copied().sum();
+        assert_eq!(
+            before, 0,
+            "precondition: this is exactly why the cap could be bypassed"
+        );
+
+        restore_interrupted_slots(&mut state);
+
+        let after: u32 = crate::daemon::run_demand(&state).values().copied().sum();
+        assert_eq!(
+            after, 3,
+            "every slot the workflow is about to re-dispatch has to count as demand"
+        );
+    }
 
     /// `--without suite --reload-config` on a run whose earlier round already dispatched
     /// an agent tester must reap that slot, not leave it for the next round to

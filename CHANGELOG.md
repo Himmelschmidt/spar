@@ -4,6 +4,42 @@ All notable changes to spar are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- **Runs now survive the session that started them.** Starting a run in the
+  background gives it a session of its own, so closing the terminal, an aborted
+  command, or a timeout in whatever launched it no longer takes the run down with
+  it. Starting one also waits until the run has genuinely taken ownership before
+  reporting success, so a run that dies on startup tells you immediately instead of
+  looking healthy for the next quarter minute.
+- **You can be told when a run needs you.** If you've configured an external
+  notifier, a run now pushes to it when it stops at a decision, gets stuck, runs
+  out of provider capacity, or fails outright. Silence means healthy. Success is
+  deliberately silent too: the notification worth having at the end of a good run
+  is the one asking you to ship it.
+- **A task can be handed over as a written document.** You can start a run from a
+  file or from piped input instead of a single-line description, and the document
+  is kept with the run so it outlives whatever you wrote it in.
+- **A new command brings a fresh session up to speed on a run** — what it is, what
+  it decided, which agents worked on it, what it produced, and the exact command
+  to move it forward.
+- **A new command picks a run back up** where it was left: stopped, failed,
+  abandoned by a dead session. It refuses the cases that need a person and names
+  the command that resolves each one, rather than quietly doing something else.
+- **An optional per-project supervisor.** When you run it, it restarts runs whose
+  owner died, tells you when one has been abandoned, and can hold a limit on how
+  many agents work against the same provider at once, releasing queued runs as
+  capacity frees up. It never approves a plan, confirms a ship, merges anything,
+  or chooses which agents to use — those stay yours.
+
+### Changed
+
+- **Archiving everything now reaches runs that halted.** Stopped, failed, stuck
+  and out-of-capacity runs are archived along with the finished ones, instead of
+  having to be named one at a time. Runs waiting on your decision are still left
+  alone unless you ask for them specifically, and archiving remains reversible.
+
+
 ### Changed
 
 - **The dashboard has a look of its own.** It now paints its own background rather

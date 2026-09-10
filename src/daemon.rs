@@ -315,7 +315,7 @@ fn log_line(paths: &SparPaths, msg: &str) {
 /// otherwise a one-provider run with `max_slots_per_bucket = 1` never fits: its finished
 /// planner plus its pending implementer read as demand 2 against zero running supply,
 /// forever.
-fn run_demand(state: &RunState) -> HashMap<String, u32> {
+pub(crate) fn run_demand(state: &RunState) -> HashMap<String, u32> {
     let providers: Vec<&str> = if !state.slots.is_empty() {
         state
             .slots
