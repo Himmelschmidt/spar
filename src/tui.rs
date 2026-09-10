@@ -12,11 +12,13 @@ use crate::workflow;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton,
+    MouseEventKind,
 };
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
+    EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::ExecutableCommand;
 use ratatui::buffer::Buffer;
@@ -34,11 +36,10 @@ use std::time::{Duration, Instant, SystemTime};
 use tui_term::widget::PseudoTerminal;
 
 use crate::theme::{
-    chip, dim, muted, rule, selected, ACCENT, ACCENT_SOFT, ALERT, ALERT_WASH, DRIVE_WASH, FG,
-    FG_DIM, FG_MUTED, GATE_WASH, HINT, INFO, INK, OK, RULE, WARN,
+    chip, dim, lerp, muted, page, rule, selected, toward_bg, ACCENT, ACCENT_SOFT, ALERT,
+    ALERT_WASH, BG_OVERLAY, DRIVE_WASH, FG, FG_DIM, FG_MUTED, GATE_WASH, HINT, INFO, INK, OK,
+    PULSE_HI, PULSE_LO, RULE, TRAIL_FALLOFF, WARN,
 };
-
-const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Chrome glyphs. One border language: a thin rule under the chrome bands, a thin
 /// seam between rail and Main, and a heavy underline marking the active tab.
@@ -46,9 +47,13 @@ const RULE_H: &str = "─";
 const RULE_SEAM: &str = "│";
 const RULE_TEE: &str = "┬";
 const TAB_MARK: &str = "━";
-/// The rail's selection bar. Replaces the old raised-background row highlight, which
-/// needed a page background to sit on.
+/// The rail's selection bar.
 const SEL_BAR: &str = "▌";
+/// The state-marker cell for a row that is working: a bar that breathes between
+/// `PULSE_LO` and `PULSE_HI` (U30). Deliberately not a spinner — a rail of eight
+/// runs with three spinners in it reads as noise, where three bars breathing in
+/// phase read as one fact.
+const LIVE_BAR: &str = "┃";
 
 /// Two focus targets, not an N-way ring: the drill-down rail and the one main
 /// area. `1` / `2` jump straight to one; `Tab` / `BackTab` cycles between them
@@ -89,6 +94,20 @@ const MAIN_TABS: [MainTab; 4] = [
     MainTab::Shell,
 ];
 
+/// Home's tabs. Log/Activity/Diff are all `f(a selected run)` and Home has none,
+/// so at Home the other three rendered the identical body and the strip offered
+/// three ways to change nothing (U31). Shell is genuinely still there: it is
+/// project-scoped, not run-scoped (see `manage_terminal`).
+const HOME_TABS: [MainTab; 2] = [MainTab::Log, MainTab::Shell];
+
+/// The tabs that mean something at `browse`, in strip and `[`/`]` order.
+fn tabs_for(browse: BrowseLevel) -> &'static [MainTab] {
+    match browse {
+        BrowseLevel::Home => &HOME_TABS,
+        _ => &MAIN_TABS,
+    }
+}
+
 impl MainTab {
     fn label(self) -> &'static str {
         match self {
@@ -98,14 +117,25 @@ impl MainTab {
             MainTab::Shell => "Shell",
         }
     }
-    fn idx(self) -> usize {
-        MAIN_TABS.iter().position(|t| *t == self).unwrap_or(0)
+
+    /// What this tab is called at `browse`. The Log tab is the run's live stream
+    /// everywhere except Home, where the same slot holds the landing detail — so
+    /// it is named for what it shows rather than for which slot it occupies.
+    fn label_at(self, browse: BrowseLevel) -> &'static str {
+        match (self, browse) {
+            (MainTab::Log, BrowseLevel::Home) => "Home",
+            _ => self.label(),
+        }
     }
-    fn next(self) -> Self {
-        MAIN_TABS[(self.idx() + 1) % MAIN_TABS.len()]
+
+    fn idx_in(self, tabs: &[MainTab]) -> usize {
+        tabs.iter().position(|t| *t == self).unwrap_or(0)
     }
-    fn prev(self) -> Self {
-        MAIN_TABS[(self.idx() + MAIN_TABS.len() - 1) % MAIN_TABS.len()]
+    fn next_in(self, tabs: &[MainTab]) -> Self {
+        tabs[(self.idx_in(tabs) + 1) % tabs.len()]
+    }
+    fn prev_in(self, tabs: &[MainTab]) -> Self {
+        tabs[(self.idx_in(tabs) + tabs.len() - 1) % tabs.len()]
     }
 }
 
@@ -270,6 +300,10 @@ pub fn run_with(opts: TuiOpts) -> Result<crate::exit_codes::ExitCode> {
     // Bracketed paste so the embedded tmux client receives pastes as one framed
     // chunk (Event::Paste) rather than a storm of synthetic keystrokes.
     out.execute(EnableBracketedPaste)?;
+    // Focus reporting: an unfocused window animates nothing (U30). Terminals that
+    // do not implement 1004 simply never send the events, which leaves `focused`
+    // at its startup `true` and the old always-animating behaviour.
+    out.execute(EnableFocusChange)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
     terminal.clear()?;
 
@@ -288,6 +322,7 @@ impl Drop for TerminalGuard {
         let _ = disable_raw_mode();
         let mut out = stdout();
         let _ = out.execute(DisableBracketedPaste);
+        let _ = out.execute(DisableFocusChange);
         let _ = out.execute(DisableMouseCapture);
         let _ = out.execute(LeaveAlternateScreen);
     }
@@ -360,6 +395,10 @@ enum HomeRow {
         band: HomeBand,
         n: usize,
     },
+    /// A band with nothing in it, saying so on its own row. The header alone is
+    /// reserved space (U14) but not an answer: "RUNNING" with a gap under it does
+    /// not distinguish "nothing is running" from "still loading". Not selectable.
+    Empty(HomeBand),
     /// Band 4's project switcher: an index into the snapshot's `projects` (for the
     /// lookups that need the full entry) plus that project's root, carried alongside
     /// so `home_row_key` has a stable identity that does not move when the registry
@@ -511,8 +550,16 @@ struct App {
     /// Scroll offset into the help overlay; reset whenever help is (re)opened.
     help_scroll: u16,
     /// Whether the current frame is part of an animation; drives the spinner so
-    /// it shows a static glyph when idle instead of a frame frozen mid-spin.
+    /// it shows a static glyph when idle instead of a frame frozen mid-spin, and
+    /// selects the frame clock (`FRAME_ANIMATING` vs `FRAME_IDLE`).
     animated: bool,
+    /// Whether the terminal window has keyboard focus, per DECSET 1004. A window
+    /// you are not looking at animates nothing (U30). Starts `true` so a terminal
+    /// that never reports focus behaves as it always did.
+    focused: bool,
+    /// The one motion time origin. Every animation derives its position from this
+    /// instant, so effects sharing a period stay in phase (U10).
+    clock: crate::motion::Clock,
     /// One status line carrying the breadcrumb; tapping it returns focus to the rail.
     rect_status: Rect,
     /// The drill-down rail (zero-sized when zoomed, or in narrow while Main is focused).
@@ -727,6 +774,8 @@ impl App {
             show_help: false,
             help_scroll: 0,
             animated: false,
+            focused: true,
+            clock: crate::motion::Clock::new(),
             rect_status: Rect::default(),
             rect_rail: Rect::default(),
             rect_main: Rect::default(),
@@ -771,11 +820,29 @@ impl App {
     }
 
     fn spinner(&self) -> &'static str {
-        if self.animated {
-            SPINNER[(self.tick as usize) % SPINNER.len()]
-        } else {
-            "·"
+        if !self.animated {
+            return "·";
         }
+        let phase = self.clock.cycle(crate::motion::SPIN_PERIOD);
+        crate::motion::frame(crate::motion::BRAILLE, phase).unwrap_or("·")
+    }
+
+    /// Brightness of a breathing gutter this frame, `0.0..1.0` (U10). One value
+    /// for the whole frame, so every live rail on screen breathes together
+    /// instead of each starting its own cycle when it appears.
+    fn pulse(&self) -> f32 {
+        if !self.animated {
+            return 0.55;
+        }
+        crate::motion::breathe(self.clock.cycle(crate::motion::BREATHE_PERIOD))
+    }
+
+    /// The colour of a live block's gutter, `depth` rows below its head. The head
+    /// breathes; each row below fades further toward the page, so a streaming
+    /// block reads as having a direction (U30).
+    fn gutter(&self, depth: usize) -> Color {
+        let head = lerp(PULSE_LO, PULSE_HI, self.pulse());
+        toward_bg(head, (depth as f32 * TRAIL_FALLOFF).min(1.0))
     }
 
     fn reset_stream_view(&mut self) {
@@ -1069,8 +1136,18 @@ fn new_run_fixture() -> NewRun {
 
 /// How often the background thread re-reads the run state from disk.
 const REFRESH: Duration = Duration::from_millis(200);
-/// Upper bound on how long the render thread sleeps; also the animation rate.
-const FRAME: Duration = Duration::from_millis(100);
+/// Upper bound on how long the render thread sleeps while something on screen is
+/// moving: ~60fps (U10). Nothing derives its *speed* from this — every animation
+/// reads the wall clock through `motion` — so raising or lowering it changes only
+/// how smooth the motion is.
+const FRAME_ANIMATING: Duration = Duration::from_millis(16);
+/// One full blink of a text cursor. Time-based like everything else, so it keeps
+/// its rate across the frame-clock ramp instead of speeding up sixfold (U10).
+const CURSOR_BLINK: Duration = Duration::from_millis(1060);
+/// Upper bound on how long the render thread sleeps with nothing moving. Long
+/// enough that an idle spar costs nothing, short enough that input still feels
+/// immediate, since any input wakes the loop rather than waiting this out.
+const FRAME_IDLE: Duration = Duration::from_millis(250);
 /// How often Home repaints purely to age its wait/age columns forward when nothing
 /// on disk moved. Home has no selected `full` run, so `animating()` never fires for
 /// it; without this a static Home (only gates/broken/finished rows) freezes its
@@ -1560,6 +1637,10 @@ fn push_home_band(
     now: DateTime<Utc>,
     cap: Option<usize>,
 ) {
+    if runs.is_empty() {
+        rows.push(HomeRow::Empty(band));
+        return;
+    }
     let shown = match cap {
         Some(c) => runs.len().min(c),
         None => runs.len(),
@@ -1735,67 +1816,160 @@ fn home_band_count(rows: &[HomeRow], band: HomeBand) -> usize {
 /// fresh at render time rather than trusting each row's stored `waited` (which is
 /// only as fresh as the last snapshot rebuild, and a gated run with nothing else
 /// changing can go a long time between rebuilds) — a review finding.
-fn home_overview(
+/// Main's body at Home: the **detail** of whatever the rail is sitting on.
+///
+/// This replaces a re-render of the rail's own list. Main is `f(rail selection)`
+/// at every other level (X2, U1) and Home was the one exception, which cost the
+/// whole right-hand pane to say a second time what the rail had already said. The
+/// list is the rail's job; saying what one row *is* is Main's.
+fn home_detail(
     rows: &[HomeRow],
+    projects: &[registry::ProjectEntry],
+    sel: usize,
     scope: &HomeScope,
     watermark: DateTime<Utc>,
     now: DateTime<Utc>,
+    width: u16,
 ) -> String {
-    let mut out = format!("\n  Home · {}\n\n", home_scope_label(scope));
-    let mut i = 0;
-    while i < rows.len() {
-        let HomeRow::Header(band) = rows[i] else {
-            i += 1;
-            continue;
-        };
-        // The Finished band's header names the watermark it is bounded by, so the
-        // operator knows what "last look" means without opening a project (AC-25).
-        let suffix = if band == HomeBand::Finished {
-            format!(" (since {})", relative_age(watermark))
-        } else {
-            String::new()
-        };
-        out.push_str(&format!("  {}{suffix}\n", home_band_label(band)));
-        let mut j = i + 1;
-        let mut any = false;
-        while j < rows.len() && !matches!(rows[j], HomeRow::Header(_)) {
-            match &rows[j] {
-                HomeRow::Run { run, .. } => {
-                    any = true;
-                    let flag = if run.wants > 1 {
-                        format!(" ⚑{}", run.wants)
-                    } else {
-                        String::new()
-                    };
-                    out.push_str(&format!(
-                        "    {} · {} · {} · waited {}{flag}\n",
-                        run.project_name.as_deref().unwrap_or("?"),
-                        truncate(home_display_id(run), 8),
-                        rail_phase(run.phase),
-                        relative_wait(home_wait(run.updated_at, now)),
-                    ));
+    // Two columns of padding, and never narrower than something can be read in.
+    let wrap_w = width.saturating_sub(4).max(20) as usize;
+    let Some(row) = rows.get(sel) else {
+        return format!("\n  Home · {}\n{}", home_scope_label(scope), HOME_ACTIONS);
+    };
+    let body = match row {
+        HomeRow::Header(band) => {
+            let n = home_band_count(rows, *band);
+            let mut out = format!("\n  {}\n\n", home_band_label(*band));
+            let what = match band {
+                HomeBand::NeedsMe => {
+                    "Runs stopped at a gate, broken, or abandoned. Ranked by how long \
+                     they have been waiting, longest first. Nothing here moves until \
+                     you move it."
                 }
-                HomeRow::More { n, .. } => {
-                    any = true;
-                    out.push_str(&format!("    … {n} more\n"));
+                HomeBand::Running => {
+                    "Runs with work in flight. They need nothing from you; the rail's \
+                     bar breathes while they are moving."
                 }
-                HomeRow::NewRun => {
-                    any = true;
-                    out.push_str("    n — start something new\n");
+                HomeBand::Finished => {
+                    "Runs that reached a terminal phase since your last look. The \
+                     watermark advances when you quit, so this band empties itself."
                 }
-                HomeRow::Project(..) => {}
-                HomeRow::Header(_) => unreachable!(),
+                HomeBand::StartNew => {
+                    "Compose a new run, or change which projects Home is looking at."
+                }
+            };
+            out.push_str(&wrap_indent(what, wrap_w, "  "));
+            out.push_str(&format!("\n\n  {n} row(s) in this band.\n"));
+            if *band == HomeBand::Finished {
+                out.push_str(&format!("  Last look: {} ago.\n", relative_age(watermark)));
             }
-            j += 1;
+            out
         }
-        if !any {
-            let t = home_band_empty_text(band);
-            if !t.is_empty() {
-                out.push_str(&format!("    {t}\n"));
+        HomeRow::Run { run, .. } => {
+            let mut out = String::from("\n");
+            out.push_str(&format!(
+                "  {} · {}\n",
+                run.project_name.as_deref().unwrap_or("?"),
+                home_display_id(run),
+            ));
+            out.push_str(&format!("  {}\n\n", rail_phase(run.phase)));
+            match run.task.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+                Some(task) => {
+                    out.push_str(&wrap_indent(task, wrap_w, "  "));
+                    out.push('\n');
+                }
+                // A run with no brief is a real state (a bare `spar review`), not a
+                // rendering gap: say so rather than leaving Main blank.
+                None => out.push_str("  (no brief on this run)\n"),
+            }
+            out.push('\n');
+            let waited = relative_wait(home_wait(run.updated_at, now));
+            out.push_str(&format!("  waited     {waited}\n"));
+            // Every variant is one word, so the Debug name is the spelling the
+            // operator types on the CLI.
+            out.push_str(&format!(
+                "  workflow   {}\n",
+                format!("{:?}", run.workflow).to_lowercase()
+            ));
+            out.push_str(&format!("  round      {}\n", run.round));
+            if run.wants > 1 {
+                out.push_str(&format!(
+                    "  legs       {} of this unit want you\n",
+                    run.wants
+                ));
+            }
+            if run.dry_run {
+                out.push_str("  dry-run    yes\n");
+            }
+            if run.abandoned {
+                out.push_str("  abandoned  no live orchestrator owns this run\n");
+            }
+            out.push_str("\n  Enter opens it.\n");
+            out
+        }
+        HomeRow::Empty(band) => format!(
+            "\n  {}\n\n  {}.\n",
+            home_band_label(*band),
+            home_band_empty_text(*band),
+        ),
+        HomeRow::More { band, n } => format!(
+            "\n  {}\n\n  {n} more row(s) than this band shows.\n\n  \
+             Enter opens the project to see all of them.\n",
+            home_band_label(*band),
+        ),
+        HomeRow::NewRun => String::from(
+            "\n  START SOMETHING NEW\n\n  \
+             Compose a run: a brief, a workflow, and a fleet.\n",
+        ),
+        HomeRow::Project(i, root) => {
+            let name = projects
+                .get(*i)
+                .and_then(|p| p.name.as_deref())
+                .unwrap_or_else(|| root.file_name().and_then(|s| s.to_str()).unwrap_or("?"));
+            format!(
+                "\n  {name}\n\n  {}\n\n  Enter scopes Home to this project.\n",
+                root.display(),
+            )
+        }
+    };
+    format!("{body}{HOME_ACTIONS}")
+}
+
+/// The standing actions, appended to every Home detail. Main is the whole screen
+/// at phone width, so this is the only CTA there is; it is a footer rather than a
+/// row so it cannot be scrolled away from or selected past.
+const HOME_ACTIONS: &str = "\n  ─────\n  n start something new · p projects · a next alert\n";
+
+/// Wrap `text` to `w` columns, prefixing every line with `indent`. Word-wrapping
+/// only: a token longer than the width goes on its own line rather than being cut,
+/// because the tokens that get long here are run ids and paths.
+fn wrap_indent(text: &str, w: usize, indent: &str) -> String {
+    let mut out = String::new();
+    for para in text.split('\n') {
+        let mut line = String::new();
+        for word in para.split_whitespace() {
+            if line.is_empty() {
+                line.push_str(word);
+            } else if line.chars().count() + 1 + word.chars().count() <= w {
+                line.push(' ');
+                line.push_str(word);
+            } else {
+                out.push_str(indent);
+                out.push_str(&line);
+                out.push('\n');
+                line.clear();
+                line.push_str(word);
             }
         }
-        out.push('\n');
-        i = j;
+        if !line.is_empty() {
+            out.push_str(indent);
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    // The caller decides the trailing blank line.
+    while out.ends_with('\n') {
+        out.pop();
     }
     out
 }
@@ -1836,6 +2010,7 @@ fn home_row_key(row: &HomeRow) -> String {
             )
         }
         HomeRow::More { band, .. } => format!("more:{band:?}"),
+        HomeRow::Empty(b) => format!("empty:{b:?}"),
         HomeRow::Project(_, root) => format!("proj:{}", root.display()),
         HomeRow::NewRun => "newrun".to_string(),
     }
@@ -1857,7 +2032,12 @@ fn resync_home_selection(app: &mut App, rows: &[HomeRow]) {
         }
     }
     let mut i = app.selected_home.min(rows.len() - 1);
-    let unselectable = |r: &HomeRow| matches!(r, HomeRow::Header(_) | HomeRow::More { .. });
+    let unselectable = |r: &HomeRow| {
+        matches!(
+            r,
+            HomeRow::Header(_) | HomeRow::More { .. } | HomeRow::Empty(_)
+        )
+    };
     if unselectable(&rows[i]) {
         if let Some(f) = (i..rows.len()).find(|&j| !unselectable(&rows[j])) {
             i = f;
@@ -2194,6 +2374,11 @@ fn diff_content(swarm: &SparPaths, full: Option<&RunState>, slot_idx: usize) -> 
 /// running slot). An active phase with no running slot — Suite, Review,
 /// Shipping — still animates so the header spinner keeps turning.
 fn animating(app: &App, snap: &Snapshot) -> bool {
+    // A window you are not looking at is not worth a frame (U30). Focus reporting
+    // is best-effort: a terminal that never sends it leaves `focused` true.
+    if !app.focused {
+        return false;
+    }
     app.flash.is_some()
         || app.editing_text()
         // A live terminal streams between disk snapshots; keep repainting it.
@@ -2410,6 +2595,11 @@ fn run_loop(
 
         if dirty {
             app.tick = app.tick.wrapping_add(1);
+            // Atomic frame (DECSET 2026). At `FRAME_ANIMATING` a 200-column repaint
+            // is otherwise wide enough to be caught mid-flight and tear. Terminals
+            // without it ignore both halves, so this costs nothing where it is not
+            // understood.
+            let _ = std::io::stdout().execute(BeginSynchronizedUpdate);
             terminal.draw(|f| {
                 draw(
                     f,
@@ -2426,10 +2616,16 @@ fn run_loop(
                     &mut rail_state,
                 );
             })?;
+            let _ = std::io::stdout().execute(EndSynchronizedUpdate);
             dirty = false;
         }
 
-        match msg_rx.recv_timeout(FRAME) {
+        let frame = if app.animated {
+            FRAME_ANIMATING
+        } else {
+            FRAME_IDLE
+        };
+        match msg_rx.recv_timeout(frame) {
             Ok(Msg::Data) => dirty = true,
             Ok(Msg::Flash(msg, color)) => {
                 app.flash(msg, color);
@@ -2474,6 +2670,10 @@ fn run_loop(
                             local_root.as_deref(),
                             rail_state.offset(),
                         ),
+                        // DECSET 1004. Repaint on the transition so the frame the
+                        // window is left on is the unfocused one, then stop.
+                        Event::FocusGained => app.focused = true,
+                        Event::FocusLost => app.focused = false,
                         // Forward a paste to the tmux client as bracketed paste.
                         Event::Paste(text) if app.shell_active() => {
                             if let Some(pane) = app.terminal_pane.as_ref() {
@@ -2673,10 +2873,10 @@ fn handle_key(
         }
         // ] / [ move between Main's tabs — the only thing that changes on screen.
         KeyCode::Char(']') => {
-            app.main_tab = app.main_tab.next();
+            app.main_tab = app.main_tab.next_in(tabs_for(app.browse));
         }
         KeyCode::Char('[') => {
-            app.main_tab = app.main_tab.prev();
+            app.main_tab = app.main_tab.prev_in(tabs_for(app.browse));
         }
         KeyCode::Char('+') => app.zoom = true,
         KeyCode::Char('_') => app.zoom = false,
@@ -3604,7 +3804,12 @@ fn step_home(rows: &[HomeRow], cur: usize, delta: i32) -> usize {
     // (`rail_enter`'s Home arm no-ops it) — selectable-but-inert reads as broken
     // (round-7 review finding), so it is excluded the same way a header is.
     let selectable: Vec<usize> = (0..rows.len())
-        .filter(|&i| !matches!(rows[i], HomeRow::Header(_) | HomeRow::More { .. }))
+        .filter(|&i| {
+            !matches!(
+                rows[i],
+                HomeRow::Header(_) | HomeRow::More { .. } | HomeRow::Empty(_)
+            )
+        })
         .collect();
     if selectable.is_empty() {
         return cur;
@@ -3813,7 +4018,7 @@ fn rail_enter(
                 // (AC-32).
                 open_new_run(app, projects, home_rows, local_root, None);
             }
-            Some(HomeRow::Header(_)) | Some(HomeRow::More { .. }) | None => {}
+            Some(HomeRow::Header(_) | HomeRow::More { .. } | HomeRow::Empty(_)) | None => {}
         },
         BrowseLevel::Projects => {
             if let Some(p) = projects.get(app.selected_project) {
@@ -4172,7 +4377,7 @@ fn rail_select(
         BrowseLevel::Home => {
             if matches!(
                 home_rows.get(row),
-                Some(HomeRow::Header(_)) | Some(HomeRow::More { .. })
+                Some(HomeRow::Header(_) | HomeRow::More { .. } | HomeRow::Empty(_))
             ) {
                 return false;
             }
@@ -4367,10 +4572,13 @@ fn draw(
     rail_state: &mut ListState,
 ) {
     let area = f.area();
-    // Full clear each frame — prevents styled-cell ghosting across the whole UI, and
-    // leaves every cell on the terminal's own background (no page fill: the host
-    // theme, and its transparency, show through).
+    // Full clear each frame — prevents styled-cell ghosting across the whole UI —
+    // then paint spar's own ground over it. U12 left the page to the host theme;
+    // U29 takes it back, because a raised band, a sunken output block and a fading
+    // gutter all need something to be raised or sunken *from*. The cost, paid
+    // knowingly, is host-theme transparency.
     f.render_widget(Clear, area);
+    f.buffer_mut().set_style(area, page());
 
     // On the first narrow render with an active run, land on the live log so a
     // phone glance shows progress — but only once, and never over a manual move.
@@ -4397,6 +4605,13 @@ fn draw(
         }
     }
 
+    // A level whose strip does not carry the active tab would light none of them
+    // and leave `[`/`]` starting from an index that is not on screen. Snap first.
+    let tabs = tabs_for(app.browse);
+    if !tabs.contains(&app.main_tab) {
+        app.main_tab = tabs[0];
+    }
+
     let driving = app.driving();
     let lay = layout_rects(area, app.focus, app.zoom, driving);
     // Keep mouse hit regions aligned with the frame actually painted.
@@ -4420,7 +4635,7 @@ fn draw(
             draw_context_band(f, lay.context, projects, runs, full, home, app);
         }
         if lay.labels.height > 0 {
-            draw_labels(f, &lay, swarm, projects, runs, full, home, app);
+            draw_labels(f, &lay, swarm, projects, runs, full, app);
             draw_rule(f, &lay, app);
         }
     }
@@ -4434,6 +4649,7 @@ fn draw(
         draw_main(
             f,
             lay.main,
+            projects,
             full,
             stream_text,
             activity,
@@ -4461,7 +4677,7 @@ fn draw(
 /// The Main tab strip. Labels + the Activity alert badge; the active tab is lit by
 /// weight and by the accent underline on the rule below it, never by a filled block.
 fn main_tab_spans(app: &App) -> Vec<(MainTab, String, Style)> {
-    MAIN_TABS
+    tabs_for(app.browse)
         .iter()
         .map(|t| {
             // Every tab reserves the same 4-column badge slot, blank unless it is
@@ -4477,7 +4693,7 @@ fn main_tab_spans(app: &App) -> Vec<(MainTab, String, Style)> {
             } else {
                 "    ".to_string()
             };
-            let text = format!("  {}{badge}  ", t.label());
+            let text = format!("  {}{badge}  ", t.label_at(app.browse));
             let style = if *t == app.main_tab {
                 Style::default().fg(ACCENT).bold()
             } else if *t == MainTab::Activity && app.human_alerts_n > 0 {
@@ -4502,7 +4718,6 @@ fn draw_labels(
     projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
-    home: &HomeData,
     app: &mut App,
 ) {
     let area = lay.labels;
@@ -4521,7 +4736,7 @@ fn draw_labels(
         // strip entirely does it fall back to gluing the badge onto Activity alone,
         // trading gap uniformity for keeping all four tabs on screen.
         let badge_w: u16 = if app.human_alerts_n > 0 { 4 } else { 0 };
-        let raw: Vec<(MainTab, &str, Style)> = MAIN_TABS
+        let raw: Vec<(MainTab, &str, Style)> = tabs_for(app.browse)
             .iter()
             .map(|t| {
                 let style = if *t == app.main_tab {
@@ -4531,7 +4746,7 @@ fn draw_labels(
                 } else {
                     dim()
                 };
-                (*t, t.label(), style)
+                (*t, t.label_at(app.browse), style)
             })
             .collect();
         let n = raw.len() as u16;
@@ -4633,7 +4848,7 @@ fn draw_labels(
     }
 
     if lay.rail.width > 0 {
-        let title = rail_title(projects, runs, full, home, app);
+        let title = rail_title(projects, runs, full, app);
         let rail_row = Rect {
             x: lay.rail.x.saturating_add(1),
             width: lay.rail.width.saturating_sub(1),
@@ -5092,23 +5307,30 @@ fn draw_context_band(
     }
 
     if app.browse == BrowseLevel::Home {
-        let need = home_needs_you(&home.rows);
+        // Deliberately not the ⚑ roll-up (header chip) or the scope (rail title):
+        // this row carries the portfolio totals, which are the one Home fact no
+        // other surface has.
         let running = home_band_count(&home.rows, HomeBand::Running);
         let finished = home_band_count(&home.rows, HomeBand::Finished);
+        let n_projects = home.project_stats.len();
+        let n_runs: usize = home.project_stats.iter().map(|p| p.n_runs).sum();
         let line = Line::from(vec![
-            Span::styled(
-                format!("{need} need you"),
-                Style::default().fg(if need > 0 { WARN } else { FG_MUTED }),
-            ),
+            Span::styled(format!("{n_projects} projects"), dim()),
+            Span::styled(" · ", muted()),
+            Span::styled(format!("{n_runs} runs"), dim()),
             Span::styled(" · ", muted()),
             Span::styled(
                 format!("{running} running"),
                 Style::default().fg(if running > 0 { INFO } else { FG_MUTED }),
             ),
             Span::styled(" · ", muted()),
-            Span::styled(format!("{finished} finished"), dim()),
-            Span::styled(" · ", muted()),
-            Span::styled(home_scope_label(&app.home_scope), muted()),
+            Span::styled(
+                format!(
+                    "{finished} finished since {}",
+                    relative_age(app.home_watermark)
+                ),
+                dim(),
+            ),
         ]);
         f.render_widget(Paragraph::new(line), pad);
         return;
@@ -5133,7 +5355,6 @@ fn draw_context_band(
             f.render_widget(Paragraph::new(line), pad);
             return;
         }
-        let need = runs_needing_attention(runs);
         let running = runs.iter().filter(|r| is_active_phase(r.phase)).count();
         let line = if runs.is_empty() {
             Line::from(Span::styled(
@@ -5141,17 +5362,13 @@ fn draw_context_band(
                 muted(),
             ))
         } else {
+            // No ⚑ term: the header chip carries the roll-up in every view (U31).
             Line::from(vec![
                 Span::styled(format!("{} runs", runs.len()), dim()),
                 Span::styled(" · ", muted()),
                 Span::styled(
                     format!("{running} running"),
                     Style::default().fg(if running > 0 { INFO } else { FG_MUTED }),
-                ),
-                Span::styled(" · ", muted()),
-                Span::styled(
-                    format!("⚑{need} need you"),
-                    Style::default().fg(if need > 0 { WARN } else { FG_MUTED }),
                 ),
             ])
         };
@@ -5324,8 +5541,11 @@ fn status_cue(
             );
         }
         let need = home_needs_you(&home.rows);
+        // With gates pending, the right-hand chip on this very row already flies
+        // `⚑N need you · a`. An inline cue repeating it made the roll-up appear
+        // twice in one row and four times in three (U31). Silence is the cue.
         return if need > 0 {
-            (format!("⚑{need} need you"), WARN, None)
+            (String::new(), WARN, None)
         } else {
             ("nothing needs you · n starts a run".into(), FG_MUTED, None)
         };
@@ -5659,11 +5879,13 @@ fn rail_title(
     projects: &[registry::ProjectEntry],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
-    home: &HomeData,
     app: &App,
 ) -> String {
     let base = match app.browse {
-        BrowseLevel::Home => format!("HOME  {} need you", home_needs_you(&home.rows)),
+        // Not the ⚑ roll-up: the header chip already flies that in every view, and
+        // three surfaces saying "9 need you" in three consecutive rows is what this
+        // row used to be part of. The rail's own fact is what it is listing.
+        BrowseLevel::Home => format!("HOME  {}", home_scope_label(&app.home_scope)),
         BrowseLevel::Projects => format!("PROJECTS  {}", projects.len()),
         BrowseLevel::Runs => format!("RUNS  {}", runs.len()),
         BrowseLevel::Agents => {
@@ -5712,10 +5934,20 @@ fn draw_rail(
     f.render_stateful_widget(List::new(items), area, state);
 }
 
-/// The lead columns: the selection bar, then the attention flag. Two cells, both fixed,
+/// The lead columns: the selection bar, then the state marker. Two cells, both fixed,
 /// because they are independent facts — one column for both meant that on a project
 /// where every run wants you (biddesk: 12 of 13) the cursor was invisible.
-fn rail_lead(sel: bool, focused: bool, flag: Option<Color>) -> Vec<Span<'static>> {
+///
+/// The second cell carries one of two mutually exclusive facts, in this order:
+/// a `⚑` when the row wants the operator, or a breathing [`LIVE_BAR`] when it is
+/// working (U30). Attention outranks activity — a row that both wants you and is
+/// moving is a row you should look at, and a pulse there would read as "fine".
+fn rail_lead(
+    sel: bool,
+    focused: bool,
+    flag: Option<Color>,
+    live: Option<Color>,
+) -> Vec<Span<'static>> {
     vec![
         if sel {
             Span::styled(
@@ -5725,11 +5957,39 @@ fn rail_lead(sel: bool, focused: bool, flag: Option<Color>) -> Vec<Span<'static>
         } else {
             Span::raw(" ")
         },
-        match flag {
-            Some(c) => Span::styled("⚑", Style::default().fg(c).bold()),
-            None => Span::raw(" "),
+        match (flag, live) {
+            (Some(c), _) => Span::styled("⚑", Style::default().fg(c).bold()),
+            (None, Some(c)) => Span::styled(LIVE_BAR, Style::default().fg(c)),
+            (None, None) => Span::raw(" "),
         },
     ]
+}
+
+/// A label under a travelling highlight: one span per cell, ramped from `base` to
+/// `peak` (U30). This is for work that is **dispatched but not yet producing** —
+/// the state a breathing gutter would over-claim, because nothing is moving yet.
+/// A sweep says "queued and alive"; the gutter says "working".
+fn sweep_spans(text: &str, base: Color, peak: Color, phase: f32) -> Vec<Span<'static>> {
+    let n = text.chars().count();
+    text.chars()
+        .enumerate()
+        .map(|(i, ch)| {
+            let t = crate::motion::sweep(i, n, SWEEP_HALF, phase);
+            Span::styled(ch.to_string(), Style::default().fg(lerp(base, peak, t)))
+        })
+        .collect()
+}
+
+/// Half-width of the sweep's highlight, in cells. Wide enough to read as a
+/// gradient rather than a moving dot, narrow enough that a nine-column role label
+/// is never lit end to end.
+const SWEEP_HALF: f32 = 3.5;
+
+/// The breathing colour for a run's state-marker cell, or `None` when the run is
+/// not moving. An abandoned run is in an active phase and going nowhere, so it
+/// never breathes — the red `⚑` it already flies is the true story.
+fn run_live(r: &state::RunSummary, app: &App) -> Option<Color> {
+    (!r.abandoned && is_active_phase(r.phase)).then(|| app.gutter(0))
 }
 
 /// A dimmed row for something the `/` filter did not match. Filtered rows stay in
@@ -5817,7 +6077,7 @@ fn rail_project_items(
                 ));
             }
             rail_row(
-                rail_lead(sel, focused, (stat.needs_you > 0).then_some(WARN)),
+                rail_lead(sel, focused, (stat.needs_you > 0).then_some(WARN), None),
                 body,
                 Span::styled(relative_age(p.last_seen), muted()),
                 w,
@@ -5868,7 +6128,7 @@ fn rail_home_items(
                         Span::styled(more, Style::default().fg(WARN).bold()),
                     ];
                     rail_row(
-                        rail_lead(sel, focused, flag),
+                        rail_lead(sel, focused, flag, run_live(run, app)),
                         body,
                         Span::styled(
                             relative_wait(home_wait(run.updated_at, Utc::now())),
@@ -5877,6 +6137,10 @@ fn rail_home_items(
                         w,
                     )
                 }
+                HomeRow::Empty(b) => ListItem::new(Span::styled(
+                    format!("  {}", home_band_empty_text(*b)),
+                    muted().italic(),
+                )),
                 HomeRow::More { n, .. } => ListItem::new(Span::styled(
                     format!("  … {n} more"),
                     Style::default().fg(FG_MUTED).italic(),
@@ -5894,7 +6158,7 @@ fn rail_home_items(
                             Style::default().fg(INFO)
                         },
                     )];
-                    rail_row(rail_lead(sel, focused, None), body, Span::raw(""), w)
+                    rail_row(rail_lead(sel, focused, None, None), body, Span::raw(""), w)
                 }
                 HomeRow::NewRun => {
                     let body = vec![Span::styled(
@@ -5905,7 +6169,7 @@ fn rail_home_items(
                             Style::default().fg(ACCENT)
                         },
                     )];
-                    rail_row(rail_lead(sel, focused, None), body, Span::raw(""), w)
+                    rail_row(rail_lead(sel, focused, None, None), body, Span::raw(""), w)
                 }
             }
         })
@@ -5961,7 +6225,7 @@ fn rail_run_items(
                 Span::styled(more, Style::default().fg(WARN).bold()),
             ];
             rail_row(
-                rail_lead(sel, focused, flag),
+                rail_lead(sel, focused, flag, run_live(r, app)),
                 body,
                 Span::styled(relative_age(r.updated_at), muted()),
                 w,
@@ -6006,19 +6270,37 @@ fn rail_slot_items(
             } else {
                 slot_status_label(s.status).to_string()
             };
-            let body = vec![
-                Span::styled(
-                    format!("{} ", slot_icon(s, app)),
-                    Style::default().fg(color),
-                ),
-                Span::styled(
-                    format!("{:<role_w$}", truncate(&slot_short(slots, i), role_w)),
+            let role = format!("{:<role_w$}", truncate(&slot_short(slots, i), role_w));
+            let mut body = vec![Span::styled(
+                format!("{} ", slot_icon(s, app)),
+                Style::default().fg(color),
+            )];
+            // A pending slot is dispatched and alive but has produced nothing yet:
+            // a sweep across its name says so without claiming work is happening.
+            if s.status == SlotStatus::Pending && app.animated {
+                body.extend(sweep_spans(
+                    &role,
+                    FG_MUTED,
+                    FG,
+                    app.clock.cycle(crate::motion::SWEEP_PERIOD),
+                ));
+            } else {
+                body.push(Span::styled(
+                    role,
                     if sel { selected(focused) } else { dim() },
-                ),
-                Span::styled(slot_model(s, model_w), Style::default().fg(HINT)),
-            ];
+                ));
+            }
+            body.push(Span::styled(
+                slot_model(s, model_w),
+                Style::default().fg(HINT),
+            ));
             rail_row(
-                rail_lead(sel, focused, broken.then_some(ALERT)),
+                rail_lead(
+                    sel,
+                    focused,
+                    broken.then_some(ALERT),
+                    (!broken && s.status == SlotStatus::Running).then(|| app.gutter(0)),
+                ),
                 body,
                 Span::styled(tail, Style::default().fg(color)),
                 w,
@@ -6034,6 +6316,7 @@ fn rail_slot_items(
 fn draw_main(
     f: &mut Frame,
     area: Rect,
+    projects: &[registry::ProjectEntry],
     full: Option<&RunState>,
     stream_text: &str,
     activity: &[String],
@@ -6065,7 +6348,7 @@ fn draw_main(
     // per-run Activity/Diff to show at a cross-project landing view. Shell stays the
     // real project-scoped workspace terminal regardless (see `manage_terminal`).
     if app.browse == BrowseLevel::Home && app.main_tab != MainTab::Shell {
-        draw_home_body(f, inner, home, app);
+        draw_home_body(f, inner, home, projects, app);
         return;
     }
 
@@ -6090,8 +6373,22 @@ fn draw_main(
 
 /// Main's Home body: the four bands (C7). Reuses the same scrollable-log viewport as
 /// the other no-run bodies.
-fn draw_home_body(f: &mut Frame, inner: Rect, home: &HomeData, app: &mut App) {
-    let text = home_overview(&home.rows, &app.home_scope, app.home_watermark, Utc::now());
+fn draw_home_body(
+    f: &mut Frame,
+    inner: Rect,
+    home: &HomeData,
+    projects: &[registry::ProjectEntry],
+    app: &mut App,
+) {
+    let text = home_detail(
+        &home.rows,
+        projects,
+        app.selected_home,
+        &app.home_scope,
+        app.home_watermark,
+        Utc::now(),
+        inner.width,
+    );
     app.stream_view_h = inner.height;
     app.stream_max = render_scrollable_log(
         f,
@@ -6383,6 +6680,7 @@ fn render_scrollable_log(
         height: area.height,
     };
     f.render_widget(Clear, text_area);
+    f.buffer_mut().set_style(text_area, page());
     f.render_widget(
         CellLog {
             lines: visible,
@@ -6685,7 +6983,35 @@ fn compact_log_line(raw: &str) -> String {
     if s.starts_with('…') {
         return format!("  {}", collapse_ws(s.trim_start_matches('…').trim()));
     }
-    collapse_ws(s)
+    // Plain lines keep their own spacing. The marker arms above collapse because
+    // what follows a `→`/`←` is one field the coalescer already joined; a plain
+    // line is the only place structure can arrive pre-aligned, and squashing it
+    // was the renderer destroying information the input had (feature 010's
+    // opening complaint). Tabs still normalise: terminals disagree on their width,
+    // so a tab is the one whitespace that cannot be trusted to hold a column.
+    expand_tabs(s)
+}
+
+/// Tabs to spaces on an 8-column grid. Rendering a tab verbatim leaves the column
+/// it lands in up to the host terminal, which is exactly what a fixed column
+/// cannot depend on.
+fn expand_tabs(s: &str) -> String {
+    if !s.contains('\t') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut col = 0usize;
+    for ch in s.chars() {
+        if ch == '\t' {
+            let n = 8 - (col % 8);
+            out.push_str(&" ".repeat(n));
+            col += n;
+        } else {
+            out.push(ch);
+            col += 1;
+        }
+    }
+    out
 }
 
 /// Drop the provider's tool-call id from a result line. It is ~27 columns of opaque
@@ -6837,6 +7163,8 @@ fn draw_palette(f: &mut Frame, area: Rect, runs: &[state::RunSummary], app: &mut
     };
     app.rect_palette = rect;
     f.render_widget(Clear, rect);
+    f.buffer_mut()
+        .set_style(rect, Style::default().bg(BG_OVERLAY));
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -6852,7 +7180,7 @@ fn draw_palette(f: &mut Frame, area: Rect, runs: &[state::RunSummary], app: &mut
         return;
     }
 
-    let cursor = if (app.tick / 6).is_multiple_of(2) {
+    let cursor = if app.clock.cycle(CURSOR_BLINK) < 0.5 {
         "▌"
     } else {
         " "
@@ -7194,6 +7522,8 @@ fn draw_help_overlay(f: &mut Frame, area: Rect, app: &mut App) {
         height: h,
     };
     f.render_widget(Clear, rect);
+    f.buffer_mut()
+        .set_style(rect, Style::default().bg(BG_OVERLAY));
     let title = if max_scroll > 0 {
         " Help · j/k scroll "
     } else {
@@ -7392,6 +7722,8 @@ fn draw_new_run(f: &mut Frame, area: Rect, projects: &[registry::ProjectEntry], 
         .collect();
     app.rect_new_run = rect;
     f.render_widget(Clear, rect);
+    f.buffer_mut()
+        .set_style(rect, Style::default().bg(BG_OVERLAY));
     let text: Vec<Line> = lines
         .into_iter()
         .take(inner_h)
@@ -8445,10 +8777,117 @@ mod labels {
 
     #[test]
     fn main_tabs_cycle_both_ways() {
-        assert_eq!(MainTab::Log.next(), MainTab::Activity);
-        assert_eq!(MainTab::Shell.next(), MainTab::Log);
-        assert_eq!(MainTab::Log.prev(), MainTab::Shell);
-        assert_eq!(MainTab::Diff.prev(), MainTab::Activity);
+        let all = &MAIN_TABS[..];
+        assert_eq!(MainTab::Log.next_in(all), MainTab::Activity);
+        assert_eq!(MainTab::Shell.next_in(all), MainTab::Log);
+        assert_eq!(MainTab::Log.prev_in(all), MainTab::Shell);
+        assert_eq!(MainTab::Diff.prev_in(all), MainTab::Activity);
+    }
+
+    /// U30. The state-marker column carries one fact, and attention outranks
+    /// activity: a run that both wants you and is moving must fly the flag, or
+    /// the pulse reads as "fine, leave it alone".
+    #[test]
+    fn the_state_marker_prefers_attention_over_activity() {
+        let glyph = |flag, live| {
+            rail_lead(false, false, flag, live)[1]
+                .content
+                .clone()
+                .into_owned()
+        };
+        assert_eq!(glyph(Some(WARN), Some(ACCENT)), "⚑", "both: flag wins");
+        assert_eq!(glyph(Some(WARN), None), "⚑");
+        assert_eq!(glyph(None, Some(ACCENT)), LIVE_BAR, "moving: it breathes");
+        assert_eq!(glyph(None, None), " ", "at rest: nothing");
+    }
+
+    /// The selection bar and the state marker stay two separate cells whatever
+    /// they carry, or a project where every run wants you hides the cursor.
+    #[test]
+    fn the_lead_columns_never_change_width() {
+        for flag in [None, Some(WARN)] {
+            for live in [None, Some(ACCENT)] {
+                for sel in [false, true] {
+                    let w: usize = rail_lead(sel, true, flag, live)
+                        .iter()
+                        .map(|s| s.content.chars().count())
+                        .sum();
+                    assert_eq!(w, 2, "sel={sel} flag={flag:?} live={live:?}");
+                }
+            }
+        }
+    }
+
+    /// An abandoned run sits in an active phase and is going nowhere. Breathing
+    /// for it would claim work is happening; the red flag is the true story.
+    #[test]
+    fn an_abandoned_run_does_not_breathe() {
+        let app = test_app();
+        let at = |phase| state::RunSummary {
+            id: "aband001".into(),
+            workflow: crate::cli::WorkflowKind::Loop,
+            archived: false,
+            phase,
+            updated_at: Utc::now(),
+            task: None,
+            dry_run: false,
+            abandoned: false,
+            parent_run: None,
+            round: 1,
+            legs: 1,
+            wants: 0,
+            unit_id: None,
+            base_ref: None,
+            base_commit: None,
+            project_root: None,
+            project_name: None,
+        };
+        let mut r = at(Phase::WaitCompletion);
+        assert!(run_live(&r, &app).is_some(), "an active run breathes");
+        r.abandoned = true;
+        assert!(run_live(&r, &app).is_none(), "an abandoned one does not");
+        assert!(
+            run_live(&at(Phase::Done), &app).is_none(),
+            "a finished run does not breathe"
+        );
+        assert!(
+            run_live(&at(Phase::AwaitingShipConfirm), &app).is_none(),
+            "a run parked at a gate is not moving"
+        );
+    }
+
+    /// The sweep marks a label without ever consuming or reordering it: a moving
+    /// highlight that dropped a character would be a rendering bug that only
+    /// shows up one frame in ten.
+    #[test]
+    fn a_swept_label_is_still_the_same_label() {
+        for phase in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let spans = sweep_spans("implementer", FG_MUTED, FG, phase);
+            let rebuilt: String = spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(rebuilt, "implementer", "phase {phase}");
+        }
+    }
+
+    /// At Home, Log/Activity/Diff all rendered the identical body, so the strip
+    /// offered three ways to change nothing (U31). The cycle must not visit them.
+    #[test]
+    fn home_cycles_only_the_tabs_that_mean_something() {
+        let home = tabs_for(BrowseLevel::Home);
+        assert_eq!(home, &[MainTab::Log, MainTab::Shell]);
+        assert_eq!(MainTab::Log.next_in(home), MainTab::Shell);
+        assert_eq!(MainTab::Shell.next_in(home), MainTab::Log);
+        assert_eq!(MainTab::Log.prev_in(home), MainTab::Shell);
+        // Named for what it shows, not for the slot it occupies.
+        assert_eq!(MainTab::Log.label_at(BrowseLevel::Home), "Home");
+        assert_eq!(MainTab::Log.label_at(BrowseLevel::Runs), "Log");
+        // Every other level keeps all four.
+        for lvl in [
+            BrowseLevel::Projects,
+            BrowseLevel::Runs,
+            BrowseLevel::Agents,
+        ] {
+            assert_eq!(tabs_for(lvl).len(), MAIN_TABS.len(), "{lvl:?}");
+        }
     }
 
     /// The tab strip must out-rank the terminal's mouse forwarding: on a phone it is
@@ -8837,16 +9276,7 @@ mod labels {
             false,
         );
         term.draw(|f| {
-            draw_labels(
-                f,
-                &lay,
-                &swarm,
-                &[],
-                &[],
-                Some(&st),
-                &HomeData::default(),
-                &mut app,
-            );
+            draw_labels(f, &lay, &swarm, &[], &[], Some(&st), &mut app);
             draw_rule(f, &lay, &app);
         })
         .unwrap();
@@ -10332,19 +10762,8 @@ mod render_stability {
                 height: 30,
             };
             let lay = layout_rects(area, Focus::Main, false, false);
-            term.draw(|f| {
-                draw_labels(
-                    f,
-                    &lay,
-                    &swarm,
-                    &[],
-                    &[],
-                    Some(&st),
-                    &HomeData::default(),
-                    &mut app,
-                )
-            })
-            .unwrap();
+            term.draw(|f| draw_labels(f, &lay, &swarm, &[], &[], Some(&st), &mut app))
+                .unwrap();
             // Column positions, not byte offsets: the Activity badge's `⚠` is a
             // multi-byte char, so a `str::find`-based byte offset silently drifts out
             // of alignment with the terminal columns `app.main_tabs` records.
@@ -10457,16 +10876,7 @@ mod render_stability {
                 };
                 let lay = layout_rects(area, Focus::Main, false, false);
                 term.draw(|f| {
-                    draw_labels(
-                        f,
-                        &lay,
-                        &swarm,
-                        &[],
-                        &[],
-                        Some(&st),
-                        &HomeData::default(),
-                        &mut app,
-                    );
+                    draw_labels(f, &lay, &swarm, &[], &[], Some(&st), &mut app);
                     draw_rule(f, &lay, &app);
                 })
                 .unwrap();
@@ -10514,19 +10924,8 @@ mod render_stability {
                     height: 30,
                 };
                 let lay = layout_rects(area, Focus::Main, false, false);
-                term.draw(|f| {
-                    draw_labels(
-                        f,
-                        &lay,
-                        &swarm,
-                        &[],
-                        &[],
-                        Some(&st),
-                        &HomeData::default(),
-                        &mut app,
-                    )
-                })
-                .unwrap();
+                term.draw(|f| draw_labels(f, &lay, &swarm, &[], &[], Some(&st), &mut app))
+                    .unwrap();
                 assert_eq!(
                     app.main_tabs.len(),
                     4,
@@ -10586,19 +10985,8 @@ mod render_stability {
                     !lay.narrow,
                     "width {width} unexpectedly took the narrow band"
                 );
-                term.draw(|f| {
-                    draw_labels(
-                        f,
-                        &lay,
-                        &swarm,
-                        &[],
-                        &[],
-                        Some(&st),
-                        &HomeData::default(),
-                        &mut app,
-                    )
-                })
-                .unwrap();
+                term.draw(|f| draw_labels(f, &lay, &swarm, &[], &[], Some(&st), &mut app))
+                    .unwrap();
                 assert_eq!(
                     app.main_tabs.len(),
                     4,
@@ -11244,9 +11632,15 @@ mod render_stability {
                 })
                 .collect(),
         };
+        // The rail carries the `… N more` row; Main's detail for a band header
+        // states the band's true total, which is the stronger claim and the one
+        // that does not depend on where the rail's viewport happens to end.
         let term = paint_home(120, 40, &projects, &home, |_| {});
         let text = whole(&term);
-        assert!(text.contains("more"), "a capped band must say so: {text:?}");
+        assert!(
+            text.contains(&format!("{needs_me} row(s) in this band")),
+            "a capped band must state its true size: {text:?}"
+        );
     }
 
     /// AC-4. Layout stability: the four band headers are present, in band
@@ -11289,30 +11683,49 @@ mod render_stability {
             ],
             project_stats: Vec::new(),
         };
-        // Main's body carries the four headers; assert on it directly so the
-        // ordering claim does not depend on the rail's viewport height.
+        // Assert on the row list itself: it is the source both the rail and Main
+        // render from, so the ordering claim depends on no viewport at all.
         for home in [&full, &drained] {
-            let body =
-                home_overview(&home.rows, &HomeScope::All, Utc::now(), Utc::now()).to_lowercase();
-            let idx = |needle: &str| {
-                body.find(needle)
-                    .unwrap_or_else(|| panic!("band header {needle:?} missing from: {body:?}"))
-            };
-            let a = idx("needs");
-            let b = idx("running");
-            let c = idx("finished");
-            let d = idx("start something new");
-            assert!(a < b && b < c && c < d, "bands out of order: {body:?}");
+            let bands: Vec<HomeBand> = home
+                .rows
+                .iter()
+                .filter_map(|r| match r {
+                    HomeRow::Header(b) => Some(*b),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                bands,
+                vec![
+                    HomeBand::NeedsMe,
+                    HomeBand::Running,
+                    HomeBand::Finished,
+                    HomeBand::StartNew
+                ],
+                "bands out of order"
+            );
         }
-        // Each empty band still says what is empty, on its own line.
-        let body =
-            home_overview(&drained.rows, &HomeScope::All, Utc::now(), Utc::now()).to_lowercase();
+        // Each empty band still says what is empty, on its own row in the rail —
+        // a header with a gap under it does not distinguish empty from loading.
+        // Built rather than hand-written: the claim is that the *builder* emits
+        // these for a drained workspace, which a literal fixture cannot show.
+        let built = build_home_rows(&[], &[], &HomeScope::All, Utc::now(), Utc::now());
+        let empties: Vec<&str> = built
+            .iter()
+            .filter_map(|r| match r {
+                HomeRow::Empty(b) => Some(home_band_empty_text(*b)),
+                _ => None,
+            })
+            .collect();
         for phrase in [
             "nothing needs you",
             "nothing running",
             "nothing finished since your last look",
         ] {
-            assert!(body.contains(phrase), "missing {phrase:?} in: {body:?}");
+            assert!(
+                empties.contains(&phrase),
+                "missing {phrase:?} in: {empties:?}"
+            );
         }
     }
 
@@ -11441,8 +11854,20 @@ mod render_stability {
         };
         let (home_gates, home_tabs) = probe(BrowseLevel::Home);
         let (runs_gates, runs_tabs) = probe(BrowseLevel::Runs);
-        assert_eq!(home_tabs, runs_tabs, "the tab strip moved at Home");
+        // The gate zone is reserved identically at every level: it must not move
+        // when the rail is browsed, which is the U11 claim.
         assert_eq!(home_gates, runs_gates, "the gate zone moved at Home");
+        // The strip itself carries a different tab set at Home (U31: Log/Activity/
+        // Diff are all f(a selected run) and Home has none), so it is not the same
+        // rects. What must hold is that both strips start at Main's own column —
+        // a strip that started somewhere else would read as a different pane.
+        assert_eq!(
+            home_tabs.first().map(|r: &Rect| r.x),
+            runs_tabs.first().map(|r: &Rect| r.x),
+            "the tab strip changed origin at Home"
+        );
+        assert_eq!(home_tabs.len(), 2, "Home carries Home + Shell");
+        assert_eq!(runs_tabs.len(), MAIN_TABS.len(), "a run carries all four");
     }
 
     /// AC-8. R9: at phone width the rail and Main do not coexist. Home must
@@ -11559,7 +11984,7 @@ mod render_stability {
             snap.home
                 .rows
                 .iter()
-                .all(|r| matches!(r, HomeRow::Header(_) | HomeRow::NewRun)),
+                .all(|r| matches!(r, HomeRow::Header(_) | HomeRow::Empty(_) | HomeRow::NewRun)),
             "no disk-backed rows, but the static chrome is present: {:?}",
             snap.home.rows
         );
@@ -12755,15 +13180,14 @@ mod home_ia {
             2,
             "the roll-up counts legs, not rows"
         );
+        // The `⚑N` suffix is rendered from `wants` by both the rail row and Main's
+        // detail; assert the fact rather than one of the two renderings.
         assert!(
-            home_overview(
-                &rows,
-                &HomeScope::All,
-                now - chrono::Duration::hours(6),
-                now
-            )
-            .contains("⚑2"),
-            "a multi-gate unit says so on screen"
+            rows.iter().any(|r| matches!(
+                r,
+                HomeRow::Run { run, .. } if run.wants == 2
+            )),
+            "a multi-gate unit must carry its leg count on the row"
         );
     }
 
