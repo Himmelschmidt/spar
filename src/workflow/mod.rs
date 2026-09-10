@@ -9,8 +9,10 @@ pub mod roles_resolve;
 
 use crate::cli::{Backend, WorkflowKind};
 use crate::config::Config;
+use crate::executor;
 use crate::exit_codes::ExitCode;
 use crate::paths::SparPaths;
+use crate::state::RunState;
 use crate::util;
 use anyhow::Result;
 
@@ -142,5 +144,68 @@ pub fn run_named(
         WorkflowKind::Roles => roles::run(opts, paths, cfg),
         WorkflowKind::Peer => peer::run(opts, paths, cfg),
         WorkflowKind::Review => review::run(opts, paths, cfg),
+    }
+}
+
+/// Shared `--detach` path for `arena`/`roles`/`peer`/`review`, matching what `plan` and
+/// `implement` already do: a busy-owner pre-flight, cap admission, then a `setsid`
+/// session of its own with a startup handshake — never a raw `Command::spawn()` left in
+/// the launcher's own session.
+pub fn detach_and_wait(state: &RunState, paths: &SparPaths, json: bool) -> Result<ExitCode> {
+    if let Some(owner) = crate::runlock::RunLock::owner(paths, &state.id) {
+        if owner.alive() {
+            return Err(crate::runlock::OrchestratorBusy {
+                run_id: state.id.clone(),
+                owner_pid: owner.pid,
+            }
+            .into());
+        }
+    }
+    if let Some(msg) = crate::daemon::maybe_enqueue(paths, state)? {
+        if json {
+            executor::emit_run_json(state)?;
+        } else {
+            executor::print_run_human(state);
+            println!("{msg}");
+        }
+        return Ok(ExitCode::Success);
+    }
+    let detached = match crate::process::spawn_detached_orchestrator(paths, &state.id) {
+        Ok(d) => d,
+        Err(e) => {
+            crate::daemon::release_reservation(paths, &state.id);
+            return Err(e);
+        }
+    };
+    let outcome = match crate::process::await_detached_start(paths, &state.id, detached) {
+        Ok(o) => o,
+        Err(e) => {
+            crate::daemon::release_reservation(paths, &state.id);
+            return Err(e);
+        }
+    };
+    match outcome {
+        crate::process::DetachOutcome::Confirmed { pid } => {
+            if json {
+                executor::emit_run_json(state)?;
+            } else {
+                executor::print_run_human(state);
+                println!(
+                    "detached (pid {pid}, session of its own); wait with: spar wait {}",
+                    state.id
+                );
+            }
+            Ok(ExitCode::Success)
+        }
+        crate::process::DetachOutcome::Completed => {
+            crate::daemon::release_reservation(paths, &state.id);
+            let state = RunState::load_for_display(paths, &state.id)?;
+            if json {
+                executor::emit_run_json(&state)?;
+            } else {
+                executor::print_run_human(&state);
+            }
+            Ok(state.exit_code())
+        }
     }
 }

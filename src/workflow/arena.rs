@@ -85,7 +85,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     state.save(paths)?;
 
     if opts.detach {
-        return detach(&state, opts.json);
+        return super::detach_and_wait(&state, paths, opts.json);
     }
 
     let _lock = crate::runlock::RunLock::acquire(paths, &state.id)?;
@@ -506,25 +506,4 @@ pub fn reconcile(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> R
         println!("reconcile complete for {run_id}; confirm ship when ready");
     }
     Ok(state.exit_code())
-}
-
-fn detach(state: &RunState, json: bool) -> Result<ExitCode> {
-    #[cfg(unix)]
-    {
-        let mut child_cmd = std::process::Command::new(std::env::current_exe()?);
-        child_cmd
-            .arg("__internal_continue")
-            .arg(&state.id)
-            .env("SPAR_INTERNAL", "1")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        let _ = child_cmd.spawn()?;
-    }
-    if json {
-        executor::emit_run_json(state)?;
-    } else {
-        executor::print_run_human(state);
-    }
-    Ok(ExitCode::Success)
 }

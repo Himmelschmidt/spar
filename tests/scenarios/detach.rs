@@ -159,6 +159,41 @@ fn internal_continue_on_a_vanished_run_fails_fast() {
     assert!(start.elapsed() < std::time::Duration::from_secs(5));
 }
 
+/// `arena`/`roles`/`peer`/`review` used to spawn their own raw, session-inheriting
+/// `Command::spawn()` for `--detach` instead of the shared handshake (`spawn_detached_orchestrator`
+/// and `await_detached_start`) that `plan`/`implement` already use. This is the
+/// same "dry-run finishes inside the first poll" case as
+/// `dry_run_detach_that_completes_inside_the_poll_reports_the_real_outcome` above, but
+/// for `run --workflow arena --detach`: it must report the run's real gate rather than
+/// unconditionally printing "detached" for a child a raw spawn never confirmed.
+#[test]
+fn arena_dry_run_detach_that_completes_inside_the_poll_reports_the_real_outcome() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    init_repo(&proj);
+
+    let out = spar_cmd()
+        .current_dir(&proj)
+        .args([
+            "run",
+            "--workflow",
+            "arena",
+            "--task",
+            "hello",
+            "--providers",
+            "cli:claude",
+            "--dry-run",
+            "--detach",
+            "--json",
+        ])
+        .assert()
+        .code(2);
+    let v = json_of(&out);
+    assert_eq!(v["phase"], "awaiting_winner_confirm");
+    assert_eq!(v["exit_code"], 2);
+}
+
 /// `implement --run --detach` against a run with a live orchestrator refuses instead
 /// of spawning a second one, naming the existing owner's pid (mirrors the guard
 /// `detach_implement` already had; `detach_self`/`plan --detach` on a replan now has

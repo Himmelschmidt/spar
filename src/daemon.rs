@@ -306,11 +306,23 @@ fn log_line(paths: &SparPaths, msg: &str) {
     }
 }
 
-/// Bucket a run's providers by `storage_key()`. Real slots once they exist; the
-/// projected fleet (feature 011) when a run is queued before any slot is dispatched.
+/// Bucket a run's *dispatchable* seats by `storage_key()`: real slots once they exist,
+/// the projected fleet (feature 011) when a run is queued before any slot is dispatched.
+///
+/// A slot at `Done`/`Failed`/`Stuck` is retained as run history (`prepare_implement_slots`
+/// deliberately keeps a completed planner slot around once the implementer seat is added)
+/// and will never occupy a concurrency seat again, so it must not count toward demand —
+/// otherwise a one-provider run with `max_slots_per_bucket = 1` never fits: its finished
+/// planner plus its pending implementer read as demand 2 against zero running supply,
+/// forever.
 fn run_demand(state: &RunState) -> HashMap<String, u32> {
     let providers: Vec<&str> = if !state.slots.is_empty() {
-        state.slots.iter().map(|s| s.provider.as_str()).collect()
+        state
+            .slots
+            .iter()
+            .filter(|s| matches!(s.status, SlotStatus::Pending | SlotStatus::Running))
+            .map(|s| s.provider.as_str())
+            .collect()
     } else {
         state
             .projected_fleet
@@ -457,8 +469,13 @@ pub fn maybe_enqueue(paths: &SparPaths, state: &RunState) -> Result<Option<Strin
         enqueued_at: Utc::now(),
     };
     let path = paths.queue_file(&state.id);
-    fs::write(&path, serde_json::to_string_pretty(&entry)?)
-        .with_context(|| format!("write {}", path.display()))?;
+    // Temp file + rename, not a plain `fs::write`: a crash or torn write mid-write must
+    // never leave a half-written spool file behind, since a malformed spool file is
+    // exactly what makes a run invisible to recovery (see `is_queued`).
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    fs::write(&tmp, serde_json::to_string_pretty(&entry)?)
+        .with_context(|| format!("write {}", tmp.display()))?;
+    fs::rename(&tmp, &path).with_context(|| format!("replace {}", path.display()))?;
     Ok(Some(format!(
         "queued behind capacity on {}; spar status {}",
         entry.buckets.join(", "),
@@ -570,9 +587,21 @@ fn drain_queue(paths: &SparPaths, cfg: &Config) {
     let mut entries: Vec<(PathBuf, QueueEntry)> = read
         .flatten()
         .filter_map(|e| {
-            let text = fs::read_to_string(e.path()).ok()?;
-            let entry: QueueEntry = serde_json::from_str(&text).ok()?;
-            Some((e.path(), entry))
+            let path = e.path();
+            let Ok(text) = fs::read_to_string(&path) else {
+                return None;
+            };
+            match serde_json::from_str::<QueueEntry>(&text) {
+                Ok(entry) => Some((path, entry)),
+                Err(_) => {
+                    // A crash or torn write can leave a malformed spool file. Retaining
+                    // it forever would wedge its run behind a corpse: `is_queued`
+                    // already treats an unparseable file as not-owning, so remove it
+                    // here too and let normal abandonment recovery apply.
+                    let _ = fs::remove_file(&path);
+                    None
+                }
+            }
         })
         .collect();
     entries.sort_by_key(|(_, e)| e.enqueued_at);
@@ -584,10 +613,21 @@ fn drain_queue(paths: &SparPaths, cfg: &Config) {
         };
         // The spool file is the only record of "this run wants to launch"; an operator
         // `spar stop` on a queued run clears it (see `stop_one`), but a stale entry can
-        // still exist if the state moved on some other way. A queued run is always still
-        // `Phase::Init` with nobody holding its lock — anything else means the run is no
-        // longer the daemon's to admit, so discard the entry rather than dispatch it.
-        if state.phase != crate::state::Phase::Init
+        // still exist if the state moved on some other way. A freshly queued run sits at
+        // `Phase::Init` with nobody holding its lock. A queued *resumption* (`spar resume
+        // --detach` on a stopped run, admission-blocked by the cap) sits at
+        // `Phase::Stopped` instead, and `resume` always clears the `stopped` marker
+        // *before* enqueueing — so a `Phase::Stopped` entry with the marker still present
+        // is a genuinely stale one (the operator asked to stop it and the queue file
+        // should have been cancelled, see `stop_one`) and must still be discarded, not
+        // dispatched. Only a marker-free `Stopped` entry is a legitimate queued resume.
+        let stale_stopped = state.phase == crate::state::Phase::Stopped
+            && crate::markers::marker_exists(paths, &entry.run_id, "stopped");
+        if stale_stopped
+            || !matches!(
+                state.phase,
+                crate::state::Phase::Init | crate::state::Phase::Stopped
+            )
             || crate::state::orchestrator_alive(paths, &entry.run_id)
         {
             let _ = fs::remove_file(&path);
@@ -1081,8 +1121,11 @@ mod tests {
         let paths = SparPaths::new(tmp.path());
         // A queue entry the operator's `spar stop` should have cancelled (see
         // `stop_one` in `src/main.rs`) but, hypothetically, did not: the run itself has
-        // moved off `Init` to `Stopped`, so the spool file is stale and must never be
-        // admitted.
+        // moved off `Init` to `Stopped` *and the operator's stop marker is still set*
+        // (as `reap_run` always writes it), so the spool file is stale and must never
+        // be admitted. This is what actually distinguishes a stale entry from a
+        // legitimately queued `spar resume --detach` (see the admits-a-queued-resume
+        // test below), which always clears the marker before enqueueing.
         let mut state = RunState::new(
             "r1",
             crate::cli::WorkflowKind::Loop,
@@ -1090,6 +1133,7 @@ mod tests {
         );
         state.phase = crate::state::Phase::Stopped;
         state.save(&paths).unwrap();
+        crate::markers::write_marker(&paths, "r1", "stopped", "stopped by operator\n").unwrap();
         std::fs::create_dir_all(paths.queue_dir()).unwrap();
         std::fs::write(
             paths.queue_file("r1"),
@@ -1113,6 +1157,57 @@ mod tests {
         assert!(
             !paths.logs_dir("r1").join("orchestrator.log").is_file(),
             "a stopped run must never be spawned from the admission queue"
+        );
+    }
+
+    #[test]
+    fn drain_queue_treats_a_marker_free_stopped_entry_as_a_live_resume_not_stale() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        // Mirrors `spar resume --detach` on a stopped run that hit a full cap: `resume`
+        // clears the `stopped` marker before enqueueing, so unlike the genuinely stale
+        // case above, this entry must survive the phase/marker gate and reach the
+        // capacity decision — proven here by denying it on cap (via another run's real
+        // `Running` slot occupying the one seat) without ever spawning a process, and
+        // asserting the entry is *retained* rather than discarded.
+        let mut state = RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.phase = crate::state::Phase::Stopped;
+        let mut slot =
+            crate::executor::init_slot("impl", "cli:claude", crate::state::SlotRole::Implementer);
+        slot.status = SlotStatus::Pending;
+        state.slots.push(slot);
+        state.save(&paths).unwrap();
+        std::fs::create_dir_all(paths.queue_dir()).unwrap();
+        std::fs::write(
+            paths.queue_file("r1"),
+            serde_json::json!({
+                "run_id": "r1",
+                "buckets": ["cli:claude"],
+                "enqueued_at": Utc::now().to_rfc3339(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // Occupies the only seat in the bucket so `try_admit` denies r1 without this
+        // test ever needing a real orchestrator to spawn and confirm.
+        running_run(&paths, "other", "cli:claude");
+
+        let mut cfg = Config::default();
+        cfg.daemon.max_slots_per_bucket = 1;
+        drain_queue(&paths, &cfg);
+
+        assert!(
+            paths.queue_file("r1").is_file(),
+            "a marker-free stopped resume must be retained (blocked on capacity), not \
+             discarded as stale"
+        );
+        assert!(
+            !paths.logs_dir("r1").join("orchestrator.log").is_file(),
+            "denied-on-capacity must never attempt a spawn"
         );
     }
 

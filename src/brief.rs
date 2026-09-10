@@ -5,7 +5,8 @@
 
 use crate::paths::SparPaths;
 use anyhow::{Context, Result};
-use std::io::Read;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 pub struct Brief {
@@ -38,12 +39,36 @@ pub fn read_spec_text(spec: &Path) -> Result<String> {
 /// happen to share a title must not clobber each other.
 pub fn intake(paths: &SparPaths, spec: &Path) -> Result<Brief> {
     let body = read_spec_text(spec)?;
-    let slug = unique_slug(paths, &slug_of(&body));
+    let base = slug_of(&body);
     let dir = paths.briefs_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let path = paths.brief_file(&slug);
-    std::fs::write(&path, &body).with_context(|| format!("write {}", path.display()))?;
-    Ok(Brief { slug, path, body })
+
+    // Exclusive create, not check-then-write: two concurrent `plan --spec` calls with
+    // the same title racing past a plain `exists()` check would both pick `<slug>.md`
+    // and the second write would clobber the first. `create_new` makes the filesystem
+    // the arbiter, and an `AlreadyExists` just means try the next suffix.
+    let mut candidate = base.clone();
+    let mut n = 1u32;
+    let path = loop {
+        let path = paths.brief_file(&candidate);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut f) => {
+                f.write_all(body.as_bytes())
+                    .with_context(|| format!("write {}", path.display()))?;
+                break path;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                n += 1;
+                candidate = format!("{base}-{n}");
+            }
+            Err(e) => return Err(e).with_context(|| format!("create {}", path.display())),
+        }
+    };
+    Ok(Brief {
+        slug: candidate,
+        path,
+        body,
+    })
 }
 
 /// The first `# ` heading, else the first non-empty line; lowercased, non-alphanumerics
@@ -78,20 +103,6 @@ fn slug_of(body: &str) -> String {
         slug = "brief".to_string();
     }
     slug
-}
-
-fn unique_slug(paths: &SparPaths, base: &str) -> String {
-    if !paths.brief_file(base).exists() {
-        return base.to_string();
-    }
-    let mut n = 2;
-    loop {
-        let candidate = format!("{base}-{n}");
-        if !paths.brief_file(&candidate).exists() {
-            return candidate;
-        }
-        n += 1;
-    }
 }
 
 #[cfg(test)]

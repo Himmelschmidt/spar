@@ -831,8 +831,22 @@ pub fn is_abandoned(phase: Phase, orchestrator_alive: bool) -> bool {
 /// orchestrator of its own yet. Without this check `is_abandoned(Init, false)` reads a
 /// queued run as abandoned to `status`, `wait` and the daemon's own sweep alike — it is
 /// owned by the queue, not orphaned.
+///
+/// A spool file that exists but fails to parse (a crash or torn write mid-`fs::write`,
+/// before the queue writer moved to a temp-file-plus-rename) does not own the run: a
+/// bookkeeping failure must never be the thing that makes a run invisible to recovery.
+/// Such a file is removed on sight so normal abandonment detection takes over instead of
+/// wedging the run behind a corpse forever.
 pub fn is_queued(paths: &SparPaths, run_id: &str) -> bool {
-    paths.queue_file(run_id).is_file()
+    let path = paths.queue_file(run_id);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    if serde_json::from_str::<serde_json::Value>(&text).is_ok() {
+        return true;
+    }
+    let _ = std::fs::remove_file(&path);
+    false
 }
 
 /// Whether `spar cleanup --all` may reap this run's worktrees.
