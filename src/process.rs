@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -437,12 +438,11 @@ pub fn run_captured(
         req.args.join(" "),
         req.cwd.display()
     );
-    {
-        let mut f = File::create(&req.log_path)
-            .with_context(|| format!("create log {}", req.log_path.display()))?;
-        f.write_all(header.as_bytes())?;
-        f.flush()?;
-    }
+    let writer = std::sync::Arc::new(
+        LogWriter::create(&req.log_path)
+            .with_context(|| format!("create log {}", req.log_path.display()))?,
+    );
+    writer.append(&header)?;
     let mut initial = StreamStats::default();
     initial.touch_log();
     let _ = initial.save(&req.log_path);
@@ -476,20 +476,20 @@ pub fn run_captured(
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let log_path = req.log_path.clone();
-    let log_err = req.log_path.clone();
+    let writer_out = writer.clone();
+    let writer_err = writer.clone();
     let stats_holder = std::sync::Arc::new(std::sync::Mutex::new(StreamStats::default()));
     let stats_out = stats_holder.clone();
     let stats_err = stats_holder.clone();
 
     let t_out = std::thread::spawn(move || {
         if let Some(out) = stdout {
-            stream_to_log(out, &log_path, false, stats_out);
+            stream_to_log(out, &writer_out, false, stats_out);
         }
     });
     let t_err = std::thread::spawn(move || {
         if let Some(err) = stderr {
-            stream_to_log(err, &log_err, true, stats_err);
+            stream_to_log(err, &writer_err, true, stats_err);
         }
     });
 
@@ -505,7 +505,7 @@ pub fn run_captured(
                     let _ = t_err.join();
                     #[cfg(unix)]
                     shutdown::untrack(tracked_pid);
-                    append_log(&req.log_path, "\n! timed out\n")?;
+                    writer.append("\n! timed out\n")?;
                     let stats = stats_holder.lock().map(|s| s.clone()).unwrap_or_default();
                     let _ = stats.save(&req.log_path);
                     return Ok(SpawnResult {
@@ -842,10 +842,11 @@ pub fn extract_muse_session_id(line: &str) -> Option<String> {
 
 fn stream_to_log(
     pipe: impl Read,
-    log_path: &Path,
+    writer: &LogWriter,
     is_err: bool,
     stats: std::sync::Arc<std::sync::Mutex<StreamStats>>,
 ) {
+    let log_path = writer.log_path.clone();
     let reader = BufReader::new(pipe);
     let mut c = StreamCoalescer::new(is_err);
     for line in reader.lines() {
@@ -860,7 +861,7 @@ fn stream_to_log(
         let chunk = c.feed(&line);
         let appended = chunk
             .as_ref()
-            .map(|ch| append_log(log_path, ch).is_ok())
+            .map(|ch| writer.append(ch).is_ok())
             .unwrap_or(false);
         if let Ok(mut s) = stats.lock() {
             if appended {
@@ -869,7 +870,7 @@ fn stream_to_log(
                 s.touch_log();
             }
             c.merge_counters_into(&mut s);
-            let _ = s.save(log_path);
+            let _ = s.save(&log_path);
         }
     }
     // The final merge is unconditional. Counters used to ride along with a log append,
@@ -879,7 +880,7 @@ fn stream_to_log(
     let tail = c.finish();
     let appended = tail
         .as_ref()
-        .map(|chunk| append_log(log_path, chunk).is_ok())
+        .map(|chunk| writer.append(chunk).is_ok())
         .unwrap_or(false);
     if let Ok(mut s) = stats.lock() {
         if appended {
@@ -890,7 +891,7 @@ fn stream_to_log(
             s.touch_log();
         }
         c.merge_counters_into(&mut s);
-        let _ = s.save(log_path);
+        let _ = s.save(&log_path);
     }
 }
 
@@ -2030,11 +2031,106 @@ fn truncate_json(v: &serde_json::Value, max: usize) -> String {
     first_line(&s, max)
 }
 
-fn append_log(path: &Path, text: &str) -> Result<()> {
-    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
-    f.write_all(text.as_bytes())?;
-    f.flush()?;
-    Ok(())
+/// Sidecar path for a slot log's byte-offset -> time index (U33/AC-9). Mirrors
+/// `StreamStats::stats_path`'s "same stem, new suffix" convention.
+pub fn log_index_path(log_path: &Path) -> PathBuf {
+    let mut p = log_path.to_path_buf();
+    let stem = log_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("slot");
+    p.set_file_name(format!("{stem}.log.idx"));
+    p
+}
+
+/// Index entries with `from <= offset < to`, sorted by offset (the file is append-only,
+/// so on-disk order already is offset order). A missing or unreadable index is not an
+/// error — it means "this log predates the index" and callers render times as `None`.
+pub fn read_log_index(log_path: &Path, from: u64, to: u64) -> Result<Vec<(u64, DateTime<Utc>)>> {
+    let index_path = log_index_path(log_path);
+    let text = match std::fs::read_to_string(&index_path) {
+        Ok(t) => t,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(offset), Some(millis)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let (Ok(offset), Ok(millis)) = (offset.parse::<u64>(), millis.parse::<i64>()) else {
+            continue;
+        };
+        if offset < from || offset >= to {
+            continue;
+        }
+        if let Some(at) = Utc.timestamp_millis_opt(millis).single() {
+            out.push((offset, at));
+        }
+    }
+    Ok(out)
+}
+
+struct LogWriterState {
+    log: File,
+    index: File,
+}
+
+/// One writer shared by `run_captured`'s stdout and stderr coalescer threads (plus the
+/// timeout path), so log append and index append happen under a single lock. Observing
+/// the log's length from two independent `O_APPEND` writers races: both can succeed while
+/// disagreeing about which wrote first, which desyncs the index from the bytes it claims
+/// to describe. Serializing "offset, write, index entry, flush" here removes the race
+/// instead of trying to detect it after the fact (correction #2).
+pub struct LogWriter {
+    log_path: PathBuf,
+    inner: std::sync::Mutex<LogWriterState>,
+}
+
+impl LogWriter {
+    /// Fresh log: truncates any prior log and index (a re-dispatch must not read a
+    /// previous dispatch's times).
+    pub fn create(log_path: &Path) -> Result<Self> {
+        Self::open_with(log_path, true)
+    }
+
+    fn open_with(log_path: &Path, truncate: bool) -> Result<Self> {
+        if let Some(parent) = log_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let index_path = log_index_path(log_path);
+        let log = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(truncate)
+            .open(log_path)?;
+        let index = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(truncate)
+            .open(&index_path)?;
+        Ok(Self {
+            log_path: log_path.to_path_buf(),
+            inner: std::sync::Mutex::new(LogWriterState { log, index }),
+        })
+    }
+
+    /// Appends `text` to the log and one matching `<offset> <epoch_millis>` line to the
+    /// index, atomically with respect to any other appender sharing this writer. Returns
+    /// the byte offset `text` was written at.
+    pub fn append(&self, text: &str) -> Result<u64> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("log writer lock poisoned"))?;
+        let offset = state.log.seek(SeekFrom::End(0))?;
+        state.log.write_all(text.as_bytes())?;
+        state.log.flush()?;
+        let millis = Utc::now().timestamp_millis();
+        writeln!(state.index, "{offset} {millis}")?;
+        state.index.flush()?;
+        Ok(offset)
+    }
 }
 
 pub struct TailLog {
@@ -2042,6 +2138,10 @@ pub struct TailLog {
     pub truncated: bool,
     /// True when open/read failed (caller should not cache as a successful empty).
     pub io_error: bool,
+    /// The byte offset `text` begins at, adjusted past any UTF-8 continuation byte a raw
+    /// seek landed on. Never the pre-adjustment seek position (AC-10): a parser mapping
+    /// this tail back to the time index would otherwise be off by the skipped bytes.
+    pub start: u64,
 }
 
 pub fn tail_log(path: &Path, max_bytes: usize) -> String {
@@ -2055,6 +2155,7 @@ pub fn tail_log_info(path: &Path, max_bytes: usize) -> TailLog {
             text: String::new(),
             truncated: false,
             io_error: true,
+            start: 0,
         };
     };
     let Ok(len) = f.seek(SeekFrom::End(0)) else {
@@ -2062,9 +2163,11 @@ pub fn tail_log_info(path: &Path, max_bytes: usize) -> TailLog {
             text: String::new(),
             truncated: false,
             io_error: true,
+            start: 0,
         };
     };
     let truncated = len > max_bytes as u64;
+    let seek_pos = if truncated { len - max_bytes as u64 } else { 0 };
     if truncated {
         let back = max_bytes as u64;
         if f.seek(SeekFrom::End(-(back as i64))).is_err() {
@@ -2072,6 +2175,7 @@ pub fn tail_log_info(path: &Path, max_bytes: usize) -> TailLog {
                 text: String::new(),
                 truncated: false,
                 io_error: true,
+                start: 0,
             };
         }
     } else if f.seek(SeekFrom::Start(0)).is_err() {
@@ -2079,6 +2183,7 @@ pub fn tail_log_info(path: &Path, max_bytes: usize) -> TailLog {
             text: String::new(),
             truncated: false,
             io_error: true,
+            start: 0,
         };
     }
     let mut buf = Vec::new();
@@ -2087,18 +2192,22 @@ pub fn tail_log_info(path: &Path, max_bytes: usize) -> TailLog {
             text: String::new(),
             truncated: false,
             io_error: true,
+            start: 0,
         };
     }
+    let mut start = seek_pos;
     if truncated {
-        let start = next_char_boundary(&buf, 0);
-        if start > 0 {
-            buf = buf[start..].to_vec();
+        let skip = next_char_boundary(&buf, 0);
+        if skip > 0 {
+            buf = buf[skip..].to_vec();
         }
+        start += skip as u64;
     }
     TailLog {
         text: String::from_utf8_lossy(&buf).into_owned(),
         truncated,
         io_error: false,
+        start,
     }
 }
 
@@ -3117,9 +3226,10 @@ mod tests {
             "
 ",
         );
+        let writer = LogWriter::create(&log).unwrap();
         stream_to_log(
             std::io::Cursor::new(stdout.as_bytes()),
-            &log,
+            &writer,
             false,
             stats.clone(),
         );
@@ -3128,7 +3238,7 @@ mod tests {
                 b"runtime command acknowledgement timed out after 30s
 ",
             ),
-            &log,
+            &writer,
             true,
             stats.clone(),
         );
@@ -3165,9 +3275,10 @@ mod tests {
             "
 ",
         );
+        let writer = LogWriter::create(&log).unwrap();
         stream_to_log(
             std::io::Cursor::new(stream.as_bytes()),
-            &log,
+            &writer,
             false,
             stats.clone(),
         );
@@ -3218,12 +3329,13 @@ mod tests {
         let log = tmp.path().join("slot.log");
         let stats = std::sync::Arc::new(std::sync::Mutex::new(StreamStats::default()));
         stats.lock().unwrap().model = Some("claude-opus".into());
+        let writer = LogWriter::create(&log).unwrap();
         stream_to_log(
             std::io::Cursor::new(
                 b"plain trailing line
 ",
             ),
-            &log,
+            &writer,
             false,
             stats.clone(),
         );
@@ -3331,7 +3443,7 @@ mod tests {
     fn serialized_log_writer_keeps_index_offsets_monotonic_under_concurrent_appends() {
         let tmp = tempdir().unwrap();
         let log = tmp.path().join("stream.log");
-        let writer = std::sync::Arc::new(LogWriter::open(&log).unwrap());
+        let writer = std::sync::Arc::new(LogWriter::create(&log).unwrap());
         let left = writer.clone();
         let right = writer.clone();
         let first = std::thread::spawn(move || left.append("stdout\n"));

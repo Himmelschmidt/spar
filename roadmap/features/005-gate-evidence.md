@@ -1,7 +1,7 @@
 ---
 id: 5
 title: Gate evidence
-status: backlog
+status: in-progress
 milestone: 6
 effort: M
 priority: high

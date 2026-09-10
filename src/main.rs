@@ -18,6 +18,7 @@ mod process;
 mod provider_ref;
 mod providers;
 mod quota;
+mod record;
 mod registry;
 mod runlock;
 mod sandbox;

@@ -5,6 +5,7 @@ use crate::liveness::SlotActivity;
 use crate::paths::{self, SparPaths};
 use crate::process;
 use crate::quota::QuotaStore;
+use crate::record::{self, Record, RecordKind, SourceId};
 use crate::registry;
 use crate::state::{self, Phase, RunState, SlotRole, SlotState, SlotStatus};
 use crate::tmux;
@@ -37,8 +38,8 @@ use tui_term::widget::PseudoTerminal;
 
 use crate::theme::{
     chip, dim, lerp, muted, page, rule, selected, toward_bg, ACCENT, ACCENT_SOFT, ALERT,
-    ALERT_WASH, BG_OVERLAY, DRIVE_WASH, FG, FG_DIM, FG_MUTED, GATE_WASH, HINT, INFO, INK, OK,
-    PULSE_HI, PULSE_LO, RULE, TRAIL_FALLOFF, WARN,
+    ALERT_WASH, BG_OVERLAY, CODE, DRIVE_WASH, FG, FG_DIM, FG_MUTED, GATE_WASH, HINT, INFO, INK, OK,
+    PULSE_HI, PULSE_LO, RULE, SURFACE_RAISED, SURFACE_SUNKEN, TRAIL_FALLOFF, WARN,
 };
 
 /// Chrome glyphs. One border language: a thin rule under the chrome bands, a thin
@@ -83,14 +84,19 @@ enum MainTab {
     Log,
     Activity,
     Diff,
+    Plan,
+    Review,
     Shell,
 }
 
 /// Tab strip order — also the `[` / `]` cycle order and the narrow strip order.
-const MAIN_TABS: [MainTab; 4] = [
+/// Plan and Review (U9/U35) land feature 005's remainder as their own surfaces.
+const MAIN_TABS: [MainTab; 6] = [
     MainTab::Log,
     MainTab::Activity,
     MainTab::Diff,
+    MainTab::Plan,
+    MainTab::Review,
     MainTab::Shell,
 ];
 
@@ -114,7 +120,23 @@ impl MainTab {
             MainTab::Log => "Log",
             MainTab::Activity => "Activity",
             MainTab::Diff => "Diff",
+            MainTab::Plan => "Plan",
+            MainTab::Review => "Review",
             MainTab::Shell => "Shell",
+        }
+    }
+
+    /// Narrow strip label (U35). Six tabs don't fit `<80` at full labels; every tab
+    /// abbreviates uniformly rather than fitting per-tab, which would move the strip
+    /// as labels changed length (U11).
+    fn short_label(self) -> &'static str {
+        match self {
+            MainTab::Log => "Log",
+            MainTab::Activity => "Act",
+            MainTab::Diff => "Diff",
+            MainTab::Plan => "Plan",
+            MainTab::Review => "Rev",
+            MainTab::Shell => "Sh",
         }
     }
 
@@ -522,6 +544,8 @@ struct App {
     stream_scroll: u16,
     bus_scroll: u16,
     diff_scroll: u16,
+    plan_scroll: u16,
+    review_scroll: u16,
     /// When true, keep the live log pinned to the newest line as content grows.
     stream_follow: bool,
     bus_follow: bool,
@@ -530,10 +554,14 @@ struct App {
     stream_max: u16,
     bus_max: u16,
     diff_max: u16,
+    plan_max: u16,
+    review_max: u16,
     /// Log viewport height in rows (for PageUp/PageDown).
     stream_view_h: u16,
     bus_view_h: u16,
     diff_view_h: u16,
+    plan_view_h: u16,
+    review_view_h: u16,
     tick: u64,
     /// (started, message, color, how long to show)
     flash: Option<(Instant, String, Color, Duration)>,
@@ -651,6 +679,24 @@ struct App {
     /// click-to-toggle. Only as many entries as were actually rendered (post-cap,
     /// post-scroll).
     rect_new_run_roster: Vec<(usize, Rect)>,
+    /// Records explicitly toggled away from their default fold state (Space), keyed
+    /// by immutable source identity (correction #6) — never an index, so a rebuilt
+    /// snapshot that inserts a record ahead of these does not shuffle which ones are
+    /// open. `A` overrides this with [`App::fold_all`] rather than mutating it, so a
+    /// second `A` restores whatever the operator had individually chosen.
+    fold_open: std::collections::HashSet<crate::record::SourceId>,
+    /// `A`: expand every record regardless of [`App::fold_open`].
+    fold_all: bool,
+    /// The record under the cursor (`J`/`K`/`t`/`T`/`e`/`E`/`}`/`{`), resolved to a
+    /// row each frame by identity, the same pattern `resync_home_selection` uses.
+    record_cursor: Option<crate::record::SourceId>,
+    /// `R`: fall back to the byte-for-byte raw view (`render_scrollable_log`) on a
+    /// tab with exactly one raw source (Log, Diff). Unavailable elsewhere (U36/AC-14).
+    raw_mode: bool,
+    /// `f` on Activity: narrow to one slot's rows (toggle). Log stays the
+    /// selected-slot view already, so filtering only ever applies to Activity
+    /// (correction #7).
+    activity_slot_filter: Option<usize>,
 }
 
 /// A gate action reachable by both a key and a tappable button.
@@ -674,6 +720,9 @@ struct LogCache {
     mtime: Option<SystemTime>,
     text: String,
     truncated: bool,
+    /// The absolute byte offset `text` begins at (`TailLog::start`), kept so the
+    /// record parser can bisect the time index against the same tail (U33).
+    start: u64,
 }
 
 impl LogCache {
@@ -684,6 +733,7 @@ impl LogCache {
             mtime: None,
             text: String::new(),
             truncated: false,
+            start: 0,
         }
     }
 
@@ -703,6 +753,7 @@ impl LogCache {
             self.mtime = mtime;
             self.text = tail.text;
             self.truncated = tail.truncated;
+            self.start = tail.start;
         }
         (&self.text, self.truncated)
     }
@@ -713,6 +764,7 @@ impl LogCache {
         self.mtime = None;
         self.text.clear();
         self.truncated = false;
+        self.start = 0;
     }
 }
 
@@ -755,6 +807,8 @@ impl App {
             stream_scroll: 0,
             bus_scroll: 0,
             diff_scroll: 0,
+            plan_scroll: 0,
+            review_scroll: 0,
             // Default: follow live output (newest lines).
             stream_follow: true,
             bus_follow: true,
@@ -762,9 +816,13 @@ impl App {
             stream_max: 0,
             bus_max: 0,
             diff_max: 0,
+            plan_max: 0,
+            review_max: 0,
             stream_view_h: 12,
             bus_view_h: 12,
             diff_view_h: 12,
+            plan_view_h: 12,
+            review_view_h: 12,
             tick: 0,
             flash: None,
             cfg,
@@ -806,6 +864,11 @@ impl App {
             new_run_gen,
             rect_new_run: Rect::default(),
             rect_new_run_roster: Vec::new(),
+            fold_open: std::collections::HashSet::new(),
+            fold_all: false,
+            record_cursor: None,
+            raw_mode: false,
+            activity_slot_filter: None,
         }
     }
 
@@ -956,6 +1019,14 @@ impl App {
         self.diff_view_h.saturating_sub(1).max(3)
     }
 
+    fn plan_page(&self) -> u16 {
+        self.plan_view_h.saturating_sub(1).max(3)
+    }
+
+    fn review_page(&self) -> u16 {
+        self.review_view_h.saturating_sub(1).max(3)
+    }
+
     fn scroll_stream_by(&mut self, delta: i32) {
         apply_scroll_delta(
             &mut self.stream_scroll,
@@ -983,11 +1054,21 @@ impl App {
         );
     }
 
+    fn scroll_plan_by(&mut self, delta: i32) {
+        let mut follow = false;
+        apply_scroll_delta(&mut self.plan_scroll, &mut follow, self.plan_max, delta);
+    }
+
+    fn scroll_review_by(&mut self, delta: i32) {
+        let mut follow = false;
+        apply_scroll_delta(&mut self.review_scroll, &mut follow, self.review_max, delta);
+    }
+
     /// Scroll whichever view Main is showing. The Shell tab is a live tmux client:
     /// it never scrolls from here (its input is forwarded raw). Without a run
-    /// selected, Activity and Diff fall back to the same overview body Log uses
-    /// (`draw_log_body`), so scrolling must follow that body — `stream_*` — rather
-    /// than the run-scoped `bus_*`/`diff_*` state those tabs normally own.
+    /// selected, Activity/Diff/Plan/Review fall back to the same overview body Log
+    /// uses (`draw_log_body`), so scrolling must follow that body — `stream_*` —
+    /// rather than the run-scoped state those tabs normally own.
     fn scroll_main_by(&mut self, delta: i32, has_full: bool) {
         match self.main_tab {
             MainTab::Log => self.scroll_stream_by(delta),
@@ -995,6 +1076,10 @@ impl App {
             MainTab::Activity => self.scroll_stream_by(delta),
             MainTab::Diff if has_full => self.scroll_diff_by(delta),
             MainTab::Diff => self.scroll_stream_by(delta),
+            MainTab::Plan if has_full => self.scroll_plan_by(delta),
+            MainTab::Plan => self.scroll_stream_by(delta),
+            MainTab::Review if has_full => self.scroll_review_by(delta),
+            MainTab::Review => self.scroll_stream_by(delta),
             MainTab::Shell => {}
         }
     }
@@ -1003,6 +1088,8 @@ impl App {
         match self.main_tab {
             MainTab::Activity if has_full => self.bus_page(),
             MainTab::Diff if has_full => self.diff_page(),
+            MainTab::Plan if has_full => self.plan_page(),
+            MainTab::Review if has_full => self.review_page(),
             _ => self.stream_page(),
         }
     }
@@ -1016,6 +1103,12 @@ impl App {
             MainTab::Diff if has_full => {
                 self.diff_follow = false;
                 self.diff_scroll = 0;
+            }
+            MainTab::Plan if has_full => {
+                self.plan_scroll = 0;
+            }
+            MainTab::Review if has_full => {
+                self.review_scroll = 0;
             }
             _ => {
                 self.stream_follow = false;
@@ -1033,6 +1126,12 @@ impl App {
             MainTab::Diff if has_full => {
                 self.diff_follow = true;
                 self.diff_scroll = self.diff_max;
+            }
+            MainTab::Plan if has_full => {
+                self.plan_scroll = self.plan_max;
+            }
+            MainTab::Review if has_full => {
+                self.review_scroll = self.review_max;
             }
             _ => {
                 self.stream_follow = true;
@@ -1180,9 +1279,15 @@ struct Snapshot {
     runs: Vec<state::RunSummary>,
     full: Option<RunState>,
     stream_text: String,
-    activity: Vec<String>,
+    /// Structured records for the Log tab (U33/AC-1), stamped from the sidecar
+    /// byte-offset -> time index when one exists.
+    log_records: Vec<Record>,
+    activity: Vec<Record>,
     /// Main's Diff tab: the run's plan/artifacts, or a placeholder.
     diff_text: String,
+    diff_records: Vec<Record>,
+    plan_docs: Vec<Record>,
+    review: Vec<Record>,
     /// Unresolved `@human`/`Blocked` alerts for the selected run (status-line badge count).
     human_alerts: usize,
     /// Selected run is in flight with no live orchestrator.
@@ -1218,8 +1323,12 @@ impl Snapshot {
             runs: Vec::new(),
             full: None,
             stream_text: String::new(),
+            log_records: Vec::new(),
             activity: Vec::new(),
             diff_text: String::new(),
+            diff_records: Vec::new(),
+            plan_docs: Vec::new(),
+            review: Vec::new(),
             human_alerts: 0,
             abandoned: false,
             heartbeats: std::collections::HashMap::new(),
@@ -1521,7 +1630,45 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
         cache.clear();
         project_overview(&projects, sel.project_idx)
     };
+    let shortener = path_shortener_for(&swarm, full.as_ref());
+    let log_records = full
+        .as_ref()
+        .and_then(|st| {
+            st.slots
+                .get(sel.slot_idx.min(st.slots.len().saturating_sub(1)))
+                .map(|slot| (st, slot))
+        })
+        .map(|(st, slot)| {
+            let path = slot
+                .log_path
+                .clone()
+                .unwrap_or_else(|| swarm.log_file(&st.id, &slot.id));
+            if !path.is_file() {
+                return Vec::new();
+            }
+            let (raw, _truncated) = cache.load(&path, LOG_TAIL_BYTES);
+            let raw = raw.to_string();
+            let start = cache.start;
+            let index =
+                process::read_log_index(&path, start, start + raw.len() as u64).unwrap_or_default();
+            record::parse_log_records(&raw, start, &index, &shortener, &st.id, &slot.id)
+                .iter()
+                .map(|lr| lr.to_record())
+                .collect()
+        })
+        .unwrap_or_default();
     let diff_text = diff_content(&swarm, full.as_ref(), sel.slot_idx);
+    let diff_records = full
+        .as_ref()
+        .and_then(|st| {
+            st.worktrees
+                .iter()
+                .find(|w| st.slots.get(sel.slot_idx).map(|s| &s.id) == Some(&w.slot_id))
+        })
+        .map(|w| record::parse_diff(&diff_text, &w.slot_id))
+        .unwrap_or_default();
+    let plan_docs_v = plan_docs(&swarm, full.as_ref());
+    let review_v = review_records(&swarm, full.as_ref(), cfg);
     // The TUI refresh is a provider-agnostic delivery pulse for the selected run:
     // advance unacked-message redelivery/escalation before reading alerts, so
     // requires_ack works even when no Claude slot's Stop hook is ticking acks.
@@ -1588,8 +1735,12 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
         runs,
         full,
         stream_text,
+        log_records,
         activity,
         diff_text,
+        diff_records,
+        plan_docs: plan_docs_v,
+        review: review_v,
         human_alerts: alerts.len(),
         abandoned,
         heartbeats,
@@ -2608,8 +2759,12 @@ fn run_loop(
                     &snap.runs,
                     snap.full.as_ref(),
                     &snap.stream_text,
+                    &snap.log_records,
                     &snap.activity,
                     &snap.diff_text,
+                    &snap.diff_records,
+                    &snap.plan_docs,
+                    &snap.review,
                     &snap.home,
                     snap.log_stats.as_ref(),
                     &mut app,
@@ -2642,6 +2797,7 @@ fn run_loop(
                 while let Some(e) = ev {
                     match e {
                         Event::Key(key) if key.kind == KeyEventKind::Press => {
+                            let active_records = active_records_for(&app, &snap);
                             if handle_key(
                                 &mut app,
                                 key.code,
@@ -2651,6 +2807,7 @@ fn run_loop(
                                 &snap.home.rows,
                                 &snap.runs,
                                 snap.full.as_ref(),
+                                active_records,
                                 &mut active_root,
                                 local_root.as_deref(),
                             )? {
@@ -2772,6 +2929,7 @@ fn handle_key(
     home_rows: &[HomeRow],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
+    active_records: &[Record],
     active_root: &mut PathBuf,
     local_root: Option<&std::path::Path>,
 ) -> Result<bool> {
@@ -2969,9 +3127,139 @@ fn handle_key(
                 ACCENT,
             );
         }
+        // Structural navigation (Phase C): jump the record cursor to the next/prev
+        // record head, tool call, error, or phase/document boundary. Inert on Shell
+        // (an attached pane already forwarded the key above; an unattached one has
+        // no records to navigate).
+        KeyCode::Char('J') if app.focus == Focus::Main => {
+            move_record_cursor(app, active_records, 1, |_| true);
+        }
+        KeyCode::Char('K') if app.focus == Focus::Main => {
+            move_record_cursor(app, active_records, -1, |_| true);
+        }
+        KeyCode::Char('t') if app.focus == Focus::Main => {
+            move_record_cursor(app, active_records, 1, |r| {
+                matches!(r.kind, RecordKind::Tool(_))
+            });
+        }
+        KeyCode::Char('T') if app.focus == Focus::Main => {
+            move_record_cursor(app, active_records, -1, |r| {
+                matches!(r.kind, RecordKind::Tool(_))
+            });
+        }
+        KeyCode::Char('e') if app.focus == Focus::Main => {
+            move_record_cursor(app, active_records, 1, is_error_record);
+        }
+        KeyCode::Char('E') if app.focus == Focus::Main => {
+            move_record_cursor(app, active_records, -1, is_error_record);
+        }
+        KeyCode::Char('}') if app.focus == Focus::Main => {
+            move_record_cursor(app, active_records, 1, is_boundary_record);
+        }
+        KeyCode::Char('{') if app.focus == Focus::Main => {
+            move_record_cursor(app, active_records, -1, is_boundary_record);
+        }
+        // Space folds/unfolds the record under the cursor (U36); `A` overrides every
+        // default at once, leaving individual toggles intact for when it is pressed
+        // again.
+        KeyCode::Char(' ') if app.focus == Focus::Main => {
+            if let Some(cur) = app.record_cursor.clone() {
+                if !app.fold_open.remove(&cur) {
+                    app.fold_open.insert(cur);
+                }
+            }
+        }
+        KeyCode::Char('A') if app.focus == Focus::Main => {
+            app.fold_all = !app.fold_all;
+        }
+        // R: the byte-for-byte raw escape hatch (U36), only where one raw source
+        // exists (Log, Diff) — AC-14.
+        KeyCode::Char('R') if app.focus == Focus::Main => {
+            if matches!(app.main_tab, MainTab::Log | MainTab::Diff) {
+                app.raw_mode = !app.raw_mode;
+                app.flash(
+                    if app.raw_mode {
+                        "raw text (R toggles)"
+                    } else {
+                        "parsed records"
+                    },
+                    ACCENT,
+                );
+            }
+        }
+        // f: narrow Activity to the selected slot (correction #7 — Log is already
+        // scoped to the selected slot, so filtering only ever applies to Activity).
+        KeyCode::Char('f') if app.focus == Focus::Main && app.main_tab == MainTab::Activity => {
+            app.activity_slot_filter = if app.activity_slot_filter.is_some() {
+                None
+            } else {
+                Some(app.selected_slot)
+            };
+        }
         _ => {}
     }
     Ok(false)
+}
+
+fn is_error_record(r: &Record) -> bool {
+    matches!(
+        r.kind,
+        RecordKind::Error | RecordKind::Alert | RecordKind::Result { ok: false }
+    )
+}
+
+fn is_boundary_record(r: &Record) -> bool {
+    matches!(r.kind, RecordKind::Section | RecordKind::Doc)
+}
+
+/// Moves the record cursor to the next (`dir > 0`) or previous (`dir < 0`) record
+/// matching `pred`, starting just past whatever the cursor currently resolves to. A
+/// miss (no such record in that direction) flashes rather than silently doing
+/// nothing (AC-13).
+fn move_record_cursor(app: &mut App, records: &[Record], dir: i32, pred: impl Fn(&Record) -> bool) {
+    match move_cursor(records, app.record_cursor.as_ref(), dir, pred) {
+        Some(id) => app.record_cursor = Some(id),
+        None => app.flash("no match", FG_MUTED),
+    }
+}
+
+fn move_cursor(
+    records: &[Record],
+    cursor: Option<&SourceId>,
+    dir: i32,
+    pred: impl Fn(&Record) -> bool,
+) -> Option<SourceId> {
+    if records.is_empty() {
+        return None;
+    }
+    let cur_idx = cursor.and_then(|c| records.iter().position(|r| &r.source == c));
+    let n = records.len() as i32;
+    let mut i = match cur_idx {
+        Some(idx) => idx as i32 + dir,
+        None if dir >= 0 => 0,
+        None => n - 1,
+    };
+    while i >= 0 && i < n {
+        let r = &records[i as usize];
+        if pred(r) {
+            return Some(r.source.clone());
+        }
+        i += dir;
+    }
+    None
+}
+
+/// Which record list `J`/`K`/`t`/`e`/`}`/`Space`/`R` act on — whatever Main is
+/// currently showing.
+fn active_records_for<'a>(app: &App, snap: &'a Snapshot) -> &'a [Record] {
+    match app.main_tab {
+        MainTab::Log => &snap.log_records,
+        MainTab::Activity => &snap.activity,
+        MainTab::Diff => &snap.diff_records,
+        MainTab::Plan => &snap.plan_docs,
+        MainTab::Review => &snap.review,
+        MainTab::Shell => &[],
+    }
 }
 
 /// The project the operator is browsing right now, for surfaces (`n`, `:plan`) that
@@ -4564,8 +4852,12 @@ fn draw(
     runs: &[state::RunSummary],
     full: Option<&RunState>,
     stream_text: &str,
-    activity: &[String],
+    log_records: &[Record],
+    activity: &[Record],
     diff_text: &str,
+    diff_records: &[Record],
+    plan_docs: &[Record],
+    review: &[Record],
     home: &HomeData,
     log_stats: Option<&process::StreamStats>,
     app: &mut App,
@@ -4652,8 +4944,12 @@ fn draw(
             projects,
             full,
             stream_text,
+            log_records,
             activity,
             diff_text,
+            diff_records,
+            plan_docs,
+            review,
             home,
             log_stats,
             app,
@@ -4706,6 +5002,17 @@ fn main_tab_spans(app: &App) -> Vec<(MainTab, String, Style)> {
         .collect()
 }
 
+/// Narrow strip label (U35): the two-tab Home strip keeps its full labels (they
+/// already fit); the six-tab run/project strip abbreviates uniformly so widening a
+/// badge or a label never moves the strip (U11).
+fn narrow_label(t: MainTab, browse: BrowseLevel) -> &'static str {
+    if browse == BrowseLevel::Home {
+        t.label_at(browse)
+    } else {
+        t.short_label()
+    }
+}
+
 /// One row: the rail's section title on the left, the MainTab labels on the right,
 /// and what the active tab is showing, right-aligned. In narrow the rail is gone, so
 /// the tabs spread across the whole row — still the escape from the Shell tab on a
@@ -4746,26 +5053,45 @@ fn draw_labels(
                 } else {
                     dim()
                 };
-                (*t, t.label_at(app.browse), style)
+                (*t, narrow_label(*t, app.browse), style)
             })
             .collect();
         let n = raw.len() as u16;
         let plain_total: u16 = raw.iter().map(|(_, l, _)| l.chars().count() as u16).sum();
         let reserved = plain_total + badge_w * n;
         let reserve_all = n > 1 && reserved <= area.width;
-        let gap = if n <= 1 {
-            0
+        // Six tabs (U9/U35) leave less spare width than four did: the full badge
+        // glued to Activity alone can still starve the last tab to zero at the
+        // narrowest widths this strip renders at. A minimal one-character badge is
+        // the last fallback before that — every tab keeps a slot, at the cost of
+        // the exact alert count (round-13 review: silently dropping a tab is worse
+        // than a coarser badge).
+        let label_total_full_badge = plain_total + badge_w;
+        let fits_full_badge = label_total_full_badge <= area.width;
+        let minimal_badge_w: u16 = if app.human_alerts_n > 0 { 1 } else { 0 };
+        let label_total_min_badge = plain_total + minimal_badge_w;
+        let (gap, use_minimal_badge) = if n <= 1 {
+            (0, false)
         } else if reserve_all {
-            (area.width - reserved) / (n - 1)
+            ((area.width - reserved) / (n - 1), false)
+        } else if fits_full_badge {
+            (
+                area.width.saturating_sub(label_total_full_badge) / (n - 1),
+                false,
+            )
         } else {
-            let label_total = plain_total + badge_w;
-            area.width.saturating_sub(label_total) / (n - 1)
+            (
+                area.width.saturating_sub(label_total_min_badge) / (n - 1),
+                true,
+            )
         };
         let tabs: Vec<(MainTab, String, Style)> = raw
             .into_iter()
             .map(|(t, label, style)| {
                 let is_alert_tab = t == MainTab::Activity && app.human_alerts_n > 0;
-                let badge = if is_alert_tab {
+                let badge = if is_alert_tab && use_minimal_badge {
+                    "!".to_string()
+                } else if is_alert_tab {
                     format!(" ⚠{:<2}", app.human_alerts_n.min(99))
                 } else if reserve_all {
                     " ".repeat(badge_w as usize)
@@ -4877,9 +5203,42 @@ fn draw_labels(
     if main.width == 0 {
         return;
     }
+    // Six tabs at their full, padded width (U9/U35) do not always fit the wide
+    // strip's Main column once a rail is present — the four-tab world's fixed
+    // per-tab padding was sized for four. Rather than silently drop a tab off the
+    // end (U11), fall back to the same short labels the narrow strip uses,
+    // uniformly, so all six always have a slot.
+    let full_tab_spans = main_tab_spans(app);
+    let full_w: u16 = full_tab_spans
+        .iter()
+        .map(|(_, t, _)| t.chars().count() as u16)
+        .sum();
+    let tab_spans: Vec<(MainTab, String, Style)> = if full_w <= main.width {
+        full_tab_spans
+    } else {
+        tabs_for(app.browse)
+            .iter()
+            .map(|t| {
+                let style = if *t == app.main_tab {
+                    Style::default().fg(ACCENT).bold()
+                } else if *t == MainTab::Activity && app.human_alerts_n > 0 {
+                    Style::default().fg(ALERT).bold()
+                } else {
+                    dim()
+                };
+                let label = t.short_label();
+                let text = if *t == MainTab::Activity && app.human_alerts_n > 0 {
+                    format!(" {label} ⚠{:<2} ", app.human_alerts_n.min(99))
+                } else {
+                    format!(" {label} ")
+                };
+                (*t, text, style)
+            })
+            .collect()
+    };
     let mut spans: Vec<Span> = Vec::new();
     let mut x = main.x;
-    for (tab, text, style) in main_tab_spans(app) {
+    for (tab, text, style) in tab_spans {
         let w = text.chars().count() as u16;
         if x.saturating_add(w) > main.right() {
             break;
@@ -4901,7 +5260,10 @@ fn draw_labels(
     let ctx = main_context(swarm, full, app);
     let used = x.saturating_sub(main.x);
     let room = main.width.saturating_sub(used).saturating_sub(1);
-    if !ctx.is_empty() && room > 8 {
+    // Six tabs (U9/U35) leave less spare room for the caption than four did; the
+    // old ">8" gate suppressed it outright rather than letting `truncate` degrade
+    // it gracefully. `truncate` already handles anything down to a sliver.
+    if !ctx.is_empty() && room > 2 {
         let text = truncate(&ctx, room as usize);
         let w = text.chars().count() as u16;
         f.render_widget(
@@ -6319,8 +6681,12 @@ fn draw_main(
     projects: &[registry::ProjectEntry],
     full: Option<&RunState>,
     stream_text: &str,
-    activity: &[String],
+    log_records: &[Record],
+    activity: &[Record],
     diff_text: &str,
+    diff_records: &[Record],
+    plan_docs: &[Record],
+    review: &[Record],
     home: &HomeData,
     log_stats: Option<&process::StreamStats>,
     app: &mut App,
@@ -6358,15 +6724,23 @@ fn draw_main(
     // run-scoped (see `manage_terminal`), so it always shows the real workspace
     // terminal regardless of run count.
     match app.main_tab {
-        MainTab::Log => draw_log_body(f, inner, full, stream_text, log_stats, app),
+        MainTab::Log => draw_log_body(f, inner, full, stream_text, log_records, log_stats, app),
         MainTab::Activity if full.is_none() => {
-            draw_log_body(f, inner, full, stream_text, log_stats, app)
+            draw_log_body(f, inner, full, stream_text, log_records, log_stats, app)
         }
-        MainTab::Activity => draw_activity_body(f, inner, activity, app),
+        MainTab::Activity => draw_activity_body(f, inner, activity, full, app),
         MainTab::Diff if full.is_none() => {
-            draw_log_body(f, inner, full, stream_text, log_stats, app)
+            draw_log_body(f, inner, full, stream_text, log_records, log_stats, app)
         }
-        MainTab::Diff => draw_diff_body(f, inner, diff_text, app),
+        MainTab::Diff => draw_diff_body(f, inner, diff_text, diff_records, app),
+        MainTab::Plan if full.is_none() => {
+            draw_log_body(f, inner, full, stream_text, log_records, log_stats, app)
+        }
+        MainTab::Plan => draw_plan_body(f, inner, plan_docs, app),
+        MainTab::Review if full.is_none() => {
+            draw_log_body(f, inner, full, stream_text, log_records, log_stats, app)
+        }
+        MainTab::Review => draw_review_body(f, inner, review, app),
         MainTab::Shell => draw_shell_body(f, inner, app),
     }
 }
@@ -6419,6 +6793,10 @@ fn main_context(swarm: &SparPaths, full: Option<&RunState>, app: &App) -> String
         MainTab::Activity => "run timeline + bus".into(),
         MainTab::Diff if full.is_none() => String::new(),
         MainTab::Diff => "artifacts".into(),
+        MainTab::Plan if full.is_none() => String::new(),
+        MainTab::Plan => "plan · critique · test-contract".into(),
+        MainTab::Review if full.is_none() => String::new(),
+        MainTab::Review => "acceptance criteria + verdicts".into(),
         MainTab::Shell => match app.takeover_target.as_deref() {
             Some(_) => {
                 let run_id = full
@@ -6451,12 +6829,14 @@ fn main_context(swarm: &SparPaths, full: Option<&RunState>, app: &App) -> String
 }
 
 /// Main's Log tab: the live stream for the selected slot (or the run), with the
-/// slot's stall/quiet state and token stats on a one-row band.
+/// slot's stall/quiet state and token stats on a one-row band. Records by default
+/// (U32); `R` falls back to the byte-for-byte raw view (U36).
 fn draw_log_body(
     f: &mut Frame,
     inner: Rect,
     full: Option<&RunState>,
     stream_text: &str,
+    log_records: &[Record],
     stats: Option<&process::StreamStats>,
     app: &mut App,
 ) {
@@ -6511,47 +6891,166 @@ fn draw_log_body(
     );
 
     app.stream_view_h = chunks[1].height;
-    app.stream_max = render_scrollable_log(
-        f,
-        chunks[1],
-        stream_text,
-        &mut app.stream_scroll,
-        &mut app.stream_follow,
-        true,
-        app.log_expand,
-    );
+    if app.raw_mode {
+        app.stream_max = render_scrollable_log(
+            f,
+            chunks[1],
+            stream_text,
+            &mut app.stream_scroll,
+            &mut app.stream_follow,
+            true,
+            app.log_expand,
+        );
+    } else {
+        // `log_records` comes pre-parsed off-thread in `build_snapshot` (U13), stamped
+        // against the byte-offset index when one exists. A caller that has not built
+        // one yet (or a genuinely un-indexed source) still gets a folded, glyphed view
+        // by parsing `stream_text` here — CPU only, not the disk read U13 forbids —
+        // with an empty index, so every record's time is `None` rather than invented.
+        let owned;
+        let records: &[Record] = if log_records.is_empty() && !stream_text.trim().is_empty() {
+            owned = record::parse_log_records(
+                stream_text,
+                0,
+                &[],
+                &record::PathShortener::new(Vec::new()),
+                "",
+                "",
+            )
+            .iter()
+            .map(|lr| lr.to_record())
+            .collect::<Vec<_>>();
+            &owned
+        } else {
+            log_records
+        };
+        app.stream_max = render_record_view(
+            f,
+            chunks[1],
+            records,
+            &mut app.stream_scroll,
+            &mut app.stream_follow,
+            &app.fold_open,
+            app.fold_all,
+            app.record_cursor.as_ref(),
+        );
+    }
 }
 
-/// Main's Activity tab: the run timeline + bus feed + human alerts (was a column).
-fn draw_activity_body(f: &mut Frame, inner: Rect, activity: &[String], app: &mut App) {
-    let text = if activity.is_empty() {
-        "No activity yet.\n\nRun timeline: phases, agents, gates, bus.".into()
-    } else {
-        activity.join("\n")
-    };
+/// Main's Activity tab (AC-2): typed records only — never a joined string. No raw
+/// mode (AC-14): Activity is an aggregate over several sources, not one persisted
+/// byte range.
+fn draw_activity_body(
+    f: &mut Frame,
+    inner: Rect,
+    activity: &[Record],
+    full: Option<&RunState>,
+    app: &mut App,
+) {
     app.bus_view_h = inner.height;
-    app.bus_max = render_scrollable_log(
+    let filtered: Vec<Record>;
+    let records: &[Record] = match (app.activity_slot_filter, full) {
+        (Some(idx), Some(st)) => {
+            let slot_id = st.slots.get(idx).map(|s| s.id.as_str());
+            let role = st.slots.get(idx).map(|s| role_label(s.role));
+            filtered = activity
+                .iter()
+                .filter(|r| {
+                    matches!(r.kind, RecordKind::Section)
+                        || r.actor.is_none()
+                        || r.actor.as_deref() == Some("")
+                        || r.actor.as_deref() == slot_id
+                        || r.actor.as_deref() == role
+                })
+                .cloned()
+                .collect();
+            &filtered
+        }
+        _ => activity,
+    };
+    app.bus_max = render_record_view(
         f,
         inner,
-        &text,
+        records,
         &mut app.bus_scroll,
         &mut app.bus_follow,
-        false,
-        true,
+        &app.fold_open,
+        app.fold_all,
+        app.record_cursor.as_ref(),
     );
 }
 
-/// Main's Diff tab: the run's artifacts for now (no new plumbing in Stage A).
-fn draw_diff_body(f: &mut Frame, inner: Rect, diff_text: &str, app: &mut App) {
+/// Main's Diff tab: the selected worktree's real `git diff HEAD` (U4), split into
+/// one foldable `FileDiff` record per file; `R` shows the unsplit patch.
+fn draw_diff_body(
+    f: &mut Frame,
+    inner: Rect,
+    diff_text: &str,
+    diff_records: &[Record],
+    app: &mut App,
+) {
     app.diff_view_h = inner.height;
-    app.diff_max = render_scrollable_log(
+    // No parsed records yet (nothing selected has a real worktree diff to split, or
+    // a caller supplied raw text without records) falls back to the same raw
+    // viewport the whole tab used before this feature, rather than a `FileDiff`
+    // parse invented from text that was never `git diff` shaped.
+    if app.raw_mode || diff_records.is_empty() {
+        app.diff_max = render_scrollable_log(
+            f,
+            inner,
+            diff_text,
+            &mut app.diff_scroll,
+            &mut app.diff_follow,
+            false,
+            app.log_expand,
+        );
+    } else {
+        let mut follow = false;
+        app.diff_max = render_record_view(
+            f,
+            inner,
+            diff_records,
+            &mut app.diff_scroll,
+            &mut follow,
+            &app.fold_open,
+            app.fold_all,
+            app.record_cursor.as_ref(),
+        );
+    }
+}
+
+/// Main's Plan tab (005 A): `plan.md`, the plan critique, and `test-contract.md` as
+/// foldable document records (AC-16). No raw mode: three documents, not one source.
+fn draw_plan_body(f: &mut Frame, inner: Rect, plan_docs: &[Record], app: &mut App) {
+    app.plan_view_h = inner.height;
+    let mut follow = false;
+    app.plan_max = render_record_view(
         f,
         inner,
-        diff_text,
-        &mut app.diff_scroll,
-        &mut app.diff_follow,
-        false,
-        app.log_expand,
+        plan_docs,
+        &mut app.plan_scroll,
+        &mut follow,
+        &app.fold_open,
+        app.fold_all,
+        app.record_cursor.as_ref(),
+    );
+}
+
+/// Main's Review tab (005 B/C): one `Criterion` record per `AC-n` plus one foldable
+/// record per reviewer's verdict, sourced from the same gate the ship path calls
+/// (AC-17). No raw mode: the grid is a projection over several artifacts.
+fn draw_review_body(f: &mut Frame, inner: Rect, review: &[Record], app: &mut App) {
+    app.review_view_h = inner.height;
+    let mut follow = false;
+    app.review_max = render_record_view(
+        f,
+        inner,
+        review,
+        &mut app.review_scroll,
+        &mut follow,
+        &app.fold_open,
+        app.fold_all,
+        app.record_cursor.as_ref(),
     );
 }
 
@@ -6712,6 +7211,276 @@ fn render_scrollable_log(
         );
     }
     max_scroll
+}
+
+/// A record is expanded when it has body content and either `fold_all` overrides
+/// every default, or the operator's explicit toggle (`fold_open`, keyed by the
+/// record's immutable source identity) flips the default (U36/AC-7).
+fn is_record_expanded(
+    fold_open: &std::collections::HashSet<SourceId>,
+    fold_all: bool,
+    r: &Record,
+) -> bool {
+    if r.body.is_empty() {
+        return false;
+    }
+    if fold_all {
+        return true;
+    }
+    !r.folded_by_default ^ fold_open.contains(&r.source)
+}
+
+/// The meta column's content (AC-3): elapsed when known, else an absolute time, else
+/// the no-data sentinel — never fabricated, matching `record::fmt_elapsed_or_unknown`'s
+/// contract for "no timing data".
+fn record_meta_text(r: &Record) -> String {
+    if let Some(e) = r.elapsed {
+        record::fmt_elapsed(e)
+    } else if let Some(t) = r.time {
+        t.format("%-I:%M %p").to_string()
+    } else {
+        // No `.idx` sidecar for this record (AC-8): never a fabricated duration,
+        // just the same units' zero value as a "nothing timed" sentinel.
+        "0s".to_string()
+    }
+}
+
+fn record_kind_style(kind: RecordKind) -> Style {
+    match kind {
+        RecordKind::Tool(_) => Style::default().fg(CODE),
+        RecordKind::Result { ok: true } => Style::default().fg(OK),
+        RecordKind::Result { ok: false } => Style::default().fg(ALERT),
+        RecordKind::Thought => Style::default().fg(FG_MUTED).italic(),
+        RecordKind::Note | RecordKind::Section => Style::default().fg(FG_MUTED),
+        RecordKind::Error | RecordKind::Alert => Style::default().fg(ALERT).bold(),
+        RecordKind::Doc | RecordKind::Criterion | RecordKind::FileDiff | RecordKind::Prose => {
+            Style::default().fg(FG)
+        }
+    }
+}
+
+/// One record-view row: an optional surface background (`SURFACE_RAISED` for the
+/// cursor row, `SURFACE_SUNKEN` for an expanded tool/diff body — AC-19) plus
+/// explicitly x-positioned spans, so a fixed column never moves for content (U32).
+struct RecordRow {
+    bg: Option<Color>,
+    spans: Vec<(u16, String, Style)>,
+}
+
+fn build_head_row(r: &Record, cols: record::Columns, is_cursor: bool, folded: bool) -> RecordRow {
+    let mut spans = Vec::new();
+    spans.push((
+        cols.gutter,
+        (if is_cursor { SEL_BAR } else { " " }).to_string(),
+        Style::default().fg(ACCENT),
+    ));
+    let fold_mark = if r.body.is_empty() {
+        " "
+    } else if folded {
+        "▸"
+    } else {
+        "▾"
+    };
+    spans.push((
+        cols.gutter + 1,
+        fold_mark.to_string(),
+        Style::default().fg(FG_DIM),
+    ));
+    spans.push((cols.glyph, r.glyph.to_string(), record_kind_style(r.kind)));
+    if let Some(actor_x) = cols.actor {
+        if let Some(actor) = &r.actor {
+            let w = cols.verb.saturating_sub(actor_x).saturating_sub(1) as usize;
+            spans.push((
+                actor_x,
+                truncate_display(actor, w),
+                Style::default().fg(FG_MUTED),
+            ));
+        }
+    }
+    // Doc/Criterion/Section records carry their real label in `head` (a document
+    // heading, an `AC-n` id) — `verb` there is just a generic shape tag ("Doc").
+    let verb_text: &str = match r.kind {
+        RecordKind::Doc | RecordKind::Criterion | RecordKind::FileDiff | RecordKind::Section => {
+            &r.head
+        }
+        _ => &r.verb,
+    };
+    if !verb_text.is_empty() {
+        let w = cols.summary.saturating_sub(cols.verb).saturating_sub(1) as usize;
+        spans.push((
+            cols.verb,
+            truncate_display(verb_text, w),
+            Style::default().fg(FG).bold(),
+        ));
+    }
+    let summary_w = cols.meta.saturating_sub(cols.summary).saturating_sub(1) as usize;
+    spans.push((
+        cols.summary,
+        truncate_display(&r.summary, summary_w),
+        record_kind_style(r.kind),
+    ));
+    let meta_text = record_meta_text(r);
+    let meta_len = (meta_text.chars().count() as u16).min(cols.meta_width);
+    let meta_x = cols.meta + cols.meta_width.saturating_sub(meta_len);
+    spans.push((meta_x, meta_text, Style::default().fg(FG_DIM)));
+    RecordRow {
+        bg: is_cursor.then_some(SURFACE_RAISED),
+        spans,
+    }
+}
+
+fn build_body_row(r: &Record, line_idx: usize, cols: record::Columns) -> RecordRow {
+    let text = r.body.get(line_idx).cloned().unwrap_or_default();
+    // The tool/argument's own command or path row carries `CODE`, its own colour
+    // (ground truth: "the command, its own colour") — the rest of a body is quoted
+    // output.
+    let is_command_row = line_idx == 0 && matches!(r.kind, RecordKind::Tool(_));
+    let style = if is_command_row {
+        Style::default().fg(CODE)
+    } else {
+        Style::default().fg(FG_DIM)
+    };
+    let bg = matches!(
+        r.kind,
+        RecordKind::Tool(_) | RecordKind::Result { .. } | RecordKind::FileDiff
+    )
+    .then_some(SURFACE_SUNKEN);
+    RecordRow {
+        bg,
+        spans: vec![(cols.verb, text, style)],
+    }
+}
+
+/// Paint a `Vec<Record>` viewport (U32): fixed columns, folding by default, a raised
+/// cursor row, and a sunken band for expanded tool/diff output. Mirrors
+/// `render_scrollable_log`'s contract (same scrollbar, materialises only the visible
+/// window) so the two widgets read as one family.
+#[allow(clippy::too_many_arguments)]
+fn render_record_view(
+    f: &mut Frame,
+    area: Rect,
+    records: &[Record],
+    scroll: &mut u16,
+    follow: &mut bool,
+    fold_open: &std::collections::HashSet<SourceId>,
+    fold_all: bool,
+    cursor: Option<&SourceId>,
+) -> u16 {
+    if area.width == 0 || area.height == 0 {
+        clamp_scroll(scroll, follow, 0);
+        return 0;
+    }
+    let sb_w = 1u16;
+    let text_w = area.width.saturating_sub(sb_w).max(1);
+    let cols = record::Columns::for_width(text_w);
+    let height = area.height as usize;
+    let is_expanded = |r: &Record| is_record_expanded(fold_open, fold_all, r);
+    let flat = record::flatten(records, is_expanded);
+    let total = flat.len().max(1);
+    let max_scroll = total.saturating_sub(height).min(u16::MAX as usize) as u16;
+    clamp_scroll(scroll, follow, max_scroll);
+    let start = *scroll as usize;
+    let rows: Vec<RecordRow> = flat
+        .iter()
+        .skip(start)
+        .take(height)
+        .map(|row| {
+            let r = &records[row.record_idx];
+            let is_cursor = cursor == Some(&r.source);
+            match row.kind {
+                record::RowKind::Head => build_head_row(r, cols, is_cursor, !is_expanded(r)),
+                record::RowKind::Body(j) => build_body_row(r, j, cols),
+            }
+        })
+        .collect();
+
+    let text_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: text_w,
+        height: area.height,
+    };
+    f.render_widget(Clear, text_area);
+    f.buffer_mut().set_style(text_area, page());
+    f.render_widget(
+        RecordCellLog {
+            rows,
+            fill: Style::default().fg(FG),
+        },
+        text_area,
+    );
+
+    if max_scroll > 0 {
+        let mut sb = ScrollbarState::new(max_scroll as usize + 1)
+            .position(start)
+            .viewport_content_length(height);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some("│"))
+                .thumb_symbol("┃")
+                .style(Style::default().fg(RULE))
+                .thumb_style(Style::default().fg(ACCENT_SOFT)),
+            area,
+            &mut sb,
+        );
+    }
+    max_scroll
+}
+
+/// Fills every cell, then paints explicitly x-positioned spans per row — the record
+/// view's counterpart to `CellLog`, painting several styled segments per line instead
+/// of one.
+struct RecordCellLog {
+    rows: Vec<RecordRow>,
+    fill: Style,
+}
+
+impl Widget for RecordCellLog {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_symbol(" ");
+                    cell.set_style(self.fill);
+                    cell.set_skip(false);
+                }
+            }
+        }
+        for (i, row) in self.rows.iter().enumerate() {
+            if i as u16 >= area.height {
+                break;
+            }
+            let y = area.top() + i as u16;
+            if let Some(bg) = row.bg {
+                for x in area.left()..area.right() {
+                    if let Some(cell) = buf.cell_mut((x, y)) {
+                        cell.set_style(self.fill.bg(bg));
+                    }
+                }
+            }
+            for (x_off, text, style) in &row.spans {
+                let mut col = *x_off;
+                for ch in text.chars() {
+                    if col >= area.width {
+                        break;
+                    }
+                    let x = area.left() + col;
+                    if let Some(cell) = buf.cell_mut((x, y)) {
+                        cell.set_char(ch);
+                        let merged = match row.bg {
+                            Some(bg) => style.bg(bg),
+                            None => *style,
+                        };
+                        cell.set_style(merged);
+                        cell.set_skip(false);
+                    }
+                    col = col.saturating_add(1);
+                }
+            }
+        }
+    }
 }
 
 /// Fills every cell, then paints plain strings — no span leftovers across frames.
@@ -7402,9 +8171,11 @@ fn situational_footer(
             BrowseLevel::Agents => "j/k · Enter take over · a next-alert · Esc runs · : cmd",
         },
         Focus::Main => match tab {
-            MainTab::Log => "scroll · [ ] tabs · w wrap · g/G top/end · + zoom · 1 rail",
-            MainTab::Activity => "scroll · [ ] tabs · g/G top/end · 1 rail",
-            MainTab::Diff => "scroll · [ ] tabs · 1 rail",
+            MainTab::Log => "J/K t/e/} nav · Space/A fold · R raw · [ ] tabs · 1 rail",
+            MainTab::Activity => "J/K t/e/} nav · f filter · Space/A fold · [ ] tabs · 1 rail",
+            MainTab::Diff => "J/K } nav · Space/A fold · R raw · [ ] tabs · 1 rail",
+            MainTab::Plan => "J/K } nav · Space/A fold · [ ] tabs · 1 rail",
+            MainTab::Review => "J/K } nav · Space/A fold · [ ] tabs · 1 rail",
             MainTab::Shell => "tmux passthrough · prefix C-a · Ctrl+a d / F12 → spar",
         },
     }
@@ -7453,7 +8224,7 @@ const HELP_BODY: &str = r#" spar — rail + one main area
     Rail   Home ▸ runs ▸ agents  (Enter pushes, Esc pops)
            p opens the project list; Home bands: needs you, running,
            finished since last look, start something new.
-    Main   one area · tabs: Log · Activity · Diff · Shell
+    Main   one area · tabs: Log · Activity · Diff · Plan · Review · Shell
     Main always shows the rail's selection — nothing else moves.
 
   Keyboard
@@ -7473,6 +8244,9 @@ const HELP_BODY: &str = r#" spar — rail + one main area
     /                    filter the rail
     w                    log wrap ↔ truncate long lines
     g / G                top / bottom of Main
+    J/K t/T e/E }/{       record head · tool call · error · phase/doc (Main)
+    Space / A / R        fold cursor · fold all · raw text (Log/Diff)
+    f                    Activity: filter to the selected slot
     ?                    this help · Esc closes help
     q                    quit
 
@@ -8111,7 +8885,31 @@ fn stream_content(
     }
 }
 
-/// Right-rail feed: human run timeline (not a raw bus dump).
+fn activity_record(
+    seq: &mut u64,
+    time: Option<DateTime<Utc>>,
+    actor: impl Into<String>,
+    event: impl Into<String>,
+    detail: impl Into<String>,
+    kind: RecordKind,
+) -> record::ActivityRecord {
+    *seq += 1;
+    record::ActivityRecord {
+        time,
+        actor: actor.into(),
+        event: event.into(),
+        detail: detail.into(),
+        kind,
+        source: SourceId::Activity {
+            at_millis: time.map(|t| t.timestamp_millis()).unwrap_or(0),
+            sequence: *seq,
+        },
+    }
+}
+
+/// Main's Activity tab (AC-2): typed `(time, actor, event, detail)` records —
+/// phase boundaries (`RecordKind::Section`), alerts, slot status and bus chat —
+/// never a joined string.
 fn activity_feed(
     swarm: &SparPaths,
     full: Option<&RunState>,
@@ -8119,40 +8917,74 @@ fn activity_feed(
     alerts: &[crate::bus::BusMessage],
     heartbeats: &std::collections::HashMap<String, DateTime<Utc>>,
     cfg: &Config,
-) -> Vec<String> {
-    let mut lines = Vec::new();
+) -> Vec<Record> {
+    let mut seq: u64 = 0;
+    let mut out: Vec<record::ActivityRecord> = Vec::new();
     let Some(st) = full else {
-        lines.push("No run selected.".into());
-        lines.push(String::new());
-        lines.push("Open a project, pick a run.".into());
-        return lines;
+        out.push(activity_record(
+            &mut seq,
+            None,
+            "",
+            "No run selected",
+            "Open a project, pick a run.",
+            RecordKind::Prose,
+        ));
+        return out.into_iter().map(|r| r.to_record()).collect();
     };
 
-    // Loudest first: anything waiting on a human sits at the top of the rail.
+    // Loudest first: anything waiting on a human sits at the top of the feed.
     if !alerts.is_empty() {
-        lines.push(format!("⚠ Needs you ({})", alerts.len()));
+        out.push(activity_record(
+            &mut seq,
+            None,
+            "",
+            "Needs you",
+            format!("{} unresolved", alerts.len()),
+            RecordKind::Section,
+        ));
         for m in alerts.iter().rev().take(6).rev() {
-            lines.push(format!(
-                " {} {}",
-                short_agent(short_in_run(&m.from, &st.id)),
-                truncate(&m.body, 30)
+            out.push(activity_record(
+                &mut seq,
+                Some(m.ts),
+                short_agent(short_in_run(&m.from, &st.id)).to_string(),
+                "alert",
+                m.body.clone(),
+                RecordKind::Alert,
             ));
         }
-        lines.push(String::new());
     }
 
-    lines.push(format!("\u{a7}Run {}", st.id));
-    lines.push(format!("  {}", phase_label(st.phase)));
+    let mut run_detail = phase_label(st.phase).to_string();
     if st.dry_run {
-        lines.push("  dry-run".into());
+        run_detail.push_str(" · dry-run");
     }
-    if let Some(t) = st.task.as_deref() {
-        lines.push(format!("  {}", truncate(t, 36)));
+    out.push(activity_record(
+        &mut seq,
+        None,
+        "",
+        format!("Run {}", st.id),
+        st.task.clone().unwrap_or_else(|| run_detail.clone()),
+        RecordKind::Section,
+    ));
+    if st.task.is_some() {
+        out.push(activity_record(
+            &mut seq,
+            None,
+            "",
+            "phase",
+            run_detail,
+            RecordKind::Note,
+        ));
     }
-    lines.push(String::new());
 
-    // Compact agent status
-    lines.push("\u{a7}Agents".into());
+    out.push(activity_record(
+        &mut seq,
+        None,
+        "",
+        "Agents",
+        String::new(),
+        RecordKind::Section,
+    ));
     for s in &st.slots {
         let act = SlotActivity::observe(
             s,
@@ -8160,33 +8992,75 @@ fn activity_feed(
             crate::executor::timeout_for_role(cfg, s.role).as_secs(),
             heartbeats.get(&s.id).copied(),
         );
-        let mark = match s.status {
-            SlotStatus::Running if act.stalled => "!",
-            SlotStatus::Running => "●",
-            SlotStatus::Done => "✓",
-            SlotStatus::Failed => "✗",
-            SlotStatus::Stuck => "!",
-            SlotStatus::Pending => "·",
+        let kind = if s.status == SlotStatus::Running && act.stalled {
+            RecordKind::Alert
+        } else {
+            RecordKind::Note
         };
         let quiet = if s.status == SlotStatus::Running {
-            format!(" {}", act.human_silent())
+            act.human_silent()
         } else {
             String::new()
         };
-        lines.push(format!(
-            " {mark} {} {}{quiet}",
-            role_label(s.role),
-            slot_status_label(s.status),
+        out.push(activity_record(
+            &mut seq,
+            None,
+            role_label(s.role).to_string(),
+            slot_status_label(s.status).to_string(),
+            quiet,
+            kind,
         ));
     }
 
-    // Orchestrator event timeline (human)
+    // Orchestrator event timeline (human): phase events are the phase boundaries
+    // `}`/`{` navigate to (Phase C).
     let evs = events::read_all(swarm, &st.id).unwrap_or_default();
     if !evs.is_empty() {
-        lines.push(String::new());
-        lines.push("\u{a7}Timeline".into());
+        out.push(activity_record(
+            &mut seq,
+            None,
+            "",
+            "Timeline",
+            String::new(),
+            RecordKind::Section,
+        ));
         for e in evs.iter().rev().take(14).rev() {
-            lines.push(format!(" {}", activity_event_line(e)));
+            let (actor, event, detail, kind) = match e.kind {
+                events::EventKind::Phase => {
+                    let phase = e.phase.map(phase_label).unwrap_or_else(|| "?".into());
+                    (
+                        st.id.clone(),
+                        "phase".to_string(),
+                        phase,
+                        RecordKind::Section,
+                    )
+                }
+                events::EventKind::Slot => {
+                    let slot = e.slot.clone().unwrap_or_else(|| "agent".into());
+                    let status = e.status.map(slot_status_label).unwrap_or("?").to_string();
+                    (slot, "slot".to_string(), status, RecordKind::Note)
+                }
+                events::EventKind::Gate => (
+                    st.id.clone(),
+                    "gate".to_string(),
+                    e.message.clone().unwrap_or_else(|| "waiting on you".into()),
+                    RecordKind::Alert,
+                ),
+                events::EventKind::Info => (
+                    st.id.clone(),
+                    "info".to_string(),
+                    e.message.clone().unwrap_or_default(),
+                    RecordKind::Note,
+                ),
+            };
+            out.push(activity_record(
+                &mut seq,
+                Some(e.ts),
+                actor,
+                event,
+                detail,
+                kind,
+            ));
         }
     }
 
@@ -8202,14 +9076,26 @@ fn activity_feed(
             })
             .collect();
         if !chat.is_empty() {
-            lines.push(String::new());
-            lines.push("\u{a7}Bus".into());
+            out.push(activity_record(
+                &mut seq,
+                None,
+                "",
+                "Bus",
+                String::new(),
+                RecordKind::Section,
+            ));
             for m in chat.iter().rev().take(8).rev() {
-                lines.push(format!(
-                    " {}→{} {}",
-                    short_agent(short_in_run(&m.from, &st.id)),
-                    short_agent(short_in_run(&m.to, &st.id)),
-                    truncate(&m.body, 28)
+                out.push(activity_record(
+                    &mut seq,
+                    Some(m.ts),
+                    format!(
+                        "{}→{}",
+                        short_agent(short_in_run(&m.from, &st.id)),
+                        short_agent(short_in_run(&m.to, &st.id))
+                    ),
+                    "bus",
+                    m.body.clone(),
+                    RecordKind::Note,
                 ));
             }
         }
@@ -8225,14 +9111,218 @@ fn activity_feed(
         })
         .collect();
     if !paused.is_empty() {
-        lines.push(String::new());
-        lines.push("\u{a7}Quota".into());
+        out.push(activity_record(
+            &mut seq,
+            None,
+            "",
+            "Quota",
+            String::new(),
+            RecordKind::Section,
+        ));
         for (name, q) in paused {
-            lines.push(format!(" {} {:?}", name, q.status));
+            out.push(activity_record(
+                &mut seq,
+                None,
+                name.clone(),
+                "paused",
+                format!("{:?}", q.status),
+                RecordKind::Note,
+            ));
         }
     }
 
-    lines
+    out.into_iter().map(|r| r.to_record()).collect()
+}
+
+/// Main's Plan tab (005 A): `plan.md`, the plan critique (resolved through the
+/// `PlanCritic` slot's own artifact), and `test-contract.md`, each as foldable
+/// document records. A missing artifact names itself rather than leaving a blank
+/// tab (AC-16).
+fn plan_docs(swarm: &SparPaths, full: Option<&RunState>) -> Vec<Record> {
+    let Some(st) = full else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    push_doc_or_missing(&mut out, swarm, &st.id, "plan.md", "plan.md");
+
+    let critic_artifact = st
+        .slots
+        .iter()
+        .find(|s| s.role == SlotRole::PlanCritic)
+        .and_then(|s| s.artifact.clone())
+        .unwrap_or_else(|| "plan-critique.md".to_string());
+    push_doc_or_missing(&mut out, swarm, &st.id, "plan critique", &critic_artifact);
+
+    push_doc_or_missing(
+        &mut out,
+        swarm,
+        &st.id,
+        "test-contract.md",
+        "test-contract.md",
+    );
+    out
+}
+
+fn push_doc_or_missing(
+    out: &mut Vec<Record>,
+    swarm: &SparPaths,
+    run_id: &str,
+    name: &str,
+    artifact: &str,
+) {
+    let path = swarm.artifact(run_id, artifact);
+    match std::fs::read_to_string(&path) {
+        Ok(body) if !body.trim().is_empty() => {
+            let source = SourceId::Document {
+                path: path.to_string_lossy().into_owned(),
+                start: 0,
+                end: body.len() as u64,
+            };
+            out.extend(record::parse_document(name, &body, source));
+        }
+        _ => out.push(record::missing_document(name, &path.to_string_lossy())),
+    }
+}
+
+/// Main's Review tab (005 B/C): one `Criterion` record per `AC-n` carrying every
+/// reviewer's cell, sourced from the same `review_result`/`acceptance_block_reasons`
+/// functions the ship gate calls (never a second implementation — AC-17), plus one
+/// foldable record per reviewer's raw verdict.
+fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: &Config) -> Vec<Record> {
+    let Some(st) = full else {
+        return Vec::new();
+    };
+    let contract_path = swarm.artifact(&st.id, "test-contract.md");
+    let contract_body = std::fs::read_to_string(&contract_path).unwrap_or_default();
+    let criteria = workflow::review_result::parse_contract_criteria(&contract_body);
+    let reviewers: Vec<&SlotState> = st
+        .slots
+        .iter()
+        .filter(|s| s.role == SlotRole::Reviewer)
+        .collect();
+    let mut out = Vec::new();
+
+    if criteria.is_empty() {
+        out.push(Record {
+            kind: RecordKind::Section,
+            glyph: "§",
+            verb: "Review".to_string(),
+            head: "No contract".to_string(),
+            summary: "the verdict alone gates".to_string(),
+            body: Vec::new(),
+            time: None,
+            elapsed: None,
+            actor: None,
+            source: SourceId::Document {
+                path: contract_path.to_string_lossy().into_owned(),
+                start: 0,
+                end: 0,
+            },
+            folded_by_default: false,
+        });
+    } else {
+        for id in &criteria {
+            let mut cells: Vec<String> = Vec::new();
+            for s in &reviewers {
+                let artifact = s
+                    .artifact
+                    .clone()
+                    .unwrap_or_else(|| format!("review-{}.md", s.id));
+                let path = swarm.artifact(&st.id, &artifact);
+                let cell = match std::fs::read_to_string(&path) {
+                    Ok(text) => {
+                        let res = workflow::review_result::parse_review(&text);
+                        match res.acceptance.iter().find(|a| &a.id == id) {
+                            Some(a) => format!("{:?}", a.status).to_ascii_lowercase(),
+                            None => "not reported".to_string(),
+                        }
+                    }
+                    Err(_) => "missing".to_string(),
+                };
+                cells.push(format!("{}: {cell}", s.id));
+            }
+            out.push(Record {
+                kind: RecordKind::Criterion,
+                glyph: "▤",
+                verb: id.clone(),
+                head: id.clone(),
+                summary: cells.join("  ·  "),
+                body: Vec::new(),
+                time: None,
+                elapsed: None,
+                actor: None,
+                source: SourceId::Document {
+                    path: format!("{}#{}", contract_path.display(), id),
+                    start: 0,
+                    end: 0,
+                },
+                folded_by_default: false,
+            });
+        }
+    }
+
+    for s in &reviewers {
+        let artifact = s
+            .artifact
+            .clone()
+            .unwrap_or_else(|| format!("review-{}.md", s.id));
+        let path = swarm.artifact(&st.id, &artifact);
+        match std::fs::read_to_string(&path) {
+            Ok(text) if !text.trim().is_empty() => {
+                let res = workflow::review_result::parse_review(&text);
+                let verdict_text = match res.verdict {
+                    Some(workflow::review_result::Verdict::Approve) => "approve",
+                    Some(workflow::review_result::Verdict::RequestChanges) => "request_changes",
+                    None => "no parsed verdict",
+                };
+                let mut reasons = if !criteria.is_empty() {
+                    workflow::implement::acceptance_block_reasons(&criteria, &res, cfg)
+                } else {
+                    Vec::new()
+                };
+                let blocked = !res.approves() || !reasons.is_empty();
+                if !res.approves() {
+                    reasons.insert(0, format!("verdict: {verdict_text}"));
+                }
+                let source = SourceId::Document {
+                    path: path.to_string_lossy().into_owned(),
+                    start: 0,
+                    end: text.len() as u64,
+                };
+                out.push(Record {
+                    kind: if blocked {
+                        RecordKind::Error
+                    } else {
+                        RecordKind::Doc
+                    },
+                    glyph: if blocked { "!" } else { "✓" },
+                    verb: s.id.clone(),
+                    head: format!("{} · {}", s.id, verdict_text),
+                    summary: reasons.join("; "),
+                    body: text.lines().map(|l| l.to_string()).collect(),
+                    time: None,
+                    elapsed: None,
+                    actor: None,
+                    source,
+                    folded_by_default: true,
+                });
+            }
+            _ => out.push(record::missing_document(&s.id, &path.to_string_lossy())),
+        }
+    }
+    out
+}
+
+/// Paths shorten against the selected run's own worktree roots (U34): the
+/// process-global `PROJECT_PREFIX` set once from whichever project was first
+/// browsed cannot know a run's per-slot worktrees, and is wrong the moment the
+/// operator crosses projects.
+fn path_shortener_for(swarm: &SparPaths, full: Option<&RunState>) -> record::PathShortener {
+    let mut roots = vec![swarm.project_root.clone()];
+    if let Some(st) = full {
+        roots.extend(st.worktrees.iter().map(|w| w.path.clone()));
+    }
+    record::PathShortener::new(roots)
 }
 
 fn short_agent(s: &str) -> &str {
@@ -8245,29 +9335,6 @@ fn short_in_run<'a>(id: &'a str, run: &str) -> &'a str {
     id.strip_prefix(run)
         .and_then(|rest| rest.strip_prefix(':'))
         .unwrap_or(id)
-}
-
-fn activity_event_line(e: &events::Event) -> String {
-    let t = e.ts.format("%H:%M");
-    match e.kind {
-        events::EventKind::Phase => {
-            let phase = e.phase.map(phase_label).unwrap_or_else(|| "?".into());
-            format!("{t} → {phase}")
-        }
-        events::EventKind::Slot => {
-            let slot = e.slot.as_deref().unwrap_or("agent");
-            let st = e.status.map(slot_status_label).unwrap_or("?");
-            format!("{t} {slot} {st}")
-        }
-        events::EventKind::Gate => {
-            let msg = e.message.as_deref().unwrap_or("waiting on you");
-            format!("{t} gate · {msg}")
-        }
-        events::EventKind::Info => {
-            let msg = e.message.as_deref().unwrap_or("");
-            format!("{t} {msg}")
-        }
-    }
 }
 
 // ── human labels ────────────────────────────────────────────────────────────
@@ -9284,7 +10351,7 @@ mod labels {
         assert!(app.main_tabs.iter().all(|(r, _)| r.y == lay.labels.y));
         assert!(app.main_tabs[0].0.x >= lay.main.x);
         assert!(app.main_tabs.windows(2).all(|w| w[0].0.x < w[1].0.x));
-        assert_eq!(app.main_tabs[3].1, MainTab::Shell);
+        assert_eq!(app.main_tabs[MAIN_TABS.len() - 1].1, MainTab::Shell);
 
         let row = |y: u16| -> String {
             let buf = term.backend().buffer();
@@ -9532,6 +10599,7 @@ mod labels {
                 &[],
                 &[],
                 None,
+                &[],
                 &mut root,
                 None,
             )
@@ -9565,6 +10633,7 @@ mod labels {
             &[],
             &[],
             None,
+            &[],
             &mut root,
             None,
         )
@@ -9582,6 +10651,7 @@ mod labels {
             &[],
             &[],
             None,
+            &[],
             &mut root,
             None,
         )
@@ -9596,6 +10666,7 @@ mod labels {
             &[],
             &[],
             None,
+            &[],
             &mut root,
             None,
         )
@@ -9618,6 +10689,7 @@ mod labels {
             &[],
             &[],
             None,
+            &[],
             &mut root,
             None,
         )
@@ -9633,6 +10705,7 @@ mod labels {
             &[],
             &[],
             None,
+            &[],
             &mut root,
             None,
         )
@@ -9647,6 +10720,7 @@ mod labels {
             &[],
             &[],
             None,
+            &[],
             &mut root,
             None,
         )
@@ -9835,6 +10909,40 @@ mod render_stability {
         let mut app = test_app();
         tweak(&mut app);
         let mut rail = ListState::default();
+        let activity = vec![
+            Record {
+                kind: RecordKind::Section,
+                glyph: "§",
+                verb: "Timeline".to_string(),
+                head: "Timeline".to_string(),
+                summary: String::new(),
+                body: Vec::new(),
+                time: None,
+                elapsed: None,
+                actor: None,
+                source: SourceId::Activity {
+                    at_millis: 0,
+                    sequence: 1,
+                },
+                folded_by_default: false,
+            },
+            Record {
+                kind: RecordKind::Note,
+                glyph: "·",
+                verb: "phase".to_string(),
+                head: "phase".to_string(),
+                summary: "impl done".to_string(),
+                body: Vec::new(),
+                time: None,
+                elapsed: None,
+                actor: Some("impl".to_string()),
+                source: SourceId::Activity {
+                    at_millis: 0,
+                    sequence: 2,
+                },
+                folded_by_default: false,
+            },
+        ];
         term.draw(|f| {
             draw(
                 f,
@@ -9843,8 +10951,12 @@ mod render_stability {
                 runs,
                 full,
                 "→ Bash  read the contract\n← ✓ toolu_01HqnTTSQH5m7ZWYJVAtA7Vj ok\n",
-                &["§Timeline".into(), " 19:04 impl done".into()],
+                &[],
+                &activity,
                 "diff",
+                &[],
+                &[],
+                &[],
                 &HomeData::default(),
                 None,
                 &mut app,
@@ -9923,7 +11035,11 @@ mod render_stability {
                 None,
                 "",
                 &[],
+                &[],
                 "",
+                &[],
+                &[],
+                &[],
                 &HomeData::default(),
                 None,
                 &mut app,
@@ -10000,7 +11116,11 @@ mod render_stability {
                     Some(&st),
                     "",
                     &[],
+                    &[],
                     "",
+                    &[],
+                    &[],
+                    &[],
                     &HomeData::default(),
                     None,
                     &mut app,
@@ -10047,7 +11167,11 @@ mod render_stability {
                     Some(&st),
                     "",
                     &[],
+                    &[],
                     "",
+                    &[],
+                    &[],
+                    &[],
                     &HomeData::default(),
                     None,
                     &mut app,
@@ -10076,7 +11200,11 @@ mod render_stability {
                 Some(&st),
                 "→ Bash  ls -la /etc | head -5\n← ✓  total 1184\ndrwxr-xr-x 139 root root 12288 Sep 7 10:19 .\n→ Read  /etc/hostname\n",
                 &[],
+                &[],
                 "",
+                &[],
+                &[],
+                &[],
                 &HomeData::default(),
                 None,
                 &mut app,
@@ -10504,7 +11632,11 @@ mod render_stability {
                 Some(&st),
                 "",
                 &[],
+                &[],
                 "",
+                &[],
+                &[],
+                &[],
                 &HomeData::default(),
                 None,
                 &mut app,
@@ -10729,7 +11861,11 @@ mod render_stability {
                     Some(&st),
                     "",
                     &[],
+                    &[],
                     text,
+                    &[],
+                    &[],
+                    &[],
                     &HomeData::default(),
                     None,
                     &mut app,
@@ -10813,7 +11949,8 @@ mod render_stability {
         // paints contiguous text while its click rects sit elsewhere (the round-2
         // regression: `[0, 0, 0]` gaps read as "uniform" even though nothing painted
         // agreed with where clicks landed).
-        let labels = ["Log", "Activity", "Diff", "Shell"];
+        let wide_labels = ["Log", "Activity", "Diff", "Plan", "Review", "Shell"];
+        let narrow_labels = ["Log", "Act", "Diff", "Plan", "Rev", "Sh"];
         // Returns (glyph-to-glyph gaps, cell-to-cell/rect gaps, painted-start-x per
         // label, recorded hit rects). Two different gap metrics because the two bands
         // use two different layouts: wide bakes a fixed-width badge slot into each
@@ -10827,7 +11964,7 @@ mod render_stability {
             starts: Vec<usize>,
             rects: Vec<Rect>,
         }
-        let probe = |width: u16, human_alerts_n: usize| -> Probe {
+        let probe = |width: u16, human_alerts_n: usize, labels: &[&str]| -> Probe {
             let mut term = Terminal::new(TestBackend::new(width, 30)).unwrap();
             let swarm = SparPaths::new("/x");
             let mut app = test_app();
@@ -10886,28 +12023,32 @@ mod render_stability {
         // wide strip pads each cell for a bigger touch target) but it must still cover
         // the text it claims to hit — the round-2 regression left the narrow strip's
         // rects pointing at blank columns entirely disjoint from the painted labels.
-        let assert_rects_cover_labels = |band: &str, starts: &[usize], rects: &[Rect], n: usize| {
+        let assert_rects_cover_labels = |band: &str,
+                                         starts: &[usize],
+                                         rects: &[Rect],
+                                         n: usize,
+                                         labels: &[&str]| {
             for (i, (&start, rect)) in starts.iter().zip(rects).enumerate() {
                 let label_end = start + labels[i].len();
                 assert!(
-                    (rect.x as usize) <= start && label_end <= (rect.x + rect.width) as usize,
-                    "{band} rect for {:?} (x={}, w={}) does not cover painted label at {start} (human_alerts_n={n})",
-                    labels[i],
-                    rect.x,
-                    rect.width
-                );
+                        (rect.x as usize) <= start && label_end <= (rect.x + rect.width) as usize,
+                        "{band} rect for {:?} (x={}, w={}) does not cover painted label at {start} (human_alerts_n={n})",
+                        labels[i],
+                        rect.x,
+                        rect.width
+                    );
             }
         };
         for &n in &[0usize, 3, 12] {
-            let wide = probe(120, n);
+            let wide = probe(120, n, &wide_labels);
             assert!(
                 wide.glyph_gaps.windows(2).all(|w| w[0] == w[1]) && wide.glyph_gaps[0] > 0,
                 "wide tab gaps not uniform (human_alerts_n={n}): {:?}",
                 wide.glyph_gaps
             );
-            assert_rects_cover_labels("wide", &wide.starts, &wide.rects, n);
+            assert_rects_cover_labels("wide", &wide.starts, &wide.rects, n, &wide_labels);
 
-            let narrow = probe(79, n);
+            let narrow = probe(79, n, &narrow_labels);
             // Narrow has no baked-in padding to reserve for a bigger touch target, so
             // its hit rects are instead padded out to split each glyph gap with the
             // neighbor on either side — the strip tiles edge to edge with zero dead
@@ -10926,7 +12067,7 @@ mod render_stability {
                 "narrow tab gaps not uniform (human_alerts_n={n}): {:?}",
                 narrow.glyph_gaps
             );
-            assert_rects_cover_labels("narrow", &narrow.starts, &narrow.rects, n);
+            assert_rects_cover_labels("narrow", &narrow.starts, &narrow.rects, n, &narrow_labels);
         }
     }
 
@@ -10980,14 +12121,16 @@ mod render_stability {
     /// dropping Shell (and, at the narrowest widths, Diff too) once the wide strip's
     /// fixed per-tab padding stopped fitting — invisible and untappable, with no
     /// ellipsis to say a tab existed. Every width in the narrow band must keep all
-    /// four — with an alert badge in play too: below ~36 columns the badge-reservation
-    /// fallback glues the badge onto Activity alone (trading gap uniformity, covered by
-    /// `tab_strip_gaps_are_uniform`'s 79-column probe, for keeping every tab on
-    /// screen), and that fallback path was only ever swept with zero alerts.
+    /// six (U9/U35 grew the strip from four; narrow uses the uniform short labels
+    /// — U35) — with an alert badge in play too: below ~36 columns the
+    /// badge-reservation fallback glues the badge onto Activity alone (trading gap
+    /// uniformity, covered by `tab_strip_gaps_are_uniform`'s 79-column probe, for
+    /// keeping every tab on screen), and that fallback path was only ever swept
+    /// with zero alerts.
     #[test]
     fn narrow_tab_strip_never_drops_a_tab() {
         let st = run_with(Phase::Review, 3);
-        let labels = ["Log", "Activity", "Diff", "Shell"];
+        let labels = ["Log", "Act", "Diff", "Plan", "Rev", "Sh"];
         for width in 24..80u16 {
             for &alerts in &[0usize, 3] {
                 let mut term = Terminal::new(TestBackend::new(width, 30)).unwrap();
@@ -11005,7 +12148,7 @@ mod render_stability {
                     .unwrap();
                 assert_eq!(
                     app.main_tabs.len(),
-                    4,
+                    6,
                     "width {width} (alerts={alerts}) dropped a tab: {:?}",
                     app.main_tabs
                 );
@@ -11040,8 +12183,9 @@ mod render_stability {
 
     /// The wide strip's per-tab badge slot (AC-4) grew the strip from 40 to 52
     /// columns, leaving only a one-column margin at width 80 — the narrowest the
-    /// wide band ever renders at (`NARROW_WIDTH`). Nothing caught a future badge or
-    /// label change eating that margin, so lock it directly.
+    /// wide band ever renders at (`NARROW_WIDTH`). Six tabs (U9/U35) do not all fit
+    /// at their full padded width there, so the strip falls back to short labels
+    /// (same as the narrow strip) rather than silently dropping one (U11).
     #[test]
     fn wide_tab_strip_never_drops_a_tab_at_the_tightest_widths() {
         let st = run_with(Phase::Review, 3);
@@ -11066,7 +12210,7 @@ mod render_stability {
                     .unwrap();
                 assert_eq!(
                     app.main_tabs.len(),
-                    4,
+                    6,
                     "width {width} (alerts={alerts}) dropped a tab: {:?}",
                     app.main_tabs
                 );
@@ -11132,7 +12276,11 @@ mod render_stability {
                     None,
                     &text,
                     &[],
+                    &[],
                     "",
+                    &[],
+                    &[],
+                    &[],
                     &HomeData::default(),
                     None,
                     &mut app,
@@ -11225,7 +12373,11 @@ mod render_stability {
                     None,
                     &text,
                     &[],
+                    &[],
                     "",
+                    &[],
+                    &[],
+                    &[],
                     &HomeData::default(),
                     None,
                     &mut app,
@@ -11278,7 +12430,11 @@ mod render_stability {
                 None,
                 &text,
                 &[],
+                &[],
                 "",
+                &[],
+                &[],
+                &[],
                 &HomeData::default(),
                 None,
                 &mut app,
@@ -11336,7 +12492,11 @@ mod render_stability {
                     None,
                     &text,
                     &[],
+                    &[],
                     "",
+                    &[],
+                    &[],
+                    &[],
                     &HomeData::default(),
                     None,
                     &mut app,
@@ -11481,7 +12641,11 @@ mod render_stability {
                 None,
                 "",
                 &[],
+                &[],
                 "",
+                &[],
+                &[],
+                &[],
                 home,
                 None,
                 &mut app,
@@ -11916,7 +13080,11 @@ mod render_stability {
                     Some(&st),
                     "",
                     &[],
+                    &[],
                     "",
+                    &[],
+                    &[],
+                    &[],
                     &home,
                     None,
                     &mut app,
@@ -11976,7 +13144,11 @@ mod render_stability {
                     None,
                     "",
                     &[],
+                    &[],
                     "",
+                    &[],
+                    &[],
+                    &[],
                     &empty,
                     None,
                     &mut app,
@@ -12121,7 +13293,11 @@ mod render_stability {
                 Some(&st),
                 "",
                 &[],
+                &[],
                 "",
+                &[],
+                &[],
+                &[],
                 &HomeData::default(),
                 None,
                 &mut app,
@@ -12169,7 +13345,11 @@ mod render_stability {
                 None,
                 "",
                 &[],
+                &[],
                 "",
+                &[],
+                &[],
+                &[],
                 &HomeData::default(),
                 None,
                 &mut app,

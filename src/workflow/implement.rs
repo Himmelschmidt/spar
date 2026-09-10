@@ -700,7 +700,11 @@ fn suite_blocks_ship(outcome: SuiteOutcome) -> bool {
 /// all (`[spec].enabled = false`) — acceptance is not evaluated and the verdict alone
 /// gates. Otherwise this is fail closed: a criterion the reviewer never mentioned counts
 /// against the ship exactly like a reported `fail`.
-fn acceptance_blocks_ship(criteria: &[String], res: &ReviewResult, cfg: &Config) -> bool {
+pub(crate) fn acceptance_blocks_ship(
+    criteria: &[String],
+    res: &ReviewResult,
+    cfg: &Config,
+) -> bool {
     if criteria.is_empty() {
         return false;
     }
@@ -721,7 +725,11 @@ fn acceptance_blocks_ship(criteria: &[String], res: &ReviewResult, cfg: &Config)
 /// Per criterion rather than pre-joined: the carry-forward brief renders these as bullets
 /// and truncates on line boundaries, so a single joined line (measured at 4k-10k chars on
 /// real reviews) is dropped whole and leaves a heading saying nothing blocked.
-fn acceptance_block_reasons(criteria: &[String], res: &ReviewResult, cfg: &Config) -> Vec<String> {
+pub(crate) fn acceptance_block_reasons(
+    criteria: &[String],
+    res: &ReviewResult,
+    cfg: &Config,
+) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
     for id in criteria {
         match res.acceptance.iter().find(|a| &a.id == id) {
