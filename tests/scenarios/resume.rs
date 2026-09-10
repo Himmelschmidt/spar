@@ -128,6 +128,115 @@ fn a_stopped_run_resumes_and_advances() {
     );
 }
 
+/// The same hazard `Phase::Quota` was fixed for: `spar stop` can park a plan run at
+/// `Stopped` before it was ever approved (mid-dispatch, before it ever reached its own
+/// gate). `spar resume` must refuse it explicitly, naming the human command, rather than
+/// falling through to `run_from_approved`'s generic "plan is not approved" bail.
+#[test]
+fn a_stopped_unapproved_plan_run_refuses_naming_the_human_command() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    init_repo(&proj);
+
+    let plan = spar_cmd()
+        .current_dir(&proj)
+        .args([
+            "plan",
+            "--task",
+            "hello",
+            "--providers",
+            "cli:claude",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2);
+    let run_id = json_of(&plan)["run_id"].as_str().unwrap().to_string();
+
+    let path = state_path(&proj, &run_id);
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(state["gates"]["plan_approved"], false, "never approved");
+    assert_eq!(state["workflow"], "plan");
+    set_phase(&proj, &run_id, "stopped");
+
+    spar_cmd()
+        .current_dir(&proj)
+        .args(["resume", &run_id])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("spar plan --run"))
+        .stderr(predicates::str::contains("spar approve"));
+}
+
+/// An *approved* plan run parked at `Stopped` stays resumable through `resume` — this is
+/// `a_stopped_run_resumes_and_advances` above, restated to make the `plan_approved`
+/// boundary explicit rather than incidental.
+#[test]
+fn a_stopped_approved_plan_run_stays_resumable() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    init_repo(&proj);
+
+    let plan = spar_cmd()
+        .current_dir(&proj)
+        .args([
+            "plan",
+            "--task",
+            "hello",
+            "--providers",
+            "cli:claude",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2);
+    let run_id = json_of(&plan)["run_id"].as_str().unwrap().to_string();
+    spar_cmd()
+        .current_dir(&proj)
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .code(0);
+    set_phase(&proj, &run_id, "stopped");
+
+    let out = spar_cmd()
+        .current_dir(&proj)
+        .args(["resume", &run_id, "--json"])
+        .assert();
+    let v = json_of(&out);
+    assert_ne!(v["phase"], "stopped");
+}
+
+/// A `--workflow loop` run has no approval step at all, so a `Stopped` park there must
+/// stay resumable regardless of `gates.plan_approved` — the same carve-out `Phase::Quota`
+/// already has for loop workflows.
+#[test]
+fn a_stopped_loop_workflow_run_stays_resumable() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    init_repo(&proj);
+
+    let run_id = implement_dry_run(&proj);
+    let path = state_path(&proj, &run_id);
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(state["workflow"], "loop");
+    set_phase(&proj, &run_id, "stopped");
+
+    let out = spar_cmd()
+        .current_dir(&proj)
+        .args(["resume", &run_id, "--json"])
+        .assert();
+    let v = json_of(&out);
+    assert_ne!(
+        v["phase"], "stopped",
+        "a loop-workflow stopped run must stay resumable"
+    );
+}
+
 #[test]
 fn a_gate_refuses_and_names_the_human_command() {
     let tmp = tempdir().unwrap();

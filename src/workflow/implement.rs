@@ -92,6 +92,23 @@ pub fn resume(
             state.phase
         );
     }
+    // `spar stop` parks a plan run at `Stopped` before it was ever approved just as
+    // readily as it parks an approved or loop-workflow run. Resuming that straight into
+    // `run_from_approved` would drive an unapproved plan through to ship — the same
+    // hazard `Phase::Quota` already guards against there. Refuse here, by name, instead
+    // of falling through to `run_from_approved`'s generic "plan is not approved" bail:
+    // resume's contract is that it names the human command for every state it refuses.
+    if state.phase == Phase::Stopped
+        && !state.gates.plan_approved
+        && state.workflow != crate::cli::WorkflowKind::Loop
+    {
+        bail!(
+            "run {run_id} is a stopped plan run that was never approved; resuming it would \
+             drive an unapproved plan through to ship. Replan it with \
+             `spar plan --run {run_id} -t \"…\"`, or if a plan is already written and \
+             awaiting a decision, `spar approve {run_id}`."
+        );
+    }
     if !state.phase.is_waitable_stop() {
         // `continue_run` has no detach knob of its own: it always runs to completion
         // in the foreground of whoever calls it. `--detach` here means the same thing
@@ -209,7 +226,6 @@ fn run_from_approved(
     let mut state = RunState::load(paths, run_id)?;
     let resumable = state.gates.plan_approved
         || state.phase == Phase::PlanApproved
-        || state.phase == Phase::Stopped
         // The round-ceiling gate is lifted by re-entering implement, so a run parked
         // there has to be resumable even when no plan gate ever ran (`--workflow loop`).
         || state.phase == Phase::AwaitingRoundExtension
@@ -224,7 +240,14 @@ fn run_from_approved(
         // `Phase::Quota` park is already covered by the `plan_approved` disjunct above,
         // so the only case this clause needs to add is `--workflow loop` (`implement -t`
         // directly), which has no approval step at all.
-        || (state.phase == Phase::Quota && state.workflow == crate::cli::WorkflowKind::Loop);
+        || (state.phase == Phase::Quota && state.workflow == crate::cli::WorkflowKind::Loop)
+        // `Phase::Stopped` has the identical hazard: `spar stop` parks a plan run here
+        // pre-approval just as readily as it parks an approved or loop-workflow run, and
+        // accepting it unconditionally would let `implement --run` (or `spar resume`)
+        // drive an unapproved plan through to ship. An *approved* stopped run is already
+        // covered by the `plan_approved` disjunct above, so the only case this clause
+        // needs to add is `--workflow loop`, which has no approval step at all.
+        || (state.phase == Phase::Stopped && state.workflow == crate::cli::WorkflowKind::Loop);
     if !resumable {
         bail!(
             "run {run_id} plan is not approved (phase={:?})",
