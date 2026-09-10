@@ -3314,4 +3314,37 @@ mod tests {
         assert!(t.text.contains("END"));
         assert!(!t.text.chars().any(|c| c == '\u{FFFD}'));
     }
+
+    #[test]
+    fn tail_log_reports_the_adjusted_source_offset_after_a_utf8_boundary() {
+        let tmp = tempdir().unwrap();
+        let log = tmp.path().join("utf8-offset.log");
+        std::fs::write(&log, "0123456789éTAIL").unwrap();
+
+        let t = tail_log_info(&log, 5);
+        assert!(t.truncated);
+        assert_eq!(t.start, 12, "start is after the skipped continuation byte");
+        assert_eq!(t.text, "TAIL");
+    }
+
+    #[test]
+    fn serialized_log_writer_keeps_index_offsets_monotonic_under_concurrent_appends() {
+        let tmp = tempdir().unwrap();
+        let log = tmp.path().join("stream.log");
+        let writer = std::sync::Arc::new(LogWriter::open(&log).unwrap());
+        let left = writer.clone();
+        let right = writer.clone();
+        let first = std::thread::spawn(move || left.append("stdout\n"));
+        let second = std::thread::spawn(move || right.append("stderr\n"));
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+
+        let bytes = std::fs::read(&log).unwrap();
+        let index = read_log_index(&log, 0, bytes.len() as u64).unwrap();
+        assert_eq!(index.len(), 2);
+        assert_eq!(index[0].0, 0);
+        assert!(index[0].0 < index[1].0);
+        assert!(index.iter().all(|(offset, _)| *offset < bytes.len() as u64));
+        assert!(index.windows(2).all(|pair| pair[0].1 <= pair[1].1));
+    }
 }

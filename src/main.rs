@@ -36,6 +36,9 @@ mod workflow;
 mod workspace;
 mod worktree;
 
+#[cfg(test)]
+mod structured_views_contract;
+
 use anyhow::Result;
 use clap::Parser;
 use cli::{BusCmd, Cli, Command, SkillsCmd};

@@ -10023,6 +10023,83 @@ mod render_stability {
         }
     }
 
+    #[test]
+    fn structured_views_have_six_stable_tabs_with_narrow_labels() {
+        let labels: Vec<_> = MAIN_TABS.iter().map(|tab| tab.label()).collect();
+        assert_eq!(
+            labels,
+            ["Log", "Activity", "Diff", "Plan", "Review", "Shell"]
+        );
+
+        for width in 20..80 {
+            let st = run_with(Phase::Review, 2);
+            let mut term = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            let swarm = SparPaths::new("/x");
+            let mut app = test_app();
+            app.human_alerts_n = 99;
+            let mut rail = ListState::default();
+            term.draw(|f| {
+                draw(
+                    f,
+                    &swarm,
+                    &[],
+                    &[],
+                    Some(&st),
+                    "",
+                    &[],
+                    "",
+                    &HomeData::default(),
+                    None,
+                    &mut app,
+                    &mut rail,
+                )
+            })
+            .unwrap();
+            assert_eq!(app.main_tabs.len(), 6, "width {width} dropped a tab");
+        }
+    }
+
+    #[test]
+    fn log_first_paint_folds_results_and_uses_distinct_tool_glyphs() {
+        let st = run_with(Phase::Review, 1);
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let swarm = SparPaths::new("/x");
+        let mut app = test_app();
+        app.open_main(MainTab::Log);
+        let mut rail = ListState::default();
+        term.draw(|f| {
+            draw(
+                f,
+                &swarm,
+                &[],
+                &[],
+                Some(&st),
+                "→ Bash  ls -la /etc | head -5\n← ✓  total 1184\ndrwxr-xr-x 139 root root 12288 Sep 7 10:19 .\n→ Read  /etc/hostname\n",
+                &[],
+                "",
+                &HomeData::default(),
+                None,
+                &mut app,
+                &mut rail,
+            )
+        })
+        .unwrap();
+        let painted: String = (0..30)
+            .map(|y| row(&term, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(painted.contains("◆ Run"), "tool head: {painted:?}");
+        assert!(painted.contains("◈ Read"), "read head: {painted:?}");
+        assert!(
+            painted.contains("0.8s") || painted.contains("0s"),
+            "elapsed: {painted:?}"
+        );
+        assert!(
+            !painted.contains("drwxr-xr-x 139"),
+            "tool output must be folded on first paint: {painted:?}"
+        );
+    }
+
     /// The stepper is read off the slots that ran, so it says the same thing whether
     /// or not the phase name happens to mention the step.
     #[test]
