@@ -92,6 +92,20 @@ impl SparPaths {
         self.queue_dir().join(run_id)
     }
 
+    /// Guards the read-decide-write admission sequence (`daemon::try_admit`) so two
+    /// concurrent launchers, or a launcher racing the daemon's own restart/drain, can
+    /// never both observe capacity and both admit past `max_slots_per_bucket`.
+    pub fn admission_lock(&self) -> PathBuf {
+        self.root.join("admission.lock")
+    }
+
+    /// In-flight admission reservations, keyed by run, while the real slot state has
+    /// not yet caught up to reflect them. TTL-pruned, so a launch that never actually
+    /// starts a slot self-heals instead of wasting capacity forever.
+    pub fn reservations_file(&self) -> PathBuf {
+        self.root.join("reservations.json")
+    }
+
     /// Workspace-level logs, independent of any single run — currently just the
     /// daemon's own log.
     pub fn workspace_logs_dir(&self) -> PathBuf {

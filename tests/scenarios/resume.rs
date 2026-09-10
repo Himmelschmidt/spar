@@ -200,3 +200,50 @@ fn a_finished_run_refuses() {
         .failure()
         .stderr(predicates::str::contains("nothing to resume"));
 }
+
+/// An abandoned in-flight run (not a waitable stop, no live owner) is the one case
+/// `resume --detach` actually exists for. It must route through the same
+/// `spawn_detached_orchestrator` / handshake machinery `implement --detach` uses,
+/// rather than silently ignoring `--detach` and calling `continue_run` in this
+/// process. `spawn_detached_orchestrator` always opens `logs/orchestrator.log` before
+/// the child even runs, so its presence is proof the detach path was taken — checking
+/// only that the run advanced would not catch a regression back to the foreground
+/// path, since `continue_run` also advances the run, just never through that log.
+#[test]
+fn an_abandoned_in_flight_run_resumes_through_the_detach_path() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    init_repo(&proj);
+
+    let run_id = implement_dry_run(&proj);
+    set_phase(&proj, &run_id, "dispatch");
+
+    let out = spar_cmd()
+        .current_dir(&proj)
+        .args(["resume", &run_id, "--detach", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.code() == Some(0) || out.status.code() == Some(2),
+        "resume --detach must not fail the launch: {out:?}"
+    );
+
+    let log = proj
+        .join(".spar/runs")
+        .join(&run_id)
+        .join("logs/orchestrator.log");
+    assert!(
+        log.is_file(),
+        "resume --detach on an in-flight abandoned run must spawn a detached \
+         orchestrator, not run continue_run in this process"
+    );
+
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(state_path(&proj, &run_id)).unwrap())
+            .unwrap();
+    assert_ne!(
+        state["phase"], "dispatch",
+        "the resumed run must actually advance"
+    );
+}

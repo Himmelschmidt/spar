@@ -154,6 +154,110 @@ struct QueueEntry {
     enqueued_at: DateTime<Utc>,
 }
 
+/// How long an admission reservation counts toward supply after being granted, before
+/// it is pruned regardless of whether the run ever actually started a slot. Long
+/// enough to cover `spawn_detached_orchestrator` + the handshake (capped at 10s by
+/// default) plus the time for the child to dispatch and mark a slot `Running`; short
+/// enough that a launch which dies on the way in self-heals instead of wasting
+/// capacity forever.
+const RESERVATION_TTL_SECS: i64 = 60;
+
+/// A grant of capacity for a run between the moment it is admitted (a launch, a
+/// restart, a queue release) and the moment its real slots reflect that demand.
+/// `bucket_supply_in_use` cannot see a run's usage until its orchestrator has actually
+/// dispatched a slot to `Running`, and that can lag admission by seconds — long enough
+/// for a second admission decision, in this process or another, to race it. A
+/// reservation closes that window: it is read back into `effective_supply` alongside
+/// the real counts until either the real counts catch up (see `effective_supply`) or
+/// the TTL above prunes it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Reservation {
+    run_id: String,
+    buckets: HashMap<String, u32>,
+    reserved_at: DateTime<Utc>,
+}
+
+fn load_reservations(paths: &SparPaths) -> Vec<Reservation> {
+    let now = Utc::now();
+    fs::read_to_string(paths.reservations_file())
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<Reservation>>(&s).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| now - r.reserved_at < chrono::Duration::seconds(RESERVATION_TTL_SECS))
+        .collect()
+}
+
+fn save_reservations(paths: &SparPaths, reservations: &[Reservation]) -> Result<()> {
+    let path = paths.reservations_file();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    fs::write(&path, serde_json::to_string_pretty(reservations)?)
+        .with_context(|| format!("write {}", path.display()))
+}
+
+/// Guard the read-decide-write admission sequence with a blocking file lock, so two
+/// concurrent launchers (or a launcher racing the daemon's own restart/drain) can
+/// never both observe the same free capacity and both admit past the cap.
+fn with_admission_lock<T>(paths: &SparPaths, f: impl FnOnce() -> T) -> Result<T> {
+    let path = paths.admission_lock();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    file.lock()
+        .with_context(|| format!("lock {}", path.display()))?;
+    let result = f();
+    let _ = file.unlock();
+    Ok(result)
+}
+
+/// Try to admit `run_id`'s `demand` against `cap`, atomically with every other
+/// admission decision in this project (same process or another). On success, records
+/// a reservation for `run_id` before returning, so the very next decision — in this
+/// loop iteration or a concurrent process — already sees the capacity as taken.
+fn try_admit(paths: &SparPaths, run_id: &str, demand: &HashMap<String, u32>, cap: u32) -> bool {
+    with_admission_lock(paths, || {
+        let mut reservations = load_reservations(paths);
+        let real_by_run = real_supply_by_run(paths);
+        let effective = effective_supply(&real_by_run, &reservations, Some(run_id));
+        if !fits(demand, &effective, cap) {
+            return false;
+        }
+        reservations.retain(|r| r.run_id != run_id);
+        if !demand.is_empty() {
+            reservations.push(Reservation {
+                run_id: run_id.to_string(),
+                buckets: demand.clone(),
+                reserved_at: Utc::now(),
+            });
+        }
+        let _ = save_reservations(paths, &reservations);
+        true
+    })
+    .unwrap_or(true) // a lock/IO failure must never block admission — the cap is advisory
+}
+
+/// Drop `run_id`'s reservation early, once it is known it will never be reflected in
+/// real slot state — the spawn or its handshake failed, or (the `--dry-run --detach`
+/// case) the run reached a waitable stop inside the handshake window without ever
+/// holding a `Running` slot for a caller to see. Best-effort: if this is never called,
+/// the TTL above still reclaims the capacity.
+pub(crate) fn release_reservation(paths: &SparPaths, run_id: &str) {
+    let _ = with_admission_lock(paths, || {
+        let mut reservations = load_reservations(paths);
+        reservations.retain(|r| r.run_id != run_id);
+        let _ = save_reservations(paths, &reservations);
+    });
+}
+
 fn log_line(paths: &SparPaths, msg: &str) {
     let dir = paths.workspace_logs_dir();
     if fs::create_dir_all(&dir).is_err() {
@@ -193,9 +297,12 @@ fn bucket_counts<'a>(providers: impl Iterator<Item = &'a str>) -> HashMap<String
     out
 }
 
-/// Slots at `Running`, across every non-archived run, bucketed the same way.
-fn bucket_supply_in_use(paths: &SparPaths) -> HashMap<String, u32> {
-    let mut out = HashMap::new();
+/// Slots at `Running`, per run, bucketed by `storage_key()`. The per-run breakdown
+/// (rather than a flat total) is what lets `effective_supply` tell "this reservation
+/// is now reflected in real state" apart from "this reservation is still the only
+/// evidence this run's slot exists" for the *same* run.
+fn real_supply_by_run(paths: &SparPaths) -> HashMap<String, HashMap<String, u32>> {
+    let mut out: HashMap<String, HashMap<String, u32>> = HashMap::new();
     for summary in crate::state::list_runs(paths).unwrap_or_default() {
         if summary.archived {
             continue;
@@ -203,12 +310,59 @@ fn bucket_supply_in_use(paths: &SparPaths) -> HashMap<String, u32> {
         let Ok(state) = RunState::load_for_display(paths, &summary.id) else {
             continue;
         };
+        let per_bucket = out.entry(summary.id).or_default();
         for slot in &state.slots {
             if slot.status == SlotStatus::Running {
                 if let Ok(r) = ProviderRef::parse(&slot.provider) {
-                    *out.entry(r.storage_key()).or_insert(0) += 1;
+                    *per_bucket.entry(r.storage_key()).or_insert(0) += 1;
                 }
             }
+        }
+    }
+    out
+}
+
+/// Slots at `Running`, across every non-archived run, bucketed by `storage_key()`.
+/// Informational only (`spar daemon status`) — admission decisions use
+/// `effective_supply`, which also accounts for in-flight reservations.
+fn bucket_supply_in_use(paths: &SparPaths) -> HashMap<String, u32> {
+    let mut out = HashMap::new();
+    for per_bucket in real_supply_by_run(paths).values() {
+        for (bucket, count) in per_bucket {
+            *out.entry(bucket.clone()).or_insert(0) += count;
+        }
+    }
+    out
+}
+
+/// Real supply plus every active reservation's *unreflected* demand: a reservation
+/// only adds to a bucket the amount by which it exceeds that same run's real slot
+/// count there, so a run whose slots have caught up to its reservation is counted
+/// once, from real state, not twice. `excluding` is the run currently being decided —
+/// its own prior reservation (if any) never counts against itself.
+fn effective_supply(
+    real_by_run: &HashMap<String, HashMap<String, u32>>,
+    reservations: &[Reservation],
+    excluding: Option<&str>,
+) -> HashMap<String, u32> {
+    let mut out: HashMap<String, u32> = HashMap::new();
+    for per_bucket in real_by_run.values() {
+        for (bucket, count) in per_bucket {
+            *out.entry(bucket.clone()).or_insert(0) += count;
+        }
+    }
+    for resv in reservations {
+        if Some(resv.run_id.as_str()) == excluding {
+            continue;
+        }
+        let real_for_run = real_by_run.get(&resv.run_id);
+        for (bucket, reserved_count) in &resv.buckets {
+            let already = real_for_run
+                .and_then(|m| m.get(bucket))
+                .copied()
+                .unwrap_or(0);
+            let extra = reserved_count.saturating_sub(already);
+            *out.entry(bucket.clone()).or_insert(0) += extra;
         }
     }
     out
@@ -226,9 +380,10 @@ fn fits(demand: &HashMap<String, u32>, in_use: &HashMap<String, u32>, cap: u32) 
 /// Launcher-side admission check for `plan --detach` / `implement --detach` /
 /// `run --detach`, called right before it would otherwise spawn a detached
 /// orchestrator. `Ok(None)` means proceed with the spawn as usual — no daemon holds
-/// the lock, the cap is off, or this run's demand fits. `Ok(Some(message))` means the
-/// caller wrote a queue entry instead of spawning and should print `message` and
-/// return success without starting anything.
+/// the lock, the cap is off, or this run's demand fits (and, on the fitting path, has
+/// already been reserved so the next concurrent decision sees it as taken). `Ok(Some(message))`
+/// means the caller wrote a queue entry instead of spawning and should print `message`
+/// and return success without starting anything.
 ///
 /// A launch must never block on a service the operator did not start: with no daemon
 /// holding `.spar/daemon.lock`, this always returns `Ok(None)`.
@@ -245,8 +400,7 @@ pub fn maybe_enqueue(paths: &SparPaths, cfg: &Config, state: &RunState) -> Resul
     if demand.is_empty() {
         return Ok(None);
     }
-    let in_use = bucket_supply_in_use(paths);
-    if fits(&demand, &in_use, cap) {
+    if try_admit(paths, &state.id, &demand, cap) {
         return Ok(None);
     }
     let dir = paths.queue_dir();
@@ -316,6 +470,13 @@ fn tick(paths: &SparPaths, cfg: &Config, book: &mut DaemonState) {
         if entry.restarts >= cfg.daemon.max_restarts {
             continue;
         }
+        // A restart is an admission point exactly like a fresh launch: it must not
+        // push a bucket past `max_slots_per_bucket` just because the run asking is
+        // one the daemon already knew about.
+        let demand = run_demand(&state);
+        if !try_admit(paths, &summary.id, &demand, cfg.daemon.max_slots_per_bucket) {
+            continue;
+        }
         match crate::process::spawn_detached_orchestrator(paths, &summary.id) {
             Ok(detached) => {
                 match crate::process::await_detached_start(paths, &summary.id, detached) {
@@ -329,11 +490,13 @@ fn tick(paths: &SparPaths, cfg: &Config, book: &mut DaemonState) {
                     Err(e) => {
                         entry.restarts += 1;
                         entry.last_restart_at = Some(now);
+                        release_reservation(paths, &summary.id);
                         log_line(paths, &format!("run {} restart failed: {e:#}", summary.id));
                     }
                 }
             }
             Err(e) => {
+                release_reservation(paths, &summary.id);
                 log_line(
                     paths,
                     &format!("run {} restart spawn failed: {e:#}", summary.id),
@@ -372,8 +535,7 @@ fn drain_queue(paths: &SparPaths, cfg: &Config) {
             continue;
         };
         let demand = run_demand(&state);
-        let in_use = bucket_supply_in_use(paths);
-        if !fits(&demand, &in_use, cap) {
+        if !try_admit(paths, &entry.run_id, &demand, cap) {
             continue;
         }
         match crate::process::spawn_detached_orchestrator(paths, &entry.run_id) {
@@ -382,6 +544,7 @@ fn drain_queue(paths: &SparPaths, cfg: &Config) {
                     let _ = fs::remove_file(&path);
                     log_line(paths, &format!("run {} admitted from queue", entry.run_id));
                 } else {
+                    release_reservation(paths, &entry.run_id);
                     log_line(
                         paths,
                         &format!("run {} failed to start from queue", entry.run_id),
@@ -389,6 +552,7 @@ fn drain_queue(paths: &SparPaths, cfg: &Config) {
                 }
             }
             Err(e) => {
+                release_reservation(paths, &entry.run_id);
                 log_line(
                     paths,
                     &format!("run {} queue spawn failed: {e:#}", entry.run_id),
@@ -605,5 +769,294 @@ mod tests {
             tmp.path().to_path_buf(),
         );
         assert!(maybe_enqueue(&paths, &cfg, &state).unwrap().is_none());
+    }
+
+    /// A run with one `Running` slot on `provider`, persisted so `real_supply_by_run`
+    /// / `list_runs` can see it.
+    fn running_run(paths: &SparPaths, id: &str, provider: &str) -> RunState {
+        let mut state = RunState::new(
+            id,
+            crate::cli::WorkflowKind::Loop,
+            paths.project_root.clone(),
+        );
+        state.phase = crate::state::Phase::Review;
+        let mut slot =
+            crate::executor::init_slot("impl", provider, crate::state::SlotRole::Implementer);
+        slot.status = SlotStatus::Running;
+        state.slots.push(slot);
+        state.save(paths).unwrap();
+        state
+    }
+
+    fn demand_of(bucket: &str, n: u32) -> HashMap<String, u32> {
+        let mut m = HashMap::new();
+        m.insert(bucket.to_string(), n);
+        m
+    }
+
+    #[test]
+    fn try_admit_denies_over_cap_and_reserves_on_success() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let demand = demand_of("cli:claude", 1);
+
+        assert!(
+            try_admit(&paths, "r1", &demand, 1),
+            "the first run into an empty bucket must be admitted"
+        );
+        assert!(
+            !try_admit(&paths, "r2", &demand, 1),
+            "a second run must not be admitted past the cap on r1's still-active reservation"
+        );
+
+        let reservations = load_reservations(&paths);
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(reservations[0].run_id, "r1");
+    }
+
+    #[test]
+    fn try_admit_replaces_the_same_runs_earlier_reservation_instead_of_stacking() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let demand = demand_of("cli:claude", 1);
+
+        assert!(try_admit(&paths, "r1", &demand, 1));
+        // Re-admitting the same run (e.g. a second detach attempt) must not double its
+        // own reservation and starve itself.
+        assert!(try_admit(&paths, "r1", &demand, 1));
+        assert_eq!(load_reservations(&paths).len(), 1);
+    }
+
+    #[test]
+    fn effective_supply_drops_a_reservations_extra_once_real_slots_catch_up() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let demand = demand_of("cli:claude", 1);
+        assert!(try_admit(&paths, "r1", &demand, 1));
+
+        // Before r1's slot is real, the reservation alone must still block a second
+        // run.
+        assert!(!try_admit(&paths, "r2", &demand, 1));
+
+        // Once r1's real slot is `Running`, the reservation's contribution collapses
+        // to zero (real state already counts it) rather than double-counting — but the
+        // bucket is still at cap from the real slot itself, so admission still fails.
+        running_run(&paths, "r1", "cli:claude");
+        let real_by_run = real_supply_by_run(&paths);
+        let reservations = load_reservations(&paths);
+        let effective = effective_supply(&real_by_run, &reservations, None);
+        assert_eq!(effective.get("cli:claude").copied(), Some(1));
+    }
+
+    #[test]
+    fn release_reservation_frees_capacity_for_the_next_admission() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let demand = demand_of("cli:claude", 1);
+        assert!(try_admit(&paths, "r1", &demand, 1));
+        assert!(!try_admit(&paths, "r2", &demand, 1));
+
+        release_reservation(&paths, "r1");
+        assert!(
+            try_admit(&paths, "r2", &demand, 1),
+            "releasing r1's reservation must free the bucket for r2"
+        );
+    }
+
+    #[test]
+    fn reservations_past_ttl_are_pruned() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let stale = Reservation {
+            run_id: "old".to_string(),
+            buckets: demand_of("cli:claude", 1),
+            reserved_at: Utc::now() - chrono::Duration::seconds(RESERVATION_TTL_SECS + 1),
+        };
+        save_reservations(&paths, &[stale]).unwrap();
+        assert!(
+            load_reservations(&paths).is_empty(),
+            "a reservation past its TTL must not still count toward capacity"
+        );
+    }
+
+    #[test]
+    fn maybe_enqueue_writes_a_queue_entry_when_over_cap() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let _lock = DaemonLock::acquire(&paths).unwrap();
+        let mut cfg = Config::default();
+        cfg.daemon.max_slots_per_bucket = 1;
+        running_run(&paths, "already-running", "cli:claude");
+
+        let state = RunState::new(
+            "r2",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        let mut state = state;
+        let mut slot =
+            crate::executor::init_slot("impl", "cli:claude", crate::state::SlotRole::Implementer);
+        slot.status = SlotStatus::Pending;
+        state.slots.push(slot);
+
+        let msg = maybe_enqueue(&paths, &cfg, &state).unwrap();
+        assert!(
+            msg.is_some(),
+            "a run over the cap must be queued, not spawned"
+        );
+        assert!(paths.queue_file("r2").is_file());
+    }
+
+    #[test]
+    fn restart_is_skipped_once_max_restarts_is_reached() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.phase = crate::state::Phase::Review; // in-flight, not waitable-stop
+        state.save(&paths).unwrap();
+
+        let mut cfg = Config::default();
+        cfg.daemon.restart = true;
+        cfg.daemon.abandon_after_secs = 0;
+        cfg.daemon.max_restarts = 0;
+        let mut book = DaemonState::new();
+        // Pre-seed as already having burned its one restart, so `tick` must skip the
+        // spawn attempt entirely rather than trying `spawn_detached_orchestrator`
+        // against a test binary that cannot stand in for a real orchestrator.
+        book.runs.entry("r1".to_string()).or_default().restarts = 0;
+
+        tick(&paths, &cfg, &mut book);
+
+        assert!(
+            !paths.logs_dir("r1").join("orchestrator.log").is_file(),
+            "max_restarts = 0 must stop tick from ever attempting a spawn"
+        );
+    }
+
+    #[test]
+    fn queued_run_is_never_marked_abandoned_by_tick() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.phase = crate::state::Phase::Init;
+        state.save(&paths).unwrap();
+        std::fs::create_dir_all(paths.queue_dir()).unwrap();
+        std::fs::write(paths.queue_file("r1"), "{}").unwrap();
+
+        let mut cfg = Config::default();
+        cfg.daemon.restart = false;
+        cfg.daemon.abandon_after_secs = 0;
+        let mut book = DaemonState::new();
+
+        tick(&paths, &cfg, &mut book);
+
+        assert!(
+            book.runs
+                .get("r1")
+                .and_then(|b| b.abandoned_since)
+                .is_none(),
+            "a run sitting in the admission queue is owned by the queue, not abandoned"
+        );
+    }
+
+    #[test]
+    fn abandonment_notified_flag_is_set_once_and_stays_set() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.phase = crate::state::Phase::Review;
+        state.save(&paths).unwrap();
+
+        let mut cfg = Config::default();
+        cfg.daemon.restart = false;
+        cfg.daemon.abandon_after_secs = 0;
+        let mut book = DaemonState::new();
+
+        tick(&paths, &cfg, &mut book);
+        assert!(book.runs["r1"].abandoned_notified);
+        let since_first = book.runs["r1"].abandoned_since;
+
+        tick(&paths, &cfg, &mut book);
+        assert!(
+            book.runs["r1"].abandoned_notified,
+            "the notified flag must not reset while the run stays abandoned"
+        );
+        assert_eq!(
+            book.runs["r1"].abandoned_since, since_first,
+            "the abandonment episode must not restart while it is ongoing"
+        );
+    }
+
+    /// D9, structural half: a source-level check that the daemon never mentions any
+    /// operator-only call. Cheap, and it is what stops the prohibition in this file's
+    /// own module doc from decaying into a comment nobody enforces.
+    #[test]
+    fn daemon_source_never_mentions_operator_only_calls() {
+        // Scan only the non-test body: the `#[cfg(test)]` module below (this test
+        // included) legitimately names these calls, both in doc comments and in this
+        // very assertion list.
+        let full = include_str!("daemon.rs");
+        let body = full.split("#[cfg(test)]").next().unwrap();
+        // Exclude comment/doc lines within the body too: the module doc at the top of
+        // this file names these calls in English, which is the point of the comment,
+        // not a violation of it.
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for banned in [
+            "cleanup_run",
+            "pick_providers",
+            "archive_sweep",
+            "gates.plan_approved",
+            "gates.ship_confirmed",
+            "ship::",
+        ] {
+            assert!(
+                !code.contains(banned),
+                "src/daemon.rs must never call `{banned}` — a supervisor is not an operator"
+            );
+        }
+    }
+
+    /// D9, behavioural half: a tick over a run parked at a gate must not touch it.
+    #[test]
+    fn tick_leaves_a_gated_run_byte_identical() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.phase = crate::state::Phase::AwaitingShipConfirm;
+        state.gates.ship_confirmed = false;
+        state.save(&paths).unwrap();
+        let before = std::fs::read_to_string(paths.state_file("r1")).unwrap();
+
+        let cfg = Config::default();
+        let mut book = DaemonState::new();
+        for _ in 0..3 {
+            tick(&paths, &cfg, &mut book);
+        }
+
+        let after = std::fs::read_to_string(paths.state_file("r1")).unwrap();
+        // `updated_at` never moves because `save` is never called again for this run —
+        // a gate is `is_waitable_stop()`, so `tick` takes none of its branches beyond
+        // the very first `abandoned()` check, which reads false and `continue`s.
+        assert_eq!(before, after, "a gate must be untouched by the daemon");
     }
 }

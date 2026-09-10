@@ -55,7 +55,9 @@ pub fn run_from_cli(
 /// `spar resume <id>`: dispatch on what the run actually is, rather than aliasing
 /// `implement --run`. A gate is refused (a decision is waiting, and resume is not an
 /// operator); a live owner is refused naming its pid; an abandoned in-flight run goes
-/// to `continue_run`, which already dispatches on `state.workflow`; an at-rest run
+/// to `continue_run` in the foreground, or (with `--detach`) through the same
+/// `detach_implement` a fresh `implement --detach` uses, since `continue_run` already
+/// dispatches on `state.workflow` regardless of which process calls it; an at-rest run
 /// goes to `run_from_approved`, which already knows how to clear a `stopped` marker,
 /// reset failed slots and re-check quota — the same path a bare `implement --run <id>`
 /// takes, so this mints no provider pool of its own.
@@ -91,9 +93,14 @@ pub fn resume(
         );
     }
     if !state.phase.is_waitable_stop() {
-        // `continue_run` has no detach knob of its own: it is the path an already
-        // in-flight, abandoned orchestrator's replacement takes, and it always runs
-        // to completion in the foreground of whoever calls it.
+        // `continue_run` has no detach knob of its own: it always runs to completion
+        // in the foreground of whoever calls it. `--detach` here means the same thing
+        // it means for `plan`/`implement`: spawn `__internal_continue` into a session
+        // of its own and hand back once it holds the run's lock, rather than running
+        // it in this process.
+        if detach {
+            return detach_implement(&state, paths, cfg, json);
+        }
         return continue_run(paths, cfg, run_id);
     }
     // `run_from_approved` always re-decides `state.dry_run` from `opts.resolve_dry_run()`
@@ -2630,6 +2637,11 @@ fn detach_implement(
             Ok(ExitCode::Success)
         }
         crate::process::DetachOutcome::Completed => {
+            // The run settled inside the handshake window without ever holding a
+            // `Running` slot for `effective_supply` to see, so its admission
+            // reservation (if `maybe_enqueue` granted one) would otherwise squat on
+            // capacity for the full TTL.
+            crate::daemon::release_reservation(paths, &state.id);
             let state = RunState::load_for_display(paths, &state.id)?;
             if json {
                 executor::emit_run_json(&state)?;

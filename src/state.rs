@@ -20,10 +20,12 @@ pub struct RunState {
     /// Never replaces `task` (the run's identity); cleared when a round runs without `-t`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amendment: Option<String>,
-    /// Path to `.spar/briefs/<slug>.md` when this run was created from `plan
-    /// --spec`/stdin. `task` still carries the brief body verbatim (every listing
-    /// already truncates it); this is only how `spar brief <id>` finds the original
-    /// file. `None` for a run created from a bare `-t`.
+    /// Project-root-relative path to `.spar/briefs/<slug>.md` when this run was
+    /// created from `plan --spec`/stdin (relative like every other path on this
+    /// struct, so the run survives the project moving or being restored elsewhere).
+    /// `task` still carries the brief body verbatim (every listing already truncates
+    /// it); this is only how `spar brief <id>` finds the original file. `None` for a
+    /// run created from a bare `-t`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub brief: Option<PathBuf>,
     pub created_at: DateTime<Utc>,
@@ -1715,6 +1717,38 @@ mod tests {
         let runs = list_runs(&paths).unwrap();
         assert_eq!(runs.len(), 1);
         assert!(runs[0].abandoned, "no lock owner ⇒ abandoned");
+    }
+
+    /// `Phase::Init` plus a spool file is `is_abandoned(Init, false)` by the raw phase
+    /// check alone — `RunState::abandoned` (and therefore `list_runs`, `status`, `wait`
+    /// and the daemon's own sweep, which all funnel through it) must recognize the
+    /// queue as ownership and not report the run as orphaned.
+    #[test]
+    fn a_queued_run_is_not_abandoned() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new("queued", WorkflowKind::Loop, tmp.path().to_path_buf());
+        state.phase = Phase::Init;
+        state.save(&paths).unwrap();
+
+        assert!(
+            state.abandoned(&paths),
+            "with no spool file, Init plus no lock owner reads abandoned as normal"
+        );
+
+        std::fs::create_dir_all(paths.queue_dir()).unwrap();
+        std::fs::write(paths.queue_file("queued"), "{}").unwrap();
+        assert!(
+            !state.abandoned(&paths),
+            "a spool file means the queue owns this run, not nobody"
+        );
+
+        let runs = list_runs(&paths).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert!(
+            !runs[0].abandoned,
+            "list_runs must agree with RunState::abandoned"
+        );
     }
 
     #[test]

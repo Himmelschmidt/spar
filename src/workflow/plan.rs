@@ -30,7 +30,14 @@ pub fn run(
         paths.project_root.clone(),
     );
     state.task = Some(task.clone());
-    state.brief = brief;
+    // Stored project-root-relative, like every other path on `state` — an absolute
+    // path would strand `spar brief` the moment the project moves or is restored
+    // somewhere else.
+    state.brief = brief.map(|p| {
+        p.strip_prefix(&paths.project_root)
+            .map(PathBuf::from)
+            .unwrap_or(p)
+    });
     state.backend = opts.backend;
     worktree::apply_run_base(&mut state, opts.base.as_deref(), opts.json)?;
     cfg.save_snapshot(paths, &state.id)?;
@@ -687,6 +694,11 @@ fn detach_self(state: &RunState, paths: &SparPaths, cfg: &Config, json: bool) ->
             Ok(ExitCode::Success)
         }
         crate::process::DetachOutcome::Completed => {
+            // The run settled inside the handshake window without ever holding a
+            // `Running` slot for `effective_supply` to see, so its admission
+            // reservation (if `maybe_enqueue` granted one) would otherwise squat on
+            // capacity for the full TTL.
+            crate::daemon::release_reservation(paths, &state.id);
             let state = RunState::load_for_display(paths, &state.id)?;
             if json {
                 executor::emit_run_json(&state)?;

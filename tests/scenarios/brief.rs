@@ -87,8 +87,9 @@ fn spec_file_writes_a_brief_and_records_it_on_the_run() {
         serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
     assert_eq!(
         state["brief"].as_str().unwrap(),
-        brief_path.to_str().unwrap(),
-        "the run must record the brief's own path"
+        ".spar/briefs/durable-run-ownership.md",
+        "the run must record the brief's own path, project-root-relative so it \
+         survives the project moving"
     );
     assert!(state["task"].as_str().unwrap().contains("do the thing"));
 }

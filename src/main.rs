@@ -881,7 +881,9 @@ fn brief_cmd(run_id: &str, full: bool, json: bool) -> Result<ExitCode> {
     let (paths, _cfg, state) = load_run_anywhere(run_id, local_root.as_deref())?;
 
     let brief_body: Option<String> = match &state.brief {
-        Some(path) => std::fs::read_to_string(path).ok(),
+        // `state.brief` is project-root-relative; `Path::join` passes an already-
+        // absolute path through unchanged, so this needs no separate branch for one.
+        Some(path) => std::fs::read_to_string(paths.project_root.join(path)).ok(),
         None => None,
     };
     let brief_text = brief_body.as_deref().or(state.task.as_deref());
