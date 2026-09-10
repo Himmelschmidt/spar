@@ -13,6 +13,9 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// What the seam actually did with the claimed messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -20,12 +23,20 @@ use std::io::Write;
 pub enum DeliveryAction {
     /// Claude: a Stop-hook `block` payload was built for the hook to relay into the model.
     StopHookBlock,
-    /// Grok: claimed messages appended to the durable turn-boundary queue.
+    /// Codex: `codex queue --thread` reported success. Not proof the *current* dispatch
+    /// saw the message — it does not, see `codex_queue_push`'s doc comment — but it does
+    /// mean this thread's *next* `build_resume` dispatch will. The poll file was written
+    /// too, same as `PolledFile`; this is just which of the two the push also hit.
+    NativePushed,
+    /// Grok: claimed messages appended to the durable turn-boundary queue (unread until
+    /// its live push channel lands).
     Queued,
     /// opencode: claimed messages appended to the durable queue for the session flush.
     Prompted,
     /// Written to the slot's poll file, which its role prompt tells it to read before
-    /// starting any new major step.
+    /// starting any new major step. Codex's guaranteed drop, whether or not a thread id
+    /// is known yet — `codex exec` is single-turn, so this is what actually reaches the
+    /// *next* dispatch, not the running one.
     PolledFile,
     /// No injection channel (agy / unknown provider): the inbox is left untouched so
     /// the agent claims it itself on its next turn.
@@ -65,6 +76,13 @@ fn is_zero(n: &usize) -> bool {
 /// inbox on its next turn, so claiming here would strand the messages. Every other
 /// strategy claims (exactly-once) and injects; an empty inbox is a no-op.
 ///
+/// `session_id` is the provider session this agent's current dispatch is running under
+/// (`StreamStats::session_id`, e.g. codex's thread id), when the caller found one. The
+/// `NativeQueuePollFallback` arm uses it to attempt a best-effort push straight into a
+/// live codex session; every other strategy ignores it. The push is not the guarantee —
+/// see `codex_queue_push`'s doc comment for why its exit code cannot be trusted, and why
+/// the poll file is what actually lands the message.
+///
 /// `dry_run` stubs the side-effecting injection call (queue append / session prompt) so
 /// the run-lifecycle test backend exercises drain + dispatch without touching a live
 /// agent. Building the Stop-hook payload is pure and runs in either mode.
@@ -73,6 +91,7 @@ pub fn deliver(
     run: Option<&str>,
     agent: &str,
     strategy: DeliveryStrategy,
+    session_id: Option<&str>,
     dry_run: bool,
 ) -> Result<Delivery> {
     if strategy == DeliveryStrategy::None {
@@ -103,8 +122,16 @@ pub fn deliver(
             (DeliveryAction::StopHookBlock, Some(block_payload(&msgs)))
         }
         DeliveryStrategy::NativeQueue => {
+            // Grok never captures a session id; every delivery is the durable queue
+            // file (unread until its live push channel lands — see the file's doc).
             enqueue(paths, run, agent, &msgs, dry_run)?;
             (DeliveryAction::Queued, None)
+        }
+        DeliveryStrategy::NativeQueuePollFallback => {
+            let text = render_reason(&msgs);
+            let (action, _path) =
+                codex_native_deliver(paths, run, agent, session_id, &text, dry_run)?;
+            (action, None)
         }
         DeliveryStrategy::SdkPrompt => {
             enqueue(paths, run, agent, &msgs, dry_run)?;
@@ -163,6 +190,115 @@ pub fn queue_path(paths: &SparPaths, run: Option<&str>, agent: &str) -> std::pat
         None => root,
     };
     dir.join(format!("{agent}.jsonl"))
+}
+
+/// Push `text` into the codex thread `session_id`. Best-effort and *not* a delivery
+/// guarantee for *this* dispatch — the caller always also writes the poll file:
+///
+/// - Exit 0 is not proof the model saw the message. Verified against codex 0.152.0:
+///   `codex queue --thread <id>` against a two-day-dead thread's rollout still exits 0
+///   with `Queued message ... for thread ...` on stdout.
+/// - A message queued against a genuinely running thread does not land in that same
+///   turn. Live probe against codex 0.152.0: pushing ~6s into a live `codex exec` turn
+///   produced exactly one `turn.completed` for the whole dispatch and the queued text
+///   never appeared anywhere in the stream — no aborted follow-up turn, nothing.
+/// - It does land at that thread's *next* dispatch. Live probe: queuing a message to an
+///   already-exited thread, then `codex exec resume <id>` on it, produced a single turn
+///   whose reply addressed both the queued message and the new resume prompt. This is
+///   what `build_resume` (DECISIONS.md O63) turns into a real channel: a nudge queued
+///   here surfaces the next time `executor::build_dispatch_command` resumes this slot's
+///   thread, not mid-flight in the dispatch it was queued against.
+///
+/// stdio is nulled: `codex queue` writes its own status line to stdout and its error to
+/// stderr, which would otherwise land inside spar's own `--json` output stream.
+///
+/// Bounded to `CODEX_QUEUE_PUSH_TIMEOUT`: `nudge` runs on the orchestrator's own
+/// `try_wait` poll loop (`process::run_captured`'s tick, which also enforces that slot's
+/// hard-ceiling kill), so a `Command::status()` with no timeout of its own would let a
+/// wedged `codex queue` process stall that entire loop — no hard-ceiling kill, no
+/// liveness beat — for as long as the hang lasts. Ordinary cost is well under a second
+/// (measured ~0.46s against a rejected thread id on codex 0.152.0); the bound only
+/// matters for the unresponsive tail. Halved from an initial 15s: `NudgeWatch::tick`
+/// can call `send` twice in one tick (`check_time` then `check_tokens`, both crossed at
+/// once), so two wedged pushes at the old bound cost 30s against the 30s poll cadence
+/// (`nudge::POLL_SECS`) that timeout was reasoned against; at 7s the same worst case is
+/// 14s.
+const CODEX_QUEUE_PUSH_TIMEOUT: Duration = Duration::from_secs(7);
+
+fn codex_queue_push(session_id: &str, text: &str) -> bool {
+    let bin = crate::providers::adapter_named("codex")
+        .and_then(|a| a.resolve_binary())
+        .unwrap_or_else(|| PathBuf::from("codex"));
+    let mut child = match Command::new(bin)
+        .args(["queue", "--thread", session_id, "--message", text])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let deadline = Instant::now() + CODEX_QUEUE_PUSH_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Codex's `NativeQueuePollFallback` delivery: attempt the best-effort native push when
+/// a thread id is known, then always write the poll file, the one guaranteed drop —
+/// whether or not a session id is known, whether or not the push succeeded, whether or
+/// not this is a dry run. Splitting the push out behind `push` lets tests exercise both
+/// branches without shelling out to the real `codex` binary.
+fn codex_native_deliver(
+    paths: &SparPaths,
+    run: Option<&str>,
+    agent: &str,
+    session_id: Option<&str>,
+    text: &str,
+    dry_run: bool,
+) -> Result<(DeliveryAction, PathBuf)> {
+    codex_native_deliver_with(
+        codex_queue_push,
+        paths,
+        run,
+        agent,
+        session_id,
+        text,
+        dry_run,
+    )
+}
+
+fn codex_native_deliver_with(
+    push: impl FnOnce(&str, &str) -> bool,
+    paths: &SparPaths,
+    run: Option<&str>,
+    agent: &str,
+    session_id: Option<&str>,
+    text: &str,
+    dry_run: bool,
+) -> Result<(DeliveryAction, PathBuf)> {
+    if dry_run {
+        let path = append_poll_file(paths, run, agent, text, dry_run)?;
+        return Ok((DeliveryAction::PolledFile, path));
+    }
+    let pushed = session_id.is_some_and(|sid| push(sid, text));
+    let path = append_poll_file(paths, run, agent, text, false)?;
+    let action = if pushed {
+        DeliveryAction::NativePushed
+    } else {
+        DeliveryAction::PolledFile
+    };
+    Ok((action, path))
 }
 
 /// Append claimed messages to the durable queue. `dry_run` stubs the write so the test
@@ -252,6 +388,31 @@ pub struct NudgeDelivery {
     pub path: Option<String>,
 }
 
+/// Append one nudge line to the durable turn-boundary queue file — grok's channel.
+/// `dry_run` stubs the write.
+fn write_queue_file(
+    paths: &SparPaths,
+    run: Option<&str>,
+    agent: &str,
+    text: &str,
+    dry_run: bool,
+) -> Result<std::path::PathBuf> {
+    let path = queue_path(paths, run, agent);
+    if dry_run {
+        return Ok(path);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    writeln!(f, "{}", serde_json::json!({ "nudge": text }))?;
+    Ok(path)
+}
+
 /// The sender id spar's own nudges carry on the bus. Not a slot, so it can never collide
 /// with one, and readable in an agent's inbox.
 pub const ORCHESTRATOR: &str = "spar";
@@ -268,6 +429,7 @@ pub fn nudge(
     run: Option<&str>,
     agent: &str,
     strategy: DeliveryStrategy,
+    session_id: Option<&str>,
     text: &str,
     dry_run: bool,
 ) -> Result<NudgeDelivery> {
@@ -300,21 +462,22 @@ pub fn nudge(
             }
             (DeliveryAction::StopHookBlock, None)
         }
-        DeliveryStrategy::NativeQueue | DeliveryStrategy::SdkPrompt => {
-            let path = queue_path(paths, run, agent);
-            if !dry_run {
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                let mut f = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                    .with_context(|| format!("open {}", path.display()))?;
-                writeln!(f, "{}", serde_json::json!({ "nudge": text }))?;
-            }
-            (DeliveryAction::Queued, Some(path))
+        // Grok never captures a session id; every nudge is the durable queue file.
+        DeliveryStrategy::NativeQueue => (
+            DeliveryAction::Queued,
+            Some(write_queue_file(paths, run, agent, text, dry_run)?),
+        ),
+        // See `deliver`'s NativeQueuePollFallback arm: the push is best-effort, the poll
+        // file is the guarantee, whether or not a session id is known.
+        DeliveryStrategy::NativeQueuePollFallback => {
+            let (action, path) =
+                codex_native_deliver(paths, run, agent, session_id, text, dry_run)?;
+            (action, Some(path))
         }
+        DeliveryStrategy::SdkPrompt => (
+            DeliveryAction::Queued,
+            Some(write_queue_file(paths, run, agent, text, dry_run)?),
+        ),
         // `None` is agy, which has no channel at all. The poll file is still the best
         // available drop: worst case the agent never reads it, which is where it started.
         DeliveryStrategy::PollFile | DeliveryStrategy::None => (
@@ -370,6 +533,7 @@ mod tests {
             Some("r1"),
             &ub,
             DeliveryStrategy::StopHookInject,
+            None,
             false,
         )
         .unwrap();
@@ -390,6 +554,7 @@ mod tests {
             Some("r1"),
             &ub,
             DeliveryStrategy::StopHookInject,
+            None,
             false,
         )
         .unwrap();
@@ -409,6 +574,7 @@ mod tests {
             Some("r1"),
             &ub,
             DeliveryStrategy::NativeQueue,
+            None,
             false,
         )
         .unwrap();
@@ -426,7 +592,15 @@ mod tests {
         seed(&paths, 1);
 
         let ub = agent_ref(Some("r1"), "b");
-        let d = deliver(&paths, Some("r1"), &ub, DeliveryStrategy::SdkPrompt, false).unwrap();
+        let d = deliver(
+            &paths,
+            Some("r1"),
+            &ub,
+            DeliveryStrategy::SdkPrompt,
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(d.action, DeliveryAction::Prompted);
         assert_eq!(d.delivered, 1);
         assert!(queue_path(&paths, Some("r1"), &ub).is_file());
@@ -439,7 +613,7 @@ mod tests {
         seed(&paths, 2);
 
         let ub = agent_ref(Some("r1"), "b");
-        let d = deliver(&paths, Some("r1"), &ub, DeliveryStrategy::None, false).unwrap();
+        let d = deliver(&paths, Some("r1"), &ub, DeliveryStrategy::None, None, false).unwrap();
         assert_eq!(d.action, DeliveryAction::LeftForInbox);
         assert_eq!(d.delivered, 0);
         assert_eq!(d.pending, 2);
@@ -454,13 +628,118 @@ mod tests {
         seed(&paths, 2);
 
         let ub = agent_ref(Some("r1"), "b");
-        let d = deliver(&paths, Some("r1"), &ub, DeliveryStrategy::NativeQueue, true).unwrap();
+        let d = deliver(
+            &paths,
+            Some("r1"),
+            &ub,
+            DeliveryStrategy::NativeQueue,
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(d.action, DeliveryAction::Queued);
         assert_eq!(d.delivered, 2);
         // Injection call stubbed: no queue file written.
         assert!(!queue_path(&paths, Some("r1"), &ub).exists());
         // But the drain is real (exactly-once): nothing remains to claim.
         assert!(bus::inbox_claim(&paths, &ub).unwrap().is_empty());
+    }
+
+    #[test]
+    fn dry_run_codex_reports_polled_file_without_shelling_out() {
+        // dry_run must never spawn the real `codex` binary, and must never claim a push
+        // it did not attempt — the guaranteed channel (poll file) is the honest answer.
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        seed(&paths, 1);
+
+        let ub = agent_ref(Some("r1"), "b");
+        let d = deliver(
+            &paths,
+            Some("r1"),
+            &ub,
+            DeliveryStrategy::NativeQueuePollFallback,
+            Some("thread-abc"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(d.action, DeliveryAction::PolledFile);
+        assert_eq!(d.delivered, 1);
+        assert!(!queue_path(&paths, Some("r1"), &ub).exists());
+        assert!(
+            !poll_file(&paths, Some("r1"), &ub).exists(),
+            "dry run writes nothing"
+        );
+    }
+
+    #[test]
+    fn no_session_id_yet_lands_in_the_poll_file_not_the_queue_file() {
+        // Before `thread.started` is captured, codex has no session id. The claimed
+        // message must still land somewhere codex's role prompt reads — the durable
+        // queue file (grok's channel) is never consumed for codex. No real `codex`
+        // binary is spawned here: with `session_id: None` the push is never attempted.
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        seed(&paths, 1);
+
+        let ub = agent_ref(Some("r1"), "b");
+        let d = deliver(
+            &paths,
+            Some("r1"),
+            &ub,
+            DeliveryStrategy::NativeQueuePollFallback,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(d.action, DeliveryAction::PolledFile);
+        assert_eq!(d.delivered, 1);
+        assert!(!queue_path(&paths, Some("r1"), &ub).exists());
+        let body = fs::read_to_string(poll_file(&paths, Some("r1"), &ub)).unwrap();
+        assert!(body.contains("New swarm messages"), "{body}");
+    }
+
+    #[test]
+    fn native_push_success_reports_pushed_and_still_writes_the_poll_file() {
+        // The push closure is injected so this never touches the real `codex` binary.
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let (action, path) = codex_native_deliver_with(
+            |_sid, _text| true,
+            &paths,
+            Some("r1"),
+            "b",
+            Some("thread-abc"),
+            "hello",
+            false,
+        )
+        .unwrap();
+        assert_eq!(action, DeliveryAction::NativePushed);
+        assert!(path.is_file());
+        assert!(fs::read_to_string(&path).unwrap().contains("hello"));
+    }
+
+    #[test]
+    fn native_push_failure_still_lands_in_the_poll_file() {
+        // A push failure (rejected thread id, dead session, spawn error, or a timeout —
+        // see `codex_queue_push`'s bound) must not lose the message: it has to land in
+        // the poll file, the channel a codex role prompt is actually told to read,
+        // regardless of what the push reported. Stubbed so no real `codex` binary runs.
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let (action, path) = codex_native_deliver_with(
+            |_sid, _text| false,
+            &paths,
+            Some("r1"),
+            "b",
+            Some("00000000-0000-0000-0000-000000000000"),
+            "hello",
+            false,
+        )
+        .unwrap();
+        assert_eq!(action, DeliveryAction::PolledFile);
+        assert!(!queue_path(&paths, Some("r1"), "b").exists());
+        assert!(fs::read_to_string(&path).unwrap().contains("hello"));
     }
 
     /// Two concurrent runs share a deterministic slot id ("b"), hence one workspace inbox,
@@ -500,6 +779,7 @@ mod tests {
             Some("rB"),
             &ub,
             DeliveryStrategy::NativeQueue,
+            None,
             false,
         )
         .unwrap();
@@ -508,6 +788,7 @@ mod tests {
             Some("rA"),
             &ua,
             DeliveryStrategy::NativeQueue,
+            None,
             false,
         )
         .unwrap();
@@ -569,6 +850,7 @@ mod tests {
             Some("r1"),
             &slot_id,
             DeliveryStrategy::StopHookInject,
+            None,
             false,
         )
         .unwrap();
@@ -581,6 +863,7 @@ mod tests {
             None,
             "bare",
             DeliveryStrategy::StopHookInject,
+            None,
             false,
         )
         .unwrap();

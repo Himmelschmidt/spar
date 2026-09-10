@@ -523,14 +523,29 @@ fn bus_deliver(
         .unwrap_or(agent);
     // A bare agent has no run slot/state, so it has no injection channel — it drains its
     // own workspace inbox on its next turn (strategy `None`).
-    let (strategy, dry_run) = match run_id {
+    let (strategy, session_id, dry_run) = match run_id {
         Some(run) => {
             let state = state::RunState::load(paths, run)?;
             let strat = agent_delivery_strategy(&state, short);
-            (strat, state.dry_run || util::env_truthy("SPAR_DRY_RUN"))
+            // The slot's own live sidecar, not `state.usage` (only set once a dispatch
+            // finishes): a mid-run codex thread id must be found while it is still
+            // running, the exact moment a turn-boundary push needs it.
+            let sid = state
+                .slots
+                .iter()
+                .find(|s| s.id == short)
+                .and_then(|s| s.log_path.as_deref())
+                .and_then(process::StreamStats::load)
+                .and_then(|s| s.session_id);
+            (
+                strat,
+                sid,
+                state.dry_run || util::env_truthy("SPAR_DRY_RUN"),
+            )
         }
         None => (
             providers::DeliveryStrategy::None,
+            None,
             util::env_truthy("SPAR_DRY_RUN"),
         ),
     };
@@ -539,7 +554,14 @@ fn bus_deliver(
     // only pulse — the wait loop and TUI refresh also tick acks, so redelivery/escalation
     // advances in runs with no Claude slot (whose Stop hook is the only pulse here).
     bus::tick_acks(paths, &bus::AckPolicy::default(), chrono::Utc::now())?;
-    let d = providers::delivery::deliver(paths, run_id, &unique, strategy, dry_run)?;
+    let d = providers::delivery::deliver(
+        paths,
+        run_id,
+        &unique,
+        strategy,
+        session_id.as_deref(),
+        dry_run,
+    )?;
     if json {
         println!("{}", serde_json::to_string_pretty(&d)?);
     } else if let Some(payload) = &d.payload {

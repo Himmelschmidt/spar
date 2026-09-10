@@ -1194,7 +1194,17 @@ impl StreamCoalescer {
         // Codex exec JSONL (thread.started / turn.* / item.* events).
         if let Some(ty) = v.get("type").and_then(|x| x.as_str()) {
             match ty {
-                "thread.started" | "turn.started" | "item.started" => return None,
+                // The thread id is spar's handle onto this codex session: it is what
+                // `codex exec resume <id>` and `codex queue --thread <id>` both take,
+                // so it is captured into `session_id` the same way opencode's
+                // `sessionID` is, even though nothing here is a token count.
+                "thread.started" => {
+                    if let Some(id) = v.get("thread_id").and_then(|x| x.as_str()) {
+                        self.session_id = Some(id.to_string());
+                    }
+                    return None;
+                }
+                "turn.started" | "item.started" => return None,
                 // `codex exec` emits exactly one turn.completed per invocation, and it
                 // is the only usage record it emits at all, so it is Terminal-scoped and
                 // settles every counter outright.
@@ -2698,6 +2708,11 @@ mod tests {
             c.billed_tokens(),
             39306,
             "codex's own total_tokens, not 2x it"
+        );
+        assert_eq!(
+            c.session_id.as_deref(),
+            Some("t1"),
+            "thread id is how spar addresses this session for queue/resume"
         );
         // codex reports usage only once, at the end, so there is no per-request record
         // to peak over and the turn total stands in for the gauge. The whole prompt is
