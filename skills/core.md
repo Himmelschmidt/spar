@@ -40,11 +40,12 @@ spar implement -t "..." --providers 'cli:codex@openai/gpt-4o-mini,api:openai@gpt
 Native CLI adapters: `cli:claude`, `cli:grok`, `cli:agy`, `cli:codex`, `cli:opencode`, `cli:muse`. Run
 `spar provider list` to see which resolve on this box and their live pause/cooldown status.
 
-**agy note.** agy runs headless with `--print` and emits almost nothing to stdout, so spar
-recovers its tools/tokens/quota from disk: tool counts + activity from agy's per-conversation
-transcript, and token/quota counts by teeing agy's statusline payload. To capture the latter,
-spar installs a wrapper into `~/.gemini/antigravity-cli/settings.json` that **chains to your
-existing statusline** (it wraps, never replaces it) and tees payloads to `~/.gemini/antigravity-cli/.spar/`.
+**agy note.** agy runs headless with `--output-format stream-json`, so spar parses its tools,
+text and tokens directly from that structured stream. What the stream doesn't carry — the
+account's quota buckets and the context-window snapshot — spar still recovers by teeing agy's
+statusline payload. To capture that, spar installs a wrapper into
+`~/.gemini/antigravity-cli/settings.json` that **chains to your existing statusline** (it wraps,
+never replaces it) and tees payloads to `~/.gemini/antigravity-cli/.spar/`.
 Run `spar provider agy-statusline-uninstall` to remove the wrapper and restore your original.
 agy's `--print-timeout` is also derived from the role's hard ceiling, so a long
 agy slot runs its full budget instead of dying at agy's 30-minute default.
@@ -569,9 +570,14 @@ slot is stuck on.**
   running one. Thresholds are checked every 30 seconds, so a nudge lands at the next 30s
   boundary rather than the instant a budget is crossed.
 - **Live token visibility differs by adapter**, so token nudges are not uniformly prompt.
-  **opencode** reports usage per step and is exact live. **muse** carries no tokens on
-  stdout at all, so spar tails its session log (`~/.local/share/muse/sessions/…`), which is
-  appended as the turn runs; that is exact live too. **claude** reports per-message usage
+  **opencode** reports usage per step and is exact live for the slot's own session, but a
+  `task` subagent's spend lands only after exit (opencode's json emitter never puts a
+  child session's steps on stdout at all), so a live nudge undercounts a fanned-out slot
+  until then — the undercount can be several times the parent's own token count and
+  grows with how many subagents (or how deep a chain of them) ran. **muse** carries no
+  tokens on stdout at all, so spar tails its session log (`~/.local/share/muse/sessions/…`), which is
+  appended as the turn runs, including its own subagent sessions; that is exact live too.
+  **claude** reports per-message usage
   whose input and cache-read arms are `max`ed until its terminal `result` lands, so a live
   reading runs low and its token nudge fires late rather than early. Not a categorical
   guarantee: the same live path *sums* `output_tokens` across the repeated per-content-block
@@ -833,14 +839,20 @@ rail's selection.
   - Conventions per adapter, since the wire formats differ: **claude** is settled by the
     terminal `result` record, which supersedes the per-message ones; **codex** by
     `turn.completed` (its only usage record, so it also stands in for the gauge);
-    **opencode** by summing its per-step deltas; **muse** from its session log after the
-    slot exits. Those four reconcile against the provider's own session-level ledger, at
-    the session level: a codex slot's `billed_tokens` equals its `token_count`
-    `total_tokens`, a muse slot's equals the sum of its billed
-    `goal_usage_attribution` records, an opencode slot's equals `opencode.db`'s per-step
-    `tokens.total` summed. That verification is session-scoped and therefore cannot see
-    spend that never appears in the session it checked; the known instance is opencode's
-    `task` subagents (`roadmap/BACKLOG.md`).
+    **opencode** by summing its per-step deltas, plus a post-exit pass that adds in any
+    `task` subagent spend; **muse** from its session log after the slot exits. Those four
+    reconcile against the provider's own session-level ledger, at the session level: a
+    codex slot's `billed_tokens` equals its `token_count` `total_tokens`, a muse slot's
+    equals the sum of its billed `goal_usage_attribution` records, an opencode slot's
+    equals its own `tokens.total` summed plus every descendant session's totals in
+    `opencode.db` (walked transitively through `session.parent_id`, since a subagent can
+    itself fan out). opencode's json emitter filters child sessions
+    out of the stream it prints, so a subagent's usage never reaches stdout at all; spar
+    recovers it after the slot exits by summing `tokens_input + output + reasoning +
+    cache_read + cache_write` over every descendant session row reachable from the
+    slot's own session id, additively on top of the stream-parsed parent totals. Tool
+    counts are not recovered this way, only spend — a fanned-out slot's `tools` still
+    reflects the parent session alone.
   - **Two adapters report a cached prompt as a slice of `input_tokens` rather than a
     sibling of it**, the opposite of Anthropic's convention: codex's `cached_input_tokens`
     and muse's `cached_tokens`. spar normalizes both on the way in, storing the uncached
@@ -861,6 +873,34 @@ rail's selection.
     never resolve tool *names* (the tool *count* is exact). Known defect, tracked
     separately (`DECISIONS.md` O48); do not budget tightly against a grok slot until it is
     fixed.
+- **Cost and subagent accounting** ride the same `"usage"` entries and
+  `logs/<slot>.stats.json` as the token fields above, additive alongside them:
+  - **`cost_usd`**: whole-dispatch USD spend, as the provider itself computed it.
+    claude sets it once from its terminal `result.total_cost_usd`; opencode sums
+    it from each step's own `part.cost`, the same way it sums tokens. `None` for
+    codex, muse and grok — they don't report a cost. A run's total is the sum of
+    `cost_usd` over its `usage[]` entries (skip entries where it's absent).
+  - **`subagent_stats`**: claude-only. How many Task-tool subagents this dispatch
+    spawned and how they ended — `spawned`, `completed`, `failed`, `requested`
+    (`background`/`foreground`/`unset`), `killed` (`parent`/`user`/`system`),
+    `refused` (`depth_limit`/`concurrency_limit`/`budget`), `max_depth`, and
+    `by_type` (a count per subagent type name). `None` for every other adapter.
+  - **`model_usage`**: claude-only, from the terminal `result.modelUsage`. A map
+    keyed by model id, one entry per distinct model claude actually billed in the
+    dispatch (its own model and, when it spawned subagents on a different model,
+    theirs too) — `cost_usd`, `context_window`, `max_output_tokens`,
+    `input_tokens`, `output_tokens`, `cache_read_input_tokens`,
+    `cache_creation_input_tokens`, `canonical_model`, `provider`. Empty map for
+    every other adapter. Only `cost_usd` reconciles against this map (it sums
+    `model_usage`'s `cost_usd` entries) — the token fields above come from the
+    terminal `result.usage` instead, a different accounting that does **not**
+    reconcile with `model_usage`'s token counts (a probe run saw `result.usage`
+    report `input_tokens: 10` for the same dispatch `model_usage` billed at
+    `inputTokens: 907`). Read `model_usage` when a mixed-model claude dispatch
+    needs attributing spend, not for token reconciliation.
+  - **`session_id`**: the provider's own resume/session handle, when the stream
+    names one. All three of muse, opencode and claude set it; claude reads it off
+    the same `system`/`init` line the `model` field comes from.
 - Run state: `.spar/runs/<id>/state.json`
 - Events (orchestrator): `.spar/runs/<id>/events.jsonl`
 - Logs: `.spar/runs/<id>/logs/<slot>.log`

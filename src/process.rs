@@ -69,6 +69,174 @@ pub struct StreamStats {
     /// RFC3339 of last successful log append (for stall detection).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_log_at: Option<String>,
+    /// Whole-dispatch USD spend (this one spawned process, one `stats.json`), as the
+    /// provider itself computed it: claude's terminal `result.total_cost_usd` (an
+    /// absolute overwrite) or opencode's per-step `part.cost` (summed the same way
+    /// its token deltas are). One field for both so a caller never needs to know
+    /// which adapter produced it. A run's total is the sum over its dispatches; see
+    /// `state::SlotUsage::cost_usd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    /// claude's terminal `result.subagent_stats`: how many Task-tool subagents this
+    /// dispatch spawned and how they ended. No other adapter reports this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_stats: Option<SubagentStats>,
+    /// claude's terminal `result.modelUsage`: per-model cost/token/context breakdown,
+    /// keyed by the model id as claude names it (e.g. a main-agent model and a
+    /// cheaper subagent model appear as separate entries). No other adapter reports
+    /// this.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub model_usage: std::collections::BTreeMap<String, ModelUsage>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ModelUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SubagentRequested {
+    #[serde(default)]
+    pub background: u32,
+    #[serde(default)]
+    pub foreground: u32,
+    #[serde(default)]
+    pub unset: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SubagentKilled {
+    #[serde(default)]
+    pub parent: u32,
+    #[serde(default)]
+    pub user: u32,
+    #[serde(default)]
+    pub system: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SubagentRefused {
+    #[serde(default)]
+    pub depth_limit: u32,
+    #[serde(default)]
+    pub concurrency_limit: u32,
+    #[serde(default)]
+    pub budget: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SubagentStats {
+    #[serde(default)]
+    pub spawned: u32,
+    #[serde(default)]
+    pub completed: u32,
+    #[serde(default)]
+    pub failed: u32,
+    #[serde(default)]
+    pub requested: SubagentRequested,
+    #[serde(default)]
+    pub killed: SubagentKilled,
+    #[serde(default)]
+    pub refused: SubagentRefused,
+    #[serde(default)]
+    pub max_depth: u32,
+    #[serde(default)]
+    pub by_type: std::collections::BTreeMap<String, u32>,
+}
+
+/// Field-by-field, not `serde_json::from_value::<SubagentStats>`: a rigid struct
+/// deserialize fails the whole object on one unexpected type (e.g. a counter
+/// arriving as a float, or `by_type` values shaped as objects instead of bare
+/// counts), silently dropping every counter that *did* parse. Reading each field
+/// on its own means a shape drift in one corner degrades that corner to zero
+/// instead of erasing the capture.
+fn parse_subagent_stats(v: &serde_json::Value) -> SubagentStats {
+    fn u32_field(v: &serde_json::Value, key: &str) -> u32 {
+        v.get(key)
+            .and_then(|x| x.as_u64())
+            .map(|n| n as u32)
+            .unwrap_or(0)
+    }
+    let requested = v.get("requested");
+    let killed = v.get("killed");
+    let refused = v.get("refused");
+    SubagentStats {
+        spawned: u32_field(v, "spawned"),
+        completed: u32_field(v, "completed"),
+        failed: u32_field(v, "failed"),
+        requested: SubagentRequested {
+            background: requested.map(|r| u32_field(r, "background")).unwrap_or(0),
+            foreground: requested.map(|r| u32_field(r, "foreground")).unwrap_or(0),
+            unset: requested.map(|r| u32_field(r, "unset")).unwrap_or(0),
+        },
+        killed: SubagentKilled {
+            parent: killed.map(|k| u32_field(k, "parent")).unwrap_or(0),
+            user: killed.map(|k| u32_field(k, "user")).unwrap_or(0),
+            system: killed.map(|k| u32_field(k, "system")).unwrap_or(0),
+        },
+        refused: SubagentRefused {
+            depth_limit: refused.map(|r| u32_field(r, "depth_limit")).unwrap_or(0),
+            concurrency_limit: refused
+                .map(|r| u32_field(r, "concurrency_limit"))
+                .unwrap_or(0),
+            budget: refused.map(|r| u32_field(r, "budget")).unwrap_or(0),
+        },
+        max_depth: u32_field(v, "max_depth"),
+        by_type: v
+            .get("by_type")
+            .and_then(|x| x.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, val)| val.as_u64().map(|n| (k.clone(), n as u32)))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// Same field-by-field approach as `parse_subagent_stats`, and for the same reason:
+/// one model entry with an unexpected type must not cost the whole `modelUsage` map.
+fn parse_model_usage(v: &serde_json::Value) -> ModelUsage {
+    ModelUsage {
+        cost_usd: v.get("costUSD").and_then(|x| x.as_f64()),
+        context_window: v.get("contextWindow").and_then(|x| x.as_u64()),
+        max_output_tokens: v.get("maxOutputTokens").and_then(|x| x.as_u64()),
+        input_tokens: v.get("inputTokens").and_then(|x| x.as_u64()).unwrap_or(0),
+        output_tokens: v.get("outputTokens").and_then(|x| x.as_u64()).unwrap_or(0),
+        cache_read_input_tokens: v
+            .get("cacheReadInputTokens")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
+        cache_creation_input_tokens: v
+            .get("cacheCreationInputTokens")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
+        canonical_model: v
+            .get("canonicalModel")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+        provider: v
+            .get("provider")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+    }
 }
 
 impl StreamStats {
@@ -101,6 +269,26 @@ impl StreamStats {
         let text = std::fs::read_to_string(path).ok()?;
         serde_json::from_str(&text).ok()
     }
+}
+
+/// Reconstruct `StreamStats` from a completed log file by feeding it through the same
+/// coalescer `run_captured` feeds live. `run_captured` merges counters as the stream is
+/// read, so a caller that only has the finished file (tmux's `tee`d pane output, which
+/// `run_tmux` never pipes through a live coalescer) can recover the same numbers after
+/// the fact. Only meaningful for a provider whose pane runs the same structured stream as
+/// headless (opencode's `run --format json`); other adapters' interactive TUI output is
+/// not JSON, so the coalescer degrades every line to inert text and this returns zeros.
+pub fn stats_from_log(log_path: &Path) -> StreamStats {
+    let mut stats = StreamStats::default();
+    let Ok(text) = std::fs::read_to_string(log_path) else {
+        return stats;
+    };
+    let mut c = StreamCoalescer::new(false);
+    for line in text.lines() {
+        c.feed(line);
+    }
+    c.merge_counters_into(&mut stats);
+    stats
 }
 
 #[derive(Debug)]
@@ -700,6 +888,9 @@ struct StreamCoalescer {
     saw_terminal_usage: bool,
     model: Option<String>,
     session_id: Option<String>,
+    cost_usd: Option<f64>,
+    subagent_stats: Option<SubagentStats>,
+    model_usage: std::collections::BTreeMap<String, ModelUsage>,
     text_chars: u64,
     /// opencode double-emits every event in dash and underscore spellings with the
     /// same `part.id`; keyed by `(normalized type, part.id)` to count each once.
@@ -742,6 +933,9 @@ impl StreamCoalescer {
             saw_terminal_usage: false,
             model: None,
             session_id: None,
+            cost_usd: None,
+            subagent_stats: None,
+            model_usage: std::collections::BTreeMap::new(),
             text_chars: 0,
             seen_opencode: std::collections::HashSet::new(),
         }
@@ -795,6 +989,16 @@ impl StreamCoalescer {
             }
         }
 
+        // agy `--output-format stream-json` (verified against agy 1.1.26). Every line
+        // carries a top-level `event` naming one of three envelopes (`init`, `step_update`,
+        // `result`); gated off before the `type`-matched branches below since agy lines
+        // carry no top-level `type` at all.
+        if let Some(event) = v.get("event").and_then(|x| x.as_str()) {
+            if matches!(event, "init" | "step_update" | "result") {
+                return self.handle_agy(event, &v);
+            }
+        }
+
         // Grok token stream
         if let Some(ty) = v.get("type").and_then(|x| x.as_str()) {
             if matches!(ty, "text" | "thought" | "output" | "response") {
@@ -838,6 +1042,12 @@ impl StreamCoalescer {
                         let mut out = self.flush_buf();
                         let model = v.get("model").and_then(|x| x.as_str()).unwrap_or("claude");
                         self.model = Some(model.to_string());
+                        // claude's resume handle, captured for parity with muse's and
+                        // opencode's session ids: makes a claude slot checkable against
+                        // its own transcript, same as the other two adapters already are.
+                        if let Some(id) = v.get("session_id").and_then(|x| x.as_str()) {
+                            self.session_id = Some(id.to_string());
+                        }
                         out.push_str(&format!("· session  {model}\n"));
                         return Some(out);
                     }
@@ -933,13 +1143,30 @@ impl StreamCoalescer {
                 "user" => return self.handle_claude_user(&v),
                 "result" => {
                     let mut out = self.flush_buf();
+                    if let Some(cost) = v.get("total_cost_usd").and_then(|x| x.as_f64()) {
+                        self.cost_usd = Some(cost);
+                    }
+                    if let Some(stats) = v.get("subagent_stats") {
+                        let parsed = parse_subagent_stats(stats);
+                        if parsed != SubagentStats::default() {
+                            self.subagent_stats = Some(parsed);
+                        }
+                    }
+                    if let Some(models) = v.get("modelUsage").and_then(|x| x.as_object()) {
+                        for (model, usage) in models {
+                            if usage.is_object() {
+                                self.model_usage
+                                    .insert(model.clone(), parse_model_usage(usage));
+                            }
+                        }
+                    }
                     let sub = v.get("subtype").and_then(|x| x.as_str()).unwrap_or("ok");
                     out.push_str(&format!(
                         "· done  {sub}  ·  {} tools  ·  {}\n",
                         self.tools,
                         format_tokens(
                             self.input_tokens,
-                            self.output_tokens.max(self.est_output_tokens),
+                            self.effective_output_tokens(),
                             self.cache_read
                         )
                     ));
@@ -988,7 +1215,7 @@ impl StreamCoalescer {
                         self.tools,
                         format_tokens(
                             self.input_tokens,
-                            self.output_tokens.max(self.est_output_tokens),
+                            self.effective_output_tokens(),
                             self.cache_read
                         )
                     ));
@@ -1139,6 +1366,11 @@ impl StreamCoalescer {
                         .context_peak
                         .max(input.saturating_add(cache_read).saturating_add(cache_write));
                 }
+                // Each step's `cost` is that call's own delta, like its `tokens` — sum
+                // rather than overwrite, same as opencode's other billed components.
+                if let Some(cost) = part.get("cost").and_then(|x| x.as_f64()) {
+                    self.cost_usd = Some(self.cost_usd.unwrap_or(0.0) + cost);
+                }
                 None
             }
             "text" => {
@@ -1171,6 +1403,144 @@ impl StreamCoalescer {
             }
             _ => None,
         }
+    }
+
+    /// agy's three `stream-json` envelopes. `result.usage.total_tokens` is the exact sum
+    /// of the per-step usages (verified on a live multi-step run), confirming each
+    /// `step_update.usage` is that step's own delta, not a running total — so, unlike
+    /// claude's Request-scope usage, input/output are summed here rather than maxed,
+    /// the same shape as opencode's `step_finish`.
+    ///
+    /// Known gaps, not fixed here:
+    /// * a `step_type: "subagent"` step carries no usage of its own, and the `result`
+    ///   total reconciles exactly against the parent's own steps, so a subagent's spend
+    ///   is never attributed to it.
+    /// * a failing tool step carries no status/exit field on the wire — the failure text
+    ///   lives only inside `tool_info.output` — so `tool_errors` stays 0 for agy.
+    fn handle_agy(&mut self, event: &str, v: &serde_json::Value) -> Option<String> {
+        match event {
+            "init" => {
+                let mut out = self.flush_buf();
+                if let Some(cid) = v.get("conversation_id").and_then(|x| x.as_str()) {
+                    self.session_id = Some(cid.to_string());
+                }
+                // "agy" here names the provider, not a model (agy's `init` carries none) —
+                // filled into the model slot every other adapter's `· session  {model}`
+                // line uses, to keep the column shape consistent.
+                out.push_str("· session  agy\n");
+                Some(out)
+            }
+            "step_update" => {
+                let su = v.get("step_update")?;
+                if self.session_id.is_none() {
+                    if let Some(cid) = su.get("conversation_id").and_then(|x| x.as_str()) {
+                        self.session_id = Some(cid.to_string());
+                    }
+                }
+                let state = su.get("state").and_then(|x| x.as_str()).unwrap_or("");
+                let step_type = su.get("step_type").and_then(|x| x.as_str()).unwrap_or("");
+                if state == "DONE" {
+                    self.absorb_agy_usage(su.get("usage"), UsageScope::Request);
+                }
+                match step_type {
+                    "agent_response" => {
+                        let text = su.get("text_delta").and_then(|x| x.as_str())?;
+                        if text.is_empty() {
+                            return None;
+                        }
+                        self.push_token(CoalesceKind::Text, text)
+                    }
+                    "tool" if state == "DONE" => {
+                        self.tools += 1;
+                        let mut out = self.flush_buf();
+                        let name = su
+                            .get("tool_name")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("tool");
+                        out.push_str(&format!("→ {name}\n"));
+                        Some(out)
+                    }
+                    _ => None,
+                }
+            }
+            "result" => {
+                let r = v.get("result")?;
+                self.absorb_agy_usage(r.get("usage"), UsageScope::Terminal);
+                let mut out = self.flush_buf();
+                let status = r.get("status").and_then(|x| x.as_str()).unwrap_or("?");
+                // The coalesced log is the only surviving diagnostic text for agy (the
+                // transcript scrape is gone): a failure's `error` must land in it so quota
+                // detection and artifact salvage still have something to read, and a
+                // success whose `agent_response` never streamed still needs its text.
+                // `scrape_strong_quota_signal` / `scrape_log_hint` match per line, so a
+                // multi-line rejection is emitted as one `! ` line per source line
+                // (each capped, not just the first) rather than truncated to line one.
+                if let Some(err) = r
+                    .get("error")
+                    .and_then(|x| x.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    for line in err.lines().take(20) {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        out.push_str(&format!("! {}\n", first_line(line, 200)));
+                    }
+                } else if self.text_chars == 0 {
+                    if let Some(resp) = r
+                        .get("response")
+                        .and_then(|x| x.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        out.push_str(resp);
+                        if !resp.ends_with('\n') {
+                            out.push('\n');
+                        }
+                    }
+                }
+                out.push_str(&format!(
+                    "· done  {status}  ·  {} tools  ·  {}\n",
+                    self.tools,
+                    format_tokens(
+                        self.input_tokens,
+                        self.effective_output_tokens(),
+                        self.cache_read
+                    )
+                ));
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    /// agy's field names (`cache_read_tokens`, `thinking_tokens`) differ from the
+    /// Anthropic/codex shapes `absorb_usage` normalizes, so this stays separate rather
+    /// than bolting more field-name fallbacks onto that function. `thinking_tokens` is a
+    /// breakdown *of* `output_tokens`, not additional to it — every live envelope
+    /// satisfies `total_tokens == input_tokens + output_tokens` exactly, thinking and
+    /// cache_read excluded — so it is not added here.
+    fn absorb_agy_usage(&mut self, usage: Option<&serde_json::Value>, scope: UsageScope) {
+        let Some(u) = usage else { return };
+        let get = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or_default();
+        let input = get("input_tokens");
+        let output = get("output_tokens");
+        let cache_read = get("cache_read_tokens");
+
+        if scope == UsageScope::Terminal {
+            self.input_tokens = input;
+            self.output_tokens = output;
+            self.cache_read = cache_read;
+            self.saw_terminal_usage = true;
+            return;
+        }
+
+        self.context_peak = self.context_peak.max(input.saturating_add(cache_read));
+        if self.saw_terminal_usage {
+            return;
+        }
+        self.input_tokens = self.input_tokens.saturating_add(input);
+        self.output_tokens = self.output_tokens.saturating_add(output);
+        self.cache_read = self.cache_read.saturating_add(cache_read);
     }
 
     fn handle_codex_item(&mut self, v: &serde_json::Value) -> Option<String> {
@@ -1427,11 +1797,23 @@ impl StreamCoalescer {
             .saturating_add(self.cache_write)
     }
 
+    /// The char-count estimate exists only to cover providers that never report exact
+    /// output tokens. Once a terminal usage record has settled `output_tokens`, that
+    /// exact value must win outright — maxing it against the estimate can only inflate
+    /// an already-exact total for a token-efficient response.
+    fn effective_output_tokens(&self) -> u64 {
+        if self.saw_terminal_usage {
+            self.output_tokens
+        } else {
+            self.output_tokens.max(self.est_output_tokens)
+        }
+    }
+
     /// Cumulative billed tokens: exactly the sum of the four component counters this
     /// coalescer writes into `StreamStats`, so the sidecar's own numbers always add up.
     fn billed_tokens(&self) -> u64 {
         self.input_tokens
-            .saturating_add(self.output_tokens.max(self.est_output_tokens))
+            .saturating_add(self.effective_output_tokens())
             .saturating_add(self.cache_read)
             .saturating_add(self.cache_write)
     }
@@ -1449,7 +1831,7 @@ impl StreamCoalescer {
         s.tools = self.tools;
         s.tool_errors = self.tool_errors;
         s.input_tokens = self.input_tokens;
-        s.output_tokens = self.output_tokens.max(self.est_output_tokens);
+        s.output_tokens = self.effective_output_tokens();
         s.cache_read_tokens = self.cache_read;
         s.cache_write_tokens = self.cache_write;
         s.context_tokens = self.context_tokens();
@@ -1473,6 +1855,15 @@ impl StreamCoalescer {
         }
         if self.session_id.is_some() {
             s.session_id = self.session_id.clone();
+        }
+        if self.cost_usd.is_some() {
+            s.cost_usd = self.cost_usd;
+        }
+        if self.subagent_stats.is_some() {
+            s.subagent_stats = self.subagent_stats.clone();
+        }
+        for (model, usage) in &self.model_usage {
+            s.model_usage.insert(model.clone(), usage.clone());
         }
     }
 
@@ -2126,6 +2517,171 @@ mod tests {
     }
 
     #[test]
+    fn claude_init_captures_session_id() {
+        let mut c = StreamCoalescer::new(false);
+        c.feed(r#"{"type":"system","subtype":"init","model":"claude-opus","session_id":"sess-abc-123"}"#);
+        assert_eq!(c.session_id.as_deref(), Some("sess-abc-123"));
+    }
+
+    #[test]
+    fn claude_result_captures_cost_and_subagent_stats() {
+        // Field values and shape taken from a real `claude -p ... --output-format
+        // stream-json --verbose` terminal `result` line (captured 2026-09-07,
+        // claude-code 2.1.248): `subagent_stats` carries extra fields spar doesn't
+        // model (`started_in_background`, `spawned_by_subagents`) that the lenient
+        // parser below must ignore without failing the rest of the object, and
+        // `modelUsage` carries extra fields (`webSearchRequests`, `costBasis`) with
+        // the same requirement.
+        let mut c = StreamCoalescer::new(false);
+        c.feed(
+            r#"{"type":"result","subtype":"success","total_cost_usd":0.4521,
+               "usage":{"input_tokens":49,"output_tokens":241},
+               "modelUsage":{"claude-opus-5":{"inputTokens":6,"outputTokens":294,
+                 "cacheReadInputTokens":40232,"cacheCreationInputTokens":32020,
+                 "webSearchRequests":0,"costUSD":0.2848,"contextWindow":1000000,
+                 "maxOutputTokens":64000,"canonicalModel":"claude-opus-5",
+                 "provider":"firstParty","costBasis":"list"},
+                 "claude-haiku-4-5-20251001":{"inputTokens":921,"outputTokens":16,
+                 "cacheReadInputTokens":0,"cacheCreationInputTokens":0,
+                 "costUSD":0.0010,"contextWindow":200000,"maxOutputTokens":32000,
+                 "canonicalModel":"claude-haiku-4-5","provider":"firstParty"}},
+               "subagent_stats":{"spawned":3,"completed":2,"failed":1,
+                 "requested":{"background":1,"foreground":2,"unset":0},
+                 "started_in_background":0,"spawned_by_subagents":0,
+                 "killed":{"parent":0,"user":1,"system":0},
+                 "refused":{"depth_limit":0,"concurrency_limit":0,"budget":1},
+                 "max_depth":2,"by_type":{"Explore":2,"general-purpose":1}}}"#,
+        );
+        assert_eq!(c.cost_usd, Some(0.4521));
+        let stats = c.subagent_stats.clone().expect("subagent_stats captured");
+        assert_eq!(stats.spawned, 3);
+        assert_eq!(stats.completed, 2);
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.requested.background, 1);
+        assert_eq!(stats.requested.foreground, 2);
+        assert_eq!(stats.killed.user, 1);
+        assert_eq!(stats.refused.budget, 1);
+        assert_eq!(stats.max_depth, 2);
+        assert_eq!(stats.by_type.get("Explore"), Some(&2));
+
+        let opus = c
+            .model_usage
+            .get("claude-opus-5")
+            .expect("opus model usage captured");
+        assert_eq!(opus.cost_usd, Some(0.2848));
+        assert_eq!(opus.context_window, Some(1_000_000));
+        assert_eq!(opus.max_output_tokens, Some(64_000));
+        assert_eq!(opus.input_tokens, 6);
+        assert_eq!(opus.output_tokens, 294);
+        assert_eq!(opus.cache_read_input_tokens, 40232);
+        assert_eq!(opus.cache_creation_input_tokens, 32020);
+        assert_eq!(opus.canonical_model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(opus.provider.as_deref(), Some("firstParty"));
+        assert!(c.model_usage.contains_key("claude-haiku-4-5-20251001"));
+
+        let mut s = StreamStats::default();
+        c.merge_counters_into(&mut s);
+        assert_eq!(s.cost_usd, Some(0.4521));
+        assert_eq!(s.subagent_stats.as_ref().unwrap().spawned, 3);
+        assert_eq!(s.model_usage.len(), 2);
+
+        // Round-trip through the sidecar file: `stats.json` is what a run record
+        // and a later TUI repaint actually read back, not the coalescer's own state.
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("slot.log");
+        s.save(&log_path).unwrap();
+        let loaded = StreamStats::load(&log_path).expect("stats.json round-trips");
+        assert_eq!(loaded.cost_usd, Some(0.4521));
+        assert_eq!(loaded.subagent_stats.as_ref().unwrap().spawned, 3);
+        assert_eq!(
+            loaded
+                .subagent_stats
+                .as_ref()
+                .unwrap()
+                .by_type
+                .get("Explore"),
+            Some(&2)
+        );
+        assert_eq!(
+            loaded.model_usage.get("claude-opus-5").unwrap().cost_usd,
+            Some(0.2848)
+        );
+    }
+
+    #[test]
+    fn all_zero_subagent_stats_is_not_captured() {
+        // claude emits `subagent_stats` unconditionally, every counter at 0, on a
+        // dispatch that never spawned a subagent. Capturing that verbatim would put
+        // ~20 lines of zeros into `stats.json`/`state.json` on every claude dispatch,
+        // so an all-default block must stay `None` rather than `Some(zeros)`.
+        let mut c = StreamCoalescer::new(false);
+        c.feed(
+            r#"{"type":"result","subtype":"success",
+               "subagent_stats":{"spawned":0,"completed":0,"failed":0,
+                 "requested":{"background":0,"foreground":0,"unset":0},
+                 "killed":{"parent":0,"user":0,"system":0},
+                 "refused":{"depth_limit":0,"concurrency_limit":0,"budget":0},
+                 "max_depth":0,"by_type":{}}}"#,
+        );
+        assert!(c.subagent_stats.is_none());
+    }
+
+    #[test]
+    fn model_usage_skips_non_object_entries() {
+        // A `null` or scalar `modelUsage` entry must be skipped, not inserted as a
+        // phantom model with all-zero/None fields.
+        let mut c = StreamCoalescer::new(false);
+        c.feed(
+            r#"{"type":"result","subtype":"success",
+               "modelUsage":{"claude-opus-5":null,"claude-haiku-4-5":"weird"}}"#,
+        );
+        assert!(c.model_usage.is_empty());
+    }
+
+    #[test]
+    fn subagent_stats_degrades_field_by_field_instead_of_losing_everything() {
+        // A rigid `serde_json::from_value::<SubagentStats>` fails the whole object
+        // on one unexpected type. `by_type` values shaped as nested objects (instead
+        // of bare counts) is exactly that kind of drift; `spawned` still parses fine
+        // and must not be lost along with it.
+        let mut c = StreamCoalescer::new(false);
+        c.feed(
+            r#"{"type":"result","subtype":"success",
+               "subagent_stats":{"spawned":3,"completed":2,
+                 "requested":null,
+                 "by_type":{"Explore":{"count":2},"general-purpose":1}}}"#,
+        );
+        let stats = c.subagent_stats.clone().expect("stats still captured");
+        assert_eq!(
+            stats.spawned, 3,
+            "well-typed sibling field must not be lost"
+        );
+        assert_eq!(stats.completed, 2);
+        assert_eq!(stats.requested.background, 0, "null nested object defaults");
+        assert_eq!(
+            stats.by_type.get("general-purpose"),
+            Some(&1),
+            "well-typed by_type entry must not be lost"
+        );
+        assert!(
+            !stats.by_type.contains_key("Explore"),
+            "malformed entry is dropped, not the whole map"
+        );
+    }
+
+    #[test]
+    fn opencode_sums_per_step_cost_into_one_field() {
+        let mut c = StreamCoalescer::new(false);
+        c.feed(
+            r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_a","type":"step-finish","cost":0.01,"tokens":{"input":10,"output":2,"cache":{"read":0,"write":0}}}}"#,
+        );
+        c.feed(
+            r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_b","type":"step-finish","cost":0.02,"tokens":{"input":5,"output":1,"cache":{"read":0,"write":0}}}}"#,
+        );
+        assert!((c.cost_usd.unwrap() - 0.03).abs() < 1e-9);
+    }
+
+    #[test]
     fn codex_jsonl_text_and_usage() {
         // Real `codex exec --json` event sequence (captured from codex-cli 0.144.4).
         let mut c = StreamCoalescer::new(false);
@@ -2250,6 +2806,125 @@ mod tests {
     }
 
     #[test]
+    fn agy_stream_json_renders_session_tools_text_and_sums_step_usage() {
+        // Shape per agy `--output-format stream-json`, re-seeded from two live captures
+        // against the installed agy 1.1.27 (`--print-timeout 150s --output-format
+        // stream-json --dangerously-skip-permissions --print`). Live invariant pinned
+        // here: tool steps carry no `usage` at all, and every envelope satisfies
+        // `total_tokens == input_tokens + output_tokens` exactly, `thinking_tokens` and
+        // `cache_read_tokens` excluded from that sum. This fixture uses a single DONE
+        // `agent_response` frame for brevity; the dominant production shape — several
+        // ACTIVE partials followed by a DONE tail fragment — is covered separately by
+        // `agy_agent_response_streams_active_partials_before_a_done_tail`.
+        let lines = [
+            r#"{"event":"init","conversation_id":"agy-conv-1","init":{"cwd":"/wt","tools":["run_command"],"permission_mode":"always-proceed"}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"agy-conv-1","step_index":0,"state":"DONE","step_type":"agent_response","text_delta":"Hello","usage":{"input_tokens":100,"output_tokens":6,"thinking_tokens":4,"cache_read_tokens":10,"total_tokens":106}}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"agy-conv-1","step_index":1,"state":"ACTIVE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"echo hi"}}}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"agy-conv-1","step_index":1,"state":"DONE","step_type":"tool","tool_name":"run_command"}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"agy-conv-1","step_index":2,"state":"DONE","step_type":"agent_response","text_delta":"World","usage":{"input_tokens":50,"output_tokens":2,"thinking_tokens":1,"cache_read_tokens":0,"total_tokens":52}}}"#,
+            r#"{"event":"result","result":{"conversation_id":"agy-conv-1","status":"SUCCESS","response":"Hello World","duration_seconds":1.5,"num_turns":2,"usage":{"input_tokens":150,"output_tokens":8,"thinking_tokens":5,"cache_read_tokens":10,"total_tokens":158}}}"#,
+        ];
+        let mut c = StreamCoalescer::new(false);
+        let mut out = String::new();
+        for l in lines {
+            if let Some(chunk) = c.feed(l) {
+                out.push_str(&chunk);
+            }
+        }
+        assert_eq!(c.session_id.as_deref(), Some("agy-conv-1"));
+        assert!(out.contains("Hello"), "first DONE agent_response: {out:?}");
+        assert!(out.contains("World"), "second DONE agent_response: {out:?}");
+        assert_eq!(
+            c.tools, 1,
+            "only the DONE tool step counts, not its ACTIVE start"
+        );
+        assert!(out.contains("→ run_command"), "tool name in log: {out:?}");
+        // Per-step usage sums to the same total agy's own `result.usage` reports
+        // (input 100+50=150, output 6+2=8), and the terminal record settles to that same
+        // total rather than correcting it. thinking_tokens is never added to output.
+        assert_eq!(c.input_tokens, 150);
+        assert_eq!(c.output_tokens, 8);
+        assert_eq!(c.cache_read, 10);
+        assert!(out.contains("· done  SUCCESS  ·  1 tools"));
+    }
+
+    #[test]
+    fn agy_agent_response_streams_active_partials_before_a_done_tail() {
+        // Live capture against agy 1.1.27: a real answer arrives as several ACTIVE
+        // `agent_response` frames carrying `text_delta`, then a DONE frame whose own
+        // `text_delta` is only the trailing fragment, not the full text. The DONE
+        // frame is also where `usage` lands. Concatenating every delta must reproduce
+        // `result.response` exactly, and that response must not be appended again on
+        // top of the streamed text.
+        let lines = [
+            r#"{"event":"init","conversation_id":"c1","init":{"cwd":"/wt","tools":[],"permission_mode":"always-proceed"}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"c1","step_index":0,"state":"ACTIVE","step_type":"agent_response","text_delta":"Hello "}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"c1","step_index":0,"state":"ACTIVE","step_type":"agent_response","text_delta":"brave "}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"c1","step_index":0,"state":"ACTIVE","step_type":"agent_response","text_delta":"new "}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"c1","step_index":0,"state":"DONE","step_type":"agent_response","text_delta":"world","usage":{"input_tokens":10,"output_tokens":4,"cache_read_tokens":0,"total_tokens":14}}}"#,
+            r#"{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","response":"Hello brave new world","usage":{"input_tokens":10,"output_tokens":4,"cache_read_tokens":0,"total_tokens":14}}}"#,
+        ];
+        let mut c = StreamCoalescer::new(false);
+        let mut out = String::new();
+        for l in lines {
+            if let Some(chunk) = c.feed(l) {
+                out.push_str(&chunk);
+            }
+        }
+        assert_eq!(
+            out.matches("Hello brave new world").count(),
+            1,
+            "streamed deltas must concatenate to the full response exactly once, \
+             not duplicate it via the result.response fallback: {out:?}"
+        );
+    }
+
+    #[test]
+    fn agy_result_usage_settles_the_terminal_total() {
+        // If the terminal total does not match the per-step sum, `result` wins: it is
+        // Terminal-scoped and supersedes, same as claude's `result` / codex's
+        // `turn.completed`.
+        let mut c = StreamCoalescer::new(false);
+        c.feed(
+            r#"{"event":"step_update","step_update":{"conversation_id":"c1","step_index":0,"state":"DONE","step_type":"agent_response","text_delta":"hi","usage":{"input_tokens":10,"output_tokens":1,"cache_read_tokens":0,"total_tokens":11}}}"#,
+        );
+        c.feed(
+            r#"{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","response":"hi","usage":{"input_tokens":999,"output_tokens":42,"cache_read_tokens":5,"total_tokens":1046}}}"#,
+        );
+        assert_eq!(c.input_tokens, 999);
+        assert_eq!(c.output_tokens, 42);
+        assert_eq!(c.cache_read, 5);
+    }
+
+    #[test]
+    fn agy_result_error_lands_in_the_log() {
+        // With the transcript scrape gone, `result.error` is the only surviving
+        // diagnostic text for a failed agy slot; quota detection and artifact salvage
+        // both read the coalesced log, so it must be in there.
+        let mut c = StreamCoalescer::new(false);
+        let out = c
+            .feed(
+                r#"{"event":"result","result":{"conversation_id":"c1","status":"ERROR","error":"rate limit exceeded","usage":{"input_tokens":10,"output_tokens":1,"cache_read_tokens":0,"total_tokens":11}}}"#,
+            )
+            .unwrap_or_default();
+        assert!(out.contains("rate limit exceeded"), "error text: {out:?}");
+        assert!(out.contains("· done  ERROR"));
+    }
+
+    #[test]
+    fn agy_result_response_fills_in_when_no_agent_response_streamed() {
+        // A run that never emitted an `agent_response` step_update (e.g. a tool-only
+        // turn) must still surface its answer from `result.response`.
+        let mut c = StreamCoalescer::new(false);
+        let out = c
+            .feed(
+                r#"{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","response":"final answer","usage":{"input_tokens":10,"output_tokens":2,"cache_read_tokens":0,"total_tokens":12}}}"#,
+            )
+            .unwrap_or_default();
+        assert!(out.contains("final answer"), "fallback response: {out:?}");
+    }
+
+    #[test]
     fn opencode_jsonl_dedupes_a_republished_part() {
         // Real `opencode run --format json` events (captured from opencode 1.17.4). The
         // top-level `type` is always the underscore spelling the emitter hardcodes; the
@@ -2259,7 +2934,7 @@ mod tests {
         // output 19, cache.read 1920.
         let mut c = StreamCoalescer::new(false);
         let mut out = String::new();
-        let finish = r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_f1","type":"step-finish","tokens":{"total":14677,"input":12738,"output":19,"reasoning":0,"cache":{"write":0,"read":1920}}}}"#;
+        let finish = r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_f1","type":"step-finish","tokens":{"total":14677,"input":12738,"output":19,"reasoning":0,"cache":{"write":0,"read":1920}},"cost":0.07}}"#;
         for line in [
             r#"{"type":"step_start","sessionID":"ses_1","part":{"id":"prt_s1","type":"step-start"}}"#,
             r#"{"type":"tool_use","sessionID":"ses_1","part":{"type":"tool","tool":"write","callID":"call_1","state":{"status":"completed"}}}"#,
@@ -2280,6 +2955,11 @@ mod tests {
         assert_eq!(c.output_tokens, 19, "output must count once, not double");
         assert_eq!(c.input_tokens, 12738, "input must count once, not double");
         assert_eq!(c.cache_read, 1920, "cache.read must count once, not double");
+        assert_eq!(
+            c.cost_usd,
+            Some(0.07),
+            "cost must count once too, not double-billed like tokens would be"
+        );
         assert_eq!(
             c.session_id.as_deref(),
             Some("ses_1"),
@@ -2434,6 +3114,38 @@ mod tests {
         assert_eq!(s.cache_read_tokens, 1920);
         assert_eq!(s.billed_tokens, 12738 + 1920 + s.output_tokens);
         assert_eq!(s.session_id.as_deref(), Some("ses_1"));
+    }
+
+    #[test]
+    fn stats_from_log_recovers_a_tmuxd_opencode_stream() {
+        // `run_tmux` never runs a live coalescer over the pane's output; it only tees the
+        // raw stream to `log_path` (plus a trailing `tee`-added `EXIT:$?` line). This is
+        // the post-hoc reconstruction that closes that gap, fed the same shape of file.
+        let tmp = tempdir().unwrap();
+        let log = tmp.path().join("slot.log");
+        std::fs::write(
+            &log,
+            concat!(
+                r#"{"type":"text","sessionID":"ses_1","part":{"id":"prt_t","type":"text","text":"DONE"}}"#,
+                "\n",
+                r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_f","type":"step-finish","tokens":{"input":12738,"output":19,"cache":{"read":1920,"write":0}}}}"#,
+                "\n",
+                "EXIT:0\n",
+            ),
+        )
+        .unwrap();
+        let s = stats_from_log(&log);
+        assert_eq!(s.input_tokens, 12738);
+        assert_eq!(s.cache_read_tokens, 1920);
+        assert_eq!(s.billed_tokens, 12738 + 1920 + s.output_tokens);
+        assert_eq!(s.session_id.as_deref(), Some("ses_1"));
+    }
+
+    #[test]
+    fn stats_from_log_is_zero_for_a_missing_file() {
+        let s = stats_from_log(Path::new("/nonexistent/spar-test-slot.log"));
+        assert_eq!(s.billed_tokens, 0);
+        assert!(s.session_id.is_none());
     }
 
     #[test]

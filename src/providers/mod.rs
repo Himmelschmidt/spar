@@ -7,6 +7,7 @@ mod grok;
 mod muse;
 pub mod muse_telemetry;
 mod opencode;
+pub mod opencode_telemetry;
 pub mod presence;
 
 use crate::provider_ref::{ExecBackend, ProviderRef};

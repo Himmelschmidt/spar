@@ -16,6 +16,23 @@ All notable changes to spar are recorded here.
 - **Two ready-made fleet sizes.** One option gives you today's defaults; the other gives
   you the smallest useful setup — one reviewer, no critic, no test writer, no automatic
   tester — while still running your project's own test command if you've configured one.
+- **A slot's own resume handle, per-dispatch dollar cost, and subagent counts are now
+  recorded alongside its token usage**, when the provider reports them. Claude,
+  OpenCode and Muse dispatches carry a session id you can check against the
+  provider's own transcript; Claude dispatches additionally carry that dispatch's
+  own USD spend, a per-model cost/token breakdown for dispatches that used more
+  than one model, and how many Task-tool subagents ran and how they ended.
+
+### Fixed
+
+- **An agy slot's tool count and token usage are now exact instead of best-effort.**
+  Previously they were recovered from disk after the fact (or read as zero when nothing
+  was there to recover); they now come straight from agy's own structured output as the
+  slot runs.
+- **A slot that fans out subagents no longer has its real spend hidden.** Some slots can
+  spawn their own child workers to split up a task; that child spend was previously
+  omitted from the token counts shown for the slot, understating usage by several times
+  over. It's now added back in after the slot finishes.
 - **A codex implementer's next round now continues its own conversation instead of
   starting over from scratch.** When a fix round re-dispatches the same codex agent,
   spar picks up where that agent's own session left off rather than opening a brand new
