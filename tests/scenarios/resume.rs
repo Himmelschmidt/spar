@@ -237,6 +237,75 @@ fn a_stopped_loop_workflow_run_stays_resumable() {
     );
 }
 
+/// A dry-run `--workflow review`: no plan-approval gate exists for this workflow at
+/// all, so `gates.plan_approved` stays `false` the whole time — exactly the shape that
+/// used to make `resume`'s old `workflow != Loop` guard misfire.
+fn review_dry_run(proj: &std::path::Path) -> String {
+    let out = spar_cmd()
+        .current_dir(proj)
+        .args([
+            "run",
+            "--workflow",
+            "review",
+            "-t",
+            "review this",
+            "--providers",
+            "cli:claude,cli:claude",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
+    v["run_id"].as_str().expect("run id").to_string()
+}
+
+/// The bug this round fixes: the previous guard refused *every* non-`Loop` workflow
+/// parked at `Stopped` with `gates.plan_approved == false`, including `Review`, which
+/// has no plan-approval gate at all and so never sets that flag `true`. `resume` must
+/// route a stopped `Review` run to its own continuation (`workflow::review::execute`,
+/// via `implement::continue_run`'s dispatch) instead of refusing it or driving it
+/// through `run_from_approved`, which would rewrite its workflow to `Loop`.
+#[test]
+fn a_stopped_review_workflow_run_resumes_into_its_own_continuation() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    init_repo(&proj);
+
+    let run_id = review_dry_run(&proj);
+    let path = state_path(&proj, &run_id);
+    let before: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(before["workflow"], "review");
+    assert_eq!(
+        before["gates"]["plan_approved"], false,
+        "review has no approval gate; this must never gate resume"
+    );
+
+    set_phase(&proj, &run_id, "stopped");
+
+    // Unlike `run_from_approved`'s path, `continue_run`'s per-workflow dispatch
+    // (`review::execute`, here) prints nothing on its own — the same as the existing
+    // abandoned-in-flight foreground path. So the result is read back off disk, not
+    // off stdout.
+    let _ = spar_cmd()
+        .current_dir(&proj)
+        .args(["resume", &run_id])
+        .assert();
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_ne!(
+        after["phase"], "stopped",
+        "a stopped review run must resume, not stay parked"
+    );
+    assert_eq!(
+        after["workflow"], "review",
+        "resuming must not rewrite the run's workflow to loop"
+    );
+}
+
 #[test]
 fn a_gate_refuses_and_names_the_human_command() {
     let tmp = tempdir().unwrap();

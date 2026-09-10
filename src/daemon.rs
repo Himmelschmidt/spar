@@ -542,6 +542,8 @@ fn tick(paths: &SparPaths, cfg: &Config, book: &mut DaemonState) {
                 }
             }
             Err(e) => {
+                entry.restarts += 1;
+                entry.last_restart_at = Some(now);
                 release_reservation(paths, &summary.id);
                 log_line(
                     paths,
@@ -995,6 +997,51 @@ mod tests {
         assert!(
             !paths.logs_dir("r1").join("orchestrator.log").is_file(),
             "max_restarts = 0 must stop tick from ever attempting a spawn"
+        );
+    }
+
+    #[test]
+    fn a_restart_that_fails_to_spawn_still_consumes_max_restarts() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.phase = crate::state::Phase::Review; // in-flight, not waitable-stop
+        state.save(&paths).unwrap();
+
+        // Force `spawn_detached_orchestrator` to fail deterministically: `state.save`
+        // above already created `logs_dir(run_id)` (via `ensure_run_dirs`), so put a
+        // *directory* at the exact path the orchestrator log file must open — opening
+        // a directory for append always fails, with no dependence on permissions or a
+        // real orchestrator binary.
+        let log_file = paths.logs_dir("r1").join("orchestrator.log");
+        std::fs::create_dir_all(&log_file).unwrap();
+
+        let mut cfg = Config::default();
+        cfg.daemon.restart = true;
+        cfg.daemon.abandon_after_secs = 0;
+        cfg.daemon.max_restarts = 1;
+        let mut book = DaemonState::new();
+
+        tick(&paths, &cfg, &mut book);
+        assert_eq!(
+            book.runs.get("r1").map(|e| e.restarts),
+            Some(1),
+            "a spawn failure must count toward max_restarts exactly like a handshake failure"
+        );
+        assert!(book.runs.get("r1").unwrap().last_restart_at.is_some());
+
+        // A second tick must not attempt another spawn: the counter is already at
+        // max_restarts. Nothing to assert on process state (the spawn never runs a
+        // real binary either way), but the counter must not climb past 1.
+        tick(&paths, &cfg, &mut book);
+        assert_eq!(
+            book.runs.get("r1").map(|e| e.restarts),
+            Some(1),
+            "max_restarts must stop further attempts once reached"
         );
     }
 

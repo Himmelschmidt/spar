@@ -57,10 +57,14 @@ pub fn run_from_cli(
 /// operator); a live owner is refused naming its pid; an abandoned in-flight run goes
 /// to `continue_run` in the foreground, or (with `--detach`) through the same
 /// `detach_implement` a fresh `implement --detach` uses, since `continue_run` already
-/// dispatches on `state.workflow` regardless of which process calls it; an at-rest run
-/// goes to `run_from_approved`, which already knows how to clear a `stopped` marker,
-/// reset failed slots and re-check quota — the same path a bare `implement --run <id>`
-/// takes, so this mints no provider pool of its own.
+/// dispatches on `state.workflow` regardless of which process calls it. A stopped
+/// `Plan` run — the one workflow with a plan-approval gate — either refuses (never
+/// approved) or falls through to `run_from_approved` (approved, or `Loop`, which has no
+/// approval step at all). A stopped `Arena`/`Roles`/`Peer`/`Review` run has no approval
+/// gate to check at all, so it is routed straight to `continue_run` instead: those
+/// workflows are not `run_from_approved`'s business, since it only knows approved plans
+/// and `Loop`, and `prepare_implement_slots` would otherwise rewrite the run's workflow
+/// to `Loop`, silently changing what the run is.
 pub fn resume(
     paths: &SparPaths,
     cfg: &Config,
@@ -93,14 +97,20 @@ pub fn resume(
         );
     }
     // `spar stop` parks a plan run at `Stopped` before it was ever approved just as
-    // readily as it parks an approved or loop-workflow run. Resuming that straight into
-    // `run_from_approved` would drive an unapproved plan through to ship — the same
-    // hazard `Phase::Quota` already guards against there. Refuse here, by name, instead
-    // of falling through to `run_from_approved`'s generic "plan is not approved" bail:
-    // resume's contract is that it names the human command for every state it refuses.
+    // readily as it parks an approved run. Resuming that straight into `run_from_approved`
+    // would drive an unapproved plan through to ship — the same hazard `Phase::Quota`
+    // already guards against there. Refuse here, by name, instead of falling through to
+    // `run_from_approved`'s generic "plan is not approved" bail: resume's contract is that
+    // it names the human command for every state it refuses.
+    //
+    // `Plan` is the *only* workflow with an approval gate, so it is the only workflow this
+    // check applies to. `Loop` has none and resumes below via `run_from_approved`'s own
+    // `Stopped`+`Loop` disjunct. `Arena`/`Roles`/`Peer`/`Review` have none either, and are
+    // routed to their own continuation just below — never through `run_from_approved`,
+    // which would treat them as unapproved plans and refuse, or worse, rewrite them.
     if state.phase == Phase::Stopped
+        && state.workflow == crate::cli::WorkflowKind::Plan
         && !state.gates.plan_approved
-        && state.workflow != crate::cli::WorkflowKind::Loop
     {
         bail!(
             "run {run_id} is a stopped plan run that was never approved; resuming it would \
@@ -108,6 +118,18 @@ pub fn resume(
              `spar plan --run {run_id} -t \"…\"`, or if a plan is already written and \
              awaiting a decision, `spar approve {run_id}`."
         );
+    }
+    if state.phase == Phase::Stopped
+        && !matches!(
+            state.workflow,
+            crate::cli::WorkflowKind::Plan | crate::cli::WorkflowKind::Loop
+        )
+    {
+        let _ = std::fs::remove_file(paths.marker(run_id, "stopped"));
+        if detach {
+            return detach_implement(&state, paths, json);
+        }
+        return continue_run(paths, cfg, run_id);
     }
     if !state.phase.is_waitable_stop() {
         // `continue_run` has no detach knob of its own: it always runs to completion
