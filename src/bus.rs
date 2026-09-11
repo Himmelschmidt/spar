@@ -418,7 +418,19 @@ pub fn send(paths: &SparPaths, msg: BusMessage, budget: MessageBudget) -> Result
     check_loop(&recent, &msg, guard)?;
     // Budget check and both appends happen under one lock so two senders can't both
     // read a below-cap count and both write (TOCTOU across processes).
-    append_event_checked(paths, &msg, budget.max_messages(), run)?;
+    // Unauthenticated chat surface claims are downgraded: an agent that sets
+    // meta.surface="chat" without proving it is the conversation's agent (from ==
+    // agent_ref(run, conversation) and turn present) does not get the uncapped
+    // Chatty budget.
+    let effective_budget = if budget == MessageBudget::Chatty
+        && msg.meta.get("surface").map(|v| v.as_str()) == Some("chat")
+        && !is_conversation_message(&msg)
+    {
+        MessageBudget::Normal
+    } else {
+        budget
+    };
+    append_event_checked(paths, &msg, effective_budget.max_messages(), run)?;
     deliver_inbox(paths, &msg)?;
     // also mirror to legacy mailbox for tools that still read it (run-scoped only)
     if let Some(r) = run {
@@ -456,7 +468,23 @@ pub fn send(paths: &SparPaths, msg: BusMessage, budget: MessageBudget) -> Result
 }
 
 pub fn is_conversation_message(msg: &BusMessage) -> bool {
-    msg.meta.get("surface").map(|v| v.as_str()) == Some("chat")
+    if msg.meta.get("surface").map(|v| v.as_str()) != Some("chat") {
+        return false;
+    }
+    let Some(conv) = msg.meta.get("conversation") else {
+        return false;
+    };
+    if conv.is_empty() {
+        return false;
+    }
+    let Some(turn) = msg.meta.get("turn") else {
+        return false;
+    };
+    if turn.is_empty() {
+        return false;
+    }
+    let expected = agent_ref(msg.run.as_deref(), conv);
+    msg.from == expected
 }
 
 /// A message the human needs to see: addressed to [`HUMAN`], or any `Blocked`

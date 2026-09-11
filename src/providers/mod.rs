@@ -2,6 +2,7 @@ mod agy;
 pub mod agy_telemetry;
 mod claude;
 pub(crate) mod codex;
+pub mod conversation_turn;
 pub mod delivery;
 mod grok;
 mod muse;

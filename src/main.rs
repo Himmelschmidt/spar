@@ -131,12 +131,6 @@ fn run() -> Result<ExitCode> {
             if count != 1 {
                 anyhow::bail!("pass exactly one of -t / --spec / --brief (got {count})");
             }
-            if brief.is_some() && task.is_some() {
-                anyhow::bail!("--brief is exclusive with -t");
-            }
-            if brief.is_some() && spec.is_some() {
-                anyhow::bail!("--brief is exclusive with --spec");
-            }
             // A replan reads the run's own frozen config (O27), never the live file,
             // and re-dispatches the run's existing planner and critic slots. Flags that
             // could only apply to a NEW run are refused, not silently dropped. `--spec`
@@ -190,14 +184,17 @@ fn run() -> Result<ExitCode> {
                     (b.body, Some(b.path))
                 }
                 (None, Some(path), None) => {
+                    if path == std::path::Path::new("-") {
+                        anyhow::bail!("--brief requires an existing file, not stdin ('-')");
+                    }
+                    if !path.is_file() {
+                        anyhow::bail!("brief file not found: {}", path.display());
+                    }
                     let body = brief::read_spec_text(&path)?;
                     let rel = path
                         .strip_prefix(&paths.project_root)
                         .map(|p| p.to_path_buf())
                         .unwrap_or(path.clone());
-                    if !path.exists() {
-                        anyhow::bail!("brief file not found: {}", path.display());
-                    }
                     (body, Some(rel))
                 }
                 (None, None, Some(t)) => (t, None),
@@ -474,13 +471,13 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             turn,
         } => {
             let mut meta = std::collections::HashMap::new();
-            if let Some(s) = surface {
+            if let Some(s) = surface.clone() {
                 meta.insert("surface".to_string(), s);
             }
-            if let Some(c) = conversation {
+            if let Some(c) = conversation.clone() {
                 meta.insert("conversation".to_string(), c);
             }
-            if let Some(t) = turn {
+            if let Some(t) = turn.clone() {
                 meta.insert("turn".to_string(), t);
             }
             let msg = bus::BusMessage {
@@ -494,9 +491,21 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
                 subject: None,
                 refs: bus::MsgRefs::default(),
                 requires_ack: false,
-                meta,
+                meta: meta.clone(),
             };
-            let msg = bus::send(&paths, msg, bus::MessageBudget::Normal)?;
+            let is_conversation = surface.as_deref() == Some("chat")
+                && conversation
+                    .as_deref()
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false)
+                && turn.as_deref().map(|v| !v.is_empty()).unwrap_or(false)
+                && from == bus::agent_ref(run.as_deref(), conversation.as_deref().unwrap_or(""));
+            let budget = if is_conversation {
+                bus::MessageBudget::Chatty
+            } else {
+                bus::MessageBudget::Normal
+            };
+            let msg = bus::send(&paths, msg, budget)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&msg)?);
             } else {

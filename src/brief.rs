@@ -42,6 +42,7 @@ pub fn intake_body(paths: &SparPaths, body: &str) -> Result<Brief> {
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let mut candidate = base.clone();
     let mut n = 1u32;
+    // Use create_new to avoid overwriting a same-titled brief created concurrently (O41).
     let path = loop {
         let path = paths.brief_file(&candidate);
         match OpenOptions::new().write(true).create_new(true).open(&path) {

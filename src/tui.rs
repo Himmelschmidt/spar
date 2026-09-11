@@ -577,7 +577,11 @@ struct App {
     chat_watermarks: std::collections::HashMap<String, usize>,
     chat_turns: std::collections::HashMap<String, String>,
     chat_pending_proposal: Option<crate::orchestrator::Proposal>,
+    chat_pending_brief_path: Option<std::path::PathBuf>,
     chat_active_turn: Option<std::sync::Arc<crate::orchestrator::TurnHandle>>,
+    chat_latest_stats: std::collections::HashMap<String, crate::process::StreamStats>,
+    chat_accum_stats: std::collections::HashMap<String, crate::process::StreamStats>,
+    chat_last_preserved_worktree: Option<std::path::PathBuf>,
     tick: u64,
     /// (started, message, color, how long to show)
     flash: Option<(Instant, String, Color, Duration)>,
@@ -876,7 +880,11 @@ impl App {
             chat_watermarks: std::collections::HashMap::new(),
             chat_turns: std::collections::HashMap::new(),
             chat_pending_proposal: None,
+            chat_pending_brief_path: None,
             chat_active_turn: None,
+            chat_latest_stats: std::collections::HashMap::new(),
+            chat_accum_stats: std::collections::HashMap::new(),
+            chat_last_preserved_worktree: None,
             tick: 0,
             flash: None,
             cfg,
@@ -1091,6 +1099,10 @@ impl App {
         self.review_view_h.saturating_sub(1).max(3)
     }
 
+    fn chat_page(&self) -> u16 {
+        self.chat_view_h.saturating_sub(1).max(3)
+    }
+
     /// `has_full` mirrors exactly what `draw_log_body` branches on: without a
     /// full run the overview always paints via the raw fields (AC-14 does not
     /// apply — there is nothing parsed to preserve), and with one, `raw_mode`
@@ -1195,6 +1207,7 @@ impl App {
             MainTab::Diff if has_full => self.diff_page(),
             MainTab::Plan if has_full => self.plan_page(),
             MainTab::Review if has_full => self.review_page(),
+            MainTab::Chat => self.chat_page(),
             _ => self.stream_page(),
         }
     }
@@ -1478,6 +1491,7 @@ impl Snapshot {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Msg {
     Input(Event),
     Data,
@@ -1489,6 +1503,12 @@ enum Msg {
     /// that generation, so a cancelled or reopened modal can't be clobbered.
     RosterReady(u64, Vec<RosterEntry>),
     ChatTurnDone,
+    ChatTurnResult {
+        conv: String,
+        stats: Option<crate::process::StreamStats>,
+        worktree: Option<std::path::PathBuf>,
+        error: Option<String>,
+    },
 }
 
 /// Size+mtime of everything a snapshot is derived from. Comparing these is a
@@ -1843,12 +1863,15 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
     // Review tab silently show a *different* set of blockers than the one the
     // ship gate actually evaluated for this run. Fail closed instead — `None`
     // tells `review_records` to say so rather than guess.
-    let run_cfg = full.as_ref().map(|st| Config::for_run(&swarm, &st.id));
-    let review_v = review_records(
-        &swarm,
-        full.as_ref(),
-        run_cfg.as_ref().and_then(|r| r.as_ref().ok()),
-    );
+    let run_cfg = full.as_ref().and_then(|st| {
+        let snap = swarm.run_config_file(&st.id);
+        if snap.is_file() {
+            Config::for_run(&swarm, &st.id).ok()
+        } else {
+            None
+        }
+    });
+    let review_v = review_records(&swarm, full.as_ref(), run_cfg.as_ref());
     // The TUI refresh is a provider-agnostic delivery pulse for the selected run:
     // advance unacked-message redelivery/escalation before reading alerts, so
     // requires_ack works even when no Claude slot's Stop hook is ticking acks.
@@ -3133,6 +3156,40 @@ fn run_loop(
                 app.chat_active_turn = None;
                 dirty = true;
             }
+            Ok(Msg::ChatTurnResult {
+                conv,
+                stats,
+                worktree,
+                error,
+            }) => {
+                app.chat_active_turn = None;
+                if let Some(s) = stats.clone() {
+                    app.chat_latest_stats.insert(conv.clone(), s.clone());
+                    let entry = app.chat_accum_stats.entry(conv.clone()).or_default();
+                    entry.billed_tokens = entry.billed_tokens.saturating_add(s.billed_tokens);
+                    entry.input_tokens = entry.input_tokens.saturating_add(s.input_tokens);
+                    entry.output_tokens = entry.output_tokens.saturating_add(s.output_tokens);
+                    entry.cache_read_tokens =
+                        entry.cache_read_tokens.saturating_add(s.cache_read_tokens);
+                    entry.cache_write_tokens = entry
+                        .cache_write_tokens
+                        .saturating_add(s.cache_write_tokens);
+                    entry.context_tokens = entry.context_tokens.max(s.context_tokens);
+                    entry.tools = entry.tools.saturating_add(s.tools);
+                }
+                if let Some(wt) = worktree.clone() {
+                    if wt.exists() {
+                        app.chat_last_preserved_worktree = Some(wt.clone());
+                        app.flash(format!("preserved dirty worktree: {}", wt.display()), ALERT);
+                    }
+                }
+                if let Some(err) = error {
+                    if !err.is_empty() {
+                        app.flash(format!("turn: {err}"), ALERT);
+                    }
+                }
+                dirty = true;
+            }
             Ok(Msg::Input(ev)) => {
                 dirty = true;
                 let mut ev = Some(ev);
@@ -3199,6 +3256,46 @@ fn run_loop(
                         }
                         Ok(Msg::ChatTurnDone) => {
                             app.chat_active_turn = None;
+                            None
+                        }
+                        Ok(Msg::ChatTurnResult {
+                            conv,
+                            stats,
+                            worktree,
+                            error,
+                        }) => {
+                            app.chat_active_turn = None;
+                            if let Some(s) = stats.clone() {
+                                app.chat_latest_stats.insert(conv.clone(), s.clone());
+                                let entry = app.chat_accum_stats.entry(conv.clone()).or_default();
+                                entry.billed_tokens =
+                                    entry.billed_tokens.saturating_add(s.billed_tokens);
+                                entry.input_tokens =
+                                    entry.input_tokens.saturating_add(s.input_tokens);
+                                entry.output_tokens =
+                                    entry.output_tokens.saturating_add(s.output_tokens);
+                                entry.cache_read_tokens =
+                                    entry.cache_read_tokens.saturating_add(s.cache_read_tokens);
+                                entry.cache_write_tokens = entry
+                                    .cache_write_tokens
+                                    .saturating_add(s.cache_write_tokens);
+                                entry.context_tokens = entry.context_tokens.max(s.context_tokens);
+                                entry.tools = entry.tools.saturating_add(s.tools);
+                            }
+                            if let Some(wt) = worktree.clone() {
+                                if wt.exists() {
+                                    app.chat_last_preserved_worktree = Some(wt.clone());
+                                    app.flash(
+                                        format!("preserved dirty worktree: {}", wt.display()),
+                                        ALERT,
+                                    );
+                                }
+                            }
+                            if let Some(err) = error {
+                                if !err.is_empty() {
+                                    app.flash(format!("turn: {err}"), ALERT);
+                                }
+                            }
                             None
                         }
                         Ok(Msg::Data) => None,
@@ -3425,6 +3522,9 @@ fn handle_key_inner(
                 if let Ok(records) = crate::orchestrator::transcript(swarm, &scope, Some(&conv_id))
                 {
                     for rec in records.iter().rev() {
+                        if rec.actor.as_deref() != Some("spar") {
+                            continue;
+                        }
                         if let Ok(Some(proposal)) =
                             crate::orchestrator::parse_proposal(&rec.summary)
                         {
@@ -3447,51 +3547,12 @@ fn handle_key_inner(
                 return Ok(false);
             }
         }
-        if let KeyCode::Char(c) = code {
-            if (mods.is_empty() || mods == KeyModifiers::SHIFT) && c != ':' && c != '/' {
-                let is_global = if app.main_tab == MainTab::Chat {
-                    matches!(c, '[' | ']' | 'q' | '?' | '1' | '2' | '+' | '_' | '{' | '}')
-                } else {
-                    matches!(
-                        c,
-                        '[' | ']'
-                            | 'q'
-                            | '?'
-                            | '1'
-                            | '2'
-                            | '+'
-                            | '_'
-                            | 'a'
-                            | 'p'
-                            | 'P'
-                            | 'f'
-                            | 'R'
-                            | 'A'
-                            | 'w'
-                            | 'g'
-                            | 'G'
-                            | 'r'
-                            | 's'
-                            | 'n'
-                            | 'j'
-                            | 'k'
-                            | 'J'
-                            | 'K'
-                            | 't'
-                            | 'T'
-                            | 'e'
-                            | 'E'
-                            | '{'
-                            | '}'
-                            | ' '
-                    )
-                } && !(c == 'o' && app.browse == BrowseLevel::Home);
-                if !is_global {
-                    app.chat_composing = true;
-                    app.chat_input.push(c);
-                    return Ok(false);
-                }
-            }
+        // Explicit compose key: only `i` enters composition, so global keys
+        // like `q`/`?` and future bindings keep working while not composing,
+        // and a message can begin with any character once composing.
+        if code == KeyCode::Char('i') && mods.is_empty() {
+            app.chat_composing = true;
+            return Ok(false);
         }
     }
 
@@ -3508,6 +3569,10 @@ fn handle_key_inner(
                 return Ok(false);
             }
             KeyCode::Enter => {
+                if app.chat_active_turn.is_some() {
+                    app.flash("turn in flight".to_string(), ALERT);
+                    return Ok(false);
+                }
                 let trimmed = app.chat_input.trim().to_string();
                 if trimmed.is_empty() {
                     return Ok(false);
@@ -3561,30 +3626,64 @@ fn handle_key_inner(
                 app.chat_active_turn = Some(handle.clone());
                 if let Some(tx) = app.bg_tx.clone() {
                     let swarm_clone = swarm.clone();
+                    let conv_clone = conv_id.clone();
                     std::thread::spawn(move || {
                         let res = crate::orchestrator::dispatch_turn_with_handle(
                             swarm_clone,
                             req,
                             &handle,
                         );
-                        let _ = tx.send(Msg::ChatTurnDone);
                         match res {
                             Ok(out) => {
-                                if let Some(err) = out.error {
-                                    let _ = tx.send(Msg::Flash(format!("turn: {err}"), ALERT));
-                                }
+                                let _ = tx.send(Msg::ChatTurnResult {
+                                    conv: conv_clone,
+                                    stats: out.stats.clone(),
+                                    worktree: out.worktree.clone(),
+                                    error: out.error.clone(),
+                                });
+                                let _ = tx.send(Msg::ChatTurnDone);
                             }
                             Err(e) => {
-                                let _ = tx.send(Msg::Flash(format!("turn failed: {e:#}"), ALERT));
+                                let _ = tx.send(Msg::ChatTurnResult {
+                                    conv: conv_clone,
+                                    stats: None,
+                                    worktree: None,
+                                    error: Some(format!("turn failed: {e:#}")),
+                                });
+                                let _ = tx.send(Msg::ChatTurnDone);
                             }
                         }
                     });
                 } else {
-                    let _ =
+                    let out =
                         crate::orchestrator::dispatch_turn_with_handle(swarm.clone(), req, &handle);
+                    if let Ok(out) = out {
+                        if let Some(s) = out.stats.clone() {
+                            app.chat_latest_stats.insert(conv_id.clone(), s.clone());
+                            let entry = app.chat_accum_stats.entry(conv_id.clone()).or_default();
+                            entry.billed_tokens =
+                                entry.billed_tokens.saturating_add(s.billed_tokens);
+                            entry.input_tokens = entry.input_tokens.saturating_add(s.input_tokens);
+                            entry.output_tokens =
+                                entry.output_tokens.saturating_add(s.output_tokens);
+                            entry.cache_read_tokens =
+                                entry.cache_read_tokens.saturating_add(s.cache_read_tokens);
+                            entry.cache_write_tokens = entry
+                                .cache_write_tokens
+                                .saturating_add(s.cache_write_tokens);
+                            entry.context_tokens = entry.context_tokens.max(s.context_tokens);
+                            entry.tools = entry.tools.saturating_add(s.tools);
+                        }
+                        if let Some(wt) = out.worktree.clone() {
+                            if wt.exists() {
+                                app.chat_last_preserved_worktree = Some(wt);
+                            }
+                        }
+                    }
                     app.chat_active_turn = None;
                 }
                 app.chat_input.clear();
+                app.chat_composing = false;
                 return Ok(false);
             }
             KeyCode::Backspace => {
@@ -4204,7 +4303,11 @@ fn apply_roster_ready(app: &mut App, gen: u64, mut roster: Vec<RosterEntry>) {
     if let Some(nr) = app.new_run.as_mut() {
         if nr.gen == gen {
             if let Some(proposal) = app.chat_pending_proposal.clone() {
+                let saved_task = nr.task.clone();
                 apply_proposal_to_roster(&proposal, &mut roster, nr);
+                if saved_task.trim() != proposal.task.trim() && !saved_task.trim().is_empty() {
+                    nr.task = saved_task;
+                }
             }
             nr.roster = roster;
             nr.loading = false;
@@ -4227,6 +4330,7 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
     if code == KeyCode::Esc {
         app.new_run = None;
         app.chat_pending_proposal = None;
+        app.chat_pending_brief_path = None;
         return;
     }
     if code == KeyCode::Enter {
@@ -4253,28 +4357,29 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 app.flash("no providers selected", ALERT);
                 return;
             }
-            let brief_body = if nr.task.trim() != proposal.task.trim() {
-                let edited = nr.task.trim().to_string();
-                if proposal.brief.contains(&proposal.task) {
-                    proposal.brief.replacen(&proposal.task, &edited, 1)
-                } else {
-                    format!("# {}\n\n{}", edited, proposal.brief)
-                }
+            // Keep the original brief byte-identical; the operator's edited task
+            // stays as the picker's task line separately and does not rewrite the
+            // brief (the brief is a record of what was asked for).
+            let brief_path = if let Some(existing) = app.chat_pending_brief_path.clone() {
+                existing
             } else {
-                proposal.brief.clone()
-            };
-            let swarm = SparPaths::new(&project);
-            let brief = match crate::brief::intake_body(&swarm, &brief_body) {
-                Ok(b) => b,
-                Err(e) => {
-                    app.flash(format!("brief intake failed: {e:#}"), ALERT);
-                    return;
+                let swarm = SparPaths::new(&project);
+                let brief_body = proposal.brief.clone();
+                match crate::brief::intake_body(&swarm, &brief_body) {
+                    Ok(b) => {
+                        app.chat_pending_brief_path = Some(b.path.clone());
+                        b.path
+                    }
+                    Err(e) => {
+                        app.flash(format!("brief intake failed: {e:#}"), ALERT);
+                        return;
+                    }
                 }
             };
             let mut args = vec![
                 "plan".to_string(),
                 "--brief".to_string(),
-                brief.path.display().to_string(),
+                brief_path.display().to_string(),
                 "--providers".to_string(),
                 providers.join(","),
             ];
@@ -4288,12 +4393,23 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 }
             }
             match spawn_detached_workflow(&target_swarm, &args, "Plan started") {
-                Ok(PaletteResult::Flash(msg, color)) => app.flash(msg, color),
-                Ok(_) => {}
-                Err(e) => app.flash(format!("Plan failed to start: {e:#}"), ALERT),
+                Ok(PaletteResult::Flash(msg, color)) => {
+                    app.flash(msg, color);
+                    app.new_run = None;
+                    app.chat_pending_proposal = None;
+                    app.chat_pending_brief_path = None;
+                }
+                Ok(_) => {
+                    app.new_run = None;
+                    app.chat_pending_proposal = None;
+                    app.chat_pending_brief_path = None;
+                }
+                Err(e) => {
+                    app.flash(format!("Plan failed to start: {e:#}"), ALERT);
+                    // Keep proposal and brief path so retry does not mint a duplicate
+                    // brief — AC-9 forbids a second copy on a failed detached launch.
+                }
             }
-            app.new_run = None;
-            app.chat_pending_proposal = None;
             return;
         }
         let Some(nr) = app.new_run.as_ref() else {
@@ -5861,7 +5977,7 @@ fn main_tab_spans(app: &App) -> Vec<(MainTab, String, Style)> {
 }
 
 /// Narrow strip label (U35): the two-tab Home strip keeps its full labels (they
-/// already fit); the six-tab run/project strip abbreviates uniformly so widening a
+/// already fit); the seven-tab run/project strip abbreviates uniformly so widening a
 /// badge or a label never moves the strip (U11).
 fn narrow_label(t: MainTab, browse: BrowseLevel) -> &'static str {
     if browse == BrowseLevel::Home {
@@ -7659,7 +7775,7 @@ fn draw_main(
             app,
         ),
         MainTab::Review => draw_review_body(f, inner, review, app),
-        MainTab::Chat => draw_chat_body(f, inner, chat, app),
+        MainTab::Chat => draw_chat_body(f, inner, chat, full, app),
         MainTab::Shell => draw_shell_body(f, inner, app),
     }
 }
@@ -7977,16 +8093,51 @@ fn draw_review_body(f: &mut Frame, inner: Rect, review: &[Record], app: &mut App
     );
 }
 
-fn draw_chat_body(f: &mut Frame, inner: Rect, chat: &[Record], app: &mut App) {
-    // Split into transcript and input line (1 row for input, if space)
-    let input_h = 1;
-    let transcript_h = inner.height.saturating_sub(input_h);
+fn draw_chat_body(
+    f: &mut Frame,
+    inner: Rect,
+    chat: &[Record],
+    full: Option<&RunState>,
+    app: &mut App,
+) {
+    // Stats line shows latest + accumulated conversation stats (AC-7) without
+    // touching run usage, scoped to the currently selected conversation so a
+    // Home Chat does not show run-scoped spend and vice versa. Displayed as
+    // "conversation stats" so the feature is discoverable by grep.
+    // Reserve the input row permanently (U11) — it is always 1 row; stats is an
+    // extra row above it only when the current conversation has spend.
+    let input_h: u16 = 1;
+    let scope_key = full.map(|s| s.id.as_str()).unwrap_or("home").to_string();
+    let cur_conv = app.chat_conversations.get(&scope_key).cloned();
+    let (has_stats, total_billed, latest_billed) = if let Some(conv) = &cur_conv {
+        let latest = app
+            .chat_latest_stats
+            .get(conv)
+            .map(|s| s.billed_tokens)
+            .unwrap_or(0);
+        let total = app
+            .chat_accum_stats
+            .get(conv)
+            .map(|s| s.billed_tokens)
+            .unwrap_or(0);
+        (latest > 0 || total > 0, total, latest)
+    } else {
+        (false, 0, 0)
+    };
+    let stats_h = if has_stats { 1 } else { 0 };
+    let transcript_h = inner.height.saturating_sub(input_h + stats_h);
     let transcript_area = Rect {
         height: transcript_h,
         ..inner
     };
-    let input_area = Rect {
+    let stats_area = Rect {
         y: inner.y + transcript_h,
+        height: stats_h.min(inner.height.saturating_sub(input_h)),
+        width: inner.width,
+        x: inner.x,
+    };
+    let input_area = Rect {
+        y: inner.y + transcript_h + stats_h,
         height: input_h.min(inner.height),
         ..inner
     };
@@ -8003,6 +8154,14 @@ fn draw_chat_body(f: &mut Frame, inner: Rect, chat: &[Record], app: &mut App) {
         &mut app.record_cursor_dirty,
         None,
     );
+    if has_stats && stats_area.height > 0 {
+        let chat_stats_line =
+            format!("conversation stats — latest {latest_billed} · total {total_billed} tokens");
+        f.render_widget(
+            Paragraph::new(chat_stats_line).style(Style::default().fg(Color::Rgb(160, 160, 160))),
+            stats_area,
+        );
+    }
     // Input line
     let input_text = if app.chat_composing {
         format!("> {}█", app.chat_input)
@@ -9374,7 +9533,9 @@ fn situational_footer(
     }
     match focus {
         Focus::Rail => match browse {
-            BrowseLevel::Home => "j/k · Enter open · n new run · P scope · p projects · a next-alert · : cmd · ? help",
+            BrowseLevel::Home => {
+                "j/k · Enter open · n chat · P scope · p projects · a next-alert · : cmd · ? help"
+            }
             BrowseLevel::Projects => "j/k · Enter open · / filter · : cmd · 2 main · ? help",
             BrowseLevel::Runs => "j/k · Enter agents · a next-alert · / filter · : cmd · ? help",
             BrowseLevel::Agents => "j/k · Enter take over · a next-alert · Esc runs · : cmd",
@@ -9434,7 +9595,7 @@ const HELP_BODY: &str = r#" spar — rail + one main area
     Rail   Home ▸ runs ▸ agents  (Enter pushes, Esc pops)
            p opens the project list; Home bands: needs you, running,
            finished since last look, start something new.
-    Main   one area · tabs: Log · Activity · Diff · Plan · Review · Shell
+    Main   one area · tabs: Log · Activity · Diff · Plan · Review · Chat · Shell
     Main always shows the rail's selection — nothing else moves.
 
   Keyboard
@@ -9445,7 +9606,7 @@ const HELP_BODY: &str = r#" spar — rail + one main area
     Esc                  pop a rail level · clear filter (never quits)
     [ ]                  previous / next Main tab
     + / _                zoom Main fullscreen / restore
-    n                    new run + fleet picker
+    n                    chat (Home: new conversation, run: gate consultation)
     P                    toggle Home scope (this project ↔ all)
     p                    jump to Projects
     a                    jump to the next run that needs you
@@ -14527,10 +14688,8 @@ mod render_stability {
         };
         for &n in &[0usize, 3, 12] {
             let wide = probe(120, n, &wide_labels);
-            let max_gap = *wide.glyph_gaps.iter().max().unwrap();
-            let min_gap = *wide.glyph_gaps.iter().min().unwrap();
             assert!(
-                max_gap - min_gap <= 1 && max_gap > 0,
+                wide.glyph_gaps.windows(2).all(|w| w[0] == w[1]) && wide.glyph_gaps[0] > 0,
                 "wide tab gaps not uniform (human_alerts_n={n}): {:?}",
                 wide.glyph_gaps
             );
@@ -15971,6 +16130,7 @@ mod render_stability {
         .unwrap();
         // Neither reviewer's artifact exists on disk.
         let cfg = Config::default();
+        cfg.save_snapshot(&swarm, &st.id).unwrap();
         let records = review_records(&swarm, Some(&st), Some(&cfg));
         let blockers: Vec<_> = records
             .iter()
@@ -16019,6 +16179,7 @@ mod render_stability {
         )
         .unwrap();
         let cfg = Config::default();
+        cfg.save_snapshot(&swarm, &st.id).unwrap();
         let records = review_records(&swarm, Some(&st), Some(&cfg));
 
         let grid_row = records
@@ -16071,6 +16232,7 @@ mod render_stability {
         )
         .unwrap();
         let cfg = Config::default();
+        cfg.save_snapshot(&swarm, &st.id).unwrap();
         let records = review_records(&swarm, Some(&st), Some(&cfg));
         let grid_row = records
             .iter()
@@ -16110,6 +16272,7 @@ mod render_stability {
 
         let mut cfg = Config::default();
         cfg.review.require_all_criteria = false;
+        cfg.save_snapshot(&swarm, &st.id).unwrap();
         let relaxed = review_records(&swarm, Some(&st), Some(&cfg));
         let reviewer_row = relaxed
             .iter()
@@ -16123,6 +16286,7 @@ mod render_stability {
         );
 
         cfg.review.require_all_criteria = true;
+        cfg.save_snapshot(&swarm, &st.id).unwrap();
         let strict = review_records(&swarm, Some(&st), Some(&cfg));
         let reviewer_row = strict
             .iter()
@@ -18798,6 +18962,8 @@ mod chat_acceptance {
 
     #[test]
     fn chat_composer_captures_global_keys_and_rejects_empty_submit() {
+        let prev = std::env::var("SPAR_DRY_RUN").ok();
+        std::env::set_var("SPAR_DRY_RUN", "1");
         let mut app = App::new(None, Config::default(), Some(Path::new("/x")));
         app.browse = BrowseLevel::Runs;
         app.main_tab = MainTab::Chat;
@@ -18914,6 +19080,11 @@ mod chat_acceptance {
             app.chat_input.is_empty(),
             "Ctrl+C must not be captured as literal"
         );
+        if let Some(v) = prev {
+            std::env::set_var("SPAR_DRY_RUN", v);
+        } else {
+            std::env::remove_var("SPAR_DRY_RUN");
+        }
     }
 
     #[test]
@@ -18986,31 +19157,92 @@ mod chat_acceptance {
             app.new_run.is_some(),
             "o at Home with proposal must open picker"
         );
-        let roster = crate::providers::detect_all();
-        let _ = roster;
-        app.chat_conversations.insert("home".into(), conv);
-        assert!(app.new_run.is_some());
         if let Some(nr) = &app.new_run {
-            let has_unknown = nr.roster.iter().any(|e| match &e.choice {
-                RosterChoice::Provider(p) => p == "cli:unknown",
-                _ => false,
-            });
-            if has_unknown {
-                let entry = nr
-                    .roster
-                    .iter()
-                    .find(|e| matches!(&e.choice, RosterChoice::Provider(p) if p=="cli:unknown"))
-                    .unwrap();
-                assert!(
-                    !entry.available,
-                    "unknown provider must be visible but unavailable"
-                );
-            }
+            assert!(
+                nr.roster.iter().any(|e| match &e.choice {
+                    RosterChoice::Provider(p) => p == "cli:unknown",
+                    _ => false,
+                }),
+                "unknown provider must be visible in roster"
+            );
+            let entry = nr
+                .roster
+                .iter()
+                .find(|e| matches!(&e.choice, RosterChoice::Provider(p) if p=="cli:unknown"))
+                .unwrap();
+            assert!(
+                !entry.available,
+                "unknown provider must be visible but unavailable"
+            );
+            assert!(
+                !nr.picked.contains(
+                    &nr.roster
+                        .iter()
+                        .position(
+                            |e| matches!(&e.choice, RosterChoice::Provider(p) if p=="cli:unknown")
+                        )
+                        .unwrap()
+                ),
+                "unknown provider must not be auto-picked"
+            );
+            assert_eq!(nr.task, "do thing");
+        } else {
+            panic!("new_run missing after Home o");
         }
+        // Run-scoped gate reply cannot launch: even with a valid proposal for that run's conversation, `o` on a non-Home browse must not open the picker.
+        // Seed a run-scoped proposal.
+        let run_conv = "talk-r1-proposal".to_string();
+        let run_proposal_body = "intro\n```spar-proposal\ntask = \"run task\"\nbrief = \"run brief\"\nproviders = [\"cli:claude\"]\n```\noutro";
+        let mut run_meta = std::collections::HashMap::new();
+        run_meta.insert("surface".into(), "chat".into());
+        run_meta.insert("conversation".into(), run_conv.clone());
+        run_meta.insert("turn".into(), "t2".into());
+        let run_agent = crate::bus::agent_ref(Some("r1"), &run_conv);
+        crate::bus::send(
+            &paths,
+            crate::bus::BusMessage {
+                id: crate::bus::new_id(),
+                ts: chrono::Utc::now(),
+                from: run_agent,
+                to: crate::bus::HUMAN.into(),
+                kind: crate::bus::MsgKind::Chat,
+                body: run_proposal_body.into(),
+                run: Some("r1".into()),
+                subject: None,
+                refs: crate::bus::MsgRefs::default(),
+                requires_ack: false,
+                meta: run_meta,
+            },
+            crate::bus::MessageBudget::Chatty,
+        )
+        .unwrap();
         let mut app2 = App::new(None, Config::default(), Some(project.as_path()));
-        app2.browse = BrowseLevel::Agents;
+        app2.browse = BrowseLevel::Runs;
+        app2.main_tab = MainTab::Chat;
+        app2.focus = Focus::Main;
         app2.selected_run = 0;
-        app2.chat_conversations.insert("r1".into(), "talk-x".into());
+        app2.chat_conversations
+            .insert("r1".into(), run_conv.clone());
+        let run_summary = crate::state::RunSummary {
+            id: "r1".into(),
+            workflow: crate::cli::WorkflowKind::Loop,
+            phase: crate::state::Phase::AwaitingPlanApproval,
+            updated_at: chrono::Utc::now(),
+            task: Some("run task".into()),
+            dry_run: false,
+            abandoned: false,
+            archived: false,
+            parent_run: None,
+            round: 1,
+            legs: 1,
+            wants: 0,
+            unit_id: None,
+            base_ref: None,
+            base_commit: None,
+            project_root: Some(project.clone()),
+            project_name: Some("proj".into()),
+        };
+        let runs = vec![run_summary];
         let sw2 = SparPaths::new(&project);
         handle_key(
             &mut app2,
@@ -19019,7 +19251,7 @@ mod chat_acceptance {
             &sw2,
             &projects,
             &[],
-            &[],
+            &runs,
             None,
             &[],
             &mut project.clone(),
@@ -19027,5 +19259,119 @@ mod chat_acceptance {
         )
         .unwrap();
         assert!(app2.new_run.is_none(), "run-scoped o must not launch");
+    }
+
+    #[test]
+    fn chat_pending_proposal_launch_uses_verbatim_brief_once() {
+        let prev_dry = std::env::var("SPAR_DRY_RUN").ok();
+        std::env::set_var("SPAR_DRY_RUN", "1");
+        let tmp = tempdir().unwrap();
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&project)
+            .output()
+            .unwrap();
+        let proposal = crate::orchestrator::Proposal {
+            task: "orig task".into(),
+            brief: "# Orig Title\n\nThis is the original brief with orig task inside.\n".into(),
+            providers: vec!["cli:claude".into()],
+        };
+        let edited_task = "edited task";
+        let mut app = App::new(None, Config::default(), Some(project.as_path()));
+        app.browse = BrowseLevel::Home;
+        app.main_tab = MainTab::Chat;
+        app.focus = Focus::Main;
+        app.chat_pending_proposal = Some(proposal.clone());
+        app.chat_pending_brief_path = None;
+        // Prepare a NewRun with edited task, as if operator edited the picker.
+        let mut nr = pending_new_run(
+            Some(project.clone()),
+            vec![project.clone()],
+            edited_task.into(),
+            NewRunField::Task,
+            1,
+        );
+        // Simulate roster ready with cli:claude available.
+        nr.roster = vec![RosterEntry {
+            choice: RosterChoice::Provider("cli:claude".into()),
+            label: "cli:claude".into(),
+            available: true,
+            reason: None,
+            source: RosterSource::Detected,
+        }];
+        nr.picked = vec![0];
+        nr.loading = false;
+        app.new_run = Some(nr);
+        // Launch via Enter (which should intake verbatim brief and not rewrite with edited task).
+        handle_new_run_key(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        // Brief must be verbatim, not containing edited task's injected title.
+        let briefs: Vec<_> = std::fs::read_dir(project.join(".spar/briefs"))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            briefs.len(),
+            1,
+            "must create exactly one brief, not a duplicate, got {briefs:?}"
+        );
+        let brief_path = briefs[0].path();
+        let body = std::fs::read_to_string(&brief_path).unwrap();
+        assert_eq!(
+            body, proposal.brief,
+            "brief must be byte-identical to proposal.brief, not edited"
+        );
+        assert!(
+            !body.contains(edited_task) || proposal.brief.contains(edited_task),
+            "brief must not be rewritten with edited task"
+        );
+        // Verify the argv would have been `plan --brief <path> --providers cli:claude`
+        // by checking the brief path is used and task is not injected.
+        // The brief path should be the one we created.
+        assert!(
+            brief_path.to_string_lossy().contains("orig-title")
+                || brief_path.to_string_lossy().contains("brief"),
+            "brief path should be derived from proposal.brief, got {brief_path:?}"
+        );
+        // Simulate a failed detached launch that kept pending_brief_path: second Enter with same
+        // proposal but edited task should reuse the same brief path, not create a second file.
+        // Re-open the modal with same proposal and pending path.
+        app.chat_pending_proposal = Some(proposal.clone());
+        // Keep the pending path from previous launch (simulate failure keeping it).
+        // The previous launch cleared it on success, so we restore it to test reuse.
+        app.chat_pending_brief_path = Some(brief_path.clone());
+        let mut nr2 = pending_new_run(
+            Some(project.clone()),
+            vec![project.clone()],
+            "another edit".into(),
+            NewRunField::Task,
+            2,
+        );
+        nr2.roster = vec![RosterEntry {
+            choice: RosterChoice::Provider("cli:claude".into()),
+            label: "cli:claude".into(),
+            available: true,
+            reason: None,
+            source: RosterSource::Detected,
+        }];
+        nr2.picked = vec![0];
+        nr2.loading = false;
+        app.new_run = Some(nr2);
+        handle_new_run_key(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        let briefs2: Vec<_> = std::fs::read_dir(project.join(".spar/briefs"))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            briefs2.len(),
+            1,
+            "retry must not create a second brief file (AC-9), got {briefs2:?}"
+        );
+        if let Some(v) = prev_dry {
+            std::env::set_var("SPAR_DRY_RUN", v);
+        } else {
+            std::env::remove_var("SPAR_DRY_RUN");
+        }
     }
 }

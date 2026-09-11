@@ -33,6 +33,7 @@ impl Scope {
     }
 }
 
+#[allow(dead_code)]
 pub fn agent_id(scope: &Scope) -> String {
     match scope {
         Scope::Home => "talk".to_string(),
@@ -56,7 +57,6 @@ pub fn transcript(
 ) -> Result<Vec<Record>> {
     let run = scope.run_tag();
     let all_events = crate::bus::list_events(paths, None)?;
-    let generic_agent = agent_id(scope);
     let conv_agent = conversation.map(|conv| crate::bus::agent_ref(run, conv));
     let mut out = Vec::new();
     for msg in all_events.iter().filter(|m| {
@@ -77,11 +77,11 @@ pub fn transcript(
         };
         let from_is_human = m.from == crate::bus::HUMAN || m.from == "human";
         let to_is_human = m.to == crate::bus::HUMAN;
-        let from_is_agent = m.from == *agent || m.from == generic_agent;
-        let to_is_agent = m.to == *agent || m.to == generic_agent;
+        let from_is_agent = m.from == *agent;
+        let to_is_agent = m.to == *agent;
         (from_is_human && to_is_agent) || (from_is_agent && to_is_human)
     }) {
-        let conv_agent_val = conv_agent.as_deref().unwrap_or(&generic_agent);
+        let conv_agent_val = conv_agent.as_deref().unwrap();
         let actor = if msg.from == conv_agent_val {
             Some("spar".to_string())
         } else if msg.from == crate::bus::HUMAN || msg.from == "human" {
@@ -118,7 +118,12 @@ pub fn transcript(
             has_command_row: false,
         });
         let proposal_seq = seq.wrapping_add(1);
-        let proposal_parse = parse_proposal(&msg.body);
+        let is_from_agent = msg.from == conv_agent_val;
+        let proposal_parse = if is_from_agent {
+            parse_proposal(&msg.body)
+        } else {
+            Ok(None)
+        };
         if let Err(e) = &proposal_parse {
             out.push(Record {
                 kind: RecordKind::Error,
@@ -230,7 +235,11 @@ impl TurnHandle {
 
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::SeqCst);
-        if let Some(pid) = *self.pid.lock().unwrap() {
+        let pid = {
+            let guard = self.pid.lock().unwrap();
+            *guard
+        };
+        if let Some(pid) = pid {
             crate::process::terminate_tree(pid, true);
         }
     }
@@ -245,7 +254,11 @@ impl TurnHandle {
 
     pub fn on_tick(&self) {
         if self.is_cancelled() {
-            if let Some(pid) = *self.pid.lock().unwrap() {
+            let pid = {
+                let guard = self.pid.lock().unwrap();
+                *guard
+            };
+            if let Some(pid) = pid {
                 crate::process::terminate_tree(pid, true);
             }
         }
@@ -285,13 +298,13 @@ pub fn collect_gate_evidence(paths: &SparPaths, run_id: &str) -> GateEvidence {
 pub fn collect_gate_evidence_with_fallback(
     paths: &SparPaths,
     run_id: &str,
-    fallback: Option<&Config>,
+    _fallback: Option<&Config>,
 ) -> GateEvidence {
     let snap_path = paths.run_config_file(run_id);
     let cfg = if snap_path.is_file() {
         Config::for_run(paths, run_id).ok()
     } else {
-        fallback.cloned()
+        None
     };
     let st = crate::state::RunState::load(paths, run_id).ok();
     let contract_path = paths.artifact(run_id, "test-contract.md");
@@ -314,12 +327,17 @@ pub fn collect_gate_evidence_with_fallback(
                 .clone()
                 .unwrap_or_else(|| format!("review-{}.md", r.id));
             let path = paths.artifact(run_id, &artifact);
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                let res = crate::workflow::review_result::parse_review(&text);
-                let reasons =
-                    crate::workflow::implement::acceptance_block_reasons(&criteria, &res, cfg);
-                if !reasons.is_empty() {
-                    block_reasons.push((r.id.clone(), reasons));
+            match std::fs::read_to_string(&path) {
+                Ok(text) if !text.trim().is_empty() => {
+                    let res = crate::workflow::review_result::parse_review(&text);
+                    let reasons =
+                        crate::workflow::implement::acceptance_block_reasons(&criteria, &res, cfg);
+                    if !reasons.is_empty() {
+                        block_reasons.push((r.id.clone(), reasons));
+                    }
+                }
+                _ => {
+                    block_reasons.push((r.id.clone(), vec!["missing".to_string()]));
                 }
             }
         }
@@ -409,7 +427,15 @@ fn dispatch_turn_inner(
 ) -> Result<TurnOutcome> {
     let provider_name = resolve_conversation_provider(&paths, req.run_id.as_deref());
     if provider_name.starts_with("api:") {
-        anyhow::bail!("api-sdk is the better long-term host and explicitly does not block this: api-sdk turn not yet implemented for provider {provider_name}");
+        return Ok(TurnOutcome {
+            success: false,
+            error: Some(format!(
+                "api-sdk is the better long-term host and explicitly does not block this: api-sdk turn not yet implemented for provider {provider_name}"
+            )),
+            reply: None,
+            worktree: None,
+            stats: Some(crate::process::StreamStats::default()),
+        });
     }
 
     let run_tag = req.run_id.as_deref();
@@ -426,16 +452,26 @@ fn dispatch_turn_inner(
             conv.trim_start_matches("talk-"),
             &turn[..8.min(turn.len())]
         ));
-    // For Home, use invoking HEAD; for Run, use base_commit
-    let base_commit = if let Some(run_id) = &req.run_id {
-        crate::state::RunState::load(&paths, run_id)
+    let base_ref = if let Some(run_id) = &req.run_id {
+        let st = crate::state::RunState::load(&paths, run_id)
             .ok()
-            .and_then(|st| st.base_commit.clone())
+            .and_then(|s| s.base_commit.clone());
+        match st {
+            Some(commit) => commit,
+            None => {
+                return Ok(TurnOutcome {
+                    success: false,
+                    error: Some(format!(
+                        "run {} has no base_commit; worktrees must be cut from state.base_commit per O26, never from HEAD",
+                        run_id
+                    )),
+                    reply: None,
+                    worktree: None,
+                    stats: Some(crate::process::StreamStats::default()),
+                });
+            }
+        }
     } else {
-        None
-    };
-    let base_ref = base_commit.unwrap_or_else(|| {
-        // Use HEAD of project_root
         std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(&req.project_root)
@@ -449,7 +485,7 @@ fn dispatch_turn_inner(
                 }
             })
             .unwrap_or_else(|| "HEAD".to_string())
-    });
+    };
 
     // Create worktree (best-effort) — track only if we actually created it.
     let _ = std::fs::create_dir_all(worktree.parent().unwrap());
@@ -470,28 +506,20 @@ fn dispatch_turn_inner(
     };
     let worktree_existed = !worktree_created && worktree.exists();
 
-    // Presence wiring — backend owns dispatch (U17), so resolve real adapter.
-    let spar_exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("spar"));
     let slot_id = conv.clone();
-    let adapter_box = crate::providers::adapter_named(&provider_name)
-        .unwrap_or_else(|| Box::new(crate::providers::ClaudeAdapter));
-    let adapter: &dyn crate::providers::ProviderAdapter = &*adapter_box;
-    let identity = crate::providers::presence::SlotIdentity {
-        agent_id: &slot_id,
-        run_id: run_tag,
-        project_root: &req.project_root,
-        worktree: &worktree,
-        spar_exe: &spar_exe,
-    };
-    let wiring = crate::providers::presence::wire(adapter, &identity);
-    let mut env = wiring.env.clone();
-    // Ensure SPAR_AGENT_ID is the unique conversation agent
-    env.retain(|(k, _)| k != "SPAR_AGENT_ID");
-    env.push((
-        "SPAR_AGENT_ID".to_string(),
-        crate::bus::agent_ref(run_tag, &slot_id),
-    ));
-    // Also ensure conversation/turn env for debugging
+    let mut env = vec![
+        (
+            "SPAR_PROJECT_ROOT".to_string(),
+            req.project_root.display().to_string(),
+        ),
+        (
+            "SPAR_AGENT_ID".to_string(),
+            crate::bus::agent_ref(run_tag, &slot_id),
+        ),
+    ];
+    if let Some(run) = run_tag {
+        env.push(("SPAR_RUN_ID".to_string(), run.to_string()));
+    }
     env.push(("SPAR_CONVERSATION_ID".to_string(), conv.clone()));
     env.push(("SPAR_TURN_ID".to_string(), turn.clone()));
 
@@ -504,7 +532,6 @@ fn dispatch_turn_inner(
         .join(format!("turn-{}", &turn[..8.min(turn.len())]));
     let _ = std::fs::create_dir_all(&log_dir);
     let log_path = log_dir.join("turn.log");
-    let stats_path = log_dir.join("turn.stats.json");
 
     // Build prompt: include transcript and evidence
     let mut prompt = String::new();
@@ -554,104 +581,65 @@ fn dispatch_turn_inner(
     let mut spawn_error: Option<String> = None;
 
     if !dry_run {
-        if let Some(adapter_box) = crate::providers::adapter_named(&provider_name) {
-            if let Some(bin) = adapter_box.resolve_binary() {
-                let spawn_opts = crate::providers::SpawnOpts {
-                    prompt: prompt.clone(),
-                    prompt_file: Some(prompt_path.clone()),
-                    cwd: worktree.clone(),
-                    trust: crate::providers::TrustPolicy::FullAuto,
-                    extra_args: vec![],
-                    model: None,
-                    timeout_secs: Some(120),
-                };
-                let cmd = adapter_box.build_headless(&bin, &spawn_opts);
-                let (program, args) = crate::providers::command_to_parts(&cmd);
-                let isolation = if let Some(run_id) = &req.run_id {
-                    Config::for_run(&paths, run_id)
-                        .map(|c| c.isolation)
-                        .unwrap_or(crate::config::IsolationMode::Worktree)
-                } else {
-                    Config::load(&paths.project_root)
-                        .map(|c| c.isolation)
-                        .unwrap_or(crate::config::IsolationMode::Worktree)
-                };
-                let (program, args) =
-                    crate::sandbox::maybe_wrap(isolation, &worktree, &program, &args);
-                let spawn_req = crate::process::SpawnRequest {
-                    program,
-                    args,
-                    cwd: worktree.clone(),
-                    log_path: log_path.clone(),
-                    env: env.clone(),
-                    timeout: std::time::Duration::from_secs(120),
-                };
-                let handle_for_spawn = handle.cloned();
-                let handle_for_tick = handle.cloned();
-                let on_spawn = handle_for_spawn.as_ref().map(|h| {
-                    let hh = h.clone();
-                    move |pid: u32| hh.on_spawn(pid)
-                });
-                let on_spawn_ref: Option<&dyn Fn(u32)> =
-                    on_spawn.as_ref().map(|f| f as &dyn Fn(u32));
-                let on_tick = handle_for_tick.as_ref().map(|h| {
-                    let hh = h.clone();
-                    move || hh.on_tick()
-                });
-                let on_tick_ref: Option<&dyn Fn()> = on_tick.as_ref().map(|f| f as &dyn Fn());
-                let run_result = if handle.map(|h| h.is_cancelled()).unwrap_or(false) {
-                    Err(anyhow::anyhow!("turn cancelled"))
-                } else {
-                    crate::process::run_captured(&spawn_req, on_spawn_ref, on_tick_ref)
-                };
-                match run_result {
-                    Ok(res) => {
-                        exit_success = res.exit_code == Some(0) && !res.timed_out;
-                        spawn_stats = Some(res.stats);
-                        if res.timed_out {
-                            spawn_error = Some("turn timed out".to_string());
-                        } else if res.exit_code != Some(0) {
-                            spawn_error = Some(format!(
-                                "turn provider exited with code {:?}",
-                                res.exit_code
-                            ));
-                        }
-                    }
-                    Err(e) => {
-                        exit_success = false;
-                        spawn_error = Some(format!("spawn failed: {e:#}"));
-                        let _ = std::fs::write(
-                            &log_path,
-                            format!(
-                                "spawn failed: {e:#}\nturn {turn} watermark {}\n",
-                                req.watermark
-                            ),
-                        );
-                    }
-                }
-            } else {
-                let _ = std::fs::write(
-                    &log_path,
-                    format!(
-                        "turn {} watermark {} prompt len {} (no provider binary for {provider_name})\n",
-                        turn,
-                        req.watermark,
-                        prompt.len()
-                    ),
-                );
-                exit_success = true;
-            }
+        if handle.map(|h| h.is_cancelled()).unwrap_or(false) {
+            exit_success = false;
+            spawn_error = Some("turn cancelled".to_string());
         } else {
-            let _ = std::fs::write(
-                &log_path,
-                format!(
-                    "turn {} watermark {} prompt len {} (unknown provider {provider_name})\n",
-                    turn,
-                    req.watermark,
-                    prompt.len()
-                ),
-            );
-            exit_success = true;
+            let isolation = if let Some(run_id) = &req.run_id {
+                Config::for_run(&paths, run_id)
+                    .map(|c| c.isolation)
+                    .unwrap_or(crate::config::IsolationMode::Worktree)
+            } else {
+                Config::load(&paths.project_root)
+                    .map(|c| c.isolation)
+                    .unwrap_or(crate::config::IsolationMode::Worktree)
+            };
+            let handle_for_spawn = handle.cloned();
+            let handle_for_tick = handle.cloned();
+            let on_spawn = handle_for_spawn.as_ref().map(|h| {
+                let hh = h.clone();
+                move |pid: u32| hh.on_spawn(pid)
+            });
+            let on_spawn_ref: Option<&dyn Fn(u32)> = on_spawn.as_ref().map(|f| f as &dyn Fn(u32));
+            let on_tick = handle_for_tick.as_ref().map(|h| {
+                let hh = h.clone();
+                move || hh.on_tick()
+            });
+            let on_tick_ref: Option<&dyn Fn()> = on_tick.as_ref().map(|f| f as &dyn Fn());
+            let is_cancelled = || handle.map(|h| h.is_cancelled()).unwrap_or(false);
+            let backend_req = crate::providers::conversation_turn::ConversationTurnRequest {
+                provider: provider_name.clone(),
+                prompt: prompt.clone(),
+                prompt_file: prompt_path.clone(),
+                cwd: worktree.clone(),
+                log_path: log_path.clone(),
+                isolation,
+                env: env.clone(),
+                timeout: std::time::Duration::from_secs(120),
+            };
+            match crate::providers::conversation_turn::dispatch_turn(
+                backend_req,
+                on_spawn_ref,
+                on_tick_ref,
+                &is_cancelled,
+            ) {
+                Ok(out) => {
+                    exit_success = out.exit_success;
+                    spawn_stats = out.stats;
+                    spawn_error = out.error;
+                }
+                Err(e) => {
+                    exit_success = false;
+                    spawn_error = Some(format!("spawn failed: {e:#}"));
+                    let _ = std::fs::write(
+                        &log_path,
+                        format!(
+                            "spawn failed: {e:#}\nturn {turn} watermark {}\n",
+                            req.watermark
+                        ),
+                    );
+                }
+            }
         }
     } else {
         let _ = std::fs::write(
@@ -672,7 +660,6 @@ fn dispatch_turn_inner(
     } else {
         let _ = stats.save(&log_path);
     }
-    let _ = stats.save(&stats_path);
 
     let validate_result = validate_turn(
         &paths,
@@ -691,10 +678,13 @@ fn dispatch_turn_inner(
             .map(|o| !o.stdout.is_empty())
             .unwrap_or(false)
             || std::process::Command::new("git")
-                .args(["log", "--branches", "--not", &base_ref, "--oneline"])
+                .args(["rev-list", "--count", &format!("{base_ref}..HEAD")])
                 .current_dir(&worktree)
                 .output()
-                .map(|o| !o.stdout.is_empty())
+                .map(|o| {
+                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    s.parse::<usize>().unwrap_or(0) != 0
+                })
                 .unwrap_or(false);
         if !is_dirty {
             let _ = std::process::Command::new("git")
@@ -705,7 +695,6 @@ fn dispatch_turn_inner(
     }
 
     let stats_loaded = crate::process::StreamStats::load(&log_path)
-        .or_else(|| crate::process::StreamStats::load(&stats_path))
         .or(spawn_stats.clone())
         .unwrap_or(stats);
 
@@ -713,8 +702,6 @@ fn dispatch_turn_inner(
         Some(e)
     } else if let Err(e) = &validate_result {
         Some(e.to_string())
-    } else if validate_result.is_err() {
-        Some("turn protocol error: missing reply".to_string())
     } else {
         None
     };
@@ -863,6 +850,100 @@ pub fn gate_evidence(paths: &SparPaths, run_id: &str) -> String {
         out.push_str(&format!("phase: {:?}\n", phase));
     }
     out.push_str(&format!("criteria: {}\n", evidence.criteria.join(", ")));
+    // Include full contract body so the orchestrator sees the same predicate the
+    // Review tab and ship gate evaluate — not just the ids.
+    let contract_path = paths.artifact(run_id, "test-contract.md");
+    if let Ok(body) = std::fs::read_to_string(&contract_path) {
+        let snippet = body.chars().take(4000).collect::<String>();
+        out.push_str(&format!("contract test-contract.md:\n{snippet}\n"));
+        if body.chars().count() > 4000 {
+            out.push_str("(contract truncated)\n");
+        }
+    }
+    // Criterion grid: per-AC per-reviewer cell, identical logic to Review tab's
+    // `review_records` (never a second predicate). Shows the same cells the
+    // operator sees.
+    if let Some(st) = &evidence.st {
+        let reviewers: Vec<&crate::state::SlotState> = st
+            .slots
+            .iter()
+            .filter(|s| s.role == crate::state::SlotRole::Reviewer)
+            .collect();
+        if !evidence.criteria.is_empty() && !reviewers.is_empty() {
+            let parsed: Vec<Option<crate::workflow::review_result::ReviewResult>> = reviewers
+                .iter()
+                .map(|s| {
+                    if s.status == crate::state::SlotStatus::Failed {
+                        return None;
+                    }
+                    let artifact = s
+                        .artifact
+                        .clone()
+                        .unwrap_or_else(|| format!("review-{}.md", s.id));
+                    let path = paths.artifact(run_id, &artifact);
+                    std::fs::read_to_string(&path)
+                        .ok()
+                        .map(|t| crate::workflow::review_result::parse_review(&t))
+                })
+                .collect();
+            for id in &evidence.criteria {
+                let mut cells: Vec<String> = Vec::new();
+                for (s, pr) in reviewers.iter().zip(&parsed) {
+                    let cell = if s.status == crate::state::SlotStatus::Failed {
+                        "failed".to_string()
+                    } else {
+                        match pr {
+                            Some(res) => match res.acceptance.iter().find(|a| &a.id == id) {
+                                Some(a) => format!("{:?}", a.status).to_ascii_lowercase(),
+                                None => "not reported".to_string(),
+                            },
+                            None => "missing".to_string(),
+                        }
+                    };
+                    cells.push(format!("{}: {cell}", s.id));
+                }
+                out.push_str(&format!("grid {}: {}\n", id, cells.join(" · ")));
+            }
+        }
+        // Raw verdict bodies per reviewer — the text the operator folds open in Review.
+        for s in reviewers {
+            if s.status == crate::state::SlotStatus::Failed {
+                out.push_str(&format!(
+                    "review {}: slot failed or produced no review\n",
+                    s.id
+                ));
+                continue;
+            }
+            let artifact = s
+                .artifact
+                .clone()
+                .unwrap_or_else(|| format!("review-{}.md", s.id));
+            let path = paths.artifact(run_id, &artifact);
+            match std::fs::read_to_string(&path) {
+                Ok(text) if !text.trim().is_empty() => {
+                    let res = crate::workflow::review_result::parse_review(&text);
+                    let verdict_text = match res.verdict {
+                        Some(crate::workflow::review_result::Verdict::Approve) => "approve",
+                        Some(crate::workflow::review_result::Verdict::RequestChanges) => {
+                            "request_changes"
+                        }
+                        None => "no parsed verdict",
+                    };
+                    let snippet = text.chars().take(3000).collect::<String>();
+                    out.push_str(&format!(
+                        "review {} verdict: {verdict_text}\n{snippet}\n",
+                        s.id
+                    ));
+                    if text.chars().count() > 3000 {
+                        out.push_str("(verdict truncated)\n");
+                    }
+                }
+                _ => {
+                    out.push_str(&format!("review {}: missing\n", s.id));
+                }
+            }
+        }
+    }
     if let (Some(cfg), Some(st)) = (&evidence.cfg, &evidence.st) {
         let reviewers: Vec<&crate::state::SlotState> = st
             .slots
@@ -935,7 +1016,10 @@ pub fn gate_evidence(paths: &SparPaths, run_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::tempdir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn parse_proposal_extracts_fields() {
@@ -961,10 +1045,12 @@ mod tests {
     fn conversation_message_predicate() {
         let mut meta = HashMap::new();
         meta.insert("surface".into(), "chat".into());
+        meta.insert("conversation".into(), "talk-1".into());
+        meta.insert("turn".into(), "turn-1".into());
         let msg = BusMessage {
             id: "1".into(),
             ts: chrono::Utc::now(),
-            from: "a".into(),
+            from: crate::bus::agent_ref(Some("r1"), "talk-1"),
             to: crate::bus::HUMAN.into(),
             kind: crate::bus::MsgKind::Chat,
             body: "hi".into(),
@@ -972,9 +1058,29 @@ mod tests {
             subject: None,
             refs: crate::bus::MsgRefs::default(),
             requires_ack: false,
-            meta,
+            meta: meta.clone(),
         };
         assert!(is_conversation_message(&msg));
+        let mut no_conv = HashMap::new();
+        no_conv.insert("surface".into(), "chat".into());
+        let mut msg2 = msg.clone();
+        msg2.meta = no_conv;
+        assert!(!is_conversation_message(&msg2));
+        let mut wrong_sender = msg.clone();
+        wrong_sender.from = "r1:other".into();
+        assert!(
+            !is_conversation_message(&wrong_sender),
+            "unauthenticated sender must not be considered a conversation message"
+        );
+        let mut no_turn = HashMap::new();
+        no_turn.insert("surface".into(), "chat".into());
+        no_turn.insert("conversation".into(), "talk-1".into());
+        let mut msg3 = msg.clone();
+        msg3.meta = no_turn;
+        assert!(
+            !is_conversation_message(&msg3),
+            "missing turn must not be considered a conversation message"
+        );
     }
 
     #[test]
@@ -988,7 +1094,7 @@ mod tests {
         meta.insert("surface".into(), "chat".into());
         meta.insert("conversation".into(), conv.into());
         meta.insert("turn".into(), "t1".into());
-        let agent = agent_id(&scope);
+        let agent = crate::bus::agent_ref(Some("r1"), conv);
         let reply = BusMessage {
             id: crate::bus::new_id(),
             ts: chrono::Utc::now(),
@@ -1012,6 +1118,9 @@ mod tests {
 
     #[test]
     fn conversation_turn_rejects_stale_duplicate_and_wrong_sender_replies() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let prev_dry = std::env::var("SPAR_DRY_RUN").ok();
+        std::env::set_var("SPAR_DRY_RUN", "1");
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         std::fs::create_dir_all(paths.project_root.join(".git")).unwrap();
@@ -1154,10 +1263,17 @@ mod tests {
             "nonzero exit must fail"
         );
         let _ = dispatch_turn(paths.clone(), req);
+        if let Some(v) = prev_dry {
+            std::env::set_var("SPAR_DRY_RUN", v);
+        } else {
+            std::env::remove_var("SPAR_DRY_RUN");
+        }
     }
 
     #[test]
     fn native_cli_conversation_turn_lifecycle_and_isolation() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let prev_dry = std::env::var("SPAR_DRY_RUN").ok();
         std::env::set_var("SPAR_DRY_RUN", "1");
         let tmp = tempdir().unwrap();
         let proj1 = tmp.path().join("p1");
@@ -1203,7 +1319,21 @@ mod tests {
             run_id: None,
         };
         let out1 = dispatch_turn(paths1.clone(), req1).unwrap();
-        assert!(out1.worktree.is_some() || !proj1.join(".spar/worktrees").exists());
+        assert!(
+            out1.worktree.is_some(),
+            "home turn must create a worktree even in dry-run"
+        );
+        let w1 = out1.worktree.clone().unwrap();
+        assert!(
+            !w1.exists(),
+            "clean conversation worktree must be removed after turn, but {w1:?} still exists"
+        );
+        assert!(out1.stats.is_some(), "turn must report stats");
+        assert_eq!(
+            out1.stats.as_ref().unwrap().billed_tokens,
+            0,
+            "dry-run stats should be zero and must not be added to run usage"
+        );
         let paths2 = SparPaths::new(&proj2);
         let conv2 = format!("talk-{}", crate::bus::new_id());
         let turn2 = crate::bus::new_id();
@@ -1216,16 +1346,32 @@ mod tests {
             run_id: None,
         };
         let out2 = dispatch_turn(paths2.clone(), req2).unwrap();
-        if let (Some(w1), Some(w2)) = (out1.worktree, out2.worktree) {
-            assert_ne!(
-                w1, w2,
-                "concurrent conversations must use separate worktrees"
-            );
-        }
-        assert!(out1.stats.is_some());
+        assert!(out2.worktree.is_some());
+        let w2 = out2.worktree.clone().unwrap();
+        assert!(
+            !w2.exists(),
+            "second clean worktree must also be removed, but {w2:?} still exists"
+        );
+        assert_ne!(
+            w1, w2,
+            "concurrent conversations must use separate worktrees"
+        );
+        // Verify per-turn logs are isolated: each turn's log dir must be separate.
+        let log1 = proj1
+            .join(".spar/workspaces")
+            .join(format!("talk-{}", conv1.trim_start_matches("talk-")))
+            .join(format!("turn-{}", &turn1[..8.min(turn1.len())]))
+            .join("turn.log");
+        let log2 = proj2
+            .join(".spar/workspaces")
+            .join(format!("talk-{}", conv2.trim_start_matches("talk-")))
+            .join(format!("turn-{}", &turn2[..8.min(turn2.len())]))
+            .join("turn.log");
+        assert!(log1.exists(), "per-turn log must be isolated: {log1:?}");
+        assert!(log2.exists(), "per-turn log must be isolated: {log2:?}");
+        assert_ne!(log1, log2);
         assert!(out2.stats.is_some());
-        let mut api_env = std::collections::HashMap::new();
-        api_env.insert("SPAR_CHAT_PROVIDER".to_string(), "api:openai".to_string());
+        let prev_provider = std::env::var("SPAR_CHAT_PROVIDER").ok();
         std::env::set_var("SPAR_CHAT_PROVIDER", "api:openai");
         let bad_req = TurnRequest {
             scope_key: "home".into(),
@@ -1235,9 +1381,98 @@ mod tests {
             project_root: proj1.clone(),
             run_id: None,
         };
-        let err = dispatch_turn(paths1.clone(), bad_req).unwrap_err();
-        assert!(err.to_string().contains("api-sdk"));
-        std::env::remove_var("SPAR_CHAT_PROVIDER");
+        let out = dispatch_turn(paths1.clone(), bad_req).unwrap();
+        assert!(!out.success);
+        assert!(out.error.as_ref().unwrap().contains("api-sdk"));
+        if let Some(v) = prev_provider {
+            std::env::set_var("SPAR_CHAT_PROVIDER", v);
+        } else {
+            std::env::remove_var("SPAR_CHAT_PROVIDER");
+        }
+
+        // Run-scoped turn without base_commit must fail visibly per O26, not use HEAD.
+        let run_id = "run-no-base";
+        std::fs::create_dir_all(paths1.run_dir(run_id)).unwrap();
+        std::fs::write(
+            paths1.state_file(run_id),
+            r#"{"id":"run-no-base","phase":"Review","slots":[]}"#,
+        )
+        .unwrap();
+        let bad_run_req = TurnRequest {
+            scope_key: run_id.into(),
+            conversation_id: format!("talk-{}", crate::bus::new_id()),
+            turn_id: crate::bus::new_id(),
+            watermark: 0,
+            project_root: proj1.clone(),
+            run_id: Some(run_id.into()),
+        };
+        let out = dispatch_turn(paths1.clone(), bad_run_req).unwrap();
+        assert!(
+            !out.success,
+            "run without base_commit must fail, not silently use HEAD"
+        );
+        assert!(
+            out.error.as_ref().unwrap().contains("base_commit"),
+            "error must mention base_commit, got {:?}",
+            out.error
+        );
+
+        // Dirty worktree preservation: pre-create the expected worktree and make it dirty.
+        let dirty_conv = format!("talk-{}", crate::bus::new_id());
+        let dirty_turn = crate::bus::new_id();
+        let dirty_wt = proj1.join(".spar/worktrees").join(format!(
+            "talk-{}-{}",
+            dirty_conv.trim_start_matches("talk-"),
+            &dirty_turn[..8.min(dirty_turn.len())]
+        ));
+        std::fs::create_dir_all(dirty_wt.parent().unwrap()).unwrap();
+        std::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "--detach",
+                dirty_wt.to_str().unwrap(),
+                "HEAD",
+            ])
+            .current_dir(&proj1)
+            .output()
+            .unwrap();
+        std::fs::write(dirty_wt.join("dirty.txt"), "uncommitted").unwrap();
+        let dirty_req = TurnRequest {
+            scope_key: "home".into(),
+            conversation_id: dirty_conv.clone(),
+            turn_id: dirty_turn.clone(),
+            watermark: 0,
+            project_root: proj1.clone(),
+            run_id: None,
+        };
+        let _out = dispatch_turn(paths1.clone(), dirty_req).unwrap();
+        // The worktree was pre-existing and dirty, so dispatch must not have removed it.
+        assert!(
+            dirty_wt.exists(),
+            "dirty worktree must be preserved, but {dirty_wt:?} was removed"
+        );
+        // Verify it is still dirty.
+        let status = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&dirty_wt)
+            .output()
+            .unwrap();
+        assert!(
+            !status.stdout.is_empty(),
+            "preserved worktree should still be dirty"
+        );
+        let _ = std::process::Command::new("git")
+            .args(["worktree", "remove", "--force", dirty_wt.to_str().unwrap()])
+            .current_dir(&proj1)
+            .output();
+        let _ = std::fs::remove_dir_all(&dirty_wt);
+
+        if let Some(v) = prev_dry {
+            std::env::set_var("SPAR_DRY_RUN", v);
+        } else {
+            std::env::remove_var("SPAR_DRY_RUN");
+        }
     }
 
     #[test]

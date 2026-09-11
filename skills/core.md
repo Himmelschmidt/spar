@@ -848,11 +848,9 @@ rail's selection.
 - Home has four bands, always in this order and always present even when empty:
   **needs you** (runs at a gate, ranked by wait time), **running**, **finished since
   last look** (a watermark of what landed while you were away), **start something
-  new**. `p` still opens the flat Projects list; `n` opens the new-run surface with a
-  fleet picker over the provider roster (superseding the old "use the CLI" punt for a
-  fresh fleet); `P` toggles Home's scope between the current project and everything
+  new**. `p` still opens the flat Projects list; `n` opens Chat (Home: new conversation, run: gate consultation) — the token-free manual path is `:plan <task>`; `P` toggles Home's scope between the current project and everything
   registered.
-- Main tabs: `Log · Activity · Diff · Plan · Review · Shell` on the labels row, marked
+- Main tabs: `Log · Activity · Diff · Plan · Review · Chat · Shell` on the labels row, marked
   by an accent underline on the rule beneath them, switched with `[` / `]` (Activity
   carries the `@human` alert badge). Every tab but Shell renders typed, folded records
   (feature 010) through one shared record view, not a raw string: Log is the parsed
@@ -881,7 +879,7 @@ rail's selection.
 - **`a` jumps to the next run that needs you** (or tap the `⚑N need you` status token);
   the status line rolls up how many runs want you across the fleet. `r`/`s` reject/ship
   at a gate; approve = tap the button or `:approve`.
-- `p` = Projects · `n` new run · `P` toggle Home scope · `w` log wrap ·
+- `p` = Projects · `n` chat · `P` toggle Home scope · `w` log wrap ·
   `g`/`G` top/bottom · `?` help · **`q` quits**.
 - Shell tab = a real tmux client: **every key goes to the agent** (incl. `Ctrl+C`);
   `F12` (or `C-a d`) hands focus back to spar. Focusing it full-screen is **Driving
