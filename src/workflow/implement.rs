@@ -226,12 +226,7 @@ struct Reentry {
 /// **A `Running` seat is never re-pointed.** Its provider is the one that is mid-flight;
 /// rewriting it would make the run's own record disagree with the process it is
 /// waiting on, and the slot's pid marker is filed against what actually spawned.
-fn repoint_existing_seats(
-    state: &mut RunState,
-    cfg: &Config,
-    dry: bool,
-    paths: &SparPaths,
-) -> Result<()> {
+fn repoint_existing_seats(state: &mut RunState, cfg: &Config) -> Result<()> {
     let pool = state.providers.clone();
     let seats = crate::workflow::roles_resolve::build_implement_seats(
         cfg,
@@ -240,18 +235,50 @@ fn repoint_existing_seats(
         false,
         &|_| None,
     );
-    let _ = (dry, paths);
     for seat in seats {
         let Some(slot) = state.slots.iter_mut().find(|s| s.id == seat.seat) else {
             continue;
         };
+        // Never touch the seat that is mid-flight: its provider is the one that
+        // spawned, and its pid marker is filed against exactly that.
         if slot.status == SlotStatus::Running {
             continue;
         }
-        if slot.provider == seat.provider && slot.model == seat.model {
+        // **Model only.** A reviewer seat's id is `review-{r}-{sanitized provider}`
+        // (`roles_resolve::build_implement_seats`), so the id *encodes* the provider:
+        // a matching id already means a matching provider, and writing
+        // `seat.provider` over it can only ever make the id contradict its own
+        // contents. The first cut of this did write it, and on a run whose reviewer
+        // pins were re-stated it put `cli:claude` behind the seat named
+        // `review-1-cli-codex` — silently collapsing a deliberate two-vendor panel to
+        // one vendor (the exact thing feature 011 exists to keep exact) and then
+        // blaming codex in the rate-limit error when claude's limit was the one hit.
+        //
+        // A genuinely *different* provider therefore resolves to a seat id that does
+        // not exist yet, falls through the `find` above, and is left to the seat
+        // machinery rather than smuggled in here. Changing who fills a seat is a
+        // different operation from changing which model they use, and only the
+        // second one is safe to do to a slot that already carries a worktree, a
+        // branch and a round history.
+        // Enforced, not asserted: a seat id that names one provider while the slot
+        // carries another is how a two-vendor panel becomes one vendor without
+        // anybody being told, and how a rate-limit error ends up blaming the wrong
+        // provider. If this ever does not hold, the seat machinery and the id
+        // formula have diverged, and refusing is the only safe answer — writing
+        // either field would bake the disagreement in.
+        if slot.provider != seat.provider {
+            bail!(
+                "seat `{}` resolves to {} but the run carries {}; the seat id encodes \
+                 its provider, so these cannot both be right. Refusing to re-point it \
+                 rather than leave a seat whose id contradicts what fills it.",
+                seat.seat,
+                seat.provider,
+                slot.provider
+            );
+        }
+        if slot.model == seat.model {
             continue;
         }
-        slot.provider = seat.provider.clone();
         slot.model = seat.model.clone();
         slot.source = Some(seat.source);
     }
@@ -579,7 +606,7 @@ fn prepare_implement_slots(
         // and nothing that runs. `skills/core.md` documents `--reload-config` as the
         // way to change a running run's fleet, so the contract was real and unhonoured.
         if reload_config {
-            repoint_existing_seats(state, cfg, dry, paths)?;
+            repoint_existing_seats(state, cfg)?;
         }
         ensure_suite_slot(state, dry, cfg, paths)?;
         return Ok(());
@@ -860,12 +887,70 @@ mod suite_reap_tests {
     fn reload_config_repoints_a_seat_that_already_exists() {
         let mut st = run_with_impl("cli:muse", "muse-spark-1.3", SlotStatus::Failed);
         let cfg = cfg_with_implementer("cli:muse@muse-spark-1.2");
-        let paths = SparPaths::new("/x");
 
-        repoint_existing_seats(&mut st, &cfg, true, &paths).unwrap();
+        repoint_existing_seats(&mut st, &cfg).unwrap();
 
         let impl_slot = st.slots.iter().find(|s| s.id == "impl").unwrap();
         assert_eq!(impl_slot.model.as_deref(), Some("muse-spark-1.2"));
+    }
+
+    /// The invariant a re-point must preserve: every reviewer seat's provider still
+    /// matches the provider its id names (`review-{r}-{provider}`).
+    ///
+    /// This pins the invariant, **not** the incident. In a live session a
+    /// `--reload-config` left `cli:claude` behind the seat named `review-1-cli-codex`
+    /// on two runs — collapsing a deliberate two-vendor panel to one vendor, which is
+    /// the exact thing feature 011 exists to keep exact, and then naming codex in the
+    /// rate-limit error when claude's limit was the one hit. The config that produced
+    /// it could not be reconstructed from the run state afterwards, so this test does
+    /// not fail against the old code. What catches that case now is the `bail!` in
+    /// `repoint_existing_seats`: a seat whose id and provider disagree is refused
+    /// instead of written.
+    #[test]
+    fn a_repoint_keeps_every_seat_matching_the_provider_its_id_names() {
+        let mut st = RunState::new(
+            "panel001",
+            crate::cli::WorkflowKind::Loop,
+            std::path::PathBuf::from("/x"),
+        );
+        for (id, prov, model) in [
+            ("review-0-cli-claude", "cli:claude", "opus"),
+            ("review-1-cli-codex", "cli:codex", "gpt-5.6-terra"),
+        ] {
+            let mut slot =
+                executor::init_slot_model(id, prov, SlotRole::Reviewer, Some(model.into()));
+            slot.status = SlotStatus::Done;
+            st.slots.push(slot);
+        }
+        st.providers = vec!["cli:claude@opus".into(), "cli:codex@gpt-5.6-terra".into()];
+
+        let mut cfg = Config::default();
+        cfg.roles.reviewer = vec!["cli:claude@opus".into(), "cli:codex@gpt-5.6-terra".into()];
+
+        repoint_existing_seats(&mut st, &cfg).unwrap();
+
+        let panel: Vec<(&str, &str)> = st
+            .slots
+            .iter()
+            .filter(|s| s.role == SlotRole::Reviewer)
+            .map(|s| (s.id.as_str(), s.provider.as_str()))
+            .collect();
+        assert_eq!(
+            panel,
+            vec![
+                ("review-0-cli-claude", "cli:claude"),
+                ("review-1-cli-codex", "cli:codex"),
+            ],
+            "every seat's provider must still match the provider its id names"
+        );
+        for s in st.slots.iter().filter(|s| s.role == SlotRole::Reviewer) {
+            assert!(
+                s.id.ends_with(&crate::util::sanitize_slot(&s.provider)),
+                "seat {} carries {}, so its id is a lie",
+                s.id,
+                s.provider
+            );
+        }
     }
 
     /// The seat that is mid-flight is the one whose provider is load-bearing: its pid
@@ -875,9 +960,8 @@ mod suite_reap_tests {
     fn a_running_seat_is_never_repointed() {
         let mut st = run_with_impl("cli:muse", "muse-spark-1.3", SlotStatus::Running);
         let cfg = cfg_with_implementer("cli:muse@muse-spark-1.2");
-        let paths = SparPaths::new("/x");
 
-        repoint_existing_seats(&mut st, &cfg, true, &paths).unwrap();
+        repoint_existing_seats(&mut st, &cfg).unwrap();
 
         let impl_slot = st.slots.iter().find(|s| s.id == "impl").unwrap();
         assert_eq!(
