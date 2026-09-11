@@ -1227,6 +1227,32 @@ mod tests {
         );
     }
 
+    /// AC-10 (round-review, codex): an indexed append that bundles the header,
+    /// the prompt dump, AND the first `→`/`←` marker pair in one atomic write must
+    /// not lose the marker just because its chunk-start offset precedes
+    /// `prompt_skip_end`. The per-line scan (not a whole-chunk skip decision) is
+    /// what makes this work regardless of how the writer happened to batch bytes.
+    #[test]
+    fn indexed_prompt_suppression_does_not_swallow_a_marker_sharing_its_chunk() {
+        let text = "# Role: impl\ncwd=/x\n---\n## Task\nDo the thing.\nI'll start now.\n→ Bash  ls\n← ✓  ok\n";
+        let index = vec![(0u64, Utc::now())];
+        let records = parse_log_records(text, 0, &index, &PathShortener::default(), "r", "s");
+        assert!(
+            records
+                .iter()
+                .any(|r| matches!(r.kind, RecordKind::Tool(_))),
+            "the tool call must survive being in the same indexed chunk as the \
+             suppressed prompt dump: {records:#?}"
+        );
+        assert!(
+            records
+                .iter()
+                .all(|r| !r.body.iter().any(|l| l.contains("Do the thing"))
+                    && !r.argument.contains("Do the thing")),
+            "the headless prompt dump must still be suppressed: {records:#?}"
+        );
+    }
+
     #[test]
     fn api_backend_tool_observations_parse_as_typed_result_records() {
         // The api-sdk backend's own private log shape (`src/api/runtime.rs`): a
