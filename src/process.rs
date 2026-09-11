@@ -2657,6 +2657,49 @@ mod tests {
         assert_eq!(c.model.as_deref(), Some("claude-opus"));
     }
 
+    /// End-to-end reproduction of a round-review defect (finding 1): a native
+    /// `assistant` message is buffered text (`Checking scope.`) followed by a
+    /// `tool_use` marker (`→ Bash ...`) in ONE coalescer chunk/`LogWriter` append —
+    /// the common shape a real stream produces, not the "marker at every chunk
+    /// head" fixtures `record::tests` used before this fix. The indexed parser
+    /// must still recognize the marker wherever it falls in the chunk, not only at
+    /// the chunk's first line.
+    #[test]
+    fn indexed_parse_recognizes_a_marker_that_is_not_chunk_initial() {
+        let mut c = StreamCoalescer::new(false);
+        let line = r#"{"type":"assistant","message":{"model":"claude-opus","usage":{"input_tokens":100,"output_tokens":5,"cache_read_input_tokens":50},"content":[{"type":"text","text":"Checking scope."},{"type":"tool_use","name":"Bash","input":{"description":"Get PR diff","command":"gh pr diff 167"}}]}}"#;
+        let chunk = c.feed(line).unwrap();
+        let index = vec![(1000u64, chrono::Utc::now())];
+        // A nonzero `start_offset` is a mid-stream tail read (well past the
+        // spawn header/prompt echo), so the prompt-suppression window that only
+        // ever applies at `start_offset == 0` cannot swallow "Checking scope."
+        // here the way it would this synthetic chunk in isolation at offset 0.
+        let records = crate::record::parse_log_records(
+            &chunk,
+            1000,
+            &index,
+            &crate::record::PathShortener::default(),
+            "r",
+            "s",
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| r.result.as_deref() == Some("Checking scope.")),
+            "the prose line must survive as its own record: {records:#?}"
+        );
+        let tool = records
+            .iter()
+            .find(|r| matches!(r.kind, crate::record::RecordKind::Tool(_)))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the tool call must parse as a typed Tool record, not be buried \
+                     as body text of the prose line: {records:#?}"
+                )
+            });
+        assert!(tool.argument.contains("Get PR diff"), "{tool:#?}");
+    }
+
     #[test]
     fn claude_init_captures_session_id() {
         let mut c = StreamCoalescer::new(false);

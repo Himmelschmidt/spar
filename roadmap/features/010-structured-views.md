@@ -1,7 +1,7 @@
 ---
 id: 10
 title: Structured views
-status: in-progress
+status: done
 milestone: 6
 effort: L
 priority: high

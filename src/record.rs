@@ -104,7 +104,13 @@ pub enum RecordKind {
 /// mode. Never derived from rendered text (a shortened path or a rebuilt summary must
 /// not change identity) — always a source range or an event's own stamp (correction
 /// #6). `Eq`/`Hash` so it can key a `HashSet`/`HashMap` directly.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// `Log.end` is deliberately excluded from equality/hashing (implemented by hand
+/// below, not derived): a streaming record's `end` is mutated as later continuation
+/// lines or its result merge in (`parse_log_records`), so keying identity on it made
+/// an expanded running tool call re-fold itself and lose the cursor the moment its
+/// next line landed. `start` (plus `run_id`/`slot_id`) is the part that never moves.
+#[derive(Debug, Clone)]
 pub enum SourceId {
     Log {
         run_id: String,
@@ -125,6 +131,92 @@ pub enum SourceId {
         worktree: String,
         path: String,
     },
+}
+
+impl PartialEq for SourceId {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                SourceId::Log {
+                    run_id,
+                    slot_id,
+                    start,
+                    ..
+                },
+                SourceId::Log {
+                    run_id: r2,
+                    slot_id: s2,
+                    start: st2,
+                    ..
+                },
+            ) => run_id == r2 && slot_id == s2 && start == st2,
+            (
+                SourceId::Document { path, start, end },
+                SourceId::Document {
+                    path: p2,
+                    start: s2,
+                    end: e2,
+                },
+            ) => path == p2 && start == s2 && end == e2,
+            (
+                SourceId::Activity {
+                    at_millis,
+                    sequence,
+                },
+                SourceId::Activity {
+                    at_millis: a2,
+                    sequence: s2,
+                },
+            ) => at_millis == a2 && sequence == s2,
+            (
+                SourceId::Diff { worktree, path },
+                SourceId::Diff {
+                    worktree: w2,
+                    path: p2,
+                },
+            ) => worktree == w2 && path == p2,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for SourceId {}
+
+impl std::hash::Hash for SourceId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            SourceId::Log {
+                run_id,
+                slot_id,
+                start,
+                ..
+            } => {
+                0u8.hash(state);
+                run_id.hash(state);
+                slot_id.hash(state);
+                start.hash(state);
+            }
+            SourceId::Document { path, start, end } => {
+                1u8.hash(state);
+                path.hash(state);
+                start.hash(state);
+                end.hash(state);
+            }
+            SourceId::Activity {
+                at_millis,
+                sequence,
+            } => {
+                2u8.hash(state);
+                at_millis.hash(state);
+                sequence.hash(state);
+            }
+            SourceId::Diff { worktree, path } => {
+                3u8.hash(state);
+                worktree.hash(state);
+                path.hash(state);
+            }
+        }
+    }
 }
 
 /// One entry from a run's log: a tool call merged with its result where the pairing
@@ -149,9 +241,12 @@ pub struct LogRecord {
 }
 
 impl LogRecord {
-    /// Derives this run's paint-time render row. Folding a multi-line result or a
-    /// thought is the *default* here (AC-6): `folded_by_default` is true whenever
-    /// there is body content to hide, never something `RecordView` decides later.
+    /// Derives this run's paint-time render row. Folding a tool result or a thought
+    /// is the *default* here (AC-6): `folded_by_default` is true whenever there is
+    /// body content to hide, never something `RecordView` decides later. Prose is
+    /// the one shape that never folds (plan step 9, constraint 3): a narrative
+    /// paragraph is exactly what the Log tab exists to show on first paint, unlike a
+    /// tool's raw output.
     pub fn to_record(&self) -> Record {
         let (glyph, verb): (&'static str, &'static str) = match &self.kind {
             RecordKind::Tool(tool) => (tool.glyph(), tool.verb()),
@@ -179,7 +274,11 @@ impl LogRecord {
             actor: None,
             ok: self.ok,
             source: self.source.clone(),
-            folded_by_default: !self.body.is_empty() || matches!(self.kind, RecordKind::Thought),
+            folded_by_default: match self.kind {
+                RecordKind::Prose => false,
+                RecordKind::Thought => true,
+                _ => !self.body.is_empty(),
+            },
         }
     }
 }
@@ -316,7 +415,10 @@ impl PathShortener {
             let root_str = root.to_string_lossy();
             let trimmed = root_str.trim_end_matches('/');
             if path == trimmed {
-                return String::new();
+                // A path exactly equal to the root has nothing left to strip; `.`
+                // is a visible, unambiguous "this is the root itself" — an empty
+                // string would look identical to a parse failure (AC-12).
+                return ".".to_string();
             }
             let prefix = format!("{trimmed}/");
             if let Some(rest) = path.strip_prefix(prefix.as_str()) {
@@ -460,6 +562,36 @@ fn api_tool_observation(line: &str) -> Option<&str> {
     line.strip_prefix("tool => ")
 }
 
+/// The api-sdk backend's own tool-*call* line: a bare `{"tool": "...", ...}` JSON
+/// object `src/api/runtime.rs::run_tool` reads, written to the log verbatim as
+/// part of the assistant's own text (`extract_tool_json`'s primary, non-fenced
+/// case). Recognized here so an api-sdk log gets a real `Tool` record — without
+/// this, the JSON line parsed as generic prose and its `tool => ` observation
+/// became an orphan `Result` with no call to merge into (AC-8).
+fn api_tool_call(line: &str) -> Option<(ToolKind, String)> {
+    let t = line.trim();
+    if !t.starts_with('{') || !t.contains("\"tool\"") {
+        return None;
+    }
+    #[derive(serde::Deserialize)]
+    struct Call {
+        tool: String,
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        cmd: Option<String>,
+    }
+    let call: Call = serde_json::from_str(t).ok()?;
+    let kind = match call.tool.as_str() {
+        "read" => ToolKind::Read,
+        "write" => ToolKind::Write,
+        "cmd" | "run" | "shell" => ToolKind::Run,
+        _ => ToolKind::Other,
+    };
+    let detail = call.path.or(call.cmd).unwrap_or_default();
+    Some((kind, detail))
+}
+
 /// A stream marker line — the same shape `stream_content`'s prompt-dump filter
 /// looks for. Used only to find where the headless prompt echo ends (U36/AC-10):
 /// the record parser must suppress the same boilerplate the old raw viewer did,
@@ -510,12 +642,15 @@ fn prompt_skip_end(text: &str) -> usize {
 /// point: leaving them in the pending queue would silently misattribute every later
 /// result too, since the queue would never drop back to exactly one.
 ///
-/// With a non-empty index, each index entry is one atomic `LogWriter::append` chunk
-/// (correction #2 makes that guarantee), so this parses chunk-by-chunk between
-/// consecutive index offsets — the chunk's own recorded offset is the record's
-/// identity, not wherever a marker character happens to land after trimming
-/// separators. Without an index (older logs, tmux-teed panes, dry-run/mock), it
-/// falls back to a best-effort newline scan with no times attached.
+/// Every line is scanned individually and stamped via `time_at`'s bisection against
+/// the sidecar index, rather than only inspecting the first line of each indexed
+/// append (an earlier chunk-oriented parser did that, and it silently dropped every
+/// marker that was not chunk-initial — the common `<prose>\n→ Bash <cmd>\n` shape a
+/// single native `assistant` turn writes in one append). Lines within the same
+/// append share that append's timestamp, which is exactly what bisection already
+/// gives for any offset inside it; a marker that lands anywhere in the text is still
+/// found. Without an index (older logs, tmux-teed panes, dry-run/mock), every line
+/// still parses, just with `time: None`.
 pub fn parse_log_records(
     text: &str,
     start_offset: u64,
@@ -524,21 +659,6 @@ pub fn parse_log_records(
     run_id: &str,
     slot_id: &str,
 ) -> Vec<LogRecord> {
-    if index.is_empty() {
-        parse_log_records_by_line(text, start_offset, shortener, run_id, slot_id)
-    } else {
-        parse_log_records_by_chunk(text, start_offset, index, shortener, run_id, slot_id)
-    }
-}
-
-fn parse_log_records_by_line(
-    text: &str,
-    start_offset: u64,
-    shortener: &PathShortener,
-    run_id: &str,
-    slot_id: &str,
-) -> Vec<LogRecord> {
-    let index: &[(u64, DateTime<Utc>)] = &[];
     let mut records: Vec<LogRecord> = Vec::new();
     let mut pending: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
     // The most recently pushed record: an unmarked line immediately following one
@@ -704,8 +824,49 @@ fn parse_log_records_by_line(
             continue;
         }
 
+        if let Some((tool, detail)) = api_tool_call(line) {
+            let argument = if matches!(tool, ToolKind::Read | ToolKind::Write) {
+                shortener.shorten(&detail)
+            } else {
+                detail
+            };
+            records.push(LogRecord {
+                time,
+                direction: LogDirection::Tool,
+                kind: RecordKind::Tool(tool),
+                tool: Some(tool),
+                argument,
+                result: None,
+                ok: None,
+                elapsed: None,
+                body: Vec::new(),
+                source: source_of(abs_start, abs_end),
+            });
+            pending.push_back(records.len() - 1);
+            last_idx = Some(records.len() - 1);
+            continue;
+        }
+
         if let Some(observation) = api_tool_observation(line) {
             let ok = !observation.starts_with("tool error:");
+            if pending.len() == 1 {
+                let idx = pending.pop_front().expect("checked len == 1");
+                let call_time = records[idx].time;
+                records[idx].result = Some(observation.to_string());
+                records[idx].ok = Some(ok);
+                records[idx].elapsed = match (call_time, time) {
+                    (Some(a), Some(b)) if b >= a => (b - a).to_std().ok(),
+                    _ => None,
+                };
+                if let SourceId::Log { end, .. } = &mut records[idx].source {
+                    *end = abs_end;
+                }
+                last_idx = Some(idx);
+                continue;
+            }
+            // See the `←` branch's comment: an ambiguous observation clears every
+            // currently-open call rather than leaving them stuck in `pending`.
+            pending.clear();
             records.push(LogRecord {
                 time,
                 direction: LogDirection::Result,
@@ -750,220 +911,6 @@ fn parse_log_records_by_line(
     records
 }
 
-fn parse_log_records_by_chunk(
-    text: &str,
-    start_offset: u64,
-    index: &[(u64, DateTime<Utc>)],
-    shortener: &PathShortener,
-    run_id: &str,
-    slot_id: &str,
-) -> Vec<LogRecord> {
-    let mut records: Vec<LogRecord> = Vec::new();
-    let mut pending: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
-    let text_len = text.len() as u64;
-
-    let source_of = |start: u64, end: u64| SourceId::Log {
-        run_id: run_id.to_string(),
-        slot_id: slot_id.to_string(),
-        start,
-        end,
-    };
-
-    let mut in_header = start_offset == 0;
-    let skip_until = if start_offset == 0 {
-        prompt_skip_end(text)
-    } else {
-        0
-    };
-    for (i, (offset, time)) in index.iter().enumerate() {
-        let abs_start = *offset;
-        if abs_start < start_offset {
-            continue;
-        }
-        let rel_start = (abs_start - start_offset).min(text_len) as usize;
-        let rel_end = index
-            .get(i + 1)
-            .map(|(next, _)| (next.saturating_sub(start_offset)).min(text_len) as usize)
-            .unwrap_or(text.len());
-        if rel_start >= rel_end || rel_end > text.len() {
-            continue;
-        }
-        // The record's end is the chunk's own boundary (the next write's recorded
-        // offset, or the tail's end) — not wherever a marker line's bytes happen to
-        // stop, which excluded every body line and the closing newline (AC-1).
-        let chunk_end = start_offset + rel_end as u64;
-        let raw_chunk = &text[rel_start..rel_end];
-        let trimmed = raw_chunk.trim_matches('\n');
-        if trimmed.is_empty() {
-            continue;
-        }
-        if in_header {
-            if is_header_line(trimmed) {
-                continue;
-            }
-            in_header = false;
-        }
-        if rel_start < skip_until {
-            continue;
-        }
-        let mut lines = trimmed.split('\n');
-        let head_line = lines.next().unwrap_or("");
-        let extra: Vec<String> = lines.map(|l| l.to_string()).collect();
-        let time = Some(*time);
-
-        if let Some(rest) = head_line.strip_prefix('→') {
-            let (name, detail) = split_tool_line(rest.trim_start());
-            let tool = ToolKind::classify(name);
-            let argument = if matches!(
-                tool,
-                ToolKind::Read
-                    | ToolKind::Write
-                    | ToolKind::Edit
-                    | ToolKind::Search
-                    | ToolKind::Fetch
-            ) {
-                shortener.shorten(detail)
-            } else {
-                detail.to_string()
-            };
-            records.push(LogRecord {
-                time,
-                direction: LogDirection::Tool,
-                kind: RecordKind::Tool(tool),
-                tool: Some(tool),
-                argument,
-                result: None,
-                ok: None,
-                elapsed: None,
-                body: extra,
-                source: source_of(abs_start, chunk_end),
-            });
-            pending.push_back(records.len() - 1);
-            continue;
-        }
-
-        if let Some(rest) = head_line.strip_prefix('←') {
-            let (ok, preview) = split_result_line(rest);
-            let clean = strip_tool_id(preview);
-            if pending.len() == 1 {
-                let idx = pending.pop_front().expect("checked len == 1");
-                let call_time = records[idx].time;
-                records[idx].result = Some(clean.to_string());
-                records[idx].ok = Some(ok);
-                if !preview.is_empty() {
-                    // Raw, not `clean`: expansion must preserve every persisted
-                    // byte, including a provider tool id (AC-6).
-                    records[idx].body.push(preview.to_string());
-                }
-                records[idx].elapsed = match (call_time, time) {
-                    (Some(a), Some(b)) if b >= a => (b - a).to_std().ok(),
-                    _ => None,
-                };
-                records[idx].body.extend(extra);
-                if let SourceId::Log { end, .. } = &mut records[idx].source {
-                    *end = chunk_end;
-                }
-                continue;
-            }
-            // See the by-line parser's comment: an ambiguous result clears every
-            // currently-open call rather than leaving them stuck in `pending` forever.
-            pending.clear();
-            records.push(LogRecord {
-                time,
-                direction: LogDirection::Result,
-                kind: RecordKind::Result { ok },
-                tool: None,
-                argument: String::new(),
-                result: Some(clean.to_string()),
-                ok: Some(ok),
-                elapsed: None,
-                body: extra,
-                source: source_of(abs_start, chunk_end),
-            });
-            continue;
-        }
-
-        if let Some(rest) = head_line.strip_prefix('·') {
-            records.push(LogRecord {
-                time,
-                direction: LogDirection::Note,
-                kind: RecordKind::Note,
-                tool: None,
-                argument: String::new(),
-                result: Some(rest.trim().to_string()),
-                ok: None,
-                elapsed: None,
-                body: extra,
-                source: source_of(abs_start, chunk_end),
-            });
-            continue;
-        }
-
-        if let Some(rest) = head_line.strip_prefix('…') {
-            records.push(LogRecord {
-                time,
-                direction: LogDirection::Thought,
-                kind: RecordKind::Thought,
-                tool: None,
-                argument: String::new(),
-                result: Some(rest.trim().to_string()),
-                ok: None,
-                elapsed: None,
-                body: extra,
-                source: source_of(abs_start, chunk_end),
-            });
-            continue;
-        }
-
-        if let Some(rest) = head_line.strip_prefix('!') {
-            records.push(LogRecord {
-                time,
-                direction: LogDirection::Error,
-                kind: RecordKind::Error,
-                tool: None,
-                argument: String::new(),
-                result: Some(rest.trim().to_string()),
-                ok: None,
-                elapsed: None,
-                body: extra,
-                source: source_of(abs_start, chunk_end),
-            });
-            continue;
-        }
-
-        if let Some(observation) = api_tool_observation(head_line) {
-            let ok = !observation.starts_with("tool error:");
-            records.push(LogRecord {
-                time,
-                direction: LogDirection::Result,
-                kind: RecordKind::Result { ok },
-                tool: None,
-                argument: String::new(),
-                result: Some(observation.to_string()),
-                ok: Some(ok),
-                elapsed: None,
-                body: extra,
-                source: source_of(abs_start, chunk_end),
-            });
-            continue;
-        }
-
-        records.push(LogRecord {
-            time,
-            direction: LogDirection::Prose,
-            kind: RecordKind::Prose,
-            tool: None,
-            argument: String::new(),
-            result: Some(head_line.to_string()),
-            ok: None,
-            elapsed: None,
-            body: extra,
-            source: source_of(abs_start, chunk_end),
-        });
-    }
-    records
-}
-
 /// Splits a markdown document into one foldable `Doc` record per `#`/`##` heading.
 /// A document with no headings becomes one record named after `name`. Each section
 /// gets its own byte range within `body` as its `SourceId` (AC-7): sharing one
@@ -974,22 +921,43 @@ pub fn parse_document(name: &str, body: &str, path: &str) -> Vec<Record> {
     let mut records = Vec::new();
     let mut current: Option<(String, Vec<String>, usize)> = None;
     let mut pos = 0usize;
+    // A fenced code block's own lines are never heading candidates: a `#` comment
+    // inside a fence (`## Result` in a shell transcript, say) must not split the
+    // section it lives in.
+    let mut in_fence = false;
     for raw in body.split_inclusive('\n') {
         let line = raw.strip_suffix('\n').unwrap_or(raw);
         let line_start = pos;
         pos += raw.len();
-        let heading = line.strip_prefix("## ").or_else(|| line.strip_prefix("# "));
+        let is_fence_delim = line.trim_start().starts_with("```");
+        let heading = (!in_fence)
+            .then(|| line.strip_prefix("## ").or_else(|| line.strip_prefix("# ")))
+            .flatten();
+        if is_fence_delim {
+            in_fence = !in_fence;
+        }
         if let Some(heading) = heading {
             if let Some((head, lines, start)) = current.take() {
                 records.push(doc_record(head, lines, doc_source(path, start, line_start)));
             }
             current = Some((heading.trim().to_string(), Vec::new(), line_start));
-        } else if let Some((_, lines, _)) = current.as_mut() {
-            if !line.trim().is_empty() {
-                lines.push(line.to_string());
+            continue;
+        }
+        // Once a section has real content, a blank line is a paragraph break or a
+        // fenced block's own blank interior — both must survive verbatim (`R`'s
+        // "every persisted byte" guarantee extends to the Plan/Review documents'
+        // own body). Only *leading* blank lines before the first real line are
+        // dropped, so the summary (`body.first()`) is never an empty string.
+        match current.as_mut() {
+            Some((_, lines, _)) => {
+                if !line.trim().is_empty() || !lines.is_empty() {
+                    lines.push(line.to_string());
+                }
             }
-        } else if !line.trim().is_empty() {
-            current = Some((name.to_string(), vec![line.to_string()], line_start));
+            None if !line.trim().is_empty() => {
+                current = Some((name.to_string(), vec![line.to_string()], line_start));
+            }
+            None => {}
         }
     }
     if let Some((head, lines, start)) = current.take() {
@@ -1262,15 +1230,20 @@ mod tests {
     #[test]
     fn api_backend_tool_observations_parse_as_typed_result_records() {
         // The api-sdk backend's own private log shape (`src/api/runtime.rs`): a
-        // step marker, the raw assistant text, then its tool observation line —
-        // never the native `→`/`←` coalescer markers.
+        // step marker, the raw assistant text (a bare `{"tool": ...}` JSON call),
+        // then its `tool => ` observation line — never the native `→`/`←`
+        // coalescer markers. AC-8: the call/observation pair merges into one typed
+        // `Tool` record, exactly like a native call/result pair, so `t`/`T` can
+        // reach it and it carries elapsed when an index is present.
         let text = "\n--- api step 0 model=gpt ---\n{\"tool\":\"read\",\"path\":\"a.rs\"}\ntool => file contents here\n";
         let records = parse_log_records(text, 0, &[], &PathShortener::default(), "r", "s");
         let obs = records
             .iter()
-            .find(|r| matches!(r.kind, RecordKind::Result { ok: true }))
-            .unwrap_or_else(|| panic!("no typed Result record in {records:#?}"));
+            .find(|r| matches!(r.kind, RecordKind::Tool(ToolKind::Read)))
+            .unwrap_or_else(|| panic!("no typed Tool record in {records:#?}"));
+        assert_eq!(obs.argument, "a.rs");
         assert_eq!(obs.result.as_deref(), Some("file contents here"));
+        assert_eq!(obs.ok, Some(true));
     }
 
     #[test]
@@ -1336,6 +1309,66 @@ mod tests {
         assert_eq!(expanded.len(), 3);
     }
 
+    /// AC-7: a streaming tool call's identity must not change as its body grows
+    /// (a continuation line arriving, then its result merging in) — `SourceId::Log`
+    /// mutates `end` in place for exactly that reason, so equality/hashing must
+    /// ignore it or an expanded call silently re-folds and the cursor loses it the
+    /// moment more of it streams in.
+    #[test]
+    fn log_source_identity_survives_end_growing_as_the_record_streams() {
+        let before = SourceId::Log {
+            run_id: "r".into(),
+            slot_id: "s".into(),
+            start: 10,
+            end: 20,
+        };
+        let after = SourceId::Log {
+            run_id: "r".into(),
+            slot_id: "s".into(),
+            start: 10,
+            end: 80,
+        };
+        assert_eq!(before, after, "growing `end` must not change identity");
+        use std::hash::{Hash, Hasher};
+        let hash_of = |id: &SourceId| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            id.hash(&mut h);
+            h.finish()
+        };
+        assert_eq!(hash_of(&before), hash_of(&after));
+
+        let mut fold_open: std::collections::HashSet<SourceId> = std::collections::HashSet::new();
+        fold_open.insert(before);
+        assert!(
+            fold_open.contains(&after),
+            "an expansion keyed on the pre-growth id must still be found post-growth"
+        );
+    }
+
+    #[test]
+    fn log_source_identity_differs_by_start_run_or_slot() {
+        let base = SourceId::Log {
+            run_id: "r".into(),
+            slot_id: "s".into(),
+            start: 10,
+            end: 20,
+        };
+        let different_start = SourceId::Log {
+            run_id: "r".into(),
+            slot_id: "s".into(),
+            start: 11,
+            end: 20,
+        };
+        let different_slot = SourceId::Log {
+            run_id: "r".into(),
+            slot_id: "other".into(),
+            start: 10,
+            end: 20,
+        };
+        assert_ne!(base, different_start);
+        assert_ne!(base, different_slot);
+    }
+
     #[test]
     fn parse_diff_splits_on_file_boundaries() {
         let text = "diff --git a/src/a.rs b/src/a.rs\n+one\n-two\ndiff --git a/src/b.rs b/src/b.rs\n+three\n";
@@ -1343,5 +1376,31 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].head, "src/a.rs");
         assert_eq!(records[1].head, "src/b.rs");
+    }
+
+    #[test]
+    fn parse_document_preserves_internal_blank_lines_and_paragraph_breaks() {
+        let body = "## Section\n\nFirst paragraph.\n\nSecond paragraph.\n";
+        let records = parse_document("doc", body, "p.md");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].body,
+            vec!["First paragraph.", "", "Second paragraph."],
+            "a blank line between paragraphs must survive, not be dropped: {:?}",
+            records[0].body
+        );
+    }
+
+    #[test]
+    fn parse_document_ignores_a_heading_shaped_line_inside_a_fence() {
+        let body = "## Real heading\n```\n## Result\nok\n```\nafter\n";
+        let records = parse_document("doc", body, "p.md");
+        assert_eq!(records.len(), 1, "{records:#?}");
+        assert_eq!(records[0].head, "Real heading");
+        assert!(
+            records[0].body.iter().any(|l| l == "## Result"),
+            "a fenced `#`-shaped line must not split the section: {:?}",
+            records[0].body
+        );
     }
 }

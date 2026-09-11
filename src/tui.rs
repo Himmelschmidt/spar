@@ -1286,6 +1286,10 @@ struct Snapshot {
     runs: Vec<state::RunSummary>,
     full: Option<RunState>,
     stream_text: String,
+    /// Exactly the bytes `stream_content` tailed from disk, with none of that
+    /// function's cosmetic truncation banner or waiting-for-stream placeholder
+    /// (AC-14): `R`'s raw view must never show text that was never persisted.
+    stream_text_raw: String,
     /// Structured records for the Log tab (U33/AC-1), stamped from the sidecar
     /// byte-offset -> time index when one exists.
     log_records: Vec<Record>,
@@ -1330,6 +1334,7 @@ impl Snapshot {
             runs: Vec::new(),
             full: None,
             stream_text: String::new(),
+            stream_text_raw: String::new(),
             log_records: Vec::new(),
             activity: Vec::new(),
             diff_text: String::new(),
@@ -1624,6 +1629,11 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
     } else {
         HomeData::default()
     };
+    let stream_text_raw = if sel.browse.in_project() {
+        stream_raw_content(&swarm, full.as_ref(), sel.slot_idx, cache)
+    } else {
+        String::new()
+    };
     let stream_text = if sel.browse.in_project() {
         stream_content(&swarm, full.as_ref(), sel.slot_idx, cache, !runs.is_empty())
     } else if sel.browse == BrowseLevel::Home {
@@ -1673,7 +1683,13 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
                 .find(|w| st.slots.get(sel.slot_idx).map(|s| &s.id) == Some(&w.slot_id))
                 .map(|w| (st, w))
         })
-        .map(|(st, w)| apply_diff_watermark(&st.id, record::parse_diff(&diff_text, &w.slot_id)))
+        .map(|(st, w)| {
+            apply_diff_watermark(
+                &st.id,
+                &w.slot_id,
+                record::parse_diff(&diff_text, &w.slot_id),
+            )
+        })
         .unwrap_or_default();
     let plan_docs_v = plan_docs(&swarm, full.as_ref());
     // O27: the Review projection evaluates the *run's own frozen* config, never the
@@ -1756,6 +1772,7 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
         runs,
         full,
         stream_text,
+        stream_text_raw,
         log_records,
         activity,
         diff_text,
@@ -2310,15 +2327,23 @@ fn hash_diff_body(body: &[String]) -> u64 {
     h.finish()
 }
 
-/// Records the diff records' current per-file hashes as "seen" for `run_id`.
-/// Called when the operator actually leaves the Diff tab or quits (`handle_key`),
-/// never on every render — that would mark everything seen before it was ever
-/// shown as new.
-fn mark_diff_seen(run_id: &str, records: &[Record]) {
-    mark_diff_seen_at(&diff_watermark_path(), run_id, records);
+/// The diff records shown for a run are always the *selected slot's* worktree
+/// (`diff_records` in `build_snapshot`), so the watermark must be scoped the same
+/// way: keying on `run_id` alone let slot A's "seen" mark suppress `NEW` on the
+/// same path in slot B's worktree under one run (round-review minor finding).
+fn diff_watermark_key(run_id: &str, slot_id: &str) -> String {
+    format!("{run_id}::{slot_id}")
 }
 
-fn mark_diff_seen_at(path: &Path, run_id: &str, records: &[Record]) {
+/// Records the diff records' current per-file hashes as "seen" for `run_id`'s
+/// selected `slot_id`. Called when the operator actually leaves the Diff tab or
+/// quits (`handle_key`/`handle_mouse`), never on every render — that would mark
+/// everything seen before it was ever shown as new.
+fn mark_diff_seen(run_id: &str, slot_id: &str, records: &[Record]) {
+    mark_diff_seen_at(&diff_watermark_path(), run_id, slot_id, records);
+}
+
+fn mark_diff_seen_at(path: &Path, run_id: &str, slot_id: &str, records: &[Record]) {
     let mut files = std::collections::HashMap::new();
     for r in records {
         if matches!(r.kind, RecordKind::FileDiff) {
@@ -2330,7 +2355,7 @@ fn mark_diff_seen_at(path: &Path, run_id: &str, records: &[Record]) {
     }
     let mut file = read_diff_watermark(path);
     file.runs.insert(
-        run_id.to_string(),
+        diff_watermark_key(run_id, slot_id),
         RunDiffWatermark {
             at: Utc::now(),
             files,
@@ -2340,16 +2365,22 @@ fn mark_diff_seen_at(path: &Path, run_id: &str, records: &[Record]) {
 }
 
 /// Marks each `FileDiff` record whose content hash differs from the stored
-/// watermark (or every one, if this run was never looked at before), and prepends
-/// a banner Section when there is a previous look to compare against and at least
-/// one file changed since it.
-fn apply_diff_watermark(run_id: &str, records: Vec<Record>) -> Vec<Record> {
-    apply_diff_watermark_at(&diff_watermark_path(), run_id, records)
+/// watermark (or every one, if this run/slot was never looked at before), and
+/// prepends a banner Section when there is a previous look to compare against and
+/// at least one file changed since it.
+fn apply_diff_watermark(run_id: &str, slot_id: &str, records: Vec<Record>) -> Vec<Record> {
+    apply_diff_watermark_at(&diff_watermark_path(), run_id, slot_id, records)
 }
 
-fn apply_diff_watermark_at(path: &Path, run_id: &str, mut records: Vec<Record>) -> Vec<Record> {
+fn apply_diff_watermark_at(
+    path: &Path,
+    run_id: &str,
+    slot_id: &str,
+    mut records: Vec<Record>,
+) -> Vec<Record> {
     let file = read_diff_watermark(path);
-    let prev = file.runs.get(run_id);
+    let key = diff_watermark_key(run_id, slot_id);
+    let prev = file.runs.get(&key);
     let mut changed = 0usize;
     for r in &mut records {
         if !matches!(r.kind, RecordKind::FileDiff) {
@@ -2595,9 +2626,10 @@ fn worktree_diff(path: &Path) -> Result<String> {
 /// Cap for the rendered worktree diff, in chars.
 const DIFF_MAX_BYTES: usize = 200_000;
 
-/// Main's Diff tab (Stage B): the selected slot's worktree diff against HEAD, falling
-/// back to the run's artifacts when the slot has no worktree (plan/review slots,
-/// headless runs) so the tab is never blank.
+/// Main's Diff tab (Stage B): the selected slot's worktree diff against HEAD. A
+/// slot with no worktree (plan/review slots, headless runs) reports that plainly
+/// (AC-18) rather than falling back to an arbitrary artifact file — that fallback
+/// used to make the tab lie about what it shows, and is now an explicit non-goal.
 fn diff_content(full: Option<&RunState>, slot_idx: usize) -> String {
     let Some(st) = full else {
         return "\n  No run selected.".into();
@@ -2882,6 +2914,7 @@ fn run_loop(
                     &snap.runs,
                     snap.full.as_ref(),
                     &snap.stream_text,
+                    &snap.stream_text_raw,
                     &snap.log_records,
                     &snap.activity,
                     &snap.diff_text,
@@ -2930,7 +2963,7 @@ fn run_loop(
                                 &snap.home.rows,
                                 &snap.runs,
                                 snap.full.as_ref(),
-                                active_records,
+                                &active_records,
                                 &mut active_root,
                                 local_root.as_deref(),
                             )? {
@@ -2946,6 +2979,7 @@ fn run_loop(
                             &snap.home.rows,
                             &snap.runs,
                             snap.full.as_ref(),
+                            &snap.diff_records,
                             &mut active_root,
                             local_root.as_deref(),
                             rail_state.offset(),
@@ -3063,6 +3097,9 @@ fn handle_key(
 ) -> Result<bool> {
     let was_diff = app.main_tab == MainTab::Diff;
     let diff_run_id = full.map(|st| st.id.clone());
+    let diff_slot_id = full
+        .and_then(|st| st.slots.get(app.selected_slot))
+        .map(|s| s.id.clone());
     let diff_snapshot: Vec<Record> = if was_diff {
         active_records.to_vec()
     } else {
@@ -3082,8 +3119,8 @@ fn handle_key(
         local_root,
     )?;
     if was_diff && (quit || app.main_tab != MainTab::Diff) {
-        if let Some(id) = diff_run_id {
-            mark_diff_seen(&id, &diff_snapshot);
+        if let (Some(run_id), Some(slot_id)) = (diff_run_id, diff_slot_id) {
+            mark_diff_seen(&run_id, &slot_id, &diff_snapshot);
         }
     }
     Ok(quit)
@@ -3422,16 +3459,47 @@ fn move_cursor(
     None
 }
 
+/// Applies the Activity tab's selected-slot filter (`f`), shared verbatim between
+/// painting (`draw_activity_body`) and cursor navigation (`active_records_for`) — a
+/// separate filtered copy in each place let the cursor move to a record the paint
+/// side had already dropped, landing it off-screen (round-review finding 3).
+fn filter_activity_records(
+    activity: &[Record],
+    slot_filter: Option<usize>,
+    full: Option<&RunState>,
+) -> Vec<Record> {
+    match (slot_filter, full) {
+        (Some(idx), Some(st)) => {
+            let slot_id = st.slots.get(idx).map(|s| s.id.as_str());
+            let role = st.slots.get(idx).map(|s| role_label(s.role));
+            activity
+                .iter()
+                .filter(|r| {
+                    matches!(r.kind, RecordKind::Section)
+                        || r.actor.is_none()
+                        || r.actor.as_deref() == Some("")
+                        || r.actor.as_deref() == slot_id
+                        || r.actor.as_deref() == role
+                })
+                .cloned()
+                .collect()
+        }
+        _ => activity.to_vec(),
+    }
+}
+
 /// Which record list `J`/`K`/`t`/`e`/`}`/`Space`/`R` act on — whatever Main is
-/// currently showing.
-fn active_records_for<'a>(app: &App, snap: &'a Snapshot) -> &'a [Record] {
+/// currently showing, filtered exactly as it is painted.
+fn active_records_for(app: &App, snap: &Snapshot) -> Vec<Record> {
     match app.main_tab {
-        MainTab::Log => &snap.log_records,
-        MainTab::Activity => &snap.activity,
-        MainTab::Diff => &snap.diff_records,
-        MainTab::Plan => &snap.plan_docs,
-        MainTab::Review => &snap.review,
-        MainTab::Shell => &[],
+        MainTab::Log => snap.log_records.clone(),
+        MainTab::Activity => {
+            filter_activity_records(&snap.activity, app.activity_slot_filter, snap.full.as_ref())
+        }
+        MainTab::Diff => snap.diff_records.clone(),
+        MainTab::Plan => snap.plan_docs.clone(),
+        MainTab::Review => snap.review.clone(),
+        MainTab::Shell => Vec::new(),
     }
 }
 
@@ -4614,8 +4682,50 @@ impl GateAction {
     }
 }
 
+/// Marks the Diff tab seen whenever a click leaves it, exactly like `handle_key`
+/// does for keyboard navigation — the tab strip is chrome reachable by a tap
+/// (round-review finding: `open_main` from the mouse path bypassed the watermark,
+/// so a mouse-only operator's `NEW` marks never cleared).
 #[allow(clippy::too_many_arguments)]
 fn handle_mouse(
+    app: &mut App,
+    m: crossterm::event::MouseEvent,
+    swarm: &SparPaths,
+    projects: &[registry::ProjectEntry],
+    home_rows: &[HomeRow],
+    runs: &[state::RunSummary],
+    full: Option<&RunState>,
+    diff_records: &[Record],
+    active_root: &mut PathBuf,
+    local_root: Option<&Path>,
+    rail_offset: usize,
+) {
+    let was_diff = app.main_tab == MainTab::Diff;
+    let diff_run_id = full.map(|st| st.id.clone());
+    let diff_slot_id = full
+        .and_then(|st| st.slots.get(app.selected_slot))
+        .map(|s| s.id.clone());
+    handle_mouse_inner(
+        app,
+        m,
+        swarm,
+        projects,
+        home_rows,
+        runs,
+        full,
+        active_root,
+        local_root,
+        rail_offset,
+    );
+    if was_diff && app.main_tab != MainTab::Diff {
+        if let (Some(run_id), Some(slot_id)) = (diff_run_id, diff_slot_id) {
+            mark_diff_seen(&run_id, &slot_id, diff_records);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_mouse_inner(
     app: &mut App,
     m: crossterm::event::MouseEvent,
     swarm: &SparPaths,
@@ -5025,6 +5135,7 @@ fn draw(
     runs: &[state::RunSummary],
     full: Option<&RunState>,
     stream_text: &str,
+    stream_text_raw: &str,
     log_records: &[Record],
     activity: &[Record],
     diff_text: &str,
@@ -5117,6 +5228,7 @@ fn draw(
             projects,
             full,
             stream_text,
+            stream_text_raw,
             log_records,
             activity,
             diff_text,
@@ -6875,6 +6987,7 @@ fn draw_main(
     projects: &[registry::ProjectEntry],
     full: Option<&RunState>,
     stream_text: &str,
+    stream_text_raw: &str,
     log_records: &[Record],
     activity: &[Record],
     diff_text: &str,
@@ -6918,22 +7031,59 @@ fn draw_main(
     // run-scoped (see `manage_terminal`), so it always shows the real workspace
     // terminal regardless of run count.
     match app.main_tab {
-        MainTab::Log => draw_log_body(f, inner, full, stream_text, log_records, log_stats, app),
-        MainTab::Activity if full.is_none() => {
-            draw_log_body(f, inner, full, stream_text, log_records, log_stats, app)
-        }
+        MainTab::Log => draw_log_body(
+            f,
+            inner,
+            full,
+            stream_text,
+            stream_text_raw,
+            log_records,
+            log_stats,
+            app,
+        ),
+        MainTab::Activity if full.is_none() => draw_log_body(
+            f,
+            inner,
+            full,
+            stream_text,
+            stream_text_raw,
+            log_records,
+            log_stats,
+            app,
+        ),
         MainTab::Activity => draw_activity_body(f, inner, activity, full, app),
-        MainTab::Diff if full.is_none() => {
-            draw_log_body(f, inner, full, stream_text, log_records, log_stats, app)
-        }
+        MainTab::Diff if full.is_none() => draw_log_body(
+            f,
+            inner,
+            full,
+            stream_text,
+            stream_text_raw,
+            log_records,
+            log_stats,
+            app,
+        ),
         MainTab::Diff => draw_diff_body(f, inner, diff_text, diff_records, app),
-        MainTab::Plan if full.is_none() => {
-            draw_log_body(f, inner, full, stream_text, log_records, log_stats, app)
-        }
+        MainTab::Plan if full.is_none() => draw_log_body(
+            f,
+            inner,
+            full,
+            stream_text,
+            stream_text_raw,
+            log_records,
+            log_stats,
+            app,
+        ),
         MainTab::Plan => draw_plan_body(f, inner, plan_docs, app),
-        MainTab::Review if full.is_none() => {
-            draw_log_body(f, inner, full, stream_text, log_records, log_stats, app)
-        }
+        MainTab::Review if full.is_none() => draw_log_body(
+            f,
+            inner,
+            full,
+            stream_text,
+            stream_text_raw,
+            log_records,
+            log_stats,
+            app,
+        ),
         MainTab::Review => draw_review_body(f, inner, review, app),
         MainTab::Shell => draw_shell_body(f, inner, app),
     }
@@ -7026,11 +7176,13 @@ fn main_context(swarm: &SparPaths, full: Option<&RunState>, app: &App) -> String
 /// Main's Log tab: the live stream for the selected slot (or the run), with the
 /// slot's stall/quiet state and token stats on a one-row band. Records by default
 /// (U32); `R` falls back to the byte-for-byte raw view (U36).
+#[allow(clippy::too_many_arguments)]
 fn draw_log_body(
     f: &mut Frame,
     inner: Rect,
     full: Option<&RunState>,
     stream_text: &str,
+    stream_text_raw: &str,
     log_records: &[Record],
     stats: Option<&process::StreamStats>,
     app: &mut App,
@@ -7088,10 +7240,13 @@ fn draw_log_body(
 
     app.stream_view_h = chunks[1].height;
     if app.raw_mode {
+        // Exactly the persisted bytes (AC-14) — `stream_text` carries a truncation
+        // banner and a "waiting for stream" placeholder for the friendly parsed
+        // fallback below, neither of which the raw escape hatch may show.
         app.stream_max = render_scrollable_log(
             f,
             chunks[1],
-            stream_text,
+            stream_text_raw,
             &mut app.stream_scroll,
             &mut app.stream_follow,
             true,
@@ -7121,6 +7276,11 @@ fn draw_log_body(
         } else {
             log_records
         };
+        // The newest record of a running slot breathes with the rail's own live
+        // gutter (`App::gutter`) rather than a second fade (U30's standing rule).
+        let live = (slot.map(|s| s.status) == Some(SlotStatus::Running))
+            .then(|| records.last().map(|r| (&r.source, app.gutter(0))))
+            .flatten();
         app.stream_max = render_record_view(
             f,
             chunks[1],
@@ -7131,6 +7291,7 @@ fn draw_log_body(
             app.fold_all,
             app.record_cursor.as_ref(),
             &mut app.record_cursor_dirty,
+            live,
         );
     }
 }
@@ -7146,36 +7307,18 @@ fn draw_activity_body(
     app: &mut App,
 ) {
     app.bus_view_h = inner.height;
-    let filtered: Vec<Record>;
-    let records: &[Record] = match (app.activity_slot_filter, full) {
-        (Some(idx), Some(st)) => {
-            let slot_id = st.slots.get(idx).map(|s| s.id.as_str());
-            let role = st.slots.get(idx).map(|s| role_label(s.role));
-            filtered = activity
-                .iter()
-                .filter(|r| {
-                    matches!(r.kind, RecordKind::Section)
-                        || r.actor.is_none()
-                        || r.actor.as_deref() == Some("")
-                        || r.actor.as_deref() == slot_id
-                        || r.actor.as_deref() == role
-                })
-                .cloned()
-                .collect();
-            &filtered
-        }
-        _ => activity,
-    };
+    let filtered = filter_activity_records(activity, app.activity_slot_filter, full);
     app.bus_max = render_record_view(
         f,
         inner,
-        records,
+        &filtered,
         &mut app.bus_scroll,
         &mut app.bus_follow,
         &app.fold_open,
         app.fold_all,
         app.record_cursor.as_ref(),
         &mut app.record_cursor_dirty,
+        None,
     );
 }
 
@@ -7220,6 +7363,7 @@ fn draw_diff_body(
             app.fold_all,
             app.record_cursor.as_ref(),
             &mut app.record_cursor_dirty,
+            None,
         );
     }
 }
@@ -7239,6 +7383,7 @@ fn draw_plan_body(f: &mut Frame, inner: Rect, plan_docs: &[Record], app: &mut Ap
         app.fold_all,
         app.record_cursor.as_ref(),
         &mut app.record_cursor_dirty,
+        None,
     );
 }
 
@@ -7258,6 +7403,7 @@ fn draw_review_body(f: &mut Frame, inner: Rect, review: &[Record], app: &mut App
         app.fold_all,
         app.record_cursor.as_ref(),
         &mut app.record_cursor_dirty,
+        None,
     );
 }
 
@@ -7484,12 +7630,22 @@ struct RecordRow {
     spans: Vec<(u16, String, Style)>,
 }
 
-fn build_head_row(r: &Record, cols: record::Columns, is_cursor: bool, folded: bool) -> RecordRow {
+fn build_head_row(
+    r: &Record,
+    cols: record::Columns,
+    is_cursor: bool,
+    folded: bool,
+    live_gutter: Option<Color>,
+) -> RecordRow {
     let mut spans = Vec::new();
+    // A running slot's newest record breathes with the rail's own live gutter
+    // (`App::gutter`, U30) rather than a second fade — this is that streaming
+    // record's one caller.
+    let gutter_color = live_gutter.unwrap_or(ACCENT);
     spans.push((
         cols.gutter,
         (if is_cursor { SEL_BAR } else { " " }).to_string(),
-        Style::default().fg(ACCENT),
+        Style::default().fg(gutter_color),
     ));
     let fold_mark = if r.body.is_empty() {
         " "
@@ -7552,14 +7708,23 @@ fn build_head_row(r: &Record, cols: record::Columns, is_cursor: bool, folded: bo
     }
 }
 
-/// One (possibly wrapped) body line. There is no reliable "this line is the
-/// command" position once a call has merged with its result — the by-line parser
-/// never puts anything but the result preview at `body[0]`, and the by-chunk
-/// parser can put genuine call continuation there — so every body line paints as
-/// plain output (`FG_DIM`); the command itself already carries `CODE` in the head
-/// row's summary (`build_head_row`/`record_kind_style`).
-fn build_body_row(kind: RecordKind, text: String, cols: record::Columns) -> RecordRow {
-    let style = Style::default().fg(FG_DIM);
+/// One (possibly wrapped) body line. `is_command` is only ever true for a
+/// still-open tool call's own continuation lines (AC-19's command/path row gets
+/// `CODE`); once a call has merged with its result, its body starts with the
+/// result's own preview instead, so every body line of a merged/standalone record
+/// paints as plain output (`FG_DIM`) — the merged call's command itself already
+/// carries `CODE` in the head row's summary (`build_head_row`/`record_kind_style`).
+fn build_body_row(
+    kind: RecordKind,
+    text: String,
+    cols: record::Columns,
+    is_command: bool,
+) -> RecordRow {
+    let style = if is_command {
+        Style::default().fg(CODE)
+    } else {
+        Style::default().fg(FG_DIM)
+    };
     let bg = matches!(
         kind,
         RecordKind::Tool(_) | RecordKind::Result { .. } | RecordKind::FileDiff
@@ -7623,7 +7788,12 @@ fn wrap_body_line(text: &str, width: usize) -> Vec<String> {
 /// silently clipped).
 enum ExpandedRowKind {
     Head,
-    Body(String),
+    /// `bool` is whether this is a still-open tool call's own command text
+    /// (continuation lines that arrived before any result merged in) rather than a
+    /// result's output — the one case body content can be identified as "the
+    /// command" with certainty, since a merged call's body starts with the result
+    /// preview instead (AC-19's command/path row).
+    Body(String, bool),
 }
 
 struct ExpandedRow {
@@ -7642,6 +7812,7 @@ fn render_record_view(
     fold_all: bool,
     cursor: Option<&SourceId>,
     cursor_dirty: &mut bool,
+    live: Option<(&SourceId, Color)>,
 ) -> u16 {
     if area.width == 0 || area.height == 0 {
         clamp_scroll(scroll, follow, 0);
@@ -7665,16 +7836,27 @@ fn render_record_view(
                 kind: ExpandedRowKind::Head,
             }),
             record::RowKind::Body(j) => {
-                let text = records[row.record_idx]
-                    .body
-                    .get(j)
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
-                for chunk in wrap_body_line(text, body_width) {
+                let rec = &records[row.record_idx];
+                let text = rec.body.get(j).map(|s| s.as_str()).unwrap_or("");
+                let is_command = matches!(rec.kind, RecordKind::Tool(_)) && rec.ok.is_none();
+                if matches!(rec.kind, RecordKind::Criterion) {
+                    // The criteria grid's row is pre-padded into fixed-width cells
+                    // (`review_records`): greedy word-wrap tokenizes on spaces and
+                    // re-joins with a single one, destroying that padding and
+                    // shifting every reviewer column after the first wrap point
+                    // (AC-17). Truncate instead — a table row that doesn't fit is
+                    // still a row, not a reflow.
                     expanded.push(ExpandedRow {
                         record_idx: row.record_idx,
-                        kind: ExpandedRowKind::Body(chunk),
+                        kind: ExpandedRowKind::Body(truncate_display(text, body_width), is_command),
                     });
+                } else {
+                    for chunk in wrap_body_line(text, body_width) {
+                        expanded.push(ExpandedRow {
+                            record_idx: row.record_idx,
+                            kind: ExpandedRowKind::Body(chunk, is_command),
+                        });
+                    }
                 }
             }
         }
@@ -7711,9 +7893,14 @@ fn render_record_view(
         .map(|row| {
             let r = &records[row.record_idx];
             let is_cursor = cursor == Some(&r.source);
+            let live_color = live.and_then(|(id, c)| (id == &r.source).then_some(c));
             match &row.kind {
-                ExpandedRowKind::Head => build_head_row(r, cols, is_cursor, !is_expanded(r)),
-                ExpandedRowKind::Body(text) => build_body_row(r.kind, text.clone(), cols),
+                ExpandedRowKind::Head => {
+                    build_head_row(r, cols, is_cursor, !is_expanded(r), live_color)
+                }
+                ExpandedRowKind::Body(text, is_command) => {
+                    build_body_row(r.kind, text.clone(), cols, *is_command)
+                }
             }
         })
         .collect();
@@ -9171,6 +9358,34 @@ fn only_header_and_prompt(raw: &str) -> bool {
     body[start..].join("\n").trim().is_empty()
 }
 
+/// Exactly the persisted bytes of the selected slot's log tail — no truncation
+/// banner, no "waiting for stream" placeholder. `stream_content` injects both for
+/// its own friendly, non-raw purpose (the empty state and the parsed-view
+/// fallback); `R`'s raw view must never show text nothing ever wrote to disk
+/// (AC-14). Absent file or run reads as empty: there is no raw source to show.
+fn stream_raw_content(
+    swarm: &SparPaths,
+    full: Option<&RunState>,
+    slot_idx: usize,
+    cache: &mut LogCache,
+) -> String {
+    let Some(st) = full else {
+        return String::new();
+    };
+    let Some(slot) = st.slots.get(slot_idx.min(st.slots.len().saturating_sub(1))) else {
+        return String::new();
+    };
+    let path = slot
+        .log_path
+        .clone()
+        .unwrap_or_else(|| swarm.log_file(&st.id, &slot.id));
+    if !path.is_file() {
+        return String::new();
+    }
+    let (raw, _truncated) = cache.load(&path, LOG_TAIL_BYTES);
+    raw.to_string()
+}
+
 fn stream_content(
     swarm: &SparPaths,
     full: Option<&RunState>,
@@ -9590,24 +9805,32 @@ fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: Option<&Confi
         // line that overruns rather than clipping it.
         const CELL_NAME_W: usize = 12;
         const CELL_STATUS_W: usize = 12;
-        for id in &criteria {
-            let mut cells: Vec<String> = Vec::new();
-            let mut compact: Vec<String> = Vec::new();
-            for s in &reviewers {
+        // Each reviewer's artifact is read and parsed once here, not once per
+        // criterion inside the loop below (N criteria x M reviewers file reads
+        // otherwise, per snapshot rebuild).
+        let parsed_reviews: Vec<Option<workflow::review_result::ReviewResult>> = reviewers
+            .iter()
+            .map(|s| {
                 let artifact = s
                     .artifact
                     .clone()
                     .unwrap_or_else(|| format!("review-{}.md", s.id));
                 let path = swarm.artifact(&st.id, &artifact);
-                let cell = match std::fs::read_to_string(&path) {
-                    Ok(text) => {
-                        let res = workflow::review_result::parse_review(&text);
-                        match res.acceptance.iter().find(|a| &a.id == id) {
-                            Some(a) => format!("{:?}", a.status).to_ascii_lowercase(),
-                            None => "not reported".to_string(),
-                        }
-                    }
-                    Err(_) => "missing".to_string(),
+                std::fs::read_to_string(&path)
+                    .ok()
+                    .map(|text| workflow::review_result::parse_review(&text))
+            })
+            .collect();
+        for id in &criteria {
+            let mut cells: Vec<String> = Vec::new();
+            let mut compact: Vec<String> = Vec::new();
+            for (s, parsed) in reviewers.iter().zip(&parsed_reviews) {
+                let cell = match parsed {
+                    Some(res) => match res.acceptance.iter().find(|a| &a.id == id) {
+                        Some(a) => format!("{:?}", a.status).to_ascii_lowercase(),
+                        None => "not reported".to_string(),
+                    },
+                    None => "missing".to_string(),
                 };
                 compact.push(format!("{}: {cell}", short_agent(&s.id)));
                 cells.push(format!(
@@ -10410,6 +10633,7 @@ mod labels {
             &[],
             &[],
             None,
+            &[],
             &mut root,
             None,
             0,
@@ -10454,6 +10678,7 @@ mod labels {
             &[],
             &[],
             None,
+            &[],
             &mut root,
             None,
             0,
@@ -11397,6 +11622,7 @@ mod render_stability {
                 runs,
                 full,
                 "→ Bash  read the contract\n← ✓ toolu_01HqnTTSQH5m7ZWYJVAtA7Vj ok\n",
+                "→ Bash  read the contract\n← ✓ toolu_01HqnTTSQH5m7ZWYJVAtA7Vj ok\n",
                 &[],
                 &activity,
                 diff_text,
@@ -11515,6 +11741,7 @@ mod render_stability {
                 &[],
                 None,
                 "",
+                "",
                 &[],
                 &[],
                 "",
@@ -11596,6 +11823,7 @@ mod render_stability {
                     &[],
                     Some(&st),
                     "",
+                    "",
                     &[],
                     &[],
                     "",
@@ -11647,6 +11875,7 @@ mod render_stability {
                     &[],
                     Some(&st),
                     "",
+                    "",
                     &[],
                     &[],
                     "",
@@ -11679,6 +11908,7 @@ mod render_stability {
                 &[],
                 &[],
                 Some(&st),
+                "→ Bash  ls -la /etc | head -5\n← ✓  total 1184\ndrwxr-xr-x 139 root root 12288 Sep 7 10:19 .\n→ Read  /etc/hostname\n",
                 "→ Bash  ls -la /etc | head -5\n← ✓  total 1184\ndrwxr-xr-x 139 root root 12288 Sep 7 10:19 .\n→ Read  /etc/hostname\n",
                 &[],
                 &[],
@@ -11742,7 +11972,7 @@ mod render_stability {
                 },
                 folded_by_default: false,
             };
-            let row = build_head_row(&r, cols, false, true);
+            let row = build_head_row(&r, cols, false, true, None);
             let (meta_x, meta_text, _) = row.spans.last().unwrap();
             let meta_len = meta_text.chars().count() as u16;
             assert_eq!(
@@ -11838,6 +12068,43 @@ mod render_stability {
                 .iter()
                 .any(|r| r.kind == RecordKind::Section && r.verb == "phase"),
             "no phase boundary record: {records:#?}"
+        );
+    }
+
+    /// `f`'s selected-slot filter must apply identically to what `J/K/t/e/}`
+    /// navigate over and to what `draw_activity_body` paints — a separate filtered
+    /// copy in each place let the cursor move to a record the paint side had
+    /// already dropped, landing it off-screen (round-review finding 3).
+    #[test]
+    fn activity_slot_filter_matches_between_navigation_and_painting() {
+        let st = run_with(Phase::Dispatch, 2);
+        let slot0 = st.slots[0].id.clone();
+        let slot1 = st.slots[1].id.clone();
+        let activity = vec![
+            activity_record(None, slot0.clone(), "started", "", RecordKind::Note).to_record(),
+            activity_record(None, slot1.clone(), "started", "", RecordKind::Note).to_record(),
+        ];
+        let mut snap = Snapshot::loading(Path::new("/x"));
+        snap.activity = activity.clone();
+        snap.full = Some(st);
+
+        let mut app = test_app();
+        app.main_tab = MainTab::Activity;
+        app.activity_slot_filter = Some(0);
+
+        let nav_records = active_records_for(&app, &snap);
+        let paint_records =
+            filter_activity_records(&snap.activity, app.activity_slot_filter, snap.full.as_ref());
+        assert_eq!(
+            nav_records.len(),
+            paint_records.len(),
+            "cursor navigation must see exactly what is painted"
+        );
+        assert!(
+            nav_records
+                .iter()
+                .all(|r| r.actor.as_deref() == Some(slot0.as_str())),
+            "the filtered set must exclude the other slot's records: {nav_records:#?}"
         );
     }
 
@@ -12286,6 +12553,7 @@ mod render_stability {
                 &[],
                 Some(&st),
                 "",
+                "",
                 &[],
                 &[],
                 "",
@@ -12514,6 +12782,7 @@ mod render_stability {
                     &[],
                     &[],
                     Some(&st),
+                    "",
                     "",
                     &[],
                     &[],
@@ -12930,6 +13199,7 @@ mod render_stability {
                     &[],
                     None,
                     &text,
+                    &text,
                     &[],
                     &[],
                     "",
@@ -13027,6 +13297,7 @@ mod render_stability {
                     &[],
                     None,
                     &text,
+                    &text,
                     &[],
                     &[],
                     "",
@@ -13083,6 +13354,7 @@ mod render_stability {
                 &[],
                 &[],
                 None,
+                &text,
                 &text,
                 &[],
                 &[],
@@ -13145,6 +13417,7 @@ mod render_stability {
                     &[],
                     &[],
                     None,
+                    &text,
                     &text,
                     &[],
                     &[],
@@ -13294,6 +13567,7 @@ mod render_stability {
                 projects,
                 &[],
                 None,
+                "",
                 "",
                 &[],
                 &[],
@@ -13734,6 +14008,7 @@ mod render_stability {
                     &[],
                     Some(&st),
                     "",
+                    "",
                     &[],
                     &[],
                     "",
@@ -13797,6 +14072,7 @@ mod render_stability {
                     &[],
                     &[],
                     None,
+                    "",
                     "",
                     &[],
                     &[],
@@ -13947,6 +14223,7 @@ mod render_stability {
                 &[],
                 Some(&st),
                 "",
+                "",
                 &[],
                 &[],
                 "",
@@ -13998,6 +14275,7 @@ mod render_stability {
                 &[],
                 &[],
                 None,
+                "",
                 "",
                 &[],
                 &[],
@@ -14140,7 +14418,7 @@ mod render_stability {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("diff_watermark.json");
         let records = diff_records_for(&[("a.rs", "+1"), ("b.rs", "+2")]);
-        let out = apply_diff_watermark_at(&path, "run1", records);
+        let out = apply_diff_watermark_at(&path, "run1", "s1", records);
         assert!(
             !out.iter().any(|r| matches!(r.kind, RecordKind::Section)),
             "no previous look to compare against: {out:#?}"
@@ -14158,10 +14436,10 @@ mod render_stability {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("diff_watermark.json");
         let seen = diff_records_for(&[("a.rs", "+1"), ("b.rs", "+2")]);
-        mark_diff_seen_at(&path, "run1", &seen);
+        mark_diff_seen_at(&path, "run1", "s1", &seen);
 
         let unchanged = diff_records_for(&[("a.rs", "+1"), ("b.rs", "+2")]);
-        let out = apply_diff_watermark_at(&path, "run1", unchanged);
+        let out = apply_diff_watermark_at(&path, "run1", "s1", unchanged);
         assert!(
             !out.iter().any(|r| r.summary.starts_with("NEW ·")),
             "nothing changed since the look: {out:#?}"
@@ -14169,7 +14447,7 @@ mod render_stability {
         assert!(!out.iter().any(|r| matches!(r.kind, RecordKind::Section)));
 
         let changed = diff_records_for(&[("a.rs", "+1 changed"), ("b.rs", "+2")]);
-        let out = apply_diff_watermark_at(&path, "run1", changed);
+        let out = apply_diff_watermark_at(&path, "run1", "s1", changed);
         let banner = out
             .iter()
             .find(|r| matches!(r.kind, RecordKind::Section))
@@ -14189,12 +14467,31 @@ mod render_stability {
         let path = dir.path().join("diff_watermark.json");
         std::fs::write(&path, "{ not json").unwrap();
         let records = diff_records_for(&[("a.rs", "+1")]);
-        let out = apply_diff_watermark_at(&path, "run1", records);
+        let out = apply_diff_watermark_at(&path, "run1", "s1", records);
         assert!(
             out.iter().all(|r| r.summary.starts_with("NEW ·")),
             "{out:#?}"
         );
         assert!(!out.iter().any(|r| matches!(r.kind, RecordKind::Section)));
+    }
+
+    /// AC-18: the watermark is scoped per selected worktree, not just per run — a
+    /// path marked seen in slot A's worktree must not suppress `NEW` on the
+    /// same-named path in slot B's worktree under the same run (round-review
+    /// minor finding).
+    #[test]
+    fn diff_watermark_is_scoped_to_the_selected_worktree_not_just_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("diff_watermark.json");
+        let seen_in_a = diff_records_for(&[("a.rs", "+1")]);
+        mark_diff_seen_at(&path, "run1", "slot-a", &seen_in_a);
+
+        let same_path_in_b = diff_records_for(&[("a.rs", "+1")]);
+        let out = apply_diff_watermark_at(&path, "run1", "slot-b", same_path_in_b);
+        assert!(
+            out.iter().all(|r| r.summary.starts_with("NEW ·")),
+            "a different slot's worktree must not inherit another slot's seen mark: {out:#?}"
+        );
     }
 }
 

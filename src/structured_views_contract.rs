@@ -85,6 +85,16 @@ fn path_shortening_is_run_local_and_keeps_the_last_two_components() {
 }
 
 #[test]
+fn shortening_a_path_exactly_equal_to_the_root_is_not_ambiguously_empty() {
+    let value = shortener().shorten("/tmp/codex/spar-44e0e49a-impl");
+    assert_ne!(
+        value, "",
+        "an empty string looks identical to a parse failure"
+    );
+    assert_eq!(value, ".");
+}
+
+#[test]
 fn widths_reserve_columns_without_moving_them_for_content() {
     let narrow = Columns::for_width(87);
     let wide = Columns::for_width(120);
