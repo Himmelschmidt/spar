@@ -1090,11 +1090,14 @@ impl App {
         );
     }
 
-    /// Mirrors `draw_diff_body`'s own branch via `diff_raw_active` (set by that
-    /// same paint), rather than re-deriving raw-vs-parsed from `raw_mode` alone —
-    /// the empty-records fallback also forces raw regardless of the toggle.
-    fn scroll_diff_by(&mut self, delta: i32) {
-        if self.diff_raw_active {
+    /// `diff_raw_active` is computed fresh from `self.raw_mode` and the current diff
+    /// records, not read off `App::diff_raw_active` — that field is only updated by
+    /// `draw_diff_body`'s paint, and the input loop drains a whole key burst before the
+    /// next paint runs. Reading the stale field here meant `R` followed by a scroll key
+    /// in the same burst scrolled the *previous* mode's viewport while the *new* mode's
+    /// was what got painted (AC-14).
+    fn scroll_diff_by(&mut self, delta: i32, diff_raw_active: bool) {
+        if diff_raw_active {
             apply_scroll_delta(
                 &mut self.diff_scroll,
                 &mut self.diff_follow,
@@ -1127,12 +1130,14 @@ impl App {
     /// selected, Activity/Diff/Plan/Review fall back to the same overview body Log
     /// uses (`draw_log_body`), so scrolling must follow that body — `stream_*` —
     /// rather than the run-scoped state those tabs normally own.
-    fn scroll_main_by(&mut self, delta: i32, has_full: bool) {
+    fn scroll_main_by(&mut self, delta: i32, has_full: bool, diff_records: &[Record]) {
         match self.main_tab {
             MainTab::Log => self.scroll_stream_by(delta, has_full),
             MainTab::Activity if has_full => self.scroll_bus_by(delta),
             MainTab::Activity => self.scroll_stream_by(delta, false),
-            MainTab::Diff if has_full => self.scroll_diff_by(delta),
+            MainTab::Diff if has_full => {
+                self.scroll_diff_by(delta, self.raw_mode || diff_records.is_empty())
+            }
             MainTab::Diff => self.scroll_stream_by(delta, false),
             MainTab::Plan if has_full => self.scroll_plan_by(delta),
             MainTab::Plan => self.scroll_stream_by(delta, false),
@@ -1152,13 +1157,14 @@ impl App {
         }
     }
 
-    fn home_for_main(&mut self, has_full: bool) {
+    fn home_for_main(&mut self, has_full: bool, diff_records: &[Record]) {
+        let diff_raw_active = self.raw_mode || diff_records.is_empty();
         match self.main_tab {
             MainTab::Activity if has_full => {
                 self.bus_follow = false;
                 self.bus_scroll = 0;
             }
-            MainTab::Diff if has_full && !self.diff_raw_active => {
+            MainTab::Diff if has_full && !diff_raw_active => {
                 self.diff_parsed_scroll = 0;
             }
             MainTab::Diff if has_full => {
@@ -1182,13 +1188,14 @@ impl App {
         }
     }
 
-    fn end_for_main(&mut self, has_full: bool) {
+    fn end_for_main(&mut self, has_full: bool, diff_records: &[Record]) {
+        let diff_raw_active = self.raw_mode || diff_records.is_empty();
         match self.main_tab {
             MainTab::Activity if has_full => {
                 self.bus_follow = true;
                 self.bus_scroll = self.bus_max;
             }
-            MainTab::Diff if has_full && !self.diff_raw_active => {
+            MainTab::Diff if has_full && !diff_raw_active => {
                 self.diff_parsed_scroll = self.diff_parsed_max;
             }
             MainTab::Diff if has_full => {
@@ -3381,23 +3388,27 @@ fn handle_key_inner(
         }
         KeyCode::Char('j') | KeyCode::Down => match app.focus {
             Focus::Rail => rail_move(app, projects, home_rows, runs, n_slots, 1),
-            Focus::Main => app.scroll_main_by(3, full.is_some()),
+            Focus::Main => app.scroll_main_by(3, full.is_some(), active_records),
         },
         KeyCode::Char('k') | KeyCode::Up => match app.focus {
             Focus::Rail => rail_move(app, projects, home_rows, runs, n_slots, -1),
-            Focus::Main => app.scroll_main_by(-3, full.is_some()),
+            Focus::Main => app.scroll_main_by(-3, full.is_some(), active_records),
         },
         KeyCode::PageDown => match app.focus {
             Focus::Rail => rail_move(app, projects, home_rows, runs, n_slots, 5),
-            Focus::Main => {
-                app.scroll_main_by(i32::from(app.main_page(full.is_some())), full.is_some())
-            }
+            Focus::Main => app.scroll_main_by(
+                i32::from(app.main_page(full.is_some())),
+                full.is_some(),
+                active_records,
+            ),
         },
         KeyCode::PageUp => match app.focus {
             Focus::Rail => rail_move(app, projects, home_rows, runs, n_slots, -5),
-            Focus::Main => {
-                app.scroll_main_by(-i32::from(app.main_page(full.is_some())), full.is_some())
-            }
+            Focus::Main => app.scroll_main_by(
+                -i32::from(app.main_page(full.is_some())),
+                full.is_some(),
+                active_records,
+            ),
         },
         // a jumps to the next run that wants you (Stage C). Approve moved to the gate
         // button / `:approve` when `a` became the fleet-wide attention binding.
@@ -3413,10 +3424,10 @@ fn handle_key_inner(
             }
         }
         KeyCode::Char('g') | KeyCode::Home => {
-            app.home_for_main(full.is_some());
+            app.home_for_main(full.is_some(), active_records);
         }
         KeyCode::Char('G') | KeyCode::End => {
-            app.end_for_main(full.is_some());
+            app.end_for_main(full.is_some(), active_records);
         }
         KeyCode::Char('?') => {
             app.show_help = true;
@@ -4814,6 +4825,7 @@ fn handle_mouse(
         home_rows,
         runs,
         full,
+        diff_records,
         active_root,
         local_root,
         rail_offset,
@@ -4834,6 +4846,7 @@ fn handle_mouse_inner(
     home_rows: &[HomeRow],
     runs: &[state::RunSummary],
     full: Option<&RunState>,
+    diff_records: &[Record],
     active_root: &mut PathBuf,
     local_root: Option<&Path>,
     rail_offset: usize,
@@ -4993,7 +5006,7 @@ fn handle_mouse_inner(
         MouseEventKind::ScrollDown => {
             if contains(app.rect_main, x, y) {
                 app.focus = Focus::Main;
-                app.scroll_main_by(3, full.is_some());
+                app.scroll_main_by(3, full.is_some(), diff_records);
             } else if contains(app.rect_rail, x, y) {
                 app.focus = Focus::Rail;
                 rail_move(app, projects, home_rows, runs, n_slots, 1);
@@ -5002,7 +5015,7 @@ fn handle_mouse_inner(
         MouseEventKind::ScrollUp => {
             if contains(app.rect_main, x, y) {
                 app.focus = Focus::Main;
-                app.scroll_main_by(-3, full.is_some());
+                app.scroll_main_by(-3, full.is_some(), diff_records);
             } else if contains(app.rect_rail, x, y) {
                 app.focus = Focus::Rail;
                 rail_move(app, projects, home_rows, runs, n_slots, -1);
@@ -9703,9 +9716,12 @@ fn activity_feed(
         } else {
             String::new()
         };
+        // The slot id, not `role_label` alone (AC-7): two slots sharing a role — two
+        // reviewers, two peers — render identical role/status/quiet text, and identity
+        // hashes on exactly those fields. Only the id tells them apart.
         out.push(activity_record(
             None,
-            role_label(s.role).to_string(),
+            s.id.clone(),
             slot_status_label(s.status).to_string(),
             quiet,
             kind,
@@ -9959,12 +9975,21 @@ fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: Option<&Confi
             let mut cells: Vec<String> = Vec::new();
             let mut compact: Vec<String> = Vec::new();
             for (s, parsed) in reviewers.iter().zip(&parsed_reviews) {
-                let cell = match parsed {
-                    Some(res) => match res.acceptance.iter().find(|a| &a.id == id) {
-                        Some(a) => format!("{:?}", a.status).to_ascii_lowercase(),
-                        None => "not reported".to_string(),
-                    },
-                    None => "missing".to_string(),
+                // A slot the executor marked `Failed` mirrors the gate's own `!review_ok`
+                // (`implement.rs`'s `if !review_ok || missing_or_empty`): the gate blocks on
+                // this regardless of whatever a *stale* review-<slot>.md from an earlier
+                // round of the same slot id still holds, so the grid must not read that
+                // leftover file as if it were this round's verdict (AC-17).
+                let cell = if s.status == SlotStatus::Failed {
+                    "failed".to_string()
+                } else {
+                    match parsed {
+                        Some(res) => match res.acceptance.iter().find(|a| &a.id == id) {
+                            Some(a) => format!("{:?}", a.status).to_ascii_lowercase(),
+                            None => "not reported".to_string(),
+                        },
+                        None => "missing".to_string(),
+                    }
                 };
                 compact.push(format!("{}: {cell}", short_agent(&s.id)));
                 cells.push(format!(
@@ -10006,6 +10031,29 @@ fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: Option<&Confi
             .clone()
             .unwrap_or_else(|| format!("review-{}.md", s.id));
         let path = swarm.artifact(&st.id, &artifact);
+        if s.status == SlotStatus::Failed {
+            // Same failed-slot predicate as the criteria grid above: a stale artifact from
+            // a previous round of this slot id must not read as this round's verdict.
+            out.push(Record {
+                kind: RecordKind::Error,
+                glyph: "!",
+                verb: s.id.clone(),
+                head: format!("{} · failed", s.id),
+                summary: "review slot failed or produced no review".to_string(),
+                body: Vec::new(),
+                time: None,
+                elapsed: None,
+                actor: None,
+                ok: Some(false),
+                source: SourceId::Document {
+                    path: path.to_string_lossy().into_owned(),
+                    start: 0,
+                    end: 0,
+                },
+                folded_by_default: false,
+            });
+            continue;
+        }
         match std::fs::read_to_string(&path) {
             Ok(text) if !text.trim().is_empty() => {
                 let res = workflow::review_result::parse_review(&text);
@@ -11679,6 +11727,85 @@ mod labels {
         assert!(!app.raw_mode, "R must be a no-op on Activity");
     }
 
+    /// AC-14: `R` followed by a scroll key in the *same* input burst must scroll the
+    /// mode the toggle just switched *to*, not the mode a not-yet-run paint last set
+    /// `App::diff_raw_active` from. The input loop drains a whole burst before the next
+    /// paint runs, so a naive read of that paint-time field lagged the toggle by one
+    /// frame (round-review finding, AC-14) — `end_for_main`/`home_for_main`/
+    /// `scroll_diff_by` must derive raw-vs-parsed fresh from `raw_mode` and the diff
+    /// records handed to them instead.
+    #[test]
+    fn r_then_end_in_one_burst_scrolls_the_mode_just_toggled_to() {
+        let st = RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            std::path::PathBuf::from("/x"),
+        );
+        let mut app = test_app();
+        app.open_main(MainTab::Diff);
+        app.raw_mode = false;
+        app.diff_max = 50;
+        app.diff_parsed_max = 30;
+        let diff_records = vec![Record {
+            kind: RecordKind::FileDiff,
+            glyph: "M",
+            verb: "src/a.rs".to_string(),
+            head: "src/a.rs".to_string(),
+            summary: String::new(),
+            body: vec!["+new line".to_string()],
+            time: None,
+            elapsed: None,
+            actor: None,
+            ok: None,
+            source: SourceId::Diff {
+                worktree: "wt".to_string(),
+                path: "src/a.rs".to_string(),
+            },
+            folded_by_default: true,
+        }];
+        let sw = SparPaths::new(std::path::Path::new("/x"));
+        let mut root = PathBuf::from("/x");
+
+        handle_key(
+            &mut app,
+            KeyCode::Char('R'),
+            KeyModifiers::empty(),
+            &sw,
+            &[],
+            &[],
+            &[],
+            Some(&st),
+            &diff_records,
+            &mut root,
+            None,
+        )
+        .unwrap();
+        assert!(app.raw_mode, "R must have switched to raw mode");
+
+        handle_key(
+            &mut app,
+            KeyCode::Char('G'),
+            KeyModifiers::empty(),
+            &sw,
+            &[],
+            &[],
+            &[],
+            Some(&st),
+            &diff_records,
+            &mut root,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            app.diff_scroll, app.diff_max,
+            "End must scroll the raw viewport, since R just switched to raw"
+        );
+        assert_eq!(
+            app.diff_parsed_scroll, 0,
+            "End must not touch the parsed viewport once raw mode is active"
+        );
+    }
+
     /// `f` toggles the Activity selected-slot filter on and off.
     #[test]
     fn f_toggles_the_activity_slot_filter() {
@@ -12057,6 +12184,23 @@ mod render_stability {
                     paint_with(w, h, &[], &[], Some(&st), |a| {
                         a.palette = Some(Palette::default())
                     });
+                }
+            }
+        }
+        // AC-20: the sweep above only ever painted the default (`Log`) tab. Every
+        // structured-view tab must survive the same exhaustive width/height range —
+        // a lower-resolution, hand-picked grid over a handful of tabs is not a
+        // substitute (round-review finding: it let a real out-of-range Rect through).
+        for tab in [
+            MainTab::Activity,
+            MainTab::Diff,
+            MainTab::Plan,
+            MainTab::Review,
+            MainTab::Shell,
+        ] {
+            for w in (1..=200).step_by(3) {
+                for h in (1..=60).step_by(2) {
+                    paint_with(w, h, &[], &[], Some(&st), |a| a.open_main(tab));
                 }
             }
         }
@@ -12472,6 +12616,55 @@ mod render_stability {
                 .iter()
                 .any(|r| r.kind == RecordKind::Section && r.verb == "phase"),
             "no phase boundary record: {records:#?}"
+        );
+    }
+
+    /// AC-7: two slots sharing a role — here, two `Reviewer`s both `Done` with nothing
+    /// to say (`quiet` empty) — render identical role/status/quiet text. Keying identity
+    /// off `role_label` alone collided them onto one `SourceId::Activity`, so folding or
+    /// selecting one silently acted on both (round-review finding, reproduced live: a
+    /// 7-slot run with both `Reviewer` slots `Done`). The slot id is what tells them
+    /// apart, so it must be the actor, not the shared role name.
+    #[test]
+    fn activity_agents_band_keys_identity_on_slot_id_not_shared_role_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let swarm = SparPaths::new(dir.path());
+        let mut st = run_with(Phase::Review, 7);
+        // Both reviewer slots (indices 5 and 6) `Done`, matching the reproduced case
+        // exactly: `run_with` otherwise leaves the last slot `Running`.
+        st.slots[5].status = SlotStatus::Done;
+        st.slots[6].status = SlotStatus::Done;
+        let slot5_id = st.slots[5].id.clone();
+        let slot6_id = st.slots[6].id.clone();
+        assert_eq!(
+            role_label(st.slots[5].role),
+            role_label(st.slots[6].role),
+            "the two slots must share a role for this regression to be meaningful"
+        );
+
+        let records = activity_feed(
+            &swarm,
+            Some(&st),
+            &QuotaStore::default(),
+            &[],
+            &std::collections::HashMap::new(),
+            &Config::default(),
+        );
+        let agent_rows: Vec<&Record> = records
+            .iter()
+            .filter(|r| {
+                r.actor.as_deref() == Some(slot5_id.as_str())
+                    || r.actor.as_deref() == Some(slot6_id.as_str())
+            })
+            .collect();
+        assert_eq!(
+            agent_rows.len(),
+            2,
+            "both reviewer slots must render their own row, {records:#?}"
+        );
+        assert_ne!(
+            agent_rows[0].source, agent_rows[1].source,
+            "identical role/status text must not collide onto one source identity"
         );
     }
 
@@ -13283,7 +13476,7 @@ mod render_stability {
         app.diff_max = 50;
 
         app.main_tab = MainTab::Activity;
-        app.scroll_main_by(10, false);
+        app.scroll_main_by(10, false, &[]);
         assert_eq!(
             app.stream_scroll, 10,
             "Activity's overview body must scroll stream_scroll"
@@ -13294,7 +13487,7 @@ mod render_stability {
         );
 
         app.main_tab = MainTab::Diff;
-        app.scroll_main_by(10, false);
+        app.scroll_main_by(10, false, &[]);
         assert_eq!(
             app.stream_scroll, 20,
             "Diff's overview body must scroll stream_scroll"
@@ -13307,7 +13500,7 @@ mod render_stability {
         // Once a run is selected, Activity/Diff render their own bodies again and own
         // their own run-scoped scroll state.
         app.main_tab = MainTab::Activity;
-        app.scroll_main_by(10, true);
+        app.scroll_main_by(10, true, &[]);
         assert_eq!(
             app.bus_scroll, 10,
             "Activity with a run selected must scroll bus_scroll"
@@ -14801,6 +14994,65 @@ mod render_stability {
                 .iter()
                 .all(|r| r.summary.contains("failed or produced no review")),
             "{blockers:#?}"
+        );
+    }
+
+    /// AC-17: a reviewer slot the executor marked `Failed` mirrors the gate's own
+    /// `!review_ok` (`implement.rs`'s `if !review_ok || missing_or_empty`) even when a
+    /// *stale* `review-<slot>.md` from an earlier round of this same slot id is still on
+    /// disk showing `approve` — the gate blocks on this regardless of that leftover file,
+    /// so reading only the file (never `SlotState.status`) would under-report the
+    /// blocker the gate actually enforces.
+    #[test]
+    fn review_failed_reviewer_slot_overrides_a_stale_approved_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let swarm = SparPaths::new(dir.path());
+        let mut st = run_with(Phase::Review, 7);
+        st.slots[5].status = SlotStatus::Failed;
+        swarm.ensure_run_dirs(&st.id).unwrap();
+        std::fs::write(
+            swarm.artifact(&st.id, "test-contract.md"),
+            "AC-1: does a thing\n",
+        )
+        .unwrap();
+        // Stale from a prior round of this same slot id: the current dispatch failed
+        // before writing anything, but the file from a previous success is still here.
+        std::fs::write(
+            swarm.artifact(&st.id, "review-slot-5.md"),
+            "## Verdict\napprove\n\n## Acceptance\nAC-1: pass\n",
+        )
+        .unwrap();
+        std::fs::write(
+            swarm.artifact(&st.id, "review-slot-6.md"),
+            "## Verdict\napprove\n\n## Acceptance\nAC-1: pass\n",
+        )
+        .unwrap();
+        let cfg = Config::default();
+        let records = review_records(&swarm, Some(&st), Some(&cfg));
+
+        let grid_row = records
+            .iter()
+            .find(|r| matches!(r.kind, RecordKind::Criterion))
+            .expect("one Criterion record for AC-1");
+        assert!(
+            grid_row.body[0].contains("failed"),
+            "the failed slot's cell must read `failed`, not the stale `pass`: {:?}",
+            grid_row.body
+        );
+
+        let failed_verdict = records
+            .iter()
+            .find(|r| r.verb == "slot-5")
+            .expect("a verdict record for the failed slot");
+        assert_eq!(
+            failed_verdict.kind,
+            RecordKind::Error,
+            "a failed slot must read as a blocker regardless of its stale artifact: {failed_verdict:?}"
+        );
+        assert!(
+            !failed_verdict.summary.contains("pass")
+                && !failed_verdict.body.iter().any(|l| l.contains("approve")),
+            "must not surface the stale file's own approve/pass text: {failed_verdict:?}"
         );
     }
 
