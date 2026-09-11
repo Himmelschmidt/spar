@@ -12395,6 +12395,58 @@ mod render_stability {
         assert_eq!(back, second);
     }
 
+    /// AC-12: `path_shortener_for` is built fresh per call from the *browsed*
+    /// project's own root plus its own run's worktrees — the regression this
+    /// guards is the old `PROJECT_PREFIX` `OnceLock`, set once per process from
+    /// whichever project was first browsed, which stayed wrong for every other
+    /// project for the rest of the session. Two projects in one session must each
+    /// shorten against their own root, never the other's.
+    #[test]
+    fn path_shortening_is_run_local_across_two_projects_in_one_session() {
+        let swarm_a = SparPaths::new(std::path::Path::new("/projects/alpha"));
+        let mut st_a = run_with(Phase::Dispatch, 1);
+        st_a.worktrees.push(state::WorktreeRecord {
+            slot_id: st_a.slots[0].id.clone(),
+            path: PathBuf::from("/projects/alpha-worktree"),
+            branch: "spar/a".into(),
+        });
+        let shortener_a = path_shortener_for(&swarm_a, Some(&st_a));
+        assert_eq!(
+            shortener_a.shorten("/projects/alpha-worktree/src/lib.rs"),
+            "src/lib.rs"
+        );
+
+        let swarm_b = SparPaths::new(std::path::Path::new("/projects/bravo"));
+        let mut st_b = run_with(Phase::Dispatch, 1);
+        st_b.worktrees.push(state::WorktreeRecord {
+            slot_id: st_b.slots[0].id.clone(),
+            path: PathBuf::from("/projects/bravo-worktree"),
+            branch: "spar/b".into(),
+        });
+        let shortener_b = path_shortener_for(&swarm_b, Some(&st_b));
+        assert_eq!(
+            shortener_b.shorten("/projects/bravo-worktree/src/lib.rs"),
+            "src/lib.rs"
+        );
+
+        // Neither shortener knows about the other project's worktree root at all —
+        // browsing bravo second must not leave alpha's root reachable, or vice versa.
+        assert!(shortener_a
+            .shorten("/projects/bravo-worktree/src/lib.rs")
+            .starts_with('/'));
+        assert!(shortener_b
+            .shorten("/projects/alpha-worktree/src/lib.rs")
+            .starts_with('/'));
+
+        // And the first shortener built is unaffected by the second one existing:
+        // rebuilding it from the same inputs still shortens against alpha, not bravo.
+        let shortener_a_again = path_shortener_for(&swarm_a, Some(&st_a));
+        assert_eq!(
+            shortener_a_again.shorten("/projects/alpha-worktree/src/lib.rs"),
+            "src/lib.rs"
+        );
+    }
+
     /// AC-7: an activity record's identity comes from its own content, not from
     /// where it lands in the feed. Two builds of the same event content, at
     /// different positions, must resolve to the same `SourceId` so fold state and
@@ -14649,6 +14701,56 @@ mod render_stability {
         );
         assert!(grid_row.body[0].contains("pass"), "{:?}", grid_row.body);
         assert!(grid_row.body[0].contains("fail"), "{:?}", grid_row.body);
+    }
+
+    /// AC-17: the per-reviewer blocking reasons must relax an `unverified` AC
+    /// exactly the same cases `acceptance_blocks_ship`/`acceptance_block_reasons`
+    /// do — `require_all_criteria = false` clears it, `= true` keeps it blocking.
+    /// A second implementation of the predicate here would be able to drift from
+    /// the actual gate.
+    #[test]
+    fn review_blockers_relax_unverified_only_when_require_all_criteria_is_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let swarm = SparPaths::new(dir.path());
+        let st = run_with(Phase::Review, 7);
+        swarm.ensure_run_dirs(&st.id).unwrap();
+        std::fs::write(
+            swarm.artifact(&st.id, "test-contract.md"),
+            "AC-1: does a thing\n",
+        )
+        .unwrap();
+        std::fs::write(
+            swarm.artifact(&st.id, "review-slot-5.md"),
+            "## Verdict\napprove\n\n## Acceptance\nAC-1: unverified\n",
+        )
+        .unwrap();
+
+        let mut cfg = Config::default();
+        cfg.review.require_all_criteria = false;
+        let relaxed = review_records(&swarm, Some(&st), Some(&cfg));
+        let reviewer_row = relaxed
+            .iter()
+            .find(|r| r.kind == RecordKind::Doc || r.kind == RecordKind::Error)
+            .expect("one record for the reviewer's own verdict");
+        assert_eq!(
+            reviewer_row.kind,
+            RecordKind::Doc,
+            "an unverified AC must not block when require_all_criteria is false: {:?}",
+            reviewer_row.body
+        );
+
+        cfg.review.require_all_criteria = true;
+        let strict = review_records(&swarm, Some(&st), Some(&cfg));
+        let reviewer_row = strict
+            .iter()
+            .find(|r| r.kind == RecordKind::Doc || r.kind == RecordKind::Error)
+            .expect("one record for the reviewer's own verdict");
+        assert_eq!(
+            reviewer_row.kind,
+            RecordKind::Error,
+            "the same unverified AC must block when require_all_criteria is true: {:?}",
+            reviewer_row.body
+        );
     }
 
     fn diff_records_for(paths: &[(&str, &str)]) -> Vec<Record> {
