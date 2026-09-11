@@ -844,9 +844,29 @@ rail's selection.
   fleet picker over the provider roster (superseding the old "use the CLI" punt for a
   fresh fleet); `P` toggles Home's scope between the current project and everything
   registered.
-- Main tabs: `Log · Activity · Diff · Shell` on the labels row, marked by an accent
-  underline on the rule beneath them, switched with `[` / `]` (Activity carries the
-  `@human` alert badge). Diff is the selected slot's real worktree diff.
+- Main tabs: `Log · Activity · Diff · Plan · Review · Shell` on the labels row, marked
+  by an accent underline on the rule beneath them, switched with `[` / `]` (Activity
+  carries the `@human` alert badge). Every tab but Shell renders typed, folded records
+  (feature 010) through one shared record view, not a raw string: Log is the parsed
+  tool-call/result/thought/prose stream (with real elapsed times where a byte-offset
+  time index exists); Activity is the phase/agent/bus/alert timeline; Diff is the
+  selected slot's real worktree diff, split one record per file, with a global
+  "since you last looked" watermark marking files changed since you last viewed
+  the tab (a slot with no worktree says so rather than falling back to an
+  artifact dump); Plan shows `plan.md`,
+  the plan critique and `test-contract.md` as documents; Review shows one row per
+  `AC-n` criterion plus each reviewer's verdict, sourced from the same gate function
+  `ship` calls. A tool result and a reasoning block are folded by default — `Space`
+  expands the record under the cursor, `A` toggles every record at once, and `R`
+  drops Log/Diff back to the byte-for-byte raw view when a parse ever hides
+  something you need (unavailable on Activity/Plan/Review, which have no single
+  raw source).
+  `J`/`K` move the record cursor to the next/previous record head, `t`/`T` to the
+  next/previous tool call, `e`/`E` to the next/previous error, `}`/`{` to the next/
+  previous phase or document boundary, and `f` toggles Activity's selected-slot filter.
+  At narrow widths (and, once six tabs stop fitting the wide strip's own padding, at
+  wide widths too) every tab abbreviates uniformly (`Log · Act · Diff · Plan · Rev ·
+  Sh`) rather than dropping a tab off the strip.
 - Focus: `1` rail · `2` main (Tab cycles the two). `+` / `_` zoom Main.
 - `:` opens the **command palette** — `approve`/`reject`/`ship`/`confirm`/`reconcile`/
   `takeover`/`implement`/`plan`/`spawn`/`chat`, Tab-completes run ids.
@@ -860,9 +880,10 @@ rail's selection.
   mode** — green banner, rail and every band but the footer collapsed, pane edge to edge.
 - Width bands: `<80` cols Main only (rail folds away, tappable tab strip — phone/SSH);
   `80–119` rail (26 cols) + Main; `>=120` rail 32, the rest of the extra width to Main.
-- Colour: spar paints no page background — it composites onto the terminal's own theme
-  (and its transparency). Backgrounds appear only on chips, gate/alert washes and
-  overlays.
+- Colour: spar paints its own page (`theme::BG`/`BG_OVERLAY` as the ground, U29) —
+  raised bands, sunken output blocks (the tool-output/diff-hunk surface), and the
+  fading gutter of a live block are all mixed against it, at the cost of host-theme
+  transparency.
 
 - `status --json` and every run JSON carry **`base_ref` / `base_commit`** — the ref and commit
   all of the run's slot worktrees were cut from (see **Base ref** above).

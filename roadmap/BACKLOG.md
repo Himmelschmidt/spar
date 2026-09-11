@@ -2,6 +2,33 @@
 
 Unscheduled ideas, grouped by theme. Promote to `roadmap/features/NNN-*.md` when picked up.
 
+## TUI
+
+- **A tool record reads answer-before-question.** `LogRecord::to_record`
+  (`src/record.rs`) puts the merged result preview on the head and pins the
+  command in `body[0]` outside the fold (`has_command_row`), so the Log tab paints
+
+  ```
+  ▸◆ Run   688:test result: ok. 666 passed; 0 failed
+       grep -n "^test result:" artifacts/build-impl.log
+  ```
+
+  The ground truth this feature was specified against is the other order — the
+  call on the head, what came back beneath it (`◆ Run  List first 5 entries in
+  /etc` over `ls -la /etc | head -5` over the output). Skimming currently means
+  reading result fragments as the primary line.
+
+  **Not a one-line swap, which is why it is here and not in 010.** Attempted by
+  hand after the run closed: making the head the argument breaks four tests whose
+  contracts are real — `merged_result_body_keeps_the_real_unshortened_path` and
+  its sibling pin "the head may shorten, the body keeps the persisted bytes", and
+  putting the *shortened result preview* on the head is precisely how `←` previews
+  got shortened at all (AC-12's round-13 fix). Moving the command to the head
+  therefore needs a third slot for a shortened result preview, with byte fidelity
+  delegated to `R` (AC-14) as review-0 already argued it should be. That is a
+  record-model change with its own review, not a late hand-edit against a frozen
+  contract.
+
 ## Remote / persistence architecture
 
 - **Thin-client split (`spar --remote`)** — a local spar TUI talking to a remote spar

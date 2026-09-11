@@ -34,6 +34,18 @@ pub const BG_OVERLAY: Color = Color::Rgb(36, 40, 49);
 /// this is the one colour that must not follow the surface stack.
 pub const INK: Color = Color::Rgb(13, 14, 18);
 
+/// Above [`BG`]: an operator-facing record head and the record cursor row (feature
+/// 010). Raised, not filled — the record still reads as part of the page, just lifted
+/// toward the foreground the way a card sits above a background.
+pub const SURFACE_RAISED: Color = Color::Rgb(24, 26, 34);
+/// Below [`BG`]: a tool result or diff hunk's expanded body (feature 010). Sunken
+/// marks "this is quoted output," the mirror of [`SURFACE_RAISED`]'s "this is
+/// operator-authored."
+pub const SURFACE_SUNKEN: Color = Color::Rgb(9, 10, 13);
+/// A command or path row's own colour (feature 010) — distinct from prose so the
+/// literal text being run or edited doesn't read as narration.
+pub const CODE: Color = Color::Rgb(140, 210, 190);
+
 // ---------------------------------------------------------------------------
 // Text weights
 // ---------------------------------------------------------------------------

@@ -20,6 +20,7 @@ mod process;
 mod provider_ref;
 mod providers;
 mod quota;
+mod record;
 mod registry;
 mod runlock;
 mod sandbox;
@@ -37,6 +38,9 @@ mod util;
 mod workflow;
 mod workspace;
 mod worktree;
+
+#[cfg(test)]
+mod structured_views_contract;
 
 use anyhow::Result;
 use clap::Parser;

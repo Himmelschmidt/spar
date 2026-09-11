@@ -124,6 +124,7 @@ pub fn run(
         let mut slot = executor::init_slot_model(&id, &prov, role, model.clone());
         slot.source = Some(source);
         state.slots.push(slot);
+        let expected_artifact = "plan.md".to_string();
         jobs.push(SlotJob {
             slot_id: id,
             provider: prov,
@@ -133,7 +134,7 @@ pub fn run(
                 "amendment_section".to_string(),
                 plan_amendment_section(&state),
             )]),
-            expected_artifact: Some("plan.md".into()),
+            expected_artifact: Some(expected_artifact),
             model,
         });
     }
@@ -854,6 +855,7 @@ fn continue_locked(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exit
             SlotRole::TestAuthor => continue,
             _ => continue,
         };
+        let expected_artifact = "plan.md".to_string();
         jobs.push(SlotJob {
             slot_id: slot.id.clone(),
             provider: slot.provider.clone(),
@@ -863,7 +865,7 @@ fn continue_locked(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exit
                 "amendment_section".to_string(),
                 amendment_section.clone(),
             )]),
-            expected_artifact: Some("plan.md".into()),
+            expected_artifact: Some(expected_artifact),
             model: None,
         });
     }
@@ -874,6 +876,7 @@ fn continue_locked(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exit
                 slot.source = Some(source);
                 state.slots.push(slot);
             }
+            let expected_artifact = "plan.md".to_string();
             jobs.push(SlotJob {
                 slot_id: id,
                 provider: prov,
@@ -883,7 +886,7 @@ fn continue_locked(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exit
                     "amendment_section".to_string(),
                     amendment_section.clone(),
                 )]),
-                expected_artifact: Some("plan.md".into()),
+                expected_artifact: Some(expected_artifact),
                 model: None,
             });
         }

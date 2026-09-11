@@ -477,6 +477,7 @@ fn execute_prepared(
                 .unwrap_or_else(|| PathBuf::from(n))
         });
         let model = prep.job.model.clone();
+        reset_api_slot_log(&prep.log_path);
         let (ok, err, usage) = crate::api::run_api_slot(&crate::api::runtime::ApiSlotRequest {
             provider_name: &prep.pref.name,
             prompt: &prep.prompt,
@@ -2203,6 +2204,7 @@ fn run_api(
         .as_ref()
         .map(|n| paths.artifact(&state.id, n));
     let model = slot_model_for(Some(state), job);
+    reset_api_slot_log(log_path);
     let (ok, err, usage) = api::run_api_slot(&api::runtime::ApiSlotRequest {
         provider_name: &pref.name,
         prompt,
@@ -2488,6 +2490,20 @@ enum TmuxDecision {
     Failed,
 }
 
+/// Truncate `log_path` and drop any stale `.idx` sidecar before an api-sdk slot's own
+/// `append_log` (`src/api/runtime.rs`) starts writing to it. That writer never touches the
+/// index — it has no `LogWriter`/`stream_to_log` of its own — so a sidecar left over from
+/// an earlier native dispatch of this same slot id, or a re-dispatch reusing this slot's log
+/// path, would otherwise get bisected against api-sdk's freshly-appended text and stamp its
+/// records with another dispatch's timestamps (AC-8).
+fn reset_api_slot_log(log_path: &Path) {
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::File::create(log_path);
+    let _ = std::fs::remove_file(process::log_index_path(log_path));
+}
+
 /// Truncate `log_path` and reset its `.stats.json` sidecar (`paths.rs` derives both from
 /// the same slot id) to a fresh, freshly-touched `StreamStats`, before the tmux pane that
 /// will write to them exists. Extracted so the reset itself — not just `run_tmux`'s tmux
@@ -2500,6 +2516,11 @@ fn reset_tmux_slot_log(log_path: &Path) {
     let mut initial = process::StreamStats::default();
     initial.touch_log();
     let _ = initial.save(log_path);
+    // A tmux pane never writes `stream_to_log`'s offset index, so any `.idx` sidecar here is
+    // leftover from a prior native dispatch that reused this slot's log path. Left in place it
+    // would bisect this round's tmux transcript against a previous round's offsets and stamp
+    // records with fabricated times (AC-8).
+    let _ = std::fs::remove_file(process::log_index_path(log_path));
 }
 
 /// A `done` marker only means success once the agent's pane process has exited.
@@ -3218,6 +3239,39 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&log_path).unwrap(), "");
         let stats = process::StreamStats::load(&log_path).expect("sidecar written");
         assert_eq!(stats.session_id, None);
+    }
+
+    /// AC-8: a `.idx` sidecar left by an earlier *native* dispatch of this slot id must
+    /// not survive into a tmux round reusing the same log path — a tmux pane never writes
+    /// the index, so a leftover one would get bisected against this round's transcript and
+    /// stamp records with the previous dispatch's times.
+    #[test]
+    fn reset_tmux_slot_log_drops_a_stale_offset_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("slot.log");
+        std::fs::write(&log_path, "leftover transcript from a prior native round\n").unwrap();
+        std::fs::write(process::log_index_path(&log_path), "0 1700000000000\n").unwrap();
+
+        reset_tmux_slot_log(&log_path);
+
+        assert!(!process::log_index_path(&log_path).exists());
+    }
+
+    /// AC-8: api-sdk's own `append_log` (`src/api/runtime.rs`) never writes the offset
+    /// index at all, so a stale `.idx` from an earlier native dispatch of this slot id
+    /// must be cleared before it starts appending, or the TUI would bisect api-sdk's
+    /// freshly-appended text against another dispatch's timestamps.
+    #[test]
+    fn reset_api_slot_log_truncates_log_and_drops_a_stale_offset_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("slot.log");
+        std::fs::write(&log_path, "leftover transcript from a prior round\n").unwrap();
+        std::fs::write(process::log_index_path(&log_path), "0 1700000000000\n").unwrap();
+
+        reset_api_slot_log(&log_path);
+
+        assert_eq!(std::fs::read_to_string(&log_path).unwrap(), "");
+        assert!(!process::log_index_path(&log_path).exists());
     }
 
     fn dispatch_opts(prompt: &str) -> SpawnOpts {
