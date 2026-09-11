@@ -4,6 +4,25 @@ All notable changes to spar are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Reloading a run's settings can no longer quietly change which agent reviews
+  it.** A recent fix that let you re-assign a seat mid-run could, when re-stating
+  a review panel, point both reviewer seats at the same agent — turning a
+  deliberate two-vendor review into the same vendor twice, without saying so, and
+  then blaming the wrong vendor when one hit a rate limit. Reloading now adjusts
+  only which model a seat uses; changing who fills a seat is a separate operation,
+  and a mismatch is refused outright rather than written.
+
+- **Changing which agent or model a run uses now actually changes it.** Asking a
+  run that had already started to reload its settings updated the saved settings
+  but left the existing seats on whatever they were first given, so the run
+  carried on using the old one — and reported the old one back to you while doing
+  it. Seats that have not started yet are now re-assigned properly; a seat that is
+  mid-flight is deliberately left alone, since that is the one whose assignment is
+  already in use.
+
+
 ### Added
 
 - **Runs now survive the session that started them.** Starting a run in the

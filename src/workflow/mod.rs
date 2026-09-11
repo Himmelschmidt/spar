@@ -37,6 +37,11 @@ pub struct CommonOpts {
     /// `--accept-contract`: adopt a `test-contract.md` that drifted under the previous
     /// round. Without it, a re-entry that would re-freeze a tampered contract refuses.
     pub accept_contract: bool,
+    /// `--reload-config`: this re-entry resolved a fresh `Config` rather than reading
+    /// the run's frozen one (O27), so seats that already exist are re-resolved from it
+    /// instead of keeping the provider they were minted with. Without this, `--role` on
+    /// a run whose slots exist silently changes `config.json` and nothing else.
+    pub reload_config: bool,
 }
 
 impl Default for CommonOpts {
@@ -50,6 +55,7 @@ impl Default for CommonOpts {
             detach: false,
             json: false,
             backend: Backend::Auto,
+            reload_config: false,
             dry_run: false,
             big: false,
             max_rounds: None,
