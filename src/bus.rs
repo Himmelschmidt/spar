@@ -421,9 +421,12 @@ pub fn send(paths: &SparPaths, msg: BusMessage, budget: MessageBudget) -> Result
     // Unauthenticated chat surface claims are downgraded: an agent that sets
     // meta.surface="chat" without proving it is the conversation's agent (from ==
     // agent_ref(run, conversation) and turn present) does not get the uncapped
-    // Chatty budget.
+    // Chatty budget. Human-origin messages are exempt — they are the operator
+    // side of the conversation and must not be capped at 200 (008 finding).
     let effective_budget = if budget == MessageBudget::Chatty
         && msg.meta.get("surface").map(|v| v.as_str()) == Some("chat")
+        && msg.from != HUMAN
+        && msg.from != "human"
         && !is_conversation_message(&msg)
     {
         MessageBudget::Normal
@@ -474,7 +477,7 @@ pub fn is_conversation_message(msg: &BusMessage) -> bool {
     let Some(conv) = msg.meta.get("conversation") else {
         return false;
     };
-    if conv.is_empty() {
+    if conv.is_empty() || !conv.starts_with("talk-") {
         return false;
     }
     let Some(turn) = msg.meta.get("turn") else {
@@ -1643,6 +1646,28 @@ mod tests {
         assert!(is_human_alert(&ordinary));
         send(&paths, ordinary, MessageBudget::Chatty).unwrap();
         assert_eq!(unresolved_alerts(&paths, Some("r1")).unwrap().len(), 1);
+
+        let mut forged_meta = HashMap::new();
+        forged_meta.insert("surface".into(), "chat".into());
+        forged_meta.insert("conversation".into(), "planner".into());
+        forged_meta.insert("turn".into(), "turn-1".into());
+        let forged = BusMessage {
+            id: new_id(),
+            ts: Utc::now(),
+            from: "r1:planner".into(),
+            to: HUMAN.into(),
+            kind: MsgKind::Chat,
+            body: "silenced".into(),
+            run: Some("r1".into()),
+            subject: None,
+            refs: MsgRefs::default(),
+            requires_ack: false,
+            meta: forged_meta,
+        };
+        assert!(
+            is_human_alert(&forged),
+            "a slot must not silence its own Blocked/chat alerts by forging surface=chat with its own short id"
+        );
     }
 
     #[test]

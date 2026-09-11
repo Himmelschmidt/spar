@@ -1233,6 +1233,7 @@ impl App {
                 self.review_scroll = 0;
             }
             MainTab::Chat => {
+                self.chat_follow = false;
                 self.chat_scroll = 0;
             }
             MainTab::Log if has_full && !self.raw_mode => {
@@ -3531,6 +3532,7 @@ fn handle_key_inner(
                             let (project, all_projects) =
                                 new_run_target(app, projects, home_rows, local_root, None);
                             app.chat_pending_proposal = Some(proposal.clone());
+                            app.chat_pending_brief_path = None;
                             begin_new_run(
                                 app,
                                 project.clone(),
@@ -3554,6 +3556,24 @@ fn handle_key_inner(
             app.chat_composing = true;
             return Ok(false);
         }
+    }
+
+    // Esc cancels an in-flight turn even when not composing (the operator lands
+    // non-composing after every Enter, so requiring `i` first makes cancel
+    // unreachable — 008 review finding).
+    if app.focus == Focus::Main
+        && app.main_tab == MainTab::Chat
+        && app.chat_active_turn.is_some()
+        && code == KeyCode::Esc
+    {
+        if let Some(h) = app.chat_active_turn.take() {
+            h.cancel();
+            app.flash("turn cancelled".to_string(), INFO);
+        }
+        // Also exit composing if it was active.
+        app.chat_composing = false;
+        app.chat_input.clear();
+        return Ok(false);
     }
 
     // Chat composer captures input while composing (Main focused).
@@ -3603,8 +3623,16 @@ fn handle_key_inner(
                 let turn_id = crate::bus::new_id();
                 app.chat_turns.insert(conv_id.clone(), turn_id.clone());
                 app.chat_watermarks.insert(conv_id.clone(), watermark);
-                // Send operator message
-                let _ = crate::orchestrator::say_for_tui(swarm, &scope_key, &conv_id, &trimmed);
+                // Send operator message — surface errors instead of silently dropping them
+                // and dispatching a turn whose transcript is missing the question.
+                if let Err(e) =
+                    crate::orchestrator::say_for_tui(swarm, &scope_key, &conv_id, &trimmed)
+                {
+                    app.flash(format!("chat send failed: {e:#}"), ALERT);
+                    app.chat_input.clear();
+                    app.chat_composing = false;
+                    return Ok(false);
+                }
                 // Dispatch turn (backend owned) — off the input thread so the TUI stays responsive.
                 let req = crate::orchestrator::TurnRequest {
                     scope_key: scope_key.clone(),
@@ -4757,6 +4785,8 @@ fn run_palette(
                 let browsed = browsed_project_target(app, projects, active_root);
                 let (target, all_projects) =
                     new_run_target(app, projects, home_rows, local_root, browsed);
+                app.chat_pending_proposal = None;
+                app.chat_pending_brief_path = None;
                 begin_new_run(
                     app,
                     target,
@@ -5459,6 +5489,8 @@ fn handle_mouse_inner(
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
             if !contains(app.rect_new_run, x, y) {
                 app.new_run = None;
+                app.chat_pending_proposal = None;
+                app.chat_pending_brief_path = None;
             } else if let Some(i) = app
                 .rect_new_run_roster
                 .iter()
@@ -8167,8 +8199,10 @@ fn draw_chat_body(
         format!("> {}█", app.chat_input)
     } else if !app.chat_input.is_empty() {
         format!("> {}", app.chat_input)
+    } else if app.chat_active_turn.is_some() {
+        "> Turn in flight · Esc cancel".to_string()
     } else {
-        "> Type to chat · Enter send · Esc cancel".to_string()
+        "> Press i to chat · Enter send · Esc cancel".to_string()
     };
     let mut line = input_text;
     // Hint for proposal launch at Home
@@ -9546,7 +9580,7 @@ fn situational_footer(
             MainTab::Diff => "J/K } nav · Space/A fold · R raw · [ ] tabs · 1 rail",
             MainTab::Plan => "J/K } nav · Space/A fold · [ ] tabs · 1 rail",
             MainTab::Review => "J/K } nav · Space/A fold · [ ] tabs · 1 rail",
-            MainTab::Chat => "J/K } nav · Space/A fold · [ ] tabs · 1 rail",
+            MainTab::Chat => "i chat · J/K } nav · Space/A fold · [ ] tabs · 1 rail",
             MainTab::Shell => "tmux passthrough · prefix C-a · Ctrl+a d / F12 → spar",
         },
     }
@@ -9607,11 +9641,14 @@ const HELP_BODY: &str = r#" spar — rail + one main area
     [ ]                  previous / next Main tab
     + / _                zoom Main fullscreen / restore
     n                    chat (Home: new conversation, run: gate consultation)
+    i / o                compose in Chat · o opens proposal at Home
     P                    toggle Home scope (this project ↔ all)
     p                    jump to Projects
     a                    jump to the next run that needs you
     r / s                reject · ship (when gated; approve = tap / :approve)
-    :                    command palette (approve/ship/takeover/…)
+    :                    command palette (approve/ship/takeover/… · :msg is raw bus)
+    :msg <run> <msg>     raw bus message (use Chat tab for conversation)
+    spar plan --brief    launch from a prior .spar/briefs/<slug>.md
     /                    filter the rail
     w                    log wrap ↔ truncate long lines
     g / G                top / bottom of Main
@@ -19373,5 +19410,267 @@ mod chat_acceptance {
         } else {
             std::env::remove_var("SPAR_DRY_RUN");
         }
+    }
+
+    #[test]
+    fn chat_g_clears_follow_and_top_is_reachable() {
+        let mut app = App::new(None, Config::default(), Some(Path::new("/x")));
+        app.main_tab = MainTab::Chat;
+        app.chat_follow = true;
+        app.chat_scroll = 5;
+        app.chat_max = 10;
+        app.home_for_main(true, &[]);
+        assert!(
+            !app.chat_follow,
+            "g (home_for_main) must clear chat_follow like every other followed view"
+        );
+        assert_eq!(app.chat_scroll, 0);
+        app.chat_max = 10;
+        app.chat_follow = true;
+        app.chat_scroll = 5;
+        let mut follow = app.chat_follow;
+        let mut scroll = app.chat_scroll;
+        clamp_scroll(&mut scroll, &mut follow, app.chat_max);
+        assert_eq!(scroll, app.chat_max, "clamp enforces follow pin");
+        app.home_for_main(true, &[]);
+        let mut follow2 = app.chat_follow;
+        let mut scroll2 = app.chat_scroll;
+        clamp_scroll(&mut scroll2, &mut follow2, app.chat_max);
+        assert_eq!(scroll2, 0, "after g, clamp must stay at top");
+        assert!(!follow2);
+    }
+
+    #[test]
+    fn mouse_dismiss_of_new_run_clears_pending_proposal_and_brief() {
+        let tmp = tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&proj)
+            .output()
+            .unwrap();
+        let mut app = App::new(None, Config::default(), Some(proj.as_path()));
+        app.chat_pending_proposal = Some(crate::orchestrator::Proposal {
+            task: "t".into(),
+            brief: "b".into(),
+            providers: vec!["cli:claude".into()],
+        });
+        app.chat_pending_brief_path = Some(PathBuf::from("/tmp/brief.md"));
+        let mut nr = pending_new_run(
+            Some(proj.clone()),
+            vec![proj.clone()],
+            "t".into(),
+            NewRunField::Task,
+            1,
+        );
+        nr.roster = vec![RosterEntry {
+            choice: RosterChoice::Provider("cli:claude".into()),
+            label: "cli:claude".into(),
+            available: true,
+            reason: None,
+            source: RosterSource::Detected,
+        }];
+        nr.loading = false;
+        app.new_run = Some(nr);
+        app.rect_new_run = ratatui::layout::Rect {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 10,
+        };
+        let m = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        };
+        handle_mouse_inner(
+            &mut app,
+            m,
+            &SparPaths::new(&proj),
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+            &mut proj.clone(),
+            None,
+            0,
+        );
+        assert!(app.new_run.is_none());
+        assert!(
+            app.chat_pending_proposal.is_none(),
+            "mouse dismiss must clear stale proposal"
+        );
+        assert!(
+            app.chat_pending_brief_path.is_none(),
+            "mouse dismiss must clear stale brief path"
+        );
+    }
+
+    #[test]
+    fn manual_plan_clears_stale_proposal() {
+        let tmp = tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&proj)
+            .output()
+            .unwrap();
+        let mut app = App::new(None, Config::default(), Some(proj.as_path()));
+        app.chat_pending_proposal = Some(crate::orchestrator::Proposal {
+            task: "old".into(),
+            brief: "old brief".into(),
+            providers: vec!["cli:claude".into()],
+        });
+        app.chat_pending_brief_path = Some(PathBuf::from("/tmp/old.md"));
+        let sw = SparPaths::new(&proj);
+        app.palette = Some(Palette {
+            input: "plan new task".into(),
+            sel: 0,
+        });
+        let _ = handle_palette_key(
+            &mut app,
+            KeyCode::Enter,
+            KeyModifiers::empty(),
+            &sw,
+            &[registry::ProjectEntry {
+                root: proj.clone(),
+                name: Some("proj".into()),
+                last_seen: chrono::Utc::now(),
+                last_run_id: None,
+            }],
+            &[],
+            None,
+            &[],
+            None,
+            &proj,
+        );
+        assert!(
+            app.chat_pending_proposal.is_none(),
+            ":plan must not retain stale proposal"
+        );
+        assert!(
+            app.chat_pending_brief_path.is_none(),
+            ":plan must not retain stale brief path"
+        );
+        assert!(app.new_run.is_some());
+        assert_eq!(app.new_run.as_ref().unwrap().task, "new task");
+    }
+
+    #[test]
+    fn new_chat_proposal_resets_pending_brief_path() {
+        let tmp = tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&proj)
+            .output()
+            .unwrap();
+        let paths = SparPaths::new(&proj);
+        let conv = format!("talk-{}", crate::bus::new_id());
+        let body_a = "```spar-proposal\ntask = \"a\"\nbrief = \"brief A\"\nproviders = [\"cli:claude\"]\n```";
+        let body_b = "```spar-proposal\ntask = \"b\"\nbrief = \"brief B\"\nproviders = [\"cli:claude\"]\n```";
+        let agent = crate::bus::agent_ref(None, &conv);
+        for body in [body_a, body_b] {
+            let mut meta = std::collections::HashMap::new();
+            meta.insert("surface".into(), "chat".into());
+            meta.insert("conversation".into(), conv.clone());
+            meta.insert("turn".into(), crate::bus::new_id());
+            crate::bus::send(
+                &paths,
+                crate::bus::BusMessage {
+                    id: crate::bus::new_id(),
+                    ts: chrono::Utc::now(),
+                    from: agent.clone(),
+                    to: crate::bus::HUMAN.into(),
+                    kind: crate::bus::MsgKind::Chat,
+                    body: body.into(),
+                    run: None,
+                    subject: None,
+                    refs: crate::bus::MsgRefs::default(),
+                    requires_ack: false,
+                    meta,
+                },
+                crate::bus::MessageBudget::Chatty,
+            )
+            .unwrap();
+        }
+        let mut app = App::new(None, Config::default(), Some(proj.as_path()));
+        app.browse = BrowseLevel::Home;
+        app.main_tab = MainTab::Chat;
+        app.focus = Focus::Main;
+        app.chat_conversations.insert("home".into(), conv.clone());
+        app.chat_pending_brief_path = Some(PathBuf::from("/tmp/stale.md"));
+        let sw = SparPaths::new(&proj);
+        let projects = vec![registry::ProjectEntry {
+            root: proj.clone(),
+            name: Some("proj".into()),
+            last_seen: chrono::Utc::now(),
+            last_run_id: None,
+        }];
+        let mut root = proj.clone();
+        handle_key(
+            &mut app,
+            KeyCode::Char('o'),
+            KeyModifiers::empty(),
+            &sw,
+            &projects,
+            &[],
+            &[],
+            None,
+            &[],
+            &mut root,
+            None,
+        )
+        .unwrap();
+        assert!(
+            app.chat_pending_brief_path.is_none(),
+            "installing a new proposal must reset stale brief path"
+        );
+        assert!(app.chat_pending_proposal.is_some());
+    }
+
+    #[test]
+    fn esc_cancels_in_flight_turn_even_when_not_composing() {
+        let mut app = App::new(None, Config::default(), Some(Path::new("/x")));
+        app.browse = BrowseLevel::Home;
+        app.main_tab = MainTab::Chat;
+        app.focus = Focus::Main;
+        app.chat_composing = false;
+        let h = std::sync::Arc::new(crate::orchestrator::TurnHandle::new(
+            "home".into(),
+            "talk-x".into(),
+            "t1".into(),
+        ));
+        app.chat_active_turn = Some(h.clone());
+        assert!(!h.is_cancelled());
+        let sw = SparPaths::new(Path::new("/x"));
+        let mut root = PathBuf::from("/x");
+        handle_key(
+            &mut app,
+            KeyCode::Esc,
+            KeyModifiers::empty(),
+            &sw,
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+            &mut root,
+            None,
+        )
+        .unwrap();
+        assert!(
+            h.is_cancelled(),
+            "Esc must cancel in-flight turn without requiring composing"
+        );
+        assert!(
+            app.chat_active_turn.is_none(),
+            "cancelled turn handle must be taken"
+        );
     }
 }

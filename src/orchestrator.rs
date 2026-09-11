@@ -504,7 +504,7 @@ fn dispatch_turn_inner(
     } else {
         false
     };
-    let worktree_existed = !worktree_created && worktree.exists();
+    let _worktree_existed = !worktree_created && worktree.exists();
 
     let slot_id = conv.clone();
     let mut env = vec![
@@ -670,8 +670,12 @@ fn dispatch_turn_inner(
         exit_success,
     );
 
-    if worktree_created && !worktree_existed {
-        let is_dirty = std::process::Command::new("git")
+    if worktree_created && std::env::var("SPAR_ORCHESTRATOR_TEST_DIRTY").as_deref() == Ok("1") {
+        let _ = std::fs::write(worktree.join(".spar-dirty-test"), "dirty");
+    }
+
+    let is_dirty = if worktree.exists() {
+        std::process::Command::new("git")
             .args(["status", "--porcelain"])
             .current_dir(&worktree)
             .output()
@@ -685,13 +689,16 @@ fn dispatch_turn_inner(
                     let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
                     s.parse::<usize>().unwrap_or(0) != 0
                 })
-                .unwrap_or(false);
-        if !is_dirty {
-            let _ = std::process::Command::new("git")
-                .args(["worktree", "remove", "--force", worktree.to_str().unwrap()])
-                .current_dir(&req.project_root)
-                .output();
-        }
+                .unwrap_or(false)
+    } else {
+        false
+    };
+
+    if worktree_created && !is_dirty {
+        let _ = std::process::Command::new("git")
+            .args(["worktree", "remove", "--force", worktree.to_str().unwrap()])
+            .current_dir(&req.project_root)
+            .output();
     }
 
     let stats_loaded = crate::process::StreamStats::load(&log_path)
@@ -707,15 +714,16 @@ fn dispatch_turn_inner(
     };
     let reply = validate_result.ok();
 
+    let worktree_out = if worktree_created || (worktree.exists() && is_dirty) {
+        Some(worktree.clone())
+    } else {
+        None
+    };
     Ok(TurnOutcome {
         success: reply.is_some() && exit_success && error.is_none(),
         error,
         reply,
-        worktree: if worktree_created {
-            Some(worktree)
-        } else {
-            None
-        },
+        worktree: worktree_out,
         stats: Some(stats_loaded),
     })
 }
@@ -1468,6 +1476,54 @@ mod tests {
             .output();
         let _ = std::fs::remove_dir_all(&dirty_wt);
 
+        // Dirty worktree created by turn is preserved via the is_dirty branch with worktree_created=true.
+        // This is the non-vacuous coverage for AC-7: a worktree the turn itself creates must not be force-removed when dirty.
+        std::env::set_var("SPAR_ORCHESTRATOR_TEST_DIRTY", "1");
+        let dirty_created_conv = format!("talk-{}", crate::bus::new_id());
+        let dirty_created_turn = crate::bus::new_id();
+        let dirty_created_wt = proj1.join(".spar/worktrees").join(format!(
+            "talk-{}-{}",
+            dirty_created_conv.trim_start_matches("talk-"),
+            &dirty_created_turn[..8.min(dirty_created_turn.len())]
+        ));
+        let dirty_created_req = TurnRequest {
+            scope_key: "home".into(),
+            conversation_id: dirty_created_conv.clone(),
+            turn_id: dirty_created_turn.clone(),
+            watermark: 0,
+            project_root: proj1.clone(),
+            run_id: None,
+        };
+        let out_dirty_created = dispatch_turn(paths1.clone(), dirty_created_req).unwrap();
+        assert!(
+            out_dirty_created.worktree.is_some(),
+            "dirty worktree created by turn must return Some"
+        );
+        assert!(
+            dirty_created_wt.exists(),
+            "dirty worktree created by turn must be preserved, but {dirty_created_wt:?} was removed"
+        );
+        let status2 = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&dirty_created_wt)
+            .output()
+            .unwrap();
+        assert!(
+            !status2.stdout.is_empty(),
+            "preserved worktree created by turn should still be dirty"
+        );
+        std::env::remove_var("SPAR_ORCHESTRATOR_TEST_DIRTY");
+        let _ = std::process::Command::new("git")
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                dirty_created_wt.to_str().unwrap(),
+            ])
+            .current_dir(&proj1)
+            .output();
+        let _ = std::fs::remove_dir_all(&dirty_created_wt);
+
         if let Some(v) = prev_dry {
             std::env::set_var("SPAR_DRY_RUN", v);
         } else {
@@ -1527,5 +1583,40 @@ mod tests {
             evidence2.contains("frozen config unavailable"),
             "must not fallback to live spar.toml"
         );
+    }
+
+    #[test]
+    fn turn_handle_cancel_reaps_child_process_group() {
+        use std::os::unix::process::CommandExt;
+        let mut child = {
+            let mut cmd = std::process::Command::new("sleep");
+            cmd.arg("30");
+            cmd.process_group(0);
+            cmd.spawn().expect("sleep must spawn")
+        };
+        let pid = child.id();
+        let handle = TurnHandle::new("home".into(), "talk-test".into(), "turn-test".into());
+        handle.on_spawn(pid);
+        assert_eq!(handle.get_pid(), Some(pid));
+        handle.cancel();
+        assert!(handle.is_cancelled());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let _ = child.wait();
+            }
+            Ok(None) => {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &format!("-{}", pid)])
+                    .output();
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("cancel did not reap child process group: pid {pid} still alive");
+            }
+            Err(e) => {
+                let _ = child.wait();
+                panic!("try_wait failed: {e}");
+            }
+        }
     }
 }

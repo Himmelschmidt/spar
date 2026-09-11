@@ -178,27 +178,31 @@ fn conversation_reply_is_scoped_and_carries_protocol_metadata() {
 #[test]
 fn conversation_module_never_mentions_operator_only_calls() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let source = std::fs::read_to_string(root.join("src/orchestrator.rs"))
-        .expect("feature 008 must provide src/orchestrator.rs");
-    let body = source.split("#[cfg(test)]").next().unwrap();
-    let code = body
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    for banned in [
+    let banned = [
         "workflow::plan::approve",
         "workflow::plan::reject",
-        "workflow::implement::ship",
+        "ship::",
+        "confirm_winner",
         "cleanup_run",
         "archive_sweep",
         "pick_providers",
         "gates.plan_approved",
         "gates.ship_confirmed",
-    ] {
-        assert!(
-            !code.contains(banned),
-            "src/orchestrator.rs must never call `{banned}`: the operator disposes"
-        );
+    ];
+    for file in ["src/orchestrator.rs", "src/providers/conversation_turn.rs"] {
+        let source = std::fs::read_to_string(root.join(file))
+            .unwrap_or_else(|_| panic!("feature 008 must provide {file}"));
+        let body = source.split("#[cfg(test)]").next().unwrap();
+        let code = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for token in banned {
+            assert!(
+                !code.contains(token),
+                "{file} must never call `{token}`: the operator disposes"
+            );
+        }
     }
 }
