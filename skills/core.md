@@ -836,7 +836,8 @@ rail's selection.
   landing view. `Enter` pushes a level, `Esc` pops one (never quits, and never past
   Home). `Enter` on an agent **takes it over** in the Shell tab. `/` filters the rail
   (Esc clears). The rail is **attention-sorted**: runs at a gate or broken fly a `⚑`
-  and float to the top (and roll up to their project row).
+  and float to the top (and roll up to their project row); a re-sort travels rather
+  than teleports.
 - Home has four bands, always in this order and always present even when empty:
   **needs you** (runs at a gate, ranked by wait time), **running**, **finished since
   last look** (a watermark of what landed while you were away), **start something

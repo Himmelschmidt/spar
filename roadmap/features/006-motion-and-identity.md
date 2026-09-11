@@ -1,7 +1,7 @@
 ---
 id: 6
 title: Motion and visual identity
-status: in-progress
+status: done
 milestone: 6
 effort: M
 priority: medium
@@ -76,11 +76,11 @@ Landed alongside: spar's own page and retuned palette (U29), and the Home chrome
 de-duplication and detail pane (U31), which are not in this feature's original
 scope but were the visible defects blocking any judgement of the motion work.
 
-### Phase B: reserved-space layout widgets
+### Phase B: reserved-space layout widgets — DONE
 
 Fixed-slot layout primitives and skeleton placeholders that fix the gate-button
 (`src/tui.rs:2740-2745`), attention-resort, list-growth and tab-breakpoint shift sources.
-Brings `Tween` and the easing curves with it.
+Brings `Tween` and the easing curves with it. `Tween` is `Tween<T>` with `f32` operations only (U40); `HomeRow::Skeleton` reserves rows under the three scan-backed bands while the first cross-project scan is in flight; `gate_zone` is now affordable from 35 columns (`GATE_ZONE_W`+12) instead of 80; the context band's `METER_ZONE_W`/`STEPPER_MIN_W` makes the stepper width a pure function of layout; the rail re-sorts by adjacent-swap travel over `REORDER_PERIOD` (U39) and the tab strip glides over `STRIP_PERIOD` with per-tab `Rect` interpolation (U41). All four U11 shift sources are now closed.
 
 Now queued behind **010** rather than 005: 010 rebuilds what Main renders, and
 animating a reorder inside a string log viewer would be written twice.
