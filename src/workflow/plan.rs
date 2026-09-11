@@ -179,36 +179,27 @@ fn plan_slot_specs(
     state: &RunState,
     cfg: &Config,
 ) -> Vec<(String, SlotRole, &'static str, String, SeatSource)> {
-    let wf = crate::runspec::SpecWorkflow::Plan;
-    let rows = crate::runspec::spec_rows(wf, cfg);
+    let mut specs = vec![(SlotRole::Planner, "planner", "planner")];
+    if cfg.critic.enabled {
+        specs.push((SlotRole::PlanCritic, "critic", "plan_critic"));
+    }
     let store = crate::quota::QuotaStore::load(&crate::paths::SparPaths::new(&state.project_root))
         .unwrap_or_default();
-    let available: std::collections::HashSet<String> = crate::providers::detect_all()
-        .into_iter()
-        .filter(|r| r.available)
-        .map(|r| r.name)
-        .collect();
-    let mut out = Vec::with_capacity(rows.len());
-    for (idx, (role, _ordinal)) in rows.iter().enumerate() {
-        let (prefix, template) = match *role {
-            SlotRole::Planner => ("planner", "planner"),
-            SlotRole::PlanCritic => ("critic", "plan_critic"),
-            SlotRole::TestAuthor => ("test-author", "test_author"),
-            _ => continue,
-        };
+    let mut out = Vec::with_capacity(specs.len());
+    for (idx, (role, prefix, template)) in specs.into_iter().enumerate() {
         let Some((prov, source)) = crate::backup::resolve_with_backup(
-            *role,
+            role,
             idx,
             idx,
             &state.providers,
             state.pool_origin,
             cfg,
             &store,
-            Some(&available),
+            None,
         )
         .or_else(|| {
             crate::workflow::roles_resolve::resolve_seat(
-                *role,
+                role,
                 idx,
                 idx,
                 &state.providers,
@@ -219,7 +210,7 @@ fn plan_slot_specs(
             continue;
         };
         let id = format!("{prefix}-{}", sanitize_slot(&prov));
-        out.push((id, *role, template, prov, source));
+        out.push((id, role, template, prov, source));
     }
     out
 }

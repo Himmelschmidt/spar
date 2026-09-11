@@ -646,19 +646,14 @@ fn prepare_implement_slots(
         anyhow::bail!("no provider resolved for implementer");
     }
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-    let available: std::collections::HashSet<String> = crate::providers::detect_all()
-        .into_iter()
-        .filter(|r| r.available)
-        .map(|r| r.name)
-        .collect();
     for seat in seats {
         let mut provider = seat.provider.clone();
         let mut source = seat.source;
         let mut model = seat.model.clone();
-        if !crate::backup::is_provider_eligible(&provider, &store, Some(&available)) {
+        if !crate::backup::is_provider_eligible(&provider, &store, None) {
             let ordinal = if seat.role == SlotRole::Reviewer {
                 seat.seat
-                    .trim_start_matches("reviewer-")
+                    .trim_start_matches("review-")
                     .split('-')
                     .next()
                     .and_then(|s| s.parse::<usize>().ok())
@@ -667,7 +662,7 @@ fn prepare_implement_slots(
                 0
             };
             if let Some(backup_raw) = crate::backup::backup_for_role(seat.role, ordinal, cfg) {
-                if crate::backup::is_provider_eligible(&backup_raw, &store, Some(&available)) {
+                if crate::backup::is_provider_eligible(&backup_raw, &store, None) {
                     if let Ok(pin) = crate::runspec::Pin::parse(&backup_raw) {
                         provider = pin.display();
                         source = crate::state::SeatSource::Backup;
