@@ -30,6 +30,11 @@ pub const BREATHE_PERIOD: Duration = Duration::from_millis(900);
 /// One full traversal of a [`sweep`] highlight across a label.
 pub const SWEEP_PERIOD: Duration = Duration::from_millis(1600);
 
+/// One reorder: how long a rail row takes to travel to its new rank.
+pub const REORDER_PERIOD: Duration = Duration::from_millis(220);
+/// One tab-strip placement change.
+pub const STRIP_PERIOD: Duration = Duration::from_millis(180);
+
 /// The motion time origin. One per `App`, created at startup and never reset:
 /// every animation derives its position from the same instant, so two effects
 /// with the same period stay in phase for the life of the process instead of
@@ -91,6 +96,88 @@ pub fn frame<'a>(frames: &[&'a str], phase: f32) -> Option<&'a str> {
     let n = frames.len();
     let i = (phase.clamp(0.0, 1.0) * n as f32) as usize;
     Some(frames[i.min(n - 1)])
+}
+
+/// Cubic ease in and out: slow at both ends, fast through the middle.
+pub fn ease_in_out(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    if t < 0.5 {
+        4.0 * t * t * t
+    } else {
+        let u = -2.0 * t + 2.0;
+        1.0 - u * u * u / 2.0
+    }
+}
+
+/// Cubic ease out: fast from the start, settling at the end.
+#[allow(dead_code)]
+pub fn ease_out(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
+}
+
+/// A value travelling from one number to another over a fixed duration, read off
+/// the wall clock like everything else in this module.
+#[derive(Debug, Clone)]
+pub struct Tween<T> {
+    from: T,
+    to: T,
+    start: Instant,
+    dur: Duration,
+}
+
+impl Tween<f32> {
+    /// A tween that is already where it is going. This is the state a freshly
+    /// constructed `App` is in, so a single-frame render (every `render_stability`
+    /// paint) sees final positions and never a first frame frozen at `from`.
+    pub fn settled(v: f32) -> Self {
+        Self {
+            from: v,
+            to: v,
+            start: Instant::now(),
+            dur: Duration::ZERO,
+        }
+    }
+
+    /// Aim at a new value, starting from wherever this tween is *right now* —
+    /// never from `from`, or retargeting mid-flight snaps backwards.
+    pub fn retarget(&mut self, to: f32, dur: Duration, now: Instant) {
+        let cur = self.value(now);
+        self.from = cur;
+        self.to = to;
+        self.start = now;
+        self.dur = dur;
+    }
+
+    pub fn value(&self, now: Instant) -> f32 {
+        if self.dur.is_zero() {
+            return self.to;
+        }
+        let elapsed = now.duration_since(self.start).as_secs_f32();
+        let total = self.dur.as_secs_f32();
+        if total <= 0.0 {
+            return self.to;
+        }
+        let t = (elapsed / total).clamp(0.0, 1.0);
+        let e = ease_in_out(t);
+        self.from + (self.to - self.from) * e
+    }
+
+    pub fn done(&self, now: Instant) -> bool {
+        if self.dur.is_zero() {
+            return true;
+        }
+        now.duration_since(self.start) >= self.dur
+    }
+
+    /// Finish immediately, at `to`. Used when the window loses focus: an
+    /// unfocused window animates nothing, and the alternative to settling is a
+    /// frame frozen halfway that nothing will repaint.
+    pub fn settle(&mut self) {
+        self.from = self.to;
+        self.dur = Duration::ZERO;
+        self.start = Instant::now();
+    }
 }
 
 /// Brightness of cell `i` of `width` under a highlight travelling left to right,

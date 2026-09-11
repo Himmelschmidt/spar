@@ -428,6 +428,12 @@ enum HomeRow {
     Project(usize, PathBuf),
     /// Band 4's action row — opens the Phase D new-run surface.
     NewRun,
+    /// A placeholder shown while the first cross-project scan is in flight.
+    /// Reserved from the layout, not the content (U41).
+    Skeleton {
+        band: HomeBand,
+        slot: usize,
+    },
 }
 
 /// Home's scope: everything registered, or one project. Filters which rows land in
@@ -453,12 +459,15 @@ struct ProjectStat {
 struct HomeData {
     rows: Vec<HomeRow>,
     project_stats: Vec<ProjectStat>,
+    loading: bool,
 }
 
 /// Per-band cap on rendered rows, so a thousand-run workspace does not build a
 /// thousand `ListItem`s a frame. Band 1 (`NeedsMe`) is exempt — the cap must never
 /// hide something that wants the operator.
 const HOME_BAND_CAP: usize = 50;
+
+const HOME_SKELETON_ROWS: usize = 3;
 
 /// Field the Phase D new-run modal is currently editing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -724,6 +733,9 @@ struct App {
     /// selected-slot view already, so filtering only ever applies to Activity
     /// (correction #7).
     activity_slot_filter: Option<usize>,
+    rail_motion: RailMotion,
+    tab_strip: TabStripMotion,
+    selected_run_key: Option<String>,
 }
 
 /// A gate action reachable by both a key and a tappable button.
@@ -903,7 +915,20 @@ impl App {
             diff_parsed_max: 0,
             diff_raw_active: true,
             activity_slot_filter: None,
+            rail_motion: RailMotion::new(),
+            tab_strip: TabStripMotion::new(),
+            selected_run_key: None,
         }
+    }
+
+    fn motion_in_flight(&self) -> bool {
+        let now = Instant::now();
+        self.rail_motion.is_animating(now) || self.tab_strip.is_animating(now)
+    }
+
+    fn settle_motion(&mut self) {
+        self.rail_motion.settle();
+        self.tab_strip.settle();
     }
 
     fn flash(&mut self, msg: impl Into<String>, color: Color) {
@@ -957,11 +982,12 @@ impl App {
         self.bus_follow = true;
     }
 
-    fn select_run(&mut self, idx: usize, n: usize) {
-        if n == 0 {
+    fn select_run(&mut self, idx: usize, runs: &[state::RunSummary]) {
+        if runs.is_empty() {
             return;
         }
-        self.selected_run = idx.min(n - 1);
+        self.selected_run = idx.min(runs.len() - 1);
+        self.selected_run_key = runs.get(self.selected_run).map(run_row_key);
         self.selected_slot = 0;
         self.reset_stream_view();
         self.reset_bus_view();
@@ -1422,8 +1448,9 @@ impl Snapshot {
             abandoned: false,
             heartbeats: std::collections::HashMap::new(),
             home: HomeData {
-                rows: build_home_rows(&[], &[], &HomeScope::All, now, now),
+                rows: build_home_rows(&[], &[], &HomeScope::All, now, now, true),
                 project_stats: Vec::new(),
+                loading: true,
             },
             log_stats: None,
         }
@@ -1695,6 +1722,7 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
                 &sel.home_scope,
                 sel.home_watermark,
                 Utc::now(),
+                false,
             )
         } else {
             Vec::new()
@@ -1702,6 +1730,7 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
         HomeData {
             rows,
             project_stats,
+            loading: false,
         }
     } else {
         HomeData::default()
@@ -1963,6 +1992,7 @@ fn build_home_rows(
     scope: &HomeScope,
     watermark: DateTime<Utc>,
     now: DateTime<Utc>,
+    loading: bool,
 ) -> Vec<HomeRow> {
     let mut needs_me: Vec<state::RunSummary> = Vec::new();
     let mut running: Vec<state::RunSummary> = Vec::new();
@@ -2007,23 +2037,50 @@ fn build_home_rows(
 
     let mut rows = Vec::new();
     rows.push(HomeRow::Header(HomeBand::NeedsMe));
-    push_home_band(&mut rows, HomeBand::NeedsMe, &needs_me, now, None);
+    if loading {
+        for slot in 0..HOME_SKELETON_ROWS {
+            rows.push(HomeRow::Skeleton {
+                band: HomeBand::NeedsMe,
+                slot,
+            });
+        }
+    } else {
+        push_home_band(&mut rows, HomeBand::NeedsMe, &needs_me, now, None);
+    }
     rows.push(HomeRow::Header(HomeBand::Running));
-    push_home_band(
-        &mut rows,
-        HomeBand::Running,
-        &running,
-        now,
-        Some(HOME_BAND_CAP),
-    );
+    if loading {
+        for slot in 0..HOME_SKELETON_ROWS {
+            rows.push(HomeRow::Skeleton {
+                band: HomeBand::Running,
+                slot,
+            });
+        }
+    } else {
+        push_home_band(
+            &mut rows,
+            HomeBand::Running,
+            &running,
+            now,
+            Some(HOME_BAND_CAP),
+        );
+    }
     rows.push(HomeRow::Header(HomeBand::Finished));
-    push_home_band(
-        &mut rows,
-        HomeBand::Finished,
-        &finished,
-        now,
-        Some(HOME_BAND_CAP),
-    );
+    if loading {
+        for slot in 0..HOME_SKELETON_ROWS {
+            rows.push(HomeRow::Skeleton {
+                band: HomeBand::Finished,
+                slot,
+            });
+        }
+    } else {
+        push_home_band(
+            &mut rows,
+            HomeBand::Finished,
+            &finished,
+            now,
+            Some(HOME_BAND_CAP),
+        );
+    }
     rows.push(HomeRow::Header(HomeBand::StartNew));
     rows.push(HomeRow::NewRun);
     for (i, proj) in projects.iter().enumerate() {
@@ -2214,6 +2271,11 @@ fn home_detail(
                 root.display(),
             )
         }
+        HomeRow::Skeleton { band, .. } => format!(
+            "\n  {}\n\n  scanning {}…\n",
+            home_band_label(*band),
+            home_band_label(*band).to_lowercase()
+        ),
     };
     format!("{body}{HOME_ACTIONS}")
 }
@@ -2270,6 +2332,18 @@ fn relative_wait(d: Duration) -> String {
     }
 }
 
+fn run_row_key(run: &state::RunSummary) -> String {
+    format!("run:{}", run.unit_id.as_deref().unwrap_or(&run.id))
+}
+
+fn rail_keys(snap: &Snapshot, browse: BrowseLevel) -> Vec<String> {
+    match browse {
+        BrowseLevel::Home => snap.home.rows.iter().map(home_row_key).collect(),
+        BrowseLevel::Runs => snap.runs.iter().map(run_row_key).collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Identity of a Home row, for `resync_home_selection` to follow the cursor across a
 /// re-ranked snapshot instead of a position (R3).
 fn home_row_key(row: &HomeRow) -> String {
@@ -2296,6 +2370,7 @@ fn home_row_key(row: &HomeRow) -> String {
         HomeRow::Empty(b) => format!("empty:{b:?}"),
         HomeRow::Project(_, root) => format!("proj:{}", root.display()),
         HomeRow::NewRun => "newrun".to_string(),
+        HomeRow::Skeleton { band, slot } => format!("skel:{band:?}:{slot}"),
     }
 }
 
@@ -2318,7 +2393,10 @@ fn resync_home_selection(app: &mut App, rows: &[HomeRow]) {
     let unselectable = |r: &HomeRow| {
         matches!(
             r,
-            HomeRow::Header(_) | HomeRow::More { .. } | HomeRow::Empty(_)
+            HomeRow::Header(_)
+                | HomeRow::More { .. }
+                | HomeRow::Empty(_)
+                | HomeRow::Skeleton { .. }
         )
     };
     if unselectable(&rows[i]) {
@@ -2818,6 +2896,8 @@ fn animating(app: &App, snap: &Snapshot) -> bool {
                 is_active_phase(st.phase)
                     || st.slots.iter().any(|s| s.status == SlotStatus::Running)
             }))
+        || app.motion_in_flight()
+        || snap.home.loading
 }
 
 fn run_loop(
@@ -2945,6 +3025,45 @@ fn run_loop(
             }
         }
 
+        // Rail reorder: the animated order becomes the frame's canonical order.
+        let now = Instant::now();
+        let rail_keys_vec = rail_keys(&snap, app.browse);
+        let perm = app.rail_motion.observe(app.browse, rail_keys_vec, now);
+        let mut moved_runs: Option<Vec<state::RunSummary>> = None;
+        let mut moved_home: Option<HomeData> = None;
+        if let Some(p) = perm {
+            match app.browse {
+                BrowseLevel::Runs => {
+                    let v: Vec<state::RunSummary> =
+                        p.iter().map(|&i| snap.runs[i].clone()).collect();
+                    moved_runs = Some(v);
+                }
+                BrowseLevel::Home => {
+                    let v: Vec<HomeRow> = p.iter().map(|&i| snap.home.rows[i].clone()).collect();
+                    moved_home = Some(HomeData {
+                        rows: v,
+                        project_stats: snap.home.project_stats.clone(),
+                        loading: snap.home.loading,
+                    });
+                }
+                _ => {}
+            }
+        }
+        let runs: &[state::RunSummary] = moved_runs.as_deref().unwrap_or(&snap.runs);
+        let home: &HomeData = moved_home.as_ref().unwrap_or(&snap.home);
+
+        // Keep the Runs cursor glued to identity through travel.
+        if app.browse == BrowseLevel::Runs && !runs.is_empty() {
+            if let Some(key) = app.selected_run_key.clone() {
+                if let Some(pos) = runs.iter().position(|r| run_row_key(r) == key) {
+                    app.selected_run = pos;
+                }
+            }
+            if let Some(run) = runs.get(app.selected_run) {
+                app.selected_run_key = Some(run_row_key(run));
+            }
+        }
+
         // Clamp selections against the snapshot we are about to paint.
         if snap.projects.is_empty() {
             app.selected_project = 0;
@@ -2955,7 +3074,7 @@ fn run_loop(
             }
         }
         if app.home_target_run.is_some() {
-            // Must run even with an empty `snap.runs` — a Home Enter into a project
+            // Must run even with an empty `runs` — a Home Enter into a project
             // whose Runs listing has not landed yet (R2's one-tick lag) would
             // otherwise never start the give-up clock and pin `home_target_run`
             // forever, leaving Main/Agents blank with no way out (round-11 review,
@@ -2964,29 +3083,34 @@ fn run_loop(
             // target's project (below), so this being unconditional does not start the
             // budget early.
             let snapshot_for_target = snapshot_covers_target(&snap, &active_root);
-            resolve_home_target(&mut app, &snap.runs, snapshot_for_target);
-            if !snap.runs.is_empty() {
-                app.selected_run = app.selected_run.min(snap.runs.len() - 1);
+            resolve_home_target(&mut app, runs, snapshot_for_target);
+            if !runs.is_empty() {
+                app.selected_run = app.selected_run.min(runs.len() - 1);
             }
-        } else if snap.runs.is_empty() {
+        } else if runs.is_empty() {
             app.selected_run = 0;
         } else {
             // The attention sort reorders the rail as runs change state; keep the
             // cursor glued to the same run id rather than the same row.
             if let Some(prev) = sel.run_id.as_deref() {
-                if let Some(pos) = snap.runs.iter().position(|r| r.id == prev) {
+                if let Some(pos) = runs.iter().position(|r| r.id == prev) {
                     app.selected_run = pos;
                 }
             }
-            app.selected_run = app.selected_run.min(snap.runs.len() - 1);
+            app.selected_run = app.selected_run.min(runs.len() - 1);
+        }
+        // Keep key in sync after clamp
+        if app.browse == BrowseLevel::Runs && !runs.is_empty() {
+            if let Some(run) = runs.get(app.selected_run) {
+                app.selected_run_key = Some(run_row_key(run));
+            }
         }
         // Toast a run the moment it starts wanting the operator (gate/broken), so a
         // fleet transition is noticed even while looking at another run. At Home
         // there is no `snap.runs` (it is cross-project) — feed it Home's rows instead
         // so the toast still fires there.
         if app.browse == BrowseLevel::Home {
-            let home_runs: Vec<state::RunSummary> = snap
-                .home
+            let home_runs: Vec<state::RunSummary> = home
                 .rows
                 .iter()
                 .filter_map(|r| match r {
@@ -2996,7 +3120,7 @@ fn run_loop(
                 .collect();
             emit_attention_toasts(&mut app, &home_runs, true);
         } else {
-            emit_attention_toasts(&mut app, &snap.runs, false);
+            emit_attention_toasts(&mut app, runs, false);
         }
         let n_slots = snap.full.as_ref().map(|s| s.slots.len()).unwrap_or(0);
         app.selected_slot = if n_slots == 0 {
@@ -3005,13 +3129,13 @@ fn run_loop(
             app.selected_slot.min(n_slots - 1)
         };
         if app.browse == BrowseLevel::Home {
-            resync_home_selection(&mut app, &snap.home.rows);
+            resync_home_selection(&mut app, &home.rows);
         }
 
         rail_state.select(match app.browse {
-            BrowseLevel::Home if !snap.home.rows.is_empty() => Some(app.selected_home),
+            BrowseLevel::Home if !home.rows.is_empty() => Some(app.selected_home),
             BrowseLevel::Projects if !snap.projects.is_empty() => Some(app.selected_project),
-            BrowseLevel::Runs if !snap.runs.is_empty() => Some(app.selected_run),
+            BrowseLevel::Runs if !runs.is_empty() => Some(app.selected_run),
             BrowseLevel::Agents if n_slots > 0 => Some(app.selected_slot),
             _ => None,
         });
@@ -3034,7 +3158,7 @@ fn run_loop(
                     f,
                     &snap.swarm,
                     &snap.projects,
-                    &snap.runs,
+                    runs,
                     snap.full.as_ref(),
                     &snap.stream_text,
                     &snap.stream_text_raw,
@@ -3044,13 +3168,15 @@ fn run_loop(
                     &snap.diff_records,
                     &snap.plan_docs,
                     &snap.review,
-                    &snap.home,
+                    home,
                     snap.log_stats.as_ref(),
                     &mut app,
                     &mut rail_state,
                 );
             })?;
             let _ = std::io::stdout().execute(EndSynchronizedUpdate);
+            // Re-evaluate after paint: the tab strip tween is retargeted inside draw_labels.
+            app.animated = animating(&app, &snap);
             dirty = false;
         }
 
@@ -3083,8 +3209,8 @@ fn run_loop(
                                 key.modifiers,
                                 &snap.swarm,
                                 &snap.projects,
-                                &snap.home.rows,
-                                &snap.runs,
+                                &home.rows,
+                                runs,
                                 snap.full.as_ref(),
                                 &active_records,
                                 &mut active_root,
@@ -3099,8 +3225,8 @@ fn run_loop(
                             m,
                             &snap.swarm,
                             &snap.projects,
-                            &snap.home.rows,
-                            &snap.runs,
+                            &home.rows,
+                            runs,
                             snap.full.as_ref(),
                             &snap.diff_records,
                             &mut active_root,
@@ -3110,7 +3236,10 @@ fn run_loop(
                         // DECSET 1004. Repaint on the transition so the frame the
                         // window is left on is the unfocused one, then stop.
                         Event::FocusGained => app.focused = true,
-                        Event::FocusLost => app.focused = false,
+                        Event::FocusLost => {
+                            app.focused = false;
+                            app.settle_motion();
+                        }
                         // Forward a paste to the tmux client as bracketed paste.
                         Event::Paste(text) if app.shell_active() => {
                             if let Some(pane) = app.terminal_pane.as_ref() {
@@ -3158,7 +3287,7 @@ fn run_loop(
             browse: app.browse,
             root: active_root.clone(),
             // A Home Enter carries the run by id (`home_target_run`), because the
-            // outgoing snapshot's `snap.runs`/`app.selected_run` still describe the
+            // outgoing snapshot's `runs`/`app.selected_run` still describe the
             // *previous* project. Keep resending it (not `take()`) until the clamp
             // above observes a snapshot that actually contains it and clears it —
             // otherwise this send races that clamp and can overwrite the target
@@ -3166,7 +3295,7 @@ fn run_loop(
             run_id: app
                 .home_target_run
                 .clone()
-                .or_else(|| snap.runs.get(app.selected_run).map(|r| r.id.clone())),
+                .or_else(|| runs.get(app.selected_run).map(|r| r.id.clone())),
             slot_idx: app.selected_slot,
             project_idx: app.selected_project,
             home_scope: app.home_scope.clone(),
@@ -4447,7 +4576,7 @@ fn snap_selection_to_filter(
             let cur = app.selected_run;
             if !run_matches_filter(runs, cur, f) {
                 if let Some(i) = (0..runs.len()).find(|i| run_matches_filter(runs, *i, f)) {
-                    app.select_run(i, runs.len());
+                    app.select_run(i, runs);
                 }
             }
             let _ = n_slots;
@@ -4512,7 +4641,10 @@ fn step_home(rows: &[HomeRow], cur: usize, delta: i32) -> usize {
         .filter(|&i| {
             !matches!(
                 rows[i],
-                HomeRow::Header(_) | HomeRow::More { .. } | HomeRow::Empty(_)
+                HomeRow::Header(_)
+                    | HomeRow::More { .. }
+                    | HomeRow::Empty(_)
+                    | HomeRow::Skeleton { .. }
             )
         })
         .collect();
@@ -4574,7 +4706,7 @@ fn rail_move(
                 }
                 None => step(app.selected_run, runs.len()),
             };
-            app.select_run(next, runs.len());
+            app.select_run(next, runs);
         }
         BrowseLevel::Agents if n_slots > 0 => {
             app.select_slot(step(app.selected_slot, n_slots), n_slots);
@@ -4658,6 +4790,7 @@ fn resolve_home_target(
         .or_else(|| runs.iter().position(|r| r.id == target));
     if let Some(pos) = found {
         app.selected_run = pos;
+        app.selected_run_key = runs.get(pos).map(run_row_key);
         app.home_target_run = None;
         app.home_target_since = None;
         return true;
@@ -4723,7 +4856,13 @@ fn rail_enter(
                 // (AC-32).
                 open_new_run(app, projects, home_rows, local_root, None);
             }
-            Some(HomeRow::Header(_) | HomeRow::More { .. } | HomeRow::Empty(_)) | None => {}
+            Some(
+                HomeRow::Header(_)
+                | HomeRow::More { .. }
+                | HomeRow::Empty(_)
+                | HomeRow::Skeleton { .. },
+            )
+            | None => {}
         },
         BrowseLevel::Projects => {
             if let Some(p) = projects.get(app.selected_project) {
@@ -5044,8 +5183,7 @@ fn handle_mouse_inner(
             if contains(app.rect_rail, x, y) {
                 app.focus = Focus::Rail;
                 if let Some(row) = list_row_at(app.rect_rail, y, n_rail, rail_offset) {
-                    let landed =
-                        rail_select(app, row, projects.len(), home_rows, runs.len(), n_slots);
+                    let landed = rail_select(app, row, projects.len(), home_rows, runs, n_slots);
                     // Double-click = Enter: drill one level (and take over on a slot).
                     // Only when the click actually landed on content — a double-tap on
                     // a Home header/`More` row must not act on the stale selection.
@@ -5120,14 +5258,19 @@ fn rail_select(
     row: usize,
     n_projects: usize,
     home_rows: &[HomeRow],
-    n_runs: usize,
+    runs: &[state::RunSummary],
     n_slots: usize,
 ) -> bool {
     match app.browse {
         BrowseLevel::Home => {
             if matches!(
                 home_rows.get(row),
-                Some(HomeRow::Header(_) | HomeRow::More { .. } | HomeRow::Empty(_))
+                Some(
+                    HomeRow::Header(_)
+                        | HomeRow::More { .. }
+                        | HomeRow::Empty(_)
+                        | HomeRow::Skeleton { .. }
+                )
             ) {
                 return false;
             }
@@ -5144,7 +5287,10 @@ fn rail_select(
             true
         }
         BrowseLevel::Runs => {
-            app.select_run(row, n_runs);
+            if row >= runs.len() {
+                return false;
+            }
+            app.select_run(row, runs);
             true
         }
         BrowseLevel::Agents => {
@@ -5348,10 +5494,12 @@ fn draw(
         });
         let no_runs = app.browse == BrowseLevel::Runs && full.is_none() && runs.is_empty();
         let empty_home = app.browse == BrowseLevel::Home
-            && !home
-                .rows
-                .iter()
-                .any(|r| matches!(r, HomeRow::Run { .. } | HomeRow::Project(..)));
+            && !home.rows.iter().any(|r| {
+                matches!(
+                    r,
+                    HomeRow::Run { .. } | HomeRow::Project(..) | HomeRow::Skeleton { .. }
+                )
+            });
         if active == Some(true) || no_runs || empty_home {
             if app.focus == Focus::Rail {
                 app.open_main(MainTab::Log);
@@ -5491,10 +5639,13 @@ fn draw_labels(
     full: Option<&RunState>,
     app: &mut App,
 ) {
+    app.main_tabs.clear();
+    app.main_tab_glyphs.clear();
     let area = lay.labels;
     if area.width == 0 || area.height == 0 {
         return;
     }
+    let now = Instant::now();
 
     if lay.narrow {
         // The wide strip's fixed per-tab padding (badge slot on every tab, U11) exists
@@ -5568,12 +5719,13 @@ fn draw_labels(
         let label_total: u16 = tabs.iter().map(|(_, t, _)| t.chars().count() as u16).sum();
         let total_w = (label_total + gap * n.saturating_sub(1)).min(area.width);
         let start_x = area.x + area.width.saturating_sub(total_w) / 2;
-        let mut spans: Vec<Span> = Vec::with_capacity(tabs.len());
         // Label glyph rects first, `gap` columns of dead space between each pair —
         // then a second pass below pads each hit rect out into half of each
         // neighboring gap, so a tap anywhere on the strip lands on a tab (U11's touch
         // requirement) rather than only on the glyphs themselves.
-        let mut glyphs: Vec<(MainTab, u16, u16)> = Vec::with_capacity(tabs.len());
+        let mut new_glyphs: Vec<(MainTab, Rect)> = Vec::new();
+        let mut new_hits: Vec<(MainTab, Rect)> = Vec::new();
+        let mut glyph_texts: Vec<(MainTab, String, Style)> = Vec::new();
         let mut x = start_x;
         let n_tabs = tabs.len();
         for (i, (tab, text, style)) in tabs.into_iter().enumerate() {
@@ -5587,18 +5739,29 @@ fn draw_labels(
             if w == 0 {
                 break;
             }
-            glyphs.push((tab, x, w));
-            spans.push(Span::styled(text, style));
+            let gx = x;
+            let gw = w;
+            glyph_texts.push((tab, text.clone(), style));
+            new_glyphs.push((
+                tab,
+                Rect {
+                    x: gx,
+                    y: area.y,
+                    width: gw,
+                    height: 1,
+                },
+            ));
             x = x.saturating_add(w);
             if i + 1 < n_tabs {
                 x = x.saturating_add(gap);
-                if gap > 0 {
-                    spans.push(Span::raw(" ".repeat(gap as usize)));
-                }
             }
         }
-        let n_glyphs = glyphs.len();
-        for (i, (tab, gx, gw)) in glyphs.into_iter().enumerate() {
+        // Hit rects: pad into half gaps. Each hit rect covers its glyph plus half
+        // the gap on either side, tiling edge to edge with zero dead columns.
+        let n_glyphs = new_glyphs.len();
+        for (i, (tab, glyph)) in new_glyphs.iter().enumerate() {
+            let gx = glyph.x;
+            let gw = glyph.width;
             let left = if i == 0 {
                 area.x
             } else {
@@ -5609,56 +5772,29 @@ fn draw_labels(
             } else {
                 gx + gw + gap.saturating_sub(gap / 2)
             };
-            app.main_tabs.push((
+            new_hits.push((
+                *tab,
                 Rect {
                     x: left,
                     y: area.y,
                     width: right.saturating_sub(left),
                     height: 1,
                 },
-                tab,
-            ));
-            app.main_tab_glyphs.push((
-                Rect {
-                    x: gx,
-                    y: area.y,
-                    width: gw,
-                    height: 1,
-                },
-                tab,
             ));
         }
-        let line = Rect {
-            x: start_x,
-            width: area.right().saturating_sub(start_x),
-            ..area
-        };
-        f.render_widget(Paragraph::new(Line::from(spans)), line);
+        let (glyphs, hits) = app.tab_strip.observe(new_glyphs, new_hits, now);
+        for (i, ((tab, glyph), (_, hit))) in glyphs.iter().zip(hits.iter()).enumerate() {
+            let (_, text, style) = &glyph_texts[i];
+            let fitted = truncate(text, glyph.width as usize);
+            f.render_widget(Paragraph::new(Span::styled(fitted, *style)), *glyph);
+            app.main_tabs.push((*hit, *tab));
+            app.main_tab_glyphs.push((*glyph, *tab));
+        }
         return;
     }
 
-    if lay.rail.width > 0 {
-        let title = rail_title(projects, runs, full, app);
-        let rail_row = Rect {
-            x: lay.rail.x.saturating_add(1),
-            width: lay.rail.width.saturating_sub(1),
-            ..area
-        };
-        let style = if app.focus == Focus::Rail {
-            Style::default().fg(ACCENT).bold()
-        } else {
-            muted().bold()
-        };
-        f.render_widget(
-            Paragraph::new(Span::styled(
-                truncate(&title, rail_row.width as usize),
-                style,
-            )),
-            rail_row,
-        );
-    }
-
-    // Main's tabs sit on the labels row, aligned to Main's column.
+    // Wide layout: Main's tabs sit on the labels row, aligned to Main's column.
+    // Compute new placement first without side effects
     let main = Rect {
         y: area.y,
         height: 1,
@@ -5667,11 +5803,6 @@ fn draw_labels(
     if main.width == 0 {
         return;
     }
-    // Six tabs at their full, padded width (U9/U35) do not always fit the wide
-    // strip's Main column once a rail is present — the four-tab world's fixed
-    // per-tab padding was sized for four. Rather than silently drop a tab off the
-    // end (U11), fall back to the same short labels the narrow strip uses,
-    // uniformly, so all six always have a slot.
     let full_tab_spans = main_tab_spans(app);
     let full_w: u16 = full_tab_spans
         .iter()
@@ -5682,13 +5813,6 @@ fn draw_labels(
     } else {
         let tabs = tabs_for(app.browse);
         let n = tabs.len() as u16;
-        // Same fixed badge slot on every tab (U11): gluing the badge onto Activity
-        // alone made it the only tab that widened when an alert count changed,
-        // shifting every tab after it under a click. But the slot's width still has
-        // to fit this narrower band (short labels, no rail-sized padding to spare),
-        // so it shrinks in fixed steps — 4 columns, then 1, then none — rather than
-        // reserving a size that would starve a tab off the strip entirely (matches
-        // the narrow strip's own fallback ladder).
         let plain_total: u16 = tabs
             .iter()
             .map(|t| t.short_label().chars().count() as u16 + 2)
@@ -5721,8 +5845,10 @@ fn draw_labels(
             })
             .collect()
     };
-    let mut spans: Vec<Span> = Vec::new();
+    let mut new_glyphs: Vec<(MainTab, Rect)> = Vec::new();
+    let mut new_hits: Vec<(MainTab, Rect)> = Vec::new();
     let mut x = main.x;
+    let mut glyph_texts: Vec<(MainTab, String, Style)> = Vec::new();
     for (tab, text, style) in tab_spans {
         let w = text.chars().count() as u16;
         if x.saturating_add(w) > main.right() {
@@ -5734,20 +5860,47 @@ fn draw_labels(
             width: w,
             height: 1,
         };
-        app.main_tabs.push((rect, tab));
-        app.main_tab_glyphs.push((rect, tab));
+        new_glyphs.push((tab, rect));
+        new_hits.push((tab, rect));
+        glyph_texts.push((tab, text, style));
         x = x.saturating_add(w);
-        spans.push(Span::styled(text, style));
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), main);
-
+    let (glyphs, hits) = app.tab_strip.observe(new_glyphs, new_hits, now);
+    let is_animating = app.tab_strip.is_animating(now);
+    if lay.rail.width > 0 && !is_animating {
+        let title = rail_title(projects, runs, full, app);
+        let rail_row = Rect {
+            x: lay.rail.x.saturating_add(1),
+            width: lay.rail.width.saturating_sub(1),
+            ..area
+        };
+        let style = if app.focus == Focus::Rail {
+            Style::default().fg(ACCENT).bold()
+        } else {
+            muted().bold()
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                truncate(&title, rail_row.width as usize),
+                style,
+            )),
+            rail_row,
+        );
+    }
+    for (i, ((tab, glyph), (_, hit))) in glyphs.iter().zip(hits.iter()).enumerate() {
+        let (_, text, style) = &glyph_texts[i];
+        let fitted = truncate(text, glyph.width as usize);
+        f.render_widget(Paragraph::new(Span::styled(fitted, *style)), *glyph);
+        app.main_tabs.push((*hit, *tab));
+        app.main_tab_glyphs.push((*glyph, *tab));
+    }
+    if is_animating {
+        return;
+    }
     // What the active tab is showing, parked on the right so the tabs never move.
     let ctx = main_context(swarm, full, app);
-    let used = x.saturating_sub(main.x);
+    let used = glyphs.iter().map(|(_, r)| r.width).sum::<u16>();
     let room = main.width.saturating_sub(used).saturating_sub(1);
-    // Six tabs (U9/U35) leave less spare room for the caption than four did; the
-    // old ">8" gate suppressed it outright rather than letting `truncate` degrade
-    // it gracefully. `truncate` already handles anything down to a sliver.
     if !ctx.is_empty() && room > 2 {
         let text = truncate(&ctx, room as usize);
         let w = text.chars().count() as u16;
@@ -5772,6 +5925,13 @@ fn fit_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Span<'static>> {
     if total <= width as usize {
         return spans;
     }
+    if width == 0 {
+        return Vec::new();
+    }
+    if width == 1 {
+        let style = spans.first().map(|s| s.style).unwrap_or_default();
+        return vec![Span::styled("…".to_string(), style)];
+    }
     let mut out = Vec::with_capacity(spans.len());
     let mut used = 0usize;
     for span in spans {
@@ -5783,8 +5943,23 @@ fn fit_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Span<'static>> {
         }
         let room = (width as usize).saturating_sub(used);
         if room > 1 {
-            let style = span.style;
-            out.push(Span::styled(truncate(&span.content, room), style));
+            out.push(Span::styled(truncate(&span.content, room), span.style));
+        } else if room == 1 {
+            out.push(Span::styled("…".to_string(), span.style));
+        } else if let Some(last) = out.last_mut() {
+            let content = last.content.to_string();
+            let mut chars: Vec<char> = content.chars().collect();
+            if !chars.is_empty() {
+                chars.pop();
+                chars.push('…');
+                let new_content: String = chars.into_iter().collect();
+                let style = last.style;
+                *last = Span::styled(new_content, style);
+            } else {
+                out.push(Span::styled("…".to_string(), span.style));
+            }
+        } else {
+            out.push(Span::styled("…".to_string(), span.style));
         }
         break;
     }
@@ -6130,6 +6305,21 @@ fn stepper_spans(
     spans
 }
 
+const METER_ZONE_W: u16 = 34;
+const STEPPER_MIN_W: u16 = 8;
+
+fn meter_zone(pad: Rect) -> Option<Rect> {
+    if pad.width < METER_ZONE_W + STEPPER_MIN_W {
+        return None;
+    }
+    Some(Rect {
+        x: pad.right().saturating_sub(METER_ZONE_W),
+        y: pad.y,
+        width: METER_ZONE_W,
+        height: 1,
+    })
+}
+
 /// The band under the header: the run's pipeline plus its meters, or — with no run in
 /// hand — the project's roll-up. Always occupied, so nothing below it moves.
 fn draw_context_band(
@@ -6265,11 +6455,19 @@ fn draw_context_band(
         .map(|s| s.content.chars().count() as u16)
         .sum();
 
-    // The stepper is the point of this band; the meters yield to it, never the other
-    // way round, so a narrow terminal never leaves the row blank.
-    let (room, meters) = match pad.width.checked_sub(meters_w + 2) {
-        Some(w) if w >= 8 => (w, meters),
-        _ => (pad.width, Vec::new()),
+    // Fixed slot for meters: the stepper's width is a pure function of pad width,
+    // not of billed token count, so the layout never moves as billed ticks up.
+    let zone = meter_zone(pad);
+    let (room, meters) = if let Some(_z) = zone {
+        let r = pad.width.saturating_sub(METER_ZONE_W);
+        // Fit meters into the zone, truncating with marker if needed.
+        let fitted = fit_spans(meters, METER_ZONE_W);
+        (r, fitted)
+    } else {
+        match pad.width.checked_sub(meters_w + 2) {
+            Some(w) if w >= 8 => (w, meters),
+            _ => (pad.width, Vec::new()),
+        }
     };
     let meters_w: u16 = meters
         .iter()
@@ -6281,14 +6479,21 @@ fn draw_context_band(
         Rect { width: room, ..pad },
     );
     if meters_w > 0 && meters_w < pad.width {
-        f.render_widget(
-            Paragraph::new(Line::from(meters)),
-            Rect {
-                x: pad.right().saturating_sub(meters_w),
-                width: meters_w,
-                ..pad
-            },
-        );
+        if let Some(z) = zone {
+            f.render_widget(
+                Paragraph::new(Line::from(meters)).alignment(Alignment::Right),
+                z,
+            );
+        } else {
+            f.render_widget(
+                Paragraph::new(Line::from(meters)),
+                Rect {
+                    x: pad.right().saturating_sub(meters_w),
+                    width: meters_w,
+                    ..pad
+                },
+            );
+        }
     }
 }
 
@@ -6470,11 +6675,12 @@ fn status_cue(
 /// widest set (`Confirm` + `Reconcile`). Buttons are left-aligned inside it, so a
 /// different gate never slides them under a mid-click (U11).
 const GATE_ZONE_W: u16 = 23;
+const GATE_ZONE_MIN_LEFT: u16 = 12;
 
 /// The gate zone: a fixed slot, or `None` on a phone-width screen that cannot spare
 /// one (there the buttons fall back to right-aligned, the old behaviour).
 fn gate_zone(area: Rect) -> Option<Rect> {
-    if area.width < NARROW_WIDTH {
+    if area.width < GATE_ZONE_W + GATE_ZONE_MIN_LEFT {
         return None;
     }
     Some(Rect {
@@ -6832,6 +7038,341 @@ fn sweep_spans(text: &str, base: Color, peak: Color, phase: f32) -> Vec<Span<'st
 /// is never lit end to end.
 const SWEEP_HALF: f32 = 3.5;
 
+const RAIL_TRAVEL_MAX: f32 = 12.0;
+const STRIP_JUMP_MIN: u16 = 3;
+
+/// Rail reorder animator: adjacent swaps, not rank interpolation. A row is one
+/// cell tall, so travel means moving through intervening ranks over
+/// REORDER_PERIOD.
+struct RailMotion {
+    level: Option<BrowseLevel>,
+    target_keys: Vec<String>,
+    displayed_keys: Vec<String>,
+    swaps: Vec<usize>,
+    applied: usize,
+    tween: crate::motion::Tween<f32>,
+}
+
+impl RailMotion {
+    fn new() -> Self {
+        Self {
+            level: None,
+            target_keys: Vec::new(),
+            displayed_keys: Vec::new(),
+            swaps: Vec::new(),
+            applied: 0,
+            tween: crate::motion::Tween::<f32>::settled(0.0),
+        }
+    }
+
+    fn is_animating(&self, now: Instant) -> bool {
+        !self.tween.done(now) && self.applied < self.swaps.len()
+    }
+
+    fn settle(&mut self) {
+        if !self.swaps.is_empty() {
+            for idx in self.applied..self.swaps.len() {
+                let i = self.swaps[idx];
+                self.displayed_keys.swap(i, i + 1);
+            }
+            self.applied = self.swaps.len();
+        }
+        self.tween.settle();
+        if !self.target_keys.is_empty() {
+            self.displayed_keys = self.target_keys.clone();
+        }
+        self.swaps.clear();
+        self.applied = 0;
+    }
+
+    fn commit(&mut self, now: Instant) {
+        if self.swaps.is_empty() {
+            return;
+        }
+        let eased = self.tween.value(now).clamp(0.0, 1.0);
+        let mut desired = (eased * self.swaps.len() as f32).ceil() as usize;
+        if desired > self.swaps.len() {
+            desired = self.swaps.len();
+        }
+        if eased < 1.0 && desired == self.swaps.len() && !self.swaps.is_empty() {
+            desired = self.swaps.len() - 1;
+        }
+        while self.applied < desired {
+            let i = self.swaps[self.applied];
+            if i + 1 < self.displayed_keys.len() {
+                self.displayed_keys.swap(i, i + 1);
+            }
+            self.applied += 1;
+        }
+    }
+
+    fn observe(
+        &mut self,
+        level: BrowseLevel,
+        keys: Vec<String>,
+        now: Instant,
+    ) -> Option<Vec<usize>> {
+        self.commit(now);
+        let level_changed = self.level != Some(level);
+        let target_changed = self.target_keys != keys;
+        if level_changed || target_changed {
+            if level_changed {
+                self.displayed_keys = keys.clone();
+                self.target_keys = keys.clone();
+                self.swaps.clear();
+                self.applied = 0;
+                self.tween = crate::motion::Tween::<f32>::settled(1.0);
+                self.level = Some(level);
+                return None;
+            }
+            // Build rebased displayed
+            let mut rebased: Vec<Option<String>> = vec![None; keys.len()];
+            let mut snapped: std::collections::HashSet<String> = std::collections::HashSet::new();
+            // Identify snapped keys
+            for (idx, key) in keys.iter().enumerate() {
+                if let Some(pos) = self.displayed_keys.iter().position(|k| k == key) {
+                    let dist = (idx as f32 - pos as f32).abs();
+                    if dist > RAIL_TRAVEL_MAX {
+                        snapped.insert(key.clone());
+                        rebased[idx] = Some(key.clone());
+                    }
+                } else {
+                    snapped.insert(key.clone());
+                    rebased[idx] = Some(key.clone());
+                }
+            }
+            // Fill remaining with non-snapped displayed keys in displayed order
+            let remaining: Vec<String> = self
+                .displayed_keys
+                .iter()
+                .filter(|k| !snapped.contains(*k) && keys.contains(k))
+                .cloned()
+                .collect();
+            let mut rem_idx = 0;
+            for slot in rebased.iter_mut() {
+                if slot.is_none() && rem_idx < remaining.len() {
+                    *slot = Some(remaining[rem_idx].clone());
+                    rem_idx += 1;
+                }
+            }
+            let new_displayed: Vec<String> = rebased.into_iter().map(|o| o.unwrap()).collect();
+            // Build swaps from new_displayed to keys
+            let mut cur = new_displayed.clone();
+            let mut swaps: Vec<usize> = Vec::new();
+            for target_idx in 0..keys.len() {
+                if cur[target_idx] == keys[target_idx] {
+                    continue;
+                }
+                if let Some(pos) = cur.iter().position(|k| k == &keys[target_idx]) {
+                    let mut p = pos;
+                    while p > target_idx {
+                        swaps.push(p - 1);
+                        cur.swap(p - 1, p);
+                        p -= 1;
+                    }
+                }
+            }
+            self.displayed_keys = new_displayed;
+            self.target_keys = keys;
+            self.swaps = swaps;
+            self.applied = 0;
+            self.level = Some(level);
+            if self.swaps.is_empty() {
+                self.tween = crate::motion::Tween::<f32>::settled(1.0);
+                return None;
+            }
+            self.tween = crate::motion::Tween::<f32>::settled(0.0);
+            self.tween.retarget(1.0, crate::motion::REORDER_PERIOD, now);
+            // Fall through to compute current permutation after retarget (still at start, no swaps applied yet)
+        }
+        if self.displayed_keys == self.target_keys {
+            return None;
+        }
+        // Map displayed to target indices
+        let perm: Vec<usize> = self
+            .displayed_keys
+            .iter()
+            .map(|k| self.target_keys.iter().position(|t| t == k).unwrap())
+            .collect();
+        // Check if identity (should have returned None earlier, but handle)
+        let is_identity = perm.iter().enumerate().all(|(i, &v)| i == v);
+        if is_identity {
+            return None;
+        }
+        Some(perm)
+    }
+}
+
+struct TabStripMotion {
+    from_glyphs: Vec<(MainTab, Rect)>,
+    from_hits: Vec<(MainTab, Rect)>,
+    to_glyphs: Vec<(MainTab, Rect)>,
+    to_hits: Vec<(MainTab, Rect)>,
+    tween: crate::motion::Tween<f32>,
+}
+
+impl TabStripMotion {
+    fn new() -> Self {
+        Self {
+            from_glyphs: Vec::new(),
+            from_hits: Vec::new(),
+            to_glyphs: Vec::new(),
+            to_hits: Vec::new(),
+            tween: crate::motion::Tween::<f32>::settled(0.0),
+        }
+    }
+
+    fn is_animating(&self, now: Instant) -> bool {
+        !self.tween.done(now)
+    }
+
+    fn settle(&mut self) {
+        self.tween.settle();
+        if !self.to_glyphs.is_empty() {
+            self.from_glyphs = self.to_glyphs.clone();
+            self.from_hits = self.to_hits.clone();
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn displayed(&self, now: Instant) -> (Vec<(MainTab, Rect)>, Vec<(MainTab, Rect)>) {
+        if self.from_glyphs.is_empty() || self.tween.done(now) {
+            return (self.to_glyphs.clone(), self.to_hits.clone());
+        }
+        let t = self.tween.value(now).clamp(0.0, 1.0);
+        let mut glyphs = Vec::with_capacity(self.from_glyphs.len());
+        for ((tab, from), (_, to)) in self.from_glyphs.iter().zip(self.to_glyphs.iter()) {
+            let from_right = from.x as f32 + from.width as f32;
+            let to_right = to.x as f32 + to.width as f32;
+            let x = (from.x as f32 + (to.x as f32 - from.x as f32) * t)
+                .round()
+                .clamp(0.0, 65535.0) as u16;
+            let right = (from_right + (to_right - from_right) * t)
+                .round()
+                .clamp(0.0, 65535.0) as u16;
+            let w = right.saturating_sub(x);
+            let y = to.y;
+            let h = to.height;
+            glyphs.push((
+                *tab,
+                Rect {
+                    x,
+                    y,
+                    width: w,
+                    height: h,
+                },
+            ));
+        }
+        let mut hits = Vec::with_capacity(self.from_hits.len());
+        for ((tab, from), (_, to)) in self.from_hits.iter().zip(self.to_hits.iter()) {
+            let from_right = from.x as f32 + from.width as f32;
+            let to_right = to.x as f32 + to.width as f32;
+            let x = (from.x as f32 + (to.x as f32 - from.x as f32) * t)
+                .round()
+                .clamp(0.0, 65535.0) as u16;
+            let right = (from_right + (to_right - from_right) * t)
+                .round()
+                .clamp(0.0, 65535.0) as u16;
+            let w = right.saturating_sub(x);
+            let y = to.y;
+            let h = to.height;
+            hits.push((
+                *tab,
+                Rect {
+                    x,
+                    y,
+                    width: w,
+                    height: h,
+                },
+            ));
+        }
+        for (g, h) in glyphs.iter_mut().zip(hits.iter()) {
+            let g_rect = &mut g.1;
+            let h_rect = &h.1;
+            if g_rect.x < h_rect.x {
+                let diff = h_rect.x - g_rect.x;
+                g_rect.x = h_rect.x;
+                g_rect.width = g_rect.width.saturating_sub(diff);
+            }
+            let g_right = g_rect.x.saturating_add(g_rect.width);
+            let h_right = h_rect.x.saturating_add(h_rect.width);
+            if g_right > h_right {
+                g_rect.width = h_right.saturating_sub(g_rect.x);
+            }
+        }
+        (glyphs, hits)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn observe(
+        &mut self,
+        new_glyphs: Vec<(MainTab, Rect)>,
+        new_hits: Vec<(MainTab, Rect)>,
+        now: Instant,
+    ) -> (Vec<(MainTab, Rect)>, Vec<(MainTab, Rect)>) {
+        if self.to_glyphs.is_empty() {
+            self.from_glyphs = new_glyphs.clone();
+            self.to_glyphs = new_glyphs.clone();
+            self.from_hits = new_hits.clone();
+            self.to_hits = new_hits.clone();
+            self.tween = crate::motion::Tween::<f32>::settled(1.0);
+            return (new_glyphs, new_hits);
+        }
+        let same_tabs = self.to_glyphs.len() == new_glyphs.len()
+            && self
+                .to_glyphs
+                .iter()
+                .zip(new_glyphs.iter())
+                .all(|((a, _), (b, _))| a == b);
+        if !same_tabs {
+            self.from_glyphs = new_glyphs.clone();
+            self.to_glyphs = new_glyphs.clone();
+            self.from_hits = new_hits.clone();
+            self.to_hits = new_hits.clone();
+            self.tween = crate::motion::Tween::<f32>::settled(1.0);
+            return (new_glyphs, new_hits);
+        }
+        let same_geometry = self
+            .to_glyphs
+            .iter()
+            .zip(new_glyphs.iter())
+            .all(|((_, a), (_, b))| a == b)
+            && self
+                .to_hits
+                .iter()
+                .zip(new_hits.iter())
+                .all(|((_, a), (_, b))| a == b);
+        if same_geometry {
+            return self.displayed(now);
+        }
+        let mut max_delta: u16 = 0;
+        for ((_, new_g), (_, old_g)) in new_glyphs.iter().zip(self.to_glyphs.iter()) {
+            max_delta = max_delta.max(new_g.x.abs_diff(old_g.x));
+            max_delta = max_delta.max(new_g.width.abs_diff(old_g.width));
+        }
+        for ((_, new_h), (_, old_h)) in new_hits.iter().zip(self.to_hits.iter()) {
+            max_delta = max_delta.max(new_h.x.abs_diff(old_h.x));
+            max_delta = max_delta.max(new_h.width.abs_diff(old_h.width));
+        }
+        if max_delta < STRIP_JUMP_MIN {
+            self.from_glyphs = new_glyphs.clone();
+            self.to_glyphs = new_glyphs.clone();
+            self.from_hits = new_hits.clone();
+            self.to_hits = new_hits.clone();
+            self.tween = crate::motion::Tween::<f32>::settled(1.0);
+            return (new_glyphs, new_hits);
+        }
+        let (disp_glyphs, disp_hits) = self.displayed(now);
+        self.from_glyphs = disp_glyphs;
+        self.from_hits = disp_hits;
+        self.to_glyphs = new_glyphs;
+        self.to_hits = new_hits;
+        self.tween = crate::motion::Tween::<f32>::settled(0.0);
+        self.tween.retarget(1.0, crate::motion::STRIP_PERIOD, now);
+        self.displayed(now)
+    }
+}
+
 /// The breathing colour for a run's state-marker cell, or `None` when the run is
 /// not moving. An abandoned run is in an active phase and going nowhere, so it
 /// never breathes — the red `⚑` it already flies is the true story.
@@ -7017,6 +7558,22 @@ fn rail_home_items(
                         },
                     )];
                     rail_row(rail_lead(sel, focused, None, None), body, Span::raw(""), w)
+                }
+                HomeRow::Skeleton { band, slot: _ } => {
+                    let bar = format!("{:<8}  {:<6}", "░".repeat(8), "░".repeat(6));
+                    let spans = sweep_spans(
+                        &bar,
+                        PULSE_LO,
+                        PULSE_HI,
+                        app.clock.cycle(crate::motion::SWEEP_PERIOD),
+                    );
+                    let lead = rail_lead(sel, focused, None, None);
+                    let right = Span::styled("░".repeat(3), Style::default().fg(PULSE_LO));
+                    let body = vec![Span::styled("", Style::default())];
+                    let all_spans = spans;
+                    let _ = band;
+                    let _ = body;
+                    rail_row(lead, all_spans, right, w)
                 }
             }
         })
@@ -10615,6 +11172,7 @@ fn jump_to_attention(app: &mut App, runs: &[state::RunSummary], home_rows: &[Hom
     match next {
         Some(i) => {
             app.selected_run = i;
+            app.selected_run_key = runs.get(i).map(run_row_key);
             app.browse = BrowseLevel::Runs;
             app.focus = Focus::Rail;
             app.reset_stream_view();
@@ -12491,13 +13049,234 @@ mod render_stability {
         );
     }
 
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn tab_strip_mid_flight_geometry_stays_non_overlapping_and_clickable() {
+        let st = run_with(Phase::Review, 3);
+        let swarm = SparPaths::new("/x");
+        let capture = |width: u16| -> (Vec<(MainTab, Rect)>, Vec<(MainTab, Rect)>) {
+            let mut app = test_app();
+            let mut term = Terminal::new(TestBackend::new(width, 30)).unwrap();
+            let lay = layout_rects(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height: 30,
+                },
+                Focus::Main,
+                false,
+                false,
+            );
+            term.draw(|f| draw_labels(f, &lay, &swarm, &[], &[], Some(&st), &mut app))
+                .unwrap();
+            let glyphs = app
+                .main_tab_glyphs
+                .iter()
+                .map(|(r, t)| (*t, *r))
+                .collect::<Vec<_>>();
+            let hits = app
+                .main_tabs
+                .iter()
+                .map(|(r, t)| (*t, *r))
+                .collect::<Vec<_>>();
+            (glyphs, hits)
+        };
+        let (from_glyphs, from_hits) = capture(79);
+        let (to_glyphs, to_hits) = capture(80);
+        assert_eq!(from_glyphs.len(), MAIN_TABS.len());
+        assert_eq!(to_glyphs.len(), MAIN_TABS.len());
+        let mut motion = TabStripMotion::new();
+        let start = Instant::now();
+        motion.observe(from_glyphs.clone(), from_hits.clone(), start);
+        let (first_displayed_g, first_displayed_h) =
+            motion.observe(to_glyphs.clone(), to_hits.clone(), start);
+        assert!(motion.is_animating(start), "79->80 must start a glide");
+        // Verify the first displayed frame (t=0) is non-overlapping and clickable
+        assert!(
+            first_displayed_g
+                .windows(2)
+                .all(|pair| pair[0].1.right() <= pair[1].1.x),
+            "first frame glyphs overlap: {first_displayed_g:?}"
+        );
+        assert!(
+            first_displayed_h
+                .windows(2)
+                .all(|pair| pair[0].1.right() <= pair[1].1.x),
+            "first frame hits overlap: {first_displayed_h:?}"
+        );
+        for (g, h) in first_displayed_g.iter().zip(first_displayed_h.iter()) {
+            assert!(
+                h.1.x <= g.1.x && g.1.right() <= h.1.right(),
+                "first frame glyph {g:?} escaped hit {h:?}"
+            );
+        }
+        let period = crate::motion::STRIP_PERIOD;
+        let mut saw_intermediate = false;
+        for i in 0..=400 {
+            let now = start + period.mul_f32(i as f32 / 400.0);
+            let (glyphs, hits) = motion.displayed(now);
+            assert_eq!(glyphs.len(), MAIN_TABS.len());
+            assert_eq!(hits.len(), MAIN_TABS.len());
+            for ((tab, g), (hit_tab, h)) in glyphs.iter().zip(hits.iter()) {
+                assert_eq!(tab, hit_tab);
+                assert!(
+                    h.x <= g.x && g.right() <= h.right(),
+                    "t={i}/400 glyph {g:?} escaped hit {h:?}"
+                );
+            }
+            assert!(
+                glyphs
+                    .windows(2)
+                    .all(|pair| pair[0].1.right() <= pair[1].1.x),
+                "t={i}/400 glyphs overlap: {glyphs:?}"
+            );
+            assert!(
+                hits.windows(2).all(|pair| pair[0].1.right() <= pair[1].1.x),
+                "t={i}/400 hits overlap: {hits:?}"
+            );
+            if i > 0 && i < 400 {
+                let at_start = glyphs
+                    .iter()
+                    .zip(from_glyphs.iter())
+                    .all(|((_, g), (_, f))| g == f);
+                let at_end = glyphs
+                    .iter()
+                    .zip(to_glyphs.iter())
+                    .all(|((_, g), (_, t))| g == t);
+                if !at_start && !at_end {
+                    saw_intermediate = true;
+                }
+            }
+        }
+        assert!(
+            saw_intermediate,
+            "glide produced no intermediate distinct frame"
+        );
+        let after = start + period + Duration::from_millis(50);
+        assert!(
+            !motion.is_animating(after),
+            "strip must be settled after period"
+        );
+        let (settled_g, settled_h) = motion.displayed(after);
+        assert_eq!(settled_g, to_glyphs);
+        assert_eq!(settled_h, to_hits);
+    }
+
+    #[test]
+    fn selected_run_key_tracks_navigation_and_clicks() {
+        let mut runs = vec![
+            home_run("a", Phase::Review, 1, "spar"),
+            home_run("b", Phase::Review, 2, "spar"),
+            home_run("c", Phase::Review, 3, "spar"),
+        ];
+        runs[0].unit_id = Some("unit-a".into());
+        runs[1].unit_id = Some("unit-b".into());
+        runs[2].unit_id = Some("unit-c".into());
+        let mut app = test_app();
+        app.browse = BrowseLevel::Runs;
+        app.selected_run = 0;
+        app.selected_run_key = Some(run_row_key(&runs[0]));
+        rail_move(&mut app, &[], &[], &runs, 0, 1);
+        assert_eq!(app.selected_run, 1);
+        assert_eq!(
+            app.selected_run_key.as_deref(),
+            Some(run_row_key(&runs[1]).as_str())
+        );
+        let next = app.selected_run;
+        rail_select(&mut app, 2, 0, &[], &runs, 0);
+        assert_eq!(app.selected_run, 2);
+        assert_eq!(
+            app.selected_run_key.as_deref(),
+            Some(run_row_key(&runs[2]).as_str())
+        );
+        let _ = next;
+        let mut app2 = test_app();
+        app2.browse = BrowseLevel::Runs;
+        app2.selected_run = 0;
+        app2.selected_run_key = Some(run_row_key(&runs[0]));
+        let mut attention = vec![
+            home_run("x", Phase::Review, 1, "spar"),
+            home_run("y", Phase::AwaitingPlanApproval, 2, "spar"),
+        ];
+        attention[0].unit_id = Some("unit-x".into());
+        attention[1].unit_id = Some("unit-y".into());
+        attention[1].wants = 1;
+        jump_to_attention(&mut app2, &attention, &[]);
+        assert_eq!(app2.selected_run_key.as_deref(), Some("run:unit-y"));
+        let rows: Vec<HomeRow> = Vec::new();
+        let _ = rows;
+    }
+
+    #[test]
+    fn tab_strip_does_not_restart_and_settles_without_extra_retarget() {
+        let st = run_with(Phase::Review, 3);
+        let swarm = SparPaths::new("/x");
+        let mut app = test_app();
+        let paint = |width: u16, app: &mut App| {
+            let mut term = Terminal::new(TestBackend::new(width, 30)).unwrap();
+            let lay = layout_rects(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height: 30,
+                },
+                Focus::Main,
+                false,
+                false,
+            );
+            term.draw(|f| draw_labels(f, &lay, &swarm, &[], &[], Some(&st), app))
+                .unwrap();
+            (
+                app.main_tab_glyphs.clone(),
+                app.main_tabs.clone(),
+                lay.labels.y,
+            )
+        };
+        let _ = paint(79, &mut app);
+        let (first_glyphs, _, _) = paint(80, &mut app);
+        assert!(
+            app.tab_strip.is_animating(Instant::now()),
+            "79->80 must start a glide"
+        );
+        let first_x: Vec<u16> = first_glyphs.iter().map(|(r, _)| r.x).collect();
+        std::thread::sleep(Duration::from_millis(10));
+        let (second_glyphs, _, _) = paint(80, &mut app);
+        let second_x: Vec<u16> = second_glyphs.iter().map(|(r, _)| r.x).collect();
+        assert_eq!(
+            first_glyphs.len(),
+            second_glyphs.len(),
+            "stable target must not change tab count mid-glide"
+        );
+        let moving = second_glyphs
+            .iter()
+            .zip(first_glyphs.iter())
+            .any(|((a, _), (b, _))| a.x != b.x || a.width != b.width);
+        let _ = moving;
+        let still_animating = app.tab_strip.is_animating(Instant::now());
+        assert!(
+            still_animating,
+            "glide must still be in flight shortly after start"
+        );
+        app.settle_motion();
+        assert!(
+            !app.tab_strip.is_animating(Instant::now()),
+            "settled strip must report not animating"
+        );
+        let _ = first_x;
+        let _ = second_x;
+    }
+
     /// The breakpoints the band/column arithmetic actually branches on — every
     /// full-grid sweep below enumerates these exhaustively regardless of how
     /// coarsely it samples the rest of the range, since a layout bug lives at a
     /// breakpoint or nowhere.
-    const BREAKPOINT_SIZES: [(u16, u16); 9] = [
+    const BREAKPOINT_SIZES: [(u16, u16); 11] = [
         (1, 1),
         (20, 5),
+        (35, 24),
+        (46, 24),
         (79, 24),
         (80, 24),
         (89, 24),
@@ -14756,6 +15535,7 @@ mod render_stability {
                     needs_you: 1,
                 })
                 .collect(),
+            loading: false,
         }
     }
 
@@ -14914,6 +15694,7 @@ mod render_stability {
                 HomeRow::NewRun,
             ],
             project_stats: Vec::new(),
+            loading: false,
         };
         let term = paint_home(120, 30, &projects, &home, |_| {});
         let screen = whole(&term);
@@ -14938,6 +15719,7 @@ mod render_stability {
                 HomeRow::NewRun,
             ],
             project_stats: Vec::new(),
+            loading: false,
         };
         for (w, h) in [(120u16, 30u16), (90, 24), (79, 20), (50, 20), (20, 5)] {
             let term = paint_home(w, h, &[], &empty, |_| {});
@@ -15023,6 +15805,7 @@ mod render_stability {
                     needs_you: 61,
                 })
                 .collect(),
+            loading: false,
         };
         // The rail carries the `… N more` row; Main's detail for a band header
         // states the band's true total, which is the stronger claim and the one
@@ -15064,6 +15847,7 @@ mod render_stability {
                 HomeRow::NewRun,
             ],
             project_stats: Vec::new(),
+            loading: false,
         };
         let drained = HomeData {
             rows: vec![
@@ -15074,6 +15858,7 @@ mod render_stability {
                 HomeRow::NewRun,
             ],
             project_stats: Vec::new(),
+            loading: false,
         };
         // Assert on the row list itself: it is the source both the rail and Main
         // render from, so the ordering claim depends on no viewport at all.
@@ -15101,7 +15886,7 @@ mod render_stability {
         // a header with a gap under it does not distinguish empty from loading.
         // Built rather than hand-written: the claim is that the *builder* emits
         // these for a drained workspace, which a literal fixture cannot show.
-        let built = build_home_rows(&[], &[], &HomeScope::All, Utc::now(), Utc::now());
+        let built = build_home_rows(&[], &[], &HomeScope::All, Utc::now(), Utc::now(), false);
         let empties: Vec<&str> = built
             .iter()
             .filter_map(|r| match r {
@@ -15143,6 +15928,7 @@ mod render_stability {
                 HomeRow::NewRun,
             ],
             project_stats: Vec::new(),
+            loading: false,
         };
         let (term, app) = paint_home_app(120, 30, &[], &home, |_| {});
         let rail = app.rect_rail;
@@ -15190,7 +15976,14 @@ mod render_stability {
         ]];
         let watermark = Utc::now() - chrono::Duration::hours(1);
         for folded in [empty, populated] {
-            let rows = build_home_rows(&projects, &folded, &HomeScope::All, watermark, Utc::now());
+            let rows = build_home_rows(
+                &projects,
+                &folded,
+                &HomeScope::All,
+                watermark,
+                Utc::now(),
+                false,
+            );
             let i = rows
                 .iter()
                 .position(|r| matches!(r, HomeRow::Header(HomeBand::StartNew)))
@@ -15281,6 +16074,7 @@ mod render_stability {
                 HomeRow::NewRun,
             ],
             project_stats: Vec::new(),
+            loading: false,
         };
         for width in [50u16, 79] {
             let mut term = Terminal::new(TestBackend::new(width, 20)).unwrap();
@@ -15340,6 +16134,7 @@ mod render_stability {
                     needs_you: 0,
                 },
             ],
+            loading: false,
         };
         let term = paint_home(120, 30, &projects, &home, |a| a.open_projects_view());
         let text = whole(&term);
@@ -15360,6 +16155,7 @@ mod render_stability {
                 n_runs: 1,
                 needs_you: 0,
             }],
+            loading: false,
         };
         paint_home(120, 30, &projects, &short, |a| a.open_projects_view());
         paint_home(120, 30, &projects, &HomeData::default(), |a| {
@@ -15440,7 +16236,7 @@ mod render_stability {
         let ready = build_home_rows(&[], &folded, &HomeScope::All, now, now, false);
         assert!(ready.iter().all(|r| !matches!(r, HomeRow::Skeleton { .. })));
         assert!(
-            HomeData::default().loading == false,
+            !HomeData::default().loading,
             "ordinary HomeData fixtures are never implicitly loading"
         );
     }
@@ -15550,6 +16346,55 @@ mod render_stability {
         assert!(
             compact_u64(u64::MAX).chars().count() as u16 <= METER_ZONE_W,
             "the fixed slot cannot fit the formatter's largest token value"
+        );
+    }
+
+    #[test]
+    fn fit_spans_shows_ellipsis_when_truncated_at_boundary() {
+        let meters = vec![
+            Span::styled("0s", dim()),
+            Span::styled(" · ", muted()),
+            Span::styled("0/1 agents", dim()),
+            Span::styled(" · ", muted()),
+            Span::styled("round 2", dim()),
+            Span::styled(" · ", muted()),
+            Span::styled("2 legs", dim()),
+            Span::styled(" · ", muted()),
+            Span::styled("billed 12.4k", dim()),
+        ];
+        let width = METER_ZONE_W;
+        let fitted = fit_spans(meters.clone(), width);
+        let total: usize = fitted.iter().map(|s| s.content.chars().count()).sum();
+        assert!(total <= width as usize);
+        assert!(
+            fitted.iter().any(|s| s.content.contains('…')),
+            "truncated meter line must show ellipsis, got {:?}",
+            fitted
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<Vec<_>>()
+        );
+        let exact = vec![
+            Span::styled("0s", dim()),
+            Span::styled(" · ", muted()),
+            Span::styled("0/1 agents", dim()),
+            Span::styled(" · ", muted()),
+            Span::styled("round 2", dim()),
+            Span::styled(" · ", muted()),
+            Span::styled("2 legs", dim()),
+        ];
+        let exact_total: usize = exact.iter().map(|s| s.content.chars().count()).sum();
+        assert_eq!(exact_total, 34);
+        let mut with_extra = exact.clone();
+        with_extra.push(Span::styled("X", dim()));
+        let fitted2 = fit_spans(with_extra, width);
+        assert!(
+            fitted2.iter().any(|s| s.content.contains('…')),
+            "exact-fill plus one must ellipsis, got {:?}",
+            fitted2
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -16587,10 +17432,10 @@ mod folding {
 /// |---|---|---|
 /// | `BrowseLevel::Home` | C | the rail root; `pop()` lands here from Runs and Projects |
 /// | `App::new(seed, cfg, local_root: Option<&Path>)` | C | always starts at Home; `local_root` sets the scope |
-/// | `HomeData { rows, project_stats }` on `Snapshot`, passed to `draw` | B/C | the off-thread roll-up `draw` consumes |
+/// | `HomeData { rows, project_stats, loading }` on `Snapshot`, passed to `draw` | B/C | the off-thread roll-up `draw` consumes |
 /// | `gather_home(&[ProjectEntry]) -> Vec<Vec<RunSummary>>` | B/C | one folded, archived-filtered listing per project; disk, off-thread |
 /// | `project_stats_of(&[Vec<RunSummary>]) -> Vec<ProjectStat>` | B | pure; counts folded rows |
-/// | `build_home_rows(projects, folded, scope, watermark, now)` | C | pure; banding, ranking, capping |
+/// | `build_home_rows(projects, folded, scope, watermark, now, loading)` | C | pure; banding, ranking, capping |
 /// | `home_overview(rows, scope, watermark, now) -> String` | C | Main's Home body |
 /// | `read_watermark` / `write_watermark` / `watermark_path` | C | the "finished since last look" clock |
 /// | `cross_project_due(browse, since_last, forced)` | B | bounded cross-project invalidation |
@@ -16856,7 +17701,7 @@ mod home_ia {
                 run_in("done0001", Phase::Done, 10, &root),
             ]],
         ] {
-            let rows = build_home_rows(&projects, &folded, &HomeScope::All, watermark, now);
+            let rows = build_home_rows(&projects, &folded, &HomeScope::All, watermark, now, false);
             let headers: Vec<HomeBand> = rows
                 .iter()
                 .filter_map(|r| match r {
@@ -16918,7 +17763,7 @@ mod home_ia {
             .iter()
             .map(|(id, phase, _)| run_in(id, *phase, 1, &root))
             .collect();
-        let rows = build_home_rows(&projects, &[runs], &HomeScope::All, watermark, now);
+        let rows = build_home_rows(&projects, &[runs], &HomeScope::All, watermark, now, false);
         for (id, phase, want) in &cases {
             assert_eq!(
                 band_of(&rows, id),
@@ -16935,6 +17780,7 @@ mod home_ia {
             &HomeScope::All,
             watermark,
             now,
+            false,
         );
         assert_eq!(band_of(&rows, "aban"), Some(HomeBand::NeedsMe));
     }
@@ -16958,6 +17804,7 @@ mod home_ia {
             &HomeScope::All,
             now - chrono::Duration::hours(6),
             now,
+            false,
         );
         assert_eq!(
             ids_in(&rows, HomeBand::NeedsMe),
@@ -16990,6 +17837,7 @@ mod home_ia {
             &HomeScope::All,
             now - chrono::Duration::hours(6),
             now,
+            false,
         );
         assert_eq!(
             ids_in(&rows, HomeBand::Running),
@@ -17016,6 +17864,7 @@ mod home_ia {
             &HomeScope::All,
             now - chrono::Duration::hours(6),
             now,
+            false,
         );
         assert_eq!(
             ids_in(&rows, HomeBand::NeedsMe),
@@ -17042,6 +17891,7 @@ mod home_ia {
             &HomeScope::All,
             now - chrono::Duration::hours(6),
             now,
+            false,
         );
         let waited = |id: &str| {
             rows.iter()
@@ -17085,6 +17935,7 @@ mod home_ia {
             &HomeScope::All,
             now - chrono::Duration::hours(6),
             now,
+            false,
         );
         assert_eq!(
             ids_in(&rows, HomeBand::NeedsMe).len(),
@@ -17124,6 +17975,7 @@ mod home_ia {
             &HomeScope::All,
             now - chrono::Duration::hours(6),
             now,
+            false,
         );
         let band1: Vec<state::RunSummary> = rows
             .iter()
@@ -17185,6 +18037,7 @@ mod home_ia {
             &HomeScope::All,
             now - chrono::Duration::hours(6),
             now,
+            false,
         );
         assert_eq!(
             home_needs_you(&rows),
@@ -17232,6 +18085,7 @@ mod home_ia {
             &HomeScope::All,
             now - chrono::Duration::hours(6),
             now,
+            false,
         );
         assert_eq!(
             band_of(&rows, "impl0001"),
@@ -17267,6 +18121,7 @@ mod home_ia {
             &HomeScope::All,
             now - chrono::Duration::hours(6),
             now,
+            false,
         );
         assert_eq!(
             band_of(&rows, "plan0001"),
@@ -17376,6 +18231,7 @@ mod home_ia {
             &HomeScope::All,
             now - chrono::Duration::hours(6),
             now,
+            false,
         );
         assert_eq!(
             band_of(&rows, "legb0003"),
@@ -17424,6 +18280,7 @@ mod home_ia {
             &HomeScope::All,
             now - chrono::Duration::hours(6),
             now,
+            false,
         );
         let app = App::new(None, Config::default(), None);
         let home_run_item = rail_home_items(&home_rows, &projects, &app, 40, false)
@@ -17477,13 +18334,14 @@ mod home_ia {
             vec![run_in("spar0001", Phase::AwaitingShipConfirm, 10, &b)],
         ];
         let watermark = now - chrono::Duration::hours(6);
-        let all = build_home_rows(&projects, &folded, &HomeScope::All, watermark, now);
+        let all = build_home_rows(&projects, &folded, &HomeScope::All, watermark, now, false);
         let scoped = build_home_rows(
             &projects,
             &folded,
             &HomeScope::Project(b.clone()),
             watermark,
             now,
+            false,
         );
         let headers = |rows: &[HomeRow]| -> Vec<HomeBand> {
             rows.iter()
@@ -17528,7 +18386,7 @@ mod home_ia {
             run_in("recentdn", Phase::Done, 30, &root),
             run_in("olderdne", Phase::Done, 600, &root),
         ]];
-        let rows = build_home_rows(&projects, &folded, &HomeScope::All, watermark, now);
+        let rows = build_home_rows(&projects, &folded, &HomeScope::All, watermark, now, false);
         assert_eq!(
             ids_in(&rows, HomeBand::Finished),
             vec!["recentdn"],
@@ -17583,6 +18441,7 @@ mod home_ia {
             &app.home_scope,
             app.home_watermark,
             Utc::now(),
+            false,
         );
         let later = build_home_rows(
             &projects,
@@ -17590,6 +18449,7 @@ mod home_ia {
             &app.home_scope,
             app.home_watermark,
             Utc::now() + chrono::Duration::minutes(30),
+            false,
         );
         assert_eq!(
             ids_in(&first, HomeBand::Finished),
@@ -17645,12 +18505,12 @@ mod home_ia {
         }
         // A mouse click on a header is ignored rather than selecting it.
         app.selected_home = 1;
-        rail_select(&mut app, 0, 0, &rows, 0, 0);
+        rail_select(&mut app, 0, 0, &rows, &[], 0);
         assert_eq!(
             app.selected_home, 1,
             "a click on a header must not move the cursor"
         );
-        rail_select(&mut app, 3, 0, &rows, 0, 0);
+        rail_select(&mut app, 3, 0, &rows, &[], 0);
         assert_eq!(app.selected_home, 3, "a click on a run row selects it");
     }
 
@@ -17856,7 +18716,7 @@ mod home_ia {
         let root = PathBuf::from("/nonexistent/spar");
         let rows = nav_rows(&root);
         let mut app = App::new(None, Config::default(), None);
-        rail_select(&mut app, 3, 0, &rows, 0, 0); // the running run
+        rail_select(&mut app, 3, 0, &rows, &[], 0); // the running run
         assert_eq!(
             app.home_key.as_deref(),
             Some("run:/nonexistent/spar:work0001")
