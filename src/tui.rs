@@ -433,7 +433,7 @@ enum HomeRow {
     /// Band 4's action row — opens the Phase D new-run surface.
     NewRun,
     /// A placeholder shown while the first cross-project scan is in flight.
-    /// Reserved from the layout, not the content (U41).
+    /// Reserved from the layout, not the content (U47).
     Skeleton {
         band: HomeBand,
         slot: usize,

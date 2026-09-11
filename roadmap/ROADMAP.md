@@ -53,7 +53,7 @@
 - [x] **Orchestrator conversation** (resident conversation surface, native-cli turn loop, intake to brief + fleet + launch, gate consultation) - see `features/008-orchestrator-conversation.md`  
 - [ ] **Run composition** (workflow choice, role-by-role fleet with models and backups, operator defaults, the conversation completes the form) - see `features/009-run-composition.md`  
 - [x] **Structured views** (records not lines: columns, timestamps, folding, navigation by structure) - see `features/010-structured-views.md`  
-- [x] **Motion and visual identity** — chrome rebuild, tokens and the snapshot harness (C+D, U14); time-based motion, 60fps frame ramp with synchronized output and focus gating, spar own page and palette (A, U29/U30/U31); reserved-space layout, animated rail re-sort, tab-strip glide and skeletons (B, U39-U43) - see `features/006-motion-and-identity.md`  
+- [x] **Motion and visual identity** — chrome rebuild, tokens and the snapshot harness (C+D, U14); time-based motion, 60fps frame ramp with synchronized output and focus gating, spar own page and palette (A, U29/U30/U31); reserved-space layout, animated rail re-sort, tab-strip glide and skeletons (B, U45-U47, U43) - see `features/006-motion-and-identity.md`  
 - [x] **Fleet shaping** (honest provider precedence, a pinned reviewer panel as an exact
   panel not a padded one, the resolved fleet visible at gates, `--without` and `--fleet`
   presets) - see `features/011-fleet-shaping.md`  
