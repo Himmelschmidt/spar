@@ -4,6 +4,10 @@ use crate::paths::SparPaths;
 use crate::record::{Record, RecordKind, SourceId};
 use anyhow::Result;
 use std::collections::HashMap;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 pub const SURFACE_CHAT: &str = "chat";
 pub const META_SURFACE: &str = "surface";
@@ -205,6 +209,56 @@ pub fn say(
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
+pub struct TurnHandle {
+    pub scope_key: String,
+    pub conversation_id: String,
+    pub turn_id: String,
+    pub cancel: Arc<AtomicBool>,
+    pub pid: Arc<Mutex<Option<u32>>>,
+}
+
+impl TurnHandle {
+    pub fn new(scope_key: String, conversation_id: String, turn_id: String) -> Self {
+        Self {
+            scope_key,
+            conversation_id,
+            turn_id,
+            cancel: Arc::new(AtomicBool::new(false)),
+            pid: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        if let Some(pid) = *self.pid.lock().unwrap() {
+            crate::process::terminate_tree(pid, true);
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
+    }
+
+    pub fn on_spawn(&self, pid: u32) {
+        *self.pid.lock().unwrap() = Some(pid);
+    }
+
+    pub fn on_tick(&self) {
+        if self.is_cancelled() {
+            if let Some(pid) = *self.pid.lock().unwrap() {
+                crate::process::terminate_tree(pid, true);
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn get_pid(&self) -> Option<u32> {
+        *self.pid.lock().unwrap()
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
 pub struct TurnRequest {
     pub scope_key: String,
     pub conversation_id: String,
@@ -222,6 +276,72 @@ pub struct TurnOutcome {
     pub reply: Option<BusMessage>,
     pub worktree: Option<std::path::PathBuf>,
     pub stats: Option<crate::process::StreamStats>,
+}
+
+pub fn collect_gate_evidence(paths: &SparPaths, run_id: &str) -> GateEvidence {
+    collect_gate_evidence_with_fallback(paths, run_id, None)
+}
+
+pub fn collect_gate_evidence_with_fallback(
+    paths: &SparPaths,
+    run_id: &str,
+    fallback: Option<&Config>,
+) -> GateEvidence {
+    let snap_path = paths.run_config_file(run_id);
+    let cfg = if snap_path.is_file() {
+        Config::for_run(paths, run_id).ok()
+    } else {
+        fallback.cloned()
+    };
+    let st = crate::state::RunState::load(paths, run_id).ok();
+    let contract_path = paths.artifact(run_id, "test-contract.md");
+    let contract_body = std::fs::read_to_string(&contract_path).unwrap_or_default();
+    let criteria = crate::workflow::review_result::parse_contract_criteria(&contract_body);
+    let mut block_reasons: Vec<(String, Vec<String>)> = Vec::new();
+    if let (Some(cfg), Some(st)) = (cfg.as_ref(), st.as_ref()) {
+        let reviewers: Vec<&crate::state::SlotState> = st
+            .slots
+            .iter()
+            .filter(|s| s.role == crate::state::SlotRole::Reviewer)
+            .collect();
+        for r in reviewers {
+            if r.status == crate::state::SlotStatus::Failed {
+                block_reasons.push((r.id.clone(), vec!["failed".to_string()]));
+                continue;
+            }
+            let artifact = r
+                .artifact
+                .clone()
+                .unwrap_or_else(|| format!("review-{}.md", r.id));
+            let path = paths.artifact(run_id, &artifact);
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let res = crate::workflow::review_result::parse_review(&text);
+                let reasons =
+                    crate::workflow::implement::acceptance_block_reasons(&criteria, &res, cfg);
+                if !reasons.is_empty() {
+                    block_reasons.push((r.id.clone(), reasons));
+                }
+            }
+        }
+    }
+    GateEvidence {
+        frozen_unavailable: cfg.is_none(),
+        criteria,
+        block_reasons,
+        phase: st.as_ref().map(|s| s.phase),
+        st,
+        cfg,
+    }
+}
+
+#[derive(Debug)]
+pub struct GateEvidence {
+    pub frozen_unavailable: bool,
+    pub criteria: Vec<String>,
+    pub block_reasons: Vec<(String, Vec<String>)>,
+    pub phase: Option<crate::state::Phase>,
+    pub st: Option<crate::state::RunState>,
+    pub cfg: Option<Config>,
 }
 
 fn resolve_conversation_provider(paths: &SparPaths, run_id: Option<&str>) -> String {
@@ -264,7 +384,29 @@ fn resolve_conversation_provider(paths: &SparPaths, run_id: Option<&str>) -> Str
     "cli:claude".to_string()
 }
 
+pub fn dispatch_turn_with_handle(
+    paths: SparPaths,
+    req: TurnRequest,
+    handle: &TurnHandle,
+) -> Result<TurnOutcome> {
+    dispatch_turn_inner(paths, req, Some(handle))
+}
+
+#[allow(dead_code)]
 pub fn dispatch_turn(paths: SparPaths, req: TurnRequest) -> Result<TurnOutcome> {
+    let handle = TurnHandle::new(
+        req.scope_key.clone(),
+        req.conversation_id.clone(),
+        req.turn_id.clone(),
+    );
+    dispatch_turn_inner(paths, req, Some(&handle))
+}
+
+fn dispatch_turn_inner(
+    paths: SparPaths,
+    req: TurnRequest,
+    handle: Option<&TurnHandle>,
+) -> Result<TurnOutcome> {
     let provider_name = resolve_conversation_provider(&paths, req.run_id.as_deref());
     if provider_name.starts_with("api:") {
         anyhow::bail!("api-sdk is the better long-term host and explicitly does not block this: api-sdk turn not yet implemented for provider {provider_name}");
@@ -444,7 +586,25 @@ pub fn dispatch_turn(paths: SparPaths, req: TurnRequest) -> Result<TurnOutcome> 
                     env: env.clone(),
                     timeout: std::time::Duration::from_secs(120),
                 };
-                match crate::process::run_captured(&spawn_req, None, None) {
+                let handle_for_spawn = handle.cloned();
+                let handle_for_tick = handle.cloned();
+                let on_spawn = handle_for_spawn.as_ref().map(|h| {
+                    let hh = h.clone();
+                    move |pid: u32| hh.on_spawn(pid)
+                });
+                let on_spawn_ref: Option<&dyn Fn(u32)> =
+                    on_spawn.as_ref().map(|f| f as &dyn Fn(u32));
+                let on_tick = handle_for_tick.as_ref().map(|h| {
+                    let hh = h.clone();
+                    move || hh.on_tick()
+                });
+                let on_tick_ref: Option<&dyn Fn()> = on_tick.as_ref().map(|f| f as &dyn Fn());
+                let run_result = if handle.map(|h| h.is_cancelled()).unwrap_or(false) {
+                    Err(anyhow::anyhow!("turn cancelled"))
+                } else {
+                    crate::process::run_captured(&spawn_req, on_spawn_ref, on_tick_ref)
+                };
+                match run_result {
                     Ok(res) => {
                         exit_success = res.exit_code == Some(0) && !res.timed_out;
                         spawn_stats = Some(res.stats);
@@ -691,37 +851,34 @@ pub fn parse_proposal(body: &str) -> Result<Option<Proposal>> {
     Ok(None)
 }
 
-#[allow(dead_code)]
 pub fn gate_evidence(paths: &SparPaths, run_id: &str) -> String {
+    let evidence = collect_gate_evidence(paths, run_id);
     let mut out = String::new();
-    let snap_path = paths.run_config_file(run_id);
-    let cfg = if snap_path.is_file() {
-        Config::for_run(paths, run_id).ok()
-    } else {
-        None
-    };
-    let st = crate::state::RunState::load(paths, run_id).ok();
-    if cfg.is_none() {
+    if evidence.frozen_unavailable {
         out.push_str(
             "frozen config unavailable — cannot evaluate criteria-based blockers for this run\n",
         );
     }
-    if let Some(st) = &st {
-        out.push_str(&format!("phase: {:?}\n", st.phase));
+    if let Some(phase) = &evidence.phase {
+        out.push_str(&format!("phase: {:?}\n", phase));
     }
-    let contract_path = paths.artifact(run_id, "test-contract.md");
-    let contract_body = std::fs::read_to_string(&contract_path).unwrap_or_default();
-    let criteria = crate::workflow::review_result::parse_contract_criteria(&contract_body);
-    out.push_str(&format!("criteria: {}\n", criteria.join(", ")));
-    if let (Some(cfg), Some(st)) = (&cfg, &st) {
+    out.push_str(&format!("criteria: {}\n", evidence.criteria.join(", ")));
+    if let (Some(cfg), Some(st)) = (&evidence.cfg, &evidence.st) {
         let reviewers: Vec<&crate::state::SlotState> = st
             .slots
             .iter()
             .filter(|s| s.role == crate::state::SlotRole::Reviewer)
             .collect();
         for r in reviewers {
+            if let Some((_, reasons)) = evidence.block_reasons.iter().find(|(id, _)| id == &r.id) {
+                if reasons.len() == 1 && reasons[0] == "failed" {
+                    out.push_str(&format!("review {} failed\n", r.id));
+                } else {
+                    out.push_str(&format!("review {} blocks: {}\n", r.id, reasons.join("; ")));
+                }
+                continue;
+            }
             if r.status == crate::state::SlotStatus::Failed {
-                out.push_str(&format!("review {} failed\n", r.id));
                 continue;
             }
             let artifact = r
@@ -731,13 +888,15 @@ pub fn gate_evidence(paths: &SparPaths, run_id: &str) -> String {
             let path = paths.artifact(run_id, &artifact);
             if let Ok(text) = std::fs::read_to_string(&path) {
                 let res = crate::workflow::review_result::parse_review(&text);
-                let reasons =
-                    crate::workflow::implement::acceptance_block_reasons(&criteria, &res, cfg);
-                if !reasons.is_empty() {
-                    out.push_str(&format!("review {} blocks: {}\n", r.id, reasons.join("; ")));
-                } else if res.approves() {
+                let block_empty = crate::workflow::implement::acceptance_block_reasons(
+                    &evidence.criteria,
+                    &res,
+                    cfg,
+                )
+                .is_empty();
+                if block_empty && res.approves() {
                     out.push_str(&format!("review {} approves\n", r.id));
-                } else {
+                } else if block_empty {
                     out.push_str(&format!("review {} requests changes\n", r.id));
                 }
             }
@@ -750,7 +909,8 @@ pub fn gate_evidence(paths: &SparPaths, run_id: &str) -> String {
             body.chars().take(500).collect::<String>()
         ));
     }
-    let critic_artifact = st
+    let critic_artifact = evidence
+        .st
         .as_ref()
         .and_then(|st| {
             st.slots

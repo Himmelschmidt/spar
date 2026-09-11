@@ -577,6 +577,7 @@ struct App {
     chat_watermarks: std::collections::HashMap<String, usize>,
     chat_turns: std::collections::HashMap<String, String>,
     chat_pending_proposal: Option<crate::orchestrator::Proposal>,
+    chat_active_turn: Option<std::sync::Arc<crate::orchestrator::TurnHandle>>,
     tick: u64,
     /// (started, message, color, how long to show)
     flash: Option<(Instant, String, Color, Duration)>,
@@ -875,6 +876,7 @@ impl App {
             chat_watermarks: std::collections::HashMap::new(),
             chat_turns: std::collections::HashMap::new(),
             chat_pending_proposal: None,
+            chat_active_turn: None,
             tick: 0,
             flash: None,
             cfg,
@@ -1486,6 +1488,7 @@ enum Msg {
     /// `NewRun::gen` it was built for — applied only if the open modal is still on
     /// that generation, so a cancelled or reopened modal can't be clobbered.
     RosterReady(u64, Vec<RosterEntry>),
+    ChatTurnDone,
 }
 
 /// Size+mtime of everything a snapshot is derived from. Comparing these is a
@@ -3126,6 +3129,10 @@ fn run_loop(
                 apply_roster_ready(&mut app, gen, roster);
                 dirty = true;
             }
+            Ok(Msg::ChatTurnDone) => {
+                app.chat_active_turn = None;
+                dirty = true;
+            }
             Ok(Msg::Input(ev)) => {
                 dirty = true;
                 let mut ev = Some(ev);
@@ -3188,6 +3195,10 @@ fn run_loop(
                         }
                         Ok(Msg::RosterReady(gen, roster)) => {
                             apply_roster_ready(&mut app, gen, roster);
+                            None
+                        }
+                        Ok(Msg::ChatTurnDone) => {
+                            app.chat_active_turn = None;
                             None
                         }
                         Ok(Msg::Data) => None,
@@ -3488,6 +3499,10 @@ fn handle_key_inner(
     if app.focus == Focus::Main && app.main_tab == MainTab::Chat && app.chat_composing {
         match code {
             KeyCode::Esc => {
+                if let Some(h) = app.chat_active_turn.take() {
+                    h.cancel();
+                    app.flash("turn cancelled".to_string(), INFO);
+                }
                 app.chat_composing = false;
                 app.chat_input.clear();
                 return Ok(false);
@@ -3538,10 +3553,22 @@ fn handle_key_inner(
                         Some(scope_key.clone())
                     },
                 };
+                let handle = std::sync::Arc::new(crate::orchestrator::TurnHandle::new(
+                    scope_key.clone(),
+                    conv_id.clone(),
+                    turn_id.clone(),
+                ));
+                app.chat_active_turn = Some(handle.clone());
                 if let Some(tx) = app.bg_tx.clone() {
                     let swarm_clone = swarm.clone();
                     std::thread::spawn(move || {
-                        match crate::orchestrator::dispatch_turn(swarm_clone, req) {
+                        let res = crate::orchestrator::dispatch_turn_with_handle(
+                            swarm_clone,
+                            req,
+                            &handle,
+                        );
+                        let _ = tx.send(Msg::ChatTurnDone);
+                        match res {
                             Ok(out) => {
                                 if let Some(err) = out.error {
                                     let _ = tx.send(Msg::Flash(format!("turn: {err}"), ALERT));
@@ -3553,7 +3580,9 @@ fn handle_key_inner(
                         }
                     });
                 } else {
-                    let _ = crate::orchestrator::dispatch_turn(swarm.clone(), req);
+                    let _ =
+                        crate::orchestrator::dispatch_turn_with_handle(swarm.clone(), req, &handle);
+                    app.chat_active_turn = None;
                 }
                 app.chat_input.clear();
                 return Ok(false);
@@ -10438,9 +10467,8 @@ fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: Option<&Confi
     let Some(st) = full else {
         return Vec::new();
     };
-    let contract_path = swarm.artifact(&st.id, "test-contract.md");
-    let contract_body = std::fs::read_to_string(&contract_path).unwrap_or_default();
-    let criteria = workflow::review_result::parse_contract_criteria(&contract_body);
+    let evidence = crate::orchestrator::collect_gate_evidence_with_fallback(swarm, &st.id, cfg);
+    let criteria = evidence.criteria.clone();
     let reviewers: Vec<&SlotState> = st
         .slots
         .iter()
@@ -10448,11 +10476,8 @@ fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: Option<&Confi
         .collect();
     let mut out = Vec::new();
 
-    // O27/AC-17: without the run's own frozen config there is no way to evaluate
-    // `acceptance_block_reasons` the way the ship gate did — falling back to the
-    // TUI's live config would silently show a *different* set of blockers. Say so
-    // instead of guessing.
-    if cfg.is_none() {
+    if evidence.frozen_unavailable {
+        let contract_path = swarm.artifact(&st.id, "test-contract.md");
         out.push(Record {
             kind: RecordKind::Alert,
             glyph: "!",
@@ -10472,6 +10497,7 @@ fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: Option<&Confi
             has_command_row: false,
         });
     }
+    let contract_path = swarm.artifact(&st.id, "test-contract.md");
 
     if criteria.is_empty() {
         out.push(Record {
@@ -10608,11 +10634,13 @@ fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: Option<&Confi
                     Some(workflow::review_result::Verdict::RequestChanges) => "request_changes",
                     None => "no parsed verdict",
                 };
-                let mut reasons = match (criteria.is_empty(), cfg) {
-                    (false, Some(cfg)) => {
-                        workflow::implement::acceptance_block_reasons(&criteria, &res, cfg)
-                    }
-                    _ => Vec::new(),
+                let _ = cfg;
+                let mut reasons = if criteria.is_empty() {
+                    Vec::new()
+                } else if let Some(c) = evidence.cfg.as_ref() {
+                    workflow::implement::acceptance_block_reasons(&criteria, &res, c)
+                } else {
+                    Vec::new()
                 };
                 let blocked = !res.approves() || !reasons.is_empty();
                 if !res.approves() {
