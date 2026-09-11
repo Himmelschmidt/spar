@@ -262,13 +262,20 @@ impl LogRecord {
         } else {
             self.result.clone().unwrap_or_default()
         };
+        // A tool's command/path is its own body row (`CODE`, AC-19) whether the
+        // call is still open or has already merged with a result — the result's
+        // own output is never the only thing left once a result arrives.
+        let mut body = self.body.clone();
+        if matches!(self.kind, RecordKind::Tool(_)) && !self.argument.is_empty() {
+            body.insert(0, self.argument.clone());
+        }
         Record {
             kind: self.kind,
             glyph,
             verb: verb.to_string(),
             head: summary.clone(),
             summary,
-            body: self.body.clone(),
+            body,
             time: self.time,
             elapsed: self.elapsed,
             actor: None,
@@ -358,14 +365,23 @@ pub struct Columns {
     pub summary: u16,
     pub meta: u16,
     pub meta_width: u16,
+    /// Below 80 there is no room for a dedicated verb column (AC-4): the verb
+    /// text is combined into the summary span at render time instead of
+    /// occupying its own 9-column field. `verb` and `summary` still differ by a
+    /// minimal amount even when folded — collapsing them to the same x-position
+    /// would violate the "glyph < verb < summary < meta" column ordering every
+    /// width must hold.
+    pub verb_folded: bool,
 }
 
 impl Columns {
     pub fn for_width(width: u16) -> Self {
         const ACTOR_BREAK: u16 = 120;
         const WIDE_META_BREAK: u16 = 100;
+        const VERB_BREAK: u16 = 80;
         const ACTOR_WIDTH: u16 = 10;
         const VERB_WIDTH: u16 = 9;
+        const NARROW_VERB_WIDTH: u16 = 1;
         const NARROW_META_WIDTH: u16 = 6;
         const WIDE_META_WIDTH: u16 = 15;
 
@@ -376,7 +392,13 @@ impl Columns {
         } else {
             (None, glyph + 2)
         };
-        let summary = verb + VERB_WIDTH;
+        let verb_folded = width < VERB_BREAK;
+        let summary = verb
+            + if verb_folded {
+                NARROW_VERB_WIDTH
+            } else {
+                VERB_WIDTH
+            };
         let meta_width = if width >= WIDE_META_BREAK {
             WIDE_META_WIDTH
         } else {
@@ -391,6 +413,7 @@ impl Columns {
             summary,
             meta,
             meta_width,
+            verb_folded,
         }
     }
 }
@@ -426,6 +449,30 @@ impl PathShortener {
             }
         }
         Self::abbreviate(path)
+    }
+
+    /// Shortens every worktree-rooted (or otherwise abbreviate-able) path token
+    /// *within* arbitrary text, rather than requiring the whole string to be one
+    /// path — a Run/Bash argument is a shell command that carries paths inline
+    /// (e.g. `cd /long/worktree/src && cargo test`), unlike Read/Write/Edit's bare
+    /// path argument (AC-12).
+    pub fn shorten_in_text(&self, text: &str) -> String {
+        text.split(' ')
+            .map(|tok| self.shorten_token(tok))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn shorten_token(&self, tok: &str) -> String {
+        let trimmed = tok.trim_matches(|c| c == '\'' || c == '"');
+        if !trimmed.starts_with('/') {
+            return tok.to_string();
+        }
+        let shortened = self.shorten(trimmed);
+        if shortened == trimmed {
+            return tok.to_string();
+        }
+        tok.replacen(trimmed, &shortened, 1)
     }
 
     fn abbreviate(path: &str) -> String {
@@ -699,17 +746,17 @@ pub fn parse_log_records(
         if let Some(rest) = line.strip_prefix('→') {
             let (name, detail) = split_tool_line(rest.trim_start());
             let tool = ToolKind::classify(name);
-            let argument = if matches!(
-                tool,
+            let argument = match tool {
                 ToolKind::Read
-                    | ToolKind::Write
-                    | ToolKind::Edit
-                    | ToolKind::Search
-                    | ToolKind::Fetch
-            ) {
-                shortener.shorten(detail)
-            } else {
-                detail.to_string()
+                | ToolKind::Write
+                | ToolKind::Edit
+                | ToolKind::Search
+                | ToolKind::Fetch => shortener.shorten(detail),
+                // A Run/Bash argument is a whole shell command, not a bare path
+                // (AC-12): paths appear inline (`cd /worktree/src && ...`), so
+                // each token is checked rather than the whole string.
+                ToolKind::Run => shortener.shorten_in_text(detail),
+                _ => detail.to_string(),
             };
             records.push(LogRecord {
                 time,
@@ -825,10 +872,10 @@ pub fn parse_log_records(
         }
 
         if let Some((tool, detail)) = api_tool_call(line) {
-            let argument = if matches!(tool, ToolKind::Read | ToolKind::Write) {
-                shortener.shorten(&detail)
-            } else {
-                detail
+            let argument = match tool {
+                ToolKind::Read | ToolKind::Write => shortener.shorten(&detail),
+                ToolKind::Run => shortener.shorten_in_text(&detail),
+                _ => detail,
             };
             records.push(LogRecord {
                 time,
@@ -854,6 +901,13 @@ pub fn parse_log_records(
                 let call_time = records[idx].time;
                 records[idx].result = Some(observation.to_string());
                 records[idx].ok = Some(ok);
+                if !observation.is_empty() {
+                    // Mirrors the `←` branch: without this, a merged call's result
+                    // exists only in `result` (used for the head summary) and never
+                    // in `body`, so a one-line api-sdk result has nothing to fold
+                    // and nothing to expand into (AC-6).
+                    records[idx].body.push(observation.to_string());
+                }
                 records[idx].elapsed = match (call_time, time) {
                     (Some(a), Some(b)) if b >= a => (b - a).to_std().ok(),
                     _ => None,
@@ -1018,13 +1072,22 @@ pub fn flatten(records: &[Record], is_expanded: impl Fn(&Record) -> bool) -> Vec
             record_idx: i,
             kind: RowKind::Head,
         });
-        if is_expanded(r) {
+        let expanded = is_expanded(r);
+        if expanded {
             for j in 0..r.body.len() {
                 out.push(FlatRow {
                     record_idx: i,
                     kind: RowKind::Body(j),
                 });
             }
+        } else if matches!(r.kind, RecordKind::Tool(_)) && !r.body.is_empty() {
+            // The command/path row (`to_record`'s inserted `body[0]`) is never
+            // part of the fold: AC-19's "standalone command surface" must survive
+            // a completed call's result collapsing, not just an open call's.
+            out.push(FlatRow {
+                record_idx: i,
+                kind: RowKind::Body(0),
+            });
         }
     }
     out

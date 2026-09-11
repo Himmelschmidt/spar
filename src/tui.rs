@@ -699,6 +699,22 @@ struct App {
     /// `R`: fall back to the byte-for-byte raw view (`render_scrollable_log`) on a
     /// tab with exactly one raw source (Log, Diff). Unavailable elsewhere (U36/AC-14).
     raw_mode: bool,
+    /// The Log tab's *parsed*-mode scroll/follow/max, kept apart from
+    /// `stream_scroll`/`stream_follow`/`stream_max` (which now belong to raw mode
+    /// only, alongside the no-run overview) so `R` round-trips without clobbering
+    /// either view's position (AC-14).
+    stream_parsed_scroll: u16,
+    stream_parsed_follow: bool,
+    stream_parsed_max: u16,
+    /// The Diff tab's *parsed*-mode scroll/max, kept apart from `diff_scroll`/
+    /// `diff_max` (raw mode and the no-records fallback) for the same reason.
+    diff_parsed_scroll: u16,
+    diff_parsed_max: u16,
+    /// Set each time `draw_diff_body` runs: whether that paint used the raw
+    /// fields (`raw_mode`, or no parsed records to show) or the parsed ones.
+    /// Scroll/Home/End key handling reads this rather than re-deriving it, so it
+    /// can never disagree with what was actually drawn.
+    diff_raw_active: bool,
     /// `f` on Activity: narrow to one slot's rows (toggle). Log stays the
     /// selected-slot view already, so filtering only ever applies to Activity
     /// (correction #7).
@@ -875,6 +891,12 @@ impl App {
             record_cursor: None,
             record_cursor_dirty: false,
             raw_mode: false,
+            stream_parsed_scroll: 0,
+            stream_parsed_follow: true,
+            stream_parsed_max: 0,
+            diff_parsed_scroll: 0,
+            diff_parsed_max: 0,
+            diff_raw_active: true,
             activity_slot_filter: None,
         }
     }
@@ -918,8 +940,11 @@ impl App {
     fn reset_stream_view(&mut self) {
         self.stream_scroll = 0;
         self.stream_follow = true;
+        self.stream_parsed_scroll = 0;
+        self.stream_parsed_follow = true;
         self.diff_scroll = 0;
         self.diff_follow = false;
+        self.diff_parsed_scroll = 0;
     }
 
     fn reset_bus_view(&mut self) {
@@ -1034,13 +1059,26 @@ impl App {
         self.review_view_h.saturating_sub(1).max(3)
     }
 
-    fn scroll_stream_by(&mut self, delta: i32) {
-        apply_scroll_delta(
-            &mut self.stream_scroll,
-            &mut self.stream_follow,
-            self.stream_max,
-            delta,
-        );
+    /// `has_full` mirrors exactly what `draw_log_body` branches on: without a
+    /// full run the overview always paints via the raw fields (AC-14 does not
+    /// apply — there is nothing parsed to preserve), and with one, `raw_mode`
+    /// picks which pair of fields this frame's paint actually used.
+    fn scroll_stream_by(&mut self, delta: i32, has_full: bool) {
+        if has_full && !self.raw_mode {
+            apply_scroll_delta(
+                &mut self.stream_parsed_scroll,
+                &mut self.stream_parsed_follow,
+                self.stream_parsed_max,
+                delta,
+            );
+        } else {
+            apply_scroll_delta(
+                &mut self.stream_scroll,
+                &mut self.stream_follow,
+                self.stream_max,
+                delta,
+            );
+        }
     }
 
     fn scroll_bus_by(&mut self, delta: i32) {
@@ -1052,13 +1090,26 @@ impl App {
         );
     }
 
+    /// Mirrors `draw_diff_body`'s own branch via `diff_raw_active` (set by that
+    /// same paint), rather than re-deriving raw-vs-parsed from `raw_mode` alone —
+    /// the empty-records fallback also forces raw regardless of the toggle.
     fn scroll_diff_by(&mut self, delta: i32) {
-        apply_scroll_delta(
-            &mut self.diff_scroll,
-            &mut self.diff_follow,
-            self.diff_max,
-            delta,
-        );
+        if self.diff_raw_active {
+            apply_scroll_delta(
+                &mut self.diff_scroll,
+                &mut self.diff_follow,
+                self.diff_max,
+                delta,
+            );
+        } else {
+            let mut follow = false;
+            apply_scroll_delta(
+                &mut self.diff_parsed_scroll,
+                &mut follow,
+                self.diff_parsed_max,
+                delta,
+            );
+        }
     }
 
     fn scroll_plan_by(&mut self, delta: i32) {
@@ -1078,15 +1129,15 @@ impl App {
     /// rather than the run-scoped state those tabs normally own.
     fn scroll_main_by(&mut self, delta: i32, has_full: bool) {
         match self.main_tab {
-            MainTab::Log => self.scroll_stream_by(delta),
+            MainTab::Log => self.scroll_stream_by(delta, has_full),
             MainTab::Activity if has_full => self.scroll_bus_by(delta),
-            MainTab::Activity => self.scroll_stream_by(delta),
+            MainTab::Activity => self.scroll_stream_by(delta, false),
             MainTab::Diff if has_full => self.scroll_diff_by(delta),
-            MainTab::Diff => self.scroll_stream_by(delta),
+            MainTab::Diff => self.scroll_stream_by(delta, false),
             MainTab::Plan if has_full => self.scroll_plan_by(delta),
-            MainTab::Plan => self.scroll_stream_by(delta),
+            MainTab::Plan => self.scroll_stream_by(delta, false),
             MainTab::Review if has_full => self.scroll_review_by(delta),
-            MainTab::Review => self.scroll_stream_by(delta),
+            MainTab::Review => self.scroll_stream_by(delta, false),
             MainTab::Shell => {}
         }
     }
@@ -1107,6 +1158,9 @@ impl App {
                 self.bus_follow = false;
                 self.bus_scroll = 0;
             }
+            MainTab::Diff if has_full && !self.diff_raw_active => {
+                self.diff_parsed_scroll = 0;
+            }
             MainTab::Diff if has_full => {
                 self.diff_follow = false;
                 self.diff_scroll = 0;
@@ -1116,6 +1170,10 @@ impl App {
             }
             MainTab::Review if has_full => {
                 self.review_scroll = 0;
+            }
+            MainTab::Log if has_full && !self.raw_mode => {
+                self.stream_parsed_follow = false;
+                self.stream_parsed_scroll = 0;
             }
             _ => {
                 self.stream_follow = false;
@@ -1130,6 +1188,9 @@ impl App {
                 self.bus_follow = true;
                 self.bus_scroll = self.bus_max;
             }
+            MainTab::Diff if has_full && !self.diff_raw_active => {
+                self.diff_parsed_scroll = self.diff_parsed_max;
+            }
             MainTab::Diff if has_full => {
                 self.diff_follow = true;
                 self.diff_scroll = self.diff_max;
@@ -1139,6 +1200,10 @@ impl App {
             }
             MainTab::Review if has_full => {
                 self.review_scroll = self.review_max;
+            }
+            MainTab::Log if has_full && !self.raw_mode => {
+                self.stream_parsed_follow = true;
+                self.stream_parsed_scroll = self.stream_parsed_max;
             }
             _ => {
                 self.stream_follow = true;
@@ -1687,6 +1752,7 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
             apply_diff_watermark(
                 &st.id,
                 &w.slot_id,
+                st.base_commit.as_deref(),
                 record::parse_diff(&diff_text, &w.slot_id),
             )
         })
@@ -2331,19 +2397,35 @@ fn hash_diff_body(body: &[String]) -> u64 {
 /// (`diff_records` in `build_snapshot`), so the watermark must be scoped the same
 /// way: keying on `run_id` alone let slot A's "seen" mark suppress `NEW` on the
 /// same path in slot B's worktree under one run (round-review minor finding).
-fn diff_watermark_key(run_id: &str, slot_id: &str) -> String {
-    format!("{run_id}::{slot_id}")
+/// `base_commit` folds in as well (AC-18): a worktree recreated or rebased onto a
+/// different base is a different diff identity even under the same run/slot id,
+/// so its watermark key must differ too — an *absent* prior key reads as "never
+/// looked" (AC-18's "only ever mark more"), never as an obsolete match.
+fn diff_watermark_key(run_id: &str, slot_id: &str, base_commit: Option<&str>) -> String {
+    format!("{run_id}::{slot_id}::{}", base_commit.unwrap_or("none"))
 }
 
 /// Records the diff records' current per-file hashes as "seen" for `run_id`'s
-/// selected `slot_id`. Called when the operator actually leaves the Diff tab or
-/// quits (`handle_key`/`handle_mouse`), never on every render — that would mark
-/// everything seen before it was ever shown as new.
-fn mark_diff_seen(run_id: &str, slot_id: &str, records: &[Record]) {
-    mark_diff_seen_at(&diff_watermark_path(), run_id, slot_id, records);
+/// selected `slot_id` at `base_commit`. Called when the operator actually leaves
+/// the Diff tab or quits (`handle_key`/`handle_mouse`), never on every render —
+/// that would mark everything seen before it was ever shown as new.
+fn mark_diff_seen(run_id: &str, slot_id: &str, base_commit: Option<&str>, records: &[Record]) {
+    mark_diff_seen_at(
+        &diff_watermark_path(),
+        run_id,
+        slot_id,
+        base_commit,
+        records,
+    );
 }
 
-fn mark_diff_seen_at(path: &Path, run_id: &str, slot_id: &str, records: &[Record]) {
+fn mark_diff_seen_at(
+    path: &Path,
+    run_id: &str,
+    slot_id: &str,
+    base_commit: Option<&str>,
+    records: &[Record],
+) {
     let mut files = std::collections::HashMap::new();
     for r in records {
         if matches!(r.kind, RecordKind::FileDiff) {
@@ -2355,7 +2437,7 @@ fn mark_diff_seen_at(path: &Path, run_id: &str, slot_id: &str, records: &[Record
     }
     let mut file = read_diff_watermark(path);
     file.runs.insert(
-        diff_watermark_key(run_id, slot_id),
+        diff_watermark_key(run_id, slot_id, base_commit),
         RunDiffWatermark {
             at: Utc::now(),
             files,
@@ -2365,21 +2447,33 @@ fn mark_diff_seen_at(path: &Path, run_id: &str, slot_id: &str, records: &[Record
 }
 
 /// Marks each `FileDiff` record whose content hash differs from the stored
-/// watermark (or every one, if this run/slot was never looked at before), and
+/// watermark (or every one, if this run/slot/base was never looked at before), and
 /// prepends a banner Section when there is a previous look to compare against and
 /// at least one file changed since it.
-fn apply_diff_watermark(run_id: &str, slot_id: &str, records: Vec<Record>) -> Vec<Record> {
-    apply_diff_watermark_at(&diff_watermark_path(), run_id, slot_id, records)
+fn apply_diff_watermark(
+    run_id: &str,
+    slot_id: &str,
+    base_commit: Option<&str>,
+    records: Vec<Record>,
+) -> Vec<Record> {
+    apply_diff_watermark_at(
+        &diff_watermark_path(),
+        run_id,
+        slot_id,
+        base_commit,
+        records,
+    )
 }
 
 fn apply_diff_watermark_at(
     path: &Path,
     run_id: &str,
     slot_id: &str,
+    base_commit: Option<&str>,
     mut records: Vec<Record>,
 ) -> Vec<Record> {
     let file = read_diff_watermark(path);
-    let key = diff_watermark_key(run_id, slot_id);
+    let key = diff_watermark_key(run_id, slot_id, base_commit);
     let prev = file.runs.get(&key);
     let mut changed = 0usize;
     for r in &mut records {
@@ -3097,6 +3191,7 @@ fn handle_key(
 ) -> Result<bool> {
     let was_diff = app.main_tab == MainTab::Diff;
     let diff_run_id = full.map(|st| st.id.clone());
+    let diff_base_commit = full.and_then(|st| st.base_commit.clone());
     let diff_slot_id = full
         .and_then(|st| st.slots.get(app.selected_slot))
         .map(|s| s.id.clone());
@@ -3120,7 +3215,12 @@ fn handle_key(
     )?;
     if was_diff && (quit || app.main_tab != MainTab::Diff) {
         if let (Some(run_id), Some(slot_id)) = (diff_run_id, diff_slot_id) {
-            mark_diff_seen(&run_id, &slot_id, &diff_snapshot);
+            mark_diff_seen(
+                &run_id,
+                &slot_id,
+                diff_base_commit.as_deref(),
+                &diff_snapshot,
+            );
         }
     }
     Ok(quit)
@@ -4702,6 +4802,7 @@ fn handle_mouse(
 ) {
     let was_diff = app.main_tab == MainTab::Diff;
     let diff_run_id = full.map(|st| st.id.clone());
+    let diff_base_commit = full.and_then(|st| st.base_commit.clone());
     let diff_slot_id = full
         .and_then(|st| st.slots.get(app.selected_slot))
         .map(|s| s.id.clone());
@@ -4719,7 +4820,7 @@ fn handle_mouse(
     );
     if was_diff && app.main_tab != MainTab::Diff {
         if let (Some(run_id), Some(slot_id)) = (diff_run_id, diff_slot_id) {
-            mark_diff_seen(&run_id, &slot_id, diff_records);
+            mark_diff_seen(&run_id, &slot_id, diff_base_commit.as_deref(), diff_records);
         }
     }
 }
@@ -7131,7 +7232,15 @@ fn main_context(swarm: &SparPaths, full: Option<&RunState>, app: &App) -> String
                 .map(|st| slot_short(&st.slots, app.selected_slot))
                 .unwrap_or_else(|| "—".into());
             let mode = if app.log_expand { "wrap" } else { "trim" };
-            let follow = if app.stream_follow { " · live" } else { "" };
+            // Parsed mode (a full run, `R` off) tracks its own follow flag
+            // (AC-14); everything else — raw mode, and the no-run overview —
+            // still reads `stream_follow`.
+            let following = if full.is_some() && !app.raw_mode {
+                app.stream_parsed_follow
+            } else {
+                app.stream_follow
+            };
+            let follow = if following { " · live" } else { "" };
             format!("{slot} · {mode}{follow}")
         }
         MainTab::Activity if full.is_none() => String::new(),
@@ -7281,12 +7390,12 @@ fn draw_log_body(
         let live = (slot.map(|s| s.status) == Some(SlotStatus::Running))
             .then(|| records.last().map(|r| (&r.source, app.gutter(0))))
             .flatten();
-        app.stream_max = render_record_view(
+        app.stream_parsed_max = render_record_view(
             f,
             chunks[1],
             records,
-            &mut app.stream_scroll,
-            &mut app.stream_follow,
+            &mut app.stream_parsed_scroll,
+            &mut app.stream_parsed_follow,
             &app.fold_open,
             app.fold_all,
             app.record_cursor.as_ref(),
@@ -7336,7 +7445,8 @@ fn draw_diff_body(
     // a caller supplied raw text without records) falls back to the same raw
     // viewport the whole tab used before this feature, rather than a `FileDiff`
     // parse invented from text that was never `git diff` shaped.
-    if app.raw_mode || diff_records.is_empty() {
+    app.diff_raw_active = app.raw_mode || diff_records.is_empty();
+    if app.diff_raw_active {
         // `diff_text` is always a real `git diff HEAD` (or a plain not-a-diff
         // notice), never a coalesced marker-style log — the marker rewriting
         // `compact_log_line` does is irrelevant here and would mangle a diff's
@@ -7353,11 +7463,11 @@ fn draw_diff_body(
         );
     } else {
         let mut follow = false;
-        app.diff_max = render_record_view(
+        app.diff_parsed_max = render_record_view(
             f,
             inner,
             diff_records,
-            &mut app.diff_scroll,
+            &mut app.diff_parsed_scroll,
             &mut follow,
             &app.fold_open,
             app.fold_all,
@@ -7678,7 +7788,12 @@ fn build_head_row(
         }
         _ => &r.verb,
     };
-    if !verb_text.is_empty() {
+    // Below 80 columns `Columns::for_width` folds the verb column into the
+    // summary column (`cols.verb == cols.summary`, AC-4): there is no separate
+    // span to paint the verb into, so it is prefixed onto the summary text
+    // instead of dropped.
+    let verb_folded = cols.verb_folded;
+    if !verb_text.is_empty() && !verb_folded {
         let w = cols.summary.saturating_sub(cols.verb).saturating_sub(1) as usize;
         spans.push((
             cols.verb,
@@ -7687,9 +7802,14 @@ fn build_head_row(
         ));
     }
     let summary_w = cols.meta.saturating_sub(cols.summary).saturating_sub(1) as usize;
+    let summary_text = if verb_folded && !verb_text.is_empty() {
+        format!("{verb_text} {}", r.summary)
+    } else {
+        r.summary.clone()
+    };
     spans.push((
         cols.summary,
-        truncate_display(&r.summary, summary_w),
+        truncate_display(&summary_text, summary_w),
         record_kind_style(r),
     ));
     // Right-aligned and never overrunning the row (AC-3): the text pushed must be
@@ -7708,12 +7828,10 @@ fn build_head_row(
     }
 }
 
-/// One (possibly wrapped) body line. `is_command` is only ever true for a
-/// still-open tool call's own continuation lines (AC-19's command/path row gets
-/// `CODE`); once a call has merged with its result, its body starts with the
-/// result's own preview instead, so every body line of a merged/standalone record
-/// paints as plain output (`FG_DIM`) — the merged call's command itself already
-/// carries `CODE` in the head row's summary (`build_head_row`/`record_kind_style`).
+/// One (possibly wrapped) body line. `is_command` is only ever true for a Tool
+/// record's `body[0]` — `to_record` inserts the command/path there whether the
+/// call is open or already merged with a result — so it always paints `CODE`
+/// (AC-19's command/path row); every other body row is the result's own output.
 fn build_body_row(
     kind: RecordKind,
     text: String,
@@ -7745,14 +7863,24 @@ fn wrap_body_line(text: &str, width: usize) -> Vec<String> {
     if width == 0 || text.chars().count() <= width {
         return vec![text.to_string()];
     }
+    // Leading spaces are content the operator's tool emitted (indentation in a
+    // directory listing, a diff hunk); `rest.split(' ')` below would otherwise
+    // swallow them, since a boundary before any real word never has anything to
+    // attach a separator to (AC-6: expansion must preserve every persisted byte).
+    // Stripped up front, budgeted out of the wrap width so the indent plus first
+    // line never exceeds `width`, then reattached to the first output line only.
+    let indent: String = text.chars().take_while(|c| *c == ' ').collect();
+    let indent_len = indent.chars().count();
+    let rest = &text[indent.len()..];
+    let rest_width = width.saturating_sub(indent_len).max(1);
     let mut out = Vec::new();
     let mut cur = String::new();
-    for raw_word in text.split(' ') {
+    for raw_word in rest.split(' ') {
         let mut remaining = raw_word.to_string();
         loop {
             let word_len = remaining.chars().count();
             let sep = if cur.is_empty() { 0 } else { 1 };
-            if cur.chars().count() + sep + word_len <= width {
+            if cur.chars().count() + sep + word_len <= rest_width {
                 if sep == 1 {
                     cur.push(' ');
                 }
@@ -7764,17 +7892,22 @@ fn wrap_body_line(text: &str, width: usize) -> Vec<String> {
                 continue;
             }
             // A single word longer than the whole (empty) line: hard-break it.
-            let take: String = remaining.chars().take(width).collect();
-            let rest: String = remaining.chars().skip(width).collect();
+            let take: String = remaining.chars().take(rest_width).collect();
+            let rest2: String = remaining.chars().skip(rest_width).collect();
             out.push(take);
-            if rest.is_empty() {
+            if rest2.is_empty() {
                 break;
             }
-            remaining = rest;
+            remaining = rest2;
         }
     }
     if !cur.is_empty() || out.is_empty() {
         out.push(cur);
+    }
+    if !indent.is_empty() {
+        if let Some(first) = out.first_mut() {
+            first.insert_str(0, &indent);
+        }
     }
     out
 }
@@ -7788,11 +7921,9 @@ fn wrap_body_line(text: &str, width: usize) -> Vec<String> {
 /// silently clipped).
 enum ExpandedRowKind {
     Head,
-    /// `bool` is whether this is a still-open tool call's own command text
-    /// (continuation lines that arrived before any result merged in) rather than a
-    /// result's output — the one case body content can be identified as "the
-    /// command" with certainty, since a merged call's body starts with the result
-    /// preview instead (AC-19's command/path row).
+    /// `bool` is whether this is a Tool record's command/path row (`body[0]`,
+    /// AC-19) rather than result output — true regardless of whether the call is
+    /// still open or has already merged with a result.
     Body(String, bool),
 }
 
@@ -7838,7 +7969,10 @@ fn render_record_view(
             record::RowKind::Body(j) => {
                 let rec = &records[row.record_idx];
                 let text = rec.body.get(j).map(|s| s.as_str()).unwrap_or("");
-                let is_command = matches!(rec.kind, RecordKind::Tool(_)) && rec.ok.is_none();
+                // `to_record` inserts the command/path as `body[0]` for every
+                // Tool record, open or merged (AC-19); only that row is the
+                // command, everything after it is the result's own output.
+                let is_command = matches!(rec.kind, RecordKind::Tool(_)) && j == 0;
                 if matches!(rec.kind, RecordKind::Criterion) {
                     // The criteria grid's row is pre-padded into fixed-width cells
                     // (`review_records`): greedy word-wrap tokenizes on spaces and
@@ -14790,7 +14924,7 @@ mod render_stability {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("diff_watermark.json");
         let records = diff_records_for(&[("a.rs", "+1"), ("b.rs", "+2")]);
-        let out = apply_diff_watermark_at(&path, "run1", "s1", records);
+        let out = apply_diff_watermark_at(&path, "run1", "s1", Some("base1"), records);
         assert!(
             !out.iter().any(|r| matches!(r.kind, RecordKind::Section)),
             "no previous look to compare against: {out:#?}"
@@ -14808,10 +14942,10 @@ mod render_stability {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("diff_watermark.json");
         let seen = diff_records_for(&[("a.rs", "+1"), ("b.rs", "+2")]);
-        mark_diff_seen_at(&path, "run1", "s1", &seen);
+        mark_diff_seen_at(&path, "run1", "s1", Some("base1"), &seen);
 
         let unchanged = diff_records_for(&[("a.rs", "+1"), ("b.rs", "+2")]);
-        let out = apply_diff_watermark_at(&path, "run1", "s1", unchanged);
+        let out = apply_diff_watermark_at(&path, "run1", "s1", Some("base1"), unchanged);
         assert!(
             !out.iter().any(|r| r.summary.starts_with("NEW ·")),
             "nothing changed since the look: {out:#?}"
@@ -14819,7 +14953,7 @@ mod render_stability {
         assert!(!out.iter().any(|r| matches!(r.kind, RecordKind::Section)));
 
         let changed = diff_records_for(&[("a.rs", "+1 changed"), ("b.rs", "+2")]);
-        let out = apply_diff_watermark_at(&path, "run1", "s1", changed);
+        let out = apply_diff_watermark_at(&path, "run1", "s1", Some("base1"), changed);
         let banner = out
             .iter()
             .find(|r| matches!(r.kind, RecordKind::Section))
@@ -14839,7 +14973,7 @@ mod render_stability {
         let path = dir.path().join("diff_watermark.json");
         std::fs::write(&path, "{ not json").unwrap();
         let records = diff_records_for(&[("a.rs", "+1")]);
-        let out = apply_diff_watermark_at(&path, "run1", "s1", records);
+        let out = apply_diff_watermark_at(&path, "run1", "s1", Some("base1"), records);
         assert!(
             out.iter().all(|r| r.summary.starts_with("NEW ·")),
             "{out:#?}"
@@ -14856,13 +14990,31 @@ mod render_stability {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("diff_watermark.json");
         let seen_in_a = diff_records_for(&[("a.rs", "+1")]);
-        mark_diff_seen_at(&path, "run1", "slot-a", &seen_in_a);
+        mark_diff_seen_at(&path, "run1", "slot-a", Some("base1"), &seen_in_a);
 
         let same_path_in_b = diff_records_for(&[("a.rs", "+1")]);
-        let out = apply_diff_watermark_at(&path, "run1", "slot-b", same_path_in_b);
+        let out = apply_diff_watermark_at(&path, "run1", "slot-b", Some("base1"), same_path_in_b);
         assert!(
             out.iter().all(|r| r.summary.starts_with("NEW ·")),
             "a different slot's worktree must not inherit another slot's seen mark: {out:#?}"
+        );
+    }
+
+    /// AC-18: a worktree recreated or rebased onto a different base commit is a
+    /// different diff identity even under the same run/slot id — its watermark
+    /// must not inherit the old base's "seen" state (round-6 review finding).
+    #[test]
+    fn diff_watermark_is_scoped_to_the_worktree_base_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("diff_watermark.json");
+        let seen = diff_records_for(&[("a.rs", "+1")]);
+        mark_diff_seen_at(&path, "run1", "s1", Some("base1"), &seen);
+
+        let same_path_rebased = diff_records_for(&[("a.rs", "+1")]);
+        let out = apply_diff_watermark_at(&path, "run1", "s1", Some("base2"), same_path_rebased);
+        assert!(
+            out.iter().all(|r| r.summary.starts_with("NEW ·")),
+            "a rebased worktree (different base_commit) must not inherit the old base's seen mark: {out:#?}"
         );
     }
 }
