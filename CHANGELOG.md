@@ -4,6 +4,17 @@ All notable changes to spar are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Changing which agent or model a run uses now actually changes it.** Asking a
+  run that had already started to reload its settings updated the saved settings
+  but left the existing seats on whatever they were first given, so the run
+  carried on using the old one — and reported the old one back to you while doing
+  it. Seats that have not started yet are now re-assigned properly; a seat that is
+  mid-flight is deliberately left alone, since that is the one whose assignment is
+  already in use.
+
+
 ### Added
 
 - **Runs now survive the session that started them.** Starting a run in the
