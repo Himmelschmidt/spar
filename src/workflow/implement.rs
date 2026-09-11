@@ -645,10 +645,41 @@ fn prepare_implement_slots(
     if seats.iter().all(|s| s.role != SlotRole::Implementer) {
         anyhow::bail!("no provider resolved for implementer");
     }
+    let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+    let available: std::collections::HashSet<String> = crate::providers::detect_all()
+        .into_iter()
+        .filter(|r| r.available)
+        .map(|r| r.name)
+        .collect();
     for seat in seats {
-        let mut slot =
-            executor::init_slot_model(&seat.seat, &seat.provider, seat.role, seat.model.clone());
-        slot.source = Some(seat.source);
+        let mut provider = seat.provider.clone();
+        let mut source = seat.source;
+        let mut model = seat.model.clone();
+        if !crate::backup::is_provider_eligible(&provider, &store, Some(&available)) {
+            let ordinal = if seat.role == SlotRole::Reviewer {
+                seat.seat
+                    .trim_start_matches("reviewer-")
+                    .split('-')
+                    .next()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            if let Some(backup_raw) = crate::backup::backup_for_role(seat.role, ordinal, cfg) {
+                if crate::backup::is_provider_eligible(&backup_raw, &store, Some(&available)) {
+                    if let Ok(pin) = crate::runspec::Pin::parse(&backup_raw) {
+                        provider = pin.display();
+                        source = crate::state::SeatSource::Backup;
+                        if let Some(m) = pin.model {
+                            model = Some(m);
+                        }
+                    }
+                }
+            }
+        }
+        let mut slot = executor::init_slot_model(&seat.seat, &provider, seat.role, model);
+        slot.source = Some(source);
         state.slots.push(slot);
     }
     // The projected panel has graduated into real slots; a stale projection would only

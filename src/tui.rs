@@ -479,6 +479,7 @@ enum NewRunField {
     Project,
     Task,
     Workflow,
+    Roles,
     Fleet,
 }
 
@@ -535,6 +536,10 @@ struct NewRun {
     /// (D2 — the `Msg::RosterReady` guard).
     gen: u64,
     workflow: Option<crate::runspec::SpecWorkflow>,
+    roles: Vec<crate::runspec::RoleAssignment>,
+    arena_pool: Vec<Option<crate::runspec::Pin>>,
+    role_sel: usize,
+    editing_backup: bool,
 }
 
 struct App {
@@ -1405,6 +1410,10 @@ fn new_run_fixture() -> NewRun {
         loading: false,
         gen: 1,
         workflow: Some(crate::runspec::SpecWorkflow::Plan),
+        roles: vec![],
+        arena_pool: vec![],
+        role_sel: 0,
+        editing_backup: false,
     }
 }
 
@@ -2844,7 +2853,6 @@ fn new_run_providers(nr: &NewRun) -> Vec<String> {
 }
 
 fn new_run_spec(nr: &NewRun, cfg: &crate::config::Config) -> crate::runspec::RunSpec {
-    let providers = new_run_providers(nr);
     let wf = nr.workflow;
     let mut spec = crate::runspec::RunSpec {
         task: nr.task.clone(),
@@ -2853,21 +2861,33 @@ fn new_run_spec(nr: &NewRun, cfg: &crate::config::Config) -> crate::runspec::Run
     };
     if let Some(wf) = wf {
         if wf == crate::runspec::SpecWorkflow::Arena {
-            let expected = crate::runspec::spec_rows(wf, cfg).len();
-            let mut pool: Vec<Option<crate::runspec::Pin>> = Vec::new();
-            for (i, raw) in providers.iter().enumerate().take(expected) {
-                if let Ok(pin) = crate::runspec::Pin::parse(raw) {
-                    if pool.len() <= i {
-                        pool.resize_with(i + 1, || None);
-                    }
-                    pool[i] = Some(pin);
+            if !nr.arena_pool.is_empty() {
+                spec.arena_pool = nr.arena_pool.clone();
+                let expected = crate::runspec::spec_rows(wf, cfg).len();
+                if spec.arena_pool.len() != expected {
+                    spec.arena_pool.resize_with(expected, || None);
                 }
+            } else {
+                let providers = new_run_providers(nr);
+                let expected = crate::runspec::spec_rows(wf, cfg).len();
+                let mut pool: Vec<Option<crate::runspec::Pin>> = Vec::new();
+                for (i, raw) in providers.iter().enumerate().take(expected) {
+                    if let Ok(pin) = crate::runspec::Pin::parse(raw) {
+                        if pool.len() <= i {
+                            pool.resize_with(i + 1, || None);
+                        }
+                        pool[i] = Some(pin);
+                    }
+                }
+                while pool.len() < expected {
+                    pool.push(None);
+                }
+                spec.arena_pool = pool;
             }
-            while pool.len() < expected {
-                pool.push(None);
-            }
-            spec.arena_pool = pool;
+        } else if !nr.roles.is_empty() {
+            spec.roles = nr.roles.clone();
         } else {
+            let providers = new_run_providers(nr);
             let rows = crate::runspec::spec_rows(wf, cfg);
             for (idx, (role, ordinal)) in rows.iter().enumerate() {
                 let primary = providers
@@ -4367,6 +4387,45 @@ fn open_new_run(
 /// A `NewRun` in its initial "checking roster" state — no disk or process I/O, so
 /// this is safe to call before the background channel exists (`App::new`'s task
 /// seed, before `run_loop` wires `bg_tx`).
+fn rebuild_roles_for_workflow(nr: &mut NewRun, cfg: &crate::config::Config) {
+    if let Some(wf) = nr.workflow {
+        let expected = crate::runspec::spec_rows(wf, cfg);
+        if wf == crate::runspec::SpecWorkflow::Arena {
+            let mut new_pool = vec![None; expected.len()];
+            for (i, pin) in nr.arena_pool.iter().enumerate().take(expected.len()) {
+                new_pool[i] = pin.clone();
+            }
+            nr.arena_pool = new_pool;
+            nr.roles.clear();
+        } else {
+            let mut new_roles = Vec::new();
+            for (role, ordinal) in expected {
+                if let Some(existing) = nr
+                    .roles
+                    .iter()
+                    .find(|r| r.role == role && r.ordinal == ordinal)
+                {
+                    new_roles.push(existing.clone());
+                } else {
+                    new_roles.push(crate::runspec::RoleAssignment {
+                        role,
+                        ordinal,
+                        primary: None,
+                        backup: None,
+                    });
+                }
+            }
+            nr.roles = new_roles;
+            nr.arena_pool.clear();
+        }
+        nr.role_sel = 0;
+        nr.editing_backup = false;
+    } else {
+        nr.roles.clear();
+        nr.arena_pool.clear();
+    }
+}
+
 fn pending_new_run(
     project: Option<PathBuf>,
     projects: Vec<PathBuf>,
@@ -4375,6 +4434,25 @@ fn pending_new_run(
     gen: u64,
 ) -> NewRun {
     let defaults = crate::defaults::load();
+    let mut roles = defaults.roles.clone();
+    let mut arena_pool = defaults.arena_pool.clone();
+    if let Some(wf) = defaults.workflow {
+        let expected = crate::runspec::spec_rows(wf, &crate::config::Config::default());
+        if wf == crate::runspec::SpecWorkflow::Arena {
+            if arena_pool.len() != expected.len() {
+                arena_pool.resize_with(expected.len(), || None);
+            }
+        } else if roles.is_empty() && !expected.is_empty() {
+            for (role, ordinal) in expected {
+                roles.push(crate::runspec::RoleAssignment {
+                    role,
+                    ordinal,
+                    primary: None,
+                    backup: None,
+                });
+            }
+        }
+    }
     NewRun {
         project,
         projects,
@@ -4390,6 +4468,10 @@ fn pending_new_run(
         loading: true,
         gen,
         workflow: defaults.workflow,
+        roles,
+        arena_pool,
+        role_sel: 0,
+        editing_backup: false,
     }
 }
 
@@ -4620,14 +4702,6 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 app.flash("no project selected", ALERT);
                 return;
             };
-            let providers = new_run_providers(nr);
-            if providers.is_empty() {
-                app.flash("no providers selected", ALERT);
-                return;
-            }
-            // Keep the original brief byte-identical; the operator's edited task
-            // stays as the picker's task line separately and does not rewrite the
-            // brief (the brief is a record of what was asked for).
             let brief_path = if let Some(existing) = app.chat_pending_brief_path.clone() {
                 existing
             } else {
@@ -4644,13 +4718,24 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                     }
                 }
             };
-            let mut args = vec![
-                "plan".to_string(),
-                "--brief".to_string(),
-                brief_path.display().to_string(),
-                "--providers".to_string(),
-                providers.join(","),
-            ];
+            let cfg = app.cfg.clone();
+            let mut spec = new_run_spec(nr, &cfg);
+            spec = crate::runspec::RunSpec::apply_proposal_to_spec(spec, &proposal, &cfg);
+            spec.brief_path = Some(brief_path.clone());
+            if spec.task.trim().is_empty() {
+                spec.task = proposal.task.clone();
+            }
+            if let Err(e) = spec.validate_for_launch(&cfg) {
+                app.flash(e.to_string(), ALERT);
+                return;
+            }
+            let mut args = match spec.argv(&cfg) {
+                Ok(a) => a,
+                Err(e) => {
+                    app.flash(e.to_string(), ALERT);
+                    return;
+                }
+            };
             let target_swarm = SparPaths::new(&project);
             if let Ok(cwd) = std::env::current_dir() {
                 if let Ok(Some(base)) =
@@ -4713,7 +4798,8 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             nr.field = match nr.field {
                 NewRunField::Project => NewRunField::Task,
                 NewRunField::Task => NewRunField::Workflow,
-                NewRunField::Workflow => NewRunField::Fleet,
+                NewRunField::Workflow => NewRunField::Roles,
+                NewRunField::Roles => NewRunField::Fleet,
                 NewRunField::Fleet => NewRunField::Project,
             };
         }
@@ -4722,7 +4808,8 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 NewRunField::Project => NewRunField::Fleet,
                 NewRunField::Task => NewRunField::Project,
                 NewRunField::Workflow => NewRunField::Task,
-                NewRunField::Fleet => NewRunField::Workflow,
+                NewRunField::Roles => NewRunField::Workflow,
+                NewRunField::Fleet => NewRunField::Roles,
             };
         }
         KeyCode::Left if nr.field == NewRunField::Project && !nr.projects.is_empty() => {
@@ -4743,7 +4830,60 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             let i = (i + 1) % nr.projects.len();
             nr.project = nr.projects.get(i).cloned();
         }
-        KeyCode::Char(' ') if nr.field == NewRunField::Fleet => toggle_roster_pick(nr, nr.sel),
+        KeyCode::Char(' ') if nr.field == NewRunField::Fleet => {
+            if nr.workflow.is_some() && (!nr.roles.is_empty() || !nr.arena_pool.is_empty()) {
+                if let Some(entry) = nr.roster.get(nr.sel).cloned() {
+                    if !entry.available {
+                        app.flash(
+                            format!(
+                                "{} is not available: {}",
+                                entry.label,
+                                entry.reason.as_deref().unwrap_or("unavailable")
+                            ),
+                            ALERT,
+                        );
+                    } else if let RosterChoice::Provider(raw) = entry.choice {
+                        if let Ok(pin) = crate::runspec::Pin::parse(&raw) {
+                            if nr.workflow == Some(crate::runspec::SpecWorkflow::Arena) {
+                                if let Some(slot) = nr.arena_pool.get_mut(nr.role_sel) {
+                                    *slot = Some(pin);
+                                }
+                            } else if let Some(ra) = nr.roles.get_mut(nr.role_sel) {
+                                if nr.editing_backup {
+                                    if let Some(primary) = &ra.primary {
+                                        if primary.storage_key() == pin.storage_key() {
+                                            app.flash(
+                                                "backup same provider as primary".to_string(),
+                                                ALERT,
+                                            );
+                                        } else {
+                                            ra.backup = Some(pin);
+                                        }
+                                    } else {
+                                        ra.backup = Some(pin);
+                                    }
+                                } else {
+                                    if let Some(backup) = &ra.backup {
+                                        if backup.storage_key() == pin.storage_key() {
+                                            app.flash(
+                                                "primary same provider as backup".to_string(),
+                                                ALERT,
+                                            );
+                                        } else {
+                                            ra.primary = Some(pin);
+                                        }
+                                    } else {
+                                        ra.primary = Some(pin);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                toggle_roster_pick(nr, nr.sel);
+            }
+        }
         KeyCode::Char('j') | KeyCode::Down if nr.field == NewRunField::Fleet => {
             if !nr.roster.is_empty() {
                 nr.sel = (nr.sel + 1).min(nr.roster.len() - 1);
@@ -4766,6 +4906,8 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 }
                 Some(crate::runspec::SpecWorkflow::Arena) => None,
             };
+            let cfg = app.cfg.clone();
+            rebuild_roles_for_workflow(nr, &cfg);
         }
         KeyCode::Left
             if nr.field == NewRunField::Workflow && !mods.contains(KeyModifiers::CONTROL) =>
@@ -4783,6 +4925,8 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 }
                 None => Some(crate::runspec::SpecWorkflow::Arena),
             };
+            let cfg = app.cfg.clone();
+            rebuild_roles_for_workflow(nr, &cfg);
         }
         KeyCode::Right
             if nr.field == NewRunField::Workflow && !mods.contains(KeyModifiers::CONTROL) =>
@@ -4800,6 +4944,44 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 }
                 Some(crate::runspec::SpecWorkflow::Arena) => None,
             };
+            let cfg = app.cfg.clone();
+            rebuild_roles_for_workflow(nr, &cfg);
+        }
+        KeyCode::Char('j') | KeyCode::Down if nr.field == NewRunField::Roles => {
+            let max = if nr.workflow == Some(crate::runspec::SpecWorkflow::Arena) {
+                nr.arena_pool.len()
+            } else {
+                nr.roles.len()
+            };
+            if max > 0 {
+                nr.role_sel = (nr.role_sel + 1).min(max - 1);
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up if nr.field == NewRunField::Roles => {
+            nr.role_sel = nr.role_sel.saturating_sub(1);
+        }
+        KeyCode::Char('b') | KeyCode::Char('B') if nr.field == NewRunField::Roles => {
+            nr.editing_backup = !nr.editing_backup;
+        }
+        KeyCode::Backspace if nr.field == NewRunField::Roles => {
+            if nr.workflow == Some(crate::runspec::SpecWorkflow::Arena) {
+                if let Some(slot) = nr.arena_pool.get_mut(nr.role_sel) {
+                    *slot = None;
+                }
+            } else if let Some(ra) = nr.roles.get_mut(nr.role_sel) {
+                if nr.editing_backup {
+                    ra.backup = None;
+                } else {
+                    ra.primary = None;
+                }
+            }
+        }
+        KeyCode::Char('d')
+            if nr.field == NewRunField::Roles && mods.contains(KeyModifiers::CONTROL) =>
+        {
+            let spec = new_run_spec(nr, &app.cfg);
+            let _ = crate::defaults::save(&spec);
+            app.flash("defaults saved".to_string(), INFO);
         }
         KeyCode::Backspace if nr.field == NewRunField::Task => {
             nr.task.pop();
@@ -10675,6 +10857,80 @@ fn draw_new_run(f: &mut Frame, area: Rect, projects: &[registry::ProjectEntry], 
         field_style(NewRunField::Workflow),
     ));
     lines.push((String::new(), Style::default()));
+    if let Some(wf) = nr.workflow {
+        if wf == crate::runspec::SpecWorkflow::Arena {
+            lines.push(("Arena pool:".to_string(), field_style(NewRunField::Roles)));
+            for (idx, slot) in nr.arena_pool.iter().enumerate() {
+                let label = slot
+                    .as_ref()
+                    .map(|p| p.display())
+                    .unwrap_or_else(|| "unassigned".to_string());
+                let cursor = if nr.field == NewRunField::Roles && nr.role_sel == idx {
+                    ">"
+                } else {
+                    " "
+                };
+                let style = if nr.field == NewRunField::Roles && nr.role_sel == idx {
+                    Style::default().fg(ACCENT).bold()
+                } else {
+                    Style::default().fg(FG)
+                };
+                let extra = if nr.field == NewRunField::Roles && nr.role_sel == idx {
+                    " ← Fleet to assign"
+                } else {
+                    ""
+                };
+                lines.push((format!("{cursor} {}. {}{}", idx + 1, label, extra), style));
+            }
+        } else {
+            lines.push(("Roles:".to_string(), field_style(NewRunField::Roles)));
+            for (idx, ra) in nr.roles.iter().enumerate() {
+                let primary = ra
+                    .primary
+                    .as_ref()
+                    .map(|p| p.display())
+                    .unwrap_or_else(|| "unassigned".to_string());
+                let backup = ra
+                    .backup
+                    .as_ref()
+                    .map(|p| format!(" backup:{}", p.display()))
+                    .unwrap_or_default();
+                let name = if ra.role == crate::state::SlotRole::Reviewer {
+                    format!("reviewer[{}]", ra.ordinal)
+                } else {
+                    ra.role.as_config_key().to_string()
+                };
+                let cursor = if nr.field == NewRunField::Roles && nr.role_sel == idx {
+                    ">"
+                } else {
+                    " "
+                };
+                let style = if nr.field == NewRunField::Roles && nr.role_sel == idx {
+                    Style::default().fg(ACCENT).bold()
+                } else if ra.primary.is_none() {
+                    Style::default().fg(FG_DIM)
+                } else {
+                    Style::default().fg(FG)
+                };
+                let editing =
+                    if nr.field == NewRunField::Roles && nr.role_sel == idx && nr.editing_backup {
+                        " (editing backup)"
+                    } else {
+                        ""
+                    };
+                lines.push((
+                    format!("{cursor} {}: {}{}{}", name, primary, backup, editing),
+                    style,
+                ));
+            }
+            lines.push((
+                "  j/k select · Fleet to assign · b backup · Backspace clear · Ctrl-D save defaults"
+                    .to_string(),
+                Style::default().fg(FG_MUTED),
+            ));
+        }
+        lines.push((String::new(), Style::default()));
+    }
     lines.push(("Fleet:".to_string(), field_style(NewRunField::Fleet)));
     if nr.loading {
         lines.push((
