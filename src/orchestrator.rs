@@ -402,6 +402,24 @@ fn resolve_conversation_provider(paths: &SparPaths, run_id: Option<&str>) -> Str
     "cli:claude".to_string()
 }
 
+/// How long a single conversation turn may run before it is killed.
+///
+/// A turn is a whole agent dispatch — it reads the repo, may run commands, and is
+/// expected to think. The 120s literal this replaces killed any turn that did real
+/// work, silently and mid-sentence, which reads to the operator as the orchestrator
+/// ignoring them. `SPAR_CHAT_TURN_SECS` overrides it; the default is generous
+/// because the operator can always cancel with Esc, and an abandoned turn costs one
+/// dispatch rather than a wrong answer.
+fn turn_timeout() -> std::time::Duration {
+    const DEFAULT_SECS: u64 = 900;
+    let secs = std::env::var("SPAR_CHAT_TURN_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
 pub fn dispatch_turn_with_handle(
     paths: SparPaths,
     req: TurnRequest,
@@ -507,19 +525,36 @@ fn dispatch_turn_inner(
     let _worktree_existed = !worktree_created && worktree.exists();
 
     let slot_id = conv.clone();
-    let mut env = vec![
-        (
-            "SPAR_PROJECT_ROOT".to_string(),
-            req.project_root.display().to_string(),
-        ),
-        (
-            "SPAR_AGENT_ID".to_string(),
-            crate::bus::agent_ref(run_tag, &slot_id),
-        ),
-    ];
-    if let Some(run) = run_tag {
-        env.push(("SPAR_RUN_ID".to_string(), run.to_string()));
-    }
+    let spar_exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("spar"));
+    // `presence::wire` rather than three hand-rolled `env.push`es: it is the one
+    // place that knows how an agent's bus id is run-qualified, and it also installs
+    // the presence hooks for adapters that use them. Re-deriving the env here meant
+    // a conversation agent got the variables but not the wiring, and any future
+    // change to either would have had to be made twice (plan step 4; both reviewers).
+    let mut env = match crate::providers::adapter_named(&provider_name) {
+        Some(adapter) => {
+            let id = crate::providers::presence::SlotIdentity {
+                agent_id: &slot_id,
+                run_id: run_tag,
+                project_root: &req.project_root,
+                worktree: &worktree,
+                spar_exe: &spar_exe,
+            };
+            crate::providers::presence::wire(adapter.as_ref(), &id).env
+        }
+        // An unresolvable provider fails in the backend a few lines below; keep the
+        // identity variables so the failure is attributable rather than anonymous.
+        None => vec![
+            (
+                "SPAR_PROJECT_ROOT".to_string(),
+                req.project_root.display().to_string(),
+            ),
+            (
+                "SPAR_AGENT_ID".to_string(),
+                crate::bus::agent_ref(run_tag, &slot_id),
+            ),
+        ],
+    };
     env.push(("SPAR_CONVERSATION_ID".to_string(), conv.clone()));
     env.push(("SPAR_TURN_ID".to_string(), turn.clone()));
 
@@ -615,7 +650,7 @@ fn dispatch_turn_inner(
                 log_path: log_path.clone(),
                 isolation,
                 env: env.clone(),
-                timeout: std::time::Duration::from_secs(120),
+                timeout: turn_timeout(),
             };
             match crate::providers::conversation_turn::dispatch_turn(
                 backend_req,
@@ -670,6 +705,12 @@ fn dispatch_turn_inner(
         exit_success,
     );
 
+    // Test-only, and `#[cfg(test)]` rather than a bare env check: the env-var form
+    // shipped in the release binary, where any process that set
+    // `SPAR_ORCHESTRATOR_TEST_DIRTY` could make spar dirty a worktree it was about
+    // to decide the fate of. This compiles out entirely outside the test profile,
+    // so the AC-7 dirty-preservation coverage survives without the backdoor.
+    #[cfg(test)]
     if worktree_created && std::env::var("SPAR_ORCHESTRATOR_TEST_DIRTY").as_deref() == Ok("1") {
         let _ = std::fs::write(worktree.join(".spar-dirty-test"), "dirty");
     }

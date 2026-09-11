@@ -1,7 +1,7 @@
 ---
 id: 6
 title: Motion and visual identity
-status: in-progress
+status: done
 milestone: 6
 effort: M
 priority: medium
