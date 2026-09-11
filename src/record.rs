@@ -257,22 +257,37 @@ impl LogRecord {
             RecordKind::Error => ("!", "Error"),
             _ => ("│", ""),
         };
-        let summary = if !self.argument.is_empty() {
+        // A tool's command/path is its own body row (`CODE`, AC-19) whether the
+        // call is still open or has already merged with a result — the result's
+        // own output is never the only thing left once a result arrives.
+        let is_tool = matches!(self.kind, RecordKind::Tool(_));
+        let mut body = self.body.clone();
+        if is_tool && !self.argument.is_empty() {
+            body.insert(0, self.argument.clone());
+        }
+        // A tool's summary must never repeat what `body[0]` just carried verbatim
+        // (round-9 finding 1): once a result has merged in, its own preview is a
+        // distinct string and becomes the head; until then the head stays empty
+        // rather than showing the same command twice, adjacent, on head and body.
+        let summary = if is_tool {
+            self.result.clone().unwrap_or_default()
+        } else if !self.argument.is_empty() {
             self.argument.clone()
         } else {
             self.result.clone().unwrap_or_default()
         };
-        // A tool's command/path is its own body row (`CODE`, AC-19) whether the
-        // call is still open or has already merged with a result — the result's
-        // own output is never the only thing left once a result arrives.
-        let mut body = self.body.clone();
-        if matches!(self.kind, RecordKind::Tool(_)) && !self.argument.is_empty() {
-            body.insert(0, self.argument.clone());
-        }
+        let verb = if matches!(self.kind, RecordKind::Thought) {
+            match self.elapsed {
+                Some(e) => format!("Thought for {}", fmt_elapsed(e)),
+                None => verb.to_string(),
+            }
+        } else {
+            verb.to_string()
+        };
         Record {
             kind: self.kind,
             glyph,
-            verb: verb.to_string(),
+            verb,
             head: summary.clone(),
             summary,
             body,
@@ -309,17 +324,22 @@ impl ActivityRecord {
             RecordKind::Section => "§",
             _ => "·",
         };
+        // `detail` lives in `body[0]`, never also in `summary` — the same string
+        // painted on both the head and its own row, adjacent, is round-9 finding
+        // 1's defect. Activity is never folded by default, so the body row is
+        // always visible right under the head; it does not need to repeat there.
+        let body = if self.detail.is_empty() {
+            Vec::new()
+        } else {
+            vec![self.detail.clone()]
+        };
         Record {
             kind: self.kind,
             glyph,
             verb: self.event.clone(),
             head: self.event.clone(),
-            summary: self.detail.clone(),
-            body: if self.detail.is_empty() {
-                Vec::new()
-            } else {
-                vec![self.detail.clone()]
-            },
+            summary: String::new(),
+            body,
             time: self.time,
             elapsed: None,
             actor: Some(self.actor.clone()),
@@ -962,6 +982,21 @@ pub fn parse_log_records(
         });
         last_idx = Some(records.len() - 1);
     }
+    // A thought has no result of its own to time itself against (round-9 finding
+    // 3, AC-3): its elapsed is how long the reasoning ran before the *next*
+    // indexed record started, mirroring how a tool call's elapsed comes from its
+    // own result's time rather than an invented duration.
+    for i in 0..records.len() {
+        if !matches!(records[i].kind, RecordKind::Thought) || records[i].elapsed.is_some() {
+            continue;
+        }
+        let next_time = records.get(i + 1).and_then(|r| r.time);
+        if let (Some(start), Some(end)) = (records[i].time, next_time) {
+            if end >= start {
+                records[i].elapsed = (end - start).to_std().ok();
+            }
+        }
+    }
     records
 }
 
@@ -1210,6 +1245,32 @@ pub fn missing_document(name: &str, path: &str) -> Record {
     }
 }
 
+/// One `Note` record saying the Log tab's parsed view is missing its earlier
+/// history — the same fact `stream_content`'s raw banner already carries, made
+/// visible on the parsed path too (round-9 finding 5): the parse-path never read
+/// `_truncated` before this, so a truncated log said nothing was missing.
+pub fn truncated_log_notice(run_id: &str, slot_id: &str, tail_kb: usize) -> Record {
+    Record {
+        kind: RecordKind::Note,
+        glyph: "·",
+        verb: "Truncated".to_string(),
+        head: "Truncated".to_string(),
+        summary: format!("earlier log truncated (showing last ~{tail_kb} KB)"),
+        body: Vec::new(),
+        time: None,
+        elapsed: None,
+        actor: None,
+        ok: None,
+        source: SourceId::Log {
+            run_id: run_id.to_string(),
+            slot_id: slot_id.to_string(),
+            start: 0,
+            end: 0,
+        },
+        folded_by_default: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1218,6 +1279,48 @@ mod tests {
     fn tool_glyphs_match_ground_truth() {
         assert_eq!(ToolKind::Run.glyph(), "◆");
         assert_eq!(ToolKind::Read.glyph(), "◈");
+    }
+
+    /// AC-3 (round-9 finding 3): a thought has no result of its own to time
+    /// against, so its elapsed must come from the next indexed record's time —
+    /// pinned end to end, from the index through the rendered head text.
+    #[test]
+    fn thought_elapsed_comes_from_the_next_indexed_records_time() {
+        let text = "… thinking about it\n→ Bash  ls\n";
+        let line2_start = text.find('→').expect("second line") as u64;
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::milliseconds(800);
+        let index = vec![(0u64, t0), (line2_start, t1)];
+        let records = parse_log_records(text, 0, &index, &PathShortener::default(), "r", "s");
+        let thought = records
+            .iter()
+            .find(|r| matches!(r.kind, RecordKind::Thought))
+            .expect("thought record");
+        assert!(
+            thought.elapsed.is_some(),
+            "elapsed must be derived from the next record's time"
+        );
+        let rendered = thought.to_record();
+        assert_eq!(rendered.verb, "Thought for 0.8s", "{}", rendered.verb);
+    }
+
+    /// AC-8: a thought with no index at all must never invent a time or elapsed.
+    #[test]
+    fn thought_with_no_index_has_no_elapsed() {
+        let records = parse_log_records(
+            "… thinking about it\n→ Bash  ls\n",
+            0,
+            &[],
+            &PathShortener::default(),
+            "r",
+            "s",
+        );
+        let thought = records
+            .iter()
+            .find(|r| matches!(r.kind, RecordKind::Thought))
+            .expect("thought record");
+        assert!(thought.elapsed.is_none());
+        assert_eq!(thought.to_record().verb, "Thought");
     }
 
     #[test]
@@ -1242,6 +1345,40 @@ mod tests {
             rendered.folded_by_default,
             "a result-bearing tool call folds by default"
         );
+    }
+
+    /// Round-9 finding 1: a tool record must never paint its own command/argument
+    /// twice, adjacent, on head and body — `summary` and `body[0]` must be two
+    /// distinct strings (or `summary` empty), never the same text repeated.
+    #[test]
+    fn tool_record_never_repeats_its_argument_between_summary_and_body() {
+        let records = parse_log_records(
+            "→ Bash  ls -la /etc | head -5\n← ✓  total 1184\n",
+            0,
+            &[],
+            &PathShortener::default(),
+            "r",
+            "s",
+        );
+        let rendered = records[0].to_record();
+        assert_eq!(rendered.body[0], "ls -la /etc | head -5");
+        assert_ne!(
+            rendered.summary, rendered.body[0],
+            "summary must not repeat the command body verbatim: {rendered:#?}"
+        );
+        // Before a result merges in, there is nothing distinct to show as a
+        // summary yet — it must stay empty, not fall back to the command again.
+        let open = parse_log_records(
+            "→ Bash  ls -la /etc | head -5\n",
+            0,
+            &[],
+            &PathShortener::default(),
+            "r",
+            "s",
+        );
+        let open_rendered = open[0].to_record();
+        assert_eq!(open_rendered.summary, "", "{open_rendered:#?}");
+        assert_eq!(open_rendered.body[0], "ls -la /etc | head -5");
     }
 
     #[test]

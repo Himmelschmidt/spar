@@ -1735,15 +1735,26 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
             if !path.is_file() {
                 return Vec::new();
             }
-            let (raw, _truncated) = cache.load(&path, LOG_TAIL_BYTES);
+            let (raw, truncated) = cache.load(&path, LOG_TAIL_BYTES);
             let raw = raw.to_string();
             let start = cache.start;
             let index =
                 process::read_log_index(&path, start, start + raw.len() as u64).unwrap_or_default();
-            record::parse_log_records(&raw, start, &index, &shortener, &st.id, &slot.id)
-                .iter()
-                .map(|lr| lr.to_record())
-                .collect()
+            let mut records: Vec<Record> =
+                record::parse_log_records(&raw, start, &index, &shortener, &st.id, &slot.id)
+                    .iter()
+                    .map(|lr| lr.to_record())
+                    .collect();
+            // The parsed path never said anything about a truncated tail before
+            // this (round-9 finding 5) — `stream_content`'s raw banner said so,
+            // but the record view read `log_records`, not that string.
+            if truncated {
+                records.insert(
+                    0,
+                    record::truncated_log_notice(&st.id, &slot.id, LOG_TAIL_BYTES / 1024),
+                );
+            }
+            records
         })
         .unwrap_or_default();
     let diff_text = diff_content(full.as_ref(), sel.slot_idx);
@@ -3481,10 +3492,23 @@ fn handle_key_inner(
         // default at once, leaving individual toggles intact for when it is pressed
         // again.
         KeyCode::Char(' ') if app.focus == Focus::Main => {
-            if let Some(cur) = app.record_cursor.clone() {
-                if !app.fold_open.remove(&cur) {
-                    app.fold_open.insert(cur);
+            // No cursor yet (the state on first paint of every tab, round-9 finding
+            // 5): default to the first record rather than silently doing nothing,
+            // the same "act, don't no-op" rule `move_record_cursor` already follows.
+            let cur = app.record_cursor.clone().or_else(|| {
+                active_records.first().map(|r| {
+                    app.record_cursor = Some(r.source.clone());
+                    app.record_cursor_dirty = true;
+                    r.source.clone()
+                })
+            });
+            match cur {
+                Some(cur) => {
+                    if !app.fold_open.remove(&cur) {
+                        app.fold_open.insert(cur);
+                    }
                 }
+                None => app.flash("no match", FG_MUTED),
             }
         }
         KeyCode::Char('A') if app.focus == Focus::Main => {
@@ -3599,11 +3623,34 @@ fn filter_activity_records(
     }
 }
 
+/// The Log tab's effective record list: the pre-parsed `log_records` when
+/// non-empty, else a CPU-only fallback parse of `stream_text` (U13 forbids the
+/// disk read, not the parse). The single list both `draw_log_body`'s paint and
+/// `active_records_for`'s navigation must agree on (round-9 finding 5) — the same
+/// fix `filter_activity_records` already gives Activity.
+fn effective_log_records(log_records: &[Record], stream_text: &str) -> Vec<Record> {
+    if log_records.is_empty() && !stream_text.trim().is_empty() {
+        record::parse_log_records(
+            stream_text,
+            0,
+            &[],
+            &record::PathShortener::new(Vec::new()),
+            "",
+            "",
+        )
+        .iter()
+        .map(|lr| lr.to_record())
+        .collect()
+    } else {
+        log_records.to_vec()
+    }
+}
+
 /// Which record list `J`/`K`/`t`/`e`/`}`/`Space`/`R` act on — whatever Main is
 /// currently showing, filtered exactly as it is painted.
 fn active_records_for(app: &App, snap: &Snapshot) -> Vec<Record> {
     match app.main_tab {
-        MainTab::Log => snap.log_records.clone(),
+        MainTab::Log => effective_log_records(&snap.log_records, &snap.stream_text),
         MainTab::Activity => {
             filter_activity_records(&snap.activity, app.activity_slot_filter, snap.full.as_ref())
         }
@@ -7379,25 +7426,10 @@ fn draw_log_body(
         // `log_records` comes pre-parsed off-thread in `build_snapshot` (U13), stamped
         // against the byte-offset index when one exists. A caller that has not built
         // one yet (or a genuinely un-indexed source) still gets a folded, glyphed view
-        // by parsing `stream_text` here — CPU only, not the disk read U13 forbids —
-        // with an empty index, so every record's time is `None` rather than invented.
-        let owned;
-        let records: &[Record] = if log_records.is_empty() && !stream_text.trim().is_empty() {
-            owned = record::parse_log_records(
-                stream_text,
-                0,
-                &[],
-                &record::PathShortener::new(Vec::new()),
-                "",
-                "",
-            )
-            .iter()
-            .map(|lr| lr.to_record())
-            .collect::<Vec<_>>();
-            &owned
-        } else {
-            log_records
-        };
+        // through the same fallback `active_records_for` uses (round-9 finding 5): paint
+        // and structural navigation must agree on one list, or `J`/`t`/`e`/`Space` flash
+        // "no match" over records visibly on screen.
+        let records = effective_log_records(log_records, stream_text);
         // The newest record of a running slot breathes with the rail's own live
         // gutter (`App::gutter`) rather than a second fade (U30's standing rule).
         let live = (slot.map(|s| s.status) == Some(SlotStatus::Running))
@@ -7406,7 +7438,7 @@ fn draw_log_body(
         app.stream_parsed_max = render_record_view(
             f,
             chunks[1],
-            records,
+            &records,
             &mut app.stream_parsed_scroll,
             &mut app.stream_parsed_follow,
             &app.fold_open,
@@ -7795,10 +7827,11 @@ fn build_head_row(
     }
     // Doc/Criterion/Section records carry their real label in `head` (a document
     // heading, an `AC-n` id) — `verb` there is just a generic shape tag ("Doc").
+    // FileDiff is deliberately not here (round-9 finding 2): its `verb` is the
+    // real `A`/`D`/`R`/`M` status letter, and `head` (the path) already repeats
+    // in `summary` — using `head` here painted the path twice and dropped status.
     let verb_text: &str = match r.kind {
-        RecordKind::Doc | RecordKind::Criterion | RecordKind::FileDiff | RecordKind::Section => {
-            &r.head
-        }
+        RecordKind::Doc | RecordKind::Criterion | RecordKind::Section => &r.head,
         _ => &r.verb,
     };
     // Below 80 columns `Columns::for_width` folds the verb column into the
@@ -7807,7 +7840,15 @@ fn build_head_row(
     // instead of dropped.
     let verb_folded = cols.verb_folded;
     if !verb_text.is_empty() && !verb_folded {
-        let w = cols.summary.saturating_sub(cols.verb).saturating_sub(1) as usize;
+        // An empty summary column has nothing to collide with, so a long head
+        // label (Activity's `§ Run 3f2…`) gets the whole run up to meta rather
+        // than truncating at the 9-column verb field and losing the rest
+        // (round-9 finding 5).
+        let w = if r.summary.is_empty() {
+            cols.meta.saturating_sub(cols.verb).saturating_sub(1)
+        } else {
+            cols.summary.saturating_sub(cols.verb).saturating_sub(1)
+        } as usize;
         spans.push((
             cols.verb,
             truncate_display(verb_text, w),
@@ -7850,6 +7891,7 @@ fn build_body_row(
     text: String,
     cols: record::Columns,
     is_command: bool,
+    live_color: Option<Color>,
 ) -> RecordRow {
     let style = if is_command {
         Style::default().fg(CODE)
@@ -7861,10 +7903,12 @@ fn build_body_row(
         RecordKind::Tool(_) | RecordKind::Result { .. } | RecordKind::FileDiff
     )
     .then_some(SURFACE_SUNKEN);
-    RecordRow {
-        bg,
-        spans: vec![(cols.verb, text, style)],
+    let mut spans = Vec::new();
+    if let Some(color) = live_color {
+        spans.push((cols.gutter, "│".to_string(), Style::default().fg(color)));
     }
+    spans.push((cols.verb, text, style));
+    RecordRow { bg, spans }
 }
 
 /// Greedy word-wrap of one body line to `width` display columns (U36: "the raw
@@ -7943,6 +7987,10 @@ enum ExpandedRowKind {
 struct ExpandedRow {
     record_idx: usize,
     kind: ExpandedRowKind,
+    /// Rows painted so far for this record, head = 0: feeds `App::gutter`'s fade
+    /// so a streaming record's body rows dim with depth the same way its head
+    /// does, rather than only the head ever calling `gutter(0)` (round-9 finding 5).
+    depth: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7973,12 +8021,18 @@ fn render_record_view(
     // a pure domain one.
     let body_width = text_w.saturating_sub(cols.verb).max(1) as usize;
     let mut expanded: Vec<ExpandedRow> = Vec::with_capacity(flat.len());
+    let mut depth = 0usize;
     for row in &flat {
         match row.kind {
-            record::RowKind::Head => expanded.push(ExpandedRow {
-                record_idx: row.record_idx,
-                kind: ExpandedRowKind::Head,
-            }),
+            record::RowKind::Head => {
+                depth = 0;
+                expanded.push(ExpandedRow {
+                    record_idx: row.record_idx,
+                    kind: ExpandedRowKind::Head,
+                    depth,
+                });
+                depth += 1;
+            }
             record::RowKind::Body(j) => {
                 let rec = &records[row.record_idx];
                 let text = rec.body.get(j).map(|s| s.as_str()).unwrap_or("");
@@ -7996,13 +8050,17 @@ fn render_record_view(
                     expanded.push(ExpandedRow {
                         record_idx: row.record_idx,
                         kind: ExpandedRowKind::Body(truncate_display(text, body_width), is_command),
+                        depth,
                     });
+                    depth += 1;
                 } else {
                     for chunk in wrap_body_line(text, body_width) {
                         expanded.push(ExpandedRow {
                             record_idx: row.record_idx,
                             kind: ExpandedRowKind::Body(chunk, is_command),
+                            depth,
                         });
+                        depth += 1;
                     }
                 }
             }
@@ -8046,7 +8104,13 @@ fn render_record_view(
                     build_head_row(r, cols, is_cursor, !is_expanded(r), live_color)
                 }
                 ExpandedRowKind::Body(text, is_command) => {
-                    build_body_row(r.kind, text.clone(), cols, *is_command)
+                    // Same fade `App::gutter(depth)` gives the rail, applied to this
+                    // body row's own depth rather than the head's depth 0 (round-9
+                    // finding 5) — a live record's expanded output keeps breathing
+                    // instead of going flat the moment it scrolls off the head row.
+                    let body_color = live_color
+                        .map(|c| toward_bg(c, (row.depth as f32 * TRAIL_FALLOFF).min(1.0)));
+                    build_body_row(r.kind, text.clone(), cols, *is_command, body_color)
                 }
             }
         })
@@ -12229,8 +12293,9 @@ mod render_stability {
     #[test]
     fn structured_views_survive_every_tab_fold_and_raw_state() {
         let st = run_with(Phase::AwaitingShipConfirm, 7);
-        let widths = [1u16, 20, 53, 79, 80, 87, 99, 100, 119, 120, 200];
-        let heights = [1u16, 5, 12, 30, 60];
+        // AC-20 (finding 4): the same exhaustive 1..=200 x 1..=60 sweep every other
+        // state gets, not a hand-picked 11x5 grid — a sampled grid let a real
+        // out-of-range Rect through in an earlier round.
         // `full: None` (no run selected — Home, or Runs with nothing highlighted)
         // is covered alongside a real run: every non-Shell tab falls back to the
         // same coherent empty message in that state, and that fallback path is a
@@ -12244,15 +12309,22 @@ mod render_stability {
                 MainTab::Review,
                 MainTab::Shell,
             ] {
+                // `R` only exists for Log/Diff (AC-14); every other tab always
+                // paints with `raw_mode == false`, so looping the second state
+                // there would only repeat identical paints.
+                let raw_states: &[bool] = if matches!(tab, MainTab::Log | MainTab::Diff) {
+                    &[false, true]
+                } else {
+                    &[false]
+                };
                 for fold_all in [false, true] {
-                    for raw_mode in [false, true] {
-                        for &w in &widths {
-                            for &h in &heights {
+                    for &raw_mode in raw_states {
+                        for w in (1..=200u16).step_by(3) {
+                            for h in (1..=60u16).step_by(2) {
                                 paint_with(w, h, &[], &[], full, |a| {
                                     a.open_main(tab);
                                     a.fold_all = fold_all;
-                                    a.raw_mode =
-                                        raw_mode && matches!(tab, MainTab::Log | MainTab::Diff);
+                                    a.raw_mode = raw_mode;
                                 });
                             }
                         }
@@ -12260,6 +12332,231 @@ mod render_stability {
                 }
             }
         }
+    }
+
+    fn draw_record_view(
+        records: &[Record],
+        width: u16,
+        height: u16,
+        cursor: Option<&SourceId>,
+        fold_all: bool,
+    ) -> Buffer {
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let mut scroll = 0u16;
+        let mut follow = false;
+        let fold_open = std::collections::HashSet::new();
+        let mut cursor_dirty = false;
+        term.draw(|f| {
+            render_record_view(
+                f,
+                area,
+                records,
+                &mut scroll,
+                &mut follow,
+                &fold_open,
+                fold_all,
+                cursor,
+                &mut cursor_dirty,
+                None,
+            );
+        })
+        .unwrap();
+        term.backend().buffer().clone()
+    }
+
+    /// AC-19 (round-9 finding 7): nothing before this asserted `SURFACE_RAISED`,
+    /// `SURFACE_SUNKEN`, and `CODE` actually reach the screen — only that they
+    /// have *a* caller (`rg` in the finding's own verify line). Pin what each
+    /// caller paints, not just that the call exists.
+    #[test]
+    fn record_view_paints_surface_raised_surface_sunken_and_code() {
+        let records = record::parse_log_records(
+            "→ Bash  ls -la /etc | head -5\n← ✓  total 1184\n",
+            0,
+            &[],
+            &record::PathShortener::default(),
+            "r",
+            "s",
+        )
+        .iter()
+        .map(|lr| lr.to_record())
+        .collect::<Vec<_>>();
+        let cursor = records[0].source.clone();
+        // `fold_all: true` expands the tool's body so its command row (SURFACE_SUNKEN,
+        // CODE) actually paints; the cursor row (SURFACE_RAISED) is the head above it.
+        let buf = draw_record_view(&records, 60, 6, Some(&cursor), true);
+        assert_eq!(
+            buf[(0, 0)].bg,
+            SURFACE_RAISED,
+            "the cursor's head row must paint SURFACE_RAISED"
+        );
+        let cols = record::Columns::for_width(59);
+        assert_eq!(
+            buf[(0, 1)].bg,
+            SURFACE_SUNKEN,
+            "an expanded tool body row must paint SURFACE_SUNKEN"
+        );
+        assert_eq!(
+            buf[(cols.verb, 1)].fg,
+            CODE,
+            "the command row (body[0]) must paint CODE"
+        );
+    }
+
+    /// AC-5 (round-9 finding 7): prose and a tool call must be skimmable apart by
+    /// glyph *and* weight, not merely by reading the text. Pins both.
+    #[test]
+    fn prose_and_tool_heads_differ_in_glyph_and_weight() {
+        // A nonzero `start_offset` is a mid-stream tail read, past the spawn
+        // header/prompt echo the parser suppresses only at offset 0 — otherwise
+        // "Checking scope." here would be swallowed as prompt dump, not parsed
+        // as its own Prose record (mirrors `process::tests::
+        // indexed_parse_recognizes_a_marker_that_is_not_chunk_initial`).
+        let records = record::parse_log_records(
+            "Checking scope.\n→ Bash  ls -la\n",
+            1000,
+            &[],
+            &record::PathShortener::default(),
+            "r",
+            "s",
+        )
+        .iter()
+        .map(|lr| lr.to_record())
+        .collect::<Vec<_>>();
+        let prose = records
+            .iter()
+            .find(|r| matches!(r.kind, RecordKind::Prose))
+            .expect("prose record");
+        let tool = records
+            .iter()
+            .find(|r| matches!(r.kind, RecordKind::Tool(_)))
+            .expect("tool record");
+        assert_ne!(
+            prose.glyph, tool.glyph,
+            "prose and a tool call must use different glyphs"
+        );
+        // >=80 columns: below that, `Columns::for_width` folds the verb column
+        // into the summary span (`cols.verb_folded`), which is a different,
+        // already-covered case (AC-4) — this test targets the dedicated verb span.
+        let buf = draw_record_view(&records, 90, 6, None, false);
+        let cols = record::Columns::for_width(89);
+        // Prose carries no verb text (`to_record`'s wildcard arm), so it never
+        // gets the bold verb span a tool call's head always does.
+        assert!(
+            buf[(cols.verb, 1)].modifier.contains(Modifier::BOLD),
+            "a tool call's verb must be bold: {:?}",
+            buf[(cols.verb, 1)]
+        );
+    }
+
+    /// AC-4 (round-9 finding 7): `record::Columns::for_width`'s own breakpoint
+    /// arithmetic is pinned in `record::tests`, but nothing before this asserted
+    /// the *painted* glyph actually lands where that arithmetic says it should —
+    /// a span-offset bug upstream of the column math would pass every existing
+    /// test. Checked at every named breakpoint, for both a short and a very long
+    /// summary, so content length cannot move it either.
+    #[test]
+    fn record_view_paints_the_glyph_at_the_reserved_column_across_breakpoints() {
+        let short = record::parse_log_records(
+            "→ Bash  x\n",
+            0,
+            &[],
+            &record::PathShortener::default(),
+            "r",
+            "s",
+        )
+        .iter()
+        .map(|lr| lr.to_record())
+        .collect::<Vec<_>>();
+        let long = record::parse_log_records(
+            "→ Bash  a very very very long command argument that keeps going and going and going\n",
+            0,
+            &[],
+            &record::PathShortener::default(),
+            "r",
+            "s",
+        )
+        .iter()
+        .map(|lr| lr.to_record())
+        .collect::<Vec<_>>();
+        for width in [79u16, 80, 99, 100, 119, 120] {
+            let cols = record::Columns::for_width(width.saturating_sub(1));
+            for records in [&short, &long] {
+                let buf = draw_record_view(records, width, 4, None, false);
+                assert_eq!(
+                    buf[(cols.glyph, 0)].symbol(),
+                    records[0].glyph,
+                    "glyph must land at the reserved column at width {width}"
+                );
+            }
+        }
+    }
+
+    /// Round-9 finding 2: a modified file's head must show its real `A`/`D`/`R`/`M`
+    /// status, not the path a second time — `build_head_row` used to override
+    /// `FileDiff`'s `verb` with `head` (the path), which `parse_diff` already put
+    /// in `summary` too.
+    #[test]
+    fn file_diff_head_shows_status_not_a_repeated_path() {
+        let diff = "diff --git a/src/a.rs b/src/a.rs\n@@ -1,2 +1,3 @@\n+new line\n-old line\n";
+        let records = record::parse_diff(diff, "wt");
+        let file = records
+            .iter()
+            .find(|r| matches!(r.kind, RecordKind::FileDiff))
+            .expect("file diff record");
+        assert_eq!(file.verb, "M");
+        let buf = draw_record_view(&records, 90, 4, None, false);
+        let cols = record::Columns::for_width(89);
+        assert_eq!(
+            buf[(cols.verb, 0)].symbol(),
+            "M",
+            "the head must paint the status letter, not the path"
+        );
+    }
+
+    /// Round-9 finding 5: `draw_log_body` falls back to a CPU-only parse of
+    /// `stream_text` when `log_records` is empty, but navigation used to read
+    /// `snap.log_records` directly and never saw that fallback — `J`/`t`/`e`
+    /// flashed "no match" over records visibly on screen. `effective_log_records`
+    /// is the one function both paths must now call.
+    #[test]
+    fn effective_log_records_falls_back_to_stream_text_when_unparsed() {
+        assert!(effective_log_records(&[], "").is_empty());
+        let fallback = effective_log_records(&[], "→ Bash  ls -la\n");
+        assert!(
+            fallback
+                .iter()
+                .any(|r| matches!(r.kind, RecordKind::Tool(_))),
+            "a nonempty stream_text with an empty log_records must still parse: {fallback:#?}"
+        );
+        // A nonempty `log_records` always wins — it is the pre-parsed, time-stamped
+        // list; the fallback exists only for when that one is empty.
+        let pre_parsed = vec![Record {
+            kind: RecordKind::Note,
+            glyph: "·",
+            verb: "Note".to_string(),
+            head: "h".to_string(),
+            summary: "s".to_string(),
+            body: Vec::new(),
+            time: None,
+            elapsed: None,
+            actor: None,
+            ok: None,
+            source: SourceId::Activity {
+                at_millis: 0,
+                sequence: 0,
+            },
+            folded_by_default: false,
+        }];
+        let kept = effective_log_records(&pre_parsed, "→ Bash  ls -la\n");
+        assert_eq!(kept.len(), 1);
+        assert!(matches!(kept[0].kind, RecordKind::Note));
     }
 
     /// The Projects level renders its own row shape, and it is the one rail level the

@@ -157,16 +157,16 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
 }
 
 /// The artifact a plan-phase slot is expected to write. The critic's real output is
-/// `plan-critique-<slot_id>.md` (`templates/plan_critic.md`'s own instruction, and
-/// `executor.rs`'s dry-run stand-in for it) — not `plan.md`, which only the planner
-/// writes. Every `SlotJob` in this file used to hardcode `"plan.md"` for both roles,
-/// so the TUI's Plan tab (which resolves the critique through this same
-/// `expected_artifact`) rendered `plan.md` twice and never found the real critique.
-fn plan_expected_artifact(role: SlotRole, slot_id: &str) -> String {
-    match role {
-        SlotRole::PlanCritic => format!("plan-critique-{slot_id}.md"),
-        _ => "plan.md".to_string(),
-    }
+/// `expected_artifact` is the slot completion gate (feeds
+/// `salvage_expected_artifact`/`owed_artifacts`), and the plan critic's primary job
+/// is editing `plan.md` (`skills/core.md`), not necessarily writing its own
+/// critique file — a critic that only edits `plan.md` must still satisfy the gate.
+/// The TUI's Plan tab resolves the critique file itself, by slot id, independently
+/// of this field (`plan_docs` in `tui.rs`), so this stays `plan.md` for every role
+/// (round-9 finding 6 — a prior round's role-based split here altered run gating
+/// with no AC or test covering it, out of scope for a rendering feature).
+fn plan_expected_artifact(_role: SlotRole, _slot_id: &str) -> String {
+    "plan.md".to_string()
 }
 
 /// The planner + critic slot specs `(id, role, template, provider, source)`, drawn from
