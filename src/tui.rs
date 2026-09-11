@@ -5908,10 +5908,7 @@ fn draw_labels(
             width: w,
             height: 1,
         };
-        let caption_overlapped = is_animating
-            && glyphs
-                .iter()
-                .any(|(_, r)| r.x < caption_rect.right() && caption_rect.x < r.right());
+        let caption_overlapped = is_animating;
         if !caption_overlapped {
             f.render_widget(Paragraph::new(Span::styled(text, muted())), caption_rect);
         }
@@ -6346,6 +6343,27 @@ fn draw_context_band(
     }
 
     if app.browse == BrowseLevel::Home {
+        // Loading is not an empty state: before the scan lands, "0 projects" is
+        // a claim made before anyone has looked. Reserve the band the way the
+        // rows are reserved — a scanning shimmer, not a zero count.
+        if home.loading {
+            let text = "scanning projects…";
+            let spans = if app.animated {
+                sweep_spans(
+                    text,
+                    PULSE_LO,
+                    PULSE_HI,
+                    app.clock.cycle(crate::motion::SWEEP_PERIOD),
+                )
+            } else {
+                vec![Span::styled(
+                    text.to_string(),
+                    Style::default().fg(PULSE_LO),
+                )]
+            };
+            f.render_widget(Paragraph::new(Line::from(spans)), pad);
+            return;
+        }
         // Deliberately not the ⚑ roll-up (header chip) or the scope (rail title):
         // this row carries the portfolio totals, which are the one Home fact no
         // other surface has.
@@ -6461,9 +6479,11 @@ fn draw_context_band(
 
     // Fixed slot for meters: the stepper's width is a pure function of pad width,
     // not of billed token count, so the layout never moves as billed ticks up.
+    // A separator column between stepper and zone prevents abutting glyphs when
+    // the meter line fills the whole zone (34 columns).
     let zone = meter_zone(pad);
     let (room, meters) = if let Some(_z) = zone {
-        let r = pad.width.saturating_sub(METER_ZONE_W);
+        let r = pad.width.saturating_sub(METER_ZONE_W + 1);
         // Fit meters into the zone, truncating with marker if needed.
         let fitted = fit_spans(meters, METER_ZONE_W);
         (r, fitted)
@@ -7097,7 +7117,9 @@ impl RailMotion {
             } else {
                 for idx in self.applied..self.swaps.len() {
                     let i = self.swaps[idx];
-                    self.displayed_keys.swap(i, i + 1);
+                    if i + 1 < self.displayed_keys.len() {
+                        self.displayed_keys.swap(i, i + 1);
+                    }
                 }
             }
             self.applied = self.swaps.len();
@@ -7167,12 +7189,6 @@ impl RailMotion {
                 return None;
             }
             if level == BrowseLevel::Home {
-                // Home: headers, empty, more, project, newrun and skeletons are fixed
-                // chrome. Only run rows (prefix "run:") animate, and their rank space
-                // is the compacted movable list, not physical rows. A swap of adjacent
-                // movable indices may therefore jump over a fixed header in physical
-                // row terms; that is intentional — headers are not ranks and a cross-
-                // band move that jumps over one is still one adjacent movable step.
                 let is_run = |k: &String| k.starts_with("run:");
                 let mut rebased: Vec<Option<String>> = vec![None; keys.len()];
                 let mut snapped: std::collections::HashSet<String> =
@@ -7250,23 +7266,17 @@ impl RailMotion {
                     return None;
                 }
                 let new_displayed: Vec<String> = rebased.into_iter().map(|o| o.unwrap()).collect();
-                let movable_target: Vec<String> = keys
-                    .iter()
-                    .filter(|k| is_run(k) && !snapped.contains(*k))
-                    .cloned()
-                    .collect();
-                let movable_new: Vec<String> = new_displayed
-                    .iter()
-                    .filter(|k| is_run(k) && !snapped.contains(*k))
-                    .cloned()
-                    .collect();
-                let mut cur = movable_new.clone();
+                // Build fully adjacent swaps over terminal rows: each swap
+                // exchanges index i with i+1, so a run traveling across a band
+                // header moves the header one step the other way. This is the
+                // physical adjacency the correction requires.
+                let mut cur = new_displayed.clone();
                 let mut swaps: Vec<usize> = Vec::new();
-                for target_idx in 0..movable_target.len() {
-                    if cur[target_idx] == movable_target[target_idx] {
+                for target_idx in 0..keys.len() {
+                    if cur[target_idx] == keys[target_idx] {
                         continue;
                     }
-                    if let Some(pos) = cur.iter().position(|k| k == &movable_target[target_idx]) {
+                    if let Some(pos) = cur.iter().position(|k| k == &keys[target_idx]) {
                         let mut p = pos;
                         while p > target_idx {
                             swaps.push(p - 1);
@@ -7276,21 +7286,13 @@ impl RailMotion {
                     }
                 }
                 self.displayed_keys = new_displayed;
-                self.home_positions = home_pos
-                    .into_iter()
-                    .filter(|idx| {
-                        keys.get(*idx)
-                            .map(|k| is_run(k) && !snapped.contains(k))
-                            .unwrap_or(false)
-                    })
-                    .collect();
+                self.home_positions.clear();
                 self.target_keys = keys;
                 self.swaps = swaps;
                 self.applied = 0;
                 self.level = Some(level);
                 if self.swaps.is_empty() {
                     self.tween = crate::motion::Tween::<f32>::settled(1.0);
-                    self.home_positions.clear();
                     return None;
                 }
                 self.tween = crate::motion::Tween::<f32>::settled(0.0);
@@ -7539,14 +7541,15 @@ impl TabStripMotion {
         if same_geometry {
             return self.displayed(now);
         }
+        let (disp_glyphs, disp_hits) = self.displayed(now);
         let mut max_delta: u16 = 0;
-        for ((_, new_g), (_, old_g)) in new_glyphs.iter().zip(self.to_glyphs.iter()) {
-            max_delta = max_delta.max(new_g.x.abs_diff(old_g.x));
-            max_delta = max_delta.max(new_g.width.abs_diff(old_g.width));
+        for ((_, new_g), (_, disp_g)) in new_glyphs.iter().zip(disp_glyphs.iter()) {
+            max_delta = max_delta.max(new_g.x.abs_diff(disp_g.x));
+            max_delta = max_delta.max(new_g.width.abs_diff(disp_g.width));
         }
-        for ((_, new_h), (_, old_h)) in new_hits.iter().zip(self.to_hits.iter()) {
-            max_delta = max_delta.max(new_h.x.abs_diff(old_h.x));
-            max_delta = max_delta.max(new_h.width.abs_diff(old_h.width));
+        for ((_, new_h), (_, disp_h)) in new_hits.iter().zip(disp_hits.iter()) {
+            max_delta = max_delta.max(new_h.x.abs_diff(disp_h.x));
+            max_delta = max_delta.max(new_h.width.abs_diff(disp_h.width));
         }
         if max_delta < STRIP_JUMP_MIN {
             self.from_glyphs = new_glyphs.clone();
@@ -7556,7 +7559,6 @@ impl TabStripMotion {
             self.tween = crate::motion::Tween::<f32>::settled(1.0);
             return (new_glyphs, new_hits);
         }
-        let (disp_glyphs, disp_hits) = self.displayed(now);
         self.from_glyphs = disp_glyphs;
         self.from_hits = disp_hits;
         self.to_glyphs = new_glyphs;
@@ -7755,12 +7757,16 @@ fn rail_home_items(
                 }
                 HomeRow::Skeleton { .. } => {
                     let bar = format!("{}  {}", "░".repeat(8), "░".repeat(6));
-                    let spans = sweep_spans(
-                        &bar,
-                        PULSE_LO,
-                        PULSE_HI,
-                        app.clock.cycle(crate::motion::SWEEP_PERIOD),
-                    );
+                    let spans = if app.animated {
+                        sweep_spans(
+                            &bar,
+                            PULSE_LO,
+                            PULSE_HI,
+                            app.clock.cycle(crate::motion::SWEEP_PERIOD),
+                        )
+                    } else {
+                        vec![Span::styled(bar.clone(), Style::default().fg(PULSE_LO))]
+                    };
                     let lead = rail_lead(sel, focused, None, None);
                     let right = Span::styled("░".repeat(3), Style::default().fg(PULSE_LO));
                     rail_row(lead, spans, right, w)
@@ -13734,25 +13740,29 @@ mod render_stability {
         let ctx = main_context(&swarm, Some(&st), &test_app());
         let used = mid_glyphs.iter().map(|(_, r)| r.width).sum::<u16>();
         let room = lay80.main.width.saturating_sub(used).saturating_sub(1);
-        if !ctx.is_empty() && room > 2 {
-            let text = truncate(&ctx, room as usize);
-            let w = text.chars().count() as u16;
-            let caption_rect = Rect {
-                x: lay80.main.right().saturating_sub(w + 1),
-                y: lay80.labels.y,
-                width: w,
-                height: 1,
-            };
-            let caption_overlapped = mid_glyphs
-                .iter()
-                .any(|(_, r)| r.x < caption_rect.right() && caption_rect.x < r.right());
-            // At mid-flight, caption would be overlapped if we tried to paint it;
-            // suppression logic checks exactly this condition.
-            assert!(
-                caption_overlapped || !caption_overlapped,
-                "caption overlap check exercised"
-            );
-        }
+        assert!(
+            !ctx.is_empty() && room > 2,
+            "caption must be renderable at 80 for suppression test: ctx {ctx:?} room {room} used {used}"
+        );
+        let text = truncate(&ctx, room as usize);
+        let w = text.chars().count() as u16;
+        let caption_rect = Rect {
+            x: lay80.main.right().saturating_sub(w + 1),
+            y: lay80.labels.y,
+            width: w,
+            height: 1,
+        };
+        // Caption is unconditionally suppressed while the strip glides; the
+        // paint path below verifies the caption cells are blank mid-flight.
+        // Keep the geometric calculation for documentation but do not assert
+        // a tautology: the real check is the buffer inspection after paint.
+        let _caption_overlapped = mid_glyphs
+            .iter()
+            .any(|(_, r)| r.x < caption_rect.right() && caption_rect.x < r.right());
+        assert!(
+            motion.is_animating(mid),
+            "mid-flight must be animating for caption suppression test"
+        );
         // Also verify via actual paint that suppression occurs: paint 79 then 80
         // with same App and inspect buffer for rail title absence mid-flight.
         let mut app = test_app();
@@ -13789,6 +13799,7 @@ mod render_stability {
             .unwrap();
         // In-flight, rail title should be suppressed if glyphs overlap rail.
         // Check buffer: rail title area should not contain "RUNS" or "HOME" if overlapped.
+        // Caption is unconditionally suppressed while gliding, so its cells must be blank mid-flight.
         if app.tab_strip.is_animating(Instant::now()) {
             let glyphs_now = app
                 .main_tab_glyphs
@@ -13806,8 +13817,33 @@ mod render_stability {
                     "rail title painted over moving tab at mid-flight: {row:?} glyphs {glyphs_now:?}"
                 );
             }
+            let ctx = main_context(&swarm, Some(&st), &app);
+            let used = app
+                .main_tab_glyphs
+                .iter()
+                .map(|(r, _)| r.width)
+                .sum::<u16>();
+            let room = lay80b.main.width.saturating_sub(used).saturating_sub(1);
+            if !ctx.is_empty() && room > 2 {
+                let text = truncate(&ctx, room as usize);
+                let w = text.chars().count() as u16;
+                let caption_rect = Rect {
+                    x: lay80b.main.right().saturating_sub(w + 1),
+                    y: lay80b.labels.y,
+                    width: w,
+                    height: 1,
+                };
+                let buf = term80.backend().buffer();
+                let row: String = (caption_rect.x..caption_rect.right())
+                    .map(|x| buf[(x, caption_rect.y)].symbol())
+                    .collect();
+                assert!(
+                    !row.contains(text.trim()) && row.trim() != text.trim(),
+                    "caption painted over moving tab at mid-flight: row {row:?} should not contain caption {text:?} rect {caption_rect:?}"
+                );
+            }
         }
-        // Settled must restore rail title.
+        // Settled must restore rail title and caption.
         app.settle_motion();
         let mut term80s = Terminal::new(TestBackend::new(80, 30)).unwrap();
         term80s
@@ -13821,6 +13857,32 @@ mod render_stability {
             row.contains("RUNS") || row.contains("HOME") || !row.trim().is_empty(),
             "settled rail title missing after glide: {row:?}"
         );
+        {
+            let ctx = main_context(&swarm, Some(&st), &app);
+            let used = app
+                .main_tab_glyphs
+                .iter()
+                .map(|(r, _)| r.width)
+                .sum::<u16>();
+            let room = lay80b.main.width.saturating_sub(used).saturating_sub(1);
+            if !ctx.is_empty() && room > 2 {
+                let text = truncate(&ctx, room as usize);
+                let w = text.chars().count() as u16;
+                let caption_rect = Rect {
+                    x: lay80b.main.right().saturating_sub(w + 1),
+                    y: lay80b.labels.y,
+                    width: w,
+                    height: 1,
+                };
+                let row: String = (caption_rect.x..caption_rect.right())
+                    .map(|x| buf[(x, caption_rect.y)].symbol())
+                    .collect();
+                assert!(
+                    !row.trim().is_empty() && row.contains(text.chars().next().unwrap_or(' ').to_string().as_str()) || row.trim() == text.trim(),
+                    "settled caption missing after glide: row {row:?} expected {text:?} rect {caption_rect:?}"
+                );
+            }
+        }
     }
 
     /// The breakpoints the band/column arithmetic actually branches on — every
@@ -16955,21 +17017,18 @@ mod render_stability {
     }
 
     #[test]
-    fn home_headers_stay_fixed_during_reorder() {
+    fn home_reorder_travels_through_adjacent_rows() {
         let now = Instant::now();
         let mut app = App::new(None, Config::default(), None);
         app.browse = BrowseLevel::Home;
-        // Build a realistic Home with bands: NeedsMe empty, Running with 3, Finished with 1.
         let r1 = home_run("r1", Phase::Review, 1, "spar");
         let r2 = home_run("r2", Phase::Review, 2, "spar");
         let r3 = home_run("r3", Phase::Review, 3, "spar");
         let x = home_run("runX", Phase::Done, 10, "spar");
-        // Initially X in Finished, then moves to NeedsMe
         let build = |order: &[&str]| -> Vec<String> {
             let mut rows: Vec<HomeRow> = Vec::new();
             rows.push(HomeRow::Header(HomeBand::NeedsMe));
             for id in order.iter().filter(|id| **id == "runX") {
-                // NeedsMe only X in target, empty otherwise in source
                 if *id == "runX" && order[0] == "runX" {
                     rows.push(HomeRow::Run {
                         band: HomeBand::NeedsMe,
@@ -17008,16 +17067,25 @@ mod render_stability {
             rows.push(HomeRow::NewRun);
             rows.iter().map(home_row_key).collect()
         };
-        // Source: X in Finished
         let source_keys = build(&["r1", "r2", "r3", "runX"]);
-        // Target: X in NeedsMe
         let target_keys = build(&["runX", "r1", "r2", "r3"]);
         app.rail_motion
             .observe(BrowseLevel::Home, source_keys.clone(), now);
         app.rail_motion
             .observe(BrowseLevel::Home, target_keys.clone(), now);
-        let mut seen_movable_orders: Vec<Vec<String>> = Vec::new();
-        for elapsed in [30, 80, 140] {
+        let swaps = app.rail_motion.swaps.clone();
+        assert!(!swaps.is_empty(), "reorder must produce swaps");
+        for &idx in &swaps {
+            assert!(
+                idx + 1 < target_keys.len(),
+                "every swap must exchange an index with its right neighbour, got {idx} for len {}",
+                target_keys.len()
+            );
+        }
+        let mut seen_full: Vec<Vec<String>> = Vec::new();
+        let mut seen_movable: Vec<Vec<String>> = Vec::new();
+        let mut saw_header_displacement = false;
+        for elapsed in [30, 80, 140, 180] {
             let perm = app
                 .rail_motion
                 .observe(
@@ -17027,44 +17095,31 @@ mod render_stability {
                 )
                 .unwrap_or_else(|| (0..target_keys.len()).collect());
             let displayed: Vec<String> = perm.iter().map(|&i| target_keys[i].clone()).collect();
-            // Headers must stay at same indices as target.
-            for (idx, key) in displayed.iter().enumerate() {
-                if key.starts_with("hdr:") || key.starts_with("empty:") {
-                    assert_eq!(
-                        key, &target_keys[idx],
-                        "header/empty moved at t={elapsed}ms idx={idx}: {displayed:?} vs {target_keys:?}"
-                    );
-                }
-            }
-            // No duplicate or loss of run rows (permutation invariant for runs)
-            let mut runs_displayed: Vec<String> = displayed
-                .iter()
-                .filter(|k| k.starts_with("run:"))
-                .cloned()
-                .collect();
-            let mut runs_target: Vec<String> = target_keys
-                .iter()
-                .filter(|k| k.starts_with("run:"))
-                .cloned()
-                .collect();
-            runs_displayed.sort();
-            runs_target.sort();
+            let mut sorted_disp = displayed.clone();
+            sorted_disp.sort();
+            let mut sorted_target = target_keys.clone();
+            sorted_target.sort();
             assert_eq!(
-                runs_displayed, runs_target,
-                "run set changed at t={elapsed}"
+                sorted_disp, sorted_target,
+                "reorder dropped or duplicated a row at t={elapsed}"
             );
-            let movable_displayed: Vec<String> = displayed
+            seen_full.push(displayed.clone());
+            let movable: Vec<String> = displayed
                 .iter()
                 .filter(|k| k.starts_with("run:"))
                 .cloned()
                 .collect();
-            seen_movable_orders.push(movable_displayed);
+            seen_movable.push(movable);
+            if displayed.iter().enumerate().any(|(idx, k)| {
+                (k.starts_with("hdr:") || k.starts_with("empty:")) && k != &target_keys[idx]
+            }) {
+                saw_header_displacement = true;
+            }
         }
-        // Cross-band travel must produce intermediate movable orders distinct from
-        // both source and target, proving travel rather than teleport, while headers
-        // remain fixed. A movable-adjacent swap over a header counts as one step;
-        // headers are not ranks, so the run jumps over the header row in one movable
-        // step — the adjacent-physical requirement does not apply across fixed chrome.
+        assert!(
+            saw_header_displacement,
+            "Home row must travel through intervening rows — header should be displaced mid-flight, got {seen_full:?}"
+        );
         let source_movable: Vec<String> = source_keys
             .iter()
             .filter(|k| k.starts_with("run:"))
@@ -17075,13 +17130,28 @@ mod render_stability {
             .filter(|k| k.starts_with("run:"))
             .cloned()
             .collect();
-        let mut distinct_intermediates: Vec<Vec<String>> = seen_movable_orders.clone();
-        distinct_intermediates.sort();
-        distinct_intermediates.dedup();
-        distinct_intermediates.retain(|o| o != &source_movable && o != &target_movable);
+        let mut distinct_full = seen_full.clone();
+        distinct_full.sort();
+        distinct_full.dedup();
+        distinct_full.retain(|o| {
+            let mov: Vec<String> = o
+                .iter()
+                .filter(|k| k.starts_with("run:"))
+                .cloned()
+                .collect();
+            mov != source_movable && mov != target_movable
+        });
         assert!(
-            !distinct_intermediates.is_empty(),
-            "cross-band move must travel through intermediate movable orders, got {seen_movable_orders:?}"
+            !distinct_full.is_empty(),
+            "cross-band move must travel through intermediate full orders, got {seen_full:?}"
+        );
+        let mut distinct_movable = seen_movable.clone();
+        distinct_movable.sort();
+        distinct_movable.dedup();
+        distinct_movable.retain(|o| o != &source_movable && o != &target_movable);
+        assert!(
+            !distinct_movable.is_empty(),
+            "cross-band move must travel through intermediate movable orders, got {seen_movable:?}"
         );
     }
 
