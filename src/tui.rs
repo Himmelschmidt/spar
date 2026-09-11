@@ -999,6 +999,7 @@ impl App {
         }
         self.selected_project = idx.min(n - 1);
         self.selected_run = 0;
+        self.selected_run_key = None;
         self.selected_slot = 0;
         self.reset_stream_view();
         self.reset_bus_view();
@@ -1015,6 +1016,7 @@ impl App {
     fn open_project_runs(&mut self) {
         self.browse = BrowseLevel::Runs;
         self.selected_run = 0;
+        self.selected_run_key = None;
         self.selected_slot = 0;
         self.reset_stream_view();
         self.reset_bus_view();
@@ -1024,6 +1026,7 @@ impl App {
     fn open_projects_view(&mut self) {
         self.browse = BrowseLevel::Projects;
         self.selected_run = 0;
+        self.selected_run_key = None;
         self.selected_slot = 0;
         self.reset_stream_view();
         self.reset_bus_view();
@@ -7125,7 +7128,7 @@ impl RailMotion {
         if desired > self.swaps.len() {
             desired = self.swaps.len();
         }
-        if eased < 1.0 && desired == self.swaps.len() && self.swaps.len() > 1 {
+        if eased < 1.0 && desired == self.swaps.len() {
             desired = self.swaps.len() - 1;
         }
         while self.applied < desired {
@@ -11980,8 +11983,10 @@ mod labels {
     fn breadcrumb_retains_space_without_gate_at_narrow_widths() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
-        // At phone widths with no gate, the header must not reserve a zone for buttons
-        // that are not there — the breadcrumb would collapse to zero width otherwise.
+        // The header reserves the gate zone whenever the width affords it, independent
+        // of whether a gate is live — otherwise the ⚑/⚠ chips slide 23 columns the
+        // instant a run enters a gate. At phone widths the breadcrumb is truncated
+        // to the fixed left limit, but must still show the brand.
         let swarm = SparPaths::new("/x");
         for w in [35, 40, 60, 79] {
             let mut term = Terminal::new(TestBackend::new(w, 1)).unwrap();
@@ -12010,6 +12015,15 @@ mod labels {
                 "breadcrumb collapsed without gate at w={w}: {row:?}"
             );
             assert!(!row.trim().is_empty(), "header empty without gate at w={w}");
+            if w >= GATE_ZONE_W + GATE_ZONE_MIN_LEFT {
+                let zone = gate_zone(Rect {
+                    x: 0,
+                    y: 0,
+                    width: w,
+                    height: 1,
+                });
+                assert!(zone.is_some(), "zone affordable at w={w} must be Some");
+            }
         }
     }
 
@@ -13260,27 +13274,40 @@ mod render_stability {
             motion.is_animating(start),
             "a 79-to-80 tab placement change must glide"
         );
-        let (moving_glyphs, moving_hits) = motion.displayed(start);
+        let mid = start + crate::motion::STRIP_PERIOD / 2;
+        let (moving_glyphs, moving_hits) = motion.displayed(mid);
         assert_eq!(moving_glyphs.len(), MAIN_TABS.len());
         assert_eq!(moving_hits.len(), MAIN_TABS.len());
         for ((tab, glyph), (hit_tab, hit)) in moving_glyphs.iter().zip(&moving_hits) {
             assert_eq!(tab, hit_tab);
             assert!(
                 hit.x <= glyph.x && glyph.right() <= hit.right(),
-                "{tab:?} glyph {glyph:?} escaped its clickable rect {hit:?}"
+                "{tab:?} glyph {glyph:?} escaped its clickable rect {hit:?} at mid"
             );
         }
         assert!(
             moving_glyphs
                 .windows(2)
                 .all(|pair| pair[0].1.right() <= pair[1].1.x),
-            "moving tab glyphs overlap: {moving_glyphs:?}"
+            "moving tab glyphs overlap at mid: {moving_glyphs:?}"
         );
         assert!(
             moving_hits
                 .windows(2)
                 .all(|pair| pair[0].1.right() <= pair[1].1.x),
-            "moving tab hit rects overlap: {moving_hits:?}"
+            "moving tab hit rects overlap at mid: {moving_hits:?}"
+        );
+        let mid_is_intermediate = moving_glyphs
+            .iter()
+            .zip(from_glyphs.iter())
+            .any(|((_, g), (_, f))| g != f)
+            && moving_glyphs
+                .iter()
+                .zip(to_glyphs.iter())
+                .any(|((_, g), (_, t))| g != t);
+        assert!(
+            mid_is_intermediate,
+            "mid-flight glyphs must be between 79 and 80 endpoints"
         );
         // Verify the paint path also yields in-flight geometry and settles to fresh.
         let mut app = test_app();
