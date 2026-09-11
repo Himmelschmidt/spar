@@ -690,6 +690,12 @@ struct App {
     /// The record under the cursor (`J`/`K`/`t`/`T`/`e`/`E`/`}`/`{`), resolved to a
     /// row each frame by identity, the same pattern `resync_home_selection` uses.
     record_cursor: Option<crate::record::SourceId>,
+    /// Set whenever a structural-navigation key (J/K/t/T/e/E/}/{) moves
+    /// `record_cursor`; consumed by `render_record_view`, which snaps the active
+    /// tab's scroll to bring the cursor into view exactly once, then clears it
+    /// (AC-13) — never on every frame, or a deliberate manual scroll away from a
+    /// stationary cursor would be fought back into place.
+    record_cursor_dirty: bool,
     /// `R`: fall back to the byte-for-byte raw view (`render_scrollable_log`) on a
     /// tab with exactly one raw source (Log, Diff). Unavailable elsewhere (U36/AC-14).
     raw_mode: bool,
@@ -867,6 +873,7 @@ impl App {
             fold_open: std::collections::HashSet::new(),
             fold_all: false,
             record_cursor: None,
+            record_cursor_dirty: false,
             raw_mode: false,
             activity_slot_filter: None,
         }
@@ -1657,24 +1664,32 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
                 .collect()
         })
         .unwrap_or_default();
-    let diff_text = diff_content(&swarm, full.as_ref(), sel.slot_idx);
+    let diff_text = diff_content(full.as_ref(), sel.slot_idx);
     let diff_records = full
         .as_ref()
         .and_then(|st| {
             st.worktrees
                 .iter()
                 .find(|w| st.slots.get(sel.slot_idx).map(|s| &s.id) == Some(&w.slot_id))
+                .map(|w| (st, w))
         })
-        .map(|w| record::parse_diff(&diff_text, &w.slot_id))
+        .map(|(st, w)| apply_diff_watermark(&st.id, record::parse_diff(&diff_text, &w.slot_id)))
         .unwrap_or_default();
     let plan_docs_v = plan_docs(&swarm, full.as_ref());
     // O27: the Review projection evaluates the *run's own frozen* config, never the
     // live `spar.toml` the TUI happened to start with — otherwise a browsed run's
     // displayed blockers can disagree with what the gate actually enforced for it.
-    let run_cfg = full
-        .as_ref()
-        .and_then(|st| Config::for_run(&swarm, &st.id).ok());
-    let review_v = review_records(&swarm, full.as_ref(), run_cfg.as_ref().unwrap_or(cfg));
+    // A run's frozen config is required to show the gate's own blockers (O27,
+    // AC-17): falling back to the TUI's live `spar.toml` here would let the
+    // Review tab silently show a *different* set of blockers than the one the
+    // ship gate actually evaluated for this run. Fail closed instead — `None`
+    // tells `review_records` to say so rather than guess.
+    let run_cfg = full.as_ref().map(|st| Config::for_run(&swarm, &st.id));
+    let review_v = review_records(
+        &swarm,
+        full.as_ref(),
+        run_cfg.as_ref().and_then(|r| r.as_ref().ok()),
+    );
     // The TUI refresh is a provider-agnostic delivery pulse for the selected run:
     // advance unacked-message redelivery/escalation before reading alerts, so
     // requires_ack works even when no Claude slot's Stop hook is ticking acks.
@@ -2247,6 +2262,139 @@ fn write_watermark(path: &Path, at: DateTime<Utc>) -> Result<()> {
     Ok(())
 }
 
+/// The Diff tab's "since you last looked" watermark (005 C/AC-18): per-run, per-file
+/// content hashes as of the last time the operator actually looked at the Diff tab.
+/// Cross-project state, so it lives at `spar_home()` like the Home watermark (U19),
+/// keyed by run id rather than a single timestamp since "changed" is per-file.
+fn diff_watermark_path() -> PathBuf {
+    registry::spar_home().join("diff_watermark.json")
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct DiffWatermarkFile {
+    #[serde(default)]
+    runs: std::collections::HashMap<String, RunDiffWatermark>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct RunDiffWatermark {
+    at: DateTime<Utc>,
+    #[serde(default)]
+    files: std::collections::HashMap<String, u64>,
+}
+
+/// A missing or corrupt file reads as "never looked" (empty `runs`) — every file in
+/// the current diff will then read as new (AC-18: "never fewer").
+fn read_diff_watermark(path: &Path) -> DiffWatermarkFile {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_diff_watermark(path: &Path, file: &DiffWatermarkFile) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let text = serde_json::to_string(file)?;
+    std::fs::write(path, text)?;
+    Ok(())
+}
+
+fn hash_diff_body(body: &[String]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for l in body {
+        l.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Records the diff records' current per-file hashes as "seen" for `run_id`.
+/// Called when the operator actually leaves the Diff tab or quits (`handle_key`),
+/// never on every render — that would mark everything seen before it was ever
+/// shown as new.
+fn mark_diff_seen(run_id: &str, records: &[Record]) {
+    mark_diff_seen_at(&diff_watermark_path(), run_id, records);
+}
+
+fn mark_diff_seen_at(path: &Path, run_id: &str, records: &[Record]) {
+    let mut files = std::collections::HashMap::new();
+    for r in records {
+        if matches!(r.kind, RecordKind::FileDiff) {
+            files.insert(r.head.clone(), hash_diff_body(&r.body));
+        }
+    }
+    if files.is_empty() {
+        return;
+    }
+    let mut file = read_diff_watermark(path);
+    file.runs.insert(
+        run_id.to_string(),
+        RunDiffWatermark {
+            at: Utc::now(),
+            files,
+        },
+    );
+    let _ = write_diff_watermark(path, &file);
+}
+
+/// Marks each `FileDiff` record whose content hash differs from the stored
+/// watermark (or every one, if this run was never looked at before), and prepends
+/// a banner Section when there is a previous look to compare against and at least
+/// one file changed since it.
+fn apply_diff_watermark(run_id: &str, records: Vec<Record>) -> Vec<Record> {
+    apply_diff_watermark_at(&diff_watermark_path(), run_id, records)
+}
+
+fn apply_diff_watermark_at(path: &Path, run_id: &str, mut records: Vec<Record>) -> Vec<Record> {
+    let file = read_diff_watermark(path);
+    let prev = file.runs.get(run_id);
+    let mut changed = 0usize;
+    for r in &mut records {
+        if !matches!(r.kind, RecordKind::FileDiff) {
+            continue;
+        }
+        let hash = hash_diff_body(&r.body);
+        let is_new = prev
+            .map(|rw| rw.files.get(&r.head).map(|h| *h != hash).unwrap_or(true))
+            .unwrap_or(true);
+        if is_new {
+            changed += 1;
+            r.summary = format!("NEW · {}", r.summary);
+        }
+    }
+    if let Some(rw) = prev {
+        if changed > 0 {
+            records.insert(
+                0,
+                Record {
+                    kind: RecordKind::Section,
+                    glyph: "§",
+                    verb: "Diff".to_string(),
+                    head: "since you last looked".to_string(),
+                    summary: format!(
+                        "{changed} file{} changed · {}",
+                        if changed == 1 { "" } else { "s" },
+                        relative_age(rw.at)
+                    ),
+                    body: Vec::new(),
+                    time: Some(rw.at),
+                    elapsed: None,
+                    actor: None,
+                    ok: None,
+                    source: SourceId::Diff {
+                        worktree: run_id.to_string(),
+                        path: "__watermark__".to_string(),
+                    },
+                    folded_by_default: false,
+                },
+            );
+        }
+    }
+    records
+}
+
 /// Build the fleet picker's roster (D2). Pure: `detected` is the result of
 /// `providers::detect_all()` already resolved by the caller — this never touches
 /// `PATH` itself (U22, U13). Parse failures are listed first (so a broken config
@@ -2450,7 +2598,7 @@ const DIFF_MAX_BYTES: usize = 200_000;
 /// Main's Diff tab (Stage B): the selected slot's worktree diff against HEAD, falling
 /// back to the run's artifacts when the slot has no worktree (plan/review slots,
 /// headless runs) so the tab is never blank.
-fn diff_content(swarm: &SparPaths, full: Option<&RunState>, slot_idx: usize) -> String {
+fn diff_content(full: Option<&RunState>, slot_idx: usize) -> String {
     let Some(st) = full else {
         return "\n  No run selected.".into();
     };
@@ -2483,47 +2631,16 @@ fn diff_content(swarm: &SparPaths, full: Option<&RunState>, slot_idx: usize) -> 
         }
     }
 
-    // No worktree for this slot (e.g. plan/review slot, or headless) — fall back to the
-    // run's artifacts so the tab is never blank.
-    let dir = swarm.artifacts_dir(&st.id);
-    let mut names: Vec<String> = std::fs::read_dir(&dir)
-        .map(|rd| {
-            rd.flatten()
-                .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect()
-        })
-        .unwrap_or_default();
-    names.sort();
-    if names.is_empty() {
-        return format!(
-            "\n  No worktree diff and no artifacts yet for {}.\n\n  The Diff tab shows the selected slot's worktree changes once it has one;\n  until then it falls back to this run's artifacts:\n    {}\n",
-            st.id,
-            dir.display()
-        );
-    }
-
-    // Prefer the selected slot's artifact, then a plan, then the first file.
-    let slot_artifact = st
+    // No worktree for this slot (e.g. a plan/review slot, or headless): the Diff
+    // tab is specifically the selected worktree's `git diff HEAD` (U4). Dumping an
+    // arbitrary artifact file here used to make the tab lie about what it shows —
+    // AC-18 makes this an explicit non-goal. Say there is no worktree diff instead.
+    let slot_id = st
         .slots
         .get(slot_idx)
-        .and_then(|s| s.artifact.as_deref())
-        .map(|a| {
-            Path::new(a)
-                .file_name()
-                .map(|f| f.to_string_lossy().into_owned())
-                .unwrap_or_else(|| a.to_string())
-        })
-        .filter(|a| names.contains(a));
-    let pick = slot_artifact
-        .or_else(|| names.iter().find(|n| n.starts_with("plan")).cloned())
-        .unwrap_or_else(|| names[0].clone());
-
-    let body = process::tail_log_info(&dir.join(&pick), LOG_TAIL_BYTES).text;
-    format!(
-        "  artifacts: {}\n  showing: {pick}\n\n{body}",
-        names.join(" · ")
-    )
+        .map(|s| s.id.as_str())
+        .unwrap_or("this slot");
+    format!("\n  {slot_id} has no worktree.\n\n  No worktree diff for this slot.")
 }
 
 /// Redraw is only worth it while something is moving on screen: a flash timer,
@@ -2925,8 +3042,55 @@ fn project_overview(projects: &[registry::ProjectEntry], idx: usize) -> String {
     )
 }
 
+/// Thin wrapper around [`handle_key_inner`]: on the way out, if the key just
+/// dispatched left the Diff tab (or quit the app while on it), records the
+/// current diff records as "seen" for the watermark (AC-18/005 C) — written here,
+/// not per-frame, so a file only reads as "new" until the operator actually
+/// leaves the tab having looked at it.
 #[allow(clippy::too_many_arguments)]
 fn handle_key(
+    app: &mut App,
+    code: KeyCode,
+    mods: KeyModifiers,
+    swarm: &SparPaths,
+    projects: &[registry::ProjectEntry],
+    home_rows: &[HomeRow],
+    runs: &[state::RunSummary],
+    full: Option<&RunState>,
+    active_records: &[Record],
+    active_root: &mut PathBuf,
+    local_root: Option<&std::path::Path>,
+) -> Result<bool> {
+    let was_diff = app.main_tab == MainTab::Diff;
+    let diff_run_id = full.map(|st| st.id.clone());
+    let diff_snapshot: Vec<Record> = if was_diff {
+        active_records.to_vec()
+    } else {
+        Vec::new()
+    };
+    let quit = handle_key_inner(
+        app,
+        code,
+        mods,
+        swarm,
+        projects,
+        home_rows,
+        runs,
+        full,
+        active_records,
+        active_root,
+        local_root,
+    )?;
+    if was_diff && (quit || app.main_tab != MainTab::Diff) {
+        if let Some(id) = diff_run_id {
+            mark_diff_seen(&id, &diff_snapshot);
+        }
+    }
+    Ok(quit)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_key_inner(
     app: &mut App,
     code: KeyCode,
     mods: KeyModifiers,
@@ -3224,7 +3388,10 @@ fn is_boundary_record(r: &Record) -> bool {
 /// nothing (AC-13).
 fn move_record_cursor(app: &mut App, records: &[Record], dir: i32, pred: impl Fn(&Record) -> bool) {
     match move_cursor(records, app.record_cursor.as_ref(), dir, pred) {
-        Some(id) => app.record_cursor = Some(id),
+        Some(id) => {
+            app.record_cursor = Some(id);
+            app.record_cursor_dirty = true;
+        }
         None => app.flash("no match", FG_MUTED),
     }
 }
@@ -6799,6 +6966,7 @@ fn draw_home_body(
         &mut app.stream_follow,
         false,
         app.log_expand,
+        false,
     );
 }
 
@@ -6879,6 +7047,7 @@ fn draw_log_body(
             &mut app.stream_follow,
             false,
             app.log_expand,
+            false,
         );
         return;
     }
@@ -6927,6 +7096,7 @@ fn draw_log_body(
             &mut app.stream_follow,
             true,
             app.log_expand,
+            true,
         );
     } else {
         // `log_records` comes pre-parsed off-thread in `build_snapshot` (U13), stamped
@@ -6960,6 +7130,7 @@ fn draw_log_body(
             &app.fold_open,
             app.fold_all,
             app.record_cursor.as_ref(),
+            &mut app.record_cursor_dirty,
         );
     }
 }
@@ -7004,6 +7175,7 @@ fn draw_activity_body(
         &app.fold_open,
         app.fold_all,
         app.record_cursor.as_ref(),
+        &mut app.record_cursor_dirty,
     );
 }
 
@@ -7022,6 +7194,10 @@ fn draw_diff_body(
     // viewport the whole tab used before this feature, rather than a `FileDiff`
     // parse invented from text that was never `git diff` shaped.
     if app.raw_mode || diff_records.is_empty() {
+        // `diff_text` is always a real `git diff HEAD` (or a plain not-a-diff
+        // notice), never a coalesced marker-style log — the marker rewriting
+        // `compact_log_line` does is irrelevant here and would mangle a diff's
+        // own significant whitespace (AC-14), so this viewport is always raw.
         app.diff_max = render_scrollable_log(
             f,
             inner,
@@ -7030,6 +7206,7 @@ fn draw_diff_body(
             &mut app.diff_follow,
             false,
             app.log_expand,
+            true,
         );
     } else {
         let mut follow = false;
@@ -7042,6 +7219,7 @@ fn draw_diff_body(
             &app.fold_open,
             app.fold_all,
             app.record_cursor.as_ref(),
+            &mut app.record_cursor_dirty,
         );
     }
 }
@@ -7060,6 +7238,7 @@ fn draw_plan_body(f: &mut Frame, inner: Rect, plan_docs: &[Record], app: &mut Ap
         &app.fold_open,
         app.fold_all,
         app.record_cursor.as_ref(),
+        &mut app.record_cursor_dirty,
     );
 }
 
@@ -7078,6 +7257,7 @@ fn draw_review_body(f: &mut Frame, inner: Rect, review: &[Record], app: &mut App
         &app.fold_open,
         app.fold_all,
         app.record_cursor.as_ref(),
+        &mut app.record_cursor_dirty,
     );
 }
 
@@ -7174,6 +7354,7 @@ fn draw_stream_stats(
 /// Paint a log viewport by writing cells directly (no Paragraph wrap/scroll).
 /// Clamps `scroll` into range and pins to bottom when `follow` is set.
 /// Returns the max valid scroll offset for this paint.
+#[allow(clippy::too_many_arguments)]
 fn render_scrollable_log(
     f: &mut Frame,
     area: Rect,
@@ -7182,6 +7363,7 @@ fn render_scrollable_log(
     follow: &mut bool,
     colorize: bool,
     expand: bool,
+    raw_mode: bool,
 ) -> u16 {
     if area.width == 0 || area.height == 0 {
         clamp_scroll(scroll, follow, 0);
@@ -7191,13 +7373,13 @@ fn render_scrollable_log(
     let sb_w = 1u16;
     let text_w = area.width.saturating_sub(sb_w).max(1) as usize;
     let height = area.height as usize;
-    let total = log_row_count(text, text_w, expand).max(1);
+    let total = log_row_count(text, text_w, expand, raw_mode).max(1);
     // Cap at u16::MAX so dense tails cannot wrap the scroll type.
     let max_scroll = total.saturating_sub(height).min(u16::MAX as usize) as u16;
     clamp_scroll(scroll, follow, max_scroll);
     let start = *scroll as usize;
     // Materialise only the rows we are about to paint, not the whole tail.
-    let visible = log_rows_window(text, text_w, colorize, expand, start, height);
+    let visible = log_rows_window(text, text_w, colorize, expand, raw_mode, start, height);
 
     let text_area = Rect {
         x: area.x,
@@ -7257,22 +7439,23 @@ fn is_record_expanded(
     !r.folded_by_default ^ fold_open.contains(&r.source)
 }
 
-/// The meta column's content (AC-3): elapsed when known, else an absolute time, else
-/// the no-data sentinel `·` — never fabricated (AC-8). `meta_width` picks the time
-/// format: the narrow (<100) column only has room for a compact 24h clock, the wide
-/// one for `11:04 AM`.
+/// The meta column's content (AC-3/AC-4): elapsed and/or an absolute time, else the
+/// no-data sentinel `·` — never fabricated (AC-8). Below the wide breakpoint
+/// (`meta_width < 15`, `Columns::for_width`'s `WIDE_META_WIDTH`) there is only room
+/// for one field, so elapsed wins (it is the more actionable of the two) and the
+/// compact 24h clock is used if only a time is known. At the wide breakpoint the
+/// column was reserved to carry *both* — U32 promises "elapsed *and* absolute
+/// time" at `>=100`, not one displacing the other.
 fn record_meta_text(r: &Record, meta_width: u16) -> String {
-    if let Some(e) = r.elapsed {
-        record::fmt_elapsed(e)
-    } else if let Some(t) = r.time {
-        if meta_width >= 8 {
-            t.format("%-I:%M %p").to_string()
-        } else {
-            t.format("%H:%M").to_string()
+    let wide = meta_width >= 15;
+    match (r.elapsed, r.time) {
+        (Some(e), Some(t)) if wide => {
+            format!("{} {}", record::fmt_elapsed(e), t.format("%-I:%M %p"))
         }
-    } else {
-        // No `.idx` sidecar for this record: never a fabricated duration.
-        "·".to_string()
+        (Some(e), _) => record::fmt_elapsed(e),
+        (None, Some(t)) if wide => t.format("%-I:%M %p").to_string(),
+        (None, Some(t)) => t.format("%H:%M").to_string(),
+        (None, None) => "·".to_string(),
     }
 }
 
@@ -7369,19 +7552,16 @@ fn build_head_row(r: &Record, cols: record::Columns, is_cursor: bool, folded: bo
     }
 }
 
-fn build_body_row(r: &Record, line_idx: usize, cols: record::Columns) -> RecordRow {
-    let text = r.body.get(line_idx).cloned().unwrap_or_default();
-    // The tool/argument's own command or path row carries `CODE`, its own colour
-    // (ground truth: "the command, its own colour") — the rest of a body is quoted
-    // output.
-    let is_command_row = line_idx == 0 && matches!(r.kind, RecordKind::Tool(_));
-    let style = if is_command_row {
-        Style::default().fg(CODE)
-    } else {
-        Style::default().fg(FG_DIM)
-    };
+/// One (possibly wrapped) body line. There is no reliable "this line is the
+/// command" position once a call has merged with its result — the by-line parser
+/// never puts anything but the result preview at `body[0]`, and the by-chunk
+/// parser can put genuine call continuation there — so every body line paints as
+/// plain output (`FG_DIM`); the command itself already carries `CODE` in the head
+/// row's summary (`build_head_row`/`record_kind_style`).
+fn build_body_row(kind: RecordKind, text: String, cols: record::Columns) -> RecordRow {
+    let style = Style::default().fg(FG_DIM);
     let bg = matches!(
-        r.kind,
+        kind,
         RecordKind::Tool(_) | RecordKind::Result { .. } | RecordKind::FileDiff
     )
     .then_some(SURFACE_SUNKEN);
@@ -7391,10 +7571,66 @@ fn build_body_row(r: &Record, line_idx: usize, cols: record::Columns) -> RecordR
     }
 }
 
+/// Greedy word-wrap of one body line to `width` display columns (U36: "the raw
+/// text must stay reachable" — a body line wider than the pane used to be clipped
+/// with no way to reach the rest). A single word longer than `width` hard-breaks
+/// by character rather than looping forever. `width == 0` returns the line whole;
+/// the caller still has to paint *something*.
+fn wrap_body_line(text: &str, width: usize) -> Vec<String> {
+    if width == 0 || text.chars().count() <= width {
+        return vec![text.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for raw_word in text.split(' ') {
+        let mut remaining = raw_word.to_string();
+        loop {
+            let word_len = remaining.chars().count();
+            let sep = if cur.is_empty() { 0 } else { 1 };
+            if cur.chars().count() + sep + word_len <= width {
+                if sep == 1 {
+                    cur.push(' ');
+                }
+                cur.push_str(&remaining);
+                break;
+            }
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+                continue;
+            }
+            // A single word longer than the whole (empty) line: hard-break it.
+            let take: String = remaining.chars().take(width).collect();
+            let rest: String = remaining.chars().skip(width).collect();
+            out.push(take);
+            if rest.is_empty() {
+                break;
+            }
+            remaining = rest;
+        }
+    }
+    if !cur.is_empty() || out.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 /// Paint a `Vec<Record>` viewport (U32): fixed columns, folding by default, a raised
 /// cursor row, and a sunken band for expanded tool/diff output. Mirrors
 /// `render_scrollable_log`'s contract (same scrollbar, materialises only the visible
 /// window) so the two widgets read as one family.
+/// One (possibly wrapped) paintable row — `record::FlatRow` after body lines wider
+/// than the viewport have been split (U36: a body line must stay reachable, never
+/// silently clipped).
+enum ExpandedRowKind {
+    Head,
+    Body(String),
+}
+
+struct ExpandedRow {
+    record_idx: usize,
+    kind: ExpandedRowKind,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_record_view(
     f: &mut Frame,
@@ -7405,6 +7641,7 @@ fn render_record_view(
     fold_open: &std::collections::HashSet<SourceId>,
     fold_all: bool,
     cursor: Option<&SourceId>,
+    cursor_dirty: &mut bool,
 ) -> u16 {
     if area.width == 0 || area.height == 0 {
         clamp_scroll(scroll, follow, 0);
@@ -7416,20 +7653,67 @@ fn render_record_view(
     let height = area.height as usize;
     let is_expanded = |r: &Record| is_record_expanded(fold_open, fold_all, r);
     let flat = record::flatten(records, is_expanded);
-    let total = flat.len().max(1);
+    // A body line wider than the pane wraps rather than clipping (AC-6): computed
+    // here, not in `record::flatten`, since wrapping is a paint-width concern, not
+    // a pure domain one.
+    let body_width = text_w.saturating_sub(cols.verb).max(1) as usize;
+    let mut expanded: Vec<ExpandedRow> = Vec::with_capacity(flat.len());
+    for row in &flat {
+        match row.kind {
+            record::RowKind::Head => expanded.push(ExpandedRow {
+                record_idx: row.record_idx,
+                kind: ExpandedRowKind::Head,
+            }),
+            record::RowKind::Body(j) => {
+                let text = records[row.record_idx]
+                    .body
+                    .get(j)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                for chunk in wrap_body_line(text, body_width) {
+                    expanded.push(ExpandedRow {
+                        record_idx: row.record_idx,
+                        kind: ExpandedRowKind::Body(chunk),
+                    });
+                }
+            }
+        }
+    }
+    let total = expanded.len().max(1);
     let max_scroll = total.saturating_sub(height).min(u16::MAX as usize) as u16;
     clamp_scroll(scroll, follow, max_scroll);
+    // Structural navigation (J/K, t/T, e/E, }/{ — AC-13) only ever moves the
+    // cursor's identity; without this the matching record could land off-screen
+    // with nothing visibly different. Only snaps right after a navigation key (the
+    // dirty flag), so a manual scroll away from a stationary cursor is not fought.
+    if *cursor_dirty {
+        if let Some(cur) = cursor {
+            let pos = expanded.iter().position(|row| {
+                matches!(row.kind, ExpandedRowKind::Head) && &records[row.record_idx].source == cur
+            });
+            if let Some(pos) = pos {
+                let pos = pos as u16;
+                if pos < *scroll {
+                    *scroll = pos;
+                } else if pos >= scroll.saturating_add(height as u16) {
+                    *scroll = pos.saturating_sub(height as u16).saturating_add(1);
+                }
+                *scroll = (*scroll).min(max_scroll);
+            }
+        }
+        *cursor_dirty = false;
+    }
     let start = *scroll as usize;
-    let rows: Vec<RecordRow> = flat
+    let rows: Vec<RecordRow> = expanded
         .iter()
         .skip(start)
         .take(height)
         .map(|row| {
             let r = &records[row.record_idx];
             let is_cursor = cursor == Some(&r.source);
-            match row.kind {
-                record::RowKind::Head => build_head_row(r, cols, is_cursor, !is_expanded(r)),
-                record::RowKind::Body(j) => build_body_row(r, j, cols),
+            match &row.kind {
+                ExpandedRowKind::Head => build_head_row(r, cols, is_cursor, !is_expanded(r)),
+                ExpandedRowKind::Body(text) => build_body_row(r.kind, text.clone(), cols),
             }
         })
         .collect();
@@ -7592,17 +7876,29 @@ fn log_line_style(line: &str, colorize: bool) -> Style {
     }
 }
 
+/// The per-line text a log viewport paints: `compact_log_line`'s rewritten form,
+/// or (AC-14) exactly the persisted line with only tabs expanded — a terminal
+/// rendering necessity, not a data change — when `raw` is the byte-for-byte
+/// escape hatch.
+fn viewport_log_line(raw: &str, raw_mode: bool) -> String {
+    if raw_mode {
+        expand_tabs(raw)
+    } else {
+        compact_log_line(raw)
+    }
+}
+
 /// Rows the log occupies, without building any of them. In trim mode this is
 /// just the line count; wrapping has to measure each line. Matches
 /// `log_rows_window`'s empty-output fallback so the two always agree.
-fn log_row_count(text: &str, width: usize, expand: bool) -> usize {
+fn log_row_count(text: &str, width: usize, expand: bool, raw_mode: bool) -> usize {
     let width = width.max(1);
     let n: usize = if !expand {
         text.lines().count()
     } else {
         text.lines()
             .map(|raw| {
-                let line = compact_log_line(raw);
+                let line = viewport_log_line(raw, raw_mode);
                 if line.is_empty() {
                     1
                 } else {
@@ -7616,11 +7912,13 @@ fn log_row_count(text: &str, width: usize, expand: bool) -> usize {
 }
 
 /// Build only the rows in `[start, start + height)`.
+#[allow(clippy::too_many_arguments)]
 fn log_rows_window(
     text: &str,
     width: usize,
     colorize: bool,
     expand: bool,
+    raw_mode: bool,
     start: usize,
     height: usize,
 ) -> Vec<(String, Style)> {
@@ -7632,7 +7930,7 @@ fn log_rows_window(
         if row >= end {
             break;
         }
-        let line = compact_log_line(raw);
+        let line = viewport_log_line(raw, raw_mode);
         let style = log_line_style(raw, colorize);
         if line.is_empty() {
             if row >= start {
@@ -7702,7 +8000,7 @@ mod window_eq {
                 for &exp in &[false, true] {
                     for &col in &[false, true] {
                         let full = old_full(text, w, col, exp);
-                        let total_fn = log_row_count(text, w, exp);
+                        let total_fn = log_row_count(text, w, exp, false);
                         assert_eq!(
                             full.len(),
                             total_fn,
@@ -7721,7 +8019,7 @@ mod window_eq {
                             (full.len(), 3),
                             (full.len().saturating_sub(1), 2),
                         ] {
-                            let win = log_rows_window(text, w, col, exp, start, height);
+                            let win = log_rows_window(text, w, col, exp, false, start, height);
                             let expected: Vec<_> =
                                 full.iter().skip(start).take(height).cloned().collect();
                             // old fallback: when full has the single empty row and we skip past it, old yields []
@@ -7745,7 +8043,7 @@ mod window_eq {
 
 #[cfg(test)]
 fn layout_log_rows(text: &str, width: usize, colorize: bool, expand: bool) -> Vec<(String, Style)> {
-    log_rows_window(text, width, colorize, expand, 0, usize::MAX)
+    log_rows_window(text, width, colorize, expand, false, 0, usize::MAX)
 }
 
 /// The project root, for shortening the absolute paths agents print. Set once per
@@ -8847,6 +9145,32 @@ fn spawn_agent_command(
     }
 }
 
+/// Whether a slot's log holds nothing but the headless spawn header and its
+/// prompt echo — used only to decide the "waiting for stream" placeholder.
+/// Mirrors `record::prompt_skip_end`'s notion of where real content starts, but
+/// never rewrites what `stream_content` actually returns (AC-14: the raw view is
+/// byte-for-byte, so filtering can inform a UI decision but must not touch the
+/// displayed/returned text itself).
+fn only_header_and_prompt(raw: &str) -> bool {
+    let body: Vec<&str> = raw
+        .lines()
+        .skip_while(|l| l.starts_with('#') || *l == "---" || l.starts_with("cwd=") || l.is_empty())
+        .collect();
+    let start = body
+        .iter()
+        .position(|l| {
+            l.starts_with('→')
+                || l.starts_with('←')
+                || l.starts_with('·')
+                || l.starts_with('…')
+                || l.starts_with('!')
+                || l.starts_with("I'll ")
+                || l.starts_with("I ")
+        })
+        .unwrap_or(0);
+    body[start..].join("\n").trim().is_empty()
+}
+
 fn stream_content(
     swarm: &SparPaths,
     full: Option<&RunState>,
@@ -8875,44 +9199,22 @@ fn stream_content(
         .unwrap_or_else(|| swarm.log_file(&st.id, &slot.id));
     if path.is_file() {
         let (raw, truncated) = cache.load(&path, LOG_TAIL_BYTES);
-        let body: Vec<&str> = raw
-            .lines()
-            .skip_while(|l| {
-                l.starts_with('#')
-                    || *l == "---"
-                    || l.starts_with("cwd=")
-                    || l.is_empty()
-                    || l.starts_with("# Role:")
-            })
-            // Drop the huge prompt dump often pasted as first "user" blob in headless spawn
-            .filter(|l| !l.starts_with("# Role:") && !l.starts_with("## Task"))
-            .collect();
-        // Skip until first real stream marker if present
-        let start = body
-            .iter()
-            .position(|l| {
-                l.starts_with('→')
-                    || l.starts_with('←')
-                    || l.starts_with('·')
-                    || l.starts_with('…')
-                    || l.starts_with('!')
-                    || l.starts_with("I'll ")
-                    || l.starts_with("I ")
-            })
-            .unwrap_or(0);
-        let body = body[start..].join("\n");
-        if body.trim().is_empty() {
+        let raw = raw.to_string();
+        if only_header_and_prompt(&raw) {
             format!(
                 "\n  {} is running — waiting for stream…\n  Quiet time is on Agents; Activity shows phase timeline.",
                 slot.id
             )
         } else if truncated {
             format!(
-                "… earlier log truncated (showing last ~{} KB)\n{body}",
+                "… earlier log truncated (showing last ~{} KB)\n{raw}",
                 LOG_TAIL_BYTES / 1024
             )
         } else {
-            body
+            // Exactly the persisted bytes (AC-14): this is also the source for the
+            // `R` raw view and the no-index record-parse fallback, neither of which
+            // may see anything other than what disk actually holds.
+            raw
         }
     } else {
         cache.clear();
@@ -9182,12 +9484,13 @@ fn plan_docs(swarm: &SparPaths, full: Option<&RunState>) -> Vec<Record> {
     let mut out = Vec::new();
     push_doc_or_missing(&mut out, swarm, &st.id, "plan.md", "plan.md");
 
-    let critic_artifact = st
-        .slots
-        .iter()
-        .find(|s| s.role == SlotRole::PlanCritic)
+    let critic_slot = st.slots.iter().find(|s| s.role == SlotRole::PlanCritic);
+    let critic_artifact = critic_slot
         .and_then(|s| s.artifact.clone())
-        .unwrap_or_else(|| "plan-critique.md".to_string());
+        .unwrap_or_else(|| match critic_slot {
+            Some(s) => format!("plan-critique-{}.md", s.id),
+            None => "plan-critique.md".to_string(),
+        });
     push_doc_or_missing(&mut out, swarm, &st.id, "plan critique", &critic_artifact);
 
     push_doc_or_missing(
@@ -9220,7 +9523,7 @@ fn push_doc_or_missing(
 /// reviewer's cell, sourced from the same `review_result`/`acceptance_block_reasons`
 /// functions the ship gate calls (never a second implementation — AC-17), plus one
 /// foldable record per reviewer's raw verdict.
-fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: &Config) -> Vec<Record> {
+fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: Option<&Config>) -> Vec<Record> {
     let Some(st) = full else {
         return Vec::new();
     };
@@ -9233,6 +9536,31 @@ fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: &Config) -> V
         .filter(|s| s.role == SlotRole::Reviewer)
         .collect();
     let mut out = Vec::new();
+
+    // O27/AC-17: without the run's own frozen config there is no way to evaluate
+    // `acceptance_block_reasons` the way the ship gate did — falling back to the
+    // TUI's live config would silently show a *different* set of blockers. Say so
+    // instead of guessing.
+    if cfg.is_none() {
+        out.push(Record {
+            kind: RecordKind::Alert,
+            glyph: "!",
+            verb: "Review".to_string(),
+            head: "frozen config unavailable".to_string(),
+            summary: "cannot evaluate criteria-based blockers for this run".to_string(),
+            body: Vec::new(),
+            time: None,
+            elapsed: None,
+            actor: None,
+            ok: None,
+            source: SourceId::Document {
+                path: format!("{}#config", contract_path.display()),
+                start: 0,
+                end: 0,
+            },
+            folded_by_default: false,
+        });
+    }
 
     if criteria.is_empty() {
         out.push(Record {
@@ -9254,10 +9582,12 @@ fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: &Config) -> V
             folded_by_default: false,
         });
     } else {
-        // One fixed-width cell per reviewer (AC-17): padded/truncated to a constant
-        // width regardless of content, so a longer slot id or verdict word cannot
-        // shift the cells after it — each reviewer holds its own column on its own
-        // body line rather than a single joined-and-truncated summary string.
+        // One fixed-width cell per reviewer, all on the *same* row (AC-17: a grid,
+        // not one line per reviewer stacked in the body) — padded/truncated to a
+        // constant width regardless of content, so a longer slot id or verdict word
+        // cannot shift a neighbouring reviewer's column. The row can still be wider
+        // than the viewport with many reviewers; `render_record_view` wraps a body
+        // line that overruns rather than clipping it.
         const CELL_NAME_W: usize = 12;
         const CELL_STATUS_W: usize = 12;
         for id in &criteria {
@@ -9294,7 +9624,11 @@ fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: &Config) -> V
                 verb: id.clone(),
                 head: id.clone(),
                 summary: compact.join("  ·  "),
-                body: cells,
+                body: if cells.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![cells.join(" ")]
+                },
                 time: None,
                 elapsed: None,
                 actor: None,
@@ -9323,10 +9657,11 @@ fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: &Config) -> V
                     Some(workflow::review_result::Verdict::RequestChanges) => "request_changes",
                     None => "no parsed verdict",
                 };
-                let mut reasons = if !criteria.is_empty() {
-                    workflow::implement::acceptance_block_reasons(&criteria, &res, cfg)
-                } else {
-                    Vec::new()
+                let mut reasons = match (criteria.is_empty(), cfg) {
+                    (false, Some(cfg)) => {
+                        workflow::implement::acceptance_block_reasons(&criteria, &res, cfg)
+                    }
+                    _ => Vec::new(),
                 };
                 let blocked = !res.approves() || !reasons.is_empty();
                 if !res.approves() {
@@ -9356,7 +9691,28 @@ fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: &Config) -> V
                     folded_by_default: true,
                 });
             }
-            _ => out.push(record::missing_document(&s.id, &path.to_string_lossy())),
+            // The gate's own rule (`implement.rs`'s ship path) treats a missing or
+            // empty review artifact as an unconditional `request_changes`, not a
+            // neutral "nothing here yet" — this record must say the same, or the
+            // Review tab under-reports a blocker the gate actually enforces (AC-17).
+            _ => out.push(Record {
+                kind: RecordKind::Error,
+                glyph: "!",
+                verb: s.id.clone(),
+                head: format!("{} · missing", s.id),
+                summary: "review slot failed or produced no review".to_string(),
+                body: Vec::new(),
+                time: None,
+                elapsed: None,
+                actor: None,
+                ok: Some(false),
+                source: SourceId::Document {
+                    path: path.to_string_lossy().into_owned(),
+                    start: 0,
+                    end: 0,
+                },
+                folded_by_default: false,
+            }),
         }
     }
     out
@@ -10443,6 +10799,20 @@ mod labels {
         assert_eq!(list_row_at(r, 11, 10, 2), Some(3));
     }
 
+    /// AC-14: the raw viewport must not rewrite markers, collapse whitespace, or
+    /// trim trailing whitespace — `compact_log_line`'s job for the parsed record
+    /// view, never the byte-for-byte escape hatch's.
+    #[test]
+    fn raw_mode_bypasses_marker_rewriting_and_preserves_trailing_whitespace() {
+        let text = "← toolu_abc123   total 1184   \n+ trailing line   \n";
+        let rows = log_rows_window(text, 200, false, false, true, 0, 10);
+        assert_eq!(rows[0].0, "← toolu_abc123   total 1184   ");
+        assert_eq!(rows[1].0, "+ trailing line   ");
+        // The same text in compact (non-raw) mode does rewrite the marker and trim.
+        let compact_rows = log_rows_window(text, 200, false, false, false, 0, 10);
+        assert_ne!(compact_rows[0].0, rows[0].0);
+    }
+
     #[test]
     fn truncate_log_default_one_row() {
         let long = format!("→ {}", "abcdefghij".repeat(8));
@@ -11386,6 +11756,42 @@ mod render_stability {
                 cols.meta_width
             );
         }
+    }
+
+    /// AC-3/AC-4: U32 promises the meta column carries elapsed *and* an absolute
+    /// time once the view is wide enough to reserve room for both (`>=100`) — a
+    /// timed tool call must not have its timestamp displaced by its elapsed, and
+    /// the combined text still respects the reserved width.
+    #[test]
+    fn wide_meta_column_carries_elapsed_and_absolute_time_together() {
+        use chrono::TimeZone;
+        let cols = record::Columns::for_width(120);
+        assert!(cols.meta_width >= 15, "{cols:?}");
+        let r = Record {
+            kind: RecordKind::Tool(record::ToolKind::Run),
+            glyph: "◆",
+            verb: "Run".to_string(),
+            head: "ls".to_string(),
+            summary: "ls -la".to_string(),
+            body: Vec::new(),
+            time: Some(Utc.with_ymd_and_hms(2026, 1, 1, 11, 4, 0).unwrap()),
+            elapsed: Some(std::time::Duration::from_millis(800)),
+            actor: None,
+            ok: Some(true),
+            source: SourceId::Activity {
+                at_millis: 0,
+                sequence: 0,
+            },
+            folded_by_default: false,
+        };
+        let text = record_meta_text(&r, cols.meta_width);
+        assert!(text.contains("0.8s"), "{text:?}");
+        assert!(text.contains("11:04"), "{text:?}");
+        assert!(
+            text.chars().count() as u16 <= cols.meta_width,
+            "meta text {text:?} overflows the {}-wide column",
+            cols.meta_width
+        );
     }
 
     /// AC-2: Activity carries phase boundaries and alerts as typed records — never
@@ -13611,6 +14017,184 @@ mod render_stability {
             !text.contains("session"),
             "retired noun on screen in the Shell tab: {text:?}"
         );
+    }
+
+    /// AC-17: without the run's own frozen config there is no way to evaluate the
+    /// gate's own criteria predicate — the tab must say so, not silently show
+    /// blockers computed from whatever config the TUI process happened to load.
+    #[test]
+    fn review_without_frozen_config_says_so_rather_than_guessing() {
+        let dir = tempfile::tempdir().unwrap();
+        let swarm = SparPaths::new(dir.path());
+        let st = run_with(Phase::Review, 7);
+        swarm.ensure_run_dirs(&st.id).unwrap();
+        let records = review_records(&swarm, Some(&st), None);
+        assert!(
+            records
+                .iter()
+                .any(|r| r.head.contains("frozen config unavailable")),
+            "{records:#?}"
+        );
+    }
+
+    /// AC-17: the ship gate treats a missing/empty review artifact as an
+    /// unconditional blocker (`implement.rs`'s "review slot failed or produced no
+    /// review"), not a neutral placeholder — the Review tab must show the same.
+    #[test]
+    fn review_missing_reviewer_artifact_is_shown_as_a_blocker() {
+        let dir = tempfile::tempdir().unwrap();
+        let swarm = SparPaths::new(dir.path());
+        let st = run_with(Phase::Review, 7);
+        swarm.ensure_run_dirs(&st.id).unwrap();
+        std::fs::write(
+            swarm.artifact(&st.id, "test-contract.md"),
+            "AC-1: does a thing\n",
+        )
+        .unwrap();
+        // Neither reviewer's artifact exists on disk.
+        let cfg = Config::default();
+        let records = review_records(&swarm, Some(&st), Some(&cfg));
+        let blockers: Vec<_> = records
+            .iter()
+            .filter(|r| matches!(r.kind, RecordKind::Error))
+            .collect();
+        assert!(
+            blockers.len() >= 2,
+            "both reviewer slots have no artifact and must both read as blockers, {records:#?}"
+        );
+        assert!(
+            blockers
+                .iter()
+                .all(|r| r.summary.contains("failed or produced no review")),
+            "{blockers:#?}"
+        );
+    }
+
+    /// AC-17: every reviewer's cell for a given `AC-n` lives on the *same* row (a
+    /// grid), not one line per reviewer stacked in the body.
+    #[test]
+    fn review_criteria_grid_puts_every_reviewer_on_one_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let swarm = SparPaths::new(dir.path());
+        let st = run_with(Phase::Review, 7);
+        swarm.ensure_run_dirs(&st.id).unwrap();
+        std::fs::write(
+            swarm.artifact(&st.id, "test-contract.md"),
+            "AC-1: does a thing\n",
+        )
+        .unwrap();
+        std::fs::write(
+            swarm.artifact(&st.id, "review-slot-5.md"),
+            "## Verdict\napprove\n\n## Acceptance\nAC-1: pass\n",
+        )
+        .unwrap();
+        std::fs::write(
+            swarm.artifact(&st.id, "review-slot-6.md"),
+            "## Verdict\nrequest_changes\n\n## Acceptance\nAC-1: fail\n",
+        )
+        .unwrap();
+        let cfg = Config::default();
+        let records = review_records(&swarm, Some(&st), Some(&cfg));
+        let grid_row = records
+            .iter()
+            .find(|r| matches!(r.kind, RecordKind::Criterion))
+            .expect("one Criterion record for AC-1");
+        assert_eq!(
+            grid_row.body.len(),
+            1,
+            "both reviewers' cells must share one row, {:?}",
+            grid_row.body
+        );
+        assert!(grid_row.body[0].contains("pass"), "{:?}", grid_row.body);
+        assert!(grid_row.body[0].contains("fail"), "{:?}", grid_row.body);
+    }
+
+    fn diff_records_for(paths: &[(&str, &str)]) -> Vec<Record> {
+        paths
+            .iter()
+            .map(|(path, body)| Record {
+                kind: RecordKind::FileDiff,
+                glyph: "±",
+                verb: "M".to_string(),
+                head: path.to_string(),
+                summary: format!("{path} +1 -0"),
+                body: vec![body.to_string()],
+                time: None,
+                elapsed: None,
+                actor: None,
+                ok: None,
+                source: SourceId::Diff {
+                    worktree: "wt".to_string(),
+                    path: path.to_string(),
+                },
+                folded_by_default: true,
+            })
+            .collect()
+    }
+
+    /// AC-18: a run never looked at before marks every file as new (over-marking
+    /// per "never fewer"), but shows no banner — there is nothing to compare a
+    /// timestamp against yet.
+    #[test]
+    fn diff_watermark_first_look_marks_every_file_new_with_no_banner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("diff_watermark.json");
+        let records = diff_records_for(&[("a.rs", "+1"), ("b.rs", "+2")]);
+        let out = apply_diff_watermark_at(&path, "run1", records);
+        assert!(
+            !out.iter().any(|r| matches!(r.kind, RecordKind::Section)),
+            "no previous look to compare against: {out:#?}"
+        );
+        assert!(
+            out.iter().all(|r| r.summary.starts_with("NEW ·")),
+            "{out:#?}"
+        );
+    }
+
+    /// AC-18: after marking seen, an unchanged file loses its NEW mark and a
+    /// changed one keeps it, with a banner reporting exactly the changed count.
+    #[test]
+    fn diff_watermark_marks_only_changed_files_after_a_look() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("diff_watermark.json");
+        let seen = diff_records_for(&[("a.rs", "+1"), ("b.rs", "+2")]);
+        mark_diff_seen_at(&path, "run1", &seen);
+
+        let unchanged = diff_records_for(&[("a.rs", "+1"), ("b.rs", "+2")]);
+        let out = apply_diff_watermark_at(&path, "run1", unchanged);
+        assert!(
+            !out.iter().any(|r| r.summary.starts_with("NEW ·")),
+            "nothing changed since the look: {out:#?}"
+        );
+        assert!(!out.iter().any(|r| matches!(r.kind, RecordKind::Section)));
+
+        let changed = diff_records_for(&[("a.rs", "+1 changed"), ("b.rs", "+2")]);
+        let out = apply_diff_watermark_at(&path, "run1", changed);
+        let banner = out
+            .iter()
+            .find(|r| matches!(r.kind, RecordKind::Section))
+            .expect("one file changed since the look, banner must appear");
+        assert!(banner.summary.contains("1 file"), "{}", banner.summary);
+        let a = out.iter().find(|r| r.head == "a.rs").unwrap();
+        assert!(a.summary.starts_with("NEW ·"));
+        let b = out.iter().find(|r| r.head == "b.rs").unwrap();
+        assert!(!b.summary.starts_with("NEW ·"));
+    }
+
+    /// AC-18: a corrupt watermark file reads as "never looked" — over-marking,
+    /// never under-marking, and never a panic.
+    #[test]
+    fn diff_watermark_corrupt_file_reads_as_never_looked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("diff_watermark.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        let records = diff_records_for(&[("a.rs", "+1")]);
+        let out = apply_diff_watermark_at(&path, "run1", records);
+        assert!(
+            out.iter().all(|r| r.summary.starts_with("NEW ·")),
+            "{out:#?}"
+        );
+        assert!(!out.iter().any(|r| matches!(r.kind, RecordKind::Section)));
     }
 }
 

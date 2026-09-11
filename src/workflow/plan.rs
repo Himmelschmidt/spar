@@ -109,6 +109,7 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
         let mut slot = executor::init_slot_model(&id, &prov, role, model.clone());
         slot.source = Some(source);
         state.slots.push(slot);
+        let expected_artifact = plan_expected_artifact(role, &id);
         jobs.push(SlotJob {
             slot_id: id,
             provider: prov,
@@ -118,7 +119,7 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
                 "amendment_section".to_string(),
                 plan_amendment_section(&state),
             )]),
-            expected_artifact: Some("plan.md".into()),
+            expected_artifact: Some(expected_artifact),
             model,
         });
     }
@@ -153,6 +154,19 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
         }
     }
     Ok(state.exit_code())
+}
+
+/// The artifact a plan-phase slot is expected to write. The critic's real output is
+/// `plan-critique-<slot_id>.md` (`templates/plan_critic.md`'s own instruction, and
+/// `executor.rs`'s dry-run stand-in for it) — not `plan.md`, which only the planner
+/// writes. Every `SlotJob` in this file used to hardcode `"plan.md"` for both roles,
+/// so the TUI's Plan tab (which resolves the critique through this same
+/// `expected_artifact`) rendered `plan.md` twice and never found the real critique.
+fn plan_expected_artifact(role: SlotRole, slot_id: &str) -> String {
+    match role {
+        SlotRole::PlanCritic => format!("plan-critique-{slot_id}.md"),
+        _ => "plan.md".to_string(),
+    }
 }
 
 /// The planner + critic slot specs `(id, role, template, provider, source)`, drawn from
@@ -787,6 +801,7 @@ fn continue_locked(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exit
             SlotRole::TestAuthor => continue,
             _ => continue,
         };
+        let expected_artifact = plan_expected_artifact(slot.role, &slot.id);
         jobs.push(SlotJob {
             slot_id: slot.id.clone(),
             provider: slot.provider.clone(),
@@ -796,7 +811,7 @@ fn continue_locked(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exit
                 "amendment_section".to_string(),
                 amendment_section.clone(),
             )]),
-            expected_artifact: Some("plan.md".into()),
+            expected_artifact: Some(expected_artifact),
             model: None,
         });
     }
@@ -807,6 +822,7 @@ fn continue_locked(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exit
                 slot.source = Some(source);
                 state.slots.push(slot);
             }
+            let expected_artifact = plan_expected_artifact(role, &id);
             jobs.push(SlotJob {
                 slot_id: id,
                 provider: prov,
@@ -816,7 +832,7 @@ fn continue_locked(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exit
                     "amendment_section".to_string(),
                     amendment_section.clone(),
                 )]),
-                expected_artifact: Some("plan.md".into()),
+                expected_artifact: Some(expected_artifact),
                 model: None,
             });
         }

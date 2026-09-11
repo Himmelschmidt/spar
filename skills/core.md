@@ -812,13 +812,17 @@ rail's selection.
   (feature 010) through one shared record view, not a raw string: Log is the parsed
   tool-call/result/thought/prose stream (with real elapsed times where a byte-offset
   time index exists); Activity is the phase/agent/bus/alert timeline; Diff is the
-  selected slot's real worktree diff, split one record per file; Plan shows `plan.md`,
+  selected slot's real worktree diff, split one record per file, with a global
+  "since you last looked" watermark marking files changed since you last viewed
+  the tab (a slot with no worktree says so rather than falling back to an
+  artifact dump); Plan shows `plan.md`,
   the plan critique and `test-contract.md` as documents; Review shows one row per
   `AC-n` criterion plus each reviewer's verdict, sourced from the same gate function
   `ship` calls. A tool result and a reasoning block are folded by default — `Space`
   expands the record under the cursor, `A` toggles every record at once, and `R`
-  drops Log/Diff back to the unparsed raw view when a parse ever hides something you
-  need (unavailable on Activity/Plan/Review, which have no single raw source).
+  drops Log/Diff back to the byte-for-byte raw view when a parse ever hides
+  something you need (unavailable on Activity/Plan/Review, which have no single
+  raw source).
   `J`/`K` move the record cursor to the next/previous record head, `t`/`T` to the
   next/previous tool call, `e`/`E` to the next/previous error, `}`/`{` to the next/
   previous phase or document boundary, and `f` toggles Activity's selected-slot filter.

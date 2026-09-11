@@ -434,16 +434,65 @@ fn strip_tool_id(rest: &str) -> &str {
     }
 }
 
+/// Splits a `←` result line's remainder into (ok, preview). Unlike the old
+/// behaviour, the returned preview keeps the provider's tool id: stripping it here
+/// meant it was gone from both the head *and* the body once merged, and AC-6
+/// requires expansion to preserve every persisted byte. Callers that want the
+/// clean, tool-id-free label for the head/summary run `strip_tool_id` themselves.
 fn split_result_line(rest: &str) -> (bool, &str) {
     let rest = rest.trim_start();
-    let (ok, rest) = if let Some(stripped) = rest.strip_prefix('✓') {
+    if let Some(stripped) = rest.strip_prefix('✓') {
         (true, stripped.trim_start())
     } else if let Some(stripped) = rest.strip_prefix('✗') {
         (false, stripped.trim_start())
     } else {
         (true, rest)
-    };
-    (ok, strip_tool_id(rest))
+    }
+}
+
+/// The api-sdk backend's own tool-observation line (`src/api/runtime.rs`'s
+/// `append_log(... "tool => {observation}\n")`): the api runtime writes a
+/// distinct, private log shape (never the native coalescer's `→`/`←` markers —
+/// changing that is provider/adapter work, out of scope here), so the record
+/// parser recognizes its literal prefix directly rather than the api runtime
+/// being made to speak the native marker vocabulary (AC-8).
+fn api_tool_observation(line: &str) -> Option<&str> {
+    line.strip_prefix("tool => ")
+}
+
+/// A stream marker line — the same shape `stream_content`'s prompt-dump filter
+/// looks for. Used only to find where the headless prompt echo ends (U36/AC-10):
+/// the record parser must suppress the same boilerplate the old raw viewer did,
+/// or the Log tab regains the wall of prompt text this feature exists to remove.
+fn is_marker_line(line: &str) -> bool {
+    line.starts_with('→')
+        || line.starts_with('←')
+        || line.starts_with('·')
+        || line.starts_with('…')
+        || line.starts_with('!')
+        || line.starts_with("I'll ")
+        || line.starts_with("I ")
+}
+
+/// The relative byte offset the headless prompt dump ends at, or `0` if no marker
+/// line ever appears (in which case nothing beyond the structural header is
+/// suppressed — mirroring `stream_content`'s `position(..).unwrap_or(0)`, which
+/// never hides a marker-less stream). Only meaningful at `start_offset == 0`: a
+/// later incremental tail has already passed the prompt.
+fn prompt_skip_end(text: &str) -> usize {
+    let mut in_header = true;
+    for (line, rel_start, _) in scan_lines(text) {
+        if in_header {
+            if is_header_line(line) {
+                continue;
+            }
+            in_header = false;
+        }
+        if is_marker_line(line) {
+            return rel_start;
+        }
+    }
+    0
 }
 
 /// Parses one slot's raw log tail into typed `LogRecord`s. `text` is exactly what was
@@ -506,6 +555,11 @@ fn parse_log_records_by_line(
     };
 
     let mut in_header = start_offset == 0;
+    let skip_until = if start_offset == 0 {
+        prompt_skip_end(text)
+    } else {
+        0
+    };
     for (line, rel_start, rel_end) in scan_lines(text) {
         if in_header {
             if is_header_line(line) {
@@ -513,6 +567,10 @@ fn parse_log_records_by_line(
                 continue;
             }
             in_header = false;
+        }
+        if rel_start < skip_until {
+            last_idx = None;
+            continue;
         }
         let abs_start = start_offset + rel_start as u64;
         let abs_end = start_offset + rel_end as u64;
@@ -552,12 +610,15 @@ fn parse_log_records_by_line(
 
         if let Some(rest) = line.strip_prefix('←') {
             let (ok, preview) = split_result_line(rest);
+            let clean = strip_tool_id(preview);
             if pending.len() == 1 {
                 let idx = pending.pop_front().expect("checked len == 1");
                 let call_time = records[idx].time;
-                records[idx].result = Some(preview.to_string());
+                records[idx].result = Some(clean.to_string());
                 records[idx].ok = Some(ok);
                 if !preview.is_empty() {
+                    // Raw, not `clean`: expansion must preserve every persisted
+                    // byte, including a provider tool id (AC-6).
                     records[idx].body.push(preview.to_string());
                 }
                 records[idx].elapsed = match (call_time, time) {
@@ -582,7 +643,7 @@ fn parse_log_records_by_line(
                 kind: RecordKind::Result { ok },
                 tool: None,
                 argument: String::new(),
-                result: Some(preview.to_string()),
+                result: Some(clean.to_string()),
                 ok: Some(ok),
                 elapsed: None,
                 body: Vec::new(),
@@ -643,6 +704,24 @@ fn parse_log_records_by_line(
             continue;
         }
 
+        if let Some(observation) = api_tool_observation(line) {
+            let ok = !observation.starts_with("tool error:");
+            records.push(LogRecord {
+                time,
+                direction: LogDirection::Result,
+                kind: RecordKind::Result { ok },
+                tool: None,
+                argument: String::new(),
+                result: Some(observation.to_string()),
+                ok: Some(ok),
+                elapsed: None,
+                body: Vec::new(),
+                source: source_of(abs_start, abs_end),
+            });
+            last_idx = Some(records.len() - 1);
+            continue;
+        }
+
         // An unmarked line continues whatever record was last pushed (prose
         // paragraphs coalesce, and a tool/result's own output folds with it) —
         // the line-scan fallback's approximation of the chunk parser's atomic
@@ -691,6 +770,11 @@ fn parse_log_records_by_chunk(
     };
 
     let mut in_header = start_offset == 0;
+    let skip_until = if start_offset == 0 {
+        prompt_skip_end(text)
+    } else {
+        0
+    };
     for (i, (offset, time)) in index.iter().enumerate() {
         let abs_start = *offset;
         if abs_start < start_offset {
@@ -718,6 +802,9 @@ fn parse_log_records_by_chunk(
                 continue;
             }
             in_header = false;
+        }
+        if rel_start < skip_until {
+            continue;
         }
         let mut lines = trimmed.split('\n');
         let head_line = lines.next().unwrap_or("");
@@ -757,12 +844,15 @@ fn parse_log_records_by_chunk(
 
         if let Some(rest) = head_line.strip_prefix('←') {
             let (ok, preview) = split_result_line(rest);
+            let clean = strip_tool_id(preview);
             if pending.len() == 1 {
                 let idx = pending.pop_front().expect("checked len == 1");
                 let call_time = records[idx].time;
-                records[idx].result = Some(preview.to_string());
+                records[idx].result = Some(clean.to_string());
                 records[idx].ok = Some(ok);
                 if !preview.is_empty() {
+                    // Raw, not `clean`: expansion must preserve every persisted
+                    // byte, including a provider tool id (AC-6).
                     records[idx].body.push(preview.to_string());
                 }
                 records[idx].elapsed = match (call_time, time) {
@@ -784,7 +874,7 @@ fn parse_log_records_by_chunk(
                 kind: RecordKind::Result { ok },
                 tool: None,
                 argument: String::new(),
-                result: Some(preview.to_string()),
+                result: Some(clean.to_string()),
                 ok: Some(ok),
                 elapsed: None,
                 body: extra,
@@ -834,6 +924,23 @@ fn parse_log_records_by_chunk(
                 argument: String::new(),
                 result: Some(rest.trim().to_string()),
                 ok: None,
+                elapsed: None,
+                body: extra,
+                source: source_of(abs_start, chunk_end),
+            });
+            continue;
+        }
+
+        if let Some(observation) = api_tool_observation(head_line) {
+            let ok = !observation.starts_with("tool error:");
+            records.push(LogRecord {
+                time,
+                direction: LogDirection::Result,
+                kind: RecordKind::Result { ok },
+                tool: None,
+                argument: String::new(),
+                result: Some(observation.to_string()),
+                ok: Some(ok),
                 elapsed: None,
                 body: extra,
                 source: source_of(abs_start, chunk_end),
@@ -1130,6 +1237,48 @@ mod tests {
             "a `#`-prefixed line after the header must stay visible, {:?}",
             records[0].body
         );
+    }
+
+    #[test]
+    fn prompt_dump_is_suppressed_up_to_the_first_stream_marker() {
+        let text = "# Role: impl\ncwd=/x\n---\n## Task\nDo the thing, in great detail,\nacross several lines of prose.\nI'll start now.\n→ Bash  ls\n← ✓  ok\n";
+        let records = parse_log_records(text, 0, &[], &PathShortener::default(), "r", "s");
+        assert!(
+            records
+                .iter()
+                .all(|r| !r.body.iter().any(|l| l.contains("Do the thing"))
+                    && !r.argument.contains("Do the thing")),
+            "the headless prompt dump must not surface as a record, {records:#?}"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| r.argument.contains("I'll start now")
+                    || r.result.as_deref() == Some("I'll start now.")),
+            "the first real content line (the thought that ends the prompt echo) must survive, {records:#?}"
+        );
+    }
+
+    #[test]
+    fn api_backend_tool_observations_parse_as_typed_result_records() {
+        // The api-sdk backend's own private log shape (`src/api/runtime.rs`): a
+        // step marker, the raw assistant text, then its tool observation line —
+        // never the native `→`/`←` coalescer markers.
+        let text = "\n--- api step 0 model=gpt ---\n{\"tool\":\"read\",\"path\":\"a.rs\"}\ntool => file contents here\n";
+        let records = parse_log_records(text, 0, &[], &PathShortener::default(), "r", "s");
+        let obs = records
+            .iter()
+            .find(|r| matches!(r.kind, RecordKind::Result { ok: true }))
+            .unwrap_or_else(|| panic!("no typed Result record in {records:#?}"));
+        assert_eq!(obs.result.as_deref(), Some("file contents here"));
+    }
+
+    #[test]
+    fn api_backend_tool_error_observation_is_flagged_not_ok() {
+        let text = "tool => tool error: no such file\n";
+        let records = parse_log_records(text, 0, &[], &PathShortener::default(), "r", "s");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].ok, Some(false));
     }
 
     #[test]
