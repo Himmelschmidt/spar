@@ -2230,20 +2230,52 @@ pub fn execute_loop(
 
 /// Change implementer **provider** only; keep stable slot id and worktree.
 fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<bool> {
-    let current = state
+    let slot = state
         .slots
         .iter()
         .find(|s| s.role == SlotRole::Implementer)
-        .map(|s| s.provider.clone());
-    let Some(cur) = current else {
+        .cloned();
+    let Some(slot_state) = slot else {
         return Ok(false);
     };
+    let cur = slot_state.provider.clone();
     let used: Vec<String> = state
         .slots
         .iter()
         .filter(|s| s.role == SlotRole::Implementer)
         .map(|s| s.provider.clone())
         .collect();
+    if slot_state.status == crate::state::SlotStatus::Failed {
+        let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+        let available: std::collections::HashSet<String> = crate::providers::detect_all()
+            .into_iter()
+            .filter(|r| r.available)
+            .map(|r| r.name)
+            .collect();
+        let cause = crate::backup::dispatch_stop_cause(&slot_state, &cur, &store, Some(&available));
+        if cause == crate::backup::StopCause::Environmental {
+            if let Some(backup_raw) = crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
+            {
+                if !used.iter().any(|u| u == &backup_raw)
+                    && crate::backup::is_provider_eligible(&backup_raw, &store, Some(&available))
+                    && slot_state.source != Some(SeatSource::Backup)
+                {
+                    let backup_pin = crate::runspec::Pin::parse(&backup_raw)
+                        .map(|p| p.display())
+                        .unwrap_or(backup_raw.clone());
+                    let impl_id = slot_state.id.clone();
+                    if let Some(s) = state.slot_mut(&impl_id) {
+                        set_slot_provider(s, backup_pin);
+                        s.source = Some(SeatSource::Backup);
+                        s.status = SlotStatus::Pending;
+                        s.error = None;
+                    }
+                    state.save(paths)?;
+                    return Ok(true);
+                }
+            }
+        }
+    }
     // Candidate order: [roles].implementer, then [providers].order, then the live fleet.
     // Rotation must report the rung it actually drew from (`set_slot_provider` only
     // touches provider/model), not leave the slot claiming its original source.
@@ -2289,12 +2321,7 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
     let Some((next, source)) = next else {
         return Ok(false);
     };
-    let impl_id = state
-        .slots
-        .iter()
-        .find(|s| s.role == SlotRole::Implementer)
-        .map(|s| s.id.clone())
-        .unwrap();
+    let impl_id = slot_state.id.clone();
     if let Some(s) = state.slot_mut(&impl_id) {
         set_slot_provider(s, next);
         s.source = Some(source);

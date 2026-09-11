@@ -45,6 +45,12 @@ pub struct Config {
     /// survives a later round with no `--reload-config` (O27).
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub cli_role_keys: std::collections::BTreeSet<String>,
+    /// Per-role backup assignment (feature 009). Mirrors `[roles]` shape.
+    #[serde(default)]
+    pub backups: BackupsConfig,
+    /// Role config keys assigned via CLI `--backup` for this run. Parallel to `cli_role_keys`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub cli_backup_keys: std::collections::BTreeSet<String>,
     /// `--fleet small`'s reviewer panel width override (feature 011). `None` leaves
     /// panel sizing to `[roles].reviewer` / `DEFAULT_REVIEWERS` as usual. A CLI `--role
     /// reviewer=…` panel always outranks this — see `roles_resolve::panel_size`.
@@ -591,6 +597,45 @@ pub struct RolesConfig {
     pub test_author: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BackupsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_critic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implementer: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviewer: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tester: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_author: Option<String>,
+}
+
+impl BackupsConfig {
+    fn validate(&self) -> Result<()> {
+        let singles = [
+            ("planner", &self.planner),
+            ("plan_critic", &self.plan_critic),
+            ("implementer", &self.implementer),
+            ("tester", &self.tester),
+            ("test_author", &self.test_author),
+        ];
+        for (key, val) in singles {
+            if let Some(v) = val {
+                crate::provider_ref::ProviderRef::parse(v)
+                    .with_context(|| format!("invalid provider in [backups].{key}: {v:?}"))?;
+            }
+        }
+        for v in &self.reviewer {
+            crate::provider_ref::ProviderRef::parse(v)
+                .with_context(|| format!("invalid provider in [backups].reviewer: {v:?}"))?;
+        }
+        Ok(())
+    }
+}
+
 impl RolesConfig {
     /// Priority 9 consumes this for the role-key invariant check.
     #[allow(dead_code)]
@@ -629,6 +674,16 @@ impl RolesConfig {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct RolesConfigFile {
+    planner: Option<String>,
+    plan_critic: Option<String>,
+    implementer: Option<String>,
+    reviewer: Option<Vec<String>>,
+    tester: Option<String>,
+    test_author: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct BackupsConfigFile {
     planner: Option<String>,
     plan_critic: Option<String>,
     implementer: Option<String>,
@@ -807,6 +862,8 @@ impl Default for Config {
             budget: BudgetConfig::default(),
             suite: SuiteConfig::default(),
             roles: RolesConfig::default(),
+            backups: BackupsConfig::default(),
+            cli_backup_keys: std::collections::BTreeSet::new(),
             review: ReviewConfig::default(),
             spec: SpecConfig::default(),
             critic: CriticConfig::default(),
@@ -857,6 +914,7 @@ struct ConfigFile {
     budget: Option<BudgetConfigFile>,
     suite: Option<SuiteConfigFile>,
     roles: Option<RolesConfigFile>,
+    backups: Option<BackupsConfigFile>,
     review: Option<ReviewConfigFile>,
     spec: Option<SpecConfigFile>,
     critic: Option<CriticConfigFile>,
@@ -1080,7 +1138,121 @@ impl Config {
         if !reviewers.is_empty() {
             self.roles.reviewer = reviewers;
         }
-        self.roles.validate()
+        self.roles.validate()?;
+        self.validate_backup_against_primary()
+    }
+
+    pub fn apply_backup_overrides(&mut self, assignments: &[String]) -> Result<()> {
+        if assignments.is_empty() {
+            return Ok(());
+        }
+        let mut backup_reviewers: Vec<String> = Vec::new();
+        let mut has_backup_reviewers = false;
+        for raw in assignments {
+            let (role, provider) = raw.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!("--backup expects <role>=<provider>, got {raw:?}")
+            })?;
+            let (role, provider) = (role.trim(), provider.trim());
+            if provider.is_empty() {
+                anyhow::bail!("--backup {role}= has no provider");
+            }
+            let slot = crate::state::SlotRole::from_config_key(role).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--backup {role}: unknown role (planner, plan_critic, implementer, \
+                     reviewer, tester, test_author)"
+                )
+            })?;
+            crate::provider_ref::ProviderRef::parse(provider)
+                .with_context(|| format!("invalid provider in --backup {role}: {provider:?}"))?;
+            match slot {
+                crate::state::SlotRole::Planner => self.backups.planner = Some(provider.into()),
+                crate::state::SlotRole::PlanCritic => {
+                    self.backups.plan_critic = Some(provider.into())
+                }
+                crate::state::SlotRole::Implementer => {
+                    self.backups.implementer = Some(provider.into())
+                }
+                crate::state::SlotRole::Tester => self.backups.tester = Some(provider.into()),
+                crate::state::SlotRole::TestAuthor => {
+                    self.backups.test_author = Some(provider.into())
+                }
+                crate::state::SlotRole::Reviewer => {
+                    backup_reviewers.push(provider.to_string());
+                    has_backup_reviewers = true;
+                }
+                other => anyhow::bail!(
+                    "--backup {}: not assignable (it is derived by the workflow)",
+                    other.as_config_key()
+                ),
+            }
+            self.cli_backup_keys
+                .insert(slot.as_config_key().to_string());
+        }
+        if has_backup_reviewers {
+            self.backups.reviewer = backup_reviewers;
+        }
+        self.backups.validate()?;
+        self.validate_backup_against_primary()
+    }
+
+    fn validate_backup_against_primary(&self) -> Result<()> {
+        let check_single = |role: &str,
+                            primary: &Option<String>,
+                            backup: &Option<String>|
+         -> Result<()> {
+            if let (Some(p), Some(b)) = (primary, backup) {
+                let p_key = crate::provider_ref::ProviderRef::parse(p)
+                    .map(|r| r.storage_key())
+                    .unwrap_or_else(|_| p.clone());
+                let b_key = crate::provider_ref::ProviderRef::parse(b)
+                    .map(|r| r.storage_key())
+                    .unwrap_or_else(|_| b.clone());
+                if p_key == b_key {
+                    anyhow::bail!(
+                        "backup for {role} has same provider storage key as primary ({p_key}); backup must be a different provider"
+                    );
+                }
+            }
+            Ok(())
+        };
+        check_single("planner", &self.roles.planner, &self.backups.planner)?;
+        check_single(
+            "plan_critic",
+            &self.roles.plan_critic,
+            &self.backups.plan_critic,
+        )?;
+        check_single(
+            "implementer",
+            &self.roles.implementer,
+            &self.backups.implementer,
+        )?;
+        check_single("tester", &self.roles.tester, &self.backups.tester)?;
+        check_single(
+            "test_author",
+            &self.roles.test_author,
+            &self.backups.test_author,
+        )?;
+        if !self.roles.reviewer.is_empty() || !self.backups.reviewer.is_empty() {
+            let len = self.roles.reviewer.len().max(self.backups.reviewer.len());
+            for i in 0..len {
+                if let (Some(p), Some(b)) =
+                    (self.roles.reviewer.get(i), self.backups.reviewer.get(i))
+                {
+                    let p_key = crate::provider_ref::ProviderRef::parse(p)
+                        .map(|r| r.storage_key())
+                        .unwrap_or_else(|_| p.clone());
+                    let b_key = crate::provider_ref::ProviderRef::parse(b)
+                        .map(|r| r.storage_key())
+                        .unwrap_or_else(|_| b.clone());
+                    if p_key == b_key {
+                        anyhow::bail!(
+                            "backup for reviewer[{i}] has same provider storage key as primary ({p_key})"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `--without <critic,spec,suite>`: drop seats for this run only, without touching
@@ -1240,6 +1412,28 @@ impl Config {
                 self.roles.test_author = Some(v.clone());
             }
             self.roles.validate()?;
+        }
+        if let Some(b) = &file.backups {
+            if let Some(v) = &b.planner {
+                self.backups.planner = Some(v.clone());
+            }
+            if let Some(v) = &b.plan_critic {
+                self.backups.plan_critic = Some(v.clone());
+            }
+            if let Some(v) = &b.implementer {
+                self.backups.implementer = Some(v.clone());
+            }
+            if let Some(v) = &b.reviewer {
+                self.backups.reviewer = v.clone();
+            }
+            if let Some(v) = &b.tester {
+                self.backups.tester = Some(v.clone());
+            }
+            if let Some(v) = &b.test_author {
+                self.backups.test_author = Some(v.clone());
+            }
+            self.backups.validate()?;
+            self.validate_backup_against_primary()?;
         }
         if let Some(r) = &file.review {
             if let Some(v) = r.require_all_criteria {

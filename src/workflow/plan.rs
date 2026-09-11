@@ -183,16 +183,35 @@ fn plan_slot_specs(
     if cfg.critic.enabled {
         specs.push((SlotRole::PlanCritic, "critic", "plan_critic"));
     }
+    let store = crate::quota::QuotaStore::load(&crate::paths::SparPaths::new(&state.project_root))
+        .unwrap_or_default();
+    let available: std::collections::HashSet<String> = crate::providers::detect_all()
+        .into_iter()
+        .filter(|r| r.available)
+        .map(|r| r.name)
+        .collect();
     let mut out = Vec::with_capacity(specs.len());
     for (idx, (role, prefix, template)) in specs.into_iter().enumerate() {
-        let Some((prov, source)) = crate::workflow::roles_resolve::resolve_seat(
+        let Some((prov, source)) = crate::backup::resolve_with_backup(
             role,
             idx,
             idx,
             &state.providers,
             state.pool_origin,
             cfg,
-        ) else {
+            &store,
+            Some(&available),
+        )
+        .or_else(|| {
+            crate::workflow::roles_resolve::resolve_seat(
+                role,
+                idx,
+                idx,
+                &state.providers,
+                state.pool_origin,
+                cfg,
+            )
+        }) else {
             continue;
         };
         let id = format!("{prefix}-{}", sanitize_slot(&prov));

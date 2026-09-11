@@ -73,6 +73,10 @@ pub enum Command {
         /// `--providers` pool.
         #[arg(long = "role", value_name = "ROLE=PROVIDER")]
         role: Vec<String>,
+        /// Backup provider for a role for THIS run: `--backup planner=cli:grok`.
+        /// Repeatable; reviewer backups preserve ordinal order. Only for role workflows.
+        #[arg(long = "backup", value_name = "ROLE=PROVIDER")]
+        backup: Vec<String>,
         /// Fleet preset for THIS run: `small` (one reviewer, no critic, no spec
         /// test-author, no agent tester — a configured deterministic `[suite].command`
         /// still runs) or `standard` (today's defaults; never re-enables a channel the
@@ -157,6 +161,9 @@ pub enum Command {
         /// `--providers` pool.
         #[arg(long = "role", value_name = "ROLE=PROVIDER")]
         role: Vec<String>,
+        /// Backup provider for a role for THIS run: `--backup planner=cli:grok`.
+        #[arg(long = "backup", value_name = "ROLE=PROVIDER")]
+        backup: Vec<String>,
         /// Fleet preset for THIS run: `small` (one reviewer, no critic, no spec
         /// test-author, no agent tester — a configured deterministic `[suite].command`
         /// still runs) or `standard` (today's defaults; never re-enables a channel the
@@ -228,6 +235,9 @@ pub enum Command {
         /// `--providers` pool.
         #[arg(long = "role", value_name = "ROLE=PROVIDER")]
         role: Vec<String>,
+        /// Backup provider for a role for THIS run: `--backup reviewer=cli:claude`.
+        #[arg(long = "backup", value_name = "ROLE=PROVIDER")]
+        backup: Vec<String>,
         /// Fleet preset for THIS run: `small` (one reviewer, no critic, no spec
         /// test-author, no agent tester — a configured deterministic `[suite].command`
         /// still runs) or `standard` (today's defaults; never re-enables a channel the

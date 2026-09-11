@@ -3036,6 +3036,7 @@ fn source_label(source: SeatSource) -> &'static str {
         SeatSource::ProvidersOrder => "providers-order",
         SeatSource::ModelSelect => "model-select",
         SeatSource::SuitePreferences => "suite-preferences",
+        SeatSource::Backup => "backup",
         SeatSource::Unknown => "unknown",
     }
 }

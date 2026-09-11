@@ -478,6 +478,7 @@ const HOME_SKELETON_ROWS: usize = 3;
 enum NewRunField {
     Project,
     Task,
+    Workflow,
     Fleet,
 }
 
@@ -533,6 +534,7 @@ struct NewRun {
     /// slow probe from a cancelled or reopened modal cannot clobber a later one
     /// (D2 — the `Msg::RosterReady` guard).
     gen: u64,
+    workflow: Option<crate::runspec::SpecWorkflow>,
 }
 
 struct App {
@@ -1402,6 +1404,7 @@ fn new_run_fixture() -> NewRun {
         sel: 0,
         loading: false,
         gen: 1,
+        workflow: Some(crate::runspec::SpecWorkflow::Plan),
     }
 }
 
@@ -2121,6 +2124,16 @@ fn build_home_rows(
     finished.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
 
     let mut rows = Vec::new();
+    rows.push(HomeRow::Header(HomeBand::StartNew));
+    rows.push(HomeRow::NewRun);
+    for (i, proj) in projects.iter().enumerate() {
+        if let HomeScope::Project(root) = scope {
+            if &proj.root != root {
+                continue;
+            }
+        }
+        rows.push(HomeRow::Project(i, proj.root.clone()));
+    }
     rows.push(HomeRow::Header(HomeBand::NeedsMe));
     if loading {
         for slot in 0..HOME_SKELETON_ROWS {
@@ -2165,16 +2178,6 @@ fn build_home_rows(
             now,
             Some(HOME_BAND_CAP),
         );
-    }
-    rows.push(HomeRow::Header(HomeBand::StartNew));
-    rows.push(HomeRow::NewRun);
-    for (i, proj) in projects.iter().enumerate() {
-        if let HomeScope::Project(root) = scope {
-            if &proj.root != root {
-                continue;
-            }
-        }
-        rows.push(HomeRow::Project(i, proj.root.clone()));
     }
     rows
 }
@@ -2840,19 +2843,58 @@ fn new_run_providers(nr: &NewRun) -> Vec<String> {
     out
 }
 
-/// Validate the new-run surface, then build the argv `run_palette`'s `plan` arm
-/// already sends. The `--base` resolution stays at the call site (it needs the
-/// operator's actual cwd, which this pure function does not have).
-fn new_run_launch(nr: &NewRun) -> std::result::Result<(PathBuf, Vec<String>), String> {
+fn new_run_spec(nr: &NewRun, cfg: &crate::config::Config) -> crate::runspec::RunSpec {
+    let providers = new_run_providers(nr);
+    let wf = nr.workflow;
+    let mut spec = crate::runspec::RunSpec {
+        task: nr.task.clone(),
+        workflow: wf,
+        ..Default::default()
+    };
+    if let Some(wf) = wf {
+        if wf == crate::runspec::SpecWorkflow::Arena {
+            let expected = crate::runspec::spec_rows(wf, cfg).len();
+            let mut pool: Vec<Option<crate::runspec::Pin>> = Vec::new();
+            for (i, raw) in providers.iter().enumerate().take(expected) {
+                if let Ok(pin) = crate::runspec::Pin::parse(raw) {
+                    if pool.len() <= i {
+                        pool.resize_with(i + 1, || None);
+                    }
+                    pool[i] = Some(pin);
+                }
+            }
+            while pool.len() < expected {
+                pool.push(None);
+            }
+            spec.arena_pool = pool;
+        } else {
+            let rows = crate::runspec::spec_rows(wf, cfg);
+            for (idx, (role, ordinal)) in rows.iter().enumerate() {
+                let primary = providers
+                    .get(idx)
+                    .and_then(|r| crate::runspec::Pin::parse(r).ok());
+                spec.roles.push(crate::runspec::RoleAssignment {
+                    role: *role,
+                    ordinal: *ordinal,
+                    primary,
+                    backup: None,
+                });
+            }
+        }
+    }
+    spec
+}
+
+fn new_run_launch_with_cfg(
+    nr: &NewRun,
+    cfg: &crate::config::Config,
+) -> std::result::Result<(PathBuf, Vec<String>), String> {
     let target = nr.project.clone().ok_or_else(|| {
         "no project to launch into — open spar in a project or choose a registered project"
             .to_string()
     })?;
     if nr.task.trim().is_empty() {
         return Err("task cannot be empty".to_string());
-    }
-    if nr.picked.is_empty() {
-        return Err("pick at least one provider".to_string());
     }
     for &idx in &nr.picked {
         match nr.roster.get(idx) {
@@ -2867,18 +2909,19 @@ fn new_run_launch(nr: &NewRun) -> std::result::Result<(PathBuf, Vec<String>), St
             None => return Err("invalid roster selection".to_string()),
         }
     }
-    let providers = new_run_providers(nr);
-    if providers.is_empty() {
-        return Err("no providers resolved".to_string());
-    }
-    let argv = vec![
-        "plan".to_string(),
-        "-t".to_string(),
-        nr.task.trim().to_string(),
-        "--providers".to_string(),
-        providers.join(","),
-    ];
+    let spec = new_run_spec(nr, cfg);
+    spec.validate_for_launch(cfg)?;
+    let argv = spec.argv(cfg)?;
     Ok((target, argv))
+}
+
+/// Validate the new-run surface, then build the argv `run_palette`'s `plan` arm
+/// already sends. The `--base` resolution stays at the call site (it needs the
+/// operator's actual cwd, which this pure function does not have).
+#[allow(dead_code)]
+fn new_run_launch(nr: &NewRun) -> std::result::Result<(PathBuf, Vec<String>), String> {
+    let cfg = crate::config::Config::default();
+    new_run_launch_with_cfg(nr, &cfg)
 }
 
 /// The real `git diff` of a slot's worktree against HEAD (Stage B): staged + unstaged,
@@ -4331,16 +4374,22 @@ fn pending_new_run(
     field: NewRunField,
     gen: u64,
 ) -> NewRun {
+    let defaults = crate::defaults::load();
     NewRun {
         project,
         projects,
-        task,
+        task: if task.is_empty() {
+            defaults.task.clone()
+        } else {
+            task
+        },
         roster: Vec::new(),
         picked: Vec::new(),
         field,
         sel: 0,
         loading: true,
         gen,
+        workflow: defaults.workflow,
     }
 }
 
@@ -4427,33 +4476,92 @@ fn apply_proposal_to_roster(
     roster: &mut Vec<RosterEntry>,
     nr: &mut NewRun,
 ) {
-    nr.task = proposal.task.clone();
+    if nr.task.trim().is_empty() {
+        nr.task = proposal.task.clone();
+    }
+    if nr.workflow.is_none() {
+        if let Some(wf) = proposal.workflow.as_deref() {
+            nr.workflow = crate::runspec::SpecWorkflow::parse(wf);
+        }
+    }
+    let mut to_add: Vec<String> = Vec::new();
     for prov in &proposal.providers {
+        if crate::runspec::Pin::parse(prov).is_ok() {
+            to_add.push(prov.clone());
+        }
+    }
+    for v in proposal.roles.values() {
+        if crate::runspec::Pin::parse(v).is_ok() && !to_add.contains(v) {
+            to_add.push(v.clone());
+        }
+    }
+    for v in &proposal.reviewer {
+        if crate::runspec::Pin::parse(v).is_ok() && !to_add.contains(v) {
+            to_add.push(v.clone());
+        }
+    }
+    for v in proposal.backups.values() {
+        if crate::runspec::Pin::parse(v).is_ok() && !to_add.contains(v) {
+            to_add.push(v.clone());
+        }
+    }
+    for v in &proposal.reviewer_backups {
+        if crate::runspec::Pin::parse(v).is_ok() && !to_add.contains(v) {
+            to_add.push(v.clone());
+        }
+    }
+    for prov in to_add {
         if !roster
             .iter()
-            .any(|e| matches!(&e.choice, RosterChoice::Provider(p) if p == prov))
+            .any(|e| matches!(&e.choice, RosterChoice::Provider(p) if p == &prov))
         {
+            let available = crate::providers::detect_all()
+                .iter()
+                .any(|r| r.name == crate::quota::normalize_key(&prov) && r.available);
             roster.push(RosterEntry {
                 choice: RosterChoice::Provider(prov.clone()),
                 label: prov.clone(),
-                available: false,
-                reason: Some("not in roster".to_string()),
+                available,
+                reason: if available {
+                    None
+                } else {
+                    Some("not in roster".to_string())
+                },
                 source: RosterSource::Detected,
             });
         }
     }
-    let mut picked = Vec::new();
-    for prov in &proposal.providers {
-        if let Some(idx) = roster
-            .iter()
-            .position(|e| matches!(&e.choice, RosterChoice::Provider(p) if p == prov))
-        {
-            if roster[idx].available {
-                picked.push(idx);
+    if nr.picked.is_empty() {
+        let mut picked = Vec::new();
+        let ordered_providers: Vec<String> =
+            if !proposal.reviewer.is_empty() || !proposal.roles.is_empty() {
+                let mut v = Vec::new();
+                for pv in proposal.roles.values() {
+                    v.push(pv.clone());
+                }
+                v.extend(proposal.reviewer.clone());
+                if v.is_empty() {
+                    proposal.providers.clone()
+                } else {
+                    v
+                }
+            } else {
+                proposal.providers.clone()
+            };
+        for prov in &ordered_providers {
+            if let Some(idx) = roster
+                .iter()
+                .position(|e| matches!(&e.choice, RosterChoice::Provider(p) if p == prov))
+            {
+                if roster[idx].available {
+                    picked.push(idx);
+                }
             }
         }
+        if !picked.is_empty() {
+            nr.picked = picked;
+        }
     }
-    nr.picked = picked;
 }
 
 /// Apply a background roster probe's result (D2) if the modal it was built for is
@@ -4575,7 +4683,7 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         let Some(nr) = app.new_run.as_ref() else {
             return;
         };
-        match new_run_launch(nr) {
+        match new_run_launch_with_cfg(nr, &app.cfg) {
             Ok((target, mut args)) => {
                 let target_swarm = SparPaths::new(&target);
                 if let Ok(cwd) = std::env::current_dir() {
@@ -4604,7 +4712,8 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         KeyCode::Tab => {
             nr.field = match nr.field {
                 NewRunField::Project => NewRunField::Task,
-                NewRunField::Task => NewRunField::Fleet,
+                NewRunField::Task => NewRunField::Workflow,
+                NewRunField::Workflow => NewRunField::Fleet,
                 NewRunField::Fleet => NewRunField::Project,
             };
         }
@@ -4612,7 +4721,8 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             nr.field = match nr.field {
                 NewRunField::Project => NewRunField::Fleet,
                 NewRunField::Task => NewRunField::Project,
-                NewRunField::Fleet => NewRunField::Task,
+                NewRunField::Workflow => NewRunField::Task,
+                NewRunField::Fleet => NewRunField::Workflow,
             };
         }
         KeyCode::Left if nr.field == NewRunField::Project && !nr.projects.is_empty() => {
@@ -4641,6 +4751,55 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         }
         KeyCode::Char('k') | KeyCode::Up if nr.field == NewRunField::Fleet => {
             nr.sel = nr.sel.saturating_sub(1);
+        }
+        KeyCode::Char('w') | KeyCode::Char('W') if nr.field == NewRunField::Workflow => {
+            nr.workflow = match nr.workflow {
+                None => Some(crate::runspec::SpecWorkflow::Plan),
+                Some(crate::runspec::SpecWorkflow::Plan) => {
+                    Some(crate::runspec::SpecWorkflow::Implement)
+                }
+                Some(crate::runspec::SpecWorkflow::Implement) => {
+                    Some(crate::runspec::SpecWorkflow::Review)
+                }
+                Some(crate::runspec::SpecWorkflow::Review) => {
+                    Some(crate::runspec::SpecWorkflow::Arena)
+                }
+                Some(crate::runspec::SpecWorkflow::Arena) => None,
+            };
+        }
+        KeyCode::Left
+            if nr.field == NewRunField::Workflow && !mods.contains(KeyModifiers::CONTROL) =>
+        {
+            nr.workflow = match nr.workflow {
+                Some(crate::runspec::SpecWorkflow::Plan) => None,
+                Some(crate::runspec::SpecWorkflow::Implement) => {
+                    Some(crate::runspec::SpecWorkflow::Plan)
+                }
+                Some(crate::runspec::SpecWorkflow::Review) => {
+                    Some(crate::runspec::SpecWorkflow::Implement)
+                }
+                Some(crate::runspec::SpecWorkflow::Arena) => {
+                    Some(crate::runspec::SpecWorkflow::Review)
+                }
+                None => Some(crate::runspec::SpecWorkflow::Arena),
+            };
+        }
+        KeyCode::Right
+            if nr.field == NewRunField::Workflow && !mods.contains(KeyModifiers::CONTROL) =>
+        {
+            nr.workflow = match nr.workflow {
+                None => Some(crate::runspec::SpecWorkflow::Plan),
+                Some(crate::runspec::SpecWorkflow::Plan) => {
+                    Some(crate::runspec::SpecWorkflow::Implement)
+                }
+                Some(crate::runspec::SpecWorkflow::Implement) => {
+                    Some(crate::runspec::SpecWorkflow::Review)
+                }
+                Some(crate::runspec::SpecWorkflow::Review) => {
+                    Some(crate::runspec::SpecWorkflow::Arena)
+                }
+                Some(crate::runspec::SpecWorkflow::Arena) => None,
+            };
         }
         KeyCode::Backspace if nr.field == NewRunField::Task => {
             nr.task.pop();
@@ -10505,6 +10664,15 @@ fn draw_new_run(f: &mut Frame, area: Rect, projects: &[registry::ProjectEntry], 
     lines.push((
         format!("Task: {}▌", nr.task),
         field_style(NewRunField::Task),
+    ));
+    lines.push((String::new(), Style::default()));
+    let workflow_label = nr
+        .workflow
+        .map(|w| w.as_str().to_string())
+        .unwrap_or_else(|| "unset (Chat can propose)".to_string());
+    lines.push((
+        format!("Workflow: {workflow_label}  ←/→ or w"),
+        field_style(NewRunField::Workflow),
     ));
     lines.push((String::new(), Style::default()));
     lines.push(("Fleet:".to_string(), field_style(NewRunField::Fleet)));
@@ -17306,14 +17474,23 @@ mod render_stability {
             let i = rows
                 .iter()
                 .position(|r| matches!(r, HomeRow::Header(HomeBand::StartNew)))
-                .expect("band 4 header");
+                .expect("band 1 header");
+            assert_eq!(i, 0, "StartNew must be the first header");
             assert!(
                 matches!(rows.get(i + 1), Some(HomeRow::NewRun)),
-                "the new-run action row must follow band 4's header: {:?}",
+                "the new-run action row must follow band 1's header: {:?}",
                 &rows[i..]
             );
+            let next_header = rows[i + 2..]
+                .iter()
+                .position(|r| matches!(r, HomeRow::Header(_)));
+            let band_slice = if let Some(pos) = next_header {
+                &rows[i + 1..i + 2 + pos]
+            } else {
+                &rows[i + 1..]
+            };
             assert!(
-                rows[i + 1..]
+                band_slice
                     .iter()
                     .all(|r| matches!(r, HomeRow::NewRun | HomeRow::Project(..))),
                 "band 4 holds only the action row and the project list"
@@ -19229,10 +19406,10 @@ mod home_ia {
             assert_eq!(
                 headers,
                 vec![
+                    HomeBand::StartNew,
                     HomeBand::NeedsMe,
                     HomeBand::Running,
-                    HomeBand::Finished,
-                    HomeBand::StartNew
+                    HomeBand::Finished
                 ],
                 "band headers must be present and in order even when empty"
             );
@@ -19802,8 +19979,8 @@ mod home_ia {
         let app = App::new(None, Config::default(), None);
         let home_run_item = rail_home_items(&home_rows, &projects, &app, 40, false)
             .into_iter()
-            .nth(1)
-            .expect("the NeedsMe header, then the run row");
+            .nth(4)
+            .expect("the NeedsMe run row after StartNew band");
         assert!(
             rendered(vec![home_run_item], 40).contains('⚑'),
             "the Home rail must flag a row unit_wants_operator flags, even though \
@@ -20722,6 +20899,7 @@ mod home_ia {
     fn the_new_run_surface_refuses_before_it_spawns() {
         let mut nr = new_run_fixture();
         nr.picked.clear();
+        nr.workflow = Some(crate::runspec::SpecWorkflow::Plan);
         assert!(
             new_run_launch(&nr).is_err(),
             "zero providers must not dispatch a fleet-less plan"
@@ -20754,19 +20932,42 @@ mod home_ia {
         );
 
         // The happy path: the target project comes from the surface, not from
-        // whatever the active root happens to be, and the argv is the same
-        // `plan -t … --providers …` the palette already sends.
-        let nr = new_run_fixture();
+        // whatever the active root happens to be, and the argv uses role pins.
+        let mut nr = new_run_fixture();
+        nr.workflow = Some(crate::runspec::SpecWorkflow::Plan);
+        nr.roster = vec![
+            RosterEntry {
+                choice: RosterChoice::Provider("cli:claude@opus".into()),
+                label: "cli:claude@opus".into(),
+                available: true,
+                reason: None,
+                source: RosterSource::Configured,
+            },
+            RosterEntry {
+                choice: RosterChoice::Provider("cli:codex@gpt-5.6-terra".into()),
+                label: "cli:codex@gpt-5.6-terra".into(),
+                available: true,
+                reason: None,
+                source: RosterSource::Detected,
+            },
+            RosterEntry {
+                choice: RosterChoice::Provider("cli:grok@fast".into()),
+                label: "cli:grok@fast".into(),
+                available: true,
+                reason: None,
+                source: RosterSource::Detected,
+            },
+        ];
+        nr.picked = vec![0, 1, 2];
         let (target, argv) = new_run_launch(&nr).expect("a valid surface launches");
         assert_eq!(target, PathBuf::from("/nonexistent/spar"));
         assert_eq!(argv[0], "plan");
         let t = argv.iter().position(|a| a == "-t").expect("-t");
         assert_eq!(argv[t + 1], nr.task);
-        let p = argv
-            .iter()
-            .position(|a| a == "--providers")
-            .expect("--providers is required on plan");
-        assert_eq!(argv[p + 1], "cli:claude@opus");
+        assert!(
+            argv.contains(&"--role".to_string()),
+            "plan workflow should emit --role pins, not --providers"
+        );
     }
 
     /// AC-35. The docs and decision rows are part of this change, not a
@@ -21298,6 +21499,7 @@ mod chat_acceptance {
             task: "orig task".into(),
             brief: "# Orig Title\n\nThis is the original brief with orig task inside.\n".into(),
             providers: vec!["cli:claude".into()],
+            ..Default::default()
         };
         let edited_task = "edited task";
         let mut app = App::new(None, Config::default(), Some(project.as_path()));
@@ -21439,6 +21641,7 @@ mod chat_acceptance {
             task: "t".into(),
             brief: "b".into(),
             providers: vec!["cli:claude".into()],
+            ..Default::default()
         });
         app.chat_pending_brief_path = Some(PathBuf::from("/tmp/brief.md"));
         let mut nr = pending_new_run(
@@ -21508,6 +21711,7 @@ mod chat_acceptance {
             task: "old".into(),
             brief: "old brief".into(),
             providers: vec!["cli:claude".into()],
+            ..Default::default()
         });
         app.chat_pending_brief_path = Some(PathBuf::from("/tmp/old.md"));
         let sw = SparPaths::new(&proj);

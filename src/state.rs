@@ -339,6 +339,7 @@ pub enum SeatSource {
     ProvidersOrder,
     ModelSelect,
     SuitePreferences,
+    Backup,
     /// A slot with no recorded provenance — pre-011 `state.json`, or a code path that has
     /// not been threaded onto a real `SeatSource` yet. Never guess `ProvidersOrder`: that
     /// claims a specific rung the seat may never have taken.
@@ -395,7 +396,7 @@ fn one_round() -> u32 {
     1
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SlotRole {
     Planner,

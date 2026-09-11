@@ -830,11 +830,16 @@ pub fn validate_turn(
     Ok(candidates[0].clone())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Proposal {
     pub task: String,
     pub brief: String,
     pub providers: Vec<String>,
+    pub workflow: Option<String>,
+    pub roles: std::collections::HashMap<String, String>,
+    pub backups: std::collections::HashMap<String, String>,
+    pub reviewer: Vec<String>,
+    pub reviewer_backups: Vec<String>,
 }
 
 pub fn parse_proposal(body: &str) -> Result<Option<Proposal>> {
@@ -872,13 +877,63 @@ pub fn parse_proposal(body: &str) -> Result<Option<Proposal>> {
                         .collect()
                 })
                 .unwrap_or_default();
+            let workflow = value
+                .get("workflow")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let mut roles = std::collections::HashMap::new();
+            let mut backups = std::collections::HashMap::new();
+            let mut reviewer = Vec::new();
+            let mut reviewer_backups = Vec::new();
+            if let Some(tbl) = value.get("roles").and_then(|v| v.as_table()) {
+                for (k, v) in tbl {
+                    if k == "reviewer" {
+                        if let Some(arr) = v.as_array() {
+                            reviewer = arr
+                                .iter()
+                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                .collect();
+                        } else if let Some(s) = v.as_str() {
+                            reviewer.push(s.to_string());
+                        }
+                    } else if let Some(s) = v.as_str() {
+                        roles.insert(k.clone(), s.to_string());
+                    }
+                }
+            }
+            if let Some(tbl) = value.get("backups").and_then(|v| v.as_table()) {
+                for (k, v) in tbl {
+                    if k == "reviewer" {
+                        if let Some(arr) = v.as_array() {
+                            reviewer_backups = arr
+                                .iter()
+                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                .collect();
+                        } else if let Some(s) = v.as_str() {
+                            reviewer_backups.push(s.to_string());
+                        }
+                    } else if let Some(s) = v.as_str() {
+                        backups.insert(k.clone(), s.to_string());
+                    }
+                }
+            }
             if task.is_empty() && brief.is_empty() {
                 anyhow::bail!("spar-proposal missing task and brief");
+            }
+            if let Some(wf) = &workflow {
+                if crate::runspec::SpecWorkflow::parse(wf).is_none() {
+                    anyhow::bail!("spar-proposal workflow {wf:?} is unknown");
+                }
             }
             return Ok(Some(Proposal {
                 task,
                 brief,
                 providers,
+                workflow,
+                roles,
+                backups,
+                reviewer,
+                reviewer_backups,
             }));
         } else {
             anyhow::bail!("unterminated spar-proposal fence");
