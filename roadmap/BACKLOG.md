@@ -2,6 +2,31 @@
 
 Unscheduled ideas, grouped by theme. Promote to `roadmap/features/NNN-*.md` when picked up.
 
+## Fleet and quota
+
+- **A cheap seat's rate limit disables the whole provider, including the expensive
+  seats.** Hit twice in one session: the suite tester (`cli:codex@gpt-5.6-luna`)
+  exhausted its budget and `cli:codex` went `paused_quota`, which also took out the
+  `gpt-5.6-terra` reviewer on both in-flight runs. Bucketing on
+  `ProviderRef::storage_key()` is model-free by design (X8) and that is right for a
+  shared five-hour window, but the consequence is that the lowest-value dispatch on
+  a provider can spend the budget the highest-value one needs. Worth considering: a
+  per-seat or per-role share of a bucket, or at minimum letting a run continue with
+  the seats that have not hit a limit rather than parking the whole run. The
+  operator workaround today is `--without suite`, which only works because the
+  tester happens to be the droppable seat.
+
+- **Dropping one seat requires re-stating the entire fleet.** `spar implement --run
+  <id> --reload-config --without suite` fails with `--providers is required (or set
+  a [roles] block…)` on a project with no `[roles]` in `spar.toml`, because
+  `--reload-config` re-resolves the pool from live config rather than starting from
+  the run's frozen one. So changing one seat means passing all six `--role` pins
+  again, exactly, or silently getting a different fleet. The run already froze a
+  complete, resolved fleet in `config.json` (O27); `--without` and `--role` should
+  amend *that* rather than requiring the operator to reconstruct it. Note `--role`
+  now genuinely re-points existing seats (O79), so this is the remaining half of the
+  same problem.
+
 ## TUI
 
 - **A tool record reads answer-before-question.** `LogRecord::to_record`
