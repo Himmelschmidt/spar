@@ -103,6 +103,14 @@ pub fn run(json: bool) -> Result<ExitCode> {
         Err(e) => notes.push(format!("model-select cache read error: {e:#}")),
     }
 
+    if let Some(root) = &project_root {
+        let daemon_paths = SparPaths::new(root);
+        match crate::daemon::DaemonLock::owner(&daemon_paths).filter(|t| t.alive()) {
+            Some(t) => notes.push(format!("daemon: running (pid {})", t.pid)),
+            None => notes.push("daemon: not running — start with `spar daemon start`".into()),
+        }
+    }
+
     let ok = git.available && any_provider;
     let report = DoctorReport {
         ok,

@@ -1234,6 +1234,100 @@ fn implement_refuses_a_quota_parked_plan_that_was_never_approved() {
         .stderr(predicate::str::contains("plan is not approved"));
 }
 
+/// `Phase::Stopped` has the identical hazard `Phase::Quota` was fixed for above: `spar
+/// stop` parks a plan run here before it was ever approved (mid-dispatch, before it ever
+/// reached its own gate), not only after approval. Making `Stopped` unconditionally
+/// resumable let `implement --run` walk an unapproved plan straight past the
+/// `plan_approved` gate, exactly like the `Quota` regression.
+#[test]
+fn implement_refuses_a_stopped_plan_that_was_never_approved() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+
+    let plan = spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "plan",
+            "--task",
+            "add a hello function",
+            "--providers",
+            "cli:claude,cli:grok",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2);
+    let stdout = String::from_utf8_lossy(plan.get_output().stdout.as_slice());
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("plan json");
+    let run_id = v["run_id"].as_str().expect("run_id").to_string();
+
+    let state_path = tmp
+        .path()
+        .join(".spar/runs")
+        .join(&run_id)
+        .join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    assert_eq!(
+        state["gates"]["plan_approved"], false,
+        "never approved this run"
+    );
+    assert_eq!(state["workflow"], "plan");
+    state["phase"] = serde_json::json!("stopped");
+    std::fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--providers",
+            "cli:claude,cli:grok",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("plan is not approved"));
+}
+
+/// The counterpart to the refusal above: an *approved* plan run parked at `Stopped`
+/// (the operator ran `spar stop` after `spar approve`, before implementation dispatched)
+/// must stay resumable through `implement --run`, same as it always has.
+#[test]
+fn implement_resumes_a_stopped_approved_plan() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let run_id = planned_run(tmp.path());
+
+    let state_path = tmp
+        .path()
+        .join(".spar/runs")
+        .join(&run_id)
+        .join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    assert_eq!(state["gates"]["plan_approved"], true);
+    state["phase"] = serde_json::json!("stopped");
+    std::fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--providers",
+            "cli:claude,cli:grok",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("plan is not approved").not());
+}
+
 #[test]
 fn arena_dry_run() {
     let tmp = tempdir().unwrap();

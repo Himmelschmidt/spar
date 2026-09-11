@@ -115,3 +115,23 @@ path = "tests/scenarios/quota_routing.rs"
 [[test]]
 name = "fleet_shaping"
 path = "tests/scenarios/fleet_shaping.rs"
+
+[[test]]
+name = "detach"
+path = "tests/scenarios/detach.rs"
+
+[[test]]
+name = "notify_lifecycle"
+path = "tests/scenarios/notify_lifecycle.rs"
+
+[[test]]
+name = "resume"
+path = "tests/scenarios/resume.rs"
+
+[[test]]
+name = "brief"
+path = "tests/scenarios/brief.rs"
+
+[[test]]
+name = "daemon"
+path = "tests/scenarios/daemon.rs"

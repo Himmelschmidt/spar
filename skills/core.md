@@ -221,6 +221,11 @@ two more `reviewer` slots on the reconciled tree.
 # Plan (ends HumanGate / awaiting_plan_approval unless autonomy auto-approves)
 spar plan -t "describe the work" --providers cli:claude,cli:grok [--big] [--dry-run] [--json] [--detach]
 
+# Or hand it a longer brief: a file, or stdin with `-`. Written once to
+# .spar/briefs/<slug>.md (never overwritten) and recorded on the run.
+spar plan --spec spec.md --providers cli:claude
+cat spec.md | spar plan --spec - --providers cli:claude
+
 # Or resolve fleet from vals.ai benchmarks + prefs (see [model_select] in spar.toml)
 spar model refresh
 spar model refresh --if-stale   # refresh only stale/missing benches (cron-friendly)
@@ -265,11 +270,19 @@ spar reclaim <run_id> | --all [--json]   # delete build output, KEEP the worktre
 spar reconcile-state <run_id> | --all    # settle slots a dead orchestrator left `running`
 spar reconcile-state <run_id> --apply    # …and write it (bare form only reports)
 spar archive <run_id> [--undo] [--json]  # hide a finished run from listings
-spar archive --all [--older-than 14d]    # hide every quiet finished run
-spar archive --all --halted              # also stopped/failed/stuck/quota (never gates,
-                                         # never plan_approved: that is work waiting on you)
+spar archive --all [--older-than 14d]    # done/plan_rejected AND stopped/failed/stuck/quota
+                                         # (never a gate, never plan_approved: that is
+                                         # work waiting on you)
+spar archive --all --gates               # also takes human gates (still never plan_approved)
 spar link <run_id> --to <run_id>         # fold a stray leg into its unit of work
 spar link <run_id> --undo                # and back out again
+
+spar brief <run_id> [--full] [--json]    # re-hydrate a fresh session: phase, gates, fleet,
+                                         # brief, artifacts, the exact next command. Read-only.
+spar resume <run_id> [--detach] [--json] # pick a stopped or abandoned run back up
+spar daemon start [--foreground]         # per-project supervisor: restart + abandoned alert + cap
+spar daemon status [--json]
+spar daemon stop
 ```
 
 ### A run is a unit of work, not an invocation
@@ -515,6 +528,15 @@ children — so they keep running and keep spending tokens with nobody collectin
 - On **SIGINT/SIGTERM** an orchestrating `spar` signals its slot groups before it exits,
   so a polite kill no longer orphans anything. `SIGKILL` cannot be caught: that is what
   the three above are for.
+- `spar resume <id>` picks an abandoned or stopped run back up without you having to know
+  which of `implement --run` / a fresh dispatch applies — it refuses a human gate (naming
+  the command that resolves it) and a run with a live orchestrator (naming its pid).
+- `spar daemon start` runs a per-project supervisor that pushes an alert the first time a
+  run has read abandoned past `[daemon].abandon_after_secs` (60s by default), and restarts
+  it if `[daemon].restart` is on (the default). It is opt-in — nothing starts it for you —
+  and it never approves a plan, confirms ship, merges, sweeps `cleanup`, or picks a fleet;
+  it only ever restarts the same orchestrator a plain `spar resume` would have, and tells
+  you when one is waiting. `spar daemon status` / `spar daemon stop`.
 
 ### Budgets and nudges: nothing kills a slot on tokens (O50)
 
@@ -625,8 +647,16 @@ cleared when it is re-dispatched, so a `running` slot never carries a previous r
 exit code and a `done` slot never carries a previous round's error. The run's ledger is
 `state.usage[]`, one entry per completed dispatch; `slots[].usage` is the latest only.
 
-Prefer `--detach` + `spar wait` over a foreground run precisely so a command timeout in
-your harness cannot orphan a fleet.
+`--detach` runs the orchestrator in a **session of its own** (`setsid`), so a signal
+aimed at the launching shell's process group — a Bash-tool timeout, an aborted turn, a
+tty hangup — no longer reaches it, and `spar plan`/`spar implement` only print `detached`
+once they have watched the child take the run's lock. A child that dies at startup fails
+the launch instead of looking healthy for 15 seconds.
+
+What it does not survive: a `SIGKILL` at the orchestrator's pid, a reboot, or the project
+directory going away. Slots die with their orchestrator, not with your shell. If a run is
+left with no owner, `spar status` marks it `ABANDONED` and `spar resume <id>` picks it
+back up; `spar daemon` does that for you.
 
 **Worktrees are not reclaimed on their own.** A successful run ends at the **ship gate**,
 not at `done`, and `auto_cleanup` is off by default, so a project accumulates one worktree
@@ -654,16 +684,24 @@ TUI rail while deleting nothing; `--undo` brings it back, `spar status --archive
 them, and the id stays addressable (`spar status <archived-id>` works). Only `--purge`
 deletes anything.
 
-Three rules make it safe to leave on:
-- **Gates are never auto-archived.** Only `done` / `plan_rejected`. A run parked at
-  `awaiting_plan_approval` is waiting on *you*, and hiding those is how the one listing
-  that matters gets lost. `stopped` / `failed` / `stuck` / `quota` are ambiguous and stay
-  visible until archived by hand.
-- **A run stays archived only while it stays finished.** Any phase change to anything
-  other than `done` / `plan_rejected` clears the flag — resumed, re-approved, or parked at
-  a gate. (Keyed off the archivable set, not the sweep's notion of rest: `spar approve`
-  accepts a `plan_rejected` run and moves it to `plan_approved`, which *is* at rest, so the
-  narrower rule left an approved run hidden while it waited for `spar implement`.)
+Two sweeps, two scopes, one predicate each — worth telling apart:
+- **The automatic launch sweep** (`auto_archive_after`, fires at `plan` / `implement` /
+  `run`, never at a read) only ever reaches `done` / `plan_rejected`. A run parked at
+  `awaiting_plan_approval`, or sitting at `stopped` / `failed` / `stuck` / `quota`, is
+  never touched by this sweep — those are ambiguous enough (or waiting on *you* clearly
+  enough) that hiding them without being asked would be the bug.
+- **`spar archive --all`** (explicit, by hand) additionally reaches every halted phase
+  nobody is driving: `stopped` / `failed` / `stuck` / `quota`, on top of `done` /
+  `plan_rejected`. Human gates are still spared by default — add `--gates` to take those
+  too. **`plan_approved` is never archived by either sweep**, gates or no: it is finished
+  in the sense of `is_terminal()`, but it is exactly the run an unlinked-plan error tells
+  you to go continue, and hiding it is the one regression this scope is careful not to
+  reintroduce.
+- **A run stays archived only while it stays in the phase that got it archived.** Any
+  phase change — resumed, re-approved, restarted — clears the flag. (`spar approve`
+  accepts a `plan_rejected` run and moves it to `plan_approved`, which *is* at rest, so a
+  narrower "archived means terminal forever" rule once left an approved run hidden while
+  it waited for `spar implement`.)
 - **Reads never archive.** `auto_archive_after` (default `14d`) fires at *launch*
   (`plan` / `implement` / `run`), never from `status`, so observing can never be what hid
   a run from you. Set it `"off"` to disable.
@@ -968,6 +1006,11 @@ rail's selection.
 | 3 | Stuck / escalated / wait timeout |
 | 4 | No usable providers (quota/pause) |
 
+Unchanged by `spar brief`, `spar resume` and `spar daemon`: `brief` is observe-only
+(always `0` if the run loads, same as `status`); `resume` returns the resumed run's own
+code from this table; `daemon` returns `0` on a clean stop and `1` on a start failure —
+neither mints nor repurposes a code.
+
 **`status` is observe-only:** process exit is always `0` if the run loads. Read JSON `exit_code` / `phase` for run state. Use `wait` (see **Subscribe, don't poll** above) when you want to block until the run needs you and get the process exit coded by gate/stuck/quota.
 
 **`--dry-run`:** stubs agent processes only; writes `.spar/runs/<id>/`. Does **not** create real git worktrees (cwd under `.spar/…/cwd-*`). Live runs create sibling worktrees.
@@ -1135,9 +1178,20 @@ carry_forward_chars = 4000
 enabled = true
 timeout_secs = 3600    # test_author's SOFT clock; hard_ceiling_multiple applies to it
 # External @human notifier (user-level config only; ignored from a repo spar.toml).
+# Fires on: a run reaching a human gate, stuck/escalated, quota, terminal failure, and
+# (from `spar daemon` only) abandoned. Silence otherwise — a good run's own push is the
+# ship gate, and `done`/`plan_rejected`/`stopped` are the operator's own actions.
 [notify]
 # command = "..."   # shell out; message on argv/stdin
 # webhook = "..."   # POST message json
+# Per-project supervisor (`spar daemon start`). Opt-in, never auto-started. Safe from a
+# repo spar.toml: no command execution, no outbound request, unlike [notify].
+[daemon]
+# tick_secs = 15               # supervision loop period
+# abandon_after_secs = 60      # how long a run must read abandoned before the daemon acts
+# restart = true               # restart a dead orchestrator holding resumable work
+# max_restarts = 2             # per run, per daemon lifetime
+# max_slots_per_bucket = 0     # cross-run concurrency cap, keyed on provider (model-free); 0 = off
 # Dynamic model select (vals). Opt-in with --select; cache under ~/.spar/cache/vals/
 [model_select]
 # benches = ["swebench"]

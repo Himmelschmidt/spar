@@ -20,6 +20,14 @@ pub struct RunState {
     /// Never replaces `task` (the run's identity); cleared when a round runs without `-t`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amendment: Option<String>,
+    /// Project-root-relative path to `.spar/briefs/<slug>.md` when this run was
+    /// created from `plan --spec`/stdin (relative like every other path on this
+    /// struct, so the run survives the project moving or being restored elsewhere).
+    /// `task` still carries the brief body verbatim (every listing already truncates
+    /// it); this is only how `spar brief <id>` finds the original file. `None` for a
+    /// run created from a bare `-t`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief: Option<PathBuf>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
@@ -516,6 +524,7 @@ impl RunState {
             archived_at: None,
             task: None,
             amendment: None,
+            brief: None,
             created_at: now,
             updated_at: now,
             slots: Vec::new(),
@@ -667,8 +676,12 @@ impl RunState {
     }
 
     /// True when the run is still mid-flight but nothing is driving it: the orchestrator
-    /// exited without reaching a terminal phase. Computed, never persisted.
+    /// exited without reaching a terminal phase. Computed, never persisted. A run sitting
+    /// in the daemon's admission queue is owned by the queue, not abandoned.
     pub fn abandoned(&self, paths: &SparPaths) -> bool {
+        if is_queued(paths, &self.id) {
+            return false;
+        }
         is_abandoned(self.phase, orchestrator_alive(paths, &self.id))
     }
 
@@ -703,6 +716,7 @@ impl RunState {
                     &crate::events::Event::gate(format!("{:?}", self.phase), self.phase),
                 );
             }
+            crate::notify::route_lifecycle(paths, self, prev_phase);
         }
         // Global index so `spar` from anywhere can find this project’s runs.
         // Dry runs are ephemeral verification fixtures (often in a temp dir), so they
@@ -811,6 +825,28 @@ pub fn reconcile_slot_status(
 /// rest — terminal, a human gate, or `Stopped` — are *meant* to have no orchestrator.
 pub fn is_abandoned(phase: Phase, orchestrator_alive: bool) -> bool {
     !phase.is_waitable_stop() && !orchestrator_alive
+}
+
+/// A run waiting in the daemon's admission queue: `Phase::Init` plus a spool file, no
+/// orchestrator of its own yet. Without this check `is_abandoned(Init, false)` reads a
+/// queued run as abandoned to `status`, `wait` and the daemon's own sweep alike — it is
+/// owned by the queue, not orphaned.
+///
+/// A spool file that exists but fails to parse (a crash or torn write mid-`fs::write`,
+/// before the queue writer moved to a temp-file-plus-rename) does not own the run: a
+/// bookkeeping failure must never be the thing that makes a run invisible to recovery.
+/// Such a file is removed on sight so normal abandonment detection takes over instead of
+/// wedging the run behind a corpse forever.
+pub fn is_queued(paths: &SparPaths, run_id: &str) -> bool {
+    let path = paths.queue_file(run_id);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    if serde_json::from_str::<serde_json::Value>(&text).is_ok() {
+        return true;
+    }
+    let _ = std::fs::remove_file(&path);
+    false
 }
 
 /// Whether `spar cleanup --all` may reap this run's worktrees.
@@ -970,31 +1006,34 @@ pub fn auto_archive(
     older_than: std::time::Duration,
     now: DateTime<Utc>,
 ) -> Result<Vec<String>> {
-    archive_sweep(paths, older_than, now, false)
+    archive_sweep(paths, older_than, now, false, false)
 }
 
-/// The sweep behind `archive --all`. `halted` widens it from the auto-archivable set
-/// to everything an operator may archive by hand — `stopped` / `failed` / `stuck` /
-/// `quota`, which auto-archiving deliberately never touches (O36). Gates are excluded
-/// either way: hiding the runs that want a human is the failure archiving exists to
-/// prevent. Opt-in only, and `--undo` still reverses it.
+/// The sweep behind `archive --all`. `by_hand` widens it from the auto-archivable set
+/// to the halted phases an operator may archive by hand — `stopped` / `failed` /
+/// `stuck` / `quota`, which auto-archiving deliberately never touches (O36). `gates`
+/// additionally reaches `phase.is_gate()`; without it gates stay reachable only by
+/// naming an id. `--undo` still reverses either.
 pub fn archive_sweep(
     paths: &SparPaths,
     older_than: std::time::Duration,
     now: DateTime<Utc>,
-    halted: bool,
+    by_hand: bool,
+    gates: bool,
 ) -> Result<Vec<String>> {
     // Spelled out, not derived: `archivable_by_hand` is `is_terminal() || is_gate() ||
     // Stopped`, and `is_terminal()` includes `PlanApproved` — a run the operator
     // approved and has not implemented yet, which is exactly what an unlinked-plan
-    // error tells them to go continue. Hiding that is the bug O36 already fixed once.
+    // error tells them to go continue. Hiding that is the bug O36 already fixed once,
+    // so `PlanApproved` is excluded here even under `--all --gates`.
     let reachable = |phase: Phase| {
         auto_archivable(phase)
-            || (halted
+            || (by_hand
                 && matches!(
                     phase,
                     Phase::Stopped | Phase::Failed | Phase::Stuck | Phase::Quota
                 ))
+            || (gates && phase.is_gate())
     };
     let mut archived = Vec::new();
     for summary in list_runs(paths)? {
@@ -1692,6 +1731,38 @@ mod tests {
         let runs = list_runs(&paths).unwrap();
         assert_eq!(runs.len(), 1);
         assert!(runs[0].abandoned, "no lock owner ⇒ abandoned");
+    }
+
+    /// `Phase::Init` plus a spool file is `is_abandoned(Init, false)` by the raw phase
+    /// check alone — `RunState::abandoned` (and therefore `list_runs`, `status`, `wait`
+    /// and the daemon's own sweep, which all funnel through it) must recognize the
+    /// queue as ownership and not report the run as orphaned.
+    #[test]
+    fn a_queued_run_is_not_abandoned() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new("queued", WorkflowKind::Loop, tmp.path().to_path_buf());
+        state.phase = Phase::Init;
+        state.save(&paths).unwrap();
+
+        assert!(
+            state.abandoned(&paths),
+            "with no spool file, Init plus no lock owner reads abandoned as normal"
+        );
+
+        std::fs::create_dir_all(paths.queue_dir()).unwrap();
+        std::fs::write(paths.queue_file("queued"), "{}").unwrap();
+        assert!(
+            !state.abandoned(&paths),
+            "a spool file means the queue owns this run, not nobody"
+        );
+
+        let runs = list_runs(&paths).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert!(
+            !runs[0].abandoned,
+            "list_runs must agree with RunState::abandoned"
+        );
     }
 
     #[test]

@@ -10,8 +10,15 @@ use crate::util::{self, sanitize_slot};
 use crate::worktree;
 use anyhow::Result;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
-pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode> {
+pub fn run(
+    task: String,
+    brief: Option<PathBuf>,
+    opts: CommonOpts,
+    paths: &SparPaths,
+    cfg: &Config,
+) -> Result<ExitCode> {
     let dry = opts.resolve_dry_run();
     if dry {
         std::env::set_var("SPAR_DRY_RUN", "1");
@@ -23,6 +30,14 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
         paths.project_root.clone(),
     );
     state.task = Some(task.clone());
+    // Stored project-root-relative, like every other path on `state` — an absolute
+    // path would strand `spar brief` the moment the project moves or is restored
+    // somewhere else.
+    state.brief = brief.map(|p| {
+        p.strip_prefix(&paths.project_root)
+            .map(PathBuf::from)
+            .unwrap_or(p)
+    });
     state.backend = opts.backend;
     worktree::apply_run_base(&mut state, opts.base.as_deref(), opts.json)?;
     cfg.save_snapshot(paths, &state.id)?;
@@ -139,7 +154,7 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
     }
 
     if opts.detach {
-        return detach_self(&state, opts.json);
+        return detach_self(&state, paths, opts.json);
     }
 
     execute_plan(&mut state, paths, cfg, &jobs)?;
@@ -192,6 +207,17 @@ pub fn execute_plan(
     cfg: &Config,
     jobs: &[SlotJob],
 ) -> Result<()> {
+    // A queued run's admission and an operator's `spar stop` race: the daemon can decide
+    // to admit before `stop_one` removes the spool file, and the admitted child can still
+    // reach here after the stop already wrote the `stopped` marker. Refuse to dispatch
+    // rather than requiring dequeue and cancellation to be mutually exclusive — the same
+    // marker `implement::should_stop` already gates every other workflow's dispatch loop
+    // on, and only an explicit resume clears it.
+    if crate::workflow::implement::should_stop(paths, &state.id) {
+        state.set_phase(Phase::Stopped);
+        state.save(paths)?;
+        return Ok(());
+    }
     let slot_ids: Vec<String> = jobs.iter().map(|j| j.slot_id.clone()).collect();
     worktree::prepare_isolation(state, paths, &slot_ids)?;
     state.set_phase(Phase::SpawnSlots);
@@ -646,31 +672,67 @@ pub fn reject(
     Ok(ExitCode::Failure)
 }
 
-fn detach_self(state: &RunState, json: bool) -> Result<ExitCode> {
-    #[cfg(unix)]
-    {
-        let mut child_cmd = std::process::Command::new(std::env::current_exe()?);
-        child_cmd
-            .arg("__internal_continue")
-            .arg(&state.id)
-            .env("SPAR_INTERNAL", "1")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        let _ = child_cmd.spawn()?;
+fn detach_self(state: &RunState, paths: &SparPaths, json: bool) -> Result<ExitCode> {
+    if let Some(owner) = crate::runlock::RunLock::owner(paths, &state.id) {
+        if owner.alive() {
+            return Err(crate::runlock::OrchestratorBusy {
+                run_id: state.id.clone(),
+                owner_pid: owner.pid,
+            }
+            .into());
+        }
     }
-    #[cfg(not(unix))]
-    {
-        anyhow::bail!("detach not supported on this platform yet");
+    if let Some(msg) = crate::daemon::maybe_enqueue(paths, state)? {
+        if json {
+            executor::emit_run_json(state)?;
+        } else {
+            executor::print_run_human(state);
+            println!("{msg}");
+        }
+        return Ok(ExitCode::Success);
     }
-
-    if json {
-        executor::emit_run_json(state)?;
-    } else {
-        executor::print_run_human(state);
-        println!("detached; poll with: spar wait {}", state.id);
+    let detached = match crate::process::spawn_detached_orchestrator(paths, &state.id) {
+        Ok(d) => d,
+        Err(e) => {
+            crate::daemon::release_reservation(paths, &state.id);
+            return Err(e);
+        }
+    };
+    let outcome = match crate::process::await_detached_start(paths, &state.id, detached) {
+        Ok(o) => o,
+        Err(e) => {
+            crate::daemon::release_reservation(paths, &state.id);
+            return Err(e);
+        }
+    };
+    match outcome {
+        crate::process::DetachOutcome::Confirmed { pid } => {
+            if json {
+                executor::emit_run_json(state)?;
+            } else {
+                executor::print_run_human(state);
+                println!(
+                    "detached (pid {pid}, session of its own); poll with: spar wait {}",
+                    state.id
+                );
+            }
+            Ok(ExitCode::Success)
+        }
+        crate::process::DetachOutcome::Completed => {
+            // The run settled inside the handshake window without ever holding a
+            // `Running` slot for `effective_supply` to see, so its admission
+            // reservation (if `maybe_enqueue` granted one) would otherwise squat on
+            // capacity for the full TTL.
+            crate::daemon::release_reservation(paths, &state.id);
+            let state = RunState::load_for_display(paths, &state.id)?;
+            if json {
+                executor::emit_run_json(&state)?;
+            } else {
+                executor::print_run_human(&state);
+            }
+            Ok(state.exit_code())
+        }
     }
-    Ok(ExitCode::Success)
 }
 
 /// The directive for this plan round, rendered for the planner and critic prompts.
@@ -731,6 +793,11 @@ pub fn replan(
             "run {run_id} is mid-flight (phase={:?}); stop it before replanning",
             state.phase
         );
+    }
+    // Resuming a stopped run: drop the marker so execute_plan dispatches instead of
+    // immediately re-parking at Stopped (see the guard at the top of execute_plan).
+    if state.phase == Phase::Stopped {
+        let _ = std::fs::remove_file(paths.marker(run_id, "stopped"));
     }
     let round = state.begin_round();
     state.amendment = Some(directive);
