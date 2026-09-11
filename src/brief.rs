@@ -33,22 +33,16 @@ pub fn read_spec_text(spec: &Path) -> Result<String> {
     Ok(body)
 }
 
-/// Read `spec` (or stdin when `spec == "-"`), derive a slug, and write
-/// `.spar/briefs/<slug>.md`. Never overwrites an existing brief: on a title collision
-/// the slug gets `-2`, `-3`, … appended — two runs from two different briefs that
-/// happen to share a title must not clobber each other.
-pub fn intake(paths: &SparPaths, spec: &Path) -> Result<Brief> {
-    let body = read_spec_text(spec)?;
-    let base = slug_of(&body);
+pub fn intake_body(paths: &SparPaths, body: &str) -> Result<Brief> {
+    if body.trim().is_empty() {
+        anyhow::bail!("brief body is empty");
+    }
+    let base = slug_of(body);
     let dir = paths.briefs_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-
-    // Exclusive create, not check-then-write: two concurrent `plan --spec` calls with
-    // the same title racing past a plain `exists()` check would both pick `<slug>.md`
-    // and the second write would clobber the first. `create_new` makes the filesystem
-    // the arbiter, and an `AlreadyExists` just means try the next suffix.
     let mut candidate = base.clone();
     let mut n = 1u32;
+    // Use create_new to avoid overwriting a same-titled brief created concurrently (O41).
     let path = loop {
         let path = paths.brief_file(&candidate);
         match OpenOptions::new().write(true).create_new(true).open(&path) {
@@ -67,8 +61,17 @@ pub fn intake(paths: &SparPaths, spec: &Path) -> Result<Brief> {
     Ok(Brief {
         slug: candidate,
         path,
-        body,
+        body: body.to_string(),
     })
+}
+
+/// Read `spec` (or stdin when `spec == "-"`), derive a slug, and write
+/// `.spar/briefs/<slug>.md`. Never overwrites an existing brief: on a title collision
+/// the slug gets `-2`, `-3`, … appended — two runs from two different briefs that
+/// happen to share a title must not clobber each other.
+pub fn intake(paths: &SparPaths, spec: &Path) -> Result<Brief> {
+    let body = read_spec_text(spec)?;
+    intake_body(paths, &body)
 }
 
 /// The first `# ` heading, else the first non-empty line; lowercased, non-alphanumerics

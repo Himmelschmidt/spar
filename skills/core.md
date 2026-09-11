@@ -226,6 +226,9 @@ spar plan -t "describe the work" --providers cli:claude,cli:grok [--big] [--dry-
 spar plan --spec spec.md --providers cli:claude
 cat spec.md | spar plan --spec - --providers cli:claude
 
+# Or reuse an already-intaken brief without copying it again (for the Chat intake)
+spar plan --brief .spar/briefs/<slug>.md --providers cli:claude --dry-run --json
+
 # Or resolve fleet from vals.ai benchmarks + prefs (see [model_select] in spar.toml)
 spar model refresh
 spar model refresh --if-stale   # refresh only stale/missing benches (cron-friendly)
@@ -283,7 +286,12 @@ spar resume <run_id> [--detach] [--json] # pick a stopped or abandoned run back 
 spar daemon start [--foreground]         # per-project supervisor: restart + abandoned alert + cap
 spar daemon status [--json]
 spar daemon stop
+spar bus send --run <run> --from <id> --to <to> --surface chat --conversation <cid> --turn <tid> --message "..."  # orchestrator turn reply
 ```
+
+### TUI Chat
+
+The TUI hosts a resident orchestrator in Main's **Chat** tab (`f(rail selection)` like every other tab): at Home it interviews into a brief, proposes a fleet with a ````spar-proposal` TOML block and launches through the same `spar plan` contract an outer agent drives; on a selected run it consults the gate against the Review tab's evidence. Transcript is `bus` messages with `surface=chat`, `conversation` and `turn` metadata, rendered as records with immutable bus-event identities. The raw bus palette verb is `:msg`, not `:chat`.
 
 ### A run is a unit of work, not an invocation
 
@@ -841,11 +849,9 @@ rail's selection.
 - Home has four bands, always in this order and always present even when empty:
   **needs you** (runs at a gate, ranked by wait time), **running**, **finished since
   last look** (a watermark of what landed while you were away), **start something
-  new**. `p` still opens the flat Projects list; `n` opens the new-run surface with a
-  fleet picker over the provider roster (superseding the old "use the CLI" punt for a
-  fresh fleet); `P` toggles Home's scope between the current project and everything
+  new**. `p` still opens the flat Projects list; `n` opens Chat (Home: new conversation, run: gate consultation) — the token-free manual path is `:plan <task>`; `P` toggles Home's scope between the current project and everything
   registered.
-- Main tabs: `Log · Activity · Diff · Plan · Review · Shell` on the labels row, marked
+- Main tabs: `Log · Activity · Diff · Plan · Review · Chat · Shell` on the labels row, marked
   by an accent underline on the rule beneath them, switched with `[` / `]` (Activity
   carries the `@human` alert badge). Every tab but Shell renders typed, folded records
   (feature 010) through one shared record view, not a raw string: Log is the parsed
@@ -865,16 +871,16 @@ rail's selection.
   `J`/`K` move the record cursor to the next/previous record head, `t`/`T` to the
   next/previous tool call, `e`/`E` to the next/previous error, `}`/`{` to the next/
   previous phase or document boundary, and `f` toggles Activity's selected-slot filter.
-  At narrow widths (and, once six tabs stop fitting the wide strip's own padding, at
+  At narrow widths (and, once seven tabs stop fitting the wide strip's own padding, at
   wide widths too) every tab abbreviates uniformly (`Log · Act · Diff · Plan · Rev ·
-  Sh`) rather than dropping a tab off the strip.
+  C · Sh`) rather than dropping a tab off the strip.
 - Focus: `1` rail · `2` main (Tab cycles the two). `+` / `_` zoom Main.
 - `:` opens the **command palette** — `approve`/`reject`/`ship`/`confirm`/`reconcile`/
-  `takeover`/`implement`/`plan`/`spawn`/`chat`, Tab-completes run ids.
+  `takeover`/`implement`/`plan`/`spawn`/`msg`, Tab-completes run ids.
 - **`a` jumps to the next run that needs you** (or tap the `⚑N need you` status token);
   the status line rolls up how many runs want you across the fleet. `r`/`s` reject/ship
   at a gate; approve = tap the button or `:approve`.
-- `p` = Projects · `n` new run · `P` toggle Home scope · `w` log wrap ·
+- `p` = Projects · `n` chat · `P` toggle Home scope · `w` log wrap ·
   `g`/`G` top/bottom · `?` help · **`q` quits**.
 - Shell tab = a real tmux client: **every key goes to the agent** (incl. `Ctrl+C`);
   `F12` (or `C-a d`) hands focus back to spar. Focusing it full-screen is **Driving

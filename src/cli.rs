@@ -39,7 +39,7 @@ pub enum Command {
 
     /// Multi-provider planning; ends in awaiting_plan_approval
     Plan {
-        /// The task, inline. Exactly one of `-t` / `--spec` is required.
+        /// The task, inline. Exactly one of `-t` / `--spec` / `--brief` is required.
         #[arg(long, short = 't')]
         task: Option<String>,
         /// Read the task from a file (or `-` for stdin) and keep a durable copy at
@@ -47,6 +47,10 @@ pub enum Command {
         /// directive instead of a new task.
         #[arg(long, value_name = "FILE")]
         spec: Option<PathBuf>,
+        /// Use an already-intaken brief at `.spar/briefs/<slug>.md` without copying
+        /// it again. Mutually exclusive with `-t` and `--spec`.
+        #[arg(long, value_name = "FILE")]
+        brief: Option<PathBuf>,
         /// Replan an existing run: a new plan round on the same id, keeping its brief,
         /// base and config. `-t`/`--spec` is the directive for the round, not a new
         /// task (O45).
@@ -533,6 +537,12 @@ pub enum BusCmd {
         message: String,
         #[arg(long)]
         json: bool,
+        #[arg(long)]
+        surface: Option<String>,
+        #[arg(long)]
+        conversation: Option<String>,
+        #[arg(long)]
+        turn: Option<String>,
     },
     /// List bus events (all runs + bare traffic; `--run` filters to one run)
     Log {

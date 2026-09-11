@@ -4,6 +4,15 @@ All notable changes to spar are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- **You can now talk to spar inside spar.** A conversation tab lets you brief a
+  run by describing what you want, have a fleet proposed, and launch it — or, with
+  a run selected, ask about a decision it is waiting on and argue it either way
+  against the same evidence the review screen shows. It proposes; approving,
+  shipping and choosing a fleet stay yours.
+
+
 ### Fixed
 
 - **Reloading a run's settings can no longer quietly change which agent reviews
