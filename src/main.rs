@@ -195,6 +195,9 @@ fn run() -> Result<ExitCode> {
                 big,
                 max_rounds: None,
                 accept_contract: false,
+                // `plan` / `run` mint their config fresh; there is no frozen one to
+                // reload against, so seats are resolved for the first time either way.
+                reload_config: false,
             };
             workflow::plan::run(task_text, brief_path, opts, &paths, &cfg)
         }
@@ -261,6 +264,7 @@ fn run() -> Result<ExitCode> {
                 big,
                 max_rounds,
                 accept_contract,
+                reload_config,
             };
             workflow::implement::run_from_cli(run_id, plan, task, new, opts, &paths, &cfg)
         }
@@ -299,6 +303,9 @@ fn run() -> Result<ExitCode> {
                 big,
                 max_rounds: None,
                 accept_contract: false,
+                // `plan` / `run` mint their config fresh; there is no frozen one to
+                // reload against, so seats are resolved for the first time either way.
+                reload_config: false,
             };
             workflow::run_named(workflow, opts, &paths, &cfg)
         }
