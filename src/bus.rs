@@ -455,9 +455,18 @@ pub fn send(paths: &SparPaths, msg: BusMessage, budget: MessageBudget) -> Result
     Ok(msg)
 }
 
+pub fn is_conversation_message(msg: &BusMessage) -> bool {
+    msg.meta.get("surface").map(|v| v.as_str()) == Some("chat")
+}
+
 /// A message the human needs to see: addressed to [`HUMAN`], or any `Blocked`
 /// report (an agent that stalled is a human-relevant event even when broadcast).
+/// Conversation replies (surface=chat) are not alerts: they are the transcript's
+/// normal turn traffic, not an interruption the operator did not ask for.
 pub fn is_human_alert(msg: &BusMessage) -> bool {
+    if is_conversation_message(msg) {
+        return false;
+    }
     msg.to == HUMAN || msg.kind == MsgKind::Blocked
 }
 
@@ -952,7 +961,7 @@ pub fn unresolved_alerts(paths: &SparPaths, run: Option<&str>) -> Result<Vec<Bus
     let mut out: Vec<BusMessage> = Vec::new();
     for m in evs
         .iter()
-        .filter(|m| m.to == HUMAN && !acked.contains(&m.id))
+        .filter(|m| m.to == HUMAN && !acked.contains(&m.id) && !is_conversation_message(m))
     {
         if seen.insert(m.id.clone()) {
             out.push(m.clone());

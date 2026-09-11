@@ -2,8 +2,8 @@ use crate::exit_codes::ExitCode;
 use anyhow::{bail, Result};
 use serde::Serialize;
 
-const CORE_SKILL: &str = include_str!("../skills/core.md");
-const FLEET_SKILL: &str = include_str!("../skills/fleet.md");
+pub const CORE_SKILL: &str = include_str!("../skills/core.md");
+pub const FLEET_SKILL: &str = include_str!("../skills/fleet.md");
 
 #[derive(Debug, Serialize)]
 struct SkillMeta {

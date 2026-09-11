@@ -15,6 +15,7 @@ mod model_select;
 mod motion;
 mod notify;
 mod nudge;
+mod orchestrator;
 mod paths;
 mod process;
 mod provider_ref;
@@ -108,6 +109,7 @@ fn run() -> Result<ExitCode> {
         Command::Plan {
             task,
             spec,
+            brief,
             run_id,
             providers,
             select,
@@ -122,10 +124,18 @@ fn run() -> Result<ExitCode> {
             dry_run,
             big,
         } => {
-            match (&task, &spec) {
-                (Some(_), Some(_)) => anyhow::bail!("pass one of -t / --spec, not both"),
-                (None, None) => anyhow::bail!("pass one of -t / --spec"),
-                _ => {}
+            let count = [task.is_some(), spec.is_some(), brief.is_some()]
+                .iter()
+                .filter(|v| **v)
+                .count();
+            if count != 1 {
+                anyhow::bail!("pass exactly one of -t / --spec / --brief (got {count})");
+            }
+            if brief.is_some() && task.is_some() {
+                anyhow::bail!("--brief is exclusive with -t");
+            }
+            if brief.is_some() && spec.is_some() {
+                anyhow::bail!("--brief is exclusive with --spec");
             }
             // A replan reads the run's own frozen config (O27), never the live file,
             // and re-dispatches the run's existing planner and critic slots. Flags that
@@ -155,9 +165,11 @@ fn run() -> Result<ExitCode> {
                         ignored.join(", ")
                     );
                 }
-                let directive = match spec {
-                    Some(path) => brief::read_spec_text(&path)?,
-                    None => task.expect("checked above: exactly one of task/spec is set"),
+                let directive = match (&task, &spec, &brief) {
+                    (Some(t), None, None) => t.clone(),
+                    (None, Some(path), None) => brief::read_spec_text(path)?,
+                    (None, None, Some(path)) => brief::read_spec_text(path)?,
+                    _ => anyhow::bail!("plan --run requires exactly one of -t / --spec / --brief"),
                 };
                 let (paths, _) = project_ctx()?;
                 let cfg = Config::for_run(&paths, &id)?;
@@ -169,18 +181,27 @@ fn run() -> Result<ExitCode> {
             }
             cfg.apply_without(&without)?;
             cfg.apply_role_overrides(&role)?;
-            let (task_text, brief_path) = match spec {
-                Some(path) => {
+            let (task_text, brief_path) = match (spec, brief, task) {
+                (Some(path), None, None) => {
                     let b = brief::intake(&paths, &path)?;
                     if !json {
                         eprintln!("brief {} written to {}", b.slug, b.path.display());
                     }
                     (b.body, Some(b.path))
                 }
-                None => (
-                    task.expect("checked above: exactly one of task/spec is set"),
-                    None,
-                ),
+                (None, Some(path), None) => {
+                    let body = brief::read_spec_text(&path)?;
+                    let rel = path
+                        .strip_prefix(&paths.project_root)
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or(path.clone());
+                    if !path.exists() {
+                        anyhow::bail!("brief file not found: {}", path.display());
+                    }
+                    (body, Some(rel))
+                }
+                (None, None, Some(t)) => (t, None),
+                _ => unreachable!("exactly one of task/spec/brief"),
             };
             let opts = CommonOpts {
                 task: Some(task_text.clone()),
@@ -448,15 +469,34 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             to,
             message,
             json,
+            surface,
+            conversation,
+            turn,
         } => {
-            let msg = bus::chat(
-                &paths,
-                run.as_deref(),
-                &from,
-                &to,
-                message,
-                bus::MessageBudget::Normal,
-            )?;
+            let mut meta = std::collections::HashMap::new();
+            if let Some(s) = surface {
+                meta.insert("surface".to_string(), s);
+            }
+            if let Some(c) = conversation {
+                meta.insert("conversation".to_string(), c);
+            }
+            if let Some(t) = turn {
+                meta.insert("turn".to_string(), t);
+            }
+            let msg = bus::BusMessage {
+                id: bus::new_id(),
+                ts: chrono::Utc::now(),
+                from: from.clone(),
+                to: to.clone(),
+                kind: bus::MsgKind::Chat,
+                body: message.clone(),
+                run: run.clone(),
+                subject: None,
+                refs: bus::MsgRefs::default(),
+                requires_ack: false,
+                meta,
+            };
+            let msg = bus::send(&paths, msg, bus::MessageBudget::Normal)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&msg)?);
             } else {
