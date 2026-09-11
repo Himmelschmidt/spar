@@ -6308,7 +6308,7 @@ const METER_ZONE_W: u16 = 34;
 const STEPPER_MIN_W: u16 = 8;
 
 fn meter_zone(pad: Rect) -> Option<Rect> {
-    if pad.width < METER_ZONE_W + STEPPER_MIN_W {
+    if pad.width < METER_ZONE_W + STEPPER_MIN_W + 1 {
         return None;
     }
     Some(Rect {
@@ -6833,15 +6833,14 @@ fn draw_header(
         right.push(Span::styled(" ABANDONED ", chip(ALERT)));
     }
 
-    let zone = if buttons.is_empty() {
-        None
-    } else {
-        gate_zone(area)
-    };
-    // Without a reserved zone (phone width, or no gate) the buttons overpaint whatever
-    // is beneath them, so the breadcrumb has to stop before they start — otherwise it
-    // is not clipped, it is buried, and it loses even its ellipsis. A zone for buttons
-    // that are not there would only steal space from the breadcrumb.
+    let zone = gate_zone(area);
+    // The zone is reserved whenever the width affords it, independent of
+    // whether a gate is live — otherwise the ⚑/⚠ chips slide 23 columns
+    // the instant a run enters a gate and a click on its way lands on empty
+    // header. Without a reserved zone (phone width) the buttons overpaint
+    // whatever is beneath them, so the breadcrumb has to stop before they
+    // start — otherwise it is not clipped, it is buried, and it loses even
+    // its ellipsis.
     let right_limit = zone
         .map(|z| z.x)
         .unwrap_or_else(|| area.right().saturating_sub(gate_buttons_width(&buttons)));
@@ -7080,7 +7079,6 @@ struct RailMotion {
     swaps: Vec<usize>,
     applied: usize,
     tween: crate::motion::Tween<f32>,
-    home_positions: Vec<usize>,
 }
 
 impl RailMotion {
@@ -7092,7 +7090,6 @@ impl RailMotion {
             swaps: Vec::new(),
             applied: 0,
             tween: crate::motion::Tween::<f32>::settled(0.0),
-            home_positions: Vec::new(),
         }
     }
 
@@ -7103,23 +7100,10 @@ impl RailMotion {
 
     fn settle(&mut self) {
         if !self.swaps.is_empty() {
-            if self.level == Some(BrowseLevel::Home) && !self.home_positions.is_empty() {
-                for idx in self.applied..self.swaps.len() {
-                    let j = self.swaps[idx];
-                    if j < self.home_positions.len() && j + 1 < self.home_positions.len() {
-                        let a = self.home_positions[j];
-                        let b = self.home_positions[j + 1];
-                        if a < self.displayed_keys.len() && b < self.displayed_keys.len() {
-                            self.displayed_keys.swap(a, b);
-                        }
-                    }
-                }
-            } else {
-                for idx in self.applied..self.swaps.len() {
-                    let i = self.swaps[idx];
-                    if i + 1 < self.displayed_keys.len() {
-                        self.displayed_keys.swap(i, i + 1);
-                    }
+            for idx in self.applied..self.swaps.len() {
+                let i = self.swaps[idx];
+                if i + 1 < self.displayed_keys.len() {
+                    self.displayed_keys.swap(i, i + 1);
                 }
             }
             self.applied = self.swaps.len();
@@ -7130,7 +7114,6 @@ impl RailMotion {
         }
         self.swaps.clear();
         self.applied = 0;
-        self.home_positions.clear();
     }
 
     fn commit(&mut self, now: Instant) {
@@ -7145,26 +7128,12 @@ impl RailMotion {
         if eased < 1.0 && desired == self.swaps.len() && self.swaps.len() > 1 {
             desired = self.swaps.len() - 1;
         }
-        if self.level == Some(BrowseLevel::Home) && !self.home_positions.is_empty() {
-            while self.applied < desired {
-                let j = self.swaps[self.applied];
-                if j < self.home_positions.len() && j + 1 < self.home_positions.len() {
-                    let a = self.home_positions[j];
-                    let b = self.home_positions[j + 1];
-                    if a < self.displayed_keys.len() && b < self.displayed_keys.len() {
-                        self.displayed_keys.swap(a, b);
-                    }
-                }
-                self.applied += 1;
+        while self.applied < desired {
+            let i = self.swaps[self.applied];
+            if i + 1 < self.displayed_keys.len() {
+                self.displayed_keys.swap(i, i + 1);
             }
-        } else {
-            while self.applied < desired {
-                let i = self.swaps[self.applied];
-                if i + 1 < self.displayed_keys.len() {
-                    self.displayed_keys.swap(i, i + 1);
-                }
-                self.applied += 1;
-            }
+            self.applied += 1;
         }
     }
 
@@ -7183,7 +7152,6 @@ impl RailMotion {
                 self.target_keys = keys.clone();
                 self.swaps.clear();
                 self.applied = 0;
-                self.home_positions.clear();
                 self.tween = crate::motion::Tween::<f32>::settled(1.0);
                 self.level = Some(level);
                 return None;
@@ -7261,7 +7229,6 @@ impl RailMotion {
                     self.target_keys = keys.clone();
                     self.swaps.clear();
                     self.applied = 0;
-                    self.home_positions.clear();
                     self.tween = crate::motion::Tween::<f32>::settled(1.0);
                     return None;
                 }
@@ -7286,7 +7253,6 @@ impl RailMotion {
                     }
                 }
                 self.displayed_keys = new_displayed;
-                self.home_positions.clear();
                 self.target_keys = keys;
                 self.swaps = swaps;
                 self.applied = 0;
@@ -7343,7 +7309,6 @@ impl RailMotion {
                     self.target_keys = keys.clone();
                     self.swaps.clear();
                     self.applied = 0;
-                    self.home_positions.clear();
                     self.tween = crate::motion::Tween::<f32>::settled(1.0);
                     return None;
                 }
@@ -7367,7 +7332,6 @@ impl RailMotion {
                 self.target_keys = keys;
                 self.swaps = swaps;
                 self.applied = 0;
-                self.home_positions.clear();
                 self.level = Some(level);
                 if self.swaps.is_empty() {
                     self.tween = crate::motion::Tween::<f32>::settled(1.0);
@@ -13541,49 +13505,90 @@ mod render_stability {
         leg_a.unit_id = Some("unit-1".into());
         leg_b.unit_id = Some("unit-1".into());
         assert_eq!(run_row_key(&leg_a), run_row_key(&leg_b));
-        let other = home_run("other", Phase::Review, 2, "spar");
+        let mut other = home_run("other", Phase::Review, 2, "spar");
+        other.unit_id = Some("unit-other".into());
         let mut app = test_app();
         app.browse = BrowseLevel::Runs;
         app.selected_run = 0;
         app.selected_run_key = Some(run_row_key(&leg_a));
-        // Simulate snapshot with leg-a as representative.
+        // Simulate a reorder where the folded unit's representative changes
+        // (leg-a -> leg-b) and its rank moves from 0 to 1. Both the identity
+        // glue and the physical travel must be correct in the same transition.
         let snap_runs_a = [leg_a.clone(), other.clone()];
-        // Simulate reorder where leg-b replaces leg-a at same rank (folded unit).
-        let snap_runs_b = [leg_b.clone(), other.clone()];
-        // Animated order mid-flight still contains one unit-1 row at index 0.
+        let snap_runs_b = [other.clone(), leg_b.clone()];
         let now = Instant::now();
         let keys_a: Vec<String> = snap_runs_a.iter().map(run_row_key).collect();
         let keys_b: Vec<String> = snap_runs_b.iter().map(run_row_key).collect();
+        assert_ne!(
+            keys_a, keys_b,
+            "keys must differ in order to drive animation"
+        );
+        assert_eq!(
+            keys_a,
+            vec!["run:unit-1".to_string(), "run:unit-other".to_string()]
+        );
+        assert_eq!(
+            keys_b,
+            vec!["run:unit-other".to_string(), "run:unit-1".to_string()]
+        );
         app.rail_motion
             .observe(BrowseLevel::Runs, keys_a.clone(), now);
         let perm = app
             .rail_motion
-            .observe(BrowseLevel::Runs, keys_b.clone(), now);
-        let runs: &[state::RunSummary] = if let Some(p) = perm {
-            // Build animated slice as run_loop does.
-            let v: Vec<state::RunSummary> = p.iter().map(|&i| snap_runs_b[i].clone()).collect();
-            // Resolve key against animated order.
-            if let Some(key) = app.selected_run_key.clone() {
-                if let Some(pos) = v.iter().position(|r| run_row_key(r) == key) {
-                    app.selected_run = pos;
-                }
+            .observe(BrowseLevel::Runs, keys_b.clone(), now)
+            .expect("reorder with changed rank must animate");
+        // At t=0 the displayed order is still the old order: unit-1 at index 0.
+        // The animated slice is built by mapping target indices through the
+        // permutation, which reconstructs displayed order from the target slice.
+        let v0: Vec<state::RunSummary> = perm.iter().map(|&i| snap_runs_b[i].clone()).collect();
+        assert_eq!(v0.len(), 2);
+        assert_eq!(run_row_key(&v0[0]), "run:unit-1");
+        assert_eq!(
+            v0[0].id, "leg-b",
+            "displayed representative must be the new leg, not stale leg-a"
+        );
+        if let Some(key) = app.selected_run_key.clone() {
+            if let Some(pos) = v0.iter().position(|r| run_row_key(r) == key) {
+                app.selected_run = pos;
             }
-            assert_eq!(app.selected_run, 0);
-            assert_eq!(run_row_key(&v[app.selected_run]), "run:unit-1");
-            // Ensure Enter would open the displayed representative, not a stale id.
-            assert_eq!(v[app.selected_run].id, "leg-b");
-            // Update key to displayed representative for next frame.
-            app.selected_run_key = Some(run_row_key(&v[app.selected_run]));
-            assert_eq!(app.selected_run_key.as_deref(), Some("run:unit-1"));
-            &[]
-        } else {
-            // No animation needed when keys are same (unit_id same, so keys_b == keys_a)
-            // In that case the run Row identity is stable and selected_run stays.
-            assert_eq!(keys_a, keys_b);
-            assert_eq!(app.selected_run, 0);
-            &[]
-        };
-        let _ = runs;
+        }
+        assert_eq!(
+            app.selected_run, 0,
+            "cursor must stay glued to unit-1 at start of travel"
+        );
+        app.selected_run_key = Some(run_row_key(&v0[app.selected_run]));
+        // Mid-flight the unit travels through the adjacent rank.
+        let perm_mid = app
+            .rail_motion
+            .observe(
+                BrowseLevel::Runs,
+                keys_b.clone(),
+                now + crate::motion::REORDER_PERIOD / 2,
+            )
+            .unwrap_or_else(|| (0..keys_b.len()).collect());
+        let vmid: Vec<state::RunSummary> =
+            perm_mid.iter().map(|&i| snap_runs_b[i].clone()).collect();
+        assert_eq!(vmid.len(), 2);
+        assert!(vmid.iter().any(|r| run_row_key(r) == "run:unit-1"));
+        // After settling the unit is at its target rank (index 1).
+        let settled = app.rail_motion.observe(
+            BrowseLevel::Runs,
+            keys_b.clone(),
+            now + crate::motion::REORDER_PERIOD + Duration::from_millis(10),
+        );
+        assert!(settled.is_none(), "settled reorder must report identity");
+        // Resolve once more against the settled target order.
+        let final_runs: &[state::RunSummary] = &snap_runs_b;
+        if let Some(key) = app.selected_run_key.clone() {
+            if let Some(pos) = final_runs.iter().position(|r| run_row_key(r) == key) {
+                app.selected_run = pos;
+            }
+        }
+        assert_eq!(
+            app.selected_run, 1,
+            "cursor must follow unit-1 to its target rank after settle"
+        );
+        assert_eq!(final_runs[app.selected_run].id, "leg-b");
     }
 
     #[test]
@@ -16949,7 +16954,7 @@ mod render_stability {
         let pad = Rect {
             x: 7,
             y: 2,
-            width: METER_ZONE_W + STEPPER_MIN_W,
+            width: METER_ZONE_W + STEPPER_MIN_W + 1,
             height: 1,
         };
         let zone = meter_zone(pad).expect("the exact affordable width has a meter slot");
@@ -17008,12 +17013,12 @@ mod render_stability {
         let pad_wide = Rect {
             x: 0,
             y: 0,
-            width: METER_ZONE_W + STEPPER_MIN_W + 20,
+            width: METER_ZONE_W + STEPPER_MIN_W + 1 + 20,
             height: 1,
         };
         let zone_wide = meter_zone(pad_wide).expect("wide pad must have zone");
         assert_eq!(zone_wide.width, METER_ZONE_W);
-        assert_eq!(pad_wide.width - METER_ZONE_W, 20 + STEPPER_MIN_W);
+        assert_eq!(pad_wide.width - METER_ZONE_W - 1, 20 + STEPPER_MIN_W);
     }
 
     #[test]
