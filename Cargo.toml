@@ -139,3 +139,7 @@ path = "tests/scenarios/daemon.rs"
 [[test]]
 name = "orchestrator_conversation"
 path = "tests/scenarios/orchestrator_conversation.rs"
+
+[[test]]
+name = "run_composition"
+path = "tests/scenarios/run_composition.rs"
