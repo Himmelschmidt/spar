@@ -11953,24 +11953,30 @@ mod render_stability {
         let st = run_with(Phase::AwaitingShipConfirm, 7);
         let widths = [1u16, 20, 53, 79, 80, 87, 99, 100, 119, 120, 200];
         let heights = [1u16, 5, 12, 30, 60];
-        for tab in [
-            MainTab::Log,
-            MainTab::Activity,
-            MainTab::Diff,
-            MainTab::Plan,
-            MainTab::Review,
-            MainTab::Shell,
-        ] {
-            for fold_all in [false, true] {
-                for raw_mode in [false, true] {
-                    for &w in &widths {
-                        for &h in &heights {
-                            paint_with(w, h, &[], &[], Some(&st), |a| {
-                                a.open_main(tab);
-                                a.fold_all = fold_all;
-                                a.raw_mode =
-                                    raw_mode && matches!(tab, MainTab::Log | MainTab::Diff);
-                            });
+        // `full: None` (no run selected — Home, or Runs with nothing highlighted)
+        // is covered alongside a real run: every non-Shell tab falls back to the
+        // same coherent empty message in that state, and that fallback path is a
+        // paint site of its own, not exercised by the `Some(&st)` leg.
+        for full in [Some(&st), None] {
+            for tab in [
+                MainTab::Log,
+                MainTab::Activity,
+                MainTab::Diff,
+                MainTab::Plan,
+                MainTab::Review,
+                MainTab::Shell,
+            ] {
+                for fold_all in [false, true] {
+                    for raw_mode in [false, true] {
+                        for &w in &widths {
+                            for &h in &heights {
+                                paint_with(w, h, &[], &[], full, |a| {
+                                    a.open_main(tab);
+                                    a.fold_all = fold_all;
+                                    a.raw_mode =
+                                        raw_mode && matches!(tab, MainTab::Log | MainTab::Diff);
+                                });
+                            }
                         }
                     }
                 }
