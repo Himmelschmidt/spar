@@ -109,7 +109,7 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
         let mut slot = executor::init_slot_model(&id, &prov, role, model.clone());
         slot.source = Some(source);
         state.slots.push(slot);
-        let expected_artifact = plan_expected_artifact(role, &id);
+        let expected_artifact = "plan.md".to_string();
         jobs.push(SlotJob {
             slot_id: id,
             provider: prov,
@@ -154,19 +154,6 @@ pub fn run(task: String, opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> R
         }
     }
     Ok(state.exit_code())
-}
-
-/// The artifact a plan-phase slot is expected to write. The critic's real output is
-/// `expected_artifact` is the slot completion gate (feeds
-/// `salvage_expected_artifact`/`owed_artifacts`), and the plan critic's primary job
-/// is editing `plan.md` (`skills/core.md`), not necessarily writing its own
-/// critique file — a critic that only edits `plan.md` must still satisfy the gate.
-/// The TUI's Plan tab resolves the critique file itself, by slot id, independently
-/// of this field (`plan_docs` in `tui.rs`), so this stays `plan.md` for every role
-/// (round-9 finding 6 — a prior round's role-based split here altered run gating
-/// with no AC or test covering it, out of scope for a rendering feature).
-fn plan_expected_artifact(_role: SlotRole, _slot_id: &str) -> String {
-    "plan.md".to_string()
 }
 
 /// The planner + critic slot specs `(id, role, template, provider, source)`, drawn from
@@ -801,7 +788,7 @@ fn continue_locked(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exit
             SlotRole::TestAuthor => continue,
             _ => continue,
         };
-        let expected_artifact = plan_expected_artifact(slot.role, &slot.id);
+        let expected_artifact = "plan.md".to_string();
         jobs.push(SlotJob {
             slot_id: slot.id.clone(),
             provider: slot.provider.clone(),
@@ -822,7 +809,7 @@ fn continue_locked(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exit
                 slot.source = Some(source);
                 state.slots.push(slot);
             }
-            let expected_artifact = plan_expected_artifact(role, &id);
+            let expected_artifact = "plan.md".to_string();
             jobs.push(SlotJob {
                 slot_id: id,
                 provider: prov,

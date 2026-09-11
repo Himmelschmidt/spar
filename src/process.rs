@@ -2233,6 +2233,12 @@ pub fn run_mock(req: &SpawnRequest, mock_output: &str) -> Result<SpawnResult> {
     if let Some(parent) = req.log_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // A slot re-dispatched under `--dry-run` on the same run and slot id keeps a
+    // stale `.log.idx` from a prior real dispatch otherwise: offset 0 always
+    // survives `read_log_index`'s filter, so mock records would be stamped with
+    // the previous dispatch's timestamps — a fabricated time (AC-8), the same
+    // stale-index hazard `reset_tmux_slot_log`/`reset_api_slot_log` guard against.
+    let _ = std::fs::remove_file(log_index_path(&req.log_path));
     let mut f = File::create(&req.log_path)?;
     writeln!(
         f,
@@ -2519,6 +2525,31 @@ mod tests {
         assert!(pid > 1, "real child pid, got {pid}");
         assert!(alive, "child must be alive at the moment the sink fires");
         assert_eq!(res.exit_code, Some(0));
+    }
+
+    /// AC-8: a slot re-dispatched under `--dry-run`/`SPAR_DRY_RUN=1` on the same run
+    /// and slot id must not keep a `.log.idx` left over from an earlier real
+    /// dispatch of that slot — offset 0 always survives `read_log_index`'s filter,
+    /// so a stale index would stamp every mock record with the previous dispatch's
+    /// timestamp instead of `None`.
+    #[test]
+    fn run_mock_drops_a_stale_offset_index_from_a_prior_dispatch() {
+        let tmp = tempdir().unwrap();
+        let req = sh_req("unused", tmp.path(), "mock.log");
+        std::fs::write(
+            &req.log_path,
+            "leftover transcript from a prior native round\n",
+        )
+        .unwrap();
+        std::fs::write(log_index_path(&req.log_path), "0 1700000000000\n").unwrap();
+
+        run_mock(&req, "mock output").expect("run_mock");
+
+        assert!(!log_index_path(&req.log_path).exists());
+        assert_eq!(
+            std::fs::read_to_string(&req.log_path).unwrap(),
+            "# mock sh -c unused\nmock output\n"
+        );
     }
 
     #[test]

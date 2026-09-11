@@ -137,3 +137,51 @@ fn document_parser_preserves_sections_and_reports_missing_documents() {
         "each document section must have its own source identity"
     );
 }
+
+#[test]
+fn path_shortening_reaches_tool_names_no_adapter_but_claude_emits() {
+    // codex, grok, muse and opencode never write `Bash`/`Read`/`Edit` — they write
+    // their own tool names (`write_file`, `run_command`, `command_execution`, …),
+    // which `ToolKind::classify` has no entry for and falls to `ToolKind::Other`.
+    // Shortening must not be gated on recognising the tool name (AC-12).
+    let root = "/tmp/codex/spar-44e0e49a-impl";
+    let text = format!("→ write_file  {root}/.spar/runs/3d3d6f59/artifacts/out.rs\n");
+    let records = parse_log_records(&text, 0, &[], &shortener(), "3d3d6f59", "implementer");
+    assert_eq!(records[0].tool, Some(ToolKind::Other));
+    assert_eq!(
+        records[0].argument, ".spar/runs/3d3d6f59/artifacts/out.rs",
+        "an unrecognised tool name must still get its path shortened: {:?}",
+        records[0].argument
+    );
+
+    let text = format!("→ command_execution  cd {root}/src && cargo test\n");
+    let records = parse_log_records(&text, 0, &[], &shortener(), "3d3d6f59", "implementer");
+    assert_eq!(records[0].argument, "cd src && cargo test");
+}
+
+#[test]
+fn path_shortening_reaches_a_json_truncated_argument_with_no_spaces() {
+    // `truncate_json` (the non-claude adapters' argument encoder) produces a single
+    // space-free token like `{"path":"/long/root/src/a.rs"}` that a whitespace
+    // split can never see inside of (AC-12).
+    let root = "/tmp/codex/spar-44e0e49a-impl";
+    let text = format!(r#"→ file_change  {{"path":"{root}/src/a.rs","op":"update"}}"#);
+    let records = parse_log_records(
+        &format!("{text}\n"),
+        0,
+        &[],
+        &shortener(),
+        "3d3d6f59",
+        "implementer",
+    );
+    assert_eq!(records[0].argument, r#"{"path":"src/a.rs","op":"update"}"#);
+}
+
+#[test]
+fn path_shortening_reaches_a_result_preview_regardless_of_tool_name() {
+    let root = "/tmp/codex/spar-44e0e49a-impl";
+    let text = format!("→ write_file  out.rs\n← ✓  wrote {root}/src/a.rs\n");
+    let records = parse_log_records(&text, 0, &[], &shortener(), "3d3d6f59", "implementer");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].result.as_deref(), Some("wrote src/a.rs"));
+}

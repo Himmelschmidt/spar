@@ -244,6 +244,12 @@ pub struct LogRecord {
     pub elapsed: Option<Duration>,
     pub body: Vec<String>,
     pub source: SourceId,
+    /// The standalone-result preview's persisted bytes, before `shorten_in_text`
+    /// rewrote `result` for the head (AC-6/AC-12 both hold: the head is allowed to
+    /// shorten a path for column width, but `to_record`'s body synthesis must
+    /// expand into what was actually on disk). `None` for every other kind, whose
+    /// own `result`/`argument` was never shortened in the first place.
+    pub raw_result: Option<String>,
 }
 
 impl LogRecord {
@@ -291,6 +297,47 @@ impl LogRecord {
         } else {
             verb.to_string()
         };
+        // Every non-Tool kind's full text lives only in `summary` — a tool call
+        // keeps its command row and result preview as separate body entries
+        // already, but a Note/Error/Thought/standalone-Result record has
+        // nowhere else to keep it. `build_head_row` paints the head as exactly
+        // one truncated row, so a long line (or one with continuation lines
+        // already in `body`, which used to gate this off entirely and drop the
+        // record's *own* first line while showing only what followed it) needs
+        // its full text copied into `body[0]` unconditionally, not only when
+        // `body` happened to start empty (round-N review, AC-6). The copy uses
+        // `raw_result` where one exists (standalone results only — the only
+        // place `summary` itself has already been shortened for the head,
+        // AC-12) so expansion reveals exactly what was persisted, never a
+        // rewritten path.
+        //
+        // Prose is excluded from the unconditional case: it never folds, so a
+        // one-line Prose record's body is *always* painted (never behind
+        // `Space`), and copying `summary` in for the common short-and-complete
+        // case would paint the identical line twice, adjacent, shifting every
+        // row after it — the same duplicate-text defect round 9 fixed for Tool
+        // heads, reintroduced here. Prose still gets the copy once it already
+        // has continuation lines (a real multi-line paragraph, where the first
+        // line is otherwise the only one missing from `body`); a single long
+        // line with no continuation stays a known, accepted gap (round-N
+        // review's "two more, both small" scope: it named Note/Error/Thought,
+        // not Prose).
+        if !is_tool && !summary.is_empty() {
+            let synthesize = !matches!(self.kind, RecordKind::Prose) || !body.is_empty();
+            if synthesize {
+                let raw = self.raw_result.clone().unwrap_or_else(|| summary.clone());
+                body.insert(0, raw);
+            }
+        }
+        let folded_by_default = match self.kind {
+            RecordKind::Prose => false,
+            RecordKind::Thought => true,
+            // Consults the final `body` (post-synthesis above), not `self.body`:
+            // a record with no continuation lines of its own only becomes
+            // foldable once its full text is copied in.
+            RecordKind::Note | RecordKind::Error | RecordKind::Result { .. } => !body.is_empty(),
+            _ => !self.body.is_empty(),
+        };
         Record {
             kind: self.kind,
             glyph,
@@ -303,11 +350,7 @@ impl LogRecord {
             actor: None,
             ok: self.ok,
             source: self.source.clone(),
-            folded_by_default: match self.kind {
-                RecordKind::Prose => false,
-                RecordKind::Thought => true,
-                _ => !self.body.is_empty(),
-            },
+            folded_by_default,
             has_command_row,
         }
     }
@@ -487,28 +530,47 @@ impl PathShortener {
         Self::abbreviate(path)
     }
 
-    /// Shortens every worktree-rooted (or otherwise abbreviate-able) path token
-    /// *within* arbitrary text, rather than requiring the whole string to be one
-    /// path — a Run/Bash argument is a shell command that carries paths inline
-    /// (e.g. `cd /long/worktree/src && cargo test`), unlike Read/Write/Edit's bare
-    /// path argument (AC-12).
+    /// Shortens every worktree-rooted (or otherwise abbreviate-able) path
+    /// substring *within* arbitrary text, rather than requiring the whole string
+    /// to be one path. Applies uniformly to every record's argument and result
+    /// text regardless of which tool emitted it (AC-12): a Run/Bash argument is a
+    /// shell command with paths inline (`cd /worktree/src && cargo test`), and a
+    /// non-claude adapter's JSON-truncated argument (`truncate_json`) puts a path
+    /// inside a quoted, space-free token (`{"path":"/long/root/src/a.rs"}`) that a
+    /// whitespace split alone can never reach.
+    ///
+    /// A candidate path starts at a `/` whose preceding character (if any) is
+    /// neither a path character nor `:` — the `:` exclusion is what keeps a URL's
+    /// `scheme://` untouched, since a real absolute path is never introduced by a
+    /// bare colon. It then extends through a maximal run of path characters
+    /// (alnum, `/.-_+~@`), so it stops cleanly at a closing quote, brace, comma,
+    /// or pipe without needing the caller to pre-tokenize the surrounding text.
     pub fn shorten_in_text(&self, text: &str) -> String {
-        text.split(' ')
-            .map(|tok| self.shorten_token(tok))
-            .collect::<Vec<_>>()
-            .join(" ")
+        let chars: Vec<char> = text.chars().collect();
+        let n = chars.len();
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0;
+        while i < n {
+            let starts_path = chars[i] == '/'
+                && (i == 0 || (!Self::is_path_char(chars[i - 1]) && chars[i - 1] != ':'));
+            if starts_path {
+                let start = i;
+                i += 1;
+                while i < n && Self::is_path_char(chars[i]) {
+                    i += 1;
+                }
+                let candidate: String = chars[start..i].iter().collect();
+                out.push_str(&self.shorten(&candidate));
+            } else {
+                out.push(chars[i]);
+                i += 1;
+            }
+        }
+        out
     }
 
-    fn shorten_token(&self, tok: &str) -> String {
-        let trimmed = tok.trim_matches(|c| c == '\'' || c == '"');
-        if !trimmed.starts_with('/') {
-            return tok.to_string();
-        }
-        let shortened = self.shorten(trimmed);
-        if shortened == trimmed {
-            return tok.to_string();
-        }
-        tok.replacen(trimmed, &shortened, 1)
+    fn is_path_char(c: char) -> bool {
+        c.is_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | '~' | '@')
     }
 
     fn abbreviate(path: &str) -> String {
@@ -566,6 +628,13 @@ fn time_at(index: &[(u64, DateTime<Utc>)], offset: u64) -> Option<DateTime<Utc>>
         Err(0) => None,
         Err(i) => Some(index[i - 1].1),
     }
+}
+
+/// True when `offset` is exactly where an indexed append began — a fresh
+/// `LogWriter::append` chunk, not a line wrapped inside the previous one. Used to
+/// tell a tool's own continuing output from the next turn's opening line (AC-8).
+fn chunk_boundary_at(offset: u64, index: &[(u64, DateTime<Utc>)]) -> bool {
+    index.binary_search_by_key(&offset, |(o, _)| *o).is_ok()
 }
 
 /// Splits `text` into `(line, start, end)` triples with byte offsets *within `text`*,
@@ -782,18 +851,14 @@ pub fn parse_log_records(
         if let Some(rest) = line.strip_prefix('→') {
             let (name, detail) = split_tool_line(rest.trim_start());
             let tool = ToolKind::classify(name);
-            let argument = match tool {
-                ToolKind::Read
-                | ToolKind::Write
-                | ToolKind::Edit
-                | ToolKind::Search
-                | ToolKind::Fetch => shortener.shorten(detail),
-                // A Run/Bash argument is a whole shell command, not a bare path
-                // (AC-12): paths appear inline (`cd /worktree/src && ...`), so
-                // each token is checked rather than the whole string.
-                ToolKind::Run => shortener.shorten_in_text(detail),
-                _ => detail.to_string(),
-            };
+            // Shortened regardless of `tool`: an unrecognised name (every adapter
+            // but claude's own emits its own tool names — `write_file`,
+            // `run_command`, `command_execution`, …) must not fall back to the
+            // unshortened detail just because `ToolKind::classify` has no entry
+            // for it (AC-12). `shorten_in_text` scans for path-shaped substrings
+            // anywhere in the text, so it is safe over a bare path, a shell
+            // command, or a space-free JSON blob alike.
+            let argument = shortener.shorten_in_text(detail);
             records.push(LogRecord {
                 time,
                 direction: LogDirection::Tool,
@@ -805,6 +870,7 @@ pub fn parse_log_records(
                 elapsed: None,
                 body: Vec::new(),
                 source: source_of(abs_start, abs_end),
+                raw_result: None,
             });
             pending.push_back(records.len() - 1);
             last_idx = Some(records.len() - 1);
@@ -813,15 +879,18 @@ pub fn parse_log_records(
 
         if let Some(rest) = line.strip_prefix('←') {
             let (ok, preview) = split_result_line(rest);
-            let clean = strip_tool_id(preview);
+            let clean = shortener.shorten_in_text(strip_tool_id(preview));
             if pending.len() == 1 {
                 let idx = pending.pop_front().expect("checked len == 1");
                 let call_time = records[idx].time;
-                records[idx].result = Some(clean.to_string());
+                records[idx].result = Some(clean);
                 records[idx].ok = Some(ok);
                 if !preview.is_empty() {
-                    // Raw, not `clean`: expansion must preserve every persisted
-                    // byte, including a provider tool id (AC-6).
+                    // Raw, not `clean`: `body` is what `Space` reveals, and AC-6
+                    // requires expansion to preserve every persisted byte in
+                    // order. Shortening is a head/summary-column concession
+                    // (AC-12), not a rewrite of the record's own history — the
+                    // shortened form already lives in `result` above.
                     records[idx].body.push(preview.to_string());
                 }
                 records[idx].elapsed = match (call_time, time) {
@@ -846,11 +915,16 @@ pub fn parse_log_records(
                 kind: RecordKind::Result { ok },
                 tool: None,
                 argument: String::new(),
-                result: Some(clean.to_string()),
+                result: Some(clean),
                 ok: Some(ok),
                 elapsed: None,
                 body: Vec::new(),
                 source: source_of(abs_start, abs_end),
+                // The un-shortened preview: `to_record`'s body synthesis expands
+                // into this, not into the shortened `result`, so `Space` on an
+                // orphan result shows the real path (AC-6), not the abbreviated
+                // one that only the head is allowed to show (AC-12).
+                raw_result: Some(preview.to_string()),
             });
             last_idx = Some(records.len() - 1);
             continue;
@@ -868,6 +942,7 @@ pub fn parse_log_records(
                 elapsed: None,
                 body: Vec::new(),
                 source: source_of(abs_start, abs_end),
+                raw_result: None,
             });
             last_idx = Some(records.len() - 1);
             continue;
@@ -885,6 +960,7 @@ pub fn parse_log_records(
                 elapsed: None,
                 body: Vec::new(),
                 source: source_of(abs_start, abs_end),
+                raw_result: None,
             });
             last_idx = Some(records.len() - 1);
             continue;
@@ -902,17 +978,14 @@ pub fn parse_log_records(
                 elapsed: None,
                 body: Vec::new(),
                 source: source_of(abs_start, abs_end),
+                raw_result: None,
             });
             last_idx = Some(records.len() - 1);
             continue;
         }
 
         if let Some((tool, detail)) = api_tool_call(line) {
-            let argument = match tool {
-                ToolKind::Read | ToolKind::Write => shortener.shorten(&detail),
-                ToolKind::Run => shortener.shorten_in_text(&detail),
-                _ => detail,
-            };
+            let argument = shortener.shorten_in_text(&detail);
             records.push(LogRecord {
                 time,
                 direction: LogDirection::Tool,
@@ -924,6 +997,7 @@ pub fn parse_log_records(
                 elapsed: None,
                 body: Vec::new(),
                 source: source_of(abs_start, abs_end),
+                raw_result: None,
             });
             pending.push_back(records.len() - 1);
             last_idx = Some(records.len() - 1);
@@ -968,16 +1042,45 @@ pub fn parse_log_records(
                 elapsed: None,
                 body: Vec::new(),
                 source: source_of(abs_start, abs_end),
+                raw_result: None,
             });
             last_idx = Some(records.len() - 1);
             continue;
         }
 
-        // An unmarked line continues whatever record was last pushed (prose
-        // paragraphs coalesce, and a tool/result's own output folds with it) —
-        // the line-scan fallback's approximation of the chunk parser's atomic
-        // per-write grouping.
-        if let Some(idx) = last_idx {
+        // An unmarked line either continues the record just pushed, or starts a
+        // fresh `Prose` record — the two must never be confused (AC-8 review
+        // finding). Continuation is unconditionally safe only for `Prose`
+        // itself: a narrated paragraph's own wrapped lines are meant to
+        // coalesce. For a `Tool`/`Result`, it is safe only *within the same
+        // indexed append* as the line before it — a genuine multi-line command
+        // dump (`ls -la`'s several rows) writes in one `LogWriter::append`
+        // alongside its `←` line, but the agent's next turn is a separate
+        // append with its own index entry, and treating that as more tool
+        // output is exactly what folded real operator-facing narration out of
+        // sight in a live run's own log (reproduced against `logs/impl.log`).
+        // `Note`/`Error`/`Thought` never accept continuation at all: the
+        // coalescer always emits each as one complete line. Without an index
+        // there is no signal to tell "same append" from "new turn" apart, so
+        // the unindexed case favors visibility (AC-8's "unknown formats remain
+        // visible prose") and never continues a marker record either.
+        let continues_last = match last_idx.map(|idx| records[idx].kind) {
+            Some(RecordKind::Prose) => true,
+            // Without an index there is no way to tell "this is the tool's own
+            // continuing output" from "this is the next turn's opening line" —
+            // in that case, favor the pre-existing grouping (every un-indexed
+            // caller, including logs with no sidecar at all, already relies on
+            // it to fold multi-line tool output together). *With* an index, use
+            // it: a chunk boundary is a real signal a genuinely separate turn
+            // started, which is exactly the case that folded real narration out
+            // of sight in a live run's own log (AC-8 review finding).
+            Some(RecordKind::Tool(_)) | Some(RecordKind::Result { .. }) => {
+                index.is_empty() || !chunk_boundary_at(abs_start, index)
+            }
+            _ => false,
+        };
+        if continues_last {
+            let idx = last_idx.expect("continues_last only set from a resolved last_idx");
             records[idx].body.push(line.to_string());
             if let SourceId::Log { end, .. } = &mut records[idx].source {
                 *end = abs_end;
@@ -995,6 +1098,7 @@ pub fn parse_log_records(
             elapsed: None,
             body: Vec::new(),
             source: source_of(abs_start, abs_end),
+            raw_result: None,
         });
         last_idx = Some(records.len() - 1);
     }
@@ -1344,6 +1448,38 @@ mod tests {
         assert_eq!(thought.to_record().verb, "Thought");
     }
 
+    /// Round-11 review: a long single-line Note/Error/Thought used to have an
+    /// empty `body`, which made it permanently unexpandable — `is_record_expanded`
+    /// treats an empty body as nothing to fold, so a summary the head truncated
+    /// was unreachable by any key. The full text must survive into `body` so
+    /// `Space` has something to reveal.
+    #[test]
+    fn a_long_note_error_or_thought_carries_its_full_text_into_body_for_expansion() {
+        let long = "x".repeat(200);
+        let records = parse_log_records(
+            &format!("· {long}\n! {long}\n… {long}\n"),
+            0,
+            &[],
+            &PathShortener::default(),
+            "r",
+            "s",
+        );
+        for record in &records {
+            let rendered = record.to_record();
+            assert_eq!(
+                rendered.body,
+                vec![long.clone()],
+                "{:?} must carry its full text into body",
+                rendered.kind
+            );
+            assert!(
+                rendered.folded_by_default,
+                "{:?} must be foldable now that it has a body",
+                rendered.kind
+            );
+        }
+    }
+
     #[test]
     fn merged_result_preview_survives_into_body_even_when_one_line() {
         let records = parse_log_records(
@@ -1365,6 +1501,210 @@ mod tests {
         assert!(
             rendered.folded_by_default,
             "a result-bearing tool call folds by default"
+        );
+    }
+
+    /// A `Prose` record's own single line is deliberately *not* copied into its
+    /// `body`: unlike Note/Error/Thought/Result, Prose never folds, so its body
+    /// paints unconditionally right under the head — copying the identical short
+    /// line in would show it twice, adjacent, and shift every row after it (the
+    /// same defect round 9 fixed for Tool heads). A single long line with no
+    /// continuation is a known, accepted gap.
+    #[test]
+    fn a_short_prose_record_with_no_continuation_gets_no_synthesized_body() {
+        let records = parse_log_records(
+            "Checking scope.\n",
+            0,
+            &[],
+            &PathShortener::default(),
+            "r",
+            "s",
+        );
+        let rendered = records[0].to_record();
+        assert!(rendered.body.is_empty(), "{:?}", rendered.body);
+    }
+
+    /// A multi-line prose paragraph, by contrast, must not drop its own first
+    /// line once it has continuation lines — the same "first line missing from
+    /// body" bug Note/Error had.
+    #[test]
+    fn a_multiline_prose_paragraph_keeps_its_first_line_in_body() {
+        let record = LogRecord {
+            time: None,
+            direction: LogDirection::Prose,
+            kind: RecordKind::Prose,
+            tool: None,
+            argument: String::new(),
+            result: Some("first line".into()),
+            ok: None,
+            elapsed: None,
+            body: vec!["second line".into()],
+            source: SourceId::Log {
+                run_id: "r".into(),
+                slot_id: "s".into(),
+                start: 0,
+                end: 1,
+            },
+            raw_result: None,
+        };
+        let rendered = record.to_record();
+        assert_eq!(rendered.body, vec!["first line", "second line"]);
+        assert!(!rendered.folded_by_default);
+    }
+
+    /// Round-N review finding 1 (continued): a `Note`/`Error` whose `body` already
+    /// carries continuation content used to fail the old `body.is_empty()` gate at
+    /// `to_record` time, so its own first line was dropped from the expansion
+    /// while only what followed it survived. `to_record` synthesis is exercised
+    /// directly here (rather than via `parse_log_records`) because the parser
+    /// itself never attaches continuation lines to a `Note`/`Error` (AC-8: the
+    /// coalescer always emits each as one complete line, and treating a
+    /// following line as automatic continuation is what folded real narration
+    /// out of sight in the sibling `header_hash_lines_...` regression).
+    #[test]
+    fn a_note_with_continuation_lines_still_carries_its_own_first_line_into_body() {
+        let record = LogRecord {
+            time: None,
+            direction: LogDirection::Note,
+            kind: RecordKind::Note,
+            tool: None,
+            argument: String::new(),
+            result: Some("short note".into()),
+            ok: None,
+            elapsed: None,
+            body: vec!["continuation line".into()],
+            source: SourceId::Log {
+                run_id: "r".into(),
+                slot_id: "s".into(),
+                start: 0,
+                end: 1,
+            },
+            raw_result: None,
+        };
+        let rendered = record.to_record();
+        assert_eq!(rendered.body, vec!["short note", "continuation line"]);
+    }
+
+    /// Round-N review finding 1 (continued): an orphan (standalone) `←` result was
+    /// in the same position as a `Note`/`Error` — its own kind was never in the
+    /// old gate's kind match at all.
+    #[test]
+    fn a_standalone_result_carries_its_full_text_into_body() {
+        let records = parse_log_records(
+            "← ✓  result for an unknown call\n",
+            0,
+            &[],
+            &PathShortener::default(),
+            "r",
+            "s",
+        );
+        assert_eq!(records.len(), 1);
+        let rendered = records[0].to_record();
+        assert_eq!(rendered.body, vec!["result for an unknown call"]);
+        assert!(rendered.folded_by_default);
+    }
+
+    /// AC-8 review finding: reproduces the real defect found against a live run's
+    /// own `logs/impl.log` — a completed tool call's result line, immediately
+    /// followed by the agent's own narration for its *next* turn. Each of the
+    /// three lines is its own `LogWriter::append` (one JSON stream event apiece),
+    /// so the index gives three distinct offsets; the narration must land as its
+    /// own visible `Prose` record, not fold invisibly into the tool call's body.
+    #[test]
+    fn narration_after_a_completed_tool_call_is_its_own_visible_prose_record() {
+        let call = "→ Bash  git status && git log --oneline -5\n";
+        let result = "← ✓  toolu_01Nj  On branch spar/3d3d6f59/impl\n";
+        let narration = "No nudges. Let's dig into the five contract failures.\n";
+        let text = format!("{call}{result}{narration}");
+        let result_offset = call.len() as u64;
+        let narration_offset = (call.len() + result.len()) as u64;
+        let index = vec![
+            (0u64, Utc::now()),
+            (result_offset, Utc::now()),
+            (narration_offset, Utc::now()),
+        ];
+        let records = parse_log_records(&text, 0, &index, &PathShortener::default(), "r", "s");
+        assert_eq!(records.len(), 2, "{records:#?}");
+        assert!(matches!(records[0].kind, RecordKind::Tool(_)));
+        assert!(
+            !records[0].body.iter().any(|l| l.contains("No nudges")),
+            "the next turn's narration must not fold into the prior tool call's body: {:?}",
+            records[0].body
+        );
+        assert_eq!(records[1].kind, RecordKind::Prose);
+        assert_eq!(
+            records[1].result.as_deref(),
+            Some("No nudges. Let's dig into the five contract failures.")
+        );
+        let rendered = records[1].to_record();
+        assert!(
+            !rendered.folded_by_default,
+            "prose is never folded, so the narration is visible on first paint"
+        );
+    }
+
+    /// The same shape, but the tool's own multi-line output genuinely does share
+    /// the `←` line's append (one write covering every row `ls -la` printed) —
+    /// that must still coalesce into the tool call's body, not split apart.
+    #[test]
+    fn genuine_multiline_result_output_in_the_same_append_still_coalesces() {
+        let text = "→ Bash  ls -la /etc | head -5\n← ✓  total 1184\ndrwxr-xr-x 139 root\n";
+        // One index entry at the start of the whole append: `←`'s line and the
+        // `drwxr-xr-x` row that follows it were written together.
+        let index = vec![(0u64, Utc::now())];
+        let records = parse_log_records(text, 0, &index, &PathShortener::default(), "r", "s");
+        assert_eq!(records.len(), 1, "{records:#?}");
+        assert!(records[0].body.iter().any(|l| l == "drwxr-xr-x 139 root"));
+    }
+
+    /// Round-N review finding 2 (AC-6 regression introduced by the AC-12 fix): a
+    /// merged tool result's body must carry the exact persisted bytes, not a
+    /// path-shortened rewrite — shortening is a head/summary-column concession
+    /// only. `Space` must reveal the real path, not an abbreviation of it.
+    #[test]
+    fn merged_result_body_keeps_the_real_unshortened_path() {
+        let shortener = PathShortener::new(vec![PathBuf::from("/w/root")]);
+        let records = parse_log_records(
+            "→ Bash  ls\n← ✓  /etc/systemd/system/foo.service\n",
+            0,
+            &[],
+            &shortener,
+            "r",
+            "s",
+        );
+        let rendered = records[0].to_record();
+        assert!(
+            rendered
+                .body
+                .iter()
+                .any(|l| l == "/etc/systemd/system/foo.service"),
+            "body must keep the persisted path verbatim, not shortened: {:?}",
+            rendered.body
+        );
+        assert_eq!(
+            rendered.summary, "/e/s/system/foo.service",
+            "no worktree root matches, but the head still fish-abbreviates"
+        );
+    }
+
+    /// Same regression as above, but through a shortener that actually rewrites
+    /// the path, so a bug reusing the shortened text in `body` cannot hide behind
+    /// "the shortener happened to be a no-op".
+    #[test]
+    fn merged_result_body_is_not_shortened_even_when_the_head_is() {
+        let root = "/w/root";
+        let shortener = PathShortener::new(vec![PathBuf::from(root)]);
+        let text = format!("→ Bash  ls\n← ✓  {root}/src/a.rs\n");
+        let records = parse_log_records(&text, 0, &[], &shortener, "r", "s");
+        let rendered = records[0].to_record();
+        assert_eq!(
+            rendered.summary, "src/a.rs",
+            "the head is allowed to shorten"
+        );
+        assert!(
+            rendered.body.iter().any(|l| l == "/w/root/src/a.rs"),
+            "the body must keep the real, unshortened path: {:?}",
+            rendered.body
         );
     }
 
@@ -1579,12 +1919,15 @@ mod tests {
                 start: 0,
                 end: 1,
             },
+            raw_result: None,
         }
         .to_record()];
         let folded = flatten(&records, |_| false);
         assert_eq!(folded.len(), 1);
         let expanded = flatten(&records, |_| true);
-        assert_eq!(expanded.len(), 3);
+        // "one" (the head text, synthesized into body[0] so it is reachable —
+        // AC-6) plus the two continuation lines already on the record.
+        assert_eq!(expanded.len(), 4);
     }
 
     /// AC-7: a streaming tool call's identity must not change as its body grows

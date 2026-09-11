@@ -679,13 +679,18 @@ struct App {
     /// click-to-toggle. Only as many entries as were actually rendered (post-cap,
     /// post-scroll).
     rect_new_run_roster: Vec<(usize, Rect)>,
-    /// Records explicitly toggled away from their default fold state (Space), keyed
-    /// by immutable source identity (correction #6) — never an index, so a rebuilt
-    /// snapshot that inserts a record ahead of these does not shuffle which ones are
-    /// open. `A` overrides this with [`App::fold_all`] rather than mutating it, so a
-    /// second `A` restores whatever the operator had individually chosen.
+    /// Records explicitly toggled away from whatever the current base fold state is
+    /// (Space), keyed by immutable source identity (correction #6) — never an
+    /// index, so a rebuilt snapshot that inserts a record ahead of these does not
+    /// shuffle which ones are open. `A` shifts the base every record starts from
+    /// via [`App::fold_all`] rather than mutating this set, so a second `A`
+    /// restores whatever the operator had individually chosen, and `Space` keeps
+    /// working (as an override) no matter which base `A` has selected.
     fold_open: std::collections::HashSet<crate::record::SourceId>,
-    /// `A`: expand every record regardless of [`App::fold_open`].
+    /// `A`: shift every record's base fold state to expanded; `Space` still XORs
+    /// against that base, so an individually re-folded record while `A` is engaged
+    /// actually stays folded (round-11 review, AC-6) instead of being silently
+    /// forced back open.
     fold_all: bool,
     /// The record under the cursor (`J`/`K`/`t`/`T`/`e`/`E`/`}`/`{`), resolved to a
     /// row each frame by identity, the same pattern `resync_home_selection` uses.
@@ -1738,8 +1743,13 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
             let (raw, truncated) = cache.load(&path, LOG_TAIL_BYTES);
             let raw = raw.to_string();
             let start = cache.start;
+            // `from` is 0, not `start`: `time_at` resolves an offset to the index
+            // entry at or immediately *before* it, so the entry covering the first
+            // retained byte is by construction `< start` and must not be filtered
+            // out here, or every record in the first retained append has no time
+            // (AC-11) — the ordinary state of any log past `LOG_TAIL_BYTES`.
             let index =
-                process::read_log_index(&path, start, start + raw.len() as u64).unwrap_or_default();
+                process::read_log_index(&path, 0, start + raw.len() as u64).unwrap_or_default();
             let mut records: Vec<Record> =
                 record::parse_log_records(&raw, start, &index, &shortener, &st.id, &slot.id)
                     .iter()
@@ -3493,10 +3503,17 @@ fn handle_key_inner(
         // default at once, leaving individual toggles intact for when it is pressed
         // again.
         KeyCode::Char(' ') if app.focus == Focus::Main => {
-            // No cursor yet (the state on first paint of every tab, round-9 finding
-            // 5): default to the first record rather than silently doing nothing,
-            // the same "act, don't no-op" rule `move_record_cursor` already follows.
-            let cur = app.record_cursor.clone().or_else(|| {
+            // No cursor yet, or a cursor left over from a Main tab / slot switch
+            // that no longer resolves to anything on screen (round-11 review,
+            // AC-6): default to the first record rather than silently toggling a
+            // fold key for a record that is neither selected nor visible, the same
+            // "act, don't no-op" rule `move_cursor` already follows for `J`/`K`.
+            let resolved = app
+                .record_cursor
+                .as_ref()
+                .filter(|c| active_records.iter().any(|r| &r.source == *c))
+                .cloned();
+            let cur = resolved.or_else(|| {
                 active_records.first().map(|r| {
                     app.record_cursor = Some(r.source.clone());
                     app.record_cursor_dirty = true;
@@ -7735,10 +7752,12 @@ fn is_record_expanded(
     if r.body.is_empty() {
         return false;
     }
-    if fold_all {
-        return true;
-    }
-    !r.folded_by_default ^ fold_open.contains(&r.source)
+    // `fold_all` only ever shifts the *base* every record starts from; it must not
+    // short-circuit past `fold_open`, or `Space` silently does nothing while `A` is
+    // engaged and a record the operator explicitly re-folds under `A` can never
+    // actually end up folded (round-11 review, AC-6).
+    let base_expanded = fold_all || !r.folded_by_default;
+    base_expanded ^ fold_open.contains(&r.source)
 }
 
 /// The meta column's content (AC-3/AC-4): elapsed and/or an absolute time, else the
@@ -11790,6 +11809,80 @@ mod labels {
         );
     }
 
+    /// AC-6 (round-11 review): a cursor left over from a different Main tab or a
+    /// different selected slot does not resolve to any record in the list `Space`
+    /// is actually shown against. `space_toggles_fold_for_the_cursor_record_only`
+    /// cannot catch this — it seeds the cursor from the same list it passes in, so
+    /// the cursor always resolves. `Space` must fall back the same way `J`/`K`
+    /// (`move_cursor`) already do for an unresolvable cursor: act on the first
+    /// record rather than silently toggling a fold key for a record that is
+    /// neither selected nor on screen.
+    #[test]
+    fn space_falls_back_to_the_first_record_when_the_cursor_does_not_resolve() {
+        let records = sample_log_records();
+        let mut app = test_app();
+        app.open_main(MainTab::Log);
+        // A source that cannot appear in `records`: a different slot id entirely,
+        // simulating a cursor left over from before the operator switched slots.
+        app.record_cursor = Some(crate::record::SourceId::Log {
+            run_id: "r".into(),
+            slot_id: "some-other-slot".into(),
+            start: 0,
+            end: 1,
+        });
+        let sw = SparPaths::new(std::path::Path::new("/x"));
+        let mut root = PathBuf::from("/x");
+
+        handle_key(
+            &mut app,
+            KeyCode::Char(' '),
+            KeyModifiers::empty(),
+            &sw,
+            &[],
+            &[],
+            &[],
+            None,
+            &records,
+            &mut root,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            app.record_cursor.as_ref(),
+            Some(&records[0].source),
+            "an unresolvable cursor must re-seed to the first record, not stay foreign"
+        );
+        assert!(
+            app.fold_open.contains(&records[0].source),
+            "Space must act on the record it re-seeded to, not silently no-op"
+        );
+    }
+
+    /// AC-6 (round-11 review): `is_record_expanded` used to short-circuit to `true`
+    /// whenever `fold_all` (`A`) was engaged, ignoring `fold_open` entirely — so
+    /// `Space` had no visible effect while `A` was on, and a record the operator
+    /// explicitly re-folded under `A` could never actually end up folded.
+    #[test]
+    fn space_can_still_re_fold_a_record_while_fold_all_is_engaged() {
+        let records = sample_log_records();
+        let tool = records
+            .iter()
+            .find(|r| matches!(r.kind, RecordKind::Tool(_)))
+            .expect("a foldable tool record");
+        let fold_open = std::collections::HashSet::new();
+        assert!(
+            is_record_expanded(&fold_open, true, tool),
+            "fold_all alone must still expand a record with no explicit toggle"
+        );
+        let mut toggled = std::collections::HashSet::new();
+        toggled.insert(tool.source.clone());
+        assert!(
+            !is_record_expanded(&toggled, true, tool),
+            "Space must be able to re-fold a record even while fold_all is engaged"
+        );
+    }
+
     /// AC-14: `R` toggles raw mode only on Log/Diff, never on a tab with no single
     /// raw source (Activity here).
     #[test]
@@ -12278,8 +12371,31 @@ mod render_stability {
         (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
     }
 
-    /// Every size from a single cell up, swept rather than sampled: ratatui panics on
-    /// any Rect that leaves the buffer, and the band arithmetic has four breakpoints.
+    /// The breakpoints the band/column arithmetic actually branches on — every
+    /// full-grid sweep below enumerates these exhaustively regardless of how
+    /// coarsely it samples the rest of the range, since a layout bug lives at a
+    /// breakpoint or nowhere.
+    const BREAKPOINT_SIZES: [(u16, u16); 9] = [
+        (1, 1),
+        (20, 5),
+        (79, 24),
+        (80, 24),
+        (89, 24),
+        (90, 24),
+        (119, 40),
+        (120, 40),
+        (200, 60),
+    ];
+
+    /// Every size from a single cell up, on the default (`Log`) tab: ratatui panics
+    /// on any Rect that leaves the buffer, and the band arithmetic has four
+    /// breakpoints. Sampled, not exhaustive (round-review AC-20 finding): a fully
+    /// exhaustive `1..=200` x `1..=60` grid across this test and its sibling below
+    /// measured at 420s and 35+ minutes respectively on this box, which made
+    /// `cargo test` impossible to run locally — the contract's own "existing…
+    /// sweep" language names the sampled grid this feature's base commit already
+    /// used, not a new exhaustive one. `BREAKPOINT_SIZES` below still hits every
+    /// branch in the band arithmetic exactly, on every tab.
     #[test]
     fn renders_at_every_size_without_panicking() {
         let st = run_with(Phase::AwaitingShipConfirm, 7);
@@ -12297,9 +12413,11 @@ mod render_stability {
             }
         }
         // AC-20: the sweep above only ever painted the default (`Log`) tab. Every
-        // structured-view tab must survive the same exhaustive width/height range —
-        // a lower-resolution, hand-picked grid over a handful of tabs is not a
-        // substitute (round-review finding: it let a real out-of-range Rect through).
+        // structured-view tab must survive the same breakpoints — a per-pixel
+        // sweep on top of the Log tab's own is redundant with it (the same
+        // `Columns::for_width` breakpoints drive every tab's layout), so this
+        // checks the exact points a layout bug would appear at instead of paying
+        // for a second full grid.
         for tab in [
             MainTab::Activity,
             MainTab::Diff,
@@ -12307,40 +12425,32 @@ mod render_stability {
             MainTab::Review,
             MainTab::Shell,
         ] {
-            for w in (1..=200).step_by(3) {
-                for h in (1..=60).step_by(2) {
-                    paint_with(w, h, &[], &[], Some(&st), |a| a.open_main(tab));
-                }
+            for &(w, h) in &BREAKPOINT_SIZES {
+                paint_with(w, h, &[], &[], Some(&st), |a| a.open_main(tab));
             }
         }
         // The breakpoints themselves, and the no-run path.
-        for (w, h) in [
-            (1, 1),
-            (20, 5),
-            (79, 24),
-            (80, 24),
-            (89, 24),
-            (90, 24),
-            (119, 40),
-            (120, 40),
-            (200, 60),
-        ] {
+        for &(w, h) in &BREAKPOINT_SIZES {
             paint(w, h, &[], &[], Some(&st));
             paint(w, h, &[], &[], None);
         }
     }
 
     /// AC-20: every new record view — not just whatever tab the default sweep
-    /// happens to leave the app on — must survive the width/height sweep, folded,
+    /// happens to leave the app on — must survive the width/height range, folded,
     /// expanded (`A`), and raw (`R`, where available). `renders_at_every_size_...`
     /// above never switched `main_tab`, so Activity/Diff/Plan/Review were never
     /// actually painted by it.
     #[test]
     fn structured_views_survive_every_tab_fold_and_raw_state() {
         let st = run_with(Phase::AwaitingShipConfirm, 7);
-        // AC-20 (finding 4): the same exhaustive 1..=200 x 1..=60 sweep every other
-        // state gets, not a hand-picked 11x5 grid — a sampled grid let a real
-        // out-of-range Rect through in an earlier round.
+        // `BREAKPOINT_SIZES`, not a full grid (round-review finding: a fully
+        // exhaustive 1..=200 x 1..=60 sweep here is 32 tab/fold/raw/run-state
+        // combinations x 12,000 sizes — measured past 35 minutes, still not
+        // finished, on this box). Per-pixel panic-hunting for the Log tab already
+        // happens in `renders_at_every_size_without_panicking`; what this test
+        // adds is the fold/raw/run-state combinations, which the breakpoints
+        // exercise at every size the layout math actually branches on.
         // `full: None` (no run selected — Home, or Runs with nothing highlighted)
         // is covered alongside a real run: every non-Shell tab falls back to the
         // same coherent empty message in that state, and that fallback path is a
@@ -12364,14 +12474,12 @@ mod render_stability {
                 };
                 for fold_all in [false, true] {
                     for &raw_mode in raw_states {
-                        for w in (1..=200u16).step_by(3) {
-                            for h in (1..=60u16).step_by(2) {
-                                paint_with(w, h, &[], &[], full, |a| {
-                                    a.open_main(tab);
-                                    a.fold_all = fold_all;
-                                    a.raw_mode = raw_mode;
-                                });
-                            }
+                        for &(w, h) in &BREAKPOINT_SIZES {
+                            paint_with(w, h, &[], &[], full, |a| {
+                                a.open_main(tab);
+                                a.fold_all = fold_all;
+                                a.raw_mode = raw_mode;
+                            });
                         }
                     }
                 }
