@@ -1556,6 +1556,58 @@ mod tests {
         assert!(unresolved_alerts(&paths, Some("r1")).unwrap().is_empty());
     }
 
+    /// A conversation reply is addressed to the operator, but it is the transcript's
+    /// normal turn traffic, not an interruption or an unresolved red badge. Ordinary
+    /// `@human` and `Blocked` messages retain both alert paths.
+    #[test]
+    fn conversation_replies_are_not_alerts_but_normal_human_messages_are() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut meta = HashMap::new();
+        meta.insert("surface".into(), "chat".into());
+        meta.insert("conversation".into(), "talk-1".into());
+        meta.insert("turn".into(), "turn-1".into());
+        let conversation = BusMessage {
+            id: new_id(),
+            ts: Utc::now(),
+            from: "r1:talk-1".into(),
+            to: HUMAN.into(),
+            kind: MsgKind::Chat,
+            body: "What should the brief cover?".into(),
+            run: Some("r1".into()),
+            subject: None,
+            refs: MsgRefs::default(),
+            requires_ack: false,
+            meta,
+        };
+        assert!(
+            !is_human_alert(&conversation),
+            "conversation replies must not trigger external human alerts"
+        );
+        send(&paths, conversation, MessageBudget::Chatty).unwrap();
+        assert!(
+            unresolved_alerts(&paths, Some("r1")).unwrap().is_empty(),
+            "conversation replies must not appear as unresolved attention"
+        );
+
+        let ordinary = BusMessage {
+            id: new_id(),
+            ts: Utc::now(),
+            from: "r1:planner".into(),
+            to: HUMAN.into(),
+            kind: MsgKind::Chat,
+            body: "I need an operator decision.".into(),
+            run: Some("r1".into()),
+            subject: None,
+            refs: MsgRefs::default(),
+            requires_ack: false,
+            meta: HashMap::new(),
+        };
+        assert!(is_human_alert(&ordinary));
+        send(&paths, ordinary, MessageBudget::Chatty).unwrap();
+        assert_eq!(unresolved_alerts(&paths, Some("r1")).unwrap().len(), 1);
+    }
+
     #[test]
     fn loop_guard_refuses_pingpong_but_passes_normal() {
         let tmp = tempdir().unwrap();
