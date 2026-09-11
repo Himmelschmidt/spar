@@ -11373,6 +11373,270 @@ mod labels {
         assert_eq!(app.palette.as_ref().map(|p| p.input.as_str()), Some("q"));
     }
 
+    fn sample_log_records() -> Vec<Record> {
+        record::parse_log_records(
+            "→ Bash  ls -la /etc | head -5\n← ✓  total 1184\ndrwxr-xr-x 2 root root\n! disk full\n",
+            0,
+            &[],
+            &record::PathShortener::default(),
+            "r",
+            "s",
+        )
+        .iter()
+        .map(|lr| lr.to_record())
+        .collect()
+    }
+
+    /// AC-13: `J`/`K`/`t`/`T`/`e`/`E` move `App.record_cursor` over whatever Main
+    /// is currently showing.
+    #[test]
+    fn record_navigation_keys_move_the_cursor() {
+        let records = sample_log_records();
+        let mut app = test_app();
+        app.open_main(MainTab::Log);
+        let sw = SparPaths::new(std::path::Path::new("/x"));
+        let mut root = PathBuf::from("/x");
+        assert!(app.record_cursor.is_none());
+
+        handle_key(
+            &mut app,
+            KeyCode::Char('J'),
+            KeyModifiers::empty(),
+            &sw,
+            &[],
+            &[],
+            &[],
+            None,
+            &records,
+            &mut root,
+            None,
+        )
+        .unwrap();
+        let first = app.record_cursor.clone().expect("J must set the cursor");
+        assert_eq!(first, records[0].source);
+
+        handle_key(
+            &mut app,
+            KeyCode::Char('t'),
+            KeyModifiers::empty(),
+            &sw,
+            &[],
+            &[],
+            &[],
+            None,
+            &records,
+            &mut root,
+            None,
+        )
+        .unwrap();
+        let tool_idx = records
+            .iter()
+            .position(|r| matches!(r.kind, RecordKind::Tool(_)))
+            .expect("fixture has a tool record");
+        assert_eq!(
+            app.record_cursor.as_ref(),
+            Some(&records[tool_idx].source),
+            "`t` must land on the tool call"
+        );
+
+        handle_key(
+            &mut app,
+            KeyCode::Char('e'),
+            KeyModifiers::empty(),
+            &sw,
+            &[],
+            &[],
+            &[],
+            None,
+            &records,
+            &mut root,
+            None,
+        )
+        .unwrap();
+        let err_idx = records
+            .iter()
+            .position(|r| matches!(r.kind, RecordKind::Error))
+            .expect("fixture has an error record");
+        assert_eq!(
+            app.record_cursor.as_ref(),
+            Some(&records[err_idx].source),
+            "`e` must land on the error"
+        );
+    }
+
+    /// AC-6: `Space` folds/unfolds exactly the record under the cursor.
+    #[test]
+    fn space_toggles_fold_for_the_cursor_record_only() {
+        let records = sample_log_records();
+        let mut app = test_app();
+        app.open_main(MainTab::Log);
+        app.record_cursor = Some(records[0].source.clone());
+        let sw = SparPaths::new(std::path::Path::new("/x"));
+        let mut root = PathBuf::from("/x");
+
+        assert!(!app.fold_open.contains(&records[0].source));
+        handle_key(
+            &mut app,
+            KeyCode::Char(' '),
+            KeyModifiers::empty(),
+            &sw,
+            &[],
+            &[],
+            &[],
+            None,
+            &records,
+            &mut root,
+            None,
+        )
+        .unwrap();
+        assert!(
+            app.fold_open.contains(&records[0].source),
+            "Space must open exactly the cursor record"
+        );
+        assert!(
+            records
+                .iter()
+                .skip(1)
+                .all(|r| !app.fold_open.contains(&r.source)),
+            "Space must not touch any other record"
+        );
+    }
+
+    /// AC-14: `R` toggles raw mode only on Log/Diff, never on a tab with no single
+    /// raw source (Activity here).
+    #[test]
+    fn r_toggles_raw_mode_only_where_a_raw_source_exists() {
+        let mut app = test_app();
+        app.open_main(MainTab::Log);
+        let sw = SparPaths::new(std::path::Path::new("/x"));
+        let mut root = PathBuf::from("/x");
+        handle_key(
+            &mut app,
+            KeyCode::Char('R'),
+            KeyModifiers::empty(),
+            &sw,
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+            &mut root,
+            None,
+        )
+        .unwrap();
+        assert!(app.raw_mode, "R must toggle raw mode on Log");
+
+        app.raw_mode = false;
+        app.open_main(MainTab::Activity);
+        handle_key(
+            &mut app,
+            KeyCode::Char('R'),
+            KeyModifiers::empty(),
+            &sw,
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+            &mut root,
+            None,
+        )
+        .unwrap();
+        assert!(!app.raw_mode, "R must be a no-op on Activity");
+    }
+
+    /// `f` toggles the Activity selected-slot filter on and off.
+    #[test]
+    fn f_toggles_the_activity_slot_filter() {
+        let mut app = test_app();
+        app.open_main(MainTab::Activity);
+        app.selected_slot = 2;
+        let sw = SparPaths::new(std::path::Path::new("/x"));
+        let mut root = PathBuf::from("/x");
+        assert!(app.activity_slot_filter.is_none());
+        handle_key(
+            &mut app,
+            KeyCode::Char('f'),
+            KeyModifiers::empty(),
+            &sw,
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+            &mut root,
+            None,
+        )
+        .unwrap();
+        assert_eq!(app.activity_slot_filter, Some(2));
+        handle_key(
+            &mut app,
+            KeyCode::Char('f'),
+            KeyModifiers::empty(),
+            &sw,
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+            &mut root,
+            None,
+        )
+        .unwrap();
+        assert_eq!(app.activity_slot_filter, None);
+    }
+
+    /// AC-13: every new binding is inert while an attached Shell pane owns the PTY
+    /// — the key must forward to the pane instead of moving the record cursor,
+    /// folding, toggling raw mode, or changing the slot filter.
+    #[test]
+    fn structural_navigation_keys_are_inert_while_shell_owns_the_pty() {
+        let records = sample_log_records();
+        let mut app = test_app();
+        app.open_main(MainTab::Shell);
+        app.terminal_pane = Some(crate::terminal::TerminalPane::new(24, 80));
+        let sw = SparPaths::new(std::path::Path::new("/x"));
+        let mut root = PathBuf::from("/x");
+
+        for code in [
+            KeyCode::Char('J'),
+            KeyCode::Char('t'),
+            KeyCode::Char('e'),
+            KeyCode::Char(' '),
+            KeyCode::Char('A'),
+            KeyCode::Char('R'),
+            KeyCode::Char('f'),
+        ] {
+            handle_key(
+                &mut app,
+                code,
+                KeyModifiers::empty(),
+                &sw,
+                &[],
+                &[],
+                &[],
+                None,
+                &records,
+                &mut root,
+                None,
+            )
+            .unwrap();
+        }
+        assert!(
+            app.record_cursor.is_none(),
+            "the PTY must have swallowed every navigation key"
+        );
+        assert!(app.fold_open.is_empty());
+        assert!(!app.fold_all);
+        assert!(!app.raw_mode);
+        assert!(app.activity_slot_filter.is_none());
+        assert_eq!(
+            app.main_tab,
+            MainTab::Shell,
+            "none of these keys leave Shell"
+        );
+    }
+
     fn summary_phase(id: &str, phase: Phase) -> state::RunSummary {
         state::RunSummary {
             phase,
