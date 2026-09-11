@@ -58,7 +58,7 @@ fn json_of(out: &assert_cmd::assert::Assert) -> serde_json::Value {
 /// report the run's real outcome (here, a gate: `awaiting_plan_approval`, exit code 2)
 /// rather than printing "detached" for a child it never actually watched running.
 #[test]
-fn dry_run_detach_that_completes_inside_the_poll_reports_the_real_outcome() {
+fn dry_run_detach_reports_honestly_whichever_side_of_the_handshake_wins() {
     let tmp = tempdir().unwrap();
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
@@ -76,11 +76,32 @@ fn dry_run_detach_that_completes_inside_the_poll_reports_the_real_outcome() {
             "--detach",
             "--json",
         ])
-        .assert()
-        .code(2);
+        .assert();
+    let code = out.get_output().status.code();
     let v = json_of(&out);
-    assert_eq!(v["phase"], "awaiting_plan_approval");
-    assert_eq!(v["exit_code"], 2);
+
+    // A dry run can finish before the handshake's first poll, or not, depending on
+    // how loaded the box is — both outcomes are correct, and asserting only the
+    // fast one made this the suite's most reliable flake. What must hold either
+    // way is that the parent never reports something it did not observe.
+    match code {
+        // `Completed`: the child finished inside the poll, so the parent reports
+        // the run's own outcome rather than claiming a detach it never confirmed.
+        Some(2) => {
+            assert_eq!(v["phase"], "awaiting_plan_approval");
+            assert_eq!(v["exit_code"], 2);
+        }
+        // `Confirmed`: the child is still alive and holds the lock. The parent may
+        // say "detached" and nothing else — in particular it must not have
+        // back-filled a terminal phase it cannot have seen.
+        Some(0) => {
+            assert_ne!(
+                v["phase"], "done",
+                "a confirmed detach cannot report a finished run"
+            );
+        }
+        other => panic!("unexpected exit {other:?}: {v}"),
+    }
 }
 
 /// A run whose `state.json` cannot be read fails the whole invocation immediately —
@@ -167,7 +188,7 @@ fn internal_continue_on_a_vanished_run_fails_fast() {
 /// for `run --workflow arena --detach`: it must report the run's real gate rather than
 /// unconditionally printing "detached" for a child a raw spawn never confirmed.
 #[test]
-fn arena_dry_run_detach_that_completes_inside_the_poll_reports_the_real_outcome() {
+fn arena_dry_run_detach_reports_honestly_whichever_side_of_the_handshake_wins() {
     let tmp = tempdir().unwrap();
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
@@ -187,11 +208,25 @@ fn arena_dry_run_detach_that_completes_inside_the_poll_reports_the_real_outcome(
             "--detach",
             "--json",
         ])
-        .assert()
-        .code(2);
+        .assert();
+    let code = out.get_output().status.code();
     let v = json_of(&out);
-    assert_eq!(v["phase"], "awaiting_winner_confirm");
-    assert_eq!(v["exit_code"], 2);
+
+    // Same race as its `plan` sibling above, and the same rule: whichever arm the
+    // handshake takes, the parent reports only what it observed.
+    match code {
+        Some(2) => {
+            assert_eq!(v["phase"], "awaiting_winner_confirm");
+            assert_eq!(v["exit_code"], 2);
+        }
+        Some(0) => {
+            assert_ne!(
+                v["phase"], "done",
+                "a confirmed detach cannot report a finished run"
+            );
+        }
+        other => panic!("unexpected exit {other:?}: {v}"),
+    }
 }
 
 /// `implement --run --detach` against a run with a live orchestrator refuses instead

@@ -109,14 +109,6 @@ pub fn ease_in_out(t: f32) -> f32 {
     }
 }
 
-/// Cubic ease out: fast from the start, settling at the end.
-#[allow(dead_code)]
-pub fn ease_out(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    let u = 1.0 - t;
-    1.0 - u * u * u
-}
-
 /// A value travelling from one number to another over a fixed duration, read off
 /// the wall clock like everything else in this module.
 #[derive(Debug, Clone)]
@@ -313,26 +305,6 @@ mod tests {
             assert!(
                 (ease_in_out(t) + ease_in_out(1.0 - t) - 1.0).abs() < 1e-6,
                 "ease_in_out lost midpoint symmetry at {t}"
-            );
-        }
-    }
-
-    #[test]
-    fn ease_out_is_clamped_and_monotone() {
-        assert_eq!(ease_out(-1.0), 0.0);
-        assert_eq!(ease_out(0.0), 0.0);
-        assert_eq!(ease_out(1.0), 1.0);
-        assert_eq!(ease_out(2.0), 1.0);
-        let samples: Vec<f32> = (0..=100).map(|i| ease_out(i as f32 / 100.0)).collect();
-        assert!(
-            samples.windows(2).all(|pair| pair[0] <= pair[1]),
-            "ease_out must not reverse: {samples:?}"
-        );
-        for &t in &[0.1, 0.3, 0.7] {
-            assert!(
-                ease_out(t) > t,
-                "ease_out must be above linear at {t}: {}",
-                ease_out(t)
             );
         }
     }

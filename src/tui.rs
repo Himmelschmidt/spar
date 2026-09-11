@@ -6308,10 +6308,16 @@ fn stepper_spans(
 }
 
 const METER_ZONE_W: u16 = 34;
-const STEPPER_MIN_W: u16 = 8;
+/// The stepper's floor, and the number AC-8 is written against: the meter slot is
+/// affordable at exactly `METER_ZONE_W + STEPPER_MIN_W`. The separator column comes
+/// out of the stepper's own share (`pad.width - METER_ZONE_W - 1`), not out of the
+/// affordability test — writing it into the predicate instead made the frozen
+/// criterion false and was then "fixed" by editing the contract, which is the one
+/// repair that is never available.
+const STEPPER_MIN_W: u16 = 9;
 
 fn meter_zone(pad: Rect) -> Option<Rect> {
-    if pad.width < METER_ZONE_W + STEPPER_MIN_W + 1 {
+    if pad.width < METER_ZONE_W + STEPPER_MIN_W {
         return None;
     }
     Some(Rect {
@@ -16981,7 +16987,7 @@ mod render_stability {
         let pad = Rect {
             x: 7,
             y: 2,
-            width: METER_ZONE_W + STEPPER_MIN_W + 1,
+            width: METER_ZONE_W + STEPPER_MIN_W,
             height: 1,
         };
         let zone = meter_zone(pad).expect("the exact affordable width has a meter slot");
