@@ -6,6 +6,34 @@ All notable changes to spar are recorded here.
 
 ### Added
 
+- **You can now talk to spar inside spar.** A conversation tab lets you brief a
+  run by describing what you want, have a fleet proposed, and launch it — or, with
+  a run selected, ask about a decision it is waiting on and argue it either way
+  against the same evidence the review screen shows. It proposes; approving,
+  shipping and choosing a fleet stay yours.
+
+
+### Fixed
+
+- **Reloading a run's settings can no longer quietly change which agent reviews
+  it.** A recent fix that let you re-assign a seat mid-run could, when re-stating
+  a review panel, point both reviewer seats at the same agent — turning a
+  deliberate two-vendor review into the same vendor twice, without saying so, and
+  then blaming the wrong vendor when one hit a rate limit. Reloading now adjusts
+  only which model a seat uses; changing who fills a seat is a separate operation,
+  and a mismatch is refused outright rather than written.
+
+- **Changing which agent or model a run uses now actually changes it.** Asking a
+  run that had already started to reload its settings updated the saved settings
+  but left the existing seats on whatever they were first given, so the run
+  carried on using the old one — and reported the old one back to you while doing
+  it. Seats that have not started yet are now re-assigned properly; a seat that is
+  mid-flight is deliberately left alone, since that is the one whose assignment is
+  already in use.
+
+
+### Added
+
 - **Runs now survive the session that started them.** Starting a run in the
   background gives it a session of its own, so closing the terminal, an aborted
   command, or a timeout in whatever launched it no longer takes the run down with
