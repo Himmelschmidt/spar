@@ -110,6 +110,14 @@ pub enum RecordKind {
 /// lines or its result merge in (`parse_log_records`), so keying identity on it made
 /// an expanded running tool call re-fold itself and lose the cursor the moment its
 /// next line landed. `start` (plus `run_id`/`slot_id`) is the part that never moves.
+///
+/// `Document` never had an `end` field to exclude in the first place (round-10
+/// review, AC-7): a document's final section closes at the whole document's byte
+/// length (`parse_document`), and `review_records` (`src/tui.rs`) built every
+/// reviewer record with `end: text.len()` — a value that moves every time the
+/// document grows between two snapshot rebuilds, so a field that was never read
+/// anywhere still broke identity by being compared. `path` + `start` (a section's
+/// own heading position, which never moves) fully identify a document section.
 #[derive(Debug, Clone)]
 pub enum SourceId {
     Log {
@@ -121,7 +129,6 @@ pub enum SourceId {
     Document {
         path: String,
         start: u64,
-        end: u64,
     },
     Activity {
         at_millis: i64,
@@ -151,13 +158,13 @@ impl PartialEq for SourceId {
                 },
             ) => run_id == r2 && slot_id == s2 && start == st2,
             (
-                SourceId::Document { path, start, end },
+                SourceId::Document { path, start, .. },
                 SourceId::Document {
                     path: p2,
                     start: s2,
-                    end: e2,
+                    ..
                 },
-            ) => path == p2 && start == s2 && end == e2,
+            ) => path == p2 && start == s2,
             (
                 SourceId::Activity {
                     at_millis,
@@ -196,11 +203,10 @@ impl std::hash::Hash for SourceId {
                 slot_id.hash(state);
                 start.hash(state);
             }
-            SourceId::Document { path, start, end } => {
+            SourceId::Document { path, start, .. } => {
                 1u8.hash(state);
                 path.hash(state);
                 start.hash(state);
-                end.hash(state);
             }
             SourceId::Activity {
                 at_millis,
@@ -262,7 +268,8 @@ impl LogRecord {
         // own output is never the only thing left once a result arrives.
         let is_tool = matches!(self.kind, RecordKind::Tool(_));
         let mut body = self.body.clone();
-        if is_tool && !self.argument.is_empty() {
+        let has_command_row = is_tool && !self.argument.is_empty();
+        if has_command_row {
             body.insert(0, self.argument.clone());
         }
         // A tool's summary must never repeat what `body[0]` just carried verbatim
@@ -301,6 +308,7 @@ impl LogRecord {
                 RecordKind::Thought => true,
                 _ => !self.body.is_empty(),
             },
+            has_command_row,
         }
     }
 }
@@ -346,6 +354,7 @@ impl ActivityRecord {
             ok: None,
             source: self.source.clone(),
             folded_by_default: false,
+            has_command_row: false,
         }
     }
 }
@@ -369,6 +378,13 @@ pub struct Record {
     pub ok: Option<bool>,
     pub source: SourceId,
     pub folded_by_default: bool,
+    /// True only when `body[0]` is a genuine command/path row, set explicitly at
+    /// construction rather than inferred later by comparing text (round-10 review:
+    /// comparing `body[0]` to `summary` broke on the native Claude coalescer path,
+    /// where a detail-less call's `body[0]` is the result preview carrying a
+    /// provider tool id that never matches the id-stripped `summary`). Everywhere
+    /// but `LogRecord::to_record`'s insert branch this is `false`.
+    pub has_command_row: bool,
 }
 
 /// Column x-positions for a record row, a pure function of view width (U32/U11
@@ -1027,7 +1043,7 @@ pub fn parse_document(name: &str, body: &str, path: &str) -> Vec<Record> {
         }
         if let Some(heading) = heading {
             if let Some((head, lines, start)) = current.take() {
-                records.push(doc_record(head, lines, doc_source(path, start, line_start)));
+                records.push(doc_record(head, lines, doc_source(path, start)));
             }
             current = Some((heading.trim().to_string(), Vec::new(), line_start));
             continue;
@@ -1050,16 +1066,15 @@ pub fn parse_document(name: &str, body: &str, path: &str) -> Vec<Record> {
         }
     }
     if let Some((head, lines, start)) = current.take() {
-        records.push(doc_record(head, lines, doc_source(path, start, pos)));
+        records.push(doc_record(head, lines, doc_source(path, start)));
     }
     records
 }
 
-fn doc_source(path: &str, start: usize, end: usize) -> SourceId {
+fn doc_source(path: &str, start: usize) -> SourceId {
     SourceId::Document {
         path: path.to_string(),
         start: start as u64,
-        end: end as u64,
     }
 }
 
@@ -1078,6 +1093,7 @@ fn doc_record(head: String, body: Vec<String>, source: SourceId) -> Record {
         ok: None,
         source,
         folded_by_default: true,
+        has_command_row: false,
     }
 }
 
@@ -1115,10 +1131,12 @@ pub fn flatten(records: &[Record], is_expanded: impl Fn(&Record) -> bool) -> Vec
                     kind: RowKind::Body(j),
                 });
             }
-        } else if matches!(r.kind, RecordKind::Tool(_)) && !r.body.is_empty() {
+        } else if !r.body.is_empty() && r.has_command_row {
             // The command/path row (`to_record`'s inserted `body[0]`) is never
             // part of the fold: AC-19's "standalone command surface" must survive
-            // a completed call's result collapsing, not just an open call's.
+            // a completed call's result collapsing, not just an open call's. A
+            // detail-less call has no such row (`has_command_row` is false), so
+            // it folds like any other result-bearing record (AC-6).
             out.push(FlatRow {
                 record_idx: i,
                 kind: RowKind::Body(0),
@@ -1173,6 +1191,7 @@ pub fn parse_diff(text: &str, worktree: &str) -> Vec<Record> {
                 path,
             },
             folded_by_default: true,
+            has_command_row: false,
         });
     }
 
@@ -1216,6 +1235,7 @@ pub fn parse_diff(text: &str, worktree: &str) -> Vec<Record> {
                     path: "__stat__".to_string(),
                 },
                 folded_by_default: true,
+                has_command_row: false,
             },
         );
     }
@@ -1239,9 +1259,9 @@ pub fn missing_document(name: &str, path: &str) -> Record {
         source: SourceId::Document {
             path: path.to_string(),
             start: 0,
-            end: 0,
         },
         folded_by_default: false,
+        has_command_row: false,
     }
 }
 
@@ -1268,6 +1288,7 @@ pub fn truncated_log_notice(run_id: &str, slot_id: &str, tail_kb: usize) -> Reco
             end: 0,
         },
         folded_by_default: false,
+        has_command_row: false,
     }
 }
 
@@ -1379,6 +1400,37 @@ mod tests {
         let open_rendered = open[0].to_record();
         assert_eq!(open_rendered.summary, "", "{open_rendered:#?}");
         assert_eq!(open_rendered.body[0], "ls -la /etc | head -5");
+    }
+
+    /// AC-6/AC-19 (round-10 review): a detail-less call (`→ {name}\n`, no
+    /// argument) has nothing to insert as a command row — `body[0]` after
+    /// merging is the result's own preview, which on the native Claude
+    /// coalescer path always carries a provider tool id (`"tool"` literal or
+    /// `toolu_…`) that `strip_tool_id` treats as opaque. A text-comparison
+    /// heuristic (`body[0] != summary`) is fooled by the id substring into
+    /// calling this a genuine command row; `has_command_row` is set explicitly
+    /// at construction instead and must stay false here.
+    #[test]
+    fn detail_less_call_never_gets_a_phantom_command_row() {
+        let records = parse_log_records(
+            "→ Bash\n← ✓  tool  total 1184\n",
+            0,
+            &[],
+            &PathShortener::default(),
+            "r",
+            "s",
+        );
+        let rendered = records[0].to_record();
+        assert!(
+            !rendered.has_command_row,
+            "a detail-less call has no command row: {rendered:#?}"
+        );
+        let flat = flatten(std::slice::from_ref(&rendered), |_| false);
+        assert_eq!(
+            flat.len(),
+            1,
+            "folded with no command row means only the head paints: {flat:#?}"
+        );
     }
 
     #[test]
@@ -1567,6 +1619,47 @@ mod tests {
         fold_open.insert(before);
         assert!(
             fold_open.contains(&after),
+            "an expansion keyed on the pre-growth id must still be found post-growth"
+        );
+    }
+
+    /// AC-7 (round-10 review): a document's final section closes its `end` at the
+    /// whole document's byte length (`parse_document`), which moves every time the
+    /// document grows between two snapshot rebuilds. Identity must survive that the
+    /// same way `Log.end` growing does, or fold state and the cursor are lost on
+    /// every rebuild of a still-being-written document (a live plan critique).
+    #[test]
+    fn document_source_identity_survives_the_final_section_growing_as_it_streams() {
+        // The exact shape of a live plan critique being tailed between two
+        // snapshot rebuilds: the last section's text (and so a naive `end`) grows,
+        // but the section itself did not become a different section.
+        let before = parse_document(
+            "plan-critique",
+            "# Critique\nLooks fine so far.\n",
+            "plan-critique.md",
+        );
+        let after = parse_document(
+            "plan-critique",
+            "# Critique\nLooks fine so far.\nAnd here is more, appended later.\n",
+            "plan-critique.md",
+        );
+        assert_eq!(before.len(), 1);
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            before[0].source, after[0].source,
+            "the same section growing must not change its identity: {before:#?} vs {after:#?}"
+        );
+        use std::hash::{Hash, Hasher};
+        let hash_of = |id: &SourceId| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            id.hash(&mut h);
+            h.finish()
+        };
+        assert_eq!(hash_of(&before[0].source), hash_of(&after[0].source));
+        let mut fold_open: std::collections::HashSet<SourceId> = std::collections::HashSet::new();
+        fold_open.insert(before[0].source.clone());
+        assert!(
+            fold_open.contains(&after[0].source),
             "an expansion keyed on the pre-growth id must still be found post-growth"
         );
     }

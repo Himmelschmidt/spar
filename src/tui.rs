@@ -2531,6 +2531,7 @@ fn apply_diff_watermark_at(
                         path: "__watermark__".to_string(),
                     },
                     folded_by_default: false,
+                    has_command_row: false,
                 },
             );
         }
@@ -8036,10 +8037,14 @@ fn render_record_view(
             record::RowKind::Body(j) => {
                 let rec = &records[row.record_idx];
                 let text = rec.body.get(j).map(|s| s.as_str()).unwrap_or("");
-                // `to_record` inserts the command/path as `body[0]` for every
-                // Tool record, open or merged (AC-19); only that row is the
-                // command, everything after it is the result's own output.
-                let is_command = matches!(rec.kind, RecordKind::Tool(_)) && j == 0;
+                // `to_record` inserts the command/path as `body[0]` for a Tool
+                // record whose call carried an argument, open or merged (AC-19),
+                // and marks that explicitly via `has_command_row` at construction
+                // time — never inferred later by comparing text, which broke on
+                // the native Claude coalescer path (round-10 review). A
+                // detail-less call has no such row: its `body[0]` is the result
+                // preview instead and paints like ordinary output.
+                let is_command = j == 0 && rec.has_command_row;
                 if matches!(rec.kind, RecordKind::Criterion) {
                     // The criteria grid's row is pre-padded into fixed-width cells
                     // (`review_records`): greedy word-wrap tokenizes on spaces and
@@ -9667,6 +9672,37 @@ fn activity_record(
     detail: impl Into<String>,
     kind: RecordKind,
 ) -> record::ActivityRecord {
+    let detail = detail.into();
+    activity_record_with_identity(time, actor, event, detail.clone(), &detail, kind)
+}
+
+/// A running slot's row (AC-7): `detail` carries `SlotActivity::human_silent()`, a
+/// "how long since its last log line" string that changes every second
+/// (`"3s"`, `"4s"`, …) purely for display. Hashing that into the identity, the
+/// way `activity_record` hashes every other call's `detail`, moved this row's
+/// `SourceId` on every snapshot rebuild — the cursor and fold state could never
+/// land on a live slot. `identity_detail` is what actually distinguishes one
+/// slot's row from another (here, nothing beyond actor/event/kind is needed) and
+/// is hashed in `detail`'s place.
+fn activity_record_live(
+    time: Option<DateTime<Utc>>,
+    actor: impl Into<String>,
+    event: impl Into<String>,
+    detail: impl Into<String>,
+    identity_detail: &str,
+    kind: RecordKind,
+) -> record::ActivityRecord {
+    activity_record_with_identity(time, actor, event, detail, identity_detail, kind)
+}
+
+fn activity_record_with_identity(
+    time: Option<DateTime<Utc>>,
+    actor: impl Into<String>,
+    event: impl Into<String>,
+    detail: impl Into<String>,
+    identity_detail: &str,
+    kind: RecordKind,
+) -> record::ActivityRecord {
     let actor = actor.into();
     let event = event.into();
     let detail = detail.into();
@@ -9677,7 +9713,7 @@ fn activity_record(
     std::mem::discriminant(&kind).hash(&mut hasher);
     actor.hash(&mut hasher);
     event.hash(&mut hasher);
-    detail.hash(&mut hasher);
+    identity_detail.hash(&mut hasher);
     let sequence = hasher.finish();
     record::ActivityRecord {
         time,
@@ -9781,13 +9817,16 @@ fn activity_feed(
             String::new()
         };
         // The slot id, not `role_label` alone (AC-7): two slots sharing a role — two
-        // reviewers, two peers — render identical role/status/quiet text, and identity
-        // hashes on exactly those fields. Only the id tells them apart.
-        out.push(activity_record(
+        // reviewers, two peers — render identical role/status text, and identity
+        // hashes on exactly those fields. Only the id tells them apart. `quiet` is
+        // display-only here (`activity_record_live`): it ticks every second for a
+        // running slot and must never itself move this row's identity.
+        out.push(activity_record_live(
             None,
             s.id.clone(),
             slot_status_label(s.status).to_string(),
             quiet,
+            "",
             kind,
         ));
     }
@@ -9913,13 +9952,16 @@ fn plan_docs(swarm: &SparPaths, full: Option<&RunState>) -> Vec<Record> {
     let mut out = Vec::new();
     push_doc_or_missing(&mut out, swarm, &st.id, "plan.md", "plan.md");
 
+    // `SlotState.artifact` is not a usable source here: it is the slot completion
+    // gate's `expected_artifact`, which is always `plan.md` for every plan-phase
+    // role including the critic (finding 6 — the gate is not this feature's to
+    // change). The critique's real filename is the template's own convention
+    // (`templates/plan_critic.md`), keyed on the critic slot's own id (AC-16).
     let critic_slot = st.slots.iter().find(|s| s.role == SlotRole::PlanCritic);
-    let critic_artifact = critic_slot
-        .and_then(|s| s.artifact.clone())
-        .unwrap_or_else(|| match critic_slot {
-            Some(s) => format!("plan-critique-{}.md", s.id),
-            None => "plan-critique.md".to_string(),
-        });
+    let critic_artifact = match critic_slot {
+        Some(s) => format!("plan-critique-{}.md", s.id),
+        None => "plan-critique.md".to_string(),
+    };
     push_doc_or_missing(&mut out, swarm, &st.id, "plan critique", &critic_artifact);
 
     push_doc_or_missing(
@@ -9985,9 +10027,9 @@ fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: Option<&Confi
             source: SourceId::Document {
                 path: format!("{}#config", contract_path.display()),
                 start: 0,
-                end: 0,
             },
             folded_by_default: false,
+            has_command_row: false,
         });
     }
 
@@ -10006,9 +10048,9 @@ fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: Option<&Confi
             source: SourceId::Document {
                 path: contract_path.to_string_lossy().into_owned(),
                 start: 0,
-                end: 0,
             },
             folded_by_default: false,
+            has_command_row: false,
         });
     } else {
         // One fixed-width cell per reviewer, all on the *same* row (AC-17: a grid,
@@ -10082,9 +10124,9 @@ fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: Option<&Confi
                 source: SourceId::Document {
                     path: format!("{}#{}", contract_path.display(), id),
                     start: 0,
-                    end: 0,
                 },
                 folded_by_default: false,
+                has_command_row: false,
             });
         }
     }
@@ -10112,9 +10154,9 @@ fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: Option<&Confi
                 source: SourceId::Document {
                     path: path.to_string_lossy().into_owned(),
                     start: 0,
-                    end: 0,
                 },
                 folded_by_default: false,
+                has_command_row: false,
             });
             continue;
         }
@@ -10139,7 +10181,6 @@ fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: Option<&Confi
                 let source = SourceId::Document {
                     path: path.to_string_lossy().into_owned(),
                     start: 0,
-                    end: text.len() as u64,
                 };
                 out.push(Record {
                     kind: if blocked {
@@ -10158,6 +10199,7 @@ fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: Option<&Confi
                     ok: None,
                     source,
                     folded_by_default: true,
+                    has_command_row: false,
                 });
             }
             // The gate's own rule (`implement.rs`'s ship path) treats a missing or
@@ -10178,9 +10220,9 @@ fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: Option<&Confi
                 source: SourceId::Document {
                     path: path.to_string_lossy().into_owned(),
                     start: 0,
-                    end: 0,
                 },
                 folded_by_default: false,
+                has_command_row: false,
             }),
         }
     }
@@ -11826,6 +11868,7 @@ mod labels {
                 path: "src/a.rs".to_string(),
             },
             folded_by_default: true,
+            has_command_row: false,
         }];
         let sw = SparPaths::new(std::path::Path::new("/x"));
         let mut root = PathBuf::from("/x");
@@ -12159,6 +12202,7 @@ mod render_stability {
                     sequence: 1,
                 },
                 folded_by_default: false,
+                has_command_row: false,
             },
             Record {
                 kind: RecordKind::Note,
@@ -12176,6 +12220,7 @@ mod render_stability {
                     sequence: 2,
                 },
                 folded_by_default: false,
+                has_command_row: false,
             },
         ];
         let diff_text = "diff --git a/src/a.rs b/src/a.rs\n@@ -1,2 +1,3 @@\n+new line\n-old line\n";
@@ -12199,9 +12244,9 @@ mod render_stability {
             source: SourceId::Document {
                 path: "contract#AC-1".to_string(),
                 start: 0,
-                end: 0,
             },
             folded_by_default: false,
+            has_command_row: false,
         }];
         term.draw(|f| {
             draw(
@@ -12553,6 +12598,7 @@ mod render_stability {
                 sequence: 0,
             },
             folded_by_default: false,
+            has_command_row: false,
         }];
         let kept = effective_log_records(&pre_parsed, "→ Bash  ls -la\n");
         assert_eq!(kept.len(), 1);
@@ -12816,6 +12862,7 @@ mod render_stability {
                     sequence: 0,
                 },
                 folded_by_default: false,
+                has_command_row: false,
             };
             let row = build_head_row(&r, cols, false, true, None);
             let (meta_x, meta_text, _) = row.spans.last().unwrap();
@@ -12858,6 +12905,7 @@ mod render_stability {
                 sequence: 0,
             },
             folded_by_default: false,
+            has_command_row: false,
         };
         let text = record_meta_text(&r, cols.meta_width);
         assert!(text.contains("0.8s"), "{text:?}");
@@ -15261,6 +15309,73 @@ mod render_stability {
         );
     }
 
+    /// AC-16: the critique is resolved through the critic slot's own id
+    /// convention, not `SlotState.artifact` (which is always `plan.md` — the
+    /// slot completion gate, not this document's real filename). `plan.md` and
+    /// the critique must come from two distinct files, each with its own
+    /// sections, not one file read twice under two names.
+    #[test]
+    fn plan_tab_resolves_the_critique_through_the_critic_slot_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let swarm = SparPaths::new(dir.path());
+        let st = run_with(Phase::Review, 7);
+        let critic_id = &st.slots[1].id;
+        assert_eq!(st.slots[1].role, SlotRole::PlanCritic);
+        swarm.ensure_run_dirs(&st.id).unwrap();
+        std::fs::write(swarm.artifact(&st.id, "plan.md"), "# Plan\nDo the thing.\n").unwrap();
+        std::fs::write(
+            swarm.artifact(&st.id, &format!("plan-critique-{critic_id}.md")),
+            "# Critique\nLooks fine.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            swarm.artifact(&st.id, "test-contract.md"),
+            "AC-1: does a thing\n",
+        )
+        .unwrap();
+        let docs = plan_docs(&swarm, Some(&st));
+        let plan = docs
+            .iter()
+            .find(|r| r.body.iter().any(|l| l.contains("Do the thing.")))
+            .expect("plan doc");
+        let critique = docs
+            .iter()
+            .find(|r| r.body.iter().any(|l| l.contains("Looks fine.")))
+            .expect("critique doc, resolved through the critic slot id, not `plan.md` again");
+        assert_ne!(
+            plan.source, critique.source,
+            "plan.md and the critique must not share an identity: {docs:#?}"
+        );
+        let contract = docs
+            .iter()
+            .find(|r| r.body.iter().any(|l| l.contains("AC-1")))
+            .expect("test-contract doc");
+        assert_ne!(critique.source, contract.source);
+    }
+
+    /// AC-16: a critic slot whose critique file never landed on disk must name
+    /// the missing document, not silently fall back to showing `plan.md` again.
+    #[test]
+    fn plan_tab_names_a_missing_critique_rather_than_repeating_plan_md() {
+        let dir = tempfile::tempdir().unwrap();
+        let swarm = SparPaths::new(dir.path());
+        let st = run_with(Phase::Review, 7);
+        swarm.ensure_run_dirs(&st.id).unwrap();
+        std::fs::write(swarm.artifact(&st.id, "plan.md"), "# Plan\nDo the thing.\n").unwrap();
+        // No critique file, no test-contract.md written.
+        let docs = plan_docs(&swarm, Some(&st));
+        let missing = docs
+            .iter()
+            .filter(|r| matches!(r.kind, RecordKind::Note) && r.verb == "Missing")
+            .collect::<Vec<_>>();
+        assert!(
+            missing
+                .iter()
+                .any(|r| r.head == "plan critique" && !r.summary.contains("plan.md")),
+            "the missing critique must name its own conventional filename, not plan.md: {docs:#?}"
+        );
+    }
+
     /// AC-17: the ship gate treats a missing/empty review artifact as an
     /// unconditional blocker (`implement.rs`'s "review slot failed or produced no
     /// review"), not a neutral placeholder — the Review tab must show the same.
@@ -15461,6 +15576,7 @@ mod render_stability {
                     path: path.to_string(),
                 },
                 folded_by_default: true,
+                has_command_row: false,
             })
             .collect()
     }

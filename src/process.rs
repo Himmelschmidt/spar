@@ -2167,16 +2167,25 @@ pub fn tail_log_info(path: &Path, max_bytes: usize) -> TailLog {
         };
     };
     let truncated = len > max_bytes as u64;
-    let seek_pos = if truncated { len - max_bytes as u64 } else { 0 };
-    if truncated {
+    // `seek_pos` is the actual resulting position of the seek just performed, not
+    // `len - max_bytes` computed from the earlier `seek(End(0))` (AC-10, round-10
+    // review): on a log still being appended to, the file can grow between that
+    // first seek and this one, so `SeekFrom::End(-back)` resolves against a later,
+    // larger end than `len` — the derived value understated how far into the file
+    // the tail actually starts, shifting every `SourceId::Log` range and index
+    // bisection built from `start`.
+    let seek_pos = if truncated {
         let back = max_bytes as u64;
-        if f.seek(SeekFrom::End(-(back as i64))).is_err() {
-            return TailLog {
-                text: String::new(),
-                truncated: false,
-                io_error: true,
-                start: 0,
-            };
+        match f.seek(SeekFrom::End(-(back as i64))) {
+            Ok(pos) => pos,
+            Err(_) => {
+                return TailLog {
+                    text: String::new(),
+                    truncated: false,
+                    io_error: true,
+                    start: 0,
+                };
+            }
         }
     } else if f.seek(SeekFrom::Start(0)).is_err() {
         return TailLog {
@@ -2185,7 +2194,9 @@ pub fn tail_log_info(path: &Path, max_bytes: usize) -> TailLog {
             io_error: true,
             start: 0,
         };
-    }
+    } else {
+        0
+    };
     let mut buf = Vec::new();
     if f.read_to_end(&mut buf).is_err() {
         return TailLog {
