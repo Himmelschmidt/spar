@@ -179,4 +179,53 @@ mod tests {
         assert_eq!(sweep(0, 0, 3.0, 0.5), 0.0);
         assert_eq!(sweep(0, 8, 0.0, 0.5), 0.0);
     }
+
+    #[test]
+    fn tween_retargets_from_the_displayed_value_and_zero_duration_settles() {
+        let start = Instant::now();
+        let mut tween = Tween::<f32>::settled(0.0);
+        assert!(tween.done(start));
+        assert_eq!(tween.value(start), 0.0);
+
+        let period = Duration::from_millis(200);
+        tween.retarget(10.0, period, start);
+        let halfway = start + period / 2;
+        assert!((tween.value(halfway) - 5.0).abs() < 1e-6);
+
+        tween.retarget(20.0, period, halfway);
+        assert!(
+            (tween.value(halfway) - 5.0).abs() < 1e-6,
+            "retargeting must start at the rendered position, not the old endpoint"
+        );
+        let after_retarget = tween.value(halfway + period / 2);
+        assert!(
+            (5.0..20.0).contains(&after_retarget),
+            "retargeted tween jumped outside its displayed-to-target interval: {after_retarget}"
+        );
+
+        tween.retarget(-3.0, Duration::ZERO, halfway);
+        assert!(tween.done(halfway));
+        assert_eq!(tween.value(halfway), -3.0);
+    }
+
+    #[test]
+    fn ease_in_out_is_clamped_monotone_and_symmetric() {
+        assert_eq!(ease_in_out(-1.0), 0.0);
+        assert_eq!(ease_in_out(0.0), 0.0);
+        assert!((ease_in_out(0.5) - 0.5).abs() < 1e-6);
+        assert_eq!(ease_in_out(1.0), 1.0);
+        assert_eq!(ease_in_out(2.0), 1.0);
+
+        let samples: Vec<f32> = (0..=100).map(|i| ease_in_out(i as f32 / 100.0)).collect();
+        assert!(
+            samples.windows(2).all(|pair| pair[0] <= pair[1]),
+            "ease_in_out must not reverse: {samples:?}"
+        );
+        for &t in &[0.1, 0.25, 0.4] {
+            assert!(
+                (ease_in_out(t) + ease_in_out(1.0 - t) - 1.0).abs() < 1e-6,
+                "ease_in_out lost midpoint symmetry at {t}"
+            );
+        }
+    }
 }

@@ -11167,9 +11167,12 @@ mod labels {
         assert_eq!(approve, ship);
         assert_eq!(approve, winner);
         assert_eq!(approve, area.right() - GATE_ZONE_W);
-        // The zone covers every band that has a rail, not just the widest one.
-        assert!(gate_zone(Rect { width: 80, ..area }).is_some());
-        assert!(gate_zone(Rect { width: 79, ..area }).is_none());
+        // The zone is affordable below the rail breakpoint too. Only widths that
+        // cannot hold both the buttons and a minimal left breadcrumb fall back to
+        // content-sized alignment.
+        assert!(gate_zone(Rect { width: 35, ..area }).is_some());
+        assert!(gate_zone(Rect { width: 34, ..area }).is_none());
+        assert!(gate_zone(Rect { width: 79, ..area }).is_some());
     }
 
     /// A Paragraph wider than its rect is clipped with no ellipsis, and gate buttons
@@ -12369,6 +12372,123 @@ mod render_stability {
     fn row(term: &Terminal<TestBackend>, y: u16) -> String {
         let buf = term.backend().buffer();
         (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    #[test]
+    fn loading_home_reserves_visible_skeleton_rows_at_narrow_width() {
+        let root = PathBuf::from("/nonexistent/definitely-not-here");
+        let snap = Snapshot::loading(&root);
+        assert!(
+            snap.home.loading,
+            "only the first cross-project snapshot loads"
+        );
+
+        let mut term = Terminal::new(TestBackend::new(79, 24)).unwrap();
+        let mut app = App::new(None, Config::default(), None);
+        app.focus = Focus::Rail;
+        let mut rail = ListState::default();
+        term.draw(|f| {
+            draw(
+                f,
+                &snap.swarm,
+                &snap.projects,
+                &snap.runs,
+                snap.full.as_ref(),
+                &snap.stream_text,
+                &snap.stream_text_raw,
+                &snap.log_records,
+                &snap.activity,
+                &snap.diff_text,
+                &snap.diff_records,
+                &snap.plan_docs,
+                &snap.review,
+                &snap.home,
+                snap.log_stats.as_ref(),
+                &mut app,
+                &mut rail,
+            )
+        })
+        .unwrap();
+
+        assert_eq!(
+            app.focus,
+            Focus::Rail,
+            "loading Home must not autofocus away from its reserved rows"
+        );
+        let text = (0..24).map(|y| row(&term, y)).collect::<String>();
+        assert!(
+            text.contains('░'),
+            "loading Home painted no skeleton: {text:?}"
+        );
+    }
+
+    #[test]
+    fn crossing_the_tab_breakpoint_keeps_painted_and_clickable_geometry_together() {
+        let st = run_with(Phase::Review, 3);
+        let swarm = SparPaths::new("/x");
+        let mut app = test_app();
+        let paint_labels = |width: u16, app: &mut App| {
+            let mut term = Terminal::new(TestBackend::new(width, 30)).unwrap();
+            let lay = layout_rects(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height: 30,
+                },
+                Focus::Main,
+                false,
+                false,
+            );
+            term.draw(|f| draw_labels(f, &lay, &swarm, &[], &[], Some(&st), app))
+                .unwrap();
+            (
+                app.main_tab_glyphs.clone(),
+                app.main_tabs.clone(),
+                term,
+                lay.labels.y,
+            )
+        };
+
+        let _ = paint_labels(79, &mut app);
+        let (moving_glyphs, moving_hits, _, _) = paint_labels(80, &mut app);
+        assert!(
+            app.motion_in_flight(),
+            "a 79-to-80 tab placement change must glide"
+        );
+        assert_eq!(moving_glyphs.len(), MAIN_TABS.len());
+        assert_eq!(moving_hits.len(), MAIN_TABS.len());
+        for ((glyph, tab), (hit, hit_tab)) in moving_glyphs.iter().zip(&moving_hits) {
+            assert_eq!(tab, hit_tab);
+            assert!(
+                hit.x <= glyph.x && glyph.right() <= hit.right(),
+                "{tab:?} glyph {glyph:?} escaped its clickable rect {hit:?}"
+            );
+        }
+        assert!(
+            moving_glyphs
+                .windows(2)
+                .all(|pair| pair[0].0.right() <= pair[1].0.x),
+            "moving tab glyphs overlap: {moving_glyphs:?}"
+        );
+        assert!(
+            moving_hits
+                .windows(2)
+                .all(|pair| pair[0].0.right() <= pair[1].0.x),
+            "moving tab hit rects overlap: {moving_hits:?}"
+        );
+        app.settle_motion();
+        let (settled_glyphs, settled_hits, _, _) = paint_labels(80, &mut app);
+        let mut fresh = test_app();
+        let (fresh_glyphs, fresh_hits, _, _) = paint_labels(80, &mut fresh);
+        assert_eq!(
+            settled_glyphs, fresh_glyphs,
+            "settled strip differs from a fresh 80-column paint"
+        );
+        assert_eq!(
+            settled_hits, fresh_hits,
+            "settled hit geometry differs from a fresh 80-column paint"
+        );
     }
 
     /// The breakpoints the band/column arithmetic actually branches on — every
@@ -15257,21 +15377,180 @@ mod render_stability {
     /// CTA are present on frame one instead of Home looking blank for a `REFRESH`
     /// tick (round-11 review, minor).
     #[test]
-    fn snapshot_loading_needs_no_disk_and_paints_empty() {
+    fn snapshot_loading_needs_no_disk_and_reserves_skeleton_rows() {
         let root = PathBuf::from("/nonexistent/definitely-not-here");
         let snap = Snapshot::loading(&root);
         assert!(snap.projects.is_empty());
         assert!(snap.runs.is_empty());
         assert!(
+            snap.home.loading,
+            "the first cross-project scan is still in flight"
+        );
+        let skeletons: Vec<&HomeRow> = snap
+            .home
+            .rows
+            .iter()
+            .filter(|r| matches!(r, HomeRow::Skeleton { .. }))
+            .collect();
+        assert_eq!(
+            skeletons.len(),
+            3 * HOME_SKELETON_ROWS,
+            "the three scan-backed bands reserve a fixed number of rows"
+        );
+        let keys: std::collections::HashSet<String> =
+            skeletons.iter().map(|row| home_row_key(row)).collect();
+        assert_eq!(
+            keys.len(),
+            skeletons.len(),
+            "every skeleton needs its own identity"
+        );
+        assert!(
             snap.home
                 .rows
                 .iter()
-                .all(|r| matches!(r, HomeRow::Header(_) | HomeRow::Empty(_) | HomeRow::NewRun)),
-            "no disk-backed rows, but the static chrome is present: {:?}",
+                .all(|r| !matches!(r, HomeRow::Empty(_))),
+            "loading must not claim a scan-backed band is empty: {:?}",
             snap.home.rows
         );
         assert!(snap.home.project_stats.is_empty());
         assert!(snap.full.is_none());
+    }
+
+    #[test]
+    fn skeleton_rows_are_unselectable_and_non_loading_home_stays_non_loading() {
+        let now = Utc::now();
+        let folded: Vec<Vec<state::RunSummary>> = Vec::new();
+        let rows = build_home_rows(&[], &folded, &HomeScope::All, now, now, true);
+        assert!(rows.iter().any(|r| matches!(r, HomeRow::Skeleton { .. })));
+        assert!(rows.iter().all(|r| !matches!(r, HomeRow::Empty(_))));
+
+        let mut app = App::new(None, Config::default(), None);
+        app.selected_home = 0;
+        resync_home_selection(&mut app, &rows);
+        assert!(
+            !matches!(rows.get(app.selected_home), Some(HomeRow::Skeleton { .. })),
+            "selection landed on an inert loading placeholder"
+        );
+        let next = step_home(&rows, app.selected_home, 1);
+        assert!(
+            !matches!(rows.get(next), Some(HomeRow::Skeleton { .. })),
+            "keyboard navigation must skip a loading placeholder"
+        );
+
+        let ready = build_home_rows(&[], &folded, &HomeScope::All, now, now, false);
+        assert!(ready.iter().all(|r| !matches!(r, HomeRow::Skeleton { .. })));
+        assert!(
+            HomeData::default().loading == false,
+            "ordinary HomeData fixtures are never implicitly loading"
+        );
+    }
+
+    #[test]
+    fn rail_reversal_travels_through_distinct_permutations_and_settles_on_focus_loss() {
+        let now = Instant::now();
+        let mut app = App::new(None, Config::default(), None);
+        app.browse = BrowseLevel::Runs;
+        let mut first_leg = home_run("leg-a", Phase::Review, 1, "spar");
+        let mut replacement_leg = home_run("leg-b", Phase::AwaitingPlanApproval, 1, "spar");
+        first_leg.unit_id = Some("unit-1".into());
+        replacement_leg.unit_id = Some("unit-1".into());
+        assert_eq!(
+            run_row_key(&first_leg),
+            run_row_key(&replacement_leg),
+            "a folded unit's cursor key changed with its representative leg"
+        );
+        let original = ["a", "b", "c", "d"];
+        let target = ["d", "c", "b", "a"];
+        let original_keys = original.iter().map(|key| (*key).to_string()).collect();
+        let target_keys: Vec<String> = target.iter().map(|key| (*key).to_string()).collect();
+
+        app.rail_motion
+            .observe(BrowseLevel::Runs, original_keys, now);
+        app.rail_motion
+            .observe(BrowseLevel::Runs, target_keys.clone(), now);
+
+        let mut intermediate = Vec::new();
+        for elapsed in [55, 110, 145] {
+            let permutation = app
+                .rail_motion
+                .observe(
+                    BrowseLevel::Runs,
+                    target_keys.clone(),
+                    now + Duration::from_millis(elapsed),
+                )
+                .expect("an in-flight reorder needs a displayed permutation");
+            let displayed: Vec<&str> = permutation.iter().map(|&index| target[index]).collect();
+            let mut sorted = displayed.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, original, "reorder dropped or duplicated a row");
+            assert_ne!(displayed, original, "reversal jumped back to its source");
+            assert_ne!(displayed, target, "reversal teleported to its target");
+            intermediate.push(displayed);
+        }
+        intermediate.dedup();
+        assert!(
+            intermediate.len() >= 2,
+            "a reversal needs more than one intermediate displayed order: {intermediate:?}"
+        );
+
+        let final_order = app
+            .rail_motion
+            .observe(
+                BrowseLevel::Runs,
+                target_keys,
+                now + crate::motion::REORDER_PERIOD,
+            )
+            .unwrap_or_else(|| (0..target.len()).collect());
+        assert_eq!(
+            final_order,
+            vec![0, 1, 2, 3],
+            "the settled permutation must be the snapshot's data order"
+        );
+
+        let snap = Snapshot::loading(Path::new("/nonexistent/definitely-not-here"));
+        assert!(
+            !app.motion_in_flight(),
+            "the completed tween still schedules frames"
+        );
+        app.rail_motion.observe(
+            BrowseLevel::Runs,
+            vec!["a".into(), "b".into(), "c".into(), "d".into()],
+            now + crate::motion::REORDER_PERIOD,
+        );
+        assert!(app.motion_in_flight());
+        assert!(animating(&app, &snap));
+        app.focused = false;
+        assert!(
+            !animating(&app, &snap),
+            "an unfocused window must not animate"
+        );
+        app.settle_motion();
+        assert!(
+            !app.motion_in_flight(),
+            "focus loss must settle, not freeze motion"
+        );
+    }
+
+    #[test]
+    fn meter_zone_is_a_fixed_slot_even_for_the_largest_token_ledger() {
+        let pad = Rect {
+            x: 7,
+            y: 2,
+            width: METER_ZONE_W + STEPPER_MIN_W,
+            height: 1,
+        };
+        let zone = meter_zone(pad).expect("the exact affordable width has a meter slot");
+        assert_eq!(zone.width, METER_ZONE_W);
+        assert_eq!(zone.right(), pad.right());
+        assert!(meter_zone(Rect {
+            width: pad.width - 1,
+            ..pad
+        })
+        .is_none());
+        assert!(
+            compact_u64(u64::MAX).chars().count() as u16 <= METER_ZONE_W,
+            "the fixed slot cannot fit the formatter's largest token value"
+        );
     }
 
     /// U13, round-7 review finding (review-0-cli-codex): `draw_log_body` used to call
