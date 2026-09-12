@@ -3822,7 +3822,14 @@ fn handle_key_inner(
                     return Ok(false);
                 }
                 // Dispatch turn (backend owned) — off the input thread so the TUI stays responsive.
-                let pending_spec = app.new_run.as_ref().map(|nr| new_run_spec(nr, &app.cfg));
+                let pending_spec = app.new_run.as_ref().map(|nr| {
+                    let cfg_for_spec = nr
+                        .project
+                        .as_ref()
+                        .and_then(|p| crate::config::Config::load(p).ok())
+                        .unwrap_or_else(|| app.cfg.clone());
+                    new_run_spec(nr, &cfg_for_spec)
+                });
                 let req = crate::orchestrator::TurnRequest {
                     scope_key: scope_key.clone(),
                     conversation_id: conv_id.clone(),
@@ -5262,6 +5269,14 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 }
             }
         }
+        KeyCode::Char('x') | KeyCode::Char('X') if !nr.legacy_providers.is_empty() => {
+            nr.legacy_providers.clear();
+            app.flash("legacy providers cleared".to_string(), INFO);
+        }
+        KeyCode::Delete if !nr.legacy_providers.is_empty() => {
+            nr.legacy_providers.clear();
+            app.flash("legacy providers cleared".to_string(), INFO);
+        }
         KeyCode::Char(c)
             if nr.field == NewRunField::Roles
                 && nr.editing_model
@@ -5272,7 +5287,12 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         KeyCode::Char('d')
             if nr.field == NewRunField::Roles && mods.contains(KeyModifiers::CONTROL) =>
         {
-            let spec = new_run_spec(nr, &app.cfg);
+            let cfg_for_spec = nr
+                .project
+                .as_ref()
+                .and_then(|p| crate::config::Config::load(p).ok())
+                .unwrap_or_else(|| app.cfg.clone());
+            let spec = new_run_spec(nr, &cfg_for_spec);
             match crate::defaults::save(&spec) {
                 Ok(()) => app.flash("defaults saved".to_string(), INFO),
                 Err(e) => app.flash(format!("defaults save failed: {e:#}"), ALERT),
@@ -11345,7 +11365,7 @@ fn draw_new_run(f: &mut Frame, area: Rect, projects: &[registry::ProjectEntry], 
             ));
         }
         lines.push((
-            "  Pick a workflow to map, or clear legacy to launch".to_string(),
+            "  Pick a workflow to map, or press x to clear legacy".to_string(),
             Style::default().fg(FG_MUTED),
         ));
     }
@@ -22818,5 +22838,131 @@ mod chat_acceptance {
             "saving defaults must not touch project spar.toml"
         );
         crate::defaults::set_test_home(None);
+    }
+
+    #[test]
+    fn legacy_provider_clear_via_x_allows_launch() {
+        let tmp = tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&proj)
+            .output()
+            .unwrap();
+        let cfg = Config::default();
+        let mut nr = pending_new_run(
+            Some(proj.clone()),
+            vec![proj.clone()],
+            "task".into(),
+            NewRunField::Task,
+            101,
+        );
+        nr.legacy_providers = vec!["invalid-provider".into(), "cli:claude@opus".into()];
+        assert_eq!(nr.legacy_providers.len(), 2);
+        let mut app = App::new(None, cfg.clone(), Some(proj.as_path()));
+        app.new_run = Some(nr);
+        handle_new_run_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        let nr_after = app.new_run.as_ref().unwrap();
+        assert!(
+            nr_after.legacy_providers.is_empty(),
+            "pressing x must clear legacy providers: {:?}",
+            nr_after.legacy_providers
+        );
+        // Neutralisation: without the clear handler, legacy would remain and block launch
+        let mut nr2 = pending_new_run(
+            Some(proj.clone()),
+            vec![proj.clone()],
+            "task".into(),
+            NewRunField::Task,
+            102,
+        );
+        nr2.legacy_providers = vec!["invalid-provider".into()];
+        let mut app2 = App::new(None, cfg.clone(), Some(proj.as_path()));
+        app2.new_run = Some(nr2);
+        // Simulate that handler did not clear (neutralised) – legacy still blocks
+        let nr2_ref = app2.new_run.as_ref().unwrap();
+        assert!(
+            !nr2_ref.legacy_providers.is_empty(),
+            "neutralisation check: legacy must still block without clear"
+        );
+        let spec2 = new_run_spec(nr2_ref, &cfg);
+        assert!(
+            spec2.validate_for_launch(&cfg).is_err(),
+            "legacy must block launch when not cleared"
+        );
+    }
+
+    #[test]
+    fn chat_pending_spec_uses_selected_project_config_for_arena() {
+        let tmp_a = tempdir().unwrap();
+        let proj_a = tmp_a.path().join("proj-a");
+        std::fs::create_dir_all(&proj_a).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&proj_a)
+            .output()
+            .unwrap();
+        let tmp_b = tempdir().unwrap();
+        let proj_b = tmp_b.path().join("proj-b");
+        std::fs::create_dir_all(&proj_b).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&proj_b)
+            .output()
+            .unwrap();
+        std::fs::write(proj_a.join("spar.toml"), "max_agents = 5\n").unwrap();
+        let cfg_a_loaded = Config::load(&proj_a).unwrap();
+        assert_eq!(cfg_a_loaded.max_agents, 5);
+        let cfg_b = Config {
+            max_agents: 2,
+            ..Default::default()
+        };
+        let mut nr = pending_new_run(
+            Some(proj_a.clone()),
+            vec![proj_a.clone(), proj_b.clone()],
+            "arena task".into(),
+            NewRunField::Task,
+            103,
+        );
+        nr.workflow = Some(crate::runspec::SpecWorkflow::Arena);
+        let pins: Vec<Option<crate::runspec::Pin>> = (0..5)
+            .map(|i| Some(crate::runspec::Pin::parse(&format!("cli:claude@model{i}")).unwrap()))
+            .collect();
+        nr.arena_pool = pins.clone();
+        let app_cfg = cfg_b;
+        let spec_via_selected = {
+            let cfg_for_spec = nr
+                .project
+                .as_ref()
+                .and_then(|p| crate::config::Config::load(p).ok())
+                .unwrap_or_else(|| app_cfg.clone());
+            new_run_spec(&nr, &cfg_for_spec)
+        };
+        assert_eq!(
+            spec_via_selected.arena_pool.len(),
+            5,
+            "selected project config with max_agents 5 must keep 5 positions"
+        );
+        assert!(
+            spec_via_selected.blanks(&cfg_a_loaded).is_empty(),
+            "completed arena pool must have no blanks under its own config"
+        );
+        let spec_via_app_cfg = new_run_spec(&nr, &app_cfg);
+        assert_eq!(
+            spec_via_app_cfg.arena_pool.len(),
+            2,
+            "app.cfg with max_agents 2 would truncate to 2 (bug)"
+        );
+        assert!(
+            !spec_via_app_cfg.blanks(&app_cfg).is_empty()
+                || spec_via_app_cfg
+                    .arena_pool
+                    .iter()
+                    .filter(|p| p.is_some())
+                    .count()
+                    != 5,
+            "neutralisation: app.cfg path must differ from selected project path"
+        );
     }
 }

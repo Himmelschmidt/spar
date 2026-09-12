@@ -2571,39 +2571,44 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
         } else {
             crate::backup::dispatch_stop_cause(&slot_state, &cur, &store, available_opt.as_ref())
         };
-        if cause == crate::backup::StopCause::Environmental {
-            if let Some(backup_raw) = crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
-            {
-                let backup_key = crate::provider_ref::ProviderRef::parse(&backup_raw)
-                    .map(|r| r.storage_key())
-                    .unwrap_or_else(|_| backup_raw.clone());
-                let used_contains_backup = used.iter().any(|u| {
-                    crate::provider_ref::ProviderRef::parse(u)
-                        .map(|r| r.storage_key())
-                        .unwrap_or_else(|_| u.clone())
-                        == backup_key
-                });
-                if !used_contains_backup
-                    && crate::backup::is_provider_eligible(
-                        &backup_raw,
-                        &store,
-                        available_opt.as_ref(),
-                    )
-                    && slot_state.source != Some(SeatSource::Backup)
+        if has_backup {
+            if cause == crate::backup::StopCause::Environmental {
+                if let Some(backup_raw) =
+                    crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
                 {
-                    let backup_pin = crate::runspec::Pin::parse(&backup_raw)
-                        .map(|p| p.display())
-                        .unwrap_or(backup_raw.clone());
-                    let impl_id = slot_state.id.clone();
-                    if let Some(s) = state.slot_mut(&impl_id) {
-                        set_slot_provider(s, backup_pin);
-                        s.source = Some(SeatSource::Backup);
-                        s.status = SlotStatus::Pending;
-                        s.error = None;
+                    let backup_key = crate::provider_ref::ProviderRef::parse(&backup_raw)
+                        .map(|r| r.storage_key())
+                        .unwrap_or_else(|_| backup_raw.clone());
+                    let used_contains_backup = used.iter().any(|u| {
+                        crate::provider_ref::ProviderRef::parse(u)
+                            .map(|r| r.storage_key())
+                            .unwrap_or_else(|_| u.clone())
+                            == backup_key
+                    });
+                    if !used_contains_backup
+                        && crate::backup::is_provider_eligible(
+                            &backup_raw,
+                            &store,
+                            available_opt.as_ref(),
+                        )
+                        && slot_state.source != Some(SeatSource::Backup)
+                    {
+                        let backup_pin = crate::runspec::Pin::parse(&backup_raw)
+                            .map(|p| p.display())
+                            .unwrap_or(backup_raw.clone());
+                        let impl_id = slot_state.id.clone();
+                        if let Some(s) = state.slot_mut(&impl_id) {
+                            set_slot_provider(s, backup_pin);
+                            s.source = Some(SeatSource::Backup);
+                            s.status = SlotStatus::Pending;
+                            s.error = None;
+                        }
+                        state.save(paths)?;
+                        return Ok(true);
                     }
-                    state.save(paths)?;
-                    return Ok(true);
                 }
+                return Ok(false);
+            } else {
                 return Ok(false);
             }
         }
@@ -3022,17 +3027,67 @@ mod try_rotate_implementer_tests {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         let mut st = state_with_impl("cli:claude", Some(SeatSource::CliRole), false);
-        // No pause, quota_hit false, provider available -> Work
         let mut cfg = Config::default();
         cfg.providers.order = vec!["cli:claude".into(), "cli:codex".into(), "cli:grok".into()];
         cfg.roles.implementer = Some("cli:claude".into());
         cfg.cli_role_keys.insert("implementer".into());
         cfg.backups.implementer = Some("cli:grok@backup".into());
-        // Work cause: dispatch_stop_cause will be Work, so backup branch not taken, falls to pool
         let changed = try_rotate_implementer(&mut st, &paths, &cfg).unwrap();
-        assert!(changed, "work failure should still rotate via pool");
+        assert!(
+            !changed,
+            "work failure with backup declared must not rotate at all (no backup, no pool)"
+        );
+        assert_eq!(st.slots[0].provider, "cli:claude");
+        assert_ne!(st.slots[0].source, Some(SeatSource::Backup));
+    }
+
+    #[test]
+    fn work_failure_without_backup_still_rotates_to_pool() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = state_with_impl("cli:claude", Some(SeatSource::CliRole), false);
+        let mut cfg = Config::default();
+        cfg.providers.order = vec!["cli:claude".into(), "cli:codex".into(), "cli:grok".into()];
+        cfg.roles.implementer = Some("cli:claude".into());
+        cfg.cli_role_keys.insert("implementer".into());
+        cfg.backups.implementer = None;
+        let changed = try_rotate_implementer(&mut st, &paths, &cfg).unwrap();
+        assert!(
+            changed,
+            "work failure without backup should rotate via pool"
+        );
         assert_eq!(st.slots[0].provider, "cli:codex");
         assert_ne!(st.slots[0].source, Some(SeatSource::Backup));
+    }
+
+    #[test]
+    fn work_failure_with_declared_backup_neutralisation_fails() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = state_with_impl("cli:claude", Some(SeatSource::CliRole), false);
+        let mut cfg = Config::default();
+        cfg.providers.order = vec!["cli:claude".into(), "cli:codex".into(), "cli:grok".into()];
+        cfg.roles.implementer = Some("cli:claude".into());
+        cfg.cli_role_keys.insert("implementer".into());
+        cfg.backups.implementer = Some("cli:grok@backup".into());
+        let changed = try_rotate_implementer(&mut st, &paths, &cfg).unwrap();
+        assert!(
+            !changed,
+            "neutralisation check: work with backup must not activate backup"
+        );
+        assert_ne!(st.slots[0].source, Some(SeatSource::Backup));
+        assert_eq!(st.slots[0].provider, "cli:claude");
+        // Environmental should still activate backup – proves branch not neutralised to always false
+        {
+            let mut store = crate::quota::QuotaStore::default();
+            store.pause_quota("cli:claude", "test");
+            store.save(&paths).unwrap();
+        }
+        let mut st2 = state_with_impl("cli:claude", Some(SeatSource::CliRole), false);
+        st2.slots[0].quota_hit = false;
+        let changed2 = try_rotate_implementer(&mut st2, &paths, &cfg).unwrap();
+        assert!(changed2, "environmental with same backup must activate");
+        assert_eq!(st2.slots[0].source, Some(SeatSource::Backup));
     }
 
     #[test]

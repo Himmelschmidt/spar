@@ -300,12 +300,99 @@ pub fn execute_plan(
 
     for job in jobs {
         if let Err(e) = executor::run_slot(state, paths, cfg, job) {
-            // A quota-detected failure parks the run regardless of role: the critic is
-            // best-effort feedback for the planner (a genuine critic defect still just
-            // marks the slot Failed and the plan proceeds without it, unchanged), but a
-            // rate limit is not a defect to shrug off — it must surface on the quota
-            // gate the same way the planner's own dispatch already does, not silently
-            // finish a plan with the critic's rate limit invisible to the caller.
+            let slot_state = state.slots.iter().find(|s| s.id == job.slot_id).cloned();
+            let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+            let has_backup_global = cfg.backups.planner.is_some()
+                || cfg.backups.plan_critic.is_some()
+                || cfg.backups.test_author.is_some();
+            let available: Option<std::collections::HashSet<String>> = if state.dry_run
+                || !has_backup_global
+            {
+                None
+            } else {
+                let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+                    .into_iter()
+                    .filter(|r| r.available)
+                    .map(|r| format!("cli:{}", r.name))
+                    .collect();
+                if detected.is_empty() {
+                    None
+                } else {
+                    Some(detected)
+                }
+            };
+            let mut handled_via_backup = false;
+            if let Some(slot_state) = slot_state {
+                let cause = crate::backup::dispatch_stop_cause(
+                    &slot_state,
+                    &job.provider,
+                    &store,
+                    available.as_ref(),
+                );
+                if cause == crate::backup::StopCause::Environmental
+                    && slot_state.source != Some(SeatSource::Backup)
+                {
+                    if let Some(raw) = crate::backup::backup_for_role(job.role, 0, cfg) {
+                        if crate::backup::is_provider_eligible(&raw, &store, available.as_ref()) {
+                            let cur_key = crate::provider_ref::ProviderRef::parse(&job.provider)
+                                .map(|r| r.storage_key())
+                                .unwrap_or_else(|_| job.provider.clone());
+                            let backup_key = crate::provider_ref::ProviderRef::parse(&raw)
+                                .map(|r| r.storage_key())
+                                .unwrap_or_else(|_| raw.clone());
+                            if cur_key != backup_key {
+                                if let Ok(pin) = crate::runspec::Pin::parse(&raw) {
+                                    if let Some(s) = state.slot_mut(&job.slot_id) {
+                                        s.provider = pin.provider.clone();
+                                        s.model = pin.model.clone();
+                                        s.source = Some(SeatSource::Backup);
+                                        s.status = crate::state::SlotStatus::Pending;
+                                        s.error = None;
+                                        s.quota_hit = false;
+                                    }
+                                    state.save(paths)?;
+                                    let retry_job = SlotJob {
+                                        slot_id: job.slot_id.clone(),
+                                        provider: pin.display(),
+                                        role: job.role,
+                                        template: job.template.clone(),
+                                        extra_vars: job.extra_vars.clone(),
+                                        expected_artifact: job.expected_artifact.clone(),
+                                        model: pin.model.clone(),
+                                    };
+                                    match executor::run_slot(state, paths, cfg, &retry_job) {
+                                        Ok(()) => {
+                                            handled_via_backup = true;
+                                        }
+                                        Err(e2) => {
+                                            if executor::slot_quota_hit(state, &retry_job.slot_id) {
+                                                state.error = Some(e2.to_string());
+                                                state.set_phase(Phase::Quota);
+                                                state.save(paths)?;
+                                                return Ok(());
+                                            }
+                                            if retry_job.role == SlotRole::Planner {
+                                                state.error = Some(e2.to_string());
+                                                state.set_phase(Phase::Failed);
+                                                state.save(paths)?;
+                                                return Err(e2);
+                                            }
+                                            if let Some(s) = state.slot_mut(&retry_job.slot_id) {
+                                                s.status = crate::state::SlotStatus::Failed;
+                                                s.error = Some(e2.to_string());
+                                            }
+                                            handled_via_backup = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if handled_via_backup {
+                continue;
+            }
             if executor::slot_quota_hit(state, &job.slot_id) {
                 state.error = Some(e.to_string());
                 state.set_phase(Phase::Quota);
@@ -520,15 +607,98 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
     };
 
     if let Err(e) = executor::run_slot(state, paths, cfg, &job) {
-        state.error = Some(format!("test-author failed: {e}"));
-        if executor::slot_quota_hit(state, &id) {
-            state.set_phase(Phase::Quota);
-            state.save(paths)?;
-            return Ok(());
+        let slot_state = state.slots.iter().find(|s| s.id == id).cloned();
+        let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+        let has_backup = cfg.backups.test_author.is_some();
+        let available: Option<std::collections::HashSet<String>> = if state.dry_run || !has_backup {
+            None
+        } else {
+            let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+                .into_iter()
+                .filter(|r| r.available)
+                .map(|r| format!("cli:{}", r.name))
+                .collect();
+            if detected.is_empty() {
+                None
+            } else {
+                Some(detected)
+            }
+        };
+        let mut handled = false;
+        if let Some(slot_state) = slot_state {
+            let cause = crate::backup::dispatch_stop_cause(
+                &slot_state,
+                &job.provider,
+                &store,
+                available.as_ref(),
+            );
+            if cause == crate::backup::StopCause::Environmental
+                && slot_state.source != Some(crate::state::SeatSource::Backup)
+            {
+                if let Some(raw) = crate::backup::backup_for_role(SlotRole::TestAuthor, 0, cfg) {
+                    if crate::backup::is_provider_eligible(&raw, &store, available.as_ref()) {
+                        let cur_key = crate::provider_ref::ProviderRef::parse(&job.provider)
+                            .map(|r| r.storage_key())
+                            .unwrap_or_else(|_| job.provider.clone());
+                        let backup_key = crate::provider_ref::ProviderRef::parse(&raw)
+                            .map(|r| r.storage_key())
+                            .unwrap_or_else(|_| raw.clone());
+                        if cur_key != backup_key {
+                            if let Ok(pin) = crate::runspec::Pin::parse(&raw) {
+                                if let Some(s) = state.slot_mut(&id) {
+                                    s.provider = pin.provider.clone();
+                                    s.model = pin.model.clone();
+                                    s.source = Some(crate::state::SeatSource::Backup);
+                                    s.status = crate::state::SlotStatus::Pending;
+                                    s.error = None;
+                                    s.quota_hit = false;
+                                }
+                                state.save(paths)?;
+                                let retry_job = SlotJob {
+                                    slot_id: id.clone(),
+                                    provider: pin.display(),
+                                    role: SlotRole::TestAuthor,
+                                    template: "test_author".into(),
+                                    extra_vars: job.extra_vars.clone(),
+                                    expected_artifact: Some("test-contract.md".into()),
+                                    model: pin.model.clone(),
+                                };
+                                match executor::run_slot(state, paths, cfg, &retry_job) {
+                                    Ok(()) => {
+                                        handled = true;
+                                    }
+                                    Err(e2) => {
+                                        if executor::slot_quota_hit(state, &id) {
+                                            state.error = Some(format!("test-author failed: {e2}"));
+                                            state.set_phase(Phase::Quota);
+                                            state.save(paths)?;
+                                            return Ok(());
+                                        }
+                                        state.error = Some(format!("test-author failed: {e2}"));
+                                        state.set_phase(Phase::Failed);
+                                        state.save(paths)?;
+                                        return Err(e2);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
-        state.set_phase(Phase::Failed);
-        state.save(paths)?;
-        return Err(e);
+        if handled {
+            // retry succeeded, continue without error
+        } else {
+            state.error = Some(format!("test-author failed: {e}"));
+            if executor::slot_quota_hit(state, &id) {
+                state.set_phase(Phase::Quota);
+                state.save(paths)?;
+                return Ok(());
+            }
+            state.set_phase(Phase::Failed);
+            state.save(paths)?;
+            return Err(e);
+        }
     }
 
     let contract = paths.artifact(&state.id, "test-contract.md");

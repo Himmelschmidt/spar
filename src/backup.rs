@@ -88,6 +88,9 @@ pub fn dispatch_stop_cause(
     store: &QuotaStore,
     available: Option<&std::collections::HashSet<String>>,
 ) -> StopCause {
+    if !slot.quota_hit && slot.status != crate::state::SlotStatus::Failed {
+        return StopCause::Work;
+    }
     if slot.quota_hit {
         return StopCause::Environmental;
     }
@@ -136,7 +139,8 @@ mod tests {
     fn paused_provider_is_environmental() {
         let mut store = QuotaStore::default();
         store.pause_quota("cli:claude", "test");
-        let slot = slot_with_quota(false);
+        let mut slot = slot_with_quota(false);
+        slot.status = SlotStatus::Failed;
         assert_eq!(
             dispatch_stop_cause(&slot, "cli:claude", &store, None),
             StopCause::Environmental
@@ -146,12 +150,38 @@ mod tests {
     #[test]
     fn unavailable_provider_is_environmental() {
         let store = QuotaStore::default();
-        let slot = slot_with_quota(false);
+        let mut slot = slot_with_quota(false);
+        slot.status = SlotStatus::Failed;
         let mut set = std::collections::HashSet::new();
         set.insert("cli:grok".to_string());
         assert_eq!(
             dispatch_stop_cause(&slot, "cli:claude", &store, Some(&set)),
             StopCause::Environmental
+        );
+    }
+
+    #[test]
+    fn succeeded_slot_is_not_environmental_even_when_provider_paused() {
+        let mut store = QuotaStore::default();
+        store.pause_quota("cli:claude", "test");
+        let mut slot = slot_with_quota(false);
+        slot.status = SlotStatus::Done;
+        assert_eq!(
+            dispatch_stop_cause(&slot, "cli:claude", &store, None),
+            StopCause::Work
+        );
+    }
+
+    #[test]
+    fn pending_slot_is_not_environmental_even_when_unavailable() {
+        let store = QuotaStore::default();
+        let mut slot = slot_with_quota(false);
+        slot.status = SlotStatus::Pending;
+        let mut set = std::collections::HashSet::new();
+        set.insert("cli:grok".to_string());
+        assert_eq!(
+            dispatch_stop_cause(&slot, "cli:claude", &store, Some(&set)),
+            StopCause::Work
         );
     }
 
@@ -224,13 +254,10 @@ mod tests {
             &store,
             Some(&set)
         ));
+        let mut slot = slot_with_quota(false);
+        slot.status = SlotStatus::Failed;
         assert_eq!(
-            dispatch_stop_cause(
-                &slot_with_quota(false),
-                "api:openai@gpt-5",
-                &store,
-                Some(&set)
-            ),
+            dispatch_stop_cause(&slot, "api:openai@gpt-5", &store, Some(&set)),
             StopCause::Environmental
         );
     }

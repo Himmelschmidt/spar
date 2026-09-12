@@ -216,6 +216,82 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
 
     executor::run_slots_parallel(state, paths, cfg, &jobs)?;
 
+    let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+    let has_backup = !cfg.backups.reviewer.is_empty();
+    let available: Option<std::collections::HashSet<String>> = if state.dry_run || !has_backup {
+        None
+    } else {
+        let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+            .into_iter()
+            .filter(|r| r.available)
+            .map(|r| format!("cli:{}", r.name))
+            .collect();
+        if detected.is_empty() {
+            None
+        } else {
+            Some(detected)
+        }
+    };
+    for (idx, job) in jobs.iter().enumerate() {
+        let slot_state = match state.slots.iter().find(|s| s.id == job.slot_id).cloned() {
+            Some(s) => s,
+            None => continue,
+        };
+        if slot_state.status != SlotStatus::Failed {
+            continue;
+        }
+        let cause = crate::backup::dispatch_stop_cause(
+            &slot_state,
+            &job.provider,
+            &store,
+            available.as_ref(),
+        );
+        if cause != crate::backup::StopCause::Environmental
+            || slot_state.source == Some(crate::state::SeatSource::Backup)
+        {
+            continue;
+        }
+        let backup_raw = match crate::backup::backup_for_role(SlotRole::Reviewer, idx, cfg) {
+            Some(b) => b,
+            None => continue,
+        };
+        if !crate::backup::is_provider_eligible(&backup_raw, &store, available.as_ref()) {
+            continue;
+        }
+        let cur_key = crate::provider_ref::ProviderRef::parse(&job.provider)
+            .map(|r| r.storage_key())
+            .unwrap_or_else(|_| job.provider.clone());
+        let backup_key = crate::provider_ref::ProviderRef::parse(&backup_raw)
+            .map(|r| r.storage_key())
+            .unwrap_or_else(|_| backup_raw.clone());
+        if cur_key == backup_key {
+            continue;
+        }
+        let pin = match crate::runspec::Pin::parse(&backup_raw) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if let Some(s) = state.slot_mut(&job.slot_id) {
+            s.provider = pin.provider.clone();
+            s.model = pin.model.clone();
+            s.source = Some(crate::state::SeatSource::Backup);
+            s.status = SlotStatus::Pending;
+            s.error = None;
+            s.quota_hit = false;
+        }
+        state.save(paths)?;
+        let retry_job = SlotJob {
+            slot_id: job.slot_id.clone(),
+            provider: pin.display(),
+            role: job.role,
+            template: job.template.clone(),
+            extra_vars: job.extra_vars.clone(),
+            expected_artifact: job.expected_artifact.clone(),
+            model: pin.model.clone(),
+        };
+        let _ = executor::run_slot(state, paths, cfg, &retry_job);
+    }
+
     // Aggregate
     let mut body = format!(
         "# Independent review summary\n\nRun: {}\nTask: {}\n\n",
