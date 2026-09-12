@@ -321,8 +321,13 @@ impl RunSpec {
         match wf {
             SpecWorkflow::Plan => {
                 argv.push("plan".to_string());
-                argv.push("-t".to_string());
-                argv.push(self.task.trim().to_string());
+                if let Some(brief) = &self.brief_path {
+                    argv.push("--brief".to_string());
+                    argv.push(brief.display().to_string());
+                } else {
+                    argv.push("-t".to_string());
+                    argv.push(self.task.trim().to_string());
+                }
             }
             SpecWorkflow::Implement => {
                 argv.push("implement".to_string());
@@ -433,6 +438,15 @@ impl RunSpec {
             } else {
                 0
             };
+            if let Some(wf) = spec.workflow {
+                let dispatched = spec_rows(wf, cfg);
+                if !dispatched
+                    .iter()
+                    .any(|(r, o)| *r == role && *o == actual_ordinal)
+                {
+                    continue;
+                }
+            }
             if let Some(existing) = spec
                 .roles
                 .iter_mut()
@@ -461,6 +475,15 @@ impl RunSpec {
             } else {
                 0
             };
+            if let Some(wf) = spec.workflow {
+                let dispatched = spec_rows(wf, cfg);
+                if !dispatched
+                    .iter()
+                    .any(|(r, o)| *r == role && *o == actual_ordinal)
+                {
+                    continue;
+                }
+            }
             if let Some(existing) = spec
                 .roles
                 .iter_mut()
@@ -478,10 +501,7 @@ impl RunSpec {
                 });
             }
         }
-        if !proposal.providers.is_empty()
-            && proposal.roles.is_empty()
-            && proposal.reviewer.is_empty()
-        {
+        if !proposal.providers.is_empty() {
             if let Some(wf) = spec.workflow {
                 if wf != SpecWorkflow::Arena {
                     let rows = spec_rows(wf, cfg);
@@ -506,6 +526,8 @@ impl RunSpec {
                                             primary: Some(pin),
                                             backup: None,
                                         });
+                                    } else {
+                                        spec.legacy_providers.push(raw.clone());
                                     }
                                 }
                                 Err(_) => {
@@ -1021,8 +1043,8 @@ mod tests {
         );
         let has_implementer = result.roles.iter().any(|r| r.role == SlotRole::Implementer);
         assert!(
-            has_implementer,
-            "proposal's implementer should be added as new role"
+            !has_implementer,
+            "proposal's implementer must not be injected into a Plan spec — only dispatched roles are added"
         );
     }
 

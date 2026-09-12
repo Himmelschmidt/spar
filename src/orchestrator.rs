@@ -585,11 +585,69 @@ fn dispatch_turn_inner(
             run_id, conv, turn
         ));
     } else {
-        prompt.push_str("You are the orchestrator. Interview the operator into a brief. You may propose a fleet with a ```spar-proposal TOML block (task, brief, providers). Only the TUI launches; you never approve, confirm, merge, or pick a fleet. Send your one reply via:\n");
+        prompt.push_str("You are the orchestrator. Interview the operator into a brief. You may propose a fleet with a ```spar-proposal TOML block. Fields: task (string), brief (string), workflow (plan|implement|review|arena), providers (array, legacy positional pool), [roles] table (planner, plan_critic, implementer, tester, test_author = \"provider\" and reviewer = [...]), [backups] table (same shape, per-role backup). Example:\n```spar-proposal\ntask = \"do thing\"\nbrief = \"detailed brief\"\nworkflow = \"plan\"\n[roles]\nplanner = \"cli:claude@opus\"\nreviewer = [\"cli:codex@terra\", \"cli:grok@fast\"]\n[backups]\nplanner = \"cli:grok@fast\"\nreviewer = [\"cli:claude@sonnet\", \"cli:codex@luna\"]\n```\nOnly blank fields will be applied; operator-filled values are preserved. Only the TUI launches; you never approve, confirm, merge, or pick a fleet. Send your one reply via:\n");
         prompt.push_str(&format!(
             "spar bus send --from \"$SPAR_AGENT_ID\" --to @human --surface chat --conversation {} --turn {} --message \"...\"\n",
             conv, turn
         ));
+        let defaults = crate::defaults::load();
+        let cfg = crate::config::Config::load(&paths.project_root).unwrap_or_default();
+        let partial = crate::runspec::RunSpec {
+            workflow: defaults.workflow,
+            task: defaults.task.clone(),
+            roles: defaults.roles.clone(),
+            arena_pool: defaults.arena_pool.clone(),
+            ..Default::default()
+        };
+        let blanks = partial.blanks(&cfg);
+        if !blanks.is_empty() || partial.workflow.is_none() || partial.task.trim().is_empty() {
+            prompt.push_str("\n\n## Partial run spec (operator has pre-filled)\n");
+            if let Some(wf) = partial.workflow {
+                prompt.push_str(&format!("workflow: {}\n", wf.as_str()));
+            } else {
+                prompt.push_str("workflow: (unset — you may propose one)\n");
+            }
+            if partial.task.trim().is_empty() {
+                prompt.push_str("task: (blank)\n");
+            } else {
+                prompt.push_str(&format!("task: {}\n", partial.task));
+            }
+            let rows = partial
+                .workflow
+                .map(|wf| crate::runspec::spec_rows(wf, &cfg))
+                .unwrap_or_default();
+            for (role, ord) in rows {
+                if let Some(ra) = partial
+                    .roles
+                    .iter()
+                    .find(|r| r.role == role && r.ordinal == ord)
+                {
+                    if let Some(p) = &ra.primary {
+                        prompt.push_str(&format!(
+                            "{}[{}]: {}\n",
+                            role.as_config_key(),
+                            ord,
+                            p.display()
+                        ));
+                    } else {
+                        prompt.push_str(&format!("{}[{}]: (blank)\n", role.as_config_key(), ord));
+                    }
+                } else {
+                    prompt.push_str(&format!("{}[{}]: (blank)\n", role.as_config_key(), ord));
+                }
+            }
+            if partial.workflow == Some(crate::runspec::SpecWorkflow::Arena) {
+                for (idx, slot) in partial.arena_pool.iter().enumerate() {
+                    if let Some(p) = slot {
+                        prompt.push_str(&format!("arena[{}]: {}\n", idx, p.display()));
+                    } else {
+                        prompt.push_str(&format!("arena[{}]: (blank)\n", idx));
+                    }
+                }
+            }
+            prompt.push_str(&format!("blanks: {}\n", blanks.join(", ")));
+            prompt.push_str("Propose only blanks; do not overwrite filled fields.\n");
+        }
     }
     // Include transcript
     let scope = if req.scope_key == "home" {

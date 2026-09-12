@@ -4440,14 +4440,16 @@ fn pending_new_run(
             if arena_pool.len() != expected.len() {
                 arena_pool.resize_with(expected.len(), || None);
             }
-        } else if roles.is_empty() && !expected.is_empty() {
+        } else {
             for (role, ordinal) in expected {
-                roles.push(crate::runspec::RoleAssignment {
-                    role,
-                    ordinal,
-                    primary: None,
-                    backup: None,
-                });
+                if !roles.iter().any(|r| r.role == role && r.ordinal == ordinal) {
+                    roles.push(crate::runspec::RoleAssignment {
+                        role,
+                        ordinal,
+                        primary: None,
+                        backup: None,
+                    });
+                }
             }
         }
     }
@@ -4758,6 +4760,46 @@ fn toggle_roster_pick(nr: &mut NewRun, i: usize) {
 
 /// Keys while the Phase D new-run modal is open.
 fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+    if let Some(nr) = app.new_run.as_mut() {
+        if nr.editing_model {
+            match code {
+                KeyCode::Esc => {
+                    nr.editing_model = false;
+                    nr.model_buffer.clear();
+                    return;
+                }
+                KeyCode::Enter => {
+                    if nr.workflow == Some(crate::runspec::SpecWorkflow::Arena) {
+                        if let Some(Some(pin)) = nr.arena_pool.get_mut(nr.role_sel) {
+                            if nr.model_buffer.trim().is_empty() {
+                                pin.model = None;
+                            } else {
+                                pin.model = Some(nr.model_buffer.trim().to_string());
+                            }
+                        }
+                    } else if let Some(ra) = nr.roles.get_mut(nr.role_sel) {
+                        let target = if nr.editing_backup {
+                            &mut ra.backup
+                        } else {
+                            &mut ra.primary
+                        };
+                        if let Some(pin) = target {
+                            if nr.model_buffer.trim().is_empty() {
+                                pin.model = None;
+                            } else {
+                                let new_model = nr.model_buffer.trim().to_string();
+                                pin.model = Some(new_model);
+                            }
+                        }
+                    }
+                    nr.editing_model = false;
+                    nr.model_buffer.clear();
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
     if code == KeyCode::Esc {
         app.new_run = None;
         app.chat_pending_proposal = None;
@@ -4908,6 +4950,14 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 .unwrap_or(0);
             let i = if i == 0 { nr.projects.len() - 1 } else { i - 1 };
             nr.project = nr.projects.get(i).cloned();
+            if nr.workflow.is_some() {
+                let cfg = nr
+                    .project
+                    .as_ref()
+                    .and_then(|p| crate::config::Config::load(p).ok())
+                    .unwrap_or_else(|| app.cfg.clone());
+                rebuild_roles_for_workflow(nr, &cfg);
+            }
         }
         KeyCode::Right if nr.field == NewRunField::Project && !nr.projects.is_empty() => {
             let i = nr
@@ -4917,6 +4967,14 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 .unwrap_or(0);
             let i = (i + 1) % nr.projects.len();
             nr.project = nr.projects.get(i).cloned();
+            if nr.workflow.is_some() {
+                let cfg = nr
+                    .project
+                    .as_ref()
+                    .and_then(|p| crate::config::Config::load(p).ok())
+                    .unwrap_or_else(|| app.cfg.clone());
+                rebuild_roles_for_workflow(nr, &cfg);
+            }
         }
         KeyCode::Char(' ') if nr.field == NewRunField::Fleet => {
             if nr.workflow.is_some() && (!nr.roles.is_empty() || !nr.arena_pool.is_empty()) {
@@ -4994,7 +5052,11 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 }
                 Some(crate::runspec::SpecWorkflow::Arena) => None,
             };
-            let cfg = app.cfg.clone();
+            let cfg = nr
+                .project
+                .as_ref()
+                .and_then(|p| crate::config::Config::load(p).ok())
+                .unwrap_or_else(|| app.cfg.clone());
             rebuild_roles_for_workflow(nr, &cfg);
         }
         KeyCode::Left
@@ -5013,7 +5075,11 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 }
                 None => Some(crate::runspec::SpecWorkflow::Arena),
             };
-            let cfg = app.cfg.clone();
+            let cfg = nr
+                .project
+                .as_ref()
+                .and_then(|p| crate::config::Config::load(p).ok())
+                .unwrap_or_else(|| app.cfg.clone());
             rebuild_roles_for_workflow(nr, &cfg);
         }
         KeyCode::Right
@@ -5032,7 +5098,11 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 }
                 Some(crate::runspec::SpecWorkflow::Arena) => None,
             };
-            let cfg = app.cfg.clone();
+            let cfg = nr
+                .project
+                .as_ref()
+                .and_then(|p| crate::config::Config::load(p).ok())
+                .unwrap_or_else(|| app.cfg.clone());
             rebuild_roles_for_workflow(nr, &cfg);
         }
         KeyCode::Char('j') | KeyCode::Down
@@ -5095,37 +5165,6 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 }
             }
         }
-        KeyCode::Esc if nr.field == NewRunField::Roles && nr.editing_model => {
-            nr.editing_model = false;
-            nr.model_buffer.clear();
-        }
-        KeyCode::Enter if nr.field == NewRunField::Roles && nr.editing_model => {
-            if nr.workflow == Some(crate::runspec::SpecWorkflow::Arena) {
-                if let Some(Some(pin)) = nr.arena_pool.get_mut(nr.role_sel) {
-                    if nr.model_buffer.trim().is_empty() {
-                        pin.model = None;
-                    } else {
-                        pin.model = Some(nr.model_buffer.trim().to_string());
-                    }
-                }
-            } else if let Some(ra) = nr.roles.get_mut(nr.role_sel) {
-                let target = if nr.editing_backup {
-                    &mut ra.backup
-                } else {
-                    &mut ra.primary
-                };
-                if let Some(pin) = target {
-                    if nr.model_buffer.trim().is_empty() {
-                        pin.model = None;
-                    } else {
-                        let new_model = nr.model_buffer.trim().to_string();
-                        pin.model = Some(new_model);
-                    }
-                }
-            }
-            nr.editing_model = false;
-            nr.model_buffer.clear();
-        }
         KeyCode::Char(c)
             if nr.field == NewRunField::Roles
                 && nr.editing_model
@@ -5137,8 +5176,10 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             if nr.field == NewRunField::Roles && mods.contains(KeyModifiers::CONTROL) =>
         {
             let spec = new_run_spec(nr, &app.cfg);
-            let _ = crate::defaults::save(&spec);
-            app.flash("defaults saved".to_string(), INFO);
+            match crate::defaults::save(&spec) {
+                Ok(()) => app.flash("defaults saved".to_string(), INFO),
+                Err(e) => app.flash(format!("defaults save failed: {e:#}"), ALERT),
+            }
         }
         KeyCode::Backspace if nr.field == NewRunField::Task => {
             nr.task.pop();
