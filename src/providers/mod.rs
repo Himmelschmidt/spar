@@ -219,7 +219,10 @@ pub trait ProviderAdapter: Send + Sync {
 }
 
 fn probe_version(bin: &PathBuf, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new(bin).args(args).output().ok()?;
+    use std::time::Duration;
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(args);
+    let output = run_with_timeout(&mut cmd, Duration::from_secs(2))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let text = if !stdout.trim().is_empty() {
@@ -235,6 +238,45 @@ fn probe_version(bin: &PathBuf, args: &[&str]) -> Option<String> {
         return Some("available".into());
     }
     Some(line.to_string())
+}
+
+fn run_with_timeout(
+    cmd: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().ok()?;
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut out = Vec::new();
+                let mut err = Vec::new();
+                if let Some(mut stdout) = child.stdout.take() {
+                    let _ = stdout.read_to_end(&mut out);
+                }
+                if let Some(mut stderr) = child.stderr.take() {
+                    let _ = stderr.read_to_end(&mut err);
+                }
+                return Some(std::process::Output {
+                    status,
+                    stdout: out,
+                    stderr: err,
+                });
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
 pub fn all_adapters() -> Vec<Box<dyn ProviderAdapter>> {

@@ -413,7 +413,7 @@ fn hanging_run(dir: &std::path::Path) -> (std::process::Child, std::path::PathBu
     let fake = bin.join("claude");
     std::fs::write(
         &fake,
-        "#!/bin/sh\necho $$ >> \"$SLOT_PIDS_FILE\"\nsleep 300\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ] || [ \"$1\" = \"-v\" ] || [ \"$1\" = \"--help\" ]; then echo \"fake version\"; exit 0; fi\necho $$ >> \"$SLOT_PIDS_FILE\"\nsleep 300\n",
     )
     .unwrap();
     use std::os::unix::fs::PermissionsExt;

@@ -185,6 +185,23 @@ fn plan_slot_specs(
     }
     let store = crate::quota::QuotaStore::load(&crate::paths::SparPaths::new(&state.project_root))
         .unwrap_or_default();
+    let has_backup = cfg.backups.planner.is_some()
+        || cfg.backups.plan_critic.is_some()
+        || cfg.backups.test_author.is_some();
+    let available: Option<std::collections::HashSet<String>> = if state.dry_run || !has_backup {
+        None
+    } else {
+        let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+            .into_iter()
+            .filter(|r| r.available)
+            .map(|r| format!("cli:{}", r.name))
+            .collect();
+        if detected.is_empty() {
+            None
+        } else {
+            Some(detected)
+        }
+    };
     let mut out = Vec::with_capacity(specs.len());
     for (idx, (role, prefix, template)) in specs.into_iter().enumerate() {
         let Some((prov, source)) = crate::backup::resolve_with_backup(
@@ -195,7 +212,7 @@ fn plan_slot_specs(
             state.pool_origin,
             cfg,
             &store,
-            None,
+            available.as_ref(),
         )
         .or_else(|| {
             crate::workflow::roles_resolve::resolve_seat(
@@ -382,15 +399,15 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
         .filter(|s| matches!(s.role, SlotRole::Planner | SlotRole::PlanCritic))
         .map(|s| s.provider.clone())
         .collect();
-    let (provider, source) = resolve_spec_provider(
+    let test_author_idx = 1 + usize::from(cfg.critic.enabled);
+    let (mut provider, mut source) = resolve_spec_provider(
         cfg,
         state.dry_run,
         &state.providers,
         state.pool_origin,
         &used,
     )?;
-    let test_author_idx = 1 + usize::from(cfg.critic.enabled);
-    let model = crate::model_select::load_select_artifact(paths, &state.id)
+    let mut model = crate::model_select::load_select_artifact(paths, &state.id)
         .ok()
         .flatten()
         .and_then(|a| {
@@ -402,6 +419,33 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
                 })
                 .and_then(|c| c.model.clone())
         });
+    let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+    let has_backup = cfg.backups.test_author.is_some();
+    let available: Option<std::collections::HashSet<String>> = if state.dry_run || !has_backup {
+        None
+    } else {
+        let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+            .into_iter()
+            .filter(|r| r.available)
+            .map(|r| format!("cli:{}", r.name))
+            .collect();
+        if detected.is_empty() {
+            None
+        } else {
+            Some(detected)
+        }
+    };
+    if !crate::backup::is_provider_eligible(&provider, &store, available.as_ref()) {
+        if let Some(backup_raw) = crate::backup::backup_for_role(SlotRole::TestAuthor, 0, cfg) {
+            if crate::backup::is_provider_eligible(&backup_raw, &store, available.as_ref()) {
+                if let Ok(pin) = crate::runspec::Pin::parse(&backup_raw) {
+                    provider = pin.display();
+                    source = crate::state::SeatSource::Backup;
+                    model = pin.model;
+                }
+            }
+        }
+    }
     let safe = sanitize_slot(&provider);
     let id = format!("test-author-{safe}");
 

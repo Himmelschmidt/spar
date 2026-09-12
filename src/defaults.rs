@@ -21,6 +21,8 @@ pub fn set_test_home(path: Option<PathBuf>) {
 struct DefaultsFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     workflow: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     roles: Vec<DefaultsRole>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -59,6 +61,7 @@ pub fn load() -> RunSpec {
         Err(_) => return RunSpec::default(),
     };
     let workflow = file.workflow.as_deref().and_then(SpecWorkflow::parse);
+    let task = file.task.clone().unwrap_or_default();
     let mut roles = Vec::new();
     for dr in file.roles {
         let Some(role) = SlotRole::from_config_key(&dr.role) else {
@@ -80,19 +83,24 @@ pub fn load() -> RunSpec {
         .collect();
     RunSpec {
         workflow,
+        task,
         roles,
         arena_pool,
         ..Default::default()
     }
 }
 
-#[allow(dead_code)]
 pub fn save(spec: &RunSpec) -> Result<()> {
     let path = defaults_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let workflow = spec.workflow.map(|w| w.as_str().to_string());
+    let task = if spec.task.trim().is_empty() {
+        None
+    } else {
+        Some(spec.task.clone())
+    };
     let roles = spec
         .roles
         .iter()
@@ -110,6 +118,7 @@ pub fn save(spec: &RunSpec) -> Result<()> {
         .collect();
     let file = DefaultsFile {
         workflow,
+        task,
         roles,
         arena_pool,
     };

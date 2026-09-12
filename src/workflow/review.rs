@@ -68,6 +68,22 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     // pool mixing `[roles]` and `[providers].order` seats reports each honestly.
     let pool_origin = crate::workflow::roles_resolve::pool_origin_for(&opts);
     state.pool_origin = pool_origin;
+    let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+    let has_backup = !cfg.backups.reviewer.is_empty();
+    let available: Option<std::collections::HashSet<String>> = if dry || !has_backup {
+        None
+    } else {
+        let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+            .into_iter()
+            .filter(|r| r.available)
+            .map(|r| format!("cli:{}", r.name))
+            .collect();
+        if detected.is_empty() {
+            None
+        } else {
+            Some(detected)
+        }
+    };
     let sources = crate::workflow::roles_resolve::resolve_seat_sources(
         SlotRole::Reviewer,
         state.providers.len(),
@@ -76,9 +92,45 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         cfg,
     );
     for (i, prov) in state.providers.iter().enumerate() {
-        let id = format!("review-{}-{}", i, sanitize_slot(prov));
-        let mut slot = executor::init_slot(&id, prov, SlotRole::Reviewer);
-        slot.source = sources.get(i).copied();
+        let mut provider = prov.clone();
+        let mut source = sources.get(i).copied();
+        let mut model = crate::runspec::Pin::parse(&provider)
+            .ok()
+            .and_then(|p| p.model);
+        let backup_pin =
+            if !crate::backup::is_provider_eligible(&provider, &store, available.as_ref()) {
+                if let Some(backup_raw) = crate::backup::backup_for_role(SlotRole::Reviewer, i, cfg)
+                {
+                    if crate::backup::is_provider_eligible(&backup_raw, &store, available.as_ref())
+                    {
+                        if let Ok(bpin) = crate::runspec::Pin::parse(&backup_raw) {
+                            provider = bpin.display();
+                            source = Some(crate::state::SeatSource::Backup);
+                            model = bpin.model.clone();
+                            Some(bpin)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+        let id = if source == Some(crate::state::SeatSource::Backup) {
+            if let Some(bpin) = backup_pin {
+                format!("review-{}-{}", i, sanitize_slot(&bpin.provider))
+            } else {
+                format!("review-{}-{}", i, sanitize_slot(&provider))
+            }
+        } else {
+            format!("review-{}-{}", i, sanitize_slot(&provider))
+        };
+        let mut slot = executor::init_slot_model(&id, &provider, SlotRole::Reviewer, model);
+        slot.source = source;
         state.slots.push(slot);
     }
 

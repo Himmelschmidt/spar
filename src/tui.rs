@@ -540,6 +540,8 @@ struct NewRun {
     arena_pool: Vec<Option<crate::runspec::Pin>>,
     role_sel: usize,
     editing_backup: bool,
+    editing_model: bool,
+    model_buffer: String,
 }
 
 struct App {
@@ -1414,6 +1416,8 @@ fn new_run_fixture() -> NewRun {
         arena_pool: vec![],
         role_sel: 0,
         editing_backup: false,
+        editing_model: false,
+        model_buffer: String::new(),
     }
 }
 
@@ -2884,22 +2888,8 @@ fn new_run_spec(nr: &NewRun, cfg: &crate::config::Config) -> crate::runspec::Run
                 }
                 spec.arena_pool = pool;
             }
-        } else if !nr.roles.is_empty() {
-            spec.roles = nr.roles.clone();
         } else {
-            let providers = new_run_providers(nr);
-            let rows = crate::runspec::spec_rows(wf, cfg);
-            for (idx, (role, ordinal)) in rows.iter().enumerate() {
-                let primary = providers
-                    .get(idx)
-                    .and_then(|r| crate::runspec::Pin::parse(r).ok());
-                spec.roles.push(crate::runspec::RoleAssignment {
-                    role: *role,
-                    ordinal: *ordinal,
-                    primary,
-                    backup: None,
-                });
-            }
+            spec.roles = nr.roles.clone();
         }
     }
     spec
@@ -4420,9 +4410,13 @@ fn rebuild_roles_for_workflow(nr: &mut NewRun, cfg: &crate::config::Config) {
         }
         nr.role_sel = 0;
         nr.editing_backup = false;
+        nr.editing_model = false;
+        nr.model_buffer.clear();
     } else {
         nr.roles.clear();
         nr.arena_pool.clear();
+        nr.editing_model = false;
+        nr.model_buffer.clear();
     }
 }
 
@@ -4436,8 +4430,12 @@ fn pending_new_run(
     let defaults = crate::defaults::load();
     let mut roles = defaults.roles.clone();
     let mut arena_pool = defaults.arena_pool.clone();
+    let cfg_for_rows = project
+        .as_ref()
+        .and_then(|p| crate::config::Config::load(p).ok())
+        .unwrap_or_default();
     if let Some(wf) = defaults.workflow {
-        let expected = crate::runspec::spec_rows(wf, &crate::config::Config::default());
+        let expected = crate::runspec::spec_rows(wf, &cfg_for_rows);
         if wf == crate::runspec::SpecWorkflow::Arena {
             if arena_pool.len() != expected.len() {
                 arena_pool.resize_with(expected.len(), || None);
@@ -4472,6 +4470,8 @@ fn pending_new_run(
         arena_pool,
         role_sel: 0,
         editing_backup: false,
+        editing_model: false,
+        model_buffer: String::new(),
     }
 }
 
@@ -4558,6 +4558,7 @@ fn apply_proposal_to_roster(
     roster: &mut Vec<RosterEntry>,
     nr: &mut NewRun,
 ) {
+    let workflow_was_none = nr.workflow.is_none();
     if nr.task.trim().is_empty() {
         nr.task = proposal.task.clone();
     }
@@ -4566,29 +4567,40 @@ fn apply_proposal_to_roster(
             nr.workflow = crate::runspec::SpecWorkflow::parse(wf);
         }
     }
+    if workflow_was_none && nr.workflow.is_some() {
+        let cfg = crate::config::Config::load(&nr.project.clone().unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        }))
+        .unwrap_or_default();
+        rebuild_roles_for_workflow(nr, &cfg);
+    }
     let mut to_add: Vec<String> = Vec::new();
     for prov in &proposal.providers {
-        if crate::runspec::Pin::parse(prov).is_ok() {
+        if !to_add.contains(prov) {
             to_add.push(prov.clone());
         }
     }
-    for v in proposal.roles.values() {
-        if crate::runspec::Pin::parse(v).is_ok() && !to_add.contains(v) {
+    let mut sorted_roles: Vec<(&String, &String)> = proposal.roles.iter().collect();
+    sorted_roles.sort_by(|a, b| a.0.cmp(b.0));
+    for (_, v) in sorted_roles {
+        if !to_add.contains(v) {
             to_add.push(v.clone());
         }
     }
     for v in &proposal.reviewer {
-        if crate::runspec::Pin::parse(v).is_ok() && !to_add.contains(v) {
+        if !to_add.contains(v) {
             to_add.push(v.clone());
         }
     }
-    for v in proposal.backups.values() {
-        if crate::runspec::Pin::parse(v).is_ok() && !to_add.contains(v) {
+    let mut sorted_backups: Vec<(&String, &String)> = proposal.backups.iter().collect();
+    sorted_backups.sort_by(|a, b| a.0.cmp(b.0));
+    for (_, v) in sorted_backups {
+        if !to_add.contains(v) {
             to_add.push(v.clone());
         }
     }
     for v in &proposal.reviewer_backups {
-        if crate::runspec::Pin::parse(v).is_ok() && !to_add.contains(v) {
+        if !to_add.contains(v) {
             to_add.push(v.clone());
         }
     }
@@ -4597,51 +4609,120 @@ fn apply_proposal_to_roster(
             .iter()
             .any(|e| matches!(&e.choice, RosterChoice::Provider(p) if p == &prov))
         {
-            let available = crate::providers::detect_all()
-                .iter()
-                .any(|r| r.name == crate::quota::normalize_key(&prov) && r.available);
+            let available = crate::runspec::Pin::parse(&prov)
+                .map(|pin| {
+                    crate::providers::detect_all().iter().any(|r| {
+                        r.name == crate::quota::normalize_key(&pin.provider) && r.available
+                    }) || crate::provider_ref::ProviderRef::parse(&prov)
+                        .map(|r| r.is_api())
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            let reason = if available {
+                None
+            } else if crate::runspec::Pin::parse(&prov).is_err() {
+                Some("invalid provider".to_string())
+            } else {
+                Some("not in roster".to_string())
+            };
             roster.push(RosterEntry {
                 choice: RosterChoice::Provider(prov.clone()),
                 label: prov.clone(),
                 available,
-                reason: if available {
-                    None
-                } else {
-                    Some("not in roster".to_string())
-                },
+                reason,
                 source: RosterSource::Detected,
             });
         }
     }
-    if nr.picked.is_empty() {
-        let mut picked = Vec::new();
-        let ordered_providers: Vec<String> =
-            if !proposal.reviewer.is_empty() || !proposal.roles.is_empty() {
-                let mut v = Vec::new();
-                for pv in proposal.roles.values() {
-                    v.push(pv.clone());
-                }
-                v.extend(proposal.reviewer.clone());
-                if v.is_empty() {
-                    proposal.providers.clone()
-                } else {
-                    v
-                }
-            } else {
-                proposal.providers.clone()
-            };
-        for prov in &ordered_providers {
-            if let Some(idx) = roster
-                .iter()
-                .position(|e| matches!(&e.choice, RosterChoice::Provider(p) if p == prov))
-            {
-                if roster[idx].available {
-                    picked.push(idx);
+    if let Some(wf) = nr.workflow {
+        if wf != crate::runspec::SpecWorkflow::Arena {
+            let mut sorted_roles: Vec<(&String, &String)> = proposal.roles.iter().collect();
+            sorted_roles.sort_by(|a, b| a.0.cmp(b.0));
+            for (k, v) in sorted_roles {
+                if let Some(role) = crate::state::SlotRole::from_config_key(k) {
+                    if let Ok(pin) = crate::runspec::Pin::parse(v) {
+                        if let Some(slot) = nr
+                            .roles
+                            .iter_mut()
+                            .find(|r| r.role == role && r.ordinal == 0 && r.primary.is_none())
+                        {
+                            slot.primary = Some(pin);
+                        }
+                    }
                 }
             }
-        }
-        if !picked.is_empty() {
-            nr.picked = picked;
+            for (idx, v) in proposal.reviewer.iter().enumerate() {
+                if let Ok(pin) = crate::runspec::Pin::parse(v) {
+                    if let Some(slot) = nr.roles.iter_mut().find(|r| {
+                        r.role == crate::state::SlotRole::Reviewer
+                            && r.ordinal == idx
+                            && r.primary.is_none()
+                    }) {
+                        slot.primary = Some(pin);
+                    }
+                }
+            }
+            let mut sorted_backups: Vec<(&String, &String)> = proposal.backups.iter().collect();
+            sorted_backups.sort_by(|a, b| a.0.cmp(b.0));
+            for (k, v) in sorted_backups {
+                if let Some(role) = crate::state::SlotRole::from_config_key(k) {
+                    if let Ok(pin) = crate::runspec::Pin::parse(v) {
+                        if let Some(slot) = nr
+                            .roles
+                            .iter_mut()
+                            .find(|r| r.role == role && r.ordinal == 0 && r.backup.is_none())
+                        {
+                            slot.backup = Some(pin);
+                        }
+                    }
+                }
+            }
+            for (idx, v) in proposal.reviewer_backups.iter().enumerate() {
+                if let Ok(pin) = crate::runspec::Pin::parse(v) {
+                    if let Some(slot) = nr.roles.iter_mut().find(|r| {
+                        r.role == crate::state::SlotRole::Reviewer
+                            && r.ordinal == idx
+                            && r.backup.is_none()
+                    }) {
+                        slot.backup = Some(pin);
+                    }
+                }
+            }
+            if proposal.roles.is_empty()
+                && proposal.reviewer.is_empty()
+                && !proposal.providers.is_empty()
+            {
+                let rows: Vec<(crate::state::SlotRole, usize)> = {
+                    let cfg =
+                        crate::config::Config::load(&nr.project.clone().unwrap_or_else(|| {
+                            std::env::current_dir()
+                                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                        }))
+                        .unwrap_or_default();
+                    crate::runspec::spec_rows(wf, &cfg)
+                };
+                for (idx, (role, ordinal)) in rows.iter().enumerate() {
+                    if let Some(raw) = proposal.providers.get(idx) {
+                        if let Ok(pin) = crate::runspec::Pin::parse(raw) {
+                            if let Some(slot) = nr.roles.iter_mut().find(|r| {
+                                r.role == *role && r.ordinal == *ordinal && r.primary.is_none()
+                            }) {
+                                slot.primary = Some(pin);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            for (idx, raw) in proposal.providers.iter().enumerate() {
+                if let Ok(pin) = crate::runspec::Pin::parse(raw) {
+                    if let Some(slot) = nr.arena_pool.get_mut(idx) {
+                        if slot.is_none() {
+                            *slot = Some(pin);
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -4718,10 +4799,12 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                     }
                 }
             };
-            let cfg = app.cfg.clone();
+            let cfg = crate::config::Config::load(&project).unwrap_or_else(|_| app.cfg.clone());
             let mut spec = new_run_spec(nr, &cfg);
             spec = crate::runspec::RunSpec::apply_proposal_to_spec(spec, &proposal, &cfg);
-            spec.brief_path = Some(brief_path.clone());
+            if spec.workflow == Some(crate::runspec::SpecWorkflow::Plan) {
+                spec.brief_path = Some(brief_path.clone());
+            }
             if spec.task.trim().is_empty() {
                 spec.task = proposal.task.clone();
             }
@@ -4768,7 +4851,12 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         let Some(nr) = app.new_run.as_ref() else {
             return;
         };
-        match new_run_launch_with_cfg(nr, &app.cfg) {
+        let cfg_for_launch = nr
+            .project
+            .as_ref()
+            .and_then(|p| crate::config::Config::load(p).ok())
+            .unwrap_or_else(|| app.cfg.clone());
+        match new_run_launch_with_cfg(nr, &cfg_for_launch) {
             Ok((target, mut args)) => {
                 let target_swarm = SparPaths::new(&target);
                 if let Ok(cwd) = std::env::current_dir() {
@@ -4947,7 +5035,9 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             let cfg = app.cfg.clone();
             rebuild_roles_for_workflow(nr, &cfg);
         }
-        KeyCode::Char('j') | KeyCode::Down if nr.field == NewRunField::Roles => {
+        KeyCode::Char('j') | KeyCode::Down
+            if nr.field == NewRunField::Roles && !nr.editing_model =>
+        {
             let max = if nr.workflow == Some(crate::runspec::SpecWorkflow::Arena) {
                 nr.arena_pool.len()
             } else {
@@ -4957,14 +5047,43 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 nr.role_sel = (nr.role_sel + 1).min(max - 1);
             }
         }
-        KeyCode::Char('k') | KeyCode::Up if nr.field == NewRunField::Roles => {
+        KeyCode::Char('k') | KeyCode::Up if nr.field == NewRunField::Roles && !nr.editing_model => {
             nr.role_sel = nr.role_sel.saturating_sub(1);
         }
-        KeyCode::Char('b') | KeyCode::Char('B') if nr.field == NewRunField::Roles => {
+        KeyCode::Char('b') | KeyCode::Char('B')
+            if nr.field == NewRunField::Roles && !nr.editing_model =>
+        {
             nr.editing_backup = !nr.editing_backup;
         }
-        KeyCode::Backspace if nr.field == NewRunField::Roles => {
+        KeyCode::Char('m') | KeyCode::Char('M')
+            if nr.field == NewRunField::Roles && !nr.editing_model =>
+        {
             if nr.workflow == Some(crate::runspec::SpecWorkflow::Arena) {
+                if let Some(slot) = nr.arena_pool.get_mut(nr.role_sel) {
+                    if let Some(pin) = slot {
+                        nr.model_buffer = pin.model.clone().unwrap_or_default();
+                    } else {
+                        nr.model_buffer.clear();
+                    }
+                }
+            } else if let Some(ra) = nr.roles.get(nr.role_sel) {
+                let target = if nr.editing_backup {
+                    &ra.backup
+                } else {
+                    &ra.primary
+                };
+                if let Some(pin) = target {
+                    nr.model_buffer = pin.model.clone().unwrap_or_default();
+                } else {
+                    nr.model_buffer.clear();
+                }
+            }
+            nr.editing_model = true;
+        }
+        KeyCode::Backspace if nr.field == NewRunField::Roles => {
+            if nr.editing_model {
+                nr.model_buffer.pop();
+            } else if nr.workflow == Some(crate::runspec::SpecWorkflow::Arena) {
                 if let Some(slot) = nr.arena_pool.get_mut(nr.role_sel) {
                     *slot = None;
                 }
@@ -4975,6 +5094,44 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                     ra.primary = None;
                 }
             }
+        }
+        KeyCode::Esc if nr.field == NewRunField::Roles && nr.editing_model => {
+            nr.editing_model = false;
+            nr.model_buffer.clear();
+        }
+        KeyCode::Enter if nr.field == NewRunField::Roles && nr.editing_model => {
+            if nr.workflow == Some(crate::runspec::SpecWorkflow::Arena) {
+                if let Some(Some(pin)) = nr.arena_pool.get_mut(nr.role_sel) {
+                    if nr.model_buffer.trim().is_empty() {
+                        pin.model = None;
+                    } else {
+                        pin.model = Some(nr.model_buffer.trim().to_string());
+                    }
+                }
+            } else if let Some(ra) = nr.roles.get_mut(nr.role_sel) {
+                let target = if nr.editing_backup {
+                    &mut ra.backup
+                } else {
+                    &mut ra.primary
+                };
+                if let Some(pin) = target {
+                    if nr.model_buffer.trim().is_empty() {
+                        pin.model = None;
+                    } else {
+                        let new_model = nr.model_buffer.trim().to_string();
+                        pin.model = Some(new_model);
+                    }
+                }
+            }
+            nr.editing_model = false;
+            nr.model_buffer.clear();
+        }
+        KeyCode::Char(c)
+            if nr.field == NewRunField::Roles
+                && nr.editing_model
+                && !mods.contains(KeyModifiers::CONTROL) =>
+        {
+            nr.model_buffer.push(c);
         }
         KeyCode::Char('d')
             if nr.field == NewRunField::Roles && mods.contains(KeyModifiers::CONTROL) =>
@@ -10876,9 +11033,13 @@ fn draw_new_run(f: &mut Frame, area: Rect, projects: &[registry::ProjectEntry], 
                     Style::default().fg(FG)
                 };
                 let extra = if nr.field == NewRunField::Roles && nr.role_sel == idx {
-                    " ← Fleet to assign"
+                    if nr.editing_model {
+                        format!(" (editing model: {}▌)", nr.model_buffer)
+                    } else {
+                        " ← Fleet to assign".to_string()
+                    }
                 } else {
-                    ""
+                    String::new()
                 };
                 lines.push((format!("{cursor} {}. {}{}", idx + 1, label, extra), style));
             }
@@ -10912,19 +11073,24 @@ fn draw_new_run(f: &mut Frame, area: Rect, projects: &[registry::ProjectEntry], 
                 } else {
                     Style::default().fg(FG)
                 };
-                let editing =
-                    if nr.field == NewRunField::Roles && nr.role_sel == idx && nr.editing_backup {
-                        " (editing backup)"
+                let editing = if nr.field == NewRunField::Roles && nr.role_sel == idx {
+                    if nr.editing_model {
+                        format!(" (editing model: {}▌)", nr.model_buffer)
+                    } else if nr.editing_backup {
+                        " (editing backup)".to_string()
                     } else {
-                        ""
-                    };
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
                 lines.push((
                     format!("{cursor} {}: {}{}{}", name, primary, backup, editing),
                     style,
                 ));
             }
             lines.push((
-                "  j/k select · Fleet to assign · b backup · Backspace clear · Ctrl-D save defaults"
+                "  j/k select · Fleet to assign · b backup · m model · Backspace clear · Ctrl-D save defaults"
                     .to_string(),
                 Style::default().fg(FG_MUTED),
             ));
@@ -21191,6 +21357,26 @@ mod home_ia {
         // whatever the active root happens to be, and the argv uses role pins.
         let mut nr = new_run_fixture();
         nr.workflow = Some(crate::runspec::SpecWorkflow::Plan);
+        nr.roles = vec![
+            crate::runspec::RoleAssignment {
+                role: crate::state::SlotRole::Planner,
+                ordinal: 0,
+                primary: Some(crate::runspec::Pin::parse("cli:claude@opus").unwrap()),
+                backup: None,
+            },
+            crate::runspec::RoleAssignment {
+                role: crate::state::SlotRole::PlanCritic,
+                ordinal: 0,
+                primary: Some(crate::runspec::Pin::parse("cli:codex@gpt-5.6-terra").unwrap()),
+                backup: None,
+            },
+            crate::runspec::RoleAssignment {
+                role: crate::state::SlotRole::TestAuthor,
+                ordinal: 0,
+                primary: Some(crate::runspec::Pin::parse("cli:grok@fast").unwrap()),
+                backup: None,
+            },
+        ];
         nr.roster = vec![
             RosterEntry {
                 choice: RosterChoice::Provider("cli:claude@opus".into()),

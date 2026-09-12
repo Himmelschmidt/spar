@@ -241,7 +241,7 @@ fn sigkilled_orchestrator_leaves_orphans_that_status_names_and_sweep_reaps() {
     let fake = bin.join("claude");
     std::fs::write(
         &fake,
-        "#!/bin/sh\necho $$ >> \"$SLOT_PIDS_FILE\"\nsleep 300\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ] || [ \"$1\" = \"-v\" ] || [ \"$1\" = \"--help\" ]; then echo \"fake version\"; exit 0; fi\necho $$ >> \"$SLOT_PIDS_FILE\"\nsleep 300\n",
     )
     .unwrap();
     #[cfg(unix)]

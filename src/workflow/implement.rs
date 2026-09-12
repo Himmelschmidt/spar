@@ -646,11 +646,29 @@ fn prepare_implement_slots(
         anyhow::bail!("no provider resolved for implementer");
     }
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+    let has_backup = cfg.backups.implementer.is_some()
+        || !cfg.backups.reviewer.is_empty()
+        || cfg.backups.tester.is_some();
+    let available: Option<std::collections::HashSet<String>> = if dry || !has_backup {
+        None
+    } else {
+        let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+            .into_iter()
+            .filter(|r| r.available)
+            .map(|r| format!("cli:{}", r.name))
+            .collect();
+        if detected.is_empty() {
+            None
+        } else {
+            Some(detected)
+        }
+    };
     for seat in seats {
         let mut provider = seat.provider.clone();
         let mut source = seat.source;
         let mut model = seat.model.clone();
-        if !crate::backup::is_provider_eligible(&provider, &store, None) {
+        let mut seat_id = seat.seat.clone();
+        if !crate::backup::is_provider_eligible(&provider, &store, available.as_ref()) {
             let ordinal = if seat.role == SlotRole::Reviewer {
                 seat.seat
                     .trim_start_matches("review-")
@@ -662,18 +680,23 @@ fn prepare_implement_slots(
                 0
             };
             if let Some(backup_raw) = crate::backup::backup_for_role(seat.role, ordinal, cfg) {
-                if crate::backup::is_provider_eligible(&backup_raw, &store, None) {
+                if crate::backup::is_provider_eligible(&backup_raw, &store, available.as_ref()) {
                     if let Ok(pin) = crate::runspec::Pin::parse(&backup_raw) {
                         provider = pin.display();
                         source = crate::state::SeatSource::Backup;
-                        if let Some(m) = pin.model {
-                            model = Some(m);
+                        model = pin.model.clone();
+                        if seat.role == SlotRole::Reviewer {
+                            seat_id = format!(
+                                "review-{}-{}",
+                                ordinal,
+                                crate::util::sanitize_slot(&pin.provider)
+                            );
                         }
                     }
                 }
             }
         }
-        let mut slot = executor::init_slot_model(&seat.seat, &provider, seat.role, model);
+        let mut slot = executor::init_slot_model(&seat_id, &provider, seat.role, model);
         slot.source = Some(source);
         state.slots.push(slot);
     }
@@ -1763,13 +1786,198 @@ pub fn execute_loop(
             provider: impl_slot.provider.clone(),
             role: SlotRole::Implementer,
             template: "implementer".into(),
-            extra_vars: extra,
+            extra_vars: extra.clone(),
             expected_artifact: Some(format!("summary-{}.md", impl_slot.id)),
             model: impl_model,
         };
         if let Err(e) = executor::run_slot(state, paths, cfg, &impl_job) {
             let quota_hit = executor::slot_quota_hit(state, &impl_job.slot_id);
-            return fail(state, paths, e, quota_hit);
+            if quota_hit {
+                if let Some(backup_raw) =
+                    crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
+                {
+                    let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+                    let has_backup = true;
+                    let available: Option<std::collections::HashSet<String>> = if !has_backup {
+                        None
+                    } else {
+                        let detected: std::collections::HashSet<String> =
+                            crate::providers::detect_all()
+                                .into_iter()
+                                .filter(|r| r.available)
+                                .map(|r| format!("cli:{}", r.name))
+                                .collect();
+                        if detected.is_empty() {
+                            None
+                        } else {
+                            Some(detected)
+                        }
+                    };
+                    let slot_state = state
+                        .slots
+                        .iter()
+                        .find(|s| s.id == impl_job.slot_id)
+                        .cloned()
+                        .unwrap();
+                    let cause = crate::backup::dispatch_stop_cause(
+                        &slot_state,
+                        &impl_slot.provider,
+                        &store,
+                        available.as_ref(),
+                    );
+                    if cause == crate::backup::StopCause::Environmental
+                        && slot_state.source != Some(SeatSource::Backup)
+                    {
+                        let backup_key = crate::provider_ref::ProviderRef::parse(&backup_raw)
+                            .map(|r| r.storage_key())
+                            .unwrap_or_else(|_| backup_raw.clone());
+                        let cur_key = crate::provider_ref::ProviderRef::parse(&impl_slot.provider)
+                            .map(|r| r.storage_key())
+                            .unwrap_or_else(|_| impl_slot.provider.clone());
+                        if backup_key != cur_key
+                            && crate::backup::is_provider_eligible(
+                                &backup_raw,
+                                &store,
+                                available.as_ref(),
+                            )
+                        {
+                            if let Some(s) = state.slot_mut(&impl_job.slot_id) {
+                                let pin = crate::runspec::Pin::parse(&backup_raw)
+                                    .map(|p| p.display())
+                                    .unwrap_or(backup_raw.clone());
+                                crate::workflow::implement::set_slot_provider(s, pin);
+                                s.source = Some(SeatSource::Backup);
+                                s.status = crate::state::SlotStatus::Pending;
+                                s.error = None;
+                                s.quota_hit = false;
+                            }
+                            state.save(paths)?;
+                            // Retry the implementer with backup in the same round
+                            let retry_impl_slot = state
+                                .slots
+                                .iter()
+                                .find(|s| s.id == impl_job.slot_id)
+                                .cloned()
+                                .unwrap();
+                            let retry_job = SlotJob {
+                                slot_id: retry_impl_slot.id.clone(),
+                                provider: retry_impl_slot.provider.clone(),
+                                role: SlotRole::Implementer,
+                                template: "implementer".into(),
+                                extra_vars: extra.clone(),
+                                expected_artifact: Some(format!(
+                                    "summary-{}.md",
+                                    retry_impl_slot.id
+                                )),
+                                model: retry_impl_slot.model.clone(),
+                            };
+                            if let Err(e2) = executor::run_slot(state, paths, cfg, &retry_job) {
+                                let quota_hit2 =
+                                    executor::slot_quota_hit(state, &retry_job.slot_id);
+                                return fail(state, paths, e2, quota_hit2);
+                            }
+                            // Retry succeeded, continue to review phase
+                        } else {
+                            return fail(state, paths, e, quota_hit);
+                        }
+                    } else {
+                        return fail(state, paths, e, quota_hit);
+                    }
+                } else {
+                    return fail(state, paths, e, quota_hit);
+                }
+            } else {
+                let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+                let available: Option<std::collections::HashSet<String>> = {
+                    let detected: std::collections::HashSet<String> =
+                        crate::providers::detect_all()
+                            .into_iter()
+                            .filter(|r| r.available)
+                            .map(|r| format!("cli:{}", r.name))
+                            .collect();
+                    if detected.is_empty() {
+                        None
+                    } else {
+                        Some(detected)
+                    }
+                };
+                let slot_state = state
+                    .slots
+                    .iter()
+                    .find(|s| s.id == impl_job.slot_id)
+                    .cloned()
+                    .unwrap();
+                let cause = crate::backup::dispatch_stop_cause(
+                    &slot_state,
+                    &impl_slot.provider,
+                    &store,
+                    available.as_ref(),
+                );
+                if cause == crate::backup::StopCause::Environmental {
+                    if let Some(backup_raw) =
+                        crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
+                    {
+                        if crate::backup::is_provider_eligible(
+                            &backup_raw,
+                            &store,
+                            available.as_ref(),
+                        ) && slot_state.source != Some(SeatSource::Backup)
+                        {
+                            let backup_key = crate::provider_ref::ProviderRef::parse(&backup_raw)
+                                .map(|r| r.storage_key())
+                                .unwrap_or_else(|_| backup_raw.clone());
+                            let cur_key =
+                                crate::provider_ref::ProviderRef::parse(&impl_slot.provider)
+                                    .map(|r| r.storage_key())
+                                    .unwrap_or_else(|_| impl_slot.provider.clone());
+                            if backup_key != cur_key {
+                                if let Some(s) = state.slot_mut(&impl_job.slot_id) {
+                                    let pin = crate::runspec::Pin::parse(&backup_raw)
+                                        .map(|p| p.display())
+                                        .unwrap_or(backup_raw);
+                                    crate::workflow::implement::set_slot_provider(s, pin);
+                                    s.source = Some(SeatSource::Backup);
+                                    s.status = crate::state::SlotStatus::Pending;
+                                    s.error = None;
+                                    s.quota_hit = false;
+                                }
+                                state.save(paths)?;
+                                let retry_impl_slot = state
+                                    .slots
+                                    .iter()
+                                    .find(|s| s.id == impl_job.slot_id)
+                                    .cloned()
+                                    .unwrap();
+                                let retry_job = SlotJob {
+                                    slot_id: retry_impl_slot.id.clone(),
+                                    provider: retry_impl_slot.provider.clone(),
+                                    role: SlotRole::Implementer,
+                                    template: "implementer".into(),
+                                    extra_vars: extra.clone(),
+                                    expected_artifact: Some(format!(
+                                        "summary-{}.md",
+                                        retry_impl_slot.id
+                                    )),
+                                    model: retry_impl_slot.model.clone(),
+                                };
+                                if let Err(e2) = executor::run_slot(state, paths, cfg, &retry_job) {
+                                    let quota_hit2 =
+                                        executor::slot_quota_hit(state, &retry_job.slot_id);
+                                    return fail(state, paths, e2, quota_hit2);
+                                }
+                            } else {
+                                return fail(state, paths, e, quota_hit);
+                            }
+                        } else {
+                            return fail(state, paths, e, quota_hit);
+                        }
+                    } else {
+                        return fail(state, paths, e, quota_hit);
+                    }
+                } else {
+                    return fail(state, paths, e, quota_hit);
+                }
+            }
         }
 
         // Refresh implementer cwd after run (worktree may have been set at prepare).
@@ -2273,17 +2481,41 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
         .collect();
     if slot_state.status == crate::state::SlotStatus::Failed {
         let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-        let available: std::collections::HashSet<String> = crate::providers::detect_all()
-            .into_iter()
-            .filter(|r| r.available)
-            .map(|r| r.name)
-            .collect();
-        let cause = crate::backup::dispatch_stop_cause(&slot_state, &cur, &store, Some(&available));
+        let has_backup = cfg.backups.implementer.is_some();
+        let available_opt: Option<std::collections::HashSet<String>> = if !has_backup {
+            None
+        } else {
+            let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+                .into_iter()
+                .filter(|r| r.available)
+                .map(|r| format!("cli:{}", r.name))
+                .collect();
+            if detected.is_empty() {
+                None
+            } else {
+                Some(detected)
+            }
+        };
+        let cause =
+            crate::backup::dispatch_stop_cause(&slot_state, &cur, &store, available_opt.as_ref());
         if cause == crate::backup::StopCause::Environmental {
             if let Some(backup_raw) = crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
             {
-                if !used.iter().any(|u| u == &backup_raw)
-                    && crate::backup::is_provider_eligible(&backup_raw, &store, Some(&available))
+                let backup_key = crate::provider_ref::ProviderRef::parse(&backup_raw)
+                    .map(|r| r.storage_key())
+                    .unwrap_or_else(|_| backup_raw.clone());
+                let used_contains_backup = used.iter().any(|u| {
+                    crate::provider_ref::ProviderRef::parse(u)
+                        .map(|r| r.storage_key())
+                        .unwrap_or_else(|_| u.clone())
+                        == backup_key
+                });
+                if !used_contains_backup
+                    && crate::backup::is_provider_eligible(
+                        &backup_raw,
+                        &store,
+                        available_opt.as_ref(),
+                    )
                     && slot_state.source != Some(SeatSource::Backup)
                 {
                     let backup_pin = crate::runspec::Pin::parse(&backup_raw)
@@ -2299,6 +2531,7 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
                     state.save(paths)?;
                     return Ok(true);
                 }
+                return Ok(false);
             }
         }
     }

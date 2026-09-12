@@ -1,4 +1,4 @@
-use crate::quota::{ProviderStatus, QuotaStore};
+use crate::quota::QuotaStore;
 use crate::state::SlotState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8,7 +8,6 @@ pub enum StopCause {
     Work,
 }
 
-#[allow(dead_code)]
 pub fn is_provider_eligible(
     provider: &str,
     store: &QuotaStore,
@@ -20,6 +19,11 @@ pub fn is_provider_eligible(
     }
     if store.effective_status(&key) != crate::quota::ProviderStatus::Available {
         return false;
+    }
+    if let Ok(pref) = crate::provider_ref::ProviderRef::parse(provider) {
+        if pref.backend == crate::provider_ref::ExecBackend::ApiSdk {
+            return true;
+        }
     }
     if let Some(set) = available {
         if !set.contains(&key) {
@@ -78,7 +82,6 @@ pub fn resolve_with_backup(
     Some((parsed.display(), crate::state::SeatSource::Backup))
 }
 
-#[allow(dead_code)]
 pub fn dispatch_stop_cause(
     slot: &SlotState,
     provider: &str,
@@ -89,11 +92,16 @@ pub fn dispatch_stop_cause(
         return StopCause::Environmental;
     }
     let key = crate::quota::normalize_key(provider);
-    if store.effective_status(&key) != ProviderStatus::Available {
+    if store.effective_status(&key) != crate::quota::ProviderStatus::Available {
         return StopCause::Environmental;
     }
     if !store.is_usable(&key) {
         return StopCause::Environmental;
+    }
+    if let Ok(pref) = crate::provider_ref::ProviderRef::parse(provider) {
+        if pref.backend == crate::provider_ref::ExecBackend::ApiSdk {
+            return StopCause::Work;
+        }
     }
     if let Some(set) = available {
         if !set.contains(&key) {
@@ -186,5 +194,44 @@ mod tests {
         set.insert("cli:claude".to_string());
         assert!(is_provider_eligible("cli:claude", &store, Some(&set)));
         assert!(!is_provider_eligible("cli:grok", &store, Some(&set)));
+    }
+
+    #[test]
+    fn api_provider_ignores_availability_set() {
+        let store = QuotaStore::default();
+        let mut set = std::collections::HashSet::new();
+        set.insert("cli:claude".to_string());
+        assert!(is_provider_eligible("api:openai@gpt-5", &store, Some(&set)));
+        assert_eq!(
+            dispatch_stop_cause(
+                &slot_with_quota(false),
+                "api:openai@gpt-5",
+                &store,
+                Some(&set)
+            ),
+            StopCause::Work
+        );
+    }
+
+    #[test]
+    fn api_provider_still_respects_quota_pause() {
+        let mut store = QuotaStore::default();
+        store.pause_quota("api:openai", "q");
+        let mut set = std::collections::HashSet::new();
+        set.insert("cli:claude".to_string());
+        assert!(!is_provider_eligible(
+            "api:openai@gpt-5",
+            &store,
+            Some(&set)
+        ));
+        assert_eq!(
+            dispatch_stop_cause(
+                &slot_with_quota(false),
+                "api:openai@gpt-5",
+                &store,
+                Some(&set)
+            ),
+            StopCause::Environmental
+        );
     }
 }
