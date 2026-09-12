@@ -68,6 +68,22 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     // pool mixing `[roles]` and `[providers].order` seats reports each honestly.
     let pool_origin = crate::workflow::roles_resolve::pool_origin_for(&opts);
     state.pool_origin = pool_origin;
+    let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+    let has_backup = !cfg.backups.reviewer.is_empty();
+    let available: Option<std::collections::HashSet<String>> = if dry || !has_backup {
+        None
+    } else {
+        let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+            .into_iter()
+            .filter(|r| r.available)
+            .map(|r| format!("cli:{}", r.name))
+            .collect();
+        if detected.is_empty() {
+            None
+        } else {
+            Some(detected)
+        }
+    };
     let sources = crate::workflow::roles_resolve::resolve_seat_sources(
         SlotRole::Reviewer,
         state.providers.len(),
@@ -76,9 +92,45 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         cfg,
     );
     for (i, prov) in state.providers.iter().enumerate() {
-        let id = format!("review-{}-{}", i, sanitize_slot(prov));
-        let mut slot = executor::init_slot(&id, prov, SlotRole::Reviewer);
-        slot.source = sources.get(i).copied();
+        let mut provider = prov.clone();
+        let mut source = sources.get(i).copied();
+        let mut model = crate::runspec::Pin::parse(&provider)
+            .ok()
+            .and_then(|p| p.model);
+        let backup_pin =
+            if !crate::backup::is_provider_eligible(&provider, &store, available.as_ref()) {
+                if let Some(backup_raw) = crate::backup::backup_for_role(SlotRole::Reviewer, i, cfg)
+                {
+                    if crate::backup::is_provider_eligible(&backup_raw, &store, available.as_ref())
+                    {
+                        if let Ok(bpin) = crate::runspec::Pin::parse(&backup_raw) {
+                            provider = bpin.display();
+                            source = Some(crate::state::SeatSource::Backup);
+                            model = bpin.model.clone();
+                            Some(bpin)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+        let id = if source == Some(crate::state::SeatSource::Backup) {
+            if let Some(bpin) = backup_pin {
+                format!("review-{}-{}", i, sanitize_slot(&bpin.provider))
+            } else {
+                format!("review-{}-{}", i, sanitize_slot(&provider))
+            }
+        } else {
+            format!("review-{}-{}", i, sanitize_slot(&provider))
+        };
+        let mut slot = executor::init_slot_model(&id, &provider, SlotRole::Reviewer, model);
+        slot.source = source;
         state.slots.push(slot);
     }
 
@@ -163,6 +215,102 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
         .collect();
 
     executor::run_slots_parallel(state, paths, cfg, &jobs)?;
+
+    let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+    let has_backup = !cfg.backups.reviewer.is_empty();
+    let available: Option<std::collections::HashSet<String>> = if state.dry_run || !has_backup {
+        None
+    } else {
+        let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+            .into_iter()
+            .filter(|r| r.available)
+            .map(|r| format!("cli:{}", r.name))
+            .collect();
+        if detected.is_empty() {
+            None
+        } else {
+            Some(detected)
+        }
+    };
+    for (idx, job) in jobs.iter().enumerate() {
+        let slot_state = match state.slots.iter().find(|s| s.id == job.slot_id).cloned() {
+            Some(s) => s,
+            None => continue,
+        };
+        if slot_state.status != SlotStatus::Failed {
+            continue;
+        }
+        let cause = crate::backup::dispatch_stop_cause(
+            &slot_state,
+            &job.provider,
+            &store,
+            available.as_ref(),
+        );
+        if cause != crate::backup::StopCause::Environmental
+            || slot_state.source == Some(crate::state::SeatSource::Backup)
+        {
+            continue;
+        }
+        let backup_raw = match crate::backup::backup_for_role(SlotRole::Reviewer, idx, cfg) {
+            Some(b) => b,
+            None => continue,
+        };
+        if !crate::backup::is_provider_eligible(&backup_raw, &store, available.as_ref()) {
+            continue;
+        }
+        let cur_key = crate::provider_ref::ProviderRef::parse(&job.provider)
+            .map(|r| r.storage_key())
+            .unwrap_or_else(|_| job.provider.clone());
+        let backup_key = crate::provider_ref::ProviderRef::parse(&backup_raw)
+            .map(|r| r.storage_key())
+            .unwrap_or_else(|_| backup_raw.clone());
+        if cur_key == backup_key {
+            continue;
+        }
+        let pin = match crate::runspec::Pin::parse(&backup_raw) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let new_id = format!(
+            "review-{}-{}",
+            idx,
+            crate::util::sanitize_slot(&pin.provider)
+        );
+        let old_id = job.slot_id.clone();
+        let mut new_slot_id = new_id.clone();
+        let new_artifact = format!("review-{new_id}.md");
+        // Carry the worktree record and reap the primary's pid marker with the
+        // rename: both are keyed on the slot id (O28), and the id has to change
+        // because it names the provider (O80).
+        state.rename_slot(paths, &old_id, &new_id);
+        if let Some(s) = state.slot_mut(&new_id) {
+            new_slot_id = s.id.clone();
+            s.provider = pin.provider.clone();
+            s.model = pin.model.clone();
+            s.source = Some(crate::state::SeatSource::Backup);
+            s.status = SlotStatus::Pending;
+            s.error = None;
+            s.quota_hit = false;
+        } else if let Some(s) = state.slot_mut(&job.slot_id) {
+            s.provider = pin.provider.clone();
+            s.model = pin.model.clone();
+            s.source = Some(crate::state::SeatSource::Backup);
+            s.status = SlotStatus::Pending;
+            s.error = None;
+            s.quota_hit = false;
+        }
+        state.save(paths)?;
+        let retry_job = SlotJob {
+            slot_id: new_slot_id,
+            provider: pin.display(),
+            role: job.role,
+            template: job.template.clone(),
+            extra_vars: job.extra_vars.clone(),
+            expected_artifact: Some(new_artifact),
+            model: pin.model.clone(),
+        };
+        let _ = executor::run_slot(state, paths, cfg, &retry_job);
+    }
 
     // Aggregate
     let mut body = format!(

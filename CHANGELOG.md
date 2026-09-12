@@ -6,6 +6,19 @@ All notable changes to spar are recorded here.
 
 ### Added
 
+- **You can now compose a run before starting it**: pick the workflow, then assign
+  each role its own agent and model, and give any of them a declared stand-in for
+  when the primary is unavailable. A stand-in takes over when the primary is
+  stopped by something that is not the work — out of capacity, rate limited, not
+  installed — and deliberately never on a genuine failure, because quietly
+  swapping who answered would cost you the one thing a two-vendor review is for.
+- **Your own defaults pre-fill that form**, stored with your other spar settings
+  rather than in any project, so per-role choices cannot leak between projects
+  that share a checkout.
+
+
+### Added
+
 - **You can now talk to spar inside spar.** A conversation tab lets you brief a
   run by describing what you want, have a fleet proposed, and launch it — or, with
   a run selected, ask about a decision it is waiting on and argue it either way

@@ -1,9 +1,11 @@
 mod api;
+mod backup;
 mod brief;
 mod bus;
 mod cli;
 mod config;
 mod daemon;
+mod defaults;
 mod doctor;
 mod events;
 mod executor;
@@ -24,6 +26,7 @@ mod quota;
 mod record;
 mod registry;
 mod runlock;
+mod runspec;
 mod sandbox;
 mod ship;
 mod skills;
@@ -115,6 +118,7 @@ fn run() -> Result<ExitCode> {
             select,
             urgency,
             role,
+            backup,
             fleet,
             without,
             base,
@@ -141,6 +145,7 @@ fn run() -> Result<ExitCode> {
                     (!providers.is_empty(), "--providers"),
                     (!select.is_empty(), "--select"),
                     (!role.is_empty(), "--role"),
+                    (!backup.is_empty(), "--backup"),
                     (fleet.is_some(), "--fleet"),
                     (!without.is_empty(), "--without"),
                     (base.is_some(), "--base"),
@@ -175,6 +180,7 @@ fn run() -> Result<ExitCode> {
             }
             cfg.apply_without(&without)?;
             cfg.apply_role_overrides(&role)?;
+            cfg.apply_backup_overrides(&backup)?;
             let (task_text, brief_path) = match (spec, brief, task) {
                 (Some(path), None, None) => {
                     let b = brief::intake(&paths, &path)?;
@@ -247,6 +253,7 @@ fn run() -> Result<ExitCode> {
             plan,
             task,
             role,
+            backup,
             fleet,
             without,
             reload_config,
@@ -265,6 +272,7 @@ fn run() -> Result<ExitCode> {
             let (paths, cfg) = implement_ctx(
                 run_id.as_deref(),
                 &role,
+                &backup,
                 &without,
                 fleet.as_deref(),
                 reload_config,
@@ -290,6 +298,7 @@ fn run() -> Result<ExitCode> {
             workflow,
             task,
             role,
+            backup,
             fleet,
             without,
             base,
@@ -302,12 +311,26 @@ fn run() -> Result<ExitCode> {
             urgency,
             big,
         } => {
+            if matches!(
+                workflow,
+                crate::cli::WorkflowKind::Arena
+                    | crate::cli::WorkflowKind::Peer
+                    | crate::cli::WorkflowKind::Roles
+            ) && !backup.is_empty()
+            {
+                anyhow::bail!(
+                    "--backup is not supported for {} workflow (it is positional, not role-based); backup: {}",
+                    format!("{:?}", workflow).to_lowercase(),
+                    backup.join(", ")
+                );
+            }
             let (paths, mut cfg) = project_ctx()?;
             if let Some(preset) = &fleet {
                 cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
             }
             cfg.apply_without(&without)?;
             cfg.apply_role_overrides(&role)?;
+            cfg.apply_backup_overrides(&backup)?;
             let opts = CommonOpts {
                 task,
                 providers,
@@ -696,6 +719,7 @@ fn bus_deliver(
 fn implement_ctx(
     run_id: Option<&str>,
     role: &[String],
+    backup: &[String],
     without: &[String],
     fleet: Option<&str>,
     reload_config: bool,
@@ -707,6 +731,7 @@ fn implement_ctx(
         }
         cfg.apply_without(without)?;
         cfg.apply_role_overrides(role)?;
+        cfg.apply_backup_overrides(backup)?;
         return Ok((paths, cfg));
     };
     if !reload_config {
@@ -714,6 +739,12 @@ fn implement_ctx(
             anyhow::bail!(
                 "run {run_id} is bound to the config it was created with; \
                  pass --reload-config to apply --role to it"
+            );
+        }
+        if !backup.is_empty() {
+            anyhow::bail!(
+                "run {run_id} is bound to the config it was created with; \
+                 pass --reload-config to apply --backup to it"
             );
         }
         if !without.is_empty() {
@@ -743,6 +774,7 @@ fn implement_ctx(
     }
     cfg.apply_without(without)?;
     cfg.apply_role_overrides(role)?;
+    cfg.apply_backup_overrides(backup)?;
     cfg.save_snapshot(&paths, run_id)?;
     eprintln!("config: re-read spar.toml for run {run_id}");
     Ok((paths, cfg))

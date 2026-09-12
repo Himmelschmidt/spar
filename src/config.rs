@@ -45,6 +45,12 @@ pub struct Config {
     /// survives a later round with no `--reload-config` (O27).
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub cli_role_keys: std::collections::BTreeSet<String>,
+    /// Per-role backup assignment (feature 009). Mirrors `[roles]` shape.
+    #[serde(default)]
+    pub backups: BackupsConfig,
+    /// Role config keys assigned via CLI `--backup` for this run. Parallel to `cli_role_keys`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub cli_backup_keys: std::collections::BTreeSet<String>,
     /// `--fleet small`'s reviewer panel width override (feature 011). `None` leaves
     /// panel sizing to `[roles].reviewer` / `DEFAULT_REVIEWERS` as usual. A CLI `--role
     /// reviewer=…` panel always outranks this — see `roles_resolve::panel_size`.
@@ -591,6 +597,76 @@ pub struct RolesConfig {
     pub test_author: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BackupsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_critic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implementer: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviewer: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tester: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_author: Option<String>,
+}
+
+fn parse_backup_role_key(role: &str) -> Result<(String, Option<usize>)> {
+    let role = role.trim();
+    if let Some(start) = role.find('[') {
+        if role.ends_with(']') {
+            let base = role[..start].trim();
+            let inner = role[start + 1..role.len() - 1].trim();
+            if inner.is_empty() {
+                anyhow::bail!("--backup {role}: empty ordinal");
+            }
+            let idx: usize = inner
+                .parse()
+                .with_context(|| format!("--backup {role}: invalid ordinal {inner:?}"))?;
+            return Ok((base.to_string(), Some(idx)));
+        }
+    }
+    if let Some(colon) = role.find(':') {
+        let base = role[..colon].trim();
+        let rest = role[colon + 1..].trim();
+        if rest.is_empty() {
+            anyhow::bail!("--backup {role}: empty ordinal");
+        }
+        if let Ok(idx) = rest.parse::<usize>() {
+            return Ok((base.to_string(), Some(idx)));
+        }
+    }
+    Ok((role.to_string(), None))
+}
+
+impl BackupsConfig {
+    fn validate(&self) -> Result<()> {
+        let singles = [
+            ("planner", &self.planner),
+            ("plan_critic", &self.plan_critic),
+            ("implementer", &self.implementer),
+            ("tester", &self.tester),
+            ("test_author", &self.test_author),
+        ];
+        for (key, val) in singles {
+            if let Some(v) = val {
+                crate::provider_ref::ProviderRef::parse(v)
+                    .with_context(|| format!("invalid provider in [backups].{key}: {v:?}"))?;
+            }
+        }
+        for v in &self.reviewer {
+            if v.is_empty() {
+                continue;
+            }
+            crate::provider_ref::ProviderRef::parse(v)
+                .with_context(|| format!("invalid provider in [backups].reviewer: {v:?}"))?;
+        }
+        Ok(())
+    }
+}
+
 impl RolesConfig {
     /// Priority 9 consumes this for the role-key invariant check.
     #[allow(dead_code)]
@@ -629,6 +705,16 @@ impl RolesConfig {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct RolesConfigFile {
+    planner: Option<String>,
+    plan_critic: Option<String>,
+    implementer: Option<String>,
+    reviewer: Option<Vec<String>>,
+    tester: Option<String>,
+    test_author: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct BackupsConfigFile {
     planner: Option<String>,
     plan_critic: Option<String>,
     implementer: Option<String>,
@@ -807,6 +893,8 @@ impl Default for Config {
             budget: BudgetConfig::default(),
             suite: SuiteConfig::default(),
             roles: RolesConfig::default(),
+            backups: BackupsConfig::default(),
+            cli_backup_keys: std::collections::BTreeSet::new(),
             review: ReviewConfig::default(),
             spec: SpecConfig::default(),
             critic: CriticConfig::default(),
@@ -857,6 +945,7 @@ struct ConfigFile {
     budget: Option<BudgetConfigFile>,
     suite: Option<SuiteConfigFile>,
     roles: Option<RolesConfigFile>,
+    backups: Option<BackupsConfigFile>,
     review: Option<ReviewConfigFile>,
     spec: Option<SpecConfigFile>,
     critic: Option<CriticConfigFile>,
@@ -1054,33 +1143,183 @@ impl Config {
                      reviewer, tester, test_author)"
                 )
             })?;
+            let pin = crate::runspec::Pin::parse(provider)
+                .with_context(|| format!("invalid provider in --role {role}: {provider:?}"))?;
+            let canonical = pin.display();
             match slot {
-                crate::state::SlotRole::Planner => self.roles.planner = Some(provider.into()),
-                crate::state::SlotRole::PlanCritic => {
-                    self.roles.plan_critic = Some(provider.into())
-                }
-                crate::state::SlotRole::Implementer => {
-                    self.roles.implementer = Some(provider.into())
-                }
-                crate::state::SlotRole::Tester => self.roles.tester = Some(provider.into()),
-                crate::state::SlotRole::TestAuthor => {
-                    self.roles.test_author = Some(provider.into())
-                }
-                crate::state::SlotRole::Reviewer => reviewers.push(provider.to_string()),
+                crate::state::SlotRole::Planner => self.roles.planner = Some(canonical),
+                crate::state::SlotRole::PlanCritic => self.roles.plan_critic = Some(canonical),
+                crate::state::SlotRole::Implementer => self.roles.implementer = Some(canonical),
+                crate::state::SlotRole::Tester => self.roles.tester = Some(canonical),
+                crate::state::SlotRole::TestAuthor => self.roles.test_author = Some(canonical),
+                crate::state::SlotRole::Reviewer => reviewers.push(canonical),
                 other => anyhow::bail!(
                     "--role {}: not assignable (it is derived by the workflow)",
                     other.as_config_key()
                 ),
             }
-            // Recorded on `Config` itself, so it snapshots with the run (O27): a later
-            // round with no `--reload-config` must still know this role was a CLI pin,
-            // not just a value that happens to match what `[roles]` says.
             self.cli_role_keys.insert(slot.as_config_key().to_string());
         }
         if !reviewers.is_empty() {
             self.roles.reviewer = reviewers;
         }
-        self.roles.validate()
+        self.roles.validate()?;
+        self.validate_backup_against_primary()
+    }
+
+    pub fn apply_backup_overrides(&mut self, assignments: &[String]) -> Result<()> {
+        if assignments.is_empty() {
+            return Ok(());
+        }
+        let mut backup_reviewers: Vec<String> = self.backups.reviewer.clone();
+        let mut has_backup_reviewers = false;
+        // The positional form (`--backup reviewer=…`, repeated) states the CLI's whole
+        // reviewer backup list, so the first one replaces whatever the project file
+        // declared rather than appending after it. Appending put CLI backups on
+        // ordinals 2 and 3 of a project that already declared two — silently backing
+        // up seats the operator had not named. This mirrors `--role reviewer=`, which
+        // sets the panel exactly rather than extending it. The ordinal form
+        // (`reviewer:N=`) is the amend-one-seat spelling and keeps the file's others.
+        let mut positional_replaced = false;
+        for raw in assignments {
+            let (role_raw, provider) = raw.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!("--backup expects <role>=<provider>, got {raw:?}")
+            })?;
+            let (role_raw, provider) = (role_raw.trim(), provider.trim());
+            if provider.is_empty() {
+                anyhow::bail!("--backup {role_raw}= has no provider");
+            }
+            let (role_key, ordinal) = parse_backup_role_key(role_raw)?;
+            let slot = crate::state::SlotRole::from_config_key(&role_key).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--backup {role_raw}: unknown role (planner, plan_critic, implementer, \
+                     reviewer, tester, test_author)"
+                )
+            })?;
+            let pin = crate::runspec::Pin::parse(provider).with_context(|| {
+                format!("invalid provider in --backup {role_raw}: {provider:?}")
+            })?;
+            let canonical = pin.display();
+            match slot {
+                crate::state::SlotRole::Planner => {
+                    if ordinal.is_some() {
+                        anyhow::bail!("--backup {role_raw}: ordinal not allowed for {role_key}");
+                    }
+                    self.backups.planner = Some(canonical);
+                }
+                crate::state::SlotRole::PlanCritic => {
+                    if ordinal.is_some() {
+                        anyhow::bail!("--backup {role_raw}: ordinal not allowed for {role_key}");
+                    }
+                    self.backups.plan_critic = Some(canonical);
+                }
+                crate::state::SlotRole::Implementer => {
+                    if ordinal.is_some() {
+                        anyhow::bail!("--backup {role_raw}: ordinal not allowed for {role_key}");
+                    }
+                    self.backups.implementer = Some(canonical);
+                }
+                crate::state::SlotRole::Tester => {
+                    if ordinal.is_some() {
+                        anyhow::bail!("--backup {role_raw}: ordinal not allowed for {role_key}");
+                    }
+                    self.backups.tester = Some(canonical);
+                }
+                crate::state::SlotRole::TestAuthor => {
+                    if ordinal.is_some() {
+                        anyhow::bail!("--backup {role_raw}: ordinal not allowed for {role_key}");
+                    }
+                    self.backups.test_author = Some(canonical);
+                }
+                crate::state::SlotRole::Reviewer => {
+                    has_backup_reviewers = true;
+                    if let Some(idx) = ordinal {
+                        if backup_reviewers.len() <= idx {
+                            backup_reviewers.resize(idx + 1, String::new());
+                        }
+                        backup_reviewers[idx] = canonical;
+                    } else {
+                        if !positional_replaced {
+                            backup_reviewers.clear();
+                            positional_replaced = true;
+                        }
+                        backup_reviewers.push(canonical);
+                    }
+                }
+                other => anyhow::bail!(
+                    "--backup {}: not assignable (it is derived by the workflow)",
+                    other.as_config_key()
+                ),
+            }
+            self.cli_backup_keys
+                .insert(slot.as_config_key().to_string());
+        }
+        if has_backup_reviewers {
+            self.backups.reviewer = backup_reviewers;
+        }
+        self.backups.validate()?;
+        self.validate_backup_against_primary()
+    }
+
+    fn validate_backup_against_primary(&self) -> Result<()> {
+        let check_single = |role: &str,
+                            primary: &Option<String>,
+                            backup: &Option<String>|
+         -> Result<()> {
+            if let (Some(p), Some(b)) = (primary, backup) {
+                let p_key = crate::provider_ref::ProviderRef::parse(p)
+                    .map(|r| r.storage_key())
+                    .unwrap_or_else(|_| p.clone());
+                let b_key = crate::provider_ref::ProviderRef::parse(b)
+                    .map(|r| r.storage_key())
+                    .unwrap_or_else(|_| b.clone());
+                if p_key == b_key {
+                    anyhow::bail!(
+                        "backup for {role} has same provider storage key as primary ({p_key}); backup must be a different provider"
+                    );
+                }
+            }
+            Ok(())
+        };
+        check_single("planner", &self.roles.planner, &self.backups.planner)?;
+        check_single(
+            "plan_critic",
+            &self.roles.plan_critic,
+            &self.backups.plan_critic,
+        )?;
+        check_single(
+            "implementer",
+            &self.roles.implementer,
+            &self.backups.implementer,
+        )?;
+        check_single("tester", &self.roles.tester, &self.backups.tester)?;
+        check_single(
+            "test_author",
+            &self.roles.test_author,
+            &self.backups.test_author,
+        )?;
+        if !self.roles.reviewer.is_empty() || !self.backups.reviewer.is_empty() {
+            let len = self.roles.reviewer.len().max(self.backups.reviewer.len());
+            for i in 0..len {
+                let b_opt = self.backups.reviewer.get(i).filter(|s| !s.is_empty());
+                if let (Some(p), Some(b)) = (self.roles.reviewer.get(i), b_opt) {
+                    let p_key = crate::provider_ref::ProviderRef::parse(p)
+                        .map(|r| r.storage_key())
+                        .unwrap_or_else(|_| p.clone());
+                    let b_key = crate::provider_ref::ProviderRef::parse(b)
+                        .map(|r| r.storage_key())
+                        .unwrap_or_else(|_| b.clone());
+                    if p_key == b_key {
+                        anyhow::bail!(
+                            "backup for reviewer[{i}] has same provider storage key as primary ({p_key})"
+                        );
+                    }
+                }
+            }
+            // Backups are repeatable across reviewer ordinals and may coincide with
+            // another ordinal's primary; only the same ordinal is checked above.
+        }
+        Ok(())
     }
 
     /// `--without <critic,spec,suite>`: drop seats for this run only, without touching
@@ -1241,6 +1480,28 @@ impl Config {
             }
             self.roles.validate()?;
         }
+        if let Some(b) = &file.backups {
+            if let Some(v) = &b.planner {
+                self.backups.planner = Some(v.clone());
+            }
+            if let Some(v) = &b.plan_critic {
+                self.backups.plan_critic = Some(v.clone());
+            }
+            if let Some(v) = &b.implementer {
+                self.backups.implementer = Some(v.clone());
+            }
+            if let Some(v) = &b.reviewer {
+                self.backups.reviewer = v.clone();
+            }
+            if let Some(v) = &b.tester {
+                self.backups.tester = Some(v.clone());
+            }
+            if let Some(v) = &b.test_author {
+                self.backups.test_author = Some(v.clone());
+            }
+            self.backups.validate()?;
+            self.validate_backup_against_primary()?;
+        }
         if let Some(r) = &file.review {
             if let Some(v) = r.require_all_criteria {
                 self.review.require_all_criteria = v;
@@ -1389,6 +1650,52 @@ fn load_file(path: &Path) -> Result<ConfigFile> {
 
 #[cfg(test)]
 mod tests {
+
+    /// AC-5. A repeated positional `--backup reviewer=` states the CLI's whole
+    /// reviewer backup list; it must not append after the ones the project file
+    /// already declared. Appending put the operator's backups on ordinals 2 and 3
+    /// of a two-reviewer project — backing up seats they never named, and leaving
+    /// the seats they did name on the file's values. `--role reviewer=` has always
+    /// set the panel exactly rather than extending it; this is the same rule.
+    #[test]
+    fn positional_reviewer_backups_replace_the_files_list_rather_than_appending() {
+        let mut cfg = Config::default();
+        cfg.backups.reviewer = vec!["cli:agy@a".into(), "cli:agy@b".into()];
+
+        cfg.apply_backup_overrides(&[
+            "reviewer=cli:claude@opus".to_string(),
+            "reviewer=cli:codex@gpt-5.6-terra".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cfg.backups.reviewer,
+            vec![
+                "cli:claude@opus".to_string(),
+                "cli:codex@gpt-5.6-terra".to_string()
+            ],
+            "the CLI states the whole list"
+        );
+    }
+
+    /// The ordinal spelling is the amend-one-seat form, so it keeps the others.
+    #[test]
+    fn an_ordinal_reviewer_backup_amends_one_seat_and_keeps_the_rest() {
+        let mut cfg = Config::default();
+        cfg.backups.reviewer = vec!["cli:agy@a".into(), "cli:agy@b".into()];
+
+        cfg.apply_backup_overrides(&["reviewer:1=cli:codex@gpt-5.6-terra".to_string()])
+            .unwrap();
+
+        assert_eq!(
+            cfg.backups.reviewer,
+            vec![
+                "cli:agy@a".to_string(),
+                "cli:codex@gpt-5.6-terra".to_string()
+            ],
+            "ordinal 0 is the file's, ordinal 1 is the CLI's"
+        );
+    }
     use super::*;
     use tempfile::tempdir;
 

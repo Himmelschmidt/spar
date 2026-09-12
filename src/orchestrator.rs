@@ -279,6 +279,7 @@ pub struct TurnRequest {
     pub watermark: usize,
     pub project_root: std::path::PathBuf,
     pub run_id: Option<String>,
+    pub pending_spec: Option<crate::runspec::RunSpec>,
 }
 
 #[allow(dead_code)]
@@ -585,11 +586,97 @@ fn dispatch_turn_inner(
             run_id, conv, turn
         ));
     } else {
-        prompt.push_str("You are the orchestrator. Interview the operator into a brief. You may propose a fleet with a ```spar-proposal TOML block (task, brief, providers). Only the TUI launches; you never approve, confirm, merge, or pick a fleet. Send your one reply via:\n");
+        prompt.push_str("You are the orchestrator. Interview the operator into a brief. You may propose a fleet with a ```spar-proposal TOML block. Fields: task (string), brief (string), workflow (plan|implement|review|arena), providers (array, legacy positional pool), [roles] table (planner, plan_critic, implementer, tester, test_author = \"provider\" and reviewer = [...]), [backups] table (same shape, per-role backup). Example:\n```spar-proposal\ntask = \"do thing\"\nbrief = \"detailed brief\"\nworkflow = \"plan\"\n[roles]\nplanner = \"cli:claude@opus\"\nreviewer = [\"cli:codex@terra\", \"cli:grok@fast\"]\n[backups]\nplanner = \"cli:grok@fast\"\nreviewer = [\"cli:claude@sonnet\", \"cli:codex@luna\"]\n```\nOnly blank fields will be applied; operator-filled values are preserved. Only the TUI launches; you never approve, confirm, merge, or pick a fleet. Send your one reply via:\n");
         prompt.push_str(&format!(
             "spar bus send --from \"$SPAR_AGENT_ID\" --to @human --surface chat --conversation {} --turn {} --message \"...\"\n",
             conv, turn
         ));
+        let partial = if let Some(pending) = req.pending_spec.clone() {
+            pending
+        } else {
+            let defaults = crate::defaults::load();
+            crate::runspec::RunSpec {
+                workflow: defaults.workflow,
+                task: defaults.task.clone(),
+                roles: defaults.roles.clone(),
+                arena_pool: defaults.arena_pool.clone(),
+                legacy_providers: Vec::new(),
+                ..Default::default()
+            }
+        };
+        let cfg = partial
+            .project
+            .as_ref()
+            .and_then(|p| crate::config::Config::load(p).ok())
+            .unwrap_or_else(|| {
+                crate::config::Config::load(&paths.project_root).unwrap_or_default()
+            });
+        let blanks = partial.blanks(&cfg);
+        if !blanks.is_empty() || partial.workflow.is_none() || partial.task.trim().is_empty() {
+            prompt.push_str("\n\n## Partial run spec (operator has pre-filled)\n");
+            if let Some(wf) = partial.workflow {
+                prompt.push_str(&format!("workflow: {}\n", wf.as_str()));
+            } else {
+                prompt.push_str("workflow: (unset — you may propose one)\n");
+            }
+            if partial.task.trim().is_empty() {
+                prompt.push_str("task: (blank)\n");
+            } else {
+                prompt.push_str(&format!("task: {}\n", partial.task));
+            }
+            let rows = partial
+                .workflow
+                .map(|wf| crate::runspec::spec_rows(wf, &cfg))
+                .unwrap_or_default();
+            for (role, ord) in rows {
+                if let Some(ra) = partial
+                    .roles
+                    .iter()
+                    .find(|r| r.role == role && r.ordinal == ord)
+                {
+                    if let Some(p) = &ra.primary {
+                        prompt.push_str(&format!(
+                            "{}[{}]: {}\n",
+                            role.as_config_key(),
+                            ord,
+                            p.display()
+                        ));
+                    } else {
+                        prompt.push_str(&format!("{}[{}]: (blank)\n", role.as_config_key(), ord));
+                    }
+                } else {
+                    prompt.push_str(&format!("{}[{}]: (blank)\n", role.as_config_key(), ord));
+                }
+            }
+            if partial.workflow == Some(crate::runspec::SpecWorkflow::Arena) {
+                for (idx, slot) in partial.arena_pool.iter().enumerate() {
+                    if let Some(p) = slot {
+                        prompt.push_str(&format!("arena[{}]: {}\n", idx, p.display()));
+                    } else {
+                        prompt.push_str(&format!("arena[{}]: (blank)\n", idx));
+                    }
+                }
+            }
+            // Backups: show only where primary exists, for the dispatched roles
+            for ra in &partial.roles {
+                if let Some(b) = &ra.backup {
+                    prompt.push_str(&format!(
+                        "{}[{}] backup: {}\n",
+                        ra.role.as_config_key(),
+                        ra.ordinal,
+                        b.display()
+                    ));
+                }
+            }
+            if !partial.legacy_providers.is_empty() {
+                prompt.push_str(&format!(
+                    "legacy_providers: {}\n",
+                    partial.legacy_providers.join(", ")
+                ));
+            }
+            prompt.push_str(&format!("blanks: {}\n", blanks.join(", ")));
+            prompt.push_str("Propose only blanks; do not overwrite filled fields.\n");
+        }
     }
     // Include transcript
     let scope = if req.scope_key == "home" {
@@ -830,11 +917,16 @@ pub fn validate_turn(
     Ok(candidates[0].clone())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Proposal {
     pub task: String,
     pub brief: String,
     pub providers: Vec<String>,
+    pub workflow: Option<String>,
+    pub roles: std::collections::HashMap<String, String>,
+    pub backups: std::collections::HashMap<String, String>,
+    pub reviewer: Vec<String>,
+    pub reviewer_backups: Vec<String>,
 }
 
 pub fn parse_proposal(body: &str) -> Result<Option<Proposal>> {
@@ -872,13 +964,63 @@ pub fn parse_proposal(body: &str) -> Result<Option<Proposal>> {
                         .collect()
                 })
                 .unwrap_or_default();
+            let workflow = value
+                .get("workflow")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let mut roles = std::collections::HashMap::new();
+            let mut backups = std::collections::HashMap::new();
+            let mut reviewer = Vec::new();
+            let mut reviewer_backups = Vec::new();
+            if let Some(tbl) = value.get("roles").and_then(|v| v.as_table()) {
+                for (k, v) in tbl {
+                    if k == "reviewer" {
+                        if let Some(arr) = v.as_array() {
+                            reviewer = arr
+                                .iter()
+                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                .collect();
+                        } else if let Some(s) = v.as_str() {
+                            reviewer.push(s.to_string());
+                        }
+                    } else if let Some(s) = v.as_str() {
+                        roles.insert(k.clone(), s.to_string());
+                    }
+                }
+            }
+            if let Some(tbl) = value.get("backups").and_then(|v| v.as_table()) {
+                for (k, v) in tbl {
+                    if k == "reviewer" {
+                        if let Some(arr) = v.as_array() {
+                            reviewer_backups = arr
+                                .iter()
+                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                .collect();
+                        } else if let Some(s) = v.as_str() {
+                            reviewer_backups.push(s.to_string());
+                        }
+                    } else if let Some(s) = v.as_str() {
+                        backups.insert(k.clone(), s.to_string());
+                    }
+                }
+            }
             if task.is_empty() && brief.is_empty() {
                 anyhow::bail!("spar-proposal missing task and brief");
+            }
+            if let Some(wf) = &workflow {
+                if crate::runspec::SpecWorkflow::parse(wf).is_none() {
+                    anyhow::bail!("spar-proposal workflow {wf:?} is unknown");
+                }
             }
             return Ok(Some(Proposal {
                 task,
                 brief,
                 providers,
+                workflow,
+                roles,
+                backups,
+                reviewer,
+                reviewer_backups,
             }));
         } else {
             anyhow::bail!("unterminated spar-proposal fence");
@@ -1211,6 +1353,7 @@ mod tests {
             watermark: before,
             project_root: paths.project_root.clone(),
             run_id: None,
+            pending_spec: None,
         };
         let mut meta = HashMap::new();
         meta.insert(META_SURFACE.into(), SURFACE_CHAT.into());
@@ -1366,6 +1509,7 @@ mod tests {
             watermark: 0,
             project_root: proj1.clone(),
             run_id: None,
+            pending_spec: None,
         };
         let out1 = dispatch_turn(paths1.clone(), req1).unwrap();
         assert!(
@@ -1393,6 +1537,7 @@ mod tests {
             watermark: 0,
             project_root: proj2.clone(),
             run_id: None,
+            pending_spec: None,
         };
         let out2 = dispatch_turn(paths2.clone(), req2).unwrap();
         assert!(out2.worktree.is_some());
@@ -1429,6 +1574,7 @@ mod tests {
             watermark: 0,
             project_root: proj1.clone(),
             run_id: None,
+            pending_spec: None,
         };
         let out = dispatch_turn(paths1.clone(), bad_req).unwrap();
         assert!(!out.success);
@@ -1454,6 +1600,7 @@ mod tests {
             watermark: 0,
             project_root: proj1.clone(),
             run_id: Some(run_id.into()),
+            pending_spec: None,
         };
         let out = dispatch_turn(paths1.clone(), bad_run_req).unwrap();
         assert!(
@@ -1494,6 +1641,7 @@ mod tests {
             watermark: 0,
             project_root: proj1.clone(),
             run_id: None,
+            pending_spec: None,
         };
         let _out = dispatch_turn(paths1.clone(), dirty_req).unwrap();
         // The worktree was pre-existing and dirty, so dispatch must not have removed it.
@@ -1534,6 +1682,7 @@ mod tests {
             watermark: 0,
             project_root: proj1.clone(),
             run_id: None,
+            pending_spec: None,
         };
         let out_dirty_created = dispatch_turn(paths1.clone(), dirty_created_req).unwrap();
         assert!(

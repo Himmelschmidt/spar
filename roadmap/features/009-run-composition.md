@@ -1,7 +1,7 @@
 ---
 id: 9
 title: Run composition
-status: backlog
+status: done
 milestone: 6
 effort: L
 priority: high

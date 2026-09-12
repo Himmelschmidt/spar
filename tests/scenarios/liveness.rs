@@ -138,7 +138,11 @@ fn assert_foreground_lock(workflow: &str) {
     std::fs::create_dir_all(&bin).unwrap();
     for name in ["claude", "grok", "agy"] {
         let p = bin.join(name);
-        std::fs::write(&p, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::write(
+            &p,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ] || [ \"$1\" = \"-v\" ] || [ \"$1\" = \"--help\" ]; then echo \"fake version\"; exit 0; fi\nsleep 30\n",
+        )
+        .unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let path_env = format!(
