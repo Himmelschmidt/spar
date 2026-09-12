@@ -72,23 +72,15 @@ pub fn run(
         state.pool_intent = requested.clone();
     }
     state.providers = providers::pick_providers(&requested, n_slots, Some(&requested), dry);
-    // `state.providers` is positional: `resolve_seat(role, idx, …)` maps each slot by
-    // index, so quota must gate the pool in place, never compact it — dropping a paused
-    // entry would slide another model into a role's slot and silently collapse the pool
-    // onto one model (identical assignment to --dry-run is the contract).
+    // `state.providers` is positional, but CLI `--role` pins outrank it (O79). A
+    // preflight quota gate that checks the pool before seat resolution sees the
+    // *pool* entry as paused and parks, even though the seat's own provider (from
+    // `cfg.roles`) would be replaced by its backup. Resolve seats first, then gate
+    // only those that remain ineligible with no eligible backup — so a declared backup
+    // actually covers its role.
     if !dry {
-        if let Err(e) = crate::quota::ensure_usable(paths, &state.providers) {
-            state.error = Some(e.to_string());
-            state.set_phase(Phase::Quota);
-            paths.ensure_run_dirs(&state.id)?;
-            state.save(paths)?;
-            if opts.json {
-                executor::emit_run_json(&state)?;
-            } else {
-                eprintln!("error: {e}");
-            }
-            return Ok(ExitCode::Quota);
-        }
+        // Check after seat resolution below; pool alone is not authoritative when backups
+        // can cover individual roles. Save the pool now and defer the quota gate.
     }
 
     if state.providers.is_empty() {
@@ -137,6 +129,55 @@ pub fn run(
             expected_artifact: Some(expected_artifact),
             model,
         });
+    }
+
+    // Backup-aware quota gate: after seat resolution, a paused primary that has an
+    // eligible backup is already covered (plan_slot_specs swapped it). Only those that
+    // remain ineligible with no eligible backup should park.
+    if !dry {
+        let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+        let has_backup = cfg.backups.planner.is_some()
+            || cfg.backups.plan_critic.is_some()
+            || cfg.backups.test_author.is_some();
+        let available: Option<std::collections::HashSet<String>> = if !has_backup {
+            None
+        } else {
+            let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+                .into_iter()
+                .filter(|r| r.available)
+                .map(|r| format!("cli:{}", r.name))
+                .collect();
+            if detected.is_empty() {
+                None
+            } else {
+                Some(detected)
+            }
+        };
+        let mut still_paused: Vec<String> = Vec::new();
+        for job in &jobs {
+            if !crate::backup::is_provider_eligible(&job.provider, &store, available.as_ref()) {
+                let key = crate::quota::normalize_key(&job.provider);
+                if !still_paused.contains(&key) {
+                    still_paused.push(key);
+                }
+            }
+        }
+        if !still_paused.is_empty() {
+            let msg = format!(
+                "provider(s) paused or on cooldown: {}. resume with `spar provider resume <name>` or reassign the role",
+                still_paused.join(", ")
+            );
+            state.error = Some(msg.clone());
+            state.set_phase(Phase::Quota);
+            paths.ensure_run_dirs(&state.id)?;
+            state.save(paths)?;
+            if opts.json {
+                executor::emit_run_json(&state)?;
+            } else {
+                eprintln!("error: {msg}");
+            }
+            return Ok(ExitCode::Quota);
+        }
     }
 
     // Printed after the slots resolve, not off `state.providers`: the pool lists what the

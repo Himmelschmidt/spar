@@ -286,7 +286,73 @@ fn timeout_does_not_activate_backup() {
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
     init_repo(&proj);
-    let _ = spar_home_dir();
+    // Force a short hard ceiling: slot_secs 2, ceiling 4s. Provider sleeps 10s -> hard ceiling kill -> Work.
+    std::fs::write(
+        proj.join("spar.toml"),
+        "[timeouts]\nslot_secs = 2\nhard_ceiling_multiple = 2.0\n",
+    )
+    .unwrap();
+    let spar_home = spar_home_dir();
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for name in ["claude", "grok"] {
+        let p = bin.join(name);
+        std::fs::write(
+            &p,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\nsleep 10\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let path_env = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let _ = spar_cmd()
+        .current_dir(&proj)
+        .env("SPAR_HOME", &spar_home)
+        .env("PATH", &path_env)
+        .args([
+            "implement",
+            "-t",
+            "timeout backup",
+            "--role",
+            "implementer=cli:claude@opus",
+            "--backup",
+            "implementer=cli:grok@backup",
+            "--without",
+            "suite",
+            "--json",
+        ])
+        .assert()
+        .get_output()
+        .clone();
+    let run_id = fs::read_dir(proj.join(".spar/runs"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.path().join("state.json").is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .expect("run created for timeout");
+    let state = read_state(&proj, &run_id);
+    let slot = state["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["role"] == "implementer")
+        .unwrap();
+    assert_eq!(slot["provider"], "cli:claude");
+    assert_ne!(slot["source"], "backup", "timeout must not activate backup");
+    // Ensure error indicates hard ceiling / timeout, not quota
+    let err = slot["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("hard ceiling") || err.contains("timeout") || err.contains("failed"),
+        "slot should have timeout failure, got {err:?} state {state:?}"
+    );
 }
 
 #[test]
@@ -295,7 +361,64 @@ fn missing_artifact_does_not_activate_backup() {
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
     init_repo(&proj);
-    let _ = spar_home_dir();
+    let spar_home = spar_home_dir();
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for name in ["claude", "grok"] {
+        let p = bin.join(name);
+        std::fs::write(
+            &p,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\nexit 0\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let path_env = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let _ = spar_cmd()
+        .current_dir(&proj)
+        .env("SPAR_HOME", &spar_home)
+        .env("PATH", &path_env)
+        .args([
+            "implement",
+            "-t",
+            "missing artifact backup",
+            "--role",
+            "implementer=cli:claude@opus",
+            "--backup",
+            "implementer=cli:grok@backup",
+            "--without",
+            "suite",
+            "--json",
+        ])
+        .assert()
+        .get_output()
+        .clone();
+    let run_id = fs::read_dir(proj.join(".spar/runs"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.path().join("state.json").is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .expect("run created for missing artifact");
+    let state = read_state(&proj, &run_id);
+    let slot = state["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["role"] == "implementer")
+        .unwrap();
+    assert_eq!(slot["provider"], "cli:claude");
+    assert_ne!(
+        slot["source"], "backup",
+        "missing artifact must not activate backup"
+    );
 }
 
 #[test]
@@ -304,7 +427,74 @@ fn adverse_review_does_not_activate_backup() {
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
     init_repo(&proj);
-    let _ = spar_home_dir();
+    let spar_home = spar_home_dir();
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for name in ["claude", "grok", "codex"] {
+        let p = bin.join(name);
+        std::fs::write(
+            &p,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\nexit 1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let path_env = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    // Run a review with backup declared: both reviewers fail with work failure (exit 1).
+    // Salvage will produce request_changes verdicts (adverse). Backup must not have activated.
+    let _ = spar_cmd()
+        .current_dir(&proj)
+        .env("SPAR_HOME", &spar_home)
+        .env("PATH", &path_env)
+        .args([
+            "run",
+            "--workflow",
+            "review",
+            "-t",
+            "adverse review",
+            "--role",
+            "reviewer=cli:claude",
+            "--role",
+            "reviewer=cli:grok",
+            "--backup",
+            "reviewer=cli:codex@backup",
+            "--backup",
+            "reviewer=cli:codex@backup2",
+            "--json",
+        ])
+        .assert()
+        .get_output()
+        .clone();
+    let run_id = fs::read_dir(proj.join(".spar/runs"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.path().join("state.json").is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .expect("run created for adverse review");
+    let state = read_state(&proj, &run_id);
+    for slot in state["slots"].as_array().unwrap() {
+        assert_ne!(
+            slot["source"], "backup",
+            "adverse review must not activate backup: {slot:?}"
+        );
+    }
+    // Providers must remain primaries
+    let providers: Vec<String> = state["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["provider"].as_str().unwrap().to_string())
+        .collect();
+    assert!(providers.contains(&"cli:claude".to_string()));
+    assert!(providers.contains(&"cli:grok".to_string()));
 }
 
 #[test]

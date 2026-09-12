@@ -229,8 +229,13 @@ impl RunSpec {
                     return Err(format!("arena[{}] is not set", idx));
                 }
                 if let Some(pin) = slot {
-                    if pin.provider.trim().is_empty() {
-                        return Err(format!("arena[{}] has empty provider", idx));
+                    if let Err(e) = crate::provider_ref::ProviderRef::parse(&pin.display()) {
+                        return Err(format!(
+                            "arena[{}] is invalid ({}): {}",
+                            idx,
+                            pin.display(),
+                            e
+                        ));
                     }
                 }
             }
@@ -306,11 +311,13 @@ impl RunSpec {
                         ));
                     }
                     if let Some(pin) = &assign.primary {
-                        if pin.provider.trim().is_empty() {
+                        if let Err(e) = crate::provider_ref::ProviderRef::parse(&pin.display()) {
                             return Err(format!(
-                                "primary for {}[{}] is empty",
+                                "primary for {}[{}] is invalid ({}): {}",
                                 role.as_config_key(),
-                                ordinal
+                                ordinal,
+                                pin.display(),
+                                e
                             ));
                         }
                     }

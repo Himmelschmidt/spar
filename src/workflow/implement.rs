@@ -501,27 +501,9 @@ fn run_from_approved(
             };
     }
     state.providers = providers::pick_providers(&requested, n, Some(&requested), state.dry_run);
-    // Gate the positional pool in place — never compact it, or a paused provider would
-    // slide a different model into a role's slot (silent single-model collapse). Paused
-    // providers fail loud so the review panel stays exactly what was specified.
-    if !state.dry_run {
-        if let Err(e) = crate::quota::ensure_usable(paths, &state.providers) {
-            state.error = Some(e.to_string());
-            state.set_phase(Phase::Quota);
-            state.save(paths)?;
-            if opts.json {
-                executor::emit_run_json(&state)?;
-            } else {
-                eprintln!("error: {e}");
-            }
-            return Ok(ExitCode::Quota);
-        }
-    }
-    // Continuing an approved plan is this unit of work's next round, not a new run
-    // (O45): the id, brief, base, config and usage ledger all carry. Counted here,
-    // past the quota gate, so an invocation that never dispatched anything does not
-    // leave the run claiming a round it did not run — five bounced retries against an
-    // exhausted bucket would otherwise read as round 6.
+    // Quota gate is now backup-aware; it runs after seats are materialized.
+    // A bare pool gate before prepare_implement_slots would see the pool entry as paused
+    // and park, even though the seat's CLI pin would be covered by its backup.
     let from_round_gate = state.phase == Phase::AwaitingRoundExtension;
     if let Some(m) = opts.max_rounds {
         state.max_rounds = m;
@@ -555,6 +537,54 @@ fn run_from_approved(
             reload_config: opts.reload_config,
         },
     )?;
+    if !dry {
+        let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+        let has_backup = cfg.backups.implementer.is_some()
+            || !cfg.backups.reviewer.is_empty()
+            || cfg.backups.tester.is_some();
+        let available: Option<std::collections::HashSet<String>> = if !has_backup {
+            None
+        } else {
+            let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+                .into_iter()
+                .filter(|r| r.available)
+                .map(|r| format!("cli:{}", r.name))
+                .collect();
+            if detected.is_empty() {
+                None
+            } else {
+                Some(detected)
+            }
+        };
+        let mut still_paused: Vec<String> = Vec::new();
+        for slot in &state.slots {
+            if matches!(
+                slot.role,
+                SlotRole::Implementer | SlotRole::Reviewer | SlotRole::Tester
+            ) && !crate::backup::is_provider_eligible(&slot.provider, &store, available.as_ref())
+            {
+                let key = crate::quota::normalize_key(&slot.provider);
+                if !still_paused.contains(&key) {
+                    still_paused.push(key);
+                }
+            }
+        }
+        if !still_paused.is_empty() {
+            let msg = format!(
+                "provider(s) paused or on cooldown: {}. resume with `spar provider resume <name>` or reassign the role",
+                still_paused.join(", ")
+            );
+            state.error = Some(msg.clone());
+            state.set_phase(crate::state::Phase::Quota);
+            state.save(paths)?;
+            if opts.json {
+                crate::executor::emit_run_json(&state)?;
+            } else {
+                eprintln!("error: {msg}");
+            }
+            return Ok(crate::exit_codes::ExitCode::Quota);
+        }
+    }
     if state.slots.iter().all(|s| s.role != SlotRole::Implementer) {
         bail!("no implementer slot after provider pick");
     }
@@ -1463,21 +1493,8 @@ fn run_with_task(
     // just at the plan phase.
     state.pool_origin = pool_origin;
     state.providers = providers::pick_providers(&requested, n, Some(&requested), dry);
-    // Gate the positional pool in place — never compact it (see the sibling entry point).
-    if !dry {
-        if let Err(e) = crate::quota::ensure_usable(paths, &state.providers) {
-            state.error = Some(e.to_string());
-            state.set_phase(Phase::Quota);
-            paths.ensure_run_dirs(&state.id)?;
-            state.save(paths)?;
-            if opts.json {
-                executor::emit_run_json(&state)?;
-            } else {
-                eprintln!("error: {e}");
-            }
-            return Ok(ExitCode::Quota);
-        }
-    }
+    // Quota gate is now backup-aware and runs after seat resolution: a paused primary
+    // with an eligible backup must not park the run.
     prepare_implement_slots(
         &mut state,
         Some(&requested),
@@ -1490,6 +1507,51 @@ fn run_with_task(
             reload_config: opts.reload_config,
         },
     )?;
+    if !dry {
+        let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+        let has_backup = cfg.backups.implementer.is_some()
+            || !cfg.backups.reviewer.is_empty()
+            || cfg.backups.tester.is_some();
+        let available: Option<std::collections::HashSet<String>> = if !has_backup {
+            None
+        } else {
+            let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+                .into_iter()
+                .filter(|r| r.available)
+                .map(|r| format!("cli:{}", r.name))
+                .collect();
+            if detected.is_empty() {
+                None
+            } else {
+                Some(detected)
+            }
+        };
+        let mut still_paused: Vec<String> = Vec::new();
+        for slot in &state.slots {
+            if !crate::backup::is_provider_eligible(&slot.provider, &store, available.as_ref()) {
+                let key = crate::quota::normalize_key(&slot.provider);
+                if !still_paused.contains(&key) {
+                    still_paused.push(key);
+                }
+            }
+        }
+        if !still_paused.is_empty() {
+            let msg = format!(
+                "provider(s) paused or on cooldown: {}. resume with `spar provider resume <name>` or reassign the role",
+                still_paused.join(", ")
+            );
+            state.error = Some(msg.clone());
+            state.set_phase(Phase::Quota);
+            paths.ensure_run_dirs(&state.id)?;
+            state.save(paths)?;
+            if opts.json {
+                executor::emit_run_json(&state)?;
+            } else {
+                eprintln!("error: {msg}");
+            }
+            return Ok(ExitCode::Quota);
+        }
+    }
 
     paths.ensure_run_dirs(&state.id)?;
     let _ = crate::bus::ensure_bus(paths);
@@ -2904,6 +2966,140 @@ mod rotate_reviewer_tests {
             try_rotate_reviewer_provider(&mut st, &paths, "review-0", tmp.path(), &cfg).unwrap();
         assert!(!changed, "truncated panel has no alternate within its size");
         assert_eq!(st.slots[0].provider, "cli:codex");
+    }
+}
+
+#[cfg(test)]
+mod try_rotate_implementer_tests {
+    use super::*;
+    use crate::state::{SeatSource, SlotStatus};
+    use tempfile::tempdir;
+
+    fn state_with_impl(provider: &str, source: Option<SeatSource>, quota_hit: bool) -> RunState {
+        let mut st = RunState::new(
+            "r-rotate-impl",
+            crate::cli::WorkflowKind::Loop,
+            PathBuf::from("/tmp/x"),
+        );
+        let mut slot = executor::init_slot("impl", provider, SlotRole::Implementer);
+        slot.source = source;
+        slot.status = SlotStatus::Failed;
+        slot.quota_hit = quota_hit;
+        slot.error = Some("simulated failure".into());
+        st.slots.push(slot);
+        st.providers = vec!["cli:claude".into(), "cli:codex".into(), "cli:grok".into()];
+        st.pool_origin = PoolOrigin::CliProviders;
+        st
+    }
+
+    #[test]
+    fn environmental_activates_backup_over_distinctive_pool_provider() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        // Primary paused -> Environmental, backup eligible, distinctive next is codex but backup is grok@backup
+        {
+            let mut store = crate::quota::QuotaStore::default();
+            store.pause_quota("cli:claude", "test");
+            store.save(&paths).unwrap();
+        }
+        let mut st = state_with_impl("cli:claude", Some(SeatSource::CliRole), false);
+        // Make primary ineligible via store
+        let mut cfg = Config::default();
+        cfg.providers.order = vec!["cli:claude".into(), "cli:codex".into(), "cli:grok".into()];
+        cfg.roles.implementer = Some("cli:claude".into());
+        cfg.cli_role_keys.insert("implementer".into());
+        cfg.backups.implementer = Some("cli:grok@backup".into());
+        // ensure backup provider is available (detect_all would list claude,grok,codex as available if binaries exist? But we use store only, and available None because we didn't set detect. is_provider_eligible will check store and available; with available None, only store matters. backup grok is not paused, so eligible)
+        let changed = try_rotate_implementer(&mut st, &paths, &cfg).unwrap();
+        assert!(changed, "environmental should rotate to backup");
+        assert_eq!(st.slots[0].provider, "cli:grok");
+        assert_eq!(st.slots[0].model.as_deref(), Some("backup"));
+        assert_eq!(st.slots[0].source, Some(SeatSource::Backup));
+    }
+
+    #[test]
+    fn work_failure_does_not_activate_backup_and_falls_to_pool() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = state_with_impl("cli:claude", Some(SeatSource::CliRole), false);
+        // No pause, quota_hit false, provider available -> Work
+        let mut cfg = Config::default();
+        cfg.providers.order = vec!["cli:claude".into(), "cli:codex".into(), "cli:grok".into()];
+        cfg.roles.implementer = Some("cli:claude".into());
+        cfg.cli_role_keys.insert("implementer".into());
+        cfg.backups.implementer = Some("cli:grok@backup".into());
+        // Work cause: dispatch_stop_cause will be Work, so backup branch not taken, falls to pool
+        let changed = try_rotate_implementer(&mut st, &paths, &cfg).unwrap();
+        assert!(changed, "work failure should still rotate via pool");
+        assert_eq!(st.slots[0].provider, "cli:codex");
+        assert_ne!(st.slots[0].source, Some(SeatSource::Backup));
+    }
+
+    #[test]
+    fn consumed_backup_is_not_reselected() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        {
+            let mut store = crate::quota::QuotaStore::default();
+            store.pause_quota("cli:claude", "test");
+            store.save(&paths).unwrap();
+        }
+        // Slot already from backup: simulate environmental failure after backup already activated
+        let mut st = state_with_impl("cli:grok", Some(SeatSource::Backup), true);
+        let mut cfg = Config::default();
+        cfg.providers.order = vec!["cli:claude".into(), "cli:codex".into(), "cli:grok".into()];
+        cfg.roles.implementer = Some("cli:claude".into());
+        cfg.cli_role_keys.insert("implementer".into());
+        cfg.backups.implementer = Some("cli:grok@backup".into());
+        st.providers = vec!["cli:grok".into(), "cli:codex".into()];
+        let changed = try_rotate_implementer(&mut st, &paths, &cfg).unwrap();
+        assert!(!changed, "consumed backup must not be reselected");
+        assert_eq!(st.slots[0].provider, "cli:grok");
+    }
+
+    #[test]
+    fn backup_not_eligible_does_not_activate() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        {
+            let mut store = crate::quota::QuotaStore::default();
+            store.pause_quota("cli:claude", "test");
+            store.save(&paths).unwrap();
+        }
+        // Also pause backup
+        let mut store = crate::quota::QuotaStore::load(&paths).unwrap();
+        store.pause_quota("cli:grok", "test");
+        store.save(&paths).unwrap();
+        let mut st = state_with_impl("cli:claude", Some(SeatSource::CliRole), false);
+        let mut cfg = Config::default();
+        cfg.providers.order = vec!["cli:claude".into(), "cli:codex".into(), "cli:grok".into()];
+        cfg.roles.implementer = Some("cli:claude".into());
+        cfg.cli_role_keys.insert("implementer".into());
+        cfg.backups.implementer = Some("cli:grok@backup".into());
+        let changed = try_rotate_implementer(&mut st, &paths, &cfg).unwrap();
+        assert!(!changed, "ineligible backup must not be selected");
+    }
+
+    #[test]
+    fn neutralization_would_fail_backup_branch() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        {
+            let mut store = crate::quota::QuotaStore::default();
+            store.pause_quota("cli:claude", "test");
+            store.save(&paths).unwrap();
+        }
+        let mut st = state_with_impl("cli:claude", Some(SeatSource::CliRole), false);
+        let mut cfg = Config::default();
+        cfg.providers.order = vec!["cli:claude".into(), "cli:codex".into()];
+        cfg.roles.implementer = Some("cli:claude".into());
+        cfg.cli_role_keys.insert("implementer".into());
+        cfg.backups.implementer = Some("cli:grok@backup".into());
+        let changed = try_rotate_implementer(&mut st, &paths, &cfg).unwrap();
+        assert!(changed);
+        assert_eq!(st.slots[0].provider, "cli:grok");
+        // If Environmental branch were deleted, rotation would fall to codex
+        // This test documents that deleting the if cause == Environmental block changes behavior
     }
 }
 

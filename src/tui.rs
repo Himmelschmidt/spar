@@ -4388,9 +4388,26 @@ fn rebuild_roles_for_workflow(nr: &mut NewRun, cfg: &crate::config::Config) {
             for (i, pin) in nr.arena_pool.iter().enumerate().take(expected.len()) {
                 new_pool[i] = pin.clone();
             }
+            // Map legacy providers into empty arena positions
+            let mut remaining_legacy = Vec::new();
+            let mut legacy_idx = 0;
+            for slot in new_pool.iter_mut() {
+                if slot.is_none() && legacy_idx < nr.legacy_providers.len() {
+                    if let Ok(pin) = crate::runspec::Pin::parse(&nr.legacy_providers[legacy_idx]) {
+                        *slot = Some(pin);
+                    } else {
+                        remaining_legacy.push(nr.legacy_providers[legacy_idx].clone());
+                    }
+                    legacy_idx += 1;
+                }
+            }
+            while legacy_idx < nr.legacy_providers.len() {
+                remaining_legacy.push(nr.legacy_providers[legacy_idx].clone());
+                legacy_idx += 1;
+            }
             nr.arena_pool = new_pool;
             nr.roles.clear();
-            nr.legacy_providers.clear();
+            nr.legacy_providers = remaining_legacy;
         } else {
             let mut new_roles = Vec::new();
             for (role, ordinal) in expected {
@@ -4409,9 +4426,26 @@ fn rebuild_roles_for_workflow(nr: &mut NewRun, cfg: &crate::config::Config) {
                     });
                 }
             }
+            // Map legacy providers into empty role slots
+            let mut remaining_legacy = Vec::new();
+            let mut legacy_idx = 0;
+            for ra in new_roles.iter_mut() {
+                if ra.primary.is_none() && legacy_idx < nr.legacy_providers.len() {
+                    if let Ok(pin) = crate::runspec::Pin::parse(&nr.legacy_providers[legacy_idx]) {
+                        ra.primary = Some(pin);
+                    } else {
+                        remaining_legacy.push(nr.legacy_providers[legacy_idx].clone());
+                    }
+                    legacy_idx += 1;
+                }
+            }
+            while legacy_idx < nr.legacy_providers.len() {
+                remaining_legacy.push(nr.legacy_providers[legacy_idx].clone());
+                legacy_idx += 1;
+            }
             nr.roles = new_roles;
             nr.arena_pool.clear();
-            nr.legacy_providers.clear();
+            nr.legacy_providers = remaining_legacy;
         }
         nr.role_sel = 0;
         nr.editing_backup = false;

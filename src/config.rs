@@ -1112,27 +1112,21 @@ impl Config {
                      reviewer, tester, test_author)"
                 )
             })?;
+            let pin = crate::runspec::Pin::parse(provider)
+                .with_context(|| format!("invalid provider in --role {role}: {provider:?}"))?;
+            let canonical = pin.display();
             match slot {
-                crate::state::SlotRole::Planner => self.roles.planner = Some(provider.into()),
-                crate::state::SlotRole::PlanCritic => {
-                    self.roles.plan_critic = Some(provider.into())
-                }
-                crate::state::SlotRole::Implementer => {
-                    self.roles.implementer = Some(provider.into())
-                }
-                crate::state::SlotRole::Tester => self.roles.tester = Some(provider.into()),
-                crate::state::SlotRole::TestAuthor => {
-                    self.roles.test_author = Some(provider.into())
-                }
-                crate::state::SlotRole::Reviewer => reviewers.push(provider.to_string()),
+                crate::state::SlotRole::Planner => self.roles.planner = Some(canonical),
+                crate::state::SlotRole::PlanCritic => self.roles.plan_critic = Some(canonical),
+                crate::state::SlotRole::Implementer => self.roles.implementer = Some(canonical),
+                crate::state::SlotRole::Tester => self.roles.tester = Some(canonical),
+                crate::state::SlotRole::TestAuthor => self.roles.test_author = Some(canonical),
+                crate::state::SlotRole::Reviewer => reviewers.push(canonical),
                 other => anyhow::bail!(
                     "--role {}: not assignable (it is derived by the workflow)",
                     other.as_config_key()
                 ),
             }
-            // Recorded on `Config` itself, so it snapshots with the run (O27): a later
-            // round with no `--reload-config` must still know this role was a CLI pin,
-            // not just a value that happens to match what `[roles]` says.
             self.cli_role_keys.insert(slot.as_config_key().to_string());
         }
         if !reviewers.is_empty() {
@@ -1162,22 +1156,17 @@ impl Config {
                      reviewer, tester, test_author)"
                 )
             })?;
-            crate::provider_ref::ProviderRef::parse(provider)
+            let pin = crate::runspec::Pin::parse(provider)
                 .with_context(|| format!("invalid provider in --backup {role}: {provider:?}"))?;
+            let canonical = pin.display();
             match slot {
-                crate::state::SlotRole::Planner => self.backups.planner = Some(provider.into()),
-                crate::state::SlotRole::PlanCritic => {
-                    self.backups.plan_critic = Some(provider.into())
-                }
-                crate::state::SlotRole::Implementer => {
-                    self.backups.implementer = Some(provider.into())
-                }
-                crate::state::SlotRole::Tester => self.backups.tester = Some(provider.into()),
-                crate::state::SlotRole::TestAuthor => {
-                    self.backups.test_author = Some(provider.into())
-                }
+                crate::state::SlotRole::Planner => self.backups.planner = Some(canonical),
+                crate::state::SlotRole::PlanCritic => self.backups.plan_critic = Some(canonical),
+                crate::state::SlotRole::Implementer => self.backups.implementer = Some(canonical),
+                crate::state::SlotRole::Tester => self.backups.tester = Some(canonical),
+                crate::state::SlotRole::TestAuthor => self.backups.test_author = Some(canonical),
                 crate::state::SlotRole::Reviewer => {
-                    backup_reviewers.push(provider.to_string());
+                    backup_reviewers.push(canonical);
                     has_backup_reviewers = true;
                 }
                 other => anyhow::bail!(

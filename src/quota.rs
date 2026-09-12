@@ -498,6 +498,7 @@ pub fn apply_quota_filter(paths: &SparPaths, names: &[String]) -> Result<Vec<Str
 /// Gate a positional fleet in place: role→slot assignment maps by index, so a paused
 /// provider must fail the run loud rather than be dropped (which would collapse the
 /// per-role fleet onto one model silently). Errors naming the paused providers.
+#[allow(dead_code)]
 pub fn ensure_usable(paths: &SparPaths, names: &[String]) -> Result<()> {
     let store = QuotaStore::load(paths).unwrap_or_default();
     let mut paused: Vec<String> = Vec::new();
