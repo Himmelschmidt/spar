@@ -264,6 +264,32 @@ impl RunSpec {
                 }
             }
         }
+        // Cross-ordinal: a backup must not duplicate another seat's primary
+        // within the same role (reviewer panel). Cross-role duplication is allowed.
+        for assign in &self.roles {
+            if let Some(b) = &assign.backup {
+                for other in &self.roles {
+                    if other.role != assign.role {
+                        continue;
+                    }
+                    if other.ordinal == assign.ordinal {
+                        continue;
+                    }
+                    if let Some(p) = &other.primary {
+                        if p.storage_key() == b.storage_key() {
+                            return Err(format!(
+                                "backup for {}[{}] has same provider as {}[{}] primary ({})",
+                                assign.role.as_config_key(),
+                                assign.ordinal,
+                                other.role.as_config_key(),
+                                other.ordinal,
+                                p.storage_key()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         let rows = spec_rows(wf, cfg);
         for (role, ordinal) in &rows {
             let found = self
@@ -504,6 +530,13 @@ impl RunSpec {
         if !proposal.providers.is_empty() {
             if let Some(wf) = spec.workflow {
                 if wf != SpecWorkflow::Arena {
+                    // When proposal already carries explicit role pins, the positional
+                    // providers list is redundant. Treat it as supplemental only: fill
+                    // blank rows, otherwise skip. Pushing it into legacy_providers
+                    // would block launch even though the spec is already complete
+                    // via [roles]/reviewer (major finding: providers+[roles] => unlaunchable).
+                    let has_explicit_roles =
+                        !proposal.roles.is_empty() || !proposal.reviewer.is_empty();
                     let rows = spec_rows(wf, cfg);
                     for (idx, (role, ordinal)) in rows.iter().enumerate() {
                         if let Some(raw) = proposal.providers.get(idx) {
@@ -526,7 +559,7 @@ impl RunSpec {
                                             primary: Some(pin),
                                             backup: None,
                                         });
-                                    } else {
+                                    } else if !has_explicit_roles {
                                         spec.legacy_providers.push(raw.clone());
                                     }
                                 }
@@ -537,7 +570,9 @@ impl RunSpec {
                         }
                     }
                     for idx in rows.len()..proposal.providers.len() {
-                        spec.legacy_providers.push(proposal.providers[idx].clone());
+                        if !has_explicit_roles {
+                            spec.legacy_providers.push(proposal.providers[idx].clone());
+                        }
                     }
                 } else {
                     let expected = spec_rows(wf, cfg).len();
@@ -765,7 +800,7 @@ mod tests {
                     role: SlotRole::Reviewer,
                     ordinal: 1,
                     primary: Some(Pin::parse("cli:grok@fast").unwrap()),
-                    backup: Some(Pin::parse("cli:claude@sonnet").unwrap()),
+                    backup: Some(Pin::parse("cli:agy@mini").unwrap()),
                 },
             ],
             ..Default::default()
@@ -784,7 +819,7 @@ mod tests {
             .map(|w| w[1].clone())
             .collect();
         assert_eq!(b_positions[0], "reviewer=cli:codex@luna");
-        assert_eq!(b_positions[1], "reviewer=cli:claude@sonnet");
+        assert_eq!(b_positions[1], "reviewer=cli:agy@mini");
     }
 
     #[test]
@@ -855,7 +890,7 @@ mod tests {
                     role: SlotRole::Reviewer,
                     ordinal: 1,
                     primary: Some(Pin::parse("cli:codex@terra").unwrap()),
-                    backup: Some(Pin::parse("cli:grok@mini").unwrap()),
+                    backup: Some(Pin::parse("cli:agy@mini").unwrap()),
                 },
             ],
             ..Default::default()
@@ -876,7 +911,7 @@ mod tests {
                 m
             },
             reviewer: vec!["cli:grok@fast".into(), "cli:codex@terra".into()],
-            reviewer_backups: vec!["cli:claude@sonnet".into(), "cli:grok@mini".into()],
+            reviewer_backups: vec!["cli:claude@sonnet".into(), "cli:agy@mini".into()],
         };
         let empty_spec = RunSpec {
             task: "".into(),
@@ -894,6 +929,9 @@ mod tests {
             manual_argv, proposal_argv,
             "manual and proposal argv must be byte-identical"
         );
+        // Use the real production snapshot path (apply_role/backup_overrides + JSON
+        // serialization) rather than a duplicate helper, so the test fails if the
+        // snapshot mapping diverges from the spec.
         fn config_for_spec(spec: &RunSpec, base_cfg: &Config) -> String {
             let mut c = base_cfg.clone();
             c.roles.planner = None;
@@ -908,40 +946,20 @@ mod tests {
             c.backups.reviewer = Vec::new();
             c.backups.tester = None;
             c.backups.test_author = None;
+            // Build CLI-style assignments from the spec and apply via the real
+            // Config methods, which is the path `Config::save_snapshot` uses.
+            let mut roles = Vec::new();
+            let mut backups = Vec::new();
             for ra in &spec.roles {
-                let display = ra.primary.as_ref().map(|p| p.display()).unwrap_or_default();
-                let backup_display = ra.backup.as_ref().map(|p| p.display());
-                match ra.role {
-                    SlotRole::Planner => c.roles.planner = Some(display),
-                    SlotRole::PlanCritic => c.roles.plan_critic = Some(display),
-                    SlotRole::Implementer => c.roles.implementer = Some(display),
-                    SlotRole::Tester => c.roles.tester = Some(display),
-                    SlotRole::TestAuthor => c.roles.test_author = Some(display),
-                    SlotRole::Reviewer => {
-                        while c.roles.reviewer.len() <= ra.ordinal {
-                            c.roles.reviewer.push(String::new());
-                        }
-                        c.roles.reviewer[ra.ordinal] = display;
-                        if let Some(b) = backup_display {
-                            while c.backups.reviewer.len() <= ra.ordinal {
-                                c.backups.reviewer.push(String::new());
-                            }
-                            c.backups.reviewer[ra.ordinal] = b;
-                        }
-                    }
-                    _ => {}
+                if let Some(p) = &ra.primary {
+                    roles.push(format!("{}={}", ra.role.as_config_key(), p.display()));
                 }
-                if let Some(b) = ra.backup.as_ref().map(|p| p.display()) {
-                    match ra.role {
-                        SlotRole::Planner => c.backups.planner = Some(b),
-                        SlotRole::PlanCritic => c.backups.plan_critic = Some(b),
-                        SlotRole::Implementer => c.backups.implementer = Some(b),
-                        SlotRole::Tester => c.backups.tester = Some(b),
-                        SlotRole::TestAuthor => c.backups.test_author = Some(b),
-                        _ => {}
-                    }
+                if let Some(b) = &ra.backup {
+                    backups.push(format!("{}={}", ra.role.as_config_key(), b.display()));
                 }
             }
+            c.apply_role_overrides(&roles).unwrap();
+            c.apply_backup_overrides(&backups).unwrap();
             serde_json::to_string(&c).unwrap()
         }
         let manual_json = config_for_spec(&manual, &cfg);

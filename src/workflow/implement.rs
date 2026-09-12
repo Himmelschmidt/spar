@@ -2487,20 +2487,21 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
     {
         let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
         let has_backup = cfg.backups.implementer.is_some();
-        let available_opt: Option<std::collections::HashSet<String>> = if !has_backup {
-            None
-        } else {
-            let detected: std::collections::HashSet<String> = crate::providers::detect_all()
-                .into_iter()
-                .filter(|r| r.available)
-                .map(|r| format!("cli:{}", r.name))
-                .collect();
-            if detected.is_empty() {
+        let available_opt: Option<std::collections::HashSet<String>> =
+            if state.dry_run || !has_backup {
                 None
             } else {
-                Some(detected)
-            }
-        };
+                let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+                    .into_iter()
+                    .filter(|r| r.available)
+                    .map(|r| format!("cli:{}", r.name))
+                    .collect();
+                if detected.is_empty() {
+                    None
+                } else {
+                    Some(detected)
+                }
+            };
         let primary_eligible =
             crate::backup::is_provider_eligible(&cur, &store, available_opt.as_ref());
         let cause = if !primary_eligible {

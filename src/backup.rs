@@ -234,4 +234,67 @@ mod tests {
             StopCause::Environmental
         );
     }
+
+    #[test]
+    fn timeout_is_work_not_environmental() {
+        let store = QuotaStore::default();
+        let mut slot = slot_with_quota(false);
+        slot.status = SlotStatus::Failed;
+        slot.error = Some("hard ceiling: slot timed out after 10s".into());
+        let mut set = std::collections::HashSet::new();
+        set.insert("cli:claude".to_string());
+        assert_eq!(
+            dispatch_stop_cause(&slot, "cli:claude", &store, Some(&set)),
+            StopCause::Work
+        );
+    }
+
+    #[test]
+    fn missing_artifact_is_work_not_environmental() {
+        let store = QuotaStore::default();
+        let mut slot = slot_with_quota(false);
+        slot.status = SlotStatus::Failed;
+        slot.error = Some("missing expected artifact: summary-impl.md".into());
+        let mut set = std::collections::HashSet::new();
+        set.insert("cli:claude".to_string());
+        assert_eq!(
+            dispatch_stop_cause(&slot, "cli:claude", &store, Some(&set)),
+            StopCause::Work
+        );
+    }
+
+    #[test]
+    fn adverse_review_is_work_not_environmental() {
+        let store = QuotaStore::default();
+        let mut slot = slot_with_quota(false);
+        slot.status = SlotStatus::Failed;
+        slot.error = Some("review verdict: request_changes".into());
+        let mut set = std::collections::HashSet::new();
+        set.insert("cli:claude".to_string());
+        assert_eq!(
+            dispatch_stop_cause(&slot, "cli:claude", &store, Some(&set)),
+            StopCause::Work
+        );
+    }
+
+    #[test]
+    fn neutralization_would_fail_work_branch() {
+        let store = QuotaStore::default();
+        let mut slot = slot_with_quota(false);
+        slot.status = SlotStatus::Failed;
+        let mut set = std::collections::HashSet::new();
+        set.insert("cli:claude".to_string());
+        // If Work branch were neutralized to Environmental, this would be Environmental
+        assert_eq!(
+            dispatch_stop_cause(&slot, "cli:claude", &store, Some(&set)),
+            StopCause::Work
+        );
+        // Verify environmental still distinct
+        let mut env_slot = slot_with_quota(true);
+        env_slot.status = SlotStatus::Failed;
+        assert_eq!(
+            dispatch_stop_cause(&env_slot, "cli:claude", &store, Some(&set)),
+            StopCause::Environmental
+        );
+    }
 }

@@ -125,7 +125,7 @@ fn direct_implement_preserves_reviewer_backup_ordinals_in_the_snapshot() {
             "--backup",
             "reviewer=cli:claude@sonnet",
             "--backup",
-            "reviewer=cli:codex@gpt-5.6-luna",
+            "reviewer=cli:agy@mini",
         ],
         2,
     );
@@ -139,7 +139,7 @@ fn direct_implement_preserves_reviewer_backup_ordinals_in_the_snapshot() {
     assert_eq!(config["backups"]["implementer"], "cli:codex@gpt-5.6-luna");
     assert_eq!(
         config["backups"]["reviewer"],
-        serde_json::json!(["cli:claude@sonnet", "cli:codex@gpt-5.6-luna"])
+        serde_json::json!(["cli:claude@sonnet", "cli:agy@mini"])
     );
 }
 
@@ -166,11 +166,11 @@ fn review_accepts_an_exact_pinned_reviewer_panel_with_ordinal_backups() {
             "--role",
             "reviewer=cli:grok@fast",
             "--backup",
-            "reviewer=cli:codex@gpt-5.6-luna",
+            "reviewer=cli:opencode@luna",
             "--backup",
-            "reviewer=cli:claude@sonnet",
+            "reviewer=api:openai@gpt-4",
             "--backup",
-            "reviewer=cli:codex@gpt-5.6-mini",
+            "reviewer=cli:agy@sonnet",
         ],
         0,
     );
@@ -186,11 +186,7 @@ fn review_accepts_an_exact_pinned_reviewer_panel_with_ordinal_backups() {
     );
     assert_eq!(
         config["backups"]["reviewer"],
-        serde_json::json!([
-            "cli:codex@gpt-5.6-luna",
-            "cli:claude@sonnet",
-            "cli:codex@gpt-5.6-mini"
-        ])
+        serde_json::json!(["cli:opencode@luna", "api:openai@gpt-4", "cli:agy@sonnet"])
     );
 }
 

@@ -4614,7 +4614,8 @@ fn apply_proposal_to_roster(
             let available = crate::runspec::Pin::parse(&prov)
                 .map(|pin| {
                     crate::providers::detect_all().iter().any(|r| {
-                        r.name == crate::quota::normalize_key(&pin.provider) && r.available
+                        format!("cli:{}", r.name) == crate::quota::normalize_key(&pin.provider)
+                            && r.available
                     }) || crate::provider_ref::ProviderRef::parse(&prov)
                         .map(|r| r.is_api())
                         .unwrap_or(false)

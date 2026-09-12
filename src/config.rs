@@ -1251,6 +1251,25 @@ impl Config {
                     }
                 }
             }
+            // Cross-ordinal: a reviewer backup must not duplicate any other reviewer primary.
+            for (bi, b) in self.backups.reviewer.iter().enumerate() {
+                let b_key = crate::provider_ref::ProviderRef::parse(b)
+                    .map(|r| r.storage_key())
+                    .unwrap_or_else(|_| b.clone());
+                for (pi, p) in self.roles.reviewer.iter().enumerate() {
+                    if pi == bi {
+                        continue;
+                    }
+                    let p_key = crate::provider_ref::ProviderRef::parse(p)
+                        .map(|r| r.storage_key())
+                        .unwrap_or_else(|_| p.clone());
+                    if p_key == b_key {
+                        anyhow::bail!(
+                            "backup for reviewer[{bi}] has same provider storage key as reviewer[{pi}] primary ({p_key}); would collapse reviewer panel"
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     }
