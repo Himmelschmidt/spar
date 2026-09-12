@@ -3822,6 +3822,7 @@ fn handle_key_inner(
                     return Ok(false);
                 }
                 // Dispatch turn (backend owned) — off the input thread so the TUI stays responsive.
+                let pending_spec = app.new_run.as_ref().map(|nr| new_run_spec(nr, &app.cfg));
                 let req = crate::orchestrator::TurnRequest {
                     scope_key: scope_key.clone(),
                     conversation_id: conv_id.clone(),
@@ -3833,6 +3834,7 @@ fn handle_key_inner(
                     } else {
                         Some(scope_key.clone())
                     },
+                    pending_spec,
                 };
                 let handle = std::sync::Arc::new(crate::orchestrator::TurnHandle::new(
                     scope_key.clone(),
@@ -3843,10 +3845,11 @@ fn handle_key_inner(
                 if let Some(tx) = app.bg_tx.clone() {
                     let swarm_clone = swarm.clone();
                     let conv_clone = conv_id.clone();
+                    let req_clone = req.clone();
                     std::thread::spawn(move || {
                         let res = crate::orchestrator::dispatch_turn_with_handle(
                             swarm_clone,
-                            req,
+                            req_clone,
                             &handle,
                         );
                         match res {

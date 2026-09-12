@@ -279,6 +279,7 @@ pub struct TurnRequest {
     pub watermark: usize,
     pub project_root: std::path::PathBuf,
     pub run_id: Option<String>,
+    pub pending_spec: Option<crate::runspec::RunSpec>,
 }
 
 #[allow(dead_code)]
@@ -590,14 +591,19 @@ fn dispatch_turn_inner(
             "spar bus send --from \"$SPAR_AGENT_ID\" --to @human --surface chat --conversation {} --turn {} --message \"...\"\n",
             conv, turn
         ));
-        let defaults = crate::defaults::load();
         let cfg = crate::config::Config::load(&paths.project_root).unwrap_or_default();
-        let partial = crate::runspec::RunSpec {
-            workflow: defaults.workflow,
-            task: defaults.task.clone(),
-            roles: defaults.roles.clone(),
-            arena_pool: defaults.arena_pool.clone(),
-            ..Default::default()
+        let partial = if let Some(pending) = req.pending_spec.clone() {
+            pending
+        } else {
+            let defaults = crate::defaults::load();
+            crate::runspec::RunSpec {
+                workflow: defaults.workflow,
+                task: defaults.task.clone(),
+                roles: defaults.roles.clone(),
+                arena_pool: defaults.arena_pool.clone(),
+                legacy_providers: Vec::new(),
+                ..Default::default()
+            }
         };
         let blanks = partial.blanks(&cfg);
         if !blanks.is_empty() || partial.workflow.is_none() || partial.task.trim().is_empty() {
@@ -644,6 +650,23 @@ fn dispatch_turn_inner(
                         prompt.push_str(&format!("arena[{}]: (blank)\n", idx));
                     }
                 }
+            }
+            // Backups: show only where primary exists, for the dispatched roles
+            for ra in &partial.roles {
+                if let Some(b) = &ra.backup {
+                    prompt.push_str(&format!(
+                        "{}[{}] backup: {}\n",
+                        ra.role.as_config_key(),
+                        ra.ordinal,
+                        b.display()
+                    ));
+                }
+            }
+            if !partial.legacy_providers.is_empty() {
+                prompt.push_str(&format!(
+                    "legacy_providers: {}\n",
+                    partial.legacy_providers.join(", ")
+                ));
             }
             prompt.push_str(&format!("blanks: {}\n", blanks.join(", ")));
             prompt.push_str("Propose only blanks; do not overwrite filled fields.\n");
@@ -1324,6 +1347,7 @@ mod tests {
             watermark: before,
             project_root: paths.project_root.clone(),
             run_id: None,
+            pending_spec: None,
         };
         let mut meta = HashMap::new();
         meta.insert(META_SURFACE.into(), SURFACE_CHAT.into());
@@ -1479,6 +1503,7 @@ mod tests {
             watermark: 0,
             project_root: proj1.clone(),
             run_id: None,
+            pending_spec: None,
         };
         let out1 = dispatch_turn(paths1.clone(), req1).unwrap();
         assert!(
@@ -1506,6 +1531,7 @@ mod tests {
             watermark: 0,
             project_root: proj2.clone(),
             run_id: None,
+            pending_spec: None,
         };
         let out2 = dispatch_turn(paths2.clone(), req2).unwrap();
         assert!(out2.worktree.is_some());
@@ -1542,6 +1568,7 @@ mod tests {
             watermark: 0,
             project_root: proj1.clone(),
             run_id: None,
+            pending_spec: None,
         };
         let out = dispatch_turn(paths1.clone(), bad_req).unwrap();
         assert!(!out.success);
@@ -1567,6 +1594,7 @@ mod tests {
             watermark: 0,
             project_root: proj1.clone(),
             run_id: Some(run_id.into()),
+            pending_spec: None,
         };
         let out = dispatch_turn(paths1.clone(), bad_run_req).unwrap();
         assert!(
@@ -1607,6 +1635,7 @@ mod tests {
             watermark: 0,
             project_root: proj1.clone(),
             run_id: None,
+            pending_spec: None,
         };
         let _out = dispatch_turn(paths1.clone(), dirty_req).unwrap();
         // The worktree was pre-existing and dirty, so dispatch must not have removed it.
@@ -1647,6 +1676,7 @@ mod tests {
             watermark: 0,
             project_root: proj1.clone(),
             run_id: None,
+            pending_spec: None,
         };
         let out_dirty_created = dispatch_turn(paths1.clone(), dirty_created_req).unwrap();
         assert!(
