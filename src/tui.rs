@@ -21478,6 +21478,229 @@ mod home_ia {
             "the palette still says a fresh fleet is impossible: {plan_help:?}"
         );
     }
+
+    /// AC-12 creation row: Home's first selectable row is Start Something New and
+    /// default Home selection lands there, not on a header. Neutralizing the
+    /// row order (e.g. pushing NewRun after NeedsMe) or making resync prefer
+    /// headers would leave selected_home on an unselectable index.
+    #[test]
+    fn home_creation_row_is_first_selectable_and_default_selection_lands_there() {
+        let root = PathBuf::from("/tmp/proj");
+        let projects = vec![project_at(&root, "proj")];
+        let folded: Vec<Vec<state::RunSummary>> = vec![vec![]];
+        let now = Utc::now();
+        let watermark = now - chrono::Duration::hours(24);
+        let rows = build_home_rows(&projects, &folded, &HomeScope::All, watermark, now, false);
+        assert!(
+            rows.len() >= 2,
+            "Home must have at least StartNew header and NewRun"
+        );
+        assert!(matches!(rows[0], HomeRow::Header(HomeBand::StartNew)));
+        assert!(matches!(rows[1], HomeRow::NewRun));
+        let is_selectable = |r: &HomeRow| {
+            !matches!(
+                r,
+                HomeRow::Header(_)
+                    | HomeRow::More { .. }
+                    | HomeRow::Empty(_)
+                    | HomeRow::Skeleton { .. }
+            )
+        };
+        let first_selectable = rows.iter().position(is_selectable).unwrap();
+        assert_eq!(
+            first_selectable, 1,
+            "first selectable row must be NewRun, not a header"
+        );
+        let mut app = App::new(None, Config::default(), Some(root.as_path()));
+        app.browse = BrowseLevel::Home;
+        app.selected_home = 0;
+        app.home_key = None;
+        resync_home_selection(&mut app, &rows);
+        assert_eq!(
+            app.selected_home, 1,
+            "default Home selection must land on NewRun, not header {}",
+            app.selected_home
+        );
+        assert!(matches!(rows[app.selected_home], HomeRow::NewRun));
+        let neutralized_first = rows.iter().position(is_selectable).unwrap_or(0);
+        assert_ne!(
+            neutralized_first, 0,
+            "neutralized row order would put a header first and this tautology would pass"
+        );
+    }
+
+    /// AC-12 over-cap: NeedsMe is uncapped while Running is capped, but the
+    /// header count and the roll-up must agree past HOME_BAND_CAP. A truncation
+    /// that discards the More.n or caps NeedsMe would undercount.
+    #[test]
+    fn home_needs_you_is_uncapped_while_band_counts_agree_past_cap() {
+        let root = PathBuf::from("/tmp/proj");
+        let projects = vec![project_at(&root, "proj")];
+        let now = Utc::now();
+        let watermark = now - chrono::Duration::hours(24);
+        let total = HOME_BAND_CAP + 17;
+        let runs: Vec<state::RunSummary> = (0..total)
+            .map(|i| {
+                run_in(
+                    &format!("gate-{i:03}"),
+                    Phase::AwaitingPlanApproval,
+                    1,
+                    &root,
+                )
+            })
+            .collect();
+        let folded = vec![runs.clone()];
+        let rows = build_home_rows(&projects, &folded, &HomeScope::All, watermark, now, false);
+        let rollup = home_needs_you(&rows);
+        assert_eq!(
+            rollup, total,
+            "roll-up must be uncapped past HOME_BAND_CAP: {rollup} vs {total}"
+        );
+        let band = home_band_count(&rows, HomeBand::NeedsMe);
+        assert_eq!(
+            band, total,
+            "NeedsMe band count must include More.n and equal roll-up past cap: {band} vs {total}"
+        );
+        let running: Vec<state::RunSummary> = (0..(HOME_BAND_CAP + 10))
+            .map(|i| run_in(&format!("run-{i:03}"), Phase::Review, 1, &root))
+            .collect();
+        let folded2 = vec![running];
+        let rows2 = build_home_rows(&projects, &folded2, &HomeScope::All, watermark, now, false);
+        let running_band = home_band_count(&rows2, HomeBand::Running);
+        assert_eq!(running_band, HOME_BAND_CAP + 10);
+        let running_rows = rows2
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    HomeRow::Run {
+                        band: HomeBand::Running,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            running_rows, HOME_BAND_CAP,
+            "Running rows must be capped at HOME_BAND_CAP"
+        );
+        assert_ne!(
+            rollup, 0,
+            "tautology guard: roll-up must never be zero while waiting"
+        );
+    }
+
+    /// AC-12 rail/roll-up agreement: the roll-up, the band header count, the
+    /// per-project rail flag, and toast all share one uncapped NeedsMe count
+    /// and never read zero while something waits. A roll-up disagreeing with
+    /// the bands is the U28 bug.
+    #[test]
+    fn home_rail_flag_and_rollup_share_one_uncapped_count_and_never_zero_while_waiting() {
+        let root = PathBuf::from("/tmp/proj");
+        let projects = vec![project_at(&root, "proj")];
+        let now = Utc::now();
+        let watermark = now - chrono::Duration::hours(24);
+        let gate = run_in("gate-001", Phase::AwaitingPlanApproval, 5, &root);
+        let broken = run_in("broken-001", Phase::Failed, 4, &root);
+        let running = run_in("run-001", Phase::Review, 3, &root);
+        let folded = vec![vec![gate.clone(), broken.clone(), running.clone()]];
+        let rows = build_home_rows(&projects, &folded, &HomeScope::All, watermark, now, false);
+        let rollup = home_needs_you(&rows);
+        assert_eq!(rollup, 2, "gate(1) + broken(1) = 2, running not counted");
+        assert_ne!(
+            rollup, 0,
+            "count must never read zero while something waits"
+        );
+        let band = home_band_count(&rows, HomeBand::NeedsMe);
+        assert_eq!(
+            band, rollup,
+            "roll-up must agree with band header count; disagreement is the U28 bug"
+        );
+        let attention = runs_needing_attention(&[gate, broken, running]);
+        assert_eq!(
+            attention, 2,
+            "runs_needing_attention counts folded units, not legs, but must be non-zero while waiting"
+        );
+        assert!(
+            attention > 0,
+            "rail flag must be set while a gate or broken run waits"
+        );
+        let empty_rows =
+            build_home_rows(&projects, &[vec![]], &HomeScope::All, watermark, now, false);
+        assert_eq!(
+            home_needs_you(&empty_rows),
+            0,
+            "empty Home must read zero, but non-empty must not"
+        );
+    }
+
+    /// AC-12 Gate and Broken toasts are load-bearing, not decoration: a
+    /// transition into either must emit a toast, and each must be impossible
+    /// to miss. Neutralizing either branch (e.g. `if attention == Gate` only)
+    /// must make one of the two assertions fail.
+    #[test]
+    fn gate_and_broken_transitions_each_toast() {
+        fn summary_phase_local(id: &str, phase: Phase) -> state::RunSummary {
+            state::RunSummary {
+                id: id.into(),
+                workflow: crate::cli::WorkflowKind::Loop,
+                archived: false,
+                phase,
+                updated_at: Utc::now(),
+                task: Some(format!("brief for {id}")),
+                dry_run: false,
+                abandoned: false,
+                parent_run: None,
+                round: 1,
+                legs: 1,
+                wants: 0,
+                unit_id: None,
+                base_ref: None,
+                base_commit: None,
+                project_root: None,
+                project_name: None,
+            }
+        }
+        let mut app = test_app();
+        let gate = summary_phase_local("r-gate", Phase::AwaitingPlanApproval);
+        let broken = summary_phase_local("r-broken", Phase::Failed);
+        let idle = summary_phase_local("r-idle", Phase::Review);
+
+        emit_attention_toasts(&mut app, &[], false);
+        app.flash = None;
+        emit_attention_toasts(&mut app, std::slice::from_ref(&idle), false);
+        assert!(app.flash.is_none(), "idle -> idle must not toast");
+
+        let mut app_gate = test_app();
+        emit_attention_toasts(&mut app_gate, &[], false);
+        app_gate.flash = None;
+        emit_attention_toasts(&mut app_gate, std::slice::from_ref(&gate), false);
+        assert!(app_gate.flash.is_some(), "transition into Gate must toast");
+        let gate_msg = app_gate.flash.clone().unwrap().1.clone();
+
+        let mut app_broken = test_app();
+        emit_attention_toasts(&mut app_broken, &[], false);
+        app_broken.flash = None;
+        emit_attention_toasts(&mut app_broken, std::slice::from_ref(&broken), false);
+        assert!(
+            app_broken.flash.is_some(),
+            "transition into Broken must toast (not only Gate)"
+        );
+        let broken_msg = app_broken.flash.clone().unwrap().1.clone();
+        assert_ne!(
+            gate_msg, broken_msg,
+            "Gate and Broken toasts must be distinct"
+        );
+
+        let mut app_stays_gate = test_app();
+        emit_attention_toasts(&mut app_stays_gate, std::slice::from_ref(&gate), false);
+        app_stays_gate.flash = None;
+        emit_attention_toasts(&mut app_stays_gate, std::slice::from_ref(&gate), false);
+        assert!(
+            app_stays_gate.flash.is_none(),
+            "staying in Gate must not re-toast"
+        );
+    }
 }
 
 #[cfg(test)]
