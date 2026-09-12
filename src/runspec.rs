@@ -269,53 +269,9 @@ impl RunSpec {
                 }
             }
         }
-        // Cross-ordinal: a backup must not duplicate another seat's primary
-        // within the same role (reviewer panel). Cross-role duplication is allowed.
-        for assign in &self.roles {
-            if let Some(b) = &assign.backup {
-                for other in &self.roles {
-                    if other.role != assign.role {
-                        continue;
-                    }
-                    if other.ordinal == assign.ordinal {
-                        continue;
-                    }
-                    if let Some(p) = &other.primary {
-                        if p.storage_key() == b.storage_key() {
-                            return Err(format!(
-                                "backup for {}[{}] has same provider as {}[{}] primary ({})",
-                                assign.role.as_config_key(),
-                                assign.ordinal,
-                                other.role.as_config_key(),
-                                other.ordinal,
-                                p.storage_key()
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-        for a in &self.roles {
-            if let Some(b1) = &a.backup {
-                for b in &self.roles {
-                    if b.role != a.role || b.ordinal <= a.ordinal {
-                        continue;
-                    }
-                    if let Some(b2) = &b.backup {
-                        if b1.storage_key() == b2.storage_key() {
-                            return Err(format!(
-                                "backup for {}[{}] and {}[{}] have same provider ({})",
-                                a.role.as_config_key(),
-                                a.ordinal,
-                                b.role.as_config_key(),
-                                b.ordinal,
-                                b1.storage_key()
-                            ));
-                        }
-                    }
-                }
-            }
-        }
+        // Backups are repeatable across reviewer ordinals and may coincide with
+        // another ordinal's primary; only the same ordinal is checked above.
+        // No cross-ordinal backup-vs-primary check.
         let rows = spec_rows(wf, cfg);
         for (role, ordinal) in &rows {
             let found = self
@@ -424,7 +380,16 @@ impl RunSpec {
                 }
                 if let Some(backup) = &assign.backup {
                     argv.push("--backup".to_string());
-                    argv.push(format!("{}={}", role.as_config_key(), backup.display()));
+                    if role == crate::state::SlotRole::Reviewer {
+                        argv.push(format!(
+                            "{}:{}={}",
+                            role.as_config_key(),
+                            ordinal,
+                            backup.display()
+                        ));
+                    } else {
+                        argv.push(format!("{}={}", role.as_config_key(), backup.display()));
+                    }
                 }
             }
         }
@@ -581,16 +546,20 @@ impl RunSpec {
                                             backup: None,
                                         });
                                     } else {
-                                        // Slot already has a primary (operator-filled or earlier proposal). Preserve operator choice — ignore proposal provider, don't reintroduce legacy.
+                                        let existing_display = spec
+                                            .roles
+                                            .iter()
+                                            .find(|r| r.role == *role && r.ordinal == *ordinal)
+                                            .and_then(|r| r.primary.as_ref().map(|p| p.display()));
+                                        if existing_display.as_deref() != Some(raw.as_str())
+                                            && !spec.legacy_providers.contains(raw)
+                                        {
+                                            spec.legacy_providers.push(raw.clone());
+                                        }
                                     }
                                 }
                                 Err(_) => {
-                                    let has_slot_filled = spec.roles.iter().any(|r| {
-                                        r.role == *role
-                                            && r.ordinal == *ordinal
-                                            && r.primary.is_some()
-                                    });
-                                    if !has_slot_filled && !spec.legacy_providers.contains(raw) {
+                                    if !spec.legacy_providers.contains(raw) {
                                         spec.legacy_providers.push(raw.clone());
                                     }
                                 }
@@ -862,8 +831,8 @@ mod tests {
             .filter(|w| w[0] == "--backup")
             .map(|w| w[1].clone())
             .collect();
-        assert_eq!(b_positions[0], "reviewer=cli:codex@luna");
-        assert_eq!(b_positions[1], "reviewer=cli:agy@mini");
+        assert_eq!(b_positions[0], "reviewer:0=cli:codex@luna");
+        assert_eq!(b_positions[1], "reviewer:1=cli:agy@mini");
     }
 
     #[test]
@@ -1362,16 +1331,26 @@ mod tests {
             ..Default::default()
         };
         let mut operator_mapped = with_workflow.clone();
-        for (role, ordinal) in crate::runspec::spec_rows(SpecWorkflow::Implement, &cfg) {
+        for (idx, (role, ordinal)) in crate::runspec::spec_rows(SpecWorkflow::Implement, &cfg)
+            .into_iter()
+            .enumerate()
+        {
             if !operator_mapped
                 .roles
                 .iter()
                 .any(|r| r.role == role && r.ordinal == ordinal)
             {
+                let pin_str = proposal
+                    .providers
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_else(|| "cli:claude@opus".into());
+                let pin =
+                    Pin::parse(&pin_str).unwrap_or_else(|_| Pin::parse("cli:claude@opus").unwrap());
                 operator_mapped.roles.push(RoleAssignment {
                     role,
                     ordinal,
-                    primary: Some(Pin::parse("cli:claude@opus").unwrap()),
+                    primary: Some(pin),
                     backup: None,
                 });
             }

@@ -212,6 +212,35 @@ pub struct WorktreeRecord {
     pub branch: String,
 }
 
+impl RunState {
+    /// Rename a slot, carrying everything else keyed on its id.
+    ///
+    /// A seat id encodes its provider (`review-1-cli-codex`), so when a declared
+    /// backup takes a seat over the id has to change or it names the wrong vendor —
+    /// the same rule O80 settled for re-pointing. But the id is also the key that
+    /// `WorktreeRecord` and the slot's pid marker are filed under, and O28 is
+    /// explicit that removing a slot record while a marker still points at the old
+    /// id is how a live agent becomes an orphan nothing can find. Renaming without
+    /// carrying them is the same bug with the record left behind instead.
+    ///
+    /// The marker is cleared rather than moved: the process it named belonged to the
+    /// primary, and the backup gets a fresh dispatch of its own.
+    pub fn rename_slot(&mut self, paths: &SparPaths, old_id: &str, new_id: &str) {
+        if old_id == new_id {
+            return;
+        }
+        crate::markers::clear_pid(paths, &self.id, old_id);
+        for wt in self.worktrees.iter_mut() {
+            if wt.slot_id == old_id {
+                wt.slot_id = new_id.to_string();
+            }
+        }
+        if let Some(s) = self.slots.iter_mut().find(|s| s.id == old_id) {
+            s.id = new_id.to_string();
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
@@ -1112,6 +1141,53 @@ pub fn list_runs(paths: &SparPaths) -> Result<Vec<RunSummary>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A backup activation renames the seat (its id names the provider, O80). The
+    /// worktree record and the pid marker are both keyed on that id, and O28 is
+    /// explicit that a marker left pointing at a stale id is how a live agent
+    /// becomes an orphan nothing can find.
+    #[test]
+    fn renaming_a_slot_carries_its_worktree_record_and_clears_its_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = RunState::new(
+            "rename01",
+            crate::cli::WorkflowKind::Review,
+            tmp.path().to_path_buf(),
+        );
+        paths.ensure_run_dirs(&st.id).unwrap();
+        let mut slot =
+            crate::executor::init_slot("review-0-cli-claude", "cli:claude", SlotRole::Reviewer);
+        slot.status = SlotStatus::Failed;
+        st.slots.push(slot);
+        st.worktrees.push(WorktreeRecord {
+            slot_id: "review-0-cli-claude".into(),
+            path: tmp.path().join("wt"),
+            branch: "spar/rename01/review-0".into(),
+        });
+        let _ = crate::markers::write_pid(
+            &paths,
+            &st.id,
+            "review-0-cli-claude",
+            crate::process::PidToken::from_pid(424242),
+        );
+        assert!(crate::markers::read_pid(&paths, &st.id, "review-0-cli-claude").is_some());
+
+        st.rename_slot(&paths, "review-0-cli-claude", "review-0-cli-codex");
+
+        assert!(
+            st.slots.iter().any(|s| s.id == "review-0-cli-codex"),
+            "the slot itself is renamed"
+        );
+        assert_eq!(
+            st.worktrees[0].slot_id, "review-0-cli-codex",
+            "the worktree record must follow the seat, not point at a slot that is gone"
+        );
+        assert!(
+            crate::markers::read_pid(&paths, &st.id, "review-0-cli-claude").is_none(),
+            "the primary's pid marker must be reaped, not orphaned under the old id"
+        );
+    }
     use super::*;
     use crate::paths::SparPaths;
     use tempfile::tempdir;

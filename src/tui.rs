@@ -2861,6 +2861,7 @@ fn new_run_providers(nr: &NewRun) -> Vec<String> {
 fn new_run_spec(nr: &NewRun, cfg: &crate::config::Config) -> crate::runspec::RunSpec {
     let wf = nr.workflow;
     let mut spec = crate::runspec::RunSpec {
+        project: nr.project.clone(),
         task: nr.task.clone(),
         workflow: wf,
         ..Default::default()
@@ -5269,17 +5270,36 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 }
             }
         }
+        // Only while a *non-text* field has focus. Guarding on `!editing_model`
+        // alone left `x` and `X` unable to be typed into the Task field whenever a
+        // legacy proposal was pending — and silently clearing the very providers
+        // the operator was composing a task about. A destructive shortcut must not
+        // live on a printable character that a focused text field wants.
         KeyCode::Char('x') | KeyCode::Char('X')
             if !nr.legacy_providers.is_empty()
-                && nr.field != NewRunField::Task
-                && !nr.editing_model =>
+                && !nr.editing_model
+                && nr.field != NewRunField::Task =>
         {
             nr.legacy_providers.clear();
             app.flash("legacy providers cleared".to_string(), INFO);
         }
-        KeyCode::Delete if !nr.legacy_providers.is_empty() => {
+        // `Delete` is not a printable character, so it stays available from the
+        // Task field too.
+        KeyCode::Delete if !nr.legacy_providers.is_empty() && !nr.editing_model => {
             nr.legacy_providers.clear();
             app.flash("legacy providers cleared".to_string(), INFO);
+        }
+        KeyCode::Backspace
+            if !nr.legacy_providers.is_empty()
+                && !nr.editing_model
+                && nr.field != NewRunField::Task =>
+        {
+            nr.legacy_providers.pop();
+            if nr.legacy_providers.is_empty() {
+                app.flash("legacy providers cleared".to_string(), INFO);
+            } else {
+                app.flash("removed last legacy provider".to_string(), INFO);
+            }
         }
         KeyCode::Char(c)
             if nr.field == NewRunField::Roles
@@ -11369,7 +11389,7 @@ fn draw_new_run(f: &mut Frame, area: Rect, projects: &[registry::ProjectEntry], 
             ));
         }
         lines.push((
-            "  Pick a workflow to map, or press x to clear legacy".to_string(),
+            "  Pick a workflow to map, or Delete to clear legacy".to_string(),
             Style::default().fg(FG_MUTED),
         ));
     }
@@ -22845,7 +22865,7 @@ mod chat_acceptance {
     }
 
     #[test]
-    fn legacy_provider_clear_via_x_allows_launch() {
+    fn legacy_providers_clear_without_stealing_a_key_the_task_field_wants() {
         let tmp = tempdir().unwrap();
         let proj = tmp.path().join("proj");
         std::fs::create_dir_all(&proj).unwrap();
@@ -22873,28 +22893,43 @@ mod chat_acceptance {
             "pressing x must clear legacy providers: {:?}",
             nr_after.legacy_providers
         );
-        // x must not clear when typing in Task field
-        let mut nr_task = pending_new_run(
-            Some(proj.clone()),
-            vec![proj.clone()],
-            "".into(),
-            NewRunField::Task,
-            103,
-        );
-        nr_task.task = "fix".into();
-        nr_task.legacy_providers = vec!["invalid-provider".into()];
-        let mut app_task = App::new(None, cfg.clone(), Some(proj.as_path()));
-        app_task.new_run = Some(nr_task);
-        handle_new_run_key(&mut app_task, KeyCode::Char('x'), KeyModifiers::NONE);
-        let nr_task_after = app_task.new_run.as_ref().unwrap();
+        // AC-4 needs an always-reachable clear so an invalid legacy provider can never
+        // dead-end the form. It must not be a *printable* one: `x` bound globally made
+        // the letter untypable in the Task field and silently destroyed the providers
+        // the operator was writing a task about. `Delete` is the universal clear —
+        // non-printable, so it can be reachable everywhere without stealing a key the
+        // text field wants — and `x` stays the shortcut for the non-text fields.
+        let with_task_focus = |code: KeyCode| {
+            let mut nr = pending_new_run(
+                Some(proj.clone()),
+                vec![proj.clone()],
+                "".into(),
+                NewRunField::Task,
+                103,
+            );
+            nr.task = "fi".into();
+            nr.legacy_providers = vec!["invalid-provider".into()];
+            let mut app = App::new(None, cfg.clone(), Some(proj.as_path()));
+            app.new_run = Some(nr);
+            handle_new_run_key(&mut app, code, KeyModifiers::NONE);
+            let nr = app.new_run.as_ref().unwrap();
+            (nr.legacy_providers.clone(), nr.task.clone())
+        };
+
+        let (legacy, task) = with_task_focus(KeyCode::Delete);
         assert!(
-            !nr_task_after.legacy_providers.is_empty(),
-            "x in Task field must not clear legacy, must insert char"
+            legacy.is_empty(),
+            "Delete must clear from the Task field too, or an invalid legacy dead-ends: {legacy:?}"
         );
+        assert_eq!(task, "fi", "Delete must not edit the task text");
+
+        let (legacy, task) = with_task_focus(KeyCode::Char('x'));
         assert_eq!(
-            nr_task_after.task, "fixx",
-            "x must be inserted into task when legacy present but Task focused"
+            legacy,
+            vec!["invalid-provider".to_string()],
+            "x must not silently destroy legacy providers while the operator is typing"
         );
+        assert_eq!(task, "fix", "x in the Task field types an x");
         // Neutralisation: without the clear handler, legacy would remain and block launch
         let mut nr2 = pending_new_run(
             Some(proj.clone()),

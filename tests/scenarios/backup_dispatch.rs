@@ -820,6 +820,10 @@ fn implementer_quota_mid_dispatch_activates_backup() {
     );
     assert_eq!(slot["source"], "backup");
     assert_eq!(slot["model"], "backup");
+    assert_ne!(
+        slot["status"], "pending",
+        "backup must have been dispatched, not just re-pointed: {state:?}"
+    );
 }
 
 #[test]
@@ -893,6 +897,10 @@ fn planner_quota_mid_dispatch_activates_backup() {
         "planner quota must activate backup: {state:?}"
     );
     assert_eq!(planner["source"], "backup");
+    assert_ne!(
+        planner["status"], "pending",
+        "planner backup must have been dispatched: {state:?}"
+    );
 }
 
 #[test]
@@ -972,6 +980,10 @@ fn reviewer_quota_mid_dispatch_activates_backup() {
         "reviewer quota must activate backup: {state:?}"
     );
     assert_eq!(r0["source"], "backup");
+    assert_ne!(
+        r0["status"], "pending",
+        "reviewer backup must have been dispatched: {state:?}"
+    );
 }
 
 #[test]

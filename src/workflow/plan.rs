@@ -353,8 +353,11 @@ pub fn execute_plan(
                                     );
                                     let old_id = job.slot_id.clone();
                                     let mut new_slot_id = new_id.clone();
-                                    if let Some(s) = state.slot_mut(&old_id) {
-                                        s.id = new_id.clone();
+                                    // Carry the worktree record and reap the primary's pid marker with the
+                                    // rename: both are keyed on the slot id (O28), and the id has to change
+                                    // because it names the provider (O80).
+                                    state.rename_slot(paths, &old_id, &new_id);
+                                    if let Some(s) = state.slot_mut(&new_id) {
                                         new_slot_id = s.id.clone();
                                         s.provider = pin.provider.clone();
                                         s.model = pin.model.clone();

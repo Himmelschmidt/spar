@@ -45,7 +45,12 @@ pub fn backup_for_role(
         crate::state::SlotRole::Implementer => cfg.backups.implementer.clone(),
         crate::state::SlotRole::Tester => cfg.backups.tester.clone(),
         crate::state::SlotRole::TestAuthor => cfg.backups.test_author.clone(),
-        crate::state::SlotRole::Reviewer => cfg.backups.reviewer.get(ordinal).cloned(),
+        crate::state::SlotRole::Reviewer => cfg
+            .backups
+            .reviewer
+            .get(ordinal)
+            .filter(|s| !s.is_empty())
+            .cloned(),
         _ => None,
     }
 }
@@ -88,7 +93,7 @@ pub fn dispatch_stop_cause(
     store: &QuotaStore,
     available: Option<&std::collections::HashSet<String>>,
 ) -> StopCause {
-    if !slot.quota_hit && slot.status != crate::state::SlotStatus::Failed {
+    if slot.status != crate::state::SlotStatus::Failed {
         return StopCause::Work;
     }
     if slot.quota_hit {
@@ -105,22 +110,46 @@ pub fn dispatch_stop_cause(
         {
             return StopCause::Work;
         }
-    }
-    let key = crate::quota::normalize_key(provider);
-    if store.effective_status(&key) != crate::quota::ProviderStatus::Available {
-        return StopCause::Environmental;
-    }
-    if !store.is_usable(&key) {
-        return StopCause::Environmental;
+        if lower.contains("rate limit")
+            || lower.contains("rate_limit")
+            || lower.contains("429")
+            || lower.contains("quota exceeded")
+            || lower.contains("too many requests")
+        {
+            return StopCause::Environmental;
+        }
+        if (lower.contains("paused")
+            || lower.contains("cooldown")
+            || lower.contains("unavailable")
+            || lower.contains("capacity")
+            || lower.contains("billing"))
+            && {
+                let key = crate::quota::normalize_key(provider);
+                store.effective_status(&key) != crate::quota::ProviderStatus::Available
+                    || !store.is_usable(&key)
+                    || available.is_some_and(|s| !s.contains(&key))
+            }
+        {
+            return StopCause::Environmental;
+        }
+        if (lower.contains("no such file")
+            || lower.contains("not found")
+            || lower.contains("spawn failed")
+            || lower.contains("os error")
+            || lower.contains("executable not found"))
+            && {
+                let key = crate::quota::normalize_key(provider);
+                store.effective_status(&key) != crate::quota::ProviderStatus::Available
+                    || !store.is_usable(&key)
+                    || available.is_some_and(|s| !s.contains(&key))
+            }
+        {
+            return StopCause::Environmental;
+        }
     }
     if let Ok(pref) = crate::provider_ref::ProviderRef::parse(provider) {
         if pref.backend == crate::provider_ref::ExecBackend::ApiSdk {
             return StopCause::Work;
-        }
-    }
-    if let Some(set) = available {
-        if !set.contains(&key) {
-            return StopCause::Environmental;
         }
     }
     StopCause::Work
@@ -140,7 +169,8 @@ mod tests {
     #[test]
     fn quota_hit_is_environmental() {
         let store = QuotaStore::default();
-        let slot = slot_with_quota(true);
+        let mut slot = slot_with_quota(true);
+        slot.status = SlotStatus::Failed;
         assert_eq!(
             dispatch_stop_cause(&slot, "cli:claude", &store, None),
             StopCause::Environmental
@@ -153,6 +183,7 @@ mod tests {
         store.pause_quota("cli:claude", "test");
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Failed;
+        slot.error = Some("rate limit exceeded".into());
         assert_eq!(
             dispatch_stop_cause(&slot, "cli:claude", &store, None),
             StopCause::Environmental
@@ -164,6 +195,7 @@ mod tests {
         let store = QuotaStore::default();
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Failed;
+        slot.error = Some("provider unavailable: cli:claude not found".into());
         let mut set = std::collections::HashSet::new();
         set.insert("cli:grok".to_string());
         assert_eq!(
@@ -268,6 +300,7 @@ mod tests {
         ));
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Failed;
+        slot.error = Some("rate limit exceeded".into());
         assert_eq!(
             dispatch_stop_cause(&slot, "api:openai@gpt-5", &store, Some(&set)),
             StopCause::Environmental
@@ -383,6 +416,38 @@ mod tests {
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Failed;
         slot.error = Some("some other failure".into());
+        assert_eq!(
+            dispatch_stop_cause(&slot, "cli:claude", &store, None),
+            StopCause::Work
+        );
+    }
+
+    #[test]
+    fn generic_failure_with_paused_provider_is_work() {
+        let mut store = QuotaStore::default();
+        store.pause_quota("cli:claude", "test");
+        let mut slot = slot_with_quota(false);
+        slot.status = SlotStatus::Failed;
+        slot.error = Some("exit code 1".into());
+        assert_eq!(
+            dispatch_stop_cause(&slot, "cli:claude", &store, None),
+            StopCause::Work
+        );
+        // Neutralisation: if paused check were leak, this would be Environmental
+        let mut env_slot = slot_with_quota(true);
+        env_slot.status = SlotStatus::Failed;
+        assert_eq!(
+            dispatch_stop_cause(&env_slot, "cli:claude", &store, None),
+            StopCause::Environmental
+        );
+    }
+
+    #[test]
+    fn rate_limit_error_is_environmental_even_without_paused_store() {
+        let store = QuotaStore::default();
+        let mut slot = slot_with_quota(false);
+        slot.status = SlotStatus::Failed;
+        slot.error = Some("rate limit seven_day rejected".into());
         assert_eq!(
             dispatch_stop_cause(&slot, "cli:claude", &store, None),
             StopCause::Environmental

@@ -591,7 +591,6 @@ fn dispatch_turn_inner(
             "spar bus send --from \"$SPAR_AGENT_ID\" --to @human --surface chat --conversation {} --turn {} --message \"...\"\n",
             conv, turn
         ));
-        let cfg = crate::config::Config::load(&paths.project_root).unwrap_or_default();
         let partial = if let Some(pending) = req.pending_spec.clone() {
             pending
         } else {
@@ -605,6 +604,13 @@ fn dispatch_turn_inner(
                 ..Default::default()
             }
         };
+        let cfg = partial
+            .project
+            .as_ref()
+            .and_then(|p| crate::config::Config::load(p).ok())
+            .unwrap_or_else(|| {
+                crate::config::Config::load(&paths.project_root).unwrap_or_default()
+            });
         let blanks = partial.blanks(&cfg);
         if !blanks.is_empty() || partial.workflow.is_none() || partial.task.trim().is_empty() {
             prompt.push_str("\n\n## Partial run spec (operator has pre-filled)\n");

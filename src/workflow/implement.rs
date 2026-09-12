@@ -2564,13 +2564,8 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
                     Some(detected)
                 }
             };
-        let primary_eligible =
-            crate::backup::is_provider_eligible(&cur, &store, available_opt.as_ref());
-        let cause = if !primary_eligible {
-            crate::backup::StopCause::Environmental
-        } else {
-            crate::backup::dispatch_stop_cause(&slot_state, &cur, &store, available_opt.as_ref())
-        };
+        let cause =
+            crate::backup::dispatch_stop_cause(&slot_state, &cur, &store, available_opt.as_ref());
         if has_backup {
             if cause == crate::backup::StopCause::Environmental {
                 if let Some(backup_raw) =
@@ -3001,13 +2996,14 @@ mod try_rotate_implementer_tests {
     fn environmental_activates_backup_over_distinctive_pool_provider() {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
-        // Primary paused -> Environmental, backup eligible, distinctive next is codex but backup is grok@backup
+        // Primary environmental (quota_hit) -> backup, distinctive next is codex but backup is grok@backup
         {
             let mut store = crate::quota::QuotaStore::default();
             store.pause_quota("cli:claude", "test");
             store.save(&paths).unwrap();
         }
-        let mut st = state_with_impl("cli:claude", Some(SeatSource::CliRole), false);
+        let mut st = state_with_impl("cli:claude", Some(SeatSource::CliRole), true);
+        st.slots[0].error = Some("rate limit seven_day rejected".into());
         // Make primary ineligible via store
         let mut cfg = Config::default();
         cfg.providers.order = vec!["cli:claude".into(), "cli:codex".into(), "cli:grok".into()];
@@ -3023,7 +3019,7 @@ mod try_rotate_implementer_tests {
     }
 
     #[test]
-    fn work_failure_does_not_activate_backup_and_falls_to_pool() {
+    fn work_failure_with_backup_declared_does_not_rotate() {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         let mut st = state_with_impl("cli:claude", Some(SeatSource::CliRole), false);
@@ -3039,6 +3035,19 @@ mod try_rotate_implementer_tests {
         );
         assert_eq!(st.slots[0].provider, "cli:claude");
         assert_ne!(st.slots[0].source, Some(SeatSource::Backup));
+        // Neutralisation: if work branch were changed to activate backup or pool, this would fail
+        let mut st_env = state_with_impl("cli:claude", Some(SeatSource::CliRole), true);
+        st_env.slots[0].error = Some("rate limit exceeded".into());
+        {
+            let mut store = crate::quota::QuotaStore::default();
+            store.pause_quota("cli:claude", "test");
+            store.save(&paths).unwrap();
+        }
+        let changed_env = try_rotate_implementer(&mut st_env, &paths, &cfg).unwrap();
+        assert!(
+            changed_env,
+            "environmental with same backup must activate, proving branch not neutralised"
+        );
     }
 
     #[test]
@@ -3083,8 +3092,8 @@ mod try_rotate_implementer_tests {
             store.pause_quota("cli:claude", "test");
             store.save(&paths).unwrap();
         }
-        let mut st2 = state_with_impl("cli:claude", Some(SeatSource::CliRole), false);
-        st2.slots[0].quota_hit = false;
+        let mut st2 = state_with_impl("cli:claude", Some(SeatSource::CliRole), true);
+        st2.slots[0].error = Some("rate limit exceeded".into());
         let changed2 = try_rotate_implementer(&mut st2, &paths, &cfg).unwrap();
         assert!(changed2, "environmental with same backup must activate");
         assert_eq!(st2.slots[0].source, Some(SeatSource::Backup));
@@ -3125,7 +3134,8 @@ mod try_rotate_implementer_tests {
         let mut store = crate::quota::QuotaStore::load(&paths).unwrap();
         store.pause_quota("cli:grok", "test");
         store.save(&paths).unwrap();
-        let mut st = state_with_impl("cli:claude", Some(SeatSource::CliRole), false);
+        let mut st = state_with_impl("cli:claude", Some(SeatSource::CliRole), true);
+        st.slots[0].error = Some("rate limit exceeded".into());
         let mut cfg = Config::default();
         cfg.providers.order = vec!["cli:claude".into(), "cli:codex".into(), "cli:grok".into()];
         cfg.roles.implementer = Some("cli:claude".into());
@@ -3144,7 +3154,8 @@ mod try_rotate_implementer_tests {
             store.pause_quota("cli:claude", "test");
             store.save(&paths).unwrap();
         }
-        let mut st = state_with_impl("cli:claude", Some(SeatSource::CliRole), false);
+        let mut st = state_with_impl("cli:claude", Some(SeatSource::CliRole), true);
+        st.slots[0].error = Some("rate limit exceeded".into());
         let mut cfg = Config::default();
         cfg.providers.order = vec!["cli:claude".into(), "cli:codex".into()];
         cfg.roles.implementer = Some("cli:claude".into());
