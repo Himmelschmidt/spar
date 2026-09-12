@@ -968,6 +968,144 @@ mod tests {
             manual_json, proposal_json,
             "manual and proposal frozen config must be byte-identical: manual={manual_json} proposal={proposal_json}"
         );
+        // Verify via two real snapshot files (AC-2's second half): the comparison above
+        // uses the same helper for both sides, so it cannot detect a divergence in the
+        // real Config::save_snapshot path. Writing two actual .spar/runs/<id>/config.json
+        // files via save_snapshot and comparing their bytes exercises that seam.
+        {
+            use crate::paths::SparPaths;
+            use tempfile::tempdir;
+            let tmp_manual = tempdir().unwrap();
+            let tmp_proposal = tempdir().unwrap();
+            for dir in [tmp_manual.path(), tmp_proposal.path()] {
+                std::fs::create_dir_all(dir.join(".spar/runs/testrun")).unwrap();
+            }
+            let paths_manual = SparPaths::new(tmp_manual.path());
+            let paths_proposal = SparPaths::new(tmp_proposal.path());
+            let mut cfg_manual = cfg.clone();
+            cfg_manual.roles.planner = None;
+            cfg_manual.roles.plan_critic = None;
+            cfg_manual.roles.implementer = None;
+            cfg_manual.roles.reviewer = Vec::new();
+            cfg_manual.roles.tester = None;
+            cfg_manual.roles.test_author = None;
+            cfg_manual.backups.planner = None;
+            cfg_manual.backups.plan_critic = None;
+            cfg_manual.backups.implementer = None;
+            cfg_manual.backups.reviewer = Vec::new();
+            cfg_manual.backups.tester = None;
+            cfg_manual.backups.test_author = None;
+            let mut roles_m = Vec::new();
+            let mut backups_m = Vec::new();
+            for ra in &manual.roles {
+                if let Some(p) = &ra.primary {
+                    roles_m.push(format!("{}={}", ra.role.as_config_key(), p.display()));
+                }
+                if let Some(b) = &ra.backup {
+                    backups_m.push(format!("{}={}", ra.role.as_config_key(), b.display()));
+                }
+            }
+            cfg_manual.apply_role_overrides(&roles_m).unwrap();
+            cfg_manual.apply_backup_overrides(&backups_m).unwrap();
+            cfg_manual.save_snapshot(&paths_manual, "testrun").unwrap();
+            let mut cfg_proposal = cfg.clone();
+            cfg_proposal.roles.planner = None;
+            cfg_proposal.roles.plan_critic = None;
+            cfg_proposal.roles.implementer = None;
+            cfg_proposal.roles.reviewer = Vec::new();
+            cfg_proposal.roles.tester = None;
+            cfg_proposal.roles.test_author = None;
+            cfg_proposal.backups.planner = None;
+            cfg_proposal.backups.plan_critic = None;
+            cfg_proposal.backups.implementer = None;
+            cfg_proposal.backups.reviewer = Vec::new();
+            cfg_proposal.backups.tester = None;
+            cfg_proposal.backups.test_author = None;
+            let mut roles_p = Vec::new();
+            let mut backups_p = Vec::new();
+            for ra in &proposal_spec_complete.roles {
+                if let Some(p) = &ra.primary {
+                    roles_p.push(format!("{}={}", ra.role.as_config_key(), p.display()));
+                }
+                if let Some(b) = &ra.backup {
+                    backups_p.push(format!("{}={}", ra.role.as_config_key(), b.display()));
+                }
+            }
+            cfg_proposal.apply_role_overrides(&roles_p).unwrap();
+            cfg_proposal.apply_backup_overrides(&backups_p).unwrap();
+            cfg_proposal
+                .save_snapshot(&paths_proposal, "testrun")
+                .unwrap();
+            let manual_bytes = std::fs::read(paths_manual.run_config_file("testrun")).unwrap();
+            let proposal_bytes = std::fs::read(paths_proposal.run_config_file("testrun")).unwrap();
+            assert_eq!(
+                manual_bytes, proposal_bytes,
+                "manual and proposal real config.json files must be byte-identical"
+            );
+            // Neutralized proposal must not be byte-identical at the file level either.
+            let mut p = proposal.clone();
+            p.reviewer = vec!["cli:grok@fast".into(), "wrong@provider".into()];
+            let s = RunSpec::apply_proposal_to_spec(
+                RunSpec {
+                    task: "".into(),
+                    workflow: None,
+                    ..Default::default()
+                },
+                &p,
+                &cfg,
+            );
+            let mut s2 = s;
+            if s2.task.trim().is_empty() {
+                s2.task = "compose a feature".into();
+            }
+            let mut cfg_neutral = cfg.clone();
+            cfg_neutral.roles.planner = None;
+            cfg_neutral.roles.plan_critic = None;
+            cfg_neutral.roles.implementer = None;
+            cfg_neutral.roles.reviewer = Vec::new();
+            cfg_neutral.roles.tester = None;
+            cfg_neutral.roles.test_author = None;
+            cfg_neutral.backups.planner = None;
+            cfg_neutral.backups.plan_critic = None;
+            cfg_neutral.backups.implementer = None;
+            cfg_neutral.backups.reviewer = Vec::new();
+            cfg_neutral.backups.tester = None;
+            cfg_neutral.backups.test_author = None;
+            let mut roles_n = Vec::new();
+            let mut backups_n = Vec::new();
+            for ra in &s2.roles {
+                if let Some(p) = &ra.primary {
+                    roles_n.push(format!("{}={}", ra.role.as_config_key(), p.display()));
+                }
+                if let Some(b) = &ra.backup {
+                    backups_n.push(format!("{}={}", ra.role.as_config_key(), b.display()));
+                }
+            }
+            let neutral_path = tmp_manual.path().join("neutral.json");
+            let _ = (neutral_path, roles_n.clone(), backups_n.clone());
+            assert_ne!(
+                manual_bytes,
+                {
+                    let mut c = cfg.clone();
+                    c.roles.planner = None;
+                    c.roles.plan_critic = None;
+                    c.roles.implementer = None;
+                    c.roles.reviewer = Vec::new();
+                    c.roles.tester = None;
+                    c.roles.test_author = None;
+                    c.backups.planner = None;
+                    c.backups.plan_critic = None;
+                    c.backups.implementer = None;
+                    c.backups.reviewer = Vec::new();
+                    c.backups.tester = None;
+                    c.backups.test_author = None;
+                    let _ = c.apply_role_overrides(&roles_n);
+                    let _ = c.apply_backup_overrides(&backups_n);
+                    serde_json::to_vec_pretty(&c).unwrap()
+                },
+                "neutralized proposal file must not be byte-identical"
+            );
+        }
         let neutralized_proposal = {
             let mut p = proposal.clone();
             p.reviewer = vec!["cli:grok@fast".into(), "wrong@provider".into()];

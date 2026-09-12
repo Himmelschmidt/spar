@@ -123,6 +123,40 @@ fn planner_paused_activates_backup_and_records_backup_source() {
     assert_eq!(slot["provider"], "cli:grok");
     assert_eq!(slot["model"], "fast");
     assert_eq!(slot["source"], "backup");
+    // Fleet output via status --json must also report backup source
+    let status = spar_cmd()
+        .current_dir(&proj)
+        .env("SPAR_HOME", &spar_home)
+        .args(["status", &run_id, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&status).unwrap();
+    let v_obj = if let Some(arr) = v.as_array() {
+        arr.iter()
+            .find(|r| r["id"] == run_id)
+            .cloned()
+            .unwrap_or(v.clone())
+    } else {
+        v.clone()
+    };
+    if let Some(fleet) = v_obj.get("fleet").and_then(|f| f.as_array()) {
+        assert!(
+            fleet.iter().any(|s| s.as_str().unwrap().contains("grok")),
+            "status --json fleet must report backup provider: {v_obj}"
+        );
+    }
+    assert!(
+        v_obj["slots"][0]["source"] == "backup"
+            || v_obj["slots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["source"] == "backup"),
+        "status slots source must be backup: {v_obj}"
+    );
 }
 
 #[test]
@@ -209,6 +243,39 @@ fn reviewer_unavailable_activates_only_its_ordinal_backup() {
     assert_eq!(r0["provider"], "cli:codex");
     assert_eq!(r0["model"], "backup");
     assert_eq!(r0["source"], "backup");
+    // Fleet output and pool checks via status --json
+    let status = spar_cmd()
+        .current_dir(&proj)
+        .env("SPAR_HOME", &spar_home)
+        .args(["status", run_id, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v2: serde_json::Value = serde_json::from_slice(&status).unwrap();
+    let v2_obj = if let Some(arr) = v2.as_array() {
+        arr.iter()
+            .find(|r| r["id"] == run_id)
+            .cloned()
+            .unwrap_or(v2.clone())
+    } else {
+        v2.clone()
+    };
+    if let Some(fleet2) = v2_obj.get("fleet").and_then(|f| f.as_array()) {
+        assert!(
+            fleet2.iter().any(|s| s.as_str().unwrap().contains("codex")),
+            "fleet must report backup: {v2_obj}"
+        );
+    }
+    assert!(
+        v2_obj["slots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["source"] == "backup"),
+        "slot source must be backup: {v2_obj}"
+    );
 }
 
 // AC-7: work failures (including timeout, missing artifact, adverse review) do not activate backup
@@ -387,6 +454,39 @@ fn implementer_paused_activates_backup_and_records_backup_source() {
         pool[0].as_str().unwrap().contains("claude"),
         "pool implementer position must not be rewritten to backup: {:?}",
         pool
+    );
+    // Fleet output via status --json
+    let status = spar_cmd()
+        .current_dir(&proj)
+        .env("SPAR_HOME", &spar_home)
+        .args(["status", &run_id, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v2: serde_json::Value = serde_json::from_slice(&status).unwrap();
+    let v2_obj = if let Some(arr) = v2.as_array() {
+        arr.iter()
+            .find(|r| r["id"] == run_id)
+            .cloned()
+            .unwrap_or(v2.clone())
+    } else {
+        v2.clone()
+    };
+    if let Some(fleet2) = v2_obj.get("fleet").and_then(|f| f.as_array()) {
+        assert!(
+            fleet2.iter().any(|s| s.as_str().unwrap().contains("grok")),
+            "fleet must report backup for implementer: {v2_obj}"
+        );
+    }
+    assert!(
+        v2_obj["slots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["source"] == "backup"),
+        "slots must contain backup"
     );
 }
 

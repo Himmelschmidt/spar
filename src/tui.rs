@@ -538,6 +538,7 @@ struct NewRun {
     workflow: Option<crate::runspec::SpecWorkflow>,
     roles: Vec<crate::runspec::RoleAssignment>,
     arena_pool: Vec<Option<crate::runspec::Pin>>,
+    legacy_providers: Vec<String>,
     role_sel: usize,
     editing_backup: bool,
     editing_model: bool,
@@ -1414,6 +1415,7 @@ fn new_run_fixture() -> NewRun {
         workflow: Some(crate::runspec::SpecWorkflow::Plan),
         roles: vec![],
         arena_pool: vec![],
+        legacy_providers: vec![],
         role_sel: 0,
         editing_backup: false,
         editing_model: false,
@@ -2863,6 +2865,7 @@ fn new_run_spec(nr: &NewRun, cfg: &crate::config::Config) -> crate::runspec::Run
         workflow: wf,
         ..Default::default()
     };
+    spec.legacy_providers = nr.legacy_providers.clone();
     if let Some(wf) = wf {
         if wf == crate::runspec::SpecWorkflow::Arena {
             if !nr.arena_pool.is_empty() {
@@ -4387,6 +4390,7 @@ fn rebuild_roles_for_workflow(nr: &mut NewRun, cfg: &crate::config::Config) {
             }
             nr.arena_pool = new_pool;
             nr.roles.clear();
+            nr.legacy_providers.clear();
         } else {
             let mut new_roles = Vec::new();
             for (role, ordinal) in expected {
@@ -4407,6 +4411,7 @@ fn rebuild_roles_for_workflow(nr: &mut NewRun, cfg: &crate::config::Config) {
             }
             nr.roles = new_roles;
             nr.arena_pool.clear();
+            nr.legacy_providers.clear();
         }
         nr.role_sel = 0;
         nr.editing_backup = false;
@@ -4470,6 +4475,7 @@ fn pending_new_run(
         workflow: defaults.workflow,
         roles,
         arena_pool,
+        legacy_providers: Vec::new(),
         role_sel: 0,
         editing_backup: false,
         editing_model: false,
@@ -4506,7 +4512,10 @@ fn begin_new_run(
             let mut roster = compute_new_run_roster(&app.cfg);
             if let Some(nr) = app.new_run.as_mut() {
                 if let Some(proposal) = app.chat_pending_proposal.clone() {
-                    apply_proposal_to_roster(&proposal, &mut roster, nr);
+                    // Temporarily set roster for proposal handling, then merge.
+                    nr.roster = roster;
+                    apply_proposal_to_roster(&proposal, nr);
+                    roster = std::mem::take(&mut nr.roster);
                 }
                 nr.roster = roster;
                 nr.loading = false;
@@ -4555,11 +4564,7 @@ fn most_recent_fleet(
         .map(|(_, id, providers)| (id, providers))
 }
 
-fn apply_proposal_to_roster(
-    proposal: &crate::orchestrator::Proposal,
-    roster: &mut Vec<RosterEntry>,
-    nr: &mut NewRun,
-) {
+fn apply_proposal_to_roster(proposal: &crate::orchestrator::Proposal, nr: &mut NewRun) {
     let workflow_was_none = nr.workflow.is_none();
     if nr.task.trim().is_empty() {
         nr.task = proposal.task.clone();
@@ -4607,7 +4612,8 @@ fn apply_proposal_to_roster(
         }
     }
     for prov in to_add {
-        if !roster
+        if !nr
+            .roster
             .iter()
             .any(|e| matches!(&e.choice, RosterChoice::Provider(p) if p == &prov))
         {
@@ -4628,7 +4634,7 @@ fn apply_proposal_to_roster(
             } else {
                 Some("not in roster".to_string())
             };
-            roster.push(RosterEntry {
+            nr.roster.push(RosterEntry {
                 choice: RosterChoice::Provider(prov.clone()),
                 label: prov.clone(),
                 available,
@@ -4728,6 +4734,57 @@ fn apply_proposal_to_roster(
             }
         }
     }
+    // Legacy providers: when workflow is unset, or when providers remain unmapped
+    // after the above, retain them visibly and block launch. Never silently drop.
+    if nr.workflow.is_none() && !proposal.providers.is_empty() {
+        for prov in &proposal.providers {
+            if !nr.legacy_providers.contains(prov) {
+                nr.legacy_providers.push(prov.clone());
+            }
+        }
+    } else if nr.workflow.is_some() && !proposal.providers.is_empty() {
+        // Check if any provider remains unmapped (extra providers beyond rows, or
+        // providers that would have been legacy when explicit roles present).
+        // For explicit-role proposals we intentionally skip legacy, so nothing to do.
+        // For positional proposals, any extra beyond rows is legacy.
+        if proposal.roles.is_empty() && proposal.reviewer.is_empty() {
+            let cfg = crate::config::Config::load(&nr.project.clone().unwrap_or_else(|| {
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            }))
+            .unwrap_or_default();
+            if let Some(wf) = nr.workflow {
+                let rows = crate::runspec::spec_rows(wf, &cfg);
+                for idx in rows.len()..proposal.providers.len() {
+                    let prov = &proposal.providers[idx];
+                    if !nr.legacy_providers.contains(prov) {
+                        nr.legacy_providers.push(prov.clone());
+                    }
+                }
+                for (idx, (role, ordinal)) in rows.iter().enumerate() {
+                    if let Some(raw) = proposal.providers.get(idx) {
+                        if crate::runspec::Pin::parse(raw).is_err()
+                            && !nr.legacy_providers.contains(raw)
+                        {
+                            nr.legacy_providers.push(raw.clone());
+                        } else if let Some(slot) = nr
+                            .roles
+                            .iter()
+                            .find(|r| r.role == *role && r.ordinal == *ordinal)
+                        {
+                            if slot.primary.is_none()
+                                && crate::runspec::Pin::parse(raw).is_ok()
+                                && !nr.legacy_providers.contains(raw)
+                            {
+                                // Valid pin but slot already filled via explicit role would have been
+                                // skipped; with explicit roles we don't push to legacy (see runspec fix).
+                                // Only push when no explicit roles.
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Apply a background roster probe's result (D2) if the modal it was built for is
@@ -4738,7 +4795,9 @@ fn apply_roster_ready(app: &mut App, gen: u64, mut roster: Vec<RosterEntry>) {
         if nr.gen == gen {
             if let Some(proposal) = app.chat_pending_proposal.clone() {
                 let saved_task = nr.task.clone();
-                apply_proposal_to_roster(&proposal, &mut roster, nr);
+                nr.roster = roster;
+                apply_proposal_to_roster(&proposal, nr);
+                roster = std::mem::take(&mut nr.roster);
                 if saved_task.trim() != proposal.task.trim() && !saved_task.trim().is_empty() {
                     nr.task = saved_task;
                 }
@@ -11218,6 +11277,40 @@ fn draw_new_run(f: &mut Frame, area: Rect, projects: &[registry::ProjectEntry], 
     let below = nr.roster.len() - roster_scroll - roster_window.len();
     if below > 0 {
         lines.push((format!("  ↓ {below} more"), Style::default().fg(FG_MUTED)));
+    }
+    if !nr.legacy_providers.is_empty() {
+        lines.push((String::new(), Style::default()));
+        lines.push((
+            "Legacy providers (needs workflow/role mapping):".to_string(),
+            Style::default().fg(ALERT).bold(),
+        ));
+        for prov in &nr.legacy_providers {
+            let pin_ok = crate::runspec::Pin::parse(prov).is_ok();
+            let avail = if pin_ok {
+                nr.roster
+                    .iter()
+                    .find(|e| e.label == *prov)
+                    .map(|e| e.available)
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+            let reason = if !pin_ok {
+                " (invalid provider)"
+            } else if !avail {
+                " (unavailable)"
+            } else {
+                ""
+            };
+            lines.push((
+                format!("  - {}{}", prov, reason),
+                Style::default().fg(ALERT),
+            ));
+        }
+        lines.push((
+            "  Pick a workflow to map, or clear legacy to launch".to_string(),
+            Style::default().fg(FG_MUTED),
+        ));
     }
     lines.push((String::new(), Style::default()));
     lines.push((
@@ -22567,5 +22660,126 @@ mod chat_acceptance {
             app.chat_active_turn.is_none(),
             "cancelled turn handle must be taken"
         );
+    }
+
+    #[test]
+    fn legacy_providers_are_visible_and_block_launch() {
+        let tmp = tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&proj)
+            .output()
+            .unwrap();
+        let cfg = Config::default();
+        let mut nr = pending_new_run(
+            Some(proj.clone()),
+            vec![proj.clone()],
+            "".into(),
+            NewRunField::Task,
+            99,
+        );
+        nr.roster = vec![
+            RosterEntry {
+                choice: RosterChoice::Provider("cli:claude".into()),
+                label: "cli:claude".into(),
+                available: true,
+                reason: None,
+                source: RosterSource::Detected,
+            },
+            RosterEntry {
+                choice: RosterChoice::Provider("cli:grok".into()),
+                label: "cli:grok".into(),
+                available: false,
+                reason: Some("not in roster".into()),
+                source: RosterSource::Detected,
+            },
+        ];
+        nr.workflow = None;
+        let proposal = crate::orchestrator::Proposal {
+            task: "legacy task".into(),
+            brief: "brief".into(),
+            providers: vec![
+                "cli:claude@opus".into(),
+                "cli:grok@fast".into(),
+                "invalid-provider".into(),
+            ],
+            ..Default::default()
+        };
+        apply_proposal_to_roster(&proposal, &mut nr);
+        assert_eq!(
+            nr.legacy_providers.len(),
+            3,
+            "all three providers must be retained visibly, including invalid"
+        );
+        assert!(nr.legacy_providers.contains(&"cli:claude@opus".to_string()));
+        assert!(nr.legacy_providers.contains(&"cli:grok@fast".to_string()));
+        assert!(nr
+            .legacy_providers
+            .contains(&"invalid-provider".to_string()));
+        let spec = new_run_spec(&nr, &cfg);
+        assert_eq!(spec.legacy_providers.len(), 3);
+        assert!(
+            spec.validate_for_launch(&cfg).is_err(),
+            "legacy must block launch"
+        );
+        // Also visible in roster: providers were added to roster
+        assert!(nr.roster.iter().any(|r| r.label == "cli:claude@opus"));
+        // Cleanup
+        crate::defaults::set_test_home(None);
+    }
+
+    #[test]
+    fn defaults_prefill_new_run_without_writing_project_toml() {
+        let tmp_home = tempdir().unwrap();
+        let home = tmp_home.path().join("spar-home");
+        std::fs::create_dir_all(&home).unwrap();
+        crate::defaults::set_test_home(Some(home.clone()));
+        let proj_tmp = tempdir().unwrap();
+        let proj = proj_tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&proj)
+            .output()
+            .unwrap();
+        let before = std::fs::read_to_string(proj.join("spar.toml")).unwrap_or_default();
+        let def_spec = crate::runspec::RunSpec {
+            workflow: Some(crate::runspec::SpecWorkflow::Plan),
+            task: "prefilled task".into(),
+            roles: vec![crate::runspec::RoleAssignment {
+                role: crate::state::SlotRole::Planner,
+                ordinal: 0,
+                primary: Some(crate::runspec::Pin::parse("cli:claude@opus").unwrap()),
+                backup: Some(crate::runspec::Pin::parse("cli:grok@fast").unwrap()),
+            }],
+            ..Default::default()
+        };
+        crate::defaults::save(&def_spec).unwrap();
+        let defaults_path = home.join("defaults.json");
+        assert!(
+            defaults_path.is_file(),
+            "defaults must be at spar_home/defaults.json"
+        );
+        let nr = pending_new_run(
+            Some(proj.clone()),
+            vec![proj.clone()],
+            "".into(),
+            NewRunField::Task,
+            100,
+        );
+        assert_eq!(nr.workflow, Some(crate::runspec::SpecWorkflow::Plan));
+        assert!(nr
+            .roles
+            .iter()
+            .any(|r| r.role == crate::state::SlotRole::Planner
+                && r.primary.as_ref().map(|p| p.display()) == Some("cli:claude@opus".into())));
+        let after = std::fs::read_to_string(proj.join("spar.toml")).unwrap_or_default();
+        assert_eq!(
+            before, after,
+            "saving defaults must not touch project spar.toml"
+        );
+        crate::defaults::set_test_home(None);
     }
 }
