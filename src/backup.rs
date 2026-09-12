@@ -94,6 +94,18 @@ pub fn dispatch_stop_cause(
     if slot.quota_hit {
         return StopCause::Environmental;
     }
+    if let Some(err) = &slot.error {
+        let lower = err.to_ascii_lowercase();
+        if lower.contains("hard ceiling")
+            || lower.contains("timed out")
+            || lower.contains("timeout")
+            || lower.contains("missing expected artifact")
+            || lower.contains("request_changes")
+            || lower.contains("adverse review")
+        {
+            return StopCause::Work;
+        }
+    }
     let key = crate::quota::normalize_key(provider);
     if store.effective_status(&key) != crate::quota::ProviderStatus::Available {
         return StopCause::Environmental;
@@ -321,6 +333,58 @@ mod tests {
         env_slot.status = SlotStatus::Failed;
         assert_eq!(
             dispatch_stop_cause(&env_slot, "cli:claude", &store, Some(&set)),
+            StopCause::Environmental
+        );
+    }
+
+    #[test]
+    fn timeout_with_paused_provider_still_work() {
+        let mut store = QuotaStore::default();
+        store.pause_quota("cli:claude", "test");
+        let mut slot = slot_with_quota(false);
+        slot.status = SlotStatus::Failed;
+        slot.error = Some("hard ceiling: slot timed out after 10s".into());
+        assert_eq!(
+            dispatch_stop_cause(&slot, "cli:claude", &store, None),
+            StopCause::Work
+        );
+    }
+
+    #[test]
+    fn missing_artifact_with_paused_provider_still_work() {
+        let mut store = QuotaStore::default();
+        store.pause_quota("cli:claude", "test");
+        let mut slot = slot_with_quota(false);
+        slot.status = SlotStatus::Failed;
+        slot.error = Some("missing expected artifact: summary-impl.md".into());
+        assert_eq!(
+            dispatch_stop_cause(&slot, "cli:claude", &store, None),
+            StopCause::Work
+        );
+    }
+
+    #[test]
+    fn adverse_review_with_paused_provider_still_work() {
+        let mut store = QuotaStore::default();
+        store.pause_quota("cli:claude", "test");
+        let mut slot = slot_with_quota(false);
+        slot.status = SlotStatus::Failed;
+        slot.error = Some("review verdict: request_changes".into());
+        assert_eq!(
+            dispatch_stop_cause(&slot, "cli:claude", &store, None),
+            StopCause::Work
+        );
+    }
+
+    #[test]
+    fn paused_provider_without_work_signal_is_environmental() {
+        let mut store = QuotaStore::default();
+        store.pause_quota("cli:claude", "test");
+        let mut slot = slot_with_quota(false);
+        slot.status = SlotStatus::Failed;
+        slot.error = Some("some other failure".into());
+        assert_eq!(
+            dispatch_stop_cause(&slot, "cli:claude", &store, None),
             StopCause::Environmental
         );
     }

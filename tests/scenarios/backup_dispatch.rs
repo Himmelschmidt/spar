@@ -217,7 +217,7 @@ fn reviewer_unavailable_activates_only_its_ordinal_backup() {
             "--backup",
             "reviewer=cli:codex@backup",
             "--backup",
-            "reviewer=cli:codex@backup2",
+            "reviewer=cli:agy@backup2",
             "--dry-run",
             "--json",
         ])
@@ -467,7 +467,7 @@ fn adverse_review_does_not_activate_backup() {
             "--backup",
             "reviewer=cli:codex@backup",
             "--backup",
-            "reviewer=cli:codex@backup2",
+            "reviewer=cli:agy@backup2",
             "--json",
         ])
         .assert()
@@ -748,6 +748,230 @@ fn implementer_work_failure_does_not_activate_backup() {
         "work failure must not activate backup"
     );
     let _ = combined;
+}
+
+#[test]
+fn implementer_quota_mid_dispatch_activates_backup() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    fs::create_dir_all(&proj).unwrap();
+    init_repo(&proj);
+    let spar_home = spar_home_dir();
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    for (name, script) in [
+        (
+            "claude",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\necho \"! rate limit seven_day rejected\" >&2\n echo \"rate limit\" >&2\nexit 1\n",
+        ),
+        (
+            "grok",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\nexit 0\n",
+        ),
+    ] {
+        let p = bin.join(name);
+        fs::write(&p, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let path_env = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let _ = spar_cmd()
+        .current_dir(&proj)
+        .env("SPAR_HOME", &spar_home)
+        .env("PATH", &path_env)
+        .args([
+            "implement",
+            "-t",
+            "quota backup mid dispatch",
+            "--role",
+            "implementer=cli:claude@opus",
+            "--backup",
+            "implementer=cli:grok@backup",
+            "--without",
+            "suite",
+            "--json",
+        ])
+        .assert()
+        .get_output()
+        .clone();
+    let run_id = fs::read_dir(proj.join(".spar/runs"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.path().join("state.json").is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .expect("run created");
+    let state = read_state(&proj, &run_id);
+    let slot = state["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["role"] == "implementer")
+        .unwrap();
+    assert_eq!(
+        slot["provider"], "cli:grok",
+        "quota mid-dispatch must activate backup: {state:?}"
+    );
+    assert_eq!(slot["source"], "backup");
+    assert_eq!(slot["model"], "backup");
+}
+
+#[test]
+fn planner_quota_mid_dispatch_activates_backup() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    fs::create_dir_all(&proj).unwrap();
+    init_repo(&proj);
+    let spar_home = spar_home_dir();
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    for (name, script) in [
+        (
+            "claude",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\necho \"! rate limit seven_day rejected\" >&2\nexit 1\n",
+        ),
+        (
+            "grok",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\necho \"plan content\" > plan.md 2>/dev/null; exit 0\n",
+        ),
+        (
+            "codex",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\nexit 0\n",
+        ),
+    ] {
+        let p = bin.join(name);
+        fs::write(&p, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let path_env = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let _ = spar_cmd()
+        .current_dir(&proj)
+        .env("SPAR_HOME", &spar_home)
+        .env("PATH", &path_env)
+        .args([
+            "plan",
+            "-t",
+            "plan quota backup",
+            "--role",
+            "planner=cli:claude@opus",
+            "--backup",
+            "planner=cli:grok@fast",
+            "--json",
+        ])
+        .assert()
+        .get_output()
+        .clone();
+    let run_id = fs::read_dir(proj.join(".spar/runs"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.path().join("state.json").is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .expect("run created");
+    let state = read_state(&proj, &run_id);
+    let planner = state["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["role"] == "planner")
+        .unwrap();
+    assert_eq!(
+        planner["provider"], "cli:grok",
+        "planner quota must activate backup: {state:?}"
+    );
+    assert_eq!(planner["source"], "backup");
+}
+
+#[test]
+fn reviewer_quota_mid_dispatch_activates_backup() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    fs::create_dir_all(&proj).unwrap();
+    init_repo(&proj);
+    let spar_home = spar_home_dir();
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    for (name, script) in [
+        (
+            "claude",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\necho \"! rate limit seven_day rejected\" >&2\nexit 1\n",
+        ),
+        (
+            "grok",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\nexit 0\n",
+        ),
+        (
+            "codex",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\nexit 0\n",
+        ),
+    ] {
+        let p = bin.join(name);
+        fs::write(&p, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let path_env = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let _ = spar_cmd()
+        .current_dir(&proj)
+        .env("SPAR_HOME", &spar_home)
+        .env("PATH", &path_env)
+        .args([
+            "run",
+            "--workflow",
+            "review",
+            "-t",
+            "review quota",
+            "--role",
+            "reviewer=cli:claude",
+            "--role",
+            "reviewer=cli:grok",
+            "--backup",
+            "reviewer=cli:codex@backup",
+            "--backup",
+            "reviewer=cli:agy@backup2",
+            "--json",
+        ])
+        .assert()
+        .get_output()
+        .clone();
+    let run_id = fs::read_dir(proj.join(".spar/runs"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.path().join("state.json").is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .expect("run created");
+    let state = read_state(&proj, &run_id);
+    let r0 = state["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"].as_str().unwrap().starts_with("review-0"))
+        .unwrap();
+    assert_eq!(
+        r0["provider"], "cli:codex",
+        "reviewer quota must activate backup: {state:?}"
+    );
+    assert_eq!(r0["source"], "backup");
 }
 
 #[test]

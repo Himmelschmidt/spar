@@ -1,6 +1,7 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::prelude::*;
 use serde_json::Value;
+use std::fs;
 use std::process::Command;
 use tempfile::tempdir;
 
@@ -288,7 +289,6 @@ fn defaults_are_stored_only_at_spar_home_and_frozen_run_ignores_them() {
     let dir = tmp.path();
     init_repo(dir);
     let before = std::fs::read_to_string(dir.join("spar.toml")).unwrap_or_default();
-    // Write a defaults file directly to the isolated home (simulates TUI saving defaults)
     let defaults_path = home_path.join("defaults.json");
     let defaults_json = serde_json::json!({
         "workflow": "plan",
@@ -301,13 +301,11 @@ fn defaults_are_stored_only_at_spar_home_and_frozen_run_ignores_them() {
     )
     .unwrap();
     assert!(defaults_path.is_file());
-    // Project spar.toml must be unchanged by writing defaults
     let after_defaults = std::fs::read_to_string(dir.join("spar.toml")).unwrap_or_default();
     assert_eq!(
         before, after_defaults,
         "writing defaults must not touch project spar.toml"
     );
-    // Create a run with explicit different role, using isolated home
     let mut cmd = cargo_bin_cmd!("spar");
     cmd.env("SPAR_HOME", &home_path);
     cmd.env_remove("SPAR_PROJECT_ROOT");
@@ -336,16 +334,13 @@ fn defaults_are_stored_only_at_spar_home_and_frozen_run_ignores_them() {
     let frozen = frozen_config(dir, run_id);
     assert_eq!(frozen["roles"]["planner"], "cli:codex@terra");
     assert_eq!(frozen["backups"]["planner"], "cli:agy@mini");
-    // Delete and corrupt defaults after launch
     std::fs::remove_file(&defaults_path).unwrap();
     std::fs::write(&defaults_path, "corrupt").unwrap();
-    // Frozen run must still be readable and unchanged
     let frozen2 = frozen_config(dir, run_id);
     assert_eq!(
         frozen, frozen2,
         "deleting/corrupting defaults must not alter frozen config"
     );
-    // status --json must still report original
     let mut cmd2 = cargo_bin_cmd!("spar");
     cmd2.env("SPAR_HOME", &home_path);
     cmd2.env_remove("SPAR_PROJECT_ROOT");
@@ -363,10 +358,97 @@ fn defaults_are_stored_only_at_spar_home_and_frozen_run_ignores_them() {
         slots.iter().any(|s| s["provider"] == "cli:codex"),
         "frozen provider must survive defaults deletion"
     );
-    // Project file still unchanged
     let after_run = std::fs::read_to_string(dir.join("spar.toml")).unwrap_or_default();
     assert_eq!(
         before, after_run,
         "run creation must not write project spar.toml"
     );
+}
+
+#[test]
+fn defaults_survive_deletion_for_implement_continuation() {
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path().join("spar-home");
+    std::fs::create_dir_all(&home_path).unwrap();
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    init_repo(dir);
+    let defaults_path = home_path.join("defaults.json");
+    let defaults_json = serde_json::json!({
+        "workflow": "plan",
+        "task": "default plan",
+        "roles": [{"role":"planner","ordinal":0,"primary":"cli:claude@opus","backup":"cli:grok@fast"}]
+    });
+    std::fs::write(
+        &defaults_path,
+        serde_json::to_string_pretty(&defaults_json).unwrap(),
+    )
+    .unwrap();
+    let mut cmd = cargo_bin_cmd!("spar");
+    cmd.env("SPAR_HOME", &home_path);
+    cmd.env_remove("SPAR_PROJECT_ROOT");
+    cmd.env_remove("SPAR_RUN_ID");
+    cmd.env_remove("SPAR_AGENT_ID");
+    let out = cmd
+        .current_dir(dir)
+        .args([
+            "plan",
+            "--task",
+            "frozen plan",
+            "--dry-run",
+            "--json",
+            "--role",
+            "planner=cli:codex@terra",
+            "--backup",
+            "planner=cli:agy@mini",
+        ])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_str(&String::from_utf8_lossy(&out)).unwrap();
+    let run_id = v["run_id"].as_str().unwrap();
+    let frozen = frozen_config(dir, run_id);
+    assert_eq!(frozen["roles"]["planner"], "cli:codex@terra");
+    std::fs::remove_file(&defaults_path).unwrap();
+    std::fs::write(&defaults_path, "corrupt").unwrap();
+    fs::write(
+        dir.join("spar.toml"),
+        "[roles]\nplanner = \"cli:grok@fast\"\n",
+    )
+    .unwrap();
+    cargo_bin_cmd!("spar")
+        .env("SPAR_HOME", &home_path)
+        .env("SPAR_PROJECT_ROOT", dir)
+        .current_dir(dir)
+        .args(["approve", run_id])
+        .assert()
+        .success();
+    let mut cmd2 = cargo_bin_cmd!("spar");
+    cmd2.env("SPAR_HOME", &home_path);
+    cmd2.env("SPAR_PROJECT_ROOT", dir);
+    cmd2.env_remove("SPAR_RUN_ID");
+    cmd2.env_remove("SPAR_AGENT_ID");
+    cmd2.current_dir(dir)
+        .args(["implement", "--run", run_id, "--dry-run", "--json"])
+        .assert()
+        .code(predicate::in_iter([0, 2]));
+    let status = cargo_bin_cmd!("spar")
+        .env("SPAR_HOME", &home_path)
+        .env("SPAR_PROJECT_ROOT", dir)
+        .current_dir(dir)
+        .args(["status", run_id, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let sv: Value = serde_json::from_slice(&status).unwrap();
+    let slots = sv["slots"].as_array().unwrap();
+    assert!(
+        slots.iter().any(|s| s["provider"] == "cli:codex"),
+        "implement --run must still use frozen provider after defaults deleted: {sv}"
+    );
+    assert_eq!(frozen_config(dir, run_id), frozen);
 }

@@ -295,6 +295,27 @@ impl RunSpec {
                 }
             }
         }
+        for a in &self.roles {
+            if let Some(b1) = &a.backup {
+                for b in &self.roles {
+                    if b.role != a.role || b.ordinal <= a.ordinal {
+                        continue;
+                    }
+                    if let Some(b2) = &b.backup {
+                        if b1.storage_key() == b2.storage_key() {
+                            return Err(format!(
+                                "backup for {}[{}] and {}[{}] have same provider ({})",
+                                a.role.as_config_key(),
+                                a.ordinal,
+                                b.role.as_config_key(),
+                                b.ordinal,
+                                b1.storage_key()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         let rows = spec_rows(wf, cfg);
         for (role, ordinal) in &rows {
             let found = self
@@ -537,13 +558,6 @@ impl RunSpec {
         if !proposal.providers.is_empty() {
             if let Some(wf) = spec.workflow {
                 if wf != SpecWorkflow::Arena {
-                    // When proposal already carries explicit role pins, the positional
-                    // providers list is redundant. Treat it as supplemental only: fill
-                    // blank rows, otherwise skip. Pushing it into legacy_providers
-                    // would block launch even though the spec is already complete
-                    // via [roles]/reviewer (major finding: providers+[roles] => unlaunchable).
-                    let has_explicit_roles =
-                        !proposal.roles.is_empty() || !proposal.reviewer.is_empty();
                     let rows = spec_rows(wf, cfg);
                     for (idx, (role, ordinal)) in rows.iter().enumerate() {
                         if let Some(raw) = proposal.providers.get(idx) {
@@ -566,26 +580,36 @@ impl RunSpec {
                                             primary: Some(pin),
                                             backup: None,
                                         });
-                                    } else if !has_explicit_roles {
-                                        spec.legacy_providers.push(raw.clone());
+                                    } else {
+                                        // Slot already has a primary (operator-filled or earlier proposal). Preserve operator choice — ignore proposal provider, don't reintroduce legacy.
                                     }
                                 }
                                 Err(_) => {
-                                    spec.legacy_providers.push(raw.clone());
+                                    let has_slot_filled = spec.roles.iter().any(|r| {
+                                        r.role == *role
+                                            && r.ordinal == *ordinal
+                                            && r.primary.is_some()
+                                    });
+                                    if !has_slot_filled && !spec.legacy_providers.contains(raw) {
+                                        spec.legacy_providers.push(raw.clone());
+                                    }
                                 }
                             }
                         }
                     }
                     for idx in rows.len()..proposal.providers.len() {
-                        if !has_explicit_roles {
-                            spec.legacy_providers.push(proposal.providers[idx].clone());
+                        let raw = &proposal.providers[idx];
+                        if !spec.legacy_providers.contains(raw) {
+                            spec.legacy_providers.push(raw.clone());
                         }
                     }
                 } else {
                     let expected = spec_rows(wf, cfg).len();
                     for (idx, raw) in proposal.providers.iter().enumerate() {
                         if idx >= expected {
-                            spec.legacy_providers.push(raw.clone());
+                            if !spec.legacy_providers.contains(raw) {
+                                spec.legacy_providers.push(raw.clone());
+                            }
                             continue;
                         }
                         match Pin::parse(raw) {
@@ -595,10 +619,19 @@ impl RunSpec {
                                 }
                                 if spec.arena_pool[idx].is_none() {
                                     spec.arena_pool[idx] = Some(pin);
+                                } else if spec.arena_pool[idx]
+                                    .as_ref()
+                                    .is_some_and(|p| p.display() == *raw)
+                                {
+                                    // already placed, consumed
+                                } else if !spec.legacy_providers.contains(raw) {
+                                    spec.legacy_providers.push(raw.clone());
                                 }
                             }
                             Err(_) => {
-                                spec.legacy_providers.push(raw.clone());
+                                if !spec.legacy_providers.contains(raw) {
+                                    spec.legacy_providers.push(raw.clone());
+                                }
                             }
                         }
                     }
@@ -607,7 +640,11 @@ impl RunSpec {
                     }
                 }
             } else {
-                spec.legacy_providers.extend(proposal.providers.clone());
+                for raw in &proposal.providers {
+                    if !spec.legacy_providers.contains(raw) {
+                        spec.legacy_providers.push(raw.clone());
+                    }
+                }
             }
         }
         spec
@@ -1290,5 +1327,128 @@ mod tests {
         let mapped = RunSpec::apply_proposal_to_spec(spec, &proposal, &cfg);
         assert!(mapped.roles.iter().any(|r| r.role == SlotRole::Implementer
             && r.primary.as_ref().unwrap().display() == "cli:claude@opus"));
+    }
+
+    #[test]
+    fn mapped_legacy_proposal_is_launchable_after_operator_mapping() {
+        let mut cfg = Config::default();
+        cfg.critic.enabled = false;
+        cfg.spec.enabled = false;
+        cfg.suite.enabled = false;
+        cfg.roles.reviewer = vec!["cli:a".into()];
+        let proposal = crate::orchestrator::Proposal {
+            task: "t".into(),
+            providers: vec!["cli:claude@opus".into(), "cli:codex@terra".into()],
+            workflow: None,
+            ..Default::default()
+        };
+        let empty = RunSpec {
+            task: "".into(),
+            workflow: None,
+            ..Default::default()
+        };
+        let spec_after_proposal = RunSpec::apply_proposal_to_spec(empty, &proposal, &cfg);
+        assert!(!spec_after_proposal.legacy_providers.is_empty());
+        let with_workflow = RunSpec {
+            task: "t".into(),
+            workflow: Some(SpecWorkflow::Implement),
+            roles: spec_after_proposal
+                .roles
+                .clone()
+                .into_iter()
+                .filter(|r| r.primary.is_some())
+                .collect(),
+            legacy_providers: spec_after_proposal.legacy_providers.clone(),
+            ..Default::default()
+        };
+        let mut operator_mapped = with_workflow.clone();
+        for (role, ordinal) in crate::runspec::spec_rows(SpecWorkflow::Implement, &cfg) {
+            if !operator_mapped
+                .roles
+                .iter()
+                .any(|r| r.role == role && r.ordinal == ordinal)
+            {
+                operator_mapped.roles.push(RoleAssignment {
+                    role,
+                    ordinal,
+                    primary: Some(Pin::parse("cli:claude@opus").unwrap()),
+                    backup: None,
+                });
+            }
+        }
+        operator_mapped.legacy_providers.clear();
+        let reconfirmed = RunSpec::apply_proposal_to_spec(operator_mapped.clone(), &proposal, &cfg);
+        assert!(
+            reconfirmed.legacy_providers.is_empty(),
+            "re-applying same proposal after operator mapping must not reintroduce legacy: {:?}",
+            reconfirmed.legacy_providers
+        );
+        assert!(
+            reconfirmed.validate_for_launch(&cfg).is_ok(),
+            "mapped spec must be launchable after double apply: {:?}",
+            reconfirmed.validate_for_launch(&cfg)
+        );
+    }
+
+    #[test]
+    fn double_apply_does_not_duplicate_legacy() {
+        let mut cfg = Config::default();
+        cfg.critic.enabled = false;
+        cfg.spec.enabled = false;
+        cfg.suite.enabled = false;
+        cfg.roles.reviewer = vec!["cli:a".into()];
+        let proposal = crate::orchestrator::Proposal {
+            task: "t".into(),
+            providers: vec!["invalid-provider".into(), "cli:claude@opus".into()],
+            ..Default::default()
+        };
+        let spec = RunSpec {
+            task: "t".into(),
+            workflow: Some(SpecWorkflow::Implement),
+            ..Default::default()
+        };
+        let once = RunSpec::apply_proposal_to_spec(spec.clone(), &proposal, &cfg);
+        let twice = RunSpec::apply_proposal_to_spec(once.clone(), &proposal, &cfg);
+        assert_eq!(
+            once.legacy_providers, twice.legacy_providers,
+            "second apply must not duplicate legacy entries"
+        );
+    }
+
+    #[test]
+    fn mixed_proposal_with_roles_and_extra_providers_retains_extra_as_legacy() {
+        let mut cfg = Config::default();
+        cfg.critic.enabled = false;
+        cfg.spec.enabled = false;
+        cfg.suite.enabled = false;
+        cfg.roles.reviewer = vec!["cli:a".into()];
+        let proposal = crate::orchestrator::Proposal {
+            task: "t".into(),
+            workflow: Some("implement".into()),
+            roles: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("implementer".into(), "cli:claude@opus".into());
+                m
+            },
+            providers: vec![
+                "cli:claude@opus".into(),
+                "cli:codex@terra".into(),
+                "cli:grok@fast".into(),
+            ],
+            ..Default::default()
+        };
+        let spec = RunSpec {
+            task: "t".into(),
+            workflow: Some(SpecWorkflow::Implement),
+            ..Default::default()
+        };
+        let mapped = RunSpec::apply_proposal_to_spec(spec, &proposal, &cfg);
+        assert!(
+            mapped
+                .legacy_providers
+                .contains(&"cli:grok@fast".to_string()),
+            "extra provider beyond rows must be retained as legacy, not silently dropped: {:?}",
+            mapped.legacy_providers
+        );
     }
 }

@@ -5269,7 +5269,11 @@ fn handle_new_run_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 }
             }
         }
-        KeyCode::Char('x') | KeyCode::Char('X') if !nr.legacy_providers.is_empty() => {
+        KeyCode::Char('x') | KeyCode::Char('X')
+            if !nr.legacy_providers.is_empty()
+                && nr.field != NewRunField::Task
+                && !nr.editing_model =>
+        {
             nr.legacy_providers.clear();
             app.flash("legacy providers cleared".to_string(), INFO);
         }
@@ -22855,7 +22859,7 @@ mod chat_acceptance {
             Some(proj.clone()),
             vec![proj.clone()],
             "task".into(),
-            NewRunField::Task,
+            NewRunField::Roles,
             101,
         );
         nr.legacy_providers = vec!["invalid-provider".into(), "cli:claude@opus".into()];
@@ -22868,6 +22872,28 @@ mod chat_acceptance {
             nr_after.legacy_providers.is_empty(),
             "pressing x must clear legacy providers: {:?}",
             nr_after.legacy_providers
+        );
+        // x must not clear when typing in Task field
+        let mut nr_task = pending_new_run(
+            Some(proj.clone()),
+            vec![proj.clone()],
+            "".into(),
+            NewRunField::Task,
+            103,
+        );
+        nr_task.task = "fix".into();
+        nr_task.legacy_providers = vec!["invalid-provider".into()];
+        let mut app_task = App::new(None, cfg.clone(), Some(proj.as_path()));
+        app_task.new_run = Some(nr_task);
+        handle_new_run_key(&mut app_task, KeyCode::Char('x'), KeyModifiers::NONE);
+        let nr_task_after = app_task.new_run.as_ref().unwrap();
+        assert!(
+            !nr_task_after.legacy_providers.is_empty(),
+            "x in Task field must not clear legacy, must insert char"
+        );
+        assert_eq!(
+            nr_task_after.task, "fixx",
+            "x must be inserted into task when legacy present but Task focused"
         );
         // Neutralisation: without the clear handler, legacy would remain and block launch
         let mut nr2 = pending_new_run(

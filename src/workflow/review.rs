@@ -271,7 +271,24 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
             Ok(p) => p,
             Err(_) => continue,
         };
-        if let Some(s) = state.slot_mut(&job.slot_id) {
+        let new_id = format!(
+            "review-{}-{}",
+            idx,
+            crate::util::sanitize_slot(&pin.provider)
+        );
+        let old_id = job.slot_id.clone();
+        let mut new_slot_id = new_id.clone();
+        let new_artifact = format!("review-{new_id}.md");
+        if let Some(s) = state.slot_mut(&old_id) {
+            s.id = new_id.clone();
+            new_slot_id = s.id.clone();
+            s.provider = pin.provider.clone();
+            s.model = pin.model.clone();
+            s.source = Some(crate::state::SeatSource::Backup);
+            s.status = SlotStatus::Pending;
+            s.error = None;
+            s.quota_hit = false;
+        } else if let Some(s) = state.slot_mut(&job.slot_id) {
             s.provider = pin.provider.clone();
             s.model = pin.model.clone();
             s.source = Some(crate::state::SeatSource::Backup);
@@ -281,12 +298,12 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
         }
         state.save(paths)?;
         let retry_job = SlotJob {
-            slot_id: job.slot_id.clone(),
+            slot_id: new_slot_id,
             provider: pin.display(),
             role: job.role,
             template: job.template.clone(),
             extra_vars: job.extra_vars.clone(),
-            expected_artifact: job.expected_artifact.clone(),
+            expected_artifact: Some(new_artifact),
             model: pin.model.clone(),
         };
         let _ = executor::run_slot(state, paths, cfg, &retry_job);

@@ -1259,6 +1259,25 @@ impl Config {
                     }
                 }
             }
+            // Backup-vs-backup: two reviewer ordinals must not declare the same backup provider; would collapse panel on dual environmental failure.
+            for (i, b1) in self.backups.reviewer.iter().enumerate() {
+                let k1 = crate::provider_ref::ProviderRef::parse(b1)
+                    .map(|r| r.storage_key())
+                    .unwrap_or_else(|_| b1.clone());
+                for (j, b2) in self.backups.reviewer.iter().enumerate() {
+                    if j <= i {
+                        continue;
+                    }
+                    let k2 = crate::provider_ref::ProviderRef::parse(b2)
+                        .map(|r| r.storage_key())
+                        .unwrap_or_else(|_| b2.clone());
+                    if k1 == k2 {
+                        anyhow::bail!(
+                            "backup for reviewer[{i}] and reviewer[{j}] have same provider storage key ({k1}); backups must be distinct providers"
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     }

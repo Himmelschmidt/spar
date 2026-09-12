@@ -342,7 +342,27 @@ pub fn execute_plan(
                                 .unwrap_or_else(|_| raw.clone());
                             if cur_key != backup_key {
                                 if let Ok(pin) = crate::runspec::Pin::parse(&raw) {
-                                    if let Some(s) = state.slot_mut(&job.slot_id) {
+                                    let prefix = match job.role {
+                                        crate::state::SlotRole::Planner => "planner",
+                                        crate::state::SlotRole::PlanCritic => "critic",
+                                        _ => "planner",
+                                    };
+                                    let new_id = format!(
+                                        "{prefix}-{}",
+                                        crate::util::sanitize_slot(&pin.provider)
+                                    );
+                                    let old_id = job.slot_id.clone();
+                                    let mut new_slot_id = new_id.clone();
+                                    if let Some(s) = state.slot_mut(&old_id) {
+                                        s.id = new_id.clone();
+                                        new_slot_id = s.id.clone();
+                                        s.provider = pin.provider.clone();
+                                        s.model = pin.model.clone();
+                                        s.source = Some(SeatSource::Backup);
+                                        s.status = crate::state::SlotStatus::Pending;
+                                        s.error = None;
+                                        s.quota_hit = false;
+                                    } else if let Some(s) = state.slot_mut(&job.slot_id) {
                                         s.provider = pin.provider.clone();
                                         s.model = pin.model.clone();
                                         s.source = Some(SeatSource::Backup);
@@ -352,7 +372,7 @@ pub fn execute_plan(
                                     }
                                     state.save(paths)?;
                                     let retry_job = SlotJob {
-                                        slot_id: job.slot_id.clone(),
+                                        slot_id: new_slot_id,
                                         provider: pin.display(),
                                         role: job.role,
                                         template: job.template.clone(),
