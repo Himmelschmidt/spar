@@ -283,3 +283,48 @@ fn ship_targets_the_runs_base_branch() {
         "ship --base must override; got:\n{ship_md}"
     );
 }
+
+/// Ship opens a **draft** PR and never merges — the invariant `skills/core.md`,
+/// `docs/PRODUCT.md` and `docs/architecture-dual-backend.md` all state. Nothing passed
+/// the flag, so every shipped PR opened ready for review; the recorded argv is the only
+/// place a test can see it without spawning `gh`.
+#[test]
+fn ship_opens_the_pr_as_a_draft() {
+    let tmp = tempdir().unwrap();
+    let (root, wt) = repo_with_linked_worktree(tmp.path());
+    let (run_id, _) = plan_run_base(&wt, &[]);
+    spar_cmd()
+        .current_dir(&wt)
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    spar_cmd()
+        .current_dir(&wt)
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--providers",
+            "cli:claude,cli:grok",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2);
+    spar_cmd()
+        .current_dir(&wt)
+        .args(["ship", &run_id, "--confirm", "--json"])
+        .assert()
+        .success();
+
+    let ship_md = std::fs::read_to_string(
+        root.join(".spar/runs")
+            .join(&run_id)
+            .join("artifacts/ship.md"),
+    )
+    .expect("ship.md");
+    assert!(
+        ship_md.contains("gh pr create --draft "),
+        "ship must open a draft PR; got:\n{ship_md}"
+    );
+}
