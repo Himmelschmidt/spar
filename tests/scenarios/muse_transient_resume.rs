@@ -60,7 +60,9 @@ fn init_repo(dir: &std::path::Path) {
 /// A fake `muse` that models the transient window: the cold dispatch does real work
 /// (session id plus a tool call) and then dies with the backend 404, while a resume
 /// of that session succeeds and writes every artifact any slot of the run could owe
-/// (keyed off the prompt filename, so no state parsing is needed).
+/// (keyed off the prompt filename, so no state parsing is needed). It speaks the
+/// real `muse exec --json` envelope (`run.model.configured` + `tool.result`), so the
+/// retry gate runs through muse's own session/tool capture, not the generic lines.
 ///
 /// `SPAR_TEST_MUSE_STATE` points at a scratch dir receiving one `calls` line per
 /// invocation (`cold` or `resume:<sid>`). `SPAR_TEST_MUSE_MODE=fail-fast` makes every
@@ -88,8 +90,8 @@ for a in "$@"; do
 done
 if [ "$RESUMED" = "0" ]; then
   echo "cold" >> "$SPAR_TEST_MUSE_STATE/calls"
-  echo '{"type":"thread.started","thread_id":"sess-e2e-1"}'
-  echo '{"type":"tool_call","name":"edit"}'
+  echo '{"schema_version":1,"stream":{"kind":"session","id":"sess-e2e-1"},"record_type":"event","payload_type":"run.model.configured","payload":{"kind":"run_model_configured","model_id":"muse-spark-1.3-contributor"}}'
+  echo '{"stream":{"kind":"session","id":"sess-e2e-1"},"payload_type":"tool.result","payload":{"kind":"tool_result","call_id":"c1","correlation_facts":{"outcome":"success","tool_name":"edit"},"edit_facts":{"path":"hello.txt","tool_name":"edit"}}}'
   echo 'model `muse-spark-1.3-contributor` does not exist or you lack access [request_id=e2e]' >&2
   exit 1
 fi
@@ -97,8 +99,8 @@ echo "resume:$SID" >> "$SPAR_TEST_MUSE_STATE/calls"
 SLOT=$(basename "$PROMPT_FILE" .md)
 SLOT=${SLOT#prompt-}
 ART="$(dirname "$PROMPT_FILE")/artifacts"
-echo '{"type":"thread.started","thread_id":"sess-e2e-1"}'
-echo '{"type":"tool_call","name":"write"}'
+echo '{"schema_version":1,"stream":{"kind":"session","id":"sess-e2e-1"},"record_type":"event","payload_type":"run.model.configured","payload":{"kind":"run_model_configured","model_id":"muse-spark-1.3-contributor"}}'
+echo '{"stream":{"kind":"session","id":"sess-e2e-1"},"payload_type":"tool.result","payload":{"kind":"tool_result","call_id":"c2","correlation_facts":{"outcome":"success","tool_name":"write"},"edit_facts":{"path":"summary.txt","tool_name":"write"}}}'
 mkdir -p "$ART"
 printf '# Summary\nDone by the fake.\n' > "$ART/summary-$SLOT.md"
 printf '# Carry-forward\nDone by the fake.\n' > "$ART/carry-forward-$SLOT.md"

@@ -404,7 +404,9 @@ on — never a restatement of the plan or contract, which the next round is hand
   carry-forward brief every provider gets. **muse is a second scoped exception (O86):**
   a captured session id re-dispatches as `muse exec --session-id <id>`, and a transient
   backend 404 after real work is retried with backoff through that same resume instead
-  of failing the slot. O52's general default is unchanged for every other provider.
+  of failing the slot. A resume the vendor answers with a fresh session (exit 0, a new
+  id) is noted in the run's events, not retried. O52's general default is unchanged
+  for every other provider.
 
 For legs that already exist, `spar link <leg> --to <run>` records the grouping
 (`parent_run`). spar never infers it — pairing runs by task text would merge unrelated

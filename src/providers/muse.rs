@@ -539,6 +539,12 @@ mod tests {
     #[test]
     fn marker_provider_key_is_the_adapter_name() {
         assert_eq!(MuseAdapter.name(), "muse");
+        // The executor keys markers with `ProviderRef::cli_name`, one indirection
+        // from this literal: pin that `cli:muse` actually resolves to this adapter's
+        // name, which is the property that keeps a resume from crossing a provider
+        // rotation. A rename breaks this; a keying regression breaks it too.
+        let pref = crate::provider_ref::ProviderRef::parse("cli:muse").unwrap();
+        assert_eq!(pref.cli_name(), Some(MuseAdapter.name()));
     }
 
     /// Point `sessions_root` at a scratch dir for the duration of the closure.

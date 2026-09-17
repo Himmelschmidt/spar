@@ -411,8 +411,21 @@ fn transient_backoff_secs() -> Vec<u64> {
     if let Ok(raw) = std::env::var("SPAR_TRANSIENT_RETRY_BACKOFF_SECS") {
         let parsed = parse_backoff_list(&raw);
         if !parsed.is_empty() {
+            // A stray value in an operator's environment silently reshapes
+            // production retries (dropped entries mean fewer attempts *and*
+            // shorter waits), so say so loudly instead of just shrinking.
+            if parsed.len() != raw.split(',').count() {
+                eprintln!(
+                    "warning: ignoring unparseable entries in SPAR_TRANSIENT_RETRY_BACKOFF_SECS={raw:?}"
+                );
+            }
             return parsed;
         }
+        // All-garbage: fall through to the real schedule rather than retrying
+        // zero times (an empty backoff list means no retries at all).
+        eprintln!(
+            "warning: ignoring SPAR_TRANSIENT_RETRY_BACKOFF_SECS={raw:?}: no parseable entries"
+        );
     }
     TRANSIENT_RETRY_BACKOFF_SECS.to_vec()
 }
@@ -460,6 +473,11 @@ fn dispatch_with_resume_recovery(
     sleep: &dyn Fn(Duration),
 ) -> Result<process::SpawnResult> {
     let used_resume = resume_attempt.is_some();
+    // Which dispatch ran last matters after retries: each retry re-resolves the
+    // marker, so the post-loop lost-session and stale-resume checks must consult
+    // the *last* dispatch's resume attempt, not the initial one.
+    let mut last_resume_attempt: Option<String> = resume_attempt.map(str::to_string);
+    let mut last_used_resume = used_resume;
     let cwd = req.cwd.clone();
     let log_path = req.log_path.clone();
     let env = req.env.clone();
@@ -491,18 +509,11 @@ fn dispatch_with_resume_recovery(
         // `run_captured` truncates `log_path`; preserve the failed resume's own log
         // (e.g. codex's "no rollout found") before the cold retry overwrites it.
         let _ = std::fs::copy(&log_path, lost_resume_log_path(&log_path));
-        let cold = adapter.build_headless(bin, opts);
-        let (program, args) = providers::command_to_parts(&cold);
-        let (program, args) = sandbox::maybe_wrap(isolation, &cwd, &program, &args);
-        let cold_req = SpawnRequest {
-            program,
-            args,
-            cwd: cwd.clone(),
-            log_path: log_path.clone(),
-            env: env.clone(),
-            timeout,
-        };
-        res = process::run_captured(&cold_req, Some(sink), Some(tick))?;
+        res = cold_redispatch(
+            adapter, bin, opts, isolation, &cwd, &env, timeout, &log_path, sink, tick,
+        )?;
+        last_used_resume = false;
+        last_resume_attempt = None;
     }
     // A transient provider failure after real work (muse's backend 404, which reads as
     // a model-access error with exit 1): back off and re-dispatch rather than failing
@@ -552,7 +563,7 @@ fn dispatch_with_resume_recovery(
         );
         sleep(wait);
         let prior = markers::read_session_id(paths, run_id, slot_id, session_provider);
-        let (cmd, _) = build_dispatch_command(adapter, bin, opts, prior.as_deref());
+        let (cmd, retry_used_resume) = build_dispatch_command(adapter, bin, opts, prior.as_deref());
         let (program, args) = providers::command_to_parts(&cmd);
         let (program, args) = sandbox::maybe_wrap(isolation, &cwd, &program, &args);
         let req = SpawnRequest {
@@ -564,7 +575,37 @@ fn dispatch_with_resume_recovery(
             timeout,
         };
         res = process::run_captured(&req, Some(sink), Some(tick))?;
+        last_used_resume = retry_used_resume;
+        last_resume_attempt = prior;
         retries += 1;
+    }
+    // A session can die between transient attempts: the loop above only retries the
+    // transient signature, so a retry that died pre-session with a missing-session
+    // signature would otherwise exit with the dead id still in the marker. One
+    // bounded cold retry, same as the initial lost-resume path — not a loop, so a
+    // missing session costs one extra dispatch, never a spiral.
+    if !adapter.is_usage_error(res.exit_code)
+        && resume_lost_its_session(last_used_resume, &res)
+        && adapter.resume_failure_is_missing_session(
+            &std::fs::read_to_string(&log_path).unwrap_or_default(),
+            last_resume_attempt.as_deref(),
+        )
+    {
+        markers::clear_session_id(paths, run_id, slot_id, session_provider);
+        let _ = crate::events::append(
+            paths,
+            run_id,
+            &crate::events::Event::slot_note(
+                slot_id,
+                "resume lost its session on a retry (no session established); retrying cold dispatch once",
+            ),
+        );
+        let _ = std::fs::copy(&log_path, lost_resume_log_path(&log_path));
+        res = cold_redispatch(
+            adapter, bin, opts, isolation, &cwd, &env, timeout, &log_path, sink, tick,
+        )?;
+        last_used_resume = false;
+        last_resume_attempt = None;
     }
     // Persisted regardless of this dispatch's own outcome: a captured thread id is what
     // lets the *next* round resume instead of a cold dispatch (O63), and that is worth
@@ -572,7 +613,77 @@ fn dispatch_with_resume_recovery(
     if let Some(sid) = &res.stats.session_id {
         let _ = markers::write_session_id(paths, run_id, slot_id, session_provider, sid);
     }
+    // An exit-0 resume against a session the vendor no longer has mints a brand-new
+    // session instead of failing (muse: exit 0 on an unknown id, `resume: false` on
+    // the fresh id), so `resume_lost_its_session` never fires — the captured id is
+    // `Some`, just not the requested one. The dispatch itself succeeded, so there is
+    // nothing to retry; note it so the operator knows this round ran with fresh
+    // context. The new marker (persisted above) already self-heals.
+    let stale_resume = if last_used_resume
+        && !res.timed_out
+        && res.exit_code == Some(0)
+        && !adapter.is_usage_error(res.exit_code)
+    {
+        match (
+            last_resume_attempt.as_deref(),
+            res.stats.session_id.as_deref(),
+        ) {
+            (Some(requested), Some(captured)) if requested != captured => {
+                let gone = adapter.resume_failure_is_missing_session(
+                    &std::fs::read_to_string(&log_path).unwrap_or_default(),
+                    Some(requested),
+                );
+                gone.then(|| (requested.to_string(), captured.to_string()))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if let Some((requested, captured)) = stale_resume {
+        let _ = crate::events::append(
+            paths,
+            run_id,
+            &crate::events::Event::slot_note(
+                slot_id,
+                format!(
+                    "resumed session {requested} was gone; continued on new session {captured} with fresh context"
+                ),
+            ),
+        );
+    }
     Ok(res)
+}
+
+/// One cold `build_headless` dispatch through the same sandbox wrapping as the
+/// resume path: the shared tail of every lost-session recovery in
+/// `dispatch_with_resume_recovery`, factored out so the initial, post-retry, and
+/// future recovery sites cannot drift apart.
+#[allow(clippy::too_many_arguments)]
+fn cold_redispatch(
+    adapter: &dyn providers::ProviderAdapter,
+    bin: &Path,
+    opts: &SpawnOpts,
+    isolation: crate::config::IsolationMode,
+    cwd: &Path,
+    env: &[(String, String)],
+    timeout: Duration,
+    log_path: &Path,
+    sink: &dyn Fn(u32),
+    tick: &dyn Fn(),
+) -> Result<process::SpawnResult> {
+    let cold = adapter.build_headless(bin, opts);
+    let (program, args) = providers::command_to_parts(&cold);
+    let (program, args) = sandbox::maybe_wrap(isolation, cwd, &program, &args);
+    let cold_req = SpawnRequest {
+        program,
+        args,
+        cwd: cwd.to_path_buf(),
+        log_path: log_path.to_path_buf(),
+        env: env.to_vec(),
+        timeout,
+    };
+    process::run_captured(&cold_req, Some(sink), Some(tick))
 }
 
 fn execute_prepared(
@@ -2211,15 +2322,19 @@ fn dispatch_error(
     signal: Option<i32>,
 ) -> String {
     if adapter.is_usage_error(code) {
+        // The command line says what spar did wrong; the provider's own stderr tail
+        // says why it rejected it — the operator's only clue, so carry it along.
         return format!(
-            "provider usage error ({}): spar built a command line the provider rejected, not an agent failure: {cmdline}",
+            "provider usage error ({}): spar built a command line the provider rejected, not an agent failure: {cmdline}\nprovider output (tail):\n{}",
             describe_exit(code, signal),
+            process::tail_log(log_path, 2000),
         );
     }
     if adapter.step_budget_exhausted(&std::fs::read_to_string(log_path).unwrap_or_default()) {
         return format!(
-            "provider stopped at its model-step budget ({}), not a crash",
+            "provider stopped at its model-step budget ({}), not a crash\nprovider output (tail):\n{}",
             describe_exit(code, signal),
+            process::tail_log(log_path, 2000),
         );
     }
     describe_exit(code, signal)
@@ -3732,6 +3847,11 @@ mod tests {
         transient_404: bool,
         /// When true, exit 2 counts as a spar usage error.
         usage_error_2: bool,
+        /// When true, every resume attempt reports its session missing regardless
+        /// of log text: stands in for muse's store-backed answer (missing session
+        /// dir, or `resume: false` on a spar-requested resume), which no stdout
+        /// prose can express.
+        missing_session: bool,
     }
 
     impl ShellAdapter {
@@ -3741,6 +3861,7 @@ mod tests {
                 resume: false,
                 transient_404: false,
                 usage_error_2: false,
+                missing_session: false,
             }
         }
     }
@@ -3785,7 +3906,7 @@ mod tests {
             log_text: &str,
             _session_id: Option<&str>,
         ) -> bool {
-            log_text.contains("no rollout found")
+            self.missing_session || log_text.contains("no rollout found")
         }
         fn dispatch_failure_is_transient(&self, log_text: &str) -> bool {
             self.transient_404 && log_text.contains("does not exist or you lack access")
@@ -3946,6 +4067,7 @@ mod tests {
             resume: true,
             transient_404: true,
             usage_error_2: false,
+            missing_session: false,
         };
         let opts = dispatch_opts("go");
         let req = shell_req(&adapter.script, &log_path);
@@ -4023,6 +4145,7 @@ mod tests {
             resume: true,
             transient_404: true,
             usage_error_2: false,
+            missing_session: false,
         };
         let opts = dispatch_opts("go");
         let req = shell_req(&adapter.script, &log_path);
@@ -4070,6 +4193,7 @@ mod tests {
             resume: true,
             transient_404: true,
             usage_error_2: true,
+            missing_session: false,
         };
         let opts = dispatch_opts("go");
         let bad_req = shell_req("exit 2", &log_path);
@@ -4117,6 +4241,7 @@ mod tests {
             resume: true,
             transient_404: false,
             usage_error_2: false,
+            missing_session: false,
         };
         let opts = dispatch_opts("go");
         let req = shell_req(&adapter.script, &log_path);
@@ -4146,6 +4271,174 @@ mod tests {
     }
 
     #[test]
+    fn stale_exit_zero_resume_is_noted_not_retried() {
+        // muse answers an unknown session id with exit 0 on a brand-new session,
+        // so the failure-path gate (`session_id.is_none()`) never fires: the
+        // captured id is `Some`, just not the requested one. The dispatch itself
+        // succeeded, so there is nothing to retry — but the operator must see
+        // that the round ran with fresh context, and the marker must point at
+        // the session that actually ran.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log_path = tmp.path().join("slot.log");
+        let adapter = ShellAdapter {
+            // The cold path must never run here: a passing marker assertion is
+            // also proof no cold retry fired on a successful dispatch.
+            script: r#"echo '{"type":"thread.started","thread_id":"should-not-run"}'"#.into(),
+            resume: true,
+            transient_404: false,
+            usage_error_2: false,
+            missing_session: true,
+        };
+        let opts = dispatch_opts("go");
+        // Simulates the resume dispatch: exit 0, but the captured id is not the
+        // requested one — the vendor minted a fresh session instead.
+        let stale_req = shell_req(
+            r#"echo '{"type":"thread.started","thread_id":"fresh-sess"}'"#,
+            &log_path,
+        );
+        let res = dispatch_with_resume_recovery(
+            &adapter,
+            Path::new("/bin/sh"),
+            &opts,
+            Some("gone-sess"),
+            crate::config::IsolationMode::None,
+            stale_req,
+            &paths,
+            "run1",
+            "slotS",
+            "shell",
+            &|_pid| {},
+            &|| {},
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(res.exit_code, Some(0));
+        assert_eq!(res.stats.session_id.as_deref(), Some("fresh-sess"));
+        assert_eq!(
+            markers::read_session_id(&paths, "run1", "slotS", "shell").as_deref(),
+            Some("fresh-sess"),
+            "the marker follows the session that actually ran"
+        );
+        let events = std::fs::read_to_string(crate::events::events_file(&paths, "run1")).unwrap();
+        assert!(
+            events.contains("gone-sess") && events.contains("fresh-sess"),
+            "the operator sees the stale resume and the fresh session: {events}"
+        );
+
+        // Same ids, same seam answer: a genuine resume notes nothing.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log_path = tmp.path().join("slot.log");
+        let opts = dispatch_opts("go");
+        let res = dispatch_with_resume_recovery(
+            &adapter,
+            Path::new("/bin/sh"),
+            &opts,
+            Some("same-sess"),
+            crate::config::IsolationMode::None,
+            shell_req(
+                r#"echo '{"type":"thread.started","thread_id":"same-sess"}'"#,
+                &log_path,
+            ),
+            &paths,
+            "run1",
+            "slotS",
+            "shell",
+            &|_pid| {},
+            &|| {},
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(res.exit_code, Some(0));
+        let events =
+            std::fs::read_to_string(crate::events::events_file(&paths, "run1")).unwrap_or_default();
+        assert!(
+            !events.contains("was gone"),
+            "a genuine resume notes nothing: {events}"
+        );
+    }
+
+    /// Attempts 1-2 fail transient after a tool call; attempt 3 (a resume) dies
+    /// pre-session with the missing-session signature; the cold retry succeeds.
+    fn transient_then_lost_script(ctr: &Path) -> String {
+        format!(
+            r#"n=$(cat "{ctr}" 2>/dev/null || echo 0); echo $((n+1)) > "{ctr}"; if [ "$n" -lt 2 ]; then echo '{{"type":"thread.started","thread_id":"sess-1"}}'; echo '{{"type":"tool_call","name":"edit"}}'; echo 'model `m` does not exist or you lack access' >&2; exit 1; fi; if [ "$n" -lt 3 ]; then echo 'no rollout found for thread id sess-1' >&2; exit 1; fi; echo '{{"type":"thread.started","thread_id":"cold-fresh"}}'; exit 0"#,
+            ctr = ctr.display(),
+        )
+    }
+
+    #[test]
+    fn retry_that_loses_its_session_retries_cold_once() {
+        // A session can die between transient attempts: the retry loop only
+        // matches the transient signature, so without the post-loop check the
+        // dead id would stay in the marker and the slot would fail.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log_path = tmp.path().join("slot.log");
+        let ctr = tmp.path().join("attempts");
+        let adapter = ShellAdapter {
+            script: transient_then_lost_script(&ctr),
+            resume: true,
+            transient_404: true,
+            usage_error_2: false,
+            missing_session: false,
+        };
+        let opts = dispatch_opts("go");
+        let req = shell_req(&adapter.script, &log_path);
+        let waits = std::cell::RefCell::new(Vec::new());
+        let res = dispatch_with_resume_recovery(
+            &adapter,
+            Path::new("/bin/sh"),
+            &opts,
+            None,
+            crate::config::IsolationMode::None,
+            req,
+            &paths,
+            "run1",
+            "slotL",
+            "shell",
+            &|_pid| {},
+            &|| {},
+            &|d| {
+                waits.borrow_mut().push(d);
+            },
+        )
+        .unwrap();
+        assert_eq!(res.exit_code, Some(0));
+        assert_eq!(res.stats.session_id.as_deref(), Some("cold-fresh"));
+        assert_eq!(
+            std::fs::read_to_string(&ctr).unwrap().trim(),
+            "4",
+            "two transient attempts, one lost retry, one cold retry"
+        );
+        assert_eq!(
+            *waits.borrow(),
+            vec![Duration::from_secs(60), Duration::from_secs(150)],
+            "only the transient failures wait; the cold retry is immediate"
+        );
+        assert_eq!(
+            markers::read_session_id(&paths, "run1", "slotL", "shell").as_deref(),
+            Some("cold-fresh"),
+            "the dead id is cleared, the cold retry's id persisted"
+        );
+        let events = std::fs::read_to_string(crate::events::events_file(&paths, "run1")).unwrap();
+        assert!(
+            events.contains("on a retry") && events.contains("retrying cold"),
+            "the operator sees the mid-retry loss and the cold retry: {events}"
+        );
+    }
+
+    #[test]
+    fn parse_backoff_list_keeps_numbers_and_drops_garbage() {
+        assert_eq!(parse_backoff_list("60,150,300"), vec![60, 150, 300]);
+        assert_eq!(parse_backoff_list("0,0,0"), vec![0, 0, 0]);
+        assert_eq!(parse_backoff_list("60,nope,30"), vec![60, 30]);
+        assert!(parse_backoff_list("nope").is_empty());
+        assert!(parse_backoff_list("").is_empty());
+    }
+
+    #[test]
     fn dispatch_error_names_usage_faults_and_budget_stops() {
         let tmp = tempfile::tempdir().unwrap();
         let log_path = tmp.path().join("slot.log");
@@ -4161,6 +4454,10 @@ mod tests {
             budget.contains("model-step budget"),
             "a step-budget stop is not a crash: {budget}"
         );
+        assert!(
+            budget.contains("hit --max-model-steps"),
+            "the budget stop carries the provider's own tail: {budget}"
+        );
         let usage = dispatch_error(
             &providers::MuseAdapter,
             &log_path,
@@ -4171,6 +4468,10 @@ mod tests {
         assert!(
             usage.contains("usage error") && usage.contains("muse exec --session-id x"),
             "a usage error names spar's command line: {usage}"
+        );
+        assert!(
+            usage.contains("hit --max-model-steps"),
+            "the usage error carries the provider's own tail: {usage}"
         );
         // Adapters without these signatures keep the generic line.
         assert_eq!(
