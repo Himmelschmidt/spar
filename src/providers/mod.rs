@@ -29,18 +29,14 @@ pub use opencode::OpencodeAdapter;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryStrategy {
-    /// Claude Code and muse: a `Stop` hook injects the claimed messages
+    /// Claude Code, muse and grok: a `Stop` hook injects the claimed messages
     /// (`{"decision":"block","reason":…}`). Headless, no pane.
     StopHookInject,
-    /// Grok: push to the native `/queue`; applied at the turn boundary even mid-turn.
-    /// Grok never captures a session id, so every delivery falls through to the durable
-    /// queue file (unread until its live push channel lands — see the file's own doc).
-    NativeQueue,
-    /// Codex: same native-push shape as `NativeQueue`, but the *guaranteed* fallback is
-    /// the poll file, not the durable queue file — nothing reads the queue file for
-    /// codex, while a codex role prompt is told to check its poll file. Used whenever no
-    /// session id is captured yet (thread id not seen) as well as whenever a push with
-    /// one fails; see W10.
+    /// Codex: a best-effort native push (`codex queue --thread`), but the *guaranteed*
+    /// fallback is the poll file, not the durable queue file — nothing reads the queue
+    /// file for codex, while a codex role prompt is told to check its poll file. Used
+    /// whenever no session id is captured yet (thread id not seen) as well as whenever
+    /// a push with one fails; see W10.
     NativeQueuePollFallback,
     /// opencode: `client.session.prompt()` / `prompt_async` into the live session.
     /// Declared for matrix completeness; constructed once the opencode adapter lands.
@@ -59,8 +55,9 @@ pub enum DeliveryStrategy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PresenceSource {
-    /// Lifecycle hooks call back into `spar bus heartbeat`. Claude and grok share
-    /// `.claude/settings.json`; muse reads its own `.muse/hooks.json`, same shape.
+    /// Lifecycle hooks call back into `spar bus heartbeat`. Claude reads
+    /// `.claude/settings.json`; grok reads its own `.grok/hooks/spar.json` and muse
+    /// its own `.muse/hooks.json`, same shape.
     Hooks,
     /// Provider posts lifecycle notifications to an HTTP endpoint (e.g. Grok push hooks).
     /// Declared for matrix completeness; constructed once that adapter path lands.
@@ -252,9 +249,10 @@ pub trait ProviderAdapter: Send + Sync {
     }
 
     /// Worktree-relative path of the project hook file `presence::wire` installs for
-    /// a `PresenceSource::Hooks` adapter. Claude and grok share `.claude/settings.json`;
-    /// muse reads its own `.muse/hooks.json` (same `{"hooks": …}` shape, probed live
-    /// against muse 1.3.0 — a bare event map without the wrapper never fires).
+    /// a `PresenceSource::Hooks` adapter. Claude reads `.claude/settings.json`;
+    /// grok reads `.grok/hooks/spar.json` and muse `.muse/hooks.json` (same
+    /// `{"hooks": …}` shape, probed live against grok 1.0.25 and muse 1.3.0 — a bare
+    /// event map without the wrapper never fires).
     fn hook_file_rel(&self) -> &'static str {
         ".claude/settings.json"
     }
@@ -462,17 +460,20 @@ mod tests {
         assert!(!GrokAdapter.dispatch_failure_is_transient("does not exist or you lack access"));
         assert!(!GrokAdapter.is_usage_error(Some(2)));
         assert!(!GrokAdapter.step_budget_exhausted("max-model-steps"));
-        assert!(GrokAdapter
-            .extra_env(&SpawnOpts {
-                prompt: String::new(),
-                prompt_file: None,
-                cwd: std::path::PathBuf::from("/tmp"),
-                trust: TrustPolicy::Prompt,
-                extra_args: vec![],
-                model: None,
-                timeout_secs: Some(60),
-            })
-            .is_empty());
+        // Grok dispatches carry run-scoped folder trust (never operator state).
+        let env = GrokAdapter.extra_env(&SpawnOpts {
+            prompt: String::new(),
+            prompt_file: None,
+            cwd: std::path::PathBuf::from("/tmp"),
+            trust: TrustPolicy::Prompt,
+            extra_args: vec![],
+            model: None,
+            timeout_secs: Some(60),
+        });
+        assert_eq!(
+            env,
+            vec![("GROK_FOLDER_TRUST".to_string(), "0".to_string())]
+        );
     }
 
     #[test]

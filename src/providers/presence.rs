@@ -55,9 +55,9 @@ pub fn wire(adapter: &dyn ProviderAdapter, id: &SlotIdentity) -> PresenceWiring 
     if let Some(run) = id.run_id {
         env.push(("SPAR_RUN_ID".to_string(), run.to_string()));
     }
-    // Only StopHookInject adapters (Claude, muse) close the delivery loop through
-    // the Stop hook. Grok shares the presence hook file but delivers via its native
-    // queue, so it gets presence hooks without the injecting Stop hook.
+    // Only StopHookInject adapters (Claude, muse, grok) close the delivery loop
+    // through the Stop hook; every other presence adapter gets lifecycle hooks
+    // without the injecting one.
     let inject_on_stop = adapter.delivery_strategy() == DeliveryStrategy::StopHookInject;
     let note = match adapter.presence_source() {
         PresenceSource::Hooks => install_hook_file(id, inject_on_stop, adapter.hook_file_rel())
@@ -97,8 +97,9 @@ fn hook_events() -> [(&'static str, Option<&'static str>, &'static str); 4] {
 }
 
 /// Merge spar presence hooks into `<worktree>/<rel>` (`rel` is the adapter's
-/// `hook_file_rel`: `.claude/settings.json` for Claude/grok, `.muse/hooks.json` for
-/// muse), preserving any existing keys. When `inject_on_stop` is set, also install a
+/// `hook_file_rel`: `.claude/settings.json` for Claude, `.grok/hooks/spar.json` for
+/// grok, `.muse/hooks.json` for muse), preserving any existing keys. When
+/// `inject_on_stop` is set, also install a
 /// Stop hook that runs `spar bus deliver` — the pane-free channel that injects claimed
 /// bus messages by blocking the turn (`{"decision":"block",…}`) instead of letting
 /// the agent go idle. Refuses to write into the primary checkout (would dirty the
@@ -304,6 +305,12 @@ pub fn muse_hooks_path(worktree: &Path) -> PathBuf {
     worktree.join(".muse").join("hooks.json")
 }
 
+/// Path to the project hook file spar writes for a grok worktree.
+#[cfg(test)]
+pub fn grok_hooks_path(worktree: &Path) -> PathBuf {
+    worktree.join(".grok").join("hooks").join("spar.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,19 +391,29 @@ mod tests {
     }
 
     #[test]
-    fn grok_gets_no_deliver_hook() {
+    fn grok_gets_a_deliver_hook_in_its_own_file() {
         let tmp = tempdir().unwrap();
         let wt = tmp.path().join("wt");
         let root = tmp.path().join("root");
         std::fs::create_dir_all(&wt).unwrap();
         std::fs::create_dir_all(&root).unwrap();
         let exe = PathBuf::from("/usr/bin/spar");
-        wire(&GrokAdapter, &id(&wt, &root, &exe));
-        let text = std::fs::read_to_string(settings_path(&wt)).unwrap();
-        // Grok delivers via its native queue, not the injecting Stop hook.
+        let w = wire(&GrokAdapter, &id(&wt, &root, &exe));
+        assert!(w.note.is_none(), "note: {:?}", w.note);
+        // Grok injects at the turn boundary through the Stop hook, same as Claude.
         assert!(
-            !text.contains("bus deliver"),
-            "grok must not get a deliver Stop hook: {text}"
+            !settings_path(&wt).exists(),
+            "grok must not touch the claude file"
+        );
+        let text = std::fs::read_to_string(grok_hooks_path(&wt)).unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        let hooks = v.get("hooks").unwrap().as_object().unwrap();
+        for ev in ["UserPromptSubmit", "PreToolUse", "Notification", "Stop"] {
+            assert!(hooks.contains_key(ev), "missing {ev}");
+        }
+        assert!(
+            text.contains("bus deliver impl-1 --run abc123"),
+            "grok Stop hook must inject via `bus deliver`: {text}"
         );
         assert!(text.contains("--status idle"));
     }
@@ -490,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn grok_shares_the_same_hook_file() {
+    fn grok_uses_its_own_hook_file() {
         let tmp = tempdir().unwrap();
         let wt = tmp.path().join("wt");
         let root = tmp.path().join("root");
@@ -499,7 +516,12 @@ mod tests {
         let exe = PathBuf::from("/usr/bin/spar");
         let w = wire(&GrokAdapter, &id(&wt, &root, &exe));
         assert!(w.note.is_none());
-        assert!(settings_path(&wt).is_file());
+        assert_eq!(GrokAdapter.hook_file_rel(), ".grok/hooks/spar.json");
+        assert!(grok_hooks_path(&wt).is_file());
+        assert!(
+            !settings_path(&wt).exists(),
+            "grok must not touch the claude file"
+        );
     }
 
     #[test]
