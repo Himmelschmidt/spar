@@ -74,6 +74,22 @@ pub enum PresenceSource {
     None,
 }
 
+/// Would-a-dispatch-start verdict for a provider whose binary resolves.
+/// Distinct from `available` (binary on PATH): a broken local config can leave
+/// the binary present while every dispatch fails instantly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Readiness {
+    /// No probe (adapter default), or the probe timed out / could not run.
+    /// Never blocks: the provider stays as available as its binary makes it.
+    Unknown,
+    /// The probe ran and passed.
+    Healthy,
+    /// The probe ran and failed. The provider is still `available`, but
+    /// `doctor` and `provider list` report it as unhealthy instead.
+    Unhealthy,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderReport {
     pub name: String,
@@ -82,6 +98,11 @@ pub struct ProviderReport {
     pub path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    pub readiness: Readiness,
+    /// The probe's own failure message, trimmed to one line. Set only when
+    /// `readiness` is `Unhealthy`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readiness_message: Option<String>,
     pub capabilities: Capabilities,
     /// Turn-boundary delivery channel this adapter exposes.
     pub delivery: DeliveryStrategy,
@@ -145,6 +166,17 @@ pub trait ProviderAdapter: Send + Sync {
     fn version_args(&self) -> &[&'static str] {
         &["--version"]
     }
+    /// Optional readiness probe: argv run against the resolved binary answering
+    /// "would a dispatch to this provider start". `None` (the default) means no
+    /// probe, which reports `Unknown` and leaves the adapter unchanged.
+    ///
+    /// Every probe is non-negotiable local-only: config, auth-file and
+    /// local-state reads, never a model call, never quota, never a mutation of
+    /// the user's state. It runs under `READINESS_TIMEOUT`; a timeout (or a
+    /// spawn failure) is `Unknown`, never `Unhealthy`.
+    fn readiness_probe(&self) -> Option<&[&'static str]> {
+        None
+    }
     fn resolve_binary(&self) -> Option<PathBuf> {
         self.binary_names()
             .iter()
@@ -152,18 +184,28 @@ pub trait ProviderAdapter: Send + Sync {
     }
     fn detect(&self) -> ProviderReport {
         let path = self.resolve_binary();
-        let (available, path_str, version) = match path {
+        let (available, path_str, version, readiness, readiness_message) = match path {
             Some(p) => {
                 let version = probe_version(&p, self.version_args());
-                (true, Some(p.display().to_string()), version)
+                let (readiness, readiness_message) =
+                    probe_readiness(&p, self.readiness_probe(), READINESS_TIMEOUT);
+                (
+                    true,
+                    Some(p.display().to_string()),
+                    version,
+                    readiness,
+                    readiness_message,
+                )
             }
-            None => (false, None, None),
+            None => (false, None, None, Readiness::Unknown, None),
         };
         ProviderReport {
             name: self.name().into(),
             available,
             path: path_str,
             version,
+            readiness,
+            readiness_message,
             capabilities: self.capabilities(),
             delivery: self.delivery_strategy(),
             presence: self.presence_source(),
@@ -257,6 +299,55 @@ pub trait ProviderAdapter: Send + Sync {
     /// against muse 1.3.0 — a bare event map without the wrapper never fires).
     fn hook_file_rel(&self) -> &'static str {
         ".claude/settings.json"
+    }
+}
+
+/// How long a readiness probe may run. Much longer than the 2s version bound:
+/// `opencode models` startup on this box varies from ~2s warm to ~10s cold,
+/// so anything under that reports Unknown on a slow day and the probe never
+/// catches a broken config. Only adapters with a probe pay this, and only up
+/// to the bound. A timeout still reports `Unknown`, never `Unhealthy`.
+pub(crate) const READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Run an adapter's readiness probe: `bin` plus `probe` argv. `None` (no probe)
+/// is `Unknown`. Otherwise exit 0 is `Healthy`; non-zero is `Unhealthy` with
+/// the probe's own message trimmed to one line (stderr first, where CLIs put
+/// errors); a timeout or spawn failure is `Unknown`.
+fn probe_readiness(
+    bin: &PathBuf,
+    probe: Option<&[&str]>,
+    timeout: std::time::Duration,
+) -> (Readiness, Option<String>) {
+    let Some(args) = probe else {
+        return (Readiness::Unknown, None);
+    };
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(args);
+    let Some(output) = run_with_timeout(&mut cmd, timeout) else {
+        return (Readiness::Unknown, None);
+    };
+    if output.status.success() {
+        return (Readiness::Healthy, None);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stderr
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .or_else(|| stdout.lines().map(str::trim).find(|l| !l.is_empty()));
+    match line {
+        Some(l) => (Readiness::Unhealthy, Some(l.to_string())),
+        None => (
+            Readiness::Unhealthy,
+            Some(format!(
+                "probe exited {} with no output",
+                output
+                    .status
+                    .code()
+                    .map_or("signal".into(), |c| c.to_string())
+            )),
+        ),
     }
 }
 
@@ -509,6 +600,89 @@ mod tests {
         // The @model ref is usable and its adapter lookup ignores the model.
         assert!(is_provider_usable("cli:claude@sonnet", true));
         assert!(adapter_named("cli:claude@sonnet").is_some());
+    }
+
+    struct StubAdapter {
+        probe: Option<&'static [&'static str]>,
+    }
+
+    impl ProviderAdapter for StubAdapter {
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+        fn binary_names(&self) -> &[&'static str] {
+            &["sh"]
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+        fn readiness_probe(&self) -> Option<&[&'static str]> {
+            self.probe
+        }
+        fn permission_args(&self, _policy: TrustPolicy) -> Vec<String> {
+            Vec::new()
+        }
+        fn build_headless(&self, bin: &Path, _opts: &SpawnOpts) -> Command {
+            Command::new(bin)
+        }
+        fn build_interactive(&self, bin: &Path, _opts: &SpawnOpts) -> Command {
+            Command::new(bin)
+        }
+    }
+
+    #[test]
+    fn no_probe_reports_unknown_and_stays_available() {
+        let r = StubAdapter { probe: None }.detect();
+        assert!(
+            r.available,
+            "binary on PATH stays available without a probe"
+        );
+        assert_eq!(r.readiness, Readiness::Unknown);
+        assert_eq!(r.readiness_message, None);
+    }
+
+    #[test]
+    fn passing_probe_reports_healthy() {
+        let r = StubAdapter {
+            probe: Some(&["-c", "exit 0"]),
+        }
+        .detect();
+        assert!(r.available);
+        assert_eq!(r.readiness, Readiness::Healthy);
+        assert_eq!(r.readiness_message, None);
+    }
+
+    #[test]
+    fn failing_probe_reports_unhealthy_with_first_line() {
+        let r = StubAdapter {
+            probe: Some(&["-c", "echo first >&2; echo second >&2; exit 1"]),
+        }
+        .detect();
+        assert!(r.available, "binary still resolves; only readiness changes");
+        assert_eq!(r.readiness, Readiness::Unhealthy);
+        assert_eq!(r.readiness_message.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn timed_out_probe_reports_unknown_not_unhealthy() {
+        let bin = which::which("sh").expect("sh on PATH for probe tests");
+        let (readiness, message) = probe_readiness(
+            &bin,
+            Some(&["-c", "sleep 30"]),
+            std::time::Duration::from_millis(100),
+        );
+        assert_eq!(readiness, Readiness::Unknown);
+        assert_eq!(message, None);
+    }
+
+    #[test]
+    fn only_opencode_wires_a_probe() {
+        assert_eq!(OpencodeAdapter.readiness_probe(), Some(&["models"][..]));
+        assert_eq!(ClaudeAdapter.readiness_probe(), None);
+        assert_eq!(GrokAdapter.readiness_probe(), None);
+        assert_eq!(AgyAdapter.readiness_probe(), None);
+        assert_eq!(CodexAdapter.readiness_probe(), None);
+        assert_eq!(MuseAdapter.readiness_probe(), None);
     }
 
     #[test]

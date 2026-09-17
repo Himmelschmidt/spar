@@ -61,6 +61,18 @@ impl ProviderAdapter for OpencodeAdapter {
         &["--version"]
     }
 
+    /// `opencode models` reads the same config a dispatch would (`--version`
+    /// does not): a broken `opencode.json` (e.g. a dangling `{file:…}` auth
+    /// reference) exits 1 with the config error on stderr, while a healthy
+    /// config exits 0 listing the configured models. Verified on this box with
+    /// both a broken and a minimal `{}` config. It lists models, it never runs
+    /// one: no model call, no quota. It touches only opencode's own runtime
+    /// bookkeeping (log/db/cache files, the same class of side effect the
+    /// version probe has); it never writes config, auth, or trust state.
+    fn readiness_probe(&self) -> Option<&[&'static str]> {
+        Some(&["models"])
+    }
+
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             headless: true,

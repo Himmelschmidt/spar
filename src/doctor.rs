@@ -54,12 +54,22 @@ pub fn run(json: bool) -> Result<ExitCode> {
     }
 
     let providers = providers::detect_all();
-    let any_provider = providers.iter().any(|p| p.available);
-    if !any_provider {
+    let any_usable = has_usable_provider(&providers);
+    if !providers.iter().any(|p| p.available) {
         notes.push(
             "no first-class providers found on PATH (claude, grok, agy, codex, opencode, muse)"
                 .into(),
         );
+    }
+    for p in providers
+        .iter()
+        .filter(|p| p.available && p.readiness == providers::Readiness::Unhealthy)
+    {
+        notes.push(format!(
+            "{} is unhealthy: {} (binary present but its readiness probe failed)",
+            p.name,
+            p.readiness_message.as_deref().unwrap_or("no details")
+        ));
     }
 
     let cfg = project_root
@@ -111,7 +121,9 @@ pub fn run(json: bool) -> Result<ExitCode> {
         }
     }
 
-    let ok = git.available && any_provider;
+    // One broken provider does not block a run while a usable one remains:
+    // only Unhealthy providers are excluded, Unknown (no probe) counts as usable.
+    let ok = git.available && any_usable;
     let report = DoctorReport {
         ok,
         project_root,
@@ -195,7 +207,13 @@ fn print_human(r: &DoctorReport) {
     print_tool(&r.bwrap);
     println!("  providers:");
     for p in &r.providers {
-        let mark = if p.available { "ok" } else { "--" };
+        let mark = if !p.available {
+            "--"
+        } else if p.readiness == providers::Readiness::Unhealthy {
+            "unhealthy"
+        } else {
+            "ok"
+        };
         println!(
             "    [{mark}] {:<8} {}",
             p.name,
@@ -209,6 +227,14 @@ fn print_human(r: &DoctorReport) {
                 p.capabilities.native_sandbox,
                 p.version.as_deref().unwrap_or("?")
             );
+            match p.readiness {
+                providers::Readiness::Healthy => println!("           readiness=healthy"),
+                providers::Readiness::Unhealthy => println!(
+                    "           readiness=unhealthy: {}",
+                    p.readiness_message.as_deref().unwrap_or("no details")
+                ),
+                providers::Readiness::Unknown => {}
+            }
         }
     }
     if !r.notes.is_empty() {
@@ -217,6 +243,15 @@ fn print_human(r: &DoctorReport) {
             println!("    - {n}");
         }
     }
+}
+
+/// A provider counts toward doctor's exit code when its binary resolves and its
+/// readiness probe did not fail. `Unknown` (no probe, timeout, spawn failure)
+/// counts as usable; only `Unhealthy` is excluded.
+fn has_usable_provider(providers: &[providers::ProviderReport]) -> bool {
+    providers
+        .iter()
+        .any(|p| p.available && p.readiness != providers::Readiness::Unhealthy)
 }
 
 fn print_tool(t: &ToolCheck) {
@@ -230,5 +265,61 @@ fn print_tool(t: &ToolCheck) {
         );
     } else {
         println!("  {:<12}  missing ({req})", t.name);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::{
+        Capabilities, DeliveryStrategy, PresenceSource, ProviderReport, Readiness,
+    };
+
+    fn report(name: &str, available: bool, readiness: Readiness) -> ProviderReport {
+        ProviderReport {
+            name: name.into(),
+            available,
+            path: Some("/bin/x".into()),
+            version: None,
+            readiness,
+            readiness_message: if readiness == Readiness::Unhealthy {
+                Some("probe failed".into())
+            } else {
+                None
+            },
+            capabilities: Capabilities::default(),
+            delivery: DeliveryStrategy::None,
+            presence: PresenceSource::None,
+        }
+    }
+
+    #[test]
+    fn all_unhealthy_is_not_usable() {
+        let ps = vec![
+            report("opencode", true, Readiness::Unhealthy),
+            report("claude", false, Readiness::Unknown),
+        ];
+        assert!(!has_usable_provider(&ps));
+    }
+
+    #[test]
+    fn one_healthy_among_unhealthy_is_usable() {
+        let ps = vec![
+            report("opencode", true, Readiness::Unhealthy),
+            report("muse", true, Readiness::Healthy),
+        ];
+        assert!(has_usable_provider(&ps));
+    }
+
+    #[test]
+    fn unknown_counts_as_usable() {
+        let ps = vec![report("claude", true, Readiness::Unknown)];
+        assert!(has_usable_provider(&ps));
+    }
+
+    #[test]
+    fn none_available_is_not_usable() {
+        let ps = vec![report("claude", false, Readiness::Unknown)];
+        assert!(!has_usable_provider(&ps));
     }
 }

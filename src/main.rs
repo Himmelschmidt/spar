@@ -2123,6 +2123,8 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                             "available": p.available,
                             "path": p.path,
                             "version": p.version,
+                            "readiness": p.readiness,
+                            "readiness_message": p.readiness_message,
                             "capabilities": p.capabilities,
                             "quota_status": status,
                             "quota_hint": hint,
@@ -2132,7 +2134,13 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                 println!("{}", serde_json::to_string_pretty(&enriched)?);
             } else {
                 for p in &report {
-                    let mark = if p.available { "ok" } else { "missing" };
+                    let mark = if !p.available {
+                        "missing"
+                    } else if p.readiness == providers::Readiness::Unhealthy {
+                        "unhealthy"
+                    } else {
+                        "ok"
+                    };
                     let status = quota.effective_status(&quota::normalize_key(&p.name));
                     println!(
                         "{:<8} {mark:<8} {:<12} {}",
@@ -2147,6 +2155,12 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                             p.capabilities.interactive,
                             p.version.as_deref().unwrap_or("unknown")
                         );
+                        if p.readiness == providers::Readiness::Unhealthy {
+                            println!(
+                                "         readiness=unhealthy: {}",
+                                p.readiness_message.as_deref().unwrap_or("no details")
+                            );
+                        }
                     }
                 }
             }
