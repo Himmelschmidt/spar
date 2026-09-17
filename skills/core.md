@@ -121,10 +121,13 @@ spar run --workflow review -t "..." --providers cli:opencode@meta/muse-spark-1.1
 SPAR_OPENCODE_MODEL=x-ai/grok-4 spar run ... --providers cli:opencode              # different OpenRouter model
 ```
 
-`cli:muse` (Muse Code, `muse exec --json --yolo --user-input-auto-resolve`) runs the
-muse-spark family through muse's own Meta account, so it needs **no** OpenRouter key; log in
-once with `muse login`. It is the cheap-implementer route: the contributor model bills about
-0.10 in / 0.20 out per M tokens against 1.25 / 4.25 for the same family through OpenRouter.
+`cli:muse` (Muse Code, `muse exec --json --yolo --user-input-auto-resolve --workspace
+<cwd>`) runs the muse-spark family through muse's own Meta account, so it needs **no**
+OpenRouter key; log in once with `muse login`. It is the cheap-implementer route: the
+contributor model bills about 0.10 in / 0.20 out per M tokens against 1.25 / 4.25 for the
+same family through OpenRouter. Presence and turn-boundary injection ride the slot
+worktree's project hook file (`.muse/hooks.json`); never touch the user's global muse
+`settings.json` or anything under `~/.config/muse`.
 Not a takeover target. Model selection, highest precedence first:
 - A per-slot model, from a `cli:muse@<model>` ref or `--select`, becomes `--model`. Ids are
   plain Meta model ids (`muse-spark-1.2`, `muse-spark-1.2-contributor`) with no vendor prefix,
@@ -608,18 +611,14 @@ slot is stuck on.**
   *does* land the next time that thread is resumed, folded into the same turn as the
   resume prompt (verified live), and `codex exec resume <id>` is exactly what a codex
   slot's next round now calls (O63), so the payoff arrives at that round's turn boundary,
-  not the running one. **muse** takes them through `muse session-message send --target
-  <session-uuid>`, once its session id is known (captured from the exec JSONL's first
-  `/stream/id` line) and its slot is still alive; the poll file is the fallback whenever
-  that push isn't confirmed (id unknown yet, send failed, the `--json` reply's `status`
-  isn't `"ok"` or `"accepted"`, or `status` is confirmed but the reply's own `receipts`
-  array is empty — `"accepted"` is muse's weakest rung and can mean the transport took
-  the write with nothing downstream confirming it). A confirmed push has never been
-  observed to actually surface inside a real muse session, so that fallback is exercised
-  in practice; a confirmed push is not also duplicated into the poll file. Under
-  `--backend tmux` muse is poll-file only: the recorded pane pid is the shell running the
-  `muse … | tee` pipeline, not the muse child, so it cannot be trusted as a liveness
-  signal. **opencode** has no push channel at all. Every poll-file case writes
+  not the running one. **muse** takes them through the same `Stop`-hook injection that
+  **claude** uses: spar writes a project hook file (`.muse/hooks.json`) into the slot
+  worktree, and the `Stop` hook drains the inbox at the turn boundary with a
+  `{"decision":"block",…}` payload (verified live against muse 1.3.0 — the file takes
+  the same `{"hooks": …}` shape as Claude's, and a blocking Stop hook re-drives a
+  headless `muse exec` run). There is no `muse session-message send` push: headless
+  slots never appear in the peer list, so that channel could never deliver to a slot
+  spar actually runs. **opencode** has no push channel at all. Every poll-file case writes
   `.spar/runs/<id>/logs/nudges-<slot>.md`, and the role prompt tells the agent to read it
   before starting any new major step. Thresholds are checked every 30 seconds, so a nudge
   lands at the next 30s boundary rather than the instant a budget is crossed.

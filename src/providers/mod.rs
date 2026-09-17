@@ -29,8 +29,8 @@ pub use opencode::OpencodeAdapter;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryStrategy {
-    /// Claude Code: a `Stop` hook injects the claimed messages
-    /// (`{"decision":"block","reason":…}` / `additionalContext`). Headless, no pane.
+    /// Claude Code and muse: a `Stop` hook injects the claimed messages
+    /// (`{"decision":"block","reason":…}`). Headless, no pane.
     StopHookInject,
     /// Grok: push to the native `/queue`; applied at the turn boundary even mid-turn.
     /// Grok never captures a session id, so every delivery falls through to the durable
@@ -46,15 +46,6 @@ pub enum DeliveryStrategy {
     /// Declared for matrix completeness; constructed once the opencode adapter lands.
     #[allow(dead_code)]
     SdkPrompt,
-    /// muse: `muse session-message send --target <session-uuid>` pushes directly into
-    /// the running session. The target is the session id `StreamCoalescer` captures off
-    /// the exec JSONL's first `/stream/id` line, so it is unknown until that line
-    /// arrives, and gated on the slot's pid still being alive (the sidecar outlives the
-    /// process). The delivery seam falls back to the poll file only when the push is not
-    /// confirmed (id unknown yet, send failed, or the `--json` reply didn't say `"ok"` or
-    /// `"accepted"`); a confirmed push is the only channel and is never duplicated into
-    /// the poll file.
-    MuseSessionMessage,
     /// No push channel into the running process, so spar writes to a slot-scoped file
     /// and the role prompt tells the agent to read it before it starts any new major
     /// step. That is the only moment a nudge is actionable anyway, so it needs no polling
@@ -68,8 +59,8 @@ pub enum DeliveryStrategy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PresenceSource {
-    /// Claude-format `.claude/settings.json` hooks call back into `spar bus heartbeat`.
-    /// Grok reads the same file, so one hook file covers both.
+    /// Lifecycle hooks call back into `spar bus heartbeat`. Claude and grok share
+    /// `.claude/settings.json`; muse reads its own `.muse/hooks.json`, same shape.
     Hooks,
     /// Provider posts lifecycle notifications to an HTTP endpoint (e.g. Grok push hooks).
     /// Declared for matrix completeness; constructed once that adapter path lands.
@@ -258,6 +249,14 @@ pub trait ProviderAdapter: Send + Sync {
     /// Defaults to none (degraded); adapters with an event stream override.
     fn presence_source(&self) -> PresenceSource {
         PresenceSource::None
+    }
+
+    /// Worktree-relative path of the project hook file `presence::wire` installs for
+    /// a `PresenceSource::Hooks` adapter. Claude and grok share `.claude/settings.json`;
+    /// muse reads its own `.muse/hooks.json` (same `{"hooks": …}` shape, probed live
+    /// against muse 1.3.0 — a bare event map without the wrapper never fires).
+    fn hook_file_rel(&self) -> &'static str {
+        ".claude/settings.json"
     }
 }
 

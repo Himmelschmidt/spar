@@ -1102,17 +1102,15 @@ fn recover_artifact(r: &ArtifactRecovery) -> bool {
     let Some(bin) = adapter.resolve_binary() else {
         return false;
     };
-    // The recovery turn streams to its own `<slot>.recovery.log`, not the original
-    // `<slot>.log` `muse_session_id` reads — so a stale session id left over from the
-    // turn being recovered would otherwise pair with the recovery process's own (live)
-    // pid marker and pass the liveness guard, targeting a session that already exited.
-    // Cleared only for the duration of the recovery spawn below and restored once it
-    // returns (see the bottom of this function). The value also gets stashed into
-    // `session_id_recovery_stash` before the clear, not just held in this local — spar
-    // getting killed mid-recovery (`spar stop`, SIGKILL, a panic) never returns here to
-    // restore it, and `muse_telemetry::enrich` / `nudge.rs`'s `live_billed` both fall back
-    // to the stash field, so a crash loses only the delivery seam's ability to target this
-    // (by then long-finished) session, not the durable usage record.
+    // The recovery turn streams to its own `<slot>.recovery.log`, so the finished
+    // turn's recorded session id is taken out for the duration of the recovery spawn
+    // below and restored once it returns (see the bottom of this function) — nothing
+    // running concurrently can mistake it for the recovery turn's. The value also gets
+    // stashed into `session_id_recovery_stash` before the clear, not just held in this
+    // local — spar getting killed mid-recovery (`spar stop`, SIGKILL, a panic) never
+    // returns here to restore it, and `muse_telemetry::enrich` / `nudge.rs`'s
+    // `live_billed` both fall back to the stash field, so a crash loses only the live
+    // session link, not the durable usage record.
     let recovered_session_id = process::StreamStats::load(r.log_path).and_then(|mut stats| {
         let id = stats.session_id.take();
         if let Some(id) = &id {
@@ -2977,25 +2975,6 @@ fn reset_api_slot_log(log_path: &Path) {
     let _ = std::fs::remove_file(process::log_index_path(log_path));
 }
 
-/// Truncate `log_path` and reset its `.stats.json` sidecar (`paths.rs` derives both from
-/// the same slot id) to a fresh, freshly-touched `StreamStats`, before the tmux pane that
-/// will write to them exists. Extracted so the reset itself — not just `run_tmux`'s tmux
-/// plumbing around it — is directly testable.
-fn reset_tmux_slot_log(log_path: &Path) {
-    if let Some(parent) = log_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::File::create(log_path);
-    let mut initial = process::StreamStats::default();
-    initial.touch_log();
-    let _ = initial.save(log_path);
-    // A tmux pane never writes `stream_to_log`'s offset index, so any `.idx` sidecar here is
-    // leftover from a prior native dispatch that reused this slot's log path. Left in place it
-    // would bisect this round's tmux transcript against a previous round's offsets and stamp
-    // records with fabricated times (AC-8).
-    let _ = std::fs::remove_file(process::log_index_path(log_path));
-}
-
 /// A `done` marker only means success once the agent's pane process has exited.
 fn tmux_outcome(marker: MarkerState, pane_alive: bool, budget_left: bool) -> TmuxDecision {
     match marker {
@@ -3084,51 +3063,17 @@ fn run_tmux(
     let (program, args) = providers::command_to_parts(&cmd);
     let shell = tmux::shell_wrap(&program, &args, log_path);
 
-    // `tee`'s own truncate-on-open doesn't happen until the pane's shell actually starts
-    // — a gap the muse session-id tailer below would otherwise read straight through,
-    // latching a prior round's session id (or transcript) onto this round's live pid.
-    // Reset both here, synchronously, before the pane exists at all: the same guarantee
-    // `run_captured` gives the native backend at spawn (`process.rs`'s `File::create` +
-    // fresh `StreamStats`). Gated on the same strategy check the tailer below uses: a
-    // non-muse tmux slot has no tailer to protect and gets no benefit from the reset, only
-    // the cost of losing the previous round's transcript for `salvage_expected_artifact` if
-    // `spawn_window` below fails.
-    let is_muse_session_message =
-        adapter.delivery_strategy() == providers::DeliveryStrategy::MuseSessionMessage;
-    if is_muse_session_message {
-        reset_tmux_slot_log(log_path);
-    }
-
     tmux::spawn_window(&session, &job.slot_id, cwd, &shell, env)?;
     let is_opencode = is_opencode_provider(&job.provider);
 
     // The pane's shell pid exists as soon as `new-window` returns — tmux creates the pane
     // synchronously as part of that command. Recording it now, not only once the `done`
-    // marker shows up (the old behavior), is what lets a liveness guard like
-    // `muse_session_id`'s ever see this slot as alive *while it is running* instead of
-    // only in the instant between it finishing and this function returning.
+    // marker shows up (the old behavior), is what lets liveness checks ever see this
+    // slot as alive *while it is running* instead of only in the instant between it
+    // finishing and this function returning.
     let mut pane_pid = tmux::pane_pid(&session, &job.slot_id).map(process::PidToken::capture);
     if let Some(token) = pane_pid {
         let _ = markers::write_pid(paths, &state.id, &job.slot_id, token);
-        // The pane's shell, not the agent child — see `markers::write_pid_is_proxy`.
-        let _ = markers::write_pid_is_proxy(paths, &state.id, &job.slot_id);
-    }
-
-    // muse has no wired push channel on this backend otherwise: `tee` writes the raw
-    // JSONL straight to `log_path` (`shell_wrap`), bypassing the coalescer that would
-    // otherwise capture the session id for free on the native backend. Tail the file for
-    // it in the background so a forced-tmux muse slot's session-message push channel
-    // isn't silently poll-file-only for its entire run.
-    let stop_tailer = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let _tailer_guard = TailerGuard(stop_tailer.clone());
-    if is_muse_session_message {
-        spawn_muse_session_id_tailer(
-            paths.clone(),
-            state.id.clone(),
-            job.slot_id.clone(),
-            log_path.to_path_buf(),
-            stop_tailer,
-        );
     }
 
     // `done` means the agent's own process has exited — not just that it wrote its marker.
@@ -3148,7 +3093,6 @@ fn run_tmux(
                 let token = process::PidToken::capture(p);
                 pane_pid = Some(token);
                 let _ = markers::write_pid(paths, &state.id, &job.slot_id, token);
-                let _ = markers::write_pid_is_proxy(paths, &state.id, &job.slot_id);
             }
         }
         // `.alive()` checks the recorded start time, not just bare liveness — a plain
@@ -3215,87 +3159,6 @@ fn run_tmux(
             }
         }
     }
-}
-
-/// Stops [`spawn_muse_session_id_tailer`]'s background thread when `run_tmux` returns by
-/// any path (success, failure, timeout) — a `Drop` guard rather than a `stop.store(true)`
-/// at every return site.
-struct TailerGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
-
-impl Drop for TailerGuard {
-    fn drop(&mut self) {
-        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// Tail `log_path` for the `run.model.configured` line that carries muse's session id,
-/// polling because `tee` (not spar) owns the writes and there is no pipe to block on.
-/// Gives up after `GIVE_UP_AFTER`: the id is emitted once, near the very start of the
-/// stream, so if it hasn't shown up by then it isn't coming and there is no reason to
-/// keep re-scanning a transcript that can run for hours. Give-up (but not the ordinary
-/// stop-on-return case) writes an `Info` event so the push channel silently degrading to
-/// poll-file-only for the rest of a multi-hour run is visible in `wait --follow` and the
-/// TUI instead of only inferable after the fact.
-fn spawn_muse_session_id_tailer(
-    paths: SparPaths,
-    run_id: String,
-    slot_id: String,
-    log_path: PathBuf,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
-    use std::sync::atomic::Ordering;
-    const GIVE_UP_AFTER: Duration = Duration::from_secs(180);
-    const POLL: Duration = Duration::from_millis(200);
-    std::thread::spawn(move || {
-        let start = std::time::Instant::now();
-        let mut pos: u64 = 0;
-        while !stop.load(Ordering::Relaxed) && start.elapsed() < GIVE_UP_AFTER {
-            if let Some(id) = scan_new_lines_for_muse_session_id(&log_path, &mut pos) {
-                let mut stats = process::StreamStats::load(&log_path).unwrap_or_default();
-                stats.session_id = Some(id);
-                let _ = stats.save(&log_path);
-                return;
-            }
-            std::thread::sleep(POLL);
-        }
-        if !stop.load(Ordering::Relaxed) {
-            let _ = crate::events::append(
-                &paths,
-                &run_id,
-                &crate::events::Event::slot_note(
-                    &slot_id,
-                    "muse session id not seen within 180s: session-message push channel \
-                     stays poll-file-only for the rest of this round",
-                ),
-            );
-        }
-    });
-}
-
-/// Read whatever complete lines have been appended to `log_path` since `*pos`, advance
-/// `*pos` past them, and return the muse session id if one of them carried it. Only
-/// complete lines are consumed (the last `\n` in the chunk is the boundary) so a write
-/// caught mid-line is picked up whole on the next poll rather than parsed truncated.
-///
-/// Defends against the file having shrunk since `*pos` was last advanced (a fresh `tee`
-/// truncating on open): if the current length is behind `*pos`, that offset belongs to
-/// a transcript that no longer exists, so scanning resumes from the top instead of
-/// seeking past EOF and reading nothing for the rest of the run.
-fn scan_new_lines_for_muse_session_id(log_path: &Path, pos: &mut u64) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(log_path).ok()?;
-    let len = f.metadata().ok()?.len();
-    if len < *pos {
-        *pos = 0;
-    }
-    f.seek(SeekFrom::Start(*pos)).ok()?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
-    let last_nl = buf.iter().rposition(|&b| b == b'\n')?;
-    *pos += (last_nl + 1) as u64;
-    String::from_utf8_lossy(&buf[..=last_nl])
-        .lines()
-        .find_map(process::extract_muse_session_id)
 }
 
 fn slot_model_for(state: Option<&RunState>, job: &SlotJob) -> Option<String> {
@@ -3613,123 +3476,6 @@ pub fn wait_run(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The forced-tmux muse tailer's read half: new complete lines are picked up and
-    /// `*pos` advances past them, but a line still being written (no trailing `\n` yet)
-    /// is left for the next poll rather than parsed truncated.
-    #[test]
-    fn scan_new_lines_for_muse_session_id_finds_the_configured_line_and_advances_pos() {
-        let tmp = tempfile::tempdir().unwrap();
-        let log_path = tmp.path().join("slot.log");
-        std::fs::write(
-            &log_path,
-            "# spawn header\n---\n\
-             {\"payload_type\":\"task.lifecycle.started\",\"stream\":{\"kind\":\"session\",\"id\":\"s0\"}}\n",
-        )
-        .unwrap();
-
-        let mut pos = 0u64;
-        assert_eq!(
-            scan_new_lines_for_muse_session_id(&log_path, &mut pos),
-            None
-        );
-        assert_eq!(pos, std::fs::metadata(&log_path).unwrap().len());
-
-        // Append the configured line plus a truncated one still mid-write.
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&log_path)
-            .unwrap();
-        writeln!(
-            f,
-            "{{\"payload_type\":\"run.model.configured\",\"stream\":{{\"kind\":\"session\",\"id\":\"sess-tmux\"}}}}"
-        )
-        .unwrap();
-        write!(f, "{{\"payload_type\":\"run.output").unwrap(); // no trailing newline
-        drop(f);
-
-        let before = pos;
-        assert_eq!(
-            scan_new_lines_for_muse_session_id(&log_path, &mut pos).as_deref(),
-            Some("sess-tmux")
-        );
-        assert!(
-            pos > before,
-            "pos must advance past the complete line consumed"
-        );
-
-        // The truncated tail is never mistaken for a match; a stray poll finds nothing
-        // new because the line still hasn't closed.
-        let mut pos2 = pos;
-        assert_eq!(
-            scan_new_lines_for_muse_session_id(&log_path, &mut pos2),
-            None
-        );
-        assert_eq!(pos2, pos, "an incomplete line must not advance pos");
-    }
-
-    /// A re-dispatched tmux slot reuses the same log path; if the tailer's saved `pos`
-    /// still points past the fresh (truncated) file's length, it must resume from the
-    /// top instead of seeking past EOF and reading nothing for the rest of the run.
-    #[test]
-    fn scan_new_lines_for_muse_session_id_resets_pos_when_file_shrinks() {
-        let tmp = tempfile::tempdir().unwrap();
-        let log_path = tmp.path().join("slot.log");
-        std::fs::write(&log_path, "x".repeat(200)).unwrap();
-        let mut pos = 150u64;
-
-        // Simulate `tee` truncating on the new round's open, then writing the new
-        // session's configured line.
-        std::fs::write(
-            &log_path,
-            "{\"payload_type\":\"run.model.configured\",\"stream\":{\"kind\":\"session\",\"id\":\"sess-new\"}}\n",
-        )
-        .unwrap();
-
-        assert_eq!(
-            scan_new_lines_for_muse_session_id(&log_path, &mut pos).as_deref(),
-            Some("sess-new")
-        );
-    }
-
-    /// A prior round's transcript and stale session id must not survive into the next
-    /// round's tmux pane — the exact gap the muse session-id tailer would otherwise read
-    /// straight through, latching a finished session's id onto the new round's live pid.
-    #[test]
-    fn reset_tmux_slot_log_truncates_transcript_and_clears_stale_session_id() {
-        let tmp = tempfile::tempdir().unwrap();
-        let log_path = tmp.path().join("slot.log");
-        std::fs::write(&log_path, "leftover transcript from a prior round\n").unwrap();
-        process::StreamStats {
-            session_id: Some("sess-stale".into()),
-            ..Default::default()
-        }
-        .save(&log_path)
-        .unwrap();
-
-        reset_tmux_slot_log(&log_path);
-
-        assert_eq!(std::fs::read_to_string(&log_path).unwrap(), "");
-        let stats = process::StreamStats::load(&log_path).expect("sidecar written");
-        assert_eq!(stats.session_id, None);
-    }
-
-    /// AC-8: a `.idx` sidecar left by an earlier *native* dispatch of this slot id must
-    /// not survive into a tmux round reusing the same log path — a tmux pane never writes
-    /// the index, so a leftover one would get bisected against this round's transcript and
-    /// stamp records with the previous dispatch's times.
-    #[test]
-    fn reset_tmux_slot_log_drops_a_stale_offset_index() {
-        let tmp = tempfile::tempdir().unwrap();
-        let log_path = tmp.path().join("slot.log");
-        std::fs::write(&log_path, "leftover transcript from a prior native round\n").unwrap();
-        std::fs::write(process::log_index_path(&log_path), "0 1700000000000\n").unwrap();
-
-        reset_tmux_slot_log(&log_path);
-
-        assert!(!process::log_index_path(&log_path).exists());
-    }
 
     /// AC-8: api-sdk's own `append_log` (`src/api/runtime.rs`) never writes the offset
     /// index at all, so a stale `.idx` from an earlier native dispatch of this slot id
