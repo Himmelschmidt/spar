@@ -611,7 +611,7 @@ slot is stuck on.**
   *does* land the next time that thread is resumed, folded into the same turn as the
   resume prompt (verified live), and `codex exec resume <id>` is exactly what a codex
   slot's next round now calls (O63), so the payoff arrives at that round's turn boundary,
-  not the running one. **muse** takes them through the same `Stop`-hook injection
+  not the running one. **muse** takes them through the same `Stop`-hook injection that
   **claude** uses: spar writes a project hook file (`.muse/hooks.json`) into the slot
   worktree, and the `Stop` hook drains the inbox at the turn boundary with a
   `{"decision":"block",…}` payload (verified live against muse 1.3.0 — the file takes

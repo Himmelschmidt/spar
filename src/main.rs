@@ -690,7 +690,8 @@ fn bus_deliver(
     // A turn boundary is one of the swarm's delivery pulses: advance any unacked-message
     // redeliveries first so a due redelivery lands in this same drain. This is not the
     // only pulse — the wait loop and TUI refresh also tick acks, so redelivery/escalation
-    // advances in runs with no Claude slot (whose Stop hook is the only pulse here).
+    // advances in runs with no Stop-hook slot (claude or muse, whose Stop hook is the
+    // only pulse here).
     bus::tick_acks(paths, &bus::AckPolicy::default(), chrono::Utc::now())?;
     let d = providers::delivery::deliver(
         paths,
