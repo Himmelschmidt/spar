@@ -73,6 +73,36 @@ fn exact_ref(cwd: &std::path::Path, git_ref: &str) -> bool {
     git_ok(cwd, &["show-ref", "--verify", "--quiet", git_ref])
 }
 
+/// PR title from the run's task. A `--spec` / `--brief` task is a whole markdown
+/// document, so the first 72 characters of it are the heading marker, the heading, and
+/// the start of the first paragraph, cut mid-word — which is what ends up naming the PR.
+/// Take the first non-blank line instead, strip its heading marker, and clamp on a word
+/// boundary. An inline `-t` task that already fits is passed through unchanged.
+fn pr_title(task: Option<&str>) -> String {
+    const FALLBACK: &str = "spar change";
+    const MAX: usize = 72;
+    let Some(line) = task.and_then(|t| t.lines().map(str::trim).find(|l| !l.is_empty())) else {
+        return FALLBACK.into();
+    };
+    // Only the leading marker: a `#` inside the text (an issue reference, a fragment) is
+    // part of the title and must survive.
+    let line = line.trim_start_matches('#').trim();
+    if line.is_empty() {
+        return FALLBACK.into();
+    }
+    if line.chars().count() <= MAX {
+        return line.to_string();
+    }
+    let cut: String = line.chars().take(MAX - 1).collect();
+    let head = match cut.rsplit_once(' ') {
+        // A single word longer than the budget has no boundary to cut on; the hard cut
+        // is still better than a title that blows the limit.
+        Some((h, _)) if !h.trim().is_empty() => h.trim_end(),
+        _ => cut.as_str(),
+    };
+    format!("{head}…")
+}
+
 fn git_ok(cwd: &std::path::Path, args: &[&str]) -> bool {
     Command::new("git")
         .args(args)
@@ -139,7 +169,7 @@ pub fn ship(
             cwd.display()
         );
         let pr_cmd = format!(
-            "cd {} && gh pr create --head {branch}{base_arg} --title dry-run --body dry-run",
+            "cd {} && gh pr create --draft --head {branch}{base_arg} --title dry-run --body dry-run",
             cwd.display()
         );
         let commands = vec![push_cmd, pr_cmd];
@@ -162,20 +192,14 @@ pub fn ship(
         return Ok(ExitCode::Success);
     }
     let remote = "origin";
-    let title = state
-        .task
-        .as_deref()
-        .unwrap_or("spar change")
-        .chars()
-        .take(72)
-        .collect::<String>();
+    let title = pr_title(state.task.as_deref());
 
     let push_cmd = format!(
         "git -C {} push --force-with-lease -u {remote} {branch}",
         cwd.display()
     );
     let pr_cmd = format!(
-        "cd {} && gh pr create --head {branch}{base_arg} --title {} --body {}",
+        "cd {} && gh pr create --draft --head {branch}{base_arg} --title {} --body {}",
         cwd.display(),
         shell_single_quote(&title),
         shell_single_quote(&format!("spar run `{}`", state.id))
@@ -211,6 +235,10 @@ pub fn ship(
         let mut args: Vec<String> = vec![
             "pr".into(),
             "create".into(),
+            // Ship opens a *draft* PR and never merges: the invariant is in
+            // `skills/core.md`, `docs/PRODUCT.md` and `docs/architecture-dual-backend.md`,
+            // but nothing passed the flag, so every shipped PR opened ready for review.
+            "--draft".into(),
             "--head".into(),
             branch.clone(),
             "--title".into(),
@@ -433,5 +461,53 @@ mod tests {
         );
         let no_base = RunState::new("r1", WorkflowKind::Loop, PathBuf::from("/x"));
         assert_eq!(pr_base(&no_base, tmp.path(), None), None);
+    }
+
+    /// The bug this replaced: `state.task.chars().take(72)` over a `--spec` brief, which
+    /// named a real PR `# Give muse slots a real presence and injection channel via its
+    /// hook sys` — marker included, cut mid-word, body text already bleeding in.
+    #[test]
+    fn pr_title_uses_the_briefs_heading_not_its_first_72_bytes() {
+        let brief = "# Give muse slots a real presence and injection channel via its hook system\n\nThree changes to spar's muse adapter: wire muse's lifecycle hooks so a muse slot\n";
+        let title = pr_title(Some(brief));
+        assert_eq!(
+            title,
+            "Give muse slots a real presence and injection channel via its hook…"
+        );
+        assert!(!title.starts_with('#'), "heading marker survived: {title}");
+        assert!(!title.contains("Three changes"), "body bled in: {title}");
+        assert!(title.chars().count() <= 72, "over budget: {title}");
+    }
+
+    #[test]
+    fn pr_title_passes_a_short_inline_task_through_untouched() {
+        assert_eq!(
+            pr_title(Some("fix the flaky quota test")),
+            "fix the flaky quota test"
+        );
+        // Leading blank lines are skipped, not rendered as an empty title.
+        assert_eq!(
+            pr_title(Some("\n\n  ## Retry muse 404s\n")),
+            "Retry muse 404s"
+        );
+        // A `#` inside the text is part of the title.
+        assert_eq!(pr_title(Some("fix #123 off-by-one")), "fix #123 off-by-one");
+    }
+
+    #[test]
+    fn pr_title_falls_back_when_there_is_no_usable_line() {
+        assert_eq!(pr_title(None), "spar change");
+        assert_eq!(pr_title(Some("")), "spar change");
+        assert_eq!(pr_title(Some("   \n\n")), "spar change");
+        assert_eq!(pr_title(Some("###\n")), "spar change");
+    }
+
+    /// One unbroken word longer than the budget has no boundary to cut on; it must still
+    /// come back inside the limit rather than falling through whole.
+    #[test]
+    fn pr_title_clamps_a_single_overlong_word() {
+        let title = pr_title(Some(&"x".repeat(200)));
+        assert!(title.chars().count() <= 72, "over budget: {title}");
+        assert!(title.ends_with('\u{2026}'));
     }
 }
