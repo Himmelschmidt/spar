@@ -309,7 +309,7 @@ impl ProviderAdapter for CodexAdapter {
     // itself is gone, so the caller must not treat them the same way (see the trait
     // doc comment: misclassifying them destroyed the marker for a session that might
     // still be fine once the unrelated failure clears).
-    fn resume_failure_is_missing_session(&self, log_text: &str) -> bool {
+    fn resume_failure_is_missing_session(&self, log_text: &str, _session_id: Option<&str>) -> bool {
         log_text.to_ascii_lowercase().contains("no rollout found")
     }
 }
@@ -651,14 +651,22 @@ mod tests {
     #[test]
     fn resume_failure_is_missing_session_matches_only_the_rollout_signature() {
         assert!(CodexAdapter.resume_failure_is_missing_session(
-            "Error: no rollout found for thread id 01a0... (code -32600)"
+            "Error: no rollout found for thread id 01a0... (code -32600)",
+            Some("thread-1"),
         ));
         // Case-insensitive: codex's own casing is not a contract.
-        assert!(CodexAdapter.resume_failure_is_missing_session("No Rollout Found for thread"));
+        assert!(CodexAdapter.resume_failure_is_missing_session("No Rollout Found for thread", None));
+        // The session id is irrelevant to the prose match; the store is a muse concern.
+        assert!(CodexAdapter.resume_failure_is_missing_session(
+            "Error: no rollout found for thread id 01a0... (code -32600)",
+            None,
+        ));
         // A pre-session failure with a different cause must not be treated as a lost
         // rollout — clearing the marker for these would destroy a still-valid session.
-        assert!(!CodexAdapter
-            .resume_failure_is_missing_session("Error: Model provider 'openrouter' not found"));
-        assert!(!CodexAdapter.resume_failure_is_missing_session(""));
+        assert!(!CodexAdapter.resume_failure_is_missing_session(
+            "Error: Model provider 'openrouter' not found",
+            Some("thread-1"),
+        ));
+        assert!(!CodexAdapter.resume_failure_is_missing_session("", None));
     }
 }

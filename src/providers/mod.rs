@@ -194,15 +194,58 @@ pub trait ProviderAdapter: Send + Sync {
     /// Whether a resume dispatch that never established a session (no native session id
     /// captured) failed because the vendor session itself is gone, as opposed to some
     /// other failure that happened to occur before the session announced itself. Given
-    /// the failed dispatch's raw log text. The caller (`executor::resume_lost_its_session`
+    /// the failed dispatch's raw log text plus the session id the resume was attempted
+    /// with (`None` when the dispatch was cold — callers only ask this on a resume, so
+    /// that is always `Some` in practice). The caller (`executor::resume_lost_its_session`
     /// call sites) only clears the slot's session marker and retries cold when this
     /// returns `true` — otherwise the marker is left alone and the failure is reported
     /// like any other, since the vendor session may still be resumable once whatever
     /// else went wrong clears up. Default `true`: adapters with no session-loss signature
     /// of their own keep the pre-existing behavior (any pre-session failure was assumed
-    /// to be a lost session).
-    fn resume_failure_is_missing_session(&self, _log_text: &str) -> bool {
+    /// to be a lost session). Adapters whose stdout never carries the answer (muse's
+    /// resume marker lives only in its on-disk session log) ignore `log_text` and answer
+    /// from their own session store via `session_id` instead.
+    fn resume_failure_is_missing_session(
+        &self,
+        _log_text: &str,
+        _session_id: Option<&str>,
+    ) -> bool {
         true
+    }
+
+    /// Whether a failed dispatch's log carries this adapter's signature of a transient
+    /// provider-side failure worth retrying (see `executor::dispatch_with_resume_recovery`).
+    /// Default `false`: no adapter retries except one that names its own string. Only
+    /// the overriding adapter's failures ever match, so no other provider's behavior
+    /// changes.
+    fn dispatch_failure_is_transient(&self, _log_text: &str) -> bool {
+        false
+    }
+
+    /// Whether `code` from this adapter means spar built a bad command line (a usage
+    /// error), rather than the agent failing. Default `false`; muse overrides for its
+    /// exit 2. A usage error is reported as spar's fault, never retried, and never
+    /// treated as an agent failure.
+    fn is_usage_error(&self, _code: Option<i32>) -> bool {
+        false
+    }
+
+    /// Whether a failed dispatch's log carries this adapter's signature of a deliberately
+    /// stopped run (a model-step or token budget the vendor enforced), rather than a
+    /// crash. Default `false`; muse overrides. Classifies the error text only — it never
+    /// gates a retry on its own.
+    fn step_budget_exhausted(&self, _log_text: &str) -> bool {
+        false
+    }
+
+    /// Extra environment for this adapter's dispatches, derived from the spawn options
+    /// (e.g. a vendor self-timeout aligned to `SpawnOpts::timeout_secs`, following the
+    /// contract its doc comment describes). Default empty. This exists because
+    /// `command_to_parts` reduces a built `Command` to program-plus-args, so anything
+    /// set via `cmd.env` in `build_headless`/`build_resume` would silently never reach
+    /// the child — the executor merges this into `SpawnRequest::env` instead.
+    fn extra_env(&self, _opts: &SpawnOpts) -> Vec<(String, String)> {
+        Vec::new()
     }
 
     /// Turn-boundary delivery channel for this adapter (see `DeliveryStrategy`).
@@ -415,8 +458,22 @@ mod tests {
         // Adapters with no session-loss signature of their own (i.e. everyone but
         // codex) keep the pre-existing behavior: any pre-session resume failure is
         // treated as a lost session, since they have no better signal to distinguish.
-        assert!(GrokAdapter.resume_failure_is_missing_session("anything, or nothing"));
-        assert!(GrokAdapter.resume_failure_is_missing_session(""));
+        assert!(GrokAdapter.resume_failure_is_missing_session("anything, or nothing", None));
+        assert!(GrokAdapter.resume_failure_is_missing_session("", Some("sess-1")));
+        assert!(!GrokAdapter.dispatch_failure_is_transient("does not exist or you lack access"));
+        assert!(!GrokAdapter.is_usage_error(Some(2)));
+        assert!(!GrokAdapter.step_budget_exhausted("max-model-steps"));
+        assert!(GrokAdapter
+            .extra_env(&SpawnOpts {
+                prompt: String::new(),
+                prompt_file: None,
+                cwd: std::path::PathBuf::from("/tmp"),
+                trust: TrustPolicy::Prompt,
+                extra_args: vec![],
+                model: None,
+                timeout_secs: Some(60),
+            })
+            .is_empty());
     }
 
     #[test]

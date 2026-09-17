@@ -149,6 +149,17 @@ sibling of it as in claude's disjoint pair, so adding the two double-counts. The
 is recovered from the same log, so it survives a round that was killed before the stream
 reported one.
 
+Resume and transient retry (DECISIONS O86). A muse slot's next round calls
+`muse exec --session-id <id>` instead of a cold dispatch when an earlier round captured
+a session id. If a dispatch exits 1 with muse's backend-404 text
+(`does not exist or you lack access`) after at least one completed tool call, spar waits
+it out (roughly 60s/150s/300s, resuming the same session each retry) instead of failing
+the slot; the same text with zero tool calls fails immediately. A resume against a
+session muse no longer has is detected from its session log and retried cold once.
+muse's stream timeouts follow the slot ceiling, exit 2 is reported as spar's bad command
+line (never the agent's fault), and an implementer slot killed mid-dispatch still leaves
+a machine-synthesized carry-forward brief naming its worktree changes.
+
 ```bash
 spar implement -t "..." --role implementer=cli:muse --role tester=cli:muse   # muse settings pick the model
 spar run --workflow review -t "..." --providers cli:muse@muse-spark-1.2      # pin the non-contributor model
@@ -390,8 +401,10 @@ on — never a restatement of the plan or contract, which the next round is hand
   round N+1 starts its context climb from a huge base (DECISIONS O52). **codex is a
   scoped exception (O63):** when a slot's earlier round captured a thread id, its next
   round calls `codex exec resume <id>` instead of a cold dispatch, on top of the same
-  carry-forward brief every provider gets. A task brief specifically asked for this
-  tradeoff for codex; O52's general default is unchanged for every other provider.
+  carry-forward brief every provider gets. **muse is a second scoped exception (O86):**
+  a captured session id re-dispatches as `muse exec --session-id <id>`, and a transient
+  backend 404 after real work is retried with backoff through that same resume instead
+  of failing the slot. O52's general default is unchanged for every other provider.
 
 For legs that already exist, `spar link <leg> --to <run>` records the grouping
 (`parent_run`). spar never infers it — pairing runs by task text would merge unrelated

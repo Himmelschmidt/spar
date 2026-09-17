@@ -391,19 +391,64 @@ fn resume_lost_its_session(used_resume: bool, res: &process::SpawnResult) -> boo
     used_resume && !res.timed_out && res.stats.session_id.is_none()
 }
 
+/// Waits between transient-failure retries. Four attempts total (the initial dispatch
+/// plus three retries) at roughly 60s/150s/300s is about 8.5 minutes elapsed, which
+/// waits out a ten-minute backend window given the first failure already burned a few
+/// minutes doing real work. Named constants, not config — `sleep` is injected so tests
+/// advance instantly instead of sleeping this schedule, and
+/// `SPAR_TRANSIENT_RETRY_BACKOFF_SECS` (a comma list like `0,0,0`) overrides the waits
+/// for the same reason. That env var is a test seam, not a user knob: it exists only
+/// so a live end-to-end run never sleeps the real schedule under test.
+const TRANSIENT_RETRY_BACKOFF_SECS: [u64; 3] = [60, 150, 300];
+
+fn parse_backoff_list(raw: &str) -> Vec<u64> {
+    raw.split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect()
+}
+
+fn transient_backoff_secs() -> Vec<u64> {
+    if let Ok(raw) = std::env::var("SPAR_TRANSIENT_RETRY_BACKOFF_SECS") {
+        let parsed = parse_backoff_list(&raw);
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    TRANSIENT_RETRY_BACKOFF_SECS.to_vec()
+}
+
+/// `<run_dir>/logs/<slot>.transient-retry-N.log` — a sibling of the shared log path,
+/// copied just before a transient retry overwrites it (`run_captured` truncates via
+/// `File::create`). Same preservation the lost-resume path already does: without it
+/// the retry's own output is all that remains and the failure that caused the wait
+/// is gone.
+fn transient_retry_log_path(log_path: &Path, attempt: usize) -> PathBuf {
+    let stem = log_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("slot");
+    log_path.with_file_name(format!("{stem}.transient-retry-{attempt}.log"))
+}
+
 /// Runs `req`, recovers from a lost-rollout resume (clears the marker, retries cold once
 /// — see `resume_lost_its_session` and `ProviderAdapter::resume_failure_is_missing_session`),
-/// and persists whatever session id the (possibly retried) dispatch captured. Shared by
-/// `execute_prepared` and `run_headless`, which differ only in how they build `req`/`opts`
-/// and their pid-capture `sink` — the recovery-and-persist sequence itself must not drift
+/// retries a transient provider failure with backoff (see
+/// `ProviderAdapter::dispatch_failure_is_transient`), and persists whatever session id
+/// the (possibly retried) dispatch captured. Shared by `execute_prepared` and
+/// `run_headless`, which differ only in how they build `req`/`opts` and their
+/// pid-capture `sink` — the recovery-and-persist sequence itself must not drift
 /// between the two, since a real bug here silently disables resume for the affected path
 /// (see `dispatch_records_session_id_and_recovers_from_lost_resume`'s test coverage).
+///
+/// `resume_attempt` is the session id the initial `req` tried to resume, if any
+/// (`None` for a cold dispatch). `sleep` is the backoff wait, injected so tests never
+/// sleep the real schedule.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_with_resume_recovery(
     adapter: &dyn providers::ProviderAdapter,
     bin: &Path,
     opts: &SpawnOpts,
-    used_resume: bool,
+    resume_attempt: Option<&str>,
     isolation: crate::config::IsolationMode,
     req: SpawnRequest,
     paths: &SparPaths,
@@ -412,15 +457,23 @@ fn dispatch_with_resume_recovery(
     session_provider: &str,
     sink: &dyn Fn(u32),
     tick: &dyn Fn(),
+    sleep: &dyn Fn(Duration),
 ) -> Result<process::SpawnResult> {
+    let used_resume = resume_attempt.is_some();
     let cwd = req.cwd.clone();
     let log_path = req.log_path.clone();
     let env = req.env.clone();
     let timeout = req.timeout;
     let mut res = process::run_captured(&req, Some(sink), Some(tick))?;
-    if resume_lost_its_session(used_resume, &res)
+    // A usage error is spar's fault (it built a command line the provider rejected),
+    // never the session's: it must be reported as such, never retried, and the marker
+    // left untouched — a cold retry of the same bad command line would just fail again
+    // while destroying a possibly-valid session id.
+    if !adapter.is_usage_error(res.exit_code)
+        && resume_lost_its_session(used_resume, &res)
         && adapter.resume_failure_is_missing_session(
             &std::fs::read_to_string(&log_path).unwrap_or_default(),
+            resume_attempt,
         )
     {
         // The rollout this slot's marker pointed at is gone (pruned, a different
@@ -450,6 +503,68 @@ fn dispatch_with_resume_recovery(
             timeout,
         };
         res = process::run_captured(&cold_req, Some(sink), Some(tick))?;
+    }
+    // A transient provider failure after real work (muse's backend 404, which reads as
+    // a model-access error with exit 1): back off and re-dispatch rather than failing
+    // the slot. Each retry re-resolves through `build_dispatch_command`, so whenever a
+    // session id was captured the retry is a resume of the same session, not a cold
+    // restart — the work the failed attempt did stays in context. Gated on at least
+    // one completed tool call: a first-call failure is indistinguishable from a
+    // genuinely wrong model name or a dead entitlement and must fail fast instead of
+    // waiting out a window that will never clear. Timeouts, signals, and usage errors
+    // never retry: a hang, a kill, and spar's own bad command line are not the backend
+    // being briefly sick.
+    let backoff = transient_backoff_secs();
+    let mut retries = 0usize;
+    while retries < backoff.len()
+        && !res.timed_out
+        && res.signal.is_none()
+        && res.exit_code != Some(0)
+        && !adapter.is_usage_error(res.exit_code)
+        && res.stats.tools >= 1
+        && adapter
+            .dispatch_failure_is_transient(&std::fs::read_to_string(&log_path).unwrap_or_default())
+    {
+        let wait = Duration::from_secs(backoff[retries]);
+        let _ = std::fs::copy(&log_path, transient_retry_log_path(&log_path, retries + 1));
+        // Persist before re-resolving: the failed attempt's captured session id is what
+        // makes this retry a resume rather than a cold restart.
+        if let Some(sid) = res.stats.session_id.clone() {
+            let _ = markers::write_session_id(paths, run_id, slot_id, session_provider, &sid);
+        }
+        let _ = crate::events::append(
+            paths,
+            run_id,
+            &crate::events::Event::slot_note(
+                slot_id,
+                format!(
+                    "transient provider failure (attempt {} of {}): waiting {}s before retrying{}",
+                    retries + 1,
+                    backoff.len() + 1,
+                    wait.as_secs(),
+                    res.stats
+                        .session_id
+                        .as_deref()
+                        .map(|sid| format!(" (resuming session {sid})"))
+                        .unwrap_or_default(),
+                ),
+            ),
+        );
+        sleep(wait);
+        let prior = markers::read_session_id(paths, run_id, slot_id, session_provider);
+        let (cmd, _) = build_dispatch_command(adapter, bin, opts, prior.as_deref());
+        let (program, args) = providers::command_to_parts(&cmd);
+        let (program, args) = sandbox::maybe_wrap(isolation, &cwd, &program, &args);
+        let req = SpawnRequest {
+            program,
+            args,
+            cwd: cwd.clone(),
+            log_path: log_path.clone(),
+            env: env.clone(),
+            timeout,
+        };
+        res = process::run_captured(&req, Some(sink), Some(tick))?;
+        retries += 1;
     }
     // Persisted regardless of this dispatch's own outcome: a captured thread id is what
     // lets the *next* round resume instead of a cold dispatch (O63), and that is worth
@@ -560,12 +675,18 @@ fn execute_prepared(
     );
     let (program, args) = providers::command_to_parts(&cmd);
     let (program, args) = sandbox::maybe_wrap(isolation, &prep.cwd, &program, &args);
+    let cmdline = format!("{} {}", program.display(), args.join(" "));
+    // Adapter-derived env (e.g. muse's self-timeout alignment) rides the request:
+    // `command_to_parts` drops anything set via `cmd.env`, so merging here is the
+    // only path that reaches the child.
+    let mut dispatch_env = prep.env.clone();
+    dispatch_env.extend(adapter.extra_env(&opts));
     let req = SpawnRequest {
         program,
         args,
         cwd: prep.cwd.clone(),
         log_path: prep.log_path.clone(),
-        env: prep.env.clone(),
+        env: dispatch_env,
         timeout,
     };
     let pid_cell = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -607,11 +728,16 @@ fn execute_prepared(
         beat.tick();
         watch.tick();
     };
+    let resume_attempt = if used_resume {
+        prep.prior_session_id.as_deref()
+    } else {
+        None
+    };
     let mut res = dispatch_with_resume_recovery(
         adapter.as_ref(),
         &bin,
         &opts,
-        used_resume,
+        resume_attempt,
         isolation,
         req,
         &prep.paths,
@@ -620,6 +746,7 @@ fn execute_prepared(
         &prep.session_provider,
         &sink,
         &tick,
+        &|d| std::thread::sleep(d),
     )?;
     let pid = load_pid(&pid_cell);
     // Before the gates below, and before any state save: markers outlive an orchestrator
@@ -679,7 +806,13 @@ fn execute_prepared(
             pid,
             exit_code: res.exit_code,
             signal: res.signal,
-            error: Some(describe_exit(res.exit_code, res.signal)),
+            error: Some(dispatch_error(
+                adapter.as_ref(),
+                &prep.log_path,
+                &cmdline,
+                res.exit_code,
+                res.signal,
+            )),
             usage: Some(usage),
             agy_quota_hit,
             quota_rejected: quota_rejected.clone(),
@@ -885,6 +1018,8 @@ fn recover_artifact(r: &ArtifactRecovery) -> bool {
     let cmd = adapter.build_headless(&bin, &opts);
     let (program, args) = providers::command_to_parts(&cmd);
     let (program, args) = sandbox::maybe_wrap(r.isolation, r.cwd, &program, &args);
+    let mut recovery_env = r.env.to_vec();
+    recovery_env.extend(adapter.extra_env(&opts));
     let req = SpawnRequest {
         program,
         args,
@@ -894,7 +1029,7 @@ fn recover_artifact(r: &ArtifactRecovery) -> bool {
         // the operator's only diagnosis and what `salvage_expected_artifact` tails when
         // recovery itself fails.
         log_path: recovery_log_path(r.log_path),
-        env: r.env.to_vec(),
+        env: recovery_env,
         timeout,
     };
     // Tracked like any other slot spawn: without the pid marker this agent is invisible to
@@ -1160,7 +1295,15 @@ fn apply_parallel_outcome(
                 s.quota_hit = quota_hit;
             }
             let err = result.error.unwrap_or_else(|| "failed".into());
-            salvage_expected_artifact(paths, &state.id, &prep.job, &prep.log_path, &err);
+            salvage_expected_artifact(
+                paths,
+                &state.id,
+                &prep.job,
+                &prep.log_path,
+                &err,
+                &prep.cwd,
+                prep.cfg.rounds.carry_forward_chars,
+            );
             if let Some(u) = result.usage {
                 if let Some(s) = state.slot_mut(slot_id) {
                     s.usage = Some(u.clone());
@@ -1178,7 +1321,15 @@ fn apply_parallel_outcome(
             )?;
         }
         Err(e) => {
-            salvage_expected_artifact(paths, &state.id, &prep.job, &prep.log_path, &e.to_string());
+            salvage_expected_artifact(
+                paths,
+                &state.id,
+                &prep.job,
+                &prep.log_path,
+                &e.to_string(),
+                &prep.cwd,
+                prep.cfg.rounds.carry_forward_chars,
+            );
             // Same api-sdk gap as `run_slot`'s early-err arm: a 429 propagates as this
             // `Err` without ever reaching `prep.log_path`, so the error text itself is
             // scraped alongside the log tail.
@@ -1228,13 +1379,31 @@ pub fn hard_ceiling_for_role(cfg: &Config, role: SlotRole) -> Duration {
 }
 
 /// On timeout/fail, keep any non-empty expected artifact; else salvage from the slot log.
+/// Also synthesizes a missing implementer carry-forward brief (see
+/// `salvage_carry_forward`): without it the next round opens cold on a half-edited
+/// worktree with no record that the tree is dirty.
 pub fn salvage_expected_artifact(
     paths: &SparPaths,
     run_id: &str,
     job: &SlotJob,
     log_path: &Path,
     reason: &str,
+    cwd: &Path,
+    carry_forward_chars: usize,
 ) {
+    // First, unconditionally: a missing implementer brief is synthesized even when the
+    // primary artifact already exists (the agent may have written its summary and died
+    // before the brief), and `salvage_carry_forward` itself no-ops for other roles and
+    // for briefs the agent already wrote.
+    salvage_carry_forward(
+        paths,
+        run_id,
+        job,
+        cwd,
+        log_path,
+        reason,
+        carry_forward_chars,
+    );
     let Some(name) = &job.expected_artifact else {
         return;
     };
@@ -1257,6 +1426,102 @@ pub fn salvage_expected_artifact(
         ),
         _ => format!("# Salvaged artifact ({reason})\n\n```\n{tail}\n```\n"),
     };
+    let _ = std::fs::write(path, body);
+}
+
+/// Best-effort `git -C <cwd> <args>`, trimmed. `None` when git is missing, `cwd` is
+/// not a repo, or the output is empty — the brief keeps its tool tail either way.
+fn git_output(cwd: &Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+fn clamp_chars(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
+/// Write the implementer carry-forward brief the dead slot never finished, from what
+/// spar can already see: the slot worktree's `git status`/`diff --stat` (what changed)
+/// plus a clamped `git diff` (how), and the tail of the coalesced tool stream (what it
+/// was doing). Provider-generic — no adapter knowledge, just the worktree and the log.
+///
+/// Never overwrites a brief the agent wrote itself. Clamped to `carry_forward_chars`,
+/// the same budget the next round's `carry_forward_section` applies, so a synthesized
+/// brief cannot smuggle a bigger context climb than a written one. With no worktree
+/// changes and no transcript there is nothing to say, and nothing is written.
+fn salvage_carry_forward(
+    paths: &SparPaths,
+    run_id: &str,
+    job: &SlotJob,
+    cwd: &Path,
+    log_path: &Path,
+    reason: &str,
+    carry_forward_chars: usize,
+) {
+    if job.role != SlotRole::Implementer || carry_forward_chars == 0 {
+        return;
+    }
+    let path = paths.artifact(
+        run_id,
+        &crate::workflow::implement::carry_forward_name(&job.slot_id),
+    );
+    if artifact_written(&path) {
+        return;
+    }
+    let mut sections = vec![format!(
+        "# Synthesized carry-forward (slot {} died mid-dispatch: {reason})\n\nMachine-written \
+         from the worktree and the partial transcript because the agent never finished \
+         its turn. Hints, not verdicts: verify before trusting.\n",
+        job.slot_id,
+    )];
+    if let Some(status) = git_output(cwd, &["status", "--porcelain"]) {
+        sections.push(format!(
+            "## Worktree status\n\n```\n{}\n```\n",
+            clamp_chars(&status, 2000)
+        ));
+    }
+    if let Some(stat) = git_output(cwd, &["diff", "--stat"]) {
+        sections.push(format!(
+            "## What changed\n\n```\n{}\n```\n",
+            clamp_chars(&stat, 2000)
+        ));
+    }
+    if git_output(cwd, &["rev-parse", "--is-inside-work-tree"]).is_some() {
+        // Inside a repo (possibly with no diff yet): the clamped diff shows how far the
+        // edits got, untracked files included via `--stat` above only when tracked, so
+        // `status` carries the new files. `--no-color` keeps the brief plain text.
+        if let Some(diff) = git_output(cwd, &["diff", "--no-color"]) {
+            sections.push(format!(
+                "## Diff (clamped)\n\n```diff\n{}\n```\n",
+                clamp_chars(&diff, carry_forward_chars / 2)
+            ));
+        }
+    }
+    let tail_budget = carry_forward_chars / 2;
+    let tail = process::tail_log(log_path, tail_budget.max(1000));
+    if !tail.trim().is_empty() {
+        sections.push(format!("## Partial tool transcript\n\n```\n{tail}\n```\n"));
+    }
+    if sections.len() == 1 {
+        return;
+    }
+    let body = clamp_chars(&sections.join("\n"), carry_forward_chars);
     let _ = std::fs::write(path, body);
 }
 
@@ -1389,7 +1654,15 @@ pub fn run_slot(
         match run_api(state, paths, job, &pref, &cwd, &log_path, &prompt, timeout) {
             Ok(r) => r,
             Err(e) => {
-                salvage_expected_artifact(paths, &state.id, job, &log_path, &e.to_string());
+                salvage_expected_artifact(
+                    paths,
+                    &state.id,
+                    job,
+                    &log_path,
+                    &e.to_string(),
+                    &cwd,
+                    cfg.rounds.carry_forward_chars,
+                );
                 quota_on_early_err(
                     state,
                     &log_path,
@@ -1417,7 +1690,15 @@ pub fn run_slot(
                 ) {
                     Ok(r) => r,
                     Err(e) => {
-                        salvage_expected_artifact(paths, &state.id, job, &log_path, &e.to_string());
+                        salvage_expected_artifact(
+                            paths,
+                            &state.id,
+                            job,
+                            &log_path,
+                            &e.to_string(),
+                            &cwd,
+                            cfg.rounds.carry_forward_chars,
+                        );
                         quota_on_early_err(
                             state,
                             &log_path,
@@ -1453,7 +1734,15 @@ pub fn run_slot(
                 ) {
                     Ok(r) => r,
                     Err(e) => {
-                        salvage_expected_artifact(paths, &state.id, job, &log_path, &e.to_string());
+                        salvage_expected_artifact(
+                            paths,
+                            &state.id,
+                            job,
+                            &log_path,
+                            &e.to_string(),
+                            &cwd,
+                            cfg.rounds.carry_forward_chars,
+                        );
                         quota_on_early_err(
                             state,
                             &log_path,
@@ -1513,7 +1802,15 @@ pub fn run_slot(
         // `quota_hit_for_outcome`.
         let quota_hit = quota_hit_for_outcome(paths, &job.provider, &log_path, &result);
         let err = result.error.as_deref().unwrap_or("failed");
-        salvage_expected_artifact(paths, &state.id, job, &log_path, err);
+        salvage_expected_artifact(
+            paths,
+            &state.id,
+            job,
+            &log_path,
+            err,
+            &cwd,
+            cfg.rounds.carry_forward_chars,
+        );
         markers::write_dispatch_verdict(
             paths,
             &state.id,
@@ -1901,6 +2198,31 @@ fn describe_exit(code: Option<i32>, signal: Option<i32>) -> String {
         Some(c) => format!("exit {c}"),
         None => "exited without a status".into(),
     }
+}
+
+/// Error text for a non-zero, non-timeout dispatch. A usage error names spar's own
+/// command line (spar's fault, never the agent's); a vendor step-budget stop is
+/// reported as a budget stop, not a crash. Everything else keeps the generic line.
+fn dispatch_error(
+    adapter: &dyn providers::ProviderAdapter,
+    log_path: &Path,
+    cmdline: &str,
+    code: Option<i32>,
+    signal: Option<i32>,
+) -> String {
+    if adapter.is_usage_error(code) {
+        return format!(
+            "provider usage error ({}): spar built a command line the provider rejected, not an agent failure: {cmdline}",
+            describe_exit(code, signal),
+        );
+    }
+    if adapter.step_budget_exhausted(&std::fs::read_to_string(log_path).unwrap_or_default()) {
+        return format!(
+            "provider stopped at its model-step budget ({}), not a crash",
+            describe_exit(code, signal),
+        );
+    }
+    describe_exit(code, signal)
 }
 
 fn mark_slot_failed(
@@ -2298,13 +2620,17 @@ fn run_headless(
         build_dispatch_command(adapter.as_ref(), &bin, &opts, prior_session_id.as_deref());
     let (program, args) = providers::command_to_parts(&cmd);
     let (program, args) = sandbox::maybe_wrap(state.isolation, cwd, &program, &args);
+    let cmdline = format!("{} {}", program.display(), args.join(" "));
+    // See `execute_prepared`: adapter-derived env rides the request, not the `Command`.
+    let mut dispatch_env = env.to_vec();
+    dispatch_env.extend(adapter.extra_env(&opts));
 
     let req = SpawnRequest {
         program,
         args,
         cwd: cwd.to_path_buf(),
         log_path: log_path.to_path_buf(),
-        env: env.to_vec(),
+        env: dispatch_env,
         timeout,
     };
     let pid_cell = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -2342,11 +2668,16 @@ fn run_headless(
         beat.tick();
         watch.tick();
     };
+    let resume_attempt = if used_resume {
+        prior_session_id.as_deref()
+    } else {
+        None
+    };
     let mut res = dispatch_with_resume_recovery(
         adapter.as_ref(),
         &bin,
         &opts,
-        used_resume,
+        resume_attempt,
         state.isolation,
         req,
         paths,
@@ -2355,6 +2686,7 @@ fn run_headless(
         cli_name,
         &sink,
         &tick,
+        &|d| std::thread::sleep(d),
     )?;
     let pid = load_pid(&pid_cell);
     // See `execute_prepared`: the verdict lands on disk before the gates and before any
@@ -2410,7 +2742,13 @@ fn run_headless(
             pid,
             exit_code: code,
             signal: res.signal,
-            error: Some(describe_exit(code, res.signal)),
+            error: Some(dispatch_error(
+                adapter.as_ref(),
+                log_path,
+                &cmdline,
+                code,
+                res.signal,
+            )),
             usage: Some(usage),
             agy_quota_hit,
             quota_rejected: quota_rejected.clone(),
@@ -3387,6 +3725,24 @@ mod tests {
     /// marker files) without spawning `codex`/`grok`/etc.
     struct ShellAdapter {
         script: String,
+        /// When true, `build_resume` echoes `RESUMED:<sid>` and then runs `script`,
+        /// so tests can tell a resume retry from a cold restart in the slot log.
+        resume: bool,
+        /// When true, the 404 string counts as transient (muse's signature).
+        transient_404: bool,
+        /// When true, exit 2 counts as a spar usage error.
+        usage_error_2: bool,
+    }
+
+    impl ShellAdapter {
+        fn cold(script: &str) -> Self {
+            Self {
+                script: script.into(),
+                resume: false,
+                transient_404: false,
+                usage_error_2: false,
+            }
+        }
     }
 
     impl providers::ProviderAdapter for ShellAdapter {
@@ -3410,8 +3766,32 @@ mod tests {
         fn build_interactive(&self, bin: &Path, opts: &SpawnOpts) -> std::process::Command {
             self.build_headless(bin, opts)
         }
-        fn resume_failure_is_missing_session(&self, log_text: &str) -> bool {
+        fn build_resume(
+            &self,
+            _bin: &Path,
+            _opts: &SpawnOpts,
+            session_id: &str,
+        ) -> Option<std::process::Command> {
+            if !self.resume {
+                return None;
+            }
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.arg("-c")
+                .arg(format!("echo 'RESUMED:{session_id}'; {}", self.script));
+            Some(cmd)
+        }
+        fn resume_failure_is_missing_session(
+            &self,
+            log_text: &str,
+            _session_id: Option<&str>,
+        ) -> bool {
             log_text.contains("no rollout found")
+        }
+        fn dispatch_failure_is_transient(&self, log_text: &str) -> bool {
+            self.transient_404 && log_text.contains("does not exist or you lack access")
+        }
+        fn is_usage_error(&self, code: Option<i32>) -> bool {
+            self.usage_error_2 && code == Some(2)
         }
     }
 
@@ -3434,16 +3814,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         let log_path = tmp.path().join("slot.log");
-        let adapter = ShellAdapter {
-            script: r#"echo '{"type":"thread.started","thread_id":"cold-id-1"}'"#.into(),
-        };
+        let adapter =
+            ShellAdapter::cold(r#"echo '{"type":"thread.started","thread_id":"cold-id-1"}'"#);
         let opts = dispatch_opts("go");
         let req = shell_req(&adapter.script, &log_path);
         let res = dispatch_with_resume_recovery(
             &adapter,
             Path::new("/bin/sh"),
             &opts,
-            false,
+            None,
             crate::config::IsolationMode::None,
             req,
             &paths,
@@ -3452,6 +3831,7 @@ mod tests {
             "shell",
             &|_pid| {},
             &|| {},
+            &|_| {},
         )
         .unwrap();
         assert_eq!(res.stats.session_id.as_deref(), Some("cold-id-1"));
@@ -3471,9 +3851,8 @@ mod tests {
         // build_headless (the cold retry) succeeds and captures a fresh session id;
         // the initial `req` simulates a resume dispatch that died before thread.started
         // with codex's own missing-rollout text.
-        let adapter = ShellAdapter {
-            script: r#"echo '{"type":"thread.started","thread_id":"fresh-id"}'"#.into(),
-        };
+        let adapter =
+            ShellAdapter::cold(r#"echo '{"type":"thread.started","thread_id":"fresh-id"}'"#);
         let opts = dispatch_opts("go");
         let lost_req = shell_req(
             "echo 'no rollout found for thread id stale-id' >&2; exit 1",
@@ -3483,7 +3862,7 @@ mod tests {
             &adapter,
             Path::new("/bin/sh"),
             &opts,
-            true,
+            Some("stale-id"),
             crate::config::IsolationMode::None,
             lost_req,
             &paths,
@@ -3492,6 +3871,7 @@ mod tests {
             "shell",
             &|_pid| {},
             &|| {},
+            &|_| {},
         )
         .unwrap();
         // The cold retry ran and its captured id is what gets persisted — the marker
@@ -3514,9 +3894,8 @@ mod tests {
         let log_path = tmp.path().join("slot.log");
         markers::write_session_id(&paths, "run1", "slotC", "shell", "still-valid-id").unwrap();
 
-        let adapter = ShellAdapter {
-            script: r#"echo '{"type":"thread.started","thread_id":"should-not-run"}'"#.into(),
-        };
+        let adapter =
+            ShellAdapter::cold(r#"echo '{"type":"thread.started","thread_id":"should-not-run"}'"#);
         let opts = dispatch_opts("go");
         let broken_req = shell_req(
             "echo 'Model provider `openrouter` not found' >&2; exit 1",
@@ -3526,7 +3905,7 @@ mod tests {
             &adapter,
             Path::new("/bin/sh"),
             &opts,
-            true,
+            Some("still-valid-id"),
             crate::config::IsolationMode::None,
             broken_req,
             &paths,
@@ -3535,6 +3914,7 @@ mod tests {
             "shell",
             &|_pid| {},
             &|| {},
+            &|_| {},
         )
         .unwrap();
         assert!(res.stats.session_id.is_none());
@@ -3543,6 +3923,480 @@ mod tests {
             Some("still-valid-id"),
             "an unrelated pre-session failure must not destroy a still-valid marker"
         );
+    }
+
+    /// First two runs fail with the 404 signature after a tool call and a captured
+    /// session id, the third succeeds. The counter file tells the attempts apart
+    /// across the separate `run_captured` spawns.
+    fn flaky_404_script(ctr: &Path) -> String {
+        format!(
+            r#"n=$(cat "{ctr}" 2>/dev/null || echo 0); echo $((n+1)) > "{ctr}"; echo '{{"type":"thread.started","thread_id":"sess-1"}}'; if [ "$n" -lt 2 ]; then echo '{{"type":"tool_call","name":"edit"}}'; echo 'model `m` does not exist or you lack access [request_id=r1]' >&2; exit 1; fi; echo '{{"type":"tool_call","name":"write"}}'; exit 0"#,
+            ctr = ctr.display(),
+        )
+    }
+
+    #[test]
+    fn transient_failure_after_tool_calls_retries_through_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log_path = tmp.path().join("slot.log");
+        let ctr = tmp.path().join("attempts");
+        let adapter = ShellAdapter {
+            script: flaky_404_script(&ctr),
+            resume: true,
+            transient_404: true,
+            usage_error_2: false,
+        };
+        let opts = dispatch_opts("go");
+        let req = shell_req(&adapter.script, &log_path);
+        // Zero sleeps: the waits are recorded, never slept, so this never waits out
+        // the real 60s/150s/300s schedule.
+        let waits = std::cell::RefCell::new(Vec::new());
+        let res = dispatch_with_resume_recovery(
+            &adapter,
+            Path::new("/bin/sh"),
+            &opts,
+            None,
+            crate::config::IsolationMode::None,
+            req,
+            &paths,
+            "run1",
+            "slotT",
+            "shell",
+            &|_pid| {},
+            &|| {},
+            &|d| {
+                waits.borrow_mut().push(d);
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            res.exit_code,
+            Some(0),
+            "the window clears on the third attempt"
+        );
+        assert!(res.stats.tools >= 1);
+        assert_eq!(res.stats.session_id.as_deref(), Some("sess-1"));
+        // The retries re-resolved through `build_dispatch_command`: the final log
+        // carries the resume marker, proving the session continued instead of
+        // cold-restarting.
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            log.contains("RESUMED:sess-1"),
+            "retry must resume the captured session, not restart cold"
+        );
+        assert_eq!(
+            *waits.borrow(),
+            vec![Duration::from_secs(60), Duration::from_secs(150)],
+            "two failed attempts, two backoff waits"
+        );
+        for n in 1..=2 {
+            let sib = transient_retry_log_path(&log_path, n);
+            let text = std::fs::read_to_string(&sib).unwrap();
+            assert!(
+                text.contains("does not exist or you lack access"),
+                "attempt {n}'s 404 must survive in {}",
+                sib.display()
+            );
+        }
+        let events = std::fs::read_to_string(crate::events::events_file(&paths, "run1")).unwrap();
+        assert_eq!(
+            events.matches("transient provider failure").count(),
+            2,
+            "one slot note per retry so the operator sees the wait"
+        );
+        assert_eq!(
+            markers::read_session_id(&paths, "run1", "slotT", "shell").as_deref(),
+            Some("sess-1")
+        );
+    }
+
+    #[test]
+    fn transient_signature_with_zero_tool_calls_fails_fast() {
+        // A first-call 404 is indistinguishable from a genuinely wrong model name or
+        // a dead entitlement: no retry, no wait, no preserved sibling log.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log_path = tmp.path().join("slot.log");
+        let adapter = ShellAdapter {
+            script: "echo 'model `m` does not exist or you lack access' >&2; exit 1".into(),
+            resume: true,
+            transient_404: true,
+            usage_error_2: false,
+        };
+        let opts = dispatch_opts("go");
+        let req = shell_req(&adapter.script, &log_path);
+        let waits = std::cell::RefCell::new(Vec::new());
+        let res = dispatch_with_resume_recovery(
+            &adapter,
+            Path::new("/bin/sh"),
+            &opts,
+            None,
+            crate::config::IsolationMode::None,
+            req,
+            &paths,
+            "run1",
+            "slotZ",
+            "shell",
+            &|_pid| {},
+            &|| {},
+            &|d| {
+                waits.borrow_mut().push(d);
+            },
+        )
+        .unwrap();
+        assert_eq!(res.exit_code, Some(1));
+        assert!(
+            waits.borrow().is_empty(),
+            "zero tool calls must not wait out a window"
+        );
+        assert!(
+            !transient_retry_log_path(&log_path, 1).exists(),
+            "no retry means no preserved sibling log"
+        );
+        assert!(markers::read_session_id(&paths, "run1", "slotZ", "shell").is_none());
+    }
+
+    #[test]
+    fn usage_error_is_never_retried_and_leaves_the_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log_path = tmp.path().join("slot.log");
+        markers::write_session_id(&paths, "run1", "slotU", "shell", "keep-me").unwrap();
+        // The adapter's own script would succeed and capture a fresh id if the cold
+        // path ever ran — so a passing marker assertion is also proof it never did.
+        let adapter = ShellAdapter {
+            script: r#"echo '{"type":"thread.started","thread_id":"should-not-run"}'"#.into(),
+            resume: true,
+            transient_404: true,
+            usage_error_2: true,
+        };
+        let opts = dispatch_opts("go");
+        let bad_req = shell_req("exit 2", &log_path);
+        let waits = std::cell::RefCell::new(Vec::new());
+        let res = dispatch_with_resume_recovery(
+            &adapter,
+            Path::new("/bin/sh"),
+            &opts,
+            Some("keep-me"),
+            crate::config::IsolationMode::None,
+            bad_req,
+            &paths,
+            "run1",
+            "slotU",
+            "shell",
+            &|_pid| {},
+            &|| {},
+            &|d| {
+                waits.borrow_mut().push(d);
+            },
+        )
+        .unwrap();
+        assert_eq!(res.exit_code, Some(2));
+        assert!(res.stats.session_id.is_none());
+        assert!(
+            waits.borrow().is_empty(),
+            "a usage error is spar's fault, never retried"
+        );
+        assert_eq!(
+            markers::read_session_id(&paths, "run1", "slotU", "shell").as_deref(),
+            Some("keep-me"),
+            "a usage error must not destroy a possibly-valid marker"
+        );
+    }
+
+    #[test]
+    fn unrelated_failure_after_tool_calls_does_not_retry() {
+        // Only the overriding adapter's own string retries: any other failure after
+        // real work still fails the slot immediately.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log_path = tmp.path().join("slot.log");
+        let adapter = ShellAdapter {
+            script: r#"echo '{"type":"tool_call","name":"edit"}'; echo 'boom' >&2; exit 1"#.into(),
+            resume: true,
+            transient_404: false,
+            usage_error_2: false,
+        };
+        let opts = dispatch_opts("go");
+        let req = shell_req(&adapter.script, &log_path);
+        let waits = std::cell::RefCell::new(Vec::new());
+        let res = dispatch_with_resume_recovery(
+            &adapter,
+            Path::new("/bin/sh"),
+            &opts,
+            None,
+            crate::config::IsolationMode::None,
+            req,
+            &paths,
+            "run1",
+            "slotN",
+            "shell",
+            &|_pid| {},
+            &|| {},
+            &|d| {
+                waits.borrow_mut().push(d);
+            },
+        )
+        .unwrap();
+        assert_eq!(res.exit_code, Some(1));
+        assert!(res.stats.tools >= 1);
+        assert!(waits.borrow().is_empty());
+        assert!(!transient_retry_log_path(&log_path, 1).exists());
+    }
+
+    #[test]
+    fn dispatch_error_names_usage_faults_and_budget_stops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("slot.log");
+        std::fs::write(&log_path, "stopped: hit --max-model-steps, exiting 1\n").unwrap();
+        let budget = dispatch_error(
+            &providers::MuseAdapter,
+            &log_path,
+            "muse exec --json",
+            Some(1),
+            None,
+        );
+        assert!(
+            budget.contains("model-step budget"),
+            "a step-budget stop is not a crash: {budget}"
+        );
+        let usage = dispatch_error(
+            &providers::MuseAdapter,
+            &log_path,
+            "muse exec --session-id x",
+            Some(2),
+            None,
+        );
+        assert!(
+            usage.contains("usage error") && usage.contains("muse exec --session-id x"),
+            "a usage error names spar's command line: {usage}"
+        );
+        // Adapters without these signatures keep the generic line.
+        assert_eq!(
+            dispatch_error(
+                &providers::GrokAdapter,
+                &log_path,
+                "grok ...",
+                Some(1),
+                None
+            ),
+            "exit 1"
+        );
+    }
+
+    #[test]
+    fn backoff_schedule_parses_and_defaults() {
+        assert_eq!(parse_backoff_list("0,0,0"), vec![0, 0, 0]);
+        assert_eq!(parse_backoff_list(" 60 , 150 , 300 "), vec![60, 150, 300]);
+        assert!(parse_backoff_list("nope").is_empty());
+        assert!(
+            parse_backoff_list("").is_empty(),
+            "an empty override falls back to the constants, it does not disable retries"
+        );
+        assert_eq!(
+            TRANSIENT_RETRY_BACKOFF_SECS,
+            [60, 150, 300],
+            "four attempts over ~8.5 minutes, waiting out a ten-minute window"
+        );
+    }
+
+    fn impl_job(slot_id: &str) -> SlotJob {
+        SlotJob {
+            slot_id: slot_id.into(),
+            provider: "cli:muse".into(),
+            role: SlotRole::Implementer,
+            template: "implement".into(),
+            extra_vars: HashMap::new(),
+            expected_artifact: Some(format!("summary-{slot_id}.md")),
+            model: None,
+        }
+    }
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git must be available for salvage tests");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn dirty_repo(base: &Path) -> PathBuf {
+        let repo = base.join("wt");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("foo.rs"), "fn main() {}\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        );
+        std::fs::write(repo.join("foo.rs"), "fn main() { println!(\"hi\"); }\n").unwrap();
+        std::fs::write(repo.join("new.rs"), "new file\n").unwrap();
+        repo
+    }
+
+    #[test]
+    fn salvage_writes_a_synthesized_carry_forward_for_a_dirty_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("r1").unwrap();
+        let repo = dirty_repo(tmp.path());
+        let log_path = paths.log_file("r1", "impl");
+        std::fs::write(&log_path, "→ edit  foo.rs  success\n").unwrap();
+        let job = impl_job("impl");
+        salvage_expected_artifact(
+            &paths,
+            "r1",
+            &job,
+            &log_path,
+            "killed by signal 9 (SIGKILL)",
+            &repo,
+            4000,
+        );
+        let brief = paths.artifact("r1", "carry-forward-impl.md");
+        let body = std::fs::read_to_string(&brief).unwrap();
+        assert!(
+            body.contains("Synthesized carry-forward"),
+            "marked machine-written"
+        );
+        assert!(
+            body.contains("foo.rs"),
+            "the brief names what changed in the worktree: {body}"
+        );
+        assert!(
+            body.len() <= 4000 + 16,
+            "clamped to the carry-forward budget, found {}",
+            body.len()
+        );
+        assert!(
+            paths.artifact("r1", "summary-impl.md").is_file(),
+            "the primary artifact is still salvaged alongside the brief"
+        );
+    }
+
+    #[test]
+    fn salvage_never_overwrites_an_agent_written_brief() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("r1").unwrap();
+        let repo = dirty_repo(tmp.path());
+        let log_path = paths.log_file("r1", "impl");
+        std::fs::write(&log_path, "→ edit  foo.rs  success\n").unwrap();
+        let brief = paths.artifact("r1", "carry-forward-impl.md");
+        std::fs::write(&brief, "agent words\n").unwrap();
+        salvage_expected_artifact(
+            &paths,
+            "r1",
+            &impl_job("impl"),
+            &log_path,
+            "killed",
+            &repo,
+            4000,
+        );
+        assert_eq!(std::fs::read_to_string(&brief).unwrap(), "agent words\n");
+    }
+
+    #[test]
+    fn salvage_clamps_the_synthesized_brief_to_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("r1").unwrap();
+        let repo = dirty_repo(tmp.path());
+        std::fs::write(repo.join("big.rs"), "x\n".repeat(2000)).unwrap();
+        git(&repo, &["add", "."]);
+        let log_path = paths.log_file("r1", "impl");
+        std::fs::write(&log_path, "→ edit  big.rs  success\n").unwrap();
+        salvage_expected_artifact(
+            &paths,
+            "r1",
+            &impl_job("impl"),
+            &log_path,
+            "killed",
+            &repo,
+            500,
+        );
+        let body = std::fs::read_to_string(paths.artifact("r1", "carry-forward-impl.md")).unwrap();
+        assert!(body.contains("Synthesized carry-forward"));
+        assert!(body.len() <= 500 + 16, "found {}", body.len());
+    }
+
+    #[test]
+    fn salvage_writes_no_brief_for_other_roles_clean_trees_or_empty_logs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("r1").unwrap();
+        let repo = dirty_repo(tmp.path());
+        let log_path = paths.log_file("r1", "rev");
+        std::fs::write(&log_path, "partial review\n").unwrap();
+        // A dirty worktree does not earn a reviewer a brief: only the implementer owes
+        // one, and only the implementer gets one synthesized.
+        let reviewer = SlotJob {
+            role: SlotRole::Reviewer,
+            expected_artifact: Some("review-rev.md".into()),
+            ..impl_job("rev")
+        };
+        salvage_expected_artifact(&paths, "r1", &reviewer, &log_path, "killed", &repo, 4000);
+        assert!(!paths.artifact("r1", "carry-forward-rev.md").exists());
+        // An implementer with a clean tree and an empty log has nothing to say.
+        let clean = tmp.path().join("clean");
+        std::fs::create_dir_all(&clean).unwrap();
+        git(&clean, &["init", "-q"]);
+        std::fs::write(clean.join("a.txt"), "a\n").unwrap();
+        git(&clean, &["add", "."]);
+        git(
+            &clean,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        );
+        let empty_log = paths.log_file("r1", "impl2");
+        std::fs::write(&empty_log, "").unwrap();
+        salvage_expected_artifact(
+            &paths,
+            "r1",
+            &impl_job("impl2"),
+            &empty_log,
+            "killed",
+            &clean,
+            4000,
+        );
+        assert!(!paths.artifact("r1", "carry-forward-impl2.md").exists());
+        // Outside any repo the diff is skipped but the transcript is kept.
+        let bare = tmp.path().join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        let bare_log = paths.log_file("r1", "impl3");
+        std::fs::write(&bare_log, "→ edit  foo.rs  success\n").unwrap();
+        salvage_expected_artifact(
+            &paths,
+            "r1",
+            &impl_job("impl3"),
+            &bare_log,
+            "killed",
+            &bare,
+            4000,
+        );
+        let body = std::fs::read_to_string(paths.artifact("r1", "carry-forward-impl3.md")).unwrap();
+        assert!(body.contains("Partial tool transcript"));
     }
 
     /// `usage_from_stream` is the only place `StreamStats`'s cost/subagent/model
@@ -4560,7 +5414,15 @@ mod tests {
             expected_artifact: Some("suite.md".into()),
             model: None,
         };
-        salvage_expected_artifact(&paths, "r1", &job, &log_path, "interrupted: timeout");
+        salvage_expected_artifact(
+            &paths,
+            "r1",
+            &job,
+            &log_path,
+            "interrupted: timeout",
+            tmp.path(),
+            4000,
+        );
         let suite = paths.artifact("r1", "suite.md");
         assert!(
             !suite.exists(),
