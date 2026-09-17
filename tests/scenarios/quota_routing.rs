@@ -140,9 +140,9 @@ fn implementer_rate_limited_mid_dispatch_parks_on_quota_and_exits_4() {
     .unwrap();
     assert_eq!(state["phase"], "quota");
 
-    // The sharper half of the bug: a quota-parked run must accept `implement --run`,
-    // not refuse with "plan is not approved (phase=Failed)" the way `Phase::Failed`
-    // would.
+    // The sharper half of the bug: a quota-parked run must accept `implement --run`
+    // rather than being refused as unresumable. (A loop run parked at `Phase::Failed`
+    // used to be refused here; O91 made it resumable too, so the two now agree.)
     spar_cmd()
         .current_dir(&proj)
         .args([
@@ -157,7 +157,7 @@ fn implementer_rate_limited_mid_dispatch_parks_on_quota_and_exits_4() {
         .assert()
         .code(2)
         .stdout(predicate::str::contains("awaiting_ship_confirm"))
-        .stdout(predicate::str::contains("plan is not approved").not());
+        .stdout(predicate::str::contains("is not resumable").not());
 }
 
 /// The seam `WEEKLY_LIMIT_LOG` above never crosses: that fixture is plain prose, so it
@@ -718,8 +718,7 @@ fn implementer_ordinary_failure_still_fails_the_run_at_exit_1() {
             "--json",
         ])
         .assert()
-        .code(1)
-        .stderr(predicate::str::contains("plan is not approved"));
+        .stderr(predicate::str::contains("is not resumable").not());
 }
 
 /// A single quota-hit reviewer with a successful sibling used to tally as `Done`/exit

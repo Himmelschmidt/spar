@@ -1174,7 +1174,11 @@ fn implement_resumes_from_quota_phase() {
         .assert()
         .code(2)
         .stdout(predicate::str::contains("awaiting_ship_confirm"))
-        .stdout(predicate::str::contains("plan is not approved").not());
+        .stdout(
+            predicate::str::contains("is not resumable")
+                .and(predicate::str::contains("Plan"))
+                .not(),
+        );
 }
 
 /// The critical regression a round-3 review caught: `Phase::Quota` is also where a
@@ -1231,7 +1235,7 @@ fn implement_refuses_a_quota_parked_plan_that_was_never_approved() {
         ])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("plan is not approved"));
+        .stderr(predicate::str::contains("is not resumable").and(predicate::str::contains("Plan")));
 }
 
 /// `Phase::Stopped` has the identical hazard `Phase::Quota` was fixed for above: `spar
@@ -1289,7 +1293,7 @@ fn implement_refuses_a_stopped_plan_that_was_never_approved() {
         ])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("plan is not approved"));
+        .stderr(predicate::str::contains("is not resumable").and(predicate::str::contains("Plan")));
 }
 
 /// The counterpart to the refusal above: an *approved* plan run parked at `Stopped`
@@ -1325,7 +1329,11 @@ fn implement_resumes_a_stopped_approved_plan() {
         ])
         .assert()
         .code(2)
-        .stdout(predicate::str::contains("plan is not approved").not());
+        .stdout(
+            predicate::str::contains("is not resumable")
+                .and(predicate::str::contains("Plan"))
+                .not(),
+        );
 }
 
 #[test]

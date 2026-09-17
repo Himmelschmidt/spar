@@ -342,15 +342,14 @@ pub fn run_loop(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<Exi
     run_with_task(task, None, opts, paths, cfg, None)
 }
 
-fn run_from_approved(
-    run_id: &str,
-    amendment: Option<String>,
-    mut opts: CommonOpts,
-    paths: &SparPaths,
-    cfg: &Config,
-) -> Result<ExitCode> {
-    let mut state = RunState::load(paths, run_id)?;
-    let resumable = state.gates.plan_approved
+/// Whether `implement --run` / `spar resume` may pick this run back up.
+///
+/// The hazard this gates is a `--workflow plan` run being driven through to ship
+/// without its plan ever being approved, so every phase clause that is not the
+/// `plan_approved` gate itself is qualified by `WorkflowKind::Loop`, which has no
+/// approval step at all.
+fn is_resumable(state: &RunState) -> bool {
+    state.gates.plan_approved
         || state.phase == Phase::PlanApproved
         // The round-ceiling gate is lifted by re-entering implement, so a run parked
         // there has to be resumable even when no plan gate ever ran (`--workflow loop`).
@@ -373,10 +372,31 @@ fn run_from_approved(
         // drive an unapproved plan through to ship. An *approved* stopped run is already
         // covered by the `plan_approved` disjunct above, so the only case this clause
         // needs to add is `--workflow loop`, which has no approval step at all.
-        || (state.phase == Phase::Stopped && state.workflow == crate::cli::WorkflowKind::Loop);
+        || (state.phase == Phase::Stopped && state.workflow == crate::cli::WorkflowKind::Loop)
+        // `Failed`/`Stuck` are terminal parks a re-dispatch is meant to pick back up —
+        // the block below this gate already clears their dead slot verdicts for exactly
+        // that. An approved run reaches it through the `plan_approved` disjunct; a
+        // `--workflow loop` run has no approval step, so without this clause its
+        // implementer dying (a transport timeout, a stuck ladder) left the run
+        // permanently unresumable, and `spar resume` refused it by naming a plan gate
+        // that workflow does not have.
+        || (matches!(state.phase, Phase::Failed | Phase::Stuck)
+            && state.workflow == crate::cli::WorkflowKind::Loop)
+}
+
+fn run_from_approved(
+    run_id: &str,
+    amendment: Option<String>,
+    mut opts: CommonOpts,
+    paths: &SparPaths,
+    cfg: &Config,
+) -> Result<ExitCode> {
+    let mut state = RunState::load(paths, run_id)?;
+    let resumable = is_resumable(&state);
     if !resumable {
         bail!(
-            "run {run_id} plan is not approved (phase={:?})",
+            "run {run_id} is not resumable (workflow={:?}, phase={:?})",
+            state.workflow,
             state.phase
         );
     }
@@ -926,6 +946,57 @@ fn resolve_suite_provider(
         return Ok((p, None, pool_origin.as_seat_source()));
     }
     bail!("suite.enabled but no usable suite provider (set [roles].tester or install a CLI)")
+}
+
+#[cfg(test)]
+mod resumable_tests {
+    use super::*;
+
+    fn run(workflow: crate::cli::WorkflowKind, phase: Phase) -> RunState {
+        let mut st = RunState::new("r1", workflow, std::path::PathBuf::from("/x"));
+        st.phase = phase;
+        st
+    }
+
+    /// The bug this guards: a `--workflow loop` run whose implementer died mid-dispatch
+    /// (observed as a muse `net-timeout` on the meta stream) parked at `Failed` and could
+    /// never be picked back up, stranding a worktree full of real work. `Failed`/`Stuck`
+    /// are exactly the parks the clear-dead-verdicts block below the gate exists for.
+    #[test]
+    fn a_failed_or_stuck_loop_run_is_resumable() {
+        for phase in [Phase::Failed, Phase::Stuck] {
+            assert!(
+                is_resumable(&run(crate::cli::WorkflowKind::Loop, phase)),
+                "{phase:?}"
+            );
+        }
+    }
+
+    /// The hazard the gate exists for: an unapproved plan must never be resumable, in any
+    /// phase, or `implement --run` drives it through to ship on a plan no human accepted.
+    #[test]
+    fn an_unapproved_plan_run_is_never_resumable() {
+        for phase in [
+            Phase::Failed,
+            Phase::Stuck,
+            Phase::Quota,
+            Phase::Stopped,
+            Phase::Dispatch,
+        ] {
+            assert!(
+                !is_resumable(&run(crate::cli::WorkflowKind::Plan, phase)),
+                "{phase:?}"
+            );
+        }
+    }
+
+    /// Approval is what admits a plan run, not its phase.
+    #[test]
+    fn an_approved_plan_run_is_resumable_from_a_terminal_park() {
+        let mut st = run(crate::cli::WorkflowKind::Plan, Phase::Failed);
+        st.gates.plan_approved = true;
+        assert!(is_resumable(&st));
+    }
 }
 
 #[cfg(test)]
