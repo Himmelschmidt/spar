@@ -12,6 +12,17 @@ use std::process::Command;
 /// may be swallowed by this, so only `MuseAdapter` implements the predicate.
 pub const TRANSIENT_MODEL_ACCESS_MESSAGE: &str = "does not exist or you lack access";
 
+/// muse's transport-failure signature, observed on 2026-09-17 killing two spar runs in
+/// this repo (`9cf0b8ea`, `8b8a5c94`) after 66 and 57 completed tool calls each:
+/// ``transport error [net-timeout]: timed out waiting for response data (meta stream)``
+/// with exit 1, one of them already carrying muse's own `(after 2 provider attempts)`.
+/// This is the same class O86/O87 built the backoff ladder for — the backend went away
+/// mid-stream after real work — but the ladder only ever matched
+/// `TRANSIENT_MODEL_ACCESS_MESSAGE`, so these dispatches were reported as work failures
+/// and their worktrees stranded. Matched on the bracketed error kind rather than the
+/// prose after it, which is muse's own wording and not a contract.
+pub const TRANSIENT_TRANSPORT_MESSAGE: &str = "transport error [net-timeout]";
+
 /// Model override (`--model`). spar's per-slot model (`--select` or a `cli:muse@<model>`
 /// ref) wins; otherwise `SPAR_MUSE_MODEL`; otherwise none, so muse's own
 /// `settings.json` picks the model (currently `muse-spark-1.2-contributor`). Leaving the
@@ -161,9 +172,11 @@ impl ProviderAdapter for MuseAdapter {
     /// that tells a transient backend blip from a genuinely wrong model name or dead
     /// entitlement lives in `executor::dispatch_with_resume_recovery`, next to the retry.
     fn dispatch_failure_is_transient(&self, log_text: &str) -> bool {
-        log_text
-            .lines()
-            .any(|l| l.starts_with("! ") && l.contains(TRANSIENT_MODEL_ACCESS_MESSAGE))
+        log_text.lines().any(|l| {
+            l.starts_with("! ")
+                && (l.contains(TRANSIENT_MODEL_ACCESS_MESSAGE)
+                    || l.contains(TRANSIENT_TRANSPORT_MESSAGE))
+        })
     }
 
     /// muse's documented exit codes: 0 success, 1 failure or cancellation (including
@@ -508,6 +521,33 @@ mod tests {
         expected.insert(tail_at, "sess-abc".into());
         expected.insert(tail_at, "--session-id".into());
         assert_eq!(resume, expected);
+    }
+
+    /// The failure that killed two spar runs on 2026-09-17 after real work: muse's
+    /// stream went away mid-dispatch, the run was reported as a work failure, and its
+    /// worktree was stranded. O86/O87's ladder should have resumed it.
+    #[test]
+    fn a_transport_timeout_after_real_work_is_transient() {
+        assert!(MuseAdapter.dispatch_failure_is_transient(
+            "→ edit_file  /x/src/main.rs  success\n! transport error [net-timeout]: timed out waiting for response data (meta stream)\n"
+        ));
+        assert!(
+            MuseAdapter.dispatch_failure_is_transient(
+                "! transport error [net-timeout]: timed out waiting for response data (meta stream) (after 2 provider attempts)\n"
+            ),
+            "muse having already retried internally does not make it permanent"
+        );
+        assert!(
+            !MuseAdapter.dispatch_failure_is_transient(
+                "transport error [net-timeout]: timed out waiting for response data\n"
+            ),
+            "unanchored: an agent writing the sentence must not buy the backoff schedule"
+        );
+        assert!(
+            !MuseAdapter
+                .dispatch_failure_is_transient("! transport error [auth]: credentials rejected\n"),
+            "a different transport error kind is not this signature"
+        );
     }
 
     #[test]
