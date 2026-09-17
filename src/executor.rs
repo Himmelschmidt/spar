@@ -975,38 +975,6 @@ fn execute_prepared(
             quota_recovered,
         });
     }
-    // A native-CLI judging slot that ran no tools produced no judgment: it cannot
-    // have read the diff. Checked before the artifact gate so the log names the
-    // precise cause; both arms fail the dispatch. Api-backed slots return before
-    // this point with a hardcoded `tools: 0`, so they never reach this gate.
-    if let Some(error) = judging_no_tool_error(
-        prep.job.role,
-        &prep.job.slot_id,
-        usage.tools,
-        prep.pref.is_api(),
-    ) {
-        let _ = crate::events::append(
-            &prep.paths,
-            &prep.run_id,
-            &crate::events::Event::slot_note(&prep.job.slot_id, &error),
-        );
-        verdict.ok = false;
-        verdict.reason = Some(error.clone());
-        let _ =
-            markers::write_dispatch_verdict(&prep.paths, &prep.run_id, &prep.job.slot_id, &verdict);
-        return Ok(SlotOutcome {
-            ok: false,
-            pid,
-            exit_code: Some(0),
-            signal: None,
-            error: Some(error),
-            usage: Some(usage),
-            agy_quota_hit,
-            quota_rejected: quota_rejected.clone(),
-            quota_resets_at,
-            quota_recovered,
-        });
-    }
     // A clean exit is not success on its own: a slot that produced no artifact (e.g. an
     // adapter that never received its prompt) must fail, not silently pass. Only a
     // write from this dispatch counts — the previous round's file is still on
@@ -1014,17 +982,50 @@ fn execute_prepared(
     // Mirrors the gate in the sequential `run_headless` path.
     if let Some(name) = &prep.job.expected_artifact {
         let path = prep.paths.artifact(&prep.run_id, name);
-        let empty = !artifact_fresh_since(&path, dispatch_start);
-        if empty
-            && !markers::wait_for_artifact(
+        // Short grace for late writers, then the freshness verdict stands.
+        let fresh = artifact_fresh_since(&path, dispatch_start)
+            || markers::wait_for_artifact(
                 &prep.paths,
                 &prep.run_id,
                 name,
                 dispatch_start,
                 Duration::from_secs(2),
             )
-            .unwrap_or(false)
-            && !recover_artifact(&ArtifactRecovery {
+            .unwrap_or(false);
+        if !fresh {
+            // No judgment landed this dispatch. Name the precise cause first: a
+            // native-CLI judging slot that ran no tools could not have read the
+            // diff. A fresh artifact would have vouched for the dispatch
+            // regardless of the parsed tool count, so this only fires when the
+            // artifact is stale too. Api-backed slots return before this point
+            // with a hardcoded `tools: 0`, so they never reach this gate.
+            if let Some(error) = judging_no_tool_error(
+                prep.job.role,
+                &prep.job.slot_id,
+                usage.tools,
+                prep.pref.is_api(),
+            ) {
+                note_no_judgment(
+                    &prep.paths,
+                    &prep.run_id,
+                    &prep.job.slot_id,
+                    &mut verdict,
+                    &error,
+                );
+                return Ok(SlotOutcome {
+                    ok: false,
+                    pid,
+                    exit_code: Some(0),
+                    signal: None,
+                    error: Some(error),
+                    usage: Some(usage),
+                    agy_quota_hit,
+                    quota_rejected: quota_rejected.clone(),
+                    quota_resets_at,
+                    quota_recovered,
+                });
+            }
+            let recovered = recover_artifact(&ArtifactRecovery {
                 paths: &prep.paths,
                 run_id: &prep.run_id,
                 slot_id: &prep.job.slot_id,
@@ -1039,29 +1040,30 @@ fn execute_prepared(
                 isolation,
                 base_commit: prep.base_commit.as_deref(),
                 artifact: &path,
-            })
-        {
-            let error = format!("missing expected artifact {name}");
-            verdict.ok = false;
-            verdict.reason = Some(error.clone());
-            let _ = markers::write_dispatch_verdict(
-                &prep.paths,
-                &prep.run_id,
-                &prep.job.slot_id,
-                &verdict,
-            );
-            return Ok(SlotOutcome {
-                ok: false,
-                pid,
-                exit_code: Some(0),
-                signal: None,
-                error: Some(error),
-                usage: Some(usage),
-                agy_quota_hit,
-                quota_rejected: quota_rejected.clone(),
-                quota_resets_at,
-                quota_recovered,
             });
+            if !recovered {
+                let error = format!("missing expected artifact {name}");
+                verdict.ok = false;
+                verdict.reason = Some(error.clone());
+                let _ = markers::write_dispatch_verdict(
+                    &prep.paths,
+                    &prep.run_id,
+                    &prep.job.slot_id,
+                    &verdict,
+                );
+                return Ok(SlotOutcome {
+                    ok: false,
+                    pid,
+                    exit_code: Some(0),
+                    signal: None,
+                    error: Some(error),
+                    usage: Some(usage),
+                    agy_quota_hit,
+                    quota_rejected: quota_rejected.clone(),
+                    quota_resets_at,
+                    quota_recovered,
+                });
+            }
         }
     }
     Ok(SlotOutcome {
@@ -1284,11 +1286,12 @@ fn artifact_written(path: &Path) -> bool {
 }
 
 /// Whether the expected artifact was written by *this* dispatch: non-empty and
-/// its mtime at or after the dispatch start instant. The previous round's file
-/// is still on disk when a slot re-dispatches, so a presence-only check reads
-/// a dead verdict as this round's. Callers that genuinely mean "does a file
-/// exist" (`recover_artifact`'s post-turn check, `salvage_carry_forward`) keep
-/// using `artifact_written`; the dispatch gates use this.
+/// its mtime at or after the dispatch start instant (1s grace, see
+/// `markers::freshness_floor`). The previous round's file is still on disk
+/// when a slot re-dispatches, so a presence-only check reads a dead verdict
+/// as this round's. Callers that genuinely mean "does a file exist"
+/// (`recover_artifact`'s post-turn check, `salvage_carry_forward`) keep using
+/// `artifact_written`; the dispatch gates use this.
 fn artifact_fresh_since(path: &Path, since: SystemTime) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
@@ -1299,21 +1302,17 @@ fn artifact_fresh_since(path: &Path, since: SystemTime) -> bool {
     let Ok(mtime) = meta.modified() else {
         return false;
     };
-    // A same-second write on a coarse-mtime filesystem must not false-negative,
-    // so the start instant gets a 1s grace. Stale round artifacts are minutes
-    // old, so the grace cannot admit one.
-    let floor = since
-        .checked_sub(Duration::from_secs(1))
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-    mtime >= floor
+    mtime >= markers::freshness_floor(since)
 }
 
 /// Whether a native-CLI judging dispatch produced no judgment at all. A
 /// reviewer or tester that ran zero tools did not read the diff: reading and
 /// writing are tool calls. Returns the failure text when the gate fires.
-/// Api-backed slots never reach this: their `SlotUsage` hardcodes `tools: 0`
-/// by construction (`run_api` and `execute_prepared`'s api arm), so `is_api`
-/// exempts them.
+/// Only consulted when no fresh artifact exists: a fresh write vouches for the
+/// dispatch regardless of the parsed tool count, so a working turn the stream
+/// parser undercounts still passes. Api-backed slots never reach this: their
+/// `SlotUsage` hardcodes `tools: 0` by construction (`run_api` and
+/// `execute_prepared`'s api arm), so `is_api` exempts them.
 fn judging_no_tool_error(
     role: SlotRole,
     slot_id: &str,
@@ -1330,6 +1329,26 @@ fn judging_no_tool_error(
         )),
         _ => None,
     }
+}
+
+/// Record a no-judgment failure where the operator can grep for it: one
+/// `events.jsonl` slot-note line naming the slot and the cause, plus the
+/// on-disk dispatch verdict downgraded. The caller builds the `SlotOutcome`.
+fn note_no_judgment(
+    paths: &SparPaths,
+    run_id: &str,
+    slot_id: &str,
+    verdict: &mut markers::DispatchVerdict,
+    error: &str,
+) {
+    let _ = crate::events::append(
+        paths,
+        run_id,
+        &crate::events::Event::slot_note(slot_id, error),
+    );
+    verdict.ok = false;
+    verdict.reason = Some(error.to_string());
+    let _ = markers::write_dispatch_verdict(paths, run_id, slot_id, verdict);
 }
 
 /// `<run_dir>/prompt-<slot>-artifact.md` — the recovery prompt, kept beside the slot's
@@ -3006,42 +3025,12 @@ fn run_headless(
             quota_recovered,
         });
     }
-    // See `execute_prepared`: a native-CLI judging slot that ran no tools
-    // produced no judgment. `run_headless` is only reached for native prefs
-    // (the caller routes api prefs to `run_api`), so `is_api` re-derives false
-    // here; it is passed rather than assumed so the exemption stays explicit.
-    let is_api = ProviderRef::parse(&job.provider)
-        .map(|p| p.is_api())
-        .unwrap_or(false);
-    if let Some(error) = judging_no_tool_error(job.role, &job.slot_id, usage.tools, is_api) {
-        let _ = crate::events::append(
-            paths,
-            &state.id,
-            &crate::events::Event::slot_note(&job.slot_id, &error),
-        );
-        verdict.ok = false;
-        verdict.reason = Some(error.clone());
-        let _ = markers::write_dispatch_verdict(paths, &state.id, &job.slot_id, &verdict);
-        return Ok(SlotOutcome {
-            ok: false,
-            pid,
-            exit_code: Some(0),
-            signal: None,
-            error: Some(error),
-            usage: Some(usage),
-            agy_quota_hit,
-            quota_rejected: quota_rejected.clone(),
-            quota_resets_at,
-            quota_recovered,
-        });
-    }
     if let Some(name) = &job.expected_artifact {
         let path = paths.artifact(&state.id, name);
         // Only a write from this dispatch counts; the previous round's file is
         // still on disk. See `execute_prepared`.
-        if !artifact_fresh_since(&path, dispatch_start) {
-            // short grace for late writers
-            let found = markers::wait_for_artifact(
+        let fresh = artifact_fresh_since(&path, dispatch_start)
+            || markers::wait_for_artifact(
                 paths,
                 &state.id,
                 name,
@@ -3049,24 +3038,47 @@ fn run_headless(
                 Duration::from_secs(2),
             )
             .unwrap_or(false);
-            let recovered = !found
-                && recover_artifact(&ArtifactRecovery {
-                    paths,
-                    run_id: &state.id,
-                    slot_id: &job.slot_id,
-                    role: job.role,
-                    owns_cwd: owns_cwd(state, &job.slot_id, cwd),
-                    provider: &job.provider,
-                    model: slot_model_for(Some(state), job),
-                    cwd,
-                    log_path,
-                    prompt_path: &recovery_prompt_path(prompt_path, &job.slot_id),
-                    env,
-                    isolation: state.isolation,
-                    base_commit: state.base_commit.as_deref(),
-                    artifact: &path,
+        if !fresh {
+            // See `execute_prepared`: name the precise cause first. `run_headless`
+            // is only reached for native prefs (the caller routes api prefs to
+            // `run_api`), so `is_api` re-derives false here; it is passed rather
+            // than assumed so the exemption stays explicit.
+            let is_api = ProviderRef::parse(&job.provider)
+                .map(|p| p.is_api())
+                .unwrap_or(false);
+            if let Some(error) = judging_no_tool_error(job.role, &job.slot_id, usage.tools, is_api)
+            {
+                note_no_judgment(paths, &state.id, &job.slot_id, &mut verdict, &error);
+                return Ok(SlotOutcome {
+                    ok: false,
+                    pid,
+                    exit_code: Some(0),
+                    signal: None,
+                    error: Some(error),
+                    usage: Some(usage),
+                    agy_quota_hit,
+                    quota_rejected: quota_rejected.clone(),
+                    quota_resets_at,
+                    quota_recovered,
                 });
-            if !found && !recovered {
+            }
+            let recovered = recover_artifact(&ArtifactRecovery {
+                paths,
+                run_id: &state.id,
+                slot_id: &job.slot_id,
+                role: job.role,
+                owns_cwd: owns_cwd(state, &job.slot_id, cwd),
+                provider: &job.provider,
+                model: slot_model_for(Some(state), job),
+                cwd,
+                log_path,
+                prompt_path: &recovery_prompt_path(prompt_path, &job.slot_id),
+                env,
+                isolation: state.isolation,
+                base_commit: state.base_commit.as_deref(),
+                artifact: &path,
+            });
+            if !recovered {
                 let error = format!("missing expected artifact {name}");
                 verdict.ok = false;
                 verdict.reason = Some(error.clone());
@@ -5759,6 +5771,34 @@ mod tests {
         assert!(
             judging_no_tool_error(SlotRole::Reviewer, "review-0", 0, true).is_none(),
             "an api-backed reviewer hardcodes tools: 0 and must not fail here"
+        );
+    }
+
+    /// The operator-grep contract: a no-judgment failure lands one `events.jsonl`
+    /// slot-note line naming the slot and `tools == 0`, and the on-disk dispatch
+    /// verdict reads failed with the same text as its reason.
+    #[test]
+    fn no_judgment_records_a_greppable_event_and_downgrades_the_verdict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("run1").unwrap();
+        let mut verdict = markers::DispatchVerdict {
+            ok: true,
+            round: 2,
+            pid: None,
+            exit_code: Some(0),
+            signal: None,
+            reason: None,
+        };
+        let error =
+            judging_no_tool_error(SlotRole::Reviewer, "review-1", 0, false).expect("must fire");
+        note_no_judgment(&paths, "run1", "review-1", &mut verdict, &error);
+        assert!(!verdict.ok, "the dispatch verdict must read failed");
+        assert_eq!(verdict.reason.as_deref(), Some(error.as_str()));
+        let events = std::fs::read_to_string(crate::events::events_file(&paths, "run1")).unwrap();
+        assert!(
+            events.contains("review-1") && events.contains("tools == 0"),
+            "one line must name the slot and the cause for later greps: {events}"
         );
     }
 }

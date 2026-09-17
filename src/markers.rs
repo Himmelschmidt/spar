@@ -171,6 +171,17 @@ pub fn clear_session_id(paths: &SparPaths, run_id: &str, slot_id: &str, provider
     let _ = std::fs::remove_file(paths.marker(run_id, &format!("{slot_id}.{provider}.session_id")));
 }
 
+/// The mtime floor a fresh artifact write must meet: the dispatch start instant
+/// with a 1s grace, so a same-second write on a coarse-mtime filesystem does
+/// not false-negative. Stale round artifacts are minutes old, so the grace
+/// cannot admit one. Shared with the executor's freshness gate so the two
+/// cannot drift apart.
+pub(crate) fn freshness_floor(since: SystemTime) -> SystemTime {
+    since
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
 /// Wait until an artifact file holds a *fresh* non-empty write: one with an mtime
 /// at or after `since` (this dispatch's start instant, with the same 1s grace
 /// for coarse-mtime filesystems). A stale file from a previous round must not
@@ -183,9 +194,7 @@ pub fn wait_for_artifact(
     timeout: Duration,
 ) -> Result<bool> {
     let path = paths.artifact(run_id, name);
-    let floor = since
-        .checked_sub(Duration::from_secs(1))
-        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let floor = freshness_floor(since);
     let start = Instant::now();
     let poll = Duration::from_millis(200);
     loop {
