@@ -1103,9 +1103,11 @@ enum UsageScope {
 /// (claude uses `session_id`, opencode `sessionID`, and opencode/muse/agy lines never
 /// carry a top-level `usage` object, so `absorb_usage` already no-ops for them) — a
 /// bare `{"type":"end"}` with no `usage`/`sessionId` is not one, and neither is any
-/// other adapter's `end`.
+/// other adapter's `end`. The `type` check lives here, not at the call site, so a
+/// future caller reusing this helper cannot get a broader gate than documented.
 fn is_grok_end(v: &serde_json::Value) -> bool {
-    v.get("usage").is_some_and(|u| u.is_object())
+    v.get("type").and_then(|x| x.as_str()) == Some("end")
+        && v.get("usage").is_some_and(|u| u.is_object())
         && v.get("sessionId").and_then(|x| x.as_str()).is_some()
 }
 
@@ -1165,7 +1167,7 @@ impl StreamCoalescer {
         // to the earlier `usage` record), so it supersedes the accumulation instead
         // of adding to it. Gated on `is_grok_end` so no other adapter's `end` is
         // captured by accident.
-        let grok_end = v.get("type").and_then(|x| x.as_str()) == Some("end") && is_grok_end(&v);
+        let grok_end = is_grok_end(&v);
         let scope = match v.get("type").and_then(|x| x.as_str()) {
             Some("result") | Some("turn.completed") => UsageScope::Terminal,
             Some("end") if grok_end => UsageScope::Terminal,
@@ -3207,6 +3209,31 @@ mod tests {
         assert_eq!(
             c.output_tokens, 12,
             "no terminal record landed, so accumulation continues"
+        );
+    }
+
+    #[test]
+    fn a_second_grok_end_supersedes_the_first() {
+        // The supersede model assumes one cumulative `end` per dispatch. If a
+        // second gate-matching `end` ever arrives (multi-turn usage scoping, a
+        // subagent `end` in the same shape), the later record wins outright for
+        // counters and session id — it never adds. This pins that behaviour so a
+        // shape change shows up here rather than as silent undercounting.
+        let mut c = StreamCoalescer::new(false);
+        c.feed(r#"{"type":"usage","usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#);
+        c.feed(r#"{"type":"end","stopReason":"end_turn","sessionId":"sess-first","usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"total_tokens":110}}"#);
+        assert_eq!(c.output_tokens, 10);
+        c.feed(r#"{"type":"usage","usage":{"input_tokens":50,"output_tokens":4,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#);
+        c.feed(r#"{"type":"end","stopReason":"end_turn","sessionId":"sess-second","usage":{"input_tokens":50,"output_tokens":4,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"total_tokens":54}}"#);
+        assert_eq!(
+            c.output_tokens, 4,
+            "the later terminal record replaces, never adds"
+        );
+        assert_eq!(c.input_tokens, 50);
+        assert_eq!(
+            c.session_id.as_deref(),
+            Some("sess-second"),
+            "forensics follows the latest terminal record"
         );
     }
 

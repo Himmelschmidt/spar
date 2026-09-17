@@ -11,9 +11,12 @@ impl ProviderAdapter for GrokAdapter {
         "grok"
     }
 
-    // Turn-boundary injection rides the Stop hook (`{"decision":"block","reason":…}`
-    // re-drives a headless grok turn, same contract as Claude; probed live against
-    // grok 1.0.25). `presence::wire` derives the injecting Stop hook from this.
+    // Turn-boundary injection rides the Stop hook: `{"decision":"block","reason":…}`
+    // is documented (grok docs ch. 10, Stop Decision Control) to feed the reason
+    // back as a user message and run another round in the same turn, the same
+    // contract as Claude — but no end-to-end block re-drive against a live grok
+    // has been observed yet (see O90), only hook firing. `presence::wire` derives
+    // the injecting Stop hook from this.
     fn delivery_strategy(&self) -> DeliveryStrategy {
         DeliveryStrategy::StopHookInject
     }
@@ -109,10 +112,11 @@ mod tests {
     use crate::providers::command_to_parts;
     use std::path::PathBuf;
 
-    /// Grok reports presence through its native project hook file and injects at
-    /// the turn boundary through the Stop hook (both probed live against grok
-    /// 1.0.25); folder trust for the dispatch comes from the env, never from
-    /// operator state outside the worktree.
+    /// Grok reports presence through its native project hook file and is wired for
+    /// turn-boundary injection through the Stop hook (file path and trust env
+    /// probed live against grok 1.0.25; the re-drive itself is documented grok
+    /// behaviour not yet observed live, see O90). Folder trust for the dispatch
+    /// comes from the env, never from operator state outside the worktree.
     #[test]
     fn presence_hooks_and_stop_hook_injection() {
         assert_eq!(

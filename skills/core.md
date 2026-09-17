@@ -604,7 +604,9 @@ slot is stuck on.**
   the same `Stop`-hook injection that **claude** uses: spar writes a project hook file
   (`.grok/hooks/spar.json`) into the slot worktree, and the `Stop` hook drains the inbox
   at the turn boundary with a `{"decision":"block",…}` payload (the dispatch carries
-  `GROK_FOLDER_TRUST=0` so the worktree's project scope actually loads). **codex** attempts one too, once it has captured a thread id (its `codex
+  `GROK_FOLDER_TRUST=0` so the worktree's project scope actually loads). The re-drive
+  itself is documented grok behaviour (Stop Decision Control), not yet observed live
+  against a spar slot (`DECISIONS.md` O90). **codex** attempts one too, once it has captured a thread id (its `codex
   exec --json` stream names one on its very first line): `codex queue --thread <id>
   --message <text>`. That does not land in the dispatch it was queued against — `codex
   exec` is single-turn and exits right after its one assigned task, and a success exit

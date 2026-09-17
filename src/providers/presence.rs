@@ -608,6 +608,17 @@ mod tests {
 
     #[test]
     fn untracked_settings_file_is_excluded_from_git_in_a_worktree() {
+        assert_untracked_hook_file_excluded(&ClaudeAdapter, ".claude/settings.json");
+    }
+
+    #[test]
+    fn untracked_grok_hook_file_is_excluded_from_git_in_a_worktree() {
+        // The grok hook file embeds the same operator path + run/agent ids, so it
+        // needs the same `info/exclude` protection as the claude file.
+        assert_untracked_hook_file_excluded(&GrokAdapter, ".grok/hooks/spar.json");
+    }
+
+    fn assert_untracked_hook_file_excluded(adapter: &dyn ProviderAdapter, rel: &str) {
         let tmp = tempdir().unwrap();
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -626,9 +637,9 @@ mod tests {
         );
         let exe = PathBuf::from("/usr/bin/spar");
 
-        let w = wire(&ClaudeAdapter, &id(&wt, &repo, &exe));
+        let w = wire(adapter, &id(&wt, &repo, &exe));
         assert!(w.note.is_none(), "note: {:?}", w.note);
-        assert!(settings_path(&wt).is_file());
+        assert!(wt.join(rel).is_file());
 
         let out = Command::new("git")
             .args(["status", "--porcelain", "--untracked-files=all"])
@@ -637,19 +648,16 @@ mod tests {
             .unwrap();
         let status = String::from_utf8_lossy(&out.stdout);
         assert!(
-            !status.contains(".claude/settings.json"),
-            "settings.json must be excluded from git status: {status}"
+            !status.contains(rel),
+            "{rel} must be excluded from git status: {status}"
         );
 
         // Idempotent: a second wire must not duplicate the exclude line.
-        wire(&ClaudeAdapter, &id(&wt, &repo, &exe));
+        wire(adapter, &id(&wt, &repo, &exe));
         let exclude =
             std::fs::read_to_string(git_common_dir(&wt).join("info").join("exclude")).unwrap();
         assert_eq!(
-            exclude
-                .lines()
-                .filter(|l| l.trim() == ".claude/settings.json")
-                .count(),
+            exclude.lines().filter(|l| l.trim() == rel).count(),
             1,
             "exclude line must not be duplicated: {exclude}"
         );

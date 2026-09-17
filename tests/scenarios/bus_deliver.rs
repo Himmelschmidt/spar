@@ -5,7 +5,8 @@
 //! injection call is stubbed and only drain + dispatch are exercised:
 //!   - Claude  → `StopHookInject`       (emits a Stop-hook `block` payload)
 //!   - Grok    → `StopHookInject`       (same turn-boundary injection as Claude: grok's
-//!     Stop hook honors the same `{"decision":"block",…}` payload, probed live)
+//!     Stop hook honors the same `{"decision":"block",…}` payload per docs ch. 10;
+//!     the end-to-end re-drive is not yet observed live, see O90)
 //!   - agy     → `None`                 (inbox left untouched for the agent's next turn)
 //!   - muse    → `StopHookInject`       (same turn-boundary injection as Claude: muse's
 //!     Stop hook honors the same `{"decision":"block",…}` payload, probed live)
