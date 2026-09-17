@@ -144,12 +144,21 @@ impl ProviderAdapter for MuseAdapter {
         muse_telemetry::resume_observed(&dir) == Some(false)
     }
 
-    /// Only muse's own transient-backend string matches. In particular a first-call 404
-    /// with zero tool calls still matches here — the `tools >= 1` gate that tells a
-    /// transient backend blip from a genuinely wrong model name or dead entitlement
-    /// lives in `executor::dispatch_with_resume_recovery`, next to the retry itself.
+    /// Only muse's own transient-backend string matches, and only on a diagnostic line.
+    /// The coalescer prefixes every stderr line with `! ` and never prefixes the model's
+    /// own stdout prose (`StreamCoalescer::feed`), so anchoring there is what separates
+    /// muse reporting the 404 from an agent that merely wrote the sentence. Without the
+    /// anchor a slot whose task quotes the string — spar-on-spar work, since the literal
+    /// lives in this repo's own tests — would buy the full backoff schedule on any
+    /// unrelated exit-1 failure before reporting the real error.
+    ///
+    /// A first-call 404 with zero tool calls still matches here: the `tools >= 1` gate
+    /// that tells a transient backend blip from a genuinely wrong model name or dead
+    /// entitlement lives in `executor::dispatch_with_resume_recovery`, next to the retry.
     fn dispatch_failure_is_transient(&self, log_text: &str) -> bool {
-        log_text.contains(TRANSIENT_MODEL_ACCESS_MESSAGE)
+        log_text
+            .lines()
+            .any(|l| l.starts_with("! ") && l.contains(TRANSIENT_MODEL_ACCESS_MESSAGE))
     }
 
     /// muse's documented exit codes: 0 success, 1 failure or cancellation (including
@@ -480,13 +489,27 @@ mod tests {
 
     #[test]
     fn transient_matches_only_muses_own_404_string() {
+        // As the coalescer renders it: muse's stderr, `! `-prefixed.
         assert!(MuseAdapter.dispatch_failure_is_transient(
-            "model `muse-spark-1.3-contributor` does not exist or you lack access [request_id=abc]"
+            "→ bash  success\n! model `muse-spark-1.3-contributor` does not exist or you lack access [request_id=abc]\n"
         ));
         assert!(!MuseAdapter
             .dispatch_failure_is_transient("Error: Model provider 'openrouter' not found"));
         assert!(!MuseAdapter.dispatch_failure_is_transient("no rollout found for thread id x"));
         assert!(!MuseAdapter.dispatch_failure_is_transient(""));
+    }
+
+    /// The anchor, not the substring, is what makes this safe on spar-on-spar work:
+    /// an agent that writes the sentence into its own stdout must not buy the backoff
+    /// schedule on an unrelated failure.
+    #[test]
+    fn transient_ignores_the_string_in_agent_output() {
+        assert!(!MuseAdapter.dispatch_failure_is_transient(
+            "I added a test asserting `model `x` does not exist or you lack access` is matched.\n"
+        ));
+        assert!(!MuseAdapter.dispatch_failure_is_transient(
+            "→ write_file  src/providers/muse.rs  success\ndoes not exist or you lack access\n"
+        ));
     }
 
     #[test]

@@ -430,6 +430,26 @@ fn transient_backoff_secs() -> Vec<u64> {
     TRANSIENT_RETRY_BACKOFF_SECS.to_vec()
 }
 
+/// The production backoff sleep: waits `total`, but in slices so liveness keeps ticking
+/// through it. The longest wait in the schedule is 300s and the slot's path-reserve
+/// lease TTL is exactly 300s (`bus::reserve_at`), so a wait that never ticks leaves
+/// presence stale for its whole duration and puts the lease on its own reclaim
+/// boundary — survived today only by that comparison being inclusive, and only while
+/// nothing else contends for the path. Slicing is invisible to the seam's contract:
+/// callers still hand over one whole wait, and the injected test seam still records it
+/// as one.
+fn sleep_ticking(total: Duration, tick: &dyn Fn()) {
+    const SLICE: Duration = Duration::from_secs(30);
+    let mut left = total;
+    while left > SLICE {
+        std::thread::sleep(SLICE);
+        tick();
+        left -= SLICE;
+    }
+    std::thread::sleep(left);
+    tick();
+}
+
 /// `<run_dir>/logs/<slot>.transient-retry-N.log` — a sibling of the shared log path,
 /// copied just before a transient retry overwrites it (`run_captured` truncates via
 /// `File::create`). Same preservation the lost-resume path already does: without it
@@ -857,7 +877,7 @@ fn execute_prepared(
         &prep.session_provider,
         &sink,
         &tick,
-        &|d| std::thread::sleep(d),
+        &|d| sleep_ticking(d, &tick),
     )?;
     let pid = load_pid(&pid_cell);
     // Before the gates below, and before any state save: markers outlive an orchestrator
@@ -2801,7 +2821,7 @@ fn run_headless(
         cli_name,
         &sink,
         &tick,
-        &|d| std::thread::sleep(d),
+        &|d| sleep_ticking(d, &tick),
     )?;
     let pid = load_pid(&pid_cell);
     // See `execute_prepared`: the verdict lands on disk before the gates and before any
