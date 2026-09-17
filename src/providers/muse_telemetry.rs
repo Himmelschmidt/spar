@@ -101,6 +101,40 @@ pub fn session_dir(root: &Path, session_id: &str) -> Option<PathBuf> {
     None
 }
 
+/// Whether the last `session.opened.observed` record in a session log says this
+/// dispatch resumed an existing session (`record.resume == true`) or cold-started one
+/// (`false`). `muse exec --json` stdout carries no `session.opened*` record at all, so
+/// this on-disk log is the only place the answer exists.
+///
+/// Returns `None` when there is no usable record (missing/unreadable log, no
+/// `session.opened.observed` line, unparseable JSON, non-boolean `resume`): the caller
+/// must treat that as unknown and fail closed, never as evidence the session is gone.
+/// When several records are present the last one wins — a cold start followed by a
+/// headless continuation carries `resume: false` then `resume: true` in one log.
+pub fn resume_observed(session_dir: &Path) -> Option<bool> {
+    let text = std::fs::read_to_string(session_dir.join("session.jsonl")).ok()?;
+    let mut last: Option<bool> = None;
+    for line in text.lines() {
+        if !line.contains("session.opened.observed") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("payload_type").and_then(|x| x.as_str()) != Some("session.opened.observed") {
+            continue;
+        }
+        match v
+            .pointer("/payload/record/resume")
+            .and_then(|x| x.as_bool())
+        {
+            Some(resumed) => last = Some(resumed),
+            None => continue,
+        }
+    }
+    last
+}
+
 /// Sum billed usage across a session log and every subagent session under it.
 ///
 /// Tool records are counted from the **main** log only: a subagent's tool calls never
@@ -482,5 +516,63 @@ mod tests {
     fn missing_log_yields_no_records() {
         let tmp = tempdir().unwrap();
         assert_eq!(collect(&tmp.path().join("nope")).records, 0);
+    }
+
+    fn observed_line(resume: bool) -> String {
+        serde_json::json!({
+            "payload_type": "session.opened.observed",
+            "payload": {"record": {"resume": resume}}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn resume_observed_reads_the_typed_marker() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("sess");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            resume_observed(&dir),
+            None,
+            "absent log is unknown, not gone"
+        );
+        std::fs::write(
+            dir.join("session.jsonl"),
+            "{\"payload_type\":\"run.lifecycle.started\"}\n",
+        )
+        .unwrap();
+        assert_eq!(resume_observed(&dir), None, "no observed record is unknown");
+        std::fs::write(
+            dir.join("session.jsonl"),
+            format!("{}\n", observed_line(false)),
+        )
+        .unwrap();
+        assert_eq!(resume_observed(&dir), Some(false));
+        std::fs::write(
+            dir.join("session.jsonl"),
+            format!("{}\n{}\n", observed_line(false), observed_line(true)),
+        )
+        .unwrap();
+        assert_eq!(resume_observed(&dir), Some(true), "last record wins");
+    }
+
+    #[test]
+    fn resume_observed_ignores_garbage_and_non_boolean_resume() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("sess");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("session.jsonl"),
+            "not json\n{\"payload_type\":\"session.opened.observed\",\"payload\":{\"record\":{}}}\n{\"payload_type\":\"session.opened.observed\",\"payload\":{\"record\":{\"resume\":\"yes\"}}}\n",
+        )
+        .unwrap();
+        assert_eq!(resume_observed(&dir), None);
+        // A bare mention elsewhere in the line is not the typed record.
+        std::fs::write(
+            dir.join("session.jsonl"),
+            "session.opened.observed was discussed in a tool result\n",
+        )
+        .unwrap();
+        assert_eq!(resume_observed(&dir), None);
     }
 }
