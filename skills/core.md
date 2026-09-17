@@ -40,6 +40,21 @@ spar implement -t "..." --providers 'cli:codex@openai/gpt-4o-mini,api:openai@gpt
 Native CLI adapters: `cli:claude`, `cli:grok`, `cli:agy`, `cli:codex`, `cli:opencode`, `cli:muse`. Run
 `spar provider list` to see which resolve on this box and their live pause/cooldown status.
 
+**Readiness.** A binary on PATH is not health: `spar doctor` and `spar provider list`
+also run each adapter's readiness probe (a local-only config/auth check, never a model
+call) and report it separately from availability. Human states: `ok` (binary resolves,
+probe passed or the adapter has no probe), `unhealthy` (binary resolves but the probe
+failed, with the probe's own one-line message, e.g. a broken opencode config),
+`missing` (not on PATH). `--json` carries the same verdict as `readiness` with values
+`healthy` / `unhealthy` / `unknown`, plus `readiness_message` (ANSI-stripped, capped at
+300 chars) when unhealthy. `doctor` exits failure only when no usable provider remains,
+so one unhealthy provider alongside working ones does not block a run. Today only
+`cli:opencode` wires a probe (`opencode models`); the other adapters report unknown and
+stay available. Limit: the probe catches broken config, not dead credentials — a
+parseable config with an expired key still reports healthy and fails at dispatch, which
+is all a local-only, no-quota check can see. An `unhealthy` provider is still eligible
+for dispatch; doctor warns, it does not exclude.
+
 **agy note.** agy runs headless with `--output-format stream-json`, so spar parses its tools,
 text and tokens directly from that structured stream. What the stream doesn't carry — the
 account's quota buckets and the context-window snapshot — spar still recovers by teeing agy's

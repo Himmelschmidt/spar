@@ -23,6 +23,12 @@ impl ProviderAdapter for ClaudeAdapter {
         &["claude"]
     }
 
+    // No readiness probe: the only local candidate, `claude doctor`, is an
+    // installation check, not dispatch readiness — it exits 0 even with no
+    // credentials (verified with an empty HOME). A probe that cannot fail on a
+    // broken-auth box would report false-healthy, so the default (Unknown)
+    // stands.
+
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             headless: true,

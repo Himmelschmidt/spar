@@ -87,6 +87,12 @@ impl ProviderAdapter for MuseAdapter {
         &["muse"]
     }
 
+    // No readiness probe. Tried: `muse config status` reports only enterprise
+    // plane documents and exits 0 identically with and without user auth
+    // (verified with an empty HOME); `muse auth` is set-only (mutating), and
+    // `muse sandbox` can set up the sandbox rather than just check it. Nothing
+    // local-only answers "would a dispatch start". Default (Unknown) stands.
+
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             headless: true,
