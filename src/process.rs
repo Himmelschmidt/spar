@@ -1919,23 +1919,29 @@ impl StreamCoalescer {
     /// **`cli:grok` usage.** grok is spawned with `--output-format streaming-json`
     /// (`providers/grok.rs`), which its own help calls "NDJSON of the agent native ACP
     /// session updates"; the Anthropic-wire option is `streaming-messages-json` and spar
-    /// does not ask for it. A grok dispatch emits exactly two usage-bearing records per
-    /// turn, both cumulative: `{"type":"usage","usage":{…}}` and a final
-    /// `{"type":"end",…,"sessionId":…,"usage":{…}}` (verified live against grok 1.0.25:
-    /// both records of a single-call turn reported input 20965, output 34,
-    /// cache_read 0, and `end` gave `total_tokens: 20999`, i.e. `input + output` —
-    /// so `reasoning_tokens` is a component of output, not an addend, and needs no
-    /// fold). Both used to land in the Request arm, where `output_tokens` is summed
-    /// while the other components are maxed — hence output read exactly 2x reality
+    /// does not ask for it. A grok dispatch emits one `{"type":"usage","usage":{…}}`
+    /// record per *model call*, then one final `{"type":"end",…,"sessionId":…,"usage":{…}}`
+    /// carrying the turn's cumulative total (verified live: a single-call turn on grok
+    /// 1.0.25 reported input 20965, output 34, cache_read 0 in both records, `end`
+    /// giving `total_tokens: 20999`; a two-call turn on grok 1.0.34 reported output 25
+    /// then 26 per call against `end`'s cumulative 51, with `end` input 21698 =
+    /// 21636 + 62 — so per-call records are per-call, not running totals, and
+    /// `reasoning_tokens` is a component of output rather than an addend, needing no
+    /// fold). All of them used to land in the Request arm, where `output_tokens` is
+    /// summed while the other components are maxed. The per-call records already sum to
+    /// the truth, so `end`'s duplicate of that same total doubled output *exactly*,
+    /// whatever the call count — hence output read exactly 2x reality
     /// (61,292 recorded against 30,646 real for biddesk run 92ae513a, reconciled
     /// against `~/.grok/sessions/<cwd>/<id>/updates.jsonl`) while the rest happened
     /// to survive. Now the `end` record maps to `UsageScope::Terminal` (gated on
     /// grok's own `sessionId` shape), so the final cumulative record supersedes the
     /// accumulation instead of adding to it. Still true and not fixed here:
     /// `context_tokens` for grok is a cumulative total wearing a peak's name (grok's
-    /// own `modelCalls` says the real window is far smaller), and `model` /
-    /// `tool_errors` / tool *names* are never recovered at all, though the tool
-    /// *count* is exact.
+    /// own `modelCalls` says the real window is far smaller), and `tool_errors` and
+    /// tool *names* are never recovered at all, though the tool *count* is exact.
+    /// `model` is the one of those that is unwired rather than unavailable:
+    /// `end.modelUsage` is keyed by model id (`"grok-4.6"`) and carries `modelCalls`
+    /// and `costUSD` alongside it.
     fn absorb_usage(&mut self, v: &serde_json::Value, scope: UsageScope) {
         let u = v.get("usage").or_else(|| v.pointer("/message/usage"));
         let Some(u) = u else { return };
@@ -3163,10 +3169,12 @@ mod tests {
     #[test]
     fn grok_end_record_counts_output_once_and_captures_session_id() {
         // Real `grok --output-format streaming-json` shape (captured from grok
-        // 1.0.25): one cumulative `usage` record mid-turn, then a final `end`
-        // carrying the same cumulative usage plus camelCase `sessionId`. Before the
-        // `end` gate both landed in the Request arm, where output is summed while
-        // the rest is maxed — recording exactly 2x output against reality.
+        // 1.0.25): a single-call turn, so its one per-call `usage` record happens to
+        // equal the turn total that the final `end` reports alongside its camelCase
+        // `sessionId`. Before the `end` gate both landed in the Request arm, where
+        // output is summed while the rest is maxed — recording exactly 2x output
+        // against reality. The two-call test below shows why that doubling is exact
+        // at any call count.
         let mut c = StreamCoalescer::new(false);
         c.feed(r#"{"type":"usage","usage":{"input_tokens":20965,"output_tokens":34,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"reasoning_tokens":31}}"#);
         c.feed(r#"{"type":"end","stopReason":"end_turn","sessionId":"01a0afec-eaf7-78c2-b076-d47691cf248a","requestId":"34f47631-cdae-4853-a2bf-01843230bbfd","usage":{"input_tokens":20965,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":34,"reasoning_tokens":31,"total_tokens":20999},"num_turns":1}"#);
@@ -3192,6 +3200,35 @@ mod tests {
         assert_eq!(
             stats.session_id.as_deref(),
             Some("01a0afec-eaf7-78c2-b076-d47691cf248a")
+        );
+    }
+
+    /// The multi-call shape the single-call fixture above cannot show: grok's
+    /// per-call `usage` records are per-call, not running totals, so they already sum
+    /// to the turn's output on their own. `end` then repeats that same total, which is
+    /// why the pre-fix Request-arm summing doubled output *exactly* at any call count
+    /// (25 + 26 + 51 = 102 against a true 51), not just on one-call turns. Captured
+    /// live from grok 1.0.34 (a turn re-driven by a Stop-hook block, hence two calls).
+    #[test]
+    fn a_multi_call_grok_turn_records_the_terminal_total_not_the_running_sum() {
+        let mut c = StreamCoalescer::new(false);
+        c.feed(r#"{"type":"usage","usage":{"input_tokens":21636,"output_tokens":25,"cache_read_input_tokens":128,"cache_creation_input_tokens":0,"reasoning_tokens":24}}"#);
+        c.feed(r#"{"type":"usage","usage":{"input_tokens":62,"output_tokens":26,"cache_read_input_tokens":21760,"cache_creation_input_tokens":0,"reasoning_tokens":23}}"#);
+        c.feed(r#"{"type":"end","stopReason":"end_turn","sessionId":"01a0b009-0ebf-7580-a1e0-b16b66ab9f49","requestId":"1e58e7fb-3f2e-4af5-b2ed-457bea534b11","usage":{"input_tokens":21698,"cache_read_input_tokens":21888,"cache_creation_input_tokens":0,"output_tokens":51,"reasoning_tokens":47,"total_tokens":43637},"num_turns":2,"total_cost_usd":0.054646,"modelUsage":{"grok-4.6":{"inputTokens":21698,"outputTokens":51,"cacheReadInputTokens":21888,"cacheCreationInputTokens":0,"modelCalls":2,"costUSD":0.054646}}}"#);
+        assert_eq!(
+            c.output_tokens, 51,
+            "the turn total, not 25 + 26 + 51 the way the Request arm summed it"
+        );
+        assert_eq!(c.input_tokens, 21698);
+        assert_eq!(c.cache_read, 21888);
+        assert_eq!(
+            c.billed_tokens(),
+            43637,
+            "grok's own total_tokens for the turn"
+        );
+        assert_eq!(
+            c.session_id.as_deref(),
+            Some("01a0b009-0ebf-7580-a1e0-b16b66ab9f49")
         );
     }
 
