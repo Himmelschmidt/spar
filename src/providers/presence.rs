@@ -55,17 +55,19 @@ pub fn wire(adapter: &dyn ProviderAdapter, id: &SlotIdentity) -> PresenceWiring 
     if let Some(run) = id.run_id {
         env.push(("SPAR_RUN_ID".to_string(), run.to_string()));
     }
-    // Only StopHookInject adapters (Claude) close the delivery loop through the Stop
-    // hook. Grok shares the presence hook file but delivers via its native queue, so it
-    // gets presence hooks without the injecting Stop hook.
+    // Only StopHookInject adapters (Claude, muse) close the delivery loop through
+    // the Stop hook. Grok shares the presence hook file but delivers via its native
+    // queue, so it gets presence hooks without the injecting Stop hook.
     let inject_on_stop = adapter.delivery_strategy() == DeliveryStrategy::StopHookInject;
     let note = match adapter.presence_source() {
-        PresenceSource::Hooks => install_claude_hooks(id, inject_on_stop).err().map(|e| {
-            format!(
-                "{}: presence hooks not installed ({e}) — degraded presence",
-                id.agent_id
-            )
-        }),
+        PresenceSource::Hooks => install_hook_file(id, inject_on_stop, adapter.hook_file_rel())
+            .err()
+            .map(|e| {
+                format!(
+                    "{}: presence hooks not installed ({e}) — degraded presence",
+                    id.agent_id
+                )
+            }),
         PresenceSource::Sse => Some(format!(
             "{}: SSE presence bus not yet subscribed — degraded presence",
             id.agent_id
@@ -82,7 +84,9 @@ pub fn wire(adapter: &dyn ProviderAdapter, id: &SlotIdentity) -> PresenceWiring 
     PresenceWiring { env, note }
 }
 
-/// The four Claude-format hook events spar maps to bus presence transitions.
+/// The four lifecycle hook events spar maps to bus presence transitions. muse
+/// accepts the same event names, matcher syntax and stdin contract (probed live
+/// against muse 1.3.0), so one table covers both files.
 fn hook_events() -> [(&'static str, Option<&'static str>, &'static str); 4] {
     [
         ("UserPromptSubmit", None, "working"),
@@ -92,17 +96,19 @@ fn hook_events() -> [(&'static str, Option<&'static str>, &'static str); 4] {
     ]
 }
 
-/// Merge spar presence hooks into `<worktree>/.claude/settings.json`, preserving any
-/// existing keys. When `inject_on_stop` is set, also install a Stop hook that runs
-/// `spar bus deliver` — the pane-free channel that injects claimed bus messages by
-/// blocking the turn (`{"decision":"block",…}`) instead of letting the agent go idle.
-/// Refuses to write into the primary checkout (would dirty the repo).
-fn install_claude_hooks(id: &SlotIdentity, inject_on_stop: bool) -> Result<()> {
+/// Merge spar presence hooks into `<worktree>/<rel>` (`rel` is the adapter's
+/// `hook_file_rel`: `.claude/settings.json` for Claude/grok, `.muse/hooks.json` for
+/// muse), preserving any existing keys. When `inject_on_stop` is set, also install a
+/// Stop hook that runs `spar bus deliver` — the pane-free channel that injects claimed
+/// bus messages by blocking the turn (`{"decision":"block",…}`) instead of letting
+/// the agent go idle. Refuses to write into the primary checkout (would dirty the
+/// repo). Project file only, never the user's global settings.
+fn install_hook_file(id: &SlotIdentity, inject_on_stop: bool, rel: &str) -> Result<()> {
     if same_dir(id.worktree, id.project_root) {
         anyhow::bail!("would pollute primary checkout working tree");
     }
-    let path = settings_path(id.worktree);
-    let dir = path.parent().expect("settings path has a parent");
+    let path = id.worktree.join(rel);
+    let dir = path.parent().expect("hook file path has a parent");
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
 
     let mut root: Value = match std::fs::read_to_string(&path) {
@@ -113,7 +119,7 @@ fn install_claude_hooks(id: &SlotIdentity, inject_on_stop: bool) -> Result<()> {
     };
     let obj = root
         .as_object_mut()
-        .context("existing .claude/settings.json is not a JSON object")?;
+        .with_context(|| format!("existing {} is not a JSON object", path.display()))?;
     let hooks = obj
         .entry("hooks")
         .or_insert_with(|| Value::Object(Map::new()))
@@ -152,16 +158,13 @@ fn install_claude_hooks(id: &SlotIdentity, inject_on_stop: bool) -> Result<()> {
     std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
     // The hook file embeds the operator's absolute spar path plus the run/agent ids, so
     // an agent's `git add -A` or `spar ship` must never stage it into the PR. Two cases:
-    // an untracked settings.json is held back by `info/exclude`; a *tracked* one (a repo
-    // that commits `.claude/settings.json`) is unaffected by excludes, so mark it
-    // `--skip-worktree` to make git ignore spar's rewrite. Both are best-effort.
-    exclude_from_index(id.worktree, SETTINGS_REL)?;
-    skip_worktree_if_tracked(id.worktree, SETTINGS_REL);
+    // an untracked hook file is held back by `info/exclude`; a *tracked* one (a repo
+    // that commits it) is unaffected by excludes, so mark it `--skip-worktree` to make
+    // git ignore spar's rewrite. Both are best-effort.
+    exclude_from_index(id.worktree, rel)?;
+    skip_worktree_if_tracked(id.worktree, rel);
     Ok(())
 }
-
-/// Worktree-relative path of the settings file spar writes.
-const SETTINGS_REL: &str = ".claude/settings.json";
 
 /// Add `rel_path` to the worktree's git exclude file so an untracked copy is never
 /// staged. Worktrees share the main checkout's `info/exclude` via `$GIT_COMMON_DIR`, so
@@ -289,15 +292,22 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Path to the settings file spar writes for a worktree (test helper / callers).
+/// Path to the settings file spar writes for a worktree.
+#[cfg(test)]
 pub fn settings_path(worktree: &Path) -> PathBuf {
     worktree.join(".claude").join("settings.json")
+}
+
+/// Path to the project hook file spar writes for a muse worktree.
+#[cfg(test)]
+pub fn muse_hooks_path(worktree: &Path) -> PathBuf {
+    worktree.join(".muse").join("hooks.json")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::{AgyAdapter, ClaudeAdapter, GrokAdapter};
+    use crate::providers::{AgyAdapter, ClaudeAdapter, GrokAdapter, MuseAdapter};
     use tempfile::tempdir;
 
     fn id<'a>(worktree: &'a Path, project_root: &'a Path, exe: &'a Path) -> SlotIdentity<'a> {
@@ -389,6 +399,94 @@ mod tests {
             "grok must not get a deliver Stop hook: {text}"
         );
         assert!(text.contains("--status idle"));
+    }
+
+    #[test]
+    fn muse_gets_its_own_hook_file_with_all_transitions_and_deliver() {
+        let tmp = tempdir().unwrap();
+        let wt = tmp.path().join("wt");
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let exe = PathBuf::from("/usr/bin/spar");
+
+        let w = wire(&MuseAdapter, &id(&wt, &root, &exe));
+        assert!(w.note.is_none(), "note: {:?}", w.note);
+        assert!(
+            !settings_path(&wt).exists(),
+            "muse must not touch the claude file"
+        );
+        let text = std::fs::read_to_string(muse_hooks_path(&wt)).unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        let hooks = v.get("hooks").unwrap().as_object().unwrap();
+        for ev in ["UserPromptSubmit", "PreToolUse", "Notification", "Stop"] {
+            assert!(hooks.contains_key(ev), "missing {ev}");
+        }
+        assert!(text.contains("--status working"));
+        assert!(text.contains("--status blocked"));
+        assert!(text.contains("--status idle"));
+        assert!(text.contains("--run abc123"));
+        // StopHookInject closes the delivery loop via a Stop `bus deliver` hook,
+        // whose `{"decision":"block",…}` payload muse 1.3.0 honors headless.
+        assert!(
+            text.contains("bus deliver impl-1 --run abc123"),
+            "muse Stop hook must inject via `bus deliver`: {text}"
+        );
+        assert!(
+            !text.contains("SPAR_AGENT_ID"),
+            "hook commands must bake ids as args, never read exported env: {text}"
+        );
+    }
+
+    #[test]
+    fn muse_hook_file_merges_and_stays_idempotent() {
+        let tmp = tempdir().unwrap();
+        let wt = tmp.path().join("wt");
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(wt.join(".muse")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            muse_hooks_path(&wt),
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo user-hook"}]}]}}"#,
+        )
+        .unwrap();
+        let exe = PathBuf::from("/usr/bin/spar");
+
+        wire(&MuseAdapter, &id(&wt, &root, &exe));
+        wire(&MuseAdapter, &id(&wt, &root, &exe)); // twice: must not duplicate
+
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(muse_hooks_path(&wt)).unwrap()).unwrap();
+        let stop = v
+            .get("hooks")
+            .unwrap()
+            .get("Stop")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert!(stop.iter().any(|g| !is_spar_group(g)));
+        let count_with = |needle: &str| {
+            stop.iter()
+                .filter(|g| serde_json::to_string(g).unwrap().contains(needle))
+                .count()
+        };
+        assert_eq!(count_with("bus heartbeat"), 1, "heartbeat must be deduped");
+        assert_eq!(count_with("bus deliver"), 1, "deliver must be deduped");
+    }
+
+    #[test]
+    fn muse_hook_file_refuses_the_primary_checkout() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let exe = PathBuf::from("/usr/bin/spar");
+        // worktree == project root: wire degrades to a note, writes nothing.
+        let w = wire(&MuseAdapter, &id(&root, &root, &exe));
+        assert!(w.note.is_some(), "expected a degraded-presence note");
+        assert!(
+            !muse_hooks_path(&root).exists(),
+            "must never write into the primary checkout"
+        );
     }
 
     #[test]
@@ -526,7 +624,10 @@ mod tests {
         let exclude =
             std::fs::read_to_string(git_common_dir(&wt).join("info").join("exclude")).unwrap();
         assert_eq!(
-            exclude.lines().filter(|l| l.trim() == SETTINGS_REL).count(),
+            exclude
+                .lines()
+                .filter(|l| l.trim() == ".claude/settings.json")
+                .count(),
             1,
             "exclude line must not be duplicated: {exclude}"
         );

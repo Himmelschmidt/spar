@@ -6,10 +6,8 @@
 //!   - Claude  → `StopHookInject`       (emits a Stop-hook `block` payload)
 //!   - Grok    → `NativeQueue`          (dispatches to the durable turn-boundary queue)
 //!   - agy     → `None`                 (inbox left untouched for the agent's next turn)
-//!   - muse    → `MuseSessionMessage`   (falls back to the poll file: no live session id
-//!     exists in this scenario, so `muse session-message send` is never even attempted —
-//!     the push-confirmed path is covered by the `providers::delivery` unit tests, which
-//!     can fake the `muse` binary and a live session id)
+//!   - muse    → `StopHookInject`       (same turn-boundary injection as Claude: muse's
+//!     Stop hook honors the same `{"decision":"block",…}` payload, probed live)
 //!
 //! `SdkPrompt` (opencode) has no adapter yet, so its dispatch is covered by the
 //! `providers::delivery` unit tests rather than end-to-end here.
@@ -281,15 +279,13 @@ fn block_reason(deliver: &Value) -> String {
         .unwrap_or_default()
 }
 
-/// muse: resolves `MuseSessionMessage` end to end through the real CLI + adapter lookup
-/// (`main.rs`'s `agent_delivery_strategy`), but no slot ever actually ran here, so there
-/// is no live session id and the send is never attempted — it must fall back to the poll
-/// file, not silently drop the message. The run is `--dry-run` like every scenario here,
-/// so the write itself is stubbed (see the `providers::delivery` unit tests for the write
-/// landing on a real filesystem); this test is what pins the strategy/action resolving
-/// correctly end to end through `agent_delivery_strategy` and the real `muse` adapter.
+/// muse: resolves `StopHookInject` end to end through the real CLI + adapter lookup
+/// (`main.rs`'s `agent_delivery_strategy`) — the same turn-boundary injection Claude
+/// uses. This test pins the strategy/action resolving correctly end to end through the
+/// real `muse` adapter; the payload shape itself is covered by the
+/// `providers::delivery` unit tests.
 #[test]
-fn muse_session_message_falls_back_to_poll_file_with_no_live_session() {
+fn muse_stop_hook_inject_claims_and_builds_block_payload() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
     let run_id = plan_and_approve_with_providers(tmp.path(), "cli:claude,cli:grok,cli:muse");
@@ -298,12 +294,16 @@ fn muse_session_message_falls_back_to_poll_file_with_no_live_session() {
     send(tmp.path(), &run_id, &agent, "keep going");
 
     let d = deliver_json(tmp.path(), &run_id, &agent);
-    assert_eq!(d["strategy"], "muse_session_message");
-    assert_eq!(d["action"], "polled_file");
+    assert_eq!(d["strategy"], "stop_hook_inject");
+    assert_eq!(d["action"], "stop_hook_block");
     assert!(d["delivered"].as_u64().unwrap() >= 1, "{d}");
+
+    let payload = d["payload"].as_str().expect("block payload");
+    let block: Value = serde_json::from_str(payload).unwrap();
+    assert_eq!(block["decision"], "block");
     assert!(
-        d.get("payload").is_none(),
-        "poll-file strategy emits no stdout payload"
+        block["reason"].as_str().unwrap().contains("keep going"),
+        "{block}"
     );
 }
 

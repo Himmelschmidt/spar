@@ -46,25 +46,30 @@ impl ProviderAdapter for MuseAdapter {
 
     // `muse exec --json` emits an event-envelope JSONL (`payload_type` + `stream`) which
     // the stream coalescer renders, but it carries **no** token usage. Usage lands only
-    // in muse's session log, which `muse_telemetry` sums after the slot exits. No
-    // presence stream is wired, so presence still degrades to the process/output
-    // heuristic. Delivery pushes into the running session: `muse session-message send
-    // --target <session-uuid>` injects directly, keyed off the session id
-    // `StreamCoalescer` captures from the exec JSONL's first `/stream/id` line, guarded on
-    // the slot's pid still being alive (a sidecar outlives its process). The delivery seam
-    // (`providers::delivery`) falls back to the poll file only when the push is not
-    // confirmed — id unknown yet, send failed, or the `--json` reply's own `status` field
-    // didn't say `"ok"` or `"accepted"`; a confirmed push is never also duplicated into
-    // the poll file. No box this has run on has ever had muse's `external_agent_ingress`
-    // gate open, so a confirmed push actually surfacing inside a *headless* `muse exec`
-    // run has never been observed end to end — the poll file is the one channel proven to
-    // work, and the push is a bonus delivery once its reply can be trusted for real.
+    // in muse's session log, which `muse_telemetry` sums after the slot exits.
+    // Presence and injection ride muse's project hook file (`.muse/hooks.json`), wired
+    // by `providers::presence` from the same four transitions as Claude
+    // (`UserPromptSubmit`/`PreToolUse` to `working`, `Notification` to `blocked`,
+    // `Stop` to `idle`), with a `Stop` hook running `spar bus deliver` for the
+    // turn-boundary injection. Probed live against muse 1.3.0: the file takes the same
+    // `{"hooks": {Event: [{matcher, hooks: [{type, command}]}]}}` shape as Claude's
+    // settings (a bare event map without the wrapper never fires), hooks get the same
+    // JSON stdin (`hook_event_name`, `session_id`, `tool_name`/`tool_input` on
+    // `PreToolUse`), and a `Stop` hook printing `{"decision":"block","reason":…}`
+    // re-drives a headless `muse exec` run with that text as new input. muse's sandbox
+    // keeps `.muse` read-only to the agent and spar writes the file pre-spawn from
+    // outside it, so the agent cannot tamper with its own wiring; project hooks load
+    // because spar passes `--yolo`, which trusts the workspace for the run.
     fn delivery_strategy(&self) -> DeliveryStrategy {
-        DeliveryStrategy::MuseSessionMessage
+        DeliveryStrategy::StopHookInject
     }
 
     fn presence_source(&self) -> PresenceSource {
-        PresenceSource::None
+        PresenceSource::Hooks
+    }
+
+    fn hook_file_rel(&self) -> &'static str {
+        ".muse/hooks.json"
     }
 
     fn binary_names(&self) -> &[&'static str] {
@@ -212,6 +217,11 @@ impl MuseAdapter {
         cmd.arg("exec");
         cmd.arg("--json");
         cmd.arg("--user-input-auto-resolve");
+        // Pin the policy-gated workspace root explicitly instead of letting muse infer
+        // it from the cwd (which it logs as `(cwd default)`). Never
+        // `--allow-workspace-switch`: a workspace mismatch must refuse, which is what
+        // the O86 resume path depends on.
+        cmd.arg("--workspace").arg(&opts.cwd);
         for a in self.permission_args(opts.trust) {
             cmd.arg(a);
         }
@@ -286,6 +296,17 @@ mod tests {
         assert!(args.iter().any(|a| a == "--json"));
         assert!(args.iter().any(|a| a == "--user-input-auto-resolve"));
         assert!(args.iter().any(|a| a == "--yolo"));
+        // The workspace root is pinned explicitly, ahead of the prompt tail.
+        let wi = args
+            .iter()
+            .position(|a| a == "--workspace")
+            .expect("--workspace");
+        assert_eq!(args.get(wi + 1).map(String::as_str), Some("/tmp"));
+        let pi = args
+            .iter()
+            .position(|a| a == "do the thing")
+            .expect("prompt");
+        assert!(wi < pi, "workspace must precede the prompt tail: {args:?}");
         assert_eq!(args.last().map(String::as_str), Some("do the thing"));
         let di = args.iter().position(|a| a == "--").expect("-- separator");
         assert_eq!(
@@ -392,15 +413,16 @@ mod tests {
         clear_env();
     }
 
-    /// Every delivery-seam test constructs `DeliveryStrategy::MuseSessionMessage` as a
-    /// literal, so nothing else pins the one line that actually routes muse onto it —
-    /// reverting `delivery_strategy` to `PollFile` would leave every other test green.
+    /// muse reports presence through its project hook file and injects at the turn
+    /// boundary through the Stop hook (both probed live against muse 1.3.0).
     #[test]
-    fn delivery_strategy_is_muse_session_message() {
+    fn presence_hooks_and_stop_hook_injection() {
         assert_eq!(
             MuseAdapter.delivery_strategy(),
-            DeliveryStrategy::MuseSessionMessage
+            DeliveryStrategy::StopHookInject
         );
+        assert_eq!(MuseAdapter.presence_source(), PresenceSource::Hooks);
+        assert_eq!(MuseAdapter.hook_file_rel(), ".muse/hooks.json");
     }
 
     #[test]
@@ -436,6 +458,7 @@ mod tests {
         let di = args.iter().position(|a| a == "--").expect("-- separator");
         assert!(si < di, "session id must precede the prompt tail: {args:?}");
         assert_eq!(args.last().map(String::as_str), Some("do the thing"));
+        assert_eq!(dash_val(&args, "--workspace").as_deref(), Some("/tmp"));
         assert!(
             !args.iter().any(|a| a == "--allow-workspace-switch"),
             "same-worktree re-dispatch keeps muse's workspace-mismatch refusal: {args:?}"

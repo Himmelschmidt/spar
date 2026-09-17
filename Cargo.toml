@@ -151,3 +151,7 @@ path = "tests/scenarios/backup_dispatch.rs"
 [[test]]
 name = "muse_transient_resume"
 path = "tests/scenarios/muse_transient_resume.rs"
+
+[[test]]
+name = "muse_hooks_presence"
+path = "tests/scenarios/muse_hooks_presence.rs"
