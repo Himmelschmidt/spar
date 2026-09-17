@@ -309,10 +309,17 @@ pub trait ProviderAdapter: Send + Sync {
 /// to the bound. A timeout still reports `Unknown`, never `Unhealthy`.
 pub(crate) const READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Longest `readiness_message` kept, in chars. The first-line rule bounds lines
+/// but not line length; without this a single multi-KB line lands verbatim in
+/// human output, notes, and JSON.
+pub(crate) const READINESS_MESSAGE_CHARS: usize = 300;
+
 /// Run an adapter's readiness probe: `bin` plus `probe` argv. `None` (no probe)
-/// is `Unknown`. Otherwise exit 0 is `Healthy`; non-zero is `Unhealthy` with
-/// the probe's own message trimmed to one line (stderr first, where CLIs put
-/// errors); a timeout or spawn failure is `Unknown`.
+/// is `Unknown`. Otherwise exit 0 is `Healthy`; a non-zero exit is `Unhealthy`
+/// with the probe's own message trimmed to one line (stderr first, where CLIs
+/// put errors), ANSI-stripped and capped at `READINESS_MESSAGE_CHARS`. A
+/// timeout, a spawn failure, or death by signal with no output to judge it by
+/// is `Unknown`: the probe could not run, so there is no verdict.
 fn probe_readiness(
     bin: &PathBuf,
     probe: Option<&[&str]>,
@@ -333,22 +340,64 @@ fn probe_readiness(
     let stdout = String::from_utf8_lossy(&output.stdout);
     let line = stderr
         .lines()
-        .map(str::trim)
+        .map(|l| strip_ansi(l).into_owned())
+        .map(|l| l.trim().to_string())
         .find(|l| !l.is_empty())
-        .or_else(|| stdout.lines().map(str::trim).find(|l| !l.is_empty()));
+        .or_else(|| {
+            stdout
+                .lines()
+                .map(|l| strip_ansi(l).into_owned())
+                .map(|l| l.trim().to_string())
+                .find(|l| !l.is_empty())
+        });
     match line {
-        Some(l) => (Readiness::Unhealthy, Some(l.to_string())),
-        None => (
+        Some(l) => (
+            Readiness::Unhealthy,
+            Some(truncate_chars(&l, READINESS_MESSAGE_CHARS)),
+        ),
+        None if output.status.code().is_some() => (
             Readiness::Unhealthy,
             Some(format!(
                 "probe exited {} with no output",
-                output
-                    .status
-                    .code()
-                    .map_or("signal".into(), |c| c.to_string())
+                output.status.code().expect("checked is_some")
             )),
         ),
+        None => (Readiness::Unknown, None),
     }
+}
+
+/// Strip ANSI CSI escape sequences (`\x1b[` … final byte, e.g. color codes) so
+/// a probe's message is plain text in human output and `--json`. No new dep
+/// for this: CLIs emit color, not cursor games, and anything unrecognized is
+/// left in place rather than eaten.
+fn strip_ansi(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains('\x1b') {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.clone().next() == Some('[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if ('\x40'..='\x7e').contains(&c) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Keep at most `max` chars (never splitting UTF-8), appending `…` when cut.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(max).collect();
+    format!("{kept}…")
 }
 
 fn probe_version(bin: &PathBuf, args: &[&str]) -> Option<String> {
@@ -379,20 +428,40 @@ fn run_with_timeout(
 ) -> Option<std::process::Output> {
     use std::io::Read;
     use std::process::Stdio;
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // stdin is null so a probed CLI can never block on a prompt; the pipes are
+    // drained on reader threads from spawn, because draining only after exit
+    // deadlocks once the child fills the pipe buffer (~64KB) and the timeout
+    // then misreports a chatty success as never-finishing.
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
     let mut child = cmd.spawn().ok()?;
+    let stdout = child.stdout.take().map(|mut out| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = out.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let stderr = child.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = err.read_to_end(&mut buf);
+            buf
+        })
+    });
     let start = std::time::Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let mut out = Vec::new();
-                let mut err = Vec::new();
-                if let Some(mut stdout) = child.stdout.take() {
-                    let _ = stdout.read_to_end(&mut out);
-                }
-                if let Some(mut stderr) = child.stderr.take() {
-                    let _ = stderr.read_to_end(&mut err);
-                }
+                // The child is dead so its write ends are closed; the joins
+                // only wait out bytes already in flight.
+                let out = stdout
+                    .map(|h| h.join().unwrap_or_default())
+                    .unwrap_or_default();
+                let err = stderr
+                    .map(|h| h.join().unwrap_or_default())
+                    .unwrap_or_default();
                 return Some(std::process::Output {
                     status,
                     stdout: out,
@@ -673,6 +742,63 @@ mod tests {
         );
         assert_eq!(readiness, Readiness::Unknown);
         assert_eq!(message, None);
+    }
+
+    #[test]
+    fn failing_probe_message_is_ansi_stripped() {
+        let bin = which::which("sh").expect("sh on PATH for probe tests");
+        // opencode's real failure shape: color codes around the message.
+        let (readiness, message) = probe_readiness(
+            &bin,
+            Some(&[
+                "-c",
+                "printf '\\033[91m\\033[1mError: \\033[0mbroken\\n' >&2; exit 1",
+            ]),
+            std::time::Duration::from_secs(10),
+        );
+        assert_eq!(readiness, Readiness::Unhealthy);
+        assert_eq!(message.as_deref(), Some("Error: broken"));
+    }
+
+    #[test]
+    fn failing_probe_message_is_capped_at_one_short_line() {
+        let bin = which::which("sh").expect("sh on PATH for probe tests");
+        let (readiness, message) = probe_readiness(
+            &bin,
+            Some(&["-c", "head -c 1000 /dev/zero | tr '\\0' 'x' >&2; exit 1"]),
+            std::time::Duration::from_secs(10),
+        );
+        assert_eq!(readiness, Readiness::Unhealthy);
+        let m = message.expect("failing probe with output names it");
+        assert_eq!(m.chars().count(), READINESS_MESSAGE_CHARS + 1);
+        assert!(m.ends_with('…'), "capped message carries an ellipsis");
+        assert!(!m.contains('\n'));
+    }
+
+    #[test]
+    fn signal_killed_probe_with_no_output_is_unknown() {
+        let bin = which::which("sh").expect("sh on PATH for probe tests");
+        let (readiness, message) = probe_readiness(
+            &bin,
+            Some(&["-c", "kill -9 $$"]),
+            std::time::Duration::from_secs(10),
+        );
+        assert_eq!(readiness, Readiness::Unknown);
+        assert_eq!(message, None);
+    }
+
+    #[test]
+    fn chatty_probe_does_not_deadlock_the_pipe() {
+        // ~1.4MB on stdout: with drain-after-exit this fills the pipe buffer
+        // and the child never exits, misreporting as Unknown on timeout.
+        let bin = which::which("sh").expect("sh on PATH for probe tests");
+        let (readiness, message) = probe_readiness(
+            &bin,
+            Some(&["-c", "seq 1 200000; exit 3"]),
+            std::time::Duration::from_secs(20),
+        );
+        assert_eq!(readiness, Readiness::Unhealthy);
+        assert_eq!(message.as_deref(), Some("1"));
     }
 
     #[test]

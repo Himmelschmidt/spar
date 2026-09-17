@@ -54,7 +54,6 @@ pub fn run(json: bool) -> Result<ExitCode> {
     }
 
     let providers = providers::detect_all();
-    let any_usable = has_usable_provider(&providers);
     if !providers.iter().any(|p| p.available) {
         notes.push(
             "no first-class providers found on PATH (claude, grok, agy, codex, opencode, muse)"
@@ -121,9 +120,7 @@ pub fn run(json: bool) -> Result<ExitCode> {
         }
     }
 
-    // One broken provider does not block a run while a usable one remains:
-    // only Unhealthy providers are excluded, Unknown (no probe) counts as usable.
-    let ok = git.available && any_usable;
+    let ok = doctor_ok(git.available, &providers);
     let report = DoctorReport {
         ok,
         project_root,
@@ -208,7 +205,7 @@ fn print_human(r: &DoctorReport) {
     println!("  providers:");
     for p in &r.providers {
         let mark = if !p.available {
-            "--"
+            "missing"
         } else if p.readiness == providers::Readiness::Unhealthy {
             "unhealthy"
         } else {
@@ -252,6 +249,13 @@ fn has_usable_provider(providers: &[providers::ProviderReport]) -> bool {
     providers
         .iter()
         .any(|p| p.available && p.readiness != providers::Readiness::Unhealthy)
+}
+
+/// Doctor's own exit rule, pinned here so the wiring (`git` gate plus the
+/// usable-provider gate) is unit-testable: one broken provider does not block
+/// a run while a usable one remains.
+fn doctor_ok(git_available: bool, providers: &[providers::ProviderReport]) -> bool {
+    git_available && has_usable_provider(providers)
 }
 
 fn print_tool(t: &ToolCheck) {
@@ -321,5 +325,26 @@ mod tests {
     fn none_available_is_not_usable() {
         let ps = vec![report("claude", false, Readiness::Unknown)];
         assert!(!has_usable_provider(&ps));
+    }
+
+    #[test]
+    fn exit_ok_with_one_healthy_beside_unhealthy() {
+        let ps = vec![
+            report("opencode", true, Readiness::Unhealthy),
+            report("muse", true, Readiness::Healthy),
+        ];
+        assert!(doctor_ok(true, &ps));
+    }
+
+    #[test]
+    fn exit_fails_when_no_usable_provider_remains() {
+        let ps = vec![report("opencode", true, Readiness::Unhealthy)];
+        assert!(!doctor_ok(true, &ps));
+    }
+
+    #[test]
+    fn exit_fails_without_git_even_when_providers_are_usable() {
+        let ps = vec![report("muse", true, Readiness::Healthy)];
+        assert!(!doctor_ok(false, &ps));
     }
 }

@@ -4,6 +4,15 @@ Unscheduled ideas, grouped by theme. Promote to `roadmap/features/NNN-*.md` when
 
 ## Fleet and quota
 
+- **An `unhealthy` provider is still auto-selected.** `spar doctor` and
+  `spar provider list` report readiness (`healthy`/`unhealthy`/`unknown` from each
+  adapter's probe), but `available_providers`, `pick_providers`,
+  `is_provider_usable`, and the TUI roster key off binary presence only. So a run
+  still rotates a slot onto a provider doctor just flagged, paying the
+  rotation-plus-round cost the probe was built to avoid. Follow-up: make dispatch
+  skip (or at least warn on) `Unhealthy` providers while keeping `Unknown`
+  eligible.
+
 - **A cheap seat's rate limit disables the whole provider, including the expensive
   seats.** Hit twice in one session: the suite tester (`cli:codex@gpt-5.6-luna`)
   exhausted its budget and `cli:codex` went `paused_quota`, which also took out the

@@ -63,12 +63,16 @@ impl ProviderAdapter for OpencodeAdapter {
 
     /// `opencode models` reads the same config a dispatch would (`--version`
     /// does not): a broken `opencode.json` (e.g. a dangling `{file:…}` auth
-    /// reference) exits 1 with the config error on stderr, while a healthy
+    /// reference) exits 1 with the config error on stderr, while a parseable
     /// config exits 0 listing the configured models. Verified on this box with
-    /// both a broken and a minimal `{}` config. It lists models, it never runs
-    /// one: no model call, no quota. It touches only opencode's own runtime
-    /// bookkeeping (log/db/cache files, the same class of side effect the
-    /// version probe has); it never writes config, auth, or trust state.
+    /// both a broken and a minimal `{}` config. Limit, stated plainly: this
+    /// catches broken config, not dead credentials — the minimal `{}` config
+    /// exits 0 with no auth at all, so an expired key still reports Healthy
+    /// and fails at dispatch. Config-parse is all a local-only, no-quota probe
+    /// can see. It lists models, it never runs one: no model call, no quota.
+    /// It touches only opencode's own runtime bookkeeping (log/db/cache files,
+    /// the same class of side effect the version probe has); it never writes
+    /// config, auth, or trust state.
     fn readiness_probe(&self) -> Option<&[&'static str]> {
         Some(&["models"])
     }

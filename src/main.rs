@@ -2155,11 +2155,17 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                             p.capabilities.interactive,
                             p.version.as_deref().unwrap_or("unknown")
                         );
-                        if p.readiness == providers::Readiness::Unhealthy {
-                            println!(
-                                "         readiness=unhealthy: {}",
-                                p.readiness_message.as_deref().unwrap_or("no details")
-                            );
+                        match p.readiness {
+                            providers::Readiness::Healthy => {
+                                println!("         readiness=healthy");
+                            }
+                            providers::Readiness::Unhealthy => {
+                                println!(
+                                    "         readiness=unhealthy: {}",
+                                    p.readiness_message.as_deref().unwrap_or("no details")
+                                );
+                            }
+                            providers::Readiness::Unknown => {}
                         }
                     }
                 }
