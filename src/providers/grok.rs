@@ -11,14 +11,36 @@ impl ProviderAdapter for GrokAdapter {
         "grok"
     }
 
+    // Turn-boundary injection rides the Stop hook: `{"decision":"block","reason":…}`
+    // is documented (grok docs ch. 10, Stop Decision Control) to feed the reason
+    // back as a user message and run another round in the same turn, the same
+    // contract as Claude — but no end-to-end block re-drive against a live grok
+    // has been observed yet (see O90), only hook firing. `presence::wire` derives
+    // the injecting Stop hook from this.
     fn delivery_strategy(&self) -> DeliveryStrategy {
-        DeliveryStrategy::NativeQueue
+        DeliveryStrategy::StopHookInject
     }
 
-    // Grok reads Claude-format `.claude/settings.json` hooks, so presence rides the
-    // same hook file spar installs for Claude.
+    // Grok's native project hook location (same shape muse uses with
+    // `.muse/hooks.json`). The Claude-compat source (`.claude/settings.json`) is a
+    // dead letter here: this box's `~/.grok/config.toml` carries
+    // `[compat.claude] hooks = false`, and project-scope hooks additionally require
+    // folder trust, which no fresh spar worktree ever has.
     fn presence_source(&self) -> PresenceSource {
         PresenceSource::Hooks
+    }
+
+    fn hook_file_rel(&self) -> &'static str {
+        ".grok/hooks/spar.json"
+    }
+
+    // Ungate the worktree's project scope for the dispatch: folder trust loads the
+    // project hook file above plus the repo's own instructions, skills, and local
+    // MCP/LSP servers. An env var rather than `~/.grok/trusted_folders.toml`
+    // because spar must not mutate operator state outside the worktree it owns;
+    // precedent is muse's `--yolo`, which already trusts the workspace for the run.
+    fn extra_env(&self, _opts: &SpawnOpts) -> Vec<(String, String)> {
+        vec![("GROK_FOLDER_TRUST".to_string(), "0".to_string())]
     }
 
     fn binary_names(&self) -> &[&'static str] {
@@ -89,6 +111,35 @@ mod tests {
     use super::*;
     use crate::providers::command_to_parts;
     use std::path::PathBuf;
+
+    /// Grok reports presence through its native project hook file and is wired for
+    /// turn-boundary injection through the Stop hook (file path and trust env
+    /// probed live against grok 1.0.25; the re-drive itself is documented grok
+    /// behaviour not yet observed live, see O90). Folder trust for the dispatch
+    /// comes from the env, never from operator state outside the worktree.
+    #[test]
+    fn presence_hooks_and_stop_hook_injection() {
+        assert_eq!(
+            GrokAdapter.delivery_strategy(),
+            DeliveryStrategy::StopHookInject
+        );
+        assert_eq!(GrokAdapter.presence_source(), PresenceSource::Hooks);
+        assert_eq!(GrokAdapter.hook_file_rel(), ".grok/hooks/spar.json");
+        let env = GrokAdapter.extra_env(&SpawnOpts {
+            prompt: String::new(),
+            prompt_file: None,
+            cwd: PathBuf::from("/tmp"),
+            trust: TrustPolicy::FullAuto,
+            extra_args: vec![],
+            model: None,
+            timeout_secs: None,
+        });
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "GROK_FOLDER_TRUST" && v == "0"),
+            "grok dispatches must carry folder trust: {env:?}"
+        );
+    }
 
     #[test]
     fn headless_prompt_file_not_double_single() {

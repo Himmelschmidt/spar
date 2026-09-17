@@ -600,8 +600,13 @@ slot is stuck on.**
   **`"ceiling_kill": true`** in `status --json`, which is how you tell it from a crash
   (`exit 143`, a signal) without parsing prose. Exit codes are unchanged.
 - Delivery is per-adapter and you never choose it. **claude** takes nudges through its
-  inbox, which its `Stop` hook drains at the turn boundary. **grok** takes them on its
-  native queue. **codex** attempts one too, once it has captured a thread id (its `codex
+  inbox, which its `Stop` hook drains at the turn boundary. **grok** takes them through
+  the same `Stop`-hook injection that **claude** uses: spar writes a project hook file
+  (`.grok/hooks/spar.json`) into the slot worktree, and the `Stop` hook drains the inbox
+  at the turn boundary with a `{"decision":"block",…}` payload (the dispatch carries
+  `GROK_FOLDER_TRUST=0` so the worktree's project scope actually loads). The re-drive
+  itself is documented grok behaviour (Stop Decision Control), not yet observed live
+  against a spar slot (`DECISIONS.md` O90). **codex** attempts one too, once it has captured a thread id (its `codex
   exec --json` stream names one on its very first line): `codex queue --thread <id>
   --message <text>`. That does not land in the dispatch it was queued against — `codex
   exec` is single-turn and exits right after its one assigned task, and a success exit
@@ -954,14 +959,13 @@ rail's selection.
     one, because its statusline sink emits one snapshot and keeps no history; it is a real
     window reading, just not a maximum.
   - **`cli:grok` is the exception: treat its numbers as approximate.** spar runs grok on
-    its native ACP stream, which reaches no terminal-record branch, so grok's figures come
-    only from the per-request path. Against grok's own session store its cache-read and
-    input were exact but its output read 2x the truth, and `context_tokens` for a grok slot
-    is a cumulative total rather than a peak, so the 80k/150k gauge means nothing there.
-    grok slots also never report a `model`, never report a `tool_errors` above zero, and
-    never resolve tool *names* (the tool *count* is exact). Known defect, tracked
-    separately (`DECISIONS.md` O48); do not budget tightly against a grok slot until it is
-    fixed.
+    its native ACP stream, whose final `end` record carries the turn's cumulative usage
+    and settles the totals (`DECISIONS.md` O90) — but a live sidecar reading still
+    over-counts output until that `end` lands, so a token nudge can fire early on a grok
+    slot. `context_tokens` for a grok slot is a cumulative total rather than a peak, so
+    the 80k/150k gauge means nothing there. grok slots also never report a `model`, never
+    report a `tool_errors` above zero, and never resolve tool *names* (the tool *count*
+    is exact). Do not budget tightly against a grok slot.
 - **Cost and subagent accounting** ride the same `"usage"` entries and
   `logs/<slot>.stats.json` as the token fields above, additive alongside them:
   - **`cost_usd`**: whole-dispatch USD spend, as the provider itself computed it.
