@@ -155,3 +155,7 @@ path = "tests/scenarios/muse_transient_resume.rs"
 [[test]]
 name = "muse_hooks_presence"
 path = "tests/scenarios/muse_hooks_presence.rs"
+
+[[test]]
+name = "stale_verdict"
+path = "tests/scenarios/stale_verdict.rs"
