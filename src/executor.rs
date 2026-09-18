@@ -48,6 +48,10 @@ pub struct SlotJob {
     pub expected_artifact: Option<String>,
     /// Optional model override for CLI `--model` / API body.
     pub model: Option<String>,
+    /// Optional reasoning-effort override for this slot. `None` at creation
+    /// everywhere today; dispatch backfills it from `[effort]` / `--effort`
+    /// via `slot_effort_for`, the way `model` backfills from the slot.
+    pub effort: Option<crate::effort::EffortLevel>,
 }
 
 /// Run multiple slots **concurrently** (live). Dry-run stays sequential for simpler state.
@@ -270,6 +274,13 @@ fn prepare_slot_execution(
     if job.model.is_none() {
         job.model = slot_model_for(Some(state), &job);
     }
+    if job.effort.is_none() {
+        job.effort = slot_effort_for(cfg, Some(state), &job);
+    }
+    // A rung this CLI does not offer refuses before spawn (O92): rotation, widening
+    // and backup can change a slot's provider after parse time, so parse time cannot
+    // know the pair. api-sdk slots record effort without rendering it, never refuse.
+    check_slot_effort(&job.provider, job.effort)?;
     // Drop any prior attempt's terminal/pid markers before this slot goes Running, so a
     // stale `<slot>.failed` doesn't outrank the live process during reconciliation.
     markers::clear_slot(paths, &state.id, &job.slot_id);
@@ -301,6 +312,9 @@ fn prepare_slot_execution(
         s.artifact = job.expected_artifact.clone();
         if s.model.is_none() {
             s.model = job.model.clone();
+        }
+        if s.effort.is_none() {
+            s.effort = job.effort;
         }
     }
     let _ = crate::events::append(
@@ -915,6 +929,7 @@ fn execute_prepared(
         extra_args: vec![],
         session_id: None,
         model: prep.job.model.clone(),
+        effort: prep.job.effort,
         timeout_secs: Some(timeout.as_secs()),
     };
     let (mut cmd, used_resume) = build_dispatch_command(
@@ -1187,6 +1202,7 @@ fn execute_prepared(
                 owns_cwd: prep.owns_cwd,
                 provider: &prep.job.provider,
                 model: prep.job.model.clone(),
+                effort: prep.job.effort,
                 cwd: &prep.cwd,
                 log_path: &prep.log_path,
                 prompt_path: &recovery_prompt_path(&prep.prompt_path, &prep.job.slot_id),
@@ -1251,6 +1267,7 @@ struct ArtifactRecovery<'a> {
     owns_cwd: bool,
     provider: &'a str,
     model: Option<String>,
+    effort: Option<crate::effort::EffortLevel>,
     cwd: &'a Path,
     log_path: &'a Path,
     prompt_path: &'a Path,
@@ -1389,6 +1406,7 @@ fn recover_artifact(r: &ArtifactRecovery) -> bool {
         extra_args: vec![],
         session_id: recovery_session,
         model: r.model.clone(),
+        effort: r.effort,
         timeout_secs: Some(timeout.as_secs()),
     };
     let cmd = adapter.build_headless(&bin, &opts);
@@ -2071,6 +2089,11 @@ pub fn run_slot(
         .with_context(|| format!("write {}", prompt_path.display()))?;
 
     let pref = ProviderRef::parse(&job.provider)?;
+    // The resolved depth this dispatch runs at (job override, then `[effort]` /
+    // `--effort` for the role). Checked before the dry-run branch so `--dry-run`
+    // catches a rung the CLI does not offer without spawning anything.
+    let effort = slot_effort_for(cfg, Some(state), job);
+    check_slot_effort(&job.provider, effort)?;
     // See prepare_slot_execution: clear a prior attempt's markers before going Running.
     markers::clear_slot(paths, &state.id, &job.slot_id);
     let round = state.round;
@@ -2099,6 +2122,11 @@ pub fn run_slot(
         });
         s.log_path = Some(log_path.clone());
         s.artifact = job.expected_artifact.clone();
+        // Unlike `model` (set at slot creation), effort has no creation-time source
+        // on this path, so dispatch is its only recording point into `state.json`.
+        if s.effort.is_none() {
+            s.effort = effort;
+        }
     }
     let _ = crate::events::append(
         paths,
@@ -2174,6 +2202,7 @@ pub fn run_slot(
                     &prompt,
                     timeout,
                     &presence_env,
+                    effort,
                 ) {
                     Ok(r) => r,
                     Err(e) => {
@@ -3171,6 +3200,7 @@ fn run_headless(
         extra_args: vec![],
         session_id: None,
         model: slot_model_for(Some(state), job),
+        effort: slot_effort_for(cfg, Some(state), job),
         timeout_secs: Some(timeout.as_secs()),
     };
     let prior_session_id =
@@ -3414,6 +3444,7 @@ fn run_headless(
                 owns_cwd: owns_cwd(state, &job.slot_id, cwd),
                 provider: &job.provider,
                 model: slot_model_for(Some(state), job),
+                effort: slot_effort_for(cfg, Some(state), job),
                 cwd,
                 log_path,
                 prompt_path: &recovery_prompt_path(prompt_path, &job.slot_id),
@@ -3590,6 +3621,7 @@ fn run_tmux(
     prompt: &str,
     timeout: Duration,
     env: &[(String, String)],
+    effort: Option<crate::effort::EffortLevel>,
 ) -> Result<SlotOutcome> {
     if !tmux::available() {
         bail!("tmux not available");
@@ -3619,6 +3651,10 @@ fn run_tmux(
         extra_args: vec![],
         session_id: None,
         model: slot_model_for(Some(state), job),
+        // The depth `run_slot` resolved and recorded: the pane must run at what
+        // `state.json` claims (muse/codex/opencode render it via their headless
+        // delegation; claude/grok/agy carry their own interactive arm).
+        effort,
         timeout_secs: None,
     };
     // The pane is teed to a log, never run through `StreamCoalescer`, so no id is
@@ -3789,6 +3825,44 @@ fn slot_model_for(state: Option<&RunState>, job: &SlotJob) -> Option<String> {
     })
 }
 
+/// Resolved reasoning effort for a dispatch: the job's own override first,
+/// then the role's `[effort]` / `--effort` assignment. (`SPAR_MUSE_REASONING_EFFORT`
+/// sits below both, inside the muse adapter, so it needs no handling here.)
+fn slot_effort_for(
+    cfg: &Config,
+    state: Option<&RunState>,
+    job: &SlotJob,
+) -> Option<crate::effort::EffortLevel> {
+    if let Some(e) = job.effort {
+        return Some(e);
+    }
+    if let Some(e) = state.and_then(|st| {
+        st.slots
+            .iter()
+            .find(|s| s.id == job.slot_id)
+            .and_then(|s| s.effort)
+    }) {
+        return Some(e);
+    }
+    cfg.effort_for(job.role)
+}
+
+/// Refuse a provider+effort pair the CLI does not offer, before spawn. A
+/// refusal is spar's fault (never retried, never an agent failure) and names
+/// the accepted levels. api-sdk slots record effort without rendering it, so
+/// they never refuse; `None` is always fine.
+fn check_slot_effort(provider: &str, effort: Option<crate::effort::EffortLevel>) -> Result<()> {
+    let Some(e) = effort else {
+        return Ok(());
+    };
+    let pref = ProviderRef::parse(provider)?;
+    if pref.is_api() {
+        return Ok(());
+    }
+    let cli_name = pref.cli_name().unwrap_or(provider);
+    crate::effort::check_compatible(cli_name, e)
+}
+
 pub fn init_slot(id: impl Into<String>, provider: impl Into<String>, role: SlotRole) -> SlotState {
     init_slot_model(id, provider, role, None)
 }
@@ -3821,6 +3895,10 @@ pub fn init_slot_model(
         // An explicit `@model` on the ref is a direct instruction and beats a
         // model chosen by `--select`'s model-select artifact (the `model` arg).
         model: pref.model.clone().or(model),
+        // Effort has no creation-time source (no `@effort` ref syntax): dispatch
+        // resolves it from the job override then `[effort]` / `--effort` and
+        // records it there, so slots start unrecorded.
+        effort: None,
         round: 1,
         quota_hit: false,
         reviewed_commit: None,
@@ -4121,6 +4199,7 @@ mod tests {
             extra_args: vec![],
             session_id: None,
             model: None,
+            effort: None,
             timeout_secs: None,
         }
     }
@@ -4593,6 +4672,7 @@ mod tests {
             extra_vars: std::collections::HashMap::new(),
             expected_artifact: None,
             model: None,
+            effort: None,
         };
         let mut opts = dispatch_opts("go");
         opts.session_id = Some("abc".into());
@@ -5459,6 +5539,7 @@ mod tests {
             extra_vars: HashMap::new(),
             expected_artifact: Some(format!("summary-{slot_id}.md")),
             model: None,
+            effort: None,
         }
     }
 
@@ -6346,6 +6427,7 @@ mod tests {
             extra_vars: HashMap::new(),
             expected_artifact: None,
             model: None,
+            effort: None,
         };
 
         // Round 1 finishes, then dies the way a killed dispatch does.
@@ -6395,6 +6477,139 @@ mod tests {
         assert_eq!(s.signal, None);
     }
 
+    /// Effort resolution order: the job's own override, then the recorded slot
+    /// value, then `[effort]` / `--effort` for the role.
+    #[test]
+    fn slot_effort_resolution_prefers_job_then_slot_then_config() {
+        use crate::effort::EffortLevel;
+        let mut cfg = Config::default();
+        cfg.effort.implementer = Some("low".into());
+        let mut job = impl_job("impl");
+        assert_eq!(slot_effort_for(&cfg, None, &job), Some(EffortLevel::Low));
+        job.effort = Some(EffortLevel::Max);
+        assert_eq!(slot_effort_for(&cfg, None, &job), Some(EffortLevel::Max));
+        job.effort = None;
+        let mut state = RunState::new(
+            "r-effort-resolve",
+            crate::cli::WorkflowKind::Loop,
+            std::path::PathBuf::from("/tmp"),
+        );
+        state.slots.push(init_slot_model(
+            "impl",
+            "cli:claude",
+            SlotRole::Implementer,
+            None,
+        ));
+        state.slot_mut("impl").unwrap().effort = Some(EffortLevel::High);
+        assert_eq!(
+            slot_effort_for(&cfg, Some(&state), &job),
+            Some(EffortLevel::High)
+        );
+    }
+
+    /// The dispatch-time compatibility check: a rung the CLI does not offer
+    /// refuses naming the accepted levels; api-sdk slots and `None` never
+    /// refuse.
+    #[test]
+    fn check_slot_effort_refuses_out_of_vocab_pair() {
+        use crate::effort::EffortLevel;
+        check_slot_effort("cli:agy", Some(EffortLevel::Medium)).unwrap();
+        check_slot_effort("cli:agy", None).unwrap();
+        check_slot_effort("api:openrouter", Some(EffortLevel::Ultra)).unwrap();
+        let err = check_slot_effort("cli:agy", Some(EffortLevel::Ultra)).unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "effort 'ultra' not accepted by cli:agy (takes: low, medium, high)"
+        );
+        // codex takes the union (it validates per model, server-side), so the
+        // top rung is accepted here rather than refused.
+        check_slot_effort("cli:codex", Some(EffortLevel::Ultra)).unwrap();
+    }
+
+    /// A rung outside the CLI's vocabulary fails the dispatch before spawn —
+    /// including under `--dry-run`, which never resolves a binary — leaving
+    /// the slot pending.
+    #[test]
+    fn run_slot_refuses_effort_outside_cli_vocab_in_dry_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut cfg = Config::default();
+        cfg.effort.implementer = Some("ultra".into());
+        let mut state = RunState::new(
+            "r-effort-refuse",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.dry_run = true;
+        state.slots.push(init_slot_model(
+            "impl",
+            "cli:agy",
+            SlotRole::Implementer,
+            None,
+        ));
+        state.save(&paths).unwrap();
+        let mut job = impl_job("impl");
+        job.provider = "cli:agy".into();
+        job.template = "implementer".into();
+        let err = run_slot(&mut state, &paths, &cfg, &job).unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "effort 'ultra' not accepted by cli:agy (takes: low, medium, high)"
+        );
+        let s = state.slot_mut("impl").unwrap();
+        assert_eq!(s.status, SlotStatus::Pending);
+    }
+
+    /// A resolved effort is recorded on the slot next to its model; a run with
+    /// no effort configured records nothing.
+    #[test]
+    fn run_slot_records_resolved_effort_in_state() {
+        use crate::effort::EffortLevel;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut cfg = Config::default();
+        cfg.effort.implementer = Some("low".into());
+        let mut state = RunState::new(
+            "r-effort-record",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.dry_run = true;
+        state.slots.push(init_slot_model(
+            "impl",
+            "cli:agy",
+            SlotRole::Implementer,
+            None,
+        ));
+        state.save(&paths).unwrap();
+        let mut job = impl_job("impl");
+        job.provider = "cli:agy".into();
+        job.template = "implementer".into();
+        run_slot(&mut state, &paths, &cfg, &job).unwrap();
+        let s = state.slot_mut("impl").unwrap();
+        assert_eq!(s.effort, Some(EffortLevel::Low));
+
+        let cfg = Config::default();
+        let mut state = RunState::new(
+            "r-effort-absent",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.dry_run = true;
+        state.slots.push(init_slot_model(
+            "impl",
+            "cli:claude",
+            SlotRole::Implementer,
+            None,
+        ));
+        state.save(&paths).unwrap();
+        let mut job = impl_job("impl");
+        job.template = "implementer".into();
+        run_slot(&mut state, &paths, &cfg, &job).unwrap();
+        let s = state.slot_mut("impl").unwrap();
+        assert_eq!(s.effort, None);
+    }
+
     /// `prepare_slot_execution`'s own `quota_hit = false` reset sits after its fallible
     /// steps (template render, prompt write, provider parse), so a slot re-dispatched
     /// after a prior round's real quota hit that then fails one of those *this* round
@@ -6432,6 +6647,7 @@ mod tests {
                 extra_vars: HashMap::new(),
                 expected_artifact: None,
                 model: None,
+                effort: None,
             })
             .collect();
 
@@ -6521,6 +6737,7 @@ mod tests {
             extra_vars: HashMap::new(),
             expected_artifact: Some(format!("review-{slot_id}.md")),
             model: None,
+            effort: None,
         }
     }
 
@@ -6725,6 +6942,7 @@ mod tests {
             extra_vars: HashMap::new(),
             expected_artifact: None,
             model: None,
+            effort: None,
         };
 
         let usage = tmux_recovered_usage(true, &paths, "r1", &job, &log_path)
@@ -6801,6 +7019,7 @@ mod tests {
             extra_vars: HashMap::new(),
             expected_artifact: Some("suite.md".into()),
             model: None,
+            effort: None,
         };
         salvage_expected_artifact(
             &paths,

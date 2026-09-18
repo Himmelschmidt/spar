@@ -340,6 +340,11 @@ pub struct SlotState {
     /// Selected model id (from model-select or explicit); passed to CLI/API spawn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Resolved reasoning effort for this slot (`--effort` / `[effort]`); rendered
+    /// by native-cli adapters onto their own control. `None` records nothing, so
+    /// runs without effort configured read exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<crate::effort::EffortLevel>,
     /// The run round this slot last ran in (O45). `1` for pre-rounds runs.
     #[serde(default = "one_round")]
     pub round: u32,

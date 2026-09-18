@@ -102,6 +102,9 @@ impl ProviderAdapter for GrokAdapter {
         if let Some(id) = opts.session_id.as_deref() {
             cmd.arg("--session-id").arg(id);
         }
+        if let Some(e) = opts.effort {
+            cmd.arg("--reasoning-effort").arg(e.as_str());
+        }
         for a in &opts.extra_args {
             cmd.arg(a);
         }
@@ -119,6 +122,9 @@ impl ProviderAdapter for GrokAdapter {
         }
         if let Some(id) = opts.session_id.as_deref() {
             cmd.arg("--session-id").arg(id);
+        }
+        if let Some(e) = opts.effort {
+            cmd.arg("--reasoning-effort").arg(e.as_str());
         }
         if !opts.prompt.is_empty() {
             cmd.arg(&opts.prompt);
@@ -198,6 +204,7 @@ mod tests {
             extra_args: vec![],
             session_id: None,
             model: None,
+            effort: None,
             timeout_secs: None,
         });
         assert!(
@@ -216,6 +223,7 @@ mod tests {
             extra_args: vec![],
             session_id: session_id.map(str::to_string),
             model: None,
+            effort: None,
             timeout_secs: None,
         }
     }
@@ -245,6 +253,17 @@ mod tests {
     #[test]
     fn headless_inline_uses_single_with_prompt() {
         let opts = opts_with_session("do the thing", None, None);
+        let opts = SpawnOpts {
+            prompt: "do the thing".into(),
+            prompt_file: None,
+            cwd: PathBuf::from("/tmp"),
+            trust: TrustPolicy::FullAuto,
+            extra_args: vec![],
+            session_id: None,
+            model: None,
+            effort: None,
+            timeout_secs: None,
+        };
         let cmd = GrokAdapter.build_headless(Path::new("grok"), &opts);
         let (_, args) = command_to_parts(&cmd);
         let i = args.iter().position(|a| a == "--single").expect("--single");
@@ -320,5 +339,60 @@ mod tests {
             id,
             Some(1),
         ));
+    }
+
+    #[test]
+    fn effort_renders_flag_when_set_and_nothing_when_unset() {
+        use crate::effort::EffortLevel;
+        let mut opts = SpawnOpts {
+            prompt: "go".into(),
+            prompt_file: None,
+            cwd: PathBuf::from("/tmp"),
+            trust: TrustPolicy::FullAuto,
+            extra_args: vec![],
+            session_id: None,
+            model: None,
+            effort: None,
+            timeout_secs: None,
+        };
+        let (_, args) = command_to_parts(&GrokAdapter.build_headless(Path::new("grok"), &opts));
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == "--reasoning-effort" || a == "--effort"),
+            "unset effort emits nothing: {args:?}"
+        );
+        opts.effort = Some(EffortLevel::Max);
+        let (_, args) = command_to_parts(&GrokAdapter.build_headless(Path::new("grok"), &opts));
+        let i = args
+            .iter()
+            .position(|a| a == "--reasoning-effort")
+            .expect("--reasoning-effort");
+        assert_eq!(args.get(i + 1).map(String::as_str), Some("max"));
+    }
+
+    #[test]
+    fn effort_interactive_matches_headless() {
+        use crate::effort::EffortLevel;
+        let mut opts = SpawnOpts {
+            prompt: "go".into(),
+            prompt_file: None,
+            cwd: PathBuf::from("/tmp"),
+            trust: TrustPolicy::FullAuto,
+            extra_args: vec![],
+            session_id: None,
+            model: None,
+            effort: Some(EffortLevel::Low),
+            timeout_secs: None,
+        };
+        let (_, args) = command_to_parts(&GrokAdapter.build_interactive(Path::new("grok"), &opts));
+        let i = args
+            .iter()
+            .position(|a| a == "--reasoning-effort")
+            .expect("--reasoning-effort");
+        assert_eq!(args.get(i + 1).map(String::as_str), Some("low"));
+        opts.effort = None;
+        let (_, args) = command_to_parts(&GrokAdapter.build_interactive(Path::new("grok"), &opts));
+        assert!(!args.iter().any(|a| a == "--reasoning-effort"));
     }
 }

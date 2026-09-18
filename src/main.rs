@@ -7,6 +7,7 @@ mod config;
 mod daemon;
 mod defaults;
 mod doctor;
+mod effort;
 mod events;
 mod executor;
 mod exit_codes;
@@ -120,6 +121,7 @@ fn run() -> Result<ExitCode> {
             urgency,
             role,
             backup,
+            effort,
             fleet,
             without,
             base,
@@ -147,6 +149,7 @@ fn run() -> Result<ExitCode> {
                     (!select.is_empty(), "--select"),
                     (!role.is_empty(), "--role"),
                     (!backup.is_empty(), "--backup"),
+                    (!effort.is_empty(), "--effort"),
                     (fleet.is_some(), "--fleet"),
                     (!without.is_empty(), "--without"),
                     (base.is_some(), "--base"),
@@ -182,6 +185,7 @@ fn run() -> Result<ExitCode> {
             cfg.apply_without(&without)?;
             cfg.apply_role_overrides(&role)?;
             cfg.apply_backup_overrides(&backup)?;
+            cfg.apply_effort_overrides(&effort)?;
             let (task_text, brief_path) = match (spec, brief, task) {
                 (Some(path), None, None) => {
                     let b = brief::intake(&paths, &path)?;
@@ -255,6 +259,7 @@ fn run() -> Result<ExitCode> {
             task,
             role,
             backup,
+            effort,
             fleet,
             without,
             reload_config,
@@ -274,6 +279,7 @@ fn run() -> Result<ExitCode> {
                 run_id.as_deref(),
                 &role,
                 &backup,
+                &effort,
                 &without,
                 fleet.as_deref(),
                 reload_config,
@@ -300,6 +306,7 @@ fn run() -> Result<ExitCode> {
             task,
             role,
             backup,
+            effort,
             fleet,
             without,
             base,
@@ -325,6 +332,26 @@ fn run() -> Result<ExitCode> {
                     backup.join(", ")
                 );
             }
+            // Peer/roles seats take fleet positions and carry `SlotRole::Peer`,
+            // which `effort_for` maps to `None`, so a per-role depth there would
+            // parse, snapshot, and never render. Refuse it like `--backup` rather
+            // than accepting a silent no-op. Arena is deliberately *not* refused:
+            // its implementer legs carry `SlotRole::Implementer` and its reconcile
+            // reviewers `SlotRole::Reviewer`, so effort resolves and renders on
+            // arena dispatches exactly as it does in the loop. Refusing the flag
+            // while `[effort]` config kept rendering on the same run was the
+            // inconsistency this closes.
+            if matches!(
+                workflow,
+                crate::cli::WorkflowKind::Peer | crate::cli::WorkflowKind::Roles
+            ) && !effort.is_empty()
+            {
+                anyhow::bail!(
+                    "--effort is not supported for {} workflow (it is positional, not role-based); effort: {}",
+                    format!("{:?}", workflow).to_lowercase(),
+                    effort.join(", ")
+                );
+            }
             let (paths, mut cfg) = project_ctx()?;
             if let Some(preset) = &fleet {
                 cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
@@ -332,6 +359,7 @@ fn run() -> Result<ExitCode> {
             cfg.apply_without(&without)?;
             cfg.apply_role_overrides(&role)?;
             cfg.apply_backup_overrides(&backup)?;
+            cfg.apply_effort_overrides(&effort)?;
             let opts = CommonOpts {
                 task,
                 providers,
@@ -722,6 +750,7 @@ fn implement_ctx(
     run_id: Option<&str>,
     role: &[String],
     backup: &[String],
+    effort: &[String],
     without: &[String],
     fleet: Option<&str>,
     reload_config: bool,
@@ -734,6 +763,7 @@ fn implement_ctx(
         cfg.apply_without(without)?;
         cfg.apply_role_overrides(role)?;
         cfg.apply_backup_overrides(backup)?;
+        cfg.apply_effort_overrides(effort)?;
         return Ok((paths, cfg));
     };
     if !reload_config {
@@ -747,6 +777,12 @@ fn implement_ctx(
             anyhow::bail!(
                 "run {run_id} is bound to the config it was created with; \
                  pass --reload-config to apply --backup to it"
+            );
+        }
+        if !effort.is_empty() {
+            anyhow::bail!(
+                "run {run_id} is bound to the config it was created with; \
+                 pass --reload-config to apply --effort to it"
             );
         }
         if !without.is_empty() {
@@ -777,6 +813,7 @@ fn implement_ctx(
     cfg.apply_without(without)?;
     cfg.apply_role_overrides(role)?;
     cfg.apply_backup_overrides(backup)?;
+    cfg.apply_effort_overrides(effort)?;
     cfg.save_snapshot(&paths, run_id)?;
     eprintln!("config: re-read spar.toml for run {run_id}");
     Ok((paths, cfg))

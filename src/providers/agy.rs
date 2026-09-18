@@ -96,6 +96,11 @@ impl ProviderAdapter for AgyAdapter {
         if let Some(m) = &opts.model {
             cmd.arg("--model").arg(m);
         }
+        // Before `--print`: Go's `flag` stops parsing at the first positional,
+        // and the prompt rides `--print`, so anything after it is orphaned.
+        if let Some(e) = opts.effort {
+            cmd.arg("--effort").arg(e.as_str());
+        }
         let prompt = if !opts.prompt.is_empty() {
             opts.prompt.clone()
         } else if let Some(pf) = &opts.prompt_file {
@@ -121,6 +126,10 @@ impl ProviderAdapter for AgyAdapter {
         }
         if let Some(m) = &opts.model {
             cmd.arg("--model").arg(m);
+        }
+        // Before the prompt value flag, same Go-`flag` rule as `build_headless`.
+        if let Some(e) = opts.effort {
+            cmd.arg("--effort").arg(e.as_str());
         }
         if !opts.prompt.is_empty() {
             cmd.arg("--prompt-interactive").arg(&opts.prompt);
@@ -157,6 +166,7 @@ mod tests {
             extra_args,
             session_id: None,
             model: model.map(str::to_string),
+            effort: None,
             timeout_secs: None,
         }
     }
@@ -223,6 +233,45 @@ mod tests {
             skip < p && model < p,
             "flags must precede --print: {args:?}"
         );
+    }
+
+    #[test]
+    fn effort_precedes_print_when_set_and_absent_when_unset() {
+        use crate::effort::EffortLevel;
+        let (_, args) =
+            command_to_parts(&AgyAdapter.build_headless(Path::new("agy"), &opts("hi", None, None)));
+        assert!(
+            !args.iter().any(|a| a == "--effort"),
+            "unset effort emits nothing: {args:?}"
+        );
+        let mut o = opts("hi", None, None);
+        o.effort = Some(EffortLevel::Medium);
+        let (_, args) = command_to_parts(&AgyAdapter.build_headless(Path::new("agy"), &o));
+        let e = args.iter().position(|a| a == "--effort").expect("--effort");
+        assert_eq!(args.get(e + 1).map(String::as_str), Some("medium"));
+        let p = args.iter().position(|a| a == "--print").expect("--print");
+        assert!(
+            e < p,
+            "--effort must precede --print or Go's flag parser orphans it: {args:?}"
+        );
+    }
+
+    #[test]
+    fn effort_interactive_precedes_prompt_flag() {
+        use crate::effort::EffortLevel;
+        let mut o = opts("hi", None, None);
+        o.effort = Some(EffortLevel::High);
+        let (_, args) = command_to_parts(&AgyAdapter.build_interactive(Path::new("agy"), &o));
+        let e = args.iter().position(|a| a == "--effort").expect("--effort");
+        assert_eq!(args.get(e + 1).map(String::as_str), Some("high"));
+        let p = args
+            .iter()
+            .position(|a| a == "--prompt-interactive")
+            .expect("--prompt-interactive");
+        assert!(e < p, "--effort must precede the prompt flag: {args:?}");
+        o.effort = None;
+        let (_, args) = command_to_parts(&AgyAdapter.build_interactive(Path::new("agy"), &o));
+        assert!(!args.iter().any(|a| a == "--effort"));
     }
 
     #[test]

@@ -128,6 +128,7 @@ pub fn run(
             )]),
             expected_artifact: Some(expected_artifact),
             model,
+            effort: None,
         });
     }
 
@@ -382,6 +383,7 @@ pub fn execute_plan(
                                         extra_vars: job.extra_vars.clone(),
                                         expected_artifact: job.expected_artifact.clone(),
                                         model: pin.model.clone(),
+                                        effort: None,
                                     };
                                     match executor::run_slot(state, paths, cfg, &retry_job) {
                                         Ok(()) => {
@@ -627,6 +629,7 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
         extra_vars: extra,
         expected_artifact: Some("test-contract.md".into()),
         model,
+        effort: None,
     };
 
     if let Err(e) = executor::run_slot(state, paths, cfg, &job) {
@@ -685,6 +688,7 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
                                     extra_vars: job.extra_vars.clone(),
                                     expected_artifact: Some("test-contract.md".into()),
                                     model: pin.model.clone(),
+                                    effort: None,
                                 };
                                 match executor::run_slot(state, paths, cfg, &retry_job) {
                                     Ok(()) => {
@@ -1159,6 +1163,7 @@ fn continue_locked(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exit
             )]),
             expected_artifact: Some(expected_artifact),
             model: None,
+            effort: None,
         });
     }
     if jobs.is_empty() {
@@ -1180,6 +1185,7 @@ fn continue_locked(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exit
                 )]),
                 expected_artifact: Some(expected_artifact),
                 model: None,
+                effort: None,
             });
         }
         state.save(paths)?;

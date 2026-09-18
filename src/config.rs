@@ -48,6 +48,12 @@ pub struct Config {
     /// Per-role backup assignment (feature 009). Mirrors `[roles]` shape.
     #[serde(default)]
     pub backups: BackupsConfig,
+    /// Per-role reasoning-effort assignment (`[effort]` / `--effort`). One level
+    /// per assignable role; the reviewer panel shares a single level. Values are
+    /// ladder rungs, validated at load; `--effort` overlays land here too, so the
+    /// O27 snapshot carries them into later rounds.
+    #[serde(default)]
+    pub effort: EffortConfig,
     /// Role config keys assigned via CLI `--backup` for this run. Parallel to `cli_role_keys`.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub cli_backup_keys: std::collections::BTreeSet<String>,
@@ -667,6 +673,58 @@ impl BackupsConfig {
     }
 }
 
+/// Per-role reasoning-effort assignment. Values are ladder rungs
+/// (`EffortLevel::from_str`), one per assignable role; `reviewer` covers the
+/// whole panel. Empty (all `None`) means no configured effort: dispatches run
+/// at each CLI's own default and `state.json` records nothing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EffortConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_critic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implementer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tester: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_author: Option<String>,
+}
+
+impl EffortConfig {
+    /// Priority 9 consumes this for the role-key invariant check.
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.planner.is_none()
+            && self.plan_critic.is_none()
+            && self.implementer.is_none()
+            && self.reviewer.is_none()
+            && self.tester.is_none()
+            && self.test_author.is_none()
+    }
+
+    /// Validate every assigned value parses as a ladder rung, naming the
+    /// offending role key. Keeps `effort_for`'s parse infallible from config.
+    fn validate(&self) -> Result<()> {
+        for (key, val) in [
+            ("planner", &self.planner),
+            ("plan_critic", &self.plan_critic),
+            ("implementer", &self.implementer),
+            ("reviewer", &self.reviewer),
+            ("tester", &self.tester),
+            ("test_author", &self.test_author),
+        ] {
+            if let Some(v) = val {
+                v.parse::<crate::effort::EffortLevel>()
+                    .with_context(|| format!("invalid effort in [effort].{key}: {v:?}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl RolesConfig {
     /// Priority 9 consumes this for the role-key invariant check.
     #[allow(dead_code)]
@@ -709,6 +767,21 @@ struct RolesConfigFile {
     plan_critic: Option<String>,
     implementer: Option<String>,
     reviewer: Option<Vec<String>>,
+    tester: Option<String>,
+    test_author: Option<String>,
+}
+
+/// `[effort]` file form: one ladder rung per assignable role. The reviewer
+/// panel shares a single level (no per-ordinal effort), so `reviewer` is a
+/// scalar here, unlike `[roles].reviewer`. Unknown keys are refused rather
+/// than silently ignored (a typo'd role must not parse clean and do nothing).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EffortConfigFile {
+    planner: Option<String>,
+    plan_critic: Option<String>,
+    implementer: Option<String>,
+    reviewer: Option<String>,
     tester: Option<String>,
     test_author: Option<String>,
 }
@@ -894,6 +967,7 @@ impl Default for Config {
             suite: SuiteConfig::default(),
             roles: RolesConfig::default(),
             backups: BackupsConfig::default(),
+            effort: EffortConfig::default(),
             cli_backup_keys: std::collections::BTreeSet::new(),
             review: ReviewConfig::default(),
             spec: SpecConfig::default(),
@@ -946,6 +1020,7 @@ struct ConfigFile {
     suite: Option<SuiteConfigFile>,
     roles: Option<RolesConfigFile>,
     backups: Option<BackupsConfigFile>,
+    effort: Option<EffortConfigFile>,
     review: Option<ReviewConfigFile>,
     spec: Option<SpecConfigFile>,
     critic: Option<CriticConfigFile>,
@@ -1107,8 +1182,12 @@ impl Config {
         if snap.is_file() {
             let text = std::fs::read_to_string(&snap)
                 .with_context(|| format!("read run config {}", snap.display()))?;
-            return serde_json::from_str(&text)
-                .with_context(|| format!("parse run config {}", snap.display()));
+            let cfg: Self = serde_json::from_str(&text)
+                .with_context(|| format!("parse run config {}", snap.display()))?;
+            // A hand-edited snapshot rung must refuse here, naming the role key:
+            // reading it as unset would run at a different depth than recorded.
+            cfg.effort.validate()?;
+            return Ok(cfg);
         }
         Self::load(&paths.project_root)
     }
@@ -1165,6 +1244,78 @@ impl Config {
         }
         self.roles.validate()?;
         self.validate_backup_against_primary()
+    }
+
+    /// The configured effort for a role (`--effort` overlay first, then
+    /// `[effort]` — both land in `self.effort`, so one lookup covers the top
+    /// two precedence rungs). Values were validated at load/overlay time, so a
+    /// value that no longer parses (hand-edited snapshot) reads as unset
+    /// rather than failing a dispatch.
+    pub fn effort_for(&self, role: crate::state::SlotRole) -> Option<crate::effort::EffortLevel> {
+        let raw: Option<&str> = match role {
+            crate::state::SlotRole::Planner => self.effort.planner.as_deref(),
+            crate::state::SlotRole::PlanCritic => self.effort.plan_critic.as_deref(),
+            crate::state::SlotRole::Implementer => self.effort.implementer.as_deref(),
+            crate::state::SlotRole::Reviewer => self.effort.reviewer.as_deref(),
+            crate::state::SlotRole::Tester => self.effort.tester.as_deref(),
+            crate::state::SlotRole::TestAuthor => self.effort.test_author.as_deref(),
+            _ => None,
+        };
+        let raw = raw?;
+        match raw.parse() {
+            Ok(level) => Some(level),
+            Err(_) => {
+                // Every file path validates (load, overlay, snapshot-read), so this
+                // is unreachable today. It is asserted rather than silently mapped
+                // to "run at default", which is the silent-depth shape this feature
+                // exists to prevent: a future writer that bypasses validation must
+                // fail loudly in debug rather than quietly change a slot's depth.
+                debug_assert!(false, "unvalidated effort level in config: {raw:?}");
+                None
+            }
+        }
+    }
+
+    /// Overlay `--effort <role>=<level>` onto `[effort]`, so a run's per-role
+    /// depth can be chosen without writing the project's shared `spar.toml`.
+    /// Mirrors `apply_role_overrides`: same six assignable roles, same snapshot
+    /// semantics (O27), same `--reload-config` rule on existing runs.
+    pub fn apply_effort_overrides(&mut self, assignments: &[String]) -> Result<()> {
+        if assignments.is_empty() {
+            return Ok(());
+        }
+        for raw in assignments {
+            let (role, level) = raw
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("--effort expects <role>=<level>, got {raw:?}"))?;
+            let (role, level) = (role.trim(), level.trim());
+            if level.is_empty() {
+                anyhow::bail!("--effort {role}= has no level");
+            }
+            let slot = crate::state::SlotRole::from_config_key(role).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--effort {role}: unknown role (planner, plan_critic, implementer, \
+                     reviewer, tester, test_author)"
+                )
+            })?;
+            let parsed: crate::effort::EffortLevel = level
+                .parse()
+                .with_context(|| format!("invalid effort in --effort {role}: {level:?}"))?;
+            let canonical = parsed.as_str().to_string();
+            match slot {
+                crate::state::SlotRole::Planner => self.effort.planner = Some(canonical),
+                crate::state::SlotRole::PlanCritic => self.effort.plan_critic = Some(canonical),
+                crate::state::SlotRole::Implementer => self.effort.implementer = Some(canonical),
+                crate::state::SlotRole::Reviewer => self.effort.reviewer = Some(canonical),
+                crate::state::SlotRole::Tester => self.effort.tester = Some(canonical),
+                crate::state::SlotRole::TestAuthor => self.effort.test_author = Some(canonical),
+                other => anyhow::bail!(
+                    "--effort {}: not assignable (it is derived by the workflow)",
+                    other.as_config_key()
+                ),
+            }
+        }
+        self.effort.validate()
     }
 
     pub fn apply_backup_overrides(&mut self, assignments: &[String]) -> Result<()> {
@@ -1479,6 +1630,27 @@ impl Config {
                 self.roles.test_author = Some(v.clone());
             }
             self.roles.validate()?;
+        }
+        if let Some(e) = &file.effort {
+            if let Some(v) = &e.planner {
+                self.effort.planner = Some(v.clone());
+            }
+            if let Some(v) = &e.plan_critic {
+                self.effort.plan_critic = Some(v.clone());
+            }
+            if let Some(v) = &e.implementer {
+                self.effort.implementer = Some(v.clone());
+            }
+            if let Some(v) = &e.reviewer {
+                self.effort.reviewer = Some(v.clone());
+            }
+            if let Some(v) = &e.tester {
+                self.effort.tester = Some(v.clone());
+            }
+            if let Some(v) = &e.test_author {
+                self.effort.test_author = Some(v.clone());
+            }
+            self.effort.validate()?;
         }
         if let Some(b) = &file.backups {
             if let Some(v) = &b.planner {
@@ -2001,6 +2173,100 @@ test_author = "cli:grok"
     }
 
     #[test]
+    fn effort_block_parses_and_resolves_per_role() {
+        use crate::state::SlotRole;
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+        std::fs::write(
+            project.join("spar.toml"),
+            "[effort]\nplanner = \"max\"\nreviewer = \"low\"\ntester = \"minimal\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load(project).unwrap();
+        assert_eq!(
+            cfg.effort_for(SlotRole::Planner),
+            Some(crate::effort::EffortLevel::Max)
+        );
+        assert_eq!(
+            cfg.effort_for(SlotRole::Reviewer),
+            Some(crate::effort::EffortLevel::Low)
+        );
+        assert_eq!(
+            cfg.effort_for(SlotRole::Tester),
+            Some(crate::effort::EffortLevel::Minimal)
+        );
+        assert_eq!(cfg.effort_for(SlotRole::Implementer), None);
+        assert_eq!(cfg.effort_for(SlotRole::Ranker), None);
+        assert!(!cfg.effort.is_empty());
+    }
+
+    #[test]
+    fn effort_default_is_empty() {
+        assert!(Config::default().effort.is_empty());
+    }
+
+    #[test]
+    fn effort_rejects_unknown_role_key() {
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+        std::fs::write(project.join("spar.toml"), "[effort]\ntestr = \"low\"\n").unwrap();
+        let err = Config::load(project).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("testr"),
+            "error must name the bad key, got: {msg}"
+        );
+        std::fs::write(project.join("spar.toml"), "[effort]\npeer = \"high\"\n").unwrap();
+        let err = Config::load(project).unwrap_err();
+        assert!(format!("{err:#}").contains("peer"));
+    }
+
+    #[test]
+    fn effort_rejects_bad_level_naming_role() {
+        let tmp = tempdir().unwrap();
+        let project = tmp.path();
+        std::fs::write(project.join("spar.toml"), "[effort]\ntester = \"turbo\"\n").unwrap();
+        let err = Config::load(project).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("tester"),
+            "error must name the role key, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn effort_overrides_beat_file_and_reject_bad_roles() {
+        use crate::state::SlotRole;
+        let mut cfg = Config::default();
+        cfg.apply_effort_overrides(&["tester=low".to_string(), "planner=MAX".to_string()])
+            .unwrap();
+        assert_eq!(
+            cfg.effort_for(SlotRole::Tester),
+            Some(crate::effort::EffortLevel::Low)
+        );
+        assert_eq!(
+            cfg.effort_for(SlotRole::Planner),
+            Some(crate::effort::EffortLevel::Max)
+        );
+        let err = cfg
+            .apply_effort_overrides(&["critic=high".to_string()])
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("critic"));
+        let err = cfg
+            .apply_effort_overrides(&["peer=high".to_string()])
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("not assignable"));
+        let err = cfg
+            .apply_effort_overrides(&["tester=turbo".to_string()])
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("tester"));
+        let err = cfg
+            .apply_effort_overrides(&["tester".to_string()])
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("--effort expects"));
+    }
+
+    #[test]
     fn roles_accept_model_ref() {
         let tmp = tempdir().unwrap();
         let project = tmp.path();
@@ -2156,6 +2422,29 @@ planner = "best"
         // The live file is still what a *new* run would get.
         let fresh = Config::load(tmp.path()).unwrap();
         assert_eq!(fresh.roles.planner.as_deref(), Some("cli:codex"));
+    }
+
+    #[test]
+    fn snapshot_with_corrupt_effort_rung_refuses() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut cfg = Config::load(tmp.path()).unwrap();
+        cfg.effort.tester = Some("low".into());
+        cfg.save_snapshot(&paths, "run1").unwrap();
+        let bound = Config::for_run(&paths, "run1").unwrap();
+        assert_eq!(
+            bound.effort_for(crate::state::SlotRole::Tester),
+            Some(crate::effort::EffortLevel::Low)
+        );
+        // A hand-edited snapshot rung refuses naming the role key instead of
+        // running at a different depth than recorded.
+        let snap = paths.run_config_file("run1");
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&snap).unwrap()).unwrap();
+        v["effort"]["tester"] = serde_json::Value::String("turbo".into());
+        std::fs::write(&snap, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        let err = Config::for_run(&paths, "run1").unwrap_err();
+        assert!(format!("{err:#}").contains("tester"), "{err:#}");
     }
 
     #[test]

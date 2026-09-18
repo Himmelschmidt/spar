@@ -81,6 +81,9 @@ impl ProviderAdapter for ClaudeAdapter {
         if let Some(id) = opts.session_id.as_deref() {
             cmd.arg("--session-id").arg(id);
         }
+        if let Some(e) = opts.effort {
+            cmd.arg("--effort").arg(e.as_str());
+        }
         for a in &opts.extra_args {
             cmd.arg(a);
         }
@@ -98,6 +101,9 @@ impl ProviderAdapter for ClaudeAdapter {
         }
         if let Some(id) = opts.session_id.as_deref() {
             cmd.arg("--session-id").arg(id);
+        }
+        if let Some(e) = opts.effort {
+            cmd.arg("--effort").arg(e.as_str());
         }
         if !opts.prompt.is_empty() {
             cmd.arg(&opts.prompt);
@@ -166,6 +172,7 @@ mod tests {
             extra_args: vec![],
             session_id: None,
             model: None,
+            effort: None,
             timeout_secs: None,
         };
         let cmd = ClaudeAdapter.build_headless(Path::new("claude"), &opts);
@@ -185,8 +192,24 @@ mod tests {
             extra_args: vec![],
             session_id: session_id.map(str::to_string),
             model: None,
+            effort: None,
             timeout_secs: None,
         }
+    }
+
+    #[test]
+    fn effort_renders_flag_when_set_and_nothing_when_unset() {
+        use crate::effort::EffortLevel;
+        let mut opts = opts_with_session(None);
+        opts.effort = Some(EffortLevel::Xhigh);
+        let (_, args) = command_to_parts(&ClaudeAdapter.build_headless(Path::new("claude"), &opts));
+        assert_eq!(dash_val(&args, "--effort").as_deref(), Some("xhigh"));
+        opts.effort = None;
+        let (_, args) = command_to_parts(&ClaudeAdapter.build_headless(Path::new("claude"), &opts));
+        assert!(
+            !args.iter().any(|a| a == "--effort"),
+            "no flag without an effort: {args:?}"
+        );
     }
 
     fn dash_val(args: &[String], flag: &str) -> Option<String> {
@@ -264,5 +287,20 @@ mod tests {
             .expect("claude recovery always names a session");
         assert_ne!(id, "main-session");
         assert!(crate::session_id::is_uuid_shape(&id));
+    }
+
+    #[test]
+    fn effort_interactive_matches_headless() {
+        use crate::effort::EffortLevel;
+        let mut opts = opts_with_session(None);
+        opts.effort = Some(EffortLevel::High);
+        let (_, args) =
+            command_to_parts(&ClaudeAdapter.build_interactive(Path::new("claude"), &opts));
+        let i = args.iter().position(|a| a == "--effort").expect("--effort");
+        assert_eq!(args.get(i + 1).map(String::as_str), Some("high"));
+        opts.effort = None;
+        let (_, args) =
+            command_to_parts(&ClaudeAdapter.build_interactive(Path::new("claude"), &opts));
+        assert!(!args.iter().any(|a| a == "--effort"));
     }
 }

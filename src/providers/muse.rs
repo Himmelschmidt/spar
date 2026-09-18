@@ -12,6 +12,17 @@ use std::process::Command;
 /// may be swallowed by this, so only `MuseAdapter` implements the predicate.
 pub const TRANSIENT_MODEL_ACCESS_MESSAGE: &str = "does not exist or you lack access";
 
+/// muse's transport-failure signature, observed on 2026-09-17 killing two spar runs in
+/// this repo (`9cf0b8ea`, `8b8a5c94`) after 66 and 57 completed tool calls each:
+/// ``transport error [net-timeout]: timed out waiting for response data (meta stream)``
+/// with exit 1, one of them already carrying muse's own `(after 2 provider attempts)`.
+/// This is the same class O86/O87 built the backoff ladder for — the backend went away
+/// mid-stream after real work — but the ladder only ever matched
+/// `TRANSIENT_MODEL_ACCESS_MESSAGE`, so these dispatches were reported as work failures
+/// and their worktrees stranded. Matched on the bracketed error kind rather than the
+/// prose after it, which is muse's own wording and not a contract.
+pub const TRANSIENT_TRANSPORT_MESSAGE: &str = "transport error [net-timeout]";
+
 /// Model override (`--model`). spar's per-slot model (`--select` or a `cli:muse@<model>`
 /// ref) wins; otherwise `SPAR_MUSE_MODEL`; otherwise none, so muse's own
 /// `settings.json` picks the model (currently `muse-spark-1.2-contributor`). Leaving the
@@ -28,9 +39,14 @@ fn muse_model(opts: &SpawnOpts) -> Option<String> {
         })
 }
 
-/// Meta reasoning effort (`--reasoning-effort`): none|minimal|low|medium|high|xhigh|ultra.
-/// spar has no per-role effort knob, so this is env-only; unset leaves muse's default (high).
-fn muse_reasoning_effort() -> Option<String> {
+/// Meta reasoning effort (`--reasoning-effort`). A resolved per-role effort
+/// (`SpawnOpts::effort`, from `--effort` / `[effort]`) wins; otherwise
+/// `SPAR_MUSE_REASONING_EFFORT` passes through unvalidated exactly as before;
+/// unset leaves muse's default (high).
+fn muse_reasoning_effort(opts: &SpawnOpts) -> Option<String> {
+    if let Some(e) = opts.effort {
+        return Some(e.as_str().to_string());
+    }
     std::env::var("SPAR_MUSE_REASONING_EFFORT")
         .ok()
         .map(|s| s.trim().to_string())
@@ -183,9 +199,11 @@ impl ProviderAdapter for MuseAdapter {
     /// that tells a transient backend blip from a genuinely wrong model name or dead
     /// entitlement lives in `executor::dispatch_with_resume_recovery`, next to the retry.
     fn dispatch_failure_is_transient(&self, log_text: &str) -> bool {
-        log_text
-            .lines()
-            .any(|l| l.starts_with("! ") && l.contains(TRANSIENT_MODEL_ACCESS_MESSAGE))
+        log_text.lines().any(|l| {
+            l.starts_with("! ")
+                && (l.contains(TRANSIENT_MODEL_ACCESS_MESSAGE)
+                    || l.contains(TRANSIENT_TRANSPORT_MESSAGE))
+        })
     }
 
     /// muse's documented exit codes: 0 success, 1 failure or cancellation (including
@@ -250,7 +268,7 @@ impl MuseAdapter {
         if let Some(m) = muse_model(opts) {
             cmd.arg("--model").arg(m);
         }
-        if let Some(e) = muse_reasoning_effort() {
+        if let Some(e) = muse_reasoning_effort(opts) {
             cmd.arg("--reasoning-effort").arg(e);
         }
         // A spar-assigned cold-dispatch id rides here, ahead of the prompt tail.
@@ -304,6 +322,7 @@ mod tests {
             extra_args: vec![],
             session_id: session_id.map(Into::into),
             model: model.map(Into::into),
+            effort: None,
             timeout_secs: None,
         }
     }
@@ -432,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_is_env_only() {
+    fn reasoning_effort_env_applies_when_no_flag() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_env();
         let (_, a) =
@@ -443,6 +462,79 @@ mod tests {
         let (_, a) =
             command_to_parts(&MuseAdapter.build_headless(Path::new("muse"), &opts("x", None)));
         assert_eq!(dash_val(&a, "--reasoning-effort").as_deref(), Some("xhigh"));
+        clear_env();
+    }
+
+    #[test]
+    fn reasoning_effort_flag_beats_env() {
+        use crate::effort::EffortLevel;
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        std::env::set_var("SPAR_MUSE_REASONING_EFFORT", "low");
+        let mut o = opts("x", None);
+        o.effort = Some(EffortLevel::Max);
+        let (_, a) = command_to_parts(&MuseAdapter.build_headless(Path::new("muse"), &o));
+        assert_eq!(dash_val(&a, "--reasoning-effort").as_deref(), Some("max"));
+        clear_env();
+    }
+
+    #[test]
+    fn reasoning_effort_resume_matches_headless() {
+        use crate::effort::EffortLevel;
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let mut o = opts("x", None);
+        o.effort = Some(EffortLevel::Low);
+        let (_, head) = command_to_parts(&MuseAdapter.build_headless(Path::new("muse"), &o));
+        let resume = MuseAdapter
+            .build_resume(Path::new("muse"), &o, "session-1")
+            .expect("resume");
+        let (_, res) = command_to_parts(&resume);
+        assert_eq!(
+            dash_val(&head, "--reasoning-effort").as_deref(),
+            Some("low")
+        );
+        assert_eq!(dash_val(&res, "--reasoning-effort").as_deref(), Some("low"));
+        o.effort = None;
+        let (_, head) = command_to_parts(&MuseAdapter.build_headless(Path::new("muse"), &o));
+        let resume = MuseAdapter
+            .build_resume(Path::new("muse"), &o, "session-1")
+            .expect("resume");
+        let (_, res) = command_to_parts(&resume);
+        assert!(!head.iter().any(|x| x == "--reasoning-effort"));
+        assert!(!res.iter().any(|x| x == "--reasoning-effort"));
+        clear_env();
+    }
+
+    #[test]
+    fn reasoning_effort_config_beats_env() {
+        use crate::config::Config;
+        use crate::state::SlotRole;
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        std::env::set_var("SPAR_MUSE_REASONING_EFFORT", "low");
+        let mut cfg = Config::default();
+        cfg.apply_effort_overrides(&["implementer=max".to_string()])
+            .unwrap();
+        let mut o = opts("x", None);
+        o.effort = cfg.effort_for(SlotRole::Implementer);
+        let (_, a) = command_to_parts(&MuseAdapter.build_headless(Path::new("muse"), &o));
+        assert_eq!(dash_val(&a, "--reasoning-effort").as_deref(), Some("max"));
+        clear_env();
+    }
+
+    #[test]
+    fn reasoning_effort_interactive_matches_headless() {
+        use crate::effort::EffortLevel;
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let mut o = opts("x", None);
+        o.effort = Some(EffortLevel::High);
+        let (_, a) = command_to_parts(&MuseAdapter.build_interactive(Path::new("muse"), &o));
+        assert_eq!(dash_val(&a, "--reasoning-effort").as_deref(), Some("high"));
+        o.effort = None;
+        let (_, a) = command_to_parts(&MuseAdapter.build_interactive(Path::new("muse"), &o));
+        assert!(!a.iter().any(|x| x == "--reasoning-effort"));
         clear_env();
     }
 
@@ -590,6 +682,33 @@ mod tests {
         expected.insert(tail_at, "sess-abc".into());
         expected.insert(tail_at, "--session-id".into());
         assert_eq!(resume, expected);
+    }
+
+    /// The failure that killed two spar runs on 2026-09-17 after real work: muse's
+    /// stream went away mid-dispatch, the run was reported as a work failure, and its
+    /// worktree was stranded. O86/O87's ladder should have resumed it.
+    #[test]
+    fn a_transport_timeout_after_real_work_is_transient() {
+        assert!(MuseAdapter.dispatch_failure_is_transient(
+            "→ edit_file  /x/src/main.rs  success\n! transport error [net-timeout]: timed out waiting for response data (meta stream)\n"
+        ));
+        assert!(
+            MuseAdapter.dispatch_failure_is_transient(
+                "! transport error [net-timeout]: timed out waiting for response data (meta stream) (after 2 provider attempts)\n"
+            ),
+            "muse having already retried internally does not make it permanent"
+        );
+        assert!(
+            !MuseAdapter.dispatch_failure_is_transient(
+                "transport error [net-timeout]: timed out waiting for response data\n"
+            ),
+            "unanchored: an agent writing the sentence must not buy the backoff schedule"
+        );
+        assert!(
+            !MuseAdapter
+                .dispatch_failure_is_transient("! transport error [auth]: credentials rejected\n"),
+            "a different transport error kind is not this signature"
+        );
     }
 
     #[test]

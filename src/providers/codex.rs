@@ -150,6 +150,20 @@ fn last_message_path_for_opts(opts: &SpawnOpts) -> Option<PathBuf> {
     )
 }
 
+/// Reasoning effort (`-c model_reasoning_effort=<v>`), the same `-c` override
+/// channel `build_headless` already uses. One helper serves both `build_headless`
+/// and `build_resume` so the two cannot drift (the O65 class of bug). `None`
+/// emits nothing.
+fn effort_args(opts: &SpawnOpts) -> Vec<String> {
+    match opts.effort {
+        Some(e) => vec![
+            "-c".into(),
+            format!("model_reasoning_effort={}", e.as_str()),
+        ],
+        None => vec![],
+    }
+}
+
 /// The trailing prompt positional: inline `opts.prompt` if set, else the prompt file's
 /// contents, else empty. stdin is null (spar spawns detached), so codex only ever sees
 /// the prompt from this argument.
@@ -274,6 +288,9 @@ impl ProviderAdapter for CodexAdapter {
                 }
             }
         }
+        for a in effort_args(opts) {
+            cmd.arg(a);
+        }
         for a in &opts.extra_args {
             cmd.arg(a);
         }
@@ -333,6 +350,9 @@ impl ProviderAdapter for CodexAdapter {
                     }
                 }
             }
+        }
+        for a in effort_args(opts) {
+            cmd.arg(a);
         }
         for a in &opts.extra_args {
             cmd.arg(a);
@@ -398,6 +418,7 @@ mod tests {
             extra_args: vec![],
             session_id: None,
             model: model.map(Into::into),
+            effort: None,
             timeout_secs: None,
         }
     }
@@ -606,6 +627,30 @@ mod tests {
     }
 
     #[test]
+    fn effort_interactive_matches_headless() {
+        use crate::effort::EffortLevel;
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SPAR_CODEX_PROFILE");
+        std::env::remove_var("SPAR_CODEX_MODEL");
+        let home = tempdir().unwrap();
+        std::env::set_var("CODEX_HOME", home.path());
+        let mut o = opts("go", None);
+        o.effort = Some(EffortLevel::High);
+        let (_, a) = command_to_parts(&CodexAdapter.build_interactive(Path::new("codex"), &o));
+        assert!(
+            a.iter().any(|x| x == "model_reasoning_effort=high"),
+            "{a:?}"
+        );
+        o.effort = None;
+        let (_, a) = command_to_parts(&CodexAdapter.build_interactive(Path::new("codex"), &o));
+        std::env::remove_var("CODEX_HOME");
+        assert!(
+            !a.iter().any(|x| x.starts_with("model_reasoning_effort")),
+            "{a:?}"
+        );
+    }
+
+    #[test]
     fn build_resume_carries_model_override() {
         let _guard = ENV_LOCK.lock().unwrap();
         let cmd = CodexAdapter.build_resume(
@@ -619,6 +664,65 @@ mod tests {
             args.get(mi + 1).map(String::as_str),
             Some("meta/muse-spark-1.1")
         );
+    }
+
+    #[test]
+    fn effort_renders_config_override_when_set_and_nothing_when_unset() {
+        use crate::effort::EffortLevel;
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SPAR_CODEX_PROFILE");
+        std::env::remove_var("SPAR_CODEX_MODEL");
+        let home = tempdir().unwrap();
+        std::env::set_var("CODEX_HOME", home.path());
+        let (_, args) =
+            command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &opts("go", None)));
+        assert!(
+            !args.iter().any(|a| a.starts_with("model_reasoning_effort")),
+            "unset effort emits nothing: {args:?}"
+        );
+        let mut o = opts("go", None);
+        o.effort = Some(EffortLevel::High);
+        let (_, args) = command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &o));
+        std::env::remove_var("CODEX_HOME");
+        let ci = args.iter().position(|a| a == "-c").expect("-c present");
+        assert_eq!(
+            args.get(ci + 1).map(String::as_str),
+            Some("model_reasoning_effort=high")
+        );
+        let di = args.iter().position(|a| a == "--").expect("-- separator");
+        assert!(ci < di, "effort override must precede the prompt: {args:?}");
+    }
+
+    #[test]
+    fn effort_resume_matches_headless() {
+        use crate::effort::EffortLevel;
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SPAR_CODEX_PROFILE");
+        std::env::remove_var("SPAR_CODEX_MODEL");
+        let home = tempdir().unwrap();
+        std::env::set_var("CODEX_HOME", home.path());
+        let mut o = opts("go", None);
+        o.effort = Some(EffortLevel::Low);
+        let (_, head) = command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &o));
+        let resume = CodexAdapter
+            .build_resume(Path::new("codex"), &o, "thread-1")
+            .expect("codex supports resume");
+        let (_, res) = command_to_parts(&resume);
+        let head_effort = head.iter().any(|a| a == "model_reasoning_effort=low");
+        let res_effort = res.iter().any(|a| a == "model_reasoning_effort=low");
+        assert!(
+            head_effort && res_effort,
+            "headless={head:?} resume={res:?}"
+        );
+        o.effort = None;
+        let (_, head) = command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &o));
+        let resume = CodexAdapter
+            .build_resume(Path::new("codex"), &o, "thread-1")
+            .expect("codex supports resume");
+        let (_, res) = command_to_parts(&resume);
+        std::env::remove_var("CODEX_HOME");
+        assert!(!head.iter().any(|a| a.starts_with("model_reasoning_effort")));
+        assert!(!res.iter().any(|a| a.starts_with("model_reasoning_effort")));
     }
 
     #[test]
@@ -808,6 +912,7 @@ mod tests {
             trust: TrustPolicy::FullAuto,
             extra_args: vec![],
             model: None,
+            effort: None,
             timeout_secs: None,
             session_id: None,
         };

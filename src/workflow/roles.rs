@@ -154,6 +154,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
             extra_vars: extra,
             expected_artifact: Some(format!("summary-{}.md", slot.id)),
             model: None,
+            effort: None,
         };
         let _ = executor::run_slot(state, paths, cfg, &job);
     }

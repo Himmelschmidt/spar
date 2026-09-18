@@ -108,6 +108,7 @@ pub fn spawn_agent(req: &SpawnRequest) -> Result<(String, String)> {
         extra_args: vec![],
         session_id: None,
         model: None,
+        effort: None,
         timeout_secs: None,
     };
     let cmd = adapter.build_interactive(&bin, &opts);

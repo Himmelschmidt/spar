@@ -80,6 +80,7 @@ pub fn dispatch_turn(
         extra_args: vec![],
         session_id: None,
         model: None,
+        effort: None,
         timeout_secs: Some(req.timeout.as_secs()),
     };
     let cmd = adapter_box.build_headless(&bin, &spawn_opts);

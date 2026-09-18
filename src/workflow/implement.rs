@@ -1976,6 +1976,7 @@ pub fn execute_loop(
             extra_vars: extra.clone(),
             expected_artifact: Some(format!("summary-{}.md", impl_slot.id)),
             model: impl_model,
+            effort: None,
         };
         if let Err(e) = executor::run_slot(state, paths, cfg, &impl_job) {
             let quota_hit = executor::slot_quota_hit(state, &impl_job.slot_id);
@@ -2058,6 +2059,7 @@ pub fn execute_loop(
                                     retry_impl_slot.id
                                 )),
                                 model: retry_impl_slot.model.clone(),
+                                effort: None,
                             };
                             if let Err(e2) = executor::run_slot(state, paths, cfg, &retry_job) {
                                 let quota_hit2 =
@@ -2151,6 +2153,7 @@ pub fn execute_loop(
                                         retry_impl_slot.id
                                     )),
                                     model: retry_impl_slot.model.clone(),
+                                    effort: None,
                                 };
                                 if let Err(e2) = executor::run_slot(state, paths, cfg, &retry_job) {
                                     let quota_hit2 =
@@ -2296,6 +2299,7 @@ pub fn execute_loop(
                     extra_vars: HashMap::new(),
                     expected_artifact: Some("suite.md".into()),
                     model: tester.model.clone(),
+                    effort: None,
                 };
                 let suite_ok = executor::run_slot(state, paths, cfg, &suite_job).is_ok();
                 if !suite_ok && executor::slot_quota_hit(state, &tester.id) {
@@ -2503,6 +2507,7 @@ pub fn execute_loop(
                 extra_vars: extra,
                 expected_artifact: Some(format!("review-{}.md", rev.id)),
                 model: None,
+                effort: None,
             };
             let mut review_ok = executor::run_slot(state, paths, cfg, &job).is_ok();
             if !review_ok {

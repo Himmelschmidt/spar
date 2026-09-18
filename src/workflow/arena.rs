@@ -192,6 +192,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
                     extra_vars: HashMap::new(),
                     expected_artifact: Some(format!("summary-{}.md", slot.id)),
                     model: None,
+                    effort: None,
                 };
                 if let Err(e) = executor::run_slot(state, paths, cfg, &job) {
                     if let Some(s) = state.slot_mut(&slot.id) {
@@ -258,6 +259,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
             extra_vars: extra,
             expected_artifact: Some("ranking.md".into()),
             model: None,
+            effort: None,
         };
         if let Err(e) = executor::run_slot(state, paths, cfg, &job) {
             // Quota-detected only: a genuine ranker defect keeps the existing
@@ -418,6 +420,7 @@ pub fn reconcile(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> R
         extra_vars: extra,
         expected_artifact: Some("summary-reconcile.md".into()),
         model: None,
+        effort: None,
     };
     if let Err(e) = executor::run_slot(&mut state, paths, cfg, &job) {
         let quota_hit = executor::slot_quota_hit(&state, &recon_id);
@@ -461,6 +464,7 @@ pub fn reconcile(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> R
             extra_vars: extra,
             expected_artifact: Some(format!("review-reconcile-{i}.md")),
             model: None,
+            effort: None,
         };
         if let Err(e) = executor::run_slot(&mut state, paths, cfg, &job) {
             let quota_hit = executor::slot_quota_hit(&state, &job.slot_id);
