@@ -28,6 +28,10 @@ impl ProviderAdapter for AgyAdapter {
         &["agy"]
     }
 
+    // No readiness probe. Tried `agy models`: it prints "Fetching available
+    // models..." — a network fetch, not a local-state read, so it fails the
+    // probe's local-only constraint. Default (Unknown) stands.
+
     fn version_args(&self) -> &[&'static str] {
         &["--help"]
     }

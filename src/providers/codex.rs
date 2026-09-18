@@ -173,6 +173,16 @@ impl ProviderAdapter for CodexAdapter {
         &["codex"]
     }
 
+    // No readiness probe. Tried `codex doctor --json` (config + auth + runtime
+    // health, verified against codex 0.153.4): it is too slow for a probe
+    // (~7s once, over 25s another time on this box) and it performs network
+    // reachability checks (provider endpoints, Responses websocket), which a
+    // local-only probe must not do; bare `codex doctor` hangs with no output
+    // outside a TTY. Anything built on `codex exec` is out regardless: exec
+    // appends a `[projects."<cwd>"]` trust_level entry to the user's config
+    // for every new directory, the exact kind of state mutation a probe must
+    // not have. Default (Unknown) stands.
+
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             headless: true,

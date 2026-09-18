@@ -47,6 +47,13 @@ impl ProviderAdapter for GrokAdapter {
         &["grok"]
     }
 
+    // No readiness probe. Tried: `grok doctor` checks terminal/clipboard/color
+    // support only, not auth or config; `grok models` exits 0 even when logged
+    // out ("You are not authenticated", verified), so it cannot distinguish a
+    // dispatchable box from a broken one; `grok inspect` is per-directory
+    // (project trust) and per-worktree checks are out of scope. Default
+    // (Unknown) stands.
+
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             headless: true,
