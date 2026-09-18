@@ -809,6 +809,7 @@ mod tests {
             extra_args: vec![],
             model: None,
             timeout_secs: None,
+            session_id: None,
         };
         assert_eq!(
             last_message_path_for_opts(&o).as_deref(),

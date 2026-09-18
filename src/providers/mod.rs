@@ -883,6 +883,7 @@ mod tests {
             extra_args: vec![],
             model: None,
             timeout_secs: None,
+            session_id: None,
         };
         let mut resumed = Vec::new();
         for a in all_adapters() {
