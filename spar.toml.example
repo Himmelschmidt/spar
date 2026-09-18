@@ -80,6 +80,16 @@ other = 12000000     # ranker / peer / reconciler: no measured distribution of t
 # tester = "cli:agy"          # cheap suite runner (was [suite].provider)
 # test_author = "cli:grok"    # pre-coding test author (was [spec].provider)
 
+# Reasoning effort per role. Values are ladder rungs (none, minimal, low, medium,
+# high, xhigh, max, ultra), one per role; the reviewer panel shares a single level.
+# Each adapter maps the rung onto its own control; a rung a CLI does not offer
+# refuses the dispatch before spawn. Precedence: --effort flag > [effort] >
+# SPAR_MUSE_REASONING_EFFORT (muse only) > the CLI's own default.
+[effort]
+# planner = "max"     # deep planning
+# reviewer = "medium"
+# tester = "low"      # cheap suite runner, not a judge
+
 # Full test suite channel. Implementers/reviewers must not run multi-hour suites.
 [suite]
 enabled = true

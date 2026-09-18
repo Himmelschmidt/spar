@@ -210,6 +210,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
                 extra_vars: extra,
                 expected_artifact: Some(format!("review-{}.md", slot.id)),
                 model: None,
+                effort: None,
             }
         })
         .collect();
@@ -308,6 +309,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
             extra_vars: job.extra_vars.clone(),
             expected_artifact: Some(new_artifact),
             model: pin.model.clone(),
+            effort: None,
         };
         let _ = executor::run_slot(state, paths, cfg, &retry_job);
     }

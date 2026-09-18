@@ -163,6 +163,10 @@ pub struct SpawnOpts {
     pub session_id: Option<String>,
     /// Preferred model id (`--model` on CLIs that support it).
     pub model: Option<String>,
+    /// Resolved reasoning effort, rendered by each adapter onto its own
+    /// control (`--effort`, `--reasoning-effort`, `-c`, `--variant`). `None`
+    /// emits nothing, so command lines are byte-identical to before effort.
+    pub effort: Option<crate::effort::EffortLevel>,
     /// Resolved slot wall-clock budget in seconds: the role's **hard ceiling**, not its
     /// soft budget (`executor::hard_ceiling_for_role`, i.e. whichever of `slot_secs` /
     /// `review_secs` / `suite.timeout_secs` / `spec.timeout_secs` the role drew, times
@@ -690,6 +694,7 @@ mod tests {
             extra_args: vec![],
             session_id: None,
             model: None,
+            effort: None,
             timeout_secs: Some(60),
         });
         assert_eq!(
@@ -882,6 +887,7 @@ mod tests {
             trust: TrustPolicy::FullAuto,
             extra_args: vec![],
             model: None,
+            effort: None,
             timeout_secs: None,
             session_id: None,
         };

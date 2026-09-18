@@ -77,6 +77,11 @@ pub enum Command {
         /// Repeatable; reviewer backups preserve ordinal order. Only for role workflows.
         #[arg(long = "backup", value_name = "ROLE=PROVIDER")]
         backup: Vec<String>,
+        /// Reasoning effort for a role for THIS run, without touching `spar.toml`:
+        /// `--effort planner=max --effort tester=low`. Repeatable; the reviewer panel
+        /// shares one level. Outranks `[effort]` for the roles it covers.
+        #[arg(long = "effort", value_name = "ROLE=LEVEL")]
+        effort: Vec<String>,
         /// Fleet preset for THIS run: `small` (one reviewer, no critic, no spec
         /// test-author, no agent tester — a configured deterministic `[suite].command`
         /// still runs) or `standard` (today's defaults; never re-enables a channel the
@@ -164,6 +169,11 @@ pub enum Command {
         /// Backup provider for a role for THIS run: `--backup planner=cli:grok`.
         #[arg(long = "backup", value_name = "ROLE=PROVIDER")]
         backup: Vec<String>,
+        /// Reasoning effort for a role for THIS run, without touching `spar.toml`:
+        /// `--effort planner=max --effort tester=low`. Repeatable; the reviewer panel
+        /// shares one level. Outranks `[effort]` for the roles it covers.
+        #[arg(long = "effort", value_name = "ROLE=LEVEL")]
+        effort: Vec<String>,
         /// Fleet preset for THIS run: `small` (one reviewer, no critic, no spec
         /// test-author, no agent tester — a configured deterministic `[suite].command`
         /// still runs) or `standard` (today's defaults; never re-enables a channel the
@@ -238,6 +248,11 @@ pub enum Command {
         /// Backup provider for a role for THIS run: `--backup reviewer=cli:claude`.
         #[arg(long = "backup", value_name = "ROLE=PROVIDER")]
         backup: Vec<String>,
+        /// Reasoning effort for a role for THIS run, without touching `spar.toml`:
+        /// `--effort planner=max --effort tester=low`. Repeatable; the reviewer panel
+        /// shares one level. Outranks `[effort]` for the roles it covers.
+        #[arg(long = "effort", value_name = "ROLE=LEVEL")]
+        effort: Vec<String>,
         /// Fleet preset for THIS run: `small` (one reviewer, no critic, no spec
         /// test-author, no agent tester — a configured deterministic `[suite].command`
         /// still runs) or `standard` (today's defaults; never re-enables a channel the

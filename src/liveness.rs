@@ -233,6 +233,7 @@ mod tests {
             artifact: None,
             usage: None,
             model: None,
+            effort: None,
             round: 1,
             quota_hit: false,
             reviewed_commit: None,

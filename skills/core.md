@@ -152,8 +152,11 @@ Not a takeover target. Model selection, highest precedence first:
   choice of the contributor tier (whose discount is paid for with "your content may be used
   for product improvement") a single decision on the box rather than something spar bakes
   into every repo. On a repo where that matters, pin `cli:muse@muse-spark-1.2`.
-- `SPAR_MUSE_REASONING_EFFORT` maps to `--reasoning-effort` (none|minimal|low|medium|high|
-  xhigh|ultra); unset leaves muse's default of high.
+- Effort for a muse slot comes from `--effort <role>=<level>` / `[effort]` first (all
+  8 rungs); otherwise `SPAR_MUSE_REASONING_EFFORT` passes through to
+  `--reasoning-effort` unvalidated exactly as before; unset leaves muse's default
+  of high. A run with no effort flag anywhere renders byte-identical command lines
+  to before.
 
 Token accounting differs from every other adapter, deliberately. muse reports **no** usage on
 stdout, so spar reads its session log
@@ -1077,6 +1080,45 @@ own `[roles]` into it are writing over each other.
 ```bash
 spar plan -t "…" --role planner=cli:grok --role plan_critic=cli:claude@opus --role reviewer=cli:grok
 ```
+
+**Reasoning effort per role (O95):** spar speaks one 8-rung ladder — `none minimal
+low medium high xhigh max ultra` — set per role and mapped by each adapter onto its
+own control. One run can dispatch a cheap tester and a deep planner:
+
+```bash
+spar plan -t "…" --effort planner=max --effort tester=low
+```
+
+- **Surface:** repeatable `--effort <role>=<level>` on `plan`, `implement` and `run`,
+  plus an `[effort]` block in `spar.toml` with the same six role keys `[roles]`
+  takes. The reviewer panel shares one level. `spar plan --run <id>` refuses
+  `--effort`, and `implement --run <id>` needs `--reload-config` for it, exactly
+  like `--role`; values land in the run's frozen `config.json` (O27). `--effort`
+  is refused on `arena`/`peer`/`roles` workflows (positional, not role-based),
+  like `--backup`.
+- **Precedence:** `--effort` flag, then `[effort]`, then `SPAR_MUSE_REASONING_EFFORT`
+  (muse only, unvalidated passthrough exactly as before), then the CLI's own
+  default. No flag anywhere means byte-identical command lines to before. Once a
+  slot records a depth, later dispatches keep rendering it (like `model`): changing
+  `[effort]` plus `--reload-config` in round 2 does not move already-dispatched slots.
+- **Per-adapter mapping:** claude `--effort` (low, medium, high, xhigh, max); grok
+  `--reasoning-effort` (none through max); muse `--reasoning-effort` (all 8);
+  codex `-c model_reasoning_effort=<v>` (all 8: codex validates per *model*
+  server-side — `gpt-5.5` stops at xhigh while `gpt-5.6-terra` takes ultra — so
+  spar sends the union rather than guessing a per-provider ceiling); opencode
+  `--variant` (any rung, free string — `--variant` names an operator-configured
+  variant, so a rung with no matching variant fails at runtime and the failure
+  looks like an agent defect, not a config error); agy `--effort` (low, medium,
+  high).
+- **Refusal, not clamping:** a rung a CLI does not offer fails the dispatch before
+  spawn with the accepted levels named (e.g. `effort 'ultra' not accepted by
+  cli:agy (takes: low, medium, high)`) — `--dry-run` catches it too. It is
+  spar's own misconfiguration rather than an agent failure, but not yet a typed
+  fault class: on the reviewer path it still costs one provider rotation and then
+  reads as a `request_changes` blocker.
+- **Workflows:** `--effort` is accepted on `loop`, `plan` and `arena`, and refused
+  for `peer`/`roles`, whose seats resolve to no per-role depth. A finished run's `state.json` records each slot's resolved depth
+  next to its model.
 
 ## Fleet shaping (`--fleet`, `--without`, run JSON `fleet`)
 

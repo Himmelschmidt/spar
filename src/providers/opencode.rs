@@ -116,6 +116,10 @@ impl ProviderAdapter for OpencodeAdapter {
         if let Some(m) = opencode_model(opts) {
             cmd.arg("-m").arg(opencode_model_arg(&m));
         }
+        // `--variant` is a free string, so every ladder rung passes through.
+        if let Some(e) = opts.effort {
+            cmd.arg("--variant").arg(e.as_str());
+        }
         for a in &opts.extra_args {
             cmd.arg(a);
         }
@@ -161,6 +165,7 @@ mod tests {
             extra_args: vec![],
             session_id: None,
             model: model.map(Into::into),
+            effort: None,
             timeout_secs: None,
         }
     }
@@ -285,6 +290,36 @@ mod tests {
             &OpencodeAdapter.build_headless(Path::new("opencode"), &opts("x", None)),
         );
         assert!(!a.iter().any(|x| x == "-m"), "no model -> no -m: {a:?}");
+    }
+
+    #[test]
+    fn effort_renders_variant_when_set_and_nothing_when_unset() {
+        use crate::effort::EffortLevel;
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SPAR_OPENCODE_MODEL");
+        let (_, a) = command_to_parts(
+            &OpencodeAdapter.build_headless(Path::new("opencode"), &opts("x", None)),
+        );
+        assert!(
+            !a.iter().any(|x| x == "--variant"),
+            "unset effort emits nothing: {a:?}"
+        );
+        let mut o = opts("x", None);
+        o.effort = Some(EffortLevel::Ultra);
+        let (_, a) = command_to_parts(&OpencodeAdapter.build_headless(Path::new("opencode"), &o));
+        assert_eq!(dash_val(&a, "--variant").as_deref(), Some("ultra"));
+    }
+
+    #[test]
+    fn effort_interactive_matches_headless() {
+        use crate::effort::EffortLevel;
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SPAR_OPENCODE_MODEL");
+        let mut o = opts("x", None);
+        o.effort = Some(EffortLevel::Ultra);
+        let (_, a) =
+            command_to_parts(&OpencodeAdapter.build_interactive(Path::new("opencode"), &o));
+        assert_eq!(dash_val(&a, "--variant").as_deref(), Some("ultra"));
     }
 
     #[test]
