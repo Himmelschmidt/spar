@@ -51,8 +51,8 @@ If you branch on backend inside a workflow, you are in the wrong layer.
 - `--providers` or `--select` is required on `plan` / `implement` / `run`.
 - Exit codes are a public contract: `0` ok, `1` fail, `2` human gate,
   `3` stuck, `4` quota. Never repurpose them.
-- Completion is process exit plus expected artifacts. Timeout alone is
-  not success.
+- Completion is process exit plus expected artifacts **from this
+  dispatch**. Timeout alone is not success.
 - Swarm bus is workspace-scoped and `agent_id`-keyed at `.spar/bus/`, not
   under a run (W5).
 

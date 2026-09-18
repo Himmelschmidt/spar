@@ -4,7 +4,9 @@
 //! One scenario per landed strategy, all under `--dry-run` so the side-effecting
 //! injection call is stubbed and only drain + dispatch are exercised:
 //!   - Claude  → `StopHookInject`       (emits a Stop-hook `block` payload)
-//!   - Grok    → `NativeQueue`          (dispatches to the durable turn-boundary queue)
+//!   - Grok    → `StopHookInject`       (same turn-boundary injection as Claude: grok's
+//!     Stop hook honors the same `{"decision":"block",…}` payload per docs ch. 10;
+//!     the end-to-end re-drive is not yet observed live, see O90)
 //!   - agy     → `None`                 (inbox left untouched for the agent's next turn)
 //!   - muse    → `StopHookInject`       (same turn-boundary injection as Claude: muse's
 //!     Stop hook honors the same `{"decision":"block",…}` payload, probed live)
@@ -196,10 +198,11 @@ fn stop_hook_inject_hook_mode_emits_only_payload() {
     );
 }
 
-/// Grok: deliver drains once and dispatches to the native-queue strategy. Under
-/// dry-run the queue write is stubbed, but the drain is real (exactly-once).
+/// Grok: deliver drains once and hands the batch to the Stop-hook block channel,
+/// the same turn-boundary injection Claude uses. A second deliver drains nothing
+/// (exactly-once).
 #[test]
-fn native_queue_drains_once_and_dispatches() {
+fn grok_stop_hook_inject_drains_once_and_builds_block() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
     let run_id = plan_and_approve(tmp.path());
@@ -208,12 +211,19 @@ fn native_queue_drains_once_and_dispatches() {
     send(tmp.path(), &run_id, &agent, "review the diff");
 
     let d = deliver_json(tmp.path(), &run_id, &agent);
-    assert_eq!(d["strategy"], "native_queue");
-    assert_eq!(d["action"], "queued");
+    assert_eq!(d["strategy"], "stop_hook_inject");
+    assert_eq!(d["action"], "stop_hook_block");
     assert!(d["delivered"].as_u64().unwrap() >= 1, "{d}");
+
+    let payload = d["payload"].as_str().expect("block payload");
+    let block: Value = serde_json::from_str(payload).unwrap();
+    assert_eq!(block["decision"], "block");
     assert!(
-        d.get("payload").is_none(),
-        "queue strategy emits no stdout payload"
+        block["reason"]
+            .as_str()
+            .unwrap()
+            .contains("review the diff"),
+        "{block}"
     );
 
     let again = deliver_json(tmp.path(), &run_id, &agent);
