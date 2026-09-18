@@ -67,7 +67,8 @@ fn only_run_id(proj: &std::path::Path) -> String {
 /// off its `Write ... to:` line, never hardcoded. Behavior per artifact:
 /// - `summary-*.md` (implementer): always written, every round.
 /// - `review-*-review-0-*.md`: approved on every dispatch, proving a fresh
-///   write satisfies the gate (the non-vacuity guard).
+///   write satisfies the gate (the non-vacuity guard). Carries an honest
+///   `Reviewed-Commit` so the sha layer never fires inside this O89 test.
 /// - `review-*-review-1-*.md`: written once with `request_changes`, then never
 ///   again. Later dispatches still exit 0 with one tool call on stdout, which
 ///   is exactly the stale-verdict shape: the verdict on disk is real, recent,
@@ -78,19 +79,28 @@ STATE="$(dirname "$0")/state"
 mkdir -p "$STATE"
 TOOL_LINE='{"type":"assistant","message":{"model":"fake","usage":{"input_tokens":10,"output_tokens":5},"content":[{"type":"text","text":"Looking."},{"type":"tool_use","name":"Read","input":{"file_path":"x"}}]}}'
 DEST=""
+CWD=""
 for a in "$@"; do
   case "$a" in
     *"Write review to:"*)
       DEST=$(printf '%s' "$a" | sed -n 's/.*Write review to: \([^ ]*\).*/\1/p' | head -n 1)
+      ;;
+    *"Code under review (worktree):"*)
+      CWD=$(printf '%s' "$a" | sed -n 's/.*Code under review (worktree): \([^ ]*\).*/\1/p' | head -n 1)
       ;;
     *"Write a summary to"*)
       DEST=$(printf '%s' "$a" | sed -n 's/.*Write a summary to `\([^`]*\)`.*/\1/p' | head -n 1)
       ;;
   esac
 done
+write_review() {
+  printf '## Verdict\n%s\n' "$1"
+  SHA=$(git -C "$CWD" rev-parse HEAD 2>/dev/null || true)
+  if [ -n "$SHA" ]; then printf 'Reviewed-Commit: %s\n' "$SHA"; fi
+}
 case "$DEST" in
   *review-0-*)
-    printf '## Verdict\napprove\n' > "$DEST"
+    write_review approve > "$DEST"
     echo "$TOOL_LINE"
     exit 0
     ;;
@@ -101,7 +111,9 @@ case "$DEST" in
       exit 0
     fi
     touch "$MARK"
-    printf '## Verdict\nrequest_changes\n\n## Findings\n- severity: major - stub defect\n' > "$DEST"
+    # Honest sha, real request_changes: round 1 stays a pure O89 exercise, so the
+    # redispatch that writes nothing can only fail on the mtime layer, not the sha.
+    { write_review request_changes; printf '\n## Findings\n- severity: major - stub defect\n'; } > "$DEST"
     echo "$TOOL_LINE"
     exit 0
     ;;

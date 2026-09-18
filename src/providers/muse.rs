@@ -92,7 +92,9 @@ impl ProviderAdapter for MuseAdapter {
             // Headless resume: `muse exec --session-id <uuid> <follow-up>`, which
             // continues the named session in a fresh process. (The interactive
             // `muse resume` exists too, but spar never drives an adapter that way.)
-            resume: true,
+            // Derived from `supports_resume` (true: `build_resume` is implemented
+            // below), never asserted literally.
+            resume: self.supports_resume(),
             skip_permissions: true,
             // `--yolo` turns muse's own sandbox off; the worktree is the boundary,
             // matching the other adapters.
@@ -113,6 +115,11 @@ impl ProviderAdapter for MuseAdapter {
         append_prompt_tail(&mut cmd, opts);
         cmd.current_dir(&opts.cwd);
         cmd
+    }
+
+    /// Resume is implemented, so the derived `Capabilities.resume` reports true.
+    fn supports_resume(&self) -> bool {
+        true
     }
 
     /// Resume the session `session_id` names instead of a cold dispatch: the same

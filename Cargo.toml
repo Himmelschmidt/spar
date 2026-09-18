@@ -159,3 +159,7 @@ path = "tests/scenarios/muse_hooks_presence.rs"
 [[test]]
 name = "stale_verdict"
 path = "tests/scenarios/stale_verdict.rs"
+
+[[test]]
+name = "reviewed_commit"
+path = "tests/scenarios/reviewed_commit.rs"

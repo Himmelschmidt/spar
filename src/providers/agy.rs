@@ -11,11 +11,19 @@ impl ProviderAdapter for AgyAdapter {
         "agy"
     }
 
-    // No idle-injection (verified against agy 1.1.26: no `hooks` subcommand; Stop is
-    // notify-only), so messages wait for the next turn and presence is degraded to the
-    // process/output heuristic. `--output-format stream-json` (build_headless below) does
-    // give us a structured event stream, but it's parsed for telemetry
-    // (StreamCoalescer::handle_agy in process.rs), not a channel for mid-turn injection.
+    // No turn-boundary push spar drives (verified against agy 1.2.5: still no
+    // `hooks` subcommand), so messages wait for the next turn and presence is
+    // degraded to the process/output heuristic. Note 1.2.5 does add a real
+    // injection channel spar deliberately does not wire: `--input-format
+    // stream-json` reads one NDJSON message per line from stdin and runs a turn
+    // for each, which would make `DeliveryStrategy::None` no longer forced.
+    // But spar spawns detached with stdin null and never feeds it, so the
+    // channel stays unused. `--output-format stream-json` (build_headless below)
+    // does give us a structured event stream, but it's parsed for telemetry
+    // (StreamCoalescer::handle_agy in process.rs), not a channel for mid-turn
+    // injection. Also deliberately not wired, each its own decision: `--effort`,
+    // `--json-schema`, `--add-dir`, `--sandbox`, `--conversation`/`--continue`
+    // (see `supports_resume`). `cli:agy` is out of both fleets on this machine.
     fn delivery_strategy(&self) -> DeliveryStrategy {
         DeliveryStrategy::None
     }
@@ -40,7 +48,10 @@ impl ProviderAdapter for AgyAdapter {
         Capabilities {
             headless: true,
             interactive: true,
-            resume: true,
+            // No `build_resume`: a real implementation would continue via
+            // `agy --continue` or `agy --conversation <ID>` (verified against
+            // agy 1.2.5). Unimplemented, so the derived flag stays false.
+            resume: self.supports_resume(),
             skip_permissions: true,
             native_sandbox: true,
             // Capture-only: agy resumes by `--conversation <ID>` but offers no flag
@@ -65,17 +76,18 @@ impl ProviderAdapter for AgyAdapter {
         // is then a harmless trailing arg, not something that swallows `--print`.
         let mut cmd = Command::new(bin);
         // Print timeout = the resolved slot budget so agy runs the full wall clock the
-        // orchestrator granted it, not a fixed 30 min that silently kills long slots. Shave
-        // a small margin so agy hits its own timeout and exits cleanly a beat before spar's
-        // process backstop (same budget) SIGKILLs it mid-write. Go durations require a unit
-        // ("1800" alone is rejected as `missing unit in duration`); fall back to 1800s when
-        // no budget was supplied.
+        // orchestrator granted it, not the short built-in default (5m0s on agy 1.2.5)
+        // that silently kills long slots. Shave a small margin so agy hits its own
+        // timeout and exits cleanly a beat before spar's process backstop (same
+        // budget) SIGKILLs it mid-write. Go durations require a unit ("1800" alone
+        // is rejected as `missing unit in duration`); fall back to 1800s when no
+        // budget was supplied.
         let print_timeout = opts
             .timeout_secs
             .map(|s| format!("{}s", if s > 20 { s - 10 } else { s }))
             .unwrap_or_else(|| "1800s".into());
         cmd.arg("--print-timeout").arg(print_timeout);
-        // Structured NDJSON on stdout (verified against agy 1.1.26) so the coalescer can
+        // Structured NDJSON on stdout (verified against agy 1.2.5) so the coalescer can
         // parse real tools/tokens/session id instead of the ~empty plain-text stream.
         cmd.arg("--output-format").arg("stream-json");
         for a in self.permission_args(opts.trust) {

@@ -111,6 +111,10 @@ pub struct ProviderReport {
 pub struct Capabilities {
     pub headless: bool,
     pub interactive: bool,
+    /// Whether the adapter resumes a prior native session. Never asserted
+    /// literally: every adapter sets this to `self.supports_resume()`, and the
+    /// test below pins the two (plus `build_resume`) to agree, so the flag
+    /// cannot drift from the implementation again.
     pub resume: bool,
     pub skip_permissions: bool,
     pub native_sandbox: bool,
@@ -231,6 +235,15 @@ pub trait ProviderAdapter: Send + Sync {
     /// declines to use it here; the caller falls back to `build_headless`.
     fn build_resume(&self, _bin: &Path, _opts: &SpawnOpts, _session_id: &str) -> Option<Command> {
         None
+    }
+
+    /// Whether this adapter resumes a prior native session via `build_resume`.
+    /// Default `false` matches the default `build_resume` (`None`); an adapter
+    /// that implements `build_resume` overrides this to `true` next to it.
+    /// `capabilities().resume` is set from this, never literally, so the
+    /// reported flag and the implementation cannot drift apart again.
+    fn supports_resume(&self) -> bool {
+        false
     }
 
     /// Whether a resume dispatch that never established a session (no native session id
@@ -849,6 +862,52 @@ mod tests {
         );
         assert_eq!(readiness, Readiness::Unhealthy);
         assert_eq!(message.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn reported_resume_matches_the_resume_implementation_on_every_adapter() {
+        // The reported `Capabilities.resume` is derived from
+        // `supports_resume`, which itself must agree with `build_resume`: only
+        // codex and muse implement it, so only they may report true. This pins
+        // all three together so the flag cannot drift from the code again.
+        let _guard = codex::ENV_LOCK.lock().unwrap();
+        // Hermetic: codex's `build_resume` reads the profile model from
+        // `$CODEX_HOME`, which must not be the developer's real config here.
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CODEX_HOME", home.path());
+        let opts = SpawnOpts {
+            prompt: "go".into(),
+            prompt_file: None,
+            cwd: std::path::PathBuf::from("/tmp"),
+            trust: TrustPolicy::FullAuto,
+            extra_args: vec![],
+            model: None,
+            timeout_secs: None,
+        };
+        let mut resumed = Vec::new();
+        for a in all_adapters() {
+            let implemented = a
+                .build_resume(Path::new("bin"), &opts, "probe-session-id")
+                .is_some();
+            assert_eq!(
+                a.supports_resume(),
+                implemented,
+                "{}: supports_resume must match build_resume",
+                a.name()
+            );
+            assert_eq!(
+                a.capabilities().resume,
+                a.supports_resume(),
+                "{}: reported resume must be derived, not asserted",
+                a.name()
+            );
+            if implemented {
+                resumed.push(a.name().to_string());
+            }
+        }
+        std::env::remove_var("CODEX_HOME");
+        resumed.sort();
+        assert_eq!(resumed, vec!["codex".to_string(), "muse".to_string()]);
     }
 
     #[test]

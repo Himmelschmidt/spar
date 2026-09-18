@@ -286,6 +286,7 @@ fn prepare_slot_execution(
         s.error = None;
         s.usage = None;
         s.quota_hit = false;
+        s.reviewed_commit = None;
         // Stamp the round at dispatch: slot ids are stable across re-dispatch (the
         // implementer keeps its worktree through fix rounds), so this is where a slot
         // joins the round that is running now (O45).
@@ -1555,6 +1556,42 @@ fn load_pid(cell: &std::sync::atomic::AtomicU32) -> Option<u32> {
     }
 }
 
+/// The provider's own final message for a codex dispatch, when it is usable as
+/// salvage input: the slot-scoped `--output-last-message` file beside the slot
+/// log, non-empty and fresh for this dispatch. Freshness is relative to the slot
+/// log, which `run_captured` truncates at spawn: a last-message file older than
+/// the log is left over from an earlier round (O89) and must not be mistaken for
+/// this dispatch's output. `None` for any other provider and for a missing,
+/// empty, stale or unreadable file. Read-only: never writes.
+fn codex_last_message(log_path: &Path, provider: &str) -> Option<String> {
+    if !provider_is_codex(provider) {
+        return None;
+    }
+    let path = providers::codex::last_message_path(log_path);
+    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) == 0 {
+        return None;
+    }
+    let mtime = std::fs::metadata(&path).ok()?.modified().ok()?;
+    let log_mtime = std::fs::metadata(log_path).ok()?.modified().ok()?;
+    if mtime < markers::freshness_floor(log_mtime) {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(clamp_chars(&text, 6000))
+}
+
+/// True when a provider ref resolves to the codex adapter (`cli:codex`, bare
+/// `codex`, `codex@model`).
+fn provider_is_codex(provider: &str) -> bool {
+    ProviderRef::parse(provider)
+        .ok()
+        .and_then(|p| p.cli_name().map(|n| n == "codex"))
+        .unwrap_or(provider == "codex")
+}
+
 /// True when a provider ref resolves to the agy adapter (`cli:agy`, bare `agy`, `agy@model`).
 fn provider_is_agy(provider: &str) -> bool {
     ProviderRef::parse(provider)
@@ -1857,7 +1894,15 @@ pub fn salvage_expected_artifact(
     if job.role == SlotRole::Tester {
         return;
     }
-    let tail = process::tail_log(log_path, 6000);
+    // A codex dispatch was passed `--output-last-message` pointing at a slot-scoped
+    // file under this run's `logs/` (see `CodexAdapter::build_headless`): when that
+    // file is fresh for this dispatch it carries the provider's own final message,
+    // which beats the reconstructed log tail. Anything else (another provider, a
+    // missing file, a stale file from an earlier round) falls back to today's tail.
+    // Either way the content lands inside the role-shaped transcript section below,
+    // never as the artifact itself: a reviewer's final chat message is not a review.
+    let tail = codex_last_message(log_path, &job.provider)
+        .unwrap_or_else(|| process::tail_log(log_path, 6000));
     let body = match job.role {
         SlotRole::Reviewer => format!(
             "## Verdict\nrequest_changes\n\n## Findings\n- severity: major — review slot interrupted ({reason}); partial transcript salvaged below\n\n## Tests\nsee partial transcript\n\n## Partial transcript\n\n```\n{tail}\n```\n"
@@ -2041,6 +2086,7 @@ pub fn run_slot(
         s.error = None;
         s.usage = None;
         s.quota_hit = false;
+        s.reviewed_commit = None;
         // Stamp the round at dispatch: slot ids are stable across re-dispatch (the
         // implementer keeps its worktree through fix rounds), so this is where a slot
         // joins the round that is running now (O45).
@@ -2941,8 +2987,15 @@ fn write_dry_artifacts(
                     format!("## Acceptance\n{}\n\n", lines.join("\n"))
                 }
             };
+            // The reviewed-commit gate reads every reviewer artifact, synthetic ones
+            // included: resolve HEAD in the slot's own cwd, the same dir the panel
+            // head came from, so both resolve or both do not. Omit when
+            // unresolvable — coherent with the gate's fail-open on its own side.
+            let sha_line = git_output(cwd, &["rev-parse", "HEAD"])
+                .map(|h| format!("Reviewed-Commit: {h}\n"))
+                .unwrap_or_default();
             let body = format!(
-                "## Verdict\n{verdict}\n\n{acceptance}## Findings\n- severity: minor — dry-run synthetic review from {}\n\n## Tests\nsuite channel (dry-run); no full suite here\n",
+                "## Verdict\n{verdict}\n\n{sha_line}{acceptance}## Findings\n- severity: minor — dry-run synthetic review from {}\n\n## Tests\nsuite channel (dry-run); no full suite here\n",
                 job.provider
             );
             if let Some(name) = &job.expected_artifact {
@@ -3770,6 +3823,7 @@ pub fn init_slot_model(
         model: pref.model.clone().or(model),
         round: 1,
         quota_hit: false,
+        reviewed_commit: None,
         source: None,
     }
 }
@@ -6444,6 +6498,145 @@ mod tests {
         assert!(!provider_is_agy("cli:grok"));
         assert!(!provider_is_agy("cli:claude"));
         assert!(!provider_is_agy("api:google"));
+    }
+
+    #[test]
+    fn provider_is_codex_recognizes_forms() {
+        // This gate decides whether the `--output-last-message` file is even
+        // consulted during salvage.
+        assert!(provider_is_codex("cli:codex"));
+        assert!(provider_is_codex("cli:codex@openai/gpt-4o-mini"));
+        assert!(provider_is_codex("codex"));
+        assert!(!provider_is_codex("cli:muse"));
+        assert!(!provider_is_codex("cli:claude"));
+        assert!(!provider_is_codex("api:openai"));
+    }
+
+    fn codex_reviewer_job(slot_id: &str) -> SlotJob {
+        SlotJob {
+            slot_id: slot_id.into(),
+            provider: "cli:codex".into(),
+            role: SlotRole::Reviewer,
+            template: "review".into(),
+            extra_vars: HashMap::new(),
+            expected_artifact: Some(format!("review-{slot_id}.md")),
+            model: None,
+        }
+    }
+
+    #[test]
+    fn salvage_prefers_codex_last_message_over_the_log_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("r1").unwrap();
+        let log_path = paths.log_file("r1", "rev");
+        std::fs::write(&log_path, "log tail words\n").unwrap();
+        // Written after the log, so it is fresh for this dispatch.
+        let last = crate::providers::codex::last_message_path(&log_path);
+        std::fs::write(&last, "provider final words\n").unwrap();
+        salvage_expected_artifact(
+            &paths,
+            "r1",
+            &codex_reviewer_job("rev"),
+            &log_path,
+            "interrupted",
+            tmp.path(),
+            4000,
+        );
+        let body = std::fs::read_to_string(paths.artifact("r1", "review-rev.md")).unwrap();
+        assert!(
+            body.contains("provider final words"),
+            "fresh last message wins: {body}"
+        );
+        assert!(
+            !body.contains("log tail words"),
+            "log tail must not shadow it: {body}"
+        );
+        // Still a verdict-shaped salvage, not the raw chat message: a reviewer's
+        // final message is salvage input, never the review itself.
+        assert!(body.contains("request_changes"));
+    }
+
+    #[test]
+    fn salvage_falls_back_to_the_log_tail_without_a_last_message_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("r1").unwrap();
+        let log_path = paths.log_file("r1", "rev");
+        std::fs::write(&log_path, "log tail words\n").unwrap();
+        salvage_expected_artifact(
+            &paths,
+            "r1",
+            &codex_reviewer_job("rev"),
+            &log_path,
+            "interrupted",
+            tmp.path(),
+            4000,
+        );
+        let body = std::fs::read_to_string(paths.artifact("r1", "review-rev.md")).unwrap();
+        assert!(body.contains("log tail words"), "fallback: {body}");
+    }
+
+    #[test]
+    fn salvage_ignores_a_stale_last_message_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("r1").unwrap();
+        let last = crate::providers::codex::last_message_path(&paths.log_file("r1", "rev"));
+        std::fs::write(&last, "older round words\n").unwrap();
+        let log_path = paths.log_file("r1", "rev");
+        std::fs::write(&log_path, "log tail words\n").unwrap();
+        // Age the log past the 1s grace so the earlier round's file reads stale.
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&log_path)
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
+        salvage_expected_artifact(
+            &paths,
+            "r1",
+            &codex_reviewer_job("rev"),
+            &log_path,
+            "interrupted",
+            tmp.path(),
+            4000,
+        );
+        let body = std::fs::read_to_string(paths.artifact("r1", "review-rev.md")).unwrap();
+        assert!(
+            !body.contains("older round words"),
+            "stale file must not be used: {body}"
+        );
+        assert!(body.contains("log tail words"), "fallback: {body}");
+    }
+
+    #[test]
+    fn salvage_ignores_last_message_for_other_providers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("r1").unwrap();
+        let log_path = paths.log_file("r1", "rev");
+        std::fs::write(&log_path, "log tail words\n").unwrap();
+        let last = crate::providers::codex::last_message_path(&log_path);
+        std::fs::write(&last, "provider final words\n").unwrap();
+        let mut job = codex_reviewer_job("rev");
+        job.provider = "cli:muse".into();
+        salvage_expected_artifact(
+            &paths,
+            "r1",
+            &job,
+            &log_path,
+            "interrupted",
+            tmp.path(),
+            4000,
+        );
+        let body = std::fs::read_to_string(paths.artifact("r1", "review-rev.md")).unwrap();
+        assert!(body.contains("log tail words"), "fallback: {body}");
+        assert!(
+            !body.contains("provider final words"),
+            "another provider's dispatch never wrote that file: {body}"
+        );
     }
 
     #[test]

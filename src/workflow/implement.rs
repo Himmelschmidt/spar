@@ -1293,6 +1293,60 @@ pub(crate) fn acceptance_block_reasons(
     parts
 }
 
+/// The reviewed-commit gate's decision for one reviewer slot. The panel-dispatch
+/// head is the contract: a reviewer that judged an older sha is stale, and one
+/// that judged a newer sha is equally not a verdict — the suite ran against the
+/// contract head and sibling reviewers judged it, so counting a verdict about a
+/// different tree would smuggle an unjudged tree past the panel. Both self-heal:
+/// the mismatch feeds `any_request_changes` and the next round re-resolves head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewedCommitDecision {
+    /// spar could not resolve the panel head; skip the check loudly, fail open.
+    Skipped,
+    /// The parsed sha names the panel head.
+    Match,
+    /// The artifact names no (parsable) commit.
+    Absent,
+    /// The parsed sha names a different commit.
+    Mismatch,
+}
+
+fn decide_reviewed_commit(panel_head: Option<&str>, res: &ReviewResult) -> ReviewedCommitDecision {
+    let Some(head) = panel_head else {
+        return ReviewedCommitDecision::Skipped;
+    };
+    let Some(sha) = res.reviewed_commit.as_deref() else {
+        return ReviewedCommitDecision::Absent;
+    };
+    if review_result::reviewed_commit_matches(head, sha) {
+        ReviewedCommitDecision::Match
+    } else {
+        ReviewedCommitDecision::Mismatch
+    }
+}
+
+/// Fail a reviewer slot closed on a reviewed-commit gate trip: failed status with
+/// a greppable error, a slot-attributed event, and a stderr warning. The
+/// artifact bytes are preserved as drift evidence, never synthesized over.
+fn fail_review_slot_on_commit(
+    state: &mut RunState,
+    paths: &SparPaths,
+    slot_id: &str,
+    error: String,
+) {
+    if let Some(s) = state.slot_mut(slot_id) {
+        s.status = SlotStatus::Failed;
+        s.error = Some(error.clone());
+    }
+    eprintln!("warning: review slot `{slot_id}` failed: {error}");
+    let _ = crate::events::append(
+        paths,
+        &state.id,
+        &crate::events::Event::slot_note(slot_id, error),
+    );
+    let _ = state.save(paths);
+}
+
 /// Why the suite was `Inconclusive`, for the bus broadcast and the reviewer prompt.
 fn suite_inconclusive_reason(
     slot_ok: bool,
@@ -2407,6 +2461,22 @@ pub fn execute_loop(
                 paths.artifact(&state.id, "suite.md").display()
             ));
         }
+        // One head per panel, resolved once after the suite ran: the commit the
+        // panel was dispatched against is the contract every verdict is judged
+        // against. A rotated re-dispatch inside the panel keeps the same head;
+        // widened reviewers join a later round's panel with its freshly resolved
+        // head. Unresolvable (review_cwd falls back to a possibly non-repo
+        // project_root) fails OPEN, loudly: failing closed there would brick such
+        // runs permanently with no reviewer fault.
+        let panel_head = worktree::git_out(&review_cwd, &["rev-parse", "HEAD"]);
+        if panel_head.is_none() {
+            let msg = format!(
+                "review panel sha check skipped: could not resolve HEAD in {}",
+                review_cwd.display()
+            );
+            eprintln!("warning: {msg}");
+            let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg));
+        }
         for rev in &reviewers {
             // Stop boundary: before each reviewer job.
             if should_stop(paths, &state.id) {
@@ -2503,6 +2573,67 @@ pub fn execute_loop(
                 // Fail closed: only an anchored `## Verdict` / approve clears the gate,
                 // and every contract criterion must be reported as passing (O19/O20).
                 let res = review_result::parse_review(&text);
+                // The semantic layer above the mtime gate: a verdict that names no
+                // commit, or one about a commit that is not the panel head, is not
+                // a verdict — treated exactly like a missing review.
+                match decide_reviewed_commit(panel_head.as_deref(), &res) {
+                    ReviewedCommitDecision::Skipped => {}
+                    ReviewedCommitDecision::Match => {
+                        if let Some(s) = state.slot_mut(&rev.id) {
+                            s.reviewed_commit = res.reviewed_commit.clone();
+                        }
+                        let _ = crate::events::append(
+                            paths,
+                            &state.id,
+                            &crate::events::Event::slot_note(
+                                &rev.id,
+                                format!(
+                                    "judged commit {}",
+                                    res.reviewed_commit.as_deref().unwrap_or("?")
+                                ),
+                            ),
+                        );
+                    }
+                    ReviewedCommitDecision::Absent => {
+                        any_request_changes = true;
+                        let head = panel_head.as_deref().unwrap_or("unknown");
+                        blockers.push(format!(
+                            "review `{}` names no commit (panel head {head})",
+                            rev.id
+                        ));
+                        fail_review_slot_on_commit(
+                            state,
+                            paths,
+                            &rev.id,
+                            format!(
+                                "review names no commit (panel head {head}); a verdict that names no commit cannot be counted"
+                            ),
+                        );
+                    }
+                    ReviewedCommitDecision::Mismatch => {
+                        any_request_changes = true;
+                        let judged = res.reviewed_commit.as_deref().unwrap_or("?");
+                        let head = panel_head.as_deref().unwrap_or("unknown");
+                        let mut blocker = format!(
+                            "review `{}` judged {judged}, panel dispatched against {head}",
+                            rev.id
+                        );
+                        // A mid-panel commit visible at a glance: current HEAD as a
+                        // third value when it moved past the panel head.
+                        if let Some(cur) = worktree::git_out(&review_cwd, &["rev-parse", "HEAD"]) {
+                            if cur != head {
+                                blocker.push_str(&format!(" [current HEAD {cur}]"));
+                            }
+                        }
+                        blockers.push(blocker);
+                        fail_review_slot_on_commit(
+                            state,
+                            paths,
+                            &rev.id,
+                            format!("review judged {judged}, panel dispatched against {head}"),
+                        );
+                    }
+                }
                 if !res.approves() {
                     any_request_changes = true;
                     blockers.push(format!(
@@ -4139,6 +4270,84 @@ mod suite_parse_tests {
             reviewer.contains("{{suite_body}}"),
             "suite_body is seeded in base_vars and must be referenced"
         );
+    }
+
+    #[test]
+    fn reviewer_template_requires_the_judged_commit() {
+        let reviewer = include_str!("../../templates/reviewer_adversarial.md");
+        assert!(
+            reviewer.contains("Reviewed-Commit:"),
+            "the verdict must name the commit it judged"
+        );
+        assert!(
+            reviewer.contains("git rev-parse HEAD"),
+            "the reviewer must be told how to learn HEAD"
+        );
+        assert!(
+            reviewer.contains("cannot be counted"),
+            "the template must say plainly why a commit-less verdict is not a verdict"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reviewed_commit_gate_tests {
+    use super::{decide_reviewed_commit, ReviewedCommitDecision};
+    use crate::workflow::review_result::parse_review;
+
+    const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn decide(head: Option<&str>, body: &str) -> ReviewedCommitDecision {
+        decide_reviewed_commit(head, &parse_review(body))
+    }
+
+    #[test]
+    fn full_sha_match_is_a_verdict() {
+        let body = format!("## Verdict\napprove\n\nReviewed-Commit: {HEAD}\n");
+        assert_eq!(decide(Some(HEAD), &body), ReviewedCommitDecision::Match);
+    }
+
+    #[test]
+    fn short_prefix_match_is_a_verdict() {
+        let body = "## Verdict\napprove\n\nReviewed-Commit: 0123456\n";
+        assert_eq!(decide(Some(HEAD), body), ReviewedCommitDecision::Match);
+    }
+
+    #[test]
+    fn full_mismatch_is_not_a_verdict() {
+        let body =
+            "## Verdict\napprove\n\nReviewed-Commit: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n";
+        assert_eq!(decide(Some(HEAD), body), ReviewedCommitDecision::Mismatch);
+    }
+
+    #[test]
+    fn short_non_prefix_is_not_a_verdict() {
+        let body = "## Verdict\napprove\n\nReviewed-Commit: deadbee\n";
+        assert_eq!(decide(Some(HEAD), body), ReviewedCommitDecision::Mismatch);
+    }
+
+    #[test]
+    fn absent_line_is_not_a_verdict() {
+        assert_eq!(
+            decide(Some(HEAD), "## Verdict\napprove\n"),
+            ReviewedCommitDecision::Absent
+        );
+    }
+
+    #[test]
+    fn malformed_line_is_absence_not_mismatch() {
+        let body = "## Verdict\napprove\n\nReviewed-Commit: <full-sha-of-HEAD>\n";
+        assert_eq!(decide(Some(HEAD), body), ReviewedCommitDecision::Absent);
+    }
+
+    #[test]
+    fn unresolvable_panel_head_skips_either_way() {
+        assert_eq!(
+            decide(None, "## Verdict\napprove\n"),
+            ReviewedCommitDecision::Skipped
+        );
+        let body = format!("## Verdict\napprove\n\nReviewed-Commit: {HEAD}\n");
+        assert_eq!(decide(None, &body), ReviewedCommitDecision::Skipped);
     }
 }
 

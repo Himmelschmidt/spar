@@ -119,7 +119,14 @@ echo '{"stream":{"kind":"session","id":"sess-e2e-1"},"payload_type":"tool.result
 mkdir -p "$ART"
 printf '# Summary\nDone by the fake.\n' > "$ART/summary-$SLOT.md"
 printf '# Carry-forward\nDone by the fake.\n' > "$ART/carry-forward-$SLOT.md"
-printf '## Verdict\napprove\n' > "$ART/review-$SLOT.md"
+CWD=$(sed -n 's/.*Code under review (worktree): \([^ ]*\).*/\1/p' "$PROMPT_FILE" | head -n 1)
+SHA=""
+if [ -n "$CWD" ]; then SHA=$(git -C "$CWD" rev-parse HEAD 2>/dev/null); fi
+if [ -n "$SHA" ]; then
+  printf '## Verdict\napprove\n\nReviewed-Commit: %s\n' "$SHA" > "$ART/review-$SLOT.md"
+else
+  printf '## Verdict\napprove\n' > "$ART/review-$SLOT.md"
+fi
 exit 0
 "#,
     )
