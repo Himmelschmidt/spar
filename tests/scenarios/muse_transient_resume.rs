@@ -67,6 +67,14 @@ fn init_repo(dir: &std::path::Path) {
 /// `SPAR_TEST_MUSE_STATE` points at a scratch dir receiving one `calls` line per
 /// invocation (`cold` or `resume:<sid>`). `SPAR_TEST_MUSE_MODE=fail-fast` makes every
 /// dispatch fail with the same string but zero tool calls and no session.
+///
+/// Cold-vs-resume models the real CLI since spar started assigning session ids:
+/// every dispatch carries `--session-id`, so flag presence no longer distinguishes
+/// them. Instead the fake keeps a session store (`$STATE/sessions`): an incoming id
+/// it has never issued is a cold dispatch (it does real work, then dies with the
+/// 404), while an incoming id it issued before is a resume of that session. The
+/// cold dispatch always issues the fixed `sess-e2e-1`, so the retry the test
+/// asserts on is `resume:sess-e2e-1` regardless of the derived cold id.
 fn install_fake_muse(bin: &std::path::Path) {
     fs::create_dir_all(bin).unwrap();
     let p = bin.join("muse");
@@ -79,15 +87,22 @@ if [ "$SPAR_TEST_MUSE_MODE" = "fail-fast" ]; then
   echo "cold" >> "$SPAR_TEST_MUSE_STATE/calls"
   exit 1
 fi
-SID="sess-e2e-1"
-RESUMED=0
+SID=""
 PROMPT_FILE=""
 prev=""
 for a in "$@"; do
-  if [ "$prev" = "--session-id" ]; then SID="$a"; RESUMED=1; fi
+  if [ "$prev" = "--session-id" ]; then SID="$a"; fi
   if [ "$prev" = "--prompt-file" ]; then PROMPT_FILE="$a"; fi
   prev="$a"
 done
+touch "$SPAR_TEST_MUSE_STATE/sessions"
+RESUMED=0
+if [ -n "$SID" ] && grep -qxF "$SID" "$SPAR_TEST_MUSE_STATE/sessions" 2>/dev/null; then
+  RESUMED=1
+else
+  if [ -n "$SID" ]; then echo "$SID" >> "$SPAR_TEST_MUSE_STATE/sessions"; fi
+  echo "sess-e2e-1" >> "$SPAR_TEST_MUSE_STATE/sessions"
+fi
 if [ "$RESUMED" = "0" ]; then
   echo "cold" >> "$SPAR_TEST_MUSE_STATE/calls"
   echo '{"schema_version":1,"stream":{"kind":"session","id":"sess-e2e-1"},"record_type":"event","payload_type":"run.model.configured","payload":{"kind":"run_model_configured","model_id":"muse-spark-1.3-contributor"}}'

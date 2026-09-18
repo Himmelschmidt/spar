@@ -234,6 +234,10 @@ impl ProviderAdapter for CodexAdapter {
             // FullAuto bypasses codex's own sandbox (the worktree is the boundary,
             // matching the other adapters), so we do not rely on a native sandbox.
             native_sandbox: false,
+            // Capture-only: codex 0.153.4 has no flag to name a new thread (it
+            // reports `thread.started`), so `SpawnOpts::session_id` is never read
+            // here and the id keeps arriving from the stream.
+            assigns_session_id: false,
         }
     }
 
@@ -392,9 +396,24 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             trust: TrustPolicy::FullAuto,
             extra_args: vec![],
+            session_id: None,
             model: model.map(Into::into),
             timeout_secs: None,
         }
+    }
+
+    #[test]
+    fn capture_only_adapter_ignores_assigned_session_id() {
+        // codex cannot name a new thread: the command line must be byte-identical
+        // with and without the field set (the executor never sets it here either).
+        let _guard = ENV_LOCK.lock().unwrap();
+        let plain = opts("do the thing", None);
+        let mut assigned = plain.clone();
+        assigned.session_id = Some("123e4567-e89b-52d3-a456-426614174000".into());
+        let (_, a) = command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &plain));
+        let (_, b) = command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &assigned));
+        assert_eq!(a, b);
+        assert!(!CodexAdapter.capabilities().assigns_session_id);
     }
 
     #[test]
@@ -790,6 +809,7 @@ mod tests {
             extra_args: vec![],
             model: None,
             timeout_secs: None,
+            session_id: None,
         };
         assert_eq!(
             last_message_path_for_opts(&o).as_deref(),

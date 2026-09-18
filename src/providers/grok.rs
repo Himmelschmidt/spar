@@ -67,6 +67,8 @@ impl ProviderAdapter for GrokAdapter {
             resume: self.supports_resume(),
             skip_permissions: true,
             native_sandbox: false,
+            // `grok -s/--session-id` names a new conversation (1.0.34).
+            assigns_session_id: true,
         }
     }
 
@@ -93,6 +95,13 @@ impl ProviderAdapter for GrokAdapter {
         if let Some(m) = &opts.model {
             cmd.arg("--model").arg(m);
         }
+        // Long form; `-s` is equivalent but this greps. Never alongside `--resume`:
+        // grok only allows `--session-id` with `--resume` together with
+        // `--fork-session`, and spar has no grok `build_resume`, so the two are
+        // structurally disjoint.
+        if let Some(id) = opts.session_id.as_deref() {
+            cmd.arg("--session-id").arg(id);
+        }
         for a in &opts.extra_args {
             cmd.arg(a);
         }
@@ -108,6 +117,9 @@ impl ProviderAdapter for GrokAdapter {
         if let Some(m) = &opts.model {
             cmd.arg("--model").arg(m);
         }
+        if let Some(id) = opts.session_id.as_deref() {
+            cmd.arg("--session-id").arg(id);
+        }
         if !opts.prompt.is_empty() {
             cmd.arg(&opts.prompt);
         }
@@ -116,6 +128,46 @@ impl ProviderAdapter for GrokAdapter {
         }
         cmd.current_dir(&opts.cwd);
         cmd
+    }
+
+    /// grok refuses a `--session-id` naming an already-existing session on stderr
+    /// before doing any work (exit 1,
+    /// `Error: Error: Session ID <uuid> is already in use.`, probed live on 1.0.34
+    /// against a real session dir — no model call, refusal precedes everything).
+    /// Malformed ids refuse the same way (`must be a valid UUID`, probed live);
+    /// spar only ever sends well-formed v5 ids, so that arm is defense-in-depth.
+    /// Both arms require a vendor-error start plus the dispatch's own assigned id
+    /// (reuse arm) or the malformed wording, so agent prose (e.g. "the port is
+    /// already in use") can never match; the matcher accepts the log with or
+    /// without the coalescer's `! ` stderr prefix (headless vs tmux tee).
+    fn assigned_session_refused(
+        &self,
+        log_text: &str,
+        assigned_id: &str,
+        _code: Option<i32>,
+    ) -> bool {
+        log_text.lines().any(|l| {
+            let line = l.strip_prefix("! ").unwrap_or(l);
+            line.starts_with("Error")
+                && (line.contains("must be a valid UUID")
+                    || (line.contains("Session ID")
+                        && line.contains(assigned_id)
+                        && line.contains("is already in use")))
+        })
+    }
+
+    /// grok refuses `--session-id` naming an already-existing session (probed live
+    /// on 1.0.34), so a recovery turn cannot reuse the marker id the failed
+    /// dispatch already created. It derives a distinct session instead; the marker
+    /// keeps naming the main session for forensics.
+    fn recovery_session_id(
+        &self,
+        _marker_id: Option<&str>,
+        run_id: &str,
+        slot_id: &str,
+        round: u32,
+    ) -> Option<String> {
+        Some(crate::session_id::derive_recovery(run_id, slot_id, round))
     }
 }
 
@@ -144,6 +196,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             trust: TrustPolicy::FullAuto,
             extra_args: vec![],
+            session_id: None,
             model: None,
             timeout_secs: None,
         });
@@ -154,17 +207,28 @@ mod tests {
         );
     }
 
-    #[test]
-    fn headless_prompt_file_not_double_single() {
-        let opts = SpawnOpts {
-            prompt: "hi".into(),
-            prompt_file: Some(PathBuf::from("/tmp/p.md")),
+    fn opts_with_session(prompt: &str, file: Option<&str>, session_id: Option<&str>) -> SpawnOpts {
+        SpawnOpts {
+            prompt: prompt.into(),
+            prompt_file: file.map(PathBuf::from),
             cwd: PathBuf::from("/tmp"),
             trust: TrustPolicy::FullAuto,
             extra_args: vec![],
+            session_id: session_id.map(str::to_string),
             model: None,
             timeout_secs: None,
-        };
+        }
+    }
+
+    fn dash_val(args: &[String], flag: &str) -> Option<String> {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1).cloned())
+    }
+
+    #[test]
+    fn headless_prompt_file_not_double_single() {
+        let opts = opts_with_session("hi", Some("/tmp/p.md"), None);
         let cmd = GrokAdapter.build_headless(Path::new("grok"), &opts);
         let (_, args) = command_to_parts(&cmd);
         assert!(
@@ -180,19 +244,81 @@ mod tests {
 
     #[test]
     fn headless_inline_uses_single_with_prompt() {
-        let opts = SpawnOpts {
-            prompt: "do the thing".into(),
-            prompt_file: None,
-            cwd: PathBuf::from("/tmp"),
-            trust: TrustPolicy::FullAuto,
-            extra_args: vec![],
-            model: None,
-            timeout_secs: None,
-        };
+        let opts = opts_with_session("do the thing", None, None);
         let cmd = GrokAdapter.build_headless(Path::new("grok"), &opts);
         let (_, args) = command_to_parts(&cmd);
         let i = args.iter().position(|a| a == "--single").expect("--single");
         assert_eq!(args.get(i + 1).map(String::as_str), Some("do the thing"));
         assert!(!args.iter().any(|a| a == "-p"));
+    }
+
+    #[test]
+    fn assigned_session_id_rendered_when_present() {
+        let id = "123e4567-e89b-52d3-a456-426614174000";
+        for cmd in [
+            GrokAdapter.build_headless(Path::new("grok"), &opts_with_session("hi", None, Some(id))),
+            GrokAdapter
+                .build_interactive(Path::new("grok"), &opts_with_session("hi", None, Some(id))),
+        ] {
+            let (_, args) = command_to_parts(&cmd);
+            assert_eq!(dash_val(&args, "--session-id").as_deref(), Some(id));
+            assert!(
+                !args.iter().any(|a| a == "--resume"),
+                "assigned id never rides with --resume: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn assigned_session_id_absent_when_none() {
+        for cmd in [
+            GrokAdapter.build_headless(Path::new("grok"), &opts_with_session("hi", None, None)),
+            GrokAdapter.build_interactive(Path::new("grok"), &opts_with_session("hi", None, None)),
+        ] {
+            let (_, args) = command_to_parts(&cmd);
+            assert!(
+                !args.iter().any(|a| a == "--session-id" || a == "-s"),
+                "no flag without an assigned id: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn existing_session_refusal_matches_vendor_stderr() {
+        let id = "01a0afec-eaf7-78c2-b076-d47691cf248a";
+        assert!(GrokAdapter.assigned_session_refused(
+            &format!("! Error: Error: Session ID {id} is already in use.\n"),
+            id,
+            Some(1),
+        ));
+        // Same line without the coalescer prefix (tmux pane tee).
+        assert!(GrokAdapter.assigned_session_refused(
+            &format!("Error: Error: Session ID {id} is already in use.\n"),
+            id,
+            Some(1),
+        ));
+        // Malformed refusal, probed live (defense-in-depth: spar never sends one).
+        assert!(GrokAdapter.assigned_session_refused(
+            "! Error: Error: --session-id must be a valid UUID (got 'not-a-uuid').\n",
+            id,
+            Some(1),
+        ));
+        // A refusal naming a *different* session is not ours.
+        assert!(!GrokAdapter.assigned_session_refused(
+            "! Error: Error: Session ID 00000000-0000-0000-0000-000000000000 is already in use.\n",
+            id,
+            Some(1),
+        ));
+        assert!(!GrokAdapter.assigned_session_refused("", id, Some(1)));
+        assert!(!GrokAdapter.assigned_session_refused(
+            "! the agent wrote that the port is already in use\n",
+            id,
+            Some(1),
+        ));
+        assert!(!GrokAdapter.assigned_session_refused(
+            &format!("the agent wrote Session ID {id} is already in use in its summary\n"),
+            id,
+            Some(1),
+        ));
     }
 }

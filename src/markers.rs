@@ -130,6 +130,11 @@ pub fn read_pid(
 /// Unlike `.pid`, this is never cleared by `clear_slot`: it is meant to outlive the
 /// dispatch that wrote it, across every round the slot id survives.
 ///
+/// The marker is a record, not a discovery: on the assign path (adapters whose CLI
+/// accepts a caller-supplied id) spar derives the id and writes this file *before*
+/// the spawn; on the capture-only path it is written from the stream-captured stats
+/// after the dispatch. Both paths end with the same file.
+///
 /// Scoped by `provider` (the adapter's bare name, e.g. `"codex"`), not just `slot_id`:
 /// slot ids outlive a provider rotation (`try_rotate_implementer` / `try_rotate_reviewer_provider`
 /// reuse the existing slot id under a new provider), and a session id captured under one

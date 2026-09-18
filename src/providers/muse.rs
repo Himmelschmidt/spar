@@ -87,6 +87,8 @@ impl ProviderAdapter for MuseAdapter {
             headless: true,
             // Only `muse exec` (headless) is verified; interactive TUI takeover is not.
             interactive: false,
+            // `muse exec --session-id <uuid>` names the session (1.3.0).
+            assigns_session_id: true,
             // Headless resume: `muse exec --session-id <uuid> <follow-up>`, which
             // continues the named session in a fresh process. (The interactive
             // `muse resume` exists too, but spar never drives an adapter that way.)
@@ -125,7 +127,14 @@ impl ProviderAdapter for MuseAdapter {
     /// tail. No `--allow-workspace-switch`: spar re-dispatches in the same worktree,
     /// and muse refusing a workspace mismatch by design is the guard we want. Never
     /// `--no-session-log`: muse rejects a session id without retained logging.
+    /// The id comes only from the `session_id` argument: the executor's invariant is
+    /// that `SpawnOpts::session_id` is `None` on every resume path, so the prefix's
+    /// own render of that field can never double-emit here.
     fn build_resume(&self, bin: &Path, opts: &SpawnOpts, session_id: &str) -> Option<Command> {
+        debug_assert!(
+            opts.session_id.is_none(),
+            "resume must not carry an assigned cold-dispatch id"
+        );
         let mut cmd = self.exec_prefix(bin, opts);
         cmd.arg("--session-id").arg(session_id);
         append_prompt_tail(&mut cmd, opts);
@@ -244,6 +253,12 @@ impl MuseAdapter {
         if let Some(e) = muse_reasoning_effort() {
             cmd.arg("--reasoning-effort").arg(e);
         }
+        // A spar-assigned cold-dispatch id rides here, ahead of the prompt tail.
+        // `build_resume` shares this prefix but always runs with `session_id: None`
+        // (executor invariant), so its own `--session-id <sid>` below is the only one.
+        if let Some(id) = opts.session_id.as_deref() {
+            cmd.arg("--session-id").arg(id);
+        }
         for a in &opts.extra_args {
             cmd.arg(a);
         }
@@ -277,12 +292,17 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn opts(prompt: &str, model: Option<&str>) -> SpawnOpts {
+        opts_with_session(prompt, model, None)
+    }
+
+    fn opts_with_session(prompt: &str, model: Option<&str>, session_id: Option<&str>) -> SpawnOpts {
         SpawnOpts {
             prompt: prompt.into(),
             prompt_file: None,
             cwd: PathBuf::from("/tmp"),
             trust: TrustPolicy::FullAuto,
             extra_args: vec![],
+            session_id: session_id.map(Into::into),
             model: model.map(Into::into),
             timeout_secs: None,
         }
@@ -452,6 +472,55 @@ mod tests {
     fn capabilities_advertise_headless_resume() {
         assert!(MuseAdapter.capabilities().resume);
         assert!(MuseAdapter.capabilities().headless);
+        assert!(MuseAdapter.capabilities().assigns_session_id);
+    }
+
+    #[test]
+    fn assigned_session_id_rendered_when_present() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let id = "123e4567-e89b-52d3-a456-426614174000";
+        let (_, args) = command_to_parts(
+            &MuseAdapter
+                .build_headless(Path::new("muse"), &opts_with_session("go", None, Some(id))),
+        );
+        assert_eq!(dash_val(&args, "--session-id").as_deref(), Some(id));
+        let si = args
+            .iter()
+            .position(|a| a == "--session-id")
+            .expect("--session-id");
+        let di = args.iter().position(|a| a == "--").expect("-- separator");
+        assert!(
+            si < di,
+            "assigned id must precede the prompt tail: {args:?}"
+        );
+    }
+
+    #[test]
+    fn assigned_session_id_absent_when_none() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let (_, args) =
+            command_to_parts(&MuseAdapter.build_headless(Path::new("muse"), &opts("x", None)));
+        assert!(
+            !args.iter().any(|a| a == "--session-id"),
+            "no flag without an assigned id: {args:?}"
+        );
+    }
+
+    #[test]
+    fn resume_carries_exactly_one_session_id() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let cmd = MuseAdapter
+            .build_resume(Path::new("muse"), &opts("go", None), "sess-abc")
+            .expect("muse supports resume");
+        let (_, args) = command_to_parts(&cmd);
+        assert_eq!(
+            args.iter().filter(|a| *a == "--session-id").count(),
+            1,
+            "resume names its session once: {args:?}"
+        );
     }
 
     #[test]

@@ -118,6 +118,10 @@ pub struct Capabilities {
     pub resume: bool,
     pub skip_permissions: bool,
     pub native_sandbox: bool,
+    /// Whether the CLI accepts a caller-supplied session id on a cold dispatch
+    /// (claude/grok/muse `--session-id`). The executor branches only on this bit,
+    /// never on the provider name. Adapters without it stay capture-from-stream.
+    pub assigns_session_id: bool,
 }
 
 impl Default for Capabilities {
@@ -128,6 +132,7 @@ impl Default for Capabilities {
             resume: false,
             skip_permissions: false,
             native_sandbox: false,
+            assigns_session_id: false,
         }
     }
 }
@@ -149,6 +154,13 @@ pub struct SpawnOpts {
     pub trust: TrustPolicy,
     /// Extra args appended after provider defaults.
     pub extra_args: Vec<String>,
+    /// Spar-assigned session id for this cold dispatch (`session_id::derive`), carried
+    /// as `--session-id` by adapters whose `Capabilities.assigns_session_id` is true.
+    /// Always `None` on the resume path: a resume names its session through
+    /// `build_resume`'s `session_id` argument, never through this field, so the two
+    /// can never disagree inside one dispatch. Adapters without the capability bit
+    /// never read this field.
+    pub session_id: Option<String>,
     /// Preferred model id (`--model` on CLIs that support it).
     pub model: Option<String>,
     /// Resolved slot wall-clock budget in seconds: the role's **hard ceiling**, not its
@@ -271,6 +283,42 @@ pub trait ProviderAdapter: Send + Sync {
     /// treated as an agent failure.
     fn is_usage_error(&self, _code: Option<i32>) -> bool {
         false
+    }
+
+    /// Whether a failed cold dispatch's log carries this adapter's signature of the
+    /// vendor refusing the spar-assigned session id, as opposed to the agent
+    /// failing. `assigned_id` is the id the dispatch carried (`SpawnOpts::session_id`);
+    /// matchers must require it in the refusal line, so agent prose quoting a
+    /// refusal can never match. Callers only ask this when the dispatch was cold
+    /// and carried an assigned id, so a match means spar named a session the vendor
+    /// would not start — reported as spar's usage error (never a silent cold
+    /// fallback, never a retry: the same id would refuse again). `log_text` is the
+    /// persisted log either way: the coalesced slot log on headless (vendor stderr
+    /// arrives `! `-prefixed) or the raw pane tee on tmux (no prefix), so matchers
+    /// accept both. Default `false`: capture-only adapters never assign, so they
+    /// have no refusal shape.
+    fn assigned_session_refused(
+        &self,
+        _log_text: &str,
+        _assigned_id: &str,
+        _code: Option<i32>,
+    ) -> bool {
+        false
+    }
+
+    /// Session id for an artifact-recovery turn (`executor::recover_artifact`).
+    /// Default: reuse the slot's current marker id — the same session, one more
+    /// turn — which is sound for every adapter that accepts an already-existing
+    /// id. An adapter whose vendor refuses id reuse (grok) overrides this with a
+    /// distinct session instead and leaves the marker alone.
+    fn recovery_session_id(
+        &self,
+        marker_id: Option<&str>,
+        _run_id: &str,
+        _slot_id: &str,
+        _round: u32,
+    ) -> Option<String> {
+        marker_id.map(str::to_string)
     }
 
     /// Whether a failed dispatch's log carries this adapter's signature of a deliberately
@@ -640,6 +688,7 @@ mod tests {
             cwd: std::path::PathBuf::from("/tmp"),
             trust: TrustPolicy::Prompt,
             extra_args: vec![],
+            session_id: None,
             model: None,
             timeout_secs: Some(60),
         });
@@ -834,6 +883,7 @@ mod tests {
             extra_args: vec![],
             model: None,
             timeout_secs: None,
+            session_id: None,
         };
         let mut resumed = Vec::new();
         for a in all_adapters() {

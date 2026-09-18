@@ -78,6 +78,7 @@ pub fn dispatch_turn(
         cwd: req.cwd.clone(),
         trust: crate::providers::TrustPolicy::FullAuto,
         extra_args: vec![],
+        session_id: None,
         model: None,
         timeout_secs: Some(req.timeout.as_secs()),
     };
