@@ -7,6 +7,7 @@ use crate::process::{self, SpawnRequest};
 use crate::provider_ref::ProviderRef;
 use crate::providers::{self, SpawnOpts, TrustPolicy};
 use crate::sandbox;
+use crate::session_id;
 use crate::state::{FleetSeat, RunState, SeatSource, SlotRole, SlotState, SlotStatus, SlotUsage};
 use crate::templates;
 use crate::tmux;
@@ -363,6 +364,36 @@ fn prior_session_for_role(
         return None;
     }
     markers::read_session_id(paths, run_id, slot_id, provider)
+}
+
+/// Decide this cold dispatch's vendor session id up front and record it before the
+/// spawn, for adapters whose CLI accepts a caller-supplied id. Returns the id when
+/// one was assigned (and the marker written). Resume dispatches never reach here:
+/// they already have the right marker naming the session being resumed, and
+/// overwriting it pre-spawn would destroy the only pointer to it. Judging roles
+/// dispatch cold by the `prior_session_for_role` gate alone — the derived id only
+/// names their fresh session, it never decides the coldness — so exactly one
+/// mechanism stays load-bearing.
+fn assign_session_id(
+    adapter: &dyn providers::ProviderAdapter,
+    paths: &SparPaths,
+    run_id: &str,
+    slot_id: &str,
+    session_provider: &str,
+    round: u32,
+    opts: &mut SpawnOpts,
+) -> Option<String> {
+    if !adapter.capabilities().assigns_session_id {
+        return None;
+    }
+    let id = session_id::derive(run_id, slot_id, round);
+    debug_assert!(
+        session_id::is_uuid_shape(&id),
+        "derived ids must satisfy the vendors' well-formed-UUID requirement"
+    );
+    opts.session_id = Some(id.clone());
+    let _ = markers::write_session_id(paths, run_id, slot_id, session_provider, &id);
+    Some(id)
 }
 
 /// Resume a previously captured native session (`prior_session_id`) instead of a cold
@@ -808,21 +839,36 @@ fn execute_prepared(
             let _ = providers::agy_telemetry::ensure_statusline_hook(&root);
         }
     }
-    let opts = SpawnOpts {
+    let mut opts = SpawnOpts {
         prompt: prep.prompt.clone(),
         prompt_file: Some(prep.prompt_path.clone()),
         cwd: prep.cwd.clone(),
         trust: TrustPolicy::FullAuto,
         extra_args: vec![],
+        session_id: None,
         model: prep.job.model.clone(),
         timeout_secs: Some(timeout.as_secs()),
     };
-    let (cmd, used_resume) = build_dispatch_command(
+    let (mut cmd, used_resume) = build_dispatch_command(
         adapter.as_ref(),
         &bin,
         &opts,
         prep.prior_session_id.as_deref(),
     );
+    if !used_resume
+        && assign_session_id(
+            adapter.as_ref(),
+            &prep.paths,
+            &prep.run_id,
+            &prep.job.slot_id,
+            &prep.session_provider,
+            prep.round,
+            &mut opts,
+        )
+        .is_some()
+    {
+        cmd = adapter.build_headless(&bin, &opts);
+    }
     let (program, args) = providers::command_to_parts(&cmd);
     let (program, args) = sandbox::maybe_wrap(isolation, &prep.cwd, &program, &args);
     let cmdline = format!("{} {}", program.display(), args.join(" "));
@@ -955,6 +1001,44 @@ fn execute_prepared(
             quota_recovered,
         });
     }
+    // A refused assigned id fails here, before the generic gate: the pre-written
+    // marker names a session that never started, so it is cleared, and the slot
+    // fails as spar's usage error with the triple and the remediation — never a
+    // silent cold fallback, never a retry of the same refused id.
+    if assigned_session_was_refused(
+        adapter.as_ref(),
+        &opts,
+        resume_attempt.is_none(),
+        &res,
+        &prep.log_path,
+    ) {
+        markers::clear_session_id(
+            &prep.paths,
+            &prep.run_id,
+            &prep.job.slot_id,
+            &prep.session_provider,
+        );
+        return Ok(SlotOutcome {
+            ok: false,
+            pid,
+            exit_code: res.exit_code,
+            signal: res.signal,
+            error: Some(assigned_session_refused_error(
+                &cmdline,
+                &prep.log_path,
+                res.exit_code,
+                res.signal,
+                &prep.run_id,
+                &prep.job.slot_id,
+                prep.round,
+            )),
+            usage: Some(usage),
+            agy_quota_hit,
+            quota_rejected: quota_rejected.clone(),
+            quota_resets_at,
+            quota_recovered,
+        });
+    }
     if res.exit_code != Some(0) {
         return Ok(SlotOutcome {
             ok: false,
@@ -1029,6 +1113,7 @@ fn execute_prepared(
                 paths: &prep.paths,
                 run_id: &prep.run_id,
                 slot_id: &prep.job.slot_id,
+                round: prep.round,
                 role: prep.job.role,
                 owns_cwd: prep.owns_cwd,
                 provider: &prep.job.provider,
@@ -1091,6 +1176,7 @@ struct ArtifactRecovery<'a> {
     paths: &'a SparPaths,
     run_id: &'a str,
     slot_id: &'a str,
+    round: u32,
     role: SlotRole,
     /// `cwd` is this slot's own worktree. See [`owns_cwd`].
     owns_cwd: bool,
@@ -1168,6 +1254,19 @@ fn recover_artifact(r: &ArtifactRecovery) -> bool {
     let Some(bin) = adapter.resolve_binary() else {
         return false;
     };
+    let session_provider = ProviderRef::parse(r.provider)
+        .ok()
+        .and_then(|p| p.cli_name().map(str::to_string))
+        .unwrap_or_else(|| r.provider.to_string());
+    let assigns = adapter.capabilities().assigns_session_id;
+    let marker_id = markers::read_session_id(r.paths, r.run_id, r.slot_id, &session_provider);
+    // On the assign path the marker already names the session (pre-written before the
+    // spawn) and the id never changes, so there is nothing to launder: no clear, no
+    // stash, no restore window — a crash mid-recovery loses nothing. The recovery
+    // turn reuses that same session (or a distinct derived one for an adapter whose
+    // vendor refuses reuse, via `recovery_session_id`). Capture-only adapters keep
+    // the existing stash path below byte for byte.
+    //
     // The recovery turn streams to its own `<slot>.recovery.log`, so the finished
     // turn's recorded session id is taken out for the duration of the recovery spawn
     // below and restored once it returns (see the bottom of this function) — nothing
@@ -1177,16 +1276,20 @@ fn recover_artifact(r: &ArtifactRecovery) -> bool {
     // returns here to restore it, and `muse_telemetry::enrich` / `nudge.rs`'s
     // `live_billed` both fall back to the stash field, so a crash loses only the live
     // session link, not the durable usage record.
-    let recovered_session_id = process::StreamStats::load(r.log_path).and_then(|mut stats| {
-        let id = stats.session_id.take();
-        if let Some(id) = &id {
-            stats.session_id_recovery_stash = Some(id.clone());
-        }
-        if id.is_some() {
-            let _ = stats.save(r.log_path);
-        }
-        id
-    });
+    let recovered_session_id = if assigns {
+        None
+    } else {
+        process::StreamStats::load(r.log_path).and_then(|mut stats| {
+            let id = stats.session_id.take();
+            if let Some(id) = &id {
+                stats.session_id_recovery_stash = Some(id.clone());
+            }
+            if id.is_some() {
+                let _ = stats.save(r.log_path);
+            }
+            id
+        })
+    };
     let prompt = format!(
         "Your previous turn ended without writing `{}`, but your work is still in this \
          worktree ({}).\n\nWrite that file now, and nothing else. Read your own changes \
@@ -1201,12 +1304,21 @@ fn recover_artifact(r: &ArtifactRecovery) -> bool {
         return false;
     }
     let timeout = Duration::from_secs(ARTIFACT_RECOVERY_SECS);
+    // Assign path: the recovery turn names its session up front (same session for
+    // adapters that accept reuse, a distinct derived one where the vendor refuses
+    // it). Capture-only adapters pass nothing, as before.
+    let recovery_session = if assigns {
+        adapter.recovery_session_id(marker_id.as_deref(), r.run_id, r.slot_id, r.round)
+    } else {
+        None
+    };
     let opts = SpawnOpts {
         prompt,
         prompt_file: Some(r.prompt_path.to_path_buf()),
         cwd: r.cwd.to_path_buf(),
         trust: TrustPolicy::FullAuto,
         extra_args: vec![],
+        session_id: recovery_session,
         model: r.model.clone(),
         timeout_secs: Some(timeout.as_secs()),
     };
@@ -2461,6 +2573,65 @@ fn describe_exit(code: Option<i32>, signal: Option<i32>) -> String {
     }
 }
 
+/// The usage-error report shape: spar's own command line plus the provider's
+/// clamped stderr tail. Shared by `dispatch_error` and the assigned-session refusal
+/// gate so a refused id reads exactly like the muse exit-2 usage error it is.
+fn usage_error_text(
+    cmdline: &str,
+    log_path: &Path,
+    code: Option<i32>,
+    signal: Option<i32>,
+) -> String {
+    // The command line says what spar did wrong; the provider's own stderr tail
+    // says why it rejected it — the operator's only clue, so carry it along.
+    format!(
+        "provider usage error ({}): spar built a command line the provider rejected, not an agent failure: {cmdline}\nprovider output (tail):\n{}",
+        describe_exit(code, signal),
+        process::tail_log(log_path, 2000),
+    )
+}
+
+/// True when a cold dispatch that carried a spar-assigned session id was refused by
+/// the vendor. Only consulted on the cold path, so a resume that mints a fresh
+/// session (the O87 muse shape) never trips it, and a match can never be a resume.
+/// Callers clear the pre-written marker (it names a session that never started) and
+/// fail the slot as spar's usage error: never a silent cold fallback, never a retry
+/// of the same refused id. Unreachable for retries in practice — a refusal exits
+/// before any tool runs, so the transient gate (`tools >= 1`) cannot fire and the
+/// lost-session gate needs a resume — but the cold-only condition keeps it exact
+/// even if a retry path ever runs first.
+fn assigned_session_was_refused(
+    adapter: &dyn providers::ProviderAdapter,
+    opts: &SpawnOpts,
+    cold: bool,
+    res: &process::SpawnResult,
+    log_path: &Path,
+) -> bool {
+    cold && opts.session_id.is_some()
+        && adapter.assigned_session_refused(
+            &std::fs::read_to_string(log_path).unwrap_or_default(),
+            res.exit_code,
+        )
+}
+
+/// Error text for a refused assigned id: the usage-error shape plus the triple and
+/// the remediation, since the same `(run, slot, round)` re-dispatched derives the
+/// same id and would refuse again.
+fn assigned_session_refused_error(
+    cmdline: &str,
+    log_path: &Path,
+    code: Option<i32>,
+    signal: Option<i32>,
+    run_id: &str,
+    slot_id: &str,
+    round: u32,
+) -> String {
+    format!(
+        "{}\nremediation: clear the vendor session or advance the round and re-dispatch (run={run_id} slot={slot_id} round={round})",
+        usage_error_text(cmdline, log_path, code, signal)
+    )
+}
+
 /// Error text for a non-zero, non-timeout dispatch. A usage error names spar's own
 /// command line (spar's fault, never the agent's); a vendor step-budget stop is
 /// reported as a budget stop, not a crash. Everything else keeps the generic line.
@@ -2472,13 +2643,7 @@ fn dispatch_error(
     signal: Option<i32>,
 ) -> String {
     if adapter.is_usage_error(code) {
-        // The command line says what spar did wrong; the provider's own stderr tail
-        // says why it rejected it — the operator's only clue, so carry it along.
-        return format!(
-            "provider usage error ({}): spar built a command line the provider rejected, not an agent failure: {cmdline}\nprovider output (tail):\n{}",
-            describe_exit(code, signal),
-            process::tail_log(log_path, 2000),
-        );
+        return usage_error_text(cmdline, log_path, code, signal);
     }
     if adapter.step_budget_exhausted(&std::fs::read_to_string(log_path).unwrap_or_default()) {
         return format!(
@@ -2871,19 +3036,34 @@ fn run_headless(
         }
     }
 
-    let opts = SpawnOpts {
+    let mut opts = SpawnOpts {
         prompt: prompt.to_string(),
         prompt_file: Some(prompt_path.to_path_buf()),
         cwd: cwd.to_path_buf(),
         trust: TrustPolicy::FullAuto,
         extra_args: vec![],
+        session_id: None,
         model: slot_model_for(Some(state), job),
         timeout_secs: Some(timeout.as_secs()),
     };
     let prior_session_id =
         prior_session_for_role(paths, &state.id, &job.slot_id, cli_name, job.role);
-    let (cmd, used_resume) =
+    let (mut cmd, used_resume) =
         build_dispatch_command(adapter.as_ref(), &bin, &opts, prior_session_id.as_deref());
+    if !used_resume
+        && assign_session_id(
+            adapter.as_ref(),
+            paths,
+            &state.id,
+            &job.slot_id,
+            cli_name,
+            state.round,
+            &mut opts,
+        )
+        .is_some()
+    {
+        cmd = adapter.build_headless(&bin, &opts);
+    }
     let (program, args) = providers::command_to_parts(&cmd);
     let (program, args) = sandbox::maybe_wrap(state.isolation, cwd, &program, &args);
     let cmdline = format!("{} {}", program.display(), args.join(" "));
@@ -3004,6 +3184,37 @@ fn run_headless(
             quota_recovered,
         });
     }
+    // See `execute_prepared`: a refused assigned id fails as spar's usage error with
+    // the marker cleared, never a silent cold fallback.
+    if assigned_session_was_refused(
+        adapter.as_ref(),
+        &opts,
+        resume_attempt.is_none(),
+        &res,
+        log_path,
+    ) {
+        markers::clear_session_id(paths, &state.id, &job.slot_id, cli_name);
+        return Ok(SlotOutcome {
+            ok: false,
+            pid,
+            exit_code: res.exit_code,
+            signal: res.signal,
+            error: Some(assigned_session_refused_error(
+                &cmdline,
+                log_path,
+                res.exit_code,
+                res.signal,
+                &state.id,
+                &job.slot_id,
+                state.round,
+            )),
+            usage: Some(usage),
+            agy_quota_hit,
+            quota_rejected: quota_rejected.clone(),
+            quota_resets_at,
+            quota_recovered,
+        });
+    }
     let code = res.exit_code;
     if code != Some(0) {
         return Ok(SlotOutcome {
@@ -3066,6 +3277,7 @@ fn run_headless(
                 paths,
                 run_id: &state.id,
                 slot_id: &job.slot_id,
+                round: state.round,
                 role: job.role,
                 owns_cwd: owns_cwd(state, &job.slot_id, cwd),
                 provider: &job.provider,
@@ -3215,15 +3427,32 @@ fn run_tmux(
     let bin = adapter
         .resolve_binary()
         .ok_or_else(|| anyhow::anyhow!("provider {} not on PATH", job.provider))?;
-    let opts = SpawnOpts {
+    let mut opts = SpawnOpts {
         prompt: prompt.to_string(),
         prompt_file: Some(prompt_path.to_path_buf()),
         cwd: cwd.to_path_buf(),
         trust: TrustPolicy::FullAuto,
         extra_args: vec![],
+        session_id: None,
         model: slot_model_for(Some(state), job),
         timeout_secs: None,
     };
+    // The pane is teed to a log, never run through `StreamCoalescer`, so no id is
+    // ever captured here (O65). An adapter that accepts a caller-supplied id gets
+    // its session decided up front and pre-written instead, so `build_interactive`
+    // carries it and the marker names the session without any log parsing.
+    // Capture-only adapters (codex/opencode/agy) still capture nothing on this
+    // backend: the gap O65 records stands for them. tmux never resumes, so every
+    // tmux dispatch is a cold one and the resume-path reservation does not apply.
+    assign_session_id(
+        adapter.as_ref(),
+        paths,
+        &state.id,
+        &job.slot_id,
+        cli_name,
+        state.round,
+        &mut opts,
+    );
     // prefer interactive for tmux
     let cmd = adapter.build_interactive(&bin, &opts);
     let (program, args) = providers::command_to_parts(&cmd);
@@ -3642,6 +3871,7 @@ pub fn wait_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::ProviderAdapter;
 
     /// AC-8: api-sdk's own `append_log` (`src/api/runtime.rs`) never writes the offset
     /// index at all, so a stale `.idx` from an earlier native dispatch of this slot id
@@ -3667,6 +3897,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             trust: TrustPolicy::FullAuto,
             extra_args: vec![],
+            session_id: None,
             model: None,
             timeout_secs: None,
         }
@@ -3704,6 +3935,210 @@ mod tests {
         let (_, args) = providers::command_to_parts(&cmd);
         assert_eq!(args.first().map(String::as_str), Some("exec"));
         assert!(!args.iter().any(|a| a == "resume"));
+    }
+
+    struct RefusingAdapter;
+
+    impl providers::ProviderAdapter for RefusingAdapter {
+        fn name(&self) -> &'static str {
+            "refusing"
+        }
+        fn binary_names(&self) -> &[&'static str] {
+            &["sh"]
+        }
+        fn capabilities(&self) -> providers::Capabilities {
+            providers::Capabilities {
+                assigns_session_id: true,
+                ..providers::Capabilities::default()
+            }
+        }
+        fn permission_args(&self, _policy: TrustPolicy) -> Vec<String> {
+            Vec::new()
+        }
+        fn build_headless(&self, bin: &Path, _opts: &SpawnOpts) -> std::process::Command {
+            std::process::Command::new(bin)
+        }
+        fn build_interactive(&self, bin: &Path, opts: &SpawnOpts) -> std::process::Command {
+            self.build_headless(bin, opts)
+        }
+        fn assigned_session_refused(&self, log_text: &str, _code: Option<i32>) -> bool {
+            log_text.contains("is already in use")
+        }
+    }
+
+    fn refused_result() -> process::SpawnResult {
+        process::SpawnResult {
+            exit_code: Some(1),
+            signal: None,
+            timed_out: false,
+            log_path: PathBuf::from("/tmp/x"),
+            stdout_tail: String::new(),
+            stats: process::StreamStats::default(),
+        }
+    }
+
+    /// The marker is the same file whichever way the id arrived: the assign path
+    /// pre-writes exactly what the capture path writes post-dispatch, keyed per
+    /// `(slot, provider)`.
+    #[test]
+    fn assign_session_id_pre_writes_the_same_marker_the_capture_path_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("run1").unwrap();
+        let mut opts = dispatch_opts("go");
+        let id = assign_session_id(
+            &providers::MuseAdapter,
+            &paths,
+            "run1",
+            "slotA",
+            "muse",
+            2,
+            &mut opts,
+        )
+        .expect("muse assigns");
+        assert_eq!(opts.session_id.as_deref(), Some(id.as_str()));
+        assert_eq!(
+            markers::read_session_id(&paths, "run1", "slotA", "muse").as_deref(),
+            Some(id.as_str()),
+            "pre-spawn write lands in the same file the capture path reads"
+        );
+        // The capture path overwrites with the same content when the vendor echoes
+        // the assigned id: idempotent, same file, same keying.
+        markers::write_session_id(&paths, "run1", "slotA", "muse", &id).unwrap();
+        assert_eq!(
+            markers::read_session_id(&paths, "run1", "slotA", "muse").as_deref(),
+            Some(id.as_str())
+        );
+        // Per-provider keying survives: another provider's marker is untouched.
+        assert_eq!(
+            markers::read_session_id(&paths, "run1", "slotA", "codex"),
+            None
+        );
+    }
+
+    /// Capture-only adapters never assign: no id on the opts, no marker touched.
+    #[test]
+    fn assign_session_id_is_a_no_op_for_capture_only_adapters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("run1").unwrap();
+        let mut opts = dispatch_opts("go");
+        assert_eq!(
+            assign_session_id(
+                &ShellAdapter::cold("true"),
+                &paths,
+                "run1",
+                "slotA",
+                "shell",
+                1,
+                &mut opts,
+            ),
+            None
+        );
+        assert_eq!(opts.session_id, None);
+        assert_eq!(
+            markers::read_session_id(&paths, "run1", "slotA", "shell"),
+            None
+        );
+    }
+
+    /// A refused id surfaces as a usage error rather than a silent cold dispatch:
+    /// it fires only for a cold dispatch that carried an assigned id, and the
+    /// default seam never fires at all.
+    #[test]
+    fn refused_assigned_id_gate_fires_only_on_cold_assigned_dispatches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("slot.log");
+        std::fs::write(&log_path, "! Error: Session ID abc is already in use.\n").unwrap();
+        let res = refused_result();
+        let mut opts = dispatch_opts("go");
+        opts.session_id = Some("abc".into());
+        assert!(assigned_session_was_refused(
+            &RefusingAdapter,
+            &opts,
+            true,
+            &res,
+            &log_path
+        ));
+        assert!(
+            !assigned_session_was_refused(&RefusingAdapter, &opts, false, &res, &log_path),
+            "a resume never trips the refusal gate"
+        );
+        let cold_no_id = dispatch_opts("go");
+        assert!(
+            !assigned_session_was_refused(&RefusingAdapter, &cold_no_id, true, &res, &log_path),
+            "no assigned id, no refusal"
+        );
+        assert!(
+            !assigned_session_was_refused(
+                &ShellAdapter::cold("true"),
+                &opts,
+                true,
+                &res,
+                &log_path
+            ),
+            "the default seam never refuses"
+        );
+    }
+
+    /// The refusal error reads like the muse exit-2 usage error (command line plus
+    /// clamped provider tail) and names the triple with the remediation.
+    #[test]
+    fn refused_assigned_id_error_names_cmdline_triple_and_remediation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("slot.log");
+        std::fs::write(&log_path, "! Error: Session ID abc is already in use.\n").unwrap();
+        let err = assigned_session_refused_error(
+            "grok --session-id abc",
+            &log_path,
+            Some(1),
+            None,
+            "run1",
+            "slotA",
+            3,
+        );
+        assert!(err.contains("provider usage error"), "same shape: {err}");
+        assert!(
+            err.contains("grok --session-id abc"),
+            "names the command line: {err}"
+        );
+        assert!(
+            err.contains("is already in use"),
+            "carries the refusal: {err}"
+        );
+        assert!(err.contains("run=run1"), "names the triple: {err}");
+        assert!(err.contains("slot=slotA"), "names the triple: {err}");
+        assert!(err.contains("round=3"), "names the triple: {err}");
+        assert!(
+            err.contains("remediation"),
+            "tells the operator what to do: {err}"
+        );
+    }
+
+    /// Recovery naming: capture-only adapters reuse the marker id, grok derives a
+    /// distinct session because its vendor refuses reuse.
+    #[test]
+    fn recovery_session_id_reuses_marker_except_where_reuse_refuses() {
+        assert_eq!(
+            ShellAdapter::cold("true")
+                .recovery_session_id(Some("m"), "r", "s", 1)
+                .as_deref(),
+            Some("m")
+        );
+        assert_eq!(
+            ShellAdapter::cold("true").recovery_session_id(None, "r", "s", 1),
+            None
+        );
+        let grok_id = providers::GrokAdapter
+            .recovery_session_id(Some("main-session"), "run1", "slotA", 2)
+            .expect("grok recovery always names a session");
+        assert_ne!(grok_id, "main-session");
+        assert!(crate::session_id::is_uuid_shape(&grok_id));
+        assert_eq!(
+            grok_id,
+            crate::session_id::derive_recovery("run1", "slotA", 2),
+            "recovery derivation is stable across processes"
+        );
     }
 
     #[test]

@@ -88,6 +88,10 @@ impl ProviderAdapter for OpencodeAdapter {
             // `--dangerously-skip-permissions` edits autonomously; the worktree is the
             // boundary (matching the other adapters), so no native sandbox is relied on.
             native_sandbox: false,
+            // Capture-only: opencode continues an existing session (`-s/--session`)
+            // but offers no flag to name a new one, so `SpawnOpts::session_id` is
+            // never read here and the id keeps arriving from the stream.
+            assigns_session_id: false,
         }
     }
 
@@ -154,9 +158,26 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             trust: TrustPolicy::FullAuto,
             extra_args: vec![],
+            session_id: None,
             model: model.map(Into::into),
             timeout_secs: None,
         }
+    }
+
+    #[test]
+    fn capture_only_adapter_ignores_assigned_session_id() {
+        // opencode cannot name a new session: the command line must be
+        // byte-identical with and without the field set.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let plain = opts("do the thing", None);
+        let mut assigned = plain.clone();
+        assigned.session_id = Some("123e4567-e89b-52d3-a456-426614174000".into());
+        let (_, a) =
+            command_to_parts(&OpencodeAdapter.build_headless(Path::new("opencode"), &plain));
+        let (_, b) =
+            command_to_parts(&OpencodeAdapter.build_headless(Path::new("opencode"), &assigned));
+        assert_eq!(a, b);
+        assert!(!OpencodeAdapter.capabilities().assigns_session_id);
     }
 
     fn dash_val(args: &[String], flag: &str) -> Option<String> {

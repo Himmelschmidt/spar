@@ -28,6 +28,7 @@ mod registry;
 mod runlock;
 mod runspec;
 mod sandbox;
+mod session_id;
 mod ship;
 mod skills;
 mod state;

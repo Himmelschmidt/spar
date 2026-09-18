@@ -43,6 +43,9 @@ impl ProviderAdapter for AgyAdapter {
             resume: true,
             skip_permissions: true,
             native_sandbox: true,
+            // Capture-only: agy resumes by `--conversation <ID>` but offers no flag
+            // to name a new session, so `SpawnOpts::session_id` is never read here.
+            assigns_session_id: false,
         }
     }
 
@@ -140,6 +143,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             trust: TrustPolicy::FullAuto,
             extra_args,
+            session_id: None,
             model: model.map(str::to_string),
             timeout_secs: None,
         }
@@ -151,6 +155,20 @@ mod tests {
         let (_, args) = command_to_parts(&cmd);
         let i = args.iter().position(|a| a == "--print").expect("--print");
         assert_eq!(args.get(i + 1).map(String::as_str), Some("review this"));
+    }
+
+    #[test]
+    fn capture_only_adapter_ignores_assigned_session_id() {
+        // agy cannot name a new session: the command line must be byte-identical
+        // with and without the field set.
+        let plain = opts("review this", None, None);
+        let mut assigned = plain.clone();
+        assigned.session_id = Some("123e4567-e89b-52d3-a456-426614174000".into());
+        let (_, a) = command_to_parts(&AgyAdapter.build_headless(Path::new("agy"), &plain));
+        let (_, b) = command_to_parts(&AgyAdapter.build_headless(Path::new("agy"), &assigned));
+        assert_eq!(a, b);
+        assert!(!AgyAdapter.capabilities().assigns_session_id);
+        assert!(!AgyAdapter.assigned_session_refused("anything", Some(1)));
     }
 
     #[test]

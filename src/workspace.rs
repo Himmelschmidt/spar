@@ -106,6 +106,7 @@ pub fn spawn_agent(req: &SpawnRequest) -> Result<(String, String)> {
         cwd: req.cwd.to_path_buf(),
         trust: TrustPolicy::FullAuto,
         extra_args: vec![],
+        session_id: None,
         model: None,
         timeout_secs: None,
     };
