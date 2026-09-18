@@ -29,8 +29,8 @@ pub enum DeliveryAction {
     /// mean this thread's *next* `build_resume` dispatch will. The poll file was written
     /// too, same as `PolledFile`; this is just which of the two the push also hit.
     NativePushed,
-    /// Grok: claimed messages appended to the durable turn-boundary queue (unread until
-    /// its live push channel lands).
+    /// Claimed messages appended to the durable turn-boundary queue for a later
+    /// session flush.
     Queued,
     /// opencode: claimed messages appended to the durable queue for the session flush.
     Prompted,
@@ -70,8 +70,8 @@ fn is_zero(n: &usize) -> bool {
 ///
 /// `agent` is the unique bus id (run slots: `run:slot`, bare agents: their own id), so
 /// the inbox directory already isolates one agent's traffic — no run filter is needed on
-/// the drain. `run` is still threaded to [`queue_path`] to keep each run's durable
-/// turn-boundary queue partitioned.
+/// the drain. `run` is still threaded to [`queue_path`] (used by `SdkPrompt`) to keep
+/// each run's durable turn-boundary queue partitioned.
 ///
 /// `None` never consumes the inbox — an agent with no injection channel reads its own
 /// inbox on its next turn, so claiming here would strand the messages. Every other
@@ -122,12 +122,6 @@ pub fn deliver(
         DeliveryStrategy::StopHookInject => {
             (DeliveryAction::StopHookBlock, Some(block_payload(&msgs)))
         }
-        DeliveryStrategy::NativeQueue => {
-            // Grok never captures a session id; every delivery is the durable queue
-            // file (unread until its live push channel lands — see the file's doc).
-            enqueue(paths, run, agent, &msgs, dry_run)?;
-            (DeliveryAction::Queued, None)
-        }
         DeliveryStrategy::NativeQueuePollFallback => {
             let text = render_reason(&msgs);
             let (action, _path) =
@@ -173,10 +167,10 @@ fn render_reason(msgs: &[BusMessage]) -> String {
     s
 }
 
-/// Per-agent durable turn-boundary queue path. Grok's own `/queue` and opencode's
-/// session prompt are in-process channels into a *running* slot; until the live push
-/// lands (Track A panes / the opencode adapter) spar persists the claimed prompts here
-/// so nothing is lost between the claim and the flush.
+/// Per-agent durable turn-boundary queue path. opencode's session prompt is an
+/// in-process channel into a *running* slot; until the live push lands (the opencode
+/// adapter) spar persists the claimed prompts here so nothing is lost between the
+/// claim and the flush.
 ///
 /// `run` scopes the queue file exactly like the inbox drain: slot ids are deterministic
 /// per provider/role and collide across concurrent same-shaped runs, so a bare
@@ -389,8 +383,8 @@ pub struct NudgeDelivery {
     pub path: Option<String>,
 }
 
-/// Append one nudge line to the durable turn-boundary queue file — grok's channel.
-/// `dry_run` stubs the write.
+/// Append one nudge line to the durable turn-boundary queue file (`SdkPrompt`'s
+/// channel). `dry_run` stubs the write.
 fn write_queue_file(
     paths: &SparPaths,
     run: Option<&str>,
@@ -424,8 +418,8 @@ pub const ORCHESTRATOR: &str = "spar";
 /// these branches runs is the seam's business, not the orchestrator's. Text sent to a
 /// *busy* CLI agent's TTY only queues unsubmitted, so every branch here lands somewhere
 /// the agent reads at a turn boundary instead: a Stop-hook adapter's hook drains its
-/// inbox at the turn boundary, grok applies its native queue, and everything else reads
-/// the poll file its prompt names.
+/// inbox at the turn boundary, and everything else reads the poll file its prompt
+/// names.
 pub fn nudge(
     paths: &SparPaths,
     run: Option<&str>,
@@ -464,11 +458,6 @@ pub fn nudge(
             }
             (DeliveryAction::StopHookBlock, None)
         }
-        // Grok never captures a session id; every nudge is the durable queue file.
-        DeliveryStrategy::NativeQueue => (
-            DeliveryAction::Queued,
-            Some(write_queue_file(paths, run, agent, text, dry_run)?),
-        ),
         // See `deliver`'s NativeQueuePollFallback arm: the push is best-effort, the poll
         // file is the guarantee, whether or not a session id is known.
         DeliveryStrategy::NativeQueuePollFallback => {
@@ -565,7 +554,7 @@ mod tests {
     }
 
     #[test]
-    fn native_queue_appends_durable_queue() {
+    fn sdk_prompt_queue_appends_durable_queue_via_deliver() {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         seed(&paths, 3);
@@ -575,12 +564,12 @@ mod tests {
             &paths,
             Some("r1"),
             &ub,
-            DeliveryStrategy::NativeQueue,
+            DeliveryStrategy::SdkPrompt,
             None,
             false,
         )
         .unwrap();
-        assert_eq!(d.action, DeliveryAction::Queued);
+        assert_eq!(d.action, DeliveryAction::Prompted);
         assert_eq!(d.delivered, 3);
         assert!(d.payload.is_none());
         let queued = fs::read_to_string(queue_path(&paths, Some("r1"), &ub)).unwrap();
@@ -634,12 +623,12 @@ mod tests {
             &paths,
             Some("r1"),
             &ub,
-            DeliveryStrategy::NativeQueue,
+            DeliveryStrategy::SdkPrompt,
             None,
             true,
         )
         .unwrap();
-        assert_eq!(d.action, DeliveryAction::Queued);
+        assert_eq!(d.action, DeliveryAction::Prompted);
         assert_eq!(d.delivered, 2);
         // Injection call stubbed: no queue file written.
         assert!(!queue_path(&paths, Some("r1"), &ub).exists());
@@ -747,8 +736,9 @@ mod tests {
     /// Two concurrent runs share a deterministic slot id ("b"), hence one workspace inbox,
     /// but the durable queue must stay run-isolated: run B's flush must never surface run
     /// A's claimed prompts. Each run enqueues into its own `queue/<run>/b.jsonl`.
+    /// Exercised through `SdkPrompt`, the surviving queue-file strategy.
     #[test]
-    fn native_queue_is_run_scoped_across_identical_slot_ids() {
+    fn sdk_prompt_queue_is_run_scoped_across_identical_slot_ids() {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         // Two runs, each with the same slot id "b" fed by its own sender "a".
@@ -780,7 +770,7 @@ mod tests {
             &paths,
             Some("rB"),
             &ub,
-            DeliveryStrategy::NativeQueue,
+            DeliveryStrategy::SdkPrompt,
             None,
             false,
         )
@@ -789,7 +779,7 @@ mod tests {
             &paths,
             Some("rA"),
             &ua,
-            DeliveryStrategy::NativeQueue,
+            DeliveryStrategy::SdkPrompt,
             None,
             false,
         )
