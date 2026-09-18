@@ -417,11 +417,18 @@ fn an_abandoned_in_flight_run_resumes_through_the_detach_path() {
          orchestrator, not run continue_run in this process"
     );
 
-    let state: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(state_path(&proj, &run_id)).unwrap())
-            .unwrap();
-    assert_ne!(
-        state["phase"], "dispatch",
-        "the resumed run must actually advance"
-    );
+    // `resume --detach` hands back as soon as the spawned orchestrator holds the run
+    // lock, which is *before* that orchestrator has written its first phase. Reading
+    // `state.json` once here raced it: under load (a busy box, a cold `target/`) the
+    // child had not stamped a new phase yet and the assertion read the `dispatch` the
+    // test itself set. Poll for the advance instead, with the same bounded idiom the
+    // other scenario tests use for detached work.
+    let advanced = (0..60).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(state_path(&proj, &run_id)).unwrap())
+                .unwrap();
+        state["phase"] != "dispatch"
+    });
+    assert!(advanced, "the resumed run must actually advance");
 }
