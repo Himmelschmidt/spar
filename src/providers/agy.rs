@@ -168,7 +168,7 @@ mod tests {
         let (_, b) = command_to_parts(&AgyAdapter.build_headless(Path::new("agy"), &assigned));
         assert_eq!(a, b);
         assert!(!AgyAdapter.capabilities().assigns_session_id);
-        assert!(!AgyAdapter.assigned_session_refused("anything", Some(1)));
+        assert!(!AgyAdapter.assigned_session_refused("anything", "abc", Some(1)));
     }
 
     #[test]

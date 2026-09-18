@@ -273,13 +273,23 @@ pub trait ProviderAdapter: Send + Sync {
     }
 
     /// Whether a failed cold dispatch's log carries this adapter's signature of the
-    /// vendor refusing the spar-assigned session id (`SpawnOpts::session_id`), as
-    /// opposed to the agent failing. Callers only ask this when the dispatch was
-    /// cold and carried an assigned id, so a match means spar named a session the
-    /// vendor would not start — reported as spar's usage error (never a silent cold
-    /// fallback, never a retry: the same id would refuse again). Default `false`:
-    /// capture-only adapters never assign, so they have no refusal shape.
-    fn assigned_session_refused(&self, _log_text: &str, _code: Option<i32>) -> bool {
+    /// vendor refusing the spar-assigned session id, as opposed to the agent
+    /// failing. `assigned_id` is the id the dispatch carried (`SpawnOpts::session_id`);
+    /// matchers must require it in the refusal line, so agent prose quoting a
+    /// refusal can never match. Callers only ask this when the dispatch was cold
+    /// and carried an assigned id, so a match means spar named a session the vendor
+    /// would not start — reported as spar's usage error (never a silent cold
+    /// fallback, never a retry: the same id would refuse again). `log_text` is the
+    /// persisted log either way: the coalesced slot log on headless (vendor stderr
+    /// arrives `! `-prefixed) or the raw pane tee on tmux (no prefix), so matchers
+    /// accept both. Default `false`: capture-only adapters never assign, so they
+    /// have no refusal shape.
+    fn assigned_session_refused(
+        &self,
+        _log_text: &str,
+        _assigned_id: &str,
+        _code: Option<i32>,
+    ) -> bool {
         false
     }
 

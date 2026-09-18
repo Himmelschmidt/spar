@@ -129,12 +129,25 @@ impl ProviderAdapter for GrokAdapter {
     /// before doing any work (exit 1,
     /// `Error: Error: Session ID <uuid> is already in use.`, probed live on 1.0.34
     /// against a real session dir — no model call, refusal precedes everything).
-    /// Malformed ids refuse the same way (`must be a valid UUID`); spar only ever
-    /// sends well-formed v5 ids. Anchored on the coalescer's stderr prefix so agent
-    /// prose (e.g. "the port is already in use") can never match.
-    fn assigned_session_refused(&self, log_text: &str, _code: Option<i32>) -> bool {
+    /// Malformed ids refuse the same way (`must be a valid UUID`, probed live);
+    /// spar only ever sends well-formed v5 ids, so that arm is defense-in-depth.
+    /// Both arms require a vendor-error start plus the dispatch's own assigned id
+    /// (reuse arm) or the malformed wording, so agent prose (e.g. "the port is
+    /// already in use") can never match; the matcher accepts the log with or
+    /// without the coalescer's `! ` stderr prefix (headless vs tmux tee).
+    fn assigned_session_refused(
+        &self,
+        log_text: &str,
+        assigned_id: &str,
+        _code: Option<i32>,
+    ) -> bool {
         log_text.lines().any(|l| {
-            l.starts_with("! ") && l.contains("Session ID") && l.contains("is already in use")
+            let line = l.strip_prefix("! ").unwrap_or(l);
+            line.starts_with("Error")
+                && (line.contains("must be a valid UUID")
+                    || (line.contains("Session ID")
+                        && line.contains(assigned_id)
+                        && line.contains("is already in use")))
         })
     }
 
@@ -267,13 +280,39 @@ mod tests {
 
     #[test]
     fn existing_session_refusal_matches_vendor_stderr() {
+        let id = "01a0afec-eaf7-78c2-b076-d47691cf248a";
         assert!(GrokAdapter.assigned_session_refused(
-            "! Error: Error: Session ID 01a0afec-eaf7-78c2-b076-d47691cf248a is already in use.\n",
+            &format!("! Error: Error: Session ID {id} is already in use.\n"),
+            id,
             Some(1),
         ));
-        assert!(!GrokAdapter.assigned_session_refused("", Some(1)));
+        // Same line without the coalescer prefix (tmux pane tee).
+        assert!(GrokAdapter.assigned_session_refused(
+            &format!("Error: Error: Session ID {id} is already in use.\n"),
+            id,
+            Some(1),
+        ));
+        // Malformed refusal, probed live (defense-in-depth: spar never sends one).
+        assert!(GrokAdapter.assigned_session_refused(
+            "! Error: Error: --session-id must be a valid UUID (got 'not-a-uuid').\n",
+            id,
+            Some(1),
+        ));
+        // A refusal naming a *different* session is not ours.
+        assert!(!GrokAdapter.assigned_session_refused(
+            "! Error: Error: Session ID 00000000-0000-0000-0000-000000000000 is already in use.\n",
+            id,
+            Some(1),
+        ));
+        assert!(!GrokAdapter.assigned_session_refused("", id, Some(1)));
         assert!(!GrokAdapter.assigned_session_refused(
             "! the agent wrote that the port is already in use\n",
+            id,
+            Some(1),
+        ));
+        assert!(!GrokAdapter.assigned_session_refused(
+            &format!("the agent wrote Session ID {id} is already in use in its summary\n"),
+            id,
             Some(1),
         ));
     }
