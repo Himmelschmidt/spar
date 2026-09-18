@@ -460,6 +460,22 @@ impl SlotRole {
         }
     }
 
+    /// Whether a later round of the same slot id may resume this role's captured
+    /// native session instead of dispatching cold.
+    ///
+    /// Judging roles never resume: a review, suite report, or plan critique is a
+    /// fresh judgment of the current commit, and reopening the session that
+    /// already delivered the verdict cannot re-judge it (the slot answers
+    /// "already complete" and the previous round's artifact stands as this
+    /// round's). Every other role's work is cumulative across rounds, so they
+    /// keep resume.
+    pub fn resumes_across_rounds(&self) -> bool {
+        !matches!(
+            self,
+            SlotRole::Reviewer | SlotRole::Tester | SlotRole::PlanCritic
+        )
+    }
+
     /// Parse a canonical config/state key back into a `SlotRole`. No aliases —
     /// `critic` is not accepted (see plan Priority 8: one vocabulary, not three).
     #[allow(dead_code)]
@@ -1285,6 +1301,29 @@ mod tests {
             );
         }
         assert_eq!(SlotRole::from_config_key("critic"), None);
+    }
+
+    #[test]
+    fn only_judging_roles_skip_resume_across_rounds() {
+        for role in [
+            SlotRole::Planner,
+            SlotRole::TestAuthor,
+            SlotRole::Implementer,
+            SlotRole::Ranker,
+            SlotRole::Peer,
+            SlotRole::Reconciler,
+        ] {
+            assert!(
+                role.resumes_across_rounds(),
+                "{role:?} is cumulative across rounds and keeps resume"
+            );
+        }
+        for role in [SlotRole::Reviewer, SlotRole::Tester, SlotRole::PlanCritic] {
+            assert!(
+                !role.resumes_across_rounds(),
+                "{role:?} judges the current commit and must dispatch cold"
+            );
+        }
     }
 
     #[test]
