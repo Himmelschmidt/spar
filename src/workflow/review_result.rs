@@ -66,7 +66,12 @@ pub fn parse_reviewed_commit(body: &str) -> Option<String> {
         let Some((key, value)) = raw.split_once(':') else {
             continue;
         };
-        if !key.trim().eq_ignore_ascii_case("reviewed-commit") {
+        // The key is normalized the same way the value below is. A reviewer that
+        // bolds or bullets the line (`**Reviewed-Commit:** <sha>`, `- Reviewed-Commit:
+        // <sha>`) has still named its commit, and the gate fails closed, so a
+        // stricter key than value would reject a real verdict over markup.
+        let key = key.trim().trim_matches(['*', '`', '-', '+', ' ', '\t']);
+        if !key.eq_ignore_ascii_case("reviewed-commit") {
             continue;
         }
         let v = value.trim().trim_matches(['*', '`', ' ', '\t']);
@@ -417,6 +422,21 @@ mod tests {
 
     fn judged(body: &str) -> Option<String> {
         parse_review(body).reviewed_commit
+    }
+
+    /// Markup must not cost a reviewer its verdict: the gate fails closed, so a
+    /// bolded or bulleted key is a real-world way to lose a real review.
+    #[test]
+    fn reviewed_commit_survives_markup_on_the_key() {
+        for line in [
+            format!("**Reviewed-Commit:** {HEAD}"),
+            format!("- Reviewed-Commit: {HEAD}"),
+            format!("`Reviewed-Commit`: {HEAD}"),
+            format!("**Reviewed-Commit**: {HEAD}"),
+        ] {
+            let body = format!("## Verdict\napprove\n\n{line}\n");
+            assert_eq!(judged(&body).as_deref(), Some(HEAD), "{line}");
+        }
     }
 
     #[test]
