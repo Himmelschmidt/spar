@@ -59,7 +59,12 @@ impl ProviderAdapter for GrokAdapter {
         Capabilities {
             headless: true,
             interactive: true,
-            resume: true,
+            // No `build_resume`: a real implementation would resume via
+            // `grok -r/--resume <id>` (`--fork-session` for the fork form;
+            // `-s/--session-id` only names a new or forked session, verified
+            // against grok 1.0.34). Unimplemented, so the derived flag stays
+            // false.
+            resume: self.supports_resume(),
             skip_permissions: true,
             native_sandbox: false,
         }

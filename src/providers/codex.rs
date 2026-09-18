@@ -118,6 +118,38 @@ fn flatten_toml_override(path: &str, value: &toml::Value, out: &mut Vec<String>)
     out.push(format!("{path}={rendered}"));
 }
 
+/// The last-message file for the dispatch that wrote `log_path`
+/// (`<run_dir>/logs/<slot>.log`): the `<slot>.last-message.md` beside it. Used by
+/// `executor::salvage_expected_artifact`; the dispatch side reaches the same file
+/// through `last_message_path_for_opts` (same slot, same `logs/` dir).
+pub(crate) fn last_message_path(log_path: &Path) -> PathBuf {
+    let stem = log_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("slot");
+    log_path.with_file_name(format!("{stem}.last-message.md"))
+}
+
+/// Slot-scoped `--output-last-message` path for this dispatch, derived from the
+/// prompt file the executor wrote (`<run_dir>/prompt-<slot>.md`, see
+/// `prepare_slot_execution`): `<run_dir>/logs/<slot>.last-message.md`, next to
+/// the slot log. `None` when no prompt file is set or it is not
+/// executor-shaped. Then no flag is emitted and salvage falls back to the log
+/// tail, the pre-existing behavior.
+fn last_message_path_for_opts(opts: &SpawnOpts) -> Option<PathBuf> {
+    let pf = opts.prompt_file.as_ref()?;
+    let name = pf.file_name()?.to_str()?;
+    let slot = name.strip_prefix("prompt-")?.strip_suffix(".md")?;
+    if slot.is_empty() {
+        return None;
+    }
+    Some(
+        pf.parent()?
+            .join("logs")
+            .join(format!("{slot}.last-message.md")),
+    )
+}
+
 /// The trailing prompt positional: inline `opts.prompt` if set, else the prompt file's
 /// contents, else empty. stdin is null (spar spawns detached), so codex only ever sees
 /// the prompt from this argument.
@@ -195,7 +227,9 @@ impl ProviderAdapter for CodexAdapter {
             // the resumed thread, which is exactly the cost O52 measured and chose a
             // compact carry-forward brief over for the general fix-round case; O63 records
             // the tradeoff for codex specifically rather than reversing O52's default.
-            resume: true,
+            // Derived from `supports_resume` (true: `build_resume` is implemented
+            // below), never asserted literally.
+            resume: self.supports_resume(),
             skip_permissions: true,
             // FullAuto bypasses codex's own sandbox (the worktree is the boundary,
             // matching the other adapters), so we do not rely on a native sandbox.
@@ -239,12 +273,26 @@ impl ProviderAdapter for CodexAdapter {
         for a in &opts.extra_args {
             cmd.arg(a);
         }
+        // The provider's own final message, free artifact-salvage input:
+        // `-o/--output-last-message` writes the agent's last message to a path of
+        // spar's choosing (verified against codex 0.153.4). Slot-scoped under the
+        // run's `logs/`; `executor::salvage_expected_artifact` prefers it over the
+        // reconstructed log tail when the expected artifact is missing, subject to
+        // the O89 freshness rule. A salvage input only, never the artifact itself.
+        if let Some(path) = last_message_path_for_opts(opts) {
+            cmd.arg("--output-last-message").arg(path);
+        }
         // `--` ends option parsing so a prompt starting with `-` (or matching a
         // `codex exec` subcommand like `review`/`resume`) is taken literally.
         cmd.arg("--");
         cmd.arg(resolved_prompt(opts));
         cmd.current_dir(&opts.cwd);
         cmd
+    }
+
+    /// Resume is implemented, so the derived `Capabilities.resume` reports true.
+    fn supports_resume(&self) -> bool {
+        true
     }
 
     // `codex exec resume [OPTIONS] [SESSION_ID] [PROMPT]` (verified against codex
@@ -284,6 +332,12 @@ impl ProviderAdapter for CodexAdapter {
         }
         for a in &opts.extra_args {
             cmd.arg(a);
+        }
+        // Same last-message flag as the cold dispatch (verified against codex
+        // 0.153.4: `exec resume` takes `-o/--output-last-message` too), so a
+        // resumed round's final message is salvageable the same way.
+        if let Some(path) = last_message_path_for_opts(opts) {
+            cmd.arg("--output-last-message").arg(path);
         }
         cmd.arg(session_id);
         cmd.arg("--");
@@ -655,6 +709,91 @@ mod tests {
         assert_eq!(
             args.get(mi + 1).map(String::as_str),
             Some("meta/muse-spark-1.1")
+        );
+    }
+
+    #[test]
+    fn headless_and_resume_carry_output_last_message_under_run_logs() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SPAR_CODEX_PROFILE");
+        std::env::remove_var("SPAR_CODEX_MODEL");
+        // Executor-shaped prompt file: `<run_dir>/prompt-<slot>.md`.
+        let dir = tempdir().unwrap();
+        let run = dir.path().join("runs").join("run1");
+        let mut o = opts("do the thing", None);
+        o.prompt_file = Some(run.join("prompt-impl.md"));
+        let want = run.join("logs").join("impl.last-message.md");
+
+        let (_, a) = command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &o));
+        let i = a
+            .iter()
+            .position(|x| x == "--output-last-message")
+            .expect("--output-last-message");
+        assert_eq!(
+            a.get(i + 1).map(String::as_str),
+            want.to_str(),
+            "flag must point at the slot-scoped logs path"
+        );
+        // Still ahead of the `--` / prompt tail.
+        let di = a.iter().position(|x| x == "--").expect("-- separator");
+        assert!(i + 1 < di, "flag must precede the prompt tail: {a:?}");
+        assert_eq!(a.last().map(String::as_str), Some("do the thing"));
+
+        let home = tempdir().unwrap();
+        std::env::set_var("CODEX_HOME", home.path());
+        let (_, a) = command_to_parts(
+            &CodexAdapter
+                .build_resume(Path::new("codex"), &o, "thread-1")
+                .expect("codex supports resume"),
+        );
+        std::env::remove_var("CODEX_HOME");
+        let i = a
+            .iter()
+            .position(|x| x == "--output-last-message")
+            .expect("resume carries the same flag");
+        assert_eq!(a.get(i + 1).map(String::as_str), want.to_str());
+        // Session id still precedes `--` and the prompt.
+        let si = a.iter().position(|x| x == "thread-1").unwrap();
+        let di = a.iter().position(|x| x == "--").unwrap();
+        assert!(
+            i + 1 < si && si < di,
+            "flag, session, separator order: {a:?}"
+        );
+    }
+
+    #[test]
+    fn no_last_message_flag_without_an_executor_shaped_prompt_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // No prompt file at all: old command line, salvage falls back to the log.
+        let (_, a) =
+            command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &opts("x", None)));
+        assert!(!a.iter().any(|x| x == "--output-last-message"));
+        // A prompt file that is not `<run_dir>/prompt-<slot>.md` carries no
+        // slot to scope the path to, so no flag either.
+        let mut o = opts("x", None);
+        o.prompt_file = Some(PathBuf::from("/tmp/some-notes.md"));
+        let (_, a) = command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &o));
+        assert!(!a.iter().any(|x| x == "--output-last-message"));
+    }
+
+    #[test]
+    fn prompt_derived_path_agrees_with_log_derived_path() {
+        // The dispatch side (prompt file) and the salvage side (slot log) must
+        // name the same file, or the flag writes where salvage never reads.
+        let dir = tempdir().unwrap();
+        let run = dir.path().join("run1");
+        let o = SpawnOpts {
+            prompt: "x".into(),
+            prompt_file: Some(run.join("prompt-rev.md")),
+            cwd: PathBuf::from("/tmp"),
+            trust: TrustPolicy::FullAuto,
+            extra_args: vec![],
+            model: None,
+            timeout_secs: None,
+        };
+        assert_eq!(
+            last_message_path_for_opts(&o).as_deref(),
+            Some(last_message_path(&run.join("logs").join("rev.log")).as_path()),
         );
     }
 
