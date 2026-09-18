@@ -81,9 +81,10 @@ impl ProviderAdapter for OpencodeAdapter {
         Capabilities {
             headless: true,
             // Only `opencode run` (headless) is verified; interactive TUI takeover and
-            // session resume are not.
+            // session resume are not (no `build_resume`, so the derived flag stays
+            // false).
             interactive: false,
-            resume: false,
+            resume: self.supports_resume(),
             skip_permissions: true,
             // `--dangerously-skip-permissions` edits autonomously; the worktree is the
             // boundary (matching the other adapters), so no native sandbox is relied on.

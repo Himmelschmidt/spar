@@ -33,7 +33,11 @@ impl ProviderAdapter for ClaudeAdapter {
         Capabilities {
             headless: true,
             interactive: true,
-            resume: true,
+            // No `build_resume`: a real implementation would hand the captured
+            // session id to `claude -r/--resume <id>` (fork forms add
+            // `--fork-session` / `--session-id`; verified against claude
+            // 2.1.248). Unimplemented, so the derived flag stays false.
+            resume: self.supports_resume(),
             skip_permissions: true,
             native_sandbox: false,
         }
