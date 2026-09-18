@@ -29,6 +29,8 @@ Write the artifact early and iteratively — partial findings are better than no
 ## Verdict
 approve | request_changes
 
+Reviewed-Commit: <full-sha-of-HEAD>
+
 ## Acceptance
 AC-1: pass|fail|unverified — evidence (command output, file:line, or observed behavior)
 AC-2: ...
@@ -41,6 +43,7 @@ what was checked; be explicit about suite evidence vs targeted checks
 ```
 
 Rules:
+- At the moment you read the diff, run `git rev-parse HEAD` in the code-under-review worktree and paste the full sha on the `Reviewed-Commit:` line. A verdict that names no commit cannot be counted: the gate treats it exactly like a missing review.
 - Every `AC-n` in the acceptance contract above must appear in `## Acceptance` **exactly once**. A criterion you omit blocks the ship exactly like a `fail`.
 - `unverified` means you could not check it — not that it looks fine. By default it blocks.
 - Evidence is mandatory for `pass`.

@@ -349,6 +349,12 @@ pub struct SlotState {
     /// Reset at the start of every dispatch, so a re-dispatch never carries a stale hit.
     #[serde(default)]
     pub quota_hit: bool,
+    /// The commit a reviewer slot's artifact claimed to judge (`Reviewed-Commit:`),
+    /// lowercase hex as written; `None` when the artifact named none. Recorded at
+    /// gate read so a finished run answers which commit each reviewer judged.
+    /// Reset at dispatch alongside the other per-dispatch fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_commit: Option<String>,
     /// Which precedence rung this seat's provider was resolved from (feature 011).
     /// `None` for slots created outside the fleet resolver (arena/peer/roles/review) or
     /// for state written before this field existed.

@@ -30,6 +30,10 @@ pub struct ReviewResult {
     /// `None` means no parsable verdict. Callers treat that as blocking.
     pub verdict: Option<Verdict>,
     pub acceptance: Vec<AcLine>,
+    /// The commit the reviewer claims to have judged (`Reviewed-Commit:`), lowercase
+    /// hex as written. `None` when the line is absent or malformed; the implement
+    /// loop's gate treats that exactly like a missing review (fail closed).
+    pub reviewed_commit: Option<String>,
 }
 
 impl ReviewResult {
@@ -51,8 +55,55 @@ enum Section {
     Acceptance,
 }
 
+/// First well-formed `Reviewed-Commit: <sha>` line wins. The key is
+/// case-insensitive with surrounding whitespace tolerated; the value is 7..=40
+/// hex, lowercase-normalized, so a short sha an agent pasted still names its
+/// commit. Anything else — absent, non-hex, too short, too long, or the
+/// template's non-hex `<full-sha-of-HEAD>` placeholder echoed back — parses as
+/// absent, never as a coincidental match.
+pub fn parse_reviewed_commit(body: &str) -> Option<String> {
+    for raw in body.lines() {
+        let Some((key, value)) = raw.split_once(':') else {
+            continue;
+        };
+        // The key is normalized the same way the value below is. A reviewer that
+        // bolds or bullets the line (`**Reviewed-Commit:** <sha>`, `- Reviewed-Commit:
+        // <sha>`) has still named its commit, and the gate fails closed, so a
+        // stricter key than value would reject a real verdict over markup.
+        let key = key.trim().trim_matches(['*', '`', '-', '+', ' ', '\t']);
+        if !key.eq_ignore_ascii_case("reviewed-commit") {
+            continue;
+        }
+        let v = value.trim().trim_matches(['*', '`', ' ', '\t']);
+        if (7..=40).contains(&v.len()) && v.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Some(v.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+/// Pure string comparison, no git: a full-length verdict sha must equal the
+/// panel head; a short (7..=39) one must prefix it. A prefix-match exists by
+/// construction, so no `rev-parse --verify` existence check: anything else
+/// fails closed anyway.
+pub fn reviewed_commit_matches(panel_head: &str, parsed: &str) -> bool {
+    let head = panel_head.trim().to_ascii_lowercase();
+    let sha = parsed.trim().to_ascii_lowercase();
+    if sha.is_empty() || head.is_empty() {
+        return false;
+    }
+    if sha.len() >= 40 {
+        sha == head
+    } else {
+        head.starts_with(&sha)
+    }
+}
+
 pub fn parse_review(body: &str) -> ReviewResult {
-    let mut out = ReviewResult::default();
+    let mut out = ReviewResult {
+        reviewed_commit: parse_reviewed_commit(body),
+        ..Default::default()
+    };
     let mut section = Section::Other;
 
     for raw in body.lines() {
@@ -365,6 +416,106 @@ mod tests {
 
     fn verdict(body: &str) -> Option<Verdict> {
         parse_review(body).verdict
+    }
+
+    const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn judged(body: &str) -> Option<String> {
+        parse_review(body).reviewed_commit
+    }
+
+    /// Markup must not cost a reviewer its verdict: the gate fails closed, so a
+    /// bolded or bulleted key is a real-world way to lose a real review.
+    #[test]
+    fn reviewed_commit_survives_markup_on_the_key() {
+        for line in [
+            format!("**Reviewed-Commit:** {HEAD}"),
+            format!("- Reviewed-Commit: {HEAD}"),
+            format!("`Reviewed-Commit`: {HEAD}"),
+            format!("**Reviewed-Commit**: {HEAD}"),
+        ] {
+            let body = format!("## Verdict\napprove\n\n{line}\n");
+            assert_eq!(judged(&body).as_deref(), Some(HEAD), "{line}");
+        }
+    }
+
+    #[test]
+    fn reviewed_commit_full_sha() {
+        let body = format!("## Verdict\napprove\n\nReviewed-Commit: {HEAD}\n");
+        assert_eq!(judged(&body).as_deref(), Some(HEAD));
+    }
+
+    #[test]
+    fn reviewed_commit_short_sha() {
+        let body = "## Verdict\napprove\n\nReviewed-Commit: 0123456\n";
+        assert_eq!(judged(body).as_deref(), Some("0123456"));
+    }
+
+    #[test]
+    fn reviewed_commit_key_case_and_spacing_tolerated() {
+        assert_eq!(
+            judged("reviewed-commit: 0123456\n").as_deref(),
+            Some("0123456")
+        );
+        assert_eq!(
+            judged("  Reviewed-Commit  :  0123456  \n").as_deref(),
+            Some("0123456")
+        );
+        assert_eq!(
+            judged("REVIEWED-COMMIT: ABCDEF1\n").as_deref(),
+            Some("abcdef1")
+        );
+    }
+
+    #[test]
+    fn reviewed_commit_absent() {
+        assert_eq!(judged("## Verdict\napprove\n"), None);
+    }
+
+    #[test]
+    fn reviewed_commit_malformed_parses_as_absent() {
+        for bad in [
+            "Reviewed-Commit: xyz\n",
+            "Reviewed-Commit: 12345\n",
+            "Reviewed-Commit: 0123456789abcdef0123456789abcdef012345678\n",
+            "Reviewed-Commit: <full-sha-of-HEAD>\n",
+            "Reviewed-Commit:\n",
+        ] {
+            assert_eq!(judged(bad), None, "must parse as absent: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn reviewed_commit_template_skeleton_echo_parses_as_absent() {
+        let skeleton =
+            "## Verdict\napprove | request_changes\n\nReviewed-Commit: <full-sha-of-HEAD>\n";
+        let res = parse_review(skeleton);
+        assert_eq!(res.verdict, None);
+        assert_eq!(res.reviewed_commit, None);
+    }
+
+    #[test]
+    fn reviewed_commit_first_well_formed_wins() {
+        let body = "Reviewed-Commit: not-hex\nReviewed-Commit: 0123456\nReviewed-Commit: deadbee\n";
+        assert_eq!(judged(body).as_deref(), Some("0123456"));
+    }
+
+    #[test]
+    fn reviewed_commit_match_full_and_short() {
+        assert!(reviewed_commit_matches(HEAD, HEAD));
+        assert!(reviewed_commit_matches(HEAD, &HEAD[..7]));
+        assert!(reviewed_commit_matches(HEAD, &HEAD.to_ascii_uppercase()));
+    }
+
+    #[test]
+    fn reviewed_commit_mismatch() {
+        assert!(!reviewed_commit_matches(HEAD, "deadbeef"));
+        assert!(!reviewed_commit_matches(
+            HEAD,
+            "0123456789abcdef0123456789abcdef01234568"
+        ));
+        assert!(!reviewed_commit_matches(HEAD, ""));
+        assert!(!reviewed_commit_matches("", "0123456"));
     }
 
     #[test]
