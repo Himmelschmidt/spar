@@ -1,6 +1,6 @@
 use crate::paths::SparPaths;
 use anyhow::{Context, Result};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 pub fn write_marker(paths: &SparPaths, run_id: &str, name: &str, body: &str) -> Result<()> {
     paths.ensure_run_dirs(run_id)?;
@@ -171,21 +171,39 @@ pub fn clear_session_id(paths: &SparPaths, run_id: &str, slot_id: &str, provider
     let _ = std::fs::remove_file(paths.marker(run_id, &format!("{slot_id}.{provider}.session_id")));
 }
 
-/// Wait until an artifact file is non-empty.
-#[allow(dead_code)]
+/// The mtime floor a fresh artifact write must meet: the dispatch start instant
+/// with a 1s grace, so a same-second write on a coarse-mtime filesystem does
+/// not false-negative. Stale round artifacts are minutes old, so the grace
+/// cannot admit one. Shared with the executor's freshness gate so the two
+/// cannot drift apart.
+pub(crate) fn freshness_floor(since: SystemTime) -> SystemTime {
+    since
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+/// Wait until an artifact file holds a *fresh* non-empty write: one with an mtime
+/// at or after `since` (this dispatch's start instant, with the same 1s grace
+/// for coarse-mtime filesystems). A stale file from a previous round must not
+/// satisfy the wait, or the grace window returns instantly on a dead verdict.
 pub fn wait_for_artifact(
     paths: &SparPaths,
     run_id: &str,
     name: &str,
+    since: SystemTime,
     timeout: Duration,
 ) -> Result<bool> {
     let path = paths.artifact(run_id, name);
+    let floor = freshness_floor(since);
     let start = Instant::now();
     let poll = Duration::from_millis(200);
     loop {
         // A transient metadata error (e.g. mid-write) must not abort the wait — keep
         // polling until the deadline instead of failing the slot prematurely.
-        if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 0 {
+        let fresh = std::fs::metadata(&path)
+            .map(|m| m.len() > 0 && m.modified().map(|t| t >= floor).unwrap_or(false))
+            .unwrap_or(false);
+        if fresh {
             return Ok(true);
         }
         if start.elapsed() >= timeout {
@@ -271,6 +289,65 @@ mod tests {
             read_session_id(&paths, "r1", "slot-a", "muse"),
             Some("muse-session-1".to_string())
         );
+    }
+
+    #[test]
+    fn wait_for_artifact_ignores_a_stale_file() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        std::fs::create_dir_all(paths.artifacts_dir("r1")).unwrap();
+        std::fs::write(paths.artifact("r1", "review-x.md"), "stale verdict").unwrap();
+        // A previous round's file, however fresh-looking: `since` after its mtime
+        // must wait out the deadline instead of returning instantly on it.
+        let since = SystemTime::now() + Duration::from_secs(3600);
+        let found = wait_for_artifact(
+            &paths,
+            "r1",
+            "review-x.md",
+            since,
+            Duration::from_millis(300),
+        )
+        .unwrap();
+        assert!(!found, "a stale artifact must not satisfy the wait");
+    }
+
+    #[test]
+    fn wait_for_artifact_accepts_a_fresh_write_and_a_late_one() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        std::fs::create_dir_all(paths.artifacts_dir("r1")).unwrap();
+        let since = SystemTime::now();
+        assert!(
+            !wait_for_artifact(
+                &paths,
+                "r1",
+                "missing.md",
+                since,
+                Duration::from_millis(100)
+            )
+            .unwrap(),
+            "no file at all must still time out"
+        );
+        let artifact = paths.artifact("r1", "review-y.md");
+        std::fs::write(&artifact, "fresh verdict").unwrap();
+        assert!(
+            wait_for_artifact(&paths, "r1", "review-y.md", since, Duration::from_secs(2)).unwrap(),
+            "a write from this dispatch must satisfy the wait at once"
+        );
+        // A dispatch that is still writing when the gate first looks must be
+        // waited for, not failed: the file lands mid-deadline.
+        let late = paths.artifact("r1", "review-z.md");
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(300));
+                std::fs::write(&late, "late verdict").unwrap();
+            });
+            assert!(
+                wait_for_artifact(&paths, "r1", "review-z.md", since, Duration::from_secs(5))
+                    .unwrap(),
+                "a write landing inside the deadline must satisfy the wait"
+            );
+        });
     }
 
     #[test]

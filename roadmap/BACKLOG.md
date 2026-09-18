@@ -4,6 +4,15 @@ Unscheduled ideas, grouped by theme. Promote to `roadmap/features/NNN-*.md` when
 
 ## Fleet and quota
 
+- **An `unhealthy` provider is still auto-selected.** `spar doctor` and
+  `spar provider list` report readiness (`healthy`/`unhealthy`/`unknown` from each
+  adapter's probe), but `available_providers`, `pick_providers`,
+  `is_provider_usable`, and the TUI roster key off binary presence only. So a run
+  still rotates a slot onto a provider doctor just flagged, paying the
+  rotation-plus-round cost the probe was built to avoid. Follow-up: make dispatch
+  skip (or at least warn on) `Unhealthy` providers while keeping `Unknown`
+  eligible.
+
 - **A cheap seat's rate limit disables the whole provider, including the expensive
   seats.** Hit twice in one session: the suite tester (`cli:codex@gpt-5.6-luna`)
   exhausted its budget and `cli:codex` went `paused_quota`, which also took out the
@@ -128,36 +137,31 @@ that for finished runs. These two reduce how much gets created in the first plac
   against grok's own `~/.grok/sessions/<cwd>/<id>/updates.jsonl` (its `turn_completed`
   update is ground truth) rather than guessed:
   - No grok log on the box carries a `· session`, `· done` or `· turn` marker, so grok
-    hits neither claude's `result` arm nor codex's `turn.completed`. It never gets a
-    terminal usage record and is scored entirely on the per-request path.
+    hits neither claude's `result` arm nor codex's `turn.completed`. Since O90 its
+    terminal usage record is the `end` event (gated on `sessionId`), which supersedes
+    the per-request accumulation at turn end.
   - Exact today: `cache_read` (2,853,504) and `input_tokens` as the uncached remainder
     (124,866 = 2,978,370 - 2,853,504), both because grok emits them cumulatively and
     `max` lands on the final value. The tool *count* is also exact (83 = 83 `tool_call`
     updates).
-  - Wrong today: `output_tokens` read 61,292 against a real 30,646, a cumulative value
-    counted twice. O48 removed the duplicate `absorb_usage` calls, which is the likely
-    fix, but it is **unverified**: grok is out of quota and was deliberately not probed.
-    The mechanism is identified and fits every observation: `feed` absorbed usage from
-    every parsed line (`src/process.rs:732`), and `handle_claude_assistant` then absorbed
-    a second time via `v.pointer("/message").unwrap_or(v)` — on a line with no `/message`
-    the fallback re-absorbs the *same* value, which is exactly 2x and nothing else. It
-    also explains the rest of grok's symptoms together: `v.pointer("/message/content")?`
-    then returns `None`, so the arm bails before printing, which is why grok logs carry no
-    marker, and `/message/model` never resolves, which is why `model` is always `None`.
-    Measured on four matched slot/session pairs, the output ratio is 2.00 in all four and
-    `input + cache_read` reconstructs grok's `inputTokens` exactly in all four. Confirming
-    it needs one live capture showing grok's stdout carries top-level `type: "assistant"`.
-  - Still wrong after O48 regardless: `context_tokens` for grok is a cumulative total, not
-    a peak (grok's own `modelCalls: 31` says the real window is far smaller), so the
-    context gauge is meaningless for grok slots; `model` is never captured; `tool_errors`
-    is structurally always zero; tool names never resolve (every line is a bare `→ tool`).
-  - The fix is a real grok/ACP branch in `StreamCoalescer::feed` reading
-    `params.update.sessionUpdate` and the camelCase `turn_completed` usage
-    (`inputTokens` / `outputTokens` / `cachedReadTokens` / `cacheCreationTokens`, with
-    `reasoningTokens` already inside `outputTokens`). Needs one live grok run to confirm
-    the stdout shape, which is **not** byte-identical to the persisted envelope, since spar
-    matches `cache_read` today so stdout evidently uses different keys from the stored
-    JSON-RPC form. Do not rewrite the parser without that capture.
+  - Wrong before O90, fixed there: `output_tokens` read 61,292 against a real 30,646,
+    a cumulative value counted twice. The mechanism is now verified by a live capture:
+    a turn emits exactly two usage-bearing records, both cumulative — `{"type":"usage",
+    "usage":{…}}` then a final `{"type":"end",…,"sessionId":…,"usage":{…}}` — and both
+    landed in the Request arm, where output is summed while the rest is maxed. The
+    capture also settled the stdout shape the old "do not rewrite without that capture"
+    note was waiting on: stdout uses snake_case (`input_tokens` / `output_tokens` /
+    `cache_read_input_tokens`), **not** the persisted envelope's camelCase
+    `params.update.sessionUpdate` form, so no new key branch was needed — the fix is
+    the `end`→Terminal gate plus `sessionId` capture. `end` gave `total_tokens` equal
+    to `input + output`, confirming `reasoning_tokens` is a component of output.
+  - Still wrong after O90, deliberately not fixed there: `context_tokens` for grok is a
+    cumulative total, not a peak (grok's own `modelCalls` says the real window is far
+    smaller), so the context gauge is meaningless for grok slots; `model` is never
+    captured; `tool_errors` is structurally always zero; tool names never resolve
+    (every line is a bare `→ tool`). Residual: a *live* sidecar reading still
+    over-counts output until the turn's `end` lands, so a grok token nudge can fire
+    early; settled totals are exact only at turn end.
 
 - **`worktree+bwrap` cannot write artifacts or markers.** `src/sandbox/bwrap.rs` binds `/`
   read-only and makes only the slot's `cwd` writable, but `artifacts_dir` and `markers_dir`

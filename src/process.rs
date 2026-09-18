@@ -1090,12 +1090,25 @@ enum CoalesceKind {
 }
 
 /// What one `usage` record covers. Providers report both shapes on the same stream and
-/// they cannot be added together: claude's `result` and codex's `turn.completed` are the
-/// invocation total, every other record is one model call.
+/// they cannot be added together: claude's `result`, codex's `turn.completed` and
+/// grok's `end` are the invocation total, every other record is one model call.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum UsageScope {
     Request,
     Terminal,
+}
+
+/// True for grok's terminal `end` record: `type == "end"` with a top-level `usage`
+/// object and grok's camelCase `sessionId`. That key is unique to grok on this stream
+/// (claude uses `session_id`, opencode `sessionID`, and opencode/muse/agy lines never
+/// carry a top-level `usage` object, so `absorb_usage` already no-ops for them) — a
+/// bare `{"type":"end"}` with no `usage`/`sessionId` is not one, and neither is any
+/// other adapter's `end`. The `type` check lives here, not at the call site, so a
+/// future caller reusing this helper cannot get a broader gate than documented.
+fn is_grok_end(v: &serde_json::Value) -> bool {
+    v.get("type").and_then(|x| x.as_str()) == Some("end")
+        && v.get("usage").is_some_and(|u| u.is_object())
+        && v.get("sessionId").and_then(|x| x.as_str()).is_some()
 }
 
 impl StreamCoalescer {
@@ -1150,11 +1163,25 @@ impl StreamCoalescer {
             return Some(out);
         };
 
+        // Grok's `end` record carries the turn's final cumulative usage (byte-equal
+        // to the earlier `usage` record), so it supersedes the accumulation instead
+        // of adding to it. Gated on `is_grok_end` so no other adapter's `end` is
+        // captured by accident.
+        let grok_end = is_grok_end(&v);
         let scope = match v.get("type").and_then(|x| x.as_str()) {
             Some("result") | Some("turn.completed") => UsageScope::Terminal,
+            Some("end") if grok_end => UsageScope::Terminal,
             _ => UsageScope::Request,
         };
         self.absorb_usage(&v, scope);
+        if grok_end {
+            // Grok's resume/session handle (camelCase; claude uses `session_id`,
+            // opencode `sessionID`). Makes a grok slot checkable against
+            // `~/.grok/sessions/` and `grok usage <session>`.
+            if let Some(id) = v.get("sessionId").and_then(|x| x.as_str()) {
+                self.session_id = Some(id.to_string());
+            }
+        }
 
         // opencode `run --format json` NDJSON. Each line carries a top-level `sessionID`
         // and a `part` object; that pair is unique to opencode and gates it off before
@@ -1889,24 +1916,32 @@ impl StreamCoalescer {
         }
     }
 
-    /// **Known gap: `cli:grok`.** grok is spawned with `--output-format streaming-json`
+    /// **`cli:grok` usage.** grok is spawned with `--output-format streaming-json`
     /// (`providers/grok.rs`), which its own help calls "NDJSON of the agent native ACP
     /// session updates"; the Anthropic-wire option is `streaming-messages-json` and spar
-    /// does not ask for it. No grok slot log on this box contains a `· session`, `· done`
-    /// or `· turn` marker, so grok reaches neither the claude `result` arm nor codex's
-    /// `turn.completed` and **never gets a Terminal-scope record**, so its numbers come
-    /// entirely from the Request arm below. Measured against grok's own session store for
-    /// biddesk run 92ae513a (`~/.grok/sessions/<cwd>/<id>/updates.jsonl`, whose
-    /// `turn_completed` update carries the truth): `cache_read` matched exactly
-    /// (2,853,504) and `input_tokens` matched exactly as the uncached remainder (124,866
-    /// = 2,978,370 - 2,853,504), because grok emits both cumulatively and `max` lands on
-    /// the final value. `output_tokens` did **not**: 61,292 recorded against 30,646 real,
-    /// i.e. a cumulative value summed more than once. Removing the duplicate
-    /// `absorb_usage` calls (this change) is the likely fix but is **unverified**: grok
-    /// is out of quota and was not probed. Two consequences to fix separately, not here:
+    /// does not ask for it. A grok dispatch emits one `{"type":"usage","usage":{…}}`
+    /// record per *model call*, then one final `{"type":"end",…,"sessionId":…,"usage":{…}}`
+    /// carrying the turn's cumulative total (verified live: a single-call turn on grok
+    /// 1.0.25 reported input 20965, output 34, cache_read 0 in both records, `end`
+    /// giving `total_tokens: 20999`; a two-call turn on grok 1.0.34 reported output 25
+    /// then 26 per call against `end`'s cumulative 51, with `end` input 21698 =
+    /// 21636 + 62 — so per-call records are per-call, not running totals, and
+    /// `reasoning_tokens` is a component of output rather than an addend, needing no
+    /// fold). All of them used to land in the Request arm, where `output_tokens` is
+    /// summed while the other components are maxed. The per-call records already sum to
+    /// the truth, so `end`'s duplicate of that same total doubled output *exactly*,
+    /// whatever the call count — hence output read exactly 2x reality
+    /// (61,292 recorded against 30,646 real for biddesk run 92ae513a, reconciled
+    /// against `~/.grok/sessions/<cwd>/<id>/updates.jsonl`) while the rest happened
+    /// to survive. Now the `end` record maps to `UsageScope::Terminal` (gated on
+    /// grok's own `sessionId` shape), so the final cumulative record supersedes the
+    /// accumulation instead of adding to it. Still true and not fixed here:
     /// `context_tokens` for grok is a cumulative total wearing a peak's name (grok's
-    /// `modelCalls: 31` says the real window is far smaller), and `model` / `tool_errors`
-    /// / tool *names* are never recovered at all, though the tool *count* is exact.
+    /// own `modelCalls` says the real window is far smaller), and `tool_errors` and
+    /// tool *names* are never recovered at all, though the tool *count* is exact.
+    /// `model` is the one of those that is unwired rather than unavailable:
+    /// `end.modelUsage` is keyed by model id (`"grok-4.6"`) and carries `modelCalls`
+    /// and `costUSD` alongside it.
     fn absorb_usage(&mut self, v: &serde_json::Value, scope: UsageScope) {
         let u = v.get("usage").or_else(|| v.pointer("/message/usage"));
         let Some(u) = u else { return };
@@ -3129,6 +3164,125 @@ mod tests {
         // The gauge does not inherit the terminal record's cumulative cache read,
         // which is what made every claude slot read as permanently over threshold.
         assert_eq!(c.context_tokens(), 39 + 259 + 36571);
+    }
+
+    #[test]
+    fn grok_end_record_counts_output_once_and_captures_session_id() {
+        // Real `grok --output-format streaming-json` shape (captured from grok
+        // 1.0.25): a single-call turn, so its one per-call `usage` record happens to
+        // equal the turn total that the final `end` reports alongside its camelCase
+        // `sessionId`. Before the `end` gate both landed in the Request arm, where
+        // output is summed while the rest is maxed — recording exactly 2x output
+        // against reality. The two-call test below shows why that doubling is exact
+        // at any call count.
+        let mut c = StreamCoalescer::new(false);
+        c.feed(r#"{"type":"usage","usage":{"input_tokens":20965,"output_tokens":34,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"reasoning_tokens":31}}"#);
+        c.feed(r#"{"type":"end","stopReason":"end_turn","sessionId":"01a0afec-eaf7-78c2-b076-d47691cf248a","requestId":"34f47631-cdae-4853-a2bf-01843230bbfd","usage":{"input_tokens":20965,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":34,"reasoning_tokens":31,"total_tokens":20999},"num_turns":1}"#);
+        assert_eq!(
+            c.output_tokens, 34,
+            "cumulative output recorded once, not twice"
+        );
+        assert_eq!(c.input_tokens, 20965);
+        assert_eq!(c.cache_read, 0);
+        assert_eq!(
+            c.billed_tokens(),
+            20999,
+            "the turn's own total_tokens: reasoning stays a component of output"
+        );
+        assert_eq!(
+            c.session_id.as_deref(),
+            Some("01a0afec-eaf7-78c2-b076-d47691cf248a"),
+            "grok session id is the forensics handle for ~/.grok/sessions"
+        );
+        let mut stats = StreamStats::default();
+        c.merge_counters_into(&mut stats);
+        assert_eq!(stats.output_tokens, 34);
+        assert_eq!(
+            stats.session_id.as_deref(),
+            Some("01a0afec-eaf7-78c2-b076-d47691cf248a")
+        );
+    }
+
+    /// The multi-call shape the single-call fixture above cannot show: grok's
+    /// per-call `usage` records are per-call, not running totals, so they already sum
+    /// to the turn's output on their own. `end` then repeats that same total, which is
+    /// why the pre-fix Request-arm summing doubled output *exactly* at any call count
+    /// (25 + 26 + 51 = 102 against a true 51), not just on one-call turns. Captured
+    /// live from grok 1.0.34 (a turn re-driven by a Stop-hook block, hence two calls).
+    #[test]
+    fn a_multi_call_grok_turn_records_the_terminal_total_not_the_running_sum() {
+        let mut c = StreamCoalescer::new(false);
+        c.feed(r#"{"type":"usage","usage":{"input_tokens":21636,"output_tokens":25,"cache_read_input_tokens":128,"cache_creation_input_tokens":0,"reasoning_tokens":24}}"#);
+        c.feed(r#"{"type":"usage","usage":{"input_tokens":62,"output_tokens":26,"cache_read_input_tokens":21760,"cache_creation_input_tokens":0,"reasoning_tokens":23}}"#);
+        c.feed(r#"{"type":"end","stopReason":"end_turn","sessionId":"01a0b009-0ebf-7580-a1e0-b16b66ab9f49","requestId":"1e58e7fb-3f2e-4af5-b2ed-457bea534b11","usage":{"input_tokens":21698,"cache_read_input_tokens":21888,"cache_creation_input_tokens":0,"output_tokens":51,"reasoning_tokens":47,"total_tokens":43637},"num_turns":2,"total_cost_usd":0.054646,"modelUsage":{"grok-4.6":{"inputTokens":21698,"outputTokens":51,"cacheReadInputTokens":21888,"cacheCreationInputTokens":0,"modelCalls":2,"costUSD":0.054646}}}"#);
+        assert_eq!(
+            c.output_tokens, 51,
+            "the turn total, not 25 + 26 + 51 the way the Request arm summed it"
+        );
+        assert_eq!(c.input_tokens, 21698);
+        assert_eq!(c.cache_read, 21888);
+        assert_eq!(
+            c.billed_tokens(),
+            43637,
+            "grok's own total_tokens for the turn"
+        );
+        assert_eq!(
+            c.session_id.as_deref(),
+            Some("01a0b009-0ebf-7580-a1e0-b16b66ab9f49")
+        );
+    }
+
+    #[test]
+    fn a_bare_end_without_grok_shape_sets_no_terminal_state() {
+        // A bare `{"type":"end"}` — no `usage`, no `sessionId` — must not latch the
+        // terminal arm: a later usage record still accumulates, and no session id
+        // is captured.
+        let mut c = StreamCoalescer::new(false);
+        c.feed(r#"{"type":"usage","usage":{"input_tokens":100,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#);
+        c.feed(r#"{"type":"end"}"#);
+        assert_eq!(c.session_id, None);
+        assert!(!c.saw_terminal_usage);
+        c.feed(r#"{"type":"usage","usage":{"input_tokens":100,"output_tokens":7,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#);
+        assert_eq!(
+            c.output_tokens, 12,
+            "no terminal record landed, so accumulation continues"
+        );
+    }
+
+    #[test]
+    fn a_second_grok_end_supersedes_the_first() {
+        // The supersede model assumes one cumulative `end` per dispatch. If a
+        // second gate-matching `end` ever arrives (multi-turn usage scoping, a
+        // subagent `end` in the same shape), the later record wins outright for
+        // counters and session id — it never adds. This pins that behaviour so a
+        // shape change shows up here rather than as silent undercounting.
+        let mut c = StreamCoalescer::new(false);
+        c.feed(r#"{"type":"usage","usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#);
+        c.feed(r#"{"type":"end","stopReason":"end_turn","sessionId":"sess-first","usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"total_tokens":110}}"#);
+        assert_eq!(c.output_tokens, 10);
+        c.feed(r#"{"type":"usage","usage":{"input_tokens":50,"output_tokens":4,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#);
+        c.feed(r#"{"type":"end","stopReason":"end_turn","sessionId":"sess-second","usage":{"input_tokens":50,"output_tokens":4,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"total_tokens":54}}"#);
+        assert_eq!(
+            c.output_tokens, 4,
+            "the later terminal record replaces, never adds"
+        );
+        assert_eq!(c.input_tokens, 50);
+        assert_eq!(
+            c.session_id.as_deref(),
+            Some("sess-second"),
+            "forensics follows the latest terminal record"
+        );
+    }
+
+    #[test]
+    fn a_foreign_end_with_snake_case_session_id_is_not_grok_terminal() {
+        // claude's `session_id` spelling plus a usage object is still not grok's
+        // shape: the gate requires camelCase `sessionId`, so this stays Request.
+        let mut c = StreamCoalescer::new(false);
+        c.feed(r#"{"type":"end","session_id":"sess-1","usage":{"input_tokens":100,"output_tokens":5}}"#);
+        assert_eq!(c.session_id, None);
+        assert!(!c.saw_terminal_usage);
+        assert_eq!(c.output_tokens, 5, "Request arm sums, never sets");
     }
 
     #[test]

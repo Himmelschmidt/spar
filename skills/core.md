@@ -40,6 +40,21 @@ spar implement -t "..." --providers 'cli:codex@openai/gpt-4o-mini,api:openai@gpt
 Native CLI adapters: `cli:claude`, `cli:grok`, `cli:agy`, `cli:codex`, `cli:opencode`, `cli:muse`. Run
 `spar provider list` to see which resolve on this box and their live pause/cooldown status.
 
+**Readiness.** A binary on PATH is not health: `spar doctor` and `spar provider list`
+also run each adapter's readiness probe (a local-only config/auth check, never a model
+call) and report it separately from availability. Human states: `ok` (binary resolves,
+probe passed or the adapter has no probe), `unhealthy` (binary resolves but the probe
+failed, with the probe's own one-line message, e.g. a broken opencode config),
+`missing` (not on PATH). `--json` carries the same verdict as `readiness` with values
+`healthy` / `unhealthy` / `unknown`, plus `readiness_message` (ANSI-stripped, capped at
+300 chars) when unhealthy. `doctor` exits failure only when no usable provider remains,
+so one unhealthy provider alongside working ones does not block a run. Today only
+`cli:opencode` wires a probe (`opencode models`); the other adapters report unknown and
+stay available. Limit: the probe catches broken config, not dead credentials — a
+parseable config with an expired key still reports healthy and fails at dispatch, which
+is all a local-only, no-quota check can see. An `unhealthy` provider is still eligible
+for dispatch; doctor warns, it does not exclude.
+
 **agy note.** agy runs headless with `--output-format stream-json`, so spar parses its tools,
 text and tokens directly from that structured stream. What the stream doesn't carry — the
 account's quota buckets and the context-window snapshot — spar still recovers by teeing agy's
@@ -600,8 +615,13 @@ slot is stuck on.**
   **`"ceiling_kill": true`** in `status --json`, which is how you tell it from a crash
   (`exit 143`, a signal) without parsing prose. Exit codes are unchanged.
 - Delivery is per-adapter and you never choose it. **claude** takes nudges through its
-  inbox, which its `Stop` hook drains at the turn boundary. **grok** takes them on its
-  native queue. **codex** attempts one too, once it has captured a thread id (its `codex
+  inbox, which its `Stop` hook drains at the turn boundary. **grok** takes them through
+  the same `Stop`-hook injection that **claude** uses: spar writes a project hook file
+  (`.grok/hooks/spar.json`) into the slot worktree, and the `Stop` hook drains the inbox
+  at the turn boundary with a `{"decision":"block",…}` payload (the dispatch carries
+  `GROK_FOLDER_TRUST=0` so the worktree's project scope actually loads). The re-drive
+  itself is documented grok behaviour (Stop Decision Control), not yet observed live
+  against a spar slot (`DECISIONS.md` O90). **codex** attempts one too, once it has captured a thread id (its `codex
   exec --json` stream names one on its very first line): `codex queue --thread <id>
   --message <text>`. That does not land in the dispatch it was queued against — `codex
   exec` is single-turn and exits right after its one assigned task, and a success exit
@@ -954,14 +974,13 @@ rail's selection.
     one, because its statusline sink emits one snapshot and keeps no history; it is a real
     window reading, just not a maximum.
   - **`cli:grok` is the exception: treat its numbers as approximate.** spar runs grok on
-    its native ACP stream, which reaches no terminal-record branch, so grok's figures come
-    only from the per-request path. Against grok's own session store its cache-read and
-    input were exact but its output read 2x the truth, and `context_tokens` for a grok slot
-    is a cumulative total rather than a peak, so the 80k/150k gauge means nothing there.
-    grok slots also never report a `model`, never report a `tool_errors` above zero, and
-    never resolve tool *names* (the tool *count* is exact). Known defect, tracked
-    separately (`DECISIONS.md` O48); do not budget tightly against a grok slot until it is
-    fixed.
+    its native ACP stream, whose final `end` record carries the turn's cumulative usage
+    and settles the totals (`DECISIONS.md` O90) — but a live sidecar reading still
+    over-counts output until that `end` lands, so a token nudge can fire early on a grok
+    slot. `context_tokens` for a grok slot is a cumulative total rather than a peak, so
+    the 80k/150k gauge means nothing there. grok slots also never report a `model`, never
+    report a `tool_errors` above zero, and never resolve tool *names* (the tool *count*
+    is exact). Do not budget tightly against a grok slot.
 - **Cost and subagent accounting** ride the same `"usage"` entries and
   `logs/<slot>.stats.json` as the token fields above, additive alongside them:
   - **`cost_usd`**: whole-dispatch USD spend, as the provider itself computed it.
