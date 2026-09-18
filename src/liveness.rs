@@ -235,6 +235,7 @@ mod tests {
             model: None,
             round: 1,
             quota_hit: false,
+            reviewed_commit: None,
             source: None,
         }
     }

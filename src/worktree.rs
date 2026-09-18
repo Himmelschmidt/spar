@@ -141,7 +141,7 @@ fn dirty(dir: &Path) -> bool {
     git_out(dir, &["status", "--porcelain", "--", ":!.spar"]).is_some_and(|s| !s.is_empty())
 }
 
-fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
+pub(crate) fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
         .args(args)
         .current_dir(dir)

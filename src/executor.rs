@@ -285,6 +285,7 @@ fn prepare_slot_execution(
         s.error = None;
         s.usage = None;
         s.quota_hit = false;
+        s.reviewed_commit = None;
         // Stamp the round at dispatch: slot ids are stable across re-dispatch (the
         // implementer keeps its worktree through fix rounds), so this is where a slot
         // joins the round that is running now (O45).
@@ -1861,6 +1862,7 @@ pub fn run_slot(
         s.error = None;
         s.usage = None;
         s.quota_hit = false;
+        s.reviewed_commit = None;
         // Stamp the round at dispatch: slot ids are stable across re-dispatch (the
         // implementer keeps its worktree through fix rounds), so this is where a slot
         // joins the round that is running now (O45).
@@ -2702,8 +2704,15 @@ fn write_dry_artifacts(
                     format!("## Acceptance\n{}\n\n", lines.join("\n"))
                 }
             };
+            // The reviewed-commit gate reads every reviewer artifact, synthetic ones
+            // included: resolve HEAD in the slot's own cwd, the same dir the panel
+            // head came from, so both resolve or both do not. Omit when
+            // unresolvable — coherent with the gate's fail-open on its own side.
+            let sha_line = git_output(cwd, &["rev-parse", "HEAD"])
+                .map(|h| format!("Reviewed-Commit: {h}\n"))
+                .unwrap_or_default();
             let body = format!(
-                "## Verdict\n{verdict}\n\n{acceptance}## Findings\n- severity: minor — dry-run synthetic review from {}\n\n## Tests\nsuite channel (dry-run); no full suite here\n",
+                "## Verdict\n{verdict}\n\n{sha_line}{acceptance}## Findings\n- severity: minor — dry-run synthetic review from {}\n\n## Tests\nsuite channel (dry-run); no full suite here\n",
                 job.provider
             );
             if let Some(name) = &job.expected_artifact {
@@ -3373,6 +3382,7 @@ pub fn init_slot_model(
         model: pref.model.clone().or(model),
         round: 1,
         quota_hit: false,
+        reviewed_commit: None,
         source: None,
     }
 }
