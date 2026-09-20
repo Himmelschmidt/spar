@@ -1969,6 +1969,7 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
                         cache_read_tokens: u.cache_read_tokens,
                         cache_write_tokens: 0,
                         context_tokens: u.context_tokens,
+                        context_semantics: u.context_semantics,
                         billed_tokens: u.billed_tokens,
                         model: u.model.clone(),
                         session_id: None,
@@ -3361,7 +3362,7 @@ fn run_loop(
                     entry.cache_write_tokens = entry
                         .cache_write_tokens
                         .saturating_add(s.cache_write_tokens);
-                    entry.context_tokens = entry.context_tokens.max(s.context_tokens);
+                    entry.accum_context_peak(&s);
                     entry.tools = entry.tools.saturating_add(s.tools);
                 }
                 if let Some(wt) = worktree.clone() {
@@ -3469,7 +3470,7 @@ fn run_loop(
                                 entry.cache_write_tokens = entry
                                     .cache_write_tokens
                                     .saturating_add(s.cache_write_tokens);
-                                entry.context_tokens = entry.context_tokens.max(s.context_tokens);
+                                entry.accum_context_peak(&s);
                                 entry.tools = entry.tools.saturating_add(s.tools);
                             }
                             if let Some(wt) = worktree.clone() {
@@ -3898,7 +3899,7 @@ fn handle_key_inner(
                             entry.cache_write_tokens = entry
                                 .cache_write_tokens
                                 .saturating_add(s.cache_write_tokens);
-                            entry.context_tokens = entry.context_tokens.max(s.context_tokens);
+                            entry.accum_context_peak(&s);
                             entry.tools = entry.tools.saturating_add(s.tools);
                         }
                         if let Some(wt) = out.worktree.clone() {
@@ -9657,7 +9658,12 @@ fn draw_stream_stats(
         return;
     };
     let ctx = s.context_tokens;
-    let ctx_color = if ctx > 150_000 {
+    // The thresholds below read the number as a fraction of a context window, which
+    // is only honest for a true per-request peak. Anything else renders as a plain
+    // number with no window coloring.
+    let ctx_color = if s.context_semantics != crate::state::ContextSemantics::Peak {
+        FG_MUTED
+    } else if ctx > 150_000 {
         ALERT
     } else if ctx > 80_000 {
         WARN
@@ -16617,6 +16623,7 @@ mod render_stability {
             output_tokens: 0,
             cache_read_tokens: 0,
             context_tokens: 0,
+            context_semantics: crate::state::ContextSemantics::Unknown,
             billed_tokens: 0,
             tools: 0,
             model: Some("x-ai/grok-4.5".into()),
@@ -16639,6 +16646,7 @@ mod render_stability {
             output_tokens: 0,
             cache_read_tokens: 0,
             context_tokens: 0,
+            context_semantics: crate::state::ContextSemantics::Unknown,
             billed_tokens: billed,
             tools: 0,
             model: None,

@@ -8,7 +8,9 @@ use crate::provider_ref::ProviderRef;
 use crate::providers::{self, SpawnOpts, TrustPolicy};
 use crate::sandbox;
 use crate::session_id;
-use crate::state::{FleetSeat, RunState, SeatSource, SlotRole, SlotState, SlotStatus, SlotUsage};
+use crate::state::{
+    ContextSemantics, FleetSeat, RunState, SeatSource, SlotRole, SlotState, SlotStatus, SlotUsage,
+};
 use crate::templates;
 use crate::tmux;
 use anyhow::{bail, Context, Result};
@@ -873,6 +875,7 @@ fn execute_prepared(
             output_tokens: usage.output_tokens,
             cache_read_tokens: 0,
             context_tokens: usage.peak_input_tokens,
+            context_semantics: ContextSemantics::Peak,
             billed_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
             tools: 0,
             model: usage.model.or(model),
@@ -1722,6 +1725,9 @@ fn usage_from_stream(slot_id: &str, provider: &str, s: &process::StreamStats) ->
         output_tokens: s.output_tokens,
         cache_read_tokens: s.cache_read_tokens,
         context_tokens: s.context_tokens,
+        // The label travels with the number from the coalescer (or the muse/agy
+        // enrichments that overwrote it), so this copies rather than re-derives.
+        context_semantics: s.context_semantics,
         billed_tokens: s.billed_tokens,
         tools: s.tools,
         model: s.model.clone(),
@@ -3130,6 +3136,7 @@ fn run_api(
         output_tokens: usage.output_tokens,
         cache_read_tokens: 0,
         context_tokens: usage.peak_input_tokens,
+        context_semantics: ContextSemantics::Peak,
         billed_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
         tools: 0,
         model: usage.model.or(model),
@@ -6445,6 +6452,7 @@ mod tests {
                 output_tokens: 2,
                 cache_read_tokens: 0,
                 context_tokens: 3,
+                context_semantics: ContextSemantics::Peak,
                 billed_tokens: 3,
                 tools: 0,
                 model: None,

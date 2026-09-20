@@ -29,7 +29,14 @@ pub struct StreamStats {
     /// i.e. how full the agent's window got. Not a running total: it is what the
     /// context gauge is read against, so a long run does not drift past every
     /// threshold just by making more calls.
+    ///
+    /// Except this is only true when `context_semantics` says `Peak`: codex and grok
+    /// report an invocation total here instead (see `StreamCoalescer`), so any gauge
+    /// or cross-slot max must check the label first.
     pub context_tokens: u64,
+    /// What `context_tokens` measures. Old sidecars predate it and load as `Unknown`.
+    #[serde(default)]
+    pub context_semantics: crate::state::ContextSemantics,
     /// Cumulative billed tokens for the whole slot, under each adapter's own
     /// convention: `input + cache_read + cache_write + output` as written above, with
     /// reasoning already folded into `output`. This is the spend meter and the number
@@ -276,6 +283,17 @@ impl StreamStats {
         let path = Self::stats_path(log_path);
         let text = std::fs::read_to_string(path).ok()?;
         serde_json::from_str(&text).ok()
+    }
+
+    /// Fold one turn's gauge reading into an accumulated one. Only `Peak` readings
+    /// max together: a max of peaks is itself a peak, while an invocation total or
+    /// an unknown answers a different question and must not move the gauge.
+    pub fn accum_context_peak(&mut self, other: &StreamStats) {
+        use crate::state::ContextSemantics::Peak;
+        if other.context_semantics == Peak {
+            self.context_tokens = self.context_tokens.max(other.context_tokens);
+            self.context_semantics = Peak;
+        }
     }
 }
 
@@ -1068,6 +1086,9 @@ struct StreamCoalescer {
     cache_write: u64,
     /// Largest single-request prompt footprint seen, from per-request usage only.
     context_peak: u64,
+    /// What `context_tokens()` measures, from the shape of the records that wrote it.
+    /// Never derived from `context_peak > 0`: grok sets a peak that is really a total.
+    context_semantics: crate::state::ContextSemantics,
     /// A cumulative end-of-invocation usage record has been absorbed, so per-request
     /// records must no longer touch the billed components.
     saw_terminal_usage: bool,
@@ -1128,6 +1149,7 @@ impl StreamCoalescer {
             cache_read: 0,
             cache_write: 0,
             context_peak: 0,
+            context_semantics: crate::state::ContextSemantics::Unknown,
             saw_terminal_usage: false,
             model: None,
             session_id: None,
@@ -1577,6 +1599,9 @@ impl StreamCoalescer {
                     self.context_peak = self
                         .context_peak
                         .max(input.saturating_add(cache_read).saturating_add(cache_write));
+                    // One step is one call and every field is that call's own delta, so
+                    // the max over steps is a genuine per-request peak.
+                    self.context_semantics = crate::state::ContextSemantics::Peak;
                 }
                 // Each step's `cost` is that call's own delta, like its `tokens` — sum
                 // rather than overwrite, same as opencode's other billed components.
@@ -1738,6 +1763,8 @@ impl StreamCoalescer {
         let output = get("output_tokens");
         let cache_read = get("cache_read_tokens");
 
+        // agy is out of both fleets and its sidecar semantics are undetermined.
+        self.context_semantics = crate::state::ContextSemantics::Unknown;
         if scope == UsageScope::Terminal {
             self.input_tokens = input;
             self.output_tokens = output;
@@ -1935,10 +1962,11 @@ impl StreamCoalescer {
     /// against `~/.grok/sessions/<cwd>/<id>/updates.jsonl`) while the rest happened
     /// to survive. Now the `end` record maps to `UsageScope::Terminal` (gated on
     /// grok's own `sessionId` shape), so the final cumulative record supersedes the
-    /// accumulation instead of adding to it. Still true and not fixed here:
-    /// `context_tokens` for grok is a cumulative total wearing a peak's name (grok's
-    /// own `modelCalls` says the real window is far smaller), and `tool_errors` and
-    /// tool *names* are never recovered at all, though the tool *count* is exact.
+    /// accumulation instead of adding to it. `context_tokens` for grok stays a
+    /// cumulative total (grok's own `modelCalls` says the real window is far
+    /// smaller), but it is now labeled `InvocationTotal` rather than wearing a
+    /// peak's name. Still true and not fixed here: `tool_errors` and tool *names*
+    /// are never recovered at all, though the tool *count* is exact.
     /// `model` is the one of those that is unwired rather than unavailable:
     /// `end.modelUsage` is keyed by model id (`"grok-4.6"`) and carries `modelCalls`
     /// and `costUSD` alongside it.
@@ -1987,9 +2015,26 @@ impl StreamCoalescer {
             self.cache_read = cache_read;
             self.cache_write = cache_write;
             self.saw_terminal_usage = true;
+            // Terminal scope is `result` (claude), `turn.completed` (codex) or grok's
+            // `end`. codex emits no per-request record and grok's are cumulative, so
+            // whatever this terminal total stands in for is an invocation total.
+            // claude's `result` is left alone: its gauge comes from the per-message
+            // records below, and this record must not demote it.
+            if v.get("type").and_then(|x| x.as_str()) != Some("result") {
+                self.context_semantics = crate::state::ContextSemantics::InvocationTotal;
+            }
             return;
         }
 
+        // Top-level `usage` at Request scope is grok's cumulative per-call shape (only
+        // grok emits that here; see `is_grok_end`), so maxing it lands on the final
+        // total, not a peak. claude's per-message records arrive under
+        // `/message/usage` instead and are genuine per-request peaks.
+        if v.get("usage").is_some_and(|x| x.is_object()) {
+            self.context_semantics = crate::state::ContextSemantics::InvocationTotal;
+        } else {
+            self.context_semantics = crate::state::ContextSemantics::Peak;
+        }
         self.context_peak = self
             .context_peak
             .max(input.saturating_add(cache_read).saturating_add(cache_write));
@@ -2007,7 +2052,8 @@ impl StreamCoalescer {
 
     /// Peak single-request prompt footprint. Adapters that report usage only once, at
     /// the end of the invocation (codex), have no per-request record to peak over, so
-    /// their invocation total stands in.
+    /// their invocation total stands in. Read `context_semantics` alongside this:
+    /// the value alone no longer claims to be a peak.
     fn context_tokens(&self) -> u64 {
         if self.context_peak > 0 {
             return self.context_peak;
@@ -2055,6 +2101,7 @@ impl StreamCoalescer {
         s.cache_read_tokens = self.cache_read;
         s.cache_write_tokens = self.cache_write;
         s.context_tokens = self.context_tokens();
+        s.context_semantics = self.context_semantics;
         s.billed_tokens = self.billed_tokens();
         // Unconditional, like every other counter above: `self.quota_rejected` already
         // reflects the coalescer's *current* verdict (the rate_limit_event handler
@@ -3230,6 +3277,119 @@ mod tests {
             c.session_id.as_deref(),
             Some("01a0b009-0ebf-7580-a1e0-b16b66ab9f49")
         );
+    }
+
+    /// grok sets a nonzero peak from per-call records that are really cumulative, so
+    /// a `context_peak > 0` trust check would wave it through as a peak. The label
+    /// comes from the record shape instead: top-level Request-scope `usage` is grok.
+    #[test]
+    fn grok_peak_is_labeled_invocation_total_despite_nonzero_peak() {
+        use crate::state::ContextSemantics;
+        let mut c = StreamCoalescer::new(false);
+        c.feed(r#"{"type":"usage","usage":{"input_tokens":21636,"output_tokens":25,"cache_read_input_tokens":128,"cache_creation_input_tokens":0}}"#);
+        c.feed(r#"{"type":"usage","usage":{"input_tokens":62,"output_tokens":26,"cache_read_input_tokens":21760,"cache_creation_input_tokens":0}}"#);
+        let mut stats = StreamStats::default();
+        c.merge_counters_into(&mut stats);
+        assert!(
+            stats.context_tokens > 0,
+            "the trap this test guards: a peak exists"
+        );
+        assert_eq!(stats.context_semantics, ContextSemantics::InvocationTotal);
+        c.feed(r#"{"type":"end","stopReason":"end_turn","sessionId":"01a0b009-0ebf-7580-a1e0-b16b66ab9f49","usage":{"input_tokens":21698,"cache_read_input_tokens":21888,"cache_creation_input_tokens":0,"output_tokens":51,"total_tokens":43637}}"#);
+        let mut stats = StreamStats::default();
+        c.merge_counters_into(&mut stats);
+        assert_eq!(stats.context_semantics, ContextSemantics::InvocationTotal);
+    }
+
+    #[test]
+    fn codex_terminal_only_usage_is_labeled_invocation_total() {
+        use crate::state::ContextSemantics;
+        let mut c = StreamCoalescer::new(false);
+        c.feed(r#"{"type":"turn.completed","usage":{"input_tokens":39189,"cached_input_tokens":39185,"output_tokens":117}}"#);
+        let mut stats = StreamStats::default();
+        c.merge_counters_into(&mut stats);
+        assert_eq!(stats.context_tokens, 39189);
+        assert_eq!(stats.context_semantics, ContextSemantics::InvocationTotal);
+    }
+
+    #[test]
+    fn claude_per_message_usage_is_labeled_peak_and_survives_result() {
+        use crate::state::ContextSemantics;
+        let mut c = StreamCoalescer::new(false);
+        c.feed(r#"{"type":"assistant","message":{"model":"claude-haiku","usage":{"input_tokens":39,"cache_creation_input_tokens":259,"cache_read_input_tokens":36571,"output_tokens":1},"content":[{"type":"text","text":"hi"}]}}"#);
+        let mut stats = StreamStats::default();
+        c.merge_counters_into(&mut stats);
+        assert_eq!(stats.context_semantics, ContextSemantics::Peak);
+        c.feed(r#"{"type":"result","subtype":"success","usage":{"input_tokens":49,"cache_creation_input_tokens":18778,"cache_read_input_tokens":54623,"output_tokens":241}}"#);
+        let mut stats = StreamStats::default();
+        c.merge_counters_into(&mut stats);
+        assert_eq!(stats.context_tokens, 39 + 259 + 36571);
+        assert_eq!(
+            stats.context_semantics,
+            ContextSemantics::Peak,
+            "the terminal total must not demote a per-message peak"
+        );
+    }
+
+    #[test]
+    fn opencode_step_deltas_are_labeled_peak() {
+        use crate::state::ContextSemantics;
+        let mut c = StreamCoalescer::new(false);
+        c.feed(r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_a","type":"step-finish","tokens":{"input":12738,"output":19,"cache":{"read":1920,"write":0}}}}"#);
+        let mut stats = StreamStats::default();
+        c.merge_counters_into(&mut stats);
+        assert_eq!(stats.context_tokens, 12738 + 1920);
+        assert_eq!(stats.context_semantics, ContextSemantics::Peak);
+    }
+
+    #[test]
+    fn agy_usage_is_labeled_unknown() {
+        use crate::state::ContextSemantics;
+        let mut c = StreamCoalescer::new(false);
+        c.feed(r#"{"event":"step_update","step_update":{"state":"DONE","step_type":"agent_response","text_delta":"hi","usage":{"input_tokens":100,"output_tokens":5,"cache_read_tokens":10}}}"#);
+        let mut stats = StreamStats::default();
+        c.merge_counters_into(&mut stats);
+        assert_eq!(stats.context_tokens, 110);
+        assert_eq!(stats.context_semantics, ContextSemantics::Unknown);
+        let mut c = StreamCoalescer::new(false);
+        c.feed(r#"{"event":"result","result":{"status":"success","usage":{"input_tokens":200,"output_tokens":10,"cache_read_tokens":20}}}"#);
+        let mut stats = StreamStats::default();
+        c.merge_counters_into(&mut stats);
+        assert_eq!(
+            stats.context_semantics,
+            ContextSemantics::Unknown,
+            "a result-only agy stream still has undetermined semantics"
+        );
+    }
+
+    #[test]
+    fn empty_stream_is_unknown_not_peak() {
+        use crate::state::ContextSemantics;
+        let c = StreamCoalescer::new(false);
+        let mut stats = StreamStats::default();
+        c.merge_counters_into(&mut stats);
+        assert_eq!(stats.context_tokens, 0);
+        assert_eq!(stats.context_semantics, ContextSemantics::Unknown);
+    }
+
+    #[test]
+    fn accum_context_peak_maxes_peaks_and_ignores_totals() {
+        use crate::state::ContextSemantics;
+        let reading = |n: u64, s: ContextSemantics| StreamStats {
+            context_tokens: n,
+            context_semantics: s,
+            ..Default::default()
+        };
+        let mut entry = StreamStats::default();
+        entry.accum_context_peak(&reading(1_700_000, ContextSemantics::InvocationTotal));
+        assert_eq!(entry.context_tokens, 0);
+        assert_eq!(entry.context_semantics, ContextSemantics::Unknown);
+        entry.accum_context_peak(&reading(164_000, ContextSemantics::Peak));
+        entry.accum_context_peak(&reading(100_000, ContextSemantics::Peak));
+        entry.accum_context_peak(&reading(2_000_000, ContextSemantics::InvocationTotal));
+        entry.accum_context_peak(&reading(50_000, ContextSemantics::Unknown));
+        assert_eq!(entry.context_tokens, 164_000);
+        assert_eq!(entry.context_semantics, ContextSemantics::Peak);
     }
 
     #[test]
