@@ -176,6 +176,25 @@ pub enum ContextSemantics {
     Unknown,
 }
 
+/// What `context_tokens` measures for a dispatch of `provider`. Accepts qualified
+/// (`cli:codex`, `api:openai`, with or without `@model`) and bare (`codex`)
+/// adapter ids. Anything unlisted fails closed to `Unknown`: a new adapter must
+/// earn its row here, never inherit a peak.
+pub fn context_semantics_for_provider(provider: &str) -> ContextSemantics {
+    if provider.starts_with("api:") {
+        return ContextSemantics::Peak;
+    }
+    let base = provider.split('@').next().unwrap_or(provider);
+    let bare = base.strip_prefix("cli:").unwrap_or(base);
+    match bare {
+        "claude" | "opencode" | "muse" => ContextSemantics::Peak,
+        "codex" | "grok" => ContextSemantics::InvocationTotal,
+        // agy is out of both fleets and its sidecar semantics are undetermined;
+        // anything else unlisted fails closed the same way.
+        _ => ContextSemantics::Unknown,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlotUsage {
     pub slot_id: String,
@@ -1203,6 +1222,37 @@ mod tests {
             serde_json::to_value(ContextSemantics::Peak).unwrap(),
             serde_json::Value::String("peak".into())
         );
+    }
+
+    /// The whole adapter table in one place: qualified and bare ids agree, api-sdk
+    /// is always a peak, and anything unlisted fails closed to `Unknown`.
+    #[test]
+    fn context_semantics_map_matches_the_adapter_table() {
+        use ContextSemantics::*;
+        for (provider, want) in [
+            ("cli:claude", Peak),
+            ("claude", Peak),
+            ("cli:claude@opus", Peak),
+            ("cli:opencode", Peak),
+            ("opencode", Peak),
+            ("cli:muse", Peak),
+            ("muse", Peak),
+            ("api:openai", Peak),
+            ("cli:codex", InvocationTotal),
+            ("codex", InvocationTotal),
+            ("cli:grok", InvocationTotal),
+            ("grok", InvocationTotal),
+            ("cli:agy", Unknown),
+            ("agy", Unknown),
+            ("cli:something-new", Unknown),
+            ("", Unknown),
+        ] {
+            assert_eq!(
+                context_semantics_for_provider(provider),
+                want,
+                "provider {provider:?}"
+            );
+        }
     }
 
     /// A backup activation renames the seat (its id names the provider, O80). The

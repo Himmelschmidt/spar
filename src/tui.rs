@@ -3362,7 +3362,7 @@ fn run_loop(
                     entry.cache_write_tokens = entry
                         .cache_write_tokens
                         .saturating_add(s.cache_write_tokens);
-                    entry.accum_context_peak(&s);
+                    entry.accum_context_reading(&s);
                     entry.tools = entry.tools.saturating_add(s.tools);
                 }
                 if let Some(wt) = worktree.clone() {
@@ -3470,7 +3470,7 @@ fn run_loop(
                                 entry.cache_write_tokens = entry
                                     .cache_write_tokens
                                     .saturating_add(s.cache_write_tokens);
-                                entry.accum_context_peak(&s);
+                                entry.accum_context_reading(&s);
                                 entry.tools = entry.tools.saturating_add(s.tools);
                             }
                             if let Some(wt) = worktree.clone() {
@@ -3899,7 +3899,7 @@ fn handle_key_inner(
                             entry.cache_write_tokens = entry
                                 .cache_write_tokens
                                 .saturating_add(s.cache_write_tokens);
-                            entry.accum_context_peak(&s);
+                            entry.accum_context_reading(&s);
                             entry.tools = entry.tools.saturating_add(s.tools);
                         }
                         if let Some(wt) = out.worktree.clone() {
@@ -13321,6 +13321,50 @@ mod labels {
             .all(|(r, _)| r.y == 0 && r.right() <= 90));
         assert!(app.gate_buttons[0].0.x < app.gate_buttons[1].0.x);
         assert_eq!(app.gate_buttons[1].1, GateAction::Reject);
+    }
+
+    /// The stream gauge's window bands (green/amber/red) must never apply to a
+    /// number that is not a per-request peak: a grok/codex invocation total renders
+    /// as a muted raw number, while a genuine peak keeps its band.
+    #[test]
+    fn stream_gauge_mutes_non_peak_context_but_colors_a_peak() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let fg_of_context = |stats: &process::StreamStats| -> ratatui::style::Color {
+            let mut term = Terminal::new(TestBackend::new(120, 1)).unwrap();
+            term.draw(|f| {
+                draw_stream_stats(
+                    f,
+                    f.area(),
+                    Some(stats),
+                    Some(SlotStatus::Running),
+                    "",
+                    false,
+                )
+            })
+            .unwrap();
+            let buf = term.backend().buffer().clone();
+            let row: String = (0..120).map(|x| buf[(x, 0)].symbol()).collect();
+            let x = row.find("context").expect("gauge renders context") as u16;
+            buf[(x, 0)].fg
+        };
+        let total = process::StreamStats {
+            context_tokens: 1_700_000,
+            context_semantics: state::ContextSemantics::InvocationTotal,
+            ..Default::default()
+        };
+        assert_eq!(fg_of_context(&total), FG_MUTED);
+        let unknown = process::StreamStats {
+            context_tokens: 1_700_000,
+            ..Default::default()
+        };
+        assert_eq!(fg_of_context(&unknown), FG_MUTED);
+        let peak = process::StreamStats {
+            context_tokens: 160_000,
+            context_semantics: state::ContextSemantics::Peak,
+            ..Default::default()
+        };
+        assert_eq!(fg_of_context(&peak), ALERT);
     }
 
     /// U11: the gate zone is reserved from the layout, so a different gate's labels
