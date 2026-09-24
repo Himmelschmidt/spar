@@ -99,7 +99,12 @@ pub fn dispatch_turn(
         return Err(anyhow::anyhow!("turn cancelled"));
     }
 
-    let run_result = crate::process::run_captured(&spawn_req, on_spawn, on_tick);
+    let run_result = crate::process::run_captured_with_adapter(
+        &spawn_req,
+        on_spawn,
+        on_tick,
+        Some(adapter_box.name()),
+    );
     match run_result {
         Ok(res) => {
             let exit_success = res.exit_code == Some(0) && !res.timed_out;

@@ -1969,6 +1969,7 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
                         cache_read_tokens: u.cache_read_tokens,
                         cache_write_tokens: 0,
                         context_tokens: u.context_tokens,
+                        context_semantics: u.context_semantics,
                         billed_tokens: u.billed_tokens,
                         model: u.model.clone(),
                         session_id: None,
@@ -3361,7 +3362,7 @@ fn run_loop(
                     entry.cache_write_tokens = entry
                         .cache_write_tokens
                         .saturating_add(s.cache_write_tokens);
-                    entry.context_tokens = entry.context_tokens.max(s.context_tokens);
+                    entry.accum_context_reading(&s);
                     entry.tools = entry.tools.saturating_add(s.tools);
                 }
                 if let Some(wt) = worktree.clone() {
@@ -3469,7 +3470,7 @@ fn run_loop(
                                 entry.cache_write_tokens = entry
                                     .cache_write_tokens
                                     .saturating_add(s.cache_write_tokens);
-                                entry.context_tokens = entry.context_tokens.max(s.context_tokens);
+                                entry.accum_context_reading(&s);
                                 entry.tools = entry.tools.saturating_add(s.tools);
                             }
                             if let Some(wt) = worktree.clone() {
@@ -3898,7 +3899,7 @@ fn handle_key_inner(
                             entry.cache_write_tokens = entry
                                 .cache_write_tokens
                                 .saturating_add(s.cache_write_tokens);
-                            entry.context_tokens = entry.context_tokens.max(s.context_tokens);
+                            entry.accum_context_reading(&s);
                             entry.tools = entry.tools.saturating_add(s.tools);
                         }
                         if let Some(wt) = out.worktree.clone() {
@@ -9657,7 +9658,12 @@ fn draw_stream_stats(
         return;
     };
     let ctx = s.context_tokens;
-    let ctx_color = if ctx > 150_000 {
+    // The thresholds below read the number as a fraction of a context window, which
+    // is only honest for a true per-request peak. Anything else renders as a plain
+    // number with no window coloring.
+    let ctx_color = if s.context_semantics != crate::state::ContextSemantics::Peak {
+        FG_MUTED
+    } else if ctx > 150_000 {
         ALERT
     } else if ctx > 80_000 {
         WARN
@@ -13317,6 +13323,50 @@ mod labels {
         assert_eq!(app.gate_buttons[1].1, GateAction::Reject);
     }
 
+    /// The stream gauge's window bands (green/amber/red) must never apply to a
+    /// number that is not a per-request peak: a grok/codex invocation total renders
+    /// as a muted raw number, while a genuine peak keeps its band.
+    #[test]
+    fn stream_gauge_mutes_non_peak_context_but_colors_a_peak() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let fg_of_context = |stats: &process::StreamStats| -> ratatui::style::Color {
+            let mut term = Terminal::new(TestBackend::new(120, 1)).unwrap();
+            term.draw(|f| {
+                draw_stream_stats(
+                    f,
+                    f.area(),
+                    Some(stats),
+                    Some(SlotStatus::Running),
+                    "",
+                    false,
+                )
+            })
+            .unwrap();
+            let buf = term.backend().buffer().clone();
+            let row: String = (0..120).map(|x| buf[(x, 0)].symbol()).collect();
+            let x = row.find("context").expect("gauge renders context") as u16;
+            buf[(x, 0)].fg
+        };
+        let total = process::StreamStats {
+            context_tokens: 1_700_000,
+            context_semantics: state::ContextSemantics::InvocationTotal,
+            ..Default::default()
+        };
+        assert_eq!(fg_of_context(&total), FG_MUTED);
+        let unknown = process::StreamStats {
+            context_tokens: 1_700_000,
+            ..Default::default()
+        };
+        assert_eq!(fg_of_context(&unknown), FG_MUTED);
+        let peak = process::StreamStats {
+            context_tokens: 160_000,
+            context_semantics: state::ContextSemantics::Peak,
+            ..Default::default()
+        };
+        assert_eq!(fg_of_context(&peak), ALERT);
+    }
+
     /// U11: the gate zone is reserved from the layout, so a different gate's labels
     /// cannot slide the first button out from under a click already on its way.
     #[test]
@@ -16617,6 +16667,7 @@ mod render_stability {
             output_tokens: 0,
             cache_read_tokens: 0,
             context_tokens: 0,
+            context_semantics: crate::state::ContextSemantics::Unknown,
             billed_tokens: 0,
             tools: 0,
             model: Some("x-ai/grok-4.5".into()),
@@ -16639,6 +16690,7 @@ mod render_stability {
             output_tokens: 0,
             cache_read_tokens: 0,
             context_tokens: 0,
+            context_semantics: crate::state::ContextSemantics::Unknown,
             billed_tokens: billed,
             tools: 0,
             model: None,

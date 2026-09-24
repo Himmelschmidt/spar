@@ -299,6 +299,7 @@ pub fn apply(stats: &mut StreamStats, usage: &Usage) {
     // The gauge wants the biggest single call, not the run's cumulative input, and each
     // record's `input_tokens` is already the whole prompt (cached part included).
     stats.context_tokens = usage.peak_input_tokens;
+    stats.context_semantics = crate::state::ContextSemantics::Peak;
 }
 
 #[cfg(test)]
@@ -478,6 +479,31 @@ mod tests {
         assert_eq!(
             stats.tools, 191,
             "tool count survives a stream that lost it"
+        );
+    }
+
+    #[test]
+    fn apply_labels_the_sidecar_peak() {
+        let mut stats = StreamStats::default();
+        apply(
+            &mut stats,
+            &Usage {
+                peak_input_tokens: 180_000,
+                records: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(stats.context_tokens, 180_000);
+        assert_eq!(
+            stats.context_semantics,
+            crate::state::ContextSemantics::Peak
+        );
+        // No billed records: the gauge keeps whatever it had, still untrusted.
+        let mut stats = StreamStats::default();
+        apply(&mut stats, &Usage::default());
+        assert_eq!(
+            stats.context_semantics,
+            crate::state::ContextSemantics::Unknown
         );
     }
 

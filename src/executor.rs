@@ -8,7 +8,10 @@ use crate::provider_ref::ProviderRef;
 use crate::providers::{self, SpawnOpts, TrustPolicy};
 use crate::sandbox;
 use crate::session_id;
-use crate::state::{FleetSeat, RunState, SeatSource, SlotRole, SlotState, SlotStatus, SlotUsage};
+use crate::state::{
+    context_semantics_for_provider, ContextSemantics, FleetSeat, RunState, SeatSource, SlotRole,
+    SlotState, SlotStatus, SlotUsage,
+};
 use crate::templates;
 use crate::tmux;
 use anyhow::{bail, Context, Result};
@@ -613,7 +616,8 @@ fn dispatch_with_resume_recovery(
     let log_path = req.log_path.clone();
     let env = req.env.clone();
     let timeout = req.timeout;
-    let mut res = process::run_captured(&req, Some(sink), Some(tick))?;
+    let mut res =
+        process::run_captured_with_adapter(&req, Some(sink), Some(tick), Some(adapter.name()))?;
     // A usage error is spar's fault (it built a command line the provider rejected),
     // never the session's: it must be reported as such, never retried, and the marker
     // left untouched — a cold retry of the same bad command line would just fail again
@@ -718,7 +722,8 @@ fn dispatch_with_resume_recovery(
             env: env.clone(),
             timeout,
         };
-        res = process::run_captured(&req, Some(sink), Some(tick))?;
+        res =
+            process::run_captured_with_adapter(&req, Some(sink), Some(tick), Some(adapter.name()))?;
         last_used_resume = retry_used_resume;
         last_resume_attempt = prior;
         retries += 1;
@@ -835,7 +840,7 @@ fn cold_redispatch(
         env: env.to_vec(),
         timeout,
     };
-    process::run_captured(&cold_req, Some(sink), Some(tick))
+    process::run_captured_with_adapter(&cold_req, Some(sink), Some(tick), Some(adapter.name()))
 }
 
 fn execute_prepared(
@@ -873,6 +878,7 @@ fn execute_prepared(
             output_tokens: usage.output_tokens,
             cache_read_tokens: 0,
             context_tokens: usage.peak_input_tokens,
+            context_semantics: ContextSemantics::Peak,
             billed_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
             tools: 0,
             model: usage.model.or(model),
@@ -1440,7 +1446,8 @@ fn recover_artifact(r: &ArtifactRecovery) -> bool {
         last: std::cell::Cell::new(std::time::Instant::now()),
     };
     let tick = || beat.tick();
-    let spawned = process::run_captured(&req, Some(&sink), Some(&tick));
+    let spawned =
+        process::run_captured_with_adapter(&req, Some(&sink), Some(&tick), Some(adapter.name()));
     if let Some(id) = recovered_session_id {
         if let Some(mut stats) = process::StreamStats::load(r.log_path) {
             stats.session_id = Some(id);
@@ -1722,6 +1729,9 @@ fn usage_from_stream(slot_id: &str, provider: &str, s: &process::StreamStats) ->
         output_tokens: s.output_tokens,
         cache_read_tokens: s.cache_read_tokens,
         context_tokens: s.context_tokens,
+        // From the adapter table, not from the stream: the coalescer was built with
+        // the same table, so the two agree, but this is the authoritative label.
+        context_semantics: context_semantics_for_provider(provider),
         billed_tokens: s.billed_tokens,
         tools: s.tools,
         model: s.model.clone(),
@@ -3130,6 +3140,7 @@ fn run_api(
         output_tokens: usage.output_tokens,
         cache_read_tokens: 0,
         context_tokens: usage.peak_input_tokens,
+        context_semantics: ContextSemantics::Peak,
         billed_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
         tools: 0,
         model: usage.model.or(model),
@@ -3546,7 +3557,7 @@ fn tmux_recovered_usage(
     if !is_opencode {
         return None;
     }
-    let mut stats = process::stats_from_log(log_path);
+    let mut stats = process::stats_from_log(log_path, Some(&job.provider));
     enrich_opencode_stats(
         &mut stats,
         &job.provider,
@@ -6445,6 +6456,7 @@ mod tests {
                 output_tokens: 2,
                 cache_read_tokens: 0,
                 context_tokens: 3,
+                context_semantics: ContextSemantics::Peak,
                 billed_tokens: 3,
                 tools: 0,
                 model: None,

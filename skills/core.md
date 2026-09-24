@@ -947,7 +947,9 @@ rail's selection.
     (`input + cache read + cache write`), i.e. how full the agent's window got. It is a
     maximum, never a running total, so it stays comparable to the model's window and does
     not grow just because a run made more calls. Do **not** sum it and do not read it as
-    spend.
+    spend. Every entry carries **`context_semantics`** beside it saying what the number
+    actually measures: `peak`, `invocation_total`, or `unknown`. Only `peak` is
+    comparable to a window; the TUI mutes anything else to a plain number.
   - Conventions per adapter, since the wire formats differ: **claude** is settled by the
     terminal `result` record, which supersedes the per-message ones; **codex** by
     `turn.completed` (its only usage record, so it also stands in for the gauge);
@@ -972,16 +974,19 @@ rail's selection.
     and you never have to know which convention the provider used. The consequence to be
     aware of: `input_tokens` for a codex or muse slot is **not** the number that provider's
     own dashboard shows under "input"; add `cache_read_tokens` back to get it.
-  - **`context_tokens` is a peak for every adapter except two.** `cli:grok` (below) reports
-    a cumulative total. `cli:agy` reports the *latest* call's prompt rather than the largest
-    one, because its statusline sink emits one snapshot and keeps no history; it is a real
-    window reading, just not a maximum.
+  - **`context_tokens` is a peak for claude, opencode, muse and api-sdk dispatches.**
+    `cli:codex` and `cli:grok` report an invocation total instead (codex has no
+    per-request usage record; grok's records are cumulative), labeled
+    `invocation_total`. `cli:agy` is labeled `unknown`: it is out of both fleets and its
+    sidecar semantics are undetermined. Runs written before the marker read as `unknown`
+    too — untrusted, never silently trusted.
   - **`cli:grok` is the exception: treat its numbers as approximate.** spar runs grok on
     its native ACP stream, whose final `end` record carries the turn's cumulative usage
     and settles the totals (`DECISIONS.md` O90) — but a live sidecar reading still
     over-counts output until that `end` lands, so a token nudge can fire early on a grok
-    slot. `context_tokens` for a grok slot is a cumulative total rather than a peak, so
-    the 80k/150k gauge means nothing there. grok slots also never report a `model`, never
+    slot. `context_tokens` for a grok slot is a cumulative total rather than a peak
+    (labeled `invocation_total`), so the 80k/150k gauge means nothing there. grok slots
+    also never report a `model`, never
     report a `tool_errors` above zero, and never resolve tool *names* (the tool *count*
     is exact). Do not budget tightly against a grok slot.
 - **Cost and subagent accounting** ride the same `"usage"` entries and

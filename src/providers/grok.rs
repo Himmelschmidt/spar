@@ -252,7 +252,6 @@ mod tests {
 
     #[test]
     fn headless_inline_uses_single_with_prompt() {
-        let opts = opts_with_session("do the thing", None, None);
         let opts = SpawnOpts {
             prompt: "do the thing".into(),
             prompt_file: None,

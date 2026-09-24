@@ -29,7 +29,14 @@ pub struct StreamStats {
     /// i.e. how full the agent's window got. Not a running total: it is what the
     /// context gauge is read against, so a long run does not drift past every
     /// threshold just by making more calls.
+    ///
+    /// Except this is only true when `context_semantics` says `Peak`: codex and grok
+    /// report an invocation total here instead (see `StreamCoalescer`), so any gauge
+    /// or cross-slot max must check the label first.
     pub context_tokens: u64,
+    /// What `context_tokens` measures. Old sidecars predate it and load as `Unknown`.
+    #[serde(default)]
+    pub context_semantics: crate::state::ContextSemantics,
     /// Cumulative billed tokens for the whole slot, under each adapter's own
     /// convention: `input + cache_read + cache_write + output` as written above, with
     /// reasoning already folded into `output`. This is the spend meter and the number
@@ -277,6 +284,18 @@ impl StreamStats {
         let text = std::fs::read_to_string(path).ok()?;
         serde_json::from_str(&text).ok()
     }
+
+    /// Fold one turn's gauge reading into an accumulated one. The max wins and the
+    /// label follows the reading that provided it, so the accumulated number always
+    /// says what it is: dropping non-peak readings would show a false `context 0`
+    /// for an all-totals conversation, and maxing without the label would present a
+    /// total as a window fraction.
+    pub fn accum_context_reading(&mut self, other: &StreamStats) {
+        if other.context_tokens > self.context_tokens {
+            self.context_tokens = other.context_tokens;
+            self.context_semantics = other.context_semantics;
+        }
+    }
 }
 
 /// Reconstruct `StreamStats` from a completed log file by feeding it through the same
@@ -286,12 +305,12 @@ impl StreamStats {
 /// the fact. Only meaningful for a provider whose pane runs the same structured stream as
 /// headless (opencode's `run --format json`); other adapters' interactive TUI output is
 /// not JSON, so the coalescer degrades every line to inert text and this returns zeros.
-pub fn stats_from_log(log_path: &Path) -> StreamStats {
+pub fn stats_from_log(log_path: &Path, adapter: Option<&str>) -> StreamStats {
     let mut stats = StreamStats::default();
     let Ok(text) = std::fs::read_to_string(log_path) else {
         return stats;
     };
-    let mut c = StreamCoalescer::new(false);
+    let mut c = StreamCoalescer::new_with_adapter(false, adapter);
     for line in text.lines() {
         c.feed(line);
     }
@@ -421,10 +440,26 @@ fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
 /// loop, so callers can record a live pid. `on_tick` fires on every wait-poll
 /// iteration while the child is still alive; the supervisor uses it to refresh the
 /// slot's liveness (the callback self-throttles the actual cadence).
+/// Adapter-unknown spawn: the sidecar label stays `Unknown`. Every production slot
+/// knows its adapter and uses `run_captured_with_adapter`; this survives for
+/// probes and tests that spawn something else.
+#[allow(dead_code)]
 pub fn run_captured(
     req: &SpawnRequest,
     on_spawn: Option<&dyn Fn(u32)>,
     on_tick: Option<&dyn Fn()>,
+) -> Result<SpawnResult> {
+    run_captured_with_adapter(req, on_spawn, on_tick, None)
+}
+
+/// `run_captured` for a known adapter: `adapter` (bare `ProviderAdapter::name`)
+/// labels the live sidecar's `context_tokens` from the adapter table up front, so
+/// the gauge is honest from the first paint instead of only after the dispatch.
+pub fn run_captured_with_adapter(
+    req: &SpawnRequest,
+    on_spawn: Option<&dyn Fn(u32)>,
+    on_tick: Option<&dyn Fn()>,
+    adapter: Option<&str>,
 ) -> Result<SpawnResult> {
     if let Some(parent) = req.log_path.parent() {
         std::fs::create_dir_all(parent)
@@ -443,6 +478,9 @@ pub fn run_captured(
     );
     writer.append(&header)?;
     let mut initial = StreamStats::default();
+    if let Some(name) = adapter {
+        initial.context_semantics = crate::state::context_semantics_for_provider(name);
+    }
     initial.touch_log();
     let _ = initial.save(&req.log_path);
 
@@ -481,14 +519,19 @@ pub fn run_captured(
     let stats_out = stats_holder.clone();
     let stats_err = stats_holder.clone();
 
+    // Resolved before the spawn: the label is `Copy`, the adapter name is borrowed.
+    let label = adapter.map_or(
+        crate::state::ContextSemantics::Unknown,
+        crate::state::context_semantics_for_provider,
+    );
     let t_out = std::thread::spawn(move || {
         if let Some(out) = stdout {
-            stream_to_log(out, &writer_out, false, stats_out);
+            stream_to_log(out, &writer_out, false, stats_out, label);
         }
     });
     let t_err = std::thread::spawn(move || {
         if let Some(err) = stderr {
-            stream_to_log(err, &writer_err, true, stats_err);
+            stream_to_log(err, &writer_err, true, stats_err, label);
         }
     });
 
@@ -997,10 +1040,11 @@ fn stream_to_log(
     writer: &LogWriter,
     is_err: bool,
     stats: std::sync::Arc<std::sync::Mutex<StreamStats>>,
+    label: crate::state::ContextSemantics,
 ) {
     let log_path = writer.log_path.clone();
     let reader = BufReader::new(pipe);
-    let mut c = StreamCoalescer::new(is_err);
+    let mut c = StreamCoalescer::new_with_label(is_err, label);
     for line in reader.lines() {
         let Ok(line) = line else { break };
         if let Ok(mut s) = stats.lock() {
@@ -1068,6 +1112,10 @@ struct StreamCoalescer {
     cache_write: u64,
     /// Largest single-request prompt footprint seen, from per-request usage only.
     context_peak: u64,
+    /// What `context_tokens()` measures, fixed at construction from the adapter
+    /// table. Never derived from `context_peak > 0`: grok sets a peak that is
+    /// really a total.
+    context_semantics: crate::state::ContextSemantics,
     /// A cumulative end-of-invocation usage record has been absorbed, so per-request
     /// records must no longer touch the billed components.
     saw_terminal_usage: bool,
@@ -1112,7 +1160,19 @@ fn is_grok_end(v: &serde_json::Value) -> bool {
 }
 
 impl StreamCoalescer {
-    fn new(is_err: bool) -> Self {
+    /// A coalescer for a known adapter: the `context_tokens` label comes from the
+    /// adapter table, fixed for the whole stream, never sniffed from record shapes.
+    fn new_with_adapter(is_err: bool, adapter: Option<&str>) -> Self {
+        Self::new_with_label(
+            is_err,
+            adapter.map_or(
+                crate::state::ContextSemantics::Unknown,
+                crate::state::context_semantics_for_provider,
+            ),
+        )
+    }
+
+    fn new_with_label(is_err: bool, label: crate::state::ContextSemantics) -> Self {
         Self {
             is_err,
             quota_rejected: None,
@@ -1128,6 +1188,7 @@ impl StreamCoalescer {
             cache_read: 0,
             cache_write: 0,
             context_peak: 0,
+            context_semantics: label,
             saw_terminal_usage: false,
             model: None,
             session_id: None,
@@ -1935,10 +1996,11 @@ impl StreamCoalescer {
     /// against `~/.grok/sessions/<cwd>/<id>/updates.jsonl`) while the rest happened
     /// to survive. Now the `end` record maps to `UsageScope::Terminal` (gated on
     /// grok's own `sessionId` shape), so the final cumulative record supersedes the
-    /// accumulation instead of adding to it. Still true and not fixed here:
-    /// `context_tokens` for grok is a cumulative total wearing a peak's name (grok's
-    /// own `modelCalls` says the real window is far smaller), and `tool_errors` and
-    /// tool *names* are never recovered at all, though the tool *count* is exact.
+    /// accumulation instead of adding to it. `context_tokens` for grok stays a
+    /// cumulative total (grok's own `modelCalls` says the real window is far
+    /// smaller), but it is now labeled `InvocationTotal` rather than wearing a
+    /// peak's name. Still true and not fixed here: `tool_errors` and tool *names*
+    /// are never recovered at all, though the tool *count* is exact.
     /// `model` is the one of those that is unwired rather than unavailable:
     /// `end.modelUsage` is keyed by model id (`"grok-4.6"`) and carries `modelCalls`
     /// and `costUSD` alongside it.
@@ -2007,7 +2069,8 @@ impl StreamCoalescer {
 
     /// Peak single-request prompt footprint. Adapters that report usage only once, at
     /// the end of the invocation (codex), have no per-request record to peak over, so
-    /// their invocation total stands in.
+    /// their invocation total stands in. Read `context_semantics` alongside this:
+    /// the value alone no longer claims to be a peak.
     fn context_tokens(&self) -> u64 {
         if self.context_peak > 0 {
             return self.context_peak;
@@ -2055,6 +2118,7 @@ impl StreamCoalescer {
         s.cache_read_tokens = self.cache_read;
         s.cache_write_tokens = self.cache_write;
         s.context_tokens = self.context_tokens();
+        s.context_semantics = self.context_semantics;
         s.billed_tokens = self.billed_tokens();
         // Unconditional, like every other counter above: `self.quota_rejected` already
         // reflects the coalescer's *current* verdict (the rate_limit_event handler
@@ -2456,13 +2520,13 @@ mod tests {
     /// itself had rendered from these very fields.
     #[test]
     fn a_rejected_rate_limit_event_is_captured_typed() {
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         c.feed(r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"seven_day"}}"#);
         assert_eq!(c.quota_rejected.as_deref(), Some("seven_day"));
 
         // An allowed event, and a warning short of rejection, are not rejections.
         for status in ["allowed", "allowed_warning"] {
-            let mut c = StreamCoalescer::new(false);
+            let mut c = StreamCoalescer::new_with_adapter(false, None);
             c.feed(&format!(
                 r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"{status}","rateLimitType":"five_hour"}}}}"#
             ));
@@ -2476,7 +2540,7 @@ mod tests {
     /// misrouted as a quota hit.
     #[test]
     fn a_later_allowed_event_clears_an_earlier_rejection() {
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         c.feed(
             r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":1788000000}}"#,
         );
@@ -2508,7 +2572,7 @@ mod tests {
             "implementer: editing src/quota.rs, the rate limit rejected path",
         ];
         for (i, line) in FIXTURES.iter().enumerate() {
-            let mut c = StreamCoalescer::new(false);
+            let mut c = StreamCoalescer::new_with_adapter(false, None);
             c.feed(line);
             assert_eq!(c.quota_rejected, None, "FIXTURES[{i}] must not route");
         }
@@ -2520,7 +2584,7 @@ mod tests {
     /// must fail this.
     #[test]
     fn a_rejection_reaches_stream_stats_with_its_reset_instant() {
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         c.feed(
             r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"seven_day","resetsAt":1788000000}}"#,
         );
@@ -2537,7 +2601,7 @@ mod tests {
     /// A window-specific `unifiedWindows` entry outranks the top-level one.
     #[test]
     fn the_window_specific_reset_instant_wins() {
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         c.feed(
             r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"seven_day","resetsAt":1,"unifiedWindows":{"seven_day":{"resetsAt":1788000000}}}}"#,
         );
@@ -2548,7 +2612,7 @@ mod tests {
     /// to the top-level `resetsAt`, not silently drop the instant.
     #[test]
     fn a_window_absent_from_unified_windows_falls_back_to_the_top_level_reset_instant() {
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         c.feed(
             r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"seven_day","resetsAt":1788000000,"unifiedWindows":{"five_hour":{"resetsAt":1}}}}"#,
         );
@@ -2561,7 +2625,7 @@ mod tests {
     /// rather than come back empty.
     #[test]
     fn an_empty_rate_limit_type_falls_back_to_the_top_level_reset_instant() {
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         c.feed(
             r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1788000000}}"#,
         );
@@ -2576,7 +2640,7 @@ mod tests {
     /// arriving through a malformed event instead of a recovered one.
     #[test]
     fn a_malformed_status_does_not_clear_an_existing_rejection() {
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         c.feed(
             r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":1788000000}}"#,
         );
@@ -2592,7 +2656,7 @@ mod tests {
     /// Regresses to the guarded form and this fails.
     #[test]
     fn a_recovered_stream_is_not_latched_in_stream_stats() {
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         let mut stats = StreamStats::default();
         c.feed(
             r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":1788000000}}"#,
@@ -2624,7 +2688,7 @@ mod tests {
     /// prose fallback.
     #[test]
     fn a_stream_with_no_rate_limit_event_is_not_marked_recovered() {
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         let mut stats = StreamStats::default();
         c.feed(r#"{"type":"system","subtype":"init","model":"claude"}"#);
         c.merge_counters_into(&mut stats);
@@ -2639,7 +2703,7 @@ mod tests {
     /// permanently dead for the provider this feature was built for.
     #[test]
     fn an_allowed_event_with_no_prior_rejection_is_not_a_recovery() {
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         let mut stats = StreamStats::default();
         c.feed(
             r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour"}}"#,
@@ -2860,7 +2924,7 @@ mod tests {
 
     #[test]
     fn grok_tokens_coalesce() {
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         let mut out = String::new();
         for tok in ["I'll", " pull", " PR", " 167", "."] {
             let line = format!(r#"{{"type":"text","data":"{tok}"}}"#);
@@ -2875,7 +2939,7 @@ mod tests {
 
     #[test]
     fn claude_tools_and_usage() {
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         let line = r#"{"type":"assistant","message":{"model":"claude-opus","usage":{"input_tokens":100,"output_tokens":5,"cache_read_input_tokens":50},"content":[{"type":"text","text":"Checking scope."},{"type":"tool_use","name":"Bash","input":{"description":"Get PR diff","command":"gh pr diff 167"}}]}}"#;
         let chunk = c.feed(line).unwrap();
         assert!(chunk.contains("Checking scope."));
@@ -2895,7 +2959,7 @@ mod tests {
     /// the chunk's first line.
     #[test]
     fn indexed_parse_recognizes_a_marker_that_is_not_chunk_initial() {
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         let line = r#"{"type":"assistant","message":{"model":"claude-opus","usage":{"input_tokens":100,"output_tokens":5,"cache_read_input_tokens":50},"content":[{"type":"text","text":"Checking scope."},{"type":"tool_use","name":"Bash","input":{"description":"Get PR diff","command":"gh pr diff 167"}}]}}"#;
         let chunk = c.feed(line).unwrap();
         let index = vec![(1000u64, chrono::Utc::now())];
@@ -2931,7 +2995,7 @@ mod tests {
 
     #[test]
     fn claude_init_captures_session_id() {
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         c.feed(r#"{"type":"system","subtype":"init","model":"claude-opus","session_id":"sess-abc-123"}"#);
         assert_eq!(c.session_id.as_deref(), Some("sess-abc-123"));
     }
@@ -2945,7 +3009,7 @@ mod tests {
         // parser below must ignore without failing the rest of the object, and
         // `modelUsage` carries extra fields (`webSearchRequests`, `costBasis`) with
         // the same requirement.
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         c.feed(
             r#"{"type":"result","subtype":"success","total_cost_usd":0.4521,
                "usage":{"input_tokens":49,"output_tokens":241},
@@ -3027,7 +3091,7 @@ mod tests {
         // dispatch that never spawned a subagent. Capturing that verbatim would put
         // ~20 lines of zeros into `stats.json`/`state.json` on every claude dispatch,
         // so an all-default block must stay `None` rather than `Some(zeros)`.
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         c.feed(
             r#"{"type":"result","subtype":"success",
                "subagent_stats":{"spawned":0,"completed":0,"failed":0,
@@ -3043,7 +3107,7 @@ mod tests {
     fn model_usage_skips_non_object_entries() {
         // A `null` or scalar `modelUsage` entry must be skipped, not inserted as a
         // phantom model with all-zero/None fields.
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         c.feed(
             r#"{"type":"result","subtype":"success",
                "modelUsage":{"claude-opus-5":null,"claude-haiku-4-5":"weird"}}"#,
@@ -3057,7 +3121,7 @@ mod tests {
         // on one unexpected type. `by_type` values shaped as nested objects (instead
         // of bare counts) is exactly that kind of drift; `spawned` still parses fine
         // and must not be lost along with it.
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         c.feed(
             r#"{"type":"result","subtype":"success",
                "subagent_stats":{"spawned":3,"completed":2,
@@ -3084,7 +3148,7 @@ mod tests {
 
     #[test]
     fn opencode_sums_per_step_cost_into_one_field() {
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         c.feed(
             r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_a","type":"step-finish","cost":0.01,"tokens":{"input":10,"output":2,"cache":{"read":0,"write":0}}}}"#,
         );
@@ -3097,7 +3161,7 @@ mod tests {
     #[test]
     fn codex_jsonl_text_and_usage() {
         // Real `codex exec --json` event sequence (captured from codex-cli 0.144.4).
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         let mut out = String::new();
         for line in [
             r#"{"type":"thread.started","thread_id":"t1"}"#,
@@ -3144,7 +3208,7 @@ mod tests {
                 r#"{{"type":"assistant","message":{{"model":"claude-haiku","usage":{{"input_tokens":{input},"cache_creation_input_tokens":{cw},"cache_read_input_tokens":{cr},"output_tokens":{out}}},"content":[{{"type":"text","text":"hi"}}]}}}}"#
             )
         };
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         for _ in 0..3 {
             c.feed(&msg(10, 18519, 18052, 4));
         }
@@ -3175,7 +3239,7 @@ mod tests {
         // output is summed while the rest is maxed — recording exactly 2x output
         // against reality. The two-call test below shows why that doubling is exact
         // at any call count.
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         c.feed(r#"{"type":"usage","usage":{"input_tokens":20965,"output_tokens":34,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"reasoning_tokens":31}}"#);
         c.feed(r#"{"type":"end","stopReason":"end_turn","sessionId":"01a0afec-eaf7-78c2-b076-d47691cf248a","requestId":"34f47631-cdae-4853-a2bf-01843230bbfd","usage":{"input_tokens":20965,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":34,"reasoning_tokens":31,"total_tokens":20999},"num_turns":1}"#);
         assert_eq!(
@@ -3211,7 +3275,7 @@ mod tests {
     /// live from grok 1.0.34 (a turn re-driven by a Stop-hook block, hence two calls).
     #[test]
     fn a_multi_call_grok_turn_records_the_terminal_total_not_the_running_sum() {
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         c.feed(r#"{"type":"usage","usage":{"input_tokens":21636,"output_tokens":25,"cache_read_input_tokens":128,"cache_creation_input_tokens":0,"reasoning_tokens":24}}"#);
         c.feed(r#"{"type":"usage","usage":{"input_tokens":62,"output_tokens":26,"cache_read_input_tokens":21760,"cache_creation_input_tokens":0,"reasoning_tokens":23}}"#);
         c.feed(r#"{"type":"end","stopReason":"end_turn","sessionId":"01a0b009-0ebf-7580-a1e0-b16b66ab9f49","requestId":"1e58e7fb-3f2e-4af5-b2ed-457bea534b11","usage":{"input_tokens":21698,"cache_read_input_tokens":21888,"cache_creation_input_tokens":0,"output_tokens":51,"reasoning_tokens":47,"total_tokens":43637},"num_turns":2,"total_cost_usd":0.054646,"modelUsage":{"grok-4.6":{"inputTokens":21698,"outputTokens":51,"cacheReadInputTokens":21888,"cacheCreationInputTokens":0,"modelCalls":2,"costUSD":0.054646}}}"#);
@@ -3232,12 +3296,137 @@ mod tests {
         );
     }
 
+    /// grok's per-call records max into a nonzero peak-shaped number that is really
+    /// cumulative, so a `context_peak > 0` trust check would wave it through as a
+    /// peak. The label comes from the adapter instead and never sees the records.
+    #[test]
+    fn grok_peak_is_labeled_invocation_total_despite_nonzero_peak() {
+        use crate::state::ContextSemantics;
+        let mut c = StreamCoalescer::new_with_adapter(false, Some("grok"));
+        c.feed(r#"{"type":"usage","usage":{"input_tokens":21636,"output_tokens":25,"cache_read_input_tokens":128,"cache_creation_input_tokens":0}}"#);
+        c.feed(r#"{"type":"usage","usage":{"input_tokens":62,"output_tokens":26,"cache_read_input_tokens":21760,"cache_creation_input_tokens":0}}"#);
+        let mut stats = StreamStats::default();
+        c.merge_counters_into(&mut stats);
+        assert!(
+            stats.context_tokens > 0,
+            "the trap this test guards: a peak-shaped number exists"
+        );
+        assert_eq!(stats.context_semantics, ContextSemantics::InvocationTotal);
+        c.feed(r#"{"type":"end","stopReason":"end_turn","sessionId":"01a0b009-0ebf-7580-a1e0-b16b66ab9f49","usage":{"input_tokens":21698,"cache_read_input_tokens":21888,"cache_creation_input_tokens":0,"output_tokens":51,"total_tokens":43637}}"#);
+        let mut stats = StreamStats::default();
+        c.merge_counters_into(&mut stats);
+        assert_eq!(stats.context_semantics, ContextSemantics::InvocationTotal);
+    }
+
+    #[test]
+    fn codex_terminal_only_usage_is_labeled_invocation_total() {
+        use crate::state::ContextSemantics;
+        let mut c = StreamCoalescer::new_with_adapter(false, Some("codex"));
+        c.feed(r#"{"type":"turn.completed","usage":{"input_tokens":39189,"cached_input_tokens":39185,"output_tokens":117}}"#);
+        let mut stats = StreamStats::default();
+        c.merge_counters_into(&mut stats);
+        assert_eq!(stats.context_tokens, 39189);
+        assert_eq!(stats.context_semantics, ContextSemantics::InvocationTotal);
+    }
+
+    #[test]
+    fn claude_per_message_usage_is_labeled_peak_and_survives_result() {
+        use crate::state::ContextSemantics;
+        let mut c = StreamCoalescer::new_with_adapter(false, Some("claude"));
+        c.feed(r#"{"type":"assistant","message":{"model":"claude-haiku","usage":{"input_tokens":39,"cache_creation_input_tokens":259,"cache_read_input_tokens":36571,"output_tokens":1},"content":[{"type":"text","text":"hi"}]}}"#);
+        let mut stats = StreamStats::default();
+        c.merge_counters_into(&mut stats);
+        assert_eq!(stats.context_semantics, ContextSemantics::Peak);
+        c.feed(r#"{"type":"result","subtype":"success","usage":{"input_tokens":49,"cache_creation_input_tokens":18778,"cache_read_input_tokens":54623,"output_tokens":241}}"#);
+        let mut stats = StreamStats::default();
+        c.merge_counters_into(&mut stats);
+        assert_eq!(stats.context_tokens, 39 + 259 + 36571);
+        assert_eq!(stats.context_semantics, ContextSemantics::Peak);
+    }
+
+    #[test]
+    fn opencode_step_deltas_are_labeled_peak() {
+        use crate::state::ContextSemantics;
+        let mut c = StreamCoalescer::new_with_adapter(false, Some("opencode"));
+        c.feed(r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_a","type":"step-finish","tokens":{"input":12738,"output":19,"cache":{"read":1920,"write":0}}}}"#);
+        let mut stats = StreamStats::default();
+        c.merge_counters_into(&mut stats);
+        assert_eq!(stats.context_tokens, 12738 + 1920);
+        assert_eq!(stats.context_semantics, ContextSemantics::Peak);
+    }
+
+    #[test]
+    fn agy_usage_is_labeled_unknown() {
+        use crate::state::ContextSemantics;
+        let mut c = StreamCoalescer::new_with_adapter(false, Some("agy"));
+        c.feed(r#"{"event":"step_update","step_update":{"state":"DONE","step_type":"agent_response","text_delta":"hi","usage":{"input_tokens":100,"output_tokens":5,"cache_read_tokens":10}}}"#);
+        let mut stats = StreamStats::default();
+        c.merge_counters_into(&mut stats);
+        assert_eq!(stats.context_tokens, 110);
+        assert_eq!(stats.context_semantics, ContextSemantics::Unknown);
+        let mut c = StreamCoalescer::new_with_adapter(false, Some("agy"));
+        c.feed(r#"{"event":"result","result":{"status":"success","usage":{"input_tokens":200,"output_tokens":10,"cache_read_tokens":20}}}"#);
+        let mut stats = StreamStats::default();
+        c.merge_counters_into(&mut stats);
+        assert_eq!(stats.context_semantics, ContextSemantics::Unknown);
+    }
+
+    #[test]
+    fn adapter_label_survives_records_from_another_shape() {
+        // The label is fixed at construction: even a claude-shaped stream fed to a
+        // grok-built coalescer keeps grok's label. Cross-adapter streams never
+        // happen; if they did, mislabeling toward the total is the fail-closed side.
+        use crate::state::ContextSemantics;
+        let mut c = StreamCoalescer::new_with_adapter(false, Some("grok"));
+        c.feed(r#"{"type":"assistant","message":{"model":"claude-haiku","usage":{"input_tokens":39,"cache_creation_input_tokens":259,"cache_read_input_tokens":36571,"output_tokens":1},"content":[{"type":"text","text":"hi"}]}}"#);
+        let mut stats = StreamStats::default();
+        c.merge_counters_into(&mut stats);
+        assert_eq!(stats.context_semantics, ContextSemantics::InvocationTotal);
+    }
+
+    #[test]
+    fn empty_stream_is_unknown_not_peak() {
+        use crate::state::ContextSemantics;
+        let c = StreamCoalescer::new_with_adapter(false, None);
+        let mut stats = StreamStats::default();
+        c.merge_counters_into(&mut stats);
+        assert_eq!(stats.context_tokens, 0);
+        assert_eq!(stats.context_semantics, ContextSemantics::Unknown);
+    }
+
+    #[test]
+    fn accum_reading_keeps_the_max_and_its_label() {
+        use crate::state::ContextSemantics;
+        let reading = |n: u64, s: ContextSemantics| StreamStats {
+            context_tokens: n,
+            context_semantics: s,
+            ..Default::default()
+        };
+        let mut entry = StreamStats::default();
+        entry.accum_context_reading(&reading(1_700_000, ContextSemantics::InvocationTotal));
+        assert_eq!(entry.context_tokens, 1_700_000);
+        assert_eq!(entry.context_semantics, ContextSemantics::InvocationTotal);
+        entry.accum_context_reading(&reading(164_000, ContextSemantics::Peak));
+        assert_eq!(
+            (entry.context_tokens, entry.context_semantics),
+            (1_700_000, ContextSemantics::InvocationTotal),
+            "a smaller peak does not displace a larger total"
+        );
+        entry.accum_context_reading(&reading(2_000_000, ContextSemantics::Peak));
+        assert_eq!(
+            (entry.context_tokens, entry.context_semantics),
+            (2_000_000, ContextSemantics::Peak),
+            "a larger peak displaces the total and takes its label with it"
+        );
+        entry.accum_context_reading(&reading(50_000, ContextSemantics::Unknown));
+        assert_eq!(entry.context_tokens, 2_000_000);
+    }
     #[test]
     fn a_bare_end_without_grok_shape_sets_no_terminal_state() {
         // A bare `{"type":"end"}` — no `usage`, no `sessionId` — must not latch the
         // terminal arm: a later usage record still accumulates, and no session id
         // is captured.
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         c.feed(r#"{"type":"usage","usage":{"input_tokens":100,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#);
         c.feed(r#"{"type":"end"}"#);
         assert_eq!(c.session_id, None);
@@ -3256,7 +3445,7 @@ mod tests {
         // subagent `end` in the same shape), the later record wins outright for
         // counters and session id — it never adds. This pins that behaviour so a
         // shape change shows up here rather than as silent undercounting.
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         c.feed(r#"{"type":"usage","usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#);
         c.feed(r#"{"type":"end","stopReason":"end_turn","sessionId":"sess-first","usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"total_tokens":110}}"#);
         assert_eq!(c.output_tokens, 10);
@@ -3278,7 +3467,7 @@ mod tests {
     fn a_foreign_end_with_snake_case_session_id_is_not_grok_terminal() {
         // claude's `session_id` spelling plus a usage object is still not grok's
         // shape: the gate requires camelCase `sessionId`, so this stays Request.
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         c.feed(r#"{"type":"end","session_id":"sess-1","usage":{"input_tokens":100,"output_tokens":5}}"#);
         assert_eq!(c.session_id, None);
         assert!(!c.saw_terminal_usage);
@@ -3296,7 +3485,7 @@ mod tests {
             r#"{"schema_version":1,"stream":{"kind":"session","id":"11111111-2222-3333-4444-555555555555"},"record_type":"status","payload_type":"run.output.delta","payload":{"kind":"run_output_delta","text":"ONE"}}"#,
             r#"{"schema_version":1,"stream":{"kind":"session","id":"11111111-2222-3333-4444-555555555555"},"record_type":"event","payload_type":"run.terminal.completed","payload":{"kind":"run_terminal","reason":null,"terminal":"completed","text":"DONE"}}"#,
         ];
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         let mut out = String::new();
         for l in lines {
             if let Some(chunk) = c.feed(l) {
@@ -3326,7 +3515,7 @@ mod tests {
 
     #[test]
     fn muse_tool_failure_counts_as_error() {
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         let out = c
             .feed(
                 r#"{"stream":{"kind":"session","id":"s1"},"payload_type":"tool.result","payload":{"correlation_facts":{"outcome":"error","tool_name":"shell"},"kind":"tool_result"}}"#,
@@ -3356,7 +3545,7 @@ mod tests {
             r#"{"event":"step_update","step_update":{"conversation_id":"agy-conv-1","step_index":2,"state":"DONE","step_type":"agent_response","text_delta":"World","usage":{"input_tokens":50,"output_tokens":2,"thinking_tokens":1,"cache_read_tokens":0,"total_tokens":52}}}"#,
             r#"{"event":"result","result":{"conversation_id":"agy-conv-1","status":"SUCCESS","response":"Hello World","duration_seconds":1.5,"num_turns":2,"usage":{"input_tokens":150,"output_tokens":8,"thinking_tokens":5,"cache_read_tokens":10,"total_tokens":158}}}"#,
         ];
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         let mut out = String::new();
         for l in lines {
             if let Some(chunk) = c.feed(l) {
@@ -3396,7 +3585,7 @@ mod tests {
             r#"{"event":"step_update","step_update":{"conversation_id":"c1","step_index":0,"state":"DONE","step_type":"agent_response","text_delta":"world","usage":{"input_tokens":10,"output_tokens":4,"cache_read_tokens":0,"total_tokens":14}}}"#,
             r#"{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","response":"Hello brave new world","usage":{"input_tokens":10,"output_tokens":4,"cache_read_tokens":0,"total_tokens":14}}}"#,
         ];
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         let mut out = String::new();
         for l in lines {
             if let Some(chunk) = c.feed(l) {
@@ -3416,7 +3605,7 @@ mod tests {
         // If the terminal total does not match the per-step sum, `result` wins: it is
         // Terminal-scoped and supersedes, same as claude's `result` / codex's
         // `turn.completed`.
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         c.feed(
             r#"{"event":"step_update","step_update":{"conversation_id":"c1","step_index":0,"state":"DONE","step_type":"agent_response","text_delta":"hi","usage":{"input_tokens":10,"output_tokens":1,"cache_read_tokens":0,"total_tokens":11}}}"#,
         );
@@ -3433,7 +3622,7 @@ mod tests {
         // With the transcript scrape gone, `result.error` is the only surviving
         // diagnostic text for a failed agy slot; quota detection and artifact salvage
         // both read the coalesced log, so it must be in there.
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         let out = c
             .feed(
                 r#"{"event":"result","result":{"conversation_id":"c1","status":"ERROR","error":"rate limit exceeded","usage":{"input_tokens":10,"output_tokens":1,"cache_read_tokens":0,"total_tokens":11}}}"#,
@@ -3447,7 +3636,7 @@ mod tests {
     fn agy_result_response_fills_in_when_no_agent_response_streamed() {
         // A run that never emitted an `agent_response` step_update (e.g. a tool-only
         // turn) must still surface its answer from `result.response`.
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         let out = c
             .feed(
                 r#"{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","response":"final answer","usage":{"input_tokens":10,"output_tokens":2,"cache_read_tokens":0,"total_tokens":12}}}"#,
@@ -3464,7 +3653,7 @@ mod tests {
         // republishes `PartUpdated` for an id it already sent, so the same `prt_f1`
         // arrives twice and must be billed once. Real single-step tokens: input 12738,
         // output 19, cache.read 1920.
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         let mut out = String::new();
         let finish = r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_f1","type":"step-finish","tokens":{"total":14677,"input":12738,"output":19,"reasoning":0,"cache":{"write":0,"read":1920}},"cost":0.07}}"#;
         for line in [
@@ -3505,7 +3694,7 @@ mod tests {
         // writer uses five hardcoded underscore literals -- so the `-` to `_` mapping is
         // defensive. Pinned rather than deleted: if a future build did emit both, the
         // dedupe key has to fold them together or every step bills twice.
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         for line in [
             r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_f1","type":"step-finish","tokens":{"input":12738,"output":19,"cache":{"read":1920,"write":0}}}}"#,
             r#"{"type":"step-finish","sessionID":"ses_1","part":{"id":"prt_f1","type":"step-finish","tokens":{"input":12738,"output":19,"cache":{"read":1920,"write":0}}}}"#,
@@ -3523,7 +3712,7 @@ mod tests {
         // call's own delta: opencode.db's session totals equal the sum of its steps
         // (ses_fc0c768c2f: 20 steps, cache_read 2,550,766 = sum, max only 170,295), so
         // maxing under-reported the cache-heavy fields by an order of magnitude.
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         for line in [
             r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_a","type":"step-finish","tokens":{"input":12738,"output":19,"cache":{"read":1920,"write":0}}}}"#,
             r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_b","type":"step-finish","tokens":{"input":97,"output":2,"cache":{"read":14592,"write":0}}}}"#,
@@ -3548,7 +3737,7 @@ mod tests {
                 r#"{{"type":"step_finish","sessionID":"ses_1","part":{{"id":"{id}","type":"step-finish","tokens":{{"input":{input},"output":{out},"reasoning":{reason},"cache":{{"read":{cr},"write":0}}}}}}}}"#
             )
         };
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         for line in [
             step("prt_a", 15193, 23, 363, 1920),
             step("prt_a", 15193, 23, 363, 1920),
@@ -3593,6 +3782,7 @@ mod tests {
             &writer,
             false,
             stats.clone(),
+            crate::state::ContextSemantics::Unknown,
         );
         stream_to_log(
             std::io::Cursor::new(
@@ -3602,6 +3792,7 @@ mod tests {
             &writer,
             true,
             stats.clone(),
+            crate::state::ContextSemantics::Unknown,
         );
 
         let s = stats.lock().unwrap();
@@ -3642,6 +3833,7 @@ mod tests {
             &writer,
             false,
             stats.clone(),
+            crate::state::ContextSemantics::Unknown,
         );
         let s = stats.lock().unwrap();
         assert_eq!(s.input_tokens, 12738);
@@ -3668,16 +3860,21 @@ mod tests {
             ),
         )
         .unwrap();
-        let s = stats_from_log(&log);
+        let s = stats_from_log(&log, Some("opencode"));
         assert_eq!(s.input_tokens, 12738);
         assert_eq!(s.cache_read_tokens, 1920);
         assert_eq!(s.billed_tokens, 12738 + 1920 + s.output_tokens);
         assert_eq!(s.session_id.as_deref(), Some("ses_1"));
+        assert_eq!(
+            s.context_semantics,
+            crate::state::ContextSemantics::Peak,
+            "the tmux recovery path is opencode-only, so its gauge is a peak"
+        );
     }
 
     #[test]
     fn stats_from_log_is_zero_for_a_missing_file() {
-        let s = stats_from_log(Path::new("/nonexistent/spar-test-slot.log"));
+        let s = stats_from_log(Path::new("/nonexistent/spar-test-slot.log"), None);
         assert_eq!(s.billed_tokens, 0);
         assert!(s.session_id.is_none());
     }
@@ -3699,6 +3896,7 @@ mod tests {
             &writer,
             false,
             stats.clone(),
+            crate::state::ContextSemantics::Unknown,
         );
         assert_eq!(stats.lock().unwrap().model.as_deref(), Some("claude-opus"));
     }
@@ -3706,7 +3904,7 @@ mod tests {
     #[test]
     fn codex_top_level_error_renders_unquoted() {
         // Codex emits `{"type":"error","message":"…"}`; it must render without quotes.
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         let chunk = c
             .feed(
                 r#"{"type":"error","message":"Missing environment variable: OPENROUTER_API_KEY."}"#,
@@ -3721,7 +3919,7 @@ mod tests {
 
     #[test]
     fn codex_jsonl_command_counts_tool() {
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         let line = r#"{"type":"item.completed","item":{"id":"i2","type":"command_execution","command":"cargo test","status":"completed"}}"#;
         let chunk = c.feed(line).unwrap();
         assert!(chunk.contains("→ command_execution"));
@@ -3732,7 +3930,7 @@ mod tests {
 
     #[test]
     fn tool_result_preview() {
-        let mut c = StreamCoalescer::new(false);
+        let mut c = StreamCoalescer::new_with_adapter(false, None);
         let line = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"a.rs\nb.rs"}]}}"#;
         let chunk = c.feed(line).unwrap();
         assert!(chunk.contains("←"));

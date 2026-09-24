@@ -159,6 +159,42 @@ pub enum ArenaFinish {
     Reconcile,
 }
 
+/// What `SlotUsage::context_tokens` actually measures. Two adapters report a number
+/// that is not a peak (codex has no per-request record; grok's records are
+/// cumulative), so the number is meaningless across providers without this label.
+/// Old runs predate the field and deserialize as `Unknown`: untrusted, never
+/// silently trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextSemantics {
+    /// Largest single-request prompt footprint. Safe for the window gauge.
+    Peak,
+    /// Whole-invocation total wearing a peak's name. Spend, not a gauge reading.
+    InvocationTotal,
+    /// Undetermined (pre-marker runs, agy, empty dispatches). Never a gauge reading.
+    #[default]
+    Unknown,
+}
+
+/// What `context_tokens` measures for a dispatch of `provider`. Accepts qualified
+/// (`cli:codex`, `api:openai`, with or without `@model`) and bare (`codex`)
+/// adapter ids. Anything unlisted fails closed to `Unknown`: a new adapter must
+/// earn its row here, never inherit a peak.
+pub fn context_semantics_for_provider(provider: &str) -> ContextSemantics {
+    if provider.starts_with("api:") {
+        return ContextSemantics::Peak;
+    }
+    let base = provider.split('@').next().unwrap_or(provider);
+    let bare = base.strip_prefix("cli:").unwrap_or(base);
+    match bare {
+        "claude" | "opencode" | "muse" => ContextSemantics::Peak,
+        "codex" | "grok" => ContextSemantics::InvocationTotal,
+        // agy is out of both fleets and its sidecar semantics are undetermined;
+        // anything else unlisted fails closed the same way.
+        _ => ContextSemantics::Unknown,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlotUsage {
     pub slot_id: String,
@@ -170,6 +206,10 @@ pub struct SlotUsage {
     /// Peak prompt footprint of a single request, for the context gauge. Never a total.
     #[serde(default)]
     pub context_tokens: u64,
+    /// What `context_tokens` measures. Derived from which adapter produced the
+    /// number, never from whether it is nonzero.
+    #[serde(default)]
+    pub context_semantics: ContextSemantics,
     /// Cumulative billed tokens for this dispatch (input + cache read + cache write +
     /// output, reasoning folded into output). `state.usage` is the run's ledger, one
     /// entry per dispatch, so a run's billed total is the sum over it.
@@ -1168,6 +1208,52 @@ pub fn list_runs(paths: &SparPaths) -> Result<Vec<RunSummary>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every run on disk predates the marker: it must load as untrusted, never as a
+    /// silently trusted peak. There is no migration; this default is the whole story.
+    #[test]
+    fn slot_usage_without_semantics_deserializes_to_unknown() {
+        let u: SlotUsage = serde_json::from_str(
+            r#"{"slot_id":"s","provider":"cli:codex","input_tokens":1,"output_tokens":2,"context_tokens":500000,"billed_tokens":3}"#,
+        )
+        .unwrap();
+        assert_eq!(u.context_semantics, ContextSemantics::Unknown);
+        assert_eq!(
+            serde_json::to_value(ContextSemantics::Peak).unwrap(),
+            serde_json::Value::String("peak".into())
+        );
+    }
+
+    /// The whole adapter table in one place: qualified and bare ids agree, api-sdk
+    /// is always a peak, and anything unlisted fails closed to `Unknown`.
+    #[test]
+    fn context_semantics_map_matches_the_adapter_table() {
+        use ContextSemantics::*;
+        for (provider, want) in [
+            ("cli:claude", Peak),
+            ("claude", Peak),
+            ("cli:claude@opus", Peak),
+            ("cli:opencode", Peak),
+            ("opencode", Peak),
+            ("cli:muse", Peak),
+            ("muse", Peak),
+            ("api:openai", Peak),
+            ("cli:codex", InvocationTotal),
+            ("codex", InvocationTotal),
+            ("cli:grok", InvocationTotal),
+            ("grok", InvocationTotal),
+            ("cli:agy", Unknown),
+            ("agy", Unknown),
+            ("cli:something-new", Unknown),
+            ("", Unknown),
+        ] {
+            assert_eq!(
+                context_semantics_for_provider(provider),
+                want,
+                "provider {provider:?}"
+            );
+        }
+    }
 
     /// A backup activation renames the seat (its id names the provider, O80). The
     /// worktree record and the pid marker are both keyed on that id, and O28 is
