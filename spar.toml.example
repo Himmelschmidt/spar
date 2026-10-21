@@ -23,6 +23,12 @@ auto_archive_after = "14d"
 # and are never reaped this way.
 auto_cleanup_merged = true
 
+# Where slot worktrees are cut. Unset (the default) puts them beside the repo, at
+# ../<repo>-spar-<run>-<slot>. Set it to collect every run under one directory
+# instead, at <root>/<repo>/<run>-<slot>, so the repo's parent stays clean and
+# there is a single place to inspect or sweep. A leading ~ is expanded.
+# root = "~/projects/spar/worktrees"
+
 [providers]
 # Mix CLI + API: "cli:claude", "cli:grok", "api:openai", "api:xai", ...
 order = ["cli:claude", "cli:grok", "cli:agy"]
