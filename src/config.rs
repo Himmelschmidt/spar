@@ -572,6 +572,10 @@ pub struct SuiteConfig {
     /// commands in a repo that has not declared them.
     #[serde(default)]
     pub command: Vec<String>,
+    /// `command` came from `--suite-command`, not a file. `--reload-config` rebuilds from
+    /// the live `spar.toml`, so this is what lets it keep the run's own suite.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub command_from_cli: bool,
 }
 
 impl Default for SuiteConfig {
@@ -580,6 +584,7 @@ impl Default for SuiteConfig {
             enabled: true,
             timeout_secs: default_suite_timeout_secs(),
             command: Vec::new(),
+            command_from_cli: false,
         }
     }
 }
@@ -1504,6 +1509,42 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// `--suite-command <cmd>` (repeatable): this run's deterministic suite, replacing
+    /// `[suite].command`. Turns the channel on, since naming a suite is asking for one,
+    /// so it refuses `--without suite` rather than letting either silently win.
+    pub fn apply_suite_command(&mut self, commands: &[String], without: &[String]) -> Result<()> {
+        if commands.is_empty() {
+            return Ok(());
+        }
+        if without.iter().any(|w| w.trim() == "suite") {
+            anyhow::bail!("--suite-command and --without suite contradict each other; pass one");
+        }
+        if let Some(bad) = commands.iter().position(|c| c.trim().is_empty()) {
+            anyhow::bail!("--suite-command #{} is empty", bad + 1);
+        }
+        if self.suite.timeout_secs == 0 {
+            anyhow::bail!(
+                "--suite-command with [suite].timeout_secs = 0: the suite would never run"
+            );
+        }
+        self.suite.command = commands.to_vec();
+        self.suite.command_from_cli = true;
+        self.suite.enabled = true;
+        Ok(())
+    }
+
+    /// `--reload-config` rebuilds from the live `spar.toml`. A suite the run was given on
+    /// the command line is the operator's pin for this run, not file state, so it is
+    /// carried over from the run's frozen config.
+    pub fn carry_cli_suite_command(&mut self, frozen: &Config) {
+        if !frozen.suite.command_from_cli {
+            return;
+        }
+        self.suite.command = frozen.suite.command.clone();
+        self.suite.command_from_cli = true;
+        self.suite.enabled = true;
     }
 
     /// Apply `--fleet <preset>` as the *base*: `--without` and `--role` are applied after
@@ -2497,6 +2538,36 @@ planner = "best"
         let mut cfg = Config::default();
         cfg.apply_file(&file, Trust::Project).unwrap();
         assert!(!cfg.worktree.auto_cleanup_merged);
+    }
+
+    #[test]
+    fn suite_command_flag_pins_an_enabled_builtin_suite() {
+        let mut cfg = Config::default();
+        cfg.apply_fleet_preset(FleetPreset::Small);
+        assert!(!cfg.suite.enabled, "small drops the agent tester");
+        cfg.apply_suite_command(&["cargo test -p ui".into()], &[])
+            .unwrap();
+        assert!(cfg.suite.is_builtin());
+        assert!(cfg.suite.command_from_cli);
+        assert!(cfg.apply_suite_command(&["  ".into()], &[]).is_err());
+        assert!(cfg
+            .apply_suite_command(&["x".into()], &["suite".into()])
+            .is_err());
+
+        let frozen: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        let mut reloaded = Config::default();
+        reloaded.carry_cli_suite_command(&frozen);
+        assert_eq!(reloaded.suite.command, vec!["cargo test -p ui"]);
+        assert!(reloaded.suite.command_from_cli);
+
+        let mut from_file = Config::default();
+        from_file.suite.command = vec!["make check".into()];
+        let mut reloaded = Config::default();
+        reloaded.carry_cli_suite_command(&from_file);
+        assert!(
+            reloaded.suite.command.is_empty(),
+            "file state is re-read, not carried"
+        );
     }
 
     #[test]

@@ -124,6 +124,7 @@ fn run() -> Result<ExitCode> {
             effort,
             fleet,
             without,
+            suite_command,
             base,
             detach,
             json,
@@ -152,6 +153,7 @@ fn run() -> Result<ExitCode> {
                     (!effort.is_empty(), "--effort"),
                     (fleet.is_some(), "--fleet"),
                     (!without.is_empty(), "--without"),
+                    (!suite_command.is_empty(), "--suite-command"),
                     (base.is_some(), "--base"),
                     (big, "--big"),
                     (detach, "--detach"),
@@ -186,6 +188,7 @@ fn run() -> Result<ExitCode> {
             cfg.apply_role_overrides(&role)?;
             cfg.apply_backup_overrides(&backup)?;
             cfg.apply_effort_overrides(&effort)?;
+            cfg.apply_suite_command(&suite_command, &without)?;
             let (task_text, brief_path) = match (spec, brief, task) {
                 (Some(path), None, None) => {
                     let b = brief::intake(&paths, &path)?;
@@ -262,6 +265,7 @@ fn run() -> Result<ExitCode> {
             effort,
             fleet,
             without,
+            suite_command,
             reload_config,
             max_rounds,
             accept_contract,
@@ -281,6 +285,7 @@ fn run() -> Result<ExitCode> {
                 &backup,
                 &effort,
                 &without,
+                &suite_command,
                 fleet.as_deref(),
                 reload_config,
             )?;
@@ -746,12 +751,14 @@ fn bus_deliver(
 /// its own run cannot change the fleet, timeouts or ship gate of one already in flight.
 /// `--reload-config` is the deliberate way out: it re-reads the file and re-freezes the
 /// run against it.
+#[allow(clippy::too_many_arguments)]
 fn implement_ctx(
     run_id: Option<&str>,
     role: &[String],
     backup: &[String],
     effort: &[String],
     without: &[String],
+    suite_command: &[String],
     fleet: Option<&str>,
     reload_config: bool,
 ) -> Result<(paths::SparPaths, Config)> {
@@ -764,6 +771,7 @@ fn implement_ctx(
         cfg.apply_role_overrides(role)?;
         cfg.apply_backup_overrides(backup)?;
         cfg.apply_effort_overrides(effort)?;
+        cfg.apply_suite_command(suite_command, without)?;
         return Ok((paths, cfg));
     };
     if !reload_config {
@@ -791,6 +799,12 @@ fn implement_ctx(
                  pass --reload-config to apply --without to it"
             );
         }
+        if !suite_command.is_empty() {
+            anyhow::bail!(
+                "run {run_id} is bound to the config it was created with; \
+                 pass --reload-config to apply --suite-command to it"
+            );
+        }
         if let Some(preset) = fleet {
             // Validate before refusing: an unknown preset name is its own error, not
             // one the `--reload-config` refusal should swallow. `standard` is a
@@ -807,6 +821,9 @@ fn implement_ctx(
         let cfg = Config::for_run(&paths, run_id)?;
         return Ok((paths, cfg));
     }
+    // Before the flags, so this invocation's `--without suite` or `--suite-command`
+    // still wins over the carried pin.
+    cfg.carry_cli_suite_command(&Config::for_run(&paths, run_id)?);
     if let Some(preset) = fleet {
         cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
     }
@@ -814,6 +831,7 @@ fn implement_ctx(
     cfg.apply_role_overrides(role)?;
     cfg.apply_backup_overrides(backup)?;
     cfg.apply_effort_overrides(effort)?;
+    cfg.apply_suite_command(suite_command, without)?;
     cfg.save_snapshot(&paths, run_id)?;
     eprintln!("config: re-read spar.toml for run {run_id}");
     Ok((paths, cfg))

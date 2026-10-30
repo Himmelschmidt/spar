@@ -344,7 +344,7 @@ So `implement` will not silently mint a second id for work that is already a run
 - `--new` always forks, including from a plan spar could have traced.
 
 `spar plan --run <id>` **refuses** `--providers` / `--select` / `--role` / `--fleet` /
-`--without` / `--base` / `--big` / `--detach` / `--dry-run`: a replan inherits the run's
+`--without` / `--suite-command` / `--base` / `--big` / `--detach` / `--dry-run`: a replan inherits the run's
 pool, base and frozen config, so a flag that could only apply to a new run is an error
 rather than a silent no-op. It also refuses a run that is mid-flight, and it moves the previous round's
 `plan.md` and `test-contract.md` to `plan-round<N>.md` / `test-contract-round<N>.md` so a
@@ -1153,6 +1153,13 @@ touching `spar.toml`, on `plan`, `implement` and `run`. Composition order: prese
   existing `--run <id>` it needs `--reload-config`, exactly like `--role`.
 - Both flags are applied where `--role` is (`main.rs`), so they land in the run's frozen
   `config.json` and survive a later round with no `--reload-config` (O27).
+
+**`--suite-command "<cmd>"`** (repeatable, on `plan` and `implement`) sets this run's
+deterministic suite, replacing `[suite].command` and turning the suite channel on even under
+`--fleet small`. It is frozen into `config.json`, and unlike the other run flags it is
+**kept across `--reload-config`**: a reload re-reads `spar.toml` but carries the run's
+`--suite-command` over unless the flag is given again. On an existing `--run <id>` it needs
+`--reload-config`, and combined with `--without suite` it is refused (O109).
 
 **Run JSON carries a `fleet` array**, one entry per seat: `{seat, role, provider, model,
 source, projected}`. `source` names the precedence rung the provider came from —

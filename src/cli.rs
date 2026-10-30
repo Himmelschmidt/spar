@@ -92,6 +92,11 @@ pub enum Command {
         /// Applied before `--role`, so an explicit role flag still wins.
         #[arg(long, value_delimiter = ',')]
         without: Vec<String>,
+        /// This run's deterministic suite, replacing `[suite].command`: spar runs each
+        /// command itself instead of dispatching a tester. Repeatable, one command per
+        /// flag. Frozen into the run's config and kept across `--reload-config`.
+        #[arg(long = "suite-command", value_name = "CMD")]
+        suite_command: Vec<String>,
         /// Ref to cut every slot worktree from (branch, tag or sha).
         /// Default: the HEAD of the directory spar was invoked from.
         #[arg(long)]
@@ -185,6 +190,12 @@ pub enum Command {
         /// `--run <id>` this needs `--reload-config`, exactly like `--role`.
         #[arg(long, value_delimiter = ',')]
         without: Vec<String>,
+        /// This run's deterministic suite, replacing `[suite].command`: spar runs each
+        /// command itself instead of dispatching a tester. Repeatable, one command per
+        /// flag. Frozen into the run's config and kept across `--reload-config`;
+        /// on an existing `--run <id>` it needs `--reload-config`, like `--role`.
+        #[arg(long = "suite-command", value_name = "CMD")]
+        suite_command: Vec<String>,
         /// Re-read `spar.toml` for an existing run and replace its frozen config.
         /// Without this, `--run <id>` uses the config the run was created with, whatever
         /// the project file says now.

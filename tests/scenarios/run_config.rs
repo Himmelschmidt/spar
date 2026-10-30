@@ -275,3 +275,134 @@ fn role_on_a_resume_requires_reload_config() {
         .code(1)
         .stderr(predicates::str::contains("--reload-config"));
 }
+
+fn frozen_suite(dir: &std::path::Path, run_id: &str) -> serde_json::Value {
+    let text = std::fs::read_to_string(dir.join(".spar/runs").join(run_id).join("config.json"))
+        .expect("config.json");
+    serde_json::from_str::<serde_json::Value>(&text).expect("json")["suite"].clone()
+}
+
+/// #172: a run's own suite is a CLI flag frozen into the run, and `--reload-config`
+/// keeps it unless the flag is given again.
+#[test]
+fn suite_command_is_frozen_and_survives_reload_config() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    init_repo(dir);
+    write_roles(dir, "cli:grok");
+    std::fs::write(
+        dir.join("spar.toml"),
+        format!(
+            "{}[suite]\ncommand = \"cargo test\"\n",
+            std::fs::read_to_string(dir.join("spar.toml")).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let plan = spar_cmd()
+        .current_dir(dir)
+        .args([
+            "plan",
+            "--task",
+            "task A",
+            "--dry-run",
+            "--json",
+            "--suite-command",
+            "pnpm test ui",
+            "--suite-command",
+            "pnpm lint",
+        ])
+        .assert()
+        .code(2);
+    let run_id = json_of(&plan)["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    let suite = frozen_suite(dir, &run_id);
+    assert_eq!(
+        suite["command"],
+        serde_json::json!(["pnpm test ui", "pnpm lint"])
+    );
+    spar_cmd()
+        .current_dir(dir)
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+
+    spar_cmd()
+        .current_dir(dir)
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--dry-run",
+            "--json",
+            "--suite-command",
+            "x",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("--reload-config"));
+
+    spar_cmd()
+        .current_dir(dir)
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--dry-run",
+            "--json",
+            "--reload-config",
+        ])
+        .assert()
+        .code(2);
+    assert_eq!(
+        frozen_suite(dir, &run_id)["command"],
+        serde_json::json!(["pnpm test ui", "pnpm lint"]),
+        "--reload-config must keep the run's --suite-command"
+    );
+
+    spar_cmd()
+        .current_dir(dir)
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--dry-run",
+            "--json",
+            "--reload-config",
+            "--suite-command",
+            "pnpm test api",
+        ])
+        .assert()
+        .code(2);
+    assert_eq!(
+        frozen_suite(dir, &run_id)["command"],
+        serde_json::json!(["pnpm test api"]),
+        "a new --suite-command replaces the pin"
+    );
+}
+
+#[test]
+fn suite_command_contradicting_without_suite_is_refused() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    init_repo(dir);
+    write_roles(dir, "cli:grok");
+    spar_cmd()
+        .current_dir(dir)
+        .args([
+            "implement",
+            "--task",
+            "x",
+            "--dry-run",
+            "--json",
+            "--without",
+            "suite",
+            "--suite-command",
+            "cargo test",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("contradict"));
+}
