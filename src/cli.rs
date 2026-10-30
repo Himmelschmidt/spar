@@ -686,7 +686,7 @@ pub enum BusCmd {
         run: Option<String>,
         #[arg(long, default_value = "human")]
         from: String,
-        /// An agent id, `broadcast`, `@human`, or `impl` (with `--run`: that run's
+        /// An agent id, `broadcast`, `@human`, or `impl` (needs `--run`: that run's
         /// implementer)
         #[arg(long, default_value = "broadcast")]
         to: String,
@@ -710,8 +710,8 @@ pub enum BusCmd {
         /// Withdraw an earlier message of yours from every inbox that has not taken it yet
         #[arg(long, value_name = "MSG_ID")]
         supersedes: Option<String>,
-        /// Withdraw this message once the run passes round N (default: the current
-        /// round). Needs `--run`
+        /// Withdraw this message once the run passes round N (default: the round a slot
+        /// is dispatching in, else the next round). Needs `--run`
         #[arg(long, value_name = "N", num_args = 0..=1)]
         expires_after_round: Option<Option<u32>>,
     },

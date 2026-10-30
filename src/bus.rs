@@ -1082,6 +1082,21 @@ pub fn receipts_path(paths: &SparPaths) -> PathBuf {
     bus_root(paths).join("receipts.jsonl")
 }
 
+/// `receipts.jsonl` is rotated to `receipts.jsonl.1` past this size, so the two files
+/// keep roughly the last 16 MiB of receipts.
+pub const RECEIPTS_ROTATE_BYTES: u64 = 8 * 1024 * 1024;
+
+fn rotated_receipts_path(paths: &SparPaths) -> PathBuf {
+    bus_root(paths).join("receipts.jsonl.1")
+}
+
+fn rotate_receipts(paths: &SparPaths, limit: u64) {
+    let path = receipts_path(paths);
+    if fs::metadata(&path).is_ok_and(|m| m.len() >= limit) {
+        let _ = fs::rename(&path, rotated_receipts_path(paths));
+    }
+}
+
 /// Best effort: a receipt that cannot be written never fails the delivery it records.
 pub fn record_receipt(
     paths: &SparPaths,
@@ -1098,6 +1113,7 @@ pub fn record_receipt(
         ts: Utc::now(),
         via: via.into(),
     };
+    rotate_receipts(paths, RECEIPTS_ROTATE_BYTES);
     if let Err(e) = append_jsonl(&receipts_path(paths), &r) {
         eprintln!("warning: bus receipt for {msg_id} not recorded: {e:#}");
     }
@@ -1144,8 +1160,13 @@ pub struct LogEntry {
     pub expired: bool,
 }
 
+/// Streams the rotated file then the live one, one line at a time.
 fn receipts_by_message(paths: &SparPaths) -> HashMap<String, Vec<RecipientReceipt>> {
-    let rows: Vec<Receipt> = read_jsonl(&receipts_path(paths)).unwrap_or_default();
+    let rows = [rotated_receipts_path(paths), receipts_path(paths)]
+        .into_iter()
+        .filter_map(|p| File::open(p).ok())
+        .flat_map(|f| std::io::BufReader::new(f).lines().map_while(|l| l.ok()))
+        .filter_map(|l| serde_json::from_str::<Receipt>(&l).ok());
     let mut out: HashMap<String, Vec<RecipientReceipt>> = HashMap::new();
     for r in rows {
         let list = out.entry(r.msg_id).or_default();
@@ -1267,22 +1288,26 @@ pub fn withdraw(paths: &SparPaths, msg_id: &str) -> Result<Withdrawal> {
 
 /// Persisted messages to `slot` in `run` that still stand: not superseded, not past
 /// their round, not acked by the slot. Oldest first.
+///
+/// Withdrawals and acks are read from the whole workspace log: a `--supersedes` or an
+/// ack sent without `--run` (to `run:slot`) carries no run tag but still counts.
 pub fn persisted_for(paths: &SparPaths, run: &str, slot: &str) -> Result<Vec<BusMessage>> {
-    let all = list_events(paths, Some(run))?;
+    let all = list_events(paths, None)?;
     let me = agent_ref(Some(run), slot);
     let gone: HashSet<&str> = all
         .iter()
         .filter_map(|m| m.refs.supersedes.as_deref())
         .chain(
             all.iter()
-                .filter(|m| m.kind == MsgKind::Ack && resolve_addr(Some(run), &m.from) == me)
+                .filter(|m| m.kind == MsgKind::Ack && resolve_addr(m.run.as_deref(), &m.from) == me)
                 .filter_map(|m| m.refs.reply_to.as_deref()),
         )
         .collect();
     let mut rounds = RunRounds::default();
     let mut out: Vec<BusMessage> = all
         .iter()
-        .filter(|m| m.persist && resolve_addr(Some(run), &m.to) == me)
+        .filter(|m| m.persist && m.run.as_deref() == Some(run))
+        .filter(|m| resolve_addr(Some(run), &m.to) == me)
         .filter(|m| !gone.contains(m.id.as_str()))
         .filter(|m| !rounds.expired(paths, m))
         .cloned()
@@ -2396,5 +2421,44 @@ mod tests {
             .map(|m| m.id)
             .collect();
         assert_eq!(ids, vec![keep.id]);
+    }
+
+    /// A `--supersedes` or ack sent without `--run` (to `run:slot`) still takes a
+    /// persisted message out of the carry-forward.
+    #[test]
+    fn a_withdrawal_without_a_run_tag_still_counts() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut a = directed(&paths, "r1", "human", "impl", "seed");
+        a.id = new_id();
+        a.persist = true;
+        let a = send(&paths, a, MessageBudget::Chatty).unwrap();
+        let mut b = a.clone();
+        b.id = new_id();
+        let b = send(&paths, b, MessageBudget::Chatty).unwrap();
+        let mut sup = a.clone();
+        sup.id = new_id();
+        sup.run = None;
+        sup.persist = false;
+        sup.to = "r1:impl".into();
+        sup.refs.supersedes = Some(a.id.clone());
+        send(&paths, sup, MessageBudget::Chatty).unwrap();
+        ack(&paths, None, "r1:impl", &b.id).unwrap();
+        assert!(persisted_for(&paths, "r1", "impl").unwrap().is_empty());
+    }
+
+    /// Past the size limit the live file rolls to `.1`, and the log still reads both.
+    #[test]
+    fn receipts_rotate_and_both_files_are_read() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let m = directed(&paths, "r1", "human", "impl", "x");
+        rotate_receipts(&paths, 1);
+        assert!(rotated_receipts_path(&paths).is_file());
+        inbox_claim(&paths, "r1:impl", "test").unwrap();
+        let entries = log_entries(&paths, Some("r1")).unwrap();
+        let r = receipt(&entries, &m.id);
+        assert!(r.queued_at.is_some(), "from the rotated file");
+        assert!(r.delivered_at.is_some(), "from the live file");
     }
 }

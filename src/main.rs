@@ -629,6 +629,9 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             if needs_run && run.is_none() {
                 anyhow::bail!("--persist and --expires-after-round need --run");
             }
+            if to == "impl" && run.is_none() {
+                anyhow::bail!("--to impl needs --run to know whose implementer");
+            }
             let run_state = match run.as_deref() {
                 Some(r) if needs_run || to == "impl" => Some(state::RunState::load(&paths, r)?),
                 _ => None,
@@ -651,8 +654,24 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
                     );
                 }
             }
-            let expires_after_round = expires_after_round
-                .map(|n| n.unwrap_or_else(|| run_state.as_ref().map_or(0, |st| st.round)));
+            // A bare flag means "this round": the one a slot is dispatching in, or, when
+            // the run waits at a gate between rounds, the next one, which is the first
+            // round anyone can read it in.
+            let expires_after_round = expires_after_round.map(|n| {
+                n.unwrap_or_else(|| {
+                    run_state.as_ref().map_or(0, |st| {
+                        let dispatching = st
+                            .slots
+                            .iter()
+                            .any(|s| s.status == state::SlotStatus::Running);
+                        if dispatching {
+                            st.round
+                        } else {
+                            st.round + 1
+                        }
+                    })
+                })
+            });
             if let Some(old) = supersedes.as_deref() {
                 let prior = bus::find_event(&paths, old)?
                     .ok_or_else(|| anyhow::anyhow!("no bus message {old}"))?;

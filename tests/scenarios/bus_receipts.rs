@@ -281,6 +281,41 @@ fn persist_reaches_the_next_carry_forward_and_expiry_withdraws() {
         .assert()
         .failure();
     assert!(String::from_utf8_lossy(&err.get_output().stderr).contains("implementer"));
+    let err = spar(&env, dir)
+        .args(["bus", "send", "--to", "impl", "-m", "x"])
+        .assert()
+        .failure();
+    assert!(
+        String::from_utf8_lossy(&err.get_output().stderr).contains("--to impl needs --run"),
+        "a bare `impl` must not silently become a bare agent id"
+    );
+
+    let withdrawn = send(
+        &env,
+        dir,
+        &[
+            "--run",
+            &run,
+            "--to",
+            "impl",
+            "--persist",
+            "-m",
+            "OLD RULING: drop the API",
+        ],
+    );
+    let unrun_to = format!("{run}:impl");
+    send(
+        &env,
+        dir,
+        &[
+            "--to",
+            &unrun_to,
+            "--supersedes",
+            withdrawn["id"].as_str().unwrap(),
+            "-m",
+            "never mind",
+        ],
+    );
 
     let ruling = send(
         &env,
@@ -303,6 +338,7 @@ fn persist_reaches_the_next_carry_forward_and_expiry_withdraws() {
             .success(),
     );
     let round = status["round"].as_u64().unwrap();
+    let round_s = round.to_string();
     let expiring = send(
         &env,
         dir,
@@ -312,11 +348,30 @@ fn persist_reaches_the_next_carry_forward_and_expiry_withdraws() {
             "--to",
             "impl",
             "--expires-after-round",
+            &round_s,
             "-m",
             "this round only",
         ],
     );
     assert_eq!(expiring["expires_after_round"], round, "{expiring}");
+    let next = send(
+        &env,
+        dir,
+        &[
+            "--run",
+            &run,
+            "--to",
+            "impl",
+            "--expires-after-round",
+            "-m",
+            "next round",
+        ],
+    );
+    assert_eq!(
+        next["expires_after_round"],
+        round + 1,
+        "parked at a gate, a bare flag means the next round: {next}"
+    );
 
     let _ = spar(&env, dir)
         .args([
@@ -333,6 +388,10 @@ fn persist_reaches_the_next_carry_forward_and_expiry_withdraws() {
     let prompt =
         std::fs::read_to_string(dir.join(".spar/runs").join(&run).join("prompt-impl.md")).unwrap();
     assert!(prompt.contains("OPERATOR RULING: keep the API"), "{prompt}");
+    assert!(
+        !prompt.contains("OLD RULING"),
+        "superseded without --run still leaves the carry-forward: {prompt}"
+    );
     assert!(prompt.contains("Operator messages"), "{prompt}");
 
     let entries = log(&env, dir, &run);
@@ -346,6 +405,10 @@ fn persist_reaches_the_next_carry_forward_and_expiry_withdraws() {
     );
     let e = entry(&entries, expiring["id"].as_str().unwrap());
     assert_eq!(e["expired"], true, "{e}");
+    assert_eq!(
+        entry(&entries, next["id"].as_str().unwrap())["expired"],
+        false
+    );
     let inbox = json(
         &spar(&env, dir)
             .args(["bus", "inbox", "impl", "--run", &run, "--json"])

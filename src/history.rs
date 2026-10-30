@@ -63,7 +63,8 @@ pub struct VerdictRow {
     pub slot: String,
     pub verdict: Option<Verdict>,
     pub synthetic: bool,
-    /// Critical plus major findings in this one review, deduplicated within it.
+    /// Findings in this one review that held the ship under the run's `block_on`
+    /// (`Finding::blocks`), deduplicated within it.
     #[serde(default)]
     pub blocking: u32,
 }
@@ -141,6 +142,21 @@ pub struct HistoryRow {
     /// Times the run entered the `quota` phase.
     #[serde(default)]
     pub quota_parks: u32,
+    /// `[review] block_on` the `blocking` counts were taken at.
+    #[serde(default)]
+    pub block_on: Option<Severity>,
+    /// Written at a phase a run is often resumed from (`quota`, `plan_approved`):
+    /// `dispatches` and `timing` are left out, so a run that parks many times does not
+    /// repeat its ledger. Read the run-level totals.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compact: bool,
+}
+
+impl HistoryRow {
+    /// No per-dispatch ledger: a schema 1 line or a compact one.
+    pub fn run_level_only(&self) -> bool {
+        self.schema_version < 2 || self.compact
+    }
 }
 
 /// The role a slot id names, for usage entries whose slot was since renamed (a backup
@@ -219,7 +235,15 @@ fn timing(events: &[Event]) -> Timing {
     }
 }
 
-pub fn row(state: &RunState, events: &[Event], trigger: Trigger, now: DateTime<Utc>) -> HistoryRow {
+/// `block_on` is the run's `[review] block_on`, so `blocking` counts what the gate
+/// counted (O118).
+pub fn row(
+    state: &RunState,
+    events: &[Event],
+    block_on: Severity,
+    trigger: Trigger,
+    now: DateTime<Utc>,
+) -> HistoryRow {
     let mut rounds: BTreeMap<u32, RoundRow> = BTreeMap::new();
     let mut seen: HashSet<(u32, Finding)> = HashSet::new();
     for entry in &state.review_history {
@@ -232,10 +256,7 @@ pub fn row(state: &RunState, events: &[Event], trigger: Trigger, now: DateTime<U
         let mut blocking = 0;
         for f in &entry.review.findings {
             let key = normalized(f);
-            if !f.synthetic
-                && matches!(f.severity, Severity::Critical | Severity::Major)
-                && own.insert(key.clone())
-            {
+            if f.blocks(block_on, entry.review.scoped) && own.insert(key.clone()) {
                 blocking += 1;
             }
             if !seen.insert((entry.round, key)) {
@@ -331,7 +352,16 @@ pub fn row(state: &RunState, events: &[Event], trigger: Trigger, now: DateTime<U
             .iter()
             .filter(|e| e.kind == EventKind::Phase && e.phase == Some(Phase::Quota))
             .count() as u32,
+        block_on: Some(block_on),
+        compact: false,
     }
+}
+
+/// The run's gate threshold, from its frozen config.
+pub fn block_on(paths: &SparPaths, run_id: &str) -> Severity {
+    crate::config::Config::for_run(paths, run_id)
+        .map(|c| c.review.block_on)
+        .unwrap_or_else(|_| crate::config::Config::default().review.block_on)
 }
 
 /// Rows from `.spar/history.jsonl`, one per run id: the line with the latest
@@ -372,7 +402,19 @@ pub fn append(paths: &SparPaths, state: &RunState, trigger: Trigger) {
 
 fn write_line(paths: &SparPaths, state: &RunState, trigger: Trigger) -> Result<()> {
     let events = crate::events::read_all(paths, &state.id).unwrap_or_default();
-    let mut line = serde_json::to_string(&row(state, &events, trigger, Utc::now()))?;
+    let mut row = row(
+        state,
+        &events,
+        block_on(paths, &state.id),
+        trigger,
+        Utc::now(),
+    );
+    if trigger == Trigger::Terminal && matches!(state.phase, Phase::Quota | Phase::PlanApproved) {
+        row.dispatches.clear();
+        row.timing = Timing::default();
+        row.compact = true;
+    }
+    let mut line = serde_json::to_string(&row)?;
     line.push('\n');
     std::fs::create_dir_all(&paths.root)?;
     let path = paths.history_file();
@@ -436,7 +478,7 @@ mod tests {
             usage(50, None),
             usage(25, Some(0.25)),
         ];
-        let row = row(&st, &[], Trigger::Purge, Utc::now());
+        let row = row(&st, &[], Severity::Major, Trigger::Purge, Utc::now());
         assert_eq!(row.task.as_deref(), Some("Add history"));
         assert_eq!(row.review_rounds.len(), 2);
         let r1 = &row.review_rounds[0];
@@ -509,7 +551,7 @@ mod tests {
             slot_ev(4100, "impl", SlotStatus::Done),
         ];
         let st = RunState::new("r1", crate::cli::WorkflowKind::Loop, "/x".into());
-        let row = row(&st, &events, Trigger::Live, Utc::now());
+        let row = row(&st, &events, Severity::Major, Trigger::Live, Utc::now());
         let slots: Vec<(&str, Option<u32>, i64)> = row
             .timing
             .slots
@@ -557,7 +599,7 @@ mod tests {
             "review-1-cli-codex",
             "## Verdict\nrequest_changes\n\n## Findings\n- severity: critical — a\n- severity: major — b\n- severity: major — b\n- severity: minor — c\n",
         )];
-        let row = row(&st, &[], Trigger::Live, Utc::now());
+        let row = row(&st, &[], Severity::Major, Trigger::Live, Utc::now());
         assert_eq!(row.dispatches[0].role, "reviewer");
         assert_eq!(row.dispatches[1].role, "implementer");
         assert_eq!(row.dispatches[1].model.as_deref(), Some("muse-spark-1.3"));
@@ -599,5 +641,56 @@ mod tests {
         assert_eq!(a.phase, Phase::Done);
         assert!(a.dispatches.is_empty());
         assert_eq!(a.review_rounds[0].verdicts[0].blocking, 0);
+    }
+
+    /// `blocking` follows the gate: the run's `block_on` decides minors, and a scoped
+    /// round's follow-up major does not block while a critical always does.
+    #[test]
+    fn blocking_counts_what_the_gate_counts() {
+        let body = "## Verdict\nrequest_changes\n\n## Findings\n- severity: major — m at a.rs:1\n- severity: minor — n\n\n## Follow-up\n- severity: major — later\n- severity: critical — now\n";
+        let mut st = RunState::new("r1", crate::cli::WorkflowKind::Loop, "/x".into());
+        let mut scoped = entry(2, "review-0", body);
+        scoped.review.scoped = true;
+        st.review_history = vec![entry(1, "review-0", body), scoped];
+        let at = |b: Severity| {
+            let r = row(&st, &[], b, Trigger::Live, Utc::now());
+            (
+                r.review_rounds[0].verdicts[0].blocking,
+                r.review_rounds[1].verdicts[0].blocking,
+            )
+        };
+        assert_eq!(at(Severity::Major), (3, 2));
+        assert_eq!(at(Severity::Minor), (4, 3));
+        assert_eq!(at(Severity::Critical), (1, 1));
+        assert_eq!(
+            row(&st, &[], Severity::Minor, Trigger::Live, Utc::now()).block_on,
+            Some(Severity::Minor)
+        );
+    }
+
+    /// A run parked at `quota` (or handed off at `plan_approved`) writes a compact line
+    /// with no ledger; a final phase writes the full one.
+    #[test]
+    fn resumable_terminal_rows_are_compact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = RunState::new("r1", crate::cli::WorkflowKind::Loop, tmp.path().into());
+        st.usage = vec![usage(10, Some(0.5))];
+        st.phase = Phase::Quota;
+        append(&paths, &st, Trigger::Terminal);
+        st.phase = Phase::Done;
+        append(&paths, &st, Trigger::Terminal);
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(paths.history_file())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines[0]["compact"], true);
+        assert!(lines[0]["dispatches"].as_array().unwrap().is_empty());
+        assert_eq!(lines[0]["billed_tokens"], 10);
+        assert!(lines[1].get("compact").is_none());
+        assert_eq!(lines[1]["dispatches"].as_array().unwrap().len(), 1);
+        let rows = read_latest(&paths).unwrap();
+        assert!(!rows[0].run_level_only());
     }
 }

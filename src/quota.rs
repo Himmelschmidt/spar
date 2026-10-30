@@ -170,7 +170,14 @@ impl QuotaStore {
             .with_context(|| format!("append {}", path.display()))
     }
 
+    /// Logs a pause only when it starts one: a provider already held by a live pause of
+    /// the same kind is the same pause re-stated, not a new event.
     fn note_pause(&mut self, name: &str, manual: bool, until: Option<DateTime<Utc>>, hint: &str) {
+        let held = !self.is_usable(name);
+        let was_manual = self.get(name).status == ProviderStatus::PausedManual;
+        if held && was_manual == manual {
+            return;
+        }
         self.pending.push(QuotaEvent {
             schema_version: QUOTA_EVENTS_SCHEMA,
             ts: Utc::now(),
@@ -754,15 +761,25 @@ pub fn ensure_usable(paths: &SparPaths, names: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     /// Each pause, quota or manual, lands one line in `quota-events.jsonl` on save;
-    /// a resume or a second save of the same store adds none.
+    /// re-stating a live pause (another 429, a typed reset), a resume or a second save
+    /// adds none.
     #[test]
     fn pauses_are_logged_once_on_save() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = crate::paths::SparPaths::new(tmp.path());
         let mut store = super::QuotaStore::default();
         store.pause_quota("cli:codex", "429");
+        store.pause_quota("cli:codex", "429 again");
+        store.pause_quota_until(
+            "cli:codex",
+            Some(Utc::now() + chrono::Duration::hours(1)),
+            "typed",
+        );
         store.pause_manual("cli:claude", None);
         store.save(&paths).unwrap();
+        let mut again = super::QuotaStore::load(&paths).unwrap();
+        again.pause_quota("cli:codex", "still limited");
+        again.save(&paths).unwrap();
         store.resume("cli:codex");
         store.save(&paths).unwrap();
         let evs = super::read_events(&paths);

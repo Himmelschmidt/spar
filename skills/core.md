@@ -1153,8 +1153,8 @@ spar bus ack <msg_id> --from <agent> [--run <id>]  # stop a requires_ack redeliv
 
 **Send options (O135).**
 
-- `--to impl` (with `--run`) resolves to that run's implementer slot; it errors when the
-  run has none or several (arena), naming them.
+- `--to impl` needs `--run` and resolves to that run's implementer slot; it errors without
+  `--run`, or when the run has none or several (arena), naming them.
 - `--requires-ack` redelivers on backoff until the recipient runs `spar bus ack <id>
   --from <agent>`, then escalates to `@human`.
 - `--persist` (with `--run`, to the implementer) also puts the message at the top of the
@@ -1165,7 +1165,8 @@ spar bus ack <msg_id> --from <agent> [--run <id>]  # stop a requires_ack redeliv
   yet taken is removed and its redelivery stops; a persisted one leaves the carry-forward.
   A copy already delivered cannot be unread; `--json` reports
   `withdrawal: {msg_id, withdrawn_from: [...], already_delivered: [...]}`.
-- `--expires-after-round [N]` (with `--run`; `N` defaults to the run's current round): once
+- `--expires-after-round [N]` (with `--run`; `N` defaults to the round a slot is dispatching
+  in, or the next round when the run waits at a gate, the first round anyone reads it in): once
   the run passes round `N` the message is never delivered. A claim withdraws it, `inbox`
   hides it, redelivery stops, and a persisted one leaves the carry-forward.
 
@@ -1184,7 +1185,8 @@ recipient acked it), `withdrawn` (superseded or expired). A poll file or codex q
  "superseded_by": "msg id" | null, "expired": false}
 ```
 
-Each time is the earliest of its kind. `bus send --json` returns the message with
+Each time is the earliest of its kind. `receipts.jsonl` rolls to `receipts.jsonl.1` at
+8 MiB (about the last 16 MiB are kept); `bus log` streams both. `bus send --json` returns the message with
 `schema_version` (and `withdrawal` under `--supersedes`). The human `bus log` shows the
 message id and `[delivered n/m, read n/m; superseded by …; expired]`.
 
@@ -1310,13 +1312,17 @@ stderr and the purge or sweep goes on.
 
 Finding counts are per round, deduplicated within a round (same severity, location and
 whitespace-normalized text from two reviewers count once); `findings` sums the rounds.
-Synthetic findings count under `synthetic` only. `blocking` is one review's own critical
-plus major findings. `cost_usd` is `null` when no dispatch reported a cost. `pr_url` is
+Synthetic findings count under `synthetic` only. `blocking` is one review's findings that
+held the ship under the run's `[review] block_on` (`block_on` on the row), with a scoped
+round's follow-ups exempt as the gate exempts them. `cost_usd` is `null` when no dispatch reported a cost. `pr_url` is
 the PR ship opened or adopted, or `sync-prs` found (also `pr_url` in `status --json`, with
 `merged_at`, `merge_commit` and `pr_state` once `sync-prs` settled the run). `dispatches` is
 the run's usage ledger, one entry per dispatch, with the model the provider reported.
 `timing.rounds` spans a round's first slot start to its last slot end (a gate wait is not
 counted); a slot timed from before phase events carried the round has `round: null`.
+A line written at `quota` or `plan_approved`, phases a run is usually resumed from, is
+`"compact": true`: no `dispatches` or `timing`, run-level totals only. The final terminal
+line and the purge line carry the full ledger.
 Schema 1 lines (before O131) have no `dispatches`, `timing`, `quota_parks`, `blocking`,
 `source` or `parked_run`; read them as empty. `parked_run` is a slot whose last
 dispatch failed on quota or a refused credential.
@@ -1337,6 +1343,10 @@ pauses from `quota-events.jsonl`. `--by` defaults to `provider` (the storage key
 `cli:claude`). `--all-projects` reads every project in the local registry. `--since` keeps
 runs whose `ended_at` (last change, for a live run) and pauses whose `ts` fall inside the
 window. Dry runs are excluded unless `--include-dry-run`; `excluded_dry_runs` says how many.
+Runs read from a schema 1 or compact history line have no per-dispatch ledger: their
+`billed_tokens` and `cost_usd` go to `run_level_only` (`{"runs", "billed_tokens",
+"cost_usd"}`), never into a group's `usage`. A provider pause is logged once when it starts,
+not on every re-stated 429.
 Remote hosts are not read.
 
 ```json
@@ -1355,6 +1365,7 @@ Remote hosts are not read.
     "wall_time": {"rounds_timed": 20, "round_secs_mean": 1500.0 | null, "round_secs_total": 30000,
                   "slots_timed": 40, "slot_secs_mean": 600.0 | null, "slot_secs_total": 24000}
   }],
+  "run_level_only": {"runs": 3, "billed_tokens": 4500000, "cost_usd": 2.1 | null},
   "quota": [{"provider": "cli:codex", "pauses": 3, "manual_pauses": 0, "parks": 1, "backup_engagements": 2}]
 }
 ```

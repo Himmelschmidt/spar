@@ -111,6 +111,16 @@ pub struct QuotaRow {
     pub backup_engagements: u32,
 }
 
+/// Runs whose history line has no per-dispatch ledger (schema 1, or a compact line):
+/// their run totals cannot be split by model, role or provider, so they are summed
+/// here and never in `groups[].usage`.
+#[derive(Debug, Default, Serialize)]
+pub struct RunLevelOnly {
+    pub runs: u32,
+    pub billed_tokens: u64,
+    pub cost_usd: Option<f64>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Report {
     pub schema_version: u32,
@@ -123,6 +133,7 @@ pub struct Report {
     pub runs_live: u32,
     pub excluded_dry_runs: u32,
     pub groups: Vec<Group>,
+    pub run_level_only: RunLevelOnly,
     pub quota: Vec<QuotaRow>,
 }
 
@@ -364,7 +375,13 @@ fn project_runs(paths: &SparPaths, now: DateTime<Utc>) -> Result<Vec<HistoryRow>
                 continue;
             };
             let events = crate::events::read_all(paths, &id).unwrap_or_default();
-            rows.push(history::row(&state, &events, Trigger::Live, now));
+            rows.push(history::row(
+                &state,
+                &events,
+                history::block_on(paths, &id),
+                Trigger::Live,
+                now,
+            ));
             on_disk.insert(id);
         }
     }
@@ -426,8 +443,16 @@ pub fn report(
         }
     }
     let mut groups: BTreeMap<String, Acc> = BTreeMap::new();
+    let mut run_level = RunLevelOnly::default();
     for run in &runs {
         add_run(&mut groups, by, run);
+        if run.row.run_level_only() {
+            run_level.runs += 1;
+            run_level.billed_tokens += run.row.billed_tokens;
+            if let Some(c) = run.row.cost_usd {
+                run_level.cost_usd = Some(run_level.cost_usd.unwrap_or(0.0) + c);
+            }
+        }
         for r in &run.row.roles {
             if r.source == Some(SeatSource::Backup) {
                 quota_row(&mut quota, crate::quota::normalize_key(&r.provider))
@@ -464,6 +489,7 @@ pub fn report(
         runs_live: live_total,
         excluded_dry_runs: dry,
         groups: groups.into_iter().map(|(k, a)| finish(k, a)).collect(),
+        run_level_only: run_level,
         quota: quota.into_values().collect(),
     })
 }
@@ -577,6 +603,17 @@ pub fn print_human(r: &Report) {
             w.rounds_timed,
             secs(w.slot_secs_mean),
             w.slots_timed
+        );
+    }
+    let rl = &r.run_level_only;
+    if rl.runs > 0 {
+        println!(
+            "\nrun-level only ({} runs with no per-dispatch ledger, not in the groups above): billed {}  cost {}",
+            rl.runs,
+            tokens(rl.billed_tokens),
+            rl.cost_usd
+                .map(|c| format!("${c:.2}"))
+                .unwrap_or_else(|| "not reported".into())
         );
     }
     if !r.quota.is_empty() {
@@ -983,5 +1020,41 @@ mod tests {
             "/x".into(),
         ));
         assert_eq!(describe_cost(&empty.total), "no dispatch reported a cost");
+    }
+
+    /// A schema 1 line has no ledger: its run totals land in `run_level_only`, never in
+    /// a provider's usage.
+    #[test]
+    fn schema_1_rows_are_reported_run_level_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        std::fs::create_dir_all(&paths.root).unwrap();
+        let v1 = json!({
+            "schema_version": 1, "written_at": "2026-10-20T00:00:00Z", "trigger": "terminal",
+            "id": "old", "task": null, "workflow": "loop", "dry_run": false, "phase": "done",
+            "roles": [{"slot": "impl", "role": "implementer", "provider": "cli:claude", "model": null}],
+            "rounds": 1, "max_rounds": 5, "review_rounds": [],
+            "findings": {"critical": 0, "major": 0, "minor": 0, "synthetic": 0},
+            "billed_tokens": 5000, "cost_usd": 1.5, "pr_url": null,
+            "created_at": "2026-10-19T00:00:00Z", "ended_at": "2026-10-20T00:00:00Z"
+        });
+        std::fs::write(paths.history_file(), format!("{v1}\n")).unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-10-30T00:00:00Z")
+            .unwrap()
+            .to_utc();
+        let r = report(
+            &[tmp.path().to_path_buf()],
+            None,
+            GroupBy::Provider,
+            false,
+            now,
+        )
+        .unwrap();
+        assert_eq!(r.run_level_only.runs, 1);
+        assert_eq!(r.run_level_only.billed_tokens, 5000);
+        assert_eq!(r.run_level_only.cost_usd, Some(1.5));
+        let claude = group(&r, "cli:claude");
+        assert_eq!(claude.runs, 1);
+        assert_eq!(claude.usage.billed_tokens, 0);
     }
 }
