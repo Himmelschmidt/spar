@@ -444,6 +444,34 @@ pub enum Command {
         /// Only record confirmation without pushing
         #[arg(long)]
         confirm_only: bool,
+        /// Ship the implementer HEAD from a gate the review never cleared (round
+        /// extension, stuck, failed, quota or any ship gate). Needs `--reason`; every open
+        /// finding goes in the PR body and the override is recorded in `artifacts/ship.md`.
+        #[arg(long)]
+        override_gate: bool,
+        /// Why the gate is being overridden. Required with `--override-gate`.
+        #[arg(long)]
+        reason: Option<String>,
+        /// When the remote branch has commits the run lacks, fast-forward the worktree to
+        /// it (refused if dirty or not a fast-forward) and ship.
+        #[arg(long)]
+        adopt_remote: bool,
+    },
+
+    /// Settle shipped runs from GitHub: a merged PR moves its run to `done`, a closed
+    /// one to `stopped`. Open PRs are left alone. Reads PR state through `gh`.
+    SyncPrs {
+        /// One run. Omit with `--all`.
+        #[arg(long)]
+        run: Option<String>,
+        /// Every run with a recorded PR or a shipped branch.
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+        /// Report what would change without writing.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Confirm arena winner (or use ranked default)
@@ -545,6 +573,13 @@ pub enum Command {
         if_merged: bool,
     },
 
+    /// Operator rulings: settled points every later reviewer and implementer prompt
+    /// carries. A run ruling may waive an acceptance criterion (O121).
+    Rule {
+        #[command(subcommand)]
+        action: RuleCmd,
+    },
+
     /// Built-in skills for outer agents (agent-browser style)
     Skills {
         #[command(subcommand)]
@@ -555,7 +590,8 @@ pub enum Command {
     /// `abandoned` lifecycle event, and enforces the cross-run concurrency cap.
     /// `spar daemon install` makes it a systemd user unit; nothing starts it silently.
     /// It never approves a plan, confirms ship, merges, sweeps `cleanup`, or picks a
-    /// fleet.
+    /// fleet. With `[daemon] sync_prs = true` it also runs `sync-prs --all`, at most
+    /// every five minutes.
     Daemon {
         #[command(subcommand)]
         cmd: DaemonCmd,
@@ -587,6 +623,46 @@ pub enum DaemonCmd {
     Stop,
     /// Pid, uptime, tick, cap, per-bucket usage, the queue, and the runs it watches.
     Status {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RuleCmd {
+    /// Record a ruling on a run (`--run <id>`) or on the project (`--project`).
+    #[command(group(clap::ArgGroup::new("target").required(true).args(["run", "project"])))]
+    Add {
+        text: String,
+        #[arg(long)]
+        run: Option<String>,
+        /// Project-wide: every run in this project, stored under `.spar/rules/`.
+        #[arg(long)]
+        project: bool,
+        /// Take this criterion out of the run's acceptance gate. Repeatable. Run only.
+        #[arg(long = "waive", value_name = "AC-n")]
+        waive: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// The rulings in force: a run lists the project's rulings and its own.
+    #[command(group(clap::ArgGroup::new("target").required(true).args(["run", "project"])))]
+    List {
+        #[arg(long)]
+        run: Option<String>,
+        #[arg(long)]
+        project: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a ruling by id (`R<n>` on a run, `P<n>` on the project).
+    #[command(group(clap::ArgGroup::new("target").required(true).args(["run", "project"])))]
+    Rm {
+        rule_id: String,
+        #[arg(long)]
+        run: Option<String>,
+        #[arg(long)]
+        project: bool,
         #[arg(long)]
         json: bool,
     },
@@ -721,6 +797,20 @@ pub enum ProviderAction {
         name: String,
         #[arg(long)]
         json: bool,
+    },
+    /// Make one cheap real call per provider and clear or set its quota state from the
+    /// answer. Never clears a manual pause.
+    Probe {
+        /// Provider ref (`cli:codex`, `claude`). Exactly one of this or `--all`.
+        name: Option<String>,
+        /// Probe every installed CLI adapter.
+        #[arg(long, conflicts_with = "name")]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+        /// Show the call each probe would make; spawn nothing, write nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Remove spar's agy statusline wrapper and restore the user's original statusline.
     AgyStatuslineUninstall,

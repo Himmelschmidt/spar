@@ -310,7 +310,10 @@ pub fn collect_gate_evidence_with_fallback(
     let st = crate::state::RunState::load(paths, run_id).ok();
     let contract_path = paths.artifact(run_id, "test-contract.md");
     let contract_body = std::fs::read_to_string(&contract_path).unwrap_or_default();
-    let criteria = crate::workflow::review_result::parse_contract_criteria(&contract_body);
+    let criteria = crate::rules::unwaived(
+        &crate::workflow::review_result::parse_contract_criteria(&contract_body),
+        &crate::rules::for_run(paths, run_id),
+    );
     let mut block_reasons: Vec<(String, Vec<String>)> = Vec::new();
     if let (Some(cfg), Some(st)) = (cfg.as_ref(), st.as_ref()) {
         let reviewers: Vec<&crate::state::SlotState> = st
@@ -1159,7 +1162,10 @@ pub fn gate_evidence(paths: &SparPaths, run_id: &str) -> String {
                 .unwrap_or_else(|| format!("review-{}.md", r.id));
             let path = paths.artifact(run_id, &artifact);
             if let Ok(text) = std::fs::read_to_string(&path) {
-                let res = crate::workflow::review_result::parse_review(&text);
+                let res = crate::workflow::review_result::ReviewResult {
+                    scoped: r.review.as_ref().is_some_and(|x| x.scoped),
+                    ..crate::workflow::review_result::parse_review(&text)
+                };
                 let block_empty = crate::workflow::implement::acceptance_block_reasons(
                     &evidence.criteria,
                     &res,
@@ -1168,6 +1174,11 @@ pub fn gate_evidence(paths: &SparPaths, run_id: &str) -> String {
                 .is_empty();
                 if block_empty && res.approves() {
                     out.push_str(&format!("review {} approves\n", r.id));
+                } else if block_empty && !res.blocks(cfg.review.block_on) {
+                    out.push_str(&format!(
+                        "review {} approves with notes (request_changes, non-blocking findings only)\n",
+                        r.id
+                    ));
                 } else if block_empty {
                     out.push_str(&format!("review {} requests changes\n", r.id));
                 }

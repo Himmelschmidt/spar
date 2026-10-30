@@ -1,5 +1,6 @@
 use crate::bus::MessageBudget;
 use crate::paths::SparPaths;
+use crate::workflow::review_result::Severity;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -202,6 +203,9 @@ pub struct DaemonConfig {
     pub max_restarts: u32,
     #[serde(default)]
     pub max_slots_per_bucket: u32,
+    /// Run `spar sync-prs --all` from the tick (O123). Off by default: it calls `gh`.
+    #[serde(default)]
+    pub sync_prs: bool,
 }
 
 impl Default for DaemonConfig {
@@ -212,6 +216,7 @@ impl Default for DaemonConfig {
             restart: true,
             max_restarts: default_daemon_max_restarts(),
             max_slots_per_bucket: 0,
+            sync_prs: false,
         }
     }
 }
@@ -416,6 +421,9 @@ pub struct ShipConfig {
     /// Longest PR title in characters, clamped on a word boundary. `0` never clamps.
     #[serde(default = "default_title_max")]
     pub title_max: usize,
+    /// Open new PRs as drafts. An adopted PR keeps whatever draft state it has.
+    #[serde(default = "default_true")]
+    pub draft: bool,
 }
 
 impl Default for ShipConfig {
@@ -423,6 +431,7 @@ impl Default for ShipConfig {
         Self {
             auto_confirm: false,
             title_max: default_title_max(),
+            draft: true,
         }
     }
 }
@@ -932,14 +941,35 @@ pub struct ReviewConfig {
     /// regardless of this setting.
     #[serde(default = "default_true")]
     pub require_all_criteria: bool,
+    /// Lowest reviewer-finding severity that lets a `request_changes` hold the ship
+    /// (O118). At the default `major`, a `request_changes` whose only reviewer findings
+    /// are minor counts as approve-with-notes. Acceptance criteria gate separately.
+    #[serde(default = "default_block_on")]
+    pub block_on: Severity,
+    /// From this round on, reviewers get the previous panel's findings and the diff
+    /// since the commit it judged, and file new non-critical findings under
+    /// `## Follow-up` (O119). `0` disables.
+    #[serde(default = "default_scoped_from_round")]
+    pub scoped_from_round: u32,
 }
 
 impl Default for ReviewConfig {
     fn default() -> Self {
         Self {
             require_all_criteria: true,
+            block_on: default_block_on(),
+            scoped_from_round: default_scoped_from_round(),
         }
     }
+}
+
+fn default_block_on() -> Severity {
+    Severity::Major
+}
+
+/// Round 3 is the first fix round of a planned run (plan 1, implement 2).
+fn default_scoped_from_round() -> u32 {
+    3
 }
 
 /// Pre-coding test-author channel (plan → before human gate).
@@ -1196,6 +1226,7 @@ struct ProviderConfigFile {
 struct ShipConfigFile {
     auto_confirm: Option<bool>,
     title_max: Option<usize>,
+    draft: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1228,6 +1259,7 @@ struct DaemonConfigFile {
     restart: Option<bool>,
     max_restarts: Option<u32>,
     max_slots_per_bucket: Option<u32>,
+    sync_prs: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1261,6 +1293,8 @@ where
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ReviewConfigFile {
     require_all_criteria: Option<bool>,
+    block_on: Option<Severity>,
+    scoped_from_round: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1786,6 +1820,9 @@ impl Config {
             if let Some(v) = s.title_max {
                 self.ship.title_max = v;
             }
+            if let Some(v) = s.draft {
+                self.ship.draft = v;
+            }
         }
         if let Some(t) = &file.timeouts {
             if let Some(v) = t.slot_secs {
@@ -1926,6 +1963,12 @@ impl Config {
             if let Some(v) = r.require_all_criteria {
                 self.review.require_all_criteria = v;
             }
+            if let Some(v) = r.block_on {
+                self.review.block_on = v;
+            }
+            if let Some(v) = r.scoped_from_round {
+                self.review.scoped_from_round = v;
+            }
         }
         if let Some(c) = &file.critic {
             if let Some(v) = c.enabled {
@@ -2044,6 +2087,9 @@ impl Config {
             }
             if let Some(v) = d.max_slots_per_bucket {
                 self.daemon.max_slots_per_bucket = v;
+            }
+            if let Some(v) = d.sync_prs {
+                self.daemon.sync_prs = v;
             }
         }
         if let Some(capture) = file.env.as_ref().and_then(|e| e.capture.clone()) {
@@ -2164,6 +2210,45 @@ mod tests {
         let bound = Config::for_run(&paths, "r1").unwrap();
         assert_eq!(bound.rounds.max, 5);
         assert_eq!(bound.rounds.carry_forward_chars, 900);
+    }
+
+    /// O118/O119: severity gating and scoped re-review are on by default, tunable per
+    /// project, and frozen onto a run with the rest of its config.
+    #[test]
+    fn review_gating_overlays_defaults_and_survives_the_snapshot() {
+        let tmp = tempdir().unwrap();
+        let d = Config::default();
+        assert_eq!(d.review.block_on, Severity::Major);
+        assert_eq!(d.review.scoped_from_round, 3);
+
+        std::fs::write(
+            tmp.path().join("spar.toml"),
+            "[review]\nblock_on = \"minor\"\nscoped_from_round = 0\n",
+        )
+        .unwrap();
+        let cfg = Config::load(tmp.path()).unwrap();
+        assert_eq!(cfg.review.block_on, Severity::Minor);
+        assert_eq!(cfg.review.scoped_from_round, 0);
+        assert!(cfg.review.require_all_criteria);
+
+        std::fs::write(
+            tmp.path().join("spar.toml"),
+            "[review]\nblock_on = \"nit\"\n",
+        )
+        .unwrap();
+        assert!(
+            Config::load(tmp.path()).is_err(),
+            "an unknown severity must not pass silently"
+        );
+
+        let paths = SparPaths::new(tmp.path());
+        let mut cfg = Config::default();
+        cfg.review.block_on = Severity::Critical;
+        cfg.review.scoped_from_round = 5;
+        cfg.save_snapshot(&paths, "r1").unwrap();
+        let bound = Config::for_run(&paths, "r1").unwrap();
+        assert_eq!(bound.review.block_on, Severity::Critical);
+        assert_eq!(bound.review.scoped_from_round, 5);
     }
 
     #[test]
@@ -2768,6 +2853,19 @@ planner = "best"
         let mut cfg = Config::default();
         cfg.apply_file(&file, Trust::Project).unwrap();
         assert_eq!(cfg.ship.title_max, 0);
+    }
+
+    #[test]
+    fn ship_draft_and_daemon_sync_prs_read_from_the_file() {
+        let cfg = Config::default();
+        assert!(cfg.ship.draft);
+        assert!(!cfg.daemon.sync_prs);
+        let file: ConfigFile =
+            toml::from_str("[ship]\ndraft = false\n\n[daemon]\nsync_prs = true\n").unwrap();
+        let mut cfg = Config::default();
+        cfg.apply_file(&file, Trust::Project).unwrap();
+        assert!(!cfg.ship.draft);
+        assert!(cfg.daemon.sync_prs);
     }
 
     #[test]

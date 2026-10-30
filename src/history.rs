@@ -80,6 +80,9 @@ pub struct HistoryRow {
     pub billed_tokens: u64,
     pub cost_usd: Option<f64>,
     pub pr_url: Option<String>,
+    /// Set once `sync-prs` saw the PR merged (O123).
+    pub merged_at: Option<DateTime<Utc>>,
+    pub merge_commit: Option<String>,
     pub created_at: DateTime<Utc>,
     pub ended_at: DateTime<Utc>,
 }
@@ -159,6 +162,8 @@ pub fn row(state: &RunState, trigger: Trigger, now: DateTime<Utc>) -> HistoryRow
         billed_tokens: state.usage.iter().map(|u| u.billed_tokens).sum(),
         cost_usd: (!costs.is_empty()).then(|| costs.iter().sum()),
         pr_url: state.pr_url.clone(),
+        merged_at: state.merged_at,
+        merge_commit: state.merge_commit.clone(),
         created_at: state.created_at,
         ended_at: state.updated_at,
     }

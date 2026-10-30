@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
 /// 32-bit FNV-1a as 8 hex chars. Stable across Rust releases, unlike `DefaultHasher`.
-fn short_hash(s: &str) -> String {
+pub(crate) fn short_hash(s: &str) -> String {
     let h = s.bytes().fold(0x811c_9dc5_u32, |h, b| {
         (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
     });

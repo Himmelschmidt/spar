@@ -118,7 +118,7 @@ const PR_BODY_MAX: usize = 65_000;
 /// PR body: the shipped slot's summary, the OPEN questions it lists, and each reviewer's
 /// final verdict. Questions and verdicts come first so truncation only ever eats the tail
 /// of the summary.
-fn pr_body(paths: &SparPaths, state: &RunState, branch: &str) -> String {
+fn pr_body(paths: &SparPaths, state: &RunState, branch: &str, cwd: &Path) -> String {
     let shipped = state
         .worktrees
         .iter()
@@ -133,6 +133,9 @@ fn pr_body(paths: &SparPaths, state: &RunState, branch: &str) -> String {
         });
 
     let mut body = format!("Shipped by spar run `{}`.\n", state.id);
+    if let Some(o) = &state.ship_override {
+        body.push_str(&override_section(o));
+    }
     if let Some((_, text)) = &summary {
         let questions = open_questions(text);
         if !questions.is_empty() {
@@ -148,6 +151,16 @@ fn pr_body(paths: &SparPaths, state: &RunState, branch: &str) -> String {
         body.push_str("\n## Review\n\n");
         for line in reviews {
             body.push_str(&line);
+            body.push('\n');
+        }
+    }
+    // The run reached the ship gate, so none of these held it: minors under `block_on`,
+    // follow-ups, notes on an approving review. They are the work this PR leaves (O118).
+    let open = crate::workflow::review_result::open_findings(state, cwd);
+    if !open.is_empty() {
+        body.push_str("\n## Open findings (non-blocking)\n\n");
+        for f in open {
+            body.push_str(&f.line());
             body.push('\n');
         }
     }
@@ -245,31 +258,243 @@ fn git_ok(cwd: &std::path::Path, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+pub struct ShipOpts<'a> {
+    /// Branch the PR targets, over the run's own base.
+    pub base: Option<&'a str>,
+    /// `--override-gate --reason`: ship from a phase the gate never cleared (O124).
+    pub override_reason: Option<&'a str>,
+    /// `--adopt-remote`: fast-forward the worktree to a remote tip that moved (O125).
+    pub adopt_remote: bool,
+}
+
+/// Phases `--override-gate` ships from: the normal gates plus the ones a run reaches when
+/// the loop gave up or ran out of rounds or quota.
+fn overridable(phase: Phase) -> bool {
+    matches!(
+        phase,
+        Phase::AwaitingShipConfirm
+            | Phase::AwaitingWinnerConfirm
+            | Phase::AwaitingReconcile
+            | Phase::AwaitingRoundExtension
+            | Phase::Stuck
+            | Phase::Failed
+            | Phase::Quota
+    )
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OpenFinding {
+    slot_id: String,
+    round: u32,
+    reviewed_commit: Option<String>,
+    finding: crate::workflow::review_result::Finding,
+}
+
+/// A `--override-gate`, kept on the run for the round it shipped (O124).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ShipOverride {
+    who: String,
+    at: chrono::DateTime<chrono::Utc>,
+    reason: String,
+    /// Phase the override shipped from; a failed ship goes back to it.
+    from_phase: Phase,
+    findings: Vec<OpenFinding>,
+}
+
+/// Every finding of the last round the gate read: `review_history`'s highest round, or
+/// the slots' own records on a run with no history.
+fn open_findings(state: &RunState) -> Vec<OpenFinding> {
+    let latest = state.review_history.iter().map(|e| e.round).max();
+    let reviews: Vec<(String, u32, &crate::workflow::review_result::ReviewResult)> = match latest {
+        Some(round) => state
+            .review_history
+            .iter()
+            .filter(|e| e.round == round)
+            .map(|e| (e.slot_id.clone(), e.round, &e.review))
+            .collect(),
+        None => state
+            .slots
+            .iter()
+            .filter_map(|s| s.review.as_ref().map(|r| (s.id.clone(), s.round, r)))
+            .collect(),
+    };
+    reviews
+        .into_iter()
+        .flat_map(|(slot_id, round, review)| {
+            review.findings.iter().map(move |f| OpenFinding {
+                slot_id: slot_id.clone(),
+                round,
+                reviewed_commit: review.reviewed_commit.clone(),
+                finding: f.clone(),
+            })
+        })
+        .collect()
+}
+
+fn finding_line(f: &OpenFinding) -> String {
+    let severity = match f.finding.severity {
+        crate::workflow::review_result::Severity::Critical => "critical",
+        crate::workflow::review_result::Severity::Major => "major",
+        crate::workflow::review_result::Severity::Minor => "minor",
+    };
+    let location = match (&f.finding.file, f.finding.line) {
+        (Some(file), Some(line)) => format!(" `{file}:{line}`"),
+        (Some(file), None) => format!(" `{file}`"),
+        _ => String::new(),
+    };
+    let commit = f
+        .reviewed_commit
+        .as_deref()
+        .map(|c| format!(", Reviewed-Commit `{}`", &c[..c.len().min(12)]))
+        .unwrap_or_default();
+    let synthetic = if f.finding.synthetic {
+        " [synthetic]"
+    } else {
+        ""
+    };
+    let text = f
+        .finding
+        .text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "- **{severity}**{location}: {text} ({}, round {}{commit}){synthetic}",
+        f.slot_id, f.round
+    )
+}
+
+fn findings_list(o: &ShipOverride) -> String {
+    if o.findings.is_empty() {
+        return "_No open findings were recorded._\n".into();
+    }
+    let mut out = String::new();
+    for f in &o.findings {
+        out.push_str(&finding_line(f));
+        out.push('\n');
+    }
+    out
+}
+
+fn override_section(o: &ShipOverride) -> String {
+    format!(
+        "\n## Shipped over open findings\n\nThe ship gate was overridden by {} at {}: {}\n\n{}",
+        o.who,
+        o.at.to_rfc3339(),
+        o.reason,
+        findings_list(o)
+    )
+}
+
+fn override_record(o: &ShipOverride) -> String {
+    format!(
+        "\n## Gate override\n\nBy: {}\nAt: {}\nReason: {}\n\n### Open findings\n\n{}",
+        o.who,
+        o.at.to_rfc3339(),
+        o.reason,
+        findings_list(o)
+    )
+}
+
+fn operator() -> String {
+    std::env::var("USER").unwrap_or_else(|_| "unknown".into())
+}
+
+/// Checked before ship takes the run lock: once it holds the lock, the lock's owner is
+/// ship itself and liveness reads as alive.
+fn check_override(paths: &SparPaths, state: &RunState, reason: &str) -> Result<()> {
+    if reason.trim().is_empty() {
+        bail!("--override-gate needs a non-empty --reason");
+    }
+    if !overridable(state.phase) {
+        bail!(
+            "run {} cannot be shipped over its gate from phase {:?}",
+            state.id,
+            state.phase
+        );
+    }
+    if crate::state::orchestrator_alive(paths, &state.id) {
+        bail!(
+            "run {} still has a live orchestrator; stop it (spar stop {}) before overriding its gate",
+            state.id,
+            state.id
+        );
+    }
+    Ok(())
+}
+
+fn record_override(paths: &SparPaths, state: &mut RunState, reason: &str) -> Result<Phase> {
+    if !overridable(state.phase) {
+        bail!(
+            "run {} moved to phase {:?}; not overriding its gate",
+            state.id,
+            state.phase
+        );
+    }
+    let o = ShipOverride {
+        who: operator(),
+        at: chrono::Utc::now(),
+        reason: reason.trim().to_string(),
+        from_phase: state.phase,
+        findings: open_findings(state),
+    };
+    let mut message = format!(
+        "ship gate overridden by {} from {:?}: {} ({} open findings)",
+        o.who,
+        state.phase,
+        o.reason,
+        o.findings.len()
+    );
+    for f in &o.findings {
+        message.push('\n');
+        message.push_str(&finding_line(f));
+    }
+    crate::events::append(paths, &state.id, &crate::events::Event::info(message))?;
+    let from = o.from_phase;
+    state.ship_override = Some(o);
+    Ok(from)
+}
+
 pub fn ship(
     paths: &SparPaths,
     cfg: &Config,
     run_id: &str,
     json: bool,
-    base: Option<&str>,
+    opts: &ShipOpts,
 ) -> Result<ExitCode> {
     // Loaded first so a mistyped id fails without the lock minting a run dir. The lock is
     // then held through `Shipping`: a push that runs past `abandon_after_secs` must read
     // as owned, or the daemon restarts the run and re-dispatches its implementer while
     // the push is still going (O117).
-    RunState::load(paths, run_id)?;
+    let before = RunState::load(paths, run_id)?;
+    if let Some(reason) = opts.override_reason {
+        check_override(paths, &before, reason)?;
+    }
     let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
     let mut state = RunState::load(paths, run_id)?;
-    if !matches!(
-        state.phase,
-        Phase::AwaitingShipConfirm | Phase::Shipping | Phase::Done
-    ) && !state.gates.ship_confirmed
+    let overridden = match opts.override_reason {
+        Some(reason) => Some(record_override(paths, &mut state, reason)?),
+        None => None,
+    };
+    if overridden.is_none()
+        && !matches!(
+            state.phase,
+            Phase::AwaitingShipConfirm | Phase::Shipping | Phase::Done
+        )
+        && !state.gates.ship_confirmed
     {
         bail!(
             "run {run_id} is not ready to ship (phase={:?})",
             state.phase
         );
     }
-    if !state.gates.ship_confirmed && !cfg.ship.auto_confirm && !cfg.auto_ship() {
+    // The override is this invocation's confirmation only: it is not persisted as
+    // `ship_confirmed`, so a refused push cannot leave a stuck run shippable without it.
+    if overridden.is_none()
+        && !state.gates.ship_confirmed
+        && !cfg.ship.auto_confirm
+        && !cfg.auto_ship()
+    {
         if state.phase == Phase::AwaitingShipConfirm {
             state.save(paths)?;
             if json {
@@ -287,10 +512,15 @@ pub fn ship(
     if cfg.auto_ship() || cfg.ship.auto_confirm {
         state.gates.ship_confirmed = true;
     }
+    let override_md = state
+        .ship_override
+        .as_ref()
+        .map(override_record)
+        .unwrap_or_default();
 
     // Determine branch/worktree to push
     let (branch, cwd) = select_branch_cwd(&state)?;
-    let pr_base = pr_base(&state, &cwd, base);
+    let pr_base = pr_base(&state, &cwd, opts.base);
     let base_arg = match &pr_base {
         Some(b) => format!(" --base {}", shell_single_quote(b)),
         None => String::new(),
@@ -300,25 +530,30 @@ pub fn ship(
             eprintln!("note: run base {r} is not a branch on origin; PR targets the repo default");
         }
     }
+    let draft_arg = if cfg.ship.draft { " --draft" } else { "" };
+    let list_cmd = format!(
+        "cd {} && gh pr list --head {branch} --state open --json number,url,state,isDraft",
+        cwd.display()
+    );
     if state.dry_run {
         let push_cmd = format!(
             "git -C {} push --force-with-lease=refs/heads/{branch}:<fetched origin tip> origin HEAD:refs/heads/{branch}",
             cwd.display()
         );
         let pr_cmd = format!(
-            "cd {} && gh pr create --draft --head {branch}{base_arg} --title dry-run --body dry-run",
+            "cd {} && gh pr create{draft_arg} --head {branch}{base_arg} --title dry-run --body dry-run",
             cwd.display()
         );
-        let commands = vec![push_cmd, pr_cmd];
+        let commands = vec![push_cmd, list_cmd, pr_cmd];
         state.ship_commands = Some(commands.clone());
         std::fs::write(
             paths.artifact(run_id, "ship.md"),
             format!(
-                "# Ship (dry-run — not executed)\n\nBranch: `{branch}`\nPR base: `{}`\n\n```\n{}\n```\n\n## PR title\n\n{}\n\n## PR body\n\n{}",
+                "# Ship (dry-run — not executed)\n\nBranch: `{branch}`\nPR base: `{}`\n\n```\n{}\n```\n{override_md}\n## PR title\n\n{}\n\n## PR body\n\n{}",
                 pr_base.as_deref().unwrap_or("(repo default)"),
                 commands.join("\n"),
                 pr_title(state.task.as_deref(), cfg.ship.title_max),
-                pr_body(paths, &state, &branch)
+                pr_body(paths, &state, &branch, &cwd)
             ),
         )?;
         state.set_phase(Phase::Done);
@@ -334,7 +569,13 @@ pub fn ship(
     let title = pr_title(state.task.as_deref(), cfg.ship.title_max);
     let body_file = paths.artifact(run_id, "pr-body.md");
 
-    let push_args = match push_args(&cwd, remote, &branch, state.base_commit.as_deref()) {
+    let push_args = match push_args(
+        &cwd,
+        remote,
+        &branch,
+        state.base_commit.as_deref(),
+        opts.adopt_remote,
+    ) {
         Ok(args) => args,
         Err(e) => {
             state.error = Some(format!("ship refused: {e}"));
@@ -349,19 +590,19 @@ pub fn ship(
     };
     let push_cmd = format!("git -C {} {}", cwd.display(), push_args.join(" "));
     let pr_cmd = format!(
-        "cd {} && gh pr create --draft --head {branch}{base_arg} --title {} --body-file {}",
+        "cd {} && gh pr create{draft_arg} --head {branch}{base_arg} --title {} --body-file {}",
         cwd.display(),
         shell_single_quote(&title),
         shell_single_quote(&body_file.display().to_string())
     );
 
-    let commands = vec![push_cmd, pr_cmd];
-    std::fs::write(&body_file, pr_body(paths, &state, &branch))?;
+    let commands = vec![push_cmd, list_cmd, pr_cmd];
+    let body = pr_body(paths, &state, &branch, &cwd);
+    std::fs::write(&body_file, &body)?;
     state.ship_commands = Some(commands.clone());
     state.set_phase(Phase::Shipping);
     state.save(paths)?;
 
-    // Prefer printing if gh/git might fail; try execute
     let mut executed = Vec::new();
     let mut failed = false;
 
@@ -370,7 +611,12 @@ pub fn ship(
         .current_dir(&cwd)
         .status();
     match push_status {
-        Ok(s) if s.success() => executed.push(format!("pushed {branch}")),
+        Ok(s) if s.success() => {
+            executed.push(format!("pushed {branch}"));
+            state.shipped_round = Some(state.round);
+            state.shipped_head = worktree::git_out(&cwd, &["rev-parse", "HEAD"]);
+            state.shipped_base = pr_base.clone();
+        }
         Ok(s) => {
             failed = true;
             executed.push(format!("push failed (exit {:?})", s.code()));
@@ -382,43 +628,73 @@ pub fn ship(
     }
 
     if !failed {
-        let mut args: Vec<String> = vec![
-            "pr".into(),
-            "create".into(),
-            // Ship opens a *draft* PR and never merges: the invariant is in
-            // `skills/core.md`, `docs/PRODUCT.md` and `docs/architecture-dual-backend.md`,
-            // but nothing passed the flag, so every shipped PR opened ready for review.
-            "--draft".into(),
-            "--head".into(),
-            branch.clone(),
-            "--title".into(),
-            title.clone(),
-            "--body-file".into(),
-            body_file.display().to_string(),
-        ];
-        if let Some(b) = &pr_base {
-            args.push("--base".into());
-            args.push(b.clone());
-        }
-        let pr = Command::new("gh").args(&args).current_dir(&cwd).output();
-        match pr {
-            Ok(o) if o.status.success() => {
-                let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                state.pr_url = out
-                    .lines()
-                    .rev()
-                    .find(|l| l.trim_start().starts_with("https://"))
-                    .map(|l| l.trim().to_string());
-                executed.push(out);
+        match crate::prs::open_pr_for(&cwd, &branch, pr_base.as_deref()) {
+            Ok(Some(pr)) => {
+                executed.push(format!("adopted open PR #{}: {}", pr.number, pr.url));
+                let current = pr.body.as_deref().unwrap_or("").trim();
+                let ours = crate::paths::short_hash(current);
+                if current != body.trim() && state.pr_body_hash.as_deref() != Some(ours.as_str()) {
+                    let note = format!(
+                        "PR #{} body differs from what spar last wrote; replacing it (old body not kept)",
+                        pr.number
+                    );
+                    eprintln!("warning: {note}");
+                    executed.push(note);
+                }
+                // The PR exists and the branch is pushed; a body that did not update is
+                // not worth re-parking the run at the gate over (#164).
+                let file = body_file.display().to_string();
+                match crate::prs::gh(
+                    &cwd,
+                    &["pr", "edit", &pr.number.to_string(), "--body-file", &file],
+                ) {
+                    Ok(_) => state.pr_body_hash = Some(crate::paths::short_hash(body.trim())),
+                    Err(e) => {
+                        eprintln!(
+                            "warning: adopted PR #{} but its body was not updated: {e}",
+                            pr.number
+                        );
+                        executed.push(format!("body not updated: {e}"));
+                    }
+                }
+                state.pr_url = Some(pr.url);
             }
-            Ok(o) => {
-                // print commands instead of hard-fail if pr exists
-                let err = String::from_utf8_lossy(&o.stderr);
-                executed.push(format!("gh pr create: {err}"));
-                failed = true;
+            Ok(None) => {
+                let mut args: Vec<String> = vec!["pr".into(), "create".into()];
+                if cfg.ship.draft {
+                    args.push("--draft".into());
+                }
+                args.extend([
+                    "--head".into(),
+                    branch.clone(),
+                    "--title".into(),
+                    title.clone(),
+                    "--body-file".into(),
+                    body_file.display().to_string(),
+                ]);
+                if let Some(b) = &pr_base {
+                    args.push("--base".into());
+                    args.push(b.clone());
+                }
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                match crate::prs::gh(&cwd, &args) {
+                    Ok(out) => {
+                        state.pr_url = out
+                            .lines()
+                            .rev()
+                            .find(|l| l.trim_start().starts_with("https://"))
+                            .map(|l| l.trim().to_string());
+                        state.pr_body_hash = Some(crate::paths::short_hash(body.trim()));
+                        executed.push(out);
+                    }
+                    Err(e) => {
+                        executed.push(format!("gh pr create: {e}"));
+                        failed = true;
+                    }
+                }
             }
             Err(e) => {
-                executed.push(format!("gh missing or failed: {e}"));
+                executed.push(format!("gh pr list: {e}"));
                 failed = true;
             }
         }
@@ -427,7 +703,7 @@ pub fn ship(
     std::fs::write(
         paths.artifact(run_id, "ship.md"),
         format!(
-            "# Ship\n\nBranch: `{branch}`\nPR base: `{}`\nCwd: `{}`\n\n## Commands\n```\n{}\n```\n\n## Result\n{}\n",
+            "# Ship\n\nBranch: `{branch}`\nPR base: `{}`\nCwd: `{}`\n\n## Commands\n```\n{}\n```\n{override_md}\n## Result\n{}\n",
             pr_base.as_deref().unwrap_or("(repo default)"),
             cwd.display(),
             commands.join("\n"),
@@ -436,8 +712,9 @@ pub fn ship(
     )?;
 
     if failed {
-        // leave commands for human; still not merge
-        state.set_phase(Phase::AwaitingShipConfirm);
+        // An override goes back where it came from: parking a stuck run at the ship
+        // gate would let a plain `ship --confirm` finish it.
+        state.set_phase(overridden.unwrap_or(Phase::AwaitingShipConfirm));
         state.error = Some("ship partial failure; see artifacts/ship.md".into());
         state.save(paths)?;
         if json {
@@ -457,7 +734,8 @@ pub fn ship(
     if json {
         executor::emit_run_json(&state)?;
     } else {
-        println!("shipped branch {branch} (PR created or updated). Never merged.");
+        let url = state.pr_url.as_deref().unwrap_or("(no URL printed)");
+        println!("shipped branch {branch}: {url}. Never merged.");
     }
     Ok(ExitCode::Success)
 }
@@ -465,10 +743,23 @@ pub fn ship(
 /// `git push` arguments that ship the worktree's HEAD (not whatever the branch name
 /// points at) to `refs/heads/<branch>`, leased on the remote tip just fetched. Refuses
 /// rather than rewind a remote branch (O10): a lease against the local tracking ref alone
-/// passes after any fetch, which is how a hand-pushed branch got reset.
-fn push_args(cwd: &Path, remote: &str, branch: &str, base: Option<&str>) -> Result<Vec<String>> {
+/// passes after any fetch, which is how a hand-pushed branch got reset. With
+/// `adopt_remote`, a remote tip ahead of HEAD is fast-forwarded into the worktree first.
+fn push_args(
+    cwd: &Path,
+    remote: &str,
+    branch: &str,
+    base: Option<&str>,
+    adopt_remote: bool,
+) -> Result<Vec<String>> {
     let on_branch = check_head_branch(cwd, branch, base)?;
-    let lease = remote_tip(cwd, remote, branch)?;
+    if adopt_remote && !on_branch {
+        bail!(
+            "--adopt-remote fast-forwards only {branch}, and worktree {} is not on it; check out {branch} and retry",
+            cwd.display()
+        );
+    }
+    let lease = remote_tip(cwd, remote, branch, adopt_remote)?;
     let mut args = vec![
         "push".to_string(),
         format!(
@@ -526,8 +817,14 @@ fn check_head_branch(cwd: &Path, branch: &str, base: Option<&str>) -> Result<boo
 }
 
 /// The remote's current tip of `branch`, fetched, or `None` when the branch does not
-/// exist there. Errors when that tip is not contained in HEAD.
-fn remote_tip(cwd: &Path, remote: &str, branch: &str) -> Result<Option<String>> {
+/// exist there. Errors when that tip is not contained in HEAD, unless `adopt_remote`
+/// and the worktree can fast-forward to it.
+fn remote_tip(
+    cwd: &Path,
+    remote: &str,
+    branch: &str,
+    adopt_remote: bool,
+) -> Result<Option<String>> {
     let out = Command::new("git")
         .args([
             "ls-remote",
@@ -560,17 +857,50 @@ fn remote_tip(cwd: &Path, remote: &str, branch: &str) -> Result<Option<String>> 
     let Some(tip) = worktree::git_out(cwd, &["rev-parse", "--verify", &tracking]) else {
         bail!("could not resolve {tracking} after fetch");
     };
-    if !git_ok(cwd, &["merge-base", "--is-ancestor", &tip, "HEAD"]) {
+    if git_ok(cwd, &["merge-base", "--is-ancestor", &tip, "HEAD"]) {
+        return Ok(Some(tip));
+    }
+    if !adopt_remote {
         bail!(
-            "remote {branch} has commits the run lacks; fast-forward the worktree by hand \
-             (git -C {} merge --ff-only {remote}/{branch}) and retry ship",
+            "remote {branch} has commits the run lacks; adopt them with `spar ship <id> --adopt-remote`, \
+             which fast-forwards the worktree {} to {remote}/{branch}",
             cwd.display()
         );
     }
+    fast_forward(cwd, &tip, &format!("{remote}/{branch}"))?;
     Ok(Some(tip))
 }
 
-fn select_branch_cwd(state: &RunState) -> Result<(String, std::path::PathBuf)> {
+/// `--adopt-remote`: move the worktree to `tip` only when that is a fast-forward of a
+/// clean worktree. Anything else would drop the run's commits or the operator's edits.
+fn fast_forward(cwd: &Path, tip: &str, shown: &str) -> Result<()> {
+    if !git_ok(cwd, &["merge-base", "--is-ancestor", "HEAD", tip]) {
+        bail!(
+            "{shown} and worktree {} have diverged; --adopt-remote only fast-forwards, reconcile them by hand",
+            cwd.display()
+        );
+    }
+    let status = worktree::git_out(cwd, &["status", "--porcelain", "--untracked-files=no"]);
+    match status.as_deref() {
+        Some("") => {}
+        Some(_) => bail!(
+            "worktree {} has uncommitted changes; commit or stash them before --adopt-remote",
+            cwd.display()
+        ),
+        None => bail!("could not read the status of worktree {}", cwd.display()),
+    }
+    if !git_ok(cwd, &["merge", "--ff-only", "--quiet", tip]) {
+        bail!("git merge --ff-only {shown} failed in {}", cwd.display());
+    }
+    eprintln!(
+        "note: fast-forwarded worktree {} to {shown} ({})",
+        cwd.display(),
+        &tip[..tip.len().min(12)]
+    );
+    Ok(())
+}
+
+pub(crate) fn select_branch_cwd(state: &RunState) -> Result<(String, std::path::PathBuf)> {
     if let Some(winner) = state
         .gates
         .winner_confirmed
@@ -787,7 +1117,7 @@ mod tests {
         )
         .unwrap();
 
-        let body = pr_body(&paths, &state, "spar/rb1/impl");
+        let body = pr_body(&paths, &state, "spar/rb1/impl", tmp.path());
         assert!(body.starts_with("Shipped by spar run `rb1`."), "{body}");
         assert!(
             body.contains(
@@ -811,18 +1141,59 @@ mod tests {
         assert!(open < body.find("## Implementer summary").unwrap());
     }
 
+    /// O118: the minors and follow-ups the last panel left go into the PR body, from the
+    /// recorded reviews, and before the summary so truncation cannot eat them.
+    #[test]
+    fn pr_body_lists_the_last_panels_open_findings() {
+        let tmp = tempdir().unwrap();
+        let (paths, mut state) = body_state(tmp.path());
+        let parse = crate::workflow::review_result::parse_review;
+        for (round, slot, body) in [
+            (2, "review-1", "## Verdict\nrequest_changes\n## Findings\n- severity: major — fixed long ago\n"),
+            (3, "review-1", "## Verdict\nrequest_changes\n## Findings\n- severity: minor — stale doc at src/a.rs:9\n"),
+            (3, "review-2", "## Verdict\napprove\n## Follow-up\n- severity: major — split the parser later\n"),
+        ] {
+            state.review_history.push(crate::state::ReviewHistoryEntry {
+                round,
+                slot_id: slot.into(),
+                review: parse(body),
+            });
+        }
+        let body = pr_body(&paths, &state, "spar/rb1/impl", tmp.path());
+        let section = body
+            .split("## Open findings (non-blocking)\n\n")
+            .nth(1)
+            .unwrap_or_else(|| panic!("{body}"));
+        assert!(
+            section.starts_with("- minor `src/a.rs:9` (review-1): stale doc"),
+            "{body}"
+        );
+        assert!(
+            section.contains("- major follow-up (review-2): split the parser later"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("fixed long ago"),
+            "an earlier round is not open: {body}"
+        );
+        assert!(
+            body.find("## Open findings").unwrap() < body.find("## Implementer summary").unwrap()
+        );
+    }
+
     #[test]
     fn pr_body_without_a_summary_or_reviews_says_so() {
         let tmp = tempdir().unwrap();
         let (paths, mut state) = body_state(tmp.path());
         state.slots.clear();
-        let body = pr_body(&paths, &state, "spar/rb1/impl");
+        let body = pr_body(&paths, &state, "spar/rb1/impl", tmp.path());
         assert!(
             body.contains("_No implementer summary was written._"),
             "{body}"
         );
         assert!(!body.contains("## Review"), "{body}");
         assert!(!body.contains("## Open questions"), "{body}");
+        assert!(!body.contains("## Open findings"), "{body}");
     }
 
     #[test]
@@ -837,7 +1208,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let body = pr_body(&paths, &state, "spar/rb1/impl");
+        let body = pr_body(&paths, &state, "spar/rb1/impl", tmp.path());
         assert!(body.chars().count() <= 65_536, "{}", body.chars().count());
         assert!(body.contains("- keep me"));
         assert!(
@@ -981,7 +1352,7 @@ mod tests {
         // The stale local tracking ref is exactly what the old bare lease checked.
         commit(&work, "run-work");
 
-        let err = push_args(&work, "origin", BRANCH, None)
+        let err = push_args(&work, "origin", BRANCH, None, false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("has commits the run lacks"), "{err}");
@@ -996,7 +1367,7 @@ mod tests {
         let pushed = remote_tip_of(&origin);
         let head = commit(&work, "more");
 
-        let args = push_args(&work, "origin", BRANCH, None).unwrap();
+        let args = push_args(&work, "origin", BRANCH, None, false).unwrap();
         assert!(
             args.contains(&format!("--force-with-lease=refs/heads/{BRANCH}:{pushed}")),
             "lease must name the observed tip: {args:?}"
@@ -1013,7 +1384,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let (origin, work) = origin_and_work(tmp.path());
         commit(&work, "run-work");
-        let args = push_args(&work, "origin", BRANCH, None).unwrap();
+        let args = push_args(&work, "origin", BRANCH, None, false).unwrap();
         assert!(args.contains(&format!("--force-with-lease=refs/heads/{BRANCH}:")));
 
         let other = tmp.path().join("other");
@@ -1045,7 +1416,7 @@ mod tests {
         git_in(&work, &["checkout", "-q", "-b", "review-x"]);
         let head = commit(&work, "reviewed");
 
-        let args = push_args(&work, "origin", BRANCH, None).unwrap();
+        let args = push_args(&work, "origin", BRANCH, None, false).unwrap();
         assert!(!args.contains(&"-u".to_string()), "{args:?}");
         assert!(args.contains(&format!("HEAD:refs/heads/{BRANCH}")));
         assert!(run_push(&work, &args));
@@ -1060,7 +1431,7 @@ mod tests {
         commit(&work, "impl-work");
         git_in(&work, &["checkout", "-q", "-b", "review-x", &base]);
 
-        let err = push_args(&work, "origin", BRANCH, None)
+        let err = push_args(&work, "origin", BRANCH, None, false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("review-x"), "{err}");
@@ -1077,7 +1448,7 @@ mod tests {
         git_in(&work, &["checkout", "-q", "-b", "main"]);
         commit(&work, "unrelated");
 
-        let err = push_args(&work, "origin", BRANCH, Some(&base))
+        let err = push_args(&work, "origin", BRANCH, Some(&base), false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("never advanced past the run base"), "{err}");
@@ -1104,12 +1475,310 @@ mod tests {
         });
         state.save(&paths).unwrap();
 
-        let code = ship(&paths, &Config::default(), "r1", true, None).unwrap();
+        let code = ship(
+            &paths,
+            &Config::default(),
+            "r1",
+            true,
+            &ShipOpts {
+                base: None,
+                override_reason: None,
+                adopt_remote: false,
+            },
+        )
+        .unwrap();
         assert_eq!(code, ExitCode::Failure);
         let after = RunState::load(&paths, "r1").unwrap();
         assert_eq!(after.phase, Phase::AwaitingShipConfirm);
         let err = after.error.unwrap_or_default();
         assert!(err.starts_with("ship refused:"), "{err}");
         assert!(err.contains("review-x"), "{err}");
+    }
+
+    /// A remote that moved past the run, fetched into a clean worktree with nothing of
+    /// its own on top: `(origin, work, hand_tip)`.
+    fn remote_moved(tmp: &Path) -> (PathBuf, PathBuf, String) {
+        let (origin, work) = origin_and_work(tmp);
+        git_in(&work, &["push", "-q", "origin", BRANCH]);
+        git_in(
+            tmp,
+            &[
+                "clone",
+                "-q",
+                "-b",
+                BRANCH,
+                origin.to_str().unwrap(),
+                "hand",
+            ],
+        );
+        let hand = tmp.join("hand");
+        git_in(&hand, &["config", "user.email", "h@h.com"]);
+        git_in(&hand, &["config", "user.name", "h"]);
+        let hand_tip = commit(&hand, "by-hand");
+        git_in(&hand, &["push", "-q", "origin", BRANCH]);
+        (origin, work, hand_tip)
+    }
+
+    #[test]
+    fn refusal_names_adopt_remote() {
+        let tmp = tempdir().unwrap();
+        let (_origin, work, _) = remote_moved(tmp.path());
+        let err = push_args(&work, "origin", BRANCH, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--adopt-remote"), "{err}");
+    }
+
+    /// #163: `--adopt-remote` fast-forwards the worktree to the hand-pushed tip and the
+    /// push that follows is a no-op, never a rewind.
+    #[test]
+    fn adopt_remote_fast_forwards_a_clean_worktree() {
+        let tmp = tempdir().unwrap();
+        let (origin, work, hand_tip) = remote_moved(tmp.path());
+
+        let args = push_args(&work, "origin", BRANCH, None, true).unwrap();
+        assert_eq!(git_in(&work, &["rev-parse", "HEAD"]), hand_tip);
+        assert!(
+            args.contains(&format!(
+                "--force-with-lease=refs/heads/{BRANCH}:{hand_tip}"
+            )),
+            "{args:?}"
+        );
+        assert!(run_push(&work, &args));
+        assert_eq!(remote_tip_of(&origin), hand_tip);
+    }
+
+    #[test]
+    fn adopt_remote_refuses_when_not_a_fast_forward() {
+        let tmp = tempdir().unwrap();
+        let (origin, work, hand_tip) = remote_moved(tmp.path());
+        let ours = commit(&work, "run-work");
+
+        let err = push_args(&work, "origin", BRANCH, None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("diverged"), "{err}");
+        assert_eq!(git_in(&work, &["rev-parse", "HEAD"]), ours);
+        assert_eq!(remote_tip_of(&origin), hand_tip);
+    }
+
+    #[test]
+    fn adopt_remote_refuses_a_dirty_worktree() {
+        let tmp = tempdir().unwrap();
+        let (_origin, work, _) = remote_moved(tmp.path());
+        let before = git_in(&work, &["rev-parse", "HEAD"]);
+        std::fs::write(work.join("base"), "edited").unwrap();
+
+        let err = push_args(&work, "origin", BRANCH, None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("uncommitted changes"), "{err}");
+        assert_eq!(git_in(&work, &["rev-parse", "HEAD"]), before);
+        assert_eq!(
+            std::fs::read_to_string(work.join("base")).unwrap(),
+            "edited"
+        );
+    }
+
+    #[test]
+    fn adopt_remote_refuses_a_worktree_left_on_another_branch() {
+        let tmp = tempdir().unwrap();
+        let (_origin, work, _) = remote_moved(tmp.path());
+        git_in(&work, &["checkout", "-q", "-b", "review-x"]);
+        let before = commit(&work, "reviewed");
+        let err = push_args(&work, "origin", BRANCH, None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not on it"), "{err}");
+        assert_eq!(git_in(&work, &["rev-parse", "HEAD"]), before);
+    }
+
+    fn finding(
+        severity: crate::workflow::review_result::Severity,
+        file: Option<&str>,
+        line: Option<u32>,
+        text: &str,
+    ) -> crate::workflow::review_result::Finding {
+        crate::workflow::review_result::Finding {
+            severity,
+            file: file.map(Into::into),
+            line,
+            text: text.into(),
+            synthetic: false,
+            follow_up: false,
+        }
+    }
+
+    fn review_with(
+        commit: &str,
+        findings: Vec<crate::workflow::review_result::Finding>,
+    ) -> crate::workflow::review_result::ReviewResult {
+        crate::workflow::review_result::ReviewResult {
+            verdict: Some(crate::workflow::review_result::Verdict::RequestChanges),
+            reviewed_commit: Some(commit.into()),
+            findings,
+            ..Default::default()
+        }
+    }
+
+    /// #166: only the last round's findings are open; earlier rounds were addressed or
+    /// re-reported.
+    #[test]
+    fn open_findings_come_from_the_latest_reviewed_round() {
+        use crate::workflow::review_result::Severity;
+        let mut state = RunState::new("r1", WorkflowKind::Loop, PathBuf::from("/x"));
+        state.review_history = vec![
+            crate::state::ReviewHistoryEntry {
+                round: 1,
+                slot_id: "review-0".into(),
+                review: review_with("aaaa", vec![finding(Severity::Critical, None, None, "old")]),
+            },
+            crate::state::ReviewHistoryEntry {
+                round: 2,
+                slot_id: "review-0".into(),
+                review: review_with(
+                    "0123456789abcdef",
+                    vec![finding(
+                        Severity::Major,
+                        Some("src/a.rs"),
+                        Some(12),
+                        "off by\n one",
+                    )],
+                ),
+            },
+            crate::state::ReviewHistoryEntry {
+                round: 2,
+                slot_id: "review-1".into(),
+                review: review_with(
+                    "0123456789abcdef",
+                    vec![finding(Severity::Minor, None, None, "nit")],
+                ),
+            },
+        ];
+        let found = open_findings(&state);
+        assert_eq!(found.len(), 2);
+        assert_eq!(
+            finding_line(&found[0]),
+            "- **major** `src/a.rs:12`: off by one (review-0, round 2, Reviewed-Commit `0123456789ab`)"
+        );
+        assert_eq!(
+            finding_line(&found[1]),
+            "- **minor**: nit (review-1, round 2, Reviewed-Commit `0123456789ab`)"
+        );
+    }
+
+    #[test]
+    fn override_section_leads_the_pr_body() {
+        let tmp = tempdir().unwrap();
+        let (paths, mut state) = body_state(tmp.path());
+        std::fs::write(paths.artifact("rb1", "summary-impl.md"), "did it\n").unwrap();
+        assert!(!pr_body(&paths, &state, "spar/rb1/impl", tmp.path()).contains("Shipped over"));
+        state.ship_override = Some(ShipOverride {
+            who: "op".into(),
+            at: chrono::Utc::now(),
+            reason: "ceiling hit, minors only".into(),
+            from_phase: Phase::Stuck,
+            findings: vec![OpenFinding {
+                slot_id: "review-1".into(),
+                round: 4,
+                reviewed_commit: Some("feedface".into()),
+                finding: finding(
+                    crate::workflow::review_result::Severity::Minor,
+                    Some("src/b.rs"),
+                    Some(3),
+                    "rename",
+                ),
+            }],
+        });
+        let body = pr_body(&paths, &state, "spar/rb1/impl", tmp.path());
+        let section = body.find("## Shipped over open findings").expect(&body);
+        assert!(section < body.find("## Implementer summary").unwrap());
+        assert!(body.contains("overridden by op at "), "{body}");
+        assert!(body.contains(": ceiling hit, minors only\n"), "{body}");
+        assert!(
+            body.contains(
+                "- **minor** `src/b.rs:3`: rename (review-1, round 4, Reviewed-Commit `feedface`)"
+            ),
+            "{body}"
+        );
+    }
+
+    fn override_state(tmp: &Path, phase: Phase) -> (SparPaths, Config) {
+        let paths = SparPaths::new(tmp);
+        let mut state = RunState::new("ro1", WorkflowKind::Loop, tmp.to_path_buf());
+        state.phase = phase;
+        state.dry_run = true;
+        state.worktrees.push(crate::state::WorktreeRecord {
+            slot_id: "impl".into(),
+            path: tmp.join("wt"),
+            branch: "spar/ro1/impl".into(),
+        });
+        state.save(&paths).unwrap();
+        (paths, Config::default())
+    }
+
+    fn override_opts(reason: &str) -> ShipOpts<'_> {
+        ShipOpts {
+            base: None,
+            override_reason: Some(reason),
+            adopt_remote: false,
+        }
+    }
+
+    #[test]
+    fn override_refuses_while_an_orchestrator_is_alive() {
+        let tmp = tempdir().unwrap();
+        let (paths, cfg) = override_state(tmp.path(), Phase::Stuck);
+        let _lock = crate::runlock::RunLock::acquire(&paths, "ro1").unwrap();
+        let err = ship(&paths, &cfg, "ro1", true, &override_opts("why"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("live orchestrator"), "{err}");
+        assert_eq!(RunState::load(&paths, "ro1").unwrap().phase, Phase::Stuck);
+    }
+
+    /// A refused override must not leave the stuck run confirmed for a plain ship.
+    #[test]
+    fn a_refused_override_does_not_confirm_the_gate() {
+        let tmp = tempdir().unwrap();
+        let (paths, cfg) = override_state(tmp.path(), Phase::Stuck);
+        let mut state = RunState::load(&paths, "ro1").unwrap();
+        state.dry_run = false;
+        state.save(&paths).unwrap();
+
+        let code = ship(&paths, &cfg, "ro1", true, &override_opts("why")).unwrap();
+        assert_eq!(code, ExitCode::Failure);
+        let after = RunState::load(&paths, "ro1").unwrap();
+        assert_eq!(after.phase, Phase::Stuck);
+        assert!(!after.gates.ship_confirmed);
+        assert!(ship(
+            &paths,
+            &cfg,
+            "ro1",
+            true,
+            &ShipOpts {
+                base: None,
+                override_reason: None,
+                adopt_remote: false
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn override_refuses_a_run_still_working_or_an_empty_reason() {
+        let tmp = tempdir().unwrap();
+        let (paths, cfg) = override_state(tmp.path(), Phase::Dispatch);
+        let err = ship(&paths, &cfg, "ro1", true, &override_opts("why"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot be shipped over its gate"), "{err}");
+
+        let tmp = tempdir().unwrap();
+        let (paths, cfg) = override_state(tmp.path(), Phase::Failed);
+        let err = ship(&paths, &cfg, "ro1", true, &override_opts("  "))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-empty --reason"), "{err}");
     }
 }

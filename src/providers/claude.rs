@@ -23,11 +23,28 @@ impl ProviderAdapter for ClaudeAdapter {
         &["claude"]
     }
 
-    // No readiness probe: the only local candidate, `claude doctor`, is an
-    // installation check, not dispatch readiness — it exits 0 even with no
-    // credentials (verified with an empty HOME). A probe that cannot fail on a
-    // broken-auth box would report false-healthy, so the default (Unknown)
-    // stands.
+    // `claude auth status` exits 1 with `"loggedIn": false` when logged out and
+    // 0 when logged in (verified on 2.1.314 with an empty HOME and a real one).
+    // It phones home for telemetry unless nonessential traffic is off; with it
+    // off, strace shows no network connection. It does not check expiry: a
+    // credentials file whose refresh token expired still reads logged in, so
+    // `credential_fault` reads that from the file. (`claude doctor` is an
+    // install check that exits 0 with no credentials at all.)
+    fn readiness_probe(&self) -> Option<Vec<String>> {
+        Some(vec!["auth".into(), "status".into()])
+    }
+
+    fn readiness_env(&self) -> &[(&'static str, &'static str)] {
+        &[("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")]
+    }
+
+    fn credential_fault(&self) -> Option<String> {
+        let dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+            .map(std::path::PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))?;
+        let text = std::fs::read_to_string(dir.join(".credentials.json")).ok()?;
+        expired_refresh_token(&text, chrono::Utc::now())
+    }
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
@@ -320,5 +337,44 @@ mod tests {
         let (_, args) =
             command_to_parts(&ClaudeAdapter.build_interactive(Path::new("claude"), &opts));
         assert!(!args.iter().any(|a| a == "--effort"));
+    }
+}
+
+/// The OAuth login is dead once its refresh token expires: the access token can no
+/// longer be renewed and every dispatch fails with a 401. Reads `claudeAiOauth` in
+/// `.credentials.json` (Linux; macOS keeps it in the keychain, where this finds no
+/// file and reports nothing).
+fn expired_refresh_token(text: &str, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let ms = v
+        .pointer("/claudeAiOauth/refreshTokenExpiresAt")?
+        .as_i64()?;
+    let at = chrono::DateTime::from_timestamp_millis(ms)?;
+    (at <= now).then(|| {
+        format!(
+            "claude login expired at {} (refresh token); run `claude auth login`",
+            at.to_rfc3339()
+        )
+    })
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+
+    #[test]
+    fn an_expired_refresh_token_is_a_credential_fault() {
+        let now = chrono::DateTime::from_timestamp_millis(1_793_400_000_000).unwrap();
+        let expired = r#"{"claudeAiOauth":{"accessToken":"x","refreshToken":"y","expiresAt":1793300000000,"refreshTokenExpiresAt":1793300000000,"scopes":["user:inference"]}}"#;
+        let msg = expired_refresh_token(expired, now).expect("expired");
+        assert!(msg.contains("claude auth login"), "{msg}");
+
+        let live = r#"{"claudeAiOauth":{"expiresAt":1793300000000,"refreshTokenExpiresAt":1795923537481}}"#;
+        assert!(
+            expired_refresh_token(live, now).is_none(),
+            "an expired access token alone is renewed by the CLI"
+        );
+        assert!(expired_refresh_token(r#"{"other":1}"#, now).is_none());
+        assert!(expired_refresh_token("not json", now).is_none());
     }
 }

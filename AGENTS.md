@@ -46,8 +46,8 @@ If you branch on backend inside a workflow, you are in the wrong layer.
   `project_root`'s HEAD (O26).
 - A run reads `.spar/runs/<id>/config.json`, not live `spar.toml` (O27).
   Use `Config::for_run`, not `Config::load`.
-- `ship` opens a draft PR and never merges. Force-push only to swarm
-  branches.
+- `ship` opens a PR (draft by default) or adopts an open one, and never
+  merges. Force-push only to swarm branches.
 - `--providers` or `--select` is required on `plan` / `implement` / `run`.
 - Exit codes are a public contract: `0` ok, `1` fail, `2` human gate,
   `3` stuck, `4` quota. Never repurpose them.

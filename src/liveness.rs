@@ -239,6 +239,7 @@ mod tests {
             reviewed_commit: None,
             review: None,
             source: None,
+            auth_fault: false,
         }
     }
 

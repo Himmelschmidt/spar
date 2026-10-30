@@ -22,12 +22,15 @@ mod notify;
 mod nudge;
 mod orchestrator;
 mod paths;
+mod probe;
 mod process;
 mod provider_ref;
 mod providers;
+mod prs;
 mod quota;
 mod record;
 mod registry;
+mod rules;
 mod runlock;
 mod runspec;
 mod sandbox;
@@ -52,7 +55,7 @@ mod structured_views_contract;
 
 use anyhow::Result;
 use clap::Parser;
-use cli::{BusCmd, Cli, Command, SkillsCmd};
+use cli::{BusCmd, Cli, Command, RuleCmd, SkillsCmd};
 use config::Config;
 use exit_codes::ExitCode;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -554,17 +557,42 @@ fn run() -> Result<ExitCode> {
             base,
             confirm,
             confirm_only,
+            override_gate,
+            reason,
+            adopt_remote,
         } => {
             let (paths, _) = project_ctx()?;
             let cfg = Config::for_run(&paths, &run_id)?;
+            if override_gate {
+                refuse_inside_slot("spar ship --override-gate")?;
+                if reason.is_none() {
+                    anyhow::bail!("--override-gate needs --reason \"<why>\"");
+                }
+                if confirm || confirm_only {
+                    anyhow::bail!("--override-gate ships without --confirm / --confirm-only");
+                }
+            } else if reason.is_some() {
+                anyhow::bail!("--reason only applies with --override-gate");
+            }
             if confirm || confirm_only {
                 ship::confirm_ship(&paths, &run_id, json)?;
                 if confirm_only {
                     return Ok(ExitCode::Success);
                 }
             }
-            ship::ship(&paths, &cfg, &run_id, json, base.as_deref())
+            let opts = ship::ShipOpts {
+                base: base.as_deref(),
+                override_reason: reason.as_deref(),
+                adopt_remote,
+            };
+            ship::ship(&paths, &cfg, &run_id, json, &opts)
         }
+        Command::SyncPrs {
+            run,
+            all,
+            json,
+            dry_run,
+        } => sync_prs_cmd(run.as_deref(), all, json, dry_run),
         Command::Confirm {
             run_id,
             winner,
@@ -639,6 +667,7 @@ fn run() -> Result<ExitCode> {
             undo,
             json,
         } => link_cmd(&run_id, parent.as_deref(), undo, json),
+        Command::Rule { action } => rule_cmd(action),
         Command::Skills { action } => match action {
             SkillsCmd::List { json } => skills::run(skills::SkillsAction::List { json }),
             SkillsCmd::Get { name } => skills::run(skills::SkillsAction::Get { name }),
@@ -1275,6 +1304,94 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> 
     Ok(ExitCode::Success)
 }
 
+/// `spar rule`: operator rulings on a run or the project (O121).
+fn rule_cmd(action: RuleCmd) -> Result<ExitCode> {
+    let (run, project, json) = match &action {
+        RuleCmd::Add {
+            run, project, json, ..
+        }
+        | RuleCmd::List { run, project, json }
+        | RuleCmd::Rm {
+            run, project, json, ..
+        } => (run.clone(), *project, *json),
+    };
+    // Rulings override reviewers and can waive criteria, so a slot must not issue its
+    // own. spar exports these into every slot it dispatches (O121).
+    if !matches!(action, RuleCmd::List { .. })
+        && ["SPAR_AGENT_ID", "SPAR_RUN_ID"]
+            .iter()
+            .any(|k| std::env::var(k).is_ok_and(|v| !v.is_empty()))
+    {
+        anyhow::bail!(
+            "rulings are operator-only: `spar rule add` / `rm` refuse to run inside a spar slot"
+        );
+    }
+    let paths = match &run {
+        Some(id) => load_run_anywhere(id, paths::find_project_root().ok().as_deref())?.0,
+        None if project => project_ctx()?.0,
+        None => anyhow::bail!("pass --run <id> or --project"),
+    };
+    let target = match &run {
+        Some(id) => rules::Target::Run(id),
+        None => rules::Target::Project,
+    };
+    match action {
+        RuleCmd::Add { text, waive, .. } => {
+            let ruling = rules::add(&paths, target, &text, &waive)?;
+            if let rules::Target::Run(id) = target {
+                let _ = events::append(
+                    &paths,
+                    id,
+                    &events::Event::info(format!(
+                        "operator ruling {} recorded{}: {}",
+                        ruling.id,
+                        if ruling.waives.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" (waives {})", ruling.waives.join(", "))
+                        },
+                        ruling.text
+                    )),
+                );
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&ruling)?);
+            } else {
+                println!("{}", rules::line(&ruling));
+                println!("takes effect at the next reviewer or implementer dispatch");
+            }
+        }
+        RuleCmd::List { .. } => {
+            let all = rules::list(&paths, target)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&all)?);
+            } else if all.is_empty() {
+                println!("no rulings");
+            } else {
+                for r in &all {
+                    println!("{}", rules::line(r));
+                }
+            }
+        }
+        RuleCmd::Rm { rule_id, .. } => {
+            let removed = rules::remove(&paths, target, &rule_id)?;
+            if let rules::Target::Run(id) = target {
+                let _ = events::append(
+                    &paths,
+                    id,
+                    &events::Event::info(format!("operator ruling {} removed", removed.id)),
+                );
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&removed)?);
+            } else {
+                println!("removed {}", rules::line(&removed));
+            }
+        }
+    }
+    Ok(ExitCode::Success)
+}
+
 /// `spar brief <id>`: re-hydrate a fresh session on a run's own state, in one call.
 /// Read-only — uses `load_for_display`, same as `status`, and never writes.
 fn brief_cmd(run_id: &str, full: bool, json: bool) -> Result<ExitCode> {
@@ -1332,6 +1449,12 @@ fn brief_cmd(run_id: &str, full: bool, json: bool) -> Result<ExitCode> {
         .collect();
 
     let next = notify::next_command(&state);
+    let rulings = rules::for_run(&paths, &state.id);
+    let waived = rules::waived(&rulings);
+    let open_findings = workflow::review_result::open_findings(
+        &state,
+        &workflow::review_result::findings_cwd(&state),
+    );
 
     if json {
         let v = serde_json::json!({
@@ -1354,6 +1477,9 @@ fn brief_cmd(run_id: &str, full: bool, json: bool) -> Result<ExitCode> {
             "error": state.error,
             "artifacts": artifacts.iter().map(|(n, p)| serde_json::json!({"name": n, "path": p})).collect::<Vec<_>>(),
             "ac_ids": ac_ids,
+            "waived": waived.iter().map(|(id, r)| serde_json::json!({"id": id, "rule": r.id, "text": r.text})).collect::<Vec<_>>(),
+            "rulings": rulings,
+            "open_findings": open_findings,
             "recent_events": events,
             "next_command": next,
         });
@@ -1418,6 +1544,21 @@ fn brief_cmd(run_id: &str, full: bool, json: bool) -> Result<ExitCode> {
     if !ac_ids.is_empty() {
         println!("acceptance criteria: {}", ac_ids.join(", "));
     }
+    for (id, r) in &waived {
+        println!("  {id} waived by {}: {}", r.id, r.text);
+    }
+    if !rulings.is_empty() {
+        println!("operator rulings:");
+        for r in &rulings {
+            println!("  {}", rules::line(r));
+        }
+    }
+    if !open_findings.is_empty() {
+        println!("open findings (last review panel; check each at HEAD):");
+        for f in &open_findings {
+            println!("  {}", f.line().replace('\n', "\n  "));
+        }
+    }
     println!("recent events:");
     for e in &events {
         println!("  - {} {:?}", e.ts.to_rfc3339(), e.kind);
@@ -1469,6 +1610,10 @@ fn run_status_json(
             Vec::new()
         };
         obj.insert("orphan_pids".into(), serde_json::json!(orphans));
+        obj.insert(
+            "rulings".into(),
+            serde_json::to_value(rules::for_run(swarm, &state.id))?,
+        );
     }
     liveness::enrich_status_json(&mut v, &state.slots, cfg, swarm, &state.id);
     Ok(v)
@@ -2040,6 +2185,65 @@ fn attach_cmd(run_id: &str) -> Result<ExitCode> {
     Ok(ExitCode::Success)
 }
 
+/// A slot (or anything it spawns) inherits `SPAR_AGENT_ID` / `SPAR_RUN_ID`; these
+/// commands decide a run's fate and belong to the operator.
+fn refuse_inside_slot(command: &str) -> Result<()> {
+    let set = ["SPAR_AGENT_ID", "SPAR_RUN_ID"]
+        .into_iter()
+        .find(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
+    match set {
+        Some(var) => {
+            anyhow::bail!(
+                "`{command}`: operator-only command; refused inside a slot ({var} is set)"
+            )
+        }
+        None => Ok(()),
+    }
+}
+
+fn sync_prs_cmd(run_id: Option<&str>, all: bool, json: bool, dry_run: bool) -> Result<ExitCode> {
+    refuse_inside_slot("spar sync-prs")?;
+    let (paths, _) = project_ctx()?;
+    let scope = match (run_id, all) {
+        (Some(_), true) => anyhow::bail!("pass --run <id> or --all, not both"),
+        (None, false) => anyhow::bail!("usage: spar sync-prs --run <id> | spar sync-prs --all"),
+        (Some(id), false) => prs::SyncScope::Run(id),
+        (None, true) => prs::SyncScope::All,
+    };
+    let rows = prs::sync_prs(&paths, scope, !dry_run)?;
+    let failed = rows.iter().any(|r| r.error.is_some());
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "dry_run": dry_run, "runs": rows }))?
+        );
+    } else {
+        for r in &rows {
+            let pr = r.pr_url.as_deref().unwrap_or("no PR");
+            match (&r.error, r.to) {
+                (Some(e), _) => println!("{}: error: {e}", r.run_id),
+                (None, Some(to)) if dry_run => {
+                    println!("{}: would move {:?} -> {to:?} ({pr})", r.run_id, r.phase)
+                }
+                (None, Some(to)) => println!("{}: {:?} -> {to:?} ({pr})", r.run_id, r.phase),
+                (None, None) => println!(
+                    "{}: unchanged, {} ({pr})",
+                    r.run_id,
+                    r.note.as_deref().unwrap_or("")
+                ),
+            }
+        }
+        if rows.is_empty() {
+            println!("no shipped runs to sync");
+        }
+    }
+    Ok(if failed {
+        ExitCode::Failure
+    } else {
+        ExitCode::Success
+    })
+}
+
 /// Delete build output inside finished runs' worktrees.
 ///
 /// Kept apart from `cleanup` in the CLI on purpose: cleanup removes worktrees and carries
@@ -2579,6 +2783,55 @@ fn cleanup_one(
     Ok(ExitCode::Success)
 }
 
+/// Pauses held on keys no CLI adapter reports (an `api:` provider, a retired adapter):
+/// `provider list` shows every pause, not only those on installed CLIs.
+fn stray_pauses(
+    store: &quota::QuotaStore,
+    report: &[providers::ProviderReport],
+) -> Vec<quota::ProviderQuota> {
+    let listed: Vec<String> = report
+        .iter()
+        .map(|p| quota::normalize_key(&p.name))
+        .collect();
+    let mut stray: Vec<quota::ProviderQuota> = store
+        .providers
+        .values()
+        .filter(|q| !listed.contains(&q.name))
+        .filter(|q| store.effective_status(&q.name) != quota::ProviderStatus::Available)
+        .cloned()
+        .collect();
+    stray.sort_by(|a, b| a.name.cmp(&b.name));
+    stray
+}
+
+/// `paused 3h12m ago until 2027-01-01T00:00:00+00:00 (manual pause)`, for a pause that
+/// still holds. The age is what tells a stale week-old quota pause from a fresh one.
+fn pause_line(store: &quota::QuotaStore, key: &str) -> Option<String> {
+    if store.effective_status(key) == quota::ProviderStatus::Available {
+        return None;
+    }
+    let q = store.get(key);
+    let age = q
+        .updated_at
+        .map(|t| {
+            let secs = (chrono::Utc::now() - t).num_seconds().max(0) as u64;
+            format!(
+                "paused {} ago",
+                record::fmt_elapsed(std::time::Duration::from_secs(secs))
+            )
+        })
+        .unwrap_or_else(|| "paused (age unknown)".into());
+    let until = match q.cooldown_until {
+        Some(u) => format!(" until {}", u.to_rfc3339()),
+        None if q.status == quota::ProviderStatus::PausedManual => {
+            " until `spar provider resume`".into()
+        }
+        None => String::new(),
+    };
+    let hint = q.hint.map(|h| format!(" ({h})")).unwrap_or_default();
+    Some(format!("{age}{until}{hint}"))
+}
+
 fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
     match action {
         cli::ProviderAction::List { json } => {
@@ -2599,9 +2852,9 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                         // Effective status: a lapsed pause reads Available, so the
                         // listing matches what a run will actually do (auto-recover).
                         let status = quota.effective_status(&key);
-                        let hint = (status != quota::ProviderStatus::Available)
-                            .then_some(q.hint)
-                            .flatten();
+                        let paused = status != quota::ProviderStatus::Available;
+                        let hint = paused.then_some(q.hint).flatten();
+                        let since = q.updated_at.filter(|_| paused);
                         serde_json::json!({
                             "name": p.name,
                             "available": p.available,
@@ -2612,8 +2865,23 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                             "capabilities": p.capabilities,
                             "quota_status": status,
                             "quota_hint": hint,
+                            "paused_since": since,
+                            "pause_age_secs": since.map(|t| (chrono::Utc::now() - t).num_seconds().max(0)),
+                            "paused_until": q.cooldown_until.filter(|_| paused),
                         })
                     })
+                    .chain(stray_pauses(&quota, &report).into_iter().map(|q| {
+                        let status = quota.effective_status(&q.name);
+                        serde_json::json!({
+                            "name": q.name,
+                            "available": serde_json::Value::Null,
+                            "quota_status": status,
+                            "quota_hint": q.hint,
+                            "paused_since": q.updated_at,
+                            "pause_age_secs": q.updated_at.map(|t| (chrono::Utc::now() - t).num_seconds().max(0)),
+                            "paused_until": q.cooldown_until,
+                        })
+                    }))
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&enriched)?);
             } else {
@@ -2625,13 +2893,17 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                     } else {
                         "ok"
                     };
-                    let status = quota.effective_status(&quota::normalize_key(&p.name));
+                    let key = quota::normalize_key(&p.name);
+                    let status = quota.effective_status(&key);
                     println!(
                         "{:<8} {mark:<8} {:<12} {}",
                         p.name,
                         format!("{status:?}"),
                         p.path.as_deref().unwrap_or("-")
                     );
+                    if let Some(line) = pause_line(&quota, &key) {
+                        println!("         {line}");
+                    }
                     if p.available {
                         println!(
                             "         headless={} interactive={} version={}",
@@ -2651,6 +2923,13 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                             }
                             providers::Readiness::Unknown => {}
                         }
+                    }
+                }
+                for q in stray_pauses(&quota, &report) {
+                    let status = quota.effective_status(&q.name);
+                    println!("{:<8} {:<8} {:<12} -", q.name, "-", format!("{status:?}"));
+                    if let Some(line) = pause_line(&quota, &q.name) {
+                        println!("         {line}");
                     }
                 }
             }
@@ -2689,6 +2968,45 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                 println!("{}", serde_json::to_string_pretty(&store.get(&key))?);
             } else {
                 println!("resumed provider {key}");
+            }
+            Ok(ExitCode::Success)
+        }
+        cli::ProviderAction::Probe {
+            name,
+            all,
+            json,
+            dry_run,
+        } => {
+            let (paths, _) = project_ctx()?;
+            let dry = dry_run || util::env_truthy("SPAR_DRY_RUN");
+            let targets: Vec<String> = match name {
+                Some(n) => vec![n],
+                None if all => providers::all_adapters()
+                    .iter()
+                    .filter(|a| a.resolve_binary().is_some())
+                    .map(|a| format!("cli:{}", a.name()))
+                    .collect(),
+                None => anyhow::bail!("name a provider or pass --all"),
+            };
+            let reports: Vec<probe::ProbeReport> = targets
+                .iter()
+                .map(|t| probe::probe(&paths, t, dry))
+                .collect();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&reports)?);
+            } else {
+                for r in &reports {
+                    println!(
+                        "{:<12} {:<8} {}{}",
+                        r.provider,
+                        format!("{:?}", r.verdict).to_ascii_lowercase(),
+                        r.store,
+                        r.detail
+                            .as_deref()
+                            .map(|d| format!(": {d}"))
+                            .unwrap_or_default()
+                    );
+                }
             }
             Ok(ExitCode::Success)
         }
