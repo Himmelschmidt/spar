@@ -212,3 +212,230 @@ fn an_implementer_auth_rejection_moves_to_the_declared_backup() {
     assert_eq!(fx.count("codex"), 2, "the backup gets its own retry");
     assert!(fx.state()["error"].as_str().unwrap().contains("auth"));
 }
+
+fn list_entry(fx: &Fixture, name: &str) -> serde_json::Value {
+    let out = fx
+        .spar()
+        .args(["provider", "list", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let list: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    list.as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == name)
+        .cloned()
+        .unwrap_or_else(|| panic!("{name} not listed: {list}"))
+}
+
+#[test]
+fn provider_list_shows_the_age_and_until_of_every_pause() {
+    let fx = Fixture::new();
+    fx.spar()
+        .args(["provider", "pause", "cli:grok"])
+        .assert()
+        .success();
+    fx.spar()
+        .args([
+            "provider",
+            "pause",
+            "codex",
+            "--until",
+            "2027-01-01T00:00:00Z",
+        ])
+        .assert()
+        .success();
+    fx.spar()
+        .args(["provider", "pause", "api:openai"])
+        .assert()
+        .success();
+
+    let grok = list_entry(&fx, "grok");
+    assert_eq!(grok["quota_status"], "paused_manual");
+    assert!(grok["paused_since"].is_string(), "{grok}");
+    assert!(grok["pause_age_secs"].as_i64().unwrap() >= 0);
+    assert!(grok["paused_until"].is_null());
+
+    let codex = list_entry(&fx, "codex");
+    assert_eq!(codex["quota_status"], "paused_manual");
+    assert!(codex["paused_until"]
+        .as_str()
+        .unwrap()
+        .starts_with("2027-01-01"));
+
+    let api = list_entry(&fx, "api:openai");
+    assert_eq!(api["quota_status"], "paused_manual");
+
+    let human = fx
+        .spar()
+        .args(["provider", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let human = String::from_utf8(human).unwrap();
+    assert!(human.contains("until `spar provider resume`"), "{human}");
+    assert!(human.contains("until 2027-01-01T00:00:00+00:00"), "{human}");
+    assert!(human.contains("api:openai"), "{human}");
+}
+
+/// The fake records every invocation, `--version` included, so an empty count proves
+/// the dry probe spawned nothing at all.
+#[test]
+fn a_dry_run_probe_spawns_nothing_and_writes_nothing() {
+    let fx = Fixture::new();
+    let p = fx.bin.join("claude");
+    fs::write(
+        &p,
+        "#!/bin/sh\necho x >> \"$FAKE_COUNT_DIR/claude.count\"\necho OK\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fx.spar()
+        .args(["provider", "pause", "cli:claude"])
+        .assert()
+        .success();
+    let before = fs::read_to_string(fx.proj.join(".spar/quota.json")).unwrap();
+    for args in [
+        vec!["provider", "probe", "cli:claude", "--dry-run", "--json"],
+        vec!["provider", "probe", "--all", "--dry-run", "--json"],
+    ] {
+        let out = fx
+            .spar()
+            .args(&args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let reports: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let claude = reports
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["provider"] == "cli:claude")
+            .unwrap();
+        assert_eq!(claude["verdict"], "skipped");
+        assert!(claude["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("dry-run: would run"));
+    }
+    fx.spar()
+        .env("SPAR_DRY_RUN", "1")
+        .args(["provider", "probe", "cli:claude"])
+        .assert()
+        .success();
+    assert_eq!(fx.count("claude"), 0, "dry-run must not spawn the provider");
+    assert_eq!(
+        fs::read_to_string(fx.proj.join(".spar/quota.json")).unwrap(),
+        before
+    );
+}
+
+fn seed_quota_pause(fx: &Fixture, key: &str, days_ago: i64) {
+    let since = chrono::Utc::now() - chrono::Duration::days(days_ago);
+    fs::create_dir_all(fx.proj.join(".spar")).unwrap();
+    fs::write(
+        fx.proj.join(".spar/quota.json"),
+        serde_json::json!({"providers": {key: {
+            "name": key,
+            "status": "paused_quota",
+            "hint": "possible quota signal: quota",
+            "updated_at": since.to_rfc3339(),
+            "cooldown_until": (chrono::Utc::now() + chrono::Duration::days(3)).to_rfc3339(),
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_probe_that_gets_an_answer_clears_a_stale_quota_pause() {
+    let fx = Fixture::new();
+    fx.cli("codex", &counted("codex", "echo OK\nexit 0"));
+    seed_quota_pause(&fx, "cli:codex", 13);
+    let out = fx
+        .spar()
+        .args(["provider", "probe", "cli:codex", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let r: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(r[0]["verdict"], "healthy", "{r}");
+    assert_eq!(r[0]["store"], "cleared quota pause");
+    assert_eq!(fx.count("codex"), 1, "one call");
+    assert_eq!(list_entry(&fx, "codex")["quota_status"], "available");
+}
+
+#[test]
+fn a_probe_that_hits_the_limit_pauses_and_one_that_is_refused_reports_auth() {
+    let fx = Fixture::new();
+    fx.cli(
+        "codex",
+        &counted(
+            "codex",
+            "echo \"You've hit your usage limit. Try again later.\" >&2\nexit 1",
+        ),
+    );
+    fx.cli(
+        "claude",
+        &counted("claude", &format!("echo '{CLAUDE_REVOKED}'\nexit 1")),
+    );
+    let out = fx
+        .spar()
+        .args(["provider", "probe", "cli:codex", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let r: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(r[0]["verdict"], "quota", "{r}");
+    assert_eq!(list_entry(&fx, "codex")["quota_status"], "paused_quota");
+
+    let out = fx
+        .spar()
+        .args(["provider", "probe", "cli:claude", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let r: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(r[0]["verdict"], "auth", "{r}");
+    assert_eq!(r[0]["store"], "unchanged");
+    assert_eq!(list_entry(&fx, "claude")["quota_status"], "available");
+}
+
+#[test]
+fn a_probe_never_clears_a_manual_pause() {
+    let fx = Fixture::new();
+    fx.cli("codex", &counted("codex", "echo OK\nexit 0"));
+    fx.spar()
+        .args(["provider", "pause", "cli:codex"])
+        .assert()
+        .success();
+    let out = fx
+        .spar()
+        .args(["provider", "probe", "cli:codex", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let r: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(r[0]["verdict"], "healthy");
+    assert_eq!(r[0]["store"], "manual pause kept");
+    assert_eq!(list_entry(&fx, "codex")["quota_status"], "paused_manual");
+}

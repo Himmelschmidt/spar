@@ -485,7 +485,7 @@ fn probe_version(bin: &PathBuf, args: &[&str]) -> Option<String> {
     Some(line.to_string())
 }
 
-fn run_with_timeout(
+pub(crate) fn run_with_timeout(
     cmd: &mut std::process::Command,
     timeout: std::time::Duration,
 ) -> Option<std::process::Output> {

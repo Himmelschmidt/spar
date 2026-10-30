@@ -55,6 +55,17 @@ parseable config with an expired key still reports healthy and fails at dispatch
 is all a local-only, no-quota check can see. An `unhealthy` provider is still eligible
 for dispatch; doctor warns, it does not exclude.
 
+**Probing quota state (O105).** `.spar/quota.json` records failures; it can be stale.
+`spar provider list` (and `--json`: `paused_since`, `pause_age_secs`, `paused_until`)
+shows the age and end of every pause, including ones on `api:` refs. `spar provider
+probe <ref>` (or `--all` for every installed CLI) makes one tiny real call through the
+adapter (`Reply with the single word OK`, the ref's `@model` if any, 120s cap) and
+writes the answer: `healthy` clears a quota pause, `quota` pauses (until the stated
+reset when claude states one), `auth` and `failed` leave the store alone. A manual pause
+is never cleared by a probe. `--dry-run` (or `SPAR_DRY_RUN=1`) prints the call each
+probe would make and spawns nothing. Exit is `0` whatever the verdicts; read them from
+`--json`.
+
 **Auth faults (O104).** A dispatch that dies on a refused credential (claude's `401 ...
 OAuth access token has been revoked` or `Please run /login`, codex `Not logged in`, muse
 ``not logged in: run `muse login` first``, grok `You are not authenticated.`,
@@ -77,9 +88,11 @@ agy's `--print-timeout` is also derived from the role's hard ceiling, so a long
 agy slot runs its full budget instead of dying at agy's 30-minute default.
 
 **Pause / cooldown.** A provider is paused manually (`spar provider pause <ref>`) or
-automatically when a slot hits a rate-limit signal. Pauses **auto-recover** ~30 min after
+automatically when a slot hits a rate-limit signal. Quota pauses **auto-recover** ~30 min after
 they were set (or at an explicit cooldown reset), so the provider is re-probed rather than
-staying dead; `spar provider resume <ref>` clears one immediately. A paused provider is
+staying dead; a manual pause never lapses on that timer: it holds until its `--until`, or
+until `spar provider resume <ref>`, and a quota event never overwrites it (O105).
+`spar provider resume <ref>` clears either immediately. A paused provider is
 never silently swapped into another role: `plan`/`implement` exit `4` (quota) naming the
 paused ref so per-role assignment stays exactly what you specified.
 
