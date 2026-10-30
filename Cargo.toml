@@ -163,3 +163,7 @@ path = "tests/scenarios/stale_verdict.rs"
 [[test]]
 name = "reviewed_commit"
 path = "tests/scenarios/reviewed_commit.rs"
+
+[[test]]
+name = "work_safety"
+path = "tests/scenarios/work_safety.rs"

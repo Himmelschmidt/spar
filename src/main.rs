@@ -468,15 +468,18 @@ fn run() -> Result<ExitCode> {
             merged,
             json,
             purge,
+            purge_artifacts,
             force,
+            if_merged,
         } => cleanup_cmd(
             run_id.as_deref(),
             all,
             older_than.as_deref(),
             merged,
             json,
-            purge,
+            Purge::from_flags(purge, purge_artifacts),
             force,
+            if_merged,
         ),
         Command::Reclaim { run_id, all, json } => reclaim_cmd(run_id.as_deref(), all, json),
         Command::Archive {
@@ -1919,14 +1922,65 @@ fn archive_cmd(
     Ok(ExitCode::Success)
 }
 
+/// What `cleanup` deletes beyond worktrees (O113).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Purge {
+    Nothing,
+    /// The run record, keeping `artifacts/`.
+    Record,
+    /// The whole run dir.
+    Everything,
+}
+
+impl Purge {
+    fn from_flags(purge: bool, purge_artifacts: bool) -> Self {
+        match (purge, purge_artifacts) {
+            (_, true) => Purge::Everything,
+            (true, false) => Purge::Record,
+            (false, false) => Purge::Nothing,
+        }
+    }
+}
+
+/// Delete a run's record. `artifacts/` survives a `Purge::Record`: merge decisions are
+/// made from the reviews and suite report in it, and a reaped run is exactly the one
+/// whose merge someone may still need to reconstruct.
+fn purge_run_dir(paths: &paths::SparPaths, run_id: &str, purge: Purge) -> Result<()> {
+    let dir = paths.run_dir(run_id);
+    if purge == Purge::Nothing || !dir.is_dir() {
+        return Ok(());
+    }
+    if purge == Purge::Everything {
+        std::fs::remove_dir_all(&dir)?;
+        return Ok(());
+    }
+    let artifacts = paths.artifacts_dir(run_id);
+    for entry in std::fs::read_dir(&dir)? {
+        let path = entry?.path();
+        if path == artifacts {
+            continue;
+        }
+        if path.is_dir() && !path.is_symlink() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    let _ = std::fs::remove_dir(&artifacts);
+    let _ = std::fs::remove_dir(&dir);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cleanup_cmd(
     run_id: Option<&str>,
     all: bool,
     older_than: Option<&str>,
     merged: bool,
     json: bool,
-    purge: bool,
+    purge: Purge,
     force: bool,
+    if_merged: bool,
 ) -> Result<ExitCode> {
     // No project-wide force. A sweep decides *for you* which runs it touches, so pairing
     // it with an override that ignores unsaved work is how one command destroys work
@@ -1934,8 +1988,13 @@ fn cleanup_cmd(
     if force && all {
         anyhow::bail!("--force applies to an explicit run id, not --all");
     }
+    if if_merged && all {
+        anyhow::bail!(
+            "--if-merged applies to an explicit run id; the sweep's evidence is --merged"
+        );
+    }
     match (run_id, all) {
-        (Some(id), false) => cleanup_one(id, json, purge, force),
+        (Some(id), false) => cleanup_one(id, json, purge, force, if_merged),
         (None, true) => cleanup_sweep(older_than, merged, json, purge),
         (Some(_), true) => anyhow::bail!("pass a run id or --all, not both"),
         (None, false) => anyhow::bail!("usage: spar cleanup <run_id> | spar cleanup --all"),
@@ -1949,7 +2008,7 @@ fn cleanup_sweep(
     older_than: Option<&str>,
     merged: bool,
     json: bool,
-    purge: bool,
+    purge: Purge,
 ) -> Result<ExitCode> {
     let (paths, _) = project_ctx()?;
     let min_idle = older_than.map(util::parse_duration).transpose()?;
@@ -1996,21 +2055,20 @@ fn cleanup_sweep(
         // `cleanup <id> --force` reaches it later, and it carries base_ref/base_commit and
         // plan.md; deleting it strands the very work the veto just saved.
         let kept_any = cleaned.iter().any(|c| c.skipped.is_some());
-        if purge && !kept_any {
-            let dir = paths.run_dir(&summary.id);
-            if dir.is_dir() {
-                std::fs::remove_dir_all(&dir)?;
-            }
+        let purged = purge != Purge::Nothing && !kept_any;
+        if purged {
+            purge_run_dir(&paths, &summary.id, purge)?;
         }
         swept.push(serde_json::json!({
             "run_id": summary.id,
             "phase": format!("{:?}", state.phase),
             "idle_secs": idle.as_secs(),
             "worktrees": cleaned,
-            "purged": purge,
+            "purged": purged,
+            "artifacts_kept": purged && purge == Purge::Record,
         }));
     }
-    if purge {
+    if purge != Purge::Nothing {
         worktree::prune_empty_spar_parents(&paths)?;
     }
     if json {
@@ -2081,21 +2139,32 @@ fn cleanup_sweep(
     Ok(ExitCode::Success)
 }
 
-fn cleanup_one(run_id: &str, json: bool, purge: bool, force: bool) -> Result<ExitCode> {
+fn cleanup_one(
+    run_id: &str,
+    json: bool,
+    purge: Purge,
+    force: bool,
+    if_merged: bool,
+) -> Result<ExitCode> {
     let (paths, _) = project_ctx()?;
     let state = state::RunState::load(&paths, run_id)?;
-    let cleaned = worktree::cleanup_run(&state, force)?;
+    if if_merged {
+        if let Err(why) = worktree::landed_in_base(&state) {
+            anyhow::bail!("run {run_id} is not merged, nothing removed: {why}");
+        }
+    }
+    // `--if-merged` has just shown the work is in the base, so the ancestry veto (which
+    // reads every squash-merged commit as unmerged) is overridden the way `--force` does,
+    // archive included.
+    let cleaned = worktree::cleanup_run(&state, force || if_merged)?;
     let kept_any = cleaned.iter().any(|c| c.skipped.is_some());
     if let Some(session) = &state.tmux_session {
         let _ = tmux::kill_session(session);
     }
     // Same rule as the sweep: the record is the only route back to a spared worktree.
-    let purged = purge && !kept_any;
+    let purged = purge != Purge::Nothing && !kept_any;
     if purged {
-        let dir = paths.run_dir(run_id);
-        if dir.is_dir() {
-            std::fs::remove_dir_all(&dir)?;
-        }
+        purge_run_dir(&paths, run_id, purge)?;
         worktree::prune_empty_spar_parents(&paths)?;
     }
     let removed = cleaned.iter().filter(|c| c.removed).count();
@@ -2110,6 +2179,7 @@ fn cleanup_one(run_id: &str, json: bool, purge: bool, force: bool) -> Result<Exi
                 "removed": removed,
                 "kept": cleaned.iter().filter(|c| c.skipped.is_some()).count(),
                 "purged": purged,
+                "artifacts_kept": purged && purge == Purge::Record,
                 "worktrees": cleaned,
             })
         );
@@ -2118,6 +2188,9 @@ fn cleanup_one(run_id: &str, json: bool, purge: bool, force: bool) -> Result<Exi
             if let Some(reason) = &w.skipped {
                 println!("skipped {}: {reason}", w.path.display());
                 continue;
+            }
+            if let Some(reference) = &w.archived {
+                println!("archived {} to {reference}", w.path.display());
             }
             if !w.killed.is_empty() {
                 let pids: Vec<String> = w.killed.iter().map(|p| p.to_string()).collect();
@@ -2135,10 +2208,16 @@ fn cleanup_one(run_id: &str, json: bool, purge: bool, force: bool) -> Result<Exi
             }
         }
         println!("cleaned worktrees for {run_id}");
-        if purge && kept_any {
+        if purge != Purge::Nothing && kept_any {
             println!("kept the run record: a worktree still holds work");
         }
-        if purged {
+        if purged && purge == Purge::Record {
+            println!(
+                "purged run record; kept {}",
+                paths.artifacts_dir(run_id).display()
+            );
+        }
+        if purged && purge == Purge::Everything {
             println!("purged run dir");
             if !paths.runs_dir().is_dir() {
                 println!("removed empty .spar/runs");

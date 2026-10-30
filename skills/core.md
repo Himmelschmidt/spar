@@ -309,8 +309,10 @@ spar reconcile <run_id>                  # arena merge-good-parts + review
 spar ship <run_id> --confirm [--base <branch>]   # draft PR (never merges)
 spar stop <run_id> [--json]              # halt dispatch, KEEP branch+worktree (resumable)
 spar stop --abandoned [--json]           # reap every run nobody is driving any more
-spar cleanup <run_id> [--purge]          # remove worktrees (and --purge run data)
-spar cleanup <run_id> --force            # remove even if it holds unsaved work
+spar cleanup <run_id> [--purge]          # remove worktrees (--purge: run record, KEEPS artifacts/)
+spar cleanup <run_id> --purge-artifacts  # …and artifacts/ too
+spar cleanup <run_id> --if-merged        # refuse unless the work landed (squash-aware), then reap
+spar cleanup <run_id> --force            # archive unsaved work to refs/spar-archive/<id>/<slot>, then remove
 spar cleanup --all [--older-than 7d]     # sweep finished runs project-wide
 spar reclaim <run_id> | --all [--json]   # delete build output, KEEP the worktree
 spar reconcile-state <run_id> | --all    # settle slots a dead orchestrator left `running`
@@ -771,6 +773,10 @@ and human gates — are spared unless you add `--older-than <dur>`, where the ag
 evidence nobody is coming back for them. A run **in flight is never swept**, abandoned or
 not: park it first (`spar stop`, or `spar stop --abandoned`). Run data under
 `.spar/runs/<id>` survives a sweep unless you pass `--purge`; only worktrees go.
+`--purge` deletes the run record (state, logs, prompts, markers) and **keeps
+`.spar/runs/<id>/artifacts/`** (plan, reviews, suite report: what merge decisions are made
+from); `--json` reports `artifacts_kept: true`. `--purge-artifacts` implies `--purge` and
+deletes `artifacts/` as well. A run with only `artifacts/` left no longer lists anywhere.
 
 Rejecting a plan (`spar reject`) reaps that run's worktrees immediately — nothing can
 resume a rejected plan — while keeping `plan.md` and the critique that justified it.
@@ -822,7 +828,21 @@ commits the run's base does not contain, and the worktree is skipped with a reas
 `remove_worktree` runs `git worktree remove --force` *and* `git branch -D`, so an unmerged
 commit is as gone as an unsaved edit. The check lives at the removal itself, so every
 evidence path inherits it. `spar cleanup <id> --force` overrides for a run you name;
-there is deliberately no `--all --force`.
+there is deliberately no `--all --force`. `--force` no longer destroys that work: before
+deleting a worktree it would have refused, it snapshots the dirty tree plus every commit
+its HEAD and branch reach into one commit at `refs/spar-archive/<run_id>/<slot>` in the
+project repo (`archived` in `--json`, `archived <path> to <ref>` in text). A worktree that
+cannot be archived is kept. Recover with `git checkout -b rescue refs/spar-archive/<id>/impl`.
+
+**Reap after a merge with `--if-merged`, not `gh pr view … && spar cleanup`.** `spar cleanup
+<id> --if-merged` exits `1` and removes nothing unless every worktree is clean and every
+commit its branch and HEAD reach is in the run's base (`base_ref`, local or `origin/`) by
+one of: ancestry; a **merged** PR for the branch (`gh pr view <branch> --json
+state,headRefOid`) whose head contains it; or patch-id containment, commit by commit
+(rebase merge) or as one combined diff (squash merge). A branch contained in another branch
+that landed counts as landed. `gh` missing or failing just skips that evidence. When it
+passes, it reaps the way `--force` does, archive included. Only with a run id; the sweep's
+evidence stays `--merged` (ancestry), so squash-merged runs are reaped by id.
 
 **Age is never evidence for a run parked at a gate.** `awaiting_plan_approval` and friends
 are blocked on *you*: idle time there measures how busy you were, not whether the run was
@@ -841,7 +861,7 @@ and the largest single object on the machine was a *stopped* run's target dir.
 also reaps at-rest runs whose every slot branch is already contained in the run's own
 `base_ref` — the work is in the base branch, so there is nothing left to lose. It still
 cannot touch a run in flight. Containment is **ancestry**, so a **squash-merged** branch
-reads as unmerged and needs `--older-than` or an explicit run id.
+reads as unmerged and needs `--older-than` or `spar cleanup <id> --if-merged`.
 
 **This also runs on its own.** `[worktree] auto_cleanup_merged` (default **true**) reaps
 merged at-rest runs project-wide just before a launch cuts new slot worktrees — the

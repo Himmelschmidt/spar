@@ -28,6 +28,10 @@ pub fn checkpoint_ref(run_id: &str, slot_id: &str) -> String {
     format!("refs/spar-checkpoint/{run_id}/{}", sanitize_slot(slot_id))
 }
 
+pub fn archive_ref(run_id: &str, slot_id: &str) -> String {
+    format!("refs/spar-archive/{run_id}/{}", sanitize_slot(slot_id))
+}
+
 /// A commit holding `dir`'s whole working tree as `git add -A` sees it, parented on HEAD
 /// and on each of `extra_parents` that differs from it. Built through a throwaway index
 /// and `commit-tree`, so the worktree's own index, HEAD and branch never move.

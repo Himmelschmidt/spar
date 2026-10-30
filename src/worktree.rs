@@ -547,6 +547,193 @@ fn resolve_commit(root: &Path, reference: &str) -> Option<String> {
     })
 }
 
+/// Squash-aware merge evidence for `cleanup --if-merged` (O113). `Err` says why the run
+/// does not count as landed.
+///
+/// Every worktree must be clean, and every commit it can reach (its branch and its HEAD)
+/// must be in the base by one of: ancestry; a merged PR for the branch whose head contains
+/// that commit (`gh`, skipped when absent or failing); patch-id containment in the base,
+/// commit by commit (rebase merge) or as one combined diff (squash merge). A branch that is
+/// an ancestor of another branch that landed (the test author's, merged into the
+/// implementer's) landed with it.
+pub fn landed_in_base(state: &RunState) -> std::result::Result<(), String> {
+    let root = &state.project_root;
+    let base_ref = state
+        .base_ref
+        .as_deref()
+        .ok_or("the run has no recorded base branch")?;
+    let mut tips: Vec<String> = Vec::new();
+    for r in [base_ref.to_string(), format!("origin/{base_ref}")] {
+        if let Some(c) = git_out(root, &["rev-parse", "--verify", &format!("{r}^{{commit}}")]) {
+            if !tips.contains(&c) {
+                tips.push(c);
+            }
+        }
+    }
+    if tips.is_empty() {
+        return Err(format!("base {base_ref} does not resolve"));
+    }
+    let mut landed: Vec<String> = Vec::new();
+    let mut pending: Vec<(String, String)> = Vec::new();
+    for rec in &state.worktrees {
+        let mut commits = Vec::new();
+        if rec.path.is_dir() {
+            if worktree_holds_uncommitted(&rec.path) {
+                return Err(format!("{} has uncommitted changes", rec.path.display()));
+            }
+            if let Some(head) = git_out(&rec.path, &["rev-parse", "--verify", "HEAD"]) {
+                commits.push((format!("HEAD of {}", rec.path.display()), head));
+            }
+        }
+        if let Some(tip) = resolve_commit(root, &rec.branch) {
+            commits.retain(|(_, c)| *c != tip);
+            commits.push((rec.branch.clone(), tip));
+        }
+        for (label, commit) in commits {
+            if commit_landed(
+                root,
+                &rec.branch,
+                &commit,
+                state.base_commit.as_deref(),
+                &tips,
+            ) {
+                landed.push(commit);
+            } else {
+                pending.push((label, commit));
+            }
+        }
+    }
+    pending.retain(|(_, c)| !landed.iter().any(|l| is_ancestor(root, c, l)));
+    match pending.first() {
+        None => Ok(()),
+        Some((label, _)) => Err(format!(
+            "{label} is not in {base_ref}: not an ancestor, no merged PR containing it, \
+             and no matching patch"
+        )),
+    }
+}
+
+fn is_ancestor(root: &Path, commit: &str, of: &str) -> bool {
+    git_quiet(root, &["merge-base", "--is-ancestor", commit, of]).unwrap_or(false)
+}
+
+fn commit_landed(
+    root: &Path,
+    branch: &str,
+    commit: &str,
+    fork: Option<&str>,
+    tips: &[String],
+) -> bool {
+    if tips.iter().any(|t| is_ancestor(root, commit, t)) {
+        return true;
+    }
+    if merged_pr_head(root, branch)
+        .is_some_and(|head| head == commit || is_ancestor(root, commit, &head))
+    {
+        return true;
+    }
+    tips.iter().any(|tip| {
+        let fork = fork
+            .map(str::to_string)
+            .or_else(|| git_out(root, &["merge-base", commit, tip]));
+        fork.is_some_and(|f| patches_in(root, &f, commit, tip))
+    })
+}
+
+/// The head commit of `branch`'s merged PR, by `gh`. `None` when gh is missing, fails, or
+/// the PR is not merged: the caller falls through to patch evidence.
+fn merged_pr_head(root: &Path, branch: &str) -> Option<String> {
+    let out = Command::new("gh")
+        .args(["pr", "view", branch, "--json", "state,headRefOid"])
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    merged_head_from_json(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn merged_head_from_json(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    if v["state"].as_str() != Some("MERGED") {
+        return None;
+    }
+    v["headRefOid"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// `fork..commit` is in `fork..tip` by patch-id: every commit has a twin (a rebase
+/// merge), or the whole range's combined diff matches one commit (a squash merge).
+fn patches_in(root: &Path, fork: &str, commit: &str, tip: &str) -> bool {
+    if fork == commit {
+        return true;
+    }
+    let upstream: Vec<String> = patch_ids(
+        root,
+        &[
+            "log",
+            "-p",
+            "--no-merges",
+            "--no-color",
+            &format!("{fork}..{tip}"),
+        ],
+    );
+    if upstream.is_empty() {
+        return false;
+    }
+    let combined = patch_ids(root, &["diff", "--no-color", fork, commit]);
+    if combined.first().is_some_and(|id| upstream.contains(id)) {
+        return true;
+    }
+    let own = patch_ids(
+        root,
+        &[
+            "log",
+            "-p",
+            "--no-merges",
+            "--no-color",
+            &format!("{fork}..{commit}"),
+        ],
+    );
+    !own.is_empty() && own.iter().all(|id| upstream.contains(id))
+}
+
+/// Stable patch ids of the patches `git <args>` prints.
+fn patch_ids(root: &Path, args: &[&str]) -> Vec<String> {
+    let Some(patch) = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+    else {
+        return Vec::new();
+    };
+    let Ok(mut child) = Command::new("git")
+        .args(["patch-id", "--stable"])
+        .current_dir(root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+    else {
+        return Vec::new();
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        let _ = stdin.write_all(&patch.stdout);
+    }
+    let Ok(out) = child.wait_with_output() else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_whitespace().next().map(str::to_string))
+        .collect()
+}
+
 /// Reap the worktrees of every at-rest run whose branches are already in their base.
 ///
 /// The disk-pollution backstop: a run that shipped and landed has nothing left to resume,
@@ -604,6 +791,9 @@ pub struct WorktreeCleanup {
     /// Set when the guard refused the path (never touched).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped: Option<String>,
+    /// The ref `--force` archived this worktree's work to before deleting it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived: Option<String>,
 }
 
 /// Cleanup only ever touches a run's own worktrees. Refuse the project root itself and
@@ -866,17 +1056,34 @@ fn unsaved_work(state: &RunState, rec: &WorktreeRecord) -> Option<String> {
 /// unguarded; guarding the deletion covers all of them, including ones not written yet.
 ///
 /// `force` is the operator naming a run and meaning it.
+///
+/// `force` never deletes work outright: whatever the veto would have protected is first
+/// archived to `refs/spar-archive/<run>/<slot>` (O113), and a worktree that cannot be
+/// archived is kept.
 pub fn cleanup_run(state: &RunState, force: bool) -> Result<Vec<WorktreeCleanup>> {
     let mut report = Vec::new();
     for rec in &state.worktrees {
-        if !force {
-            if let Some(why) = unsaved_work(state, rec) {
+        let mut archived = None;
+        if let Some(why) = unsaved_work(state, rec) {
+            let refused = if force {
+                match archive_worktree(state, rec) {
+                    Ok(reference) => {
+                        archived = Some(reference);
+                        None
+                    }
+                    Err(e) => Some(format!("holds {why} and could not be archived ({e})")),
+                }
+            } else {
+                Some(format!("holds {why} — reap by run id with --force"))
+            };
+            if let Some(reason) = refused {
                 report.push(WorktreeCleanup {
                     slot_id: rec.slot_id.clone(),
                     path: rec.path.clone(),
                     killed: Vec::new(),
                     removed: false,
-                    skipped: Some(format!("holds {why} — reap by run id with --force")),
+                    skipped: Some(reason),
+                    archived: None,
                 });
                 continue;
             }
@@ -888,6 +1095,7 @@ pub fn cleanup_run(state: &RunState, force: bool) -> Result<Vec<WorktreeCleanup>
                 killed: Vec::new(),
                 removed: false,
                 skipped: Some("refusing path: not inside the run's own worktrees".into()),
+                archived,
             });
             continue;
         }
@@ -910,9 +1118,37 @@ pub fn cleanup_run(state: &RunState, force: bool) -> Result<Vec<WorktreeCleanup>
             removed: !rec.path.exists(),
             killed,
             skipped: None,
+            archived,
         });
     }
     Ok(report)
+}
+
+/// Snapshot a worktree's dirty tree and every commit its HEAD and branch reach into one
+/// commit under `refs/spar-archive/<run>/<slot>` in the project repo, which outlives both
+/// the worktree and `git branch -D`.
+fn archive_worktree(state: &RunState, rec: &WorktreeRecord) -> std::result::Result<String, String> {
+    let root = &state.project_root;
+    let branch = resolve_commit(root, &rec.branch);
+    let commit = if rec.path.is_dir() {
+        let extra: Vec<&str> = branch.iter().map(String::as_str).collect();
+        crate::checkpoint::snapshot(
+            &rec.path,
+            &format!(
+                "spar archive: run {} slot {} before cleanup --force",
+                state.id, rec.slot_id
+            ),
+            &extra,
+        )
+        .ok_or("git could not snapshot the worktree")?
+    } else {
+        branch.ok_or("its branch does not resolve")?
+    };
+    let reference = crate::checkpoint::archive_ref(&state.id, &rec.slot_id);
+    if !crate::checkpoint::record(root, &reference, &commit) {
+        return Err(format!("could not write {reference}"));
+    }
+    Ok(reference)
 }
 
 /// What the overlay left behind: paths git ignores in the author worktree, and where
@@ -1731,6 +1967,173 @@ mod tests {
         let report = cleanup_run(&state, true).unwrap();
         assert!(report[0].skipped.is_none(), "{report:?}");
         assert!(!rec.path.exists());
+    }
+
+    /// #157: `--force` used to delete uncommitted edits and unmerged commits outright. Now
+    /// both land in one archive commit that outlives the worktree and `branch -D`.
+    #[test]
+    fn force_archives_dirty_and_unmerged_work_before_deleting() {
+        let tmp = tempdir().unwrap();
+        let (root, _wt, _) = repo_with_linked_worktree(tmp.path());
+        let mut state = RunState::new("runarch", crate::cli::WorkflowKind::Loop, root.clone());
+        state.base_commit = git_out(&root, &["rev-parse", "HEAD"]);
+        let rec = create_worktree(&root, "runarch", "impl", state.base_commit.as_deref()).unwrap();
+        state.worktrees.push(rec.clone());
+        std::fs::write(rec.path.join("committed.rs"), "c\n").unwrap();
+        fixture_git(&rec.path, &["add", "."]);
+        fixture_git(
+            &rec.path,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "c",
+            ],
+        );
+        std::fs::write(rec.path.join("dirty.rs"), "d\n").unwrap();
+
+        let report = cleanup_run(&state, true).unwrap();
+        assert!(report[0].removed, "{report:?}");
+        assert_eq!(
+            report[0].archived.as_deref(),
+            Some("refs/spar-archive/runarch/impl")
+        );
+        let archived = fixture_git(&root, &["rev-parse", "refs/spar-archive/runarch/impl"]);
+        assert_eq!(
+            fixture_git(&root, &["show", &format!("{archived}:committed.rs")]),
+            "c"
+        );
+        assert_eq!(
+            fixture_git(&root, &["show", &format!("{archived}:dirty.rs")]),
+            "d"
+        );
+        assert!(
+            resolve_commit(&root, &rec.branch).is_none(),
+            "branch deleted"
+        );
+    }
+
+    fn landed_fixture(tmp: &Path) -> (RunState, WorktreeRecord) {
+        let (root, _wt, _) = repo_with_linked_worktree(tmp);
+        let base = fixture_git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let mut state = RunState::new("runland", crate::cli::WorkflowKind::Loop, root.clone());
+        state.base_ref = Some(base);
+        state.base_commit = git_out(&root, &["rev-parse", "HEAD"]);
+        let rec = create_worktree(&root, "runland", "impl", state.base_commit.as_deref()).unwrap();
+        state.worktrees.push(rec.clone());
+        for name in ["one", "two"] {
+            std::fs::write(rec.path.join(name), format!("{name}\n")).unwrap();
+            fixture_git(&rec.path, &["add", "."]);
+            fixture_git(
+                &rec.path,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "commit",
+                    "-qm",
+                    name,
+                ],
+            );
+        }
+        (state, rec)
+    }
+
+    /// #157: a squash merge is not an ancestor, so ancestry alone called every landed
+    /// branch unmerged and made `--force` routine. Patch-id containment sees it.
+    #[test]
+    fn landed_in_base_recognizes_a_squash_merge_and_refuses_unmerged_work() {
+        let tmp = tempdir().unwrap();
+        let (state, rec) = landed_fixture(tmp.path());
+        let root = state.project_root.clone();
+        let err = landed_in_base(&state).unwrap_err();
+        assert!(err.contains(&rec.branch), "{err}");
+
+        fixture_git(&root, &["merge", "--squash", "-q", &rec.branch]);
+        fixture_git(
+            &root,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "squashed",
+            ],
+        );
+        assert_eq!(landed_in_base(&state), Ok(()));
+
+        std::fs::write(rec.path.join("late.rs"), "x\n").unwrap();
+        let err = landed_in_base(&state).unwrap_err();
+        assert!(err.contains("uncommitted"), "{err}");
+        std::fs::remove_file(rec.path.join("late.rs")).unwrap();
+
+        std::fs::write(rec.path.join("after"), "after\n").unwrap();
+        fixture_git(&rec.path, &["add", "."]);
+        fixture_git(
+            &rec.path,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "after",
+            ],
+        );
+        assert!(
+            landed_in_base(&state).is_err(),
+            "a commit made after the squash is not in the base"
+        );
+    }
+
+    #[test]
+    fn landed_in_base_recognizes_a_rebase_merge() {
+        let tmp = tempdir().unwrap();
+        let (state, rec) = landed_fixture(tmp.path());
+        let root = state.project_root.clone();
+        fixture_git(&root, &["commit", "-q", "--allow-empty", "-m", "moved on"]);
+        let commits = fixture_git(
+            &root,
+            &["rev-list", "--reverse", &format!("HEAD~1..{}", rec.branch)],
+        );
+        for c in commits.lines() {
+            fixture_git(
+                &root,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "cherry-pick",
+                    c,
+                ],
+            );
+        }
+        assert_eq!(landed_in_base(&state), Ok(()));
+    }
+
+    #[test]
+    fn a_merged_pr_counts_only_when_its_head_contains_the_commit() {
+        assert_eq!(
+            merged_head_from_json(r#"{"state":"MERGED","headRefOid":"abc"}"#).as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            merged_head_from_json(r#"{"state":"OPEN","headRefOid":"abc"}"#),
+            None
+        );
+        assert_eq!(
+            merged_head_from_json(r#"{"state":"CLOSED","headRefOid":"abc"}"#),
+            None
+        );
+        assert_eq!(merged_head_from_json("not json"), None);
     }
 
     /// "I cannot determine the base" must never read as "there is nothing to lose". Both

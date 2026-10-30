@@ -488,13 +488,23 @@ pub enum Command {
         merged: bool,
         #[arg(long)]
         json: bool,
-        /// Also delete `.spar/runs/<id>`
+        /// Also delete the run record under `.spar/runs/<id>`, keeping its `artifacts/`
+        /// (plan, reviews, suite report) unless `--purge-artifacts` is given.
         #[arg(long)]
         purge: bool,
-        /// Remove a worktree even if it holds uncommitted changes or unmerged commits.
-        /// Only with an explicit run id — there is deliberately no project-wide force.
+        /// `--purge`, and delete `artifacts/` too.
         #[arg(long)]
+        purge_artifacts: bool,
+        /// Remove a worktree even if it holds uncommitted changes or unmerged commits,
+        /// after archiving that work to `refs/spar-archive/<id>/<slot>`. Only with an
+        /// explicit run id — there is deliberately no project-wide force.
+        #[arg(long, conflicts_with = "if_merged")]
         force: bool,
+        /// Refuse unless the run's work is in its base: clean worktrees, and every commit
+        /// an ancestor of the base, in a merged PR (`gh`), or matched by patch-id (squash
+        /// and rebase merges). Then remove as `--force` would. Only with a run id.
+        #[arg(long)]
+        if_merged: bool,
     },
 
     /// Built-in skills for outer agents (agent-browser style)
