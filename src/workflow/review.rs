@@ -314,6 +314,15 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
         let _ = executor::run_slot(state, paths, cfg, &retry_job);
     }
 
+    let ids: Vec<String> = state.slots.iter().map(|s| s.id.clone()).collect();
+    for id in &ids {
+        let path = paths.artifact(&state.id, &format!("review-{id}.md"));
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let res = crate::workflow::review_result::parse_review(&text);
+            crate::workflow::review_result::record_review(state, paths, id, &res);
+        }
+    }
+
     // Aggregate
     let mut body = format!(
         "# Independent review summary\n\nRun: {}\nTask: {}\n\n",

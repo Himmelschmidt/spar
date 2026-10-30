@@ -11,6 +11,7 @@ mod effort;
 mod events;
 mod executor;
 mod exit_codes;
+mod history;
 mod liveness;
 mod mailbox;
 mod markers;
@@ -1186,10 +1187,9 @@ fn run_status_json(
                 None => serde_json::Value::Null,
             },
         );
-        obj.insert(
-            "orchestrator_alive".into(),
-            serde_json::Value::Bool(orch.map(|t| t.alive()).unwrap_or(false)),
-        );
+        if let serde_json::Value::Object(live) = serde_json::to_value(state.liveness(swarm))? {
+            obj.extend(live);
+        }
         let abandoned = state.abandoned(swarm);
         obj.insert("abandoned".into(), serde_json::Value::Bool(abandoned));
         // Only meaningful when nobody owns the run: these are slot processes still
@@ -1980,6 +1980,7 @@ fn cleanup_sweep(
         let kept_any = cleaned.iter().any(|c| c.skipped.is_some());
         if purge && !kept_any {
             let dir = paths.run_dir(&summary.id);
+            history::append(&paths, &state, history::Trigger::Purge)?;
             if dir.is_dir() {
                 std::fs::remove_dir_all(&dir)?;
             }
@@ -2075,6 +2076,7 @@ fn cleanup_one(run_id: &str, json: bool, purge: bool, force: bool) -> Result<Exi
     let purged = purge && !kept_any;
     if purged {
         let dir = paths.run_dir(run_id);
+        history::append(&paths, &state, history::Trigger::Purge)?;
         if dir.is_dir() {
             std::fs::remove_dir_all(&dir)?;
         }

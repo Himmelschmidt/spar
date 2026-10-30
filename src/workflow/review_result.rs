@@ -5,36 +5,82 @@
 //! reviewer templates spell out `approve | request_changes` in their own format
 //! block, and reviewers routinely echo it.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use crate::paths::SparPaths;
+use crate::state::RunState;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Verdict {
     Approve,
     RequestChanges,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AcStatus {
     Pass,
     Fail,
     Unverified,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcLine {
     pub id: String,
     pub status: AcStatus,
+    #[serde(default)]
     pub evidence: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    Critical,
+    Major,
+    Minor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Finding {
+    pub severity: Severity,
+    /// First `path.ext:line` the finding cites, when it cites one.
+    #[serde(default)]
+    pub file: Option<String>,
+    #[serde(default)]
+    pub line: Option<u32>,
+    pub text: String,
+    /// Written by spar in place of a review it never got, not by a reviewer.
+    #[serde(default)]
+    pub synthetic: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewResult {
     /// `None` means no parsable verdict. Callers treat that as blocking.
+    #[serde(default)]
     pub verdict: Option<Verdict>,
-    pub acceptance: Vec<AcLine>,
     /// The commit the reviewer claims to have judged (`Reviewed-Commit:`), lowercase
     /// hex as written. `None` when the line is absent or malformed; the implement
     /// loop's gate treats that exactly like a missing review (fail closed).
+    #[serde(default)]
     pub reviewed_commit: Option<String>,
+    #[serde(default)]
+    pub acceptance: Vec<AcLine>,
+    /// Only items that name a severity. A bullet without one is a note, not a finding.
+    #[serde(default)]
+    pub findings: Vec<Finding>,
+    /// The artifact carries `SYNTHETIC_REVIEW_MARKER`: spar wrote it because the
+    /// reviewer produced nothing usable.
+    #[serde(default)]
+    pub synthetic: bool,
 }
+
+/// First line of every review spar writes on a reviewer's behalf. An HTML comment so it
+/// stays invisible in rendered markdown.
+pub const SYNTHETIC_REVIEW_MARKER: &str = "<!-- spar:synthetic-review -->";
+
+/// Version of `artifacts/review-<slot>.json`. Bump on any breaking shape change.
+pub const REVIEW_JSON_SCHEMA: u32 = 1;
 
 impl ReviewResult {
     /// The fail-closed ship contract, shared by every call site so it cannot silently
@@ -53,6 +99,7 @@ enum Section {
     Other,
     Verdict,
     Acceptance,
+    Findings,
 }
 
 /// First well-formed `Reviewed-Commit: <sha>` line wins. The key is
@@ -100,17 +147,41 @@ pub fn reviewed_commit_matches(panel_head: &str, parsed: &str) -> bool {
 }
 
 pub fn parse_review(body: &str) -> ReviewResult {
+    let synthetic = body.lines().any(|l| l.trim() == SYNTHETIC_REVIEW_MARKER);
     let mut out = ReviewResult {
         reviewed_commit: parse_reviewed_commit(body),
+        synthetic,
         ..Default::default()
     };
     let mut section = Section::Other;
+    let mut findings = FindingsParser::default();
+    // Only findings honour fences: a salvaged transcript quotes the template's own
+    // `## Findings` block, and that is not the reviewer's finding list.
+    let mut fence: Option<FenceState> = None;
 
     for raw in body.lines() {
+        let trimmed = raw.trim();
+        match &fence {
+            Some(open) if fence_closes(trimmed, open) => fence = None,
+            Some(_) => {}
+            None => fence = fence_open(trimmed),
+        }
+        let fenced = fence.is_some() || fence_open(trimmed).is_some();
+        if fenced && section == Section::Findings {
+            findings.flush();
+            continue;
+        }
         if let Some(rest) = raw.trim_start().strip_prefix("##") {
-            let title = rest
-                .trim_start_matches('#')
-                .trim()
+            let deeper = rest.starts_with('#');
+            let heading = rest.trim_start_matches('#').trim();
+            // Reviewers group findings under `### Major` or title one `### major — ...`;
+            // either way a sub-heading inside Findings is still Findings.
+            if section == Section::Findings && deeper {
+                findings.heading(heading);
+                continue;
+            }
+            findings.flush();
+            let title = heading
                 .trim_matches(['*', '`', ':', ' '])
                 .to_ascii_lowercase();
             section = match title.as_str() {
@@ -119,6 +190,7 @@ pub fn parse_review(body: &str) -> ReviewResult {
                 // permanently blocking. Once a verdict parses, later sections cannot flip it.
                 "verdict" if out.verdict.is_none() => Section::Verdict,
                 "acceptance" => Section::Acceptance,
+                t if t.starts_with("findings") && !fenced => Section::Findings,
                 _ => Section::Other,
             };
             continue;
@@ -136,10 +208,253 @@ pub fn parse_review(body: &str) -> ReviewResult {
                     out.acceptance.push(line);
                 }
             }
+            Section::Findings => findings.line(raw),
             Section::Other => {}
         }
     }
+    findings.flush();
+    out.findings = findings.done;
+    for f in &mut out.findings {
+        f.synthetic = synthetic;
+    }
     out
+}
+
+#[derive(Default)]
+struct FindingsParser {
+    done: Vec<Finding>,
+    current: Option<Finding>,
+    /// Severity named by an enclosing `### Major` heading, inherited by bare bullets.
+    group: Option<Severity>,
+    prev_blank: bool,
+}
+
+impl FindingsParser {
+    fn flush(&mut self) {
+        let Some(mut f) = self.current.take() else {
+            return;
+        };
+        f.text = f.text.trim().to_string();
+        if let Some((file, line)) = cited_location(&f.text) {
+            f.file = Some(file);
+            f.line = Some(line);
+        }
+        self.done.push(f);
+    }
+
+    fn start(&mut self, severity: Severity, text: &str) {
+        self.flush();
+        self.current = Some(Finding {
+            severity,
+            file: None,
+            line: None,
+            text: text.trim().to_string(),
+            synthetic: false,
+        });
+    }
+
+    fn heading(&mut self, title: &str) {
+        self.flush();
+        self.prev_blank = false;
+        let Some((severity, rest)) = split_severity(title, true) else {
+            self.group = None;
+            return;
+        };
+        let rest_word = rest
+            .trim_matches(['*', '_', '`', ' ', ':'])
+            .to_ascii_lowercase();
+        if rest_word.is_empty() || rest_word == "findings" || rest_word == "issues" {
+            self.group = Some(severity);
+            return;
+        }
+        self.group = None;
+        self.start(severity, rest);
+    }
+
+    fn line(&mut self, raw: &str) {
+        if raw.trim().is_empty() {
+            self.prev_blank = true;
+            return;
+        }
+        let indent = raw.len() - raw.trim_start().len();
+        let after_blank = std::mem::replace(&mut self.prev_blank, false);
+        if indent < 2 {
+            if let Some(item) = list_item(raw.trim_start()) {
+                self.flush();
+                if let Some((severity, text)) = split_severity(item, false) {
+                    self.start(severity, text);
+                } else if let Some(severity) = self.group {
+                    let bare = item.trim_matches(['.', ' ', '*', '_']).to_ascii_lowercase();
+                    if bare != "none" {
+                        self.start(severity, item);
+                    }
+                }
+                return;
+            }
+        }
+        if indent < 2 && (after_blank || self.current.is_none()) {
+            self.flush();
+            if let Some((severity, text)) = split_severity(raw.trim(), false) {
+                self.start(severity, text);
+            }
+            return;
+        }
+        if let Some(f) = self.current.as_mut() {
+            f.text.push('\n');
+            f.text.push_str(raw.trim());
+        }
+    }
+}
+
+/// The text after a top-level list marker (`-`, `*`, `+`, `1.`, `1)`), if this is one.
+fn list_item(s: &str) -> Option<&str> {
+    if let Some(rest) = s.strip_prefix(['-', '*', '+']) {
+        return rest.starts_with([' ', '\t']).then(|| rest.trim_start());
+    }
+    let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    let rest = s[digits..].strip_prefix(['.', ')'])?;
+    rest.starts_with([' ', '\t']).then(|| rest.trim_start())
+}
+
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &s[prefix.len()..])
+}
+
+/// A leading severity and the description after it: `severity: major — text`,
+/// `**minor** — text`, `[critical]: text`, `minor (derived) — text`. The template's
+/// `critical|major|minor` skeleton is not a severity. Without the `severity:` key a
+/// separator (or nothing) must follow the word, so prose like `Minor refactor is fine`
+/// is not read as a finding. `bare_ok` admits a word followed by plain text, for
+/// headings like `### Major findings`.
+fn split_severity(s: &str, bare_ok: bool) -> Option<(Severity, &str)> {
+    const MARKUP: [char; 5] = ['*', '_', '`', '[', ' '];
+    let s = s.trim_start_matches(MARKUP);
+    let (keyed, s) = match strip_prefix_ci(s, "severity") {
+        Some(rest) => {
+            let rest = rest
+                .trim_start_matches(['*', '_', '`', ' '])
+                .strip_prefix(':')?;
+            (true, rest.trim_start_matches(MARKUP))
+        }
+        None => (false, s),
+    };
+    let (severity, rest) = [
+        ("critical", Severity::Critical),
+        ("major", Severity::Major),
+        ("minor", Severity::Minor),
+    ]
+    .into_iter()
+    .find_map(|(word, sev)| strip_prefix_ci(s, word).map(|rest| (sev, rest)))?;
+    if rest.starts_with(|c: char| c.is_alphanumeric() || c == '|' || c == '/') {
+        return None;
+    }
+    // `[major]` and `**major**` delimit the word themselves.
+    let closed = rest.starts_with([']', '*', '_', '`']);
+    let mut rest = rest.trim_start_matches(['*', '_', '`', ']', ' ']);
+    if rest.starts_with('(') {
+        rest = &rest[rest.find(')').map_or(rest.len(), |i| i + 1)..];
+        rest = rest.trim_start_matches(['*', '_', '`', ']', ' ']);
+    }
+    let sep = ['—', '–', '-', ':', '.', ',', ';'];
+    if rest.starts_with(sep) {
+        let mut chars = rest.chars();
+        chars.next();
+        rest = chars.as_str();
+    } else if !rest.is_empty() && !keyed && !bare_ok && !closed {
+        return None;
+    }
+    Some((
+        severity,
+        rest.trim_start_matches(['*', '_', ' ']).trim_end(),
+    ))
+}
+
+fn is_path_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-')
+}
+
+/// First `path.ext:line` in `text`. The file name must carry an alphabetic extension,
+/// so `12:30` and `AC-1:` are not locations.
+fn cited_location(text: &str) -> Option<(String, u32)> {
+    for (i, c) in text.char_indices() {
+        if c != ':' {
+            continue;
+        }
+        let after = &text[i + 1..];
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            continue;
+        }
+        let start = text[..i]
+            .char_indices()
+            .rev()
+            .find(|(_, ch)| !is_path_char(*ch))
+            .map_or(0, |(p, ch)| p + ch.len_utf8());
+        let path = &text[start..i];
+        if path.starts_with("//") {
+            continue;
+        }
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let Some((stem, ext)) = name.rsplit_once('.') else {
+            continue;
+        };
+        if stem.is_empty()
+            || ext.is_empty()
+            || !ext.chars().all(|c| c.is_ascii_alphanumeric())
+            || !ext.starts_with(|c: char| c.is_ascii_alphabetic())
+        {
+            continue;
+        }
+        let Ok(line) = after[..digits].parse() else {
+            continue;
+        };
+        return Some((path.to_string(), line));
+    }
+    None
+}
+
+/// Persist what the gate read from one reviewer: on the slot, in the run's per-round
+/// review history, and as `artifacts/review-<slot>.json` beside the markdown.
+pub fn record_review(state: &mut RunState, paths: &SparPaths, slot_id: &str, res: &ReviewResult) {
+    let Some(slot) = state.slot_mut(slot_id) else {
+        return;
+    };
+    slot.review = Some(res.clone());
+    let round = slot.round;
+    let provider = slot.provider.clone();
+    let model = slot.model.clone();
+    state
+        .review_history
+        .retain(|e| !(e.round == round && e.slot_id == slot_id));
+    state.review_history.push(crate::state::ReviewHistoryEntry {
+        round,
+        slot_id: slot_id.to_string(),
+        review: res.clone(),
+    });
+    let mut v = serde_json::json!({
+        "schema_version": REVIEW_JSON_SCHEMA,
+        "run_id": state.id,
+        "slot_id": slot_id,
+        "round": round,
+        "provider": provider,
+        "model": model,
+    });
+    if let (Some(obj), Ok(serde_json::Value::Object(review))) =
+        (v.as_object_mut(), serde_json::to_value(res))
+    {
+        obj.extend(review);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&v) {
+        let _ = std::fs::write(
+            paths.artifact(&state.id, &format!("review-{slot_id}.json")),
+            text,
+        );
+    }
 }
 
 /// `request_changes` is tested first so a hedged `request_changes (see findings)`
@@ -931,5 +1246,174 @@ See AC-1 for the rationale, and compare with AC-18 in the sibling run.
                 ("AC-4", AcStatus::Unverified),
             ]
         );
+    }
+
+    fn findings(body: &str) -> Vec<(Severity, Option<String>, Option<u32>, String)> {
+        parse_review(body)
+            .findings
+            .into_iter()
+            .map(|f| (f.severity, f.file, f.line, f.text))
+            .collect()
+    }
+
+    /// The template's own shape, as reviewers actually fill it in.
+    #[test]
+    fn findings_template_shape_with_locations() {
+        let body = "## Verdict\nrequest_changes\n\nReviewed-Commit: 0123456789abcdef0123456789abcdef01234567\n\n\
+## Acceptance\nAC-1: pass — tests/scenarios/status.rs:40 asserts it\nAC-2: fail — no test\n\n\
+## Findings\n\
+- severity: major — `resolve_home_target` drops a legitimate Enter after 10 seconds. src/tui.rs:1556-1582, 1717-1732; src/workflow/implement.rs:139-146.\n\
+- severity: minor — The ghost-target test assigns `Instant::now().checked_sub(...)` directly.\n\
+  On a platform where that returns `None` the test fails spuriously (src/tui.rs:12766).\n\
+- severity: critical — `cleanup_one` deletes the run dir before history is written (`main.rs:2066`).\n\n\
+## Tests\nran cargo test; 812 passed\n";
+        let res = parse_review(body);
+        assert_eq!(res.verdict, Some(Verdict::RequestChanges));
+        assert_eq!(res.acceptance.len(), 2);
+        assert!(!res.synthetic);
+        let f = findings(body);
+        assert_eq!(f.len(), 3, "{f:?}");
+        assert_eq!(f[0].0, Severity::Major);
+        assert_eq!(f[0].1.as_deref(), Some("src/tui.rs"));
+        assert_eq!(f[0].2, Some(1556));
+        assert!(f[0].3.starts_with("`resolve_home_target` drops"));
+        assert_eq!(f[1].0, Severity::Minor);
+        assert!(
+            f[1].3.ends_with("fails spuriously (src/tui.rs:12766)."),
+            "{:?}",
+            f[1].3
+        );
+        assert_eq!(f[1].1.as_deref(), Some("src/tui.rs"));
+        assert_eq!(f[1].2, Some(12766));
+        assert_eq!(f[2].0, Severity::Critical);
+        assert_eq!(f[2].1.as_deref(), Some("main.rs"));
+        assert_eq!(f[2].2, Some(2066));
+        assert!(res.findings.iter().all(|f| !f.synthetic));
+    }
+
+    /// Spellings seen in real review corpora: bare severity, bold, qualifiers in
+    /// parentheses, colon or period separators, numbered lists.
+    #[test]
+    fn findings_tolerate_real_world_spellings() {
+        let body = "## Verdict\napprove\n\n## Findings\n\
+- minor — `biddesk/src/handlers/tasks.rs:479` stamps the wrong column\n\
+- **major** — PROVEN. The retry loop never backs off\n\
+- **minor — `lib/automation.ts` leaks a timer\n\
+- severity: minor (derived) — carried from round 2\n\
+- minor (test coverage) — nothing pins the empty case\n\
+- minor: the comment at foo.py:12 is stale\n\
+- severity: minor. The retired flag is still parsed\n\
+1. [major] numbered and bracketed\n\
+- Severity: MAJOR — upper case\n";
+        let f = findings(body);
+        let sev: Vec<Severity> = f.iter().map(|x| x.0).collect();
+        use Severity::*;
+        assert_eq!(
+            sev,
+            vec![Minor, Major, Minor, Minor, Minor, Minor, Minor, Major, Major],
+            "{f:?}"
+        );
+        assert_eq!(f[0].1.as_deref(), Some("biddesk/src/handlers/tasks.rs"));
+        assert_eq!(f[0].2, Some(479));
+        assert_eq!(f[1].3, "PROVEN. The retry loop never backs off");
+        assert_eq!(f[3].3, "carried from round 2");
+        assert_eq!(f[5].1.as_deref(), Some("foo.py"));
+        assert_eq!(f[6].3, "The retired flag is still parsed");
+        assert_eq!(f[7].3, "numbered and bracketed");
+    }
+
+    /// Notes, `none`, prose that merely starts with a severity word, and the
+    /// template's skeleton are not findings.
+    #[test]
+    fn findings_skip_notes_skeleton_and_prose() {
+        let body = "## Verdict\napprove\n\n## Findings\n\
+- severity: critical|major|minor — description\n\
+- none\n\
+- Checked, no issue: there is no self-deadlock\n\
+- resolved (was major): prose number un-refuting an address\n\
+- note — the coverage warning is misattributed\n\
+- Minor refactor of the loop is fine\n\
+- minority report is not a severity\n\
+None.\n";
+        assert!(findings(body).is_empty(), "{:?}", findings(body));
+    }
+
+    /// `### Major` groups inherit their severity; a `### major — ...` heading is a
+    /// finding itself; any other sub-heading ends the group.
+    #[test]
+    fn findings_grouped_under_severity_headings() {
+        let body = "## Verdict\nrequest_changes\n\n## Findings (most severe first)\n\
+### Major\n\
+- `ship` never records the PR url (src/ship.rs:253)\n\
+- the sweep purges before writing history\n\n\
+### Minor findings\n\
+- typo in skills/core.md:10\n\
+### major — PR title fails the conventional-commit check\n\
+### Verified sound\n\
+- the lock is released on every path\n\n\
+## Tests\n- severity: major — not in findings\n";
+        let f = findings(body);
+        assert_eq!(f.len(), 4, "{f:?}");
+        assert_eq!(f[0].0, Severity::Major);
+        assert_eq!(f[0].1.as_deref(), Some("src/ship.rs"));
+        assert_eq!(f[1].0, Severity::Major);
+        assert_eq!(f[2].0, Severity::Minor);
+        assert_eq!(f[2].1.as_deref(), Some("skills/core.md"));
+        assert_eq!(f[3].0, Severity::Major);
+        assert_eq!(f[3].3, "PR title fails the conventional-commit check");
+    }
+
+    /// Times, AC ids and URLs are not file locations.
+    #[test]
+    fn findings_location_needs_a_file_with_an_extension() {
+        assert_eq!(cited_location("at 12:30 the run stalls"), None);
+        assert_eq!(cited_location("AC-1: fails"), None);
+        assert_eq!(cited_location("see https://example.com:8080/x"), None);
+        assert_eq!(
+            cited_location("`src/state.rs:354` and src/tui.rs:1"),
+            Some(("src/state.rs".into(), 354))
+        );
+        assert_eq!(
+            cited_location("in (w.rs:511-522)"),
+            Some(("w.rs".into(), 511))
+        );
+    }
+
+    /// spar's own stand-in reviews are marked, and a transcript quoting the
+    /// template's Findings block inside a fence contributes nothing.
+    #[test]
+    fn synthetic_review_is_marked_and_fenced_transcript_ignored() {
+        let body = format!(
+            "{SYNTHETIC_REVIEW_MARKER}\n## Verdict\nrequest_changes\n\n## Findings\n\
+- severity: major — review slot interrupted (timeout); partial transcript salvaged below\n\n\
+## Tests\nsee partial transcript\n\n## Partial transcript\n\n```\n## Findings\n\
+- severity: major — the reviewer was mid-sentence\n```\n"
+        );
+        let res = parse_review(&body);
+        assert!(res.synthetic);
+        assert_eq!(res.findings.len(), 1, "{:?}", res.findings);
+        assert!(res.findings[0].synthetic);
+        assert_eq!(res.findings[0].severity, Severity::Major);
+    }
+
+    /// The persisted shape is the contract `status --json` and
+    /// `review-<slot>.json` expose; a record from before findings existed loads.
+    #[test]
+    fn review_result_serializes_stably_and_old_records_load() {
+        let res = parse_review(
+            "## Verdict\napprove\n\nReviewed-Commit: abcdef1\n\n## Acceptance\nAC-1: pass — ok\n\n## Findings\n- severity: minor — x.rs:3 nit\n",
+        );
+        let v = serde_json::to_value(&res).unwrap();
+        assert_eq!(v["verdict"], "approve");
+        assert_eq!(v["reviewed_commit"], "abcdef1");
+        assert_eq!(v["acceptance"][0]["status"], "pass");
+        assert_eq!(v["findings"][0]["severity"], "minor");
+        assert_eq!(v["findings"][0]["file"], "x.rs");
+        assert_eq!(v["findings"][0]["line"], 3);
+        assert_eq!(v["findings"][0]["synthetic"], false);
+        assert_eq!(v["synthetic"], false);
+        let old: ReviewResult = serde_json::from_str(r#"{"verdict":"request_changes"}"#).unwrap();
+        assert_eq!(old.verdict, Some(Verdict::RequestChanges));
+        assert!(old.findings.is_empty());
     }
 }

@@ -342,48 +342,6 @@ pub fn run_loop(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<Exi
     run_with_task(task, None, opts, paths, cfg, None)
 }
 
-/// Whether `implement --run` / `spar resume` may pick this run back up.
-///
-/// The hazard this gates is a `--workflow plan` run being driven through to ship
-/// without its plan ever being approved, so every phase clause that is not the
-/// `plan_approved` gate itself is qualified by `WorkflowKind::Loop`, which has no
-/// approval step at all.
-fn is_resumable(state: &RunState) -> bool {
-    state.gates.plan_approved
-        || state.phase == Phase::PlanApproved
-        // The round-ceiling gate is lifted by re-entering implement, so a run parked
-        // there has to be resumable even when no plan gate ever ran (`--workflow loop`).
-        || state.phase == Phase::AwaitingRoundExtension
-        // A slot that died mid-dispatch from a rate limit parks here (executor::run_slot
-        // via `fail`'s quota_hit branch); re-entering must pick the run back up rather
-        // than forcing `--new` and abandoning the frozen contract and round history.
-        // But `Phase::Quota` is also where `workflow/plan.rs` parks a *plan* run that
-        // never got approved (its own pre-dispatch gate, or a paused planner/test-author
-        // mid-plan) — accepting that unconditionally would walk straight past the
-        // `plan_approved` gate above and let `implement --run` drive an unapproved plan
-        // through to ship on a salvaged placeholder plan.md. An *approved* run's own
-        // `Phase::Quota` park is already covered by the `plan_approved` disjunct above,
-        // so the only case this clause needs to add is `--workflow loop` (`implement -t`
-        // directly), which has no approval step at all.
-        || (state.phase == Phase::Quota && state.workflow == crate::cli::WorkflowKind::Loop)
-        // `Phase::Stopped` has the identical hazard: `spar stop` parks a plan run here
-        // pre-approval just as readily as it parks an approved or loop-workflow run, and
-        // accepting it unconditionally would let `implement --run` (or `spar resume`)
-        // drive an unapproved plan through to ship. An *approved* stopped run is already
-        // covered by the `plan_approved` disjunct above, so the only case this clause
-        // needs to add is `--workflow loop`, which has no approval step at all.
-        || (state.phase == Phase::Stopped && state.workflow == crate::cli::WorkflowKind::Loop)
-        // `Failed`/`Stuck` are terminal parks a re-dispatch is meant to pick back up —
-        // the block below this gate already clears their dead slot verdicts for exactly
-        // that. An approved run reaches it through the `plan_approved` disjunct; a
-        // `--workflow loop` run has no approval step, so without this clause its
-        // implementer dying (a transport timeout, a stuck ladder) left the run
-        // permanently unresumable, and `spar resume` refused it by naming a plan gate
-        // that workflow does not have.
-        || (matches!(state.phase, Phase::Failed | Phase::Stuck)
-            && state.workflow == crate::cli::WorkflowKind::Loop)
-}
-
 fn run_from_approved(
     run_id: &str,
     amendment: Option<String>,
@@ -392,7 +350,7 @@ fn run_from_approved(
     cfg: &Config,
 ) -> Result<ExitCode> {
     let mut state = RunState::load(paths, run_id)?;
-    let resumable = is_resumable(&state);
+    let resumable = crate::state::is_resumable(&state);
     if !resumable {
         bail!(
             "run {run_id} is not resumable (workflow={:?}, phase={:?})",
@@ -946,57 +904,6 @@ fn resolve_suite_provider(
         return Ok((p, None, pool_origin.as_seat_source()));
     }
     bail!("suite.enabled but no usable suite provider (set [roles].tester or install a CLI)")
-}
-
-#[cfg(test)]
-mod resumable_tests {
-    use super::*;
-
-    fn run(workflow: crate::cli::WorkflowKind, phase: Phase) -> RunState {
-        let mut st = RunState::new("r1", workflow, std::path::PathBuf::from("/x"));
-        st.phase = phase;
-        st
-    }
-
-    /// The bug this guards: a `--workflow loop` run whose implementer died mid-dispatch
-    /// (observed as a muse `net-timeout` on the meta stream) parked at `Failed` and could
-    /// never be picked back up, stranding a worktree full of real work. `Failed`/`Stuck`
-    /// are exactly the parks the clear-dead-verdicts block below the gate exists for.
-    #[test]
-    fn a_failed_or_stuck_loop_run_is_resumable() {
-        for phase in [Phase::Failed, Phase::Stuck] {
-            assert!(
-                is_resumable(&run(crate::cli::WorkflowKind::Loop, phase)),
-                "{phase:?}"
-            );
-        }
-    }
-
-    /// The hazard the gate exists for: an unapproved plan must never be resumable, in any
-    /// phase, or `implement --run` drives it through to ship on a plan no human accepted.
-    #[test]
-    fn an_unapproved_plan_run_is_never_resumable() {
-        for phase in [
-            Phase::Failed,
-            Phase::Stuck,
-            Phase::Quota,
-            Phase::Stopped,
-            Phase::Dispatch,
-        ] {
-            assert!(
-                !is_resumable(&run(crate::cli::WorkflowKind::Plan, phase)),
-                "{phase:?}"
-            );
-        }
-    }
-
-    /// Approval is what admits a plan run, not its phase.
-    #[test]
-    fn an_approved_plan_run_is_resumable_from_a_terminal_park() {
-        let mut st = run(crate::cli::WorkflowKind::Plan, Phase::Failed);
-        st.gates.plan_approved = true;
-        assert!(is_resumable(&st));
-    }
 }
 
 #[cfg(test)]
@@ -2569,15 +2476,36 @@ pub fn execute_loop(
                     let _ = std::fs::write(
                         &review_path,
                         format!(
-                            "## Verdict\nrequest_changes\n\n{acceptance}## Findings\n- severity: major — review slot `{}` failed or produced no artifact\n",
+                            "{}\n## Verdict\nrequest_changes\n\n{acceptance}## Findings\n- severity: major — review slot `{}` failed or produced no artifact\n",
+                            review_result::SYNTHETIC_REVIEW_MARKER,
                             rev.id
                         ),
                     );
                 }
+                // A failed slot's own artifact is not what the gate counted: it may be an
+                // earlier round's stale verdict or a partial one. Only spar's stand-in is.
+                let text = std::fs::read_to_string(&review_path).unwrap_or_default();
+                let mut res = review_result::parse_review(&text);
+                if !res.synthetic {
+                    res = review_result::ReviewResult {
+                        verdict: Some(review_result::Verdict::RequestChanges),
+                        findings: vec![review_result::Finding {
+                            severity: review_result::Severity::Major,
+                            file: None,
+                            line: None,
+                            text: format!("review slot `{}` failed or produced no review", rev.id),
+                            synthetic: true,
+                        }],
+                        synthetic: true,
+                        ..Default::default()
+                    };
+                }
+                review_result::record_review(state, paths, &rev.id, &res);
             } else if let Some(text) = review_text {
                 // Fail closed: only an anchored `## Verdict` / approve clears the gate,
                 // and every contract criterion must be reported as passing (O19/O20).
                 let res = review_result::parse_review(&text);
+                review_result::record_review(state, paths, &rev.id, &res);
                 // The semantic layer above the mtime gate: a verdict that names no
                 // commit, or one about a commit that is not the panel head, is not
                 // a verdict — treated exactly like a missing review.

@@ -139,7 +139,8 @@ fn run_files(dir: &Path, run_id: &str, sub: &str, prefix: &str) -> Vec<(String, 
 }
 
 fn reviews(dir: &Path, run_id: &str) -> Vec<(String, String)> {
-    let r = run_files(dir, run_id, "artifacts", "review-");
+    let mut r = run_files(dir, run_id, "artifacts", "review-");
+    r.retain(|(name, _)| name.ends_with(".md"));
     assert!(!r.is_empty(), "no review artifacts were written");
     r
 }

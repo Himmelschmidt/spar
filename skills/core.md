@@ -712,7 +712,8 @@ per slot per run until you sweep. `spar cleanup --all` reaps every run nothing c
 and human gates — are spared unless you add `--older-than <dur>`, where the age is the
 evidence nobody is coming back for them. A run **in flight is never swept**, abandoned or
 not: park it first (`spar stop`, or `spar stop --abandoned`). Run data under
-`.spar/runs/<id>` survives a sweep unless you pass `--purge`; only worktrees go.
+`.spar/runs/<id>` survives a sweep unless you pass `--purge`; only worktrees go. A purge
+appends the run's line to `.spar/history.jsonl` first.
 
 Rejecting a plan (`spar reject`) reaps that run's worktrees immediately — nothing can
 resume a rejected plan — while keeping `plan.md` and the critique that justified it.
@@ -852,6 +853,79 @@ run is never reported stuck) caps the block and returns exit `3` if it
 lapses. Poll `status --json` / `status --all` only when you genuinely can't block —
 e.g. supervising several runs at once, where you background one `wait --follow` per
 run and reconcile as each returns.
+
+### Scripting surface: booleans, structured reviews, history (O100, O101, O102)
+
+Scripts and front ends read these instead of phase names and review markdown.
+**Phase names are not a stable scripting surface**: phases are added and split as
+spar grows, and a hard-coded "live" list goes stale. Read the booleans.
+
+`status <id> --json` and every row of `status --json` (the list) carry:
+
+| Field | True when |
+|---|---|
+| `orchestrator_alive` | a live process holds the run lock |
+| `holds_seat` | the run occupies, or is about to occupy, provider capacity: orchestrator alive, or queued in the daemon's admission queue waiting on a provider bucket. Count these as live; never re-brief one |
+| `needs_human` | nothing moves until a person acts: a human gate, the `plan_approved` handoff, or a broken run (`failed`, `stuck`, `escalated`, `quota`, abandoned). The TUI's `⚑ need you` flags read the same rule |
+| `resumable` | `implement --run` / `spar resume` would pick it up now. Never true while `holds_seat` |
+
+**Reviews.** When the implement gate (or `--workflow review`) reads a reviewer's
+`review-<slot>.md`, it records the parse on that slot as `slots[].review` (`null` until
+read, reset when the slot is re-dispatched), appends it to the run's `review_history`
+(one entry per `(round, slot_id)`, a re-read replaces), and writes
+`artifacts/review-<slot>.json` beside the markdown. Shape:
+
+```json
+{
+  "schema_version": 1,              // review-<slot>.json only, with run_id/slot_id/round/provider/model
+  "verdict": "approve" | "request_changes" | null,   // null = unparseable, blocks
+  "reviewed_commit": "<sha>" | null,                  // as written, matched or not
+  "acceptance": [{"id": "AC-1", "status": "pass" | "fail" | "unverified", "evidence": "..."}],
+  "findings": [{"severity": "critical" | "major" | "minor",
+                "file": "src/x.rs" | null, "line": 12 | null,
+                "text": "...", "synthetic": false}],
+  "synthetic": false
+}
+```
+
+`synthetic: true` means spar wrote that review because the reviewer failed or left
+nothing (the artifact's first line is `<!-- spar:synthetic-review -->`); its
+`request_changes` and finding are spar's, not a reviewer's judgment. A reviewer slot
+that failed is recorded this way too, whatever its markdown says. Only list items
+that name a severity are findings (`- severity: major — ...`, `- **minor** — ...`,
+items under a `### Major` heading); bare notes are not. `file`/`line` are the first
+`path.ext:line` the finding cites. Read `slots[].review.verdict`, never grep the
+markdown: a failing `AC-n` line is not a verdict.
+
+**History.** `.spar/history.jsonl` gets one JSON line per run when it reaches a terminal
+phase (`done`, `failed`, `stuck`, `escalated`, `quota`, `plan_rejected`,
+`plan_approved`) and again just before `cleanup --purge` deletes it, so trends survive
+reaping. Append-only: a run can have several lines; keep the one with the latest
+`written_at` per `id`. A purge whose history line cannot be written fails instead of
+deleting.
+
+```json
+{
+  "schema_version": 1, "written_at": "...", "trigger": "terminal" | "purge",
+  "id": "ab12cd34", "task": "first line of the task", "workflow": "loop",
+  "dry_run": false, "phase": "done",
+  "roles": [{"slot": "review-0-cli-codex", "role": "reviewer", "provider": "cli:codex", "model": null}],
+  "rounds": 3, "max_rounds": 5,
+  "review_rounds": [{"round": 2,
+                     "verdicts": [{"slot": "review-0-cli-codex", "verdict": "request_changes", "synthetic": false}],
+                     "findings": {"critical": 0, "major": 1, "minor": 2, "synthetic": 0}}],
+  "findings": {"critical": 0, "major": 1, "minor": 2, "synthetic": 0},
+  "billed_tokens": 1234567, "cost_usd": 4.2 | null,
+  "pr_url": "https://github.com/..." | null,
+  "created_at": "...", "ended_at": "..."
+}
+```
+
+Finding counts are per round, deduplicated within a round (same severity, location and
+whitespace-normalized text from two reviewers count once); `findings` sums the rounds.
+Synthetic findings count under `synthetic` only. `cost_usd` is `null` when no dispatch
+reported a cost. `pr_url` is what `gh pr create` printed at ship (also `pr_url` in
+`status --json`).
 
 ### TUI shape (humans)
 
