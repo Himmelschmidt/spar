@@ -317,6 +317,7 @@ spar cleanup <run_id> --if-merged        # refuse unless the work landed (squash
 spar cleanup <run_id> --force            # archive unsaved work to refs/spar-archive/<id>/<slot>, then remove
 spar cleanup --all [--older-than 7d]     # sweep finished runs project-wide
 spar reclaim <run_id> | --all [--json]   # delete build output, KEEP the worktree
+spar reclaim --all --halted              # …also gated (awaiting_*) and abandoned in-flight runs
 spar reconcile-state <run_id> | --all    # settle slots a dead orchestrator left `running`
 spar reconcile-state <run_id> --apply    # …and write it (bare form only reports)
 spar archive <run_id> [--undo] [--json]  # hide a finished run from listings
@@ -881,6 +882,12 @@ finished run's worktrees and keeps the worktree, its branch, every commit and an
 uncommitted changes. Because it destroys nothing a build cannot regenerate it needs no
 evidence, no age threshold and no confirmation — which is exactly why it is a separate
 command and not a `cleanup` flag. It skips any tree with a live process working in it.
+By default it covers finished and `stopped` runs. **`--halted`** also covers every run
+nothing is driving: parked at a human gate (`awaiting_*`) or in flight with no live
+orchestrator (abandoned). A run whose orchestrator is alive is never touched, and
+`reclaim <id>` on a gated or abandoned run without `--halted` exits `1` naming the flag.
+`--halted` is manual only: no timer or `auto_*` knob runs it. Schedule it yourself if you
+want it hourly.
 `auto_reclaim` (default **true**) does the same for a run's own worktrees when its
 orchestrator finishes. Measured: 457 GB of 587 GB under one projects dir was build output,
 and the largest single object on the machine was a *stopped* run's target dir.

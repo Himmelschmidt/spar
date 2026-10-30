@@ -497,7 +497,12 @@ fn run() -> Result<ExitCode> {
             force,
             if_merged,
         ),
-        Command::Reclaim { run_id, all, json } => reclaim_cmd(run_id.as_deref(), all, json),
+        Command::Reclaim {
+            run_id,
+            all,
+            halted,
+            json,
+        } => reclaim_cmd(run_id.as_deref(), all, halted, json),
         Command::Archive {
             run_id,
             all,
@@ -1769,16 +1774,24 @@ fn attach_cmd(run_id: &str) -> Result<ExitCode> {
 /// the questions that come with that, this removes only bytes a build regenerates. Making
 /// it a `cleanup` flag would give an operator with a standing rule against autonomous
 /// sweeps a back door into one.
-fn reclaim_cmd(run_id: Option<&str>, all: bool, json: bool) -> Result<ExitCode> {
+fn reclaim_cmd(run_id: Option<&str>, all: bool, halted: bool, json: bool) -> Result<ExitCode> {
     let (paths, _) = project_ctx()?;
     let reaps = match (run_id, all) {
         (Some(_), true) => anyhow::bail!("pass a run id or --all, not both"),
         (None, false) => anyhow::bail!("usage: spar reclaim <run_id> | spar reclaim --all"),
         (Some(id), false) => {
             let state = state::RunState::load(&paths, id)?;
-            if !(state.phase.is_terminal() || state.phase == state::Phase::Stopped) {
+            if state::orchestrator_alive(&paths, id) {
+                anyhow::bail!("run {id} has a live orchestrator; its build cache is in use");
+            }
+            if !worktree::cache_reclaimable(&paths, &state, halted) {
+                let hint = if halted {
+                    ""
+                } else {
+                    "; pass --halted to reclaim a gated or abandoned run"
+                };
                 anyhow::bail!(
-                    "run {id} is still running ({:?}) — its build cache is in use",
+                    "run {id} is still running ({:?}); its build cache is in use{hint}",
                     state.phase
                 );
             }
@@ -1787,7 +1800,7 @@ fn reclaim_cmd(run_id: Option<&str>, all: bool, json: bool) -> Result<ExitCode> 
                 &worktree::LiveCwds::snapshot(),
             )]
         }
-        (None, true) => worktree::reap_finished_caches(&paths, None)?,
+        (None, true) => worktree::reap_finished_caches(&paths, None, halted)?,
     };
     let freed: u64 = reaps.iter().map(|r| r.freed_bytes).sum();
     if json {

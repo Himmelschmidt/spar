@@ -508,3 +508,85 @@ fn an_orchestrator_whose_run_dir_is_deleted_exits_without_recreating_it() {
         .unwrap_or_default();
     assert!(runs.is_empty(), "the run dir was recreated: {runs:?}");
 }
+
+/// A build cache inside the run's implementer worktree.
+fn plant_cache(proj: &Path, run_id: &str) -> PathBuf {
+    let state = read_state(proj, run_id);
+    let wt = PathBuf::from(state["worktrees"][0]["path"].as_str().unwrap());
+    let target = wt.join("target");
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    std::fs::write(
+        target.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .unwrap();
+    std::fs::write(target.join("debug/big.rlib"), vec![0u8; 4096]).unwrap();
+    target
+}
+
+/// #181: gated and abandoned runs held their build caches for days because reclaim only
+/// looked at finished and stopped runs. `--halted` takes them; plain `--all` still does not.
+#[test]
+fn reclaim_halted_takes_gated_and_abandoned_runs() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    init_repo(&proj);
+    let gated = implement_dry_run(&proj);
+    assert_eq!(read_state(&proj, &gated)["phase"], "awaiting_ship_confirm");
+    let gated_cache = plant_cache(&proj, &gated);
+    let abandoned = implement_dry_run(&proj);
+    set_phase(&proj, &abandoned, "dispatch");
+    let abandoned_cache = plant_cache(&proj, &abandoned);
+
+    spar_cmd()
+        .current_dir(&proj)
+        .args(["reclaim", "--all"])
+        .assert()
+        .code(0);
+    assert!(
+        gated_cache.exists() && abandoned_cache.exists(),
+        "plain --all is unchanged"
+    );
+
+    let out = spar_cmd()
+        .current_dir(&proj)
+        .args(["reclaim", &gated])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--halted"),
+        "{out:?}"
+    );
+
+    spar_cmd()
+        .current_dir(&proj)
+        .args(["reclaim", "--all", "--halted"])
+        .assert()
+        .code(0);
+    assert!(!gated_cache.exists(), "a gated run's cache is reclaimed");
+    assert!(
+        !abandoned_cache.exists(),
+        "an abandoned run's cache is reclaimed"
+    );
+    assert_eq!(read_state(&proj, &gated)["phase"], "awaiting_ship_confirm");
+}
+
+/// `--halted` never reaches a run something is still driving.
+#[test]
+fn reclaim_halted_spares_a_run_with_a_live_orchestrator() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    init_repo(&proj);
+    let run_id = implement_dry_run(&proj);
+    set_phase(&proj, &run_id, "dispatch");
+    let cache = plant_cache(&proj, &run_id);
+    hold_lock(&proj, &run_id);
+
+    spar_cmd()
+        .current_dir(&proj)
+        .args(["reclaim", "--all", "--halted"])
+        .assert()
+        .code(0);
+    assert!(cache.exists());
+}

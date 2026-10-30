@@ -818,19 +818,26 @@ pub fn reapable_worktree(project_root: &Path, path: &Path) -> bool {
 /// its 72 GB of build output stops earning its disk. Nothing here is unrecoverable, so
 /// unlike the worktree sweep this needs no age threshold and no evidence — only that the
 /// run is not currently running and nothing is working in the tree.
-pub fn reap_finished_caches(paths: &SparPaths, skip_run: Option<&str>) -> Result<Vec<CacheReap>> {
+///
+/// `halted` widens it to every run nothing is driving: parked at a human gate, or in
+/// flight with no live orchestrator (`cache_reclaimable`).
+pub fn reap_finished_caches(
+    paths: &SparPaths,
+    skip_run: Option<&str>,
+    halted: bool,
+) -> Result<Vec<CacheReap>> {
     let live = LiveCwds::snapshot();
     let mut out = Vec::new();
     for summary in crate::state::list_runs(paths)? {
         if skip_run == Some(summary.id.as_str()) {
             continue;
         }
-        if !(summary.phase.is_terminal() || summary.phase == crate::state::Phase::Stopped) {
-            continue;
-        }
         let Ok(state) = RunState::load(paths, &summary.id) else {
             continue;
         };
+        if !cache_reclaimable(paths, &state, halted) {
+            continue;
+        }
         // The phase on disk is a snapshot; a resuming orchestrator is briefly between load
         // and save. Same guard the worktree sweep carries (O34).
         if crate::state::orchestrator_alive(paths, &summary.id) {
@@ -842,6 +849,18 @@ pub fn reap_finished_caches(paths: &SparPaths, skip_run: Option<&str>) -> Result
         }
     }
     Ok(out)
+}
+
+/// Whether a run's build caches may be reclaimed. Finished and stopped runs always. With
+/// `halted` (O116), also a run parked at a human gate, whose orchestrator has exited and
+/// whose next step waits on a person, and an in-flight run no live orchestrator drives:
+/// both can sit for days holding tens of gigabytes a build regenerates. The live-process
+/// check in `reap_build_cache` still spares any tree something is working in.
+pub fn cache_reclaimable(paths: &SparPaths, state: &RunState, halted: bool) -> bool {
+    if state.phase.is_terminal() || state.phase == crate::state::Phase::Stopped {
+        return true;
+    }
+    halted && (state.phase.is_gate() || state.abandoned(paths))
 }
 
 /// Build-output directory names reaped from a finished run's worktrees.

@@ -310,6 +310,10 @@ pub enum Command {
         /// Reclaim from every finished run in the project.
         #[arg(long)]
         all: bool,
+        /// Also reclaim runs nothing is driving: parked at a human gate (`awaiting_*`),
+        /// or in flight with no live orchestrator. Manual only; nothing runs it for you.
+        #[arg(long)]
+        halted: bool,
         #[arg(long)]
         json: bool,
     },
