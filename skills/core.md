@@ -248,6 +248,9 @@ touching `spar.toml`; see "Fleet shaping" below.
 `spar plan -t` is `--workflow plan`. `spar implement -t` is `--workflow loop`: a fresh brief
 straight into build/review with **no** planner, critic or test-contract, which is the cheap
 middle setting between `--workflow review` and the full `plan → approve → implement` path.
+`loop` builds a change against a fixed base; it is not for chasing a moving one. A run cannot be
+re-based after creation (O26), so "make PR #N mergeable" runs re-merge main every round and do not
+converge. Resolve conflicts by hand, or cap such a run at `--max-rounds 1 --fleet small`.
 `spar reconcile <id>` is an arena continuation, not a workflow: it adds a `reconciler` plus
 two more `reviewer` slots on the reconciled tree.
 
