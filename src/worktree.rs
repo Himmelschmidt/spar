@@ -82,9 +82,47 @@ pub fn resolve_base(
 }
 
 /// The branch name checked out in `dir`, or `None` when detached.
-fn named_head(dir: &Path) -> Option<String> {
+pub(crate) fn named_head(dir: &Path) -> Option<String> {
     let branch = git_out(dir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
     (!branch.is_empty() && branch != "HEAD").then_some(branch)
+}
+
+/// Puts `dir` back on `branch` when a slot left it on another one (reviewers share the
+/// implementer's worktree). Repairs only a fast-forward, so no commit is ever dropped.
+/// `None` when there is nothing to report.
+pub fn restore_branch(dir: &Path, branch: &str) -> Option<String> {
+    let head = git_out(dir, &["rev-parse", "--verify", "HEAD"])?;
+    let current = named_head(dir);
+    if current.as_deref() == Some(branch) {
+        return None;
+    }
+    let shown = current.unwrap_or_else(|| "a detached HEAD".into());
+    let branch_ref = format!("refs/heads/{branch}");
+    let Some(old) = git_out(dir, &["rev-parse", "--verify", &branch_ref]) else {
+        return Some(format!(
+            "worktree {} is on {shown} and {branch} does not exist; left as is",
+            dir.display()
+        ));
+    };
+    if git_out(dir, &["merge-base", "--is-ancestor", &old, &head]).is_none() {
+        return Some(format!(
+            "worktree {} is on {shown}, which does not contain {branch}; left as is, \
+             ship will refuse until {branch} is an ancestor of HEAD",
+            dir.display()
+        ));
+    }
+    let repaired = git_out(dir, &["update-ref", &branch_ref, &head, &old]).is_some()
+        && git_out(dir, &["checkout", "--quiet", branch]).is_some();
+    if !repaired {
+        return Some(format!(
+            "worktree {} is on {shown}; could not fast-forward {branch} to its HEAD",
+            dir.display()
+        ));
+    }
+    Some(format!(
+        "worktree {} was on {shown}; fast-forwarded {branch} to its HEAD and checked it out",
+        dir.display()
+    ))
 }
 
 /// Resolve the base and record it on the run. Prints it unless `json`, because a base
@@ -2076,5 +2114,64 @@ mod tests {
         assert_eq!(head, feat_head, "slot must branch from the invoking HEAD");
         assert!(rec.path.join("feature.txt").is_file());
         remove_worktree(&root, &rec).unwrap();
+    }
+
+    fn restore_fixture(tmp: &Path) -> (PathBuf, String) {
+        let dir = tmp.join("wt");
+        std::fs::create_dir_all(&dir).unwrap();
+        fixture_git(&dir, &["init", "-q"]);
+        fixture_git(&dir, &["config", "user.email", "t@t.com"]);
+        fixture_git(&dir, &["config", "user.name", "t"]);
+        fixture_git(&dir, &["checkout", "-q", "-b", "spar/r1/impl"]);
+        std::fs::write(dir.join("a"), "a").unwrap();
+        fixture_git(&dir, &["add", "a"]);
+        fixture_git(&dir, &["commit", "-q", "-m", "a"]);
+        let base = fixture_git(&dir, &["rev-parse", "HEAD"]);
+        (dir, base)
+    }
+
+    fn commit_file(dir: &Path, name: &str) -> String {
+        std::fs::write(dir.join(name), name).unwrap();
+        fixture_git(dir, &["add", name]);
+        fixture_git(dir, &["commit", "-q", "-m", name]);
+        fixture_git(dir, &["rev-parse", "HEAD"])
+    }
+
+    #[test]
+    fn restore_branch_is_silent_when_already_on_the_branch() {
+        let tmp = tempdir().unwrap();
+        let (dir, _) = restore_fixture(tmp.path());
+        assert_eq!(restore_branch(&dir, "spar/r1/impl"), None);
+    }
+
+    /// #158: a reviewer committed on its own branch in the implementer's worktree. The
+    /// run's branch is fast-forwarded to that HEAD and checked out again.
+    #[test]
+    fn restore_branch_fast_forwards_and_checks_out_the_branch() {
+        let tmp = tempdir().unwrap();
+        let (dir, _) = restore_fixture(tmp.path());
+        fixture_git(&dir, &["checkout", "-q", "-b", "review-x"]);
+        let head = commit_file(&dir, "reviewed");
+
+        let note = restore_branch(&dir, "spar/r1/impl").expect("must report the repair");
+        assert!(note.contains("review-x"), "{note}");
+        assert_eq!(named_head(&dir).as_deref(), Some("spar/r1/impl"));
+        assert_eq!(fixture_git(&dir, &["rev-parse", "spar/r1/impl"]), head);
+    }
+
+    /// Diverged: repairing would drop the branch's own commits, so it is only reported.
+    #[test]
+    fn restore_branch_leaves_a_diverged_worktree_alone() {
+        let tmp = tempdir().unwrap();
+        let (dir, base) = restore_fixture(tmp.path());
+        let impl_tip = commit_file(&dir, "impl-work");
+        fixture_git(&dir, &["checkout", "-q", "-b", "review-x", &base]);
+        let side = commit_file(&dir, "side");
+
+        let note = restore_branch(&dir, "spar/r1/impl").expect("must warn");
+        assert!(note.contains("does not contain"), "{note}");
+        assert_eq!(named_head(&dir).as_deref(), Some("review-x"));
+        assert_eq!(fixture_git(&dir, &["rev-parse", "HEAD"]), side);
+        assert_eq!(fixture_git(&dir, &["rev-parse", "spar/r1/impl"]), impl_tip);
     }
 }

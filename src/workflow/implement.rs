@@ -2472,6 +2472,12 @@ pub fn execute_loop(
         // head. Unresolvable (review_cwd falls back to a possibly non-repo
         // project_root) fails OPEN, loudly: failing closed there would brick such
         // runs permanently with no reviewer fault.
+        if let Some(wt) = state.worktrees.iter().find(|w| w.slot_id == impl_slot.id) {
+            if let Some(msg) = worktree::restore_branch(&wt.path, &wt.branch) {
+                eprintln!("warning: {msg}");
+                let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg));
+            }
+        }
         let panel_head = worktree::git_out(&review_cwd, &["rev-parse", "HEAD"]);
         if panel_head.is_none() {
             let msg = format!(
