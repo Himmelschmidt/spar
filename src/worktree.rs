@@ -697,6 +697,11 @@ pub fn landed_in_base(state: &RunState) -> std::result::Result<(), String> {
     }
     let mut landed: Vec<String> = Vec::new();
     let mut pending: Vec<(String, String)> = Vec::new();
+    // `sync-prs` saw the PR holding this commit merged (O123): it and its ancestors landed.
+    let merged_head = state
+        .merged_at
+        .and(state.shipped_head.as_deref())
+        .filter(|_| state.shipped_round == Some(state.round));
     for rec in &state.worktrees {
         let mut commits = Vec::new();
         if rec.path.is_dir() {
@@ -712,6 +717,10 @@ pub fn landed_in_base(state: &RunState) -> std::result::Result<(), String> {
             commits.push((rec.branch.clone(), tip));
         }
         for (label, commit) in commits {
+            if merged_head.is_some_and(|h| h == commit || is_ancestor(root, &commit, h)) {
+                landed.push(commit);
+                continue;
+            }
             if commit_landed(
                 root,
                 &rec.branch,
@@ -2186,6 +2195,45 @@ mod tests {
 
     /// #157: a squash merge is not an ancestor, so ancestry alone called every landed
     /// branch unmerged and made `--force` routine. Patch-id containment sees it.
+    /// O123: `sync-prs` recorded a merge of the PR holding the shipped commit; that
+    /// counts as landed for `cleanup --if-merged`, but only for this round's ship and
+    /// only for commits the merged head contains.
+    #[test]
+    fn landed_in_base_accepts_a_recorded_merge_of_the_shipped_head() {
+        let tmp = tempdir().unwrap();
+        let (mut state, rec) = landed_fixture(tmp.path());
+        let head = git_out(&rec.path, &["rev-parse", "HEAD"]).unwrap();
+        assert!(landed_in_base(&state).is_err());
+
+        state.merged_at = Some(chrono::Utc::now());
+        state.shipped_head = Some(head);
+        state.shipped_round = Some(state.round);
+        assert_eq!(landed_in_base(&state), Ok(()));
+
+        state.shipped_round = Some(state.round - 1);
+        assert!(landed_in_base(&state).is_err(), "an earlier round's merge");
+        state.shipped_round = Some(state.round);
+
+        std::fs::write(rec.path.join("after"), "after\n").unwrap();
+        fixture_git(&rec.path, &["add", "."]);
+        fixture_git(
+            &rec.path,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "after",
+            ],
+        );
+        assert!(
+            landed_in_base(&state).is_err(),
+            "work after the merged head"
+        );
+    }
+
     #[test]
     fn landed_in_base_recognizes_a_squash_merge_and_refuses_unmerged_work() {
         let tmp = tempdir().unwrap();

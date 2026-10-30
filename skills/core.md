@@ -379,7 +379,10 @@ spar run --workflow review -t "..." --providers cli:grok,cli:claude --base feat/
 
 spar confirm <run_id> [--winner <slot>]   # arena winner
 spar reconcile <run_id>                  # arena merge-good-parts + review
-spar ship <run_id> --confirm [--base <branch>]   # draft PR (never merges)
+spar ship <run_id> --confirm [--base <branch>]   # draft PR (never merges); adopts an open one
+spar ship <run_id> --override-gate --reason "…"  # ship over open findings (stuck/failed/quota/ceiling)
+spar ship <run_id> --adopt-remote               # fast-forward onto a hand-pushed branch, then ship
+spar sync-prs --run <id> | --all [--json] [--dry-run]   # merged PR -> done, closed -> stopped
 spar stop <run_id> [--json]              # halt dispatch, KEEP branch+worktree (resumable)
 spar stop --abandoned [--json]           # reap every run nobody is driving any more
 spar cleanup <run_id> [--purge]          # remove worktrees (--purge: run record, KEEPS artifacts/)
@@ -677,8 +680,10 @@ unpushed branch falls through to the repo default, with a note on stderr. `spar 
 `spar ship` pushes the slot worktree's **HEAD** to `spar/<id>/<slot>`, never the branch by
 name, and **never rewinds the remote branch**. Before pushing it fetches the remote branch;
 if the remote has commits HEAD lacks (someone pushed by hand), ship exits `1` with "remote
-<branch> has commits the run lacks": fast-forward the worktree onto `origin/<branch>` by hand
-and ship again. The push is leased on the exact tip it fetched, so a push landing in between
+<branch> has commits the run lacks". `spar ship <id> --adopt-remote` fast-forwards the
+worktree onto `origin/<branch>` and ships (O125); it refuses (exit `1`, nothing moved) when the
+worktree has uncommitted changes to tracked files, is not on the run branch, or the remote
+is not a fast-forward of HEAD (the run has commits of its own on top), which is yours to reconcile by hand. The push is leased on the exact tip it fetched, so a push landing in between
 also fails. If the worktree was left on another branch (a reviewer's, or detached), ship
 pushes HEAD when HEAD contains the run's branch and that branch has moved past the run's
 base (note on stderr), and refuses otherwise. A refusal exits `1`, leaves the phase at
@@ -686,6 +691,45 @@ base (note on stderr), and refuses otherwise. A refusal exits `1`, leaves the ph
 fast-forwards the implementer's branch back onto HEAD before each review panel when a slot
 left the worktree elsewhere, and only warns (stderr + event log) when that is not a
 fast-forward, the branch is still at the base, or it is checked out in another worktree.
+
+**An open PR is adopted, not re-created (O122).** After the push, ship asks
+`gh pr list --head <branch> --state open`. If a PR from this repo (not a fork) against the
+PR base exists (an implementer opened it, or an earlier ship got that far), ship records its
+URL as `pr_url`, replaces its body with the run's, and the run goes to `done`. It warns on
+stderr when the body it replaces is not the one spar last wrote (an edit by hand is lost);
+a body that fails to update is a warning, not a failure.
+Otherwise it runs `gh pr create`. New PRs open as drafts; `[ship] draft = false` opens them
+ready for review. An adopted PR keeps its own draft state.
+
+**`spar sync-prs --run <id> | --all [--json] [--dry-run]` (O123)** settles a run that pushed
+in its **current round** (`shipped_round`, `shipped_head`) and sits at `done` or
+`awaiting_ship_confirm`; anything else is left alone, as are dry runs and runs with a live
+orchestrator. A new round or a replan clears the old round's PR fields. The PR is the run's
+`pr_url`, else the newest same-repo PR for its branch against the shipped base, and in both
+cases only a PR whose head is the shipped commit (or contains it) counts. Merged: the run
+goes to `done` with `merged_at` and `merge_commit` recorded, plus a history row carrying
+both. Closed unmerged: `stopped`, with `pr_state: "CLOSED"`. Open, or no matching PR: left
+alone. `--all` does not re-ask about a run already merged, and a `gh` rate limit ends the
+pass. Operator-only: refused when `SPAR_AGENT_ID` or `SPAR_RUN_ID` is set.
+`cleanup --if-merged` counts a recorded merge of the shipped head as landed. `--json` prints
+`{"dry_run", "runs": [{run_id, phase, to, pr_url, pr_state, note, error}]}`; `to` is the
+phase the run moved to (or would, under `--dry-run`), `null` when left alone. `gh` missing
+is exit `1`; a per-run `gh` error is that row's `error` and makes the exit `1`.
+`[daemon] sync_prs = true` runs the same `--all` pass from the daemon, at most every five
+minutes; each distinct error (`gh` missing, auth, rate limit) goes to stderr and the daemon
+log once.
+
+**`spar ship <id> --override-gate --reason "<text>"` (O124)** ships a run whose gate never
+cleared: from `awaiting_round_extension`, `stuck`, `failed`, `quota`, or any ship, winner or
+reconcile gate. `--reason` is required (exit `1` without it); it refuses while the run's
+orchestrator is alive (`spar stop` it first) and inside a slot (operator-only). A ship that
+fails after the override puts the run back in the phase it came from. The override is kept
+on the run (`ship_override`) for the round, so a later re-ship keeps the findings section. It ships the same HEAD with the same push
+safety as a normal ship. Every finding of the last reviewed round, from the structured
+review records (severity, `file:line`, reviewer slot, round, `Reviewed-Commit`), goes in
+the PR body under **Shipped over open findings**, ahead of the summary. The override (who
+from `$USER`, when, reason, the findings) is written to
+`artifacts/ship.md` under `## Gate override` and logged as an `info` event.
 
 ## Checkpoints: the implementer's work survives its worktree
 
@@ -780,7 +824,8 @@ children — so they keep running and keep spending tokens with nobody collectin
   left to it. `spar daemon stop` in a project releases that project. It never approves a
   plan, confirms ship, merges, sweeps `cleanup`, or picks a fleet; it only ever restarts
   the same orchestrator a plain `spar resume` would have, and tells you when one is
-  waiting. `spar daemon status` reports the project you stand in.
+  waiting. With `[daemon] sync_prs = true` it also settles runs whose PR merged or
+  closed (see `sync-prs`). `spar daemon status` reports the project you stand in.
 - **A run that died shipping is never re-run.** `spar ship` holds the run lock through
   `shipping`, so a slow push does not read as abandoned. If the ship process dies anyway,
   every resume entry (`spar resume`, the daemon's restart) puts the run back at
@@ -1190,8 +1235,9 @@ stderr and the purge or sweep goes on.
 Finding counts are per round, deduplicated within a round (same severity, location and
 whitespace-normalized text from two reviewers count once); `findings` sums the rounds.
 Synthetic findings count under `synthetic` only. `cost_usd` is `null` when no dispatch
-reported a cost. `pr_url` is what `gh pr create` printed at ship (also `pr_url` in
-`status --json`).
+reported a cost. `pr_url` is the PR ship opened or adopted, or `sync-prs` found (also
+`pr_url` in `status --json`, with `merged_at`, `merge_commit` and `pr_state` once
+`sync-prs` settled the run).
 
 ### TUI shape (humans)
 
@@ -1546,6 +1592,7 @@ auto_cleanup_merged = true   # reap at-rest runs already contained in their base
 copy = [".dbiso.env", ".envrc", ".env.example"]   # copied from the main checkout into every slot worktree; missing files skipped
 [ship]
 title_max = 72   # PR title clamp in characters; 0 = GitHub's 256 only
+draft = true     # open new PRs as drafts; false = ready for review
 [gates]
 plan = true
 winner = true
@@ -1631,6 +1678,7 @@ timeout_secs = 3600    # test_author's SOFT clock; hard_ceiling_multiple applies
 # restart = true               # restart a dead orchestrator holding resumable work
 # max_restarts = 2             # per run, per daemon lifetime
 # max_slots_per_bucket = 0     # cross-run concurrency cap, keyed on provider (model-free); 0 = off
+# sync_prs = false             # run `sync-prs --all` (calls gh) at most every 5 minutes
 # Dynamic model select (vals). Opt-in with --select; cache under ~/.spar/cache/vals/
 [model_select]
 # benches = ["swebench"]
@@ -1648,7 +1696,7 @@ timeout_secs = 3600    # test_author's SOFT clock; hard_ceiling_multiple applies
 
 - One run id plan → implement → ship.
 - Coding slots always use git worktrees; never check out feature branches on the primary tree.
-- Ship is draft PR only — never merge.
+- Ship opens a PR (draft unless `[ship] draft = false`) or adopts an open one, and never merges.
 - State lives under `.spar/` in the project root.
 - **Spec channel (plan):** after planner+critic, a `test-author` freezes acceptance tests (`artifacts/test-contract.md` + worktree tests) from plan/critique (bus is audit trail), **before** the plan approval gate. Implement brings those tests into the impl worktree (fail closed if author ran) by **merging the author branch**, then overlaying only the author's **uncommitted** work — tracked-but-modified plus untracked-not-ignored — on top. Committed author work is the merge's job, so the overlay never copies the author branch's revision of a file the implementer is working on, and build output never crosses between worktrees. A merge that fails is aborted **and fails the dispatch** (exit 1), because it is the only path committed acceptance tests take. Anything git ignores stays behind and is named on stderr, in the event log, on the bus, and in the implementer's own prompt, with the author worktree path: if an acceptance test needs an ignored fixture (`.env.test`, an ignored `tests/data/`), the implementer copies it across itself. Its provider follows the same precedence as every other role: CLI `--role test_author=…`, then an explicit `--providers`/`--select` pool, then `[roles].test_author`, then the run's own pool as a last resort. Disable with `[spec] enabled = false`.
 - **Criterion ids:** scenarios in `artifacts/test-contract.md` carry stable `AC-<n>` ids (numbered from 1, contiguous, never renumbered) plus a `verify:` hint naming a command, `file:line` + assertion, or observable behavior.
