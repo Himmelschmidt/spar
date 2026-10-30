@@ -216,6 +216,14 @@ pub enum Command {
         /// first: this is how a criterion gets deleted on the way to the ship gate.
         #[arg(long)]
         accept_contract: bool,
+        /// Move an existing seat of `--run <id>` to another provider:
+        /// `--reassign implementer=cli:claude@sonnet` or
+        /// `--reassign review-0-cli-codex=cli:claude@opus`. Repeatable. The seat keeps its
+        /// worktree, branch, carry-forward, round count and review history; a reviewer
+        /// or tester seat is renamed to name its new provider (O136). Refused while the run's
+        /// orchestrator is alive, onto a paused provider, and inside a slot.
+        #[arg(long = "reassign", value_name = "ROLE|SEAT=PROVIDER")]
+        reassign: Vec<String>,
         /// Ref to cut every slot worktree from (branch, tag or sha), for a NEW run.
         /// Default: the HEAD of the directory spar was invoked from. A run's base is
         /// fixed at creation, so `--run <id>` only accepts a base it already has.
@@ -567,6 +575,23 @@ pub enum Command {
         /// and rebase merges). Then remove as `--force` would. Only with a run id.
         #[arg(long)]
         if_merged: bool,
+    },
+
+    /// Amend a run's frozen acceptance contract: re-run only its test author with the
+    /// directive and the current contract, re-freeze the result, and leave the run parked
+    /// where it was (O137). Operator-only; refused while the run's orchestrator is alive.
+    Amend {
+        #[arg(long = "run")]
+        run_id: String,
+        /// What to change about how the run verifies its work.
+        #[arg(long)]
+        contract: String,
+        /// Amend a `test-contract.md` that was edited after it was frozen, starting from
+        /// the edited text. Without it spar refuses: the implementer can write to it.
+        #[arg(long)]
+        accept_contract_edits: bool,
+        #[arg(long)]
+        json: bool,
     },
 
     /// Operator rulings: settled points every later reviewer and implementer prompt

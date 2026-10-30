@@ -95,7 +95,7 @@ pub fn resume(
     detach: bool,
     json: bool,
 ) -> Result<ExitCode> {
-    let state = RunState::load(paths, run_id)?;
+    let mut state = RunState::load(paths, run_id)?;
     if let Some(owner) = crate::runlock::RunLock::owner(paths, run_id) {
         if owner.alive() {
             return Err(crate::runlock::OrchestratorBusy {
@@ -104,6 +104,12 @@ pub fn resume(
             }
             .into());
         }
+    }
+    if state.amend_in_progress.is_some() {
+        let lock = crate::runlock::RunLock::acquire(paths, run_id)?;
+        state = RunState::load(paths, run_id)?;
+        crate::workflow::plan::recover_interrupted_amend(&mut state, paths)?;
+        drop(lock);
     }
     if state.phase.is_gate() {
         bail!(
@@ -260,6 +266,11 @@ fn repoint_existing_seats(state: &mut RunState, cfg: &Config) -> Result<()> {
         if slot.status == SlotStatus::Running {
             continue;
         }
+        // The operator moved this seat by hand (O136); the config never named its
+        // provider, so it has nothing to say about its model either.
+        if slot.source == Some(SeatSource::Reassigned) {
+            continue;
+        }
         // **Model only.** A reviewer seat's id is `review-{r}-{sanitized provider}`
         // (`roles_resolve::build_implement_seats`), so the id *encodes* the provider:
         // a matching id already means a matching provider, and writing
@@ -299,6 +310,200 @@ fn repoint_existing_seats(state: &mut RunState, cfg: &Config) -> Result<()> {
         slot.source = Some(seat.source);
     }
     Ok(())
+}
+
+/// One `--reassign <role|seat>=<provider[@model]>`, checked before the run is touched.
+#[derive(Debug, Clone)]
+struct Reassignment {
+    target: String,
+    pin: crate::runspec::Pin,
+}
+
+/// Parse `--reassign` and refuse a provider the run could not dispatch anyway: unknown,
+/// manually paused, or paused on a trusted quota signal (O106, O136). Read before the run
+/// lock, so a typo costs nothing.
+fn parse_reassignments(raw: &[String], paths: &SparPaths) -> Result<Vec<Reassignment>> {
+    let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+    let mut out = Vec::new();
+    for r in raw {
+        let Some((target, provider)) = r.split_once('=') else {
+            bail!("--reassign {r:?}: expected <role|seat>=<provider[@model]>");
+        };
+        let target = target.trim();
+        if target.is_empty() {
+            bail!("--reassign {r:?}: name a role (implementer, reviewer, tester) or a seat id");
+        }
+        let pin = crate::runspec::Pin::parse(provider)
+            .map_err(|e| anyhow::anyhow!("--reassign {r:?}: {e}"))?;
+        let pref = crate::provider_ref::ProviderRef::parse(&pin.provider)?;
+        if let Some(cli) = pref.cli_name() {
+            if providers::adapter_named(cli).is_none() {
+                bail!("--reassign {r:?}: no adapter named {cli}");
+            }
+        }
+        let key = crate::quota::normalize_key(&pin.provider);
+        if store.blocks_live_dispatch(&key) {
+            bail!(
+                "--reassign {r:?}: {key} is paused; resume it with `spar provider resume {key}` \
+                 or reassign to another provider"
+            );
+        }
+        if out.iter().any(|o: &Reassignment| o.target == target) {
+            bail!("--reassign names {target} twice");
+        }
+        out.push(Reassignment {
+            target: target.to_string(),
+            pin,
+        });
+    }
+    Ok(out)
+}
+
+/// The seat a `--reassign` target names: a role with exactly one seat, or a seat id.
+fn reassign_target(state: &RunState, target: &str) -> Result<String> {
+    let movable = |s: &&SlotState| {
+        matches!(
+            s.role,
+            SlotRole::Implementer | SlotRole::Reviewer | SlotRole::Tester
+        )
+    };
+    if let Some(s) = state.slots.iter().filter(movable).find(|s| s.id == target) {
+        return Ok(s.id.clone());
+    }
+    let role = match target {
+        "implementer" | "impl" => SlotRole::Implementer,
+        "reviewer" => SlotRole::Reviewer,
+        "tester" => SlotRole::Tester,
+        _ => {
+            let seats: Vec<&str> = state
+                .slots
+                .iter()
+                .filter(movable)
+                .map(|s| s.id.as_str())
+                .collect();
+            bail!(
+                "--reassign {target}: run {} has no such seat (seats: {})",
+                state.id,
+                if seats.is_empty() {
+                    "none yet".to_string()
+                } else {
+                    seats.join(", ")
+                }
+            );
+        }
+    };
+    let seats: Vec<&SlotState> = state.slots.iter().filter(|s| s.role == role).collect();
+    match seats.as_slice() {
+        [one] => Ok(one.id.clone()),
+        [] => bail!(
+            "--reassign {target}: run {} has no {target} seat yet; `--reassign` moves a seat \
+             that exists. For a run that has not dispatched its implement panel, use \
+             `--reload-config --role {target}=…`",
+            state.id
+        ),
+        many => bail!(
+            "--reassign {target}: run {} has {} {target} seats; name one: {}",
+            state.id,
+            many.len(),
+            many.iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// Resolve every `--reassign` against the run before anything moves, so one bad
+/// target leaves every seat as it was.
+fn resolve_reassignments(
+    state: &RunState,
+    wanted: &[Reassignment],
+) -> Result<Vec<(String, crate::runspec::Pin)>> {
+    let mut out: Vec<(String, crate::runspec::Pin)> = Vec::new();
+    for r in wanted {
+        let seat = reassign_target(state, &r.target)?;
+        if out.iter().any(|(s, _)| *s == seat) {
+            bail!("--reassign names seat {seat} twice");
+        }
+        let slot = state
+            .slots
+            .iter()
+            .find(|s| s.id == seat)
+            .ok_or_else(|| anyhow::anyhow!("seat {seat} vanished"))?;
+        if slot.provider == r.pin.provider && slot.model == r.pin.model {
+            bail!(
+                "--reassign {}: seat {seat} is already on {}",
+                r.target,
+                r.pin.display()
+            );
+        }
+        let new_id = moved_seat_id(slot.role, &seat, &r.pin.provider);
+        if new_id != seat && state.slots.iter().any(|s| s.id == new_id) {
+            bail!(
+                "--reassign {}: seat {seat} would become {new_id}, which this run already has",
+                r.target
+            );
+        }
+        out.push((seat, r.pin.clone()));
+    }
+    Ok(out)
+}
+
+/// Retire a seat's provider and put another in it (O136, an operator override of O80).
+/// The worktree, branch, carry-forward brief, round count and review history stay; a
+/// reviewer seat is renamed through `rename_slot` (O85) and its last review artifact
+/// follows it, so the blockers it raised still reach the implementer next round. The new
+/// provider starts cold: a session marker left under the new seat id by an earlier
+/// rotation belongs to a conversation this seat never had.
+fn reassign_seat(
+    state: &mut RunState,
+    paths: &SparPaths,
+    seat: &str,
+    pin: &crate::runspec::Pin,
+) -> Result<crate::state::SeatReassignment> {
+    let slot = state
+        .slots
+        .iter()
+        .find(|s| s.id == seat)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("unknown seat {seat}"))?;
+    let from_provider = crate::runspec::Pin {
+        provider: slot.provider.clone(),
+        model: slot.model.clone(),
+    }
+    .display();
+    let new_id = move_seat(state, paths, seat, pin, SeatSource::Reassigned)?;
+    if new_id != seat {
+        let from = paths.artifact(&state.id, &format!("review-{seat}.md"));
+        if from.is_file() {
+            let _ = std::fs::rename(
+                &from,
+                paths.artifact(&state.id, &format!("review-{new_id}.md")),
+            );
+        }
+    }
+    if let Some(cli) = crate::provider_ref::ProviderRef::parse(&pin.provider)
+        .ok()
+        .and_then(|p| p.cli_name().map(str::to_string))
+    {
+        crate::markers::clear_session_id(paths, &state.id, &new_id, &cli);
+    }
+    let record = crate::state::SeatReassignment {
+        at: chrono::Utc::now(),
+        round: state.round,
+        role: slot.role,
+        from_seat: seat.to_string(),
+        from_provider,
+        to_seat: new_id,
+        to_provider: pin.display(),
+    };
+    state.seat_reassignments.push(record.clone());
+    let msg = format!(
+        "seat {} reassigned by the operator: {} -> {} (now seat {})",
+        record.from_seat, record.from_provider, record.to_provider, record.to_seat
+    );
+    let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg));
+    Ok(record)
 }
 
 /// What to say when someone hands us a plan we cannot trace to a run. Naming the
@@ -376,6 +581,7 @@ fn run_from_approved(
     // a run directory for it. Everything below mutates the run, so it all happens under
     // the lock: a live orchestrator refuses us before its state.json can be overwritten.
     RunState::load(paths, run_id)?;
+    let reassignments = parse_reassignments(&opts.reassign, paths)?;
     let lock = crate::runlock::RunLock::acquire(paths, run_id)?;
     let mut state = RunState::load(paths, run_id)?;
     // Read before anything below resets slot statuses for re-dispatch.
@@ -393,6 +599,7 @@ fn run_from_approved(
             state.phase
         );
     }
+    let moves = resolve_reassignments(&state, &reassignments)?;
     // Resuming a stopped run: drop the marker so execute_loop dispatches instead
     // of halting again at its first boundary.
     if state.phase == Phase::Stopped {
@@ -448,6 +655,22 @@ fn run_from_approved(
                 "run {run_id} is already based on {}; a run's base is fixed when it is \
                  created — plan a new run with `--base` instead",
                 previous.as_deref().unwrap_or("an unrecorded base")
+            );
+        }
+    }
+    for (seat, pin) in &moves {
+        let r = reassign_seat(&mut state, paths, seat, pin)?;
+        if !opts.json {
+            println!(
+                "reassigned seat {} ({}) to {}{}",
+                r.from_seat,
+                r.from_provider,
+                r.to_provider,
+                if r.to_seat == r.from_seat {
+                    String::new()
+                } else {
+                    format!(", now seat {}", r.to_seat)
+                }
             );
         }
     }
@@ -1759,7 +1982,8 @@ pub fn execute_loop(
         crate::state::ORPHANED_SLOT,
     )?;
 
-    // Only isolate the implementer; reviewers share its cwd.
+    // Only the implementer gets a branch; reviewers judge from detached checkouts cut
+    // at each panel head (O138).
     let impl_ids: Vec<String> = state
         .slots
         .iter()
@@ -1822,6 +2046,14 @@ pub fn execute_loop(
     }
     state.contract_fingerprint = Some(frozen.fingerprint.clone());
     state.contract_modified = false;
+    // The frozen text itself, kept apart from the file the implementer can write to,
+    // so `spar amend` starts from what was frozen (O137).
+    if paths.artifact(&state.id, "test-contract.md").is_file() {
+        let _ = std::fs::write(
+            paths.artifact(&state.id, crate::workflow::plan::FROZEN_CONTRACT),
+            &frozen.body,
+        );
+    }
     if moved {
         let msg = format!(
             "contract re-frozen: {} criteria (fingerprint {}, was {}){}",
@@ -1843,12 +2075,7 @@ pub fn execute_loop(
     let mut test_contract_body = test_contract_body;
 
     // Bring pre-coding acceptance tests into implementer cwd (fail closed if author ran).
-    if let Some(author) = state
-        .slots
-        .iter()
-        .find(|s| s.role == SlotRole::TestAuthor)
-        .map(|s| s.id.clone())
-    {
+    if let Some(author) = state.test_author_seat().map(|s| s.id.clone()) {
         let impl_cwd = state
             .slots
             .iter()
@@ -2219,6 +2446,7 @@ pub fn execute_loop(
         if should_stop(paths, &state.id) {
             return stop_now(state, paths);
         }
+        commit_before_review(state, paths, cfg, &impl_slot.id);
 
         // Suite channel: cheap model runs full suites; reviewers must not re-run them.
         let mut suite_body = String::new();
@@ -2538,12 +2766,20 @@ pub fn execute_loop(
                 .find(|s| s.id == rev_id)
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("reviewer `{rev_id}` vanished"))?;
+            let rev_cwd = reviewer_cwd(
+                state,
+                paths,
+                cfg,
+                &rev.id,
+                panel_head.as_deref(),
+                &review_cwd,
+            );
             if let Some(s) = state.slot_mut(&rev.id) {
                 s.status = SlotStatus::Pending;
-                s.cwd = Some(review_cwd.clone());
+                s.cwd = Some(rev_cwd.clone());
             }
             let mut extra = HashMap::new();
-            extra.insert("review_cwd".into(), review_cwd.display().to_string());
+            extra.insert("review_cwd".into(), rev_cwd.display().to_string());
             if !suite_body.is_empty() {
                 extra.insert("suite_body".into(), suite_body.clone());
             }
@@ -2585,10 +2821,15 @@ pub fn execute_loop(
                     cfg,
                     infra.is_some(),
                 )? {
+                    let rev_cwd =
+                        reviewer_cwd(state, paths, cfg, &id, panel_head.as_deref(), &review_cwd);
                     if let Some(s) = state.slot_mut(&id) {
                         s.status = SlotStatus::Pending;
                         s.error = None;
+                        s.cwd = Some(rev_cwd.clone());
                     }
+                    job.extra_vars
+                        .insert("review_cwd".into(), rev_cwd.display().to_string());
                     rev = state
                         .slots
                         .iter()
@@ -2861,6 +3102,91 @@ pub fn execute_loop(
     }
 }
 
+/// Commit what the implementer left uncommitted, overlaid acceptance tests included,
+/// on its branch before the suite and the panel run (O138): reviewers judge a detached
+/// checkout of `HEAD`, the suite runs on that same commit, and `ship` pushes it. The
+/// subject is the PR title, so it reads right as a squash subject. A failure (a hook
+/// that refuses) is said out loud and the round goes on: the panel then judges `HEAD`.
+fn commit_before_review(state: &mut RunState, paths: &SparPaths, cfg: &Config, impl_id: &str) {
+    let Some(wt) = state
+        .worktrees
+        .iter()
+        .find(|w| w.slot_id == impl_id)
+        .cloned()
+    else {
+        return;
+    };
+    if state.dry_run || !wt.path.is_dir() || wt.path.starts_with(state.project_root.join(".spar")) {
+        return;
+    }
+    if let Some(msg) = worktree::restore_branch(&wt.path, &wt.branch, state.base_commit.as_deref())
+    {
+        eprintln!("warning: {msg}");
+        let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg));
+    }
+    let subject = crate::ship::pr_title(state.task.as_deref(), cfg.ship.title_max);
+    let body = format!(
+        "spar: uncommitted implementer work before review round {}",
+        state.round
+    );
+    let note = match worktree::commit_leftovers(&wt.path, &subject, &body) {
+        Ok(None) => return,
+        Ok(Some(sha)) => format!(
+            "committed uncommitted implementer work on {} as {} before review round {}",
+            wt.branch,
+            sha.chars().take(8).collect::<String>(),
+            state.round
+        ),
+        Err(e) => {
+            let msg = format!(
+                "could not commit uncommitted implementer work before review round {}: {e}; \
+                 the panel judges HEAD without it",
+                state.round
+            );
+            eprintln!("warning: {msg}");
+            msg
+        }
+    };
+    let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(note));
+}
+
+/// The tree reviewer `seat` judges from: its own detached checkout at the panel head
+/// (O138), so a reviewer that checks out or commits anything moves nothing the
+/// implementer or `ship` reads (#158). The implementer's tree when there is no real
+/// worktree to detach from (dry run, `isolation = "none"`, a head that did not resolve),
+/// and, loudly, when the checkout cannot be made: `restore_branch` stays the net there.
+fn reviewer_cwd(
+    state: &RunState,
+    paths: &SparPaths,
+    cfg: &Config,
+    seat: &str,
+    panel_head: Option<&str>,
+    review_cwd: &Path,
+) -> PathBuf {
+    let Some(head) = panel_head else {
+        return review_cwd.to_path_buf();
+    };
+    let real_worktree = state
+        .worktrees
+        .iter()
+        .any(|w| w.path == review_cwd && !w.path.starts_with(state.project_root.join(".spar")));
+    if state.dry_run || !real_worktree {
+        return review_cwd.to_path_buf();
+    }
+    match worktree::reviewer_checkout(state, seat, head, &cfg.worktree.copy) {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = format!(
+                "reviewer `{seat}` judges from the implementer's worktree: its own checkout \
+                 failed ({e:#})"
+            );
+            eprintln!("warning: {msg}");
+            let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg));
+            review_cwd.to_path_buf()
+        }
+    }
+}
+
 /// The panel position a reviewer seat id encodes (`review-1-cli-codex` is 1), which is
 /// the index into `[backups].reviewer`. `None` for ids that carry none (`review-cli-grok-wide`).
 fn reviewer_ordinal(slot_id: &str) -> Option<usize> {
@@ -2872,16 +3198,16 @@ fn reviewer_ordinal(slot_id: &str) -> Option<usize> {
         .ok()
 }
 
-/// Put a declared backup in a seat. A reviewer seat is renamed to name its new vendor
+/// Put another provider in a seat. A reviewer seat is renamed to name its new vendor
 /// (O85); the implementer keeps its id because its worktree and branch are keyed on it.
-/// Returns the seat's id after the move.
-fn move_seat_to_backup(
+/// Returns the seat's id after the move. The caller saves.
+fn move_seat(
     state: &mut RunState,
     paths: &SparPaths,
     slot_id: &str,
-    backup_raw: &str,
+    pin: &crate::runspec::Pin,
+    source: SeatSource,
 ) -> Result<String> {
-    let pin = crate::runspec::Pin::parse(backup_raw)?;
     let role = state
         .slots
         .iter()
@@ -2890,25 +3216,50 @@ fn move_seat_to_backup(
         .ok_or_else(|| anyhow::anyhow!("unknown slot {slot_id}"))?;
     if let Some(s) = state.slot_mut(slot_id) {
         set_slot_provider(s, pin.display());
-        s.source = Some(SeatSource::Backup);
+        // A level the old CLI took may not exist on the new one; the dispatch then
+        // resolves the role's level from config.
+        if executor::check_slot_effort(&pin.display(), s.effort).is_err() {
+            s.effort = None;
+        }
+        s.source = Some(source);
         s.status = SlotStatus::Pending;
         s.error = None;
         s.quota_hit = false;
         s.auth_fault = false;
     }
-    let new_id = match (role, reviewer_ordinal(slot_id)) {
-        (SlotRole::Reviewer, Some(ordinal)) => {
-            format!("review-{ordinal}-{}", sanitize_slot(&pin.provider))
-        }
-        _ => slot_id.to_string(),
-    };
+    let new_id = moved_seat_id(role, slot_id, &pin.provider);
     if new_id != slot_id && state.slots.iter().all(|s| s.id != new_id) {
         state.rename_slot(paths, slot_id, &new_id);
-        state.save(paths)?;
         return Ok(new_id);
     }
-    state.save(paths)?;
     Ok(slot_id.to_string())
+}
+
+/// The id a seat takes when `provider` fills it: reviewer and tester ids name their
+/// provider (O80), the implementer keeps `impl`.
+fn moved_seat_id(role: SlotRole, slot_id: &str, provider: &str) -> String {
+    match (role, reviewer_ordinal(slot_id)) {
+        (SlotRole::Reviewer, Some(ordinal)) => {
+            format!("review-{ordinal}-{}", sanitize_slot(provider))
+        }
+        (SlotRole::Tester, _) => format!("suite-{}", sanitize_slot(provider)),
+        (SlotRole::Reviewer, None) if slot_id.ends_with("-wide") => {
+            format!("review-{}-wide", sanitize_slot(provider))
+        }
+        _ => slot_id.to_string(),
+    }
+}
+
+fn move_seat_to_backup(
+    state: &mut RunState,
+    paths: &SparPaths,
+    slot_id: &str,
+    backup_raw: &str,
+) -> Result<String> {
+    let pin = crate::runspec::Pin::parse(backup_raw)?;
+    let id = move_seat(state, paths, slot_id, &pin, SeatSource::Backup)?;
+    state.save(paths)?;
+    Ok(id)
 }
 
 /// Why a failed reviewer dispatch is an infrastructure failure rather than a review
@@ -3369,6 +3720,61 @@ fn try_rotate_reviewer_provider(
     }
     state.save(paths)?;
     Ok(Some(rev_id.to_string()))
+}
+
+#[cfg(test)]
+mod moved_seat_tests {
+    use super::*;
+
+    #[test]
+    fn moved_seat_ids_name_the_new_provider() {
+        assert_eq!(
+            moved_seat_id(SlotRole::Reviewer, "review-1-cli-codex", "cli:claude"),
+            "review-1-cli-claude"
+        );
+        assert_eq!(
+            moved_seat_id(SlotRole::Reviewer, "review-cli-grok-wide", "cli:claude"),
+            "review-cli-claude-wide"
+        );
+        assert_eq!(
+            moved_seat_id(SlotRole::Tester, "suite-cli-codex", "cli:pi"),
+            "suite-cli-pi"
+        );
+        assert_eq!(
+            moved_seat_id(SlotRole::Implementer, "impl", "cli:pi"),
+            "impl"
+        );
+    }
+
+    #[test]
+    fn a_rename_carries_the_artifact_and_remembers_the_old_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new("r1", crate::cli::WorkflowKind::Loop, tmp.path().into());
+        let mut slot = executor::init_slot("review-0-cli-codex", "cli:codex", SlotRole::Reviewer);
+        slot.artifact = Some("review-review-0-cli-codex.md".into());
+        let refused: crate::effort::EffortLevel = crate::effort::EffortLevel::all()
+            .iter()
+            .map(|r| r.parse().unwrap())
+            .find(|l| executor::check_slot_effort("cli:claude", Some(*l)).is_err())
+            .expect("claude refuses some level");
+        slot.effort = Some(refused);
+        state.slots.push(slot);
+        let pin = crate::runspec::Pin::parse("cli:claude").unwrap();
+        let id = move_seat(
+            &mut state,
+            &paths,
+            "review-0-cli-codex",
+            &pin,
+            SeatSource::Reassigned,
+        )
+        .unwrap();
+        let s = state.slots.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(id, "review-0-cli-claude");
+        assert_eq!(s.artifact.as_deref(), Some("review-review-0-cli-claude.md"));
+        assert_eq!(s.former_ids, ["review-0-cli-codex"]);
+        assert_eq!(s.effort, None, "a level the new CLI refuses is dropped");
+    }
 }
 
 #[cfg(test)]
@@ -4219,7 +4625,7 @@ fn blockers_from_disk(
         let scoped = state
             .review_history
             .iter()
-            .filter(|e| e.slot_id == rev.id)
+            .filter(|e| e.slot_id == rev.id || rev.former_ids.contains(&e.slot_id))
             .max_by_key(|e| e.round)
             .is_some_and(|e| e.review.scoped);
         let res = review_result::ReviewResult {

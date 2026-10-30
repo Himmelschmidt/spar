@@ -114,6 +114,10 @@ fn run() -> Result<ExitCode> {
         // observe-only, so `status` can never be the thing that hid a run from you.
         auto_archive_at_launch();
     }
+    // `amend` dispatches a test author: Ctrl-C must reap its group too (O137).
+    if matches!(command, Command::Amend { .. }) {
+        process::install_shutdown_handler();
+    }
     let detached_or_dry = match &command {
         Command::Plan {
             detach, dry_run, ..
@@ -255,6 +259,7 @@ fn run() -> Result<ExitCode> {
                 // `plan` / `run` mint their config fresh; there is no frozen one to
                 // reload against, so seats are resolved for the first time either way.
                 reload_config: false,
+                reassign: Vec::new(),
             };
             workflow::plan::run(task_text, brief_path, opts, &paths, &cfg)
         }
@@ -271,6 +276,24 @@ fn run() -> Result<ExitCode> {
             workflow::plan::reject(&paths, &run_id, reason, json)
         }
         Command::Brief { run_id, full, json } => brief_cmd(&run_id, full, json),
+        Command::Amend {
+            run_id,
+            contract,
+            accept_contract_edits,
+            json,
+        } => {
+            refuse_inside_slot("spar amend")?;
+            let (paths, _) = project_ctx()?;
+            let cfg = Config::for_run(&paths, &run_id)?;
+            workflow::plan::amend_contract(
+                &paths,
+                &cfg,
+                &run_id,
+                &contract,
+                accept_contract_edits,
+                json,
+            )
+        }
         Command::Resume {
             run_id,
             detach,
@@ -294,6 +317,7 @@ fn run() -> Result<ExitCode> {
             reload_config,
             max_rounds,
             accept_contract,
+            reassign,
             base,
             detach,
             json,
@@ -304,6 +328,12 @@ fn run() -> Result<ExitCode> {
             urgency,
             big,
         } => {
+            if !reassign.is_empty() {
+                refuse_inside_slot("spar implement --reassign")?;
+                if run_id.is_none() {
+                    anyhow::bail!("--reassign moves a seat of an existing run; pass --run <id>");
+                }
+            }
             let (paths, cfg) = implement_ctx(
                 run_id.as_deref(),
                 &role,
@@ -328,6 +358,7 @@ fn run() -> Result<ExitCode> {
                 max_rounds,
                 accept_contract,
                 reload_config,
+                reassign,
             };
             workflow::implement::run_from_cli(run_id, plan, task, new, opts, &paths, &cfg)
         }
@@ -406,6 +437,7 @@ fn run() -> Result<ExitCode> {
                 // `plan` / `run` mint their config fresh; there is no frozen one to
                 // reload against, so seats are resolved for the first time either way.
                 reload_config: false,
+                reassign: Vec::new(),
             };
             workflow::run_named(workflow, opts, &paths, &cfg)
         }
@@ -1223,6 +1255,28 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> 
                 println!(
                     "  - {} provider={} role={:?} status={:?}{pid_s} silent={silent}{stall}{zombie}{spend}",
                     slot.id, slot.provider, slot.role, slot.status
+                );
+            }
+            for r in &state.seat_reassignments {
+                println!(
+                    "reassigned: round {} {} {} -> {} {} ({})",
+                    r.round,
+                    r.from_seat,
+                    r.from_provider,
+                    r.to_seat,
+                    r.to_provider,
+                    r.at.to_rfc3339()
+                );
+            }
+            for a in &state.contract_amendments {
+                println!(
+                    "contract amended: round {} {} -> {} ({}; was artifacts/{}): {}",
+                    a.round,
+                    a.old_fingerprint,
+                    a.new_fingerprint,
+                    a.at.to_rfc3339(),
+                    a.archived,
+                    a.directive
                 );
             }
             if cost.total.dispatches > 0 {
