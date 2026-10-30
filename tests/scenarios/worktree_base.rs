@@ -4,7 +4,8 @@
 //! repo's main checkout (so `.spar/` stays one per repo), and the run used to take its
 //! base from there — handing every slot the main checkout's branch while the run looked
 //! perfectly healthy.
-use assert_cmd::cargo::cargo_bin_cmd;
+
+mod common;
 use std::process::Command;
 use tempfile::tempdir;
 
@@ -20,7 +21,7 @@ fn spar_home_dir() -> std::path::PathBuf {
 }
 
 fn spar_cmd() -> assert_cmd::Command {
-    let mut c = cargo_bin_cmd!("spar");
+    let mut c = common::spar();
     c.env("SPAR_HOME", spar_home_dir());
     c.env_remove("SPAR_PROJECT_ROOT");
     c.env_remove("SPAR_RUN_ID");

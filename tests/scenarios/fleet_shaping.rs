@@ -18,7 +18,8 @@
 //! (`cli:claude, cli:grok, cli:agy`), so a seat landing on one of those is proof the seat
 //! came from a pin, and a seat landing on `cli:grok`/`cli:agy` where no pin names them is
 //! proof it leaked out of `order`.
-use assert_cmd::cargo::cargo_bin_cmd;
+
+mod common;
 use predicates::prelude::*;
 use serde_json::Value;
 use std::process::Command;
@@ -41,7 +42,7 @@ fn spar_home_dir() -> std::path::PathBuf {
 /// this suite runs *inside* a spar worktree an un-cleared child would resolve the primary
 /// checkout and write real runs into it. Cleared per-Command, never via process env.
 fn spar_cmd() -> assert_cmd::Command {
-    let mut c = cargo_bin_cmd!("spar");
+    let mut c = common::spar();
     c.env("SPAR_HOME", spar_home_dir());
     c.env_remove("SPAR_PROJECT_ROOT");
     c.env_remove("SPAR_RUN_ID");

@@ -657,7 +657,9 @@ pub struct RunSummary {
     pub updated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Always serialized, `null` included: a remote row without the field is an older
+    /// spar the fleet key check cannot see into.
+    #[serde(default)]
     pub key: Option<String>,
     #[serde(default)]
     pub dry_run: bool,

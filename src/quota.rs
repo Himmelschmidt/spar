@@ -101,6 +101,15 @@ pub struct ProviderQuota {
     /// (O106). Legacy records read weak.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub strong: bool,
+    /// Per-account write counter (O141): every write is one past the highest version
+    /// this box had seen for the key, so "written after seeing that pause" is decided by
+    /// the counter, not by two boxes' clocks. 0 on records that predate it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub version: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 impl ProviderQuota {
@@ -113,6 +122,7 @@ impl ProviderQuota {
             updated_at: None,
             sticky: false,
             strong: false,
+            version: 0,
         }
     }
 
@@ -143,21 +153,37 @@ impl ProviderQuota {
 
 /// Combine two records for one account (O141). A pause that has lapsed counts for
 /// nothing. Between two live pauses, a manual one beats a quota one, the longest-lived
-/// manual pause wins, and among quota pauses the strong one wins, then the longest. A
-/// live pause beats `Available` unless that `Available` is a `provider resume` written
-/// after it: a resume on one box has to clear the pause for the fleet. Otherwise the
-/// newer record wins.
+/// manual pause wins, and among quota pauses the strong one wins, then the longest.
+/// Between a live pause and `available`, the higher `version` wins: a `provider resume`
+/// written after its box saw the pause clears it fleet-wide, and a pause written after
+/// its box saw the resume holds. At equal versions (concurrent writes, or records from
+/// before the counter) the resume wins unless the pause is newer by more than the clock
+/// skew allowance. The result carries the higher version.
 pub fn merge(a: ProviderQuota, b: ProviderQuota, now: DateTime<Utc>) -> ProviderQuota {
-    let newer =
-        |a: ProviderQuota, b: ProviderQuota| if b.updated_at > a.updated_at { b } else { a };
-    let resumed_after = |pause: &ProviderQuota, other: &ProviderQuota| {
-        other.status == ProviderStatus::Available && other.updated_at > pause.updated_at
+    let version = a.version.max(b.version);
+    let skew = chrono::Duration::seconds(crate::fleet::CLOCK_SKEW_SECS);
+    let resume_wins = |pause: &ProviderQuota, other: &ProviderQuota| {
+        other.status == ProviderStatus::Available
+            && match other.version.cmp(&pause.version) {
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Less => false,
+                std::cmp::Ordering::Equal => match (pause.updated_at, other.updated_at) {
+                    (Some(p), Some(r)) => p <= r + skew,
+                    (_, r) => r.is_some(),
+                },
+            }
     };
-    match (a.holds(now), b.holds(now)) {
-        (false, false) => newer(a, b),
-        (true, false) if resumed_after(&a, &b) => b,
+    let mut out = match (a.holds(now), b.holds(now)) {
+        (false, false) => {
+            if (b.version, b.updated_at) > (a.version, a.updated_at) {
+                b
+            } else {
+                a
+            }
+        }
+        (true, false) if resume_wins(&a, &b) => b,
         (true, false) => a,
-        (false, true) if resumed_after(&b, &a) => a,
+        (false, true) if resume_wins(&b, &a) => a,
         (false, true) => b,
         (true, true) => {
             let manual = |q: &ProviderQuota| q.status == ProviderStatus::PausedManual;
@@ -169,7 +195,9 @@ pub fn merge(a: ProviderQuota, b: ProviderQuota, now: DateTime<Utc>) -> Provider
                 a
             }
         }
-    }
+    };
+    out.version = version;
+    out
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -197,7 +225,9 @@ impl QuotaStore {
             Self::default()
         };
         if let Some(shared) = crate::fleet::Shared::open() {
-            store.fleet = read_fleet(&shared);
+            store.fleet =
+                crate::fleet::with_timeout("read fleet quota", move || read_fleet(&shared))
+                    .unwrap_or_default();
         }
         Ok(store)
     }
@@ -210,55 +240,34 @@ impl QuotaStore {
         if self.touched.is_empty() {
             return Ok(());
         }
-        if let Some(shared) = crate::fleet::Shared::open() {
-            if let Err(e) = self.publish(&shared) {
-                crate::fleet::warn_once(&format!("{e:#}"));
-            }
-        }
-        Ok(())
-    }
-
-    /// Merge this process's changes into the fleet file under its lock, replacing the
-    /// file by rename so a reader on another box never sees a torn write.
-    fn publish(&self, shared: &crate::fleet::Shared) -> Result<()> {
-        let lock_path = shared.quota_lock();
-        let lock = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .with_context(|| format!("open {}", lock_path.display()))?;
-        lock.lock()
-            .with_context(|| format!("lock {}", lock_path.display()))?;
-        let file = shared.quota_file();
-        let mut fleet: Self = match std::fs::read_to_string(&file) {
-            Ok(text) => {
-                serde_json::from_str(&text).with_context(|| format!("parse {}", file.display()))?
-            }
-            Err(_) => Self::default(),
+        let Some(shared) = crate::fleet::Shared::open() else {
+            return Ok(());
         };
-        let now = Utc::now();
-        for name in &self.touched {
-            let Some(mine) = self.providers.get(name) else {
-                continue;
-            };
-            let key = shared.account_key(name);
-            let merged = match fleet.providers.remove(&key) {
-                Some(theirs) => merge(theirs, mine.clone(), now),
-                None => mine.clone(),
-            };
-            fleet.providers.insert(key, merged);
+        let changed: Vec<(String, ProviderQuota)> = self
+            .touched
+            .iter()
+            .filter_map(|name| {
+                let q = self.providers.get(name)?;
+                Some((shared.account_key(name), q.clone()))
+            })
+            .collect();
+        let published = crate::fleet::with_timeout("write fleet quota", move || {
+            publish(&shared, changed).map_err(|e| format!("{e:#}"))
+        });
+        if let Some(Err(e)) = published {
+            crate::fleet::warn_once(&e);
         }
-        let tmp = file.with_extension(format!("tmp.{}", std::process::id()));
-        std::fs::write(&tmp, serde_json::to_string_pretty(&fleet)?)
-            .with_context(|| format!("write {}", tmp.display()))?;
-        std::fs::rename(&tmp, &file).with_context(|| format!("replace {}", file.display()))?;
-        let _ = lock.unlock();
         Ok(())
     }
 
-    fn insert(&mut self, q: ProviderQuota) {
+    fn insert(&mut self, mut q: ProviderQuota) {
+        let seen = [self.providers.get(&q.name), self.fleet.get(&q.name)]
+            .into_iter()
+            .flatten()
+            .map(|r| r.version)
+            .max()
+            .unwrap_or(0);
+        q.version = seen + 1;
         self.touched.insert(q.name.clone());
         self.providers.insert(q.name.clone(), q);
     }
@@ -322,6 +331,7 @@ impl QuotaStore {
             updated_at: Some(Utc::now()),
             sticky: true,
             strong: false,
+            version: 0,
         });
     }
 
@@ -338,6 +348,7 @@ impl QuotaStore {
             updated_at: Some(Utc::now()),
             sticky: false,
             strong,
+            version: 0,
         });
     }
 
@@ -363,6 +374,7 @@ impl QuotaStore {
             updated_at: Some(Utc::now()),
             sticky: false,
             strong,
+            version: 0,
         });
     }
 
@@ -396,6 +408,7 @@ impl QuotaStore {
             updated_at: Some(Utc::now()),
             sticky: false,
             strong: false,
+            version: 0,
         });
     }
 
@@ -470,6 +483,55 @@ impl QuotaStore {
         }
         None
     }
+}
+
+/// Merge `changed` (account key, record) into the fleet file under its lock, replacing
+/// the file by rename so a reader on another box never sees a torn write. A file that
+/// does not parse is moved aside and the fleet starts again from these records.
+fn publish(shared: &crate::fleet::Shared, changed: Vec<(String, ProviderQuota)>) -> Result<()> {
+    let lock_path = shared.quota_lock();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("open {}", lock_path.display()))?;
+    lock.lock()
+        .with_context(|| format!("lock {}", lock_path.display()))?;
+    let file = shared.quota_file();
+    let mut fleet: QuotaStore = match std::fs::read_to_string(&file) {
+        Ok(text) => match serde_json::from_str(&text) {
+            Ok(f) => f,
+            Err(e) => {
+                let aside =
+                    file.with_extension(format!("corrupt-{}", Utc::now().format("%Y%m%dT%H%M%S")));
+                std::fs::rename(&file, &aside)
+                    .with_context(|| format!("move aside {}", file.display()))?;
+                eprintln!(
+                    "warning: {} did not parse ({e}); moved to {} and started fresh",
+                    file.display(),
+                    aside.display()
+                );
+                QuotaStore::default()
+            }
+        },
+        Err(_) => QuotaStore::default(),
+    };
+    let now = Utc::now();
+    for (key, mine) in changed {
+        let merged = match fleet.providers.remove(&key) {
+            Some(theirs) => merge(theirs, mine, now),
+            None => mine,
+        };
+        fleet.providers.insert(key, merged);
+    }
+    let tmp = crate::fleet::unique_tmp(&file);
+    std::fs::write(&tmp, serde_json::to_string_pretty(&fleet)?)
+        .with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &file).with_context(|| format!("replace {}", file.display()))?;
+    let _ = lock.unlock();
+    Ok(())
 }
 
 /// The fleet file's records for the accounts this box uses, keyed by local storage key.
@@ -879,6 +941,7 @@ mod tests {
             updated_at: Some(now - chrono::Duration::minutes(age_mins)),
             sticky: status == ProviderStatus::PausedManual,
             strong: false,
+            version: 0,
         }
     }
 
@@ -930,6 +993,66 @@ mod tests {
             merge(stale, pause, now).status,
             ProviderStatus::PausedManual
         );
+    }
+
+    #[test]
+    fn versions_decide_resume_against_pause_and_skew_only_breaks_ties() {
+        let now = Utc::now();
+        let mut pause = rec(ProviderStatus::PausedQuota, 0, Some(60));
+        let mut resume = rec(ProviderStatus::Available, 0, None);
+        resume.updated_at = Some(now + chrono::Duration::minutes(10));
+        pause.version = 3;
+        resume.version = 2;
+        let got = merge(pause.clone(), resume.clone(), now);
+        assert_eq!(
+            got.status,
+            ProviderStatus::PausedQuota,
+            "a pause written after its box saw the resume holds, whatever the clocks say"
+        );
+        assert_eq!(got.version, 3);
+
+        resume.version = 4;
+        resume.updated_at = Some(now - chrono::Duration::minutes(10));
+        assert_eq!(
+            merge(pause.clone(), resume.clone(), now).status,
+            ProviderStatus::Available,
+            "a resume that saw the pause clears it, even stamped by a slow clock"
+        );
+
+        pause.version = 0;
+        resume.version = 0;
+        resume.updated_at = Some(now - chrono::Duration::seconds(30));
+        pause.updated_at = Some(now);
+        assert_eq!(
+            merge(pause.clone(), resume.clone(), now).status,
+            ProviderStatus::Available,
+            "inside the skew allowance a concurrent resume wins"
+        );
+        resume.updated_at = Some(now - chrono::Duration::minutes(5));
+        assert_eq!(
+            merge(pause, resume, now).status,
+            ProviderStatus::PausedQuota,
+            "a pause newer than the resume by more than the allowance wins"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_fleet_file_is_moved_aside_and_rebuilt() {
+        let tmp = tempdir().unwrap();
+        let shared = crate::fleet::Shared::at(tmp.path(), &[]);
+        std::fs::write(shared.quota_file(), "{not json").unwrap();
+        let mut q = rec(ProviderStatus::PausedManual, 0, None);
+        q.version = 1;
+        publish(&shared, vec![("cli:claude".into(), q)]).unwrap();
+        let rebuilt: QuotaStore =
+            serde_json::from_str(&std::fs::read_to_string(shared.quota_file()).unwrap()).unwrap();
+        assert!(rebuilt.providers.contains_key("cli:claude"));
+        let aside: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("corrupt-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "the unreadable file is kept for inspection");
     }
 
     #[test]

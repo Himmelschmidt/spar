@@ -10,7 +10,8 @@
 //!   - agy     → `None`                 (inbox left untouched for the agent's next turn)
 //!   - muse    → `StopHookInject`       (same turn-boundary injection as Claude: muse's
 //!     Stop hook honors the same `{"decision":"block",…}` payload, probed live)
-use assert_cmd::cargo::cargo_bin_cmd;
+
+mod common;
 use serde_json::Value;
 use tempfile::tempdir;
 
@@ -26,7 +27,7 @@ fn spar_home_dir() -> std::path::PathBuf {
 }
 
 fn spar_cmd() -> assert_cmd::Command {
-    let mut c = cargo_bin_cmd!("spar");
+    let mut c = common::spar();
     c.env("SPAR_HOME", spar_home_dir());
     // spar exports these into every slot (providers/presence.rs), so when the suite runs
     // *inside* a spar worktree the child would resolve the primary checkout instead of

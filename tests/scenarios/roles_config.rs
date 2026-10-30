@@ -1,7 +1,8 @@
 //! Role-keyed fleet scenarios (Priority 9): a project `[roles]` block satisfies the
 //! provider invariant and assigns slots by role, explicit `--providers` still overrides
 //! positionally, a bad ref fails cleanly, and reviewer widening draws from the role list.
-use assert_cmd::cargo::cargo_bin_cmd;
+
+mod common;
 use predicates::prelude::*;
 use std::process::Command;
 use tempfile::tempdir;
@@ -20,7 +21,7 @@ fn spar_home_dir() -> std::path::PathBuf {
 }
 
 fn spar_cmd() -> assert_cmd::Command {
-    let mut c = cargo_bin_cmd!("spar");
+    let mut c = common::spar();
     c.env("SPAR_HOME", spar_home_dir());
     // spar exports these into every slot (providers/presence.rs), so when the suite runs
     // *inside* a spar worktree the child would resolve the primary checkout instead of

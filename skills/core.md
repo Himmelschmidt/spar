@@ -1158,7 +1158,7 @@ spar logs <run_id> [slot] [-f|--follow]
 
 ```bash
 spar implement -t "…" --key pr-1234 [--key-scope local|fleet] ...   # also on plan / run
-spar plan --brief .spar/briefs/<slug>.md ...      # key defaults to <slug>
+spar plan --brief .spar/briefs/<slug>.md ...      # key defaults to <slug>; --no-key for none
 spar status --hosts box2,box3 [--json] [--archived]
 spar status --all-hosts [--json]                   # this host + every [registry] remotes host
 ```
@@ -1171,8 +1171,11 @@ spar status --all-hosts [--json]                   # this host + every [registry
   `escalated`, and not archived: a gate, `plan_approved`, `stopped` and `quota` hold
   the key. Resume or stop the holder; a key never moves to an existing run
   (`--key` with `implement --run` / `plan --run` is refused).
-- `plan --brief .spar/briefs/<slug>.md` without `--key` uses `<slug>` as the key.
-  `--spec` (which writes a new brief) and `-t` set no key unless you pass one.
+- `plan --brief .spar/briefs/<slug>.md` without `--key` uses `<slug>` as the key, but
+  only for a file directly in this project's `.spar/briefs/`; any other `--brief`
+  path, `--spec` and `-t` set no key unless you pass one. `--no-key` opts out.
+- **Dry runs never check or hold keys**: `--dry-run` launches pass the check and a
+  dry run's key blocks nothing.
 - Remotes live in the **user** config only (`~/.config/spar/config.toml`), never
   `spar.toml`:
 
@@ -1181,14 +1184,17 @@ spar status --all-hosts [--json]                   # this host + every [registry
   remotes = ["box2", "box3"]
   ```
 
-  Each host is queried with `ssh -o BatchMode=yes -o ConnectTimeout=10 <host> spar
-  status --all --json` (stdin closed, 20s ceiling), so `spar` must be on the remote's
+  Each host is queried with `ssh -o BatchMode=yes -o ConnectTimeout=10 -- <host> spar
+  status --all --json` (stdin closed, 20s ceiling; a host entry starting with `-` is
+  refused), so `spar` must be on the remote's
   non-interactive `PATH` and the key loaded in your agent. `--hosts`/`--all-hosts`
   `--json` prints `{"hosts": [{"host", "ok", "runs"|"error"}], "runs": [<row> + "host"]}`;
   a host that does not answer is listed as unreachable and the command still exits `0`.
 - With remotes configured the key check is fleet-wide by default (`--key-scope fleet`):
-  a remote run holds the key when its `project_name` (the checkout's directory name)
-  matches this project's. An unreachable host prints a warning and the launch
+  a remote run holds the key when its project is this one: the normalized `origin`
+  URL (`project_repo` in `status --json` listings) when both sides have one, else the
+  canonical checkout directory name. A host whose output has no `key` field runs an
+  older spar; the check warns that it cannot see that host's runs. An unreachable host prints a warning and the launch
   **proceeds**: the check covered only the hosts that answered.
 - **Check-then-act, not a lock.** Two launches in the same instant both see no holder
   and both start. The key stops relaunches, requeues and second boxes, not a
@@ -1218,26 +1224,39 @@ shared_path = "/mnt/fleet/spar"     # a directory; "" (default) = per-project .s
   `quota.lock` and replaced by atomic rename.
 - **Merge rule, per account:** a lapsed pause counts for nothing; a manual pause beats
   a quota pause; the longest-lived manual pause wins; the strongest quota pause wins
-  (strong over weak, then the longest). A `provider resume` written after a pause
-  clears it fleet-wide; an older `available` record never clears a newer pause.
-  Consequence: shortening a fleet manual pause takes `provider resume` first.
+  (strong over weak, then the longest). Between a pause and a resume, each record's
+  `version` (one past the highest the writing box had seen) decides: a resume written
+  after its box saw the pause clears it fleet-wide, a pause written after the resume
+  holds. At equal versions the resume wins unless the pause is newer by more than 60s
+  of allowed clock skew. Consequence: shortening a fleet manual pause takes
+  `provider resume` first.
+- A shared `quota.json` that does not parse is moved to `quota.corrupt-<timestamp>`
+  with a warning and rebuilt from the next write.
 - With a shared path, every live (non-dry) dispatch on every box writes a heartbeat
   lease `<shared_path>/slots/<host>-<pid>-<run>-<slot>.json`, refreshed every 30s and
-  removed when the slot exits. A daemon enforcing `[daemon] max_slots_per_bucket`
+  removed when the slot exits ("this host" is hostname plus `/etc/machine-id`). A
+  daemon enforcing `[daemon] max_slots_per_bucket`
   adds the live leases of other boxes and other projects on the same account to its
   local count, so the cap is fleet-wide. Admission is still check-then-act: a launch
   on another box counts only once its slot runs. A lease not
-  refreshed for 120s, or one from this host whose pid is dead, expires and is deleted
-  by the next reader. `spar daemon status` shows them as `in_use_elsewhere`.
+  refreshed for 120s stops counting and is deleted 60s later (the clock-skew margin);
+  one from this machine whose pid is dead is deleted at once. The daemon reads these
+  before taking its admission lock. `spar daemon status` shows them as `in_use_elsewhere`.
 - If `shared_path` is set but the directory is missing (an unmounted share), spar
   never creates it: it uses the project file only and warns once per command.
+- **Hung mounts.** Every shared-path access runs on a helper thread with a 4s
+  deadline. A miss (a hard-mounted NFS server that stopped answering) falls back to
+  the project file, warns once, and leaves the share alone for 60s before trying
+  again. The abandoned thread can stay stuck in the kernel until the mount recovers;
+  prefer `soft` or `intr` NFS mount options on boxes that run spar.
 - **Filesystem caveats.** A path only, no URL store. NFS: `flock` needs a lock daemon
   (NFSv4 has one; v3 needs `lockd`), and attribute caching can delay another box's
   write by a few seconds. sshfs: no cross-host locks at all, so two simultaneous writers
   can lose one update (the next write re-merges). syncthing: no locks and eventual
   delivery; a pause reaches other boxes after the sync interval, and a conflicting
   write lands as a `.sync-conflict` file spar ignores. Leases compare timestamps
-  across hosts, so keep clocks in NTP sync.
+  across hosts and lapse times, and the merge allows only 60s of skew, so clock sync
+  (NTP) is required on every box, for both the quota merge and the leases.
 
 ### Build-cache pool (O143, O144)
 
@@ -1258,7 +1277,12 @@ build_cache_env = "CARGO_TARGET_DIR"                   # default
   (recorded as `build_cache` on the slot in `state.json`), so a resume or
   `implement --run <id> --max-rounds N` lands back in its own warm build when it can.
 - Pool exhausted: a warning on stderr and in the event log, `build_cache` cleared, and
-  the implementer builds into its worktree's own `target/`.
+  the implementer gets `<build_cache_env>=<worktree>/target`, so it builds into its
+  own target even if spar itself was started with that variable set. The slot's env
+  always wins over the orchestrator's.
+- A lease outlives its dispatch while something may still build there: a process
+  whose cwd is inside the slot's worktree, or a tmux pane that did not end cleanly.
+  The lease passes to those processes and frees itself when the last one exits.
 - Reviewers, testers and every other role never lease: they build in their own
   checkout and target, and their env is untouched.
 - `spar reclaim` never deletes a directory whose lease is held by a live process. Pool

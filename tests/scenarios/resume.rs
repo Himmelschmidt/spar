@@ -3,7 +3,8 @@
 //! refused (naming its pid), a finished run is refused, and an at-rest resumable run
 //! (`stopped`, in these tests) is picked back up through the same path a bare
 //! `implement --run <id>` would take.
-use assert_cmd::cargo::cargo_bin_cmd;
+
+mod common;
 use std::process::Command;
 use tempfile::tempdir;
 
@@ -19,7 +20,7 @@ fn spar_home_dir() -> std::path::PathBuf {
 }
 
 fn spar_cmd() -> assert_cmd::Command {
-    let mut c = cargo_bin_cmd!("spar");
+    let mut c = common::spar();
     c.env("SPAR_HOME", spar_home_dir());
     c.env_remove("SPAR_PROJECT_ROOT");
     c.env_remove("SPAR_RUN_ID");

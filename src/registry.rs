@@ -246,6 +246,40 @@ pub fn list_project_runs(project_root: &Path) -> Result<Vec<RunSummary>> {
     Ok(runs)
 }
 
+/// The checkout's identity across boxes: its `origin` URL, normalized so the ssh and
+/// https spellings of one repository agree (`github.com/acme/app`). `None` without one.
+pub fn repo_identity(root: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["config", "--get", "remote.origin.url"])
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    normalize_repo_url(String::from_utf8_lossy(&out.stdout).trim())
+}
+
+fn normalize_repo_url(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches('/');
+    if url.is_empty() {
+        return None;
+    }
+    let rest = match url.split_once("://") {
+        Some((_, rest)) => rest.to_string(),
+        None => match url.split_once(':') {
+            Some((host, path)) if !host.contains('/') => format!("{host}/{path}"),
+            _ => url.to_string(),
+        },
+    };
+    let rest = rest.rsplit_once('@').map_or(rest.as_str(), |(_, r)| r);
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+    let path = path.trim_matches('/').trim_end_matches(".git");
+    Some(format!("{host}/{path}"))
+}
+
 /// A remote that does not answer inside this is reported unreachable, never waited on.
 const REMOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
@@ -283,11 +317,15 @@ pub fn query_remotes(hosts: &[String], archived: bool) -> Vec<HostRuns> {
 fn query_remote(host: &str, archived: bool) -> std::result::Result<Vec<serde_json::Value>, String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
+    if host.is_empty() || host.starts_with('-') {
+        return Err(format!("{host:?} is not a host name"));
+    }
     let mut args = vec![
         "-o",
         "BatchMode=yes",
         "-o",
         "ConnectTimeout=10",
+        "--",
         host,
         "spar",
         "status",
@@ -349,6 +387,29 @@ mod tests {
 
     fn set_home_override(home: &Path) {
         HOME_OVERRIDE.with(|h| *h.borrow_mut() = Some(home.to_path_buf()));
+    }
+
+    #[test]
+    fn repo_urls_normalize_across_spellings() {
+        for url in [
+            "git@github.com:Acme/app.git",
+            "ssh://git@github.com:22/Acme/app.git",
+            "https://github.com/Acme/app",
+            "https://user@GitHub.com/Acme/app.git/",
+        ] {
+            assert_eq!(
+                normalize_repo_url(url).as_deref(),
+                Some("github.com/Acme/app"),
+                "{url}"
+            );
+        }
+        assert_eq!(normalize_repo_url(""), None);
+    }
+
+    #[test]
+    fn a_host_that_looks_like_an_option_is_refused_before_ssh() {
+        let err = query_remote("-oProxyCommand=evil", false).unwrap_err();
+        assert!(err.contains("not a host"), "{err}");
     }
 
     #[test]

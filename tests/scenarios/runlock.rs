@@ -1,7 +1,8 @@
 //! `spar implement --run <id>` must serialize on the RunLock before mutating or
 //! persisting shared state: a loser that hits OrchestratorBusy must leave
 //! state.json byte-identical to the pre-invocation snapshot.
-use assert_cmd::cargo::cargo_bin_cmd;
+
+mod common;
 use predicates::prelude::*;
 use serde_json::Value;
 use std::fs::OpenOptions;
@@ -23,7 +24,7 @@ fn spar_home_dir() -> std::path::PathBuf {
 }
 
 fn spar_cmd() -> assert_cmd::Command {
-    let mut c = cargo_bin_cmd!("spar");
+    let mut c = common::spar();
     c.env("SPAR_HOME", spar_home_dir());
     // spar exports these into every slot (providers/presence.rs), so when the suite runs
     // *inside* a spar worktree the child would resolve the primary checkout instead of

@@ -1,4 +1,5 @@
-use assert_cmd::cargo::cargo_bin_cmd;
+mod common;
+
 use predicates::prelude::*;
 use serde_json::Value;
 use std::fs;
@@ -17,7 +18,7 @@ fn spar_home_dir() -> std::path::PathBuf {
 }
 
 fn spar_cmd() -> assert_cmd::Command {
-    let mut command = cargo_bin_cmd!("spar");
+    let mut command = common::spar();
     command.env("SPAR_HOME", spar_home_dir());
     command.env_remove("SPAR_PROJECT_ROOT");
     command.env_remove("SPAR_RUN_ID");
@@ -306,7 +307,7 @@ fn defaults_are_stored_only_at_spar_home_and_frozen_run_ignores_them() {
         before, after_defaults,
         "writing defaults must not touch project spar.toml"
     );
-    let mut cmd = cargo_bin_cmd!("spar");
+    let mut cmd = common::spar();
     cmd.env("SPAR_HOME", &home_path);
     cmd.env_remove("SPAR_PROJECT_ROOT");
     cmd.env_remove("SPAR_RUN_ID");
@@ -341,7 +342,7 @@ fn defaults_are_stored_only_at_spar_home_and_frozen_run_ignores_them() {
         frozen, frozen2,
         "deleting/corrupting defaults must not alter frozen config"
     );
-    let mut cmd2 = cargo_bin_cmd!("spar");
+    let mut cmd2 = common::spar();
     cmd2.env("SPAR_HOME", &home_path);
     cmd2.env_remove("SPAR_PROJECT_ROOT");
     let status_out = cmd2
@@ -384,7 +385,7 @@ fn defaults_survive_deletion_for_implement_continuation() {
         serde_json::to_string_pretty(&defaults_json).unwrap(),
     )
     .unwrap();
-    let mut cmd = cargo_bin_cmd!("spar");
+    let mut cmd = common::spar();
     cmd.env("SPAR_HOME", &home_path);
     cmd.env_remove("SPAR_PROJECT_ROOT");
     cmd.env_remove("SPAR_RUN_ID");
@@ -418,14 +419,14 @@ fn defaults_survive_deletion_for_implement_continuation() {
         "[roles]\nplanner = \"cli:grok@fast\"\n",
     )
     .unwrap();
-    cargo_bin_cmd!("spar")
+    common::spar()
         .env("SPAR_HOME", &home_path)
         .env("SPAR_PROJECT_ROOT", dir)
         .current_dir(dir)
         .args(["approve", run_id])
         .assert()
         .success();
-    let mut cmd2 = cargo_bin_cmd!("spar");
+    let mut cmd2 = common::spar();
     cmd2.env("SPAR_HOME", &home_path);
     cmd2.env("SPAR_PROJECT_ROOT", dir);
     cmd2.env_remove("SPAR_RUN_ID");
@@ -434,7 +435,7 @@ fn defaults_survive_deletion_for_implement_continuation() {
         .args(["implement", "--run", run_id, "--dry-run", "--json"])
         .assert()
         .code(predicate::in_iter([0, 2]));
-    let status = cargo_bin_cmd!("spar")
+    let status = common::spar()
         .env("SPAR_HOME", &home_path)
         .env("SPAR_PROJECT_ROOT", dir)
         .current_dir(dir)

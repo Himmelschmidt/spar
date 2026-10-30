@@ -1,7 +1,8 @@
 //! `spar daemon`: single instance per project, and it never touches the things an
 //! operator's own commands touch. The lock/bucket/queue mechanics themselves are
 //! unit-tested in `src/daemon.rs`; these cover the CLI surface.
-use assert_cmd::cargo::cargo_bin_cmd;
+
+mod common;
 use std::process::Command;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
@@ -18,7 +19,7 @@ fn spar_home_dir() -> std::path::PathBuf {
 }
 
 fn spar_cmd() -> assert_cmd::Command {
-    let mut c = cargo_bin_cmd!("spar");
+    let mut c = common::spar();
     c.env("SPAR_HOME", spar_home_dir());
     c.env_remove("SPAR_PROJECT_ROOT");
     c.env_remove("SPAR_RUN_ID");
@@ -117,7 +118,7 @@ fn stop_stops_a_real_running_daemon() {
     std::fs::create_dir_all(&proj).unwrap();
     init_repo(&proj);
 
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin("spar"))
+    let mut child = common::spar_std()
         .args(["daemon", "start", "--foreground"])
         .current_dir(&proj)
         .env("SPAR_HOME", spar_home_dir())
@@ -373,7 +374,7 @@ fn a_second_start_refuses_while_the_first_holds_the_lock() {
     std::fs::create_dir_all(&proj).unwrap();
     init_repo(&proj);
 
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin("spar"))
+    let mut child = common::spar_std()
         .args(["daemon", "start", "--foreground"])
         .current_dir(&proj)
         .env("SPAR_HOME", spar_home_dir())

@@ -3,7 +3,8 @@
 //! Two failures observed on run `d995e566`: an `AC-n` mentioned in contract prose became
 //! a criterion no reviewer could report (an unreachable ship gate), and an edit to
 //! `test-contract.md` after the round loop started had no effect and said nothing.
-use assert_cmd::cargo::cargo_bin_cmd;
+
+mod common;
 use predicates::prelude::*;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -23,7 +24,7 @@ fn spar_home_dir() -> PathBuf {
 }
 
 fn spar_cmd() -> assert_cmd::Command {
-    let mut c = cargo_bin_cmd!("spar");
+    let mut c = common::spar();
     c.env("SPAR_HOME", spar_home_dir());
     // spar exports these into every slot (providers/presence.rs), so when the suite runs
     // *inside* a spar worktree the child would resolve the primary checkout instead of

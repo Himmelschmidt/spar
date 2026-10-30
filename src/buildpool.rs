@@ -49,11 +49,40 @@ fn expand_range(s: &str) -> Vec<String> {
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct Holder {
+    pid: u32,
+    #[serde(default)]
+    starttime: Option<u64>,
+}
+
+impl Holder {
+    fn of(pid: u32) -> Self {
+        Self {
+            pid,
+            starttime: PidToken::capture(pid).starttime,
+        }
+    }
+
+    fn alive(&self) -> bool {
+        PidToken {
+            pid: self.pid,
+            starttime: self.starttime,
+        }
+        .alive()
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct LeaseFile {
     pid: u32,
     #[serde(default)]
     starttime: Option<u64>,
+    /// Processes the lease was handed to when the dispatch ended with something still
+    /// running in the slot (a tmux pane, an orphaned build). While any is set, they and
+    /// not the orchestrator decide whether the slot is free.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    holders: Vec<Holder>,
     run_id: String,
     slot_id: String,
     project_root: PathBuf,
@@ -61,11 +90,15 @@ struct LeaseFile {
 }
 
 impl LeaseFile {
-    fn token(&self) -> PidToken {
-        PidToken {
-            pid: self.pid,
-            starttime: self.starttime,
+    fn alive(&self) -> bool {
+        if self.holders.is_empty() {
+            return Holder {
+                pid: self.pid,
+                starttime: self.starttime,
+            }
+            .alive();
         }
+        self.holders.iter().any(Holder::alive)
     }
 }
 
@@ -80,39 +113,86 @@ fn read_lease(dir: &Path) -> Option<LeaseFile> {
     serde_json::from_str(&text).ok()
 }
 
+fn write_lease(dir: &Path, rec: &LeaseFile) -> bool {
+    let lease = lease_path(dir);
+    let tmp = crate::fleet::unique_tmp(&lease);
+    serde_json::to_string(rec)
+        .ok()
+        .is_some_and(|text| std::fs::write(&tmp, text).is_ok())
+        && std::fs::rename(&tmp, &lease).is_ok()
+}
+
 /// Whether a live process holds `dir`'s lease. `reclaim` asks this before deleting a
 /// build directory.
 pub fn is_leased(dir: &Path) -> bool {
     let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     [dir.to_path_buf(), canonical]
         .iter()
-        .any(|d| read_lease(d).is_some_and(|l| l.token().alive()))
+        .any(|d| read_lease(d).is_some_and(|l| l.alive()))
 }
 
-/// A held pool slot. Dropping it releases the slot, unless another process has since
-/// taken the lease over (it found ours dead, which a drop in a live process cannot be).
+/// A held pool slot. Dropping it releases the slot unless something may still be
+/// building there: any process whose cwd is inside `watch` (the slot's own worktree), or
+/// a pid passed to `keep_for` (a tmux pane spar could not confirm dead). Then the lease
+/// is handed to those processes and frees itself when the last one exits, with no sweep.
 #[derive(Debug)]
 pub struct PoolLease {
     pub dir: PathBuf,
+    watch: Option<PathBuf>,
+    kept: bool,
+    keep: Vec<u32>,
+}
+
+impl PoolLease {
+    /// The dispatch ended without proof its process is gone: never free the slot on
+    /// drop. `pid` (the pane's, when known) becomes a holder.
+    pub fn keep_for(&mut self, pid: Option<u32>) {
+        self.kept = true;
+        self.keep.extend(pid);
+    }
 }
 
 impl Drop for PoolLease {
     fn drop(&mut self) {
-        if read_lease(&self.dir).is_some_and(|l| l.pid == std::process::id()) {
-            let _ = std::fs::remove_file(lease_path(&self.dir));
+        let me = std::process::id();
+        let Some(mut rec) = read_lease(&self.dir).filter(|l| l.pid == me && l.holders.is_empty())
+        else {
+            return;
+        };
+        let mut pids = self.keep.clone();
+        if let Some(w) = &self.watch {
+            pids.extend(crate::process::pids_with_cwd_under(w));
         }
+        pids.sort_unstable();
+        pids.dedup();
+        rec.holders = pids
+            .into_iter()
+            .filter(|p| *p != me)
+            .map(Holder::of)
+            .filter(Holder::alive)
+            .collect();
+        if !rec.holders.is_empty() {
+            write_lease(&self.dir, &rec);
+            return;
+        }
+        if self.kept {
+            return;
+        }
+        let _ = std::fs::remove_file(lease_path(&self.dir));
     }
 }
 
 /// Lease the first free slot, trying `prefer` (the slot this implementer used last
-/// round, still warm with its own build) before the pool order. `None` when every slot
-/// is held by a live process.
+/// round, still warm with its own build) before the pool order. `watch` is the slot's
+/// own worktree, scanned for survivors when the lease is dropped. `None` when every
+/// slot is held by a live process.
 pub fn acquire(
     pool: &[PathBuf],
     prefer: Option<&Path>,
     run_id: &str,
     slot_id: &str,
     project_root: &Path,
+    watch: Option<&Path>,
 ) -> Option<PoolLease> {
     let preferred = prefer.filter(|p| pool.iter().any(|d| d == p));
     let order = preferred.into_iter().chain(
@@ -124,6 +204,9 @@ pub fn acquire(
         if try_lease(dir, run_id, slot_id, project_root) {
             return Some(PoolLease {
                 dir: dir.to_path_buf(),
+                watch: watch.map(Path::to_path_buf),
+                kept: false,
+                keep: Vec::new(),
             });
         }
     }
@@ -153,22 +236,21 @@ fn try_lease(dir: &Path, run_id: &str, slot_id: &str, project_root: &Path) -> bo
     if lock.lock().is_err() {
         return false;
     }
-    let free = read_lease(dir).is_none_or(|l| !l.token().alive());
+    let free = read_lease(dir).is_none_or(|l| !l.alive());
     let taken = free && {
         let pid = std::process::id();
-        let rec = LeaseFile {
-            pid,
-            starttime: PidToken::capture(pid).starttime,
-            run_id: run_id.to_string(),
-            slot_id: slot_id.to_string(),
-            project_root: project_root.to_path_buf(),
-            leased_at: Utc::now(),
-        };
-        let tmp = lease.with_extension(format!("tmp.{pid}"));
-        serde_json::to_string(&rec)
-            .ok()
-            .is_some_and(|text| std::fs::write(&tmp, text).is_ok())
-            && std::fs::rename(&tmp, &lease).is_ok()
+        write_lease(
+            dir,
+            &LeaseFile {
+                pid,
+                starttime: PidToken::capture(pid).starttime,
+                holders: Vec::new(),
+                run_id: run_id.to_string(),
+                slot_id: slot_id.to_string(),
+                project_root: project_root.to_path_buf(),
+                leased_at: Utc::now(),
+            },
+        )
     };
     let _ = lock.unlock();
     taken
@@ -183,6 +265,7 @@ mod tests {
         let rec = LeaseFile {
             pid,
             starttime,
+            holders: Vec::new(),
             run_id: "other".into(),
             slot_id: "implementer".into(),
             project_root: "/x".into(),
@@ -219,15 +302,15 @@ mod tests {
         let pool: Vec<PathBuf> = (1..=2).map(|n| tmp.path().join(format!("t-{n}"))).collect();
         let me = std::process::id();
         hold(&pool[0], me, PidToken::capture(me).starttime);
-        let lease = acquire(&pool, None, "r1", "implementer", tmp.path()).unwrap();
+        let lease = acquire(&pool, None, "r1", "implementer", tmp.path(), None).unwrap();
         assert_eq!(lease.dir, pool[1], "the held slot is skipped");
         assert!(is_leased(&pool[1]));
-        assert!(acquire(&pool, None, "r2", "implementer", tmp.path()).is_none());
+        assert!(acquire(&pool, None, "r2", "implementer", tmp.path(), None).is_none());
         drop(lease);
         assert!(!is_leased(&pool[1]), "drop releases");
 
         hold(&pool[0], u32::MAX - 7, None);
-        let again = acquire(&pool, None, "r3", "implementer", tmp.path()).unwrap();
+        let again = acquire(&pool, None, "r3", "implementer", tmp.path(), None).unwrap();
         assert_eq!(again.dir, pool[0], "a dead holder's slot is free");
     }
 
@@ -235,13 +318,51 @@ mod tests {
     fn the_previous_slot_is_preferred_when_free() {
         let tmp = tempdir().unwrap();
         let pool: Vec<PathBuf> = (1..=3).map(|n| tmp.path().join(format!("t-{n}"))).collect();
-        let lease = acquire(&pool, Some(&pool[2]), "r1", "impl", tmp.path()).unwrap();
+        let lease = acquire(&pool, Some(&pool[2]), "r1", "impl", tmp.path(), None).unwrap();
         assert_eq!(lease.dir, pool[2]);
         let outside = tmp.path().join("elsewhere");
-        let other = acquire(&pool, Some(&outside), "r1", "impl", tmp.path()).unwrap();
+        let other = acquire(&pool, Some(&outside), "r1", "impl", tmp.path(), None).unwrap();
         assert_eq!(
             other.dir, pool[0],
             "a preference outside the pool is ignored"
         );
+    }
+
+    #[test]
+    fn a_process_still_working_in_the_slot_keeps_the_lease_after_drop() {
+        let tmp = tempdir().unwrap();
+        let wt = tmp.path().join("worktree");
+        std::fs::create_dir_all(&wt).unwrap();
+        let pool = vec![tmp.path().join("t-1")];
+        let mut orphan = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&wt)
+            .spawn()
+            .unwrap();
+        let lease = acquire(&pool, None, "r1", "implementer", tmp.path(), Some(&wt)).unwrap();
+        drop(lease);
+        let rec = read_lease(&pool[0]).expect("handed over, not removed");
+        assert_eq!(rec.holders.len(), 1);
+        assert_eq!(rec.holders[0].pid, orphan.id());
+        assert!(is_leased(&pool[0]));
+        assert!(acquire(&pool, None, "r2", "implementer", tmp.path(), None).is_none());
+
+        orphan.kill().unwrap();
+        orphan.wait().unwrap();
+        assert!(
+            !is_leased(&pool[0]),
+            "the last holder's exit frees the slot"
+        );
+        assert!(acquire(&pool, None, "r3", "implementer", tmp.path(), None).is_some());
+    }
+
+    #[test]
+    fn keep_for_leaves_the_lease_in_place() {
+        let tmp = tempdir().unwrap();
+        let pool = vec![tmp.path().join("t-1")];
+        let mut lease = acquire(&pool, None, "r1", "implementer", tmp.path(), None).unwrap();
+        lease.keep_for(None);
+        drop(lease);
+        assert!(is_leased(&pool[0]), "an unconfirmed pane keeps its slot");
     }
 }

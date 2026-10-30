@@ -5,7 +5,8 @@
 //! pieces of this chain in isolation; these two drive `run_slot` -> `execute_loop`'s
 //! `fail()` -> process exit through the actual `spar` binary, the seam the pre-fix
 //! coverage never crossed.
-use assert_cmd::cargo::cargo_bin_cmd;
+
+mod common;
 use predicates::prelude::*;
 use std::process::Command;
 use tempfile::tempdir;
@@ -22,7 +23,7 @@ fn spar_home_dir() -> std::path::PathBuf {
 }
 
 fn spar_cmd() -> assert_cmd::Command {
-    let mut c = cargo_bin_cmd!("spar");
+    let mut c = common::spar();
     c.env("SPAR_HOME", spar_home_dir());
     c.env_remove("SPAR_PROJECT_ROOT");
     c.env_remove("SPAR_RUN_ID");

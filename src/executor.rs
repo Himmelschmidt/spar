@@ -403,7 +403,7 @@ fn prepare_slot_execution(
     let tmp = SlotTmp::create(paths, &state.id, &job.slot_id, state.isolation);
     let mut env = wire_slot_presence(state, paths, &job, &cwd, &pref);
     env.extend(tmp.env());
-    let build_cache = lease_build_cache(state, paths, cfg, &job);
+    let build_cache = lease_build_cache(state, paths, cfg, &job, &cwd);
     env.extend(build_cache.as_ref().map(|(_, kv)| kv.clone()));
     let owns_cwd = owns_cwd(state, &job.slot_id, &cwd);
     let session_provider = pref.cli_name().unwrap_or(job.provider.as_str()).to_string();
@@ -430,19 +430,22 @@ fn prepare_slot_execution(
         dry_run: state.dry_run,
         _tmp: tmp,
         _fleet_lease: fleet_lease,
-        _build_cache: build_cache.map(|(lease, _)| lease),
+        _build_cache: build_cache.and_then(|(lease, _)| lease),
     })
 }
 
 /// Lease a build-cache pool directory for an implementer dispatch and record it on the
-/// slot (O143). Reviewers never get one: they build in their own checkout. An exhausted
-/// pool is warned about and the slot builds into its worktree's own target.
+/// slot (O143). Reviewers never get one: they build in their own checkout. The returned
+/// variable always rides the slot's own env, which wins over anything the orchestrator
+/// inherited: the leased directory, or on an exhausted pool the worktree's own `target`,
+/// so a captured or shared value never leaks into the build.
 fn lease_build_cache(
     state: &mut RunState,
     paths: &SparPaths,
     cfg: &Config,
     job: &SlotJob,
-) -> Option<(crate::buildpool::PoolLease, (String, String))> {
+    cwd: &Path,
+) -> Option<(Option<crate::buildpool::PoolLease>, (String, String))> {
     if job.role != SlotRole::Implementer || cfg.worktree.build_cache_pool.is_empty() {
         return None;
     }
@@ -452,16 +455,22 @@ fn lease_build_cache(
         .iter()
         .find(|s| s.id == job.slot_id)
         .and_then(|s| s.build_cache.clone());
+    let watch = owns_cwd(state, &job.slot_id, cwd).then_some(cwd);
     let lease = crate::buildpool::acquire(
         &pool,
         prefer.as_deref(),
         &state.id,
         &job.slot_id,
         &state.project_root,
+        watch,
     );
     let env = &cfg.worktree.build_cache_env;
+    let dir = match &lease {
+        Some(l) => l.dir.clone(),
+        None => cwd.join("target"),
+    };
     let note = match &lease {
-        Some(l) => format!("build cache {env}={}", l.dir.display()),
+        Some(_) => format!("build cache {env}={}", dir.display()),
         None => {
             let msg = format!(
                 "build cache pool exhausted (all {} leased); {} builds into its worktree's own target",
@@ -480,9 +489,7 @@ fn lease_build_cache(
     if let Some(s) = state.slot_mut(&job.slot_id) {
         s.build_cache = lease.as_ref().map(|l| l.dir.clone());
     }
-    let lease = lease?;
-    let kv = (env.clone(), lease.dir.display().to_string());
-    Some((lease, kv))
+    Some((lease, (env.clone(), dir.display().to_string())))
 }
 
 /// Whether `cwd` is the slot's own recorded worktree.
@@ -2446,7 +2453,7 @@ pub fn run_slot(
         &crate::events::Event::slot(&job.slot_id, SlotStatus::Running),
     );
     let _ = crate::bus::heartbeat(paths, Some(&state.id), &job.slot_id, "running");
-    let build_cache = lease_build_cache(state, paths, cfg, job);
+    let mut build_cache = lease_build_cache(state, paths, cfg, job, &cwd);
     state.save(paths)?;
 
     // The kill, not the budget: `timeouts.slot_secs` is soft since O50 and reaches the
@@ -2528,11 +2535,17 @@ pub fn run_slot(
                         // Only `ok` means the marker landed and the pane is gone.
                         if !r.ok {
                             tmp.keep();
+                            if let Some((Some(lease), _)) = &mut build_cache {
+                                lease.keep_for(r.pid);
+                            }
                         }
                         r
                     }
                     Err(e) => {
                         tmp.keep();
+                        if let Some((Some(lease), _)) = &mut build_cache {
+                            lease.keep_for(None);
+                        }
                         salvage_expected_artifact(
                             paths,
                             &state.id,

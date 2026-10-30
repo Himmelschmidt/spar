@@ -2,7 +2,8 @@
 //! driving it died, so no phase change is ever coming, while its slots keep running.
 //! `wait` must say so instead of blocking, `status` must name the orphans, and
 //! `stop --abandoned` must reap them.
-use assert_cmd::cargo::cargo_bin_cmd;
+
+mod common;
 use std::process::Command;
 use tempfile::tempdir;
 
@@ -18,7 +19,7 @@ fn spar_home_dir() -> std::path::PathBuf {
 }
 
 fn spar_cmd() -> assert_cmd::Command {
-    let mut c = cargo_bin_cmd!("spar");
+    let mut c = common::spar();
     c.env("SPAR_HOME", spar_home_dir());
     c.env_remove("SPAR_PROJECT_ROOT");
     c.env_remove("SPAR_RUN_ID");
@@ -256,7 +257,7 @@ fn sigkilled_orchestrator_leaves_orphans_that_status_names_and_sweep_reaps() {
         std::env::var("PATH").unwrap_or_default()
     );
 
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin("spar"))
+    let mut child = common::spar_std()
         .args([
             "run",
             "--workflow",

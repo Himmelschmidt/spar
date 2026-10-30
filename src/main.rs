@@ -150,6 +150,7 @@ fn run() -> Result<ExitCode> {
             without,
             suite_command,
             key,
+            no_key,
             key_scope,
             base,
             detach,
@@ -219,15 +220,16 @@ fn run() -> Result<ExitCode> {
             cfg.apply_backup_overrides(&backup)?;
             cfg.apply_effort_overrides(&effort)?;
             cfg.apply_suite_command(&suite_command, &without)?;
-            // A brief on disk is the work's identity already (O41), so its slug is the
-            // natural key when the operator names none.
-            let key = key.or_else(|| {
-                brief
+            // An intaken brief (O41) is the work's identity already, so its slug is the
+            // natural key when the operator names none. Any other file is not.
+            let key = match (key, no_key) {
+                (_, true) => None,
+                (Some(k), false) => Some(k),
+                (None, false) => brief
                     .as_deref()
-                    .and_then(|p| p.file_stem())
-                    .map(|s| s.to_string_lossy().into_owned())
-            });
-            if let Some(code) = runkey::guard(&paths, key.as_deref(), key_scope, json)? {
+                    .and_then(|p| brief::intaken_slug(&paths, p)),
+            };
+            if let Some(code) = runkey::guard(&paths, key.as_deref(), key_scope, json, dry_run)? {
                 return Ok(code);
             }
             let (task_text, brief_path) = match (spec, brief, task) {
@@ -353,9 +355,13 @@ fn run() -> Result<ExitCode> {
                 key,
             };
             if opts.key.is_some() {
-                if let Some(code) =
-                    runkey::guard(&paths, opts.key.as_deref(), key_scope, opts.json)?
-                {
+                if let Some(code) = runkey::guard(
+                    &paths,
+                    opts.key.as_deref(),
+                    key_scope,
+                    opts.json,
+                    opts.dry_run,
+                )? {
                     return Ok(code);
                 }
             }
@@ -440,7 +446,9 @@ fn run() -> Result<ExitCode> {
                 reload_config: false,
                 key,
             };
-            if let Some(code) = runkey::guard(&paths, opts.key.as_deref(), key_scope, json)? {
+            if let Some(code) =
+                runkey::guard(&paths, opts.key.as_deref(), key_scope, json, opts.dry_run)?
+            {
                 return Ok(code);
             }
             workflow::run_named(workflow, opts, &paths, &cfg)
@@ -996,6 +1004,27 @@ fn auto_archive_at_launch() {
     }
 }
 
+/// Listing rows as JSON with `project_repo` (the normalized origin URL, one `git` call
+/// per project), which another box's `--key` check matches on (O140).
+fn with_repo_ids(runs: Vec<state::RunSummary>) -> Result<Vec<serde_json::Value>> {
+    let mut ids: std::collections::HashMap<std::path::PathBuf, Option<String>> =
+        std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(runs.len());
+    for r in runs {
+        let repo = r.project_root.as_ref().and_then(|root| {
+            ids.entry(root.clone())
+                .or_insert_with(|| registry::repo_identity(root))
+                .clone()
+        });
+        let mut v = serde_json::to_value(r)?;
+        if let Some(repo) = repo {
+            v["project_repo"] = serde_json::json!(repo);
+        }
+        out.push(v);
+    }
+    Ok(out)
+}
+
 /// Runs across hosts (O140). Observe-only like `status`: an unreachable host is reported
 /// in place and the command still exits 0.
 fn fleet_status_cmd(
@@ -1027,8 +1056,7 @@ fn fleet_status_cmd(
             runs.retain(|r| !r.archived);
         }
         report.push(serde_json::json!({"host": local, "ok": true, "runs": runs.len()}));
-        for r in runs {
-            let mut v = serde_json::to_value(r)?;
+        for mut v in with_repo_ids(runs)? {
             v["host"] = serde_json::json!(local);
             rows.push(v);
         }
@@ -1202,7 +1230,7 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> 
     };
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&runs)?);
+        println!("{}", serde_json::to_string_pretty(&with_repo_ids(runs)?)?);
     } else if runs.is_empty() {
         if use_all {
             println!(

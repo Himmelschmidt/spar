@@ -9,7 +9,8 @@
 //! gate: a cloned project's `spar.toml` must never be able to shell out), so each test
 //! points `HOME` at its own throwaway directory and writes
 //! `<HOME>/.config/spar/config.toml` directly.
-use assert_cmd::cargo::cargo_bin_cmd;
+
+mod common;
 use std::process::Command;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
@@ -28,7 +29,7 @@ fn spar_home_dir() -> std::path::PathBuf {
 /// A real (non-dry-run) invocation needs `SPAR_DRY_RUN` to stay unset — unlike every
 /// other scenario file's `spar_cmd`, which sets it via `--dry-run` to stay hermetic.
 fn spar_cmd(user_home: &std::path::Path) -> assert_cmd::Command {
-    let mut c = cargo_bin_cmd!("spar");
+    let mut c = common::spar();
     c.env("SPAR_HOME", spar_home_dir());
     c.env("HOME", user_home);
     c.env_remove("XDG_CONFIG_HOME");

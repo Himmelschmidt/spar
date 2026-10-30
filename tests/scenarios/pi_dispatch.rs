@@ -5,7 +5,8 @@
 //! assistant message's `stopReason: "error"`. These pin that such a dispatch fails
 //! the slot, that a 429 in that message routes the run to the quota gate, and that a
 //! clean replay is billed from the stream with spar's assigned session id on argv.
-use assert_cmd::cargo::cargo_bin_cmd;
+
+mod common;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -101,7 +102,7 @@ fn setup() -> Fake {
 }
 
 fn spar_implement(f: &Fake, stream: &Path) -> assert_cmd::assert::Assert {
-    let mut c = cargo_bin_cmd!("spar");
+    let mut c = common::spar();
     c.env("SPAR_HOME", spar_home_dir())
         .env_remove("SPAR_PROJECT_ROOT")
         .env_remove("SPAR_RUN_ID")

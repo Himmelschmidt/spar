@@ -1,7 +1,8 @@
 //! Worktrees accumulate because cleanup was per-run and manual: a successful run ends at
 //! a *gate*, not at Done, and `auto_cleanup` is off by default, so nothing ever reaped
 //! them. These cover the sweep and the rejected-plan case, on real git worktrees.
-use assert_cmd::cargo::cargo_bin_cmd;
+
+mod common;
 use std::process::Command;
 use tempfile::tempdir;
 
@@ -17,7 +18,7 @@ fn spar_home_dir() -> std::path::PathBuf {
 }
 
 fn spar_cmd() -> assert_cmd::Command {
-    let mut c = cargo_bin_cmd!("spar");
+    let mut c = common::spar();
     c.env("SPAR_HOME", spar_home_dir());
     c.env_remove("SPAR_PROJECT_ROOT");
     c.env_remove("SPAR_RUN_ID");

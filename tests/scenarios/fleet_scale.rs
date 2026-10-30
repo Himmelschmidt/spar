@@ -2,6 +2,8 @@
 //! (O141, O142) and the build-cache pool (O143, O144). Every provider CLI and `ssh` is a
 //! fake on a `PATH` that keeps only system dirs, and `HOME` / the user config dir live
 //! in a temp dir, so no real provider, host or operator config is ever reached.
+
+mod common;
 use assert_cmd::Command as AssertCommand;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -77,10 +79,10 @@ impl Fixture {
     }
 
     fn spar_in(&self, dir: &Path) -> AssertCommand {
-        let mut cmd = AssertCommand::cargo_bin("spar").unwrap();
-        cmd.env_remove("SPAR_PROJECT_ROOT")
-            .env_remove("SPAR_RUN_ID")
-            .env_remove("SPAR_AGENT_ID")
+        let mut cmd = common::spar();
+        // HOME and the user config are this fixture's own temp dirs, and these tests
+        // exercise the user-config remotes and shared path the guard would ignore.
+        cmd.env_remove("SPAR_TEST_ISOLATED")
             .env_remove("SPAR_DRY_RUN")
             .env("SPAR_HOME", &self.spar_home)
             .env("HOME", &self.home)
@@ -95,10 +97,42 @@ impl Fixture {
         self.spar_in(&self.proj)
     }
 
+    /// A dry-run plan (the fixture), with `extra` args.
     fn plan(&self, extra: &[&str]) -> assert_cmd::assert::Assert {
         let mut args = vec!["plan", "--providers", "cli:claude", "--dry-run", "--json"];
         args.extend_from_slice(extra);
         self.spar().args(&args).assert()
+    }
+
+    /// A real (non-dry) plan launch in `dir`. Its fake claude fails fast; these tests
+    /// only care whether the key guard let it through.
+    fn launch_in(&self, dir: &Path, extra: &[&str]) -> assert_cmd::assert::Assert {
+        let mut args = vec!["plan", "-t", "work", "--providers", "cli:claude", "--json"];
+        args.extend_from_slice(extra);
+        self.spar_in(dir).args(&args).assert()
+    }
+
+    fn launch(&self, extra: &[&str]) -> assert_cmd::assert::Assert {
+        self.launch_in(&self.proj, extra)
+    }
+
+    /// A run that holds `extra`'s key: minted by a dry plan, then marked real, since dry
+    /// runs never hold keys.
+    fn seed(&self, extra: &[&str]) -> String {
+        let a = self.plan(extra).code(2);
+        let id = stdout_json(&a)["run_id"].as_str().unwrap().to_string();
+        let p = self.proj.join(".spar/runs").join(&id).join("state.json");
+        let mut v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        v["dry_run"] = serde_json::json!(false);
+        fs::write(&p, v.to_string()).unwrap();
+        id
+    }
+
+    fn runs(&self) -> usize {
+        fs::read_dir(self.proj.join(".spar/runs"))
+            .map(|d| d.count())
+            .unwrap_or(0)
     }
 
     fn state(&self, run_id: &str) -> serde_json::Value {
@@ -112,8 +146,18 @@ fn stdout_json(a: &assert_cmd::assert::Assert) -> serde_json::Value {
     serde_json::from_str(&out).unwrap_or_else(|e| panic!("stdout is not json ({e}): {out}"))
 }
 
+fn stdout_of(a: &assert_cmd::assert::Assert) -> String {
+    String::from_utf8_lossy(&a.get_output().stdout).into_owned()
+}
+
 fn stderr_of(a: &assert_cmd::assert::Assert) -> String {
     String::from_utf8_lossy(&a.get_output().stderr).into_owned()
+}
+
+fn duplicate_of(a: &assert_cmd::assert::Assert) -> Option<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(&stdout_of(a))
+        .ok()
+        .filter(|v| v["kind"] == "duplicate")
 }
 
 // ---------------------------------------------------------------------------------
@@ -123,21 +167,14 @@ fn stderr_of(a: &assert_cmd::assert::Assert) -> String {
 #[test]
 fn a_second_run_with_a_held_key_is_refused_until_the_holder_finishes() {
     let fx = Fixture::new();
-    let first = fx
-        .plan(&["-t", "fix the login bug", "--key", "pr-1234"])
-        .code(2);
-    let first_id = stdout_json(&first)["run_id"].as_str().unwrap().to_string();
-    assert_eq!(fx.state(&first_id)["key"], "pr-1234");
+    let holder = fx.seed(&["-t", "fix the login bug", "--key", "pr-1234"]);
+    assert_eq!(fx.state(&holder)["key"], "pr-1234");
 
-    let dup = fx
-        .plan(&["-t", "fix the login bug", "--key", "pr-1234"])
-        .code(1);
-    let v = stdout_json(&dup);
-    assert_eq!(v["kind"], "duplicate");
-    assert_eq!(v["run_id"], first_id.as_str());
+    let dup = fx.launch(&["--key", "pr-1234"]).code(1);
+    let v = duplicate_of(&dup).expect("a duplicate refusal");
+    assert_eq!(v["run_id"], holder.as_str());
     assert!(v["error"].as_str().unwrap().contains("pr-1234"), "{v}");
-    let runs = fs::read_dir(fx.proj.join(".spar/runs")).unwrap().count();
-    assert_eq!(runs, 1, "a refused launch mints no run");
+    assert_eq!(fx.runs(), 1, "a refused launch mints no run");
 
     let text = fx
         .spar()
@@ -149,24 +186,29 @@ fn a_second_run_with_a_held_key_is_refused_until_the_holder_finishes() {
             "pr-1234",
             "--providers",
             "cli:claude",
-            "--dry-run",
         ])
         .assert()
         .code(1);
-    assert!(
-        stderr_of(&text).contains(&first_id),
-        "text mode names the holder: {}",
-        stderr_of(&text)
-    );
+    assert!(stderr_of(&text).contains(&holder), "{}", stderr_of(&text));
 
-    fx.plan(&["-t", "other work", "--key", "pr-9999"]).code(2);
+    fx.plan(&["-t", "rehearse it", "--key", "pr-1234"]).code(2);
+    assert_eq!(fx.runs(), 2, "a dry run neither checks nor is refused");
 
     fx.spar()
-        .args(["reject", &first_id])
+        .args(["reject", &holder])
         .assert()
         .stdout(predicates::str::contains("rejected"));
-    fx.plan(&["-t", "fix the login bug", "--key", "pr-1234"])
-        .code(2);
+    let after = fx.launch(&["--key", "pr-1234"]);
+    assert!(duplicate_of(&after).is_none(), "{}", stdout_of(&after));
+    assert_eq!(fx.runs(), 3);
+}
+
+#[test]
+fn a_dry_run_never_holds_a_key() {
+    let fx = Fixture::new();
+    fx.plan(&["-t", "rehearsal", "--key", "pr-7"]).code(2);
+    let real = fx.launch(&["--key", "pr-7"]);
+    assert!(duplicate_of(&real).is_none(), "{}", stdout_of(&real));
 }
 
 #[test]
@@ -187,97 +229,151 @@ fn a_key_never_moves_onto_an_existing_run() {
 }
 
 #[test]
-fn plan_brief_defaults_the_key_to_the_brief_slug() {
+fn only_an_intaken_brief_defaults_the_key_to_its_slug() {
     let fx = Fixture::new();
     let briefs = fx.proj.join(".spar/briefs");
     fs::create_dir_all(&briefs).unwrap();
     fs::write(briefs.join("durable-runs.md"), "# Durable runs\n\nbody\n").unwrap();
-    let first = fx
-        .plan(&["--brief", ".spar/briefs/durable-runs.md"])
-        .code(2);
-    let id = stdout_json(&first)["run_id"].as_str().unwrap().to_string();
+    let id = fx.seed(&["--brief", ".spar/briefs/durable-runs.md"]);
     assert_eq!(fx.state(&id)["key"], "durable-runs");
 
     let dup = fx
-        .plan(&["--brief", ".spar/briefs/durable-runs.md"])
+        .spar()
+        .args([
+            "plan",
+            "--brief",
+            ".spar/briefs/durable-runs.md",
+            "--providers",
+            "cli:claude",
+            "--json",
+        ])
+        .assert()
         .code(1);
-    assert_eq!(stdout_json(&dup)["run_id"], id.as_str());
+    assert_eq!(duplicate_of(&dup).unwrap()["run_id"], id.as_str());
 
-    let explicit = fx
+    let a = fx
         .plan(&["--brief", ".spar/briefs/durable-runs.md", "--key", "other"])
         .code(2);
-    let id2 = stdout_json(&explicit)["run_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert_eq!(fx.state(&id2)["key"], "other", "an explicit key wins");
+    let explicit = stdout_json(&a)["run_id"].as_str().unwrap().to_string();
+    assert_eq!(fx.state(&explicit)["key"], "other", "an explicit key wins");
+
+    let a = fx
+        .plan(&["--brief", ".spar/briefs/durable-runs.md", "--no-key"])
+        .code(2);
+    let none = stdout_json(&a)["run_id"].as_str().unwrap().to_string();
+    assert!(fx.state(&none).get("key").is_none(), "--no-key sets none");
+
+    let loose = fx.tmp.path().join("notes.md");
+    fs::write(&loose, "# Notes\n\nbody\n").unwrap();
+    let a = fx.plan(&["--brief", loose.to_str().unwrap()]).code(2);
+    let id = stdout_json(&a)["run_id"].as_str().unwrap().to_string();
+    assert!(
+        fx.state(&id).get("key").is_none(),
+        "a file outside .spar/briefs is not an intaken brief"
+    );
 }
 
-/// A fake `ssh` that logs its argv and answers per host: `box2` lists a run holding
-/// `pr-1` in a project named `proj`, `dead` refuses the connection.
+/// A fake `ssh` that logs its argv and answers per host: `box2` lists runs holding
+/// `pr-1` (by name) and `pr-3` (by origin URL), `old` is a spar without run keys, and
+/// `dead` refuses the connection.
 fn fake_ssh(fx: &Fixture) {
     write_exe(
         &fx.bin.join("ssh"),
         r#"echo "$@" >> "$FAKE_LOG_DIR/ssh.log"
 host=""
 for a in "$@"; do
-  case "$a" in -o|BatchMode=*|ConnectTimeout=*) ;; *) host="$a"; break;; esac
+  case "$a" in -o|BatchMode=*|ConnectTimeout=*|--) ;; *) host="$a"; break;; esac
 done
 case "$host" in
   box2) cat <<'JSON'
-[{"id":"remote01","workflow":"loop","phase":"dispatch","updated_at":"2026-10-30T00:00:00Z","key":"pr-1","project_name":"proj","archived":false},
- {"id":"remote02","workflow":"loop","phase":"done","updated_at":"2026-10-30T00:00:00Z","key":"pr-2","project_name":"proj","archived":false}]
+[{"id":"remote01","workflow":"loop","phase":"dispatch","updated_at":"2026-10-30T00:00:00Z","key":"pr-1","dry_run":false,"project_name":"proj","archived":false},
+ {"id":"remote02","workflow":"loop","phase":"done","updated_at":"2026-10-30T00:00:00Z","key":"pr-2","dry_run":false,"project_name":"proj","archived":false},
+ {"id":"remote03","workflow":"loop","phase":"dispatch","updated_at":"2026-10-30T00:00:00Z","key":"pr-3","dry_run":false,"project_name":"renamed","project_repo":"github.com/acme/app","archived":false}]
 JSON
   ;;
+  old) echo '[{"id":"old00001","workflow":"loop","phase":"dispatch","updated_at":"2026-10-30T00:00:00Z","project_name":"proj"}]';;
   *) echo "ssh: connect to host $host port 22: Connection refused" >&2; exit 255;;
 esac"#,
     );
+}
+
+fn ssh_calls(fx: &Fixture) -> usize {
+    fs::read_to_string(fx.bin.join("ssh.log"))
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
 }
 
 #[test]
 fn the_key_check_reaches_remotes_and_an_unreachable_host_only_warns() {
     let fx = Fixture::new();
     fake_ssh(&fx);
-    fx.user_config("[registry]\nremotes = [\"dead\", \"box2\"]\n");
+    fx.user_config("[registry]\nremotes = [\"dead\", \"old\", \"box2\"]\n");
 
-    let dup = fx.plan(&["-t", "work", "--key", "pr-1"]).code(1);
-    let v = stdout_json(&dup);
-    assert_eq!(v["kind"], "duplicate");
+    let dup = fx.launch(&["--key", "pr-1"]).code(1);
+    let v = duplicate_of(&dup).expect("refused");
     assert_eq!(v["run_id"], "remote01");
     assert_eq!(v["host"], "box2");
+    let err = stderr_of(&dup);
     assert!(
-        stderr_of(&dup).contains("dead"),
-        "the unreachable host is named: {}",
-        stderr_of(&dup)
+        err.contains("warning: dead"),
+        "the unreachable host is named: {err}"
+    );
+    assert!(
+        err.contains("old runs a spar that does not report run keys"),
+        "{err}"
     );
 
-    let ok = fx.plan(&["-t", "work", "--key", "pr-2"]).code(2);
+    let ok = fx.launch(&["--key", "pr-2"]);
+    assert!(duplicate_of(&ok).is_none(), "{}", stdout_of(&ok));
     assert!(
         stderr_of(&ok).contains("warning: dead"),
-        "the launch warns and proceeds: {}",
-        stderr_of(&ok)
+        "warns and proceeds"
     );
 
     let log = fs::read_to_string(fx.bin.join("ssh.log")).unwrap();
     assert!(log.contains("BatchMode=yes"), "{log}");
-    assert!(log.contains("spar status --all --json"), "{log}");
-    let calls = log.lines().count();
+    assert!(log.contains("-- box2 spar status --all --json"), "{log}");
 
-    fx.plan(&["-t", "work", "--key", "pr-1", "--key-scope", "local"])
-        .code(2);
-    let after = fs::read_to_string(fx.bin.join("ssh.log")).unwrap();
-    assert_eq!(after.lines().count(), calls, "local scope never calls ssh");
+    let calls = ssh_calls(&fx);
+    fx.launch(&["--key", "pr-9", "--key-scope", "local"]);
+    assert_eq!(ssh_calls(&fx), calls, "local scope never calls ssh");
+    fx.plan(&["-t", "dry", "--key", "pr-1"]).code(2);
+    assert_eq!(ssh_calls(&fx), calls, "a dry run never checks");
 }
 
 #[test]
-fn a_remote_run_in_another_project_does_not_hold_the_key() {
+fn a_remote_run_matches_on_origin_url_before_directory_name() {
     let fx = Fixture::new();
     fake_ssh(&fx);
     fx.user_config("[registry]\nremotes = [\"box2\"]\n");
     let other = fx.tmp.path().join("other");
     fs::create_dir_all(&other).unwrap();
     init_repo(&other);
-    fx.spar_in(&other)
+    let a = fx.launch_in(&other, &["--key", "pr-1"]);
+    assert!(
+        duplicate_of(&a).is_none(),
+        "another project's run does not hold the key: {}",
+        stdout_of(&a)
+    );
+
+    let out = std::process::Command::new("git")
+        .args(["remote", "add", "origin", "git@github.com:acme/app.git"])
+        .current_dir(&other)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let dup = fx.launch_in(&other, &["--key", "pr-3"]).code(1);
+    assert_eq!(duplicate_of(&dup).unwrap()["run_id"], "remote03");
+}
+
+#[test]
+fn an_isolated_test_spawn_ignores_user_config_remotes() {
+    let fx = Fixture::new();
+    fake_ssh(&fx);
+    fx.user_config("[registry]\nremotes = [\"box2\"]\n");
+    let a = fx
+        .spar()
+        .env("SPAR_TEST_ISOLATED", "1")
         .args([
             "plan",
             "-t",
@@ -286,11 +382,11 @@ fn a_remote_run_in_another_project_does_not_hold_the_key() {
             "pr-1",
             "--providers",
             "cli:claude",
-            "--dry-run",
             "--json",
         ])
-        .assert()
-        .code(2);
+        .assert();
+    assert!(duplicate_of(&a).is_none(), "{}", stdout_of(&a));
+    assert_eq!(ssh_calls(&fx), 0, "the guard never reaches ssh");
 }
 
 #[test]
@@ -308,7 +404,7 @@ fn status_all_hosts_merges_every_host_with_a_host_field() {
     assert_eq!(hosts.len(), 3, "{v}");
     let box2 = hosts.iter().find(|h| h["host"] == "box2").unwrap();
     assert_eq!(box2["ok"], true);
-    assert_eq!(box2["runs"], 2);
+    assert_eq!(box2["runs"], 3);
     let dead = hosts.iter().find(|h| h["host"] == "dead").unwrap();
     assert_eq!(dead["ok"], false);
     assert!(dead["error"]

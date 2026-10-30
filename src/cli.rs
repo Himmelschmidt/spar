@@ -105,9 +105,12 @@ pub enum Command {
         #[arg(long = "suite-command", value_name = "CMD")]
         suite_command: Vec<String>,
         /// Idempotency key: refuse to start while an unfinished run with this key
-        /// exists. `plan --brief` defaults it to the brief's slug.
-        #[arg(long)]
+        /// exists. `--brief .spar/briefs/<slug>.md` defaults it to `<slug>`.
+        #[arg(long, conflicts_with = "no_key")]
         key: Option<String>,
+        /// Start without a key, even from an intaken brief.
+        #[arg(long)]
+        no_key: bool,
         /// Where the `--key` check looks: `local` (this project) or `fleet` (also every
         /// `[registry] remotes` host). Default: `fleet` when remotes are configured.
         #[arg(long, value_enum)]

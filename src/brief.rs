@@ -74,6 +74,22 @@ pub fn intake(paths: &SparPaths, spec: &Path) -> Result<Brief> {
     intake_body(paths, &body)
 }
 
+/// The slug of `path` when it is an intaken brief, `.spar/briefs/<slug>.md` in this
+/// project; `None` for any other file.
+pub fn intaken_slug(paths: &SparPaths, path: &Path) -> Option<String> {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let file = abs.canonicalize().ok()?;
+    let briefs = paths.briefs_dir().canonicalize().ok()?;
+    if file.parent()? != briefs || file.extension()? != "md" {
+        return None;
+    }
+    Some(file.file_stem()?.to_string_lossy().into_owned())
+}
+
 /// The first `# ` heading, else the first non-empty line; lowercased, non-alphanumerics
 /// collapsed to `-`, trimmed, truncated to 48 chars.
 fn slug_of(body: &str) -> String {

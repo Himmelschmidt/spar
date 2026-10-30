@@ -1,3 +1,5 @@
+mod common;
+
 use assert_cmd::Command as AssertCommand;
 use predicates::prelude::predicate;
 use std::fs;
@@ -5,7 +7,7 @@ use std::path::Path;
 use tempfile::tempdir;
 
 fn spar_cmd() -> AssertCommand {
-    let mut cmd = AssertCommand::cargo_bin("spar").unwrap();
+    let mut cmd = common::spar();
     cmd.env_remove("SPAR_PROJECT_ROOT");
     cmd.env_remove("SPAR_RUN_ID");
     cmd.env_remove("SPAR_AGENT_ID");

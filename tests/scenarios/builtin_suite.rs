@@ -5,7 +5,8 @@
 //! real suite from spar's own test backend), so what these scenarios pin is the wiring:
 //! the slot is gone, `suite.md` is spar's, and the reviewers still get a suite report.
 //! Execution and the exit-code verdict are covered by the unit tests in `src/suite.rs`.
-use assert_cmd::cargo::cargo_bin_cmd;
+
+mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::tempdir;
@@ -22,7 +23,7 @@ fn spar_home_dir() -> PathBuf {
 }
 
 fn spar_cmd() -> assert_cmd::Command {
-    let mut c = cargo_bin_cmd!("spar");
+    let mut c = common::spar();
     c.env("SPAR_HOME", spar_home_dir());
     // See the trap in CLAUDE.md: without these the child resolves the primary checkout
     // when the suite runs inside a spar worktree and writes real runs into it.

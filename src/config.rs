@@ -2060,7 +2060,15 @@ impl UserConfig {
         }
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("read config {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parse config {}", path.display()))
+        let mut cfg: Self =
+            toml::from_str(&text).with_context(|| format!("parse config {}", path.display()))?;
+        // Scenario tests set this: whatever HOME a test ends up with, its spawns never
+        // write the fleet quota store or ssh to real hosts.
+        if crate::util::env_truthy("SPAR_TEST_ISOLATED") {
+            cfg.quota.shared_path.clear();
+            cfg.registry.remotes.clear();
+        }
+        Ok(cfg)
     }
 }
 

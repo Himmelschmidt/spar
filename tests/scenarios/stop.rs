@@ -1,5 +1,6 @@
 //! `spar stop`: halt dispatch, keep the worktree/branch, stay resumable.
-use assert_cmd::cargo::cargo_bin_cmd;
+
+mod common;
 use serde_json::Value;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
@@ -20,7 +21,7 @@ fn spar_home_dir() -> std::path::PathBuf {
 }
 
 fn spar_cmd() -> assert_cmd::Command {
-    let mut c = cargo_bin_cmd!("spar");
+    let mut c = common::spar();
     c.env("SPAR_HOME", spar_home_dir());
     // spar exports these into every slot (providers/presence.rs), so when the suite runs
     // *inside* a spar worktree the child would resolve the primary checkout instead of
@@ -425,7 +426,7 @@ fn hanging_run(dir: &std::path::Path) -> (std::process::Child, std::path::PathBu
         std::env::var("PATH").unwrap_or_default()
     );
 
-    let child = Command::new(assert_cmd::cargo::cargo_bin("spar"))
+    let child = common::spar_std()
         .args([
             "run",
             "--workflow",

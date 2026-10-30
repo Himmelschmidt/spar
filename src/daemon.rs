@@ -271,13 +271,16 @@ fn with_admission_lock<T>(paths: &SparPaths, f: impl FnOnce() -> T) -> Result<T>
 /// a reservation for `run_id` before returning, so the very next decision — in this
 /// loop iteration or a concurrent process — already sees the capacity as taken.
 fn try_admit(paths: &SparPaths, run_id: &str, demand: &HashMap<String, u32>, cap: u32) -> bool {
+    // Read before the lock: the shared path can hang, and every launcher in the project
+    // waits on this lock.
+    let elsewhere = crate::fleet::remote_slots(paths);
     with_admission_lock(paths, || {
         let mut reservations = load_reservations(paths);
         let real_by_run = real_supply_by_run(paths);
         let mut effective = effective_supply(&real_by_run, &reservations, Some(run_id));
         // Slots other boxes and projects hold on the same accounts (O142). Their
         // reservations are not visible here, only their running slots' leases.
-        for (bucket, n) in crate::fleet::remote_slots(paths) {
+        for (bucket, n) in elsewhere {
             *effective.entry(bucket).or_insert(0) += n;
         }
         if !fits(demand, &effective, cap) {

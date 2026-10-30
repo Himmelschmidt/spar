@@ -2470,9 +2470,6 @@ mod tests {
         assert!(wt.is_dir(), "the worktree itself survives");
     }
 
-    /// A symlinked `target/` belongs to whatever the operator pointed it at. Removing it
-    /// unlinks their setup and reports space that was never freed — `remove_dir_all` does
-    /// not follow, so the real tree survives and the byte count would be a lie.
     #[test]
     fn reclaim_never_deletes_a_leased_pool_directory() {
         let tmp = tempdir().unwrap();
@@ -2495,6 +2492,7 @@ mod tests {
             "r2",
             "implementer",
             &wt,
+            None,
         )
         .unwrap();
         let reap = reap_build_cache(&state, &LiveCwds(Vec::new()));
@@ -2516,6 +2514,9 @@ mod tests {
         );
     }
 
+    /// A symlinked `target/` belongs to whatever the operator pointed it at. Removing it
+    /// unlinks their setup and reports space that was never freed — `remove_dir_all` does
+    /// not follow, so the real tree survives and the byte count would be a lie.
     #[test]
     fn reclaim_leaves_a_symlinked_cache_alone() {
         let tmp = tempdir().unwrap();
