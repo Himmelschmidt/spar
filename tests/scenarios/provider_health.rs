@@ -506,3 +506,100 @@ fn a_manually_paused_backup_is_never_probed() {
     assert_eq!(fx.count("codex"), 0);
     assert_eq!(fx.slot("implementer")["provider"], "cli:claude");
 }
+
+/// Writes this slot's expected artifact the way a real agent would: the implementer a
+/// summary, a reviewer an approving verdict naming the commit it judged.
+const WRITE_ARTIFACT: &str = r#"run="${SPAR_AGENT_ID%%:*}"; slot="${SPAR_AGENT_ID#*:}"
+art="$FAKE_PROJECT_ROOT/.spar/runs/$run/artifacts"
+mkdir -p "$art"
+case "$slot" in
+  review-*) printf '## Verdict\napprove\n\nReviewed-Commit: %s\n\n## Findings\nnone\n' "$(git rev-parse HEAD)" > "$art/review-$slot.md";;
+  *) printf '## Summary\ndone\n' > "$art/summary-$slot.md";;
+esac
+exit 0"#;
+
+/// #175: `provider pause grok` while a run was live did not stop it dispatching its
+/// next grok reviewer. Here the implementer itself pauses grok mid-run, and the
+/// reviewer seat must move to its declared backup before dispatch.
+#[test]
+fn a_pause_set_mid_run_moves_the_next_reviewer_to_its_backup() {
+    let fx = Fixture::new();
+    let spar = assert_cmd::cargo::cargo_bin("spar");
+    fx.cli(
+        "claude",
+        &counted(
+            "claude",
+            &format!(
+                "\"{}\" provider pause cli:grok >/dev/null\n{WRITE_ARTIFACT}",
+                spar.display()
+            ),
+        ),
+    );
+    fx.cli("grok", "echo x >> \"$FAKE_COUNT_DIR/grok.count\"\nexit 1");
+    fx.cli("codex", &counted("codex", WRITE_ARTIFACT));
+    fx.spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--role",
+            "implementer=cli:claude",
+            "--role",
+            "reviewer=cli:grok",
+            "--backup",
+            "reviewer=cli:codex",
+            "--without",
+            "suite",
+        ])
+        .assert()
+        .code(2);
+    assert_eq!(
+        fx.count("grok"),
+        0,
+        "the paused provider was never dispatched"
+    );
+    let rev = fx.slot("reviewer");
+    assert_eq!(rev["id"], "review-0-cli-codex", "{rev}");
+    assert_eq!(rev["provider"], "cli:codex");
+    assert_eq!(rev["source"], "backup");
+    assert_eq!(fx.state()["phase"], "awaiting_ship_confirm");
+}
+
+#[test]
+fn a_pause_set_mid_run_with_no_backup_parks_before_the_reviewer_dispatches() {
+    let fx = Fixture::new();
+    let spar = assert_cmd::cargo::cargo_bin("spar");
+    fx.cli(
+        "claude",
+        &counted(
+            "claude",
+            &format!(
+                "\"{}\" provider pause cli:grok >/dev/null\n{WRITE_ARTIFACT}",
+                spar.display()
+            ),
+        ),
+    );
+    fx.cli("grok", "echo x >> \"$FAKE_COUNT_DIR/grok.count\"\nexit 1");
+    fx.spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--role",
+            "implementer=cli:claude",
+            "--role",
+            "reviewer=cli:grok",
+            "--without",
+            "suite",
+        ])
+        .assert()
+        .code(4);
+    assert_eq!(fx.count("grok"), 0);
+    let state = fx.state();
+    assert_eq!(state["phase"], "quota");
+    let err = state["error"].as_str().unwrap();
+    assert!(
+        err.contains("cli:grok") && err.contains("no eligible backup"),
+        "{err}"
+    );
+}

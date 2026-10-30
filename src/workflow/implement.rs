@@ -720,12 +720,7 @@ fn prepare_implement_slots(
         let mut seat_id = seat.seat.clone();
         if !crate::backup::is_provider_eligible(&provider, &store, available.as_ref()) {
             let ordinal = if seat.role == SlotRole::Reviewer {
-                seat.seat
-                    .trim_start_matches("review-")
-                    .split('-')
-                    .next()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(0)
+                reviewer_ordinal(&seat.seat).unwrap_or(0)
             } else {
                 0
             };
@@ -1946,6 +1941,17 @@ pub fn execute_loop(
         state.set_phase(Phase::Dispatch);
         state.save(paths)?;
 
+        if let Some(id) = state
+            .slots
+            .iter()
+            .find(|s| s.role == SlotRole::Implementer)
+            .map(|s| s.id.clone())
+        {
+            if let SeatCheck::Park(msg) = recheck_seat(state, paths, cfg, &id)? {
+                return fail(state, paths, anyhow::anyhow!(msg), true);
+            }
+        }
+
         // Re-resolve implementer each iteration (stable id; provider may have rotated).
         let impl_slot = state
             .slots
@@ -2494,6 +2500,16 @@ pub fn execute_loop(
             if should_stop(paths, &state.id) {
                 return stop_now(state, paths);
             }
+            let rev_id = match recheck_seat(state, paths, cfg, &rev.id)? {
+                SeatCheck::Ready(id) => id,
+                SeatCheck::Park(msg) => return fail(state, paths, anyhow::anyhow!(msg), true),
+            };
+            let rev = &state
+                .slots
+                .iter()
+                .find(|s| s.id == rev_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("reviewer `{rev_id}` vanished"))?;
             if let Some(s) = state.slot_mut(&rev.id) {
                 s.status = SlotStatus::Pending;
                 s.cwd = Some(review_cwd.clone());
@@ -2742,6 +2758,108 @@ pub fn execute_loop(
         state.set_phase(Phase::Fix);
         state.save(paths)?;
     }
+}
+
+/// The panel position a reviewer seat id encodes (`review-1-cli-codex` is 1), which is
+/// the index into `[backups].reviewer`. `None` for ids that carry none (`review-cli-grok-wide`).
+fn reviewer_ordinal(slot_id: &str) -> Option<usize> {
+    slot_id
+        .strip_prefix("review-")?
+        .split('-')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Put a declared backup in a seat. A reviewer seat is renamed to name its new vendor
+/// (O85); the implementer keeps its id because its worktree and branch are keyed on it.
+/// Returns the seat's id after the move.
+fn move_seat_to_backup(
+    state: &mut RunState,
+    paths: &SparPaths,
+    slot_id: &str,
+    backup_raw: &str,
+) -> Result<String> {
+    let pin = crate::runspec::Pin::parse(backup_raw)?;
+    let role = state
+        .slots
+        .iter()
+        .find(|s| s.id == slot_id)
+        .map(|s| s.role)
+        .ok_or_else(|| anyhow::anyhow!("unknown slot {slot_id}"))?;
+    if let Some(s) = state.slot_mut(slot_id) {
+        set_slot_provider(s, pin.display());
+        s.source = Some(SeatSource::Backup);
+        s.status = SlotStatus::Pending;
+        s.error = None;
+        s.quota_hit = false;
+        s.auth_fault = false;
+    }
+    let new_id = match (role, reviewer_ordinal(slot_id)) {
+        (SlotRole::Reviewer, Some(ordinal)) => {
+            format!("review-{ordinal}-{}", sanitize_slot(&pin.provider))
+        }
+        _ => slot_id.to_string(),
+    };
+    if new_id != slot_id && state.slots.iter().all(|s| s.id != new_id) {
+        state.rename_slot(paths, slot_id, &new_id);
+        state.save(paths)?;
+        return Ok(new_id);
+    }
+    state.save(paths)?;
+    Ok(slot_id.to_string())
+}
+
+enum SeatCheck {
+    Ready(String),
+    Park(String),
+}
+
+/// Re-read pause state right before a dispatch (#175, O106). Pauses used to be read
+/// only when a run started or resumed, so `provider pause grok --until 2027-01-01` did
+/// not stop a live run from dispatching its next grok reviewer. A seat whose provider
+/// is no longer eligible moves to its declared backup, or the run parks.
+fn recheck_seat(
+    state: &mut RunState,
+    paths: &SparPaths,
+    cfg: &Config,
+    slot_id: &str,
+) -> Result<SeatCheck> {
+    let Some(slot) = state.slots.iter().find(|s| s.id == slot_id).cloned() else {
+        return Ok(SeatCheck::Ready(slot_id.to_string()));
+    };
+    // Dry runs skip pause gating, as the run-start gate always has.
+    if state.dry_run {
+        return Ok(SeatCheck::Ready(slot_id.to_string()));
+    }
+    let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+    if crate::backup::is_provider_eligible(&slot.provider, &store, None) {
+        return Ok(SeatCheck::Ready(slot_id.to_string()));
+    }
+    let key = crate::quota::normalize_key(&slot.provider);
+    let ordinal = match slot.role {
+        SlotRole::Reviewer => reviewer_ordinal(slot_id),
+        _ => Some(0),
+    };
+    let backup = ordinal
+        .and_then(|o| crate::backup::backup_for_role(slot.role, o, cfg))
+        .filter(|b| crate::quota::normalize_key(b) != key)
+        .filter(|b| crate::backup::backup_eligible(b, &store, None, paths, state.dry_run));
+    let Some(backup_raw) = backup else {
+        return Ok(SeatCheck::Park(format!(
+            "provider {key} is paused or on cooldown and `{slot_id}` has no eligible backup. \
+             resume with `spar provider resume {key}` or reassign the role"
+        )));
+    };
+    let new_id = move_seat_to_backup(state, paths, slot_id, &backup_raw)?;
+    let note = format!("{key} is paused; `{new_id}` moved to its backup {backup_raw}");
+    eprintln!("note: {note}");
+    let _ = crate::events::append(
+        paths,
+        &state.id,
+        &crate::events::Event::slot_note(&new_id, note),
+    );
+    Ok(SeatCheck::Ready(new_id))
 }
 
 /// Change implementer **provider** only; keep stable slot id and worktree.
@@ -3088,6 +3206,86 @@ fn try_rotate_reviewer_provider(
     }
     state.save(paths)?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod recheck_seat_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn state_with(slot_id: &str, provider: &str, role: SlotRole) -> RunState {
+        let mut st = RunState::new(
+            "r-recheck",
+            crate::cli::WorkflowKind::Loop,
+            PathBuf::from("/tmp/x"),
+        );
+        st.slots.push(executor::init_slot(slot_id, provider, role));
+        st
+    }
+
+    fn pause(paths: &SparPaths, key: &str) {
+        let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+        store.pause_manual(key, None);
+        store.save(paths).unwrap();
+    }
+
+    #[test]
+    fn an_eligible_seat_dispatches_as_it_is() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = state_with("review-0-cli-grok", "cli:grok", SlotRole::Reviewer);
+        let got = recheck_seat(&mut st, &paths, &Config::default(), "review-0-cli-grok").unwrap();
+        assert!(matches!(got, SeatCheck::Ready(id) if id == "review-0-cli-grok"));
+    }
+
+    /// The 2026-10-22 shape: grok paused after the run started. The next grok reviewer
+    /// must move to its declared backup, renamed to name its new vendor (O85).
+    #[test]
+    fn a_seat_paused_mid_run_moves_to_its_backup_before_dispatch() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        pause(&paths, "cli:grok");
+        let mut st = state_with("review-1-cli-grok", "cli:grok", SlotRole::Reviewer);
+        let mut cfg = Config::default();
+        cfg.backups.reviewer = vec![String::new(), "cli:codex@gpt-5.6-terra".into()];
+        let got = recheck_seat(&mut st, &paths, &cfg, "review-1-cli-grok").unwrap();
+        let SeatCheck::Ready(id) = got else {
+            panic!("expected a move to the backup");
+        };
+        assert_eq!(id, "review-1-cli-codex");
+        let slot = st.slots.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(slot.provider, "cli:codex");
+        assert_eq!(slot.model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(slot.source, Some(SeatSource::Backup));
+    }
+
+    #[test]
+    fn a_paused_seat_with_no_eligible_backup_parks() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        pause(&paths, "cli:claude");
+        let mut st = state_with("impl", "cli:claude", SlotRole::Implementer);
+        let got = recheck_seat(&mut st, &paths, &Config::default(), "impl").unwrap();
+        assert!(matches!(got, SeatCheck::Park(ref m) if m.contains("cli:claude")));
+
+        pause(&paths, "cli:codex");
+        let mut cfg = Config::default();
+        cfg.backups.implementer = Some("cli:codex".into());
+        let got = recheck_seat(&mut st, &paths, &cfg, "impl").unwrap();
+        assert!(
+            matches!(got, SeatCheck::Park(_)),
+            "a paused backup is no way out"
+        );
+        assert_eq!(st.slots[0].provider, "cli:claude");
+    }
+
+    #[test]
+    fn reviewer_ordinal_reads_the_panel_position() {
+        assert_eq!(reviewer_ordinal("review-0-cli-claude"), Some(0));
+        assert_eq!(reviewer_ordinal("review-12-cli-codex"), Some(12));
+        assert_eq!(reviewer_ordinal("review-cli-grok-wide"), None);
+        assert_eq!(reviewer_ordinal("impl"), None);
+    }
 }
 
 #[cfg(test)]

@@ -66,7 +66,11 @@ is never cleared by a probe. `--dry-run` (or `SPAR_DRY_RUN=1`) prints the call e
 probe would make and spawns nothing. Exit is `0` whatever the verdicts; read them from
 `--json`. A declared `--backup` held on a quota pause gets the same probe before a run
 skips it (O106): a stale pause no longer benches a working backup. A manually paused
-backup is never probed, and `--dry-run` runs never probe.
+backup is never probed, and `--dry-run` runs never probe. Pause state is re-read before
+every implementer and reviewer dispatch, not only at run start: pausing a provider while
+a run is live moves its next seat to the declared backup (a reviewer seat is renamed for
+the new vendor) or parks the run at `quota` (exit `4`) when there is none. Like the
+run-start gate, this is skipped under `--dry-run`.
 
 **Auth faults (O104).** A dispatch that dies on a refused credential (claude's `401 ...
 OAuth access token has been revoked` or `Please run /login`, codex `Not logged in`, muse
