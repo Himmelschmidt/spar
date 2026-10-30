@@ -1980,7 +1980,7 @@ fn cleanup_sweep(
         let kept_any = cleaned.iter().any(|c| c.skipped.is_some());
         if purge && !kept_any {
             let dir = paths.run_dir(&summary.id);
-            history::append(&paths, &state, history::Trigger::Purge)?;
+            history::append(&paths, &state, history::Trigger::Purge);
             if dir.is_dir() {
                 std::fs::remove_dir_all(&dir)?;
             }
@@ -2076,7 +2076,7 @@ fn cleanup_one(run_id: &str, json: bool, purge: bool, force: bool) -> Result<Exi
     let purged = purge && !kept_any;
     if purged {
         let dir = paths.run_dir(run_id);
-        history::append(&paths, &state, history::Trigger::Purge)?;
+        history::append(&paths, &state, history::Trigger::Purge);
         if dir.is_dir() {
             std::fs::remove_dir_all(&dir)?;
         }

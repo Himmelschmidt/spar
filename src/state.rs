@@ -839,7 +839,7 @@ impl RunState {
             }
             crate::notify::route_lifecycle(paths, self, prev_phase);
             if self.phase.is_terminal() {
-                let _ = crate::history::append(paths, self, crate::history::Trigger::Terminal);
+                crate::history::append(paths, self, crate::history::Trigger::Terminal);
             }
         }
         // Global index so `spar` from anywhere can find this project’s runs.
@@ -1296,29 +1296,32 @@ pub fn list_runs(paths: &SparPaths) -> Result<Vec<RunSummary>> {
             continue;
         }
         let id = entry.file_name().to_string_lossy().into_owned();
-        match RunState::load(paths, &id) {
-            Ok(state) => out.push(RunSummary {
-                abandoned: state.abandoned(paths),
-                live: state.liveness(paths),
-                archived: state.is_archived(),
-                id: state.id,
-                workflow: state.workflow,
-                phase: state.phase,
-                updated_at: state.updated_at,
-                task: state.task,
-                dry_run: state.dry_run,
-                parent_run: state.parent_run,
-                round: state.round,
-                legs: 1,
-                wants: 0,
-                unit_id: None,
-                base_ref: state.base_ref,
-                base_commit: state.base_commit,
-                project_root: None,
-                project_name: None,
-            }),
-            Err(_) => continue,
-        }
+        let Ok(state) = RunState::load(paths, &id) else {
+            continue;
+        };
+        let live = state.liveness(paths);
+        out.push(RunSummary {
+            // `RunState::abandoned` without asking the lock and the queue twice: a
+            // run holding no seat is neither alive nor queued.
+            abandoned: !live.holds_seat && is_abandoned(state.phase, false),
+            live,
+            archived: state.is_archived(),
+            id: state.id,
+            workflow: state.workflow,
+            phase: state.phase,
+            updated_at: state.updated_at,
+            task: state.task,
+            dry_run: state.dry_run,
+            parent_run: state.parent_run,
+            round: state.round,
+            legs: 1,
+            wants: 0,
+            unit_id: None,
+            base_ref: state.base_ref,
+            base_commit: state.base_commit,
+            project_root: None,
+            project_name: None,
+        });
     }
     out.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
     Ok(out)

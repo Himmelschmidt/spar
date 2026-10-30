@@ -2482,24 +2482,27 @@ pub fn execute_loop(
                         ),
                     );
                 }
-                // A failed slot's own artifact is not what the gate counted: it may be an
-                // earlier round's stale verdict or a partial one. Only spar's stand-in is.
-                let text = std::fs::read_to_string(&review_path).unwrap_or_default();
-                let mut res = review_result::parse_review(&text);
-                if !res.synthetic {
-                    res = review_result::ReviewResult {
-                        verdict: Some(review_result::Verdict::RequestChanges),
-                        findings: vec![review_result::Finding {
-                            severity: review_result::Severity::Major,
-                            file: None,
-                            line: None,
-                            text: format!("review slot `{}` failed or produced no review", rev.id),
-                            synthetic: true,
-                        }],
+                // Whatever sits in a failed slot's artifact (an earlier round's stale
+                // verdict, a partial review, even a copied marker) is not what the gate
+                // counted: it counted spar's own stand-in, so that is what is recorded.
+                let why = state
+                    .slots
+                    .iter()
+                    .find(|s| s.id == rev.id)
+                    .and_then(|s| s.error.clone())
+                    .unwrap_or_else(|| "failed or produced no review".into());
+                let res = review_result::ReviewResult {
+                    verdict: Some(review_result::Verdict::RequestChanges),
+                    findings: vec![review_result::Finding {
+                        severity: review_result::Severity::Major,
+                        file: None,
+                        line: None,
+                        text: format!("review slot `{}`: {why}", rev.id),
                         synthetic: true,
-                        ..Default::default()
-                    };
-                }
+                    }],
+                    synthetic: true,
+                    ..Default::default()
+                };
                 review_result::record_review(state, paths, &rev.id, &res);
             } else if let Some(text) = review_text {
                 // Fail closed: only an anchored `## Verdict` / approve clears the gate,

@@ -99,7 +99,6 @@ enum Section {
     Other,
     Verdict,
     Acceptance,
-    Findings,
 }
 
 /// First well-formed `Reviewed-Commit: <sha>` line wins. The key is
@@ -147,41 +146,17 @@ pub fn reviewed_commit_matches(panel_head: &str, parsed: &str) -> bool {
 }
 
 pub fn parse_review(body: &str) -> ReviewResult {
-    let synthetic = body.lines().any(|l| l.trim() == SYNTHETIC_REVIEW_MARKER);
     let mut out = ReviewResult {
         reviewed_commit: parse_reviewed_commit(body),
-        synthetic,
         ..Default::default()
     };
     let mut section = Section::Other;
-    let mut findings = FindingsParser::default();
-    // Only findings honour fences: a salvaged transcript quotes the template's own
-    // `## Findings` block, and that is not the reviewer's finding list.
-    let mut fence: Option<FenceState> = None;
 
     for raw in body.lines() {
-        let trimmed = raw.trim();
-        match &fence {
-            Some(open) if fence_closes(trimmed, open) => fence = None,
-            Some(_) => {}
-            None => fence = fence_open(trimmed),
-        }
-        let fenced = fence.is_some() || fence_open(trimmed).is_some();
-        if fenced && section == Section::Findings {
-            findings.flush();
-            continue;
-        }
         if let Some(rest) = raw.trim_start().strip_prefix("##") {
-            let deeper = rest.starts_with('#');
-            let heading = rest.trim_start_matches('#').trim();
-            // Reviewers group findings under `### Major` or title one `### major — ...`;
-            // either way a sub-heading inside Findings is still Findings.
-            if section == Section::Findings && deeper {
-                findings.heading(heading);
-                continue;
-            }
-            findings.flush();
-            let title = heading
+            let title = rest
+                .trim_start_matches('#')
+                .trim()
                 .trim_matches(['*', '`', ':', ' '])
                 .to_ascii_lowercase();
             section = match title.as_str() {
@@ -190,7 +165,6 @@ pub fn parse_review(body: &str) -> ReviewResult {
                 // permanently blocking. Once a verdict parses, later sections cannot flip it.
                 "verdict" if out.verdict.is_none() => Section::Verdict,
                 "acceptance" => Section::Acceptance,
-                t if t.starts_with("findings") && !fenced => Section::Findings,
                 _ => Section::Other,
             };
             continue;
@@ -208,13 +182,64 @@ pub fn parse_review(body: &str) -> ReviewResult {
                     out.acceptance.push(line);
                 }
             }
-            Section::Findings => findings.line(raw),
             Section::Other => {}
         }
     }
+    // Findings are a separate pass so nothing they parse can reach the verdict or the
+    // acceptance lines the gate reads.
+    out.synthetic = is_synthetic(body);
+    out.findings = parse_findings(body, out.synthetic);
+    out
+}
+
+/// spar writes the marker as the artifact's first line; a reviewer quoting it anywhere
+/// else has not made its review spar's.
+fn is_synthetic(body: &str) -> bool {
+    body.lines()
+        .find(|l| !l.trim().is_empty())
+        .is_some_and(|l| l.trim() == SYNTHETIC_REVIEW_MARKER)
+}
+
+fn parse_findings(body: &str, synthetic: bool) -> Vec<Finding> {
+    let mut findings = FindingsParser::default();
+    let mut in_findings = false;
+    // A salvaged transcript quotes the template's own `## Findings` block inside a
+    // fence, and that is not the reviewer's finding list.
+    let mut fence: Option<FenceState> = None;
+    for raw in body.lines() {
+        let trimmed = raw.trim();
+        match &fence {
+            Some(open) if fence_closes(trimmed, open) => fence = None,
+            Some(_) => {}
+            None => fence = fence_open(trimmed),
+        }
+        if fence.is_some() || fence_open(trimmed).is_some() {
+            findings.flush();
+            continue;
+        }
+        let Some(rest) = raw.trim_start().strip_prefix("##") else {
+            if in_findings {
+                findings.line(raw);
+            }
+            continue;
+        };
+        let deeper = rest.starts_with('#');
+        let heading = rest.trim_start_matches('#').trim();
+        // Reviewers group findings under `### Major` or title one `### major — ...`;
+        // either way a sub-heading inside Findings is still Findings.
+        if in_findings && deeper {
+            findings.heading(heading);
+            continue;
+        }
+        findings.flush();
+        in_findings = heading
+            .trim_matches(['*', '`', ':', ' '])
+            .to_ascii_lowercase()
+            .starts_with("findings");
+    }
     findings.flush();
-    out.findings = findings.done;
-    for f in &mut out.findings {
+    let mut out = findings.done;
+    for f in &mut out {
         f.synthetic = synthetic;
     }
     out
@@ -226,11 +251,15 @@ struct FindingsParser {
     current: Option<Finding>,
     /// Severity named by an enclosing `### Major` heading, inherited by bare bullets.
     group: Option<Severity>,
+    /// `current` was opened by a `### F1 (major) — ...` heading, so paragraphs and
+    /// plain bullets up to the next heading are its body.
+    heading_body: bool,
     prev_blank: bool,
 }
 
 impl FindingsParser {
     fn flush(&mut self) {
+        self.heading_body = false;
         let Some(mut f) = self.current.take() else {
             return;
         };
@@ -256,6 +285,14 @@ impl FindingsParser {
     fn heading(&mut self, title: &str) {
         self.flush();
         self.prev_blank = false;
+        if let Some((severity, rest)) =
+            labelled_severity(title.trim_start_matches(['*', '_', '`', '[']))
+        {
+            self.group = None;
+            self.start(severity, rest);
+            self.heading_body = true;
+            return;
+        }
         let Some((severity, rest)) = split_severity(title, true) else {
             self.group = None;
             return;
@@ -280,8 +317,13 @@ impl FindingsParser {
         let after_blank = std::mem::replace(&mut self.prev_blank, false);
         if indent < 2 {
             if let Some(item) = list_item(raw.trim_start()) {
+                let explicit = split_severity(item, false);
+                if self.heading_body && explicit.is_none() {
+                    self.append(raw);
+                    return;
+                }
                 self.flush();
-                if let Some((severity, text)) = split_severity(item, false) {
+                if let Some((severity, text)) = explicit {
                     self.start(severity, text);
                 } else if let Some(severity) = self.group {
                     let bare = item.trim_matches(['.', ' ', '*', '_']).to_ascii_lowercase();
@@ -292,13 +334,17 @@ impl FindingsParser {
                 return;
             }
         }
-        if indent < 2 && (after_blank || self.current.is_none()) {
+        if indent < 2 && !self.heading_body && (after_blank || self.current.is_none()) {
             self.flush();
             if let Some((severity, text)) = split_severity(raw.trim(), false) {
                 self.start(severity, text);
             }
             return;
         }
+        self.append(raw);
+    }
+
+    fn append(&mut self, raw: &str) {
         if let Some(f) = self.current.as_mut() {
             f.text.push('\n');
             f.text.push_str(raw.trim());
@@ -343,13 +389,14 @@ fn split_severity(s: &str, bare_ok: bool) -> Option<(Severity, &str)> {
         }
         None => (false, s),
     };
-    let (severity, rest) = [
-        ("critical", Severity::Critical),
-        ("major", Severity::Major),
-        ("minor", Severity::Minor),
-    ]
-    .into_iter()
-    .find_map(|(word, sev)| strip_prefix_ci(s, word).map(|rest| (sev, rest)))?;
+    if !keyed {
+        if let Some(found) = labelled_severity(s) {
+            return Some(found);
+        }
+    }
+    let (severity, rest) = SEVERITY_WORDS
+        .into_iter()
+        .find_map(|(word, sev)| strip_prefix_ci(s, word).map(|rest| (sev, rest)))?;
     if rest.starts_with(|c: char| c.is_alphanumeric() || c == '|' || c == '/') {
         return None;
     }
@@ -360,14 +407,55 @@ fn split_severity(s: &str, bare_ok: bool) -> Option<(Severity, &str)> {
         rest = &rest[rest.find(')').map_or(rest.len(), |i| i + 1)..];
         rest = rest.trim_start_matches(['*', '_', '`', ']', ' ']);
     }
-    let sep = ['—', '–', '-', ':', '.', ',', ';'];
-    if rest.starts_with(sep) {
-        let mut chars = rest.chars();
-        chars.next();
-        rest = chars.as_str();
+    if let Some(after) = strip_separator(rest) {
+        rest = after;
     } else if !rest.is_empty() && !keyed && !bare_ok && !closed {
         return None;
     }
+    Some((
+        severity,
+        rest.trim_start_matches(['*', '_', ' ']).trim_end(),
+    ))
+}
+
+/// `medium` is folded into `minor` so the levels stay three (O100).
+const SEVERITY_WORDS: [(&str, Severity); 4] = [
+    ("critical", Severity::Critical),
+    ("major", Severity::Major),
+    ("minor", Severity::Minor),
+    ("medium", Severity::Minor),
+];
+
+fn strip_separator(s: &str) -> Option<&str> {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some('—' | '–' | '-' | ':' | '.' | ',' | ';')).then(|| chars.as_str())
+}
+
+/// An id-labelled finding whose severity sits first in the parenthetical after the
+/// label: `**F-1 (minor · scope)** — text`, `F4 (medium) — text`, `F3 (major, latent)`.
+fn labelled_severity(s: &str) -> Option<(Severity, &str)> {
+    let label_len = s
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .unwrap_or(s.len());
+    let label = &s[..label_len];
+    if label.len() > 8
+        || !label.starts_with(|c: char| c.is_ascii_alphabetic())
+        || !label.contains(|c: char| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let inner = s[label_len..].trim_start().strip_prefix('(')?;
+    let close = inner.find(')')?;
+    let word = inner[..close]
+        .trim()
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .next()?;
+    let severity = SEVERITY_WORDS
+        .into_iter()
+        .find(|(w, _)| w.eq_ignore_ascii_case(word))
+        .map(|(_, sev)| sev)?;
+    let rest = inner[close + 1..].trim_start_matches(['*', '_', '`', ']', ' ']);
+    let rest = strip_separator(rest).unwrap_or(rest);
     Some((
         severity,
         rest.trim_start_matches(['*', '_', ' ']).trim_end(),
@@ -1415,5 +1503,95 @@ None.\n";
         let old: ReviewResult = serde_json::from_str(r#"{"verdict":"request_changes"}"#).unwrap();
         assert_eq!(old.verdict, Some(Verdict::RequestChanges));
         assert!(old.findings.is_empty());
+    }
+
+    /// Verdict and acceptance as the gate reads them. The findings pass must never
+    /// move these: each case below is pinned to what the parser returned before
+    /// findings existed.
+    fn gate_view(body: &str) -> (Option<Verdict>, Vec<(String, AcStatus)>) {
+        let r = parse_review(body);
+        (
+            r.verdict,
+            r.acceptance.into_iter().map(|a| (a.id, a.status)).collect(),
+        )
+    }
+
+    #[test]
+    fn findings_never_swallow_a_later_acceptance_subheading() {
+        let body = "## Verdict\napprove\n\n## Findings\n- severity: minor — x\n### Acceptance\nAC-1: pass — ok\n";
+        assert_eq!(
+            gate_view(body),
+            (
+                Some(Verdict::Approve),
+                vec![("AC-1".into(), AcStatus::Pass)]
+            )
+        );
+        assert_eq!(parse_review(body).findings.len(), 1);
+    }
+
+    #[test]
+    fn an_open_fence_in_findings_never_swallows_acceptance() {
+        for fence in ["```text", "```rust and some prose after it"] {
+            let body = format!(
+                "## Verdict\napprove\n\n## Findings\n- severity: minor — log below\n{fence}\nerror: boom\n## Acceptance\nAC-1: pass — ok\n"
+            );
+            assert_eq!(
+                gate_view(&body),
+                (
+                    Some(Verdict::Approve),
+                    vec![("AC-1".into(), AcStatus::Pass)]
+                ),
+                "{fence}"
+            );
+        }
+    }
+
+    /// Fails open if broken: a `### Verdict` under Findings is still the first verdict.
+    #[test]
+    fn a_verdict_subheading_in_findings_still_latches_first() {
+        let body = "## Findings\n- severity: major — x\n### Verdict\nrequest_changes\n\n## Verdict\napprove\n";
+        assert_eq!(gate_view(body).0, Some(Verdict::RequestChanges));
+    }
+
+    /// The marker counts only where spar writes it, as the first non-blank line.
+    #[test]
+    fn a_quoted_marker_does_not_make_a_review_synthetic() {
+        let quoted = format!(
+            "## Verdict\napprove\n\n## Findings\n- severity: minor — spar writes\n```\n{SYNTHETIC_REVIEW_MARKER}\n```\n"
+        );
+        let r = parse_review(&quoted);
+        assert!(!r.synthetic);
+        assert!(r.findings.iter().all(|f| !f.synthetic));
+        let late = format!("## Verdict\napprove\n{SYNTHETIC_REVIEW_MARKER}\n");
+        assert!(!parse_review(&late).synthetic);
+        let first = format!("\n{SYNTHETIC_REVIEW_MARKER}\n## Verdict\napprove\n");
+        assert!(parse_review(&first).synthetic);
+    }
+
+    /// Id-labelled findings with the severity in a parenthetical, and `medium`
+    /// folded into `minor`, as they appear in real reviews.
+    #[test]
+    fn findings_labelled_and_medium_shapes() {
+        let body = "## Verdict\nrequest_changes\n\n## Findings\n\
+- **F-1 (minor · test gap)** — nothing pins the empty case in src/a.rs:4\n\
+- severity: medium — the retry is unbounded\n\n\
+### F3 (major, latent) — resolver over-collects day 1\n\n\
+The loop at src/resolver.rs:88 never stops.\n\
+- second detail bullet\n\n\
+### F4 (medium) — `{{tenant.name}}` renders empty\n\
+### Verified sound\n\
+- the lock is released\n";
+        let f = findings(body);
+        assert_eq!(f.len(), 4, "{f:?}");
+        assert_eq!(f[0].0, Severity::Minor);
+        assert_eq!(f[0].1.as_deref(), Some("src/a.rs"));
+        assert!(f[0].3.starts_with("nothing pins"), "{:?}", f[0].3);
+        assert_eq!(f[1].0, Severity::Minor);
+        assert_eq!(f[2].0, Severity::Major);
+        assert!(f[2].3.starts_with("resolver over-collects day 1"));
+        assert!(f[2].3.contains("never stops") && f[2].3.contains("second detail"));
+        assert_eq!(f[2].1.as_deref(), Some("src/resolver.rs"));
+        assert_eq!(f[3].0, Severity::Minor);
+        assert!(findings("## Findings\n- AC-1 (pass) — fine\n- R2 (note) — x\n").is_empty());
     }
 }

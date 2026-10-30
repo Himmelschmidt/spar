@@ -889,11 +889,13 @@ read, reset when the slot is re-dispatched), appends it to the run's `review_his
 ```
 
 `synthetic: true` means spar wrote that review because the reviewer failed or left
-nothing (the artifact's first line is `<!-- spar:synthetic-review -->`); its
+nothing, or the dry-run backend stood in for it (the artifact's first non-blank line is
+`<!-- spar:synthetic-review -->`; anywhere else it does not count); its
 `request_changes` and finding are spar's, not a reviewer's judgment. A reviewer slot
 that failed is recorded this way too, whatever its markdown says. Only list items
 that name a severity are findings (`- severity: major — ...`, `- **minor** — ...`,
-items under a `### Major` heading); bare notes are not. `file`/`line` are the first
+items under a `### Major` heading, id-labelled `**F-1 (minor · ...)**` /
+`### F3 (major, latent) — ...`); bare notes are not. `medium` is read as `minor`. `file`/`line` are the first
 `path.ext:line` the finding cites. Read `slots[].review.verdict`, never grep the
 markdown: a failing `AC-n` line is not a verdict.
 
@@ -901,8 +903,8 @@ markdown: a failing `AC-n` line is not a verdict.
 phase (`done`, `failed`, `stuck`, `escalated`, `quota`, `plan_rejected`,
 `plan_approved`) and again just before `cleanup --purge` deletes it, so trends survive
 reaping. Append-only: a run can have several lines; keep the one with the latest
-`written_at` per `id`. A purge whose history line cannot be written fails instead of
-deleting.
+`written_at` per `id`. History is best effort: if the line cannot be written, spar warns on
+stderr and the purge or sweep goes on.
 
 ```json
 {

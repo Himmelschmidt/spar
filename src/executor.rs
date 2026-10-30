@@ -3037,7 +3037,8 @@ fn write_dry_artifacts(
                 .map(|h| format!("Reviewed-Commit: {h}\n"))
                 .unwrap_or_default();
             let body = format!(
-                "## Verdict\n{verdict}\n\n{sha_line}{acceptance}## Findings\n- severity: minor — dry-run synthetic review from {}\n\n## Tests\nsuite channel (dry-run); no full suite here\n",
+                "{}\n## Verdict\n{verdict}\n\n{sha_line}{acceptance}## Findings\n- severity: minor — dry-run synthetic review from {}\n\n## Tests\nsuite channel (dry-run); no full suite here\n",
+                crate::workflow::review_result::SYNTHETIC_REVIEW_MARKER,
                 job.provider
             );
             if let Some(name) = &job.expected_artifact {

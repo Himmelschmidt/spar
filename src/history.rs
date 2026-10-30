@@ -165,8 +165,15 @@ pub fn row(state: &RunState, trigger: Trigger, now: DateTime<Utc>) -> HistoryRow
 }
 
 /// One `write` per line under `O_APPEND`, so concurrent writers never interleave
-/// inside a line.
-pub fn append(paths: &SparPaths, state: &RunState, trigger: Trigger) -> Result<()> {
+/// inside a line. Best effort: a failure warns on stderr and never blocks the caller,
+/// a purge included (O102).
+pub fn append(paths: &SparPaths, state: &RunState, trigger: Trigger) {
+    if let Err(e) = write_line(paths, state, trigger) {
+        eprintln!("warning: run {} not recorded in history: {e:#}", state.id);
+    }
+}
+
+fn write_line(paths: &SparPaths, state: &RunState, trigger: Trigger) -> Result<()> {
     let mut line = serde_json::to_string(&row(state, trigger, Utc::now()))?;
     line.push('\n');
     std::fs::create_dir_all(&paths.root)?;
