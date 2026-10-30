@@ -167,7 +167,7 @@ fn review_accepts_an_exact_pinned_reviewer_panel_with_ordinal_backups() {
             "--role",
             "reviewer=cli:grok@fast",
             "--backup",
-            "reviewer=cli:opencode@luna",
+            "reviewer=cli:pi@luna",
             "--backup",
             "reviewer=api:openai@gpt-4",
             "--backup",
@@ -187,7 +187,7 @@ fn review_accepts_an_exact_pinned_reviewer_panel_with_ordinal_backups() {
     );
     assert_eq!(
         config["backups"]["reviewer"],
-        serde_json::json!(["cli:opencode@luna", "api:openai@gpt-4", "cli:agy@sonnet"])
+        serde_json::json!(["cli:pi@luna", "api:openai@gpt-4", "cli:agy@sonnet"])
     );
 }
 

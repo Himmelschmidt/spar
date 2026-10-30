@@ -37,22 +37,24 @@ spar run --workflow arena -t "..." --providers api:xai,cli:claude,cli:grok
 spar implement -t "..." --providers 'cli:codex@openai/gpt-4o-mini,api:openai@gpt-5' --dry-run
 ```
 
-Native CLI adapters: `cli:claude`, `cli:grok`, `cli:agy`, `cli:codex`, `cli:opencode`, `cli:muse`. Run
+Native CLI adapters: `cli:claude`, `cli:grok`, `cli:agy`, `cli:codex`, `cli:pi`, `cli:muse`. Run
 `spar provider list` to see which resolve on this box and their live pause/cooldown status.
 
 **Readiness.** A binary on PATH is not health: `spar doctor` and `spar provider list`
 also run each adapter's readiness probe (a local-only config/auth check, never a model
 call) and report it separately from availability. Human states: `ok` (binary resolves,
 probe passed or the adapter has no probe), `unhealthy` (binary resolves but the probe
-failed, with the probe's own one-line message, e.g. a broken opencode config),
+failed, with the probe's own one-line message, e.g. pi with no OpenRouter key),
 `missing` (not on PATH). `--json` carries the same verdict as `readiness` with values
 `healthy` / `unhealthy` / `unknown`, plus `readiness_message` (ANSI-stripped, capped at
 300 chars) when unhealthy. `doctor` exits failure only when no usable provider remains,
 so one unhealthy provider alongside working ones does not block a run. Today only
-`cli:opencode` wires a probe (`opencode models`); the other adapters report unknown and
-stay available. Limit: the probe catches broken config, not dead credentials — a
-parseable config with an expired key still reports healthy and fails at dispatch, which
-is all a local-only, no-quota check can see. An `unhealthy` provider is still eligible
+`cli:pi` wires a probe (`pi auth check --provider openrouter --json --no-refresh`, or
+`--model <SPAR_PI_MODEL routed>` when that is set; detection is per adapter, so it cannot
+see a slot's own `@model`); the other adapters report unknown and stay available. Limit:
+the probe catches a missing credential, not a dead one: a key the provider would reject
+still reports healthy and fails at dispatch, which is all a local-only, no-quota check
+can see. An `unhealthy` provider is still eligible
 for dispatch; doctor warns, it does not exclude.
 
 **agy note.** agy runs headless with `--output-format stream-json`, so spar parses its tools,
@@ -73,14 +75,13 @@ staying dead; `spar provider resume <ref>` clears one immediately. A paused prov
 never silently swapped into another role: `plan`/`implement` exit `4` (quota) naming the
 paused ref so per-role assignment stays exactly what you specified.
 
-**Driving an OpenRouter model? Lead with `cli:opencode@<slug>`.** It is the recommended
-OpenRouter coder: same OpenRouter-slug routing as `cli:codex` but ~half the per-turn token
-overhead (measured ~14.6k input vs codex ~29.5k on the same trivial task + model), so it is
-the default choice; `cli:codex` remains the documented alternative.
+**Driving an OpenRouter model? Lead with `cli:pi@<slug>`.** It is the recommended
+OpenRouter coder: same OpenRouter-slug routing as `cli:codex` with a much smaller per-turn
+prompt, so it is the default choice; `cli:codex` remains the documented alternative.
 
 **Want the muse-spark family? Use `cli:muse`, not OpenRouter.** The muse CLI reaches
 muse-spark on Meta's own account pricing, where the contributor tier is roughly 12x cheaper
-in and 21x cheaper out than the same family billed through OpenRouter. `cli:opencode@meta/…`
+in and 21x cheaper out than the same family billed through OpenRouter. `cli:pi@meta/…`
 is the fallback when muse is not installed.
 
 **`@model` suffix.** Any ref may carry an optional model, split off on the **first `@`**:
@@ -118,23 +119,41 @@ SPAR_CODEX_MODEL=x-ai/grok-4 spar run ... --providers cli:codex          # diffe
 SPAR_CODEX_PROFILE=gpt        spar run ... --providers cli:codex          # a different codex profile
 ```
 
-`cli:opencode` (opencode, `opencode run --format json`) is the **recommended OpenRouter
-coder** — OpenRouter is its default routing and its per-turn token overhead is roughly half
-codex's. spar parses opencode's NDJSON per-step tokens for real usage tracking. Not a
-takeover target. Model selection, highest precedence first:
-- A per-slot model — from a `cli:opencode@<model>` ref or `--select` — becomes opencode's
-  `-m`. A bare vendor slug is **prefixed with `openrouter/`** so OpenRouter is the default
-  (`cli:opencode@meta/muse-spark-1.1` → `-m openrouter/meta/muse-spark-1.1`); an already
-  `openrouter/…` model passes through unchanged; a bare word (`gpt-5`) passes through to
-  opencode's own default provider. Different slots can run different OpenRouter models in one
-  run. Discover tool-capable slugs with `spar model list --provider openrouter`.
-- `SPAR_OPENCODE_MODEL` → same routing, when no per-slot model is set.
-- Unset → opencode's own config default model.
-- OpenRouter models need `OPENROUTER_API_KEY` exported in spar's env (opencode reads it).
+`cli:pi` (the pi coding agent, `pi --mode json --no-approve`) is the **recommended
+OpenRouter coder**. Install with `npm i -g @earendil-works/pi-coding-agent` (verified at
+1.4.0). spar parses pi's JSON event stream for per-request tokens, cost, tools and errors.
+Its first request on a trivial task measured ~3.1k input tokens (gemini-2.5-flash), a
+fraction of codex's overhead. Not a takeover target: a tmux pane runs the same JSON stream.
+Model selection, highest precedence first:
+- A per-slot model, from a `cli:pi@<model>` ref or `--select`, becomes pi's `--model`.
+  A `vendor/slug` is **always prefixed with `openrouter/`** (`cli:pi@google/gemini-2.5-flash`
+  → `--model openrouter/google/gemini-2.5-flash`), even when the vendor is also a pi
+  provider (`google`, `anthropic`, `openai`): the same ref never changes provider with
+  whichever keys happen to be set. An explicit `openrouter/…` passes through unchanged. A
+  bare word (`claude-sonnet-4-5`) passes through to pi's own resolution. To reach a pi
+  provider directly, prefix pi's own `provider/id` with `direct:`; spar strips the prefix
+  and passes the rest untouched (`cli:pi@direct:anthropic/claude-sonnet-4-5` →
+  `--model anthropic/claude-sonnet-4-5`, which needs that provider's own key). Discover
+  tool-capable OpenRouter slugs with `spar model list --provider openrouter`.
+- `SPAR_PI_MODEL` → same routing, when no per-slot model is set.
+- Unset → pi's own settings pick the model.
+- OpenRouter models need `OPENROUTER_API_KEY` exported in spar's env (pi reads it).
+- Effort maps to `--thinking`: `none` → `off`, `minimal`..`max` pass through, `ultra` is
+  refused. pi clamps a level to what the model supports.
+- Session: spar assigns the id (`--session-id`); a resume is the same flag on the same id.
+  Session files live under the run (`--session-dir .spar/runs/<id>/sessions/<slot>`), not
+  in `~/.pi`. pi never refuses a missing id: it recreates it empty and warns on stderr.
+  spar reads that warning on a resume and records a slot note that the round ran with
+  fresh context.
+- pi exits 0 when the provider fails a request. spar reads the final assistant message's
+  `stopReason`: `error` (or `aborted`) fails the slot with pi's `errorMessage`. A
+  rate-limit message there (`429 Too Many Requests`) parks the run on quota. A request
+  that succeeds after an errored one (pi retries on its own) marks the earlier error
+  recovered, so its leftover log line cannot route a later unrelated failure to quota.
 
 ```bash
-spar run --workflow review -t "..." --providers cli:opencode@meta/muse-spark-1.1  # -> openrouter/meta/muse-spark-1.1
-SPAR_OPENCODE_MODEL=x-ai/grok-4 spar run ... --providers cli:opencode              # different OpenRouter model
+spar run --workflow review -t "..." --providers cli:pi@google/gemini-2.5-flash  # -> openrouter/google/gemini-2.5-flash
+SPAR_PI_MODEL=x-ai/grok-4 spar run ... --providers cli:pi                       # different OpenRouter model
 ```
 
 `cli:muse` (Muse Code, `muse exec --json --yolo --user-input-auto-resolve --workspace
@@ -493,12 +512,12 @@ run-routing decision above never does, for the false-positive reason just descri
 That parsed cooldown is capped at the *next occurrence* of the stated time-of-day (~24h
 out), not the actual weekly rollover — a big improvement over the default, but a weekly
 pause is still re-probed daily rather than left alone for the full week, since Claude's
-line carries no date. codex, opencode, muse and grok have no provider-specific reset
+line carries no date. codex, pi, muse and grok have no provider-specific reset
 parser, so a limit on them falls back to the generic-rejection-phrase match and the
 generic cooldown. muse's dispatch-time 429, "Subscription quota exhausted", is matched
 from the text reported in real fleet incidents (any line with "quota exhausted"), as is an
 HTTP 402 ("402 Payment Required", or `402` framed as a status). codex's "You've hit your usage
-limit" is matched but still untested against captured codex output; grok and opencode
+limit" is matched but still untested against captured codex output; grok and pi
 rely on the generic phrases alone and remain unverified. agy's rejection
 states a relative reset ("Resets in 125h56m29s."), which spar turns into an exact
 cooldown (whole h/m/s components only; anything else, or a reset 8 days or more out,
@@ -676,16 +695,13 @@ slot is stuck on.**
   the same `{"hooks": …}` shape as Claude's, and a blocking Stop hook re-drives a
   headless `muse exec` run). There is no `muse session-message send` push: headless
   slots never appear in the peer list, so that channel could never deliver to a slot
-  spar actually runs. **opencode** has no push channel at all. Every poll-file case writes
+  spar actually runs. **pi** has no push channel yet (a pi extension could add one). Every poll-file case writes
   `.spar/runs/<id>/logs/nudges-<slot>.md`, and the role prompt tells the agent to read it
   before starting any new major step. Thresholds are checked every 30 seconds, so a nudge
   lands at the next 30s boundary rather than the instant a budget is crossed.
 - **Live token visibility differs by adapter**, so token nudges are not uniformly prompt.
-  **opencode** reports usage per step and is exact live for the slot's own session, but a
-  `task` subagent's spend lands only after exit (opencode's json emitter never puts a
-  child session's steps on stdout at all), so a live nudge undercounts a fanned-out slot
-  until then — the undercount can be several times the parent's own token count and
-  grows with how many subagents (or how deep a chain of them) ran. **muse**'s stdout
+  **pi** reports usage per model request as each request ends, and a compaction's spend
+  when the compaction ends, so it lags by at most one request. **muse**'s stdout
   usage record excludes subagents, so spar tails its session log (`~/.local/share/muse/sessions/…`), which is
   appended as the turn runs, including its own subagent sessions; that is exact live too.
   **claude** reports per-message usage
@@ -988,20 +1004,14 @@ rail's selection.
   - Conventions per adapter, since the wire formats differ: **claude** is settled by the
     terminal `result` record, which supersedes the per-message ones; **codex** by
     `turn.completed` (its only usage record, so it also stands in for the gauge);
-    **opencode** by summing its per-step deltas, plus a post-exit pass that adds in any
-    `task` subagent spend; **muse** from its session log after the slot exits. Those four
-    reconcile against the provider's own session-level ledger, at the session level: a
-    codex slot's `billed_tokens` equals its `token_count` `total_tokens`, a muse slot's
-    equals the sum of its billed `goal_usage_attribution` records, an opencode slot's
-    equals its own `tokens.total` summed plus every descendant session's totals in
-    `opencode.db` (walked transitively through `session.parent_id`, since a subagent can
-    itself fan out). opencode's json emitter filters child sessions
-    out of the stream it prints, so a subagent's usage never reaches stdout at all; spar
-    recovers it after the slot exits by summing `tokens_input + output + reasoning +
-    cache_read + cache_write` over every descendant session row reachable from the
-    slot's own session id, additively on top of the stream-parsed parent totals. Tool
-    counts are not recovered this way, only spend — a fanned-out slot's `tools` still
-    reflects the parent session alone.
+    **pi** by summing each assistant `message_end`'s own `usage` (one per model request;
+    `reasoning` is already inside `output`, and the `message_update` copies are ignored)
+    plus each `compaction_end`'s `result.usage` (billed, never counted into the gauge);
+    **muse** from its session log after the slot exits. These reconcile against the
+    provider's own numbers: a codex slot's `billed_tokens` equals its `token_count`
+    `total_tokens`, a muse slot's equals the sum of its billed `goal_usage_attribution`
+    records, and a pi slot's equals the sum of `totalTokens` over its assistant requests
+    and compactions (verified live for requests; compaction is not yet verified live).
   - **Two adapters report a cached prompt as a slice of `input_tokens` rather than a
     sibling of it**, the opposite of Anthropic's convention: codex's `cached_input_tokens`
     and muse's `cached_tokens`. spar normalizes both on the way in, storing the uncached
@@ -1009,7 +1019,7 @@ rail's selection.
     and you never have to know which convention the provider used. The consequence to be
     aware of: `input_tokens` for a codex or muse slot is **not** the number that provider's
     own dashboard shows under "input"; add `cache_read_tokens` back to get it.
-  - **`context_tokens` is a peak for claude, opencode, muse and api-sdk dispatches.**
+  - **`context_tokens` is a peak for claude, pi, muse and api-sdk dispatches.**
     `cli:codex` and `cli:grok` report an invocation total instead (codex has no
     per-request usage record; grok's records are cumulative), labeled
     `invocation_total`. `cli:agy` is labeled `unknown`: it is out of both fleets and its
@@ -1027,8 +1037,9 @@ rail's selection.
 - **Cost and subagent accounting** ride the same `"usage"` entries and
   `logs/<slot>.stats.json` as the token fields above, additive alongside them:
   - **`cost_usd`**: whole-dispatch USD spend, as the provider itself computed it.
-    claude sets it once from its terminal `result.total_cost_usd`; opencode sums
-    it from each step's own `part.cost`, the same way it sums tokens. `None` for
+    claude sets it once from its terminal `result.total_cost_usd`; pi sums
+    it from each request's own `usage.cost.total`, the same way it sums tokens (verified
+    on OpenRouter; other pi providers are unverified). `None` for
     codex, muse and grok — they don't report a cost. A run's total is the sum of
     `cost_usd` over its `usage[]` entries (skip entries where it's absent).
   - **`subagent_stats`**: claude-only. How many Task-tool subagents this dispatch
@@ -1050,7 +1061,7 @@ rail's selection.
     `inputTokens: 907`). Read `model_usage` when a mixed-model claude dispatch
     needs attributing spend, not for token reconciliation.
   - **`session_id`**: the provider's own resume/session handle, when the stream
-    names one. All three of muse, opencode and claude set it; claude reads it off
+    names one. muse, pi, claude, codex and grok set it; claude reads it off
     the same `system`/`init` line the `model` field comes from.
 - Run state: `.spar/runs/<id>/state.json`
 - Events (orchestrator): `.spar/runs/<id>/events.jsonl`
@@ -1146,11 +1157,10 @@ spar plan -t "…" --effort planner=max --effort tester=low
   before starting a turn); muse `--reasoning-effort` (all 8);
   codex `-c model_reasoning_effort=<v>` (all 8: codex validates per *model*
   server-side — `gpt-5.5` stops at xhigh while `gpt-5.6-terra` takes ultra — so
-  spar sends the union rather than guessing a per-provider ceiling); opencode
-  `--variant` (any rung, free string — `--variant` names an operator-configured
-  variant, so a rung with no matching variant fails at runtime and the failure
-  looks like an agent defect, not a config error); agy `--effort` (low, medium,
-  high, xhigh, max per agy 1.4.9's help).
+  spar sends the union rather than guessing a per-provider ceiling); pi
+  `--thinking` (none as `off`, then minimal through max; pi clamps to what the
+  model supports); agy `--effort` (low, medium, high, xhigh, max per agy 1.4.9's
+  help).
 - **Refusal, not clamping:** a rung a CLI does not offer fails the dispatch before
   spawn with the accepted levels named (e.g. `effort 'ultra' not accepted by
   cli:agy (takes: low, medium, high, xhigh, max)`) — `--dry-run` catches it too. It is

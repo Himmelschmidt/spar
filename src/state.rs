@@ -187,7 +187,7 @@ pub fn context_semantics_for_provider(provider: &str) -> ContextSemantics {
     let base = provider.split('@').next().unwrap_or(provider);
     let bare = base.strip_prefix("cli:").unwrap_or(base);
     match bare {
-        "claude" | "opencode" | "muse" => ContextSemantics::Peak,
+        "claude" | "pi" | "muse" => ContextSemantics::Peak,
         "codex" | "grok" => ContextSemantics::InvocationTotal,
         // agy is out of both fleets and its sidecar semantics are undetermined;
         // anything else unlisted fails closed the same way.
@@ -1235,8 +1235,8 @@ mod tests {
             ("cli:claude", Peak),
             ("claude", Peak),
             ("cli:claude@opus", Peak),
-            ("cli:opencode", Peak),
-            ("opencode", Peak),
+            ("cli:pi", Peak),
+            ("pi", Peak),
             ("cli:muse", Peak),
             ("muse", Peak),
             ("api:openai", Peak),

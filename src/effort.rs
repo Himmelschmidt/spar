@@ -65,12 +65,12 @@ impl FromStr for EffortLevel {
     }
 }
 
-/// The rungs `cli_name` accepts, or `None` when the CLI takes a free string
-/// (opencode's `--variant`) or spar knows no vocabulary for the name. Verified
-/// against the versions on this box: `claude --help`, `muse exec --help`, and
-/// `agy --help` (agy 1.4.9 lists `low|medium|high|xhigh|max`). grok 1.0.70
-/// gates the flag client-side and refuses anything else before spawning a
-/// turn: `unknown effort level 'bogus'; use one of: xhigh, high, medium, low`.
+/// The rungs `cli_name` accepts, or `None` when spar knows no vocabulary for
+/// the name. Verified against the versions on this box: `claude --help`, `muse
+/// exec --help`, `agy --help` (agy 1.4.9 lists `low|medium|high|xhigh|max`), and
+/// `pi --help` 1.4.0 (`--thinking off..max`; spar's `none` renders as `off`).
+/// grok 1.0.70 gates the flag client-side and refuses anything else before
+/// spawning a turn: `unknown effort level 'bogus'; use one of: xhigh, high, medium, low`.
 ///
 /// **codex is the union, and it is the honest limit of what this table can
 /// express.** codex has no client-side gate — it forwards `-c
@@ -94,6 +94,7 @@ pub fn accepted_levels(cli_name: &str) -> Option<&'static [&'static str]> {
             "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
         ]),
         "agy" => Some(&["low", "medium", "high", "xhigh", "max"]),
+        "pi" => Some(&["none", "minimal", "low", "medium", "high", "xhigh", "max"]),
         _ => None,
     }
 }
@@ -164,7 +165,11 @@ mod tests {
             accepted_levels("agy"),
             Some(&["low", "medium", "high", "xhigh", "max"][..])
         );
-        assert_eq!(accepted_levels("opencode"), None);
+        assert_eq!(
+            accepted_levels("pi"),
+            Some(&["none", "minimal", "low", "medium", "high", "xhigh", "max"][..])
+        );
+        assert_eq!(accepted_levels("unknown-cli"), None);
     }
 
     #[test]
@@ -178,7 +183,9 @@ mod tests {
         check_compatible("codex", EffortLevel::Max).unwrap();
         check_compatible("codex", EffortLevel::Ultra).unwrap();
         check_compatible("muse", EffortLevel::Ultra).unwrap();
-        check_compatible("opencode", EffortLevel::Ultra).unwrap();
+        check_compatible("pi", EffortLevel::None).unwrap();
+        check_compatible("pi", EffortLevel::Max).unwrap();
+        check_compatible("unknown-cli", EffortLevel::Ultra).unwrap();
     }
 
     #[test]
@@ -187,6 +194,11 @@ mod tests {
         assert_eq!(
             format!("{err:#}"),
             "effort 'ultra' not accepted by cli:agy (takes: low, medium, high, xhigh, max)"
+        );
+        let err = check_compatible("pi", EffortLevel::Ultra).unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "effort 'ultra' not accepted by cli:pi (takes: none, minimal, low, medium, high, xhigh, max)"
         );
         let err = check_compatible("claude", EffortLevel::None).unwrap_err();
         assert!(format!("{err:#}").contains("cli:claude"), "{err:#}");

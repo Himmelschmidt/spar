@@ -38,7 +38,7 @@ it never branches on provider inline (stays inside the orchestrator/adapter spli
 |---|---|---|---|
 | Claude Code | `StopHookInject` — Stop hook returns `{"decision":"block","reason":…}` / `additionalContext` | hooks: PreToolUse→working, Notification→blocked, Stop→idle | no (headless) |
 | Grok | `NativeQueue` — push to `/queue` (queues even while working); or ACP `session/prompt` | `http`-push notification hooks: `turn_complete`/`approval_required` | no |
-| opencode | `SdkPrompt` — plugin on `session.idle` → `client.session.prompt()`, or `serve`+`prompt_async` | SSE bus: `session.idle`/`tool.execute.*`/`permission.ask` | no |
+| ~~opencode~~ | ~~`SdkPrompt` — plugin on `session.idle` → `client.session.prompt()`, or `serve`+`prompt_async`~~ | ~~SSE bus: `session.idle`/`tool.execute.*`/`permission.ask`~~ | ~~no~~ (struck: opencode replaced by pi, O99) |
 | agy (Antigravity) | `None` — inbox-on-next-turn only (Stop is notify-only; PreToolUse `additionalContext` is tool-scoped, not idle) | none (degraded — process/output heuristic) | n/a |
 
 Notes: Grok **reads `.claude/settings.json` hooks**, so one Claude-format hook file covers Claude
@@ -48,8 +48,8 @@ Notes: Grok **reads `.claude/settings.json` hooks**, so one Claude-format hook f
 ## Stage 3 — Presence + delivery capability seam (shared by A & B)
 - Introduce an adapter capability seam: each adapter reports `DeliveryStrategy` + `PresenceSource`
   (see matrix). On slot spawn (`process.rs` + tmux path), wire the adapter's presence source:
-  install Claude/Grok hooks into `.claude/settings.json`; register the opencode plugin / subscribe
-  its SSE bus; agy → none, log degraded mode. Export `SPAR_AGENT_ID` to every agent.
+  install Claude/Grok hooks into `.claude/settings.json`; ~~register the opencode plugin / subscribe
+  its SSE bus~~ (struck, O99); agy → none, log degraded mode. Export `SPAR_AGENT_ID` to every agent.
 - **Accept:** each available adapter drives `working`/`blocked`/`idle` transitions visible via
   `spar bus presence`; agy logs "no event stream — inbox-on-next-turn, degraded presence";
   the matrix's provider assumptions are re-verified against installed binaries (task 1).
@@ -58,7 +58,7 @@ Notes: Grok **reads `.claude/settings.json` hooks**, so one Claude-format hook f
 - `spar bus deliver <agent>`: `--claim` drain, then dispatch to the adapter's `DeliveryStrategy`:
   - `StopHookInject` (Claude): Stop hook emits the claimed messages as `block`+reason / `additionalContext`. Headless; no pane.
   - `NativeQueue` (Grok): push claimed messages to `/queue` (safe even mid-turn — Grok applies at the boundary).
-  - `SdkPrompt` (opencode): `POST prompt_async` / `client.session.prompt` into the session.
+  - ~~`SdkPrompt` (opencode): `POST prompt_async` / `client.session.prompt` into the session.~~ (struck, O99)
   - `None` (agy): leave claimed messages for inbox-on-next-turn; agent reads them itself. Documented, no injection.
 - No `send-keys` injection required by any adapter for delivery → Track B is fully decoupled from
   Track A's panes. (`send-keys` remains only Track A's interactive-typing path, Stage 10.)
@@ -131,7 +131,7 @@ Notes: Grok **reads `.claude/settings.json` hooks**, so one Claude-format hook f
 
 ### Backlog / follow-on (out of scope here, captured from the research)
 - **Structured backends beat TTY-scraping for two providers:** Grok `agent stdio` (ACP JSON-RPC,
-  clean `session/prompt`→`stopReason`) and `opencode serve`+SSE (`GET /event`, `prompt_async`).
+  clean `session/prompt`→`stopReason`) and ~~`opencode serve`+SSE (`GET /event`, `prompt_async`)~~ (struck, O99).
   Both are stronger `api-sdk`-backend paths than a tmux pane and could reduce Track A's surface for
   those adapters. Revisit as a backend-evolution item after this initiative; don't block on it.
 - **Grok in-tool features to potentially exploit:** `/fork` (in-tool fan-out ≈ arena), native

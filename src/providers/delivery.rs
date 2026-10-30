@@ -29,11 +29,6 @@ pub enum DeliveryAction {
     /// mean this thread's *next* `build_resume` dispatch will. The poll file was written
     /// too, same as `PolledFile`; this is just which of the two the push also hit.
     NativePushed,
-    /// Claimed messages appended to the durable turn-boundary queue for a later
-    /// session flush.
-    Queued,
-    /// opencode: claimed messages appended to the durable queue for the session flush.
-    Prompted,
     /// Written to the slot's poll file, which its role prompt tells it to read before
     /// starting any new major step. Codex's guaranteed drop, whether or not a thread id
     /// is known yet — `codex exec` is single-turn, so this is what actually reaches the
@@ -70,8 +65,7 @@ fn is_zero(n: &usize) -> bool {
 ///
 /// `agent` is the unique bus id (run slots: `run:slot`, bare agents: their own id), so
 /// the inbox directory already isolates one agent's traffic — no run filter is needed on
-/// the drain. `run` is still threaded to [`queue_path`] (used by `SdkPrompt`) to keep
-/// each run's durable turn-boundary queue partitioned.
+/// the drain. `run` is still threaded through to scope the poll file to its run.
 ///
 /// `None` never consumes the inbox — an agent with no injection channel reads its own
 /// inbox on its next turn, so claiming here would strand the messages. Every other
@@ -128,10 +122,6 @@ pub fn deliver(
                 codex_native_deliver(paths, run, agent, session_id, &text, dry_run)?;
             (action, None)
         }
-        DeliveryStrategy::SdkPrompt => {
-            enqueue(paths, run, agent, &msgs, dry_run)?;
-            (DeliveryAction::Prompted, None)
-        }
         DeliveryStrategy::PollFile => {
             append_poll_file(paths, run, agent, &render_reason(&msgs), dry_run)?;
             (DeliveryAction::PolledFile, None)
@@ -165,26 +155,6 @@ fn render_reason(msgs: &[BusMessage]) -> String {
         s.push_str(&format!("\n- [{:?}] from {}: {}", m.kind, m.from, m.body));
     }
     s
-}
-
-/// Per-agent durable turn-boundary queue path. opencode's session prompt is an
-/// in-process channel into a *running* slot; until the live push lands (the opencode
-/// adapter) spar persists the claimed prompts here so nothing is lost between the
-/// claim and the flush.
-///
-/// `run` scopes the queue file exactly like the inbox drain: slot ids are deterministic
-/// per provider/role and collide across concurrent same-shaped runs, so a bare
-/// `queue/<agent>.jsonl` would mix two runs' claimed messages into one file (the flush
-/// would then leak run A's prompts into run B's slot). `Some(r)` nests the file under
-/// `queue/<r>/`, keeping each run's queue isolated; `None` (bare agents) stays at the
-/// queue root.
-pub fn queue_path(paths: &SparPaths, run: Option<&str>, agent: &str) -> std::path::PathBuf {
-    let root = bus::bus_root(paths).join("queue");
-    let dir = match run {
-        Some(r) => root.join(r),
-        None => root,
-    };
-    dir.join(format!("{agent}.jsonl"))
 }
 
 /// Push `text` into the codex thread `session_id`. Best-effort and *not* a delivery
@@ -296,35 +266,6 @@ fn codex_native_deliver_with(
     Ok((action, path))
 }
 
-/// Append claimed messages to the durable queue. `dry_run` stubs the write so the test
-/// backend never mutates delivery state.
-fn enqueue(
-    paths: &SparPaths,
-    run: Option<&str>,
-    agent: &str,
-    msgs: &[BusMessage],
-    dry_run: bool,
-) -> Result<()> {
-    if dry_run {
-        return Ok(());
-    }
-    let path = queue_path(paths, run, agent);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .with_context(|| format!("open {}", path.display()))?;
-    for m in msgs {
-        let mut line = serde_json::to_vec(m)?;
-        line.push(b'\n');
-        f.write_all(&line)?;
-    }
-    Ok(())
-}
-
 /// Where spar leaves messages for an adapter with no push channel into its running
 /// process. Slot-scoped, like every other per-slot file: `artifacts_dir` is shared by
 /// every slot in a run, and arena spawns N concurrent implementers off one template, so a
@@ -381,31 +322,6 @@ pub struct NudgeDelivery {
     /// Set when the nudge landed in a file the agent can read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-}
-
-/// Append one nudge line to the durable turn-boundary queue file (`SdkPrompt`'s
-/// channel). `dry_run` stubs the write.
-fn write_queue_file(
-    paths: &SparPaths,
-    run: Option<&str>,
-    agent: &str,
-    text: &str,
-    dry_run: bool,
-) -> Result<std::path::PathBuf> {
-    let path = queue_path(paths, run, agent);
-    if dry_run {
-        return Ok(path);
-    }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .with_context(|| format!("open {}", path.display()))?;
-    writeln!(f, "{}", serde_json::json!({ "nudge": text }))?;
-    Ok(path)
 }
 
 /// The sender id spar's own nudges carry on the bus. Not a slot, so it can never collide
@@ -465,10 +381,6 @@ pub fn nudge(
                 codex_native_deliver(paths, run, agent, session_id, text, dry_run)?;
             (action, Some(path))
         }
-        DeliveryStrategy::SdkPrompt => (
-            DeliveryAction::Queued,
-            Some(write_queue_file(paths, run, agent, text, dry_run)?),
-        ),
         // `None` is agy, which has no channel at all. The poll file is still the best
         // available drop: worst case the agent never reads it, which is where it started.
         DeliveryStrategy::PollFile | DeliveryStrategy::None => (
@@ -554,50 +466,6 @@ mod tests {
     }
 
     #[test]
-    fn sdk_prompt_queue_appends_durable_queue_via_deliver() {
-        let tmp = tempdir().unwrap();
-        let paths = SparPaths::new(tmp.path());
-        seed(&paths, 3);
-
-        let ub = agent_ref(Some("r1"), "b");
-        let d = deliver(
-            &paths,
-            Some("r1"),
-            &ub,
-            DeliveryStrategy::SdkPrompt,
-            None,
-            false,
-        )
-        .unwrap();
-        assert_eq!(d.action, DeliveryAction::Prompted);
-        assert_eq!(d.delivered, 3);
-        assert!(d.payload.is_none());
-        let queued = fs::read_to_string(queue_path(&paths, Some("r1"), &ub)).unwrap();
-        assert_eq!(queued.lines().filter(|l| !l.is_empty()).count(), 3);
-    }
-
-    #[test]
-    fn sdk_prompt_appends_durable_queue() {
-        let tmp = tempdir().unwrap();
-        let paths = SparPaths::new(tmp.path());
-        seed(&paths, 1);
-
-        let ub = agent_ref(Some("r1"), "b");
-        let d = deliver(
-            &paths,
-            Some("r1"),
-            &ub,
-            DeliveryStrategy::SdkPrompt,
-            None,
-            false,
-        )
-        .unwrap();
-        assert_eq!(d.action, DeliveryAction::Prompted);
-        assert_eq!(d.delivered, 1);
-        assert!(queue_path(&paths, Some("r1"), &ub).is_file());
-    }
-
-    #[test]
     fn none_leaves_inbox_untouched() {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
@@ -613,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_stubs_the_queue_write_but_still_drains() {
+    fn dry_run_stubs_the_poll_file_write_but_still_drains() {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         seed(&paths, 2);
@@ -623,15 +491,14 @@ mod tests {
             &paths,
             Some("r1"),
             &ub,
-            DeliveryStrategy::SdkPrompt,
+            DeliveryStrategy::PollFile,
             None,
             true,
         )
         .unwrap();
-        assert_eq!(d.action, DeliveryAction::Prompted);
+        assert_eq!(d.action, DeliveryAction::PolledFile);
         assert_eq!(d.delivered, 2);
-        // Injection call stubbed: no queue file written.
-        assert!(!queue_path(&paths, Some("r1"), &ub).exists());
+        assert!(!poll_file(&paths, Some("r1"), &ub).exists());
         // But the drain is real (exactly-once): nothing remains to claim.
         assert!(bus::inbox_claim(&paths, &ub).unwrap().is_empty());
     }
@@ -656,7 +523,6 @@ mod tests {
         .unwrap();
         assert_eq!(d.action, DeliveryAction::PolledFile);
         assert_eq!(d.delivered, 1);
-        assert!(!queue_path(&paths, Some("r1"), &ub).exists());
         assert!(
             !poll_file(&paths, Some("r1"), &ub).exists(),
             "dry run writes nothing"
@@ -664,10 +530,9 @@ mod tests {
     }
 
     #[test]
-    fn no_session_id_yet_lands_in_the_poll_file_not_the_queue_file() {
+    fn no_session_id_yet_lands_in_the_poll_file() {
         // Before `thread.started` is captured, codex has no session id. The claimed
-        // message must still land somewhere codex's role prompt reads — the durable
-        // queue file (grok's channel) is never consumed for codex. No real `codex`
+        // message must still land somewhere codex's role prompt reads. No real `codex`
         // binary is spawned here: with `session_id: None` the push is never attempted.
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
@@ -685,7 +550,6 @@ mod tests {
         .unwrap();
         assert_eq!(d.action, DeliveryAction::PolledFile);
         assert_eq!(d.delivered, 1);
-        assert!(!queue_path(&paths, Some("r1"), &ub).exists());
         let body = fs::read_to_string(poll_file(&paths, Some("r1"), &ub)).unwrap();
         assert!(body.contains("New swarm messages"), "{body}");
     }
@@ -729,72 +593,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(action, DeliveryAction::PolledFile);
-        assert!(!queue_path(&paths, Some("r1"), "b").exists());
         assert!(fs::read_to_string(&path).unwrap().contains("hello"));
-    }
-
-    /// Two concurrent runs share a deterministic slot id ("b"), hence one workspace inbox,
-    /// but the durable queue must stay run-isolated: run B's flush must never surface run
-    /// A's claimed prompts. Each run enqueues into its own `queue/<run>/b.jsonl`.
-    /// Exercised through `SdkPrompt`, the surviving queue-file strategy.
-    #[test]
-    fn sdk_prompt_queue_is_run_scoped_across_identical_slot_ids() {
-        let tmp = tempdir().unwrap();
-        let paths = SparPaths::new(tmp.path());
-        // Two runs, each with the same slot id "b" fed by its own sender "a".
-        for r in ["rA", "rB"] {
-            join(&paths, Some(r), "a", Some("cli:claude"), Some("native-cli")).unwrap();
-            join(&paths, Some(r), "b", Some("cli:grok"), Some("native-cli")).unwrap();
-        }
-        chat(
-            &paths,
-            Some("rA"),
-            "a",
-            "b",
-            "for run A".to_string(),
-            MessageBudget::Chatty,
-        )
-        .unwrap();
-        chat(
-            &paths,
-            Some("rB"),
-            "a",
-            "b",
-            "for run B".to_string(),
-            MessageBudget::Chatty,
-        )
-        .unwrap();
-
-        let (ua, ub) = (agent_ref(Some("rA"), "b"), agent_ref(Some("rB"), "b"));
-        deliver(
-            &paths,
-            Some("rB"),
-            &ub,
-            DeliveryStrategy::SdkPrompt,
-            None,
-            false,
-        )
-        .unwrap();
-        deliver(
-            &paths,
-            Some("rA"),
-            &ua,
-            DeliveryStrategy::SdkPrompt,
-            None,
-            false,
-        )
-        .unwrap();
-
-        let qa = fs::read_to_string(queue_path(&paths, Some("rA"), &ua)).unwrap();
-        let qb = fs::read_to_string(queue_path(&paths, Some("rB"), &ub)).unwrap();
-        assert!(
-            qa.contains("for run A") && !qa.contains("for run B"),
-            "run A queue: {qa}"
-        );
-        assert!(
-            qb.contains("for run B") && !qb.contains("for run A"),
-            "run B queue: {qb}"
-        );
     }
 
     /// Cross-scope directed delivery (W5) through the *real* `deliver` path: a bare agent
