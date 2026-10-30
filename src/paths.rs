@@ -125,6 +125,7 @@ impl SparPaths {
     }
 
     pub fn ensure_run_dirs(&self, run_id: &str) -> Result<()> {
+        crate::runlock::ensure_not_removed(self, run_id)?;
         for dir in [
             self.run_dir(run_id),
             self.artifacts_dir(run_id),

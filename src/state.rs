@@ -801,6 +801,7 @@ impl RunState {
         let tmp = file.with_extension(format!("tmp.{}", std::process::id()));
         std::fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
         std::fs::rename(&tmp, &file).with_context(|| format!("replace {}", file.display()))?;
+        crate::runlock::note_state_written(paths, &self.id);
 
         if prev_phase != Some(self.phase) {
             let _ = crate::events::append(

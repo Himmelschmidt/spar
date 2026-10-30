@@ -109,6 +109,22 @@ fn run() -> Result<ExitCode> {
         // observe-only, so `status` can never be the thing that hid a run from you.
         auto_archive_at_launch();
     }
+    let detached_or_dry = match &command {
+        Command::Plan {
+            detach, dry_run, ..
+        }
+        | Command::Implement {
+            detach, dry_run, ..
+        }
+        | Command::Run {
+            detach, dry_run, ..
+        } => Some(*detach || *dry_run),
+        Command::Resume { detach, .. } => Some(*detach),
+        _ => None,
+    };
+    if detached_or_dry == Some(false) {
+        warn_if_tied_to_shell();
+    }
 
     match command {
         Command::Doctor { json } => doctor::run(json),
@@ -521,6 +537,23 @@ fn run() -> Result<ExitCode> {
             workflow::implement::continue_run(&paths, &cfg, &run_id)
         }
     }
+}
+
+/// A foreground orchestrator lives in the launching shell's session: a `timeout`
+/// wrapper, an ssh command or an agent's tool call ending takes it down mid-dispatch
+/// after it printed a healthy launch line. Warned, not auto-detached, because detaching
+/// changes what the command's exit code means (O115).
+fn warn_if_tied_to_shell() {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() || util::env_truthy("SPAR_DRY_RUN") {
+        return;
+    }
+    eprintln!(
+        "warning: stdin is not a terminal and --detach was not given: this orchestrator \
+         dies with the shell that launched it (a timeout wrapper, an ssh session, a tool \
+         call ending). Pass --detach, or run `spar daemon install` so abandoned runs are \
+         restarted."
+    );
 }
 
 fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
@@ -2148,6 +2181,14 @@ fn cleanup_one(
 ) -> Result<ExitCode> {
     let (paths, _) = project_ctx()?;
     let state = state::RunState::load(&paths, run_id)?;
+    // Removing a live run's worktrees kills its agents (cleanup reaps by cwd), and
+    // purging its record leaves an orchestrator writing into a directory that is gone.
+    if let Some(owner) = runlock::RunLock::owner(&paths, run_id).filter(|o| o.alive()) {
+        anyhow::bail!(
+            "run {run_id} has a live orchestrator (pid {}); `spar stop {run_id}` first",
+            owner.pid
+        );
+    }
     if if_merged {
         if let Err(why) = worktree::landed_in_base(&state) {
             anyhow::bail!("run {run_id} is not merged, nothing removed: {why}");

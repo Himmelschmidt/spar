@@ -390,6 +390,16 @@ fn is_resumable(state: &RunState) -> bool {
             && state.workflow == crate::cli::WorkflowKind::Loop)
 }
 
+/// Whether any slot was dispatched in the run's current round. Dispatch stamps
+/// `slot.round`, moves the slot off `Pending` and saves, all before it spawns, so a round
+/// with no such slot never started anything.
+fn current_round_dispatched(state: &RunState) -> bool {
+    state
+        .slots
+        .iter()
+        .any(|s| s.round == state.round && s.status != SlotStatus::Pending)
+}
+
 fn run_from_approved(
     run_id: &str,
     amendment: Option<String>,
@@ -403,6 +413,8 @@ fn run_from_approved(
     RunState::load(paths, run_id)?;
     let lock = crate::runlock::RunLock::acquire(paths, run_id)?;
     let mut state = RunState::load(paths, run_id)?;
+    // Read before anything below resets slot statuses for re-dispatch.
+    let round_dispatched = current_round_dispatched(&state);
     let resumable = is_resumable(&state);
     if !resumable {
         bail!(
@@ -551,7 +563,14 @@ fn run_from_approved(
     if from_round_gate {
         state.error = None;
     }
-    let round = state.begin_round();
+    // A round that never dispatched is still the current round, not a spent one: an
+    // orchestrator killed between opening it and spawning anything (a launching shell
+    // that exited, a quota park before dispatch) cost nothing, so re-entry reuses it.
+    let round = if state.round > 0 && !round_dispatched {
+        state.round
+    } else {
+        state.begin_round()
+    };
     if !opts.json {
         println!("run {run_id} · round {round}");
     }
@@ -981,6 +1000,27 @@ mod resumable_tests {
                 "{phase:?}"
             );
         }
+    }
+
+    /// #179: only a slot stamped with the current round and moved off `Pending` proves
+    /// the round dispatched. A slot created at round 1 and never run does not.
+    #[test]
+    fn a_round_counts_as_dispatched_only_once_a_slot_ran_in_it() {
+        let mut st = run(crate::cli::WorkflowKind::Loop, Phase::Stopped);
+        st.round = 1;
+        st.slots.push(executor::init_slot(
+            "impl",
+            "cli:claude",
+            SlotRole::Implementer,
+        ));
+        assert!(!current_round_dispatched(&st), "created, never dispatched");
+        st.slots[0].status = SlotStatus::Failed;
+        assert!(current_round_dispatched(&st), "dispatched and died");
+        st.round = 2;
+        assert!(
+            !current_round_dispatched(&st),
+            "round 2 opened, nothing ran in it"
+        );
     }
 
     /// The hazard the gate exists for: an unapproved plan must never be resumable, in any

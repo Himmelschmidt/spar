@@ -388,6 +388,12 @@ it may spend on its own.
 spar implement --run <id> --max-rounds 12   # buy more rounds; sticky on the run
 ```
 
+**A round that never dispatched is not charged.** `implement --run` re-entering a run whose
+current round never stamped a slot (the orchestrator died between opening the round and
+spawning anything, or the round parked at `quota` before dispatch) reuses that round
+number instead of opening another. Any slot dispatched in the round, even one that then
+died, makes the next re-entry a new round.
+
 - Re-entering `implement` at the ceiling with no flag gates again **before dispatching
   anything**, so a bounced re-entry costs nothing and claims no round.
 - **`stuck` outranks the ceiling.** The rotate-implementer → widen-reviewers → `stuck`
@@ -773,6 +779,19 @@ What it does not survive: a `SIGKILL` at the orchestrator's pid, a reboot, or th
 directory going away. Slots die with their orchestrator, not with your shell. If a run is
 left with no owner, `spar status` marks it `ABANDONED` and `spar resume <id>` picks it
 back up; `spar daemon` does that for you.
+
+**Without `--detach` and without a terminal, the orchestrator dies with your shell.**
+`plan`, `implement`, `run` and `resume` print `warning: stdin is not a terminal and
+--detach was not given: this orchestrator dies with the shell that launched it …` on
+stderr in that case (`timeout N spar …`, `ssh box 'spar resume …'`, an agent's tool call).
+They do not detach for you: `--detach` changes what the exit code reports, so that stays
+your choice. Dry runs do not warn.
+
+**A run deleted under its orchestrator stays deleted.** `spar cleanup <id>` (with or without
+`--purge`) refuses, exit `1`, while the run's orchestrator is alive: `spar stop <id>` first.
+If the run dir or its `state.json` disappears anyway, the orchestrator's next write fails
+with `run <id> was removed from disk while this orchestrator held it` and it exits `1`
+without recreating the run or dispatching anything more.
 
 **Worktrees are not reclaimed on their own.** A successful run ends at the **ship gate**,
 not at `done`, and `auto_cleanup` is off by default, so a project accumulates one worktree

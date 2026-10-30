@@ -329,3 +329,182 @@ fn a_ceiling_killed_implementer_with_new_commits_is_recovered() {
     assert_eq!(st["round"], 1, "{st}");
     assert_eq!(st["phase"], "awaiting_ship_confirm", "{st}");
 }
+
+fn set_phase(proj: &Path, run_id: &str, phase: &str) {
+    let mut state = read_state(proj, run_id);
+    state["phase"] = serde_json::Value::String(phase.into());
+    write_state(proj, run_id, &state);
+}
+
+/// Make this test process the run's live orchestrator, as far as the lock file says.
+fn hold_lock(proj: &Path, run_id: &str) {
+    let lock = proj
+        .join(".spar/runs")
+        .join(run_id)
+        .join("orchestrator.lock");
+    std::fs::write(lock, std::process::id().to_string()).unwrap();
+}
+
+/// #179: purging a run under its live orchestrator left that orchestrator respawning
+/// slots into a directory that was gone. Cleanup refuses while one is alive.
+#[test]
+fn cleanup_refuses_a_run_with_a_live_orchestrator() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    init_repo(&proj);
+    let run_id = implement_dry_run(&proj);
+    hold_lock(&proj, &run_id);
+
+    let out = spar_cmd()
+        .current_dir(&proj)
+        .args(["cleanup", &run_id, "--purge"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("live orchestrator"),
+        "{out:?}"
+    );
+    assert!(state_path(&proj, &run_id).is_file());
+}
+
+/// #179: re-entry after an orchestrator died between opening a round and dispatching
+/// anything in it reuses that round instead of charging another.
+#[test]
+fn reentry_reuses_a_round_that_never_dispatched() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    init_repo(&proj);
+    let run_id = implement_dry_run(&proj);
+    let mut state = read_state(&proj, &run_id);
+    assert_eq!(state["round"], 1);
+    state["round"] = serde_json::json!(2);
+    state["phase"] = serde_json::json!("stopped");
+    write_state(&proj, &run_id, &state);
+
+    spar_cmd()
+        .current_dir(&proj)
+        .args(["implement", "--run", &run_id, "--dry-run", "--json"])
+        .assert()
+        .code(2);
+    assert_eq!(
+        read_state(&proj, &run_id)["round"],
+        2,
+        "round 2 never dispatched"
+    );
+
+    set_phase(&proj, &run_id, "stopped");
+    spar_cmd()
+        .current_dir(&proj)
+        .args(["implement", "--run", &run_id, "--dry-run", "--json"])
+        .assert()
+        .code(2);
+    assert_eq!(
+        read_state(&proj, &run_id)["round"],
+        3,
+        "round 2 did dispatch, so the next re-entry is a new round"
+    );
+}
+
+/// #179: a run whose stdin is not a terminal and that was not detached is told, loudly,
+/// that it dies with its shell. It is not detached behind the caller's back.
+#[test]
+fn a_foreground_launch_without_a_tty_warns_that_it_dies_with_the_shell() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    init_repo(&proj);
+    let run_id = implement_dry_run(&proj);
+    set_phase(&proj, &run_id, "dispatch");
+    hold_lock(&proj, &run_id);
+
+    let out = spar_cmd()
+        .current_dir(&proj)
+        .args(["resume", &run_id])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("dies with the shell"), "{err}");
+
+    let out = spar_cmd()
+        .current_dir(&proj)
+        .args(["resume", &run_id, "--detach"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("dies with the shell"), "{err}");
+}
+
+/// A fake `muse` whose implementer deletes its own run dir mid-dispatch, the way a purge
+/// from another shell does.
+fn install_purging_muse(bin: &Path) {
+    std::fs::create_dir_all(bin).unwrap();
+    let p = bin.join("muse");
+    std::fs::write(
+        &p,
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo "fake-muse 0"; exit 0; fi
+PROMPT_FILE=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--prompt-file" ]; then PROMPT_FILE="$a"; fi
+  prev="$a"
+done
+echo "dispatch" >> "$SPAR_TEST_MUSE_STATE/calls"
+rm -rf "$(dirname "$PROMPT_FILE")"
+exit 0
+"#,
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// #179: an orchestrator whose run dir disappears stops at its next write instead of
+/// recreating the run and dispatching more slots into it.
+#[test]
+fn an_orchestrator_whose_run_dir_is_deleted_exits_without_recreating_it() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    init_repo(&proj);
+    std::fs::write(proj.join("spar.toml"), "[suite]\nenabled = false\n").unwrap();
+    let bin = tmp.path().join("bin");
+    install_purging_muse(&bin);
+    let calls_dir = tmp.path().join("muse-state");
+    std::fs::create_dir_all(&calls_dir).unwrap();
+
+    let out = spar_cmd()
+        .current_dir(&proj)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("SPAR_TEST_MUSE_STATE", &calls_dir)
+        .args([
+            "implement",
+            "-t",
+            "anything",
+            "--providers",
+            "cli:muse",
+            "--fleet",
+            "small",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("removed from disk"), "{err}");
+    let calls = std::fs::read_to_string(calls_dir.join("calls")).unwrap();
+    assert_eq!(
+        calls.lines().count(),
+        1,
+        "no slot dispatched after: {calls}"
+    );
+    let runs: Vec<_> = std::fs::read_dir(proj.join(".spar/runs"))
+        .map(|d| d.flatten().collect())
+        .unwrap_or_default();
+    assert!(runs.is_empty(), "the run dir was recreated: {runs:?}");
+}
