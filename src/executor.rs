@@ -366,9 +366,10 @@ fn owns_cwd(state: &RunState, slot_id: &str, cwd: &Path) -> bool {
 }
 
 /// Read this slot's captured native session id when the role allows a resume.
-/// Judging roles (`Reviewer`, `Tester`, `PlanCritic`) always dispatch cold: their
-/// verdict judges the current commit, and reopening the session that already
-/// delivered it cannot re-judge. The marker file is left alone (the implementer
+/// Judging roles (`Reviewer`, `Tester`, `PlanCritic`) and the `TestAuthor` always
+/// dispatch cold: a judging verdict judges the current commit, and reopening the
+/// session that already delivered it cannot re-judge; a resumed test author on a
+/// replan answers "already complete" instead of writing the fresh contract. The marker file is left alone (the implementer
 /// path still needs the mechanism); it is simply not read here. Both native
 /// dispatch paths consult this one predicate so they cannot drift apart.
 fn prior_session_for_role(
@@ -7114,7 +7115,12 @@ mod tests {
             Some("sess-1"),
             "the implementer still resumes its prior session"
         );
-        for role in [SlotRole::Reviewer, SlotRole::Tester, SlotRole::PlanCritic] {
+        for role in [
+            SlotRole::Reviewer,
+            SlotRole::Tester,
+            SlotRole::PlanCritic,
+            SlotRole::TestAuthor,
+        ] {
             assert_eq!(
                 prior_session_for_role(&paths, "run1", "slotA", "shell", role),
                 None,

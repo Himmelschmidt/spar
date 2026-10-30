@@ -427,7 +427,8 @@ on — never a restatement of the plan or contract, which the next round is hand
   backend 404 after real work is retried with backoff through that same resume instead
   of failing the slot. A resume the vendor answers with a fresh session (exit 0, a new
   id) is noted in the run's events, not retried. O52's general default is unchanged
-  for every other provider.
+  for every other provider. Whatever the provider, reviewer, tester, plan-critic and
+  test-author slots never resume: they dispatch cold every round and every replan (O89).
 
 For legs that already exist, `spar link <leg> --to <run>` records the grouping
 (`parent_run`). spar never infers it — pairing runs by task text would merge unrelated
