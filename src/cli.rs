@@ -700,6 +700,20 @@ pub enum ProviderAction {
         #[arg(long)]
         json: bool,
     },
+    /// Make one cheap real call per provider and clear or set its quota state from the
+    /// answer. Never clears a manual pause.
+    Probe {
+        /// Provider ref (`cli:codex`, `claude`). Exactly one of this or `--all`.
+        name: Option<String>,
+        /// Probe every installed CLI adapter.
+        #[arg(long, conflicts_with = "name")]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+        /// Show the call each probe would make; spawn nothing, write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Remove spar's agy statusline wrapper and restore the user's original statusline.
     AgyStatuslineUninstall,
 }

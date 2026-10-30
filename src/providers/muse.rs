@@ -105,7 +105,11 @@ impl ProviderAdapter for MuseAdapter {
     // plane documents and exits 0 identically with and without user auth
     // (verified with an empty HOME); `muse auth` is set-only (mutating), and
     // `muse sandbox` can set up the sandbox rather than just check it. Nothing
-    // local-only answers "would a dispatch start". Default (Unknown) stands.
+    // local-only answers "would a dispatch start". `muse usage --json` (1.4.14)
+    // does answer it without a model turn (``not logged in: run `muse login`
+    // first``, exit 1), but it is a network call, which a readiness probe run
+    // on every `detect_all` must not make. Default (Unknown) stands; `spar
+    // provider probe cli:muse` makes a real call when one is needed.
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {

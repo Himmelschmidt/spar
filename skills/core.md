@@ -53,14 +53,57 @@ failed, with the probe's own one-line message, e.g. pi with no OpenRouter key),
 `missing` (not on PATH). `--json` carries the same verdict as `readiness` with values
 `healthy` / `unhealthy` / `unknown`, plus `readiness_message` (ANSI-stripped, capped at
 300 chars) when unhealthy. `doctor` exits failure only when no usable provider remains,
-so one unhealthy provider alongside working ones does not block a run. Today only
-`cli:pi` wires a probe (`pi auth check --provider openrouter --json --no-refresh`, or
-`--model <SPAR_PI_MODEL routed>` when that is set; detection is per adapter, so it cannot
-see a slot's own `@model`); the other adapters report unknown and stay available. Limit:
-the probe catches a missing credential, not a dead one: a key the provider would reject
-still reports healthy and fails at dispatch, which is all a local-only, no-quota check
-can see. An `unhealthy` provider is still eligible
-for dispatch; doctor warns, it does not exclude.
+so one unhealthy provider alongside working ones does not block a run. Probes wired:
+`cli:pi` runs `pi auth check --provider openrouter --json --no-refresh` (or `--model
+<SPAR_PI_MODEL routed>` when that is set; detection is per adapter, so it cannot see a
+slot's own `@model`), which catches a missing key, not a dead one; (O107) `cli:claude` runs `claude auth status` with nonessential traffic off (logged out) and
+reads its `.credentials.json` for an expired refresh token; `cli:codex` runs `codex
+login status` (logged out). grok, muse and agy have no local check that fails on a dead
+login, so they report unknown; use `spar provider probe <ref>` for a real call. Limit:
+no local probe sees a token revoked server-side; that surfaces at dispatch as an auth
+fault. An `unhealthy` provider is still eligible for dispatch; doctor warns, it does not
+exclude.
+
+**A reviewer that cannot run is not a verdict (O103).** In the implement loop, a
+reviewer dispatch that fails because the provider could not serve it (rate limit, auth
+fault, a CLI that never started, or a native CLI that exited having run no tools, e.g.
+codex unable to spawn `codex-code-mode-host`) is an infrastructure failure. spar retries
+that seat once on its declared `--backup` (renamed for the new vendor), else on the next
+eligible panel candidate. If that also cannot run, the run parks at `quota` (exit `4`)
+with `review slot ... could not run on <provider>: <reason>. the provider could not
+serve this reviewer; no verdict recorded`, no fix round is spent, and the `request_changes` stub spar used to
+salvage for it is removed. A reviewer that ran (tools > 0) and still produced no review
+keeps the old fail-closed `request_changes`.
+
+**Probing quota state (O105).** `.spar/quota.json` records failures; it can be stale.
+`spar provider list` (and `--json`: `paused_since`, `pause_age_secs`, `paused_until`)
+shows the age and end of every pause, including ones on `api:` refs. `spar provider
+probe <ref>` (or `--all` for every installed CLI) makes one tiny real call through the
+adapter (`Reply with the single word OK`, the ref's `@model` if any, 120s cap) and
+writes the answer: `healthy` clears a quota pause, `quota` pauses (until the stated
+reset when claude states one), `auth` and `failed` leave the store alone. A manual pause
+is never cleared by a probe. `--dry-run` (or `SPAR_DRY_RUN=1`) prints the call each
+probe would make and spawns nothing. Exit is `0` whatever the verdicts; read them from
+`--json`. A declared `--backup` held on a quota pause gets the same probe before a run
+skips it (O106): a stale pause no longer benches a working backup. A manually paused
+backup is never probed, and `--dry-run` runs never probe. Pause state is re-read before
+every implementer and reviewer dispatch, not only at run start: pausing a provider while
+a run is live moves its next seat to the declared backup (a reviewer seat is renamed for
+the new vendor) or parks the run at `quota` (exit `4`) when there is none. Only a manual
+pause or a trusted quota pause (a typed or clear rejection line) does this; a heuristic
+pause from a stray "429" or "quota" in a failed log steers the next run but never parks
+or reseats a live one. Like the run-start gate, this is skipped under `--dry-run`.
+
+**Auth faults (O104).** A dispatch that dies on a refused credential (claude's `401 ...
+OAuth access token has been revoked` or `Please run /login`, codex `Not logged in`, muse
+``not logged in: run `muse login` first``, grok `You are not authenticated.`,
+`invalid_grant`) is an auth fault, not a work failure and not a quota hit. spar waits
+20s and re-dispatches once (a token refreshed elsewhere usually lands within seconds),
+then moves the seat to its `--backup` like any environmental stop, and otherwise parks
+the run at `quota` (exit `4`) with `auth: <provider> rejected the credential (...)` in
+`error`. The slot carries `auth_fault: true`. An auth fault never pauses the provider:
+fix the login, then `implement --run <id>`. Only the last 15 non-empty log lines are
+read, so an agent discussing login code mid-turn is not mistaken for one.
 
 **agy note.** agy runs headless with `--output-format stream-json`, so spar parses its tools,
 text and tokens directly from that structured stream. What the stream doesn't carry — the
@@ -74,9 +117,13 @@ cleanly just before spar's own backstop would kill it (agy's own default is unli
 
 **Pause / cooldown.** A provider is paused manually (`spar provider pause <ref>`) or
 automatically when a slot hits a rate-limit signal. A slot that was killed (signal, or exit
-143/137) never pauses its provider on log text; only an adapter's typed rejection counts. Pauses **auto-recover** ~30 min after
+143/137) never pauses its provider on log text; only an adapter's typed rejection counts. Quota pauses **auto-recover** ~30 min after
 they were set (or at an explicit cooldown reset), so the provider is re-probed rather than
-staying dead; `spar provider resume <ref>` clears one immediately. A paused provider is
+staying dead; a manual pause never lapses on that timer: it holds until its `--until`, or
+until `spar provider resume <ref>`, and a quota event never overwrites it (O105). Only
+pauses set by this version are sticky (the record carries `sticky: true`); a manual pause
+written before it keeps the old ~30-minute lapse.
+`spar provider resume <ref>` clears either immediately. A paused provider is
 never silently swapped into another role: `plan`/`implement` exit `4` (quota) naming the
 paused ref so per-role assignment stays exactly what you specified.
 
