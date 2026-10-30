@@ -127,6 +127,13 @@ require_all_criteria = true
 max = 8
 carry_forward_chars = 4000
 
+# Implementer checkpoints: after every dispatch the worktree (commits and uncommitted edits)
+# is kept at the local ref refs/spar-checkpoint/<id>/<slot>. `push = true` also publishes
+# it to origin, where ANYONE who can read origin can fetch it (a force-push does not
+# retract objects). Leave it off for a public remote.
+[checkpoint]
+push = false
+
 # Plan-phase critic. `--without critic` is the per-run way to drop just this seat.
 [critic]
 enabled = true

@@ -66,6 +66,8 @@ pub struct Config {
     #[serde(default)]
     pub rounds: RoundsConfig,
     #[serde(default)]
+    pub checkpoint: CheckpointConfig,
+    #[serde(default)]
     pub gates: GatesConfig,
     #[serde(default)]
     pub autonomy: AutonomyLevel,
@@ -953,6 +955,16 @@ impl Default for RoundsConfig {
     }
 }
 
+/// Implementer checkpoints (O112). The local `refs/spar-checkpoint/<run>/<slot>` is
+/// always written. `push` also publishes it to `origin`, where anyone who can read the
+/// remote can fetch it and a later force-push does not retract the objects: so off unless
+/// the operator turns it on. Frozen into the run config like everything else (O27).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CheckpointConfig {
+    #[serde(default)]
+    pub push: bool,
+}
+
 /// A plan round plus an implement round plus the whole 3-fix budget is round 5, which
 /// covers 95% of the measured corpus (188 of 197 runs used 3 fix rounds or fewer). 8
 /// leaves room for one replan or one implementer rotation on top of that and still stops
@@ -1016,6 +1028,7 @@ impl Default for Config {
             cli_role_keys: std::collections::BTreeSet::new(),
             fleet_reviewer_override: None,
             rounds: RoundsConfig::default(),
+            checkpoint: CheckpointConfig::default(),
             gates: GatesConfig::default(),
             autonomy: AutonomyLevel::default(),
             message_budget: MessageBudget::default(),
@@ -1066,6 +1079,7 @@ struct ConfigFile {
     spec: Option<SpecConfigFile>,
     critic: Option<CriticConfigFile>,
     rounds: Option<RoundsConfigFile>,
+    checkpoint: Option<CheckpointConfigFile>,
     gates: Option<GatesConfigFile>,
     autonomy: Option<AutonomyLevel>,
     message_budget: Option<MessageBudget>,
@@ -1193,6 +1207,11 @@ struct CriticConfigFile {
 struct RoundsConfigFile {
     max: Option<u32>,
     carry_forward_chars: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct CheckpointConfigFile {
+    push: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1803,6 +1822,9 @@ impl Config {
             if let Some(v) = r.carry_forward_chars {
                 self.rounds.carry_forward_chars = v;
             }
+        }
+        if let Some(v) = file.checkpoint.as_ref().and_then(|c| c.push) {
+            self.checkpoint.push = v;
         }
         if let Some(g) = &file.gates {
             if let Some(v) = g.plan {

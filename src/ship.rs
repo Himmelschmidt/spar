@@ -441,6 +441,12 @@ pub fn ship(
     json: bool,
     opts: &ShipOpts,
 ) -> Result<ExitCode> {
+    // Loaded first so a mistyped id fails without the lock minting a run dir. The lock is
+    // then held through `Shipping`: a push that runs past `abandon_after_secs` must read
+    // as owned, or the daemon restarts the run and re-dispatches its implementer while
+    // the push is still going (O117).
+    RunState::load(paths, run_id)?;
+    let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
     let mut state = RunState::load(paths, run_id)?;
     let overridden = match opts.override_reason {
         Some(reason) => Some(begin_override(paths, &state, reason)?),

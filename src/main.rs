@@ -2,6 +2,7 @@ mod api;
 mod backup;
 mod brief;
 mod bus;
+mod checkpoint;
 mod cli;
 mod config;
 mod daemon;
@@ -109,6 +110,22 @@ fn run() -> Result<ExitCode> {
         // Launch is the one moment a mutation like this belongs: read commands must stay
         // observe-only, so `status` can never be the thing that hid a run from you.
         auto_archive_at_launch();
+    }
+    let detached_or_dry = match &command {
+        Command::Plan {
+            detach, dry_run, ..
+        }
+        | Command::Implement {
+            detach, dry_run, ..
+        }
+        | Command::Run {
+            detach, dry_run, ..
+        } => Some(*detach || *dry_run),
+        Command::Resume { detach, .. } => Some(*detach),
+        _ => None,
+    };
+    if detached_or_dry == Some(false) {
+        warn_if_tied_to_shell();
     }
 
     match command {
@@ -498,17 +515,25 @@ fn run() -> Result<ExitCode> {
             merged,
             json,
             purge,
+            purge_artifacts,
             force,
+            if_merged,
         } => cleanup_cmd(
             run_id.as_deref(),
             all,
             older_than.as_deref(),
             merged,
             json,
-            purge,
+            Purge::from_flags(purge, purge_artifacts),
             force,
+            if_merged,
         ),
-        Command::Reclaim { run_id, all, json } => reclaim_cmd(run_id.as_deref(), all, json),
+        Command::Reclaim {
+            run_id,
+            all,
+            halted,
+            json,
+        } => reclaim_cmd(run_id.as_deref(), all, halted, json),
         Command::Archive {
             run_id,
             all,
@@ -534,20 +559,41 @@ fn run() -> Result<ExitCode> {
             SkillsCmd::List { json } => skills::run(skills::SkillsAction::List { json }),
             SkillsCmd::Get { name } => skills::run(skills::SkillsAction::Get { name }),
         },
-        Command::Daemon { cmd } => {
-            let (paths, _) = project_ctx()?;
-            match cmd {
-                cli::DaemonCmd::Start { foreground } => daemon::start(&paths, foreground),
-                cli::DaemonCmd::Stop => daemon::stop(&paths),
-                cli::DaemonCmd::Status { json } => daemon::status(&paths, json),
+        Command::Daemon { cmd } => match cmd {
+            cli::DaemonCmd::Install => daemon::install(),
+            cli::DaemonCmd::Uninstall => daemon::uninstall(),
+            cli::DaemonCmd::Start {
+                all_projects: true, ..
+            } => daemon::supervise_all(),
+            cli::DaemonCmd::Start { foreground, .. } => {
+                daemon::start(&project_ctx()?.0, foreground)
             }
-        }
+            cli::DaemonCmd::Stop => daemon::stop(&project_ctx()?.0),
+            cli::DaemonCmd::Status { json } => daemon::status(&project_ctx()?.0, json),
+        },
         Command::InternalContinue { run_id } => {
             let (paths, _) = project_ctx()?;
             let cfg = Config::for_run(&paths, &run_id)?;
             workflow::implement::continue_run(&paths, &cfg, &run_id)
         }
     }
+}
+
+/// A foreground orchestrator lives in the launching shell's session: a `timeout`
+/// wrapper, an ssh command or an agent's tool call ending takes it down mid-dispatch
+/// after it printed a healthy launch line. Warned, not auto-detached, because detaching
+/// changes what the command's exit code means (O115).
+fn warn_if_tied_to_shell() {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() || util::env_truthy("SPAR_DRY_RUN") {
+        return;
+    }
+    eprintln!(
+        "warning: stdin is not a terminal and --detach was not given: this orchestrator \
+         dies with the shell that launched it (a timeout wrapper, an ssh session, a tool \
+         call ending). Pass --detach, or run `spar daemon install` so abandoned runs are \
+         restarted."
+    );
 }
 
 fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
@@ -1447,12 +1493,14 @@ fn phase_at_rest(phase: state::Phase) -> bool {
 }
 
 /// Settle slots an orchestrator left at `running` when it died, on runs that already
-/// exist. The backfill counterpart of the reconciliation `stop` and resume now do.
+/// exist, and park an abandoned in-flight run at `stopped`. The backfill counterpart of
+/// the reconciliation `stop` and resume now do.
 ///
 /// Deliberately narrow, and deliberately **not** part of `spar cleanup`: the only writes
-/// are `slots[].status` and `slots[].error`, patched into the existing `state.json`
-/// document. It never resolves, reads or removes a worktree path, never touches
-/// `logs/` or `artifacts/`, and never signals a process. A worktree is often the only
+/// are `slots[].status`, `slots[].error` and `phase`, patched into the existing
+/// `state.json` document. It never resolves, reads or removes a worktree path, never
+/// touches `logs/` or `artifacts/`, and never signals a process (a slot process still
+/// running is `spar stop --abandoned`'s to reap). A worktree is often the only
 /// copy of a slot's work, and this command wears a housekeeping name.
 fn reconcile_state_cmd(
     run_id: Option<&str>,
@@ -1474,6 +1522,7 @@ fn reconcile_state_cmd(
     };
 
     let mut changes = Vec::new();
+    let mut phases = Vec::new();
     let mut skipped = Vec::new();
     for id in ids {
         let Ok(state) = state::RunState::load(&paths, &id) else {
@@ -1488,11 +1537,34 @@ fn reconcile_state_cmd(
             skipped.push(serde_json::json!({ "run_id": id, "reason": "orchestrator is live" }));
             continue;
         }
+        // In flight with nobody driving it: the phase is a snapshot of a process that is
+        // gone, so it is parked where `spar stop` would park it (O117).
+        // Not while its slot processes still run: parking then resuming would put a
+        // second set of agents on the same worktrees. Reaping is `stop --abandoned`'s job.
+        let mut parked_from = state.abandoned(&paths).then_some(state.phase);
+        if parked_from.is_some() {
+            let alive = state::live_slot_pids(&paths, &state);
+            if !alive.is_empty() {
+                skipped.push(serde_json::json!({
+                    "run_id": id,
+                    "reason": format!(
+                        "abandoned, but {} slot process(es) still run; `spar stop --abandoned` reaps and parks it",
+                        alive.len()
+                    ),
+                }));
+                parked_from = None;
+            }
+        }
+        if let Some(from) = parked_from {
+            phases.push(serde_json::json!({
+                "run_id": id,
+                "from": serde_json::to_value(from)?,
+                "to": serde_json::to_value(parked_phase(from))?,
+            }));
+        }
         let before: Vec<state::SlotStatus> = state.slots.iter().map(|s| s.status).collect();
         let mut settled = state;
-        if !settled.reconcile_dead_slots(&paths, owner, state::ORPHANED_SLOT) {
-            continue;
-        }
+        let slots_settled = settled.reconcile_dead_slots(&paths, owner, state::ORPHANED_SLOT);
         let mut patch = Vec::new();
         for (slot, was) in settled.slots.iter().zip(before) {
             if slot.status == was {
@@ -1511,8 +1583,8 @@ fn reconcile_state_cmd(
                 "error": slot.error,
             }));
         }
-        if apply {
-            patch_slot_status(&paths, &id, &patch)?;
+        if apply && (slots_settled || parked_from.is_some()) {
+            patch_state(&paths, &id, &patch, parked_from)?;
         }
     }
 
@@ -1522,6 +1594,7 @@ fn reconcile_state_cmd(
             serde_json::to_string_pretty(&serde_json::json!({
                 "applied": apply,
                 "changes": changes,
+                "phases": phases,
                 "skipped": skipped,
             }))?
         );
@@ -1534,7 +1607,15 @@ fn reconcile_state_cmd(
             sk["reason"].as_str().unwrap_or_default()
         );
     }
-    if changes.is_empty() {
+    for p in &phases {
+        println!(
+            "{}: phase {} -> {} (no live orchestrator)",
+            p["run_id"].as_str().unwrap_or_default(),
+            p["from"].as_str().unwrap_or_default(),
+            p["to"].as_str().unwrap_or_default(),
+        );
+    }
+    if changes.is_empty() && phases.is_empty() {
         println!("nothing to reconcile");
         return Ok(ExitCode::Success);
     }
@@ -1552,27 +1633,34 @@ fn reconcile_state_cmd(
         );
     }
     if apply {
-        println!("updated {} slot(s)", changes.len());
+        println!(
+            "updated {} slot(s), parked {} run(s) at stopped",
+            changes.len(),
+            phases.len()
+        );
     } else {
         println!(
-            "{} slot(s) would change; re-run with --apply",
-            changes.len()
+            "{} slot(s) and {} run phase(s) would change; re-run with --apply",
+            changes.len(),
+            phases.len()
         );
     }
     Ok(ExitCode::Success)
 }
 
-/// Patch `status` (and `error`, where one was derived) into the run's existing
-/// `state.json` document.
+/// Patch slot `status` (and `error`, where one was derived) into the run's existing
+/// `state.json` document, and with `parked_from`, its `phase` to `parked_phase`.
 ///
 /// Value-level rather than typed, so a field spar does not model survives the write; the
 /// document is re-read here rather than re-serialized from the caller's snapshot. Only
-/// those two fields change *in content*; the round trip does re-sort keys alphabetically
+/// those fields change *in content* (`updated_at` included: parking keeps the run's true
+/// age for `cleanup --older-than`); the round trip does re-sort keys alphabetically
 /// until the next `RunState::save` writes struct order back.
-fn patch_slot_status(
+fn patch_state(
     paths: &paths::SparPaths,
     run_id: &str,
     patch: &[(String, serde_json::Value, Option<String>)],
+    parked_from: Option<state::Phase>,
 ) -> Result<()> {
     let file = paths.state_file(run_id);
     let mut doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file)?)?;
@@ -1588,9 +1676,29 @@ fn patch_slot_status(
             slot["error"] = serde_json::Value::String(e.clone());
         }
     }
+    if let Some(from) = parked_from {
+        doc["phase"] = serde_json::to_value(parked_phase(from))?;
+    }
     std::fs::write(&file, serde_json::to_string_pretty(&doc)?)
         .map_err(|e| anyhow::anyhow!("write {}: {e}", file.display()))?;
+    if let Some(from) = parked_from {
+        let _ = events::append(
+            paths,
+            run_id,
+            &events::Event::phase(parked_phase(from), Some(from)),
+        );
+    }
     Ok(())
+}
+
+/// Where an abandoned in-flight run is parked. A run that died shipping already finished
+/// its rounds, so it goes back to the ship gate; `stopped` would make the next resume
+/// buy a new round for work that is done (O117).
+fn parked_phase(from: state::Phase) -> state::Phase {
+    match from {
+        state::Phase::Shipping => state::Phase::AwaitingShipConfirm,
+        _ => state::Phase::Stopped,
+    }
 }
 
 /// Observe-only: the returned state is reconciled against on-disk markers, never written back.
@@ -1824,16 +1932,24 @@ fn sync_prs_cmd(run_id: Option<&str>, all: bool, json: bool, dry_run: bool) -> R
 /// the questions that come with that, this removes only bytes a build regenerates. Making
 /// it a `cleanup` flag would give an operator with a standing rule against autonomous
 /// sweeps a back door into one.
-fn reclaim_cmd(run_id: Option<&str>, all: bool, json: bool) -> Result<ExitCode> {
+fn reclaim_cmd(run_id: Option<&str>, all: bool, halted: bool, json: bool) -> Result<ExitCode> {
     let (paths, _) = project_ctx()?;
     let reaps = match (run_id, all) {
         (Some(_), true) => anyhow::bail!("pass a run id or --all, not both"),
         (None, false) => anyhow::bail!("usage: spar reclaim <run_id> | spar reclaim --all"),
         (Some(id), false) => {
             let state = state::RunState::load(&paths, id)?;
-            if !(state.phase.is_terminal() || state.phase == state::Phase::Stopped) {
+            if state::orchestrator_alive(&paths, id) {
+                anyhow::bail!("run {id} has a live orchestrator; its build cache is in use");
+            }
+            if !worktree::cache_reclaimable(&paths, &state, halted) {
+                let hint = if halted {
+                    ""
+                } else {
+                    "; pass --halted to reclaim a gated or abandoned run"
+                };
                 anyhow::bail!(
-                    "run {id} is still running ({:?}) — its build cache is in use",
+                    "run {id} is still running ({:?}); its build cache is in use{hint}",
                     state.phase
                 );
             }
@@ -1842,7 +1958,7 @@ fn reclaim_cmd(run_id: Option<&str>, all: bool, json: bool) -> Result<ExitCode> 
                 &worktree::LiveCwds::snapshot(),
             )]
         }
-        (None, true) => worktree::reap_finished_caches(&paths, None)?,
+        (None, true) => worktree::reap_finished_caches(&paths, None, halted)?,
     };
     let freed: u64 = reaps.iter().map(|r| r.freed_bytes).sum();
     if json {
@@ -2010,14 +2126,65 @@ fn archive_cmd(
     Ok(ExitCode::Success)
 }
 
+/// What `cleanup` deletes beyond worktrees (O113).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Purge {
+    Nothing,
+    /// The run record, keeping `artifacts/`.
+    Record,
+    /// The whole run dir.
+    Everything,
+}
+
+impl Purge {
+    fn from_flags(purge: bool, purge_artifacts: bool) -> Self {
+        match (purge, purge_artifacts) {
+            (_, true) => Purge::Everything,
+            (true, false) => Purge::Record,
+            (false, false) => Purge::Nothing,
+        }
+    }
+}
+
+/// Delete a run's record. `artifacts/` survives a `Purge::Record`: merge decisions are
+/// made from the reviews and suite report in it, and a reaped run is exactly the one
+/// whose merge someone may still need to reconstruct.
+fn purge_run_dir(paths: &paths::SparPaths, run_id: &str, purge: Purge) -> Result<()> {
+    let dir = paths.run_dir(run_id);
+    if purge == Purge::Nothing || !dir.is_dir() {
+        return Ok(());
+    }
+    if purge == Purge::Everything {
+        std::fs::remove_dir_all(&dir)?;
+        return Ok(());
+    }
+    let artifacts = paths.artifacts_dir(run_id);
+    for entry in std::fs::read_dir(&dir)? {
+        let path = entry?.path();
+        if path == artifacts {
+            continue;
+        }
+        if path.is_dir() && !path.is_symlink() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    let _ = std::fs::remove_dir(&artifacts);
+    let _ = std::fs::remove_dir(&dir);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cleanup_cmd(
     run_id: Option<&str>,
     all: bool,
     older_than: Option<&str>,
     merged: bool,
     json: bool,
-    purge: bool,
+    purge: Purge,
     force: bool,
+    if_merged: bool,
 ) -> Result<ExitCode> {
     // No project-wide force. A sweep decides *for you* which runs it touches, so pairing
     // it with an override that ignores unsaved work is how one command destroys work
@@ -2025,8 +2192,13 @@ fn cleanup_cmd(
     if force && all {
         anyhow::bail!("--force applies to an explicit run id, not --all");
     }
+    if if_merged && all {
+        anyhow::bail!(
+            "--if-merged applies to an explicit run id; the sweep's evidence is --merged"
+        );
+    }
     match (run_id, all) {
-        (Some(id), false) => cleanup_one(id, json, purge, force),
+        (Some(id), false) => cleanup_one(id, json, purge, force, if_merged),
         (None, true) => cleanup_sweep(older_than, merged, json, purge),
         (Some(_), true) => anyhow::bail!("pass a run id or --all, not both"),
         (None, false) => anyhow::bail!("usage: spar cleanup <run_id> | spar cleanup --all"),
@@ -2040,7 +2212,7 @@ fn cleanup_sweep(
     older_than: Option<&str>,
     merged: bool,
     json: bool,
-    purge: bool,
+    purge: Purge,
 ) -> Result<ExitCode> {
     let (paths, _) = project_ctx()?;
     let min_idle = older_than.map(util::parse_duration).transpose()?;
@@ -2087,22 +2259,21 @@ fn cleanup_sweep(
         // `cleanup <id> --force` reaches it later, and it carries base_ref/base_commit and
         // plan.md; deleting it strands the very work the veto just saved.
         let kept_any = cleaned.iter().any(|c| c.skipped.is_some());
-        if purge && !kept_any {
-            let dir = paths.run_dir(&summary.id);
+        let purged = purge != Purge::Nothing && !kept_any;
+        if purged {
             history::append(&paths, &state, history::Trigger::Purge);
-            if dir.is_dir() {
-                std::fs::remove_dir_all(&dir)?;
-            }
+            purge_run_dir(&paths, &summary.id, purge)?;
         }
         swept.push(serde_json::json!({
             "run_id": summary.id,
             "phase": format!("{:?}", state.phase),
             "idle_secs": idle.as_secs(),
             "worktrees": cleaned,
-            "purged": purge,
+            "purged": purged,
+            "artifacts_kept": purged && purge == Purge::Record,
         }));
     }
-    if purge {
+    if purge != Purge::Nothing {
         worktree::prune_empty_spar_parents(&paths)?;
     }
     if json {
@@ -2173,22 +2344,62 @@ fn cleanup_sweep(
     Ok(ExitCode::Success)
 }
 
-fn cleanup_one(run_id: &str, json: bool, purge: bool, force: bool) -> Result<ExitCode> {
+fn cleanup_one(
+    run_id: &str,
+    json: bool,
+    purge: Purge,
+    force: bool,
+    if_merged: bool,
+) -> Result<ExitCode> {
     let (paths, _) = project_ctx()?;
+    // What an earlier `--purge` left: `artifacts/` and no record. Nothing else is there to
+    // reap, and no record means no orchestrator could hold it.
+    if !paths.state_file(run_id).exists() && paths.run_dir(run_id).is_dir() {
+        if purge != Purge::Everything {
+            anyhow::bail!(
+                "run {run_id} has no record left, only {}; remove it with --purge-artifacts",
+                paths.artifacts_dir(run_id).display()
+            );
+        }
+        std::fs::remove_dir_all(paths.run_dir(run_id))?;
+        worktree::prune_empty_spar_parents(&paths)?;
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({ "run_id": run_id, "removed": 0, "purged": true, "worktrees": [] })
+            );
+        } else {
+            println!("purged the artifacts left for {run_id}");
+        }
+        return Ok(ExitCode::Success);
+    }
     let state = state::RunState::load(&paths, run_id)?;
-    let cleaned = worktree::cleanup_run(&state, force)?;
+    // Removing a live run's worktrees kills its agents (cleanup reaps by cwd), and
+    // purging its record leaves an orchestrator writing into a directory that is gone.
+    if let Some(owner) = runlock::RunLock::owner(&paths, run_id).filter(|o| o.alive()) {
+        anyhow::bail!(
+            "run {run_id} has a live orchestrator (pid {}); `spar stop {run_id}` first",
+            owner.pid
+        );
+    }
+    if if_merged {
+        if let Err(why) = worktree::landed_in_base(&state) {
+            anyhow::bail!("run {run_id} is not merged, nothing removed: {why}");
+        }
+    }
+    // `--if-merged` has just shown the work is in the base, so the ancestry veto (which
+    // reads every squash-merged commit as unmerged) is overridden the way `--force` does,
+    // archive included.
+    let cleaned = worktree::cleanup_run(&state, force || if_merged)?;
     let kept_any = cleaned.iter().any(|c| c.skipped.is_some());
     if let Some(session) = &state.tmux_session {
         let _ = tmux::kill_session(session);
     }
     // Same rule as the sweep: the record is the only route back to a spared worktree.
-    let purged = purge && !kept_any;
+    let purged = purge != Purge::Nothing && !kept_any;
     if purged {
-        let dir = paths.run_dir(run_id);
         history::append(&paths, &state, history::Trigger::Purge);
-        if dir.is_dir() {
-            std::fs::remove_dir_all(&dir)?;
-        }
+        purge_run_dir(&paths, run_id, purge)?;
         worktree::prune_empty_spar_parents(&paths)?;
     }
     let removed = cleaned.iter().filter(|c| c.removed).count();
@@ -2203,6 +2414,7 @@ fn cleanup_one(run_id: &str, json: bool, purge: bool, force: bool) -> Result<Exi
                 "removed": removed,
                 "kept": cleaned.iter().filter(|c| c.skipped.is_some()).count(),
                 "purged": purged,
+                "artifacts_kept": purged && purge == Purge::Record,
                 "worktrees": cleaned,
             })
         );
@@ -2211,6 +2423,9 @@ fn cleanup_one(run_id: &str, json: bool, purge: bool, force: bool) -> Result<Exi
             if let Some(reason) = &w.skipped {
                 println!("skipped {}: {reason}", w.path.display());
                 continue;
+            }
+            if let Some(reference) = &w.archived {
+                println!("archived {} to {reference}", w.path.display());
             }
             if !w.killed.is_empty() {
                 let pids: Vec<String> = w.killed.iter().map(|p| p.to_string()).collect();
@@ -2228,10 +2443,16 @@ fn cleanup_one(run_id: &str, json: bool, purge: bool, force: bool) -> Result<Exi
             }
         }
         println!("cleaned worktrees for {run_id}");
-        if purge && kept_any {
+        if purge != Purge::Nothing && kept_any {
             println!("kept the run record: a worktree still holds work");
         }
-        if purged {
+        if purged && purge == Purge::Record {
+            println!(
+                "purged run record; kept {}",
+                paths.artifacts_dir(run_id).display()
+            );
+        }
+        if purged && purge == Purge::Everything {
             println!("purged run dir");
             if !paths.runs_dir().is_dir() {
                 println!("removed empty .spar/runs");

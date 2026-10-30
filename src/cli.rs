@@ -321,6 +321,10 @@ pub enum Command {
         /// Reclaim from every finished run in the project.
         #[arg(long)]
         all: bool,
+        /// Also reclaim runs nothing is driving: parked at a human gate (`awaiting_*`),
+        /// or in flight with no live orchestrator. Manual only; nothing runs it for you.
+        #[arg(long)]
+        halted: bool,
         #[arg(long)]
         json: bool,
     },
@@ -487,10 +491,11 @@ pub enum Command {
         json: bool,
     },
 
-    /// Settle slots left at `running` by an orchestrator that never came back.
+    /// Settle slots left at `running` by an orchestrator that never came back, and park
+    /// an in-flight run nobody drives at `stopped`.
     ///
-    /// Rewrites `slots[].status` and `slots[].error` in `state.json` and nothing else.
-    /// It never touches worktrees, branches, logs or artifacts, and it is deliberately
+    /// Rewrites `slots[].status`, `slots[].error` and `phase` in `state.json` and nothing
+    /// else. It never touches worktrees, branches, logs or artifacts, and it is deliberately
     /// not part of `spar cleanup`. Dry-run unless `--apply`. Always exits 0.
     #[command(name = "reconcile-state")]
     ReconcileState {
@@ -527,13 +532,23 @@ pub enum Command {
         merged: bool,
         #[arg(long)]
         json: bool,
-        /// Also delete `.spar/runs/<id>`
+        /// Also delete the run record under `.spar/runs/<id>`, keeping its `artifacts/`
+        /// (plan, reviews, suite report) unless `--purge-artifacts` is given.
         #[arg(long)]
         purge: bool,
-        /// Remove a worktree even if it holds uncommitted changes or unmerged commits.
-        /// Only with an explicit run id — there is deliberately no project-wide force.
+        /// `--purge`, and delete `artifacts/` too.
         #[arg(long)]
+        purge_artifacts: bool,
+        /// Remove a worktree even if it holds uncommitted changes or unmerged commits,
+        /// after archiving that work to `refs/spar-archive/<id>/<slot>`. Only with an
+        /// explicit run id — there is deliberately no project-wide force.
+        #[arg(long, conflicts_with = "if_merged")]
         force: bool,
+        /// Refuse unless the run's work is in its base: clean worktrees, and every commit
+        /// an ancestor of the base, in a merged PR (`gh`), or matched by patch-id (squash
+        /// and rebase merges). Then remove as `--force` would. Only with a run id.
+        #[arg(long)]
+        if_merged: bool,
     },
 
     /// Built-in skills for outer agents (agent-browser style)
@@ -542,11 +557,12 @@ pub enum Command {
         action: SkillsCmd,
     },
 
-    /// Per-project supervisor: restarts a dead orchestrator holding resumable work,
-    /// pushes the `abandoned` lifecycle event, and enforces the cross-run concurrency
-    /// cap. Opt-in, never auto-started. It never approves a plan, confirms ship,
-    /// merges, sweeps `cleanup`, or picks a fleet. With `[daemon] sync_prs = true` it
-    /// also runs `sync-prs --all`, at most every five minutes.
+    /// Supervisor: restarts a dead orchestrator holding resumable work, pushes the
+    /// `abandoned` lifecycle event, and enforces the cross-run concurrency cap.
+    /// `spar daemon install` makes it a systemd user unit; nothing starts it silently.
+    /// It never approves a plan, confirms ship, merges, sweeps `cleanup`, or picks a
+    /// fleet. With `[daemon] sync_prs = true` it also runs `sync-prs --all`, at most
+    /// every five minutes.
     Daemon {
         #[command(subcommand)]
         cmd: DaemonCmd,
@@ -564,7 +580,16 @@ pub enum DaemonCmd {
         /// Run in this process instead of detaching into a session of its own.
         #[arg(long)]
         foreground: bool,
+        /// Supervise every project in the spar registry from this one process, in the
+        /// foreground. This is what the systemd unit runs.
+        #[arg(long)]
+        all_projects: bool,
     },
+    /// Install and enable a systemd user unit (`spar-daemon.service`) that supervises
+    /// every registered project and starts at login (and at boot, with lingering).
+    Install,
+    /// Stop, disable and remove the systemd user unit.
+    Uninstall,
     /// Signal a running daemon to stop. It notices within one tick.
     Stop,
     /// Pid, uptime, tick, cap, per-bucket usage, the queue, and the runs it watches.

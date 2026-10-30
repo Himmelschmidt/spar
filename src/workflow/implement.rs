@@ -159,7 +159,17 @@ pub fn resume(
         }
         return continue_run(paths, cfg, run_id);
     }
-    if !state.phase.is_waitable_stop() {
+    // Shipping is the operator's step, never a supervisor's (O70): a run that died
+    // mid-ship goes back to the ship gate instead of re-running its rounds (O117).
+    if state.phase == Phase::Shipping {
+        return park_interrupted_ship(paths, run_id, json);
+    }
+    // An approved plan run has finished planning, so an in-flight park continues into
+    // implementation through `run_from_approved` rather than into a second plan round
+    // that would ask for the approval again.
+    let approved_plan =
+        state.workflow == crate::cli::WorkflowKind::Plan && state.gates.plan_approved;
+    if !state.phase.is_waitable_stop() && !approved_plan {
         // `continue_run` has no detach knob of its own: it always runs to completion
         // in the foreground of whoever calls it. `--detach` here means the same thing
         // it means for `plan`/`implement`: spawn `__internal_continue` into a session
@@ -348,6 +358,13 @@ pub fn run_loop(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<Exi
     run_with_task(task, None, opts, paths, cfg, None)
 }
 
+/// Whether any slot dispatch started in the run's current round. Dispatch stamps
+/// `dispatched_round` and saves before it spawns, so a round it never reached spent
+/// nothing.
+fn current_round_dispatched(state: &RunState) -> bool {
+    state.dispatched_round >= state.round
+}
+
 fn run_from_approved(
     run_id: &str,
     amendment: Option<String>,
@@ -361,10 +378,17 @@ fn run_from_approved(
     RunState::load(paths, run_id)?;
     let lock = crate::runlock::RunLock::acquire(paths, run_id)?;
     let mut state = RunState::load(paths, run_id)?;
+    // Read before anything below resets slot statuses for re-dispatch.
+    let round_dispatched = current_round_dispatched(&state);
     let resumable = crate::state::is_resumable(&state);
     if !resumable {
+        let hint = if state.phase.is_waitable_stop() {
+            String::new()
+        } else {
+            format!("; an in-flight run nobody is driving is picked up with `spar resume {run_id}`")
+        };
         bail!(
-            "run {run_id} is not resumable (workflow={:?}, phase={:?})",
+            "run {run_id} is not resumable (workflow={:?}, phase={:?}){hint}",
             state.workflow,
             state.phase
         );
@@ -497,7 +521,12 @@ fn run_from_approved(
     if let Some(m) = opts.max_rounds {
         state.max_rounds = m;
     }
-    if state.round_ceiling_reached() {
+    // A round that never dispatched is still the current round, not a spent one: an
+    // orchestrator killed between opening it and spawning anything (a launching shell
+    // that exited, a quota park before dispatch) cost nothing, so re-entry reuses it,
+    // and reusing it is not a step past the ceiling.
+    let reuse_round = state.round > 0 && !round_dispatched;
+    if !reuse_round && state.round_ceiling_reached() {
         escalate_round_ceiling(&mut state, paths)?;
         finish_out(&state, opts.json)?;
         return Ok(state.exit_code());
@@ -509,7 +538,11 @@ fn run_from_approved(
     if from_round_gate {
         state.error = None;
     }
-    let round = state.begin_round();
+    let round = if reuse_round {
+        state.round
+    } else {
+        state.begin_round()
+    };
     if !opts.json {
         println!("run {run_id} · round {round}");
     }
@@ -915,6 +948,41 @@ fn resolve_suite_provider(
         return Ok((p, None, pool_origin.as_seat_source()));
     }
     bail!("suite.enabled but no usable suite provider (set [roles].tester or install a CLI)")
+}
+
+#[cfg(test)]
+mod round_reuse_tests {
+    use super::*;
+
+    fn run(workflow: crate::cli::WorkflowKind, phase: Phase) -> RunState {
+        let mut st = RunState::new("r1", workflow, std::path::PathBuf::from("/x"));
+        st.phase = phase;
+        st
+    }
+
+    /// #179: only a dispatch that started in the current round charges it. A slot put
+    /// back to `Pending` by a backup failover after it really ran still counts.
+    #[test]
+    fn a_round_counts_as_dispatched_only_once_a_dispatch_started_in_it() {
+        let mut st = run(crate::cli::WorkflowKind::Loop, Phase::Stopped);
+        st.round = 1;
+        st.slots.push(executor::init_slot(
+            "impl",
+            "cli:claude",
+            SlotRole::Implementer,
+        ));
+        assert!(!current_round_dispatched(&st), "created, never dispatched");
+        st.dispatched_round = 1;
+        assert!(
+            current_round_dispatched(&st),
+            "dispatched, then failed over to Pending"
+        );
+        st.round = 2;
+        assert!(
+            !current_round_dispatched(&st),
+            "round 2 opened, nothing ran in it"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3712,8 +3780,40 @@ fn detach_implement(state: &RunState, paths: &SparPaths, json: bool) -> Result<E
     }
 }
 
+/// A run whose orchestrator (or `spar ship`) died in `shipping` goes back to the ship
+/// gate: shipping is the operator's step, and every resume entry, the daemon's included,
+/// must route here rather than re-running the rounds that produced the work (O117).
+pub fn park_interrupted_ship(paths: &SparPaths, run_id: &str, json: bool) -> Result<ExitCode> {
+    let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
+    let mut state = RunState::load(paths, run_id)?;
+    if state.phase == Phase::Shipping {
+        state.set_phase(Phase::AwaitingShipConfirm);
+        state.save(paths)?;
+    }
+    if json {
+        executor::emit_run_json(&state)?;
+    } else {
+        println!(
+            "run {run_id} died while shipping; back at the ship gate: spar ship {run_id} --confirm"
+        );
+    }
+    Ok(state.exit_code())
+}
+
 pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<ExitCode> {
     let mut state = RunState::load(paths, run_id)?;
+    if state.phase == Phase::Shipping {
+        return park_interrupted_ship(paths, run_id, false);
+    }
+    // An approved plan has finished planning: continuing it is implementation, never a
+    // second plan round asking for the approval again (O117).
+    if state.workflow == crate::cli::WorkflowKind::Plan && state.gates.plan_approved {
+        let opts = CommonOpts {
+            dry_run: state.dry_run,
+            ..CommonOpts::default()
+        };
+        return run_from_approved(run_id, None, opts, paths, cfg);
+    }
     if state.workflow == crate::cli::WorkflowKind::Plan {
         return crate::workflow::plan::continue_run(paths, cfg, run_id);
     }
