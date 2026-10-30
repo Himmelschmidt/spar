@@ -265,6 +265,18 @@ fn ship_targets_the_runs_base_branch() {
         ship_md.contains("PR base: `feat`") && ship_md.contains("--base 'feat'"),
         "PR must target the run's base branch; got:\n{ship_md}"
     );
+    // #183: the title is the task's first line and the body is built from the run.
+    assert!(
+        ship_md.contains("## PR title\n\nreview this branch\n"),
+        "{ship_md}"
+    );
+    let body = &ship_md[ship_md.find("## PR body").expect("PR body section")..];
+    assert!(
+        body.contains(&format!("Shipped by spar run `{run_id}`")),
+        "{body}"
+    );
+    assert!(body.contains("## Review\n"), "{body}");
+    assert!(body.contains("## Implementer summary\n"), "{body}");
 
     // Explicit override wins over the run's own base.
     spar_cmd()

@@ -334,10 +334,26 @@ pub struct ProviderConfig {
     pub order: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShipConfig {
     #[serde(default)]
     pub auto_confirm: bool,
+    /// Longest PR title in characters, clamped on a word boundary. `0` never clamps.
+    #[serde(default = "default_title_max")]
+    pub title_max: usize,
+}
+
+impl Default for ShipConfig {
+    fn default() -> Self {
+        Self {
+            auto_confirm: false,
+            title_max: default_title_max(),
+        }
+    }
+}
+
+fn default_title_max() -> usize {
+    72
 }
 
 /// Per-role **soft** budget on one dispatch's billed tokens, plus how often a slot past
@@ -1084,6 +1100,7 @@ struct ProviderConfigFile {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ShipConfigFile {
     auto_confirm: Option<bool>,
+    title_max: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1607,6 +1624,9 @@ impl Config {
         if let Some(s) = &file.ship {
             if let Some(v) = s.auto_confirm {
                 self.ship.auto_confirm = v;
+            }
+            if let Some(v) = s.title_max {
+                self.ship.title_max = v;
             }
         }
         if let Some(t) = &file.timeouts {

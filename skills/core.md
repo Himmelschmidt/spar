@@ -553,6 +553,15 @@ is fixed when the run is created. Passing `--base` there with a different commit
 (re-basing mid-flight would drop the plan phase's frozen tests, which are overlaid wholesale
 into the implementer, onto a different base). Plan a new run to change the base.
 
+The PR **title** is the task's first non-blank line with any heading marker stripped,
+clamped on a word boundary to `[ship] title_max` characters (default 72, `0` = never).
+The PR **body** is built from the run: OPEN questions from the shipped slot's summary
+(lines under an `Open questions` heading, or lines marked `OPEN`), each reviewer's final
+verdict and the commit it named, then the summary itself (`summary-<slot>.md`, else
+`summary-impl.md`). A body over GitHub's limit is cut from the end of the summary with a
+note naming the full file. It is written to `artifacts/pr-body.md` and passed with
+`--body-file`; dry-run puts both into `artifacts/ship.md`.
+
 `spar ship` targets its draft PR at the run's base branch when a local remote-tracking ref
 (`refs/remotes/origin/<branch>`) exists for it — ship never touches the network to decide
 this, so run `git fetch --prune` if your mirror is stale. A tag, a sha, a detached base or an
@@ -1222,6 +1231,8 @@ auto_archive_after = "14d"
 [worktree]
 auto_cleanup_merged = true   # reap at-rest runs already contained in their base, at launch
 copy = [".dbiso.env", ".envrc", ".env.example"]   # copied from the main checkout into every slot worktree; missing files skipped
+[ship]
+title_max = 72   # PR title clamp in characters; 0 never clamps
 [gates]
 plan = true
 winner = true

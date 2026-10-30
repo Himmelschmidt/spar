@@ -37,6 +37,8 @@ ship = true
 
 [ship]
 auto_confirm = false
+# PR title is the task's first line, clamped on a word boundary. 0 never clamps.
+title_max = 72
 
 [timeouts]
 # SOFT since O50: where spar starts asking a slot to land its work, not where it is killed.
