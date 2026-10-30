@@ -372,7 +372,7 @@ So `implement` will not silently mint a second id for work that is already a run
 - `--new` always forks, including from a plan spar could have traced.
 
 `spar plan --run <id>` **refuses** `--providers` / `--select` / `--role` / `--fleet` /
-`--without` / `--base` / `--big` / `--detach` / `--dry-run`: a replan inherits the run's
+`--without` / `--suite-command` / `--base` / `--big` / `--detach` / `--dry-run`: a replan inherits the run's
 pool, base and frozen config, so a flag that could only apply to a new run is an error
 rather than a silent no-op. It also refuses a run that is mid-flight, and it moves the previous round's
 `plan.md` and `test-contract.md` to `plan-round<N>.md` / `test-contract-round<N>.md` so a
@@ -567,6 +567,12 @@ The base is a **commit**: uncommitted changes in your working tree are not in it
 is falling back to `project_root`'s HEAD) — those warnings are stderr-only, `--json` included,
 so a headless driver has to read stderr to see them. Commit first if the slots need the work.
 
+With no `--base`, spar also counts how far the invoking HEAD is **behind its upstream
+tracking branch** (`HEAD..@{u}`, as of your last fetch; spar does not fetch). Above zero it
+warns on stderr, `--json` included, and records the count as **`base_behind`** in the run
+JSON and `state.json`. It is absent with `--base` or when the branch has no upstream. The
+default base does not change: pass `--base origin/main` to build on the upstream (O110).
+
 Assert it before you trust a run — every run reports it:
 
 ```bash
@@ -583,6 +589,16 @@ run falls back to `project_root`'s HEAD.
 is fixed when the run is created. Passing `--base` there with a different commit exits `1`
 (re-basing mid-flight would drop the plan phase's frozen tests, which are overlaid wholesale
 into the implementer, onto a different base). Plan a new run to change the base.
+
+The PR **title** is the task's first non-blank line with any heading marker stripped,
+clamped on a word boundary to `[ship] title_max` characters (default 72, `0` = no clamp
+of spar's own), and never past GitHub's 256-character limit.
+The PR **body** is built from the run: OPEN questions from the shipped slot's summary
+(lines under an `Open questions` heading, or lines marked `OPEN`), each reviewer's final
+verdict and the commit it named, then the summary itself (`summary-<slot>.md`, else
+`summary-impl.md`). A body over GitHub's limit is cut from the end of the summary with a
+note naming the full file. It is written to `artifacts/pr-body.md` and passed with
+`--body-file`; dry-run puts both into `artifacts/ship.md`.
 
 `spar ship` targets its draft PR at the run's base branch when a local remote-tracking ref
 (`refs/remotes/origin/<branch>`) exists for it — ship never touches the network to decide
@@ -844,6 +860,24 @@ stderr and never fails a run. This is not `auto_cleanup` (still `false` by defau
 that one deletes resumable work on a phase check, this one only deletes what git says is
 already in the base branch. Set it `false` to keep every worktree until you sweep by hand.
 
+**What a slot worktree starts with.** Tracked files at the run's base, plus the files
+`[worktree] copy` names (default `.dbiso.env`, `.envrc`, `.env.example`) copied from the
+main checkout when present. Every slot process gets `TMPDIR` / `TMP` / `TEMP` set to
+`.spar/runs/<id>/tmp/<hash8>` (a short hash of the slot id, kept short for unix socket
+paths; the mapping is the slot's `TMPDIR <path>` event), created before the spawn and
+deleted when that dispatch ends, so slots never read each other's scratch files. A tmux
+slot whose pane may still be alive keeps its directory until the run directory goes. Under `worktree-bwrap` the sandbox's
+own private `/tmp` is used instead.
+
+**spar's run store stays out of commits.** When spar cuts a slot worktree it adds `/.spar/`
+to the repo's `info/exclude` (git only reads the common dir's copy for a linked worktree,
+so this covers the primary checkout too) and says so once on stderr, unless the repo
+already tracks files there. `artifacts/` is not excluded. **The primary checkout is watched:** spar records its `git status --porcelain`
+(minus `.spar/`) when a run leg starts work (not while queued) and compares it when the leg reaches a gate or a
+terminal phase. A difference is a `warning:` on stderr and an `info` event naming the
+changed paths. Edits you make while the run is parked at a gate are not reported, and
+`isolation = "none"` is never checked (its slots work there on purpose).
+
 ## Swarm bus
 
 The bus is **workspace-scoped and keyed by a globally-unique `agent_id`**. Run-slot role
@@ -1059,7 +1093,8 @@ rail's selection.
   transparency.
 
 - `status --json` and every run JSON carry **`base_ref` / `base_commit`** — the ref and commit
-  all of the run's slot worktrees were cut from (see **Base ref** above).
+  all of the run's slot worktrees were cut from (see **Base ref** above), plus
+  **`base_behind`** when the base was taken from a HEAD with an upstream.
 - **Tokens: `billed_tokens` is spend, `context_tokens` is a gauge.** Every entry in
   `"usage"` (the run's ledger, one entry per dispatch; sum it for the run total) and every
   `logs/<slot>.stats.json` carries both.
@@ -1269,6 +1304,13 @@ touching `spar.toml`, on `plan`, `implement` and `run`. Composition order: prese
 - Both flags are applied where `--role` is (`main.rs`), so they land in the run's frozen
   `config.json` and survive a later round with no `--reload-config` (O27).
 
+**`--suite-command "<cmd>"`** (repeatable, on `plan` and `implement`) sets this run's
+deterministic suite, replacing `[suite].command` and turning the suite channel on even under
+`--fleet small`. It is frozen into `config.json`, and unlike the other run flags it is
+**kept across `--reload-config`**: a reload re-reads `spar.toml` but carries the run's
+`--suite-command` over, on or off as frozen, unless the flag is given again. On an existing `--run <id>` it needs
+`--reload-config`, and combined with `--without suite` it is refused (O109).
+
 **Run JSON carries a `fleet` array**, one entry per seat: `{seat, role, provider, model,
 source, projected}`. `source` names the precedence rung the provider came from —
 `cli-role`, `cli-providers`, `roles-file`, `providers-order`, `model-select`, or
@@ -1322,6 +1364,9 @@ auto_reclaim = true    # drop a run's target/ + node_modules when it finishes
 auto_archive_after = "14d"
 [worktree]
 auto_cleanup_merged = true   # reap at-rest runs already contained in their base, at launch
+copy = [".dbiso.env", ".envrc", ".env.example"]   # copied from the main checkout into every slot worktree; missing files skipped
+[ship]
+title_max = 72   # PR title clamp in characters; 0 = GitHub's 256 only
 [gates]
 plan = true
 winner = true

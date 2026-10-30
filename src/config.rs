@@ -334,10 +334,26 @@ pub struct ProviderConfig {
     pub order: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShipConfig {
     #[serde(default)]
     pub auto_confirm: bool,
+    /// Longest PR title in characters, clamped on a word boundary. `0` never clamps.
+    #[serde(default = "default_title_max")]
+    pub title_max: usize,
+}
+
+impl Default for ShipConfig {
+    fn default() -> Self {
+        Self {
+            auto_confirm: false,
+            title_max: default_title_max(),
+        }
+    }
+}
+
+fn default_title_max() -> usize {
+    72
 }
 
 /// Per-role **soft** budget on one dispatch's billed tokens, plus how often a slot past
@@ -537,14 +553,26 @@ pub struct WorktreeConfig {
     /// a phase check, this one only deletes work git says is already in the base branch.
     #[serde(default = "default_true")]
     pub auto_cleanup_merged: bool,
+    /// Project-relative files copied from the primary checkout into every slot worktree
+    /// spar cuts. A git worktree carries only tracked files, so gitignored local config
+    /// (`.envrc`, a DB env file) is otherwise missing there. Absent files are skipped.
+    #[serde(default = "default_worktree_copy")]
+    pub copy: Vec<String>,
 }
 
 impl Default for WorktreeConfig {
     fn default() -> Self {
         Self {
             auto_cleanup_merged: true,
+            copy: default_worktree_copy(),
         }
     }
+}
+
+fn default_worktree_copy() -> Vec<String> {
+    [".dbiso.env", ".envrc", ".env.example"]
+        .map(String::from)
+        .to_vec()
 }
 
 /// Dedicated full-suite channel (cheap/dumb model). Separate from smart review/impl.
@@ -560,6 +588,10 @@ pub struct SuiteConfig {
     /// commands in a repo that has not declared them.
     #[serde(default)]
     pub command: Vec<String>,
+    /// `command` came from `--suite-command`, not a file. `--reload-config` rebuilds from
+    /// the live `spar.toml`, so this is what lets it keep the run's own suite.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub command_from_cli: bool,
 }
 
 impl Default for SuiteConfig {
@@ -568,6 +600,7 @@ impl Default for SuiteConfig {
             enabled: true,
             timeout_secs: default_suite_timeout_secs(),
             command: Vec::new(),
+            command_from_cli: false,
         }
     }
 }
@@ -1039,6 +1072,7 @@ struct ConfigFile {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct WorktreeConfigFile {
     auto_cleanup_merged: Option<bool>,
+    copy: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1066,6 +1100,7 @@ struct ProviderConfigFile {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ShipConfigFile {
     auto_confirm: Option<bool>,
+    title_max: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1493,6 +1528,43 @@ impl Config {
         Ok(())
     }
 
+    /// `--suite-command <cmd>` (repeatable): this run's deterministic suite, replacing
+    /// `[suite].command`. Turns the channel on, since naming a suite is asking for one,
+    /// so it refuses `--without suite` rather than letting either silently win.
+    pub fn apply_suite_command(&mut self, commands: &[String], without: &[String]) -> Result<()> {
+        if commands.is_empty() {
+            return Ok(());
+        }
+        if without.iter().any(|w| w.trim() == "suite") {
+            anyhow::bail!("--suite-command and --without suite contradict each other; pass one");
+        }
+        if let Some(bad) = commands.iter().position(|c| c.trim().is_empty()) {
+            anyhow::bail!("--suite-command #{} is empty", bad + 1);
+        }
+        if self.suite.timeout_secs == 0 {
+            anyhow::bail!(
+                "--suite-command with [suite].timeout_secs = 0: the suite would never run"
+            );
+        }
+        self.suite.command = commands.to_vec();
+        self.suite.command_from_cli = true;
+        self.suite.enabled = true;
+        Ok(())
+    }
+
+    /// `--reload-config` rebuilds from the live `spar.toml`. A suite the run was given on
+    /// the command line is the operator's pin for this run, not file state, so it is
+    /// carried over from the run's frozen config.
+    pub fn carry_cli_suite_command(&mut self, frozen: &Config) {
+        if !frozen.suite.command_from_cli {
+            return;
+        }
+        self.suite.command = frozen.suite.command.clone();
+        self.suite.command_from_cli = true;
+        // As frozen: a pin a later reload turned off with `--without suite` stays off.
+        self.suite.enabled = frozen.suite.enabled;
+    }
+
     /// Apply `--fleet <preset>` as the *base*: `--without` and `--role` are applied after
     /// this and win over it (composition order, feature 011).
     pub fn apply_fleet_preset(&mut self, preset: FleetPreset) {
@@ -1528,6 +1600,22 @@ impl Config {
             if let Some(v) = w.auto_cleanup_merged {
                 self.worktree.auto_cleanup_merged = v;
             }
+            if let Some(v) = &w.copy {
+                // Copied out of the primary checkout, so an entry must stay inside it.
+                use std::path::Component;
+                if let Some(bad) = v.iter().find(|p| {
+                    let p = Path::new(p.as_str());
+                    p.as_os_str().is_empty()
+                        || !p
+                            .components()
+                            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+                }) {
+                    anyhow::bail!(
+                        "[worktree].copy entry {bad:?} must be a relative path inside the project"
+                    );
+                }
+                self.worktree.copy = v.clone();
+            }
         }
         if let Some(p) = &file.providers {
             if let Some(order) = &p.order {
@@ -1537,6 +1625,9 @@ impl Config {
         if let Some(s) = &file.ship {
             if let Some(v) = s.auto_confirm {
                 self.ship.auto_confirm = v;
+            }
+            if let Some(v) = s.title_max {
+                self.ship.title_max = v;
             }
         }
         if let Some(t) = &file.timeouts {
@@ -2468,6 +2559,74 @@ planner = "best"
         let mut cfg = Config::default();
         cfg.apply_file(&file, Trust::Project).unwrap();
         assert!(!cfg.worktree.auto_cleanup_merged);
+    }
+
+    #[test]
+    fn suite_command_flag_pins_an_enabled_builtin_suite() {
+        let mut cfg = Config::default();
+        cfg.apply_fleet_preset(FleetPreset::Small);
+        assert!(!cfg.suite.enabled, "small drops the agent tester");
+        cfg.apply_suite_command(&["cargo test -p ui".into()], &[])
+            .unwrap();
+        assert!(cfg.suite.is_builtin());
+        assert!(cfg.suite.command_from_cli);
+        assert!(cfg.apply_suite_command(&["  ".into()], &[]).is_err());
+        assert!(cfg
+            .apply_suite_command(&["x".into()], &["suite".into()])
+            .is_err());
+
+        let frozen: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        let mut reloaded = Config::default();
+        reloaded.carry_cli_suite_command(&frozen);
+        assert_eq!(reloaded.suite.command, vec!["cargo test -p ui"]);
+        assert!(reloaded.suite.command_from_cli);
+
+        let mut disabled = frozen.clone();
+        disabled.suite.enabled = false;
+        let mut reloaded = Config::default();
+        reloaded.carry_cli_suite_command(&disabled);
+        assert!(!reloaded.suite.enabled, "a pin turned off stays off");
+
+        let mut from_file = Config::default();
+        from_file.suite.command = vec!["make check".into()];
+        let mut reloaded = Config::default();
+        reloaded.carry_cli_suite_command(&from_file);
+        assert!(
+            reloaded.suite.command.is_empty(),
+            "file state is re-read, not carried"
+        );
+    }
+
+    #[test]
+    fn ship_title_max_reads_from_the_file() {
+        assert_eq!(Config::default().ship.title_max, 72);
+        let file: ConfigFile = toml::from_str("[ship]\ntitle_max = 0\n").unwrap();
+        let mut cfg = Config::default();
+        cfg.apply_file(&file, Trust::Project).unwrap();
+        assert_eq!(cfg.ship.title_max, 0);
+    }
+
+    #[test]
+    fn worktree_copy_defaults_to_env_files_and_is_overridable() {
+        assert_eq!(
+            Config::default().worktree.copy,
+            vec![".dbiso.env", ".envrc", ".env.example"]
+        );
+        let file: ConfigFile =
+            toml::from_str("[worktree]\ncopy = [\".db.env\", \"config/local.toml\"]\n").unwrap();
+        let mut cfg = Config::default();
+        cfg.apply_file(&file, Trust::Project).unwrap();
+        assert_eq!(cfg.worktree.copy, vec![".db.env", "config/local.toml"]);
+    }
+
+    #[test]
+    fn worktree_copy_rejects_paths_outside_the_project() {
+        for bad in ["/etc/passwd", "../secret", "a/../../b", ""] {
+            let file: ConfigFile =
+                toml::from_str(&format!("[worktree]\ncopy = [{bad:?}]\n")).unwrap();
+            let mut cfg = Config::default();
+            assert!(cfg.apply_file(&file, Trust::Project).is_err(), "{bad}");
+        }
     }
 
     #[test]

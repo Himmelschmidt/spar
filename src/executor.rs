@@ -1,6 +1,6 @@
 use crate::api;
 use crate::cli::Backend;
-use crate::config::Config;
+use crate::config::{Config, IsolationMode};
 use crate::markers;
 use crate::paths::SparPaths;
 use crate::process::{self, SpawnRequest};
@@ -158,6 +158,9 @@ struct PreparedSlot {
     /// sizes its budgets and nudge cadence off the same document every other phase reads.
     cfg: Config,
     dry_run: bool,
+    /// Held for the dispatch's lifetime; dropped (and the directory removed) once the
+    /// outcome has been applied.
+    _tmp: SlotTmp,
 }
 
 /// Refreshes a live slot's presence heartbeat while its child process runs, throttled
@@ -215,6 +218,64 @@ fn wire_slot_presence(
         let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(note));
     }
     wiring.env
+}
+
+/// A slot's private `TMPDIR` for one dispatch, removed on drop so every exit path of the
+/// dispatch (success, failure, timeout, an early `?`) cleans it up.
+struct SlotTmp(Option<PathBuf>);
+
+impl SlotTmp {
+    /// No directory under bwrap: the sandbox mounts its own private `/tmp` and keeps
+    /// `.spar/` read-only, so a `TMPDIR` there would be unwritable.
+    fn create(paths: &SparPaths, run_id: &str, slot_id: &str, isolation: IsolationMode) -> Self {
+        if matches!(isolation, IsolationMode::WorktreeBwrap) && sandbox::bwrap_available() {
+            return Self(None);
+        }
+        let dir = paths.slot_tmp_dir(run_id, slot_id);
+        match std::fs::create_dir_all(&dir) {
+            Ok(()) => {
+                let _ = crate::events::append(
+                    paths,
+                    run_id,
+                    &crate::events::Event::slot_note(slot_id, format!("TMPDIR {}", dir.display())),
+                );
+                Self(Some(dir))
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: {slot_id}: TMPDIR {} not created ({e}); the slot uses the system default",
+                    dir.display()
+                );
+                Self(None)
+            }
+        }
+    }
+
+    fn env(&self) -> Vec<(String, String)> {
+        let Some(dir) = &self.0 else {
+            return Vec::new();
+        };
+        let dir = dir.display().to_string();
+        ["TMPDIR", "TMP", "TEMP"]
+            .into_iter()
+            .map(|k| (k.to_string(), dir.clone()))
+            .collect()
+    }
+
+    /// Leave the directory in place: its process may outlive the dispatch (a tmux pane
+    /// that was not confirmed dead), and deleting a live process's scratch breaks it.
+    /// Removed with the run's directory instead.
+    fn keep(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for SlotTmp {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.0 {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 }
 
 fn prepare_slot_execution(
@@ -327,7 +388,9 @@ fn prepare_slot_execution(
         &crate::events::Event::slot(&job.slot_id, SlotStatus::Running),
     );
     let _ = crate::bus::heartbeat(paths, Some(&state.id), &job.slot_id, "running");
-    let env = wire_slot_presence(state, paths, &job, &cwd, &pref);
+    let tmp = SlotTmp::create(paths, &state.id, &job.slot_id, state.isolation);
+    let mut env = wire_slot_presence(state, paths, &job, &cwd, &pref);
+    env.extend(tmp.env());
     let owns_cwd = owns_cwd(state, &job.slot_id, &cwd);
     let session_provider = pref.cli_name().unwrap_or(job.provider.as_str()).to_string();
     let prior_session_id =
@@ -350,6 +413,7 @@ fn prepare_slot_execution(
         session_provider,
         cfg: cfg.clone(),
         dry_run: state.dry_run,
+        _tmp: tmp,
     })
 }
 
@@ -2142,11 +2206,13 @@ pub fn run_slot(
     // dispatch as the nudge threshold instead.
     let timeout = hard_ceiling_for_role(cfg, job.role);
 
+    let mut tmp = SlotTmp::create(paths, &state.id, &job.slot_id, state.isolation);
     if state.dry_run {
         return run_dry(state, paths, job, &cwd, &log_path, &prompt);
     }
 
-    let presence_env = wire_slot_presence(state, paths, job, &cwd, &pref);
+    let mut presence_env = wire_slot_presence(state, paths, job, &cwd, &pref);
+    presence_env.extend(tmp.env());
 
     // A backend `Err` (spawn/setup failure, not a completed dispatch) still writes a
     // log a rate-limit rejection could land in on some adapters, so it gets the same
@@ -2206,8 +2272,15 @@ pub fn run_slot(
                     &presence_env,
                     effort,
                 ) {
-                    Ok(r) => r,
+                    Ok(r) => {
+                        // Only `ok` means the marker landed and the pane is gone.
+                        if !r.ok {
+                            tmp.keep();
+                        }
+                        r
+                    }
                     Err(e) => {
+                        tmp.keep();
                         salvage_expected_artifact(
                             paths,
                             &state.id,
@@ -3989,6 +4062,7 @@ pub fn emit_run_json(state: &RunState) -> Result<()> {
         "fleet": run_fleet_seats(state),
         "base_ref": state.base_ref,
         "base_commit": state.base_commit,
+        "base_behind": state.base_behind,
         "parent_run": state.parent_run,
         "child_run": state.child_run,
         "usage": state.usage,
@@ -6605,6 +6679,103 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             !slot_has_work(&repo, None),
             "with no recorded base, only a dirty tree can be judged"
         );
+    }
+
+    /// #177: every dispatch gets a run-scoped TMPDIR the child actually sees, and it is
+    /// gone once the dispatch is dropped, whatever the outcome.
+    #[test]
+    fn a_dispatch_gets_its_own_tmpdir_and_drops_it_when_done() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let cfg = Config::default();
+        let mut state = RunState::new(
+            "r-tmpdir",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.slots.push(init_slot_model(
+            "impl",
+            "cli:claude",
+            SlotRole::Implementer,
+            None,
+        ));
+        state.save(&paths).unwrap();
+        let mut job = impl_job("impl");
+        job.template = "implementer".into();
+        let prep = prepare_slot_execution(&mut state, &paths, &cfg, &job).unwrap();
+
+        let dir = paths.slot_tmp_dir("r-tmpdir", "impl");
+        assert!(dir.is_dir(), "created before spawn");
+        let dir_s = dir.display().to_string();
+        for key in ["TMPDIR", "TMP", "TEMP"] {
+            assert!(
+                prep.env.iter().any(|(k, v)| k == key && *v == dir_s),
+                "{key} missing from slot env"
+            );
+        }
+
+        let log = tmp.path().join("child.log");
+        let req = SpawnRequest {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".into(),
+                "touch \"$TMPDIR/scratch\" && printf 'tmp=%s\\n' \"$TMPDIR\"".into(),
+            ],
+            cwd: tmp.path().to_path_buf(),
+            log_path: log.clone(),
+            env: prep.env.clone(),
+            timeout: Duration::from_secs(10),
+        };
+        let res = process::run_captured(&req, None, None).unwrap();
+        assert_eq!(res.exit_code, Some(0));
+        assert!(std::fs::read_to_string(&log)
+            .unwrap()
+            .contains(&format!("tmp={dir_s}")));
+        assert!(dir.join("scratch").is_file());
+
+        drop(prep);
+        assert!(!dir.exists(), "removed when the dispatch is done");
+    }
+
+    /// The single-job `run_slot` path: the TMPDIR mapping is recorded, the directory name
+    /// is a short hash (unix sockets cap paths at 108 bytes), and it is gone afterwards.
+    #[test]
+    fn run_slot_records_a_short_tmpdir_and_removes_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let cfg = Config::default();
+        let mut state = RunState::new(
+            "r-tmpslot",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.dry_run = true;
+        let slot_id = "review-1-cli-opencode-openrouter-anthropic-claude-opus";
+        state.slots.push(init_slot_model(
+            slot_id,
+            "cli:claude",
+            SlotRole::Implementer,
+            None,
+        ));
+        state.save(&paths).unwrap();
+        let mut job = impl_job(slot_id);
+        job.template = "implementer".into();
+        run_slot(&mut state, &paths, &cfg, &job).unwrap();
+
+        let dir = paths.slot_tmp_dir("r-tmpslot", slot_id);
+        let name = dir.file_name().unwrap().to_str().unwrap();
+        assert_eq!(name.len(), 8, "{name}");
+        assert!(name.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(dir, paths.slot_tmp_dir("r-tmpslot", slot_id), "stable");
+        let recorded = crate::events::read_all(&paths, "r-tmpslot")
+            .unwrap()
+            .into_iter()
+            .any(|e| {
+                e.slot.as_deref() == Some(slot_id)
+                    && e.message.as_deref() == Some(&format!("TMPDIR {}", dir.display()))
+            });
+        assert!(recorded, "slot -> TMPDIR mapping is in the event log");
+        assert!(!dir.exists(), "removed when the dispatch returns");
     }
 
     /// A dispatch's outcome fields describe *that* dispatch. Carried into the next one

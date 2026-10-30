@@ -265,6 +265,18 @@ fn ship_targets_the_runs_base_branch() {
         ship_md.contains("PR base: `feat`") && ship_md.contains("--base 'feat'"),
         "PR must target the run's base branch; got:\n{ship_md}"
     );
+    // #183: the title is the task's first line and the body is built from the run.
+    assert!(
+        ship_md.contains("## PR title\n\nreview this branch\n"),
+        "{ship_md}"
+    );
+    let body = &ship_md[ship_md.find("## PR body").expect("PR body section")..];
+    assert!(
+        body.contains(&format!("Shipped by spar run `{run_id}`")),
+        "{body}"
+    );
+    assert!(body.contains("## Review\n"), "{body}");
+    assert!(body.contains("## Implementer summary\n"), "{body}");
 
     // Explicit override wins over the run's own base.
     spar_cmd()
@@ -327,4 +339,71 @@ fn ship_opens_the_pr_as_a_draft() {
         ship_md.contains("gh pr create --draft "),
         "ship must open a draft PR; got:\n{ship_md}"
     );
+}
+
+/// #188: a base taken implicitly from a HEAD that is behind its upstream is warned on
+/// stderr and recorded as `base_behind`; `--base` and a branch with no upstream are not.
+#[test]
+fn a_base_behind_its_upstream_is_warned_and_recorded() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    git(&root, &["init", "-q", "-b", "main"]);
+    git(&root, &["config", "user.email", "test@example.com"]);
+    git(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("README.md"), "test\n").unwrap();
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-q", "-m", "init"]);
+
+    let plan = |extra: &[&str]| {
+        let mut args = vec![
+            "plan",
+            "--task",
+            "t",
+            "--providers",
+            "cli:claude,cli:grok",
+            "--dry-run",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        let out = spar_cmd().current_dir(&root).args(&args).assert().code(2);
+        let out = out.get_output();
+        let v: serde_json::Value =
+            serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
+        (
+            v["base_behind"].clone(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+
+    let (behind, stderr) = plan(&[]);
+    assert!(
+        behind.is_null(),
+        "no upstream: nothing to compare, got {behind}"
+    );
+    assert!(!stderr.contains("behind"), "{stderr}");
+
+    git(&root, &["branch", "upstream"]);
+    git(&root, &["checkout", "-q", "upstream"]);
+    for i in 0..2 {
+        std::fs::write(root.join(format!("f{i}")), "x").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-q", "-m", &format!("ahead {i}")]);
+    }
+    git(&root, &["checkout", "-q", "main"]);
+    git(&root, &["branch", "-q", "--set-upstream-to=upstream"]);
+
+    let (behind, stderr) = plan(&[]);
+    assert_eq!(behind, serde_json::json!(2));
+    assert!(
+        stderr.contains("2 commit(s) behind upstream"),
+        "warned even under --json: {stderr}"
+    );
+
+    let (behind, stderr) = plan(&["--base", "main"]);
+    assert!(
+        behind.is_null(),
+        "an explicit --base is the operator's call"
+    );
+    assert!(!stderr.contains("behind"), "{stderr}");
 }

@@ -177,9 +177,28 @@ pub fn apply_run_base(state: &mut RunState, requested: Option<&str>, json: bool)
             cwd.display()
         );
     }
+    // An explicit `--base` is the operator's choice of commit; only a base taken
+    // implicitly from the invoking HEAD can be silently stale (O110).
+    state.base_behind = requested.is_none().then(|| behind_upstream(&cwd)).flatten();
+    if let Some(n) = state.base_behind.filter(|n| *n > 0) {
+        let upstream = git_out(&cwd, &["rev-parse", "--abbrev-ref", "@{u}"])
+            .unwrap_or_else(|| "its upstream".into());
+        eprintln!(
+            "warning: base {} is {n} commit(s) behind {upstream}; pass --base {upstream} to build on it",
+            base.reference
+        );
+    }
     state.base_ref = Some(base.reference);
     state.base_commit = Some(base.commit);
     Ok(())
+}
+
+/// Commits `dir`'s HEAD is behind its upstream tracking branch, as of the last fetch.
+/// `None` with no upstream (detached HEAD, local-only branch).
+fn behind_upstream(dir: &Path) -> Option<u32> {
+    git_out(dir, &["rev-list", "--count", "HEAD..@{u}"])?
+        .parse()
+        .ok()
 }
 
 fn same_repo(a: &Path, b: &Path) -> bool {
@@ -246,12 +265,111 @@ pub fn create_worktree(
             bail!("git worktree add failed for {}", path.display());
         }
     }
+    exclude_run_outputs(&path);
 
     Ok(WorktreeRecord {
         slot_id: slot_id.into(),
         path,
         branch,
     })
+}
+
+/// Keep spar's run store out of a slot's commits: an agent running `spar` in its worktree
+/// can create `.spar/` there, and `git add -A` then puts it in the PR. git reads only the
+/// common dir's `info/exclude` for a linked worktree (its own copy is ignored), so the
+/// line applies to the whole repo, primary checkout included. Skipped when the repo
+/// tracks files under `.spar/`.
+fn exclude_run_outputs(worktree: &Path) {
+    if git_out(worktree, &["ls-files", "--", ".spar"]).is_none_or(|s| !s.is_empty()) {
+        return;
+    }
+    match crate::providers::presence::exclude_from_index(worktree, "/.spar/") {
+        Ok(true) => eprintln!(
+            "note: added /.spar/ to this repo's .git/info/exclude so spar's run store is never committed"
+        ),
+        Ok(false) => {}
+        Err(e) => eprintln!("note: could not exclude .spar/ in {}: {e:#}", worktree.display()),
+    }
+}
+
+/// Warn when the primary checkout changed while a run leg was driving slots (#178).
+///
+/// Called on every phase change. A leg starts when the run enters an active phase from a
+/// waitable stop, from creation, or from `Init` (where a queued run waits for admission,
+/// doing nothing): that is when `git status --porcelain` is captured. It ends at the next
+/// waitable stop, which is when it is compared and the snapshot dropped, so a later leg
+/// never compares against an earlier one. Time parked at a gate is the operator's, so
+/// their own edits then are never reported. `.spar/` is outside the comparison, so the
+/// `/.spar/` exclude spar adds mid-leg cannot show up as a change. `isolation = "none"`
+/// runs slots in the primary checkout on purpose and is skipped.
+pub fn watch_primary_checkout(
+    paths: &SparPaths,
+    state: &RunState,
+    prev: Option<crate::state::Phase>,
+) {
+    use crate::state::Phase;
+    if state.isolation == IsolationMode::None {
+        return;
+    }
+    let working = |p: Phase| !p.is_waitable_stop() && p != Phase::Init;
+    let starting = working(state.phase) && !prev.is_some_and(working);
+    let stopping = state.phase.is_waitable_stop() && prev.is_some_and(working);
+    if !starting && !stopping {
+        return;
+    }
+    let file = paths.primary_status_file(&state.id);
+    let Some(now) = porcelain(&state.project_root) else {
+        return;
+    };
+    if starting {
+        let _ = std::fs::write(&file, &now);
+        return;
+    }
+    let Ok(before) = std::fs::read_to_string(&file) else {
+        return;
+    };
+    let _ = std::fs::remove_file(&file);
+    if before == now {
+        return;
+    }
+    let changed: Vec<&str> = now
+        .lines()
+        .filter(|l| !before.lines().any(|b| b == *l))
+        .chain(before.lines().filter(|b| !now.lines().any(|l| l == *b)))
+        .collect();
+    let shown = changed
+        .iter()
+        .take(5)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = changed.len().saturating_sub(5);
+    let more = if more > 0 {
+        format!(" and {more} more")
+    } else {
+        String::new()
+    };
+    let msg = format!(
+        "primary checkout {} changed while run {} was active ({shown}{more}); a slot may have written outside its worktree",
+        state.project_root.display(),
+        state.id
+    );
+    eprintln!("warning: {msg}");
+    let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg));
+}
+
+/// `git status --porcelain` minus `.spar/`, untrimmed at the front: the leading space of
+/// ` M path` is part of the status code, and `git_out`'s trim would strip it from the
+/// first line only.
+fn porcelain(dir: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .args(["status", "--porcelain", "--", ":!.spar"])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim_end().to_string())
 }
 
 pub fn remove_worktree(project_root: &Path, record: &WorktreeRecord) -> Result<()> {
@@ -283,19 +401,21 @@ fn git_quiet(project_root: &Path, args: &[&str]) -> Result<bool> {
     Ok(status.success())
 }
 
-/// Copy optional env seed files into a worktree when present.
-pub fn seed_env_files(project_root: &Path, worktree: &Path) -> Result<()> {
-    for name in [".dbiso.env", ".envrc", ".env.example"] {
+/// Copy `[worktree].copy` from the primary checkout into a fresh worktree. A file that is
+/// missing, or already present in the worktree (tracked there), is left alone.
+pub fn seed_env_files(project_root: &Path, worktree: &Path, names: &[String]) -> Result<()> {
+    for name in names {
         let src = project_root.join(name);
-        if src.is_file() {
-            let dst = worktree.join(name);
-            if !dst.exists() {
-                std::fs::copy(&src, &dst)
-                    .with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
-            }
+        let dst = worktree.join(name);
+        if !src.is_file() || dst.exists() {
+            continue;
         }
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(&src, &dst)
+            .with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
     }
-    // optional: run dbiso up if present and mode wants db
     Ok(())
 }
 
@@ -414,14 +534,13 @@ pub fn prepare_isolation(
                         state.base_commit.as_deref(),
                     )?
                 };
-                if matches!(
-                    state.isolation,
-                    IsolationMode::WorktreeDb | IsolationMode::WorktreeBwrap
-                ) {
-                    seed_env_files(&state.project_root, &rec.path)?;
-                    if matches!(state.isolation, IsolationMode::WorktreeDb) {
-                        maybe_dbiso(&state.project_root, &rec.path)?;
-                    }
+                let copy = cfg.as_ref().map_or_else(
+                    || crate::config::WorktreeConfig::default().copy,
+                    |c| c.worktree.copy.clone(),
+                );
+                seed_env_files(&state.project_root, &rec.path, &copy)?;
+                if matches!(state.isolation, IsolationMode::WorktreeDb) {
+                    maybe_dbiso(&state.project_root, &rec.path)?;
                 }
                 if let Some(slot) = state.slot_mut(sid) {
                     slot.cwd = Some(rec.path.clone());
@@ -2127,6 +2246,193 @@ mod tests {
         );
         assert!(rec.path.join("feature.txt").is_file());
         cleanup_run(&state, false).unwrap();
+    }
+
+    /// #176: gitignored local config reaches every slot worktree, in plain `worktree`
+    /// isolation too, from the list `[worktree].copy` names. Missing entries are skipped.
+    #[test]
+    fn prepare_isolation_copies_configured_files_into_slot_worktrees() {
+        let tmp = tempdir().unwrap();
+        let (root, _wt, _) = repo_with_linked_worktree(tmp.path());
+        std::fs::write(
+            root.join("spar.toml"),
+            "[worktree]\ncopy = [\".db.env\", \"conf/local.env\", \"missing.env\"]\n",
+        )
+        .unwrap();
+        std::fs::write(root.join(".db.env"), "DATABASE_URL=x\n").unwrap();
+        std::fs::create_dir_all(root.join("conf")).unwrap();
+        std::fs::write(root.join("conf/local.env"), "K=v\n").unwrap();
+        std::fs::write(root.join(".envrc"), "not listed\n").unwrap();
+
+        let mut state = RunState::new("runcopy1", crate::cli::WorkflowKind::Loop, root.clone());
+        state.isolation = IsolationMode::Worktree;
+        state.dry_run = false;
+        state.base_commit = git_out(&root, &["rev-parse", "HEAD"]);
+        let paths = SparPaths::new(&root);
+        paths.ensure_run_dirs(&state.id).unwrap();
+        prepare_isolation(&mut state, &paths, &["impl".to_string()]).unwrap();
+
+        let wt = &state.worktrees.first().expect("slot worktree").path;
+        assert_eq!(
+            std::fs::read_to_string(wt.join(".db.env")).unwrap(),
+            "DATABASE_URL=x\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join("conf/local.env")).unwrap(),
+            "K=v\n"
+        );
+        assert!(!wt.join("missing.env").exists());
+        assert!(
+            !wt.join(".envrc").exists(),
+            "only the configured list is copied"
+        );
+        cleanup_run(&state, false).unwrap();
+    }
+
+    /// #178: `.spar/` an agent creates in its worktree never shows up as a change, while
+    /// `artifacts/` stays visible (it may be the project's own), and a repo that tracks
+    /// `.spar/` is left alone.
+    #[test]
+    fn slot_worktrees_exclude_spar_only() {
+        let tmp = tempdir().unwrap();
+        let (root, _wt, _) = repo_with_linked_worktree(tmp.path());
+        let rec = create_worktree(&root, "runexcl", "impl", None).unwrap();
+        for dir in ["artifacts", ".spar"] {
+            std::fs::create_dir_all(rec.path.join(dir)).unwrap();
+            std::fs::write(rec.path.join(dir).join("summary-impl.md"), "x").unwrap();
+        }
+        assert_eq!(
+            git_out(&rec.path, &["status", "--porcelain"]).unwrap(),
+            "?? artifacts/"
+        );
+        let exclude = std::fs::read_to_string(root.join(".git/info/exclude")).unwrap();
+        assert_eq!(exclude.lines().filter(|l| *l == "/.spar/").count(), 1);
+        assert!(!exclude.contains("artifacts"), "{exclude}");
+        let again = create_worktree(&root, "runexcl", "impl-2", None).unwrap();
+        let exclude = std::fs::read_to_string(root.join(".git/info/exclude")).unwrap();
+        assert_eq!(
+            exclude.lines().filter(|l| *l == "/.spar/").count(),
+            1,
+            "idempotent"
+        );
+        remove_worktree(&root, &rec).unwrap();
+        remove_worktree(&root, &again).unwrap();
+
+        let tmp = tempdir().unwrap();
+        let (root, _wt, _) = repo_with_linked_worktree(tmp.path());
+        std::fs::create_dir_all(root.join(".spar")).unwrap();
+        std::fs::write(root.join(".spar/keep.txt"), "tracked").unwrap();
+        fixture_git(&root, &["add", "-f", ".spar/keep.txt"]);
+        fixture_git(&root, &["commit", "-q", "-m", "track .spar"]);
+        let rec = create_worktree(&root, "runexcl2", "impl", None).unwrap();
+        std::fs::write(rec.path.join(".spar/new.txt"), "x").unwrap();
+        assert_eq!(
+            git_out(&rec.path, &["status", "--porcelain"]).unwrap(),
+            "?? .spar/new.txt"
+        );
+        remove_worktree(&root, &rec).unwrap();
+    }
+
+    fn drift(paths: &SparPaths, run_id: &str) -> Option<String> {
+        crate::events::read_all(paths, run_id)
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| e.message)
+            .find(|m| m.contains("primary checkout"))
+    }
+
+    /// #178: a primary checkout that changes while slots run is warned once the leg
+    /// stops; edits made while the run is parked at a gate are the operator's and are not.
+    #[test]
+    fn a_primary_checkout_changed_during_a_leg_is_reported() {
+        use crate::state::Phase;
+        let tmp = tempdir().unwrap();
+        let (root, _wt, _) = repo_with_linked_worktree(tmp.path());
+        let paths = SparPaths::new(&root);
+        let mut state = RunState::new("runwatch", crate::cli::WorkflowKind::Loop, root.clone());
+        state.save(&paths).unwrap();
+        state.set_phase(Phase::Dispatch);
+        state.save(&paths).unwrap();
+        state.set_phase(Phase::AwaitingPlanApproval);
+        state.save(&paths).unwrap();
+        assert_eq!(drift(&paths, "runwatch"), None);
+
+        std::fs::write(root.join("README"), "operator edit at the gate").unwrap();
+        state.set_phase(Phase::PlanApproved);
+        state.save(&paths).unwrap();
+        state.set_phase(Phase::Dispatch);
+        state.save(&paths).unwrap();
+        state.set_phase(Phase::AwaitingShipConfirm);
+        state.save(&paths).unwrap();
+        assert_eq!(
+            drift(&paths, "runwatch"),
+            None,
+            "edits made at a gate are not the run's"
+        );
+
+        state.set_phase(Phase::Shipping);
+        state.save(&paths).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        state.set_phase(Phase::Failed);
+        state.save(&paths).unwrap();
+        let hit = drift(&paths, "runwatch").expect("drift reported");
+        assert!(hit.contains("?? Cargo.toml"), "{hit}");
+        assert!(
+            !hit.contains("README"),
+            "pre-existing changes are not news: {hit}"
+        );
+        assert!(
+            !paths.primary_status_file("runwatch").exists(),
+            "a leg's snapshot is dropped when it is compared"
+        );
+    }
+
+    /// A queued run sits at `Init` until admitted: the leg starts when work does, and
+    /// the `/.spar/` exclude added when slots are cut mid-leg is not a change.
+    #[test]
+    fn the_drift_leg_starts_at_work_and_ignores_spars_own_exclude() {
+        use crate::state::Phase;
+        let tmp = tempdir().unwrap();
+        let (root, _wt, _) = repo_with_linked_worktree(tmp.path());
+        let paths = SparPaths::new(&root);
+        let mut state = RunState::new("runqueue", crate::cli::WorkflowKind::Loop, root.clone());
+        state.save(&paths).unwrap();
+        assert!(
+            !paths.primary_status_file("runqueue").exists(),
+            "queued: no leg yet"
+        );
+
+        std::fs::write(root.join("README"), "edited while queued").unwrap();
+        state.set_phase(Phase::PrepareIsolation);
+        state.save(&paths).unwrap();
+        let rec = create_worktree(&root, "runqueue", "impl", None).unwrap();
+        state.set_phase(Phase::AwaitingShipConfirm);
+        state.save(&paths).unwrap();
+        assert_eq!(drift(&paths, "runqueue"), None);
+        remove_worktree(&root, &rec).unwrap();
+    }
+
+    /// Porcelain's leading space is part of the status code. Trimmed off the first line
+    /// only, an unchanged ` M` entry read as both removed and added.
+    #[test]
+    fn drift_lists_only_what_changed() {
+        use crate::state::Phase;
+        let tmp = tempdir().unwrap();
+        let (root, _wt, _) = repo_with_linked_worktree(tmp.path());
+        std::fs::write(root.join("A.txt"), "a").unwrap();
+        fixture_git(&root, &["add", "A.txt"]);
+        fixture_git(&root, &["commit", "-q", "-m", "a"]);
+        std::fs::write(root.join("README"), "dirty before the run").unwrap();
+        let paths = SparPaths::new(&root);
+        let mut state = RunState::new("runlist", crate::cli::WorkflowKind::Loop, root.clone());
+        state.set_phase(Phase::Dispatch);
+        state.save(&paths).unwrap();
+        std::fs::write(root.join("A.txt"), "changed by a slot").unwrap();
+        state.set_phase(Phase::Failed);
+        state.save(&paths).unwrap();
+        let hit = drift(&paths, "runlist").expect("drift reported");
+        assert!(hit.contains("( M A.txt)"), "{hit}");
+        assert!(!hit.contains("README"), "{hit}");
     }
 
     #[test]
