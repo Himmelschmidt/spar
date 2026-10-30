@@ -219,3 +219,113 @@ fn purge_keeps_artifacts_unless_purge_artifacts() {
         .code(0);
     assert!(!proj.join(".spar/runs").join(&gone).exists());
 }
+
+/// A fake `muse` for the ceiling test. The implementer commits its work and then hangs
+/// past the hard ceiling; the artifact-only recovery turn (`prompt-impl-artifact.md`)
+/// writes the summary; reviewers approve the commit they were shown.
+fn install_ceiling_muse(bin: &Path) {
+    std::fs::create_dir_all(bin).unwrap();
+    let p = bin.join("muse");
+    std::fs::write(
+        &p,
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo "fake-muse 0"; exit 0; fi
+PROMPT_FILE=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--prompt-file" ]; then PROMPT_FILE="$a"; fi
+  prev="$a"
+done
+NAME=$(basename "$PROMPT_FILE" .md)
+NAME=${NAME#prompt-}
+ART="$(dirname "$PROMPT_FILE")/artifacts"
+mkdir -p "$ART"
+echo '{"schema_version":1,"stream":{"kind":"session","id":"sess-c"},"record_type":"event","payload_type":"run.model.configured","payload":{"kind":"run_model_configured","model_id":"m"}}'
+case "$NAME" in
+  impl)
+    echo ceiling >> "$SPAR_TEST_MUSE_STATE/calls"
+    echo work > work.txt
+    git add work.txt
+    git commit -qm work
+    sleep 60
+    ;;
+  impl-artifact)
+    echo recovery >> "$SPAR_TEST_MUSE_STATE/calls"
+    printf '# Summary\nCommitted work.txt.\n' > "$ART/summary-impl.md"
+    ;;
+  *)
+    CWD=$(sed -n 's/.*Code under review (worktree): \([^ ]*\).*/\1/p' "$PROMPT_FILE" | head -n 1)
+    SHA=$(git -C "$CWD" rev-parse HEAD 2>/dev/null)
+    printf '## Verdict\napprove\n\nReviewed-Commit: %s\n' "$SHA" > "$ART/review-$NAME.md"
+    ;;
+esac
+exit 0
+"#,
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// #180: a slot killed at the hard ceiling after committing its work is not a failed
+/// slot. It takes the recovery turn a clean exit without its artifact takes, and the run
+/// goes on to review in the same round.
+#[test]
+fn a_ceiling_killed_implementer_with_new_commits_is_recovered() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    init_repo(&proj);
+    std::fs::write(
+        proj.join("spar.toml"),
+        "[suite]\nenabled = false\n[rounds]\nmax = 1\n[timeouts]\nslot_secs = 2\nhard_ceiling_multiple = 1.5\n",
+    )
+    .unwrap();
+    let bin = tmp.path().join("bin");
+    install_ceiling_muse(&bin);
+    let calls_dir = tmp.path().join("muse-state");
+    std::fs::create_dir_all(&calls_dir).unwrap();
+
+    let out = spar_cmd()
+        .current_dir(&proj)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("SPAR_TEST_MUSE_STATE", &calls_dir)
+        .args([
+            "implement",
+            "-t",
+            "add work",
+            "--providers",
+            "cli:muse",
+            "--fleet",
+            "small",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|_| panic!("json: {}", String::from_utf8_lossy(&out.stderr)));
+    let run_id = v["run_id"].as_str().expect("run_id").to_string();
+    let calls = std::fs::read_to_string(calls_dir.join("calls")).unwrap();
+    assert_eq!(
+        calls.lines().collect::<Vec<_>>(),
+        ["ceiling", "recovery"],
+        "{calls}"
+    );
+    let st = read_state(&proj, &run_id);
+    let impl_slot = st["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["role"] == "implementer")
+        .expect("implementer slot")
+        .clone();
+    assert_eq!(impl_slot["status"], "done", "{impl_slot}");
+    assert_eq!(st["round"], 1, "{st}");
+    assert_eq!(st["phase"], "awaiting_ship_confirm", "{st}");
+}

@@ -1024,6 +1024,9 @@ fn execute_prepared(
     // retry or transient retry inside `dispatch_with_resume_recovery` is still
     // this dispatch, and its write lands after this capture either way.
     let dispatch_start = SystemTime::now();
+    let dispatch_head = role_is_recoverable(prep.job.role)
+        .then(|| git_output(&prep.cwd, &["rev-parse", "HEAD"]))
+        .flatten();
     let mut res = dispatch_with_resume_recovery(
         adapter.as_ref(),
         &bin,
@@ -1051,7 +1054,12 @@ fn execute_prepared(
         signal: res.signal,
         reason: None,
     };
-    let _ = markers::write_dispatch_verdict(&prep.paths, &prep.run_id, &prep.job.slot_id, &verdict);
+    // A ceiling kill's verdict waits for the salvage check below: writing `.failed` here
+    // would outrank the `.done` a salvaged slot earns.
+    if !res.timed_out {
+        let _ =
+            markers::write_dispatch_verdict(&prep.paths, &prep.run_id, &prep.job.slot_id, &verdict);
+    }
     let agy_quota_hit = enrich_agy_stats(
         &mut res.stats,
         &prep.job.provider,
@@ -1079,6 +1087,47 @@ fn execute_prepared(
             &prep.run_id,
             &crate::events::Event::slot_note(&prep.job.slot_id, &error),
         );
+        let kept = prep.job.expected_artifact.as_ref().is_some_and(|name| {
+            ceiling_kill_kept_work(
+                &ArtifactRecovery {
+                    paths: &prep.paths,
+                    run_id: &prep.run_id,
+                    slot_id: &prep.job.slot_id,
+                    round: prep.round,
+                    role: prep.job.role,
+                    owns_cwd: prep.owns_cwd,
+                    provider: &prep.job.provider,
+                    model: prep.job.model.clone(),
+                    effort: prep.job.effort,
+                    cwd: &prep.cwd,
+                    log_path: &prep.log_path,
+                    prompt_path: &recovery_prompt_path(&prep.prompt_path, &prep.job.slot_id),
+                    env: &prep.env,
+                    isolation,
+                    base_commit: prep.base_commit.as_deref(),
+                    artifact: &prep.paths.artifact(&prep.run_id, name),
+                },
+                dispatch_head.as_deref(),
+                dispatch_start,
+            )
+        });
+        verdict.ok = kept;
+        let _ =
+            markers::write_dispatch_verdict(&prep.paths, &prep.run_id, &prep.job.slot_id, &verdict);
+        if kept {
+            return Ok(SlotOutcome {
+                ok: true,
+                pid,
+                exit_code: res.exit_code,
+                signal: res.signal,
+                error: None,
+                usage: Some(usage),
+                agy_quota_hit,
+                quota_rejected: quota_rejected.clone(),
+                quota_resets_at,
+                quota_recovered,
+            });
+        }
         return Ok(SlotOutcome {
             ok: false,
             pid,
@@ -1303,6 +1352,40 @@ struct ArtifactRecovery<'a> {
 /// only the write-up missing.
 fn role_is_recoverable(role: SlotRole) -> bool {
     matches!(role, SlotRole::Implementer)
+}
+
+/// Whether a ceiling-killed slot finished its work anyway (O114). The hard ceiling is a
+/// wall clock, not a verdict: a slot that committed and then hung on a final command, or
+/// wrote its artifact and never exited, has done the round. A fresh artifact keeps it as
+/// is; new commits since the dispatch began earn the same artifact-only recovery turn a
+/// clean exit without its artifact gets. A dirty tree alone does not: that is a round
+/// cut short, and the checkpoint (O112) already keeps it.
+fn ceiling_kill_kept_work(
+    r: &ArtifactRecovery,
+    dispatch_head: Option<&str>,
+    since: SystemTime,
+) -> bool {
+    if !role_is_recoverable(r.role) || !r.owns_cwd {
+        return false;
+    }
+    let kept = if artifact_fresh_since(r.artifact, since) {
+        true
+    } else {
+        let committed = dispatch_head
+            .is_some_and(|h| git_output(r.cwd, &["rev-parse", "HEAD"]).is_some_and(|now| now != h));
+        committed && recover_artifact(r)
+    };
+    if kept {
+        let _ = crate::events::append(
+            r.paths,
+            r.run_id,
+            &crate::events::Event::slot_note(
+                r.slot_id,
+                "killed at the hard ceiling after finishing its work; kept as done",
+            ),
+        );
+    }
+    kept
 }
 
 /// Work the slot left behind: uncommitted changes, or commits past the run's base.
@@ -3320,6 +3403,9 @@ fn run_headless(
     // See `execute_prepared`: the artifact gate below only counts a write from
     // this dispatch.
     let dispatch_start = SystemTime::now();
+    let dispatch_head = role_is_recoverable(job.role)
+        .then(|| git_output(cwd, &["rev-parse", "HEAD"]))
+        .flatten();
     let mut res = dispatch_with_resume_recovery(
         adapter.as_ref(),
         &bin,
@@ -3348,7 +3434,10 @@ fn run_headless(
         signal: res.signal,
         reason: None,
     };
-    let _ = markers::write_dispatch_verdict(paths, &state.id, &job.slot_id, &verdict);
+    // See `execute_prepared`: a ceiling kill's verdict waits for the salvage check.
+    if !res.timed_out {
+        let _ = markers::write_dispatch_verdict(paths, &state.id, &job.slot_id, &verdict);
+    }
     let agy_quota_hit = enrich_agy_stats(&mut res.stats, &job.provider, cwd, log_path, paths);
     enrich_muse_stats(&mut res.stats, &job.provider, log_path);
     enrich_opencode_stats(
@@ -3370,6 +3459,46 @@ fn run_headless(
             &state.id,
             &crate::events::Event::slot_note(&job.slot_id, &error),
         );
+        let kept = job.expected_artifact.as_ref().is_some_and(|name| {
+            ceiling_kill_kept_work(
+                &ArtifactRecovery {
+                    paths,
+                    run_id: &state.id,
+                    slot_id: &job.slot_id,
+                    round: state.round,
+                    role: job.role,
+                    owns_cwd: owns_cwd(state, &job.slot_id, cwd),
+                    provider: &job.provider,
+                    model: slot_model_for(Some(state), job),
+                    effort: slot_effort_for(cfg, Some(state), job),
+                    cwd,
+                    log_path,
+                    prompt_path: &recovery_prompt_path(prompt_path, &job.slot_id),
+                    env,
+                    isolation: state.isolation,
+                    base_commit: state.base_commit.as_deref(),
+                    artifact: &paths.artifact(&state.id, name),
+                },
+                dispatch_head.as_deref(),
+                dispatch_start,
+            )
+        });
+        verdict.ok = kept;
+        let _ = markers::write_dispatch_verdict(paths, &state.id, &job.slot_id, &verdict);
+        if kept {
+            return Ok(SlotOutcome {
+                ok: true,
+                pid,
+                exit_code: res.exit_code,
+                signal: res.signal,
+                error: None,
+                usage: Some(usage),
+                agy_quota_hit,
+                quota_rejected: quota_rejected.clone(),
+                quota_resets_at,
+                quota_recovered,
+            });
+        }
         return Ok(SlotOutcome {
             ok: false,
             pid,

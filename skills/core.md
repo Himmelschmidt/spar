@@ -175,9 +175,11 @@ reported one.
 Resume and transient retry (DECISIONS O86). A muse slot's next round calls
 `muse exec --session-id <id>` instead of a cold dispatch when an earlier round captured
 a session id. If a dispatch exits 1 with muse's backend-404 text
-(`does not exist or you lack access`) after at least one completed tool call, spar waits
-it out (roughly 60s/150s/300s, resuming the same session each retry) instead of failing
-the slot; the same text with zero tool calls fails immediately. A resume against a
+(`does not exist or you lack access`), a transport timeout (`transport error
+[net-timeout]`) or a lost command channel (`runtime command acknowledgement timed out`)
+after at least one completed tool call, spar waits it out (roughly 60s/150s/300s, resuming
+the same session each retry, inside the same dispatch, so no round is charged) instead of
+failing the slot; the same text with zero tool calls fails immediately. A resume against a
 session muse no longer has is detected from its session log and retried cold once.
 muse's stream timeouts follow the slot ceiling, exit 2 is reported as spar's bad command
 line (never the agent's fault), and an implementer slot killed mid-dispatch still leaves
@@ -677,6 +679,13 @@ slot is stuck on.**
 - A slot the ceiling killed records `error: "hard ceiling: killed after …"` and
   **`"ceiling_kill": true`** in `status --json`, which is how you tell it from a crash
   (`exit 143`, a signal) without parsing prose. Exit codes are unchanged.
+- **The ceiling is a clock, not a verdict.** Before an implementer the ceiling killed is
+  marked failed, spar checks whether it finished anyway: an expected artifact written
+  during this dispatch keeps the slot `done`; new commits since the dispatch began earn the
+  same artifact-only recovery turn a clean exit without its artifact gets (below). Either
+  way the slot note reads `killed at the hard ceiling after finishing its work; kept as
+  done` and the round goes on to review. A dirty tree alone is not enough (that is a round
+  cut short; its checkpoint keeps it). Implementer only, like the recovery turn.
 - Delivery is per-adapter and you never choose it. **claude** takes nudges through its
   inbox, which its `Stop` hook drains at the turn boundary. **grok** takes them through
   the same `Stop`-hook injection that **claude** uses: spar writes a project hook file
