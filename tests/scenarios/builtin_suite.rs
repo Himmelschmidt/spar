@@ -215,8 +215,9 @@ fn a_zero_timeout_with_commands_is_refused() {
             "--json",
         ])
         .assert()
-        .failure()
-        .stderr(predicates::str::contains("[suite].timeout_secs is 0"));
+        .code(1)
+        .stdout(predicates::str::contains("[suite].timeout_secs is 0"))
+        .stdout(predicates::str::contains("\"kind\": \"validation\""));
 }
 
 /// A blank entry is a config error at load, not a command that silently runs `sh -c ""`
@@ -238,6 +239,7 @@ fn an_empty_command_entry_is_refused() {
             "--json",
         ])
         .assert()
-        .failure()
-        .stderr(predicates::str::contains("[suite].command[1] is empty"));
+        .code(1)
+        .stdout(predicates::str::contains("[suite].command[1] is empty"))
+        .stdout(predicates::str::contains("\"kind\": \"validation\""));
 }

@@ -662,3 +662,65 @@ fn an_implementer_leases_a_free_pool_slot_and_releases_it() {
     );
     assert!(slot_of(&state, "implementer").get("build_cache").is_none());
 }
+
+/// The implementer's model dispatch (`claude -p`) records the CARGO_TARGET_DIR it sees.
+fn recording_claude(fx: &Fixture) {
+    write_exe(
+        &fx.bin.join("claude"),
+        "if [ \"$1\" = \"--version\" ]; then echo fake; exit 0; fi\n\
+         if [ \"$1\" = \"-p\" ]; then echo \"$CARGO_TARGET_DIR\" >> \"$FAKE_LOG_DIR/target.log\"; fi\n\
+         exit 1",
+    );
+}
+
+fn implement_real(fx: &Fixture) {
+    // The fake fails every dispatch; only what it saw matters here.
+    let _ = fx
+        .spar()
+        .env("CARGO_TARGET_DIR", "/shared/target")
+        .args([
+            "implement",
+            "-t",
+            "build the thing",
+            "--role",
+            "implementer=cli:claude",
+            "--without",
+            "suite",
+        ])
+        .assert();
+}
+
+/// `[env] capture` puts the creating shell's CARGO_TARGET_DIR back on the orchestrator
+/// (O130); the implementer slot's own value, a leased pool directory or its worktree's
+/// target, must still be what the agent sees (O143).
+#[test]
+fn the_slot_env_beats_a_captured_cargo_target_dir() {
+    let fx = Fixture::new();
+    recording_claude(&fx);
+    let pool = fx.tmp.path().join("pool");
+    fs::create_dir_all(&pool).unwrap();
+    fs::write(
+        fx.proj.join("spar.toml"),
+        format!(
+            "[env]\ncapture = [\"CARGO_TARGET_DIR\"]\n[worktree]\nbuild_cache_pool = [\"{}/t-1\"]\n",
+            pool.display()
+        ),
+    )
+    .unwrap();
+
+    implement_real(&fx);
+    let seen = fs::read_to_string(fx.bin.join("target.log")).expect("the implementer ran");
+    let first = seen.lines().next().unwrap();
+    assert_eq!(first, pool.join("t-1").display().to_string(), "{seen}");
+
+    fs::remove_file(fx.bin.join("target.log")).unwrap();
+    hold(&pool.join("t-1"));
+    implement_real(&fx);
+    let seen = fs::read_to_string(fx.bin.join("target.log")).expect("the implementer ran");
+    let first = seen.lines().next().unwrap();
+    assert_ne!(
+        first, "/shared/target",
+        "an exhausted pool never inherits the captured value"
+    );
+    assert!(first.ends_with("/target"), "{seen}");
+}

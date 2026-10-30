@@ -5,7 +5,10 @@ use std::time::{Duration, Instant, SystemTime};
 pub fn write_marker(paths: &SparPaths, run_id: &str, name: &str, body: &str) -> Result<()> {
     paths.ensure_run_dirs(run_id)?;
     let p = paths.marker(run_id, name);
-    std::fs::write(&p, body).with_context(|| format!("write marker {}", p.display()))?;
+    // Temp file plus rename: a reader polling for the marker never sees it half written.
+    let tmp = p.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp, body).with_context(|| format!("write marker {}", tmp.display()))?;
+    std::fs::rename(&tmp, &p).with_context(|| format!("write marker {}", p.display()))?;
     Ok(())
 }
 

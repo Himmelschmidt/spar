@@ -112,6 +112,12 @@ pub fn run(json: bool) -> Result<ExitCode> {
     }
 
     if let Some(root) = &project_root {
+        if let Some(note) = gate_notify_hint(&SparPaths::new(root), &cfg, chrono::Utc::now()) {
+            notes.push(note);
+        }
+    }
+
+    if let Some(root) = &project_root {
         let daemon_paths = SparPaths::new(root);
         match crate::daemon::DaemonLock::owner(&daemon_paths).filter(|t| t.alive()) {
             Some(t) => notes.push(format!("daemon: running (pid {})", t.pid)),
@@ -253,6 +259,40 @@ fn has_usable_provider(providers: &[providers::ProviderReport]) -> bool {
 /// Doctor's own exit rule, pinned here so the wiring (`git` gate plus the
 /// usable-provider gate) is unit-testable: one broken provider does not block
 /// a run while a usable one remains.
+/// How long a run may sit at a human gate before doctor says the operator should be
+/// pushed about it rather than expected to look.
+const GATE_UNSEEN_AFTER: chrono::Duration = chrono::Duration::hours(1);
+
+/// Runs parked at a human gate past `GATE_UNSEEN_AFTER` with no `[notify]` sink
+/// configured: the TUI alert panel only helps someone who has it open (#165).
+fn gate_notify_hint(
+    paths: &SparPaths,
+    cfg: &Config,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    if cfg.notify.command.is_some() || cfg.notify.webhook.is_some() {
+        return None;
+    }
+    let waiting: Vec<String> = crate::state::list_runs(paths)
+        .ok()?
+        .into_iter()
+        .filter(|r| !r.archived && r.phase.is_gate() && now - r.updated_at > GATE_UNSEEN_AFTER)
+        .map(|r| r.id)
+        .collect();
+    if waiting.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{} run(s) waiting at a human gate for over {}h with no [notify] sink ({}). \
+         Add one to ~/.config/spar/config.toml so gates reach you:\n  [notify]\n  \
+         command = \"notify-send spar \\\"$1\\\"\"   # summary on $1, message JSON on stdin\n  \
+         # or: webhook = \"https://ntfy.sh/<your-topic>\"",
+        waiting.len(),
+        GATE_UNSEEN_AFTER.num_hours(),
+        waiting.join(", ")
+    ))
+}
+
 fn doctor_ok(git_available: bool, providers: &[providers::ProviderReport]) -> bool {
     git_available && has_usable_provider(providers)
 }
@@ -274,6 +314,44 @@ fn print_tool(t: &ToolCheck) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gated_run(paths: &SparPaths, id: &str, at: chrono::DateTime<chrono::Utc>) {
+        let mut st = crate::state::RunState::new(
+            id.to_string(),
+            crate::cli::WorkflowKind::Loop,
+            paths.project_root.clone(),
+        );
+        st.set_phase(crate::state::Phase::AwaitingRoundExtension);
+        st.updated_at = at;
+        paths.ensure_run_dirs(id).unwrap();
+        std::fs::write(
+            paths.state_file(id),
+            serde_json::to_string_pretty(&st).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_long_unseen_gate_without_notify_recommends_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let now = chrono::Utc::now();
+        gated_run(&paths, "fresh", now - chrono::Duration::minutes(10));
+        let cfg = Config::default();
+        assert!(gate_notify_hint(&paths, &cfg, now).is_none());
+
+        gated_run(&paths, "stale", now - chrono::Duration::hours(3));
+        let hint = gate_notify_hint(&paths, &cfg, now).expect("hint");
+        assert!(hint.contains("stale") && !hint.contains("fresh"), "{hint}");
+        assert!(
+            hint.contains("[notify]") && hint.contains("command ="),
+            "{hint}"
+        );
+
+        let mut with_sink = Config::default();
+        with_sink.notify.webhook = Some("https://example.invalid".into());
+        assert!(gate_notify_hint(&paths, &with_sink, now).is_none());
+    }
     use crate::providers::{
         Capabilities, DeliveryStrategy, PresenceSource, ProviderReport, Readiness,
     };

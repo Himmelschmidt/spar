@@ -224,9 +224,35 @@ pub fn apply_run_base(state: &mut RunState, requested: Option<&str>, json: bool)
             base.reference
         );
     }
+    state.config_source_drift = config_source_drift(&state.project_root, &base.commit);
+    if state.config_source_drift {
+        eprintln!(
+            "warning: spar.toml in {} differs from base {}'s copy; this run uses the working \
+             file. Pull the primary checkout (or commit the edit) if that is not what you meant.",
+            state.project_root.display(),
+            base.reference
+        );
+    }
     state.base_ref = Some(base.reference);
     state.base_commit = Some(base.commit);
     Ok(())
+}
+
+/// Whether the base commit's `spar.toml` differs from the working file in the primary
+/// checkout, which is what `Config::load` (and so the run's frozen config) reads. A
+/// primary checkout days behind main runs a merged config change nowhere (#189). Absent
+/// on both sides is no drift; absent on one side is.
+fn config_source_drift(project_root: &Path, commit: &str) -> bool {
+    // A project nested inside its repo keeps `spar.toml` under that prefix in the tree.
+    let prefix = git_out(project_root, &["rev-parse", "--show-prefix"]).unwrap_or_default();
+    let at_base = git_out(
+        project_root,
+        &["show", &format!("{commit}:{prefix}spar.toml")],
+    );
+    let working = std::fs::read_to_string(project_root.join("spar.toml"))
+        .ok()
+        .map(|s| s.trim().to_string());
+    at_base != working
 }
 
 /// Commits `dir`'s HEAD is behind its upstream tracking branch, as of the last fetch.

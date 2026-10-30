@@ -171,3 +171,9 @@ timeout_secs = 3600
 # reviewer = "value"
 # tester = "fast"
 # test_author = "fast"
+
+# Shell variables a run records at creation and re-applies on resume/extend/daemon
+# restart, warning when the current shell differs. Secret-looking names are refused.
+# [env]
+# capture = ["CARGO_TARGET_DIR", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
+#            "https_proxy", "http_proxy", "all_proxy", "no_proxy"]

@@ -73,19 +73,18 @@ impl ProviderAdapter for ClaudeAdapter {
         }
     }
 
+    fn prompt_stdin(&self, opts: &SpawnOpts) -> Option<std::path::PathBuf> {
+        opts.prompt_file.clone()
+    }
+
     fn build_headless(&self, bin: &Path, opts: &SpawnOpts) -> Command {
         let mut cmd = Command::new(bin);
         cmd.arg("-p");
-        // Prefer full prompt text; if only a prompt file was provided, read it.
-        let prompt = if !opts.prompt.is_empty() {
-            opts.prompt.clone()
-        } else if let Some(pf) = &opts.prompt_file {
-            std::fs::read_to_string(pf)
-                .unwrap_or_else(|_| format!("Read and follow instructions in {}", pf.display()))
-        } else {
-            String::new()
-        };
-        cmd.arg(prompt);
+        // `-p` with no prompt argument reads the prompt from stdin, which
+        // `prompt_stdin` hands it whenever a prompt file exists.
+        if opts.prompt_file.is_none() {
+            cmd.arg(&opts.prompt);
+        }
         // stream-json emits events as they happen so spar can tail the slot log live
         cmd.arg("--output-format").arg("stream-json");
         cmd.arg("--verbose");
@@ -179,8 +178,10 @@ mod tests {
     use crate::providers::command_to_parts;
     use std::path::PathBuf;
 
+    /// #182: a prompt in argv is matched by every `pgrep -f`; with a prompt file it
+    /// rides stdin and argv carries none of it.
     #[test]
-    fn headless_passes_prompt_not_at_path() {
+    fn headless_with_a_prompt_file_reads_the_prompt_from_stdin() {
         let opts = SpawnOpts {
             prompt: "implement feature".into(),
             prompt_file: Some(PathBuf::from("/tmp/p.md")),
@@ -196,9 +197,24 @@ mod tests {
         let cmd = ClaudeAdapter.build_headless(Path::new("claude"), &opts);
         let (_, args) = command_to_parts(&cmd);
         assert_eq!(args.first().map(String::as_str), Some("-p"));
-        assert_eq!(args.get(1).map(String::as_str), Some("implement feature"));
-        assert!(args.iter().any(|a| a == "stream-json"));
+        assert_eq!(args.get(1).map(String::as_str), Some("--output-format"));
+        assert!(
+            !args.iter().any(|a| a.contains("implement feature")),
+            "{args:?}"
+        );
         assert!(!args.iter().any(|a| a.starts_with('@')));
+        assert_eq!(
+            ClaudeAdapter.prompt_stdin(&opts),
+            Some(PathBuf::from("/tmp/p.md"))
+        );
+    }
+
+    #[test]
+    fn headless_without_a_prompt_file_keeps_the_prompt_in_argv() {
+        let opts = opts_with_session(None);
+        let (_, args) = command_to_parts(&ClaudeAdapter.build_headless(Path::new("claude"), &opts));
+        assert_eq!(args.get(1).map(String::as_str), Some("implement feature"));
+        assert_eq!(ClaudeAdapter.prompt_stdin(&opts), None);
     }
 
     fn opts_with_session(session_id: Option<&str>) -> SpawnOpts {

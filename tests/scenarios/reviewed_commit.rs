@@ -78,6 +78,8 @@ fn only_run_id(proj: &std::path::Path) -> String {
 ///   fixed dead sha — fresh bytes about a commit that is not under review.
 const FAKE_CLAUDE_STALE: &str = r#"#!/bin/sh
 if [ "$1" = "--version" ]; then echo "fake-claude 0"; exit 0; fi
+# The prompt arrives on stdin, not argv (O128): scan it like an argument.
+set -- "$@" "$(cat)"
 STATE="$(dirname "$0")/state"
 mkdir -p "$STATE"
 TOOL_LINE='{"type":"assistant","message":{"model":"fake","usage":{"input_tokens":10,"output_tokens":5},"content":[{"type":"text","text":"Looking."},{"type":"tool_use","name":"Read","input":{"file_path":"x"}}]}}'
@@ -122,6 +124,8 @@ esac
 /// `Reviewed-Commit` line at all.
 const FAKE_CLAUDE_ABSENT: &str = r#"#!/bin/sh
 if [ "$1" = "--version" ]; then echo "fake-claude 0"; exit 0; fi
+# The prompt arrives on stdin, not argv (O128): scan it like an argument.
+set -- "$@" "$(cat)"
 STATE="$(dirname "$0")/state"
 mkdir -p "$STATE"
 TOOL_LINE='{"type":"assistant","message":{"model":"fake","usage":{"input_tokens":10,"output_tokens":5},"content":[{"type":"text","text":"Looking."},{"type":"tool_use","name":"Read","input":{"file_path":"x"}}]}}'

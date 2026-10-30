@@ -321,6 +321,26 @@ positions.
   `test_author`, `implementer`, `tester`, `reviewer_adversarial`, `ranker`, `reconciler`,
   `peer_half` (+ `role_frontend` / `role_backend` notes appended for `--workflow roles`).
 
+### Finding a slot's process: by env, not argv (O128)
+
+Every native-cli slot process carries `SPAR_RUN_ID=<run>`, `SPAR_SLOT=<slot id>` (the short
+id, e.g. `impl-1`) and `SPAR_AGENT_ID=<run>:<slot>` in its environment. **Kill and wait by
+env, never by `pgrep -f`:** a pattern over argv also matches the agent, its orchestrator
+and your own wait loop.
+
+```bash
+for p in /proc/[0-9]*; do
+  tr '\0' '\n' < "$p/environ" 2>/dev/null | grep -qx "SPAR_RUN_ID=$RUN" && echo "${p#/proc/}"
+done
+```
+
+Prompts stay out of argv where the CLI allows it: `cli:claude` (`-p` with the prompt on
+stdin) and `cli:codex` (`exec … -- -`, and `exec resume <id> -- -`) read the slot's prompt
+file on stdin; `cli:muse` and `cli:grok` already pass `--prompt-file`. `cli:agy` and
+`cli:pi` still put the prompt in argv (not verified against their CLIs here), and a tmux
+pane always does. Keep long tasks out of spar's own argv too: `plan --spec <file|->` and
+`implement --spec <file|->` read the task (or a `--run` amendment) from a file or stdin.
+
 ## Workflows
 
 **`--providers` or `--select`** is required for `plan`, `implement`, and `run` (no silent default fleet) unless every dispatched role is pinned via `--role`.
@@ -374,6 +394,7 @@ spar reject <run_id> [--reason "..."] [--json]
 # a new ROUND on that run, never a second run.
 spar implement --run <run_id> --providers cli:claude,cli:grok,cli:agy [--dry-run] [--json] [--detach]
 spar implement -t "small task" --providers cli:claude [--dry-run]     # a fresh brief
+spar implement --spec brief.md --providers cli:claude                # same, task from a file (or - for stdin)
 spar implement -t "small task" --select value --urgency high --dry-run
 
 # Replan in place: a second plan round on the same run. `-t` is the directive for the
@@ -493,7 +514,22 @@ it may spend on its own.
 
 ```bash
 spar implement --run <id> --max-rounds 12   # buy more rounds; sticky on the run
+spar implement --run <id> --max-rounds +2   # two rounds past the current one (O127)
 ```
+
+**Extending (O127).** The value must land above the run's current round (a round opened
+but never dispatched may be the ceiling itself); anything lower would re-park at once,
+so it is refused, exit `1` (a validation refusal, JSON under `--json`). Sent while an
+orchestrator still holds an **in-flight** run, a bare `implement --run <id> --max-rounds …`
+(no `-t`, `--providers`, `--select`, `--base`, `--reload-config`, `--accept-contract`) is
+**queued**, not refused busy: exit `0`, JSON `{"run_id", "queued_max_rounds", "owner_pid",
+"round"}`, and a `markers/max-rounds.queued` file the loop reads before its next ceiling
+check and once more right after saving the gate (or the next re-entry reads, if the
+orchestrator exits first). A run **already parked** at a gate whose orchestrator is still
+finishing up is not queued: the command waits up to 10s for the lock and applies the
+extension normally, or exits `1` with the busy error (JSON under `--json`). A queued value
+only ever raises the ceiling. `spar doctor` recommends a `[notify]` sink when any
+run has sat at a human gate for over an hour with none configured.
 
 **A round that never dispatched is not charged.** `implement --run` re-entering a run whose
 current round never stamped a slot (the orchestrator died between opening the round and
@@ -1756,6 +1792,24 @@ neither mints nor repurposes a code.
 
 **`--dry-run`:** stubs agent processes only; writes `.spar/runs/<id>/`. Does **not** create real git worktrees (cwd under `.spar/…/cwd-*`). Live runs create sibling worktrees.
 
+**Launch refusals are data (O126).** Anything `plan` / `implement` / `run` refuses before
+a run exists (bad or unknown flags, an unknown provider in `--providers` / `--role` /
+`--backup` / `[roles]` / `[backups]`, a same-storage-key backup, an empty task, a `--base`
+that does not resolve, `--providers` with `--select`) exits **1**, never 2, and with
+`--json` prints on stdout:
+
+```json
+{"ok": false, "error": "backup for implementer has same provider storage key as primary (cli:claude); …", "run_id": null, "kind": "validation"}
+```
+
+`run_id` is `null` for a new launch and the targeted id for `--run <id>`. A paused
+provider is not a validation failure: that still creates a run parked in `quota` (exit 4).
+To pre-check without launching, add `--validate-only` (any of the three commands): it runs
+the same checks, writes nothing (no run dir, no brief intake, no `--reload-config`
+snapshot) and exits 0 with `{"ok": true, "run_id": null, "kind": "validation"}`. It does not
+rank `--select` (that needs the bench cache) or probe PATH and quota. Usage errors on any
+command exit 1, not clap's default 2.
+
 **Providers (four-rung precedence):** each slot's provider is resolved **CLI `--role` for
 that role > CLI `--providers` (positional) / `--select` pool > `[roles]` > `[providers].order`**.
 `--providers` is **positional** — index 0 is the planner/implementer, the rest are
@@ -1896,6 +1950,14 @@ spar implement --run <id> --reassign review-0-cli-codex=cli:claude@opus   # or r
 
 `--reassign <role|seat>=<provider[@model]>` is repeatable and operator-only (refused with exit `1` inside a slot, where `SPAR_AGENT_ID`/`SPAR_RUN_ID` are set). The target is `implementer`, `reviewer` or `tester` when the run has exactly one such seat, or a seat id. It is refused, exit `1` and nothing moved, while the run's orchestrator is alive (`spar stop <id>` first), onto a provider that is manually paused or paused on a trusted quota signal, onto an unknown adapter, when the run is not resumable, and when the seat does not exist yet (before the implement panel was dispatched use `--reload-config --role`). The seat keeps its worktree, branch, carry-forward brief, round count and review history; the implementer keeps the id `impl`, a reviewer or tester seat is renamed to name its new provider (`review-0-cli-codex` -> `review-0-cli-claude`, `suite-cli-codex` -> `suite-cli-claude`) and a reviewer's last review artifact follows it. The new provider starts cold. The seat is recorded as `source: "reassigned"` and a later `--reload-config` leaves it alone; every move is in `state.json` `seat_reassignments` (also in `spar status`) and an event. The run then re-enters exactly as a bare `implement --run <id>` would (it is the same command).
 
+**The source is the working file, not the base commit (O129).** The snapshot is taken from
+`spar.toml` in the primary checkout's working tree. When the run's base commit carries a
+`spar.toml` that differs from it (typically a primary checkout behind main, so a merged
+config change is missing), the launch warns on stderr (`warning: spar.toml in … differs
+from base …'s copy`) and records `config_source_drift: true` in `state.json`, run JSON and
+`status --json`. It is a warning only: pull the primary checkout, or `--reload-config`
+after pulling, to pick up the base's config.
+
 ## Config knobs (`spar.toml`)
 
 ```toml
@@ -2002,6 +2064,16 @@ timeout_secs = 3600    # test_author's SOFT clock; hard_ceiling_multiple applies
 # max_slots_per_bucket = 0     # cross-run concurrency cap, keyed on provider (model-free); 0 = off
 #                              # fleet-wide when the user config sets [quota] shared_path (O142)
 # sync_prs = false             # run `sync-prs --all` (calls gh) at most every 5 minutes
+# Shell variables a run records in its config.json at creation and re-applies on every
+# re-entry (implement --run, resume, plan --run, reconcile, daemon restarts), warning on
+# stderr (names only) when the re-entering shell differs. Only variables set at creation
+# are recorded. Names containing KEY, TOKEN, SECRET or PASSWORD are refused at load (O130).
+# config.json is written 0600 when it holds captured values; nothing prints them. A slot's
+# own env beats captured env, which beats the shell. tmux panes get them via `-e`.
+# `implement --run <id> --reload-config --recapture-env` re-captures from the current shell.
+[env]
+# capture = ["CARGO_TARGET_DIR", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
+#            "https_proxy", "http_proxy", "all_proxy", "no_proxy"]   # the default
 # Dynamic model select (vals). Opt-in with --select; cache under ~/.spar/cache/vals/
 [model_select]
 # benches = ["swebench"]
@@ -2039,7 +2111,7 @@ timeout_secs = 3600    # test_author's SOFT clock; hard_ceiling_multiple applies
   - **Agent tester.** With `[suite].command` empty, a cheap `tester` slot discovers how the repo runs its tests and reports. Its provider comes from `[roles].tester` (falls through to model-select/fleet if unset/unusable). This is the fallback for a repo that has not declared its commands, and the one path where the gate depends on a model reporting its own result honestly.
 
   Independent `review` workflow does not spawn a tester by default.
-- **Round ceiling:** `state.round` is bounded by `[rounds] max` (default 8). Hitting it is a **gate** (exit 2, phase `awaiting_round_extension`), lifted with `implement --run <id> --max-rounds <N>` (>= 1; sticky; clears `error`). The rotate/widen/`stuck` ladder resolves **first**, so exit 3 always beats the gate, and a lift preserves the ladder's progress rather than re-buying it.
+- **Round ceiling:** `state.round` is bounded by `[rounds] max` (default 8). Hitting it is a **gate** (exit 2, phase `awaiting_round_extension`), lifted with `implement --run <id> --max-rounds <N|+N>` (above the current round; sticky; clears `error`; queued while an orchestrator is live). The rotate/widen/`stuck` ladder resolves **first**, so exit 3 always beats the gate, and a lift preserves the ladder's progress rather than re-buying it.
 - **Contract re-freeze is guarded:** a re-entry that would adopt a `test-contract.md` spar saw drift mid-round refuses with exit `1` unless `--accept-contract` is passed. Re-freezes are announced on stderr, not just in `events.jsonl`.
 - **Carry-forward:** the implementer writes `artifacts/carry-forward-<slot>.md`, which seeds the next round's implementer prompt (blockers first, capped at `[rounds] carry_forward_chars`, consumed on read). It never reaches a reviewer or the acceptance gate.
 - **Human TUI `/spawn`:** `/spawn <cli:provider> <prompt>` launches an agent into a pane on spar's own `tmux -L spar` socket, joined to the selected run's bus — watch and steer it in Main's **Shell** tab without leaving spar.

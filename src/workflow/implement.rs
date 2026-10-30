@@ -319,7 +319,7 @@ fn repoint_existing_seats(state: &mut RunState, cfg: &Config) -> Result<()> {
 
 /// One `--reassign <role|seat>=<provider[@model]>`, checked before the run is touched.
 #[derive(Debug, Clone)]
-struct Reassignment {
+pub struct Reassignment {
     target: String,
     pin: crate::runspec::Pin,
 }
@@ -327,7 +327,7 @@ struct Reassignment {
 /// Parse `--reassign` and refuse a provider the run could not dispatch anyway: unknown,
 /// manually paused, or paused on a trusted quota signal (O106, O136). Read before the run
 /// lock, so a typo costs nothing.
-fn parse_reassignments(raw: &[String], paths: &SparPaths) -> Result<Vec<Reassignment>> {
+pub fn parse_reassignments(raw: &[String], paths: &SparPaths) -> Result<Vec<Reassignment>> {
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
     let mut out = Vec::new();
     for r in raw {
@@ -571,7 +571,7 @@ pub fn run_loop(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<Exi
 /// Whether any slot dispatch started in the run's current round. Dispatch stamps
 /// `dispatched_round` and saves before it spawns, so a round it never reached spent
 /// nothing.
-fn current_round_dispatched(state: &RunState) -> bool {
+pub fn current_round_dispatched(state: &RunState) -> bool {
     state.dispatched_round >= state.round
 }
 
@@ -585,9 +585,41 @@ fn run_from_approved(
     // Loaded once before the lock only so a mistyped id fails without the lock minting
     // a run directory for it. Everything below mutates the run, so it all happens under
     // the lock: a live orchestrator refuses us before its state.json can be overwritten.
-    RunState::load(paths, run_id)?;
+    let unlocked = RunState::load(paths, run_id)?;
     let reassignments = parse_reassignments(&opts.reassign, paths)?;
-    let lock = crate::runlock::RunLock::acquire(paths, run_id)?;
+    let mut patient = None;
+    if let Some(mr) = opts.max_rounds {
+        let target = mr.resolve(unlocked.round);
+        check_round_extension(&unlocked, target, !current_round_dispatched(&unlocked))?;
+        let extension_only = amendment.is_none()
+            && opts.providers.is_empty()
+            && opts.select.is_empty()
+            && opts.base.is_none()
+            && !opts.reload_config
+            && !opts.accept_contract
+            && opts.reassign.is_empty();
+        let live = crate::runlock::RunLock::owner(paths, run_id).filter(|o| o.alive());
+        if let (true, Some(owner)) = (extension_only, live) {
+            if let Some(code) =
+                queue_round_extension(paths, &unlocked, target, owner.pid, opts.json)?
+            {
+                return Ok(code);
+            }
+            patient = Some((target, owner.pid));
+        }
+    }
+    let lock = match patient {
+        None => crate::runlock::RunLock::acquire(paths, run_id)?,
+        Some((target, owner_pid)) => {
+            match acquire_for_extension(paths, run_id, target, owner_pid, opts.json)? {
+                Ok(lock) => lock,
+                Err(code) => return Ok(code),
+            }
+        }
+    };
+    // Every way back into a run (`--run`, `resume`, a `--plan` the run wrote) dispatches
+    // under the environment the run was created in (O130), from its own snapshot.
+    Config::for_run(paths, run_id)?.reapply_captured_env();
     let mut state = RunState::load(paths, run_id)?;
     // Read before anything below resets slot statuses for re-dispatch.
     let round_dispatched = current_round_dispatched(&state);
@@ -604,7 +636,11 @@ fn run_from_approved(
             state.phase
         );
     }
-    let moves = resolve_reassignments(&state, &reassignments)?;
+    if let Some(mr) = opts.max_rounds {
+        check_round_extension(&state, mr.resolve(state.round), !round_dispatched)?;
+    }
+    let moves = resolve_reassignments(&state, &reassignments)
+        .map_err(|e| ReassignRefused(format!("{e:#}")))?;
     // Resuming a stopped run: drop the marker so execute_loop dispatches instead
     // of halting again at its first boundary.
     if state.phase == Phase::Stopped {
@@ -746,16 +782,18 @@ fn run_from_approved(
     // A bare pool gate before prepare_implement_slots would see the pool entry as paused
     // and park, even though the seat's CLI pin would be covered by its backup.
     let from_round_gate = state.phase == Phase::AwaitingRoundExtension;
-    if let Some(m) = opts.max_rounds {
-        state.max_rounds = m;
+    // An extension queued for an orchestrator that exited before its ceiling check
+    // still counts; an explicit flag on this re-entry outranks it.
+    apply_queued_round_extension(&mut state, paths);
+    if let Some(mr) = opts.max_rounds {
+        state.max_rounds = mr.resolve(state.round);
     }
     // A round that never dispatched is still the current round, not a spent one: an
     // orchestrator killed between opening it and spawning anything (a launching shell
     // that exited, a quota park before dispatch) cost nothing, so re-entry reuses it,
     // and reusing it is not a step past the ceiling.
     let reuse_round = state.round > 0 && !round_dispatched;
-    if !reuse_round && state.round_ceiling_reached() {
-        escalate_round_ceiling(&mut state, paths)?;
+    if !reuse_round && state.round_ceiling_reached() && escalate_round_ceiling(&mut state, paths)? {
         finish_out(&state, opts.json)?;
         return Ok(state.exit_code());
     }
@@ -1821,7 +1859,9 @@ fn run_with_task(
     state.message_budget = cfg.message_budget;
     state.big = opts.big;
     state.max_fix_rounds = 3;
-    state.max_rounds = opts.max_rounds.unwrap_or(cfg.rounds.max);
+    state.max_rounds = opts
+        .max_rounds
+        .map_or(cfg.rounds.max, |mr| mr.resolve(state.round));
     let n = crate::workflow::roles_resolve::pool_width(cfg);
     let roles: Vec<&str> = std::iter::once(SlotRole::Implementer.as_config_key())
         .chain(std::iter::repeat(SlotRole::Reviewer.as_config_key()))
@@ -3096,8 +3136,9 @@ pub fn execute_loop(
         }
         // Every path that reaches here is about to buy another cold re-dispatch, the
         // ladder's own retries included, so the ceiling bounds all of them.
-        if state.round_ceiling_reached() {
-            return escalate_round_ceiling(state, paths);
+        apply_queued_round_extension(state, paths);
+        if state.round_ceiling_reached() && escalate_round_ceiling(state, paths)? {
+            return Ok(());
         }
         // A fix pass re-dispatches the implementer and the panel, so it is a round of
         // work in its own right (O45) — `fix_rounds` bounds the loop, `round` counts
@@ -4468,11 +4509,162 @@ fn write_impl_summary(state: &RunState, paths: &SparPaths) -> Result<()> {
 
 /// Park the run at the round-ceiling gate instead of buying another cold re-dispatch.
 ///
+const QUEUED_MAX_ROUNDS: &str = "max-rounds.queued";
+
+/// A ceiling at or below the round the run is on parks it again the moment it re-enters,
+/// which reads as the flag having been ignored. `reusing` is a round opened but never
+/// dispatched: re-entry runs that round again, so it may be the ceiling itself.
+/// A `--reassign` the run's own seats refuse (no such seat, ambiguous role): found under
+/// the lock, after the launch pre-check, and still a refusal of the launch (O126).
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct ReassignRefused(String);
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "--max-rounds {target} is at or below run {run_id}'s current round {round}, so it would \
+     park at the ceiling again immediately; pass at least {floor}, or +N for N more rounds"
+)]
+pub struct RoundExtensionRefused {
+    run_id: String,
+    target: u32,
+    round: u32,
+    floor: u32,
+}
+
+pub fn check_round_extension(state: &RunState, target: u32, reusing: bool) -> Result<()> {
+    let floor = if reusing && state.round > 0 {
+        state.round
+    } else {
+        state.round + 1
+    };
+    if target >= floor {
+        return Ok(());
+    }
+    Err(RoundExtensionRefused {
+        run_id: state.id.clone(),
+        target,
+        round: state.round,
+        floor,
+    }
+    .into())
+}
+
+/// How long an extension waits for a run's lock when its orchestrator is parking or
+/// finishing up (the gate is saved before the lock is released, and reclaim can follow).
+const EXTENSION_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `implement --run <id> --max-rounds …` against a run an orchestrator is still driving.
+/// In flight, the extension is left as a marker the loop reads before its next ceiling
+/// check and once more after saving a gate. Already at a waitable stop, nothing will read
+/// it, so `None` sends the caller to wait for the lock instead; the same when the run
+/// reached one between our first read and the marker landing (whichever of us looks
+/// second sees the other's write).
+fn queue_round_extension(
+    paths: &SparPaths,
+    state: &RunState,
+    target: u32,
+    owner_pid: u32,
+    json: bool,
+) -> Result<Option<ExitCode>> {
+    if state.phase.is_waitable_stop() {
+        return Ok(None);
+    }
+    crate::markers::write_marker(paths, &state.id, QUEUED_MAX_ROUNDS, &format!("{target}\n"))?;
+    if RunState::load(paths, &state.id)?.phase.is_waitable_stop() {
+        return Ok(None);
+    }
+    let _ = crate::events::append(
+        paths,
+        &state.id,
+        &crate::events::Event::info(format!(
+            "round ceiling {target} queued for the live orchestrator (pid {owner_pid})"
+        )),
+    );
+    report_queued(&state.id, target, owner_pid, state.round, json)?;
+    Ok(Some(ExitCode::Success))
+}
+
+fn report_queued(run_id: &str, target: u32, owner_pid: u32, round: u32, json: bool) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "run_id": run_id,
+                "queued_max_rounds": target,
+                "owner_pid": owner_pid,
+                "round": round,
+            }))?
+        );
+    } else {
+        println!(
+            "run {run_id} is being driven by pid {owner_pid}; round ceiling {target} queued for its next ceiling check"
+        );
+    }
+    Ok(())
+}
+
+/// Poll for the lock of a run whose orchestrator is parking. `Err(code)` when that
+/// orchestrator consumed a marker we left and carried on (the extension took effect);
+/// `OrchestratorBusy` when the lock never frees.
+fn acquire_for_extension(
+    paths: &SparPaths,
+    run_id: &str,
+    target: u32,
+    owner_pid: u32,
+    json: bool,
+) -> Result<std::result::Result<crate::runlock::RunLock, ExitCode>> {
+    let deadline = std::time::Instant::now() + EXTENSION_LOCK_WAIT;
+    loop {
+        let err = match crate::runlock::RunLock::acquire(paths, run_id) {
+            Ok(lock) => return Ok(Ok(lock)),
+            Err(e) if e.is::<crate::runlock::OrchestratorBusy>() => e,
+            Err(e) => return Err(e),
+        };
+        if !paths.marker(run_id, QUEUED_MAX_ROUNDS).exists() {
+            let st = RunState::load(paths, run_id)?;
+            if !st.phase.is_waitable_stop() && st.max_rounds >= target {
+                report_queued(run_id, target, owner_pid, st.round, json)?;
+                return Ok(Err(ExitCode::Success));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(err);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// Consume a queued `--max-rounds`. Only ever raises: a queued value the run already
+/// passed (a later flag won) is dropped rather than lowering the ceiling under it.
+fn apply_queued_round_extension(state: &mut RunState, paths: &SparPaths) {
+    let path = paths.marker(&state.id, QUEUED_MAX_ROUNDS);
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let _ = std::fs::remove_file(&path);
+    let Ok(target) = body.trim().parse::<u32>() else {
+        return;
+    };
+    if state.max_rounds == 0 || target <= state.max_rounds {
+        return;
+    }
+    state.max_rounds = target;
+    let _ = crate::events::append(
+        paths,
+        &state.id,
+        &crate::events::Event::info(format!("round ceiling raised to {target} (queued)")),
+    );
+}
+
 /// Same idiom as the fix-round exhaustion path below it — set an error, write
 /// `escalation.md`, stop — with one deliberate difference: this is a **gate** (exit 2),
 /// not `Stuck` (exit 3). Nothing is broken; the run has simply spent the re-dispatch
 /// budget it was allowed to spend on its own, and only a human can authorise more.
-fn escalate_round_ceiling(state: &mut RunState, paths: &SparPaths) -> Result<()> {
+///
+/// `Ok(false)` when an extension queued while the gate was being saved lifted the
+/// ceiling after all: the caller carries on instead of parking (the lock is still ours).
+fn escalate_round_ceiling(state: &mut RunState, paths: &SparPaths) -> Result<bool> {
     // Deliberately does not offer `ship`: `confirm_ship` accepts only the ship and
     // winner gates, so from here it exits 1.
     let msg = format!(
@@ -4488,6 +4680,13 @@ fn escalate_round_ceiling(state: &mut RunState, paths: &SparPaths) -> Result<()>
     state.set_phase(Phase::AwaitingRoundExtension);
     state.error = Some(msg.clone());
     state.save(paths)?;
+    // An extension may have been queued between the last read and this save; a queuer
+    // that read the run before the save cannot see the gate, so this read must see it.
+    apply_queued_round_extension(state, paths);
+    if !state.round_ceiling_reached() {
+        state.error = None;
+        return Ok(false);
+    }
     // `print_run_human` shows the phase but not `error`, so without this an operator
     // running implement interactively sees a phase name and no way out of it.
     eprintln!("{msg}");
@@ -4518,7 +4717,7 @@ fn escalate_round_ceiling(state: &mut RunState, paths: &SparPaths) -> Result<()>
         msg,
         state.message_budget,
     );
-    Ok(())
+    Ok(true)
 }
 
 /// `{{prior_findings}}` for this round's panel (O119): from `[review]
@@ -5892,5 +6091,28 @@ mod carry_forward_tests {
         assert!(t.contains("Anything that makes the code do the wrong thing is major or above"));
         assert!(t.contains("Minor never blocks the ship"));
         assert!(t.contains("Be strict."));
+    }
+
+    /// O127: an extension queued while the gate was being saved is read once more after
+    /// the save, so the orchestrator carries on instead of parking over it.
+    #[test]
+    fn a_queued_extension_read_after_the_gate_save_unparks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("r1").unwrap();
+        let mut state = RunState::new("r1", crate::cli::WorkflowKind::Loop, tmp.path().into());
+        state.round = 3;
+        state.max_rounds = 3;
+        assert!(state.round_ceiling_reached());
+        crate::markers::write_marker(&paths, "r1", QUEUED_MAX_ROUNDS, "5\n").unwrap();
+        assert!(!escalate_round_ceiling(&mut state, &paths).unwrap());
+        assert_eq!(state.max_rounds, 5);
+        assert!(state.error.is_none());
+        assert!(!paths.marker("r1", QUEUED_MAX_ROUNDS).exists());
+
+        // Nothing queued: it parks.
+        state.round = 5;
+        assert!(escalate_round_ceiling(&mut state, &paths).unwrap());
+        assert_eq!(state.phase, Phase::AwaitingRoundExtension);
     }
 }

@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 pub struct Brief {
     pub slug: String,
     pub path: PathBuf,
-    pub body: String,
 }
 
 /// Read `spec` from a file, or stdin when `spec == "-"`.
@@ -33,6 +32,9 @@ pub fn read_spec_text(spec: &Path) -> Result<String> {
     Ok(body)
 }
 
+/// Write `body` to `.spar/briefs/<slug>.md`, the slug derived from its title. Never
+/// overwrites an existing brief: on a title collision the slug gets `-2`, `-3`, …
+/// appended, so two runs from two briefs that share a title cannot clobber each other.
 pub fn intake_body(paths: &SparPaths, body: &str) -> Result<Brief> {
     if body.trim().is_empty() {
         anyhow::bail!("brief body is empty");
@@ -61,17 +63,7 @@ pub fn intake_body(paths: &SparPaths, body: &str) -> Result<Brief> {
     Ok(Brief {
         slug: candidate,
         path,
-        body: body.to_string(),
     })
-}
-
-/// Read `spec` (or stdin when `spec == "-"`), derive a slug, and write
-/// `.spar/briefs/<slug>.md`. Never overwrites an existing brief: on a title collision
-/// the slug gets `-2`, `-3`, … appended — two runs from two different briefs that
-/// happen to share a title must not clobber each other.
-pub fn intake(paths: &SparPaths, spec: &Path) -> Result<Brief> {
-    let body = read_spec_text(spec)?;
-    intake_body(paths, &body)
 }
 
 /// The slug of `path` when it is an intaken brief, `.spar/briefs/<slug>.md` in this
@@ -127,6 +119,10 @@ fn slug_of(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn intake(paths: &SparPaths, spec: &Path) -> Result<Brief> {
+        intake_body(paths, &read_spec_text(spec)?)
+    }
     use tempfile::tempdir;
 
     #[test]
@@ -162,8 +158,8 @@ mod tests {
         let brief = intake(&paths, &spec).unwrap();
         assert_eq!(brief.slug, "my-task");
         assert_eq!(brief.path, paths.brief_file("my-task"));
-        assert_eq!(std::fs::read_to_string(&brief.path).unwrap(), brief.body);
-        assert!(brief.body.contains("do the thing"));
+        let body = std::fs::read_to_string(&brief.path).unwrap();
+        assert!(body.contains("do the thing"));
     }
 
     #[test]

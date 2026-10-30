@@ -341,7 +341,7 @@ fn implement_refuses_second_orchestrator() {
         ])
         .assert()
         .code(1)
-        .stderr(
+        .stdout(
             predicate::str::contains("already has a running orchestrator")
                 .and(predicate::str::contains(std::process::id().to_string())),
         );

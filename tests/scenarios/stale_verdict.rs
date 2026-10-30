@@ -76,6 +76,8 @@ fn only_run_id(proj: &std::path::Path) -> String {
 ///   and not this dispatch's.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 if [ "$1" = "--version" ]; then echo "fake-claude 0"; exit 0; fi
+# The prompt arrives on stdin, not argv (O128): scan it like an argument.
+set -- "$@" "$(cat)"
 STATE="$(dirname "$0")/state"
 mkdir -p "$STATE"
 TOOL_LINE='{"type":"assistant","message":{"model":"fake","usage":{"input_tokens":10,"output_tokens":5},"content":[{"type":"text","text":"Looking."},{"type":"tool_use","name":"Read","input":{"file_path":"x"}}]}}'

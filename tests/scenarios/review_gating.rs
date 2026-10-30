@@ -465,7 +465,8 @@ fn rule_add_list_rm() {
     .code(1)
     .stderr(predicates::str::contains("AC-9 is not a criterion"));
     rule(tmp.path(), &["add", "--project", "x", "--waive", "AC-1"]).code(1);
-    rule(tmp.path(), &["add", "no target"]).code(2);
+    // A usage error is exit 1: 2 is the human-gate code (O126).
+    rule(tmp.path(), &["add", "no target"]).code(1);
 
     for (k, v) in [("SPAR_AGENT_ID", "impl"), ("SPAR_RUN_ID", run_id.as_str())] {
         for args in [

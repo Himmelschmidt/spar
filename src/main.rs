@@ -87,7 +87,10 @@ fn main() -> StdExitCode {
 }
 
 fn run() -> Result<ExitCode> {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => return usage_error(e),
+    };
 
     if let Some(cwd) = &cli.cwd {
         if cli.command.is_some() {
@@ -105,13 +108,28 @@ fn run() -> Result<ExitCode> {
 
     // Orchestrating commands reap their slots on SIGINT/SIGTERM. Never the TUI: there
     // Ctrl+C is the agent's, not spar's.
-    if matches!(
+    let validate_only = matches!(
         command,
-        Command::Plan { .. }
-            | Command::Implement { .. }
-            | Command::Run { .. }
-            | Command::InternalContinue { .. }
-    ) {
+        Command::Plan {
+            validate_only: true,
+            ..
+        } | Command::Implement {
+            validate_only: true,
+            ..
+        } | Command::Run {
+            validate_only: true,
+            ..
+        }
+    );
+    if !validate_only
+        && matches!(
+            command,
+            Command::Plan { .. }
+                | Command::Implement { .. }
+                | Command::Run { .. }
+                | Command::InternalContinue { .. }
+        )
+    {
         process::install_shutdown_handler();
         // Launch is the one moment a mutation like this belongs: read commands must stay
         // observe-only, so `status` can never be the thing that hid a run from you.
@@ -134,7 +152,7 @@ fn run() -> Result<ExitCode> {
         Command::Resume { detach, .. } => Some(*detach),
         _ => None,
     };
-    if detached_or_dry == Some(false) {
+    if detached_or_dry == Some(false) && !validate_only {
         warn_if_tied_to_shell();
     }
 
@@ -162,125 +180,170 @@ fn run() -> Result<ExitCode> {
             json,
             backend,
             dry_run,
+            validate_only,
             big,
         } => {
-            let count = [task.is_some(), spec.is_some(), brief.is_some()]
-                .iter()
-                .filter(|v| **v)
-                .count();
-            if count != 1 {
-                anyhow::bail!("pass exactly one of -t / --spec / --brief (got {count})");
-            }
             // A replan reads the run's own frozen config (O27), never the live file,
             // and re-dispatches the run's existing planner and critic slots. Flags that
             // could only apply to a NEW run are refused, not silently dropped. `--spec`
             // is accepted here too: it is the natural way to hand a replan a long
             // directive, same as `-t`.
             if let Some(id) = run_id {
-                let ignored = [
-                    (!providers.is_empty(), "--providers"),
-                    (!select.is_empty(), "--select"),
-                    (!role.is_empty(), "--role"),
-                    (!backup.is_empty(), "--backup"),
-                    (!effort.is_empty(), "--effort"),
-                    (fleet.is_some(), "--fleet"),
-                    (!without.is_empty(), "--without"),
-                    (!suite_command.is_empty(), "--suite-command"),
-                    (key.is_some(), "--key"),
-                    (base.is_some(), "--base"),
-                    (big, "--big"),
-                    (detach, "--detach"),
-                    (dry_run, "--dry-run"),
-                ]
-                .into_iter()
-                .filter(|(set, _)| *set)
-                .map(|(_, name)| name)
-                .collect::<Vec<_>>();
-                if !ignored.is_empty() {
-                    anyhow::bail!(
-                        "`plan --run` replans an existing run and inherits its pool, base and config; \
-                         {} cannot apply. Drop them, or start new work with `spar plan -t \"…\"`.",
-                        ignored.join(", ")
-                    );
-                }
-                let directive = match (&task, &spec, &brief) {
-                    (Some(t), None, None) => t.clone(),
-                    (None, Some(path), None) => brief::read_spec_text(path)?,
-                    (None, None, Some(path)) => brief::read_spec_text(path)?,
-                    _ => anyhow::bail!("plan --run requires exactly one of -t / --spec / --brief"),
+                let checked = (|| -> Result<_> {
+                    let count = [task.is_some(), spec.is_some(), brief.is_some()]
+                        .iter()
+                        .filter(|v| **v)
+                        .count();
+                    if count != 1 {
+                        anyhow::bail!("pass exactly one of -t / --spec / --brief (got {count})");
+                    }
+                    let ignored = [
+                        (!providers.is_empty(), "--providers"),
+                        (!select.is_empty(), "--select"),
+                        (!role.is_empty(), "--role"),
+                        (!backup.is_empty(), "--backup"),
+                        (!effort.is_empty(), "--effort"),
+                        (fleet.is_some(), "--fleet"),
+                        (!without.is_empty(), "--without"),
+                        (!suite_command.is_empty(), "--suite-command"),
+                        (key.is_some(), "--key"),
+                        (base.is_some(), "--base"),
+                        (big, "--big"),
+                        (detach, "--detach"),
+                        (dry_run, "--dry-run"),
+                    ]
+                    .into_iter()
+                    .filter(|(set, _)| *set)
+                    .map(|(_, name)| name)
+                    .collect::<Vec<_>>();
+                    if !ignored.is_empty() {
+                        anyhow::bail!(
+                            "`plan --run` replans an existing run and inherits its pool, base and config; \
+                             {} cannot apply. Drop them, or start new work with `spar plan -t \"…\"`.",
+                            ignored.join(", ")
+                        );
+                    }
+                    let directive = match (&task, &spec, &brief) {
+                        (Some(t), None, None) => t.clone(),
+                        (None, Some(path), None) => brief::read_spec_text(path)?,
+                        (None, None, Some(path)) => brief::read_spec_text(path)?,
+                        _ => anyhow::bail!(
+                            "plan --run requires exactly one of -t / --spec / --brief"
+                        ),
+                    };
+                    if directive.trim().is_empty() {
+                        anyhow::bail!("replan directive is empty");
+                    }
+                    let (paths, _) = project_ctx()?;
+                    state::RunState::load(&paths, &id)?;
+                    let cfg = Config::for_run(&paths, &id)?;
+                    Ok((paths, cfg, directive))
+                })();
+                let (paths, cfg, directive) = match checked {
+                    Ok(v) => v,
+                    Err(e) => return launch_refused(e, json, Some(&id)),
                 };
-                if directive.trim().is_empty() {
-                    anyhow::bail!("replan directive is empty");
+                if validate_only {
+                    return launch_validated(json, Some(&id));
                 }
-                let (paths, _) = project_ctx()?;
-                let cfg = Config::for_run(&paths, &id)?;
+                cfg.reapply_captured_env();
                 return workflow::plan::replan(&paths, &cfg, &id, directive, json);
             }
-            let (paths, mut cfg) = project_ctx()?;
-            if let Some(preset) = &fleet {
-                cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
-            }
-            cfg.apply_without(&without)?;
-            cfg.apply_role_overrides(&role)?;
-            cfg.apply_backup_overrides(&backup)?;
-            cfg.apply_effort_overrides(&effort)?;
-            cfg.apply_suite_command(&suite_command, &without)?;
-            // An intaken brief (O41) is the work's identity already, so its slug is the
-            // natural key when the operator names none. Any other file is not.
-            let key = match (key, no_key) {
-                (_, true) => None,
-                (Some(k), false) => Some(k),
-                (None, false) => brief
-                    .as_deref()
-                    .and_then(|p| brief::intaken_slug(&paths, p)),
-            };
-            if let Some(code) = runkey::guard(&paths, key.as_deref(), key_scope, json, dry_run)? {
-                return Ok(code);
-            }
-            let (task_text, brief_path) = match (spec, brief, task) {
-                (Some(path), None, None) => {
-                    let b = brief::intake(&paths, &path)?;
-                    if !json {
-                        eprintln!("brief {} written to {}", b.slug, b.path.display());
-                    }
-                    (b.body, Some(b.path))
+            let prepared = (|| -> Result<_> {
+                let count = [task.is_some(), spec.is_some(), brief.is_some()]
+                    .iter()
+                    .filter(|v| **v)
+                    .count();
+                if count != 1 {
+                    anyhow::bail!("pass exactly one of -t / --spec / --brief (got {count})");
                 }
-                (None, Some(path), None) => {
-                    if path == std::path::Path::new("-") {
-                        anyhow::bail!("--brief requires an existing file, not stdin ('-')");
-                    }
-                    if !path.is_file() {
-                        anyhow::bail!("brief file not found: {}", path.display());
-                    }
-                    let body = brief::read_spec_text(&path)?;
-                    let rel = path
-                        .strip_prefix(&paths.project_root)
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or(path.clone());
-                    (body, Some(rel))
+                let (paths, mut cfg) = project_ctx()?;
+                if let Some(preset) = &fleet {
+                    cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
                 }
-                (None, None, Some(t)) => (t, None),
-                _ => unreachable!("exactly one of task/spec/brief"),
+                cfg.apply_without(&without)?;
+                cfg.apply_role_overrides(&role)?;
+                cfg.apply_backup_overrides(&backup)?;
+                cfg.apply_effort_overrides(&effort)?;
+                cfg.apply_suite_command(&suite_command, &without)?;
+                // An intaken brief (O41) is the work's identity already, so its slug is
+                // the natural key when the operator names none. Any other file is not.
+                let key = match (key, no_key) {
+                    (_, true) => None,
+                    (Some(k), false) => Some(k),
+                    (None, false) => brief
+                        .as_deref()
+                        .and_then(|p| brief::intaken_slug(&paths, p)),
+                };
+                // `--spec` is read now and copied into `.spar/briefs/` only after the
+                // pre-check passes, so neither a refusal nor `--validate-only` leaves one.
+                let (task_text, brief_path, spec_body) = match (spec, brief, task) {
+                    (Some(path), None, None) => {
+                        let body = brief::read_spec_text(&path)?;
+                        (body.clone(), None, Some(body))
+                    }
+                    (None, Some(path), None) => {
+                        if path == std::path::Path::new("-") {
+                            anyhow::bail!("--brief requires an existing file, not stdin ('-')");
+                        }
+                        if !path.is_file() {
+                            anyhow::bail!("brief file not found: {}", path.display());
+                        }
+                        let body = brief::read_spec_text(&path)?;
+                        let rel = path
+                            .strip_prefix(&paths.project_root)
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or(path.clone());
+                        (body, Some(rel), None)
+                    }
+                    (None, None, Some(t)) => (t, None, None),
+                    _ => unreachable!("exactly one of task/spec/brief"),
+                };
+                let opts = CommonOpts {
+                    task: Some(task_text.clone()),
+                    providers,
+                    select,
+                    urgency,
+                    base,
+                    detach,
+                    json,
+                    backend,
+                    dry_run,
+                    big,
+                    max_rounds: None,
+                    accept_contract: false,
+                    // `plan` / `run` mint their config fresh; there is no frozen one to
+                    // reload against, so seats are resolved for the first time either way.
+                    reload_config: false,
+                    key,
+                    reassign: Vec::new(),
+                };
+                workflow::preflight(&opts, &paths, &cfg)?;
+                if let Some(code) =
+                    runkey::guard(&paths, opts.key.as_deref(), key_scope, json, dry_run)?
+                {
+                    return Ok(Err(code));
+                }
+                let brief_path = match spec_body {
+                    Some(body) if !validate_only => {
+                        let b = brief::intake_body(&paths, &body)?;
+                        if !json {
+                            eprintln!("brief {} written to {}", b.slug, b.path.display());
+                        }
+                        Some(b.path)
+                    }
+                    _ => brief_path,
+                };
+                Ok(Ok((paths, cfg, task_text, brief_path, opts)))
+            })();
+            let (paths, cfg, task_text, brief_path, opts) = match prepared {
+                Ok(Ok(v)) => v,
+                Ok(Err(code)) => return Ok(code),
+                Err(e) => return launch_refused(e, json, None),
             };
-            let opts = CommonOpts {
-                task: Some(task_text.clone()),
-                providers,
-                select,
-                urgency,
-                base,
-                detach,
-                json,
-                backend,
-                dry_run,
-                big,
-                max_rounds: None,
-                accept_contract: false,
-                // `plan` / `run` mint their config fresh; there is no frozen one to
-                // reload against, so seats are resolved for the first time either way.
-                reload_config: false,
-                key,
-                reassign: Vec::new(),
-            };
+            if validate_only {
+                return launch_validated(json, None);
+            }
             workflow::plan::run(task_text, brief_path, opts, &paths, &cfg)
         }
         Command::Approve { run_id, json } => {
@@ -321,6 +384,7 @@ fn run() -> Result<ExitCode> {
         } => {
             let (paths, _) = project_ctx()?;
             let cfg = Config::for_run(&paths, &run_id)?;
+            cfg.reapply_captured_env();
             workflow::implement::resume(&paths, &cfg, &run_id, detach, json)
         }
         Command::Implement {
@@ -328,6 +392,7 @@ fn run() -> Result<ExitCode> {
             new,
             plan,
             task,
+            spec,
             role,
             backup,
             effort,
@@ -335,6 +400,7 @@ fn run() -> Result<ExitCode> {
             without,
             suite_command,
             reload_config,
+            recapture_env,
             max_rounds,
             accept_contract,
             key,
@@ -345,59 +411,107 @@ fn run() -> Result<ExitCode> {
             json,
             backend,
             dry_run,
+            validate_only,
             providers,
             select,
             urgency,
             big,
         } => {
-            if let (Some(id), Some(_)) = (&run_id, &key) {
-                anyhow::bail!("--key names a new run; run {id} already exists and keeps the key it was created with");
-            }
-            if !reassign.is_empty() {
-                refuse_inside_slot("spar implement --reassign")?;
-                if run_id.is_none() {
-                    anyhow::bail!("--reassign moves a seat of an existing run; pass --run <id>");
+            let prepared = (|| -> Result<_> {
+                if let (Some(id), Some(_)) = (&run_id, &key) {
+                    anyhow::bail!("--key names a new run; run {id} already exists and keeps the key it was created with");
                 }
-            }
-            let (paths, cfg) = implement_ctx(
-                run_id.as_deref(),
-                &role,
-                &backup,
-                &effort,
-                &without,
-                &suite_command,
-                fleet.as_deref(),
-                reload_config,
-            )?;
-            let opts = CommonOpts {
-                task: task.clone(),
-                providers,
-                select,
-                urgency,
-                base,
-                detach,
-                json,
-                backend,
-                dry_run,
-                big,
-                max_rounds,
-                accept_contract,
-                reload_config,
-                key,
-                reassign,
+                if !reassign.is_empty() {
+                    refuse_inside_slot("spar implement --reassign")?;
+                    if run_id.is_none() {
+                        anyhow::bail!(
+                            "--reassign moves a seat of an existing run; pass --run <id>"
+                        );
+                    }
+                }
+                let task = match &spec {
+                    Some(path) => Some(brief::read_spec_text(path)?),
+                    None => task,
+                };
+                let (paths, cfg) = implement_ctx(
+                    run_id.as_deref(),
+                    &role,
+                    &backup,
+                    &effort,
+                    &without,
+                    &suite_command,
+                    fleet.as_deref(),
+                    reload_config,
+                    recapture_env,
+                    !validate_only,
+                )?;
+                let opts = CommonOpts {
+                    task: task.clone(),
+                    providers,
+                    select,
+                    urgency,
+                    base,
+                    detach,
+                    json,
+                    backend,
+                    dry_run,
+                    big,
+                    max_rounds,
+                    accept_contract,
+                    reload_config,
+                    key,
+                    reassign,
+                };
+                workflow::implement::parse_reassignments(&opts.reassign, &paths)?;
+                match &run_id {
+                    Some(id) => {
+                        let st = state::RunState::load(&paths, id)?;
+                        if let Some(mr) = max_rounds {
+                            workflow::implement::check_round_extension(
+                                &st,
+                                mr.resolve(st.round),
+                                !workflow::implement::current_round_dispatched(&st),
+                            )?;
+                        }
+                        if let Some(t) = &task {
+                            runspec::validate_task(t).map_err(anyhow::Error::msg)?;
+                        }
+                    }
+                    // A `--plan` without `--new` continues the run that wrote it, which
+                    // `run_from_cli` resolves; only a new run has a pool to pre-check.
+                    None if plan.is_none() || new => workflow::preflight(&opts, &paths, &cfg)?,
+                    None => {}
+                }
+                Ok((paths, cfg, opts, task))
+            })();
+            let (paths, cfg, opts, task) = match prepared {
+                Ok(v) => v,
+                Err(e) => return launch_refused(e, json, run_id.as_deref()),
             };
-            if opts.key.is_some() {
-                if let Some(code) = runkey::guard(
-                    &paths,
-                    opts.key.as_deref(),
-                    key_scope,
-                    opts.json,
-                    opts.dry_run,
-                )? {
+            if run_id.is_none() {
+                if let Some(code) =
+                    runkey::guard(&paths, opts.key.as_deref(), key_scope, json, opts.dry_run)?
+                {
                     return Ok(code);
                 }
             }
-            workflow::implement::run_from_cli(run_id, plan, task, new, opts, &paths, &cfg)
+            if validate_only {
+                return launch_validated(json, run_id.as_deref());
+            }
+            let target = run_id.clone();
+            // A round extension refused or found busy after the pre-check is still a
+            // refusal: nothing was dispatched, so `--json` gets the same shape.
+            workflow::implement::run_from_cli(run_id, plan, task, new, opts, &paths, &cfg).or_else(
+                |e| {
+                    if e.is::<workflow::implement::RoundExtensionRefused>()
+                        || e.is::<workflow::implement::ReassignRefused>()
+                        || e.is::<runlock::OrchestratorBusy>()
+                    {
+                        return launch_refused(e, json, target.as_deref());
+                    }
+                    Err(e)
+                },
+            )
         }
         Command::Run {
             workflow,
@@ -414,75 +528,87 @@ fn run() -> Result<ExitCode> {
             json,
             backend,
             dry_run,
+            validate_only,
             providers,
             select,
             urgency,
             big,
         } => {
-            if matches!(
-                workflow,
-                crate::cli::WorkflowKind::Arena
-                    | crate::cli::WorkflowKind::Peer
-                    | crate::cli::WorkflowKind::Roles
-            ) && !backup.is_empty()
-            {
-                anyhow::bail!(
+            let prepared = (|| -> Result<_> {
+                if matches!(
+                    workflow,
+                    crate::cli::WorkflowKind::Arena
+                        | crate::cli::WorkflowKind::Peer
+                        | crate::cli::WorkflowKind::Roles
+                ) && !backup.is_empty()
+                {
+                    anyhow::bail!(
                     "--backup is not supported for {} workflow (it is positional, not role-based); backup: {}",
                     format!("{:?}", workflow).to_lowercase(),
                     backup.join(", ")
                 );
-            }
-            // Peer/roles seats take fleet positions and carry `SlotRole::Peer`,
-            // which `effort_for` maps to `None`, so a per-role depth there would
-            // parse, snapshot, and never render. Refuse it like `--backup` rather
-            // than accepting a silent no-op. Arena is deliberately *not* refused:
-            // its implementer legs carry `SlotRole::Implementer` and its reconcile
-            // reviewers `SlotRole::Reviewer`, so effort resolves and renders on
-            // arena dispatches exactly as it does in the loop. Refusing the flag
-            // while `[effort]` config kept rendering on the same run was the
-            // inconsistency this closes.
-            if matches!(
-                workflow,
-                crate::cli::WorkflowKind::Peer | crate::cli::WorkflowKind::Roles
-            ) && !effort.is_empty()
-            {
-                anyhow::bail!(
+                }
+                // Peer/roles seats take fleet positions and carry `SlotRole::Peer`,
+                // which `effort_for` maps to `None`, so a per-role depth there would
+                // parse, snapshot, and never render. Refuse it like `--backup` rather
+                // than accepting a silent no-op. Arena is deliberately *not* refused:
+                // its implementer legs carry `SlotRole::Implementer` and its reconcile
+                // reviewers `SlotRole::Reviewer`, so effort resolves and renders on
+                // arena dispatches exactly as it does in the loop. Refusing the flag
+                // while `[effort]` config kept rendering on the same run was the
+                // inconsistency this closes.
+                if matches!(
+                    workflow,
+                    crate::cli::WorkflowKind::Peer | crate::cli::WorkflowKind::Roles
+                ) && !effort.is_empty()
+                {
+                    anyhow::bail!(
                     "--effort is not supported for {} workflow (it is positional, not role-based); effort: {}",
                     format!("{:?}", workflow).to_lowercase(),
                     effort.join(", ")
                 );
-            }
-            let (paths, mut cfg) = project_ctx()?;
-            if let Some(preset) = &fleet {
-                cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
-            }
-            cfg.apply_without(&without)?;
-            cfg.apply_role_overrides(&role)?;
-            cfg.apply_backup_overrides(&backup)?;
-            cfg.apply_effort_overrides(&effort)?;
-            let opts = CommonOpts {
-                task,
-                providers,
-                select,
-                urgency,
-                base,
-                detach,
-                json,
-                backend,
-                dry_run,
-                big,
-                max_rounds: None,
-                accept_contract: false,
-                // `plan` / `run` mint their config fresh; there is no frozen one to
-                // reload against, so seats are resolved for the first time either way.
-                reload_config: false,
-                key,
-                reassign: Vec::new(),
+                }
+                let (paths, mut cfg) = project_ctx()?;
+                if let Some(preset) = &fleet {
+                    cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
+                }
+                cfg.apply_without(&without)?;
+                cfg.apply_role_overrides(&role)?;
+                cfg.apply_backup_overrides(&backup)?;
+                cfg.apply_effort_overrides(&effort)?;
+                let opts = CommonOpts {
+                    task,
+                    providers,
+                    select,
+                    urgency,
+                    base,
+                    detach,
+                    json,
+                    backend,
+                    dry_run,
+                    big,
+                    max_rounds: None,
+                    accept_contract: false,
+                    // `plan` / `run` mint their config fresh; there is no frozen one to
+                    // reload against, so seats are resolved for the first time either way.
+                    reload_config: false,
+                    key,
+                    reassign: Vec::new(),
+                };
+                workflow::preflight(&opts, &paths, &cfg)?;
+                Ok((paths, cfg, opts))
+            })();
+            let (paths, cfg, opts) = match prepared {
+                Ok(v) => v,
+                Err(e) => return launch_refused(e, json, None),
             };
             if let Some(code) =
                 runkey::guard(&paths, opts.key.as_deref(), key_scope, json, opts.dry_run)?
             {
                 return Ok(code);
+            }
+            if validate_only {
+                return launch_validated(json, None);
             }
             workflow::run_named(workflow, opts, &paths, &cfg)
         }
@@ -591,6 +717,7 @@ fn run() -> Result<ExitCode> {
         Command::Reconcile { run_id, json } => {
             let (paths, _) = project_ctx()?;
             let cfg = Config::for_run(&paths, &run_id)?;
+            cfg.reapply_captured_env();
             workflow::arena::reconcile(&paths, &cfg, &run_id, json)
         }
         Command::Bus { action } => bus_cmd(action),
@@ -673,9 +800,80 @@ fn run() -> Result<ExitCode> {
         Command::InternalContinue { run_id } => {
             let (paths, _) = project_ctx()?;
             let cfg = Config::for_run(&paths, &run_id)?;
+            cfg.reapply_captured_env();
             workflow::implement::continue_run(&paths, &cfg, &run_id)
         }
     }
+}
+
+/// clap exits 2 on a usage error, which is spar's human-gate code: a launcher reading
+/// it would wait on a person for a typo. Usage errors exit 1, and a launch command
+/// given `--json` reports one in the same shape as any other refused launch.
+fn usage_error(e: clap::Error) -> Result<ExitCode> {
+    use clap::error::ErrorKind;
+    if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+        e.exit();
+    }
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let launch = subcommand_of(&args).is_some_and(|c| matches!(c, "plan" | "implement" | "run"));
+    if launch && args.iter().any(|a| a == "--json") {
+        let msg = e.render().to_string();
+        let msg = msg.trim().trim_start_matches("error: ");
+        return launch_refused(anyhow::anyhow!("{msg}"), true, None);
+    }
+    let _ = e.print();
+    Ok(ExitCode::Failure)
+}
+
+/// The subcommand in a raw argv clap could not parse: the first positional, skipping
+/// the global flags and the values `--cwd` / `--task` take (`spar --cwd /p plan …`).
+fn subcommand_of(args: &[String]) -> Option<&str> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--cwd" || a == "--task" {
+            it.next();
+            continue;
+        }
+        if a.starts_with('-') {
+            continue;
+        }
+        return Some(a);
+    }
+    None
+}
+
+/// A launch refused before it made a run. `--json` callers get one parseable shape on
+/// stdout instead of an `error:` line to grep; the exit code is 1 either way.
+fn launch_refused(err: anyhow::Error, json: bool, run_id: Option<&str>) -> Result<ExitCode> {
+    if !json {
+        return Err(err);
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "ok": false,
+            "error": format!("{err:#}"),
+            "run_id": run_id,
+            "kind": "validation",
+        }))?
+    );
+    Ok(ExitCode::Failure)
+}
+
+fn launch_validated(json: bool, run_id: Option<&str>) -> Result<ExitCode> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "run_id": run_id,
+                "kind": "validation",
+            }))?
+        );
+    } else {
+        println!("valid: nothing launched");
+    }
+    Ok(ExitCode::Success)
 }
 
 /// A foreground orchestrator lives in the launching shell's session: a `timeout`
@@ -1065,6 +1263,9 @@ fn bus_deliver(
 /// its own run cannot change the fleet, timeouts or ship gate of one already in flight.
 /// `--reload-config` is the deliberate way out: it re-reads the file and re-freezes the
 /// run against it.
+///
+/// `persist: false` is `--validate-only`: every check a reload would make, none of
+/// its writes.
 #[allow(clippy::too_many_arguments)]
 fn implement_ctx(
     run_id: Option<&str>,
@@ -1075,6 +1276,8 @@ fn implement_ctx(
     suite_command: &[String],
     fleet: Option<&str>,
     reload_config: bool,
+    recapture_env: bool,
+    persist: bool,
 ) -> Result<(paths::SparPaths, Config)> {
     let (paths, mut cfg) = project_ctx()?;
     let Some(run_id) = run_id else {
@@ -1137,7 +1340,18 @@ fn implement_ctx(
     }
     // Before the flags, so this invocation's `--without suite` or `--suite-command`
     // still wins over the carried pin.
-    cfg.carry_cli_suite_command(&Config::for_run(&paths, run_id)?);
+    let frozen = Config::for_run(&paths, run_id)?;
+    cfg.carry_cli_suite_command(&frozen);
+    // A reload re-reads the file, not the shell: the environment stays the one the run
+    // was created in, and only a name newly added to `[env].capture` is taken from now.
+    // `--recapture-env` is the deliberate exception: this shell's values replace them.
+    if !recapture_env {
+        for (k, v) in frozen.env.captured {
+            if cfg.env.capture.contains(&k) {
+                cfg.env.captured.insert(k, v);
+            }
+        }
+    }
     if let Some(preset) = fleet {
         cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
     }
@@ -1153,6 +1367,9 @@ fn implement_ctx(
         .into());
     }
     cfg.apply_suite_command(suite_command, without)?;
+    if !persist {
+        return Ok((paths, cfg));
+    }
     cfg.save_snapshot(&paths, run_id)?;
     eprintln!("config: re-read spar.toml for run {run_id}");
     Ok((paths, cfg))

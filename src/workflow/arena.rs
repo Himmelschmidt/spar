@@ -163,6 +163,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
                         let log = paths_c.log_file(&run_id, &slot.id);
                         let _ = crate::process::run_mock(
                             &crate::process::SpawnRequest {
+                                stdin: None,
                                 program: std::path::PathBuf::from("dry-run"),
                                 args: vec![],
                                 cwd,

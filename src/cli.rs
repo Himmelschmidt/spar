@@ -131,6 +131,11 @@ pub enum Command {
         /// Structured plan-big task DAG under bus/tasks
         #[arg(long)]
         big: bool,
+        /// Check the launch (flags, roles, backups, providers, base, task) and report,
+        /// without creating a run. Exit 0 valid, 1 refused; `--json` prints
+        /// `{"ok": true|false, "error": …, "run_id": null, "kind": "validation"}`.
+        #[arg(long)]
+        validate_only: bool,
     },
 
     /// Approve a plan run so implement can proceed
@@ -183,6 +188,11 @@ pub enum Command {
         plan: Option<std::path::PathBuf>,
         #[arg(long, short = 't')]
         task: Option<String>,
+        /// Read the task (with `--run`, this round's amendment) from a file, or `-` for
+        /// stdin, instead of `-t`. Keeps a long brief out of argv, where `pgrep -f`
+        /// matches it. Unlike `plan --spec`, nothing is copied to `.spar/briefs/`.
+        #[arg(long, value_name = "FILE", conflicts_with = "task")]
+        spec: Option<PathBuf>,
         /// Assign a provider to a role for THIS run, without touching `spar.toml`:
         /// `--role planner=cli:grok --role reviewer=cli:claude@opus`. Repeatable;
         /// a `reviewer` list sets the panel size exactly, and outranks even an explicit
@@ -219,14 +229,20 @@ pub enum Command {
         /// the project file says now.
         #[arg(long)]
         reload_config: bool,
-        /// Raise this run's round ceiling to N and keep going. A run that reaches
-        /// `[rounds] max` parks at the `awaiting_round_extension` gate (exit 2) rather
-        /// than buying another cold re-dispatch; this is the operator saying the next
-        /// one is worth paying for. Sticky: it persists on the run. Must be >= 1 —
+        /// With `--reload-config`: also re-capture `[env]` from this shell, replacing the
+        /// values the run was created with. Without it a reload keeps them (O130).
+        #[arg(long, requires = "reload_config")]
+        recapture_env: bool,
+        /// Raise this run's round ceiling to N, or to N past its current round with
+        /// `+N`, and keep going. A run that reaches `[rounds] max` parks at the
+        /// `awaiting_round_extension` gate (exit 2) rather than buying another cold
+        /// re-dispatch; this is the operator saying the next one is worth paying for.
+        /// Sticky: it persists on the run. Must land above the current round, and is
+        /// queued (not refused) while an orchestrator is driving the run. Must be >= 1:
         /// turning the ceiling off entirely is `[rounds] max = 0` in `spar.toml`, a
         /// deliberate project setting rather than a flag typed under pressure at a gate.
         #[arg(long, value_parser = parse_max_rounds)]
-        max_rounds: Option<u32>,
+        max_rounds: Option<MaxRounds>,
         /// Adopt a `test-contract.md` that changed while the previous round was running.
         /// Re-entering `implement` re-freezes the contract from disk (O43); spar refuses
         /// to do that silently when it *detected* the file moving under the slot the
@@ -264,6 +280,11 @@ pub enum Command {
         /// Stub agents only; still writes `.spar/` state. Does **not** create real git worktrees.
         #[arg(long)]
         dry_run: bool,
+        /// Check the launch (flags, roles, backups, providers, base, task) and report,
+        /// without creating a run. Exit 0 valid, 1 refused; `--json` prints
+        /// `{"ok": true|false, "error": …, "run_id": null, "kind": "validation"}`.
+        #[arg(long)]
+        validate_only: bool,
         /// Comma-separated `cli:…` or `api:…` (required unless `--select` or `[roles]` is
         /// set). positional: index 0 is the planner/implementer, the rest are reviewers.
         /// Overrides `[roles]` for the positions it covers.
@@ -328,6 +349,11 @@ pub enum Command {
         backend: Backend,
         #[arg(long)]
         dry_run: bool,
+        /// Check the launch (flags, roles, backups, providers, base, task) and report,
+        /// without creating a run. Exit 0 valid, 1 refused; `--json` prints
+        /// `{"ok": true|false, "error": …, "run_id": null, "kind": "validation"}`.
+        #[arg(long)]
+        validate_only: bool,
         /// Comma-separated `cli:…` or `api:…` (required unless `--select` or `[roles]` is
         /// set). positional: index 0 is the planner/implementer, the rest are reviewers.
         /// Overrides `[roles]` for the positions it covers.
@@ -974,10 +1000,35 @@ pub enum WorkflowKind {
     Review,
 }
 
+/// `--max-rounds N` (the new ceiling) or `+N` (N rounds past the run's current one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaxRounds {
+    Absolute(u32),
+    Relative(u32),
+}
+
+impl MaxRounds {
+    pub fn resolve(self, current_round: u32) -> u32 {
+        match self {
+            MaxRounds::Absolute(n) => n,
+            MaxRounds::Relative(n) => current_round.saturating_add(n),
+        }
+    }
+}
+
 /// `--max-rounds` must buy at least one round. `0` means "no ceiling" in `spar.toml`,
 /// and silently accepting it here would let a run parked at a gate be uncapped by a
 /// flag typed under pressure — which is how a run reaches round 36.
-fn parse_max_rounds(s: &str) -> Result<u32, String> {
+fn parse_max_rounds(s: &str) -> Result<MaxRounds, String> {
+    if let Some(rel) = s.strip_prefix('+') {
+        let n: u32 = rel
+            .parse()
+            .map_err(|_| format!("{s:?} is not +<whole number of rounds>"))?;
+        if n == 0 {
+            return Err("+0 buys no rounds; pass +1 or more".into());
+        }
+        return Ok(MaxRounds::Relative(n));
+    }
     let n: u32 = s
         .parse()
         .map_err(|_| format!("{s:?} is not a whole number of rounds"))?;
@@ -989,5 +1040,5 @@ fn parse_max_rounds(s: &str) -> Result<u32, String> {
                 .into(),
         );
     }
-    Ok(n)
+    Ok(MaxRounds::Absolute(n))
 }

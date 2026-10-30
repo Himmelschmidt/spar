@@ -208,7 +208,7 @@ fn bad_role_ref_errors_cleanly() {
         .args(["plan", "--task", "x", "--dry-run", "--json"])
         .assert()
         .failure()
-        .stderr(
+        .stdout(
             predicate::str::contains("implementer").and(predicate::str::contains("panic").not()),
         );
 }
