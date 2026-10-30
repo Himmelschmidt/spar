@@ -114,6 +114,34 @@ pub fn is_provider_eligible(
     true
 }
 
+/// Whether a declared backup can take a seat. A backup the store holds on a quota pause
+/// is probed before it is skipped (#153, O106): that pause is a failure recorded at some
+/// point in the past, and a week-old one benched a working backup while its primary
+/// died. A manual pause is the operator's decision and is never probed past, and
+/// `dry` never spawns.
+pub fn backup_eligible(
+    backup: &str,
+    store: &QuotaStore,
+    available: Option<&std::collections::HashSet<String>>,
+    paths: &crate::paths::SparPaths,
+    dry: bool,
+) -> bool {
+    if is_provider_eligible(backup, store, available) {
+        return true;
+    }
+    let key = crate::quota::normalize_key(backup);
+    if dry || !store.is_quota_paused(&key) {
+        return false;
+    }
+    let report = crate::probe::probe(paths, backup, false);
+    eprintln!(
+        "note: backup {key} was on a quota pause; probe says {:?} ({})",
+        report.verdict, report.store
+    );
+    let fresh = QuotaStore::load(paths).unwrap_or_default();
+    is_provider_eligible(backup, &fresh, available)
+}
+
 #[allow(dead_code)]
 pub fn backup_for_role(
     role: crate::state::SlotRole,
@@ -147,6 +175,8 @@ pub fn resolve_with_backup(
     cfg: &crate::config::Config,
     store: &QuotaStore,
     available: Option<&std::collections::HashSet<String>>,
+    paths: &crate::paths::SparPaths,
+    dry: bool,
 ) -> Option<(String, crate::state::SeatSource)> {
     let primary = crate::workflow::roles_resolve::resolve_seat(
         role,
@@ -161,7 +191,7 @@ pub fn resolve_with_backup(
         return Some((prov, src));
     }
     let backup_raw = backup_for_role(role, role_index, cfg)?;
-    if !is_provider_eligible(&backup_raw, store, available) {
+    if !backup_eligible(&backup_raw, store, available, paths, dry) {
         return Some((prov, src));
     }
     let parsed = crate::runspec::Pin::parse(&backup_raw).ok()?;
@@ -587,6 +617,30 @@ mod tests {
         assert!(StopCause::Environmental.engages_backup());
         assert!(!StopCause::Work.engages_backup());
         assert!(slot.parks_on_quota());
+    }
+
+    #[test]
+    fn backup_eligible_never_probes_under_dry_run_or_past_a_manual_pause() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::SparPaths::new(tmp.path());
+        let mut store = QuotaStore::default();
+        assert!(backup_eligible("cli:codex", &store, None, &paths, false));
+
+        store.pause_quota("cli:codex", "possible quota signal: quota");
+        assert!(
+            !backup_eligible("cli:codex", &store, None, &paths, true),
+            "dry-run decides on the file alone"
+        );
+
+        store.pause_manual("cli:grok", None);
+        assert!(
+            !backup_eligible("cli:grok", &store, None, &paths, false),
+            "a manual pause is never probed past"
+        );
+        assert!(
+            !paths.quota_file().exists(),
+            "no probe ran, so nothing was written"
+        );
     }
 
     #[test]

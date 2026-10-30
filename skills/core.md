@@ -64,7 +64,9 @@ writes the answer: `healthy` clears a quota pause, `quota` pauses (until the sta
 reset when claude states one), `auth` and `failed` leave the store alone. A manual pause
 is never cleared by a probe. `--dry-run` (or `SPAR_DRY_RUN=1`) prints the call each
 probe would make and spawns nothing. Exit is `0` whatever the verdicts; read them from
-`--json`.
+`--json`. A declared `--backup` held on a quota pause gets the same probe before a run
+skips it (O106): a stale pause no longer benches a working backup. A manually paused
+backup is never probed, and `--dry-run` runs never probe.
 
 **Auth faults (O104).** A dispatch that dies on a refused credential (claude's `401 ...
 OAuth access token has been revoked` or `Please run /login`, codex `Not logged in`, muse

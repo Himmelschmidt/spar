@@ -101,8 +101,13 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
             if !crate::backup::is_provider_eligible(&provider, &store, available.as_ref()) {
                 if let Some(backup_raw) = crate::backup::backup_for_role(SlotRole::Reviewer, i, cfg)
                 {
-                    if crate::backup::is_provider_eligible(&backup_raw, &store, available.as_ref())
-                    {
+                    if crate::backup::backup_eligible(
+                        &backup_raw,
+                        &store,
+                        available.as_ref(),
+                        paths,
+                        dry,
+                    ) {
                         if let Ok(bpin) = crate::runspec::Pin::parse(&backup_raw) {
                             provider = bpin.display();
                             source = Some(crate::state::SeatSource::Backup);
@@ -254,7 +259,13 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
             Some(b) => b,
             None => continue,
         };
-        if !crate::backup::is_provider_eligible(&backup_raw, &store, available.as_ref()) {
+        if !crate::backup::backup_eligible(
+            &backup_raw,
+            &store,
+            available.as_ref(),
+            paths,
+            state.dry_run,
+        ) {
             continue;
         }
         let cur_key = crate::provider_ref::ProviderRef::parse(&job.provider)

@@ -439,3 +439,70 @@ fn a_probe_never_clears_a_manual_pause() {
     assert_eq!(r[0]["store"], "manual pause kept");
     assert_eq!(list_entry(&fx, "codex")["quota_status"], "paused_manual");
 }
+
+/// #153's second half: the Sonnet backup sat `paused_quota` from 09-20 while 13 runs
+/// died on a muse 429. A quota-paused backup is probed before it is skipped.
+#[test]
+fn a_quota_paused_backup_is_probed_and_used_when_it_answers() {
+    let fx = Fixture::new();
+    fx.cli(
+        "claude",
+        &counted("claude", &format!("echo '{CLAUDE_REVOKED}'\nexit 1")),
+    );
+    fx.cli("codex", &counted("codex", "echo OK\nexit 0"));
+    seed_quota_pause(&fx, "cli:codex", 13);
+    fx.spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--role",
+            "implementer=cli:claude",
+            "--backup",
+            "implementer=cli:codex",
+            "--without",
+            "suite",
+        ])
+        .assert()
+        .code(1);
+    let slot = fx.slot("implementer");
+    assert_eq!(slot["provider"], "cli:codex", "{slot}");
+    assert_eq!(slot["source"], "backup");
+    assert_eq!(fx.count("codex"), 2, "one probe, one dispatch");
+    assert!(
+        fx.quota()["providers"].get("cli:codex").is_none()
+            || fx.quota()["providers"]["cli:codex"]["status"] == "available",
+        "the probe cleared the stale pause: {}",
+        fx.quota()
+    );
+}
+
+#[test]
+fn a_manually_paused_backup_is_never_probed() {
+    let fx = Fixture::new();
+    fx.cli(
+        "claude",
+        &counted("claude", &format!("echo '{CLAUDE_REVOKED}'\nexit 1")),
+    );
+    fx.cli("codex", &counted("codex", "echo OK\nexit 0"));
+    fx.spar()
+        .args(["provider", "pause", "cli:codex"])
+        .assert()
+        .success();
+    fx.spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--role",
+            "implementer=cli:claude",
+            "--backup",
+            "implementer=cli:codex",
+            "--without",
+            "suite",
+        ])
+        .assert()
+        .code(4);
+    assert_eq!(fx.count("codex"), 0);
+    assert_eq!(fx.slot("implementer")["provider"], "cli:claude");
+}

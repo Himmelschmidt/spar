@@ -730,7 +730,13 @@ fn prepare_implement_slots(
                 0
             };
             if let Some(backup_raw) = crate::backup::backup_for_role(seat.role, ordinal, cfg) {
-                if crate::backup::is_provider_eligible(&backup_raw, &store, available.as_ref()) {
+                if crate::backup::backup_eligible(
+                    &backup_raw,
+                    &store,
+                    available.as_ref(),
+                    paths,
+                    dry,
+                ) {
                     if let Ok(pin) = crate::runspec::Pin::parse(&backup_raw) {
                         provider = pin.display();
                         source = crate::state::SeatSource::Backup;
@@ -2022,10 +2028,12 @@ pub fn execute_loop(
                             .map(|r| r.storage_key())
                             .unwrap_or_else(|_| impl_slot.provider.clone());
                         if backup_key != cur_key
-                            && crate::backup::is_provider_eligible(
+                            && crate::backup::backup_eligible(
                                 &backup_raw,
                                 &store,
                                 available.as_ref(),
+                                paths,
+                                state.dry_run,
                             )
                         {
                             if let Some(s) = state.slot_mut(&impl_job.slot_id) {
@@ -2109,10 +2117,12 @@ pub fn execute_loop(
                     if let Some(backup_raw) =
                         crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
                     {
-                        if crate::backup::is_provider_eligible(
+                        if crate::backup::backup_eligible(
                             &backup_raw,
                             &store,
                             available.as_ref(),
+                            paths,
+                            state.dry_run,
                         ) && slot_state.source != Some(SeatSource::Backup)
                         {
                             let backup_key = crate::provider_ref::ProviderRef::parse(&backup_raw)
@@ -2786,10 +2796,12 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
                             == backup_key
                     });
                     if !used_contains_backup
-                        && crate::backup::is_provider_eligible(
+                        && crate::backup::backup_eligible(
                             &backup_raw,
                             &store,
                             available_opt.as_ref(),
+                            paths,
+                            state.dry_run,
                         )
                         && slot_state.source != Some(SeatSource::Backup)
                     {

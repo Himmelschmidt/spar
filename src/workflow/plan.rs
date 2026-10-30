@@ -255,6 +255,8 @@ fn plan_slot_specs(
             cfg,
             &store,
             available.as_ref(),
+            &crate::paths::SparPaths::new(&state.project_root),
+            state.dry_run,
         )
         .or_else(|| {
             crate::workflow::roles_resolve::resolve_seat(
@@ -332,7 +334,13 @@ pub fn execute_plan(
                 );
                 if cause.engages_backup() && slot_state.source != Some(SeatSource::Backup) {
                     if let Some(raw) = crate::backup::backup_for_role(job.role, 0, cfg) {
-                        if crate::backup::is_provider_eligible(&raw, &store, available.as_ref()) {
+                        if crate::backup::backup_eligible(
+                            &raw,
+                            &store,
+                            available.as_ref(),
+                            paths,
+                            state.dry_run,
+                        ) {
                             let cur_key = crate::provider_ref::ProviderRef::parse(&job.provider)
                                 .map(|r| r.storage_key())
                                 .unwrap_or_else(|_| job.provider.clone());
@@ -591,7 +599,13 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
     };
     if !crate::backup::is_provider_eligible(&provider, &store, available.as_ref()) {
         if let Some(backup_raw) = crate::backup::backup_for_role(SlotRole::TestAuthor, 0, cfg) {
-            if crate::backup::is_provider_eligible(&backup_raw, &store, available.as_ref()) {
+            if crate::backup::backup_eligible(
+                &backup_raw,
+                &store,
+                available.as_ref(),
+                paths,
+                state.dry_run,
+            ) {
                 if let Ok(pin) = crate::runspec::Pin::parse(&backup_raw) {
                     provider = pin.display();
                     source = crate::state::SeatSource::Backup;
@@ -662,7 +676,13 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
             if cause.engages_backup() && slot_state.source != Some(crate::state::SeatSource::Backup)
             {
                 if let Some(raw) = crate::backup::backup_for_role(SlotRole::TestAuthor, 0, cfg) {
-                    if crate::backup::is_provider_eligible(&raw, &store, available.as_ref()) {
+                    if crate::backup::backup_eligible(
+                        &raw,
+                        &store,
+                        available.as_ref(),
+                        paths,
+                        state.dry_run,
+                    ) {
                         let cur_key = crate::provider_ref::ProviderRef::parse(&job.provider)
                             .map(|r| r.storage_key())
                             .unwrap_or_else(|_| job.provider.clone());
