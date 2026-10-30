@@ -159,7 +159,28 @@ pub fn resume(
         }
         return continue_run(paths, cfg, run_id);
     }
-    if !state.phase.is_waitable_stop() {
+    // Shipping is the operator's step, never a supervisor's (O70): a run that died
+    // mid-ship goes back to the ship gate instead of re-running its rounds (O117).
+    if state.phase == Phase::Shipping {
+        let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
+        let mut state = RunState::load(paths, run_id)?;
+        state.set_phase(Phase::AwaitingShipConfirm);
+        state.save(paths)?;
+        if json {
+            executor::emit_run_json(&state)?;
+        } else {
+            println!(
+                "run {run_id} died while shipping; back at the ship gate: spar ship {run_id} --confirm"
+            );
+        }
+        return Ok(ExitCode::HumanGate);
+    }
+    // An approved plan run has finished planning, so an in-flight park continues into
+    // implementation through `run_from_approved` rather than into a second plan round
+    // that would ask for the approval again.
+    let approved_plan =
+        state.workflow == crate::cli::WorkflowKind::Plan && state.gates.plan_approved;
+    if !state.phase.is_waitable_stop() && !approved_plan {
         // `continue_run` has no detach knob of its own: it always runs to completion
         // in the foreground of whoever calls it. `--detach` here means the same thing
         // it means for `plan`/`implement`: spawn `__internal_continue` into a session
@@ -417,8 +438,13 @@ fn run_from_approved(
     let round_dispatched = current_round_dispatched(&state);
     let resumable = is_resumable(&state);
     if !resumable {
+        let hint = if state.phase.is_waitable_stop() {
+            String::new()
+        } else {
+            format!("; an in-flight run nobody is driving is picked up with `spar resume {run_id}`")
+        };
         bail!(
-            "run {run_id} is not resumable (workflow={:?}, phase={:?})",
+            "run {run_id} is not resumable (workflow={:?}, phase={:?}){hint}",
             state.workflow,
             state.phase
         );

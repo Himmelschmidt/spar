@@ -528,14 +528,18 @@ fn run() -> Result<ExitCode> {
             SkillsCmd::List { json } => skills::run(skills::SkillsAction::List { json }),
             SkillsCmd::Get { name } => skills::run(skills::SkillsAction::Get { name }),
         },
-        Command::Daemon { cmd } => {
-            let (paths, _) = project_ctx()?;
-            match cmd {
-                cli::DaemonCmd::Start { foreground } => daemon::start(&paths, foreground),
-                cli::DaemonCmd::Stop => daemon::stop(&paths),
-                cli::DaemonCmd::Status { json } => daemon::status(&paths, json),
+        Command::Daemon { cmd } => match cmd {
+            cli::DaemonCmd::Install => daemon::install(),
+            cli::DaemonCmd::Uninstall => daemon::uninstall(),
+            cli::DaemonCmd::Start {
+                all_projects: true, ..
+            } => daemon::supervise_all(),
+            cli::DaemonCmd::Start { foreground, .. } => {
+                daemon::start(&project_ctx()?.0, foreground)
             }
-        }
+            cli::DaemonCmd::Stop => daemon::stop(&project_ctx()?.0),
+            cli::DaemonCmd::Status { json } => daemon::status(&project_ctx()?.0, json),
+        },
         Command::InternalContinue { run_id } => {
             let (paths, _) = project_ctx()?;
             let cfg = Config::for_run(&paths, &run_id)?;
@@ -1439,12 +1443,14 @@ fn phase_at_rest(phase: state::Phase) -> bool {
 }
 
 /// Settle slots an orchestrator left at `running` when it died, on runs that already
-/// exist. The backfill counterpart of the reconciliation `stop` and resume now do.
+/// exist, and park an abandoned in-flight run at `stopped`. The backfill counterpart of
+/// the reconciliation `stop` and resume now do.
 ///
 /// Deliberately narrow, and deliberately **not** part of `spar cleanup`: the only writes
-/// are `slots[].status` and `slots[].error`, patched into the existing `state.json`
-/// document. It never resolves, reads or removes a worktree path, never touches
-/// `logs/` or `artifacts/`, and never signals a process. A worktree is often the only
+/// are `slots[].status`, `slots[].error` and `phase`, patched into the existing
+/// `state.json` document. It never resolves, reads or removes a worktree path, never
+/// touches `logs/` or `artifacts/`, and never signals a process (a slot process still
+/// running is `spar stop --abandoned`'s to reap). A worktree is often the only
 /// copy of a slot's work, and this command wears a housekeeping name.
 fn reconcile_state_cmd(
     run_id: Option<&str>,
@@ -1466,6 +1472,7 @@ fn reconcile_state_cmd(
     };
 
     let mut changes = Vec::new();
+    let mut phases = Vec::new();
     let mut skipped = Vec::new();
     for id in ids {
         let Ok(state) = state::RunState::load(&paths, &id) else {
@@ -1480,11 +1487,34 @@ fn reconcile_state_cmd(
             skipped.push(serde_json::json!({ "run_id": id, "reason": "orchestrator is live" }));
             continue;
         }
+        // In flight with nobody driving it: the phase is a snapshot of a process that is
+        // gone, so it is parked where `spar stop` would park it (O117).
+        // Not while its slot processes still run: parking then resuming would put a
+        // second set of agents on the same worktrees. Reaping is `stop --abandoned`'s job.
+        let mut parked_from = state.abandoned(&paths).then_some(state.phase);
+        if parked_from.is_some() {
+            let alive = state::live_slot_pids(&paths, &state);
+            if !alive.is_empty() {
+                skipped.push(serde_json::json!({
+                    "run_id": id,
+                    "reason": format!(
+                        "abandoned, but {} slot process(es) still run; `spar stop --abandoned` reaps and parks it",
+                        alive.len()
+                    ),
+                }));
+                parked_from = None;
+            }
+        }
+        if let Some(from) = parked_from {
+            phases.push(serde_json::json!({
+                "run_id": id,
+                "from": serde_json::to_value(from)?,
+                "to": serde_json::to_value(state::Phase::Stopped)?,
+            }));
+        }
         let before: Vec<state::SlotStatus> = state.slots.iter().map(|s| s.status).collect();
         let mut settled = state;
-        if !settled.reconcile_dead_slots(&paths, owner, state::ORPHANED_SLOT) {
-            continue;
-        }
+        let slots_settled = settled.reconcile_dead_slots(&paths, owner, state::ORPHANED_SLOT);
         let mut patch = Vec::new();
         for (slot, was) in settled.slots.iter().zip(before) {
             if slot.status == was {
@@ -1503,8 +1533,8 @@ fn reconcile_state_cmd(
                 "error": slot.error,
             }));
         }
-        if apply {
-            patch_slot_status(&paths, &id, &patch)?;
+        if apply && (slots_settled || parked_from.is_some()) {
+            patch_state(&paths, &id, &patch, parked_from)?;
         }
     }
 
@@ -1514,6 +1544,7 @@ fn reconcile_state_cmd(
             serde_json::to_string_pretty(&serde_json::json!({
                 "applied": apply,
                 "changes": changes,
+                "phases": phases,
                 "skipped": skipped,
             }))?
         );
@@ -1526,7 +1557,15 @@ fn reconcile_state_cmd(
             sk["reason"].as_str().unwrap_or_default()
         );
     }
-    if changes.is_empty() {
+    for p in &phases {
+        println!(
+            "{}: phase {} -> {} (no live orchestrator)",
+            p["run_id"].as_str().unwrap_or_default(),
+            p["from"].as_str().unwrap_or_default(),
+            p["to"].as_str().unwrap_or_default(),
+        );
+    }
+    if changes.is_empty() && phases.is_empty() {
         println!("nothing to reconcile");
         return Ok(ExitCode::Success);
     }
@@ -1544,27 +1583,34 @@ fn reconcile_state_cmd(
         );
     }
     if apply {
-        println!("updated {} slot(s)", changes.len());
+        println!(
+            "updated {} slot(s), parked {} run(s) at stopped",
+            changes.len(),
+            phases.len()
+        );
     } else {
         println!(
-            "{} slot(s) would change; re-run with --apply",
-            changes.len()
+            "{} slot(s) and {} run phase(s) would change; re-run with --apply",
+            changes.len(),
+            phases.len()
         );
     }
     Ok(ExitCode::Success)
 }
 
-/// Patch `status` (and `error`, where one was derived) into the run's existing
-/// `state.json` document.
+/// Patch slot `status` (and `error`, where one was derived) into the run's existing
+/// `state.json` document, and with `parked_from`, its `phase` to `stopped`.
 ///
 /// Value-level rather than typed, so a field spar does not model survives the write; the
 /// document is re-read here rather than re-serialized from the caller's snapshot. Only
-/// those two fields change *in content*; the round trip does re-sort keys alphabetically
+/// those fields change *in content* (`updated_at` included: parking keeps the run's true
+/// age for `cleanup --older-than`); the round trip does re-sort keys alphabetically
 /// until the next `RunState::save` writes struct order back.
-fn patch_slot_status(
+fn patch_state(
     paths: &paths::SparPaths,
     run_id: &str,
     patch: &[(String, serde_json::Value, Option<String>)],
+    parked_from: Option<state::Phase>,
 ) -> Result<()> {
     let file = paths.state_file(run_id);
     let mut doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file)?)?;
@@ -1580,8 +1626,18 @@ fn patch_slot_status(
             slot["error"] = serde_json::Value::String(e.clone());
         }
     }
+    if parked_from.is_some() {
+        doc["phase"] = serde_json::to_value(state::Phase::Stopped)?;
+    }
     std::fs::write(&file, serde_json::to_string_pretty(&doc)?)
         .map_err(|e| anyhow::anyhow!("write {}: {e}", file.display()))?;
+    if let Some(from) = parked_from {
+        let _ = events::append(
+            paths,
+            run_id,
+            &events::Event::phase(state::Phase::Stopped, Some(from)),
+        );
+    }
     Ok(())
 }
 

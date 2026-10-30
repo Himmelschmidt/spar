@@ -452,10 +452,11 @@ pub enum Command {
         json: bool,
     },
 
-    /// Settle slots left at `running` by an orchestrator that never came back.
+    /// Settle slots left at `running` by an orchestrator that never came back, and park
+    /// an in-flight run nobody drives at `stopped`.
     ///
-    /// Rewrites `slots[].status` and `slots[].error` in `state.json` and nothing else.
-    /// It never touches worktrees, branches, logs or artifacts, and it is deliberately
+    /// Rewrites `slots[].status`, `slots[].error` and `phase` in `state.json` and nothing
+    /// else. It never touches worktrees, branches, logs or artifacts, and it is deliberately
     /// not part of `spar cleanup`. Dry-run unless `--apply`. Always exits 0.
     #[command(name = "reconcile-state")]
     ReconcileState {
@@ -517,10 +518,11 @@ pub enum Command {
         action: SkillsCmd,
     },
 
-    /// Per-project supervisor: restarts a dead orchestrator holding resumable work,
-    /// pushes the `abandoned` lifecycle event, and enforces the cross-run concurrency
-    /// cap. Opt-in, never auto-started. It never approves a plan, confirms ship,
-    /// merges, sweeps `cleanup`, or picks a fleet.
+    /// Supervisor: restarts a dead orchestrator holding resumable work, pushes the
+    /// `abandoned` lifecycle event, and enforces the cross-run concurrency cap.
+    /// `spar daemon install` makes it a systemd user unit; nothing starts it silently.
+    /// It never approves a plan, confirms ship, merges, sweeps `cleanup`, or picks a
+    /// fleet.
     Daemon {
         #[command(subcommand)]
         cmd: DaemonCmd,
@@ -538,7 +540,16 @@ pub enum DaemonCmd {
         /// Run in this process instead of detaching into a session of its own.
         #[arg(long)]
         foreground: bool,
+        /// Supervise every project in the spar registry from this one process, in the
+        /// foreground. This is what the systemd unit runs.
+        #[arg(long)]
+        all_projects: bool,
     },
+    /// Install and enable a systemd user unit (`spar-daemon.service`) that supervises
+    /// every registered project and starts at login (and at boot, with lingering).
+    Install,
+    /// Stop, disable and remove the systemd user unit.
+    Uninstall,
     /// Signal a running daemon to stop. It notices within one tick.
     Stop,
     /// Pid, uptime, tick, cap, per-bucket usage, the queue, and the runs it watches.

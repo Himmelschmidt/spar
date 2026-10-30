@@ -590,3 +590,190 @@ fn reclaim_halted_spares_a_run_with_a_live_orchestrator() {
         .code(0);
     assert!(cache.exists());
 }
+
+/// #151: a phantom run (in flight, no orchestrator) held its seat until someone ran
+/// `spar stop`. `reconcile-state --apply` now parks it at `stopped` too; without
+/// `--apply` it only reports.
+#[test]
+fn reconcile_state_apply_parks_an_abandoned_in_flight_run() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    init_repo(&proj);
+    let run_id = implement_dry_run(&proj);
+    set_phase(&proj, &run_id, "review");
+    let updated_at = read_state(&proj, &run_id)["updated_at"].clone();
+
+    let out = spar_cmd()
+        .current_dir(&proj)
+        .args(["reconcile-state", &run_id, "--json"])
+        .assert()
+        .code(0);
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(v["phases"][0]["from"], "review", "{v}");
+    assert_eq!(v["phases"][0]["to"], "stopped", "{v}");
+    assert_eq!(read_state(&proj, &run_id)["phase"], "review", "report only");
+
+    spar_cmd()
+        .current_dir(&proj)
+        .args(["reconcile-state", "--all", "--apply"])
+        .assert()
+        .code(0);
+    let st = read_state(&proj, &run_id);
+    assert_eq!(st["phase"], "stopped");
+    assert_eq!(
+        st["updated_at"], updated_at,
+        "parking keeps the run's true age"
+    );
+
+    spar_cmd()
+        .current_dir(&proj)
+        .args(["resume", &run_id, "--json"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn reconcile_state_leaves_a_live_or_resting_run_alone() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    init_repo(&proj);
+    let gated = implement_dry_run(&proj);
+    let live = implement_dry_run(&proj);
+    set_phase(&proj, &live, "dispatch");
+    hold_lock(&proj, &live);
+
+    spar_cmd()
+        .current_dir(&proj)
+        .args(["reconcile-state", "--all", "--apply"])
+        .assert()
+        .code(0);
+    assert_eq!(read_state(&proj, &gated)["phase"], "awaiting_ship_confirm");
+    assert_eq!(read_state(&proj, &live)["phase"], "dispatch");
+}
+
+/// #151: `resume` from every non-terminal phase. In-flight phases continue; a run that
+/// died mid-ship goes back to the ship gate (exit 2) instead of re-running its rounds.
+#[test]
+fn resume_works_from_every_in_flight_phase() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    init_repo(&proj);
+    for phase in [
+        "init",
+        "prepare_isolation",
+        "spawn_slots",
+        "dispatch",
+        "wait_completion",
+        "review",
+        "suite",
+        "fix",
+        "shipping",
+        "stopped",
+    ] {
+        let run_id = implement_dry_run(&proj);
+        set_phase(&proj, &run_id, phase);
+        let out = spar_cmd()
+            .current_dir(&proj)
+            .args(["resume", &run_id, "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{phase}: {out:?}");
+        let st = read_state(&proj, &run_id);
+        assert_eq!(st["phase"], "awaiting_ship_confirm", "{phase}");
+        if phase == "shipping" {
+            assert_eq!(st["round"], 1, "a mid-ship death re-runs nothing");
+        }
+    }
+}
+
+/// An approved plan whose orchestrator died in flight continues into implementation,
+/// not into a second plan round that asks for approval again.
+#[test]
+fn resume_continues_an_approved_plan_into_implementation() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    init_repo(&proj);
+    let out = spar_cmd()
+        .current_dir(&proj)
+        .args([
+            "plan",
+            "--task",
+            "hello",
+            "--providers",
+            "cli:claude",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2);
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    spar_cmd()
+        .current_dir(&proj)
+        .args(["approve", &run_id])
+        .assert()
+        .code(0);
+    set_phase(&proj, &run_id, "spec");
+
+    spar_cmd()
+        .current_dir(&proj)
+        .args(["resume", &run_id, "--json"])
+        .assert()
+        .code(2);
+    assert_eq!(read_state(&proj, &run_id)["phase"], "awaiting_ship_confirm");
+}
+
+/// #151: the systemd unit runs one supervisor over every registered project. Started
+/// outside any project, it finds the project through the registry and restarts its
+/// abandoned run in that project's directory.
+#[test]
+fn the_all_projects_supervisor_restarts_an_abandoned_run_in_a_registered_project() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    init_repo(&proj);
+    std::fs::write(
+        proj.join("spar.toml"),
+        "[daemon]\ntick_secs = 1\nabandon_after_secs = 0\n",
+    )
+    .unwrap();
+    let run_id = implement_dry_run(&proj);
+    set_phase(&proj, &run_id, "dispatch");
+
+    let home = tmp.path().join("spar-home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("registry.json"),
+        serde_json::json!({
+            "version": 1,
+            "projects": [{ "root": proj, "last_seen": "2026-10-30T00:00:00Z" }],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let elsewhere = tmp.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("spar"))
+        .current_dir(&elsewhere)
+        .env("SPAR_HOME", &home)
+        .env_remove("SPAR_PROJECT_ROOT")
+        .env_remove("SPAR_RUN_ID")
+        .env_remove("SPAR_AGENT_ID")
+        .args(["daemon", "start", "--all-projects"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let advanced = (0..80).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        read_state(&proj, &run_id)["phase"] == "awaiting_ship_confirm"
+    });
+    let held = proj.join(".spar/daemon.lock").is_file();
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(held, "the supervisor takes the project's own daemon lock");
+    assert!(
+        advanced,
+        "the abandoned run was restarted and driven to its gate"
+    );
+}

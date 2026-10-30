@@ -21,6 +21,11 @@ spar model list --provider openrouter [--all] [--json]   # OpenRouter catalog, t
 | Human | `spar` (no subcommand) → product TUI, landing on Home (scoped to the current repo when run inside one) |
 | Outer agent | subcommands + `--json` + exit codes |
 
+**Install the supervisor on every box that runs spar**, once: `spar daemon install`. It
+writes and enables a systemd user unit that restarts orchestrators which died (OOM, a
+killed shell, a reboot) in every registered project. Without it a dead orchestrator
+leaves a phantom run that nothing picks back up. See **Abandoned runs**.
+
 ## Dual backend
 
 Providers are `cli:name` (subscription CLIs) or `api:name` (OpenAI-compatible SDKs):
@@ -318,7 +323,8 @@ spar cleanup <run_id> --force            # archive unsaved work to refs/spar-arc
 spar cleanup --all [--older-than 7d]     # sweep finished runs project-wide
 spar reclaim <run_id> | --all [--json]   # delete build output, KEEP the worktree
 spar reclaim --all --halted              # …also gated (awaiting_*) and abandoned in-flight runs
-spar reconcile-state <run_id> | --all    # settle slots a dead orchestrator left `running`
+spar reconcile-state <run_id> | --all    # settle slots a dead orchestrator left `running`,
+                                         # and park its in-flight phase at `stopped`
 spar reconcile-state <run_id> --apply    # …and write it (bare form only reports)
 spar archive <run_id> [--undo] [--json]  # hide a finished run from listings
 spar archive --all [--older-than 14d]    # done/plan_rejected AND stopped/failed/stuck/quota
@@ -331,9 +337,12 @@ spar link <run_id> --undo                # and back out again
 spar brief <run_id> [--full] [--json]    # re-hydrate a fresh session: phase, gates, fleet,
                                          # brief, artifacts, the exact next command. Read-only.
 spar resume <run_id> [--detach] [--json] # pick a stopped or abandoned run back up
+spar daemon install                      # systemd user unit supervising every registered project
+spar daemon uninstall                    # stop, disable and remove it
 spar daemon start [--foreground]         # per-project supervisor: restart + abandoned alert + cap
+spar daemon start --all-projects         # every registered project, foreground (what the unit runs)
 spar daemon status [--json]
-spar daemon stop
+spar daemon stop                         # release this project (the all-projects process keeps the rest)
 spar bus send --run <run> --from <id> --to <to> --surface chat --conversation <cid> --turn <tid> --message "..."  # orchestrator turn reply
 ```
 
@@ -639,19 +648,40 @@ children — so they keep running and keep spending tokens with nobody collectin
 - On **SIGINT/SIGTERM** an orchestrating `spar` signals its slot groups before it exits,
   so a polite kill no longer orphans anything. `SIGKILL` cannot be caught: that is what
   the three above are for.
-- `spar resume <id>` picks an abandoned or stopped run back up without you having to know
-  which of `implement --run` / a fresh dispatch applies — it refuses a human gate (naming
-  the command that resolves it) and a run with a live orchestrator (naming its pid).
-  `implement --run <id>` (with or without `--detach` / `--reload-config`) refuses the same
-  way, exit 1, before it writes anything to the live run's `state.json`.
+- `spar resume <id>` picks an abandoned or stopped run back up from any non-terminal
+  phase without you having to know which of `implement --run` / a fresh dispatch applies.
+  An approved plan that died mid-flight continues into implementation (never a second plan
+  round); a run that died in `shipping` goes back to `awaiting_ship_confirm` (exit `2`)
+  instead of re-running its rounds, since shipping is yours. It refuses a human gate
+  (naming the command that resolves it) and a run with a live orchestrator (naming its
+  pid). `implement --run <id>` (with or without `--detach` / `--reload-config`) refuses a
+  live orchestrator the same way, exit 1, before it writes anything to the live run's
+  `state.json`, and on an abandoned in-flight run names `spar resume` in its refusal.
 - A foreground `spar plan` holds the run lock for its whole dispatch, so it never reads
   abandoned while its planner works.
-- `spar daemon start` runs a per-project supervisor that pushes an alert the first time a
-  run has read abandoned past `[daemon].abandon_after_secs` (60s by default), and restarts
-  it if `[daemon].restart` is on (the default). It is opt-in — nothing starts it for you —
-  and it never approves a plan, confirms ship, merges, sweeps `cleanup`, or picks a fleet;
-  it only ever restarts the same orchestrator a plain `spar resume` would have, and tells
-  you when one is waiting. `spar daemon status` / `spar daemon stop`.
+- `spar reconcile-state --all --apply` parks every abandoned in-flight run at `stopped`
+  (and settles its dead slots) without signalling anything; `--json` lists them under
+  `phases`. A run whose slot processes still run is skipped with a reason: that is
+  `spar stop --abandoned`'s job.
+- **The supervisor is the default: `spar daemon install` on every box.** It writes
+  `~/.config/systemd/user/spar-daemon.service` (`$XDG_CONFIG_HOME` honoured) running
+  `spar daemon start --foreground --all-projects` from the installed binary, with the
+  installing shell's `PATH` (and `SPAR_HOME`) frozen in, `Restart=on-failure`, and
+  `KillMode=process` so stopping the unit never kills the orchestrators it restarted. It
+  then runs `systemctl --user daemon-reload` and `enable --now`; if that fails the unit is
+  left written, the commands are printed and it exits `1`. User units stop at logout and
+  start at login unless lingering is on: install warns until you run `loginctl
+  enable-linger $USER`, which is what makes it survive a reboot with nobody logged in.
+  `spar daemon uninstall` disables and removes it. Nothing installs or starts it for you.
+- What the supervisor does, per project: pushes an alert the first time a run has read
+  abandoned past `[daemon].abandon_after_secs` (60s by default), and restarts it if
+  `[daemon].restart` is on (the default). One process covers every project in the
+  registry (`~/.spar/registry.json`), picking up new ones as they appear, and still takes
+  each project's `.spar/daemon.lock`, so a project with its own `spar daemon start` is
+  left to it. `spar daemon stop` in a project releases that project. It never approves a
+  plan, confirms ship, merges, sweeps `cleanup`, or picks a fleet; it only ever restarts
+  the same orchestrator a plain `spar resume` would have, and tells you when one is
+  waiting. `spar daemon status` reports the project you stand in.
 
 ### Budgets and nudges: nothing kills a slot on tokens (O50)
 
@@ -761,8 +791,9 @@ settle that, and you do not have to do anything to get the first two:
 - **`spar reconcile-state`** backfills runs that were already left that way. It reports
   by default and writes only with `--apply`; `--all` scans the project. It **skips any
   run with a live orchestrator** (listed under `skipped` in `--json`) because that
-  orchestrator is the authority on its own slots. It rewrites **only** `slots[].status`
-  and `slots[].error` (never a worktree, branch, log or artifact) and is deliberately not
+  orchestrator is the authority on its own slots. It rewrites **only** `slots[].status`,
+  `slots[].error` and, for an in-flight run nobody drives, `phase` (to `stopped`, keeping
+  `updated_at`), never a worktree, branch, log or artifact, and is deliberately not
   part of `spar cleanup`, which does remove worktrees. It always exits `0`.
 
 A slot's `exit_code` / `signal` / `pid` / `usage` describe its **last dispatch** and are
@@ -1387,7 +1418,7 @@ timeout_secs = 3600    # test_author's SOFT clock; hard_ceiling_multiple applies
 [notify]
 # command = "..."   # shell out; message on argv/stdin
 # webhook = "..."   # POST message json
-# Per-project supervisor (`spar daemon start`). Opt-in, never auto-started. Safe from a
+# Supervisor (`spar daemon install`, or `spar daemon start` per project). Never auto-started. Safe from a
 # repo spar.toml: no command execution, no outbound request, unlike [notify].
 [daemon]
 # tick_secs = 15               # supervision loop period

@@ -899,7 +899,9 @@ pub fn spawn_detached_orchestrator(
     run_id: &str,
 ) -> Result<DetachedChild> {
     let log = paths.logs_dir(run_id).join("orchestrator.log");
-    spawn_detached(&["__internal_continue", run_id], &log, &[])
+    // `--cwd`: an all-projects supervisor (O117) does not stand in the run's project.
+    let root = paths.project_root.display().to_string();
+    spawn_detached(&["--cwd", &root, "__internal_continue", run_id], &log, &[])
 }
 
 /// What the handshake in [`await_detached_start`] settled on.
