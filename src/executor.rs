@@ -4262,7 +4262,10 @@ fn slot_effort_for(
 /// refusal is spar's fault (never retried, never an agent failure) and names
 /// the accepted levels. api-sdk slots record effort without rendering it, so
 /// they never refuse; `None` is always fine.
-fn check_slot_effort(provider: &str, effort: Option<crate::effort::EffortLevel>) -> Result<()> {
+pub(crate) fn check_slot_effort(
+    provider: &str,
+    effort: Option<crate::effort::EffortLevel>,
+) -> Result<()> {
     let Some(e) = effort else {
         return Ok(());
     };
@@ -4316,6 +4319,7 @@ pub fn init_slot_model(
         review: None,
         source: None,
         auth_fault: false,
+        former_ids: Vec::new(),
     }
 }
 

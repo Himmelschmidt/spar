@@ -113,6 +113,10 @@ fn run() -> Result<ExitCode> {
         // observe-only, so `status` can never be the thing that hid a run from you.
         auto_archive_at_launch();
     }
+    // `amend` dispatches a test author: Ctrl-C must reap its group too (O137).
+    if matches!(command, Command::Amend { .. }) {
+        process::install_shutdown_handler();
+    }
     let detached_or_dry = match &command {
         Command::Plan {
             detach, dry_run, ..
@@ -274,12 +278,20 @@ fn run() -> Result<ExitCode> {
         Command::Amend {
             run_id,
             contract,
+            accept_contract_edits,
             json,
         } => {
             refuse_inside_slot("spar amend")?;
             let (paths, _) = project_ctx()?;
             let cfg = Config::for_run(&paths, &run_id)?;
-            workflow::plan::amend_contract(&paths, &cfg, &run_id, &contract, json)
+            workflow::plan::amend_contract(
+                &paths,
+                &cfg,
+                &run_id,
+                &contract,
+                accept_contract_edits,
+                json,
+            )
         }
         Command::Resume {
             run_id,
@@ -1049,6 +1061,28 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> 
                 println!(
                     "  - {} provider={} role={:?} status={:?}{pid_s} silent={silent}{stall}{zombie}",
                     slot.id, slot.provider, slot.role, slot.status
+                );
+            }
+            for r in &state.seat_reassignments {
+                println!(
+                    "reassigned: round {} {} {} -> {} {} ({})",
+                    r.round,
+                    r.from_seat,
+                    r.from_provider,
+                    r.to_seat,
+                    r.to_provider,
+                    r.at.to_rfc3339()
+                );
+            }
+            for a in &state.contract_amendments {
+                println!(
+                    "contract amended: round {} {} -> {} ({}; was artifacts/{}): {}",
+                    a.round,
+                    a.old_fingerprint,
+                    a.new_fingerprint,
+                    a.at.to_rfc3339(),
+                    a.archived,
+                    a.directive
                 );
             }
             if let Some(w) = &state.winner_slot {

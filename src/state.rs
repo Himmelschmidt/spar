@@ -188,11 +188,30 @@ pub struct RunState {
     pub ship_override: Option<crate::ship::ShipOverride>,
     /// Every `implement --reassign` applied to this run, oldest first (O136). The seat
     /// that was retired stays named here, so the record answers who filled it before.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub seat_reassignments: Vec<SeatReassignment>,
     /// Every `spar amend --contract` applied to this run, oldest first (O137).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub contract_amendments: Vec<ContractAmendment>,
+    /// Set while `spar amend` has the test author out, cleared when it settles. Found
+    /// set by a later `amend`, `resume` or `approve`, it means the amend was killed: the
+    /// run is put back exactly as this records (O137).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amend_in_progress: Option<AmendInProgress>,
+}
+
+/// What an interrupted `spar amend` must put back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AmendInProgress {
+    pub phase: Phase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// `artifacts/<archived>`: the frozen contract the amend started from.
+    pub archived: String,
+    pub author_seat: String,
+    /// The author worktree's HEAD before the amend, when it has a real one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_head: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -357,7 +376,20 @@ impl RunState {
         }
         if let Some(s) = self.slots.iter_mut().find(|s| s.id == old_id) {
             s.id = new_id.to_string();
+            s.former_ids.push(old_id.to_string());
+            if let Some(a) = &s.artifact {
+                s.artifact = Some(a.replace(old_id, new_id));
+            }
         }
+    }
+
+    /// The run's current test-author seat: the most recently created one, which is the
+    /// one every later overlay and amend works from.
+    pub fn test_author_seat(&self) -> Option<&SlotState> {
+        self.slots
+            .iter()
+            .rev()
+            .find(|s| s.role == SlotRole::TestAuthor)
     }
 }
 
@@ -497,6 +529,10 @@ pub struct SlotState {
     /// Reset at the start of every dispatch, like `quota_hit`.
     #[serde(default)]
     pub auth_fault: bool,
+    /// Ids this seat carried before a backup or `--reassign` renamed it (O85, O136),
+    /// oldest first, so lookups keyed on the id it judged under still find it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub former_ids: Vec<String>,
 }
 
 impl SlotState {
@@ -778,6 +814,7 @@ impl RunState {
             ship_override: None,
             seat_reassignments: Vec::new(),
             contract_amendments: Vec::new(),
+            amend_in_progress: None,
             pr_state: None,
         }
     }

@@ -568,6 +568,10 @@ pub enum Command {
         /// What to change about how the run verifies its work.
         #[arg(long)]
         contract: String,
+        /// Amend a `test-contract.md` that was edited after it was frozen, starting from
+        /// the edited text. Without it spar refuses: the implementer can write to it.
+        #[arg(long)]
+        accept_contract_edits: bool,
         #[arg(long)]
         json: bool,
     },

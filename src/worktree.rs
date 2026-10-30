@@ -336,6 +336,7 @@ pub fn reviewer_checkout(
             );
         }
         let _ = git_out(&path, &["clean", "-fdq"]);
+        seed_env_files(root, &path, copy)?;
         return Ok(path);
     }
     std::fs::create_dir_all(&area)?;
@@ -353,7 +354,47 @@ pub fn reviewer_checkout(
         bail!("git worktree add --detach failed for {}", path.display());
     }
     seed_env_files(root, &path, copy)?;
+    if matches!(state.isolation, IsolationMode::WorktreeDb) {
+        maybe_dbiso(root, &path)?;
+    }
     Ok(path)
+}
+
+/// Commit whatever the implementer left uncommitted in `dir` (tracked changes and
+/// untracked files git does not ignore) on the branch checked out there, so the review
+/// panel, the suite and `ship` all see one commit (O138). `Ok(None)` when the tree was
+/// clean. The repo's own identity is used when it has one; otherwise spar's. Hooks run.
+pub fn commit_leftovers(
+    dir: &Path,
+    subject: &str,
+    body: &str,
+) -> std::result::Result<Option<String>, String> {
+    let status = git_out(dir, &["status", "--porcelain"]).ok_or("git status failed")?;
+    if status.is_empty() {
+        return Ok(None);
+    }
+    if git_out(dir, &["add", "-A"]).is_none() {
+        return Err("git add -A failed".into());
+    }
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir)
+        .args(["commit", "--quiet", "-m", subject, "-m", body]);
+    if git_out(dir, &["config", "user.email"]).is_none_or(|e| e.is_empty()) {
+        cmd.envs([
+            ("GIT_AUTHOR_NAME", "spar"),
+            ("GIT_AUTHOR_EMAIL", "spar@localhost"),
+            ("GIT_COMMITTER_NAME", "spar"),
+            ("GIT_COMMITTER_EMAIL", "spar@localhost"),
+        ]);
+    }
+    let out = cmd.output().map_err(|e| format!("git commit: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git commit failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(git_out(dir, &["rev-parse", "HEAD"]))
 }
 
 /// `CARGO_TARGET_DIR` for a reviewer working in one of the run's reviewer checkouts: one
@@ -1002,6 +1043,11 @@ pub fn sweep_merged(paths: &SparPaths, skip_run: Option<&str>) -> Result<Vec<(St
         // re-runs `worktree remove` / `branch -D` / `prune` per stale record and reports
         // reclaiming what it already reclaimed.
         if !state.worktrees.iter().any(|r| r.path.is_dir()) {
+            // Reviewer checkouts hold nothing to keep (O138), and with the slot
+            // worktrees gone they can only be leftovers.
+            if remove_reviewer_area(&state).is_some_and(|c| c.removed) {
+                reaped.push((summary.id, 1));
+            }
             continue;
         }
         if merged_into_base(&state) != Some(true) {
@@ -1151,11 +1197,19 @@ pub fn reap_build_cache(state: &RunState, live: &LiveCwds) -> CacheReap {
         dirs: Vec::new(),
         skipped: Vec::new(),
     };
+    let area = reviewer_area(&state.project_root, &state.id).ok();
+    let checkouts: Vec<PathBuf> = area
+        .iter()
+        .filter_map(|a| std::fs::read_dir(a).ok())
+        .flat_map(|rd| rd.flatten().map(|e| e.path()))
+        .filter(|p| p.join(".git").is_file())
+        .collect();
     let trees = state
         .worktrees
         .iter()
         .map(|r| r.path.clone())
-        .chain(reviewer_area(&state.project_root, &state.id).ok());
+        .chain(area)
+        .chain(checkouts);
     for tree in trees {
         if !tree.is_dir() || !reapable_worktree(&state.project_root, &tree) {
             continue;
@@ -1748,6 +1802,45 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// O138: leftovers, overlaid acceptance tests included, are committed before the
+    /// panel; what git ignores is not.
+    #[test]
+    fn commit_leftovers_commits_untracked_and_tracked_changes_but_not_ignored_files() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        fixture_git(&root, &["init", "-q"]);
+        fixture_git(&root, &["config", "user.email", "t@t.com"]);
+        fixture_git(&root, &["config", "user.name", "t"]);
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        std::fs::write(root.join("README"), "x").unwrap();
+        fixture_git(&root, &["add", "."]);
+        fixture_git(&root, &["commit", "-q", "-m", "init"]);
+        assert_eq!(commit_leftovers(&root, "s", "b"), Ok(None));
+
+        std::fs::write(root.join("README"), "changed").unwrap();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(root.join("tests/acceptance.rs"), "fn t() {}").unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join("target/out"), "build").unwrap();
+        let sha = commit_leftovers(&root, "add work", "spar: body line")
+            .unwrap()
+            .unwrap();
+        assert_eq!(fixture_git(&root, &["rev-parse", "HEAD"]), sha);
+        assert_eq!(
+            fixture_git(&root, &["log", "-1", "--format=%s"]),
+            "add work"
+        );
+        assert_eq!(
+            fixture_git(&root, &["log", "-1", "--format=%b"]),
+            "spar: body line"
+        );
+        let files = fixture_git(&root, &["show", "--name-only", "--format=", "HEAD"]);
+        assert!(files.contains("tests/acceptance.rs") && files.contains("README"));
+        assert!(!files.contains("target/out"));
+        assert!(fixture_git(&root, &["status", "--porcelain"]).is_empty());
     }
 
     /// #158: a reviewer works in a detached checkout of its own, reused and forced onto

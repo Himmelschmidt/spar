@@ -95,7 +95,7 @@ pub fn resume(
     detach: bool,
     json: bool,
 ) -> Result<ExitCode> {
-    let state = RunState::load(paths, run_id)?;
+    let mut state = RunState::load(paths, run_id)?;
     if let Some(owner) = crate::runlock::RunLock::owner(paths, run_id) {
         if owner.alive() {
             return Err(crate::runlock::OrchestratorBusy {
@@ -104,6 +104,12 @@ pub fn resume(
             }
             .into());
         }
+    }
+    if state.amend_in_progress.is_some() {
+        let lock = crate::runlock::RunLock::acquire(paths, run_id)?;
+        state = RunState::load(paths, run_id)?;
+        crate::workflow::plan::recover_interrupted_amend(&mut state, paths)?;
+        drop(lock);
     }
     if state.phase.is_gate() {
         bail!(
@@ -2040,6 +2046,14 @@ pub fn execute_loop(
     }
     state.contract_fingerprint = Some(frozen.fingerprint.clone());
     state.contract_modified = false;
+    // The frozen text itself, kept apart from the file the implementer can write to,
+    // so `spar amend` starts from what was frozen (O137).
+    if paths.artifact(&state.id, "test-contract.md").is_file() {
+        let _ = std::fs::write(
+            paths.artifact(&state.id, crate::workflow::plan::FROZEN_CONTRACT),
+            &frozen.body,
+        );
+    }
     if moved {
         let msg = format!(
             "contract re-frozen: {} criteria (fingerprint {}, was {}){}",
@@ -2061,12 +2075,7 @@ pub fn execute_loop(
     let mut test_contract_body = test_contract_body;
 
     // Bring pre-coding acceptance tests into implementer cwd (fail closed if author ran).
-    if let Some(author) = state
-        .slots
-        .iter()
-        .find(|s| s.role == SlotRole::TestAuthor)
-        .map(|s| s.id.clone())
-    {
+    if let Some(author) = state.test_author_seat().map(|s| s.id.clone()) {
         let impl_cwd = state
             .slots
             .iter()
@@ -2421,6 +2430,7 @@ pub fn execute_loop(
         if should_stop(paths, &state.id) {
             return stop_now(state, paths);
         }
+        commit_before_review(state, paths, cfg, &impl_slot.id);
 
         // Suite channel: cheap model runs full suites; reviewers must not re-run them.
         let mut suite_body = String::new();
@@ -3076,6 +3086,54 @@ pub fn execute_loop(
     }
 }
 
+/// Commit what the implementer left uncommitted, overlaid acceptance tests included,
+/// on its branch before the suite and the panel run (O138): reviewers judge a detached
+/// checkout of `HEAD`, the suite runs on that same commit, and `ship` pushes it. The
+/// subject is the PR title, so it reads right as a squash subject. A failure (a hook
+/// that refuses) is said out loud and the round goes on: the panel then judges `HEAD`.
+fn commit_before_review(state: &mut RunState, paths: &SparPaths, cfg: &Config, impl_id: &str) {
+    let Some(wt) = state
+        .worktrees
+        .iter()
+        .find(|w| w.slot_id == impl_id)
+        .cloned()
+    else {
+        return;
+    };
+    if state.dry_run || !wt.path.is_dir() || wt.path.starts_with(state.project_root.join(".spar")) {
+        return;
+    }
+    if let Some(msg) = worktree::restore_branch(&wt.path, &wt.branch, state.base_commit.as_deref())
+    {
+        eprintln!("warning: {msg}");
+        let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg));
+    }
+    let subject = crate::ship::pr_title(state.task.as_deref(), cfg.ship.title_max);
+    let body = format!(
+        "spar: uncommitted implementer work before review round {}",
+        state.round
+    );
+    let note = match worktree::commit_leftovers(&wt.path, &subject, &body) {
+        Ok(None) => return,
+        Ok(Some(sha)) => format!(
+            "committed uncommitted implementer work on {} as {} before review round {}",
+            wt.branch,
+            sha.chars().take(8).collect::<String>(),
+            state.round
+        ),
+        Err(e) => {
+            let msg = format!(
+                "could not commit uncommitted implementer work before review round {}: {e}; \
+                 the panel judges HEAD without it",
+                state.round
+            );
+            eprintln!("warning: {msg}");
+            msg
+        }
+    };
+    let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(note));
+}
+
 /// The tree reviewer `seat` judges from: its own detached checkout at the panel head
 /// (O138), so a reviewer that checks out or commits anything moves nothing the
 /// implementer or `ship` reads (#158). The implementer's tree when there is no real
@@ -3142,6 +3200,11 @@ fn move_seat(
         .ok_or_else(|| anyhow::anyhow!("unknown slot {slot_id}"))?;
     if let Some(s) = state.slot_mut(slot_id) {
         set_slot_provider(s, pin.display());
+        // A level the old CLI took may not exist on the new one; the dispatch then
+        // resolves the role's level from config.
+        if executor::check_slot_effort(&pin.display(), s.effort).is_err() {
+            s.effort = None;
+        }
         s.source = Some(source);
         s.status = SlotStatus::Pending;
         s.error = None;
@@ -3164,6 +3227,9 @@ fn moved_seat_id(role: SlotRole, slot_id: &str, provider: &str) -> String {
             format!("review-{ordinal}-{}", sanitize_slot(provider))
         }
         (SlotRole::Tester, _) => format!("suite-{}", sanitize_slot(provider)),
+        (SlotRole::Reviewer, None) if slot_id.ends_with("-wide") => {
+            format!("review-{}-wide", sanitize_slot(provider))
+        }
         _ => slot_id.to_string(),
     }
 }
@@ -3638,6 +3704,61 @@ fn try_rotate_reviewer_provider(
     }
     state.save(paths)?;
     Ok(Some(rev_id.to_string()))
+}
+
+#[cfg(test)]
+mod moved_seat_tests {
+    use super::*;
+
+    #[test]
+    fn moved_seat_ids_name_the_new_provider() {
+        assert_eq!(
+            moved_seat_id(SlotRole::Reviewer, "review-1-cli-codex", "cli:claude"),
+            "review-1-cli-claude"
+        );
+        assert_eq!(
+            moved_seat_id(SlotRole::Reviewer, "review-cli-grok-wide", "cli:claude"),
+            "review-cli-claude-wide"
+        );
+        assert_eq!(
+            moved_seat_id(SlotRole::Tester, "suite-cli-codex", "cli:pi"),
+            "suite-cli-pi"
+        );
+        assert_eq!(
+            moved_seat_id(SlotRole::Implementer, "impl", "cli:pi"),
+            "impl"
+        );
+    }
+
+    #[test]
+    fn a_rename_carries_the_artifact_and_remembers_the_old_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new("r1", crate::cli::WorkflowKind::Loop, tmp.path().into());
+        let mut slot = executor::init_slot("review-0-cli-codex", "cli:codex", SlotRole::Reviewer);
+        slot.artifact = Some("review-review-0-cli-codex.md".into());
+        let refused: crate::effort::EffortLevel = crate::effort::EffortLevel::all()
+            .iter()
+            .map(|r| r.parse().unwrap())
+            .find(|l| executor::check_slot_effort("cli:claude", Some(*l)).is_err())
+            .expect("claude refuses some level");
+        slot.effort = Some(refused);
+        state.slots.push(slot);
+        let pin = crate::runspec::Pin::parse("cli:claude").unwrap();
+        let id = move_seat(
+            &mut state,
+            &paths,
+            "review-0-cli-codex",
+            &pin,
+            SeatSource::Reassigned,
+        )
+        .unwrap();
+        let s = state.slots.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(id, "review-0-cli-claude");
+        assert_eq!(s.artifact.as_deref(), Some("review-review-0-cli-claude.md"));
+        assert_eq!(s.former_ids, ["review-0-cli-codex"]);
+        assert_eq!(s.effort, None, "a level the new CLI refuses is dropped");
+    }
 }
 
 #[cfg(test)]
@@ -4488,7 +4609,7 @@ fn blockers_from_disk(
         let scoped = state
             .review_history
             .iter()
-            .filter(|e| e.slot_id == rev.id)
+            .filter(|e| e.slot_id == rev.id || rev.former_ids.contains(&e.slot_id))
             .max_by_key(|e| e.round)
             .is_some_and(|e| e.review.scoped);
         let res = review_result::ReviewResult {

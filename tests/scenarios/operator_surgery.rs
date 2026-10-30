@@ -217,7 +217,12 @@ fn reassign_moves_seats_in_place_and_keeps_worktree_carry_forward_and_history() 
     .unwrap();
     fs::write(
         artifacts.join(format!("review-{reviewer}.md")),
-        "## Verdict\nrequest_changes\n\n## Findings\n- severity: major — OLD-REVIEW-MARKER\n",
+        "## Verdict\nrequest_changes\n\n## Acceptance\nAC-1: fail — OLD-REVIEW-MARKER\n\n## Findings\n- severity: major — the feature is missing\n",
+    )
+    .unwrap();
+    fs::write(
+        artifacts.join("test-contract.md"),
+        "## Scenarios\n- [ ] AC-1: the feature exists — verify: `cargo test`\n",
     )
     .unwrap();
     let markers = fx.run_dir().join("markers");
@@ -278,8 +283,9 @@ fn reassign_moves_seats_in_place_and_keeps_worktree_carry_forward_and_history() 
         "carry-forward reached the new implementer"
     );
     assert!(
-        prompt.contains("review-0-cli-claude"),
-        "the retired reviewer's blockers follow the renamed seat"
+        prompt
+            .contains("acceptance (review `review-0-cli-claude`): AC-1: fail — OLD-REVIEW-MARKER"),
+        "the retired reviewer's blockers follow the renamed seat: {prompt}"
     );
     let events = fs::read_to_string(fx.run_dir().join("events.jsonl")).unwrap();
     assert!(events.contains("reassigned by the operator"));
@@ -388,7 +394,7 @@ fn reassign_is_refused_inside_a_slot_onto_a_paused_provider_and_under_a_live_orc
     let st = fx.state();
     assert_eq!(fx.slot("impl").unwrap()["provider"], "cli:claude");
     assert!(
-        st.get("seat_reassignments").is_none(),
+        st["seat_reassignments"].as_array().unwrap().is_empty(),
         "nothing moved: {st}"
     );
 }
@@ -531,7 +537,10 @@ fn amend_is_refused_inside_a_slot_under_a_live_orchestrator_and_without_a_contra
         ));
     holder.kill().unwrap();
     let _ = holder.wait();
-    assert!(fx.state().get("contract_amendments").is_none());
+    assert!(fx.state()["contract_amendments"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 
     let other = Fixture::new();
     let task_run = other.failed_task_run();
@@ -660,4 +669,304 @@ fn reviewers_judge_from_detached_checkouts_and_never_move_the_implementer_branch
     fx.spar().args(["cleanup", &id]).output().unwrap();
     assert!(!area.exists(), "cleanup removes the reviewer checkouts");
     assert!(!git(&fx.proj, &["worktree", "list"]).contains("-reviewers"));
+}
+
+/// A fake `muse` whose implementer leaves its work uncommitted, and whose reviewer
+/// records what its checkout holds.
+const UNCOMMITTED_IMPLEMENTER_MUSE: &str = r#"PROMPT_FILE=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--prompt-file" ]; then PROMPT_FILE="$a"; fi
+  prev="$a"
+done
+NAME=$(basename "$PROMPT_FILE" .md)
+NAME=${NAME#prompt-}
+ART="$(dirname "$PROMPT_FILE")/artifacts"
+mkdir -p "$ART"
+echo '{"schema_version":1,"stream":{"kind":"session","id":"sess-u"},"record_type":"event","payload_type":"run.model.configured","payload":{"kind":"run_model_configured","model_id":"m"}}'
+case "$NAME" in
+  impl)
+    echo tracked >> README.md
+    echo work > work.txt
+    printf '# Summary\nLeft it uncommitted.\n' > "$ART/summary-impl.md"
+    ;;
+  review-*)
+    if [ -f work.txt ]; then echo yes > "$ART/saw-work-$NAME"; fi
+    SHA=$(git rev-parse HEAD)
+    printf '## Verdict\napprove\n\nReviewed-Commit: %s\n' "$SHA" > "$ART/review-$NAME.md"
+    ;;
+esac
+exit 0"#;
+
+#[test]
+fn uncommitted_implementer_work_is_committed_before_the_suite_and_the_panel() {
+    let fx = Fixture::new();
+    fx.cli("muse", UNCOMMITTED_IMPLEMENTER_MUSE);
+    let suite_head = fx.home.join("suite-head");
+    fx.spar()
+        .args([
+            "implement",
+            "-t",
+            "add work\n\nwith a longer body",
+            "--providers",
+            "cli:muse",
+            "--fleet",
+            "small",
+            "--suite-command",
+            &format!("git rev-parse HEAD > {}", suite_head.display()),
+        ])
+        .assert()
+        .code(2);
+    let st = fx.state();
+    assert_eq!(st["phase"], "awaiting_ship_confirm", "{st}");
+    let impl_wt = PathBuf::from(
+        st["worktrees"].as_array().unwrap()[0]["path"]
+            .as_str()
+            .unwrap(),
+    );
+    assert!(git(&impl_wt, &["status", "--porcelain"]).is_empty());
+    let head = git(&impl_wt, &["rev-parse", "HEAD"]);
+    assert_eq!(git(&impl_wt, &["log", "-1", "--format=%s"]), "add work");
+    assert!(git(&impl_wt, &["log", "-1", "--format=%b"])
+        .contains("spar: uncommitted implementer work before review round 1"));
+    assert_eq!(
+        git(&impl_wt, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        format!("spar/{}/impl", fx.run_id())
+    );
+    assert_eq!(
+        fs::read_to_string(&suite_head).unwrap().trim(),
+        head,
+        "the suite ran on the commit the panel judged"
+    );
+    let artifacts = fx.run_dir().join("artifacts");
+    let seat = "review-0-cli-muse";
+    assert!(
+        artifacts.join(format!("saw-work-{seat}")).is_file(),
+        "the reviewer's checkout holds the uncommitted work"
+    );
+    let review = fs::read_to_string(artifacts.join(format!("review-{seat}.md"))).unwrap();
+    assert!(review.contains(&head));
+}
+
+#[test]
+fn amend_refuses_a_contract_edited_after_the_freeze_unless_told_to_accept_it() {
+    let fx = Fixture::new();
+    let id = planned_run(&fx);
+    fx.spar().args(["approve", &id]).assert().success();
+    fx.spar()
+        .args(["implement", "--run", &id, "--dry-run"])
+        .assert()
+        .stderr(predicate::str::contains("changed while the previous round").not());
+    let frozen = fx.state()["contract_fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let frozen_text =
+        fs::read_to_string(fx.run_dir().join("artifacts/test-contract.frozen.md")).unwrap();
+    fs::write(
+        fx.run_dir().join("artifacts/test-contract.md"),
+        "## Scenarios\n- [ ] AC-1: IMPLEMENTER-WEAKENED — verify: nothing\n",
+    )
+    .unwrap();
+    fx.spar()
+        .args(["amend", "--run", &id, "--contract", "x"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("edited after it was frozen"));
+    assert!(fx.state()["contract_amendments"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    let mut st = fx.state();
+    st["contract_modified"] = true.into();
+    fx.write_state(&st);
+    fs::write(
+        fx.run_dir().join("artifacts/test-contract.md"),
+        &frozen_text,
+    )
+    .unwrap();
+    fx.spar()
+        .args(["amend", "--run", &id, "--contract", "x"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("edited after it was frozen"));
+
+    fs::write(
+        fx.run_dir().join("artifacts/test-contract.md"),
+        "## Scenarios\n- [ ] AC-1: IMPLEMENTER-WEAKENED — verify: nothing\n",
+    )
+    .unwrap();
+    fx.spar()
+        .args([
+            "amend",
+            "--run",
+            &id,
+            "--contract",
+            "x",
+            "--accept-contract-edits",
+        ])
+        .assert()
+        .success();
+    let st = fx.state();
+    let am = &st["contract_amendments"].as_array().unwrap()[0];
+    assert_eq!(
+        am["old_fingerprint"],
+        frozen.as_str(),
+        "the true frozen fingerprint"
+    );
+    assert_eq!(st["contract_modified"], false);
+    let author_prompt =
+        fs::read_to_string(fx.run_dir().join("prompt-test-author-cli-claude.md")).unwrap();
+    assert!(author_prompt.contains("IMPLEMENTER-WEAKENED"));
+}
+
+#[test]
+fn an_interrupted_amend_is_rolled_back_by_approve_and_by_the_next_amend() {
+    let fx = Fixture::new();
+    let id = planned_run(&fx);
+    let original = fs::read_to_string(fx.run_dir().join("artifacts/test-contract.md")).unwrap();
+    let artifacts = fx.run_dir().join("artifacts");
+    fs::write(artifacts.join("test-contract-amend1.md"), &original).unwrap();
+    fs::write(
+        artifacts.join("test-contract.md"),
+        "half written by a killed author",
+    )
+    .unwrap();
+    let mut st = fx.state();
+    st["phase"] = "spec".into();
+    st["amend_in_progress"] = serde_json::json!({
+        "phase": "awaiting_plan_approval",
+        "archived": "test-contract-amend1.md",
+        "author_seat": "test-author-cli-claude",
+    });
+    fx.write_state(&st);
+
+    fx.spar()
+        .args(["approve", &id])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "interrupted `spar amend` was rolled back",
+        ));
+    let st = fx.state();
+    assert!(st.get("amend_in_progress").is_none());
+    assert_eq!(st["phase"], "plan_approved");
+    assert_eq!(
+        fs::read_to_string(artifacts.join("test-contract.md")).unwrap(),
+        original
+    );
+
+    let mut st = fx.state();
+    st["phase"] = "spec".into();
+    st["amend_in_progress"] = serde_json::json!({
+        "phase": "plan_approved",
+        "archived": "test-contract-amend1.md",
+        "author_seat": "test-author-cli-claude",
+    });
+    fx.write_state(&st);
+    fs::write(artifacts.join("test-contract.md"), "half written again").unwrap();
+    fx.spar()
+        .args(["amend", "--run", &id, "--contract", "second try"])
+        .assert()
+        .success();
+    let st = fx.state();
+    assert_eq!(st["phase"], "plan_approved");
+    let am = &st["contract_amendments"].as_array().unwrap()[0];
+    assert_eq!(
+        am["archived"], "test-contract-amend2.md",
+        "never overwrites amend1"
+    );
+    assert_eq!(
+        fs::read_to_string(artifacts.join("test-contract-amend2.md")).unwrap(),
+        original
+    );
+}
+
+#[test]
+fn amend_reuses_the_current_test_author_seat_and_rolls_back_when_it_fails() {
+    let fx = Fixture::new();
+    let id = planned_run(&fx);
+    // A seat the config would no longer resolve to: amend must still use it.
+    let mut st = fx.state();
+    for s in st["slots"].as_array_mut().unwrap() {
+        if s["role"] == "test_author" {
+            s["id"] = "test-author-cli-grok".into();
+            s["provider"] = "cli:grok".into();
+        }
+    }
+    for w in st["worktrees"].as_array_mut().unwrap() {
+        if w["slot_id"] == "test-author-cli-claude" {
+            w["slot_id"] = "test-author-cli-grok".into();
+        }
+    }
+    fx.write_state(&st);
+    fx.spar()
+        .args(["amend", "--run", &id, "--contract", "reuse"])
+        .assert()
+        .success();
+    let authors: Vec<String> = fx.state()["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["role"] == "test_author")
+        .map(|s| s["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(authors, ["test-author-cli-grok"], "no second seat");
+    assert!(fx
+        .run_dir()
+        .join("prompt-test-author-cli-grok.md")
+        .is_file());
+
+    // Live: grok is paused with no backup, so amend refuses before dispatching.
+    let mut st = fx.state();
+    st["dry_run"] = false.into();
+    fx.write_state(&st);
+    fx.spar()
+        .args(["provider", "pause", "cli:grok"])
+        .assert()
+        .success();
+    fx.spar()
+        .args(["amend", "--run", &id, "--contract", "x"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("has no eligible backup"));
+
+    // With a declared backup the seat moves to it; the fake codex fails, so the
+    // amendment is rolled back and the run is left exactly where it was.
+    let cfg_path = fx.run_dir().join("config.json");
+    let mut cfg: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&cfg_path).unwrap()).unwrap();
+    cfg["backups"]["test_author"] = "cli:codex".into();
+    fs::write(&cfg_path, serde_json::to_string(&cfg).unwrap()).unwrap();
+    let before = fs::read_to_string(fx.run_dir().join("artifacts/test-contract.md")).unwrap();
+    let phase = fx.state()["phase"].clone();
+    fx.spar()
+        .args(["amend", "--run", &id, "--contract", "x"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("contract amendment failed"));
+    assert!(fx.count("codex") >= 1, "the backup was dispatched");
+    assert_eq!(fx.count("grok"), 0);
+    let st = fx.state();
+    assert_eq!(st["phase"], phase);
+    assert!(st.get("amend_in_progress").is_none());
+    assert_eq!(st["contract_amendments"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        fs::read_to_string(fx.run_dir().join("artifacts/test-contract.md")).unwrap(),
+        before
+    );
+    let authors: Vec<&serde_json::Value> = st["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["role"] == "test_author")
+        .collect();
+    assert_eq!(authors.len(), 1);
+    assert_eq!(authors[0]["id"], "test-author-cli-codex");
+    assert!(st["worktrees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|w| w["slot_id"] == "test-author-cli-codex"));
 }

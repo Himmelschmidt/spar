@@ -240,6 +240,7 @@ mod tests {
             review: None,
             source: None,
             auth_fault: false,
+            former_ids: Vec::new(),
         }
     }
 
