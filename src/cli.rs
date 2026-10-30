@@ -551,6 +551,13 @@ pub enum Command {
         if_merged: bool,
     },
 
+    /// Operator rulings: settled points every later reviewer and implementer prompt
+    /// carries. A run ruling may waive an acceptance criterion (O121).
+    Rule {
+        #[command(subcommand)]
+        action: RuleCmd,
+    },
+
     /// Built-in skills for outer agents (agent-browser style)
     Skills {
         #[command(subcommand)]
@@ -594,6 +601,46 @@ pub enum DaemonCmd {
     Stop,
     /// Pid, uptime, tick, cap, per-bucket usage, the queue, and the runs it watches.
     Status {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RuleCmd {
+    /// Record a ruling on a run (`--run <id>`) or on the project (`--project`).
+    #[command(group(clap::ArgGroup::new("target").required(true).args(["run", "project"])))]
+    Add {
+        text: String,
+        #[arg(long)]
+        run: Option<String>,
+        /// Project-wide: every run in this project, stored under `.spar/rules/`.
+        #[arg(long)]
+        project: bool,
+        /// Take this criterion out of the run's acceptance gate. Repeatable. Run only.
+        #[arg(long = "waive", value_name = "AC-n")]
+        waive: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// The rulings in force: a run lists the project's rulings and its own.
+    #[command(group(clap::ArgGroup::new("target").required(true).args(["run", "project"])))]
+    List {
+        #[arg(long)]
+        run: Option<String>,
+        #[arg(long)]
+        project: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a ruling by id (`R<n>` on a run, `P<n>` on the project).
+    #[command(group(clap::ArgGroup::new("target").required(true).args(["run", "project"])))]
+    Rm {
+        rule_id: String,
+        #[arg(long)]
+        run: Option<String>,
+        #[arg(long)]
+        project: bool,
         #[arg(long)]
         json: bool,
     },

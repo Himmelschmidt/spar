@@ -12371,7 +12371,10 @@ fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: Option<&Confi
         }
         match std::fs::read_to_string(&path) {
             Ok(text) if !text.trim().is_empty() => {
-                let res = workflow::review_result::parse_review(&text);
+                let res = workflow::review_result::ReviewResult {
+                    scoped: s.review.as_ref().is_some_and(|r| r.scoped),
+                    ..workflow::review_result::parse_review(&text)
+                };
                 let verdict_text = match res.verdict {
                     Some(workflow::review_result::Verdict::Approve) => "approve",
                     Some(workflow::review_result::Verdict::RequestChanges) => "request_changes",
@@ -12385,9 +12388,18 @@ fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: Option<&Confi
                 } else {
                     Vec::new()
                 };
-                let blocked = !res.approves() || !reasons.is_empty();
-                if !res.approves() {
+                let verdict_blocks = evidence
+                    .cfg
+                    .as_ref()
+                    .map_or(!res.approves(), |c| res.blocks(c.review.block_on));
+                let blocked = verdict_blocks || !reasons.is_empty();
+                if verdict_blocks {
                     reasons.insert(0, format!("verdict: {verdict_text}"));
+                } else if !res.approves() {
+                    reasons.insert(
+                        0,
+                        "verdict: request_changes (non-blocking findings only)".into(),
+                    );
                 }
                 let source = SourceId::Document {
                     path: path.to_string_lossy().into_owned(),

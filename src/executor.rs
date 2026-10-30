@@ -325,6 +325,11 @@ fn prepare_slot_execution(
         branch: &branch,
         nudge_file: &nudge_s,
     });
+    // Read per dispatch, so a ruling added to a live run reaches its next dispatch (O121).
+    vars.insert(
+        "operator_rulings".into(),
+        crate::rules::prompt_section(&crate::rules::for_run(paths, &state.id)),
+    );
     for (k, v) in &job.extra_vars {
         vars.insert(k.clone(), v.clone());
     }
@@ -2315,6 +2320,11 @@ pub fn run_slot(
         branch: &branch,
         nudge_file: &nudge_s,
     });
+    // Read per dispatch, so a ruling added to a live run reaches its next dispatch (O121).
+    vars.insert(
+        "operator_rulings".into(),
+        crate::rules::prompt_section(&crate::rules::for_run(paths, &state.id)),
+    );
     for (k, v) in &job.extra_vars {
         vars.insert(k.clone(), v.clone());
     }
@@ -3349,11 +3359,29 @@ fn write_dry_artifacts(
             let sha_line = git_output(cwd, &["rev-parse", "HEAD"])
                 .map(|h| format!("Reviewed-Commit: {h}\n"))
                 .unwrap_or_default();
-            let body = format!(
-                "{}\n## Verdict\n{verdict}\n\n{sha_line}{acceptance}## Findings\n- severity: minor — dry-run synthetic review from {}\n\n## Tests\nsuite channel (dry-run); no full suite here\n",
-                crate::workflow::review_result::SYNTHETIC_REVIEW_MARKER,
-                job.provider
-            );
+            // Test hook: stand in for a real reviewer (no synthetic marker) that requests
+            // changes on one finding of this severity, with every criterion passing, so
+            // the severity gate (O118) can be driven without a live model.
+            let forced_finding = std::env::var("SPAR_FORCE_REVIEW_FINDING").unwrap_or_default();
+            let body = match forced_finding.as_str() {
+                "" => format!(
+                    "{}\n## Verdict\n{verdict}\n\n{sha_line}{acceptance}## Findings\n- severity: minor — dry-run synthetic review from {}\n\n## Tests\nsuite channel (dry-run); no full suite here\n",
+                    crate::workflow::review_result::SYNTHETIC_REVIEW_MARKER,
+                    job.provider
+                ),
+                forced => {
+                    let section = if forced == "follow-up" { "Follow-up" } else { "Findings" };
+                    let severity = if forced == "follow-up" { "major" } else { forced };
+                    let acceptance = acceptance.replace(
+                        "fail — dry-run forced request_changes",
+                        "pass — dry-run synthetic evidence",
+                    );
+                    format!(
+                        "## Verdict\nrequest_changes\n\n{sha_line}{acceptance}## {section}\n- severity: {severity} — dry-run forced finding from {} at src/lib.rs:1\n\n## Tests\nnone\n",
+                        job.provider
+                    )
+                }
+            };
             if let Some(name) = &job.expected_artifact {
                 std::fs::write(paths.artifact(&state.id, name), &body)?;
             }

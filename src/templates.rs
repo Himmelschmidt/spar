@@ -102,6 +102,8 @@ pub fn base_vars(ctx: &TemplateCtx<'_>) -> HashMap<String, String> {
         "(no pre-written acceptance contract)".into(),
     );
     m.insert("contract_drift_note".into(), String::new());
+    m.insert("prior_findings".into(), String::new());
+    m.insert("operator_rulings".into(), String::new());
     m.insert("planner_slot".into(), String::new());
     m.insert("critic_slot".into(), String::new());
     m.insert("review_cwd".into(), ctx.cwd.into());

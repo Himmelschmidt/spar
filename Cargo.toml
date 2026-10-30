@@ -180,5 +180,9 @@ name = "ship_flow"
 path = "tests/scenarios/ship_flow.rs"
 
 [[test]]
+name = "review_gating"
+path = "tests/scenarios/review_gating.rs"
+
+[[test]]
 name = "work_safety"
 path = "tests/scenarios/work_safety.rs"

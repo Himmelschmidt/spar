@@ -1917,7 +1917,12 @@ pub fn execute_loop(
     // paid for — is a fresh process, and an in-memory list would leave it running blind
     // on the most expensive round of the run. Nothing in the implementer's prompt tells
     // it to go read `review-*.md` on its own.
-    let mut blockers: Vec<String> = blockers_from_disk(state, paths, &frozen.criteria, cfg);
+    let mut blockers: Vec<String> = blockers_from_disk(
+        state,
+        paths,
+        &crate::rules::unwaived(&frozen.criteria, &crate::rules::for_run(paths, &state.id)),
+        cfg,
+    );
 
     loop {
         // Stop boundary: before the implementer (and every fix-round re-dispatch).
@@ -2489,6 +2494,19 @@ pub fn execute_loop(
             eprintln!("warning: {msg}");
             let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg));
         }
+        let prior_findings = scoped_review_section(state, cfg, &review_cwd);
+        // Read per panel, so a waiver added while the run is live counts from the next
+        // gate on. The contract stays frozen (O43); the waiver is the operator's (O121).
+        let rulings = crate::rules::for_run(paths, &state.id);
+        let criteria = crate::rules::unwaived(&frozen.criteria, &rulings);
+        for (id, r) in crate::rules::waived(&rulings) {
+            if !frozen.criteria.iter().any(|c| c == id) {
+                continue;
+            }
+            let msg = format!("{id} waived by operator ruling {}: {}", r.id, r.text);
+            eprintln!("note: {msg}");
+            let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg));
+        }
         for rev in &reviewers {
             // Stop boundary: before each reviewer job.
             if should_stop(paths, &state.id) {
@@ -2517,6 +2535,7 @@ pub fn execute_loop(
             extra.insert("plan_body".into(), plan_body.clone());
             extra.insert("test_contract_body".into(), test_contract_body.clone());
             extra.insert("contract_drift_note".into(), contract_drift_note.clone());
+            extra.insert("prior_findings".into(), prior_findings.clone());
             let mut job = SlotJob {
                 slot_id: rev.id.clone(),
                 provider: rev.provider.clone(),
@@ -2642,6 +2661,7 @@ pub fn execute_loop(
                         line: None,
                         text: format!("review slot `{}`: {why}", rev.id),
                         synthetic: true,
+                        follow_up: false,
                     }],
                     synthetic: true,
                     ..Default::default()
@@ -2650,7 +2670,10 @@ pub fn execute_loop(
             } else if let Some(text) = review_text {
                 // Fail closed: only an anchored `## Verdict` / approve clears the gate,
                 // and every contract criterion must be reported as passing (O19/O20).
-                let res = review_result::parse_review(&text);
+                let res = review_result::ReviewResult {
+                    scoped: !prior_findings.is_empty(),
+                    ..review_result::parse_review(&text)
+                };
                 review_result::record_review(state, paths, &rev.id, &res);
                 // The semantic layer above the mtime gate: a verdict that names no
                 // commit, or one about a commit that is not the panel head, is not
@@ -2713,17 +2736,29 @@ pub fn execute_loop(
                         );
                     }
                 }
-                if !res.approves() {
+                if res.blocks(cfg.review.block_on) {
                     any_request_changes = true;
                     blockers.push(format!(
                         "review `{}` requested changes: {}",
                         rev.id,
                         review_path.display()
                     ));
+                } else if !res.approves() {
+                    let _ = crate::events::append(
+                        paths,
+                        &state.id,
+                        &crate::events::Event::slot_note(
+                            &rev.id,
+                            format!(
+                                "request_changes counted as approve-with-notes: no finding at or above block_on = {}",
+                                cfg.review.block_on.as_str()
+                            ),
+                        ),
+                    );
                 }
-                if acceptance_blocks_ship(&frozen.criteria, &res, cfg) {
+                if acceptance_blocks_ship(&criteria, &res, cfg) {
                     any_request_changes = true;
-                    let reasons = acceptance_block_reasons(&frozen.criteria, &res, cfg);
+                    let reasons = acceptance_block_reasons(&criteria, &res, cfg);
                     // Into the next round's prompt, not only onto the bus: without this
                     // the fix round's implementer prompt is byte-identical to round 1's
                     // and never learns which criterion it failed.
@@ -4028,10 +4063,22 @@ fn escalate_round_ceiling(state: &mut RunState, paths: &SparPaths) -> Result<()>
     // `print_run_human` shows the phase but not `error`, so without this an operator
     // running implement interactively sees a phase name and no way out of it.
     eprintln!("{msg}");
+    // Findings describe the commit their reviewer read; one whose file moved since may
+    // already be fixed, and whoever takes the run over should check it at HEAD (O120).
+    let open = review_result::open_findings(state, &review_result::findings_cwd(state));
+    let mut findings = String::new();
+    if !open.is_empty() {
+        findings.push_str("\n## Open findings\n\n");
+        for f in &open {
+            findings.push_str(&f.line());
+            findings.push('\n');
+        }
+        eprint!("{findings}");
+    }
     std::fs::write(
         paths.artifact(&state.id, "escalation.md"),
         format!(
-            "# Escalation: round ceiling\n\n{msg}\n\nFix rounds this leg: {}\nSuite: {:?}\n",
+            "# Escalation: round ceiling\n\n{msg}\n\nFix rounds this leg: {}\nSuite: {:?}\n{findings}",
             state.fix_rounds, state.suite_outcome
         ),
     )?;
@@ -4044,6 +4091,88 @@ fn escalate_round_ceiling(state: &mut RunState, paths: &SparPaths) -> Result<()>
         state.message_budget,
     );
     Ok(())
+}
+
+/// `{{prior_findings}}` for this round's panel (O119): from `[review]
+/// scoped_from_round` on, the previous panel's findings and the diff since the commit it
+/// judged, so reviewers check those and look for regressions instead of re-reviewing
+/// from scratch. Empty, meaning a full review, when the previous panel cannot anchor
+/// one: none recorded, a review spar wrote itself, or reviewers that judged different
+/// commits.
+fn scoped_review_section(state: &RunState, cfg: &Config, review_cwd: &Path) -> String {
+    let from = cfg.review.scoped_from_round;
+    if from == 0 || state.round < from {
+        return String::new();
+    }
+    let panel = review_result::panel_before(&state.review_history, state.round);
+    if panel.is_empty() || panel.iter().any(|e| e.review.synthetic) {
+        return String::new();
+    }
+    let commit = panel[0].review.reviewed_commit.clone();
+    if panel.iter().any(|e| e.review.reviewed_commit != commit) {
+        return String::new();
+    }
+    // A critical filed under Follow-up blocked its round, so it is re-judged too.
+    let prior: Vec<_> = review_result::panel_findings(&panel)
+        .into_iter()
+        .filter(|(_, f)| !f.follow_up || f.severity == review_result::Severity::Critical)
+        .collect();
+    let stat = commit
+        .as_deref()
+        .and_then(|c| worktree::git_out(review_cwd, &["diff", "--stat", &format!("{c}..HEAD")]));
+    render_scoped_review(
+        state.round,
+        &prior,
+        commit.as_deref(),
+        stat.as_deref(),
+        review_cwd,
+    )
+}
+
+fn render_scoped_review(
+    round: u32,
+    prior: &[(&str, &review_result::Finding)],
+    commit: Option<&str>,
+    stat: Option<&str>,
+    review_cwd: &Path,
+) -> String {
+    let mut out = format!(
+        "## Scoped re-review (round {round})\n\n\
+         This is a re-review. Earlier rounds already reviewed this change in full. Judge \
+         the previous panel's findings below at HEAD and look for regressions in what \
+         changed since; do not re-review the whole change from scratch.\n\n"
+    );
+    if let Some(c) = commit {
+        out.push_str(&format!(
+            "The previous panel judged `{c}`. Full diff since: `git -C {} diff {c}..HEAD`.\n",
+            review_cwd.display()
+        ));
+        match stat.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(stat) => out.push_str(&format!("\n```\n{stat}\n```\n")),
+            None => out.push_str("Nothing changed since, or the diff could not be read.\n"),
+        }
+        out.push('\n');
+    }
+    out.push_str("### Prior findings\n");
+    if prior.is_empty() {
+        out.push_str("- (none recorded: the previous panel blocked on acceptance criteria only)\n");
+    }
+    for (slot, f) in prior {
+        out.push_str(&review_result::finding_line(slot, f));
+        out.push('\n');
+    }
+    out.push_str(
+        "\nThis round:\n\
+         - Under `## Findings`, list each prior finding still open at HEAD, at its severity, \
+         and any regression the change since introduced. Leave resolved ones out and name \
+         them under `## Resolved`.\n\
+         - Any other new finding that is not critical goes under `## Follow-up`, with a \
+         severity (`- severity: major — ...`). Follow-up never blocks the ship; it goes into \
+         the PR body as open work. A new critical finding still goes under `## Findings`.\n\
+         - `request_changes` means a prior finding is still open, the change since regressed \
+         something, or an acceptance criterion fails.\n",
+    );
+    out
 }
 
 /// Rebuild the previous round's blocker list from the review artifacts on disk.
@@ -4070,8 +4199,18 @@ fn blockers_from_disk(
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let res = review_result::parse_review(&text);
-        if !res.approves() {
+        // Whether that review answered a scoped prompt is on its recorded entry.
+        let scoped = state
+            .review_history
+            .iter()
+            .filter(|e| e.slot_id == rev.id)
+            .max_by_key(|e| e.round)
+            .is_some_and(|e| e.review.scoped);
+        let res = review_result::ReviewResult {
+            scoped,
+            ..review_result::parse_review(&text)
+        };
+        if res.blocks(cfg.review.block_on) {
             out.push(format!(
                 "review `{}` requested changes: {}",
                 rev.id,
@@ -5184,5 +5323,116 @@ mod carry_forward_tests {
             take_carry_forward(&paths, "r1", "b").as_deref(),
             Some("from b")
         );
+    }
+    /// A minors-only `request_changes` on disk is not a blocker for the next round
+    /// either: `blockers_from_disk` uses the same rule as the live gate (O118).
+    #[test]
+    fn a_minors_only_review_seeds_no_verdict_blocker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("r1").unwrap();
+        let mut state = RunState::new("r1", crate::cli::WorkflowKind::Loop, tmp.path().into());
+        state.slots.push(crate::executor::init_slot(
+            "rev-1",
+            "cli:claude",
+            SlotRole::Reviewer,
+        ));
+        std::fs::write(
+            paths.artifact("r1", "review-rev-1.md"),
+            "## Verdict\nrequest_changes\n\n## Acceptance\nAC-1: pass — done\n\n## Findings\n- severity: minor — stale comment at src/a.rs:3\n",
+        )
+        .unwrap();
+        let ac = ["AC-1".to_string()];
+        assert!(blockers_from_disk(&state, &paths, &ac, &Config::default()).is_empty());
+        let mut strict = Config::default();
+        strict.review.block_on = review_result::Severity::Minor;
+        assert_eq!(blockers_from_disk(&state, &paths, &ac, &strict).len(), 1);
+    }
+
+    fn scoped_state(round: u32, reviews: &[(&str, &str)]) -> RunState {
+        let mut state = RunState::new("r1", crate::cli::WorkflowKind::Loop, "/nonexistent".into());
+        state.round = round;
+        for (slot, body) in reviews {
+            state.review_history.push(crate::state::ReviewHistoryEntry {
+                round: round - 1,
+                slot_id: slot.to_string(),
+                review: review_result::parse_review(body),
+            });
+        }
+        state
+    }
+
+    const PRIOR: &str = "## Verdict\nrequest_changes\n\nReviewed-Commit: abcdef1234567\n\n## Findings\n- severity: major — the retry at src/net.rs:40 never stops\n\n## Follow-up\n- severity: minor — split the module later\n";
+
+    #[test]
+    fn scoped_review_starts_at_its_round_and_carries_the_prior_findings() {
+        let cfg = Config::default();
+        let cwd = Path::new("/nonexistent");
+        assert!(scoped_review_section(&scoped_state(2, &[("rev-1", PRIOR)]), &cfg, cwd).is_empty());
+
+        let s = scoped_review_section(&scoped_state(3, &[("rev-1", PRIOR)]), &cfg, cwd);
+        assert!(s.contains("## Scoped re-review (round 3)"), "{s}");
+        assert!(
+            s.contains("- major `src/net.rs:40` (rev-1): the retry"),
+            "{s}"
+        );
+        assert!(s.contains("diff abcdef1234567..HEAD"), "{s}");
+        assert!(s.contains("`## Follow-up`"), "{s}");
+        assert!(
+            !s.contains("split the module"),
+            "follow-ups are not re-judged: {s}"
+        );
+
+        let mut off = Config::default();
+        off.review.scoped_from_round = 0;
+        assert!(scoped_review_section(&scoped_state(5, &[("rev-1", PRIOR)]), &off, cwd).is_empty());
+    }
+
+    /// A panel spar had to stand in for, or one whose reviewers judged different
+    /// commits, cannot anchor a scoped round: that round gets a full review.
+    #[test]
+    fn scoped_review_falls_back_to_a_full_review_without_an_anchor() {
+        let cfg = Config::default();
+        let cwd = Path::new("/nonexistent");
+        let synthetic = format!("{}\n{PRIOR}", review_result::SYNTHETIC_REVIEW_MARKER);
+        assert!(scoped_review_section(
+            &scoped_state(4, &[("rev-1", PRIOR), ("rev-2", &synthetic)]),
+            &cfg,
+            cwd
+        )
+        .is_empty());
+        let other = PRIOR.replace("abcdef1234567", "1111111222222");
+        assert!(scoped_review_section(
+            &scoped_state(4, &[("rev-1", PRIOR), ("rev-2", &other)]),
+            &cfg,
+            cwd
+        )
+        .is_empty());
+        assert!(scoped_review_section(&scoped_state(4, &[]), &cfg, cwd).is_empty());
+    }
+    /// A critical filed under Follow-up blocked its own round, so the next scoped
+    /// round must still re-judge it rather than drop it with the other follow-ups.
+    #[test]
+    fn scoped_review_keeps_a_critical_filed_under_follow_up() {
+        let body =
+            format!("{PRIOR}- severity: critical — the migration drops rows at src/m.rs:5\n");
+        let s = scoped_review_section(
+            &scoped_state(3, &[("rev-1", &body)]),
+            &Config::default(),
+            Path::new("/nonexistent"),
+        );
+        assert!(
+            s.contains("- critical follow-up `src/m.rs:5` (rev-1)"),
+            "{s}"
+        );
+        assert!(!s.contains("split the module"), "{s}");
+    }
+    #[test]
+    fn reviewer_template_carries_the_severity_rubric() {
+        let t = crate::templates::get("reviewer").unwrap();
+        assert!(t.contains("Severity rubric"), "{t}");
+        assert!(t.contains("Anything that makes the code do the wrong thing is major or above"));
+        assert!(t.contains("Minor never blocks the ship"));
+        assert!(t.contains("Be strict."));
     }
 }
