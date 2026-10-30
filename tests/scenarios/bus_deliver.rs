@@ -10,9 +10,6 @@
 //!   - agy     → `None`                 (inbox left untouched for the agent's next turn)
 //!   - muse    → `StopHookInject`       (same turn-boundary injection as Claude: muse's
 //!     Stop hook honors the same `{"decision":"block",…}` payload, probed live)
-//!
-//! `SdkPrompt` (opencode) has no adapter yet, so its dispatch is covered by the
-//! `providers::delivery` unit tests rather than end-to-end here.
 use assert_cmd::cargo::cargo_bin_cmd;
 use serde_json::Value;
 use tempfile::tempdir;

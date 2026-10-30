@@ -135,6 +135,7 @@ fn call(
         model: pref.model.clone(),
         effort: None,
         timeout_secs: Some(PROBE_TIMEOUT.as_secs()),
+        session_dir: None,
     };
     let mut cmd = adapter.build_headless(&bin, &opts);
     if dry {

@@ -57,6 +57,12 @@ impl SparPaths {
         self.run_dir(run_id).join("logs")
     }
 
+    /// Vendor session files for one slot, kept under the run rather than the user's
+    /// home so they are scoped to the run and cleaned up with it.
+    pub fn sessions_dir(&self, run_id: &str, slot_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("sessions").join(slot_id)
+    }
+
     pub fn quota_file(&self) -> PathBuf {
         self.root.join("quota.json")
     }
@@ -81,6 +87,11 @@ impl SparPaths {
     /// delete — `.spar/runs/<id>/` stays the system of record for the run itself.
     pub fn daemon_state(&self) -> PathBuf {
         self.root.join("daemon.json")
+    }
+
+    /// Append-only run history (`.spar/history.jsonl`) that survives `cleanup --purge`.
+    pub fn history_file(&self) -> PathBuf {
+        self.root.join("history.jsonl")
     }
 
     /// One spool file per run admitted to the concurrency queue (`.spar/queue/<id>`).

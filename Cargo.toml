@@ -26,7 +26,6 @@ crossterm = "0.28"
 dirs = "6"
 portable-pty = "0.9"
 ratatui = "0.29"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
 rustix = { version = "1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -167,3 +166,11 @@ path = "tests/scenarios/reviewed_commit.rs"
 [[test]]
 name = "provider_health"
 path = "tests/scenarios/provider_health.rs"
+
+[[test]]
+name = "pi_dispatch"
+path = "tests/scenarios/pi_dispatch.rs"
+
+[[test]]
+name = "machine_readable"
+path = "tests/scenarios/machine_readable.rs"

@@ -1,7 +1,8 @@
 //! Recover real token usage for a `cli:muse` slot.
 //!
-//! `muse exec --json` emits an event envelope on stdout but **no** token counts. Usage
-//! is recorded only in muse's own session log, as `runtime.session` records whose
+//! `muse exec --json` stdout carries one `run.usage` record (muse 1.4.14), but it covers
+//! the main session only (`children_included: false`) and spar does not read it. The
+//! usage spar sums lives in muse's own session log, as `runtime.session` records whose
 //! `event.kind` is `goal_usage_attribution`:
 //!
 //! ```text
@@ -13,6 +14,14 @@
 //! Logs live at `${XDG_DATA_HOME:-~/.local/share}/muse/sessions/YYYY/MM/DD/<session-id>/`,
 //! with a `subagent/<id>/session.jsonl` per child session muse spawned. The children are
 //! real spend (a trivial one-file task fanned out to six of them), so they are summed too.
+//!
+//! **A child's spend counts once.** Since 2026-10-20 muse also mirrors each
+//! `reminder_child` record into the main log, same quantities, new `usage_id`, owned by
+//! the child (`owner.owner_id` is the child's session id). A main-log record whose owner
+//! has its own `subagent/<owner_id>/session.jsonl` is that mirror and is skipped; one
+//! whose owner has no log of its own is the only copy and counts. muse writes the child's
+//! record before the mirror, so a live poll sees the child's log by the time it reads the
+//! mirror.
 //!
 //! **Input is summed, not maxed.** Each record is one billed model call that re-sends the
 //! context, so the sum is what Meta charges; the `max` convention the other adapters use
@@ -142,23 +151,31 @@ pub fn resume_observed(session_dir: &Path) -> Option<bool> {
 /// count instead of recovering it.
 pub fn collect(session_dir: &Path) -> Usage {
     let mut usage = Usage::default();
-    absorb_log(&session_dir.join("session.jsonl"), true, &mut usage);
-    if let Ok(rd) = std::fs::read_dir(session_dir.join("subagent")) {
+    let subagents = session_dir.join("subagent");
+    absorb_log(
+        &session_dir.join("session.jsonl"),
+        Some(&subagents),
+        &mut usage,
+    );
+    if let Ok(rd) = std::fs::read_dir(&subagents) {
         for child in rd.flatten() {
-            absorb_log(&child.path().join("session.jsonl"), false, &mut usage);
+            absorb_log(&child.path().join("session.jsonl"), None, &mut usage);
         }
     }
     usage
 }
 
-fn absorb_log(path: &Path, main: bool, usage: &mut Usage) {
+/// `subagents` is set only for the main log: it is where a mirrored child record's own
+/// log would be.
+fn absorb_log(path: &Path, subagents: Option<&Path>, usage: &mut Usage) {
     let Ok(text) = std::fs::read_to_string(path) else {
         return;
     };
-    absorb_text(&text, main, usage);
+    absorb_text(&text, subagents, usage);
 }
 
-fn absorb_text(text: &str, main: bool, usage: &mut Usage) {
+fn absorb_text(text: &str, subagents: Option<&Path>, usage: &mut Usage) {
+    let main = subagents.is_some();
     for line in text.lines() {
         // Cheap prefilter: these logs run to hundreds of KB and only a handful of lines
         // carry usage.
@@ -182,6 +199,14 @@ fn absorb_text(text: &str, main: bool, usage: &mut Usage) {
         // silently dropped it. `tool` and `reminder` set it false and carry only zeros.
         if q.get("reported").and_then(|x| x.as_bool()) != Some(true) {
             continue;
+        }
+        if let (Some(dir), Some(owner)) = (
+            subagents,
+            rec.pointer("/owner/owner_id").and_then(|x| x.as_str()),
+        ) {
+            if dir.join(owner).join("session.jsonl").is_file() {
+                continue;
+            }
         }
         usage.absorb(q);
     }
@@ -224,20 +249,21 @@ impl LiveUsage {
     /// Cumulative billed tokens for the session and every subagent under it, as of now.
     pub fn billed(&mut self) -> u64 {
         let main = self.dir.join("session.jsonl");
-        self.absorb_new(&main, true);
+        let subagents = self.dir.join("subagent");
+        self.absorb_new(&main, Some(&subagents));
         let mut children = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(self.dir.join("subagent")) {
+        if let Ok(rd) = std::fs::read_dir(&subagents) {
             for child in rd.flatten() {
                 children.push(child.path().join("session.jsonl"));
             }
         }
         for child in children {
-            self.absorb_new(&child, false);
+            self.absorb_new(&child, None);
         }
         self.usage.billed_tokens()
     }
 
-    fn absorb_new(&mut self, path: &Path, main: bool) {
+    fn absorb_new(&mut self, path: &Path, subagents: Option<&Path>) {
         use std::io::{Read, Seek, SeekFrom};
         let offset = self.offsets.get(path).copied().unwrap_or(0);
         let Ok(mut f) = std::fs::File::open(path) else {
@@ -251,14 +277,15 @@ impl LiveUsage {
             return;
         }
         let Some(end) = buf.rfind('\n') else { return };
-        absorb_text(&buf[..end], main, &mut self.usage);
+        absorb_text(&buf[..end], subagents, &mut self.usage);
         self.offsets
             .insert(path.to_path_buf(), offset + end as u64 + 1);
     }
 }
 
-/// Rewrite a muse slot's stats from its session log. The stdout stream has no token
-/// counts at all, so without this every `cli:muse` run reports zero spend.
+/// Rewrite a muse slot's stats from its session log. spar reads no token counts from
+/// stdout (its `run.usage` record excludes subagents), so without this every `cli:muse`
+/// run reports zero spend.
 pub fn enrich(stats: &mut StreamStats) {
     // Falls back to the recovery stash: if spar was killed mid-`recover_artifact` before
     // it could restore `session_id`, that field is still the only durable record telling
@@ -388,6 +415,41 @@ mod tests {
             u.input_tokens + u.output_tokens + u.reasoning_tokens,
             "cached must not be added on top of the input it is already inside"
         );
+    }
+
+    /// The `goal_usage_attribution` lines of a real muse 1.4.14 session, verbatim. The
+    /// main log mirrors both subagents' provider records (owners `01a18e08-9192…` and
+    /// `01a18e08-91af…`) and also carries three `reminder_child` records whose owners
+    /// have no log of their own.
+    #[test]
+    fn mirrored_reminder_child_records_count_once() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/muse-reminder-mirror");
+        let u = collect(&dir);
+        let main_root = (34217 + 34398, 92 + 17, 34161, 20 + 7);
+        let main_only_children = (1656 + 1810 + 15692, 183 + 168 + 575, 1393, 35 + 25 + 397);
+        let subagent_logs = (3638 + 3720, 300 + 467, 0, 195 + 344);
+        assert_eq!(
+            u.input_tokens,
+            main_root.0 + main_only_children.0 + subagent_logs.0
+        );
+        assert_eq!(
+            u.output_tokens,
+            main_root.1 + main_only_children.1 + subagent_logs.1
+        );
+        assert_eq!(
+            u.cached_tokens,
+            main_root.2 + main_only_children.2 + subagent_logs.2
+        );
+        assert_eq!(
+            u.reasoning_tokens,
+            main_root.3 + main_only_children.3 + subagent_logs.3
+        );
+        assert_eq!(u.records, 7, "two main, three main-only children, two logs");
+        assert_eq!(u.tool_records, 1);
+        assert_eq!(u.peak_input_tokens, 34398);
+
+        let mut live = LiveUsage::at(dir);
+        assert_eq!(live.billed(), u.billed_tokens(), "live and post-exit agree");
     }
 
     /// muse appends its session log as the turn runs (verified against a live 190s

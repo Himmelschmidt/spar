@@ -82,6 +82,7 @@ pub fn dispatch_turn(
         model: None,
         effort: None,
         timeout_secs: Some(req.timeout.as_secs()),
+        session_dir: None,
     };
     let cmd = adapter_box.build_headless(&bin, &spawn_opts);
     let (program, args) = crate::providers::command_to_parts(&cmd);

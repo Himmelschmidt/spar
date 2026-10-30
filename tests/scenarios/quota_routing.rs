@@ -587,7 +587,7 @@ fn roles_workflow_rate_limited_on_every_slot_parks_on_quota_and_exits_4() {
     assert_eq!(state["phase"], "quota");
 }
 
-/// codex/opencode/muse/grok have no adapter-specific rate-limit text handling (only
+/// codex/pi/muse/grok have no adapter-specific rate-limit text handling (only
 /// claude does, via `scrape_claude_rate_limits`) — a mid-dispatch limit on any of them
 /// is detectable only through `scrape_strong_quota_signal`'s generic phrase list, and
 /// that list has never been checked against real captured output from those four CLIs

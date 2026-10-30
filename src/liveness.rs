@@ -237,6 +237,7 @@ mod tests {
             round: 1,
             quota_hit: false,
             reviewed_commit: None,
+            review: None,
             source: None,
             auth_fault: false,
         }

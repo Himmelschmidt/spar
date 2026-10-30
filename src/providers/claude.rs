@@ -30,8 +30,8 @@ impl ProviderAdapter for ClaudeAdapter {
     // credentials file whose refresh token expired still reads logged in, so
     // `credential_fault` reads that from the file. (`claude doctor` is an
     // install check that exits 0 with no credentials at all.)
-    fn readiness_probe(&self) -> Option<&[&'static str]> {
-        Some(&["auth", "status"])
+    fn readiness_probe(&self) -> Option<Vec<String>> {
+        Some(vec!["auth".into(), "status".into()])
     }
 
     fn readiness_env(&self) -> &[(&'static str, &'static str)] {
@@ -191,6 +191,7 @@ mod tests {
             model: None,
             effort: None,
             timeout_secs: None,
+            session_dir: None,
         };
         let cmd = ClaudeAdapter.build_headless(Path::new("claude"), &opts);
         let (_, args) = command_to_parts(&cmd);
@@ -211,6 +212,7 @@ mod tests {
             model: None,
             effort: None,
             timeout_secs: None,
+            session_dir: None,
         }
     }
 

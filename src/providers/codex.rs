@@ -226,8 +226,8 @@ impl ProviderAdapter for CodexAdapter {
     // at dispatch as an auth fault (O104). Not used: `codex doctor --json`
     // (slow, does network reachability checks) and anything built on `codex
     // exec` (it appends a trust entry to the user's config per directory).
-    fn readiness_probe(&self) -> Option<&[&'static str]> {
-        Some(&["login", "status"])
+    fn readiness_probe(&self) -> Option<Vec<String>> {
+        Some(vec!["login".into(), "status".into()])
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -421,6 +421,7 @@ mod tests {
             model: model.map(Into::into),
             effort: None,
             timeout_secs: None,
+            session_dir: None,
         }
     }
 
@@ -915,6 +916,7 @@ mod tests {
             model: None,
             effort: None,
             timeout_secs: None,
+            session_dir: None,
             session_id: None,
         };
         assert_eq!(

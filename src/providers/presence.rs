@@ -68,10 +68,6 @@ pub fn wire(adapter: &dyn ProviderAdapter, id: &SlotIdentity) -> PresenceWiring 
                     id.agent_id
                 )
             }),
-        PresenceSource::Sse => Some(format!(
-            "{}: SSE presence bus not yet subscribed — degraded presence",
-            id.agent_id
-        )),
         PresenceSource::HttpPush => Some(format!(
             "{}: http-push presence not yet wired — degraded presence",
             id.agent_id

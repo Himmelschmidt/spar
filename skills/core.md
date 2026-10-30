@@ -37,20 +37,21 @@ spar run --workflow arena -t "..." --providers api:xai,cli:claude,cli:grok
 spar implement -t "..." --providers 'cli:codex@openai/gpt-4o-mini,api:openai@gpt-5' --dry-run
 ```
 
-Native CLI adapters: `cli:claude`, `cli:grok`, `cli:agy`, `cli:codex`, `cli:opencode`, `cli:muse`. Run
+Native CLI adapters: `cli:claude`, `cli:grok`, `cli:agy`, `cli:codex`, `cli:pi`, `cli:muse`. Run
 `spar provider list` to see which resolve on this box and their live pause/cooldown status.
 
 **Readiness.** A binary on PATH is not health: `spar doctor` and `spar provider list`
 also run each adapter's readiness probe (a local-only config/auth check, never a model
 call) and report it separately from availability. Human states: `ok` (binary resolves,
 probe passed or the adapter has no probe), `unhealthy` (binary resolves but the probe
-failed, with the probe's own one-line message, e.g. a broken opencode config),
+failed, with the probe's own one-line message, e.g. pi with no OpenRouter key),
 `missing` (not on PATH). `--json` carries the same verdict as `readiness` with values
 `healthy` / `unhealthy` / `unknown`, plus `readiness_message` (ANSI-stripped, capped at
 300 chars) when unhealthy. `doctor` exits failure only when no usable provider remains,
-so one unhealthy provider alongside working ones does not block a run. Probes wired
-(O107): `cli:opencode` runs `opencode models` (broken config, not dead credentials);
-`cli:claude` runs `claude auth status` with nonessential traffic off (logged out) and
+so one unhealthy provider alongside working ones does not block a run. Probes wired:
+`cli:pi` runs `pi auth check --provider openrouter --json --no-refresh` (or `--model
+<SPAR_PI_MODEL routed>` when that is set; detection is per adapter, so it cannot see a
+slot's own `@model`), which catches a missing key, not a dead one; (O107) `cli:claude` runs `claude auth status` with nonessential traffic off (logged out) and
 reads its `.credentials.json` for an expired refresh token; `cli:codex` runs `codex
 login status` (logged out). grok, muse and agy have no local check that fails on a dead
 login, so they report unknown; use `spar provider probe <ref>` for a real call. Limit:
@@ -104,11 +105,12 @@ statusline payload. To capture that, spar installs a wrapper into
 `~/.gemini/antigravity-cli/settings.json` that **chains to your existing statusline** (it wraps,
 never replaces it) and tees payloads to `~/.gemini/antigravity-cli/.spar/`.
 Run `spar provider agy-statusline-uninstall` to remove the wrapper and restore your original.
-agy's `--print-timeout` is also derived from the role's hard ceiling, so a long
-agy slot runs its full budget instead of dying at agy's 30-minute default.
+agy's `--print-timeout` is also derived from the role's hard ceiling, so agy exits
+cleanly just before spar's own backstop would kill it (agy's own default is unlimited).
 
 **Pause / cooldown.** A provider is paused manually (`spar provider pause <ref>`) or
-automatically when a slot hits a rate-limit signal. Quota pauses **auto-recover** ~30 min after
+automatically when a slot hits a rate-limit signal. A slot that was killed (signal, or exit
+143/137) never pauses its provider on log text; only an adapter's typed rejection counts. Quota pauses **auto-recover** ~30 min after
 they were set (or at an explicit cooldown reset), so the provider is re-probed rather than
 staying dead; a manual pause never lapses on that timer: it holds until its `--until`, or
 until `spar provider resume <ref>`, and a quota event never overwrites it (O105). Only
@@ -118,14 +120,13 @@ written before it keeps the old ~30-minute lapse.
 never silently swapped into another role: `plan`/`implement` exit `4` (quota) naming the
 paused ref so per-role assignment stays exactly what you specified.
 
-**Driving an OpenRouter model? Lead with `cli:opencode@<slug>`.** It is the recommended
-OpenRouter coder: same OpenRouter-slug routing as `cli:codex` but ~half the per-turn token
-overhead (measured ~14.6k input vs codex ~29.5k on the same trivial task + model), so it is
-the default choice; `cli:codex` remains the documented alternative.
+**Driving an OpenRouter model? Lead with `cli:pi@<slug>`.** It is the recommended
+OpenRouter coder: same OpenRouter-slug routing as `cli:codex` with a much smaller per-turn
+prompt, so it is the default choice; `cli:codex` remains the documented alternative.
 
 **Want the muse-spark family? Use `cli:muse`, not OpenRouter.** The muse CLI reaches
 muse-spark on Meta's own account pricing, where the contributor tier is roughly 12x cheaper
-in and 21x cheaper out than the same family billed through OpenRouter. `cli:opencode@meta/…`
+in and 21x cheaper out than the same family billed through OpenRouter. `cli:pi@meta/…`
 is the fallback when muse is not installed.
 
 **`@model` suffix.** Any ref may carry an optional model, split off on the **first `@`**:
@@ -163,23 +164,41 @@ SPAR_CODEX_MODEL=x-ai/grok-4 spar run ... --providers cli:codex          # diffe
 SPAR_CODEX_PROFILE=gpt        spar run ... --providers cli:codex          # a different codex profile
 ```
 
-`cli:opencode` (opencode, `opencode run --format json`) is the **recommended OpenRouter
-coder** — OpenRouter is its default routing and its per-turn token overhead is roughly half
-codex's. spar parses opencode's NDJSON per-step tokens for real usage tracking. Not a
-takeover target. Model selection, highest precedence first:
-- A per-slot model — from a `cli:opencode@<model>` ref or `--select` — becomes opencode's
-  `-m`. A bare vendor slug is **prefixed with `openrouter/`** so OpenRouter is the default
-  (`cli:opencode@meta/muse-spark-1.1` → `-m openrouter/meta/muse-spark-1.1`); an already
-  `openrouter/…` model passes through unchanged; a bare word (`gpt-5`) passes through to
-  opencode's own default provider. Different slots can run different OpenRouter models in one
-  run. Discover tool-capable slugs with `spar model list --provider openrouter`.
-- `SPAR_OPENCODE_MODEL` → same routing, when no per-slot model is set.
-- Unset → opencode's own config default model.
-- OpenRouter models need `OPENROUTER_API_KEY` exported in spar's env (opencode reads it).
+`cli:pi` (the pi coding agent, `pi --mode json --no-approve`) is the **recommended
+OpenRouter coder**. Install with `npm i -g @earendil-works/pi-coding-agent` (verified at
+1.4.0). spar parses pi's JSON event stream for per-request tokens, cost, tools and errors.
+Its first request on a trivial task measured ~3.1k input tokens (gemini-2.5-flash), a
+fraction of codex's overhead. Not a takeover target: a tmux pane runs the same JSON stream.
+Model selection, highest precedence first:
+- A per-slot model, from a `cli:pi@<model>` ref or `--select`, becomes pi's `--model`.
+  A `vendor/slug` is **always prefixed with `openrouter/`** (`cli:pi@google/gemini-2.5-flash`
+  → `--model openrouter/google/gemini-2.5-flash`), even when the vendor is also a pi
+  provider (`google`, `anthropic`, `openai`): the same ref never changes provider with
+  whichever keys happen to be set. An explicit `openrouter/…` passes through unchanged. A
+  bare word (`claude-sonnet-4-5`) passes through to pi's own resolution. To reach a pi
+  provider directly, prefix pi's own `provider/id` with `direct:`; spar strips the prefix
+  and passes the rest untouched (`cli:pi@direct:anthropic/claude-sonnet-4-5` →
+  `--model anthropic/claude-sonnet-4-5`, which needs that provider's own key). Discover
+  tool-capable OpenRouter slugs with `spar model list --provider openrouter`.
+- `SPAR_PI_MODEL` → same routing, when no per-slot model is set.
+- Unset → pi's own settings pick the model.
+- OpenRouter models need `OPENROUTER_API_KEY` exported in spar's env (pi reads it).
+- Effort maps to `--thinking`: `none` → `off`, `minimal`..`max` pass through, `ultra` is
+  refused. pi clamps a level to what the model supports.
+- Session: spar assigns the id (`--session-id`); a resume is the same flag on the same id.
+  Session files live under the run (`--session-dir .spar/runs/<id>/sessions/<slot>`), not
+  in `~/.pi`. pi never refuses a missing id: it recreates it empty and warns on stderr.
+  spar reads that warning on a resume and records a slot note that the round ran with
+  fresh context.
+- pi exits 0 when the provider fails a request. spar reads the final assistant message's
+  `stopReason`: `error` (or `aborted`) fails the slot with pi's `errorMessage`. A
+  rate-limit message there (`429 Too Many Requests`) parks the run on quota. A request
+  that succeeds after an errored one (pi retries on its own) marks the earlier error
+  recovered, so its leftover log line cannot route a later unrelated failure to quota.
 
 ```bash
-spar run --workflow review -t "..." --providers cli:opencode@meta/muse-spark-1.1  # -> openrouter/meta/muse-spark-1.1
-SPAR_OPENCODE_MODEL=x-ai/grok-4 spar run ... --providers cli:opencode              # different OpenRouter model
+spar run --workflow review -t "..." --providers cli:pi@google/gemini-2.5-flash  # -> openrouter/google/gemini-2.5-flash
+SPAR_PI_MODEL=x-ai/grok-4 spar run ... --providers cli:pi                       # different OpenRouter model
 ```
 
 `cli:muse` (Muse Code, `muse exec --json --yolo --user-input-auto-resolve --workspace
@@ -204,12 +223,13 @@ Not a takeover target. Model selection, highest precedence first:
   of high. A run with no effort flag anywhere renders byte-identical command lines
   to before.
 
-Token accounting differs from every other adapter, deliberately. muse reports **no** usage on
-stdout, so spar reads its session log
+Token accounting differs from every other adapter, deliberately. muse's stdout `run.usage`
+record covers the main session only, so spar ignores it and reads the session log
 (`${XDG_DATA_HOME:-~/.local/share}/muse/sessions/YYYY/MM/DD/<session-id>/`) after the slot
 exits and sums the `goal_usage_attribution` records, **including the subagent sessions muse
 fans out per turn**: six of them on a trivial one-file task, which is real spend the other
-adapters would not see. Input is **summed across model calls** rather than maxed, so
+adapters would not see. muse also mirrors each child's records into the main log; those
+mirrors are skipped so a child's spend counts once. Input is **summed across model calls** rather than maxed, so
 `stats.json` reports billed tokens, not final context size. Watch one trap if you reconcile
 these numbers yourself: muse's `cached_tokens` is a **subset** of `input_tokens`, not a
 sibling of it as in claude's disjoint pair, so adding the two double-counts. The tool count
@@ -280,7 +300,7 @@ positions.
 `--fleet small|standard` and `--without critic,spec,suite` shape the seats for one run without
 touching `spar.toml`; see "Fleet shaping" below.
 
-**Run composition (009).** The new-run form is the run's single partial specification. Workflow is optional (`plan` / `implement` / `review` / `arena`) — leaving it unset lets the Chat orchestrator propose one. Each workflow shows its dispatched roles: `plan` is `planner` plus enabled `plan_critic`/`test_author`; `implement` is `implementer` plus the exact reviewer panel plus `tester` only when no deterministic suite replaces it; `review` is the exact reviewer panel; `arena` is a positional pool of `max_agents.max(2)` contenders. The six assignable roles remain the only role rows; `ranker`, `reconciler` and `peer` keep taking fleet positions. Models are opaque free text with local suggestions (`@model` on any `provider@model` ref, stored as storage key plus optional model via the `Pin` boundary — a conflicting `@model` plus separate model is rejected and a double-model ref never emits). `--role ROLE=PROVIDER[@MODEL]` is repeatable and outranks the pool; `--backup ROLE=PROVIDER[@MODEL]` declares a per-role, per-ordinal fallback. A backup fires only for an environmental stop — quota pause, rate limit, or provider unavailable — never on a nonzero work exit, timeout, missing artifact, or adverse review, and it persists as `SeatSource::Backup`. It replaces O52's blind implementer rotation only on that cause and only while not yet consumed; arena never accepts or emits `--role` or `--backup` and retains its positional quota semantics. `--backup` is new-run-only; `plan --run` and `implement --run` without `--reload-config` reject it. A backup whose canonical storage key equals its primary is rejected even when models differ. Operator defaults that prefill a newly opened form live at `registry::spar_home()/defaults.json`, never in the project's `spar.toml`; a run still freezes its resolved fleet into `.spar/runs/<id>/config.json` (O27) so deleting or corrupting defaults after launch cannot alter a continuation.
+**Run composition (009).** The new-run form is the run's single partial specification. Workflow is optional (`plan` / `implement` / `review` / `arena`) — leaving it unset lets the Chat orchestrator propose one. Each workflow shows its dispatched roles: `plan` is `planner` plus enabled `plan_critic`/`test_author`; `implement` is `implementer` plus the exact reviewer panel plus `tester` only when no deterministic suite replaces it; `review` is the exact reviewer panel; `arena` is a positional pool of `max_agents.max(2)` contenders. The six assignable roles remain the only role rows; `ranker`, `reconciler` and `peer` keep taking fleet positions. Models are opaque free text with local suggestions (`@model` on any `provider@model` ref, stored as storage key plus optional model via the `Pin` boundary — a conflicting `@model` plus separate model is rejected and a double-model ref never emits). `--role ROLE=PROVIDER[@MODEL]` is repeatable and outranks the pool; `--backup ROLE=PROVIDER[@MODEL]` declares a per-role, per-ordinal fallback. A backup fires only for an environmental stop — quota pause, rate limit, or provider unavailable — never on a nonzero work exit, timeout, missing artifact, or adverse review, and it persists as `SeatSource::Backup`. A slot that ended by signal (or exit 143/137) is judged only on the adapter's typed rejection, never on its log text. It replaces O52's blind implementer rotation only on that cause and only while not yet consumed; arena never accepts or emits `--role` or `--backup` and retains its positional quota semantics. `--backup` is new-run-only; `plan --run` and `implement --run` without `--reload-config` reject it. A backup whose canonical storage key equals its primary is rejected even when models differ. Operator defaults that prefill a newly opened form live at `registry::spar_home()/defaults.json`, never in the project's `spar.toml`; a run still freezes its resolved fleet into `.spar/runs/<id>/config.json` (O27) so deleting or corrupting defaults after launch cannot alter a continuation.
 
 | `--workflow` | Slots | Ends at |
 |---|---|---|
@@ -294,6 +314,9 @@ touching `spar.toml`; see "Fleet shaping" below.
 `spar plan -t` is `--workflow plan`. `spar implement -t` is `--workflow loop`: a fresh brief
 straight into build/review with **no** planner, critic or test-contract, which is the cheap
 middle setting between `--workflow review` and the full `plan → approve → implement` path.
+`loop` builds a change against a fixed base; it is not for chasing a moving one. A run cannot be
+re-based after creation (O26), so "make PR #N mergeable" runs re-merge main every round and do not
+converge. Resolve conflicts by hand, or cap such a run at `--max-rounds 1 --fleet small`.
 `spar reconcile <id>` is an arena continuation, not a workflow: it adds a `reconciler` plus
 two more `reviewer` slots on the reconciled tree.
 
@@ -333,6 +356,10 @@ spar plan --run <run_id> -t "narrow it to the email path" [--json]
 # Named workflows
 spar run --workflow plan|loop|arena|roles|peer|review -t "..." --providers cli:claude,cli:grok [--dry-run] [--big]
 spar run --workflow arena -t "..." --select best --urgency normal --dry-run
+
+# An empty or whitespace-only task exits 1 before any run id is minted: `-t ""` and an
+# empty --brief with `error: task is empty`, an empty --spec with `brief body is empty`.
+# `plan --run <id>` with an empty directive exits 1 with `replan directive is empty`.
 
 # Independent concurrent multi-provider review (not split-stack peer):
 spar run --workflow review -t "Review PR #12 for auth bugs" --providers cli:claude,cli:grok
@@ -473,7 +500,8 @@ on — never a restatement of the plan or contract, which the next round is hand
   backend 404 after real work is retried with backoff through that same resume instead
   of failing the slot. A resume the vendor answers with a fresh session (exit 0, a new
   id) is noted in the run's events, not retried. O52's general default is unchanged
-  for every other provider.
+  for every other provider. Whatever the provider, reviewer, tester, plan-critic and
+  test-author slots never resume: they dispatch cold every round and every replan (O89).
 
 For legs that already exist, `spar link <leg> --to <run>` records the grouping
 (`parent_run`). spar never infers it — pairing runs by task text would merge unrelated
@@ -509,12 +537,15 @@ the plural/past-tense forms a provider actually reports ("rate limits exceeded",
 limited ... reached") do still match. The discriminator
 also recognizes a rejection sentence standing alone on one line with no separate "rate
 limit ... rejected" line beside it — the exact phrases "You've hit your weekly limit"
-(Claude) and "You've hit your usage limit" (codex), and "rate limit reached" (the
+and "You've hit your 5-hour limit" (Claude; the 5-hour form is claude 2.1.312's rename of
+"session limit", taken from its changelog, not yet seen live), "You've hit your usage
+limit" (codex), agy's "Individual quota reached" and `RESOURCE_EXHAUSTED (code 429)`
+(both captured live from agy 1.4.9), and "rate limit reached" (the
 wording several adapters use, previously only "rejected"/"exceeded" routed) — are each
 treated as complete one-line rejection statements, the same class as the bare
 `"out of credits"` match; unrelated prose that merely contains "hit your" and "limit"
-elsewhere on the line (e.g. "hit your retry limit") does not match, only those two exact
-sentences do. On the api-sdk backend a 429 propagates as a Rust `Result::Err` before its
+elsewhere on the line (e.g. "hit your retry limit") does not match, only those exact
+sentences do, and a bare `RESOURCE_EXHAUSTED` without agy's `(code 429)` does not either. On the api-sdk backend a 429 propagates as a Rust `Result::Err` before its
 text ever reaches the slot's log file, so the discriminator scrapes that error's own
 text alongside the log tail rather than missing it.
 Resuming picks the same run back up, and if the provider is still on cooldown it
@@ -526,12 +557,17 @@ run-routing decision above never does, for the false-positive reason just descri
 That parsed cooldown is capped at the *next occurrence* of the stated time-of-day (~24h
 out), not the actual weekly rollover — a big improvement over the default, but a weekly
 pause is still re-probed daily rather than left alone for the full week, since Claude's
-line carries no date. codex and opencode have no provider-specific reset parser, so a
-mid-dispatch limit on them falls back to the generic-rejection-phrase match (untested
-against any real captured output from those CLIs — treat as unverified, not confirmed)
-and the generic cooldown; muse and grok are the same, also unverified. agy is the one
-adapter with its own adapter-specific signal: near-exhausted quota is read from its
-statusline telemetry (not its log, which is ~empty) and both the cooldown *and* the
+line carries no date. codex, pi, muse and grok have no provider-specific reset
+parser, so a limit on them falls back to the generic-rejection-phrase match and the
+generic cooldown. muse's dispatch-time 429, "Subscription quota exhausted", is matched
+from the text reported in real fleet incidents (any line with "quota exhausted"), as is an
+HTTP 402 ("402 Payment Required", or `402` framed as a status). codex's "You've hit your usage
+limit" is matched but still untested against captured codex output; grok and pi
+rely on the generic phrases alone and remain unverified. agy's rejection
+states a relative reset ("Resets in 125h56m29s."), which spar turns into an exact
+cooldown (whole h/m/s components only; anything else, or a reset 8 days or more out,
+falls back to the generic one). agy also has a second signal: near-exhausted quota is
+read from its statusline telemetry (not its log, which is ~empty) and both the cooldown *and* the
 quota-routing decision come from that telemetry directly, independent of the log-based
 discriminator above — a rate-limited agy dispatch parks at `quota` even though its own
 log never says so. `--workflow review`,
@@ -600,6 +636,19 @@ unpushed branch falls through to the repo default, with a note on stderr. `spar 
 --base <branch>` forces a target. The chosen target is recorded in `artifacts/ship.md`
 (`PR base:`), on the dry-run path too.
 
+`spar ship` pushes the slot worktree's **HEAD** to `spar/<id>/<slot>`, never the branch by
+name, and **never rewinds the remote branch**. Before pushing it fetches the remote branch;
+if the remote has commits HEAD lacks (someone pushed by hand), ship exits `1` with "remote
+<branch> has commits the run lacks": fast-forward the worktree onto `origin/<branch>` by hand
+and ship again. The push is leased on the exact tip it fetched, so a push landing in between
+also fails. If the worktree was left on another branch (a reviewer's, or detached), ship
+pushes HEAD when HEAD contains the run's branch and that branch has moved past the run's
+base (note on stderr), and refuses otherwise. A refusal exits `1`, leaves the phase at
+`awaiting_ship_confirm`, and records the reason in the run's `error`. The loop workflow also
+fast-forwards the implementer's branch back onto HEAD before each review panel when a slot
+left the worktree elsewhere, and only warns (stderr + event log) when that is not a
+fast-forward, the branch is still at the base, or it is checked out in another worktree.
+
 ## Abandoned runs
 
 A run is **abandoned** when it is still in a non-resting phase but no live orchestrator
@@ -623,6 +672,10 @@ children — so they keep running and keep spending tokens with nobody collectin
 - `spar resume <id>` picks an abandoned or stopped run back up without you having to know
   which of `implement --run` / a fresh dispatch applies — it refuses a human gate (naming
   the command that resolves it) and a run with a live orchestrator (naming its pid).
+  `implement --run <id>` (with or without `--detach` / `--reload-config`) refuses the same
+  way, exit 1, before it writes anything to the live run's `state.json`.
+- A foreground `spar plan` holds the run lock for its whole dispatch, so it never reads
+  abandoned while its planner works.
 - `spar daemon start` runs a per-project supervisor that pushes an alert the first time a
   run has read abandoned past `[daemon].abandon_after_secs` (60s by default), and restarts
   it if `[daemon].restart` is on (the default). It is opt-in — nothing starts it for you —
@@ -687,17 +740,14 @@ slot is stuck on.**
   the same `{"hooks": …}` shape as Claude's, and a blocking Stop hook re-drives a
   headless `muse exec` run). There is no `muse session-message send` push: headless
   slots never appear in the peer list, so that channel could never deliver to a slot
-  spar actually runs. **opencode** has no push channel at all. Every poll-file case writes
+  spar actually runs. **pi** has no push channel yet (a pi extension could add one). Every poll-file case writes
   `.spar/runs/<id>/logs/nudges-<slot>.md`, and the role prompt tells the agent to read it
   before starting any new major step. Thresholds are checked every 30 seconds, so a nudge
   lands at the next 30s boundary rather than the instant a budget is crossed.
 - **Live token visibility differs by adapter**, so token nudges are not uniformly prompt.
-  **opencode** reports usage per step and is exact live for the slot's own session, but a
-  `task` subagent's spend lands only after exit (opencode's json emitter never puts a
-  child session's steps on stdout at all), so a live nudge undercounts a fanned-out slot
-  until then — the undercount can be several times the parent's own token count and
-  grows with how many subagents (or how deep a chain of them) ran. **muse** carries no
-  tokens on stdout at all, so spar tails its session log (`~/.local/share/muse/sessions/…`), which is
+  **pi** reports usage per model request as each request ends, and a compaction's spend
+  when the compaction ends, so it lags by at most one request. **muse**'s stdout
+  usage record excludes subagents, so spar tails its session log (`~/.local/share/muse/sessions/…`), which is
   appended as the turn runs, including its own subagent sessions; that is exact live too.
   **claude** reports per-message usage
   whose input and cache-read arms are `max`ed until its terminal `result` lands, so a live
@@ -758,7 +808,8 @@ per slot per run until you sweep. `spar cleanup --all` reaps every run nothing c
 and human gates — are spared unless you add `--older-than <dur>`, where the age is the
 evidence nobody is coming back for them. A run **in flight is never swept**, abandoned or
 not: park it first (`spar stop`, or `spar stop --abandoned`). Run data under
-`.spar/runs/<id>` survives a sweep unless you pass `--purge`; only worktrees go.
+`.spar/runs/<id>` survives a sweep unless you pass `--purge`; only worktrees go. A purge
+appends the run's line to `.spar/history.jsonl` first.
 
 Rejecting a plan (`spar reject`) reaps that run's worktrees immediately — nothing can
 resume a rejected plan — while keeping `plan.md` and the critique that justified it.
@@ -872,7 +923,7 @@ event/presence mirror live under `.spar/runs/<id>/bus/`.
 ## Observe
 
 ```bash
-spar status [run_id] [--json] [--all]   # --all = every registered project
+spar status [run_id] [--json] [--all]   # --all = every registered project; a run with a live orchestrator shows `pid=<n>`
 spar wait <run_id> [--timeout 8h] [--follow] [--json]
 spar logs <run_id> [slot] [-f|--follow]
 
@@ -898,6 +949,81 @@ run is never reported stuck) caps the block and returns exit `3` if it
 lapses. Poll `status --json` / `status --all` only when you genuinely can't block —
 e.g. supervising several runs at once, where you background one `wait --follow` per
 run and reconcile as each returns.
+
+### Scripting surface: booleans, structured reviews, history (O100, O101, O102)
+
+Scripts and front ends read these instead of phase names and review markdown.
+**Phase names are not a stable scripting surface**: phases are added and split as
+spar grows, and a hard-coded "live" list goes stale. Read the booleans.
+
+`status <id> --json` and every row of `status --json` (the list) carry:
+
+| Field | True when |
+|---|---|
+| `orchestrator_alive` | a live process holds the run lock |
+| `holds_seat` | the run occupies, or is about to occupy, provider capacity: orchestrator alive, or queued in the daemon's admission queue waiting on a provider bucket. Count these as live; never re-brief one |
+| `needs_human` | nothing moves until a person acts: a human gate, the `plan_approved` handoff, or a broken run (`failed`, `stuck`, `escalated`, `quota`, abandoned). The TUI's `⚑ need you` flags read the same rule |
+| `resumable` | `implement --run` / `spar resume` would pick it up now. Never true while `holds_seat` |
+
+**Reviews.** When the implement gate (or `--workflow review`) reads a reviewer's
+`review-<slot>.md`, it records the parse on that slot as `slots[].review` (`null` until
+read, reset when the slot is re-dispatched), appends it to the run's `review_history`
+(one entry per `(round, slot_id)`, a re-read replaces), and writes
+`artifacts/review-<slot>.json` beside the markdown. Shape:
+
+```json
+{
+  "schema_version": 1,              // review-<slot>.json only, with run_id/slot_id/round/provider/model
+  "verdict": "approve" | "request_changes" | null,   // null = unparseable, blocks
+  "reviewed_commit": "<sha>" | null,                  // as written, matched or not
+  "acceptance": [{"id": "AC-1", "status": "pass" | "fail" | "unverified", "evidence": "..."}],
+  "findings": [{"severity": "critical" | "major" | "minor",
+                "file": "src/x.rs" | null, "line": 12 | null,
+                "text": "...", "synthetic": false}],
+  "synthetic": false
+}
+```
+
+`synthetic: true` means spar wrote that review because the reviewer failed or left
+nothing, or the dry-run backend stood in for it (the artifact's first non-blank line is
+`<!-- spar:synthetic-review -->`; anywhere else it does not count); its
+`request_changes` and finding are spar's, not a reviewer's judgment. A reviewer slot
+that failed is recorded this way too, whatever its markdown says. Only list items
+that name a severity are findings (`- severity: major — ...`, `- **minor** — ...`,
+items under a `### Major` heading, id-labelled `**F-1 (minor · ...)**` /
+`### F3 (major, latent) — ...`); bare notes are not. `medium` is read as `minor`. `file`/`line` are the first
+`path.ext:line` the finding cites. Read `slots[].review.verdict`, never grep the
+markdown: a failing `AC-n` line is not a verdict.
+
+**History.** `.spar/history.jsonl` gets one JSON line per run when it reaches a terminal
+phase (`done`, `failed`, `stuck`, `escalated`, `quota`, `plan_rejected`,
+`plan_approved`) and again just before `cleanup --purge` deletes it, so trends survive
+reaping. Append-only: a run can have several lines; keep the one with the latest
+`written_at` per `id`. History is best effort: if the line cannot be written, spar warns on
+stderr and the purge or sweep goes on.
+
+```json
+{
+  "schema_version": 1, "written_at": "...", "trigger": "terminal" | "purge",
+  "id": "ab12cd34", "task": "first line of the task", "workflow": "loop",
+  "dry_run": false, "phase": "done",
+  "roles": [{"slot": "review-0-cli-codex", "role": "reviewer", "provider": "cli:codex", "model": null}],
+  "rounds": 3, "max_rounds": 5,
+  "review_rounds": [{"round": 2,
+                     "verdicts": [{"slot": "review-0-cli-codex", "verdict": "request_changes", "synthetic": false}],
+                     "findings": {"critical": 0, "major": 1, "minor": 2, "synthetic": 0}}],
+  "findings": {"critical": 0, "major": 1, "minor": 2, "synthetic": 0},
+  "billed_tokens": 1234567, "cost_usd": 4.2 | null,
+  "pr_url": "https://github.com/..." | null,
+  "created_at": "...", "ended_at": "..."
+}
+```
+
+Finding counts are per round, deduplicated within a round (same severity, location and
+whitespace-normalized text from two reviewers count once); `findings` sums the rounds.
+Synthetic findings count under `synthetic` only. `cost_usd` is `null` when no dispatch
+reported a cost. `pr_url` is what `gh pr create` printed at ship (also `pr_url` in
+`status --json`).
 
 ### TUI shape (humans)
 
@@ -999,20 +1125,14 @@ rail's selection.
   - Conventions per adapter, since the wire formats differ: **claude** is settled by the
     terminal `result` record, which supersedes the per-message ones; **codex** by
     `turn.completed` (its only usage record, so it also stands in for the gauge);
-    **opencode** by summing its per-step deltas, plus a post-exit pass that adds in any
-    `task` subagent spend; **muse** from its session log after the slot exits. Those four
-    reconcile against the provider's own session-level ledger, at the session level: a
-    codex slot's `billed_tokens` equals its `token_count` `total_tokens`, a muse slot's
-    equals the sum of its billed `goal_usage_attribution` records, an opencode slot's
-    equals its own `tokens.total` summed plus every descendant session's totals in
-    `opencode.db` (walked transitively through `session.parent_id`, since a subagent can
-    itself fan out). opencode's json emitter filters child sessions
-    out of the stream it prints, so a subagent's usage never reaches stdout at all; spar
-    recovers it after the slot exits by summing `tokens_input + output + reasoning +
-    cache_read + cache_write` over every descendant session row reachable from the
-    slot's own session id, additively on top of the stream-parsed parent totals. Tool
-    counts are not recovered this way, only spend — a fanned-out slot's `tools` still
-    reflects the parent session alone.
+    **pi** by summing each assistant `message_end`'s own `usage` (one per model request;
+    `reasoning` is already inside `output`, and the `message_update` copies are ignored)
+    plus each `compaction_end`'s `result.usage` (billed, never counted into the gauge);
+    **muse** from its session log after the slot exits. These reconcile against the
+    provider's own numbers: a codex slot's `billed_tokens` equals its `token_count`
+    `total_tokens`, a muse slot's equals the sum of its billed `goal_usage_attribution`
+    records, and a pi slot's equals the sum of `totalTokens` over its assistant requests
+    and compactions (verified live for requests; compaction is not yet verified live).
   - **Two adapters report a cached prompt as a slice of `input_tokens` rather than a
     sibling of it**, the opposite of Anthropic's convention: codex's `cached_input_tokens`
     and muse's `cached_tokens`. spar normalizes both on the way in, storing the uncached
@@ -1020,7 +1140,7 @@ rail's selection.
     and you never have to know which convention the provider used. The consequence to be
     aware of: `input_tokens` for a codex or muse slot is **not** the number that provider's
     own dashboard shows under "input"; add `cache_read_tokens` back to get it.
-  - **`context_tokens` is a peak for claude, opencode, muse and api-sdk dispatches.**
+  - **`context_tokens` is a peak for claude, pi, muse and api-sdk dispatches.**
     `cli:codex` and `cli:grok` report an invocation total instead (codex has no
     per-request usage record; grok's records are cumulative), labeled
     `invocation_total`. `cli:agy` is labeled `unknown`: it is out of both fleets and its
@@ -1038,8 +1158,9 @@ rail's selection.
 - **Cost and subagent accounting** ride the same `"usage"` entries and
   `logs/<slot>.stats.json` as the token fields above, additive alongside them:
   - **`cost_usd`**: whole-dispatch USD spend, as the provider itself computed it.
-    claude sets it once from its terminal `result.total_cost_usd`; opencode sums
-    it from each step's own `part.cost`, the same way it sums tokens. `None` for
+    claude sets it once from its terminal `result.total_cost_usd`; pi sums
+    it from each request's own `usage.cost.total`, the same way it sums tokens (verified
+    on OpenRouter; other pi providers are unverified). `None` for
     codex, muse and grok — they don't report a cost. A run's total is the sum of
     `cost_usd` over its `usage[]` entries (skip entries where it's absent).
   - **`subagent_stats`**: claude-only. How many Task-tool subagents this dispatch
@@ -1061,7 +1182,7 @@ rail's selection.
     `inputTokens: 907`). Read `model_usage` when a mixed-model claude dispatch
     needs attributing spend, not for token reconciliation.
   - **`session_id`**: the provider's own resume/session handle, when the stream
-    names one. All three of muse, opencode and claude set it; claude reads it off
+    names one. muse, pi, claude, codex and grok set it; claude reads it off
     the same `system`/`init` line the `model` field comes from.
 - Run state: `.spar/runs/<id>/state.json`
 - Events (orchestrator): `.spar/runs/<id>/events.jsonl`
@@ -1153,17 +1274,17 @@ spar plan -t "…" --effort planner=max --effort tester=low
   slot records a depth, later dispatches keep rendering it (like `model`): changing
   `[effort]` plus `--reload-config` in round 2 does not move already-dispatched slots.
 - **Per-adapter mapping:** claude `--effort` (low, medium, high, xhigh, max); grok
-  `--reasoning-effort` (none through max); muse `--reasoning-effort` (all 8);
+  `--reasoning-effort` (low, medium, high, xhigh: grok 1.0.70 refuses anything else
+  before starting a turn); muse `--reasoning-effort` (all 8);
   codex `-c model_reasoning_effort=<v>` (all 8: codex validates per *model*
   server-side — `gpt-5.5` stops at xhigh while `gpt-5.6-terra` takes ultra — so
-  spar sends the union rather than guessing a per-provider ceiling); opencode
-  `--variant` (any rung, free string — `--variant` names an operator-configured
-  variant, so a rung with no matching variant fails at runtime and the failure
-  looks like an agent defect, not a config error); agy `--effort` (low, medium,
-  high).
+  spar sends the union rather than guessing a per-provider ceiling); pi
+  `--thinking` (none as `off`, then minimal through max; pi clamps to what the
+  model supports); agy `--effort` (low, medium, high, xhigh, max per agy 1.4.9's
+  help).
 - **Refusal, not clamping:** a rung a CLI does not offer fails the dispatch before
   spawn with the accepted levels named (e.g. `effort 'ultra' not accepted by
-  cli:agy (takes: low, medium, high)`) — `--dry-run` catches it too. It is
+  cli:agy (takes: low, medium, high, xhigh, max)`) — `--dry-run` catches it too. It is
   spar's own misconfiguration rather than an agent failure, but not yet a typed
   fault class: on the reviewer path it still costs one provider rotation and then
   reads as a `request_changes` blocker.
