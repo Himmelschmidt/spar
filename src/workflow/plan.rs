@@ -19,6 +19,7 @@ pub fn run(
     paths: &SparPaths,
     cfg: &Config,
 ) -> Result<ExitCode> {
+    crate::runspec::validate_task(&task).map_err(anyhow::Error::msg)?;
     let dry = opts.resolve_dry_run();
     if dry {
         std::env::set_var("SPAR_DRY_RUN", "1");

@@ -25,6 +25,9 @@ pub fn run_from_cli(
     paths: &SparPaths,
     cfg: &Config,
 ) -> Result<ExitCode> {
+    if let Some(t) = &task {
+        crate::runspec::validate_task(t).map_err(anyhow::Error::msg)?;
+    }
     if let Some(id) = run_id {
         return run_from_approved(&id, task, opts, paths, cfg);
     }

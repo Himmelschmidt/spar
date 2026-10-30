@@ -1593,3 +1593,29 @@ fn ambient_spar_project_root_does_not_capture_runs() {
     assert_eq!(leaked, 0, "run leaked into ambient SPAR_PROJECT_ROOT");
     assert!(made > 0, "run did not land in the test's own project");
 }
+
+/// An empty or whitespace task is refused on every CLI launch path before a run id is
+/// minted, by the same rule the TUI's launch validator applies (O81).
+#[test]
+fn empty_task_is_refused_before_any_run_exists() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let launches: [&[&str]; 4] = [
+        &["plan", "-t", ""],
+        &["plan", "-t", "   \n\t"],
+        &["implement", "-t", "  "],
+        &["run", "--workflow", "loop", "-t", ""],
+    ];
+    for args in launches {
+        spar_cmd()
+            .current_dir(tmp.path())
+            .args(args)
+            .args(["--providers", "cli:claude", "--dry-run"])
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains("task is empty"));
+    }
+    let runs = tmp.path().join(".spar/runs");
+    let minted = std::fs::read_dir(&runs).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(minted, 0, "a refused launch must not leave a run behind");
+}
