@@ -62,8 +62,8 @@ statusline payload. To capture that, spar installs a wrapper into
 `~/.gemini/antigravity-cli/settings.json` that **chains to your existing statusline** (it wraps,
 never replaces it) and tees payloads to `~/.gemini/antigravity-cli/.spar/`.
 Run `spar provider agy-statusline-uninstall` to remove the wrapper and restore your original.
-agy's `--print-timeout` is also derived from the role's hard ceiling, so a long
-agy slot runs its full budget instead of dying at agy's 30-minute default.
+agy's `--print-timeout` is also derived from the role's hard ceiling, so agy exits
+cleanly just before spar's own backstop would kill it (agy's own default is unlimited).
 
 **Pause / cooldown.** A provider is paused manually (`spar provider pause <ref>`) or
 automatically when a slot hits a rate-limit signal. Pauses **auto-recover** ~30 min after
@@ -158,12 +158,13 @@ Not a takeover target. Model selection, highest precedence first:
   of high. A run with no effort flag anywhere renders byte-identical command lines
   to before.
 
-Token accounting differs from every other adapter, deliberately. muse reports **no** usage on
-stdout, so spar reads its session log
+Token accounting differs from every other adapter, deliberately. muse's stdout `run.usage`
+record covers the main session only, so spar ignores it and reads the session log
 (`${XDG_DATA_HOME:-~/.local/share}/muse/sessions/YYYY/MM/DD/<session-id>/`) after the slot
 exits and sums the `goal_usage_attribution` records, **including the subagent sessions muse
 fans out per turn**: six of them on a trivial one-file task, which is real spend the other
-adapters would not see. Input is **summed across model calls** rather than maxed, so
+adapters would not see. muse also mirrors each child's records into the main log; those
+mirrors are skipped so a child's spend counts once. Input is **summed across model calls** rather than maxed, so
 `stats.json` reports billed tokens, not final context size. Watch one trap if you reconcile
 these numbers yourself: muse's `cached_tokens` is a **subset** of `input_tokens`, not a
 sibling of it as in claude's disjoint pair, so adding the two double-counts. The tool count
@@ -463,12 +464,15 @@ the plural/past-tense forms a provider actually reports ("rate limits exceeded",
 limited ... reached") do still match. The discriminator
 also recognizes a rejection sentence standing alone on one line with no separate "rate
 limit ... rejected" line beside it — the exact phrases "You've hit your weekly limit"
-(Claude) and "You've hit your usage limit" (codex), and "rate limit reached" (the
+and "You've hit your 5-hour limit" (Claude; the 5-hour form is claude 2.1.312's rename of
+"session limit", taken from its changelog, not yet seen live), "You've hit your usage
+limit" (codex), agy's "Individual quota reached" and `RESOURCE_EXHAUSTED (code 429)`
+(both captured live from agy 1.4.9), and "rate limit reached" (the
 wording several adapters use, previously only "rejected"/"exceeded" routed) — are each
 treated as complete one-line rejection statements, the same class as the bare
 `"out of credits"` match; unrelated prose that merely contains "hit your" and "limit"
-elsewhere on the line (e.g. "hit your retry limit") does not match, only those two exact
-sentences do. On the api-sdk backend a 429 propagates as a Rust `Result::Err` before its
+elsewhere on the line (e.g. "hit your retry limit") does not match, only those exact
+sentences do, and a bare `RESOURCE_EXHAUSTED` without agy's `(code 429)` does not either. On the api-sdk backend a 429 propagates as a Rust `Result::Err` before its
 text ever reaches the slot's log file, so the discriminator scrapes that error's own
 text alongside the log tail rather than missing it.
 Resuming picks the same run back up, and if the provider is still on cooldown it
@@ -483,9 +487,11 @@ pause is still re-probed daily rather than left alone for the full week, since C
 line carries no date. codex and opencode have no provider-specific reset parser, so a
 mid-dispatch limit on them falls back to the generic-rejection-phrase match (untested
 against any real captured output from those CLIs — treat as unverified, not confirmed)
-and the generic cooldown; muse and grok are the same, also unverified. agy is the one
-adapter with its own adapter-specific signal: near-exhausted quota is read from its
-statusline telemetry (not its log, which is ~empty) and both the cooldown *and* the
+and the generic cooldown; muse and grok are the same, also unverified. agy's rejection
+states a relative reset ("Resets in 125h56m29s."), which spar turns into an exact
+cooldown (whole h/m/s components only; anything else, or a reset 8 days or more out,
+falls back to the generic one). agy also has a second signal: near-exhausted quota is
+read from its statusline telemetry (not its log, which is ~empty) and both the cooldown *and* the
 quota-routing decision come from that telemetry directly, independent of the log-based
 discriminator above — a rate-limited agy dispatch parks at `quota` even though its own
 log never says so. `--workflow review`,
@@ -650,8 +656,8 @@ slot is stuck on.**
   `task` subagent's spend lands only after exit (opencode's json emitter never puts a
   child session's steps on stdout at all), so a live nudge undercounts a fanned-out slot
   until then — the undercount can be several times the parent's own token count and
-  grows with how many subagents (or how deep a chain of them) ran. **muse** carries no
-  tokens on stdout at all, so spar tails its session log (`~/.local/share/muse/sessions/…`), which is
+  grows with how many subagents (or how deep a chain of them) ran. **muse**'s stdout
+  usage record excludes subagents, so spar tails its session log (`~/.local/share/muse/sessions/…`), which is
   appended as the turn runs, including its own subagent sessions; that is exact live too.
   **claude** reports per-message usage
   whose input and cache-read arms are `max`ed until its terminal `result` lands, so a live
@@ -1107,17 +1113,18 @@ spar plan -t "…" --effort planner=max --effort tester=low
   slot records a depth, later dispatches keep rendering it (like `model`): changing
   `[effort]` plus `--reload-config` in round 2 does not move already-dispatched slots.
 - **Per-adapter mapping:** claude `--effort` (low, medium, high, xhigh, max); grok
-  `--reasoning-effort` (none through max); muse `--reasoning-effort` (all 8);
+  `--reasoning-effort` (low, medium, high, xhigh: grok 1.0.70 refuses anything else
+  before starting a turn); muse `--reasoning-effort` (all 8);
   codex `-c model_reasoning_effort=<v>` (all 8: codex validates per *model*
   server-side — `gpt-5.5` stops at xhigh while `gpt-5.6-terra` takes ultra — so
   spar sends the union rather than guessing a per-provider ceiling); opencode
   `--variant` (any rung, free string — `--variant` names an operator-configured
   variant, so a rung with no matching variant fails at runtime and the failure
   looks like an agent defect, not a config error); agy `--effort` (low, medium,
-  high).
+  high, xhigh, max per agy 1.4.9's help).
 - **Refusal, not clamping:** a rung a CLI does not offer fails the dispatch before
   spawn with the accepted levels named (e.g. `effort 'ultra' not accepted by
-  cli:agy (takes: low, medium, high)`) — `--dry-run` catches it too. It is
+  cli:agy (takes: low, medium, high, xhigh, max)`) — `--dry-run` catches it too. It is
   spar's own misconfiguration rather than an agent failure, but not yet a typed
   fault class: on the reviewer path it still costs one provider rotation and then
   reads as a `request_changes` blocker.

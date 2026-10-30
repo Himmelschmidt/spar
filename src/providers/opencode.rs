@@ -86,7 +86,7 @@ impl ProviderAdapter for OpencodeAdapter {
             interactive: false,
             resume: self.supports_resume(),
             skip_permissions: true,
-            // `--dangerously-skip-permissions` edits autonomously; the worktree is the
+            // `--auto` edits autonomously; the worktree is the
             // boundary (matching the other adapters), so no native sandbox is relied on.
             native_sandbox: false,
             // Capture-only: opencode continues an existing session (`-s/--session`)
@@ -98,7 +98,9 @@ impl ProviderAdapter for OpencodeAdapter {
 
     fn permission_args(&self, policy: TrustPolicy) -> Vec<String> {
         match policy {
-            TrustPolicy::FullAuto => vec!["--dangerously-skip-permissions".into()],
+            // opencode 1.18.30 lists only `--auto` on `run --help`;
+            // `--dangerously-skip-permissions` survives as a hidden alias.
+            TrustPolicy::FullAuto => vec!["--auto".into()],
             TrustPolicy::Prompt => vec![],
         }
     }
@@ -203,7 +205,7 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|w| w[0] == "--format" && w[1] == "json"));
-        assert!(args.iter().any(|a| a == "--dangerously-skip-permissions"));
+        assert!(args.iter().any(|a| a == "--auto"));
         // Prompt is the final positional, preceded by `--`.
         assert_eq!(args.last().map(String::as_str), Some("do the thing"));
         let di = args.iter().position(|a| a == "--").expect("-- separator");
@@ -329,11 +331,11 @@ mod tests {
         let (_, a) = command_to_parts(
             &OpencodeAdapter.build_headless(Path::new("opencode"), &opts("x", None)),
         );
-        assert!(a.iter().any(|x| x == "--dangerously-skip-permissions"));
+        assert!(a.iter().any(|x| x == "--auto"));
 
         let mut o = opts("x", None);
         o.trust = TrustPolicy::Prompt;
         let (_, a) = command_to_parts(&OpencodeAdapter.build_headless(Path::new("opencode"), &o));
-        assert!(!a.iter().any(|x| x == "--dangerously-skip-permissions"));
+        assert!(!a.iter().any(|x| x == "--auto"));
     }
 }

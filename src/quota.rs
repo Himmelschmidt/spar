@@ -247,13 +247,87 @@ impl QuotaStore {
                 // anywhere on the line: that looser form also matched unrelated prose
                 // ("hit your retry limit") and this crate's own test assertion text.
                 || contains_phrase(&lower, "hit your weekly limit")
-                || contains_phrase(&lower, "hit your usage limit");
+                || contains_phrase(&lower, "hit your usage limit")
+                // claude 2.1.312 renamed the five-hour window from "session limit" to
+                // "5-hour limit" in its usage-limit messages (changelog). The full
+                // sentence is inferred from the weekly one; no live capture yet.
+                || contains_phrase(&lower, "hit your 5-hour limit")
+                || is_agy_quota_rejection(&lower);
             if hit {
                 return Some(line.trim().to_string());
             }
         }
         None
     }
+}
+
+/// agy 1.4.9's quota rejection, captured live (exit 3): the result's `error` is
+/// "Individual quota reached. Please upgrade your subscription to increase your
+/// limits. Resets in 125h56m29s." and stderr adds `AGY_ERROR: {"short_error":
+/// "RESOURCE_EXHAUSTED (code 429): ..."}`. A bare `RESOURCE_EXHAUSTED` is a gRPC status
+/// any client code can print, so it only counts beside agy's own `(code 429)`.
+fn is_agy_quota_rejection(lower: &str) -> bool {
+    contains_phrase(lower, "individual quota reached")
+        || lower.contains("resource_exhausted (code 429)")
+}
+
+/// agy states its reset as a relative Go duration on the rejection line ("Resets in
+/// 125h56m29s."), so unlike claude's wall-clock form it needs no timezone or calendar
+/// inference. Gated on `cli:agy` for the same reason as [`scrape_claude_rate_limits`].
+/// A rejection whose duration does not parse still reports the hit with no instant,
+/// leaving the generic cooldown.
+pub fn scrape_agy_stated_reset(
+    provider: &str,
+    log: &str,
+) -> Option<(String, Option<DateTime<Utc>>, String)> {
+    if normalize_key(provider) != "cli:agy" {
+        return None;
+    }
+    let lower = log
+        .lines()
+        .map(str::to_ascii_lowercase)
+        .find(|l| is_agy_quota_rejection(l) && l.contains("resets in "))?;
+    let after = &lower[lower.find("resets in ")? + "resets in ".len()..];
+    let Some(until) = parse_go_duration(after).map(|d| Utc::now() + d) else {
+        return Some((
+            "cli:agy".into(),
+            None,
+            "agy individual quota reached (stated reset unparseable, default cooldown)".into(),
+        ));
+    };
+    Some((
+        "cli:agy".into(),
+        Some(until),
+        format!(
+            "agy individual quota reached, resets {}",
+            until.to_rfc3339()
+        ),
+    ))
+}
+
+/// Whole `h`/`m`/`s` components only, as Go prints a duration of a second or more
+/// ("125h56m29s"). A fraction or a `ms` unit is refused rather than rounded.
+fn parse_go_duration(s: &str) -> Option<chrono::Duration> {
+    let mut total: i64 = 0;
+    let mut n: Option<i64> = None;
+    let mut seen = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if let Some(d) = c.to_digit(10) {
+            n = Some(n.unwrap_or(0).checked_mul(10)?.checked_add(i64::from(d))?);
+            continue;
+        }
+        let unit = match c {
+            'h' => 3600,
+            'm' if chars.peek() == Some(&'s') => return None,
+            'm' => 60,
+            's' => 1,
+            _ => break,
+        };
+        total = total.checked_add(n.take()?.checked_mul(unit)?)?;
+        seen = true;
+    }
+    (seen && n.is_none() && total > 0).then(|| chrono::Duration::seconds(total))
 }
 
 /// Parse Claude-style `rate_limits.five_hour` JSON fragments from logs/statusline, or
@@ -316,7 +390,8 @@ pub(crate) fn scrape_claude_stated_reset(
     }
     if !(lower.contains("rate limit")
         || lower.contains("weekly limit")
-        || lower.contains("usage limit"))
+        || lower.contains("usage limit")
+        || lower.contains("5-hour limit"))
     {
         return None;
     }
@@ -778,6 +853,91 @@ mod tests {
             "Rate limit reached for gpt-5 in organization org-abc on requests per min. Limit: 3/min."
         )
         .is_some());
+    }
+
+    /// claude 2.1.312's changelog: "Changed usage limit messages to call the 5-hour
+    /// window the \"5-hour limit\" instead of the \"session limit\"". The sentence below
+    /// is the old captured one with that rename applied, not a live capture.
+    #[test]
+    fn strong_quota_signal_matches_claudes_5_hour_wording() {
+        let line = "You've hit your 5-hour limit \u{b7} resets 12:40pm (America/New_York)";
+        assert!(QuotaStore::scrape_strong_quota_signal(line).is_some());
+        let (_, until, _) =
+            scrape_claude_stated_reset(line).expect("the renamed window still states a reset");
+        assert!(until.is_some(), "a five-hour reset is a sound inference");
+        for prose in [
+            "warning: resuming would use a noticeable share of your 5-hour usage limit",
+            "docs: explain the 5-hour limit to users",
+            "you must not have hit your 5-hour limiter",
+        ] {
+            assert!(
+                QuotaStore::scrape_strong_quota_signal(prose).is_none(),
+                "false positive on: {prose}"
+            );
+        }
+    }
+
+    /// Both lines agy 1.4.9 printed on a real quota rejection (exit 3), verbatim, plus
+    /// the `! ` line the coalescer renders from the stream's `result.error`.
+    const AGY_QUOTA_STDERR: &str = "error: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 125h56m29s.\n\
+        AGY_ERROR: {\"short_error\":\"RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 125h56m29s.\",\"status\":\"RESOURCE_EXHAUSTED\",\"error_code\":429,\"code_kind\":\"http\",\"retryable\":true,\"error_id\":\"cef80e6b-34ef-40a4-8e9c-41afd12d4b27-3\"}\n";
+
+    #[test]
+    fn strong_quota_signal_matches_agys_real_rejection() {
+        for line in AGY_QUOTA_STDERR.lines() {
+            assert!(
+                QuotaStore::scrape_strong_quota_signal(line).is_some(),
+                "each agy line routes on its own: {line}"
+            );
+        }
+        assert!(QuotaStore::scrape_strong_quota_signal(
+            "! Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 125h56m29s."
+        )
+        .is_some());
+        for prose in [
+            "grpc: status RESOURCE_EXHAUSTED returned by the mock server ... FAILED",
+            "match code { Code::ResourceExhausted => retry() }",
+            "the per-user quota reached its soft threshold in the test fixture",
+        ] {
+            assert!(
+                QuotaStore::scrape_strong_quota_signal(prose).is_none(),
+                "false positive on: {prose}"
+            );
+        }
+    }
+
+    #[test]
+    fn agy_stated_reset_pauses_for_the_stated_duration() {
+        let before = Utc::now();
+        let (name, until, hint) =
+            scrape_agy_stated_reset("cli:agy@gemini-3.5-flash", AGY_QUOTA_STDERR).unwrap();
+        assert_eq!(name, "cli:agy");
+        let until = until.expect("125h56m29s parses");
+        let stated = chrono::Duration::seconds(125 * 3600 + 56 * 60 + 29);
+        assert!(until >= before + stated && until <= Utc::now() + stated);
+        assert!(hint.contains("resets"), "{hint}");
+        assert!(scrape_agy_stated_reset("cli:claude", AGY_QUOTA_STDERR).is_none());
+        assert!(scrape_agy_stated_reset("cli:agy", "Resets in 5m0s.").is_none());
+        let (_, until, _) =
+            scrape_agy_stated_reset("cli:agy", "Individual quota reached. Resets in 1m29.5s.")
+                .expect("still a hit");
+        assert!(
+            until.is_none(),
+            "a fractional duration falls back, not rounds"
+        );
+    }
+
+    #[test]
+    fn go_duration_parses_whole_components_only() {
+        let d = |s| parse_go_duration(s).map(|d| d.num_seconds());
+        assert_eq!(d("125h56m29s."), Some(125 * 3600 + 56 * 60 + 29));
+        assert_eq!(d("5m0s"), Some(300));
+        assert_eq!(d("30s"), Some(30));
+        assert_eq!(d("500ms"), None);
+        assert_eq!(d("1m29.5s"), None);
+        assert_eq!(d("0s"), None);
+        assert_eq!(d("12"), None);
+        assert_eq!(d(""), None);
     }
 
     /// Round 6's `"hit your" && "limit"` disjunct required neither adjacency nor a

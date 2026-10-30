@@ -2518,6 +2518,12 @@ fn detect_and_pause_quota(
         store.pause_quota_until(&name, until, hint);
         let _ = store.save(paths);
     }
+    if let Some((name, until, hint)) = crate::quota::scrape_agy_stated_reset(provider, log_text) {
+        let until = until.filter(|u| implausible_reset(*u).is_none());
+        let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+        store.pause_quota_until(&name, until, hint);
+        let _ = store.save(paths);
+    }
     if let Some(window) = structured {
         // The adapter stated when the window reopens, so pause until exactly then rather
         // than leaving the generic timer to re-probe. This is the answer the text path
@@ -6049,6 +6055,29 @@ mod tests {
         );
     }
 
+    /// agy 1.4.9's real rejection (`! ` is how the coalescer renders `result.error`)
+    /// routes the run to quota and pauses `cli:agy` until the stated relative reset,
+    /// overriding the generic pause the broad hint scrape writes first.
+    #[test]
+    fn detect_and_pause_quota_pauses_agy_until_its_stated_reset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log = "! Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 125h56m29s.\n";
+        let before = chrono::Utc::now();
+        assert!(detect_and_pause_quota(
+            &paths, "cli:agy", log, None, None, false
+        ));
+        let q = crate::quota::QuotaStore::load(&paths)
+            .unwrap()
+            .get("cli:agy");
+        let until = q
+            .cooldown_until
+            .expect("exact cooldown, not the generic one");
+        let stated = chrono::Duration::seconds(125 * 3600 + 56 * 60 + 29);
+        assert!(until >= before + stated, "{until}");
+        assert!(until <= chrono::Utc::now() + stated, "{until}");
+    }
+
     /// The wiring between a `SlotOutcome` and `detect_and_pause_quota`, not just the
     /// callee: a future stated instant on the outcome must pause the store until
     /// exactly then, with no rate-limit prose in the log to do it via the text scrape
@@ -6531,7 +6560,7 @@ mod tests {
         let err = check_slot_effort("cli:agy", Some(EffortLevel::Ultra)).unwrap_err();
         assert_eq!(
             format!("{err:#}"),
-            "effort 'ultra' not accepted by cli:agy (takes: low, medium, high)"
+            "effort 'ultra' not accepted by cli:agy (takes: low, medium, high, xhigh, max)"
         );
         // codex takes the union (it validates per model, server-side), so the
         // top rung is accepted here rather than refused.
@@ -6566,7 +6595,7 @@ mod tests {
         let err = run_slot(&mut state, &paths, &cfg, &job).unwrap_err();
         assert_eq!(
             format!("{err:#}"),
-            "effort 'ultra' not accepted by cli:agy (takes: low, medium, high)"
+            "effort 'ultra' not accepted by cli:agy (takes: low, medium, high, xhigh, max)"
         );
         let s = state.slot_mut("impl").unwrap();
         assert_eq!(s.status, SlotStatus::Pending);
