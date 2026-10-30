@@ -138,7 +138,7 @@ fn busy_lock_leaves_state_untouched() {
         ])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains(
+        .stdout(predicate::str::contains(
             "already has a running orchestrator",
         ));
 
@@ -200,7 +200,7 @@ fn detach_busy_lock_leaves_state_untouched() {
         ])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains(
+        .stdout(predicate::str::contains(
             "already has a running orchestrator",
         ));
 
@@ -239,7 +239,7 @@ fn reload_config_busy_lock_leaves_config_untouched() {
         ])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains(
+        .stdout(predicate::str::contains(
             "already has a running orchestrator",
         ));
 

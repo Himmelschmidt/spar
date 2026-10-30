@@ -88,6 +88,7 @@ pub fn dispatch_turn(
     let (program, args) = crate::providers::command_to_parts(&cmd);
     let (program, args) = crate::sandbox::maybe_wrap(req.isolation, &req.cwd, &program, &args);
     let spawn_req = crate::process::SpawnRequest {
+        stdin: adapter_box.prompt_stdin(&spawn_opts),
         program,
         args,
         cwd: req.cwd.clone(),

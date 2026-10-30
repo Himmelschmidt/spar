@@ -202,3 +202,7 @@ path = "tests/scenarios/bus_receipts.rs"
 [[test]]
 name = "operator_surgery"
 path = "tests/scenarios/operator_surgery.rs"
+
+[[test]]
+name = "launch_surface"
+path = "tests/scenarios/launch_surface.rs"

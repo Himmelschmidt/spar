@@ -262,6 +262,13 @@ pub trait ProviderAdapter: Send + Sync {
         }
     }
     fn permission_args(&self, policy: TrustPolicy) -> Vec<String>;
+    /// The file a headless or resume dispatch must get on stdin, when this adapter
+    /// reads its prompt there instead of from argv. Paired with `build_headless` /
+    /// `build_resume`, which leave the prompt out of argv exactly when this is `Some`.
+    /// Default `None`: argv (or the adapter's own prompt-file flag) carries it.
+    fn prompt_stdin(&self, _opts: &SpawnOpts) -> Option<PathBuf> {
+        None
+    }
     fn build_headless(&self, bin: &Path, opts: &SpawnOpts) -> Command;
     fn build_interactive(&self, bin: &Path, opts: &SpawnOpts) -> Command;
 
@@ -675,6 +682,28 @@ pub fn is_provider_usable(raw: &str, allow_missing: bool) -> bool {
 /// Slot dispatch fails later if keys are missing; this only screens the name itself.
 pub fn api_provider_supported(name: &str) -> bool {
     matches!(name, "openai" | "xai" | "anthropic" | "google" | "meta")
+}
+
+/// Refuse a provider spar has no adapter for, at launch rather than at first dispatch.
+/// Says nothing about PATH or keys: an installed-but-missing provider is a quota or
+/// usability question, not a typo.
+pub fn ensure_known(raw: &str) -> anyhow::Result<()> {
+    let pref = ProviderRef::parse(raw)?;
+    let known = match pref.backend {
+        ExecBackend::NativeCli => adapter_named(raw).is_some(),
+        ExecBackend::ApiSdk => api_provider_supported(&pref.name),
+    };
+    if known {
+        return Ok(());
+    }
+    let cli = all_adapters()
+        .iter()
+        .map(|a| format!("cli:{}", a.name()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::bail!(
+        "unknown provider {raw:?} (known: {cli}, api:openai, api:xai, api:anthropic, api:google, api:meta)"
+    )
 }
 
 /// Providers that are on PATH, as `cli:name` keys, optionally filtered by `order`.

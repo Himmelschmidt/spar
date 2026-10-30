@@ -1484,7 +1484,7 @@ fn providers_required_on_plan() {
         .args(["plan", "--task", "x", "--dry-run", "--json"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("providers").or(predicate::str::contains("required")));
+        .stdout(predicate::str::contains("providers").or(predicate::str::contains("required")));
 }
 
 #[test]

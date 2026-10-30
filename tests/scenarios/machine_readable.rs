@@ -298,6 +298,8 @@ fn a_terminal_phase_appends_a_history_row() {
 /// in for it.
 const FAKE_CLAUDE_SILENT_REVIEWER: &str = r#"#!/bin/sh
 if [ "$1" = "--version" ]; then echo "fake-claude 0"; exit 0; fi
+# The prompt arrives on stdin, not argv (O128): scan it like an argument.
+set -- "$@" "$(cat)"
 DEST=""
 CWD=""
 for a in "$@"; do

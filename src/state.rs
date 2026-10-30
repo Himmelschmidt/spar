@@ -50,6 +50,10 @@ pub struct RunState {
     /// upstream to compare against.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_behind: Option<u32>,
+    /// `spar.toml` in the base commit differed from the primary checkout's working file
+    /// when the run was created. The run still froze the working file (O27, O129).
+    #[serde(default)]
+    pub config_source_drift: bool,
     /// Spawn mode for native-cli: auto|headless|tmux
     #[serde(default)]
     pub backend: Backend,
@@ -774,6 +778,7 @@ impl RunState {
             base_ref: None,
             base_commit: None,
             base_behind: None,
+            config_source_drift: false,
             backend: Backend::Auto,
             isolation: IsolationMode::Worktree,
             dry_run: false,

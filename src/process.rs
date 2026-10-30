@@ -15,6 +15,9 @@ pub struct SpawnRequest {
     pub log_path: PathBuf,
     pub env: Vec<(String, String)>,
     pub timeout: Duration,
+    /// File fed to the child's stdin; `None` is null stdin. How an adapter that reads
+    /// its prompt from stdin keeps the prompt out of argv, where `pgrep -f` matches it.
+    pub stdin: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -496,10 +499,16 @@ pub fn run_captured_with_adapter(
     initial.touch_log();
     let _ = initial.save(&req.log_path);
 
+    let stdin = match &req.stdin {
+        Some(p) => Stdio::from(
+            std::fs::File::open(p).with_context(|| format!("open stdin {}", p.display()))?,
+        ),
+        None => Stdio::null(),
+    };
     let mut cmd = Command::new(&req.program);
     cmd.args(&req.args)
         .current_dir(&req.cwd)
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (k, v) in &req.env {
@@ -2845,6 +2854,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let log = tmp.path().join("t.log");
         let req = SpawnRequest {
+            stdin: None,
             program: PathBuf::from("mock"),
             args: vec![],
             cwd: tmp.path().to_path_buf(),
@@ -2862,6 +2872,7 @@ mod tests {
         let log = tmp.path().join("to.log");
         // Leader sleeps; grandchild would be in same process group.
         let req = SpawnRequest {
+            stdin: None,
             program: PathBuf::from("sh"),
             args: vec!["-c".into(), "sleep 30".into()],
             cwd: tmp.path().to_path_buf(),
@@ -2875,6 +2886,7 @@ mod tests {
 
     fn sh_req(script: &str, dir: &Path, log: &str) -> SpawnRequest {
         SpawnRequest {
+            stdin: None,
             program: PathBuf::from("sh"),
             args: vec!["-c".into(), script.into()],
             cwd: dir.to_path_buf(),
@@ -2921,6 +2933,28 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&req.log_path).unwrap(),
             "# mock sh -c unused\nmock output\n"
+        );
+    }
+
+    /// #182: the prompt file reaches the child on stdin; without one stdin is null.
+    #[test]
+    fn stdin_file_is_fed_to_the_child() {
+        let tmp = tempdir().unwrap();
+        let prompt = tmp.path().join("prompt.md");
+        std::fs::write(&prompt, "PROMPT-ON-STDIN\n").unwrap();
+        let mut req = sh_req("cat > got.txt", tmp.path(), "stdin.log");
+        req.stdin = Some(prompt);
+        assert_eq!(run_captured(&req, None, None).unwrap().exit_code, Some(0));
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("got.txt")).unwrap(),
+            "PROMPT-ON-STDIN\n"
+        );
+
+        let req = sh_req("cat > null.txt", tmp.path(), "null.log");
+        assert_eq!(run_captured(&req, None, None).unwrap().exit_code, Some(0));
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("null.txt")).unwrap(),
+            ""
         );
     }
 
@@ -3031,6 +3065,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let log = tmp.path().join("e.log");
         let req = SpawnRequest {
+            stdin: None,
             program: PathBuf::from("echo"),
             args: vec!["stream-me".into()],
             cwd: tmp.path().to_path_buf(),
