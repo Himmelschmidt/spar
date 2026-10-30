@@ -1194,6 +1194,51 @@ spar status --all-hosts [--json]                   # this host + every [registry
   and both start. The key stops relaunches, requeues and second boxes, not a
   simultaneous race.
 
+### Shared quota store and a fleet-wide slot cap (O141, O142)
+
+Boxes that share provider logins can share pauses, cooldowns and the daemon's
+concurrency cap through a directory every box mounts. User config only:
+
+```toml
+# ~/.config/spar/config.toml
+[quota]
+shared_path = "/mnt/fleet/spar"     # a directory; "" (default) = per-project .spar/quota.json only
+
+[accounts]                          # optional: which login each provider uses on this box
+"cli:claude" = "acct-a"
+```
+
+- Records are keyed by **account**: the provider bucket (`cli:claude`, model-free) plus
+  the `[accounts]` label, written `cli:claude#acct-a`. Boxes with the same label share
+  a pause; a box on `acct-b` is not paused by `acct-a`'s limit. No label = the bare
+  bucket, shared by every box without one.
+- Every quota read (`provider list`, seat choice, per-dispatch re-checks) merges the
+  project's `.spar/quota.json` with the shared `quota.json`. Every write still goes to
+  the project file, and the changed keys are merged into the shared file under
+  `quota.lock` and replaced by atomic rename.
+- **Merge rule, per account:** a lapsed pause counts for nothing; a manual pause beats
+  a quota pause; the longest-lived manual pause wins; the strongest quota pause wins
+  (strong over weak, then the longest). A `provider resume` written after a pause
+  clears it fleet-wide; an older `available` record never clears a newer pause.
+  Consequence: shortening a fleet manual pause takes `provider resume` first.
+- With a shared path, every live (non-dry) dispatch on every box writes a heartbeat
+  lease `<shared_path>/slots/<host>-<pid>-<run>-<slot>.json`, refreshed every 30s and
+  removed when the slot exits. A daemon enforcing `[daemon] max_slots_per_bucket`
+  adds the live leases of other boxes and other projects on the same account to its
+  local count, so the cap is fleet-wide. Admission is still check-then-act: a launch
+  on another box counts only once its slot runs. A lease not
+  refreshed for 120s, or one from this host whose pid is dead, expires and is deleted
+  by the next reader. `spar daemon status` shows them as `in_use_elsewhere`.
+- If `shared_path` is set but the directory is missing (an unmounted share), spar
+  never creates it: it uses the project file only and warns once per command.
+- **Filesystem caveats.** A path only, no URL store. NFS: `flock` needs a lock daemon
+  (NFSv4 has one; v3 needs `lockd`), and attribute caching can delay another box's
+  write by a few seconds. sshfs: no cross-host locks at all, so two simultaneous writers
+  can lose one update (the next write re-merges). syncthing: no locks and eventual
+  delivery; a pause reaches other boxes after the sync interval, and a conflicting
+  write lands as a `.sync-conflict` file spar ignores. Leases compare timestamps
+  across hosts, so keep clocks in NTP sync.
+
 **Subscribe, don't poll.** When you are waiting on a run, block on `wait` instead
 of spinning on `status` — you don't have to remember to check back:
 
@@ -1732,6 +1777,7 @@ timeout_secs = 3600    # test_author's SOFT clock; hard_ceiling_multiple applies
 # restart = true               # restart a dead orchestrator holding resumable work
 # max_restarts = 2             # per run, per daemon lifetime
 # max_slots_per_bucket = 0     # cross-run concurrency cap, keyed on provider (model-free); 0 = off
+#                              # fleet-wide when the user config sets [quota] shared_path (O142)
 # sync_prs = false             # run `sync-prs --all` (calls gh) at most every 5 minutes
 # Dynamic model select (vals). Opt-in with --select; cache under ~/.spar/cache/vals/
 [model_select]

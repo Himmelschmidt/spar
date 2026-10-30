@@ -162,6 +162,8 @@ struct PreparedSlot {
     /// Held for the dispatch's lifetime; dropped (and the directory removed) once the
     /// outcome has been applied.
     _tmp: SlotTmp,
+    /// This slot's fleet-wide claim on its account (O142); `None` without a shared path.
+    _fleet_lease: Option<crate::fleet::SlotLease>,
 }
 
 /// Refreshes a live slot's presence heartbeat while its child process runs, throttled
@@ -403,6 +405,7 @@ fn prepare_slot_execution(
     let session_provider = pref.cli_name().unwrap_or(job.provider.as_str()).to_string();
     let prior_session_id =
         prior_session_for_role(paths, &state.id, &job.slot_id, &session_provider, job.role);
+    let fleet_lease = crate::fleet::SlotLease::start(paths, &state.id, &job.slot_id, &job.provider);
 
     Ok(PreparedSlot {
         job,
@@ -422,6 +425,7 @@ fn prepare_slot_execution(
         cfg: cfg.clone(),
         dry_run: state.dry_run,
         _tmp: tmp,
+        _fleet_lease: fleet_lease,
     })
 }
 
@@ -2396,6 +2400,8 @@ pub fn run_slot(
     if state.dry_run {
         return run_dry(state, paths, job, &cwd, &log_path, &prompt);
     }
+    let _fleet_lease =
+        crate::fleet::SlotLease::start(paths, &state.id, &job.slot_id, &job.provider);
 
     let mut presence_env = wire_slot_presence(state, paths, job, &cwd, &pref);
     presence_env.extend(tmp.env());

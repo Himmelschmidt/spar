@@ -354,3 +354,99 @@ fn status_all_hosts_without_remotes_names_the_config() {
         .code(1)
         .stderr(predicates::str::contains("[registry] remotes"));
 }
+
+// ---------------------------------------------------------------------------------
+// #186: fleet-wide quota store
+// ---------------------------------------------------------------------------------
+
+fn claude_status(list: &serde_json::Value) -> String {
+    list.as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"].as_str().is_some_and(|n| n.contains("claude")))
+        .map(|p| p["quota_status"].as_str().unwrap().to_string())
+        .unwrap_or_else(|| panic!("no claude row: {list}"))
+}
+
+#[test]
+fn a_pause_on_one_project_reaches_another_through_the_shared_path_by_account() {
+    let fx = Fixture::new();
+    let shared = fx.tmp.path().join("shared");
+    fs::create_dir_all(&shared).unwrap();
+    let config = |label: &str| {
+        format!(
+            "[quota]\nshared_path = \"{}\"\n[accounts]\n\"cli:claude\" = \"{label}\"\n",
+            shared.display()
+        )
+    };
+    fx.user_config(&config("acct-a"));
+    let other = fx.tmp.path().join("other");
+    fs::create_dir_all(&other).unwrap();
+    init_repo(&other);
+
+    fx.spar()
+        .args(["provider", "pause", "claude"])
+        .assert()
+        .success();
+    let fleet = fs::read_to_string(shared.join("quota.json")).unwrap();
+    assert!(fleet.contains("cli:claude#acct-a"), "{fleet}");
+
+    let list = fx
+        .spar_in(&other)
+        .args(["provider", "list", "--json"])
+        .assert()
+        .success();
+    assert_eq!(claude_status(&stdout_json(&list)), "paused_manual");
+
+    fx.user_config(&config("acct-b"));
+    let list = fx
+        .spar_in(&other)
+        .args(["provider", "list", "--json"])
+        .assert()
+        .success();
+    assert_eq!(
+        claude_status(&stdout_json(&list)),
+        "available",
+        "another account is not held by acct-a's pause"
+    );
+
+    fx.user_config(&config("acct-a"));
+    fx.spar_in(&other)
+        .args(["provider", "resume", "claude"])
+        .assert()
+        .success();
+    let list = fx
+        .spar()
+        .args(["provider", "list", "--json"])
+        .assert()
+        .success();
+    assert_eq!(
+        claude_status(&stdout_json(&list)),
+        "available",
+        "a resume anywhere clears the fleet pause"
+    );
+}
+
+#[test]
+fn a_missing_shared_path_falls_back_to_the_project_and_warns_once() {
+    let fx = Fixture::new();
+    let missing = fx.tmp.path().join("not-mounted");
+    fx.user_config(&format!(
+        "[quota]\nshared_path = \"{}\"\n",
+        missing.display()
+    ));
+    let a = fx
+        .spar()
+        .args(["provider", "pause", "claude"])
+        .assert()
+        .success();
+    let err = stderr_of(&a);
+    assert_eq!(err.matches("unavailable").count(), 1, "{err}");
+    assert!(!missing.exists(), "spar never creates the shared path");
+    let list = fx
+        .spar()
+        .args(["provider", "list", "--json"])
+        .assert()
+        .success();
+    assert_eq!(claude_status(&stdout_json(&list)), "paused_manual");
+}

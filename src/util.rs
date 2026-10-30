@@ -48,6 +48,15 @@ pub fn sanitize_slot(s: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+pub fn expand_home(raw: &str) -> std::path::PathBuf {
+    match raw.strip_prefix("~/") {
+        Some(rest) => dirs::home_dir()
+            .map(|h| h.join(rest))
+            .unwrap_or_else(|| std::path::PathBuf::from(raw)),
+        None => std::path::PathBuf::from(raw),
+    }
+}
+
 pub fn hostname() -> Option<String> {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .or_else(|_| std::fs::read_to_string("/etc/hostname"))

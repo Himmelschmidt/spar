@@ -1996,6 +1996,19 @@ pub fn set_test_user_config(path: Option<PathBuf>) {
 pub struct UserConfig {
     #[serde(default)]
     pub registry: RegistryConfig,
+    #[serde(default)]
+    pub quota: QuotaConfig,
+    /// Account label per provider (`"cli:claude" = "acct-a"`): boxes logged into the
+    /// same account share a fleet pause and a fleet slot count, different accounts don't.
+    #[serde(default)]
+    pub accounts: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct QuotaConfig {
+    /// A directory on a filesystem every box mounts. Empty: per-project quota only.
+    #[serde(default)]
+    pub shared_path: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

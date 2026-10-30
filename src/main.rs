@@ -12,6 +12,7 @@ mod effort;
 mod events;
 mod executor;
 mod exit_codes;
+mod fleet;
 mod history;
 mod liveness;
 mod mailbox;
@@ -2752,11 +2753,11 @@ fn stray_pauses(
         .map(|p| quota::normalize_key(&p.name))
         .collect();
     let mut stray: Vec<quota::ProviderQuota> = store
-        .providers
-        .values()
-        .filter(|q| !listed.contains(&q.name))
-        .filter(|q| store.effective_status(&q.name) != quota::ProviderStatus::Available)
-        .cloned()
+        .names()
+        .into_iter()
+        .filter(|name| !listed.contains(name))
+        .filter(|name| store.effective_status(name) != quota::ProviderStatus::Available)
+        .map(|name| store.get(&name))
         .collect();
     stray.sort_by(|a, b| a.name.cmp(&b.name));
     stray
