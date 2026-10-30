@@ -324,12 +324,9 @@ mod tests {
         let mut cfg = Config::default();
         cfg.budget.implementer = 1000;
         cfg.budget.nudge_fraction = 0.2;
-        // opencode reports usage live per step and has no push channel, so it exercises
+        // pi reports usage live per request and has no push channel, so it exercises
         // both halves: a real mid-dispatch token reading and the poll-file drop.
-        let w = NudgeWatch::new(
-            spec(&paths, &log, SlotRole::Implementer, "cli:opencode"),
-            &cfg,
-        );
+        let w = NudgeWatch::new(spec(&paths, &log, SlotRole::Implementer, "cli:pi"), &cfg);
         assert_eq!(w.strategy, DeliveryStrategy::PollFile);
 
         let bill = |n: u64| {
@@ -423,7 +420,7 @@ mod tests {
         cfg.timeouts.nudge_every_secs = 600;
         // Any PollFile-strategy provider does; codex has its own native queue now
         // (see `codex_nudges_reach_the_running_thread_via_native_queue`).
-        let mut s = spec(&paths, &log, SlotRole::Implementer, "cli:opencode");
+        let mut s = spec(&paths, &log, SlotRole::Implementer, "cli:pi");
         s.soft = Duration::from_secs(60);
         let w = NudgeWatch::new(s, &cfg);
 
@@ -548,7 +545,7 @@ mod tests {
         std::fs::create_dir_all(log.parent().unwrap()).unwrap();
         let mut cfg = Config::default();
         cfg.budget.implementer = 10;
-        let mut s = spec(&paths, &log, SlotRole::Implementer, "cli:opencode");
+        let mut s = spec(&paths, &log, SlotRole::Implementer, "cli:pi");
         s.soft = Duration::from_secs(1);
         let w = NudgeWatch::new(s, &cfg);
 
@@ -556,7 +553,7 @@ mod tests {
         // enough for the wait loop to poll.
         let script = format!(
             "{}\nsleep 2",
-            r#"echo '{"type":"step_finish","sessionID":"ses_1","part":{"id":"p1","type":"step-finish","tokens":{"input":900,"output":100,"cache":{"read":0,"write":0}}}}'"#
+            r#"echo '{"type":"message_end","message":{"role":"assistant","content":[],"usage":{"input":900,"output":100,"cacheRead":0,"cacheWrite":0},"stopReason":"toolUse"}}'"#
         );
         let req = crate::process::SpawnRequest {
             program: "sh".into(),
@@ -597,7 +594,7 @@ mod tests {
         std::fs::create_dir_all(log.parent().unwrap()).unwrap();
         let mut cfg = Config::default();
         cfg.budget.implementer = 10;
-        let mut s = spec(&paths, &log, SlotRole::Implementer, "cli:opencode");
+        let mut s = spec(&paths, &log, SlotRole::Implementer, "cli:pi");
         s.artifacts = vec!["summary-impl.md".into(), "carry-forward-impl.md".into()];
         let w = NudgeWatch::new(s, &cfg);
         StreamStats {

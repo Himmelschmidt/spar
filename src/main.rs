@@ -12,6 +12,7 @@ mod effort;
 mod events;
 mod executor;
 mod exit_codes;
+mod history;
 mod liveness;
 mod mailbox;
 mod markers;
@@ -141,6 +142,7 @@ fn run() -> Result<ExitCode> {
             effort,
             fleet,
             without,
+            suite_command,
             base,
             detach,
             json,
@@ -169,6 +171,7 @@ fn run() -> Result<ExitCode> {
                     (!effort.is_empty(), "--effort"),
                     (fleet.is_some(), "--fleet"),
                     (!without.is_empty(), "--without"),
+                    (!suite_command.is_empty(), "--suite-command"),
                     (base.is_some(), "--base"),
                     (big, "--big"),
                     (detach, "--detach"),
@@ -206,6 +209,7 @@ fn run() -> Result<ExitCode> {
             cfg.apply_role_overrides(&role)?;
             cfg.apply_backup_overrides(&backup)?;
             cfg.apply_effort_overrides(&effort)?;
+            cfg.apply_suite_command(&suite_command, &without)?;
             let (task_text, brief_path) = match (spec, brief, task) {
                 (Some(path), None, None) => {
                     let b = brief::intake(&paths, &path)?;
@@ -282,6 +286,7 @@ fn run() -> Result<ExitCode> {
             effort,
             fleet,
             without,
+            suite_command,
             reload_config,
             max_rounds,
             accept_contract,
@@ -301,6 +306,7 @@ fn run() -> Result<ExitCode> {
                 &backup,
                 &effort,
                 &without,
+                &suite_command,
                 fleet.as_deref(),
                 reload_config,
             )?;
@@ -795,12 +801,14 @@ fn bus_deliver(
 /// its own run cannot change the fleet, timeouts or ship gate of one already in flight.
 /// `--reload-config` is the deliberate way out: it re-reads the file and re-freezes the
 /// run against it.
+#[allow(clippy::too_many_arguments)]
 fn implement_ctx(
     run_id: Option<&str>,
     role: &[String],
     backup: &[String],
     effort: &[String],
     without: &[String],
+    suite_command: &[String],
     fleet: Option<&str>,
     reload_config: bool,
 ) -> Result<(paths::SparPaths, Config)> {
@@ -813,6 +821,7 @@ fn implement_ctx(
         cfg.apply_role_overrides(role)?;
         cfg.apply_backup_overrides(backup)?;
         cfg.apply_effort_overrides(effort)?;
+        cfg.apply_suite_command(suite_command, without)?;
         return Ok((paths, cfg));
     };
     if !reload_config {
@@ -840,6 +849,12 @@ fn implement_ctx(
                  pass --reload-config to apply --without to it"
             );
         }
+        if !suite_command.is_empty() {
+            anyhow::bail!(
+                "run {run_id} is bound to the config it was created with; \
+                 pass --reload-config to apply --suite-command to it"
+            );
+        }
         if let Some(preset) = fleet {
             // Validate before refusing: an unknown preset name is its own error, not
             // one the `--reload-config` refusal should swallow. `standard` is a
@@ -856,6 +871,9 @@ fn implement_ctx(
         let cfg = Config::for_run(&paths, run_id)?;
         return Ok((paths, cfg));
     }
+    // Before the flags, so this invocation's `--without suite` or `--suite-command`
+    // still wins over the carried pin.
+    cfg.carry_cli_suite_command(&Config::for_run(&paths, run_id)?);
     if let Some(preset) = fleet {
         cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
     }
@@ -870,6 +888,7 @@ fn implement_ctx(
         }
         .into());
     }
+    cfg.apply_suite_command(suite_command, without)?;
     cfg.save_snapshot(&paths, run_id)?;
     eprintln!("config: re-read spar.toml for run {run_id}");
     Ok((paths, cfg))
@@ -914,7 +933,14 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> 
             println!("run: {}", state.id);
             println!("project: {}", swarm.project_root.display());
             if let (Some(r), Some(c)) = (&state.base_ref, &state.base_commit) {
-                println!("base: {r} ({})", c.chars().take(8).collect::<String>());
+                let behind = match state.base_behind {
+                    Some(n) if n > 0 => format!(", {n} behind upstream at launch"),
+                    _ => String::new(),
+                };
+                println!(
+                    "base: {r} ({}{behind})",
+                    c.chars().take(8).collect::<String>()
+                );
             }
             println!("phase: {:?}", state.phase);
             // Looking a run up by id is the documented way to reach an archived one, so it
@@ -1249,10 +1275,9 @@ fn run_status_json(
                 None => serde_json::Value::Null,
             },
         );
-        obj.insert(
-            "orchestrator_alive".into(),
-            serde_json::Value::Bool(orch.map(|t| t.alive()).unwrap_or(false)),
-        );
+        if let serde_json::Value::Object(live) = serde_json::to_value(state.liveness(swarm))? {
+            obj.extend(live);
+        }
         let abandoned = state.abandoned(swarm);
         obj.insert("abandoned".into(), serde_json::Value::Bool(abandoned));
         // Only meaningful when nobody owns the run: these are slot processes still
@@ -2159,6 +2184,7 @@ fn cleanup_sweep(
         let kept_any = cleaned.iter().any(|c| c.skipped.is_some());
         let purged = purge != Purge::Nothing && !kept_any;
         if purged {
+            history::append(&paths, &state, history::Trigger::Purge);
             purge_run_dir(&paths, &summary.id, purge)?;
         }
         swept.push(serde_json::json!({
@@ -2274,6 +2300,7 @@ fn cleanup_one(
     // Same rule as the sweep: the record is the only route back to a spared worktree.
     let purged = purge != Purge::Nothing && !kept_any;
     if purged {
+        history::append(&paths, &state, history::Trigger::Purge);
         purge_run_dir(&paths, run_id, purge)?;
         worktree::prune_empty_spar_parents(&paths)?;
     }

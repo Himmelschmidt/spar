@@ -240,15 +240,15 @@ extracted from — the point was to factor out duplication that actually exists 
 guess the abstraction up front.
 
 - **Post-exit telemetry recovery is now three near-parallel modules.**
-  `agy_telemetry.rs` (526 lines), `muse_telemetry.rs` (479) and `opencode_telemetry.rs`
-  (681, arriving with `c048816d`) each do the same four things: locate the provider's own
+  `agy_telemetry.rs` (526 lines), `muse_telemetry.rs` (479) and ~~`opencode_telemetry.rs`
+  (681, arriving with `c048816d`)~~ (deleted with opencode, O99) each do the same four things: locate the provider's own
   on-disk store, walk it, sum usage across the session **and its children**, and hand the
   total back to the slot — each with its own incremental reader for the still-running case.
   ~1,700 lines for one idea with three wire formats. A `TelemetryStore` trait (locate /
   collect / live-reader) with a per-provider impl is the obvious shape.
 
 - **`StreamCoalescer` has seven `handle_*` arms hand-rolling the same five jobs.**
-  `handle_muse`, `handle_opencode`, `handle_agy`, `handle_codex_item`,
+  `handle_muse`, `handle_pi` (was `handle_opencode`), `handle_agy`, `handle_codex_item`,
   `handle_claude_assistant`, `handle_claude_user` each re-implement session-id capture,
   per-step usage absorption, tool counting, text buffering and terminal-record detection
   against a different envelope. `absorb_usage(v, UsageScope)`, `parse_model_usage` and
