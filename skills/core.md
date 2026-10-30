@@ -1239,6 +1239,37 @@ shared_path = "/mnt/fleet/spar"     # a directory; "" (default) = per-project .s
   write lands as a `.sync-conflict` file spar ignores. Leases compare timestamps
   across hosts, so keep clocks in NTP sync.
 
+### Build-cache pool (O143, O144)
+
+```toml
+[worktree]                      # spar.toml or the user config
+build_cache_pool = ["~/projects/run-target-{1..10}"]   # `~/` and one {a..b} range per entry
+build_cache_env = "CARGO_TARGET_DIR"                   # default
+```
+
+- Each implementer dispatch leases a free pool directory and gets
+  `CARGO_TARGET_DIR=<dir>` (or your `build_cache_env`), so fix rounds, resumes and
+  extended runs rebuild incrementally in a warm target instead of compiling the
+  workspace from scratch in a fresh worktree `target/`.
+- **Free** means no live lease. The lease is `<dir>.spar-lease` beside the directory,
+  carrying the orchestrator's pid and start time (the run lock's liveness model): a
+  crashed orchestrator's slot is free again at once. It is released when the slot
+  exits and re-leased on every dispatch, preferring the directory the slot used last
+  (recorded as `build_cache` on the slot in `state.json`), so a resume or
+  `implement --run <id> --max-rounds N` lands back in its own warm build when it can.
+- Pool exhausted: a warning on stderr and in the event log, `build_cache` cleared, and
+  the implementer builds into its worktree's own `target/`.
+- Reviewers, testers and every other role never lease: they build in their own
+  checkout and target, and their env is untouched.
+- `spar reclaim` never deletes a directory whose lease is held by a live process. Pool
+  directories outside run worktrees are not reclaim's to touch at all.
+- **Caveat:** one target shared across worktrees shares build-script output. A crate
+  that bakes `CARGO_MANIFEST_DIR` (or another absolute path) into generated code, an
+  `include!` of `OUT_DIR` content, or a `build.rs` without `rerun-if-changed` can
+  carry the *previous* worktree's paths into this build. If tests read fixtures
+  through such a path, or a build looks stale, run that crate's `cargo clean -p` in
+  the leased target or leave the pool unset for that project.
+
 **Subscribe, don't poll.** When you are waiting on a run, block on `wait` instead
 of spinning on `status` — you don't have to remember to check back:
 
@@ -1687,6 +1718,8 @@ auto_archive_after = "14d"
 [worktree]
 auto_cleanup_merged = true   # reap at-rest runs already contained in their base, at launch
 copy = [".dbiso.env", ".envrc", ".env.example"]   # copied from the main checkout into every slot worktree; missing files skipped
+build_cache_pool = []        # e.g. ["~/projects/run-target-{1..10}"]: implementers lease one per dispatch (O143)
+build_cache_env = "CARGO_TARGET_DIR"   # the variable the leased directory is handed in
 [ship]
 title_max = 72   # PR title clamp in characters; 0 = GitHub's 256 only
 draft = true     # open new PRs as drafts; false = ready for review

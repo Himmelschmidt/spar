@@ -450,3 +450,119 @@ fn a_missing_shared_path_falls_back_to_the_project_and_warns_once() {
         .success();
     assert_eq!(claude_status(&stdout_json(&list)), "paused_manual");
 }
+
+// ---------------------------------------------------------------------------------
+// #161: build-cache pool
+// ---------------------------------------------------------------------------------
+
+fn own_starttime() -> u64 {
+    let stat = fs::read_to_string("/proc/self/stat").unwrap();
+    let after = &stat[stat.rfind(')').unwrap() + 1..];
+    after.split_whitespace().nth(19).unwrap().parse().unwrap()
+}
+
+/// A lease held by this (live) test process, as another orchestrator's would be.
+fn hold(dir: &Path) {
+    let lease = serde_json::json!({
+        "pid": std::process::id(),
+        "starttime": own_starttime(),
+        "run_id": "other",
+        "slot_id": "implementer",
+        "project_root": "/elsewhere",
+        "leased_at": "2026-10-30T00:00:00Z",
+    });
+    let name = format!("{}.spar-lease", dir.file_name().unwrap().to_string_lossy());
+    fs::write(dir.with_file_name(name), lease.to_string()).unwrap();
+}
+
+fn implement_dry(fx: &Fixture) -> (assert_cmd::assert::Assert, serde_json::Value) {
+    let a = fx
+        .spar()
+        .args([
+            "implement",
+            "-t",
+            "build the thing",
+            "--providers",
+            "cli:claude,cli:codex",
+            "--dry-run",
+            "--json",
+        ])
+        .assert();
+    let runs: Vec<_> = fs::read_dir(fx.proj.join(".spar/runs"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+    let newest = runs
+        .iter()
+        .max_by_key(|e| e.metadata().unwrap().modified().unwrap())
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .into_owned();
+    let state = fx.state(&newest);
+    (a, state)
+}
+
+fn slot_of<'a>(state: &'a serde_json::Value, role: &str) -> &'a serde_json::Value {
+    state["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["role"] == role)
+        .unwrap_or_else(|| panic!("no {role} slot: {state}"))
+}
+
+#[test]
+fn an_implementer_leases_a_free_pool_slot_and_releases_it() {
+    let fx = Fixture::new();
+    let pool = fx.tmp.path().join("pool");
+    fs::create_dir_all(&pool).unwrap();
+    fs::write(
+        fx.proj.join("spar.toml"),
+        format!(
+            "[worktree]\nbuild_cache_pool = [\"{}/t-{{1..2}}\"]\n",
+            pool.display()
+        ),
+    )
+    .unwrap();
+
+    let (_, state) = implement_dry(&fx);
+    let t1 = pool.join("t-1");
+    assert_eq!(
+        slot_of(&state, "implementer")["build_cache"],
+        t1.display().to_string()
+    );
+    assert!(
+        slot_of(&state, "reviewer").get("build_cache").is_none(),
+        "reviewers never lease"
+    );
+    assert!(
+        !pool.join("t-1.spar-lease").exists(),
+        "released at slot exit"
+    );
+    let events = fs::read_to_string(
+        fx.proj
+            .join(".spar/runs")
+            .join(state["id"].as_str().unwrap())
+            .join("events.jsonl"),
+    )
+    .unwrap();
+    assert!(events.contains("CARGO_TARGET_DIR="), "{events}");
+
+    hold(&t1);
+    let (_, state) = implement_dry(&fx);
+    assert_eq!(
+        slot_of(&state, "implementer")["build_cache"],
+        pool.join("t-2").display().to_string(),
+        "a live lease is skipped"
+    );
+
+    hold(&pool.join("t-2"));
+    let (a, state) = implement_dry(&fx);
+    assert!(
+        stderr_of(&a).contains("build cache pool exhausted"),
+        "{}",
+        stderr_of(&a)
+    );
+    assert!(slot_of(&state, "implementer").get("build_cache").is_none());
+}

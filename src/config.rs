@@ -569,6 +569,14 @@ pub struct WorktreeConfig {
     /// (`.envrc`, a DB env file) is otherwise missing there. Absent files are skipped.
     #[serde(default = "default_worktree_copy")]
     pub copy: Vec<String>,
+    /// Shared build directories an implementer leases one of per dispatch (O143). `~/`
+    /// and one `{a..b}` range per entry are expanded. Empty: every worktree builds into
+    /// its own target.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub build_cache_pool: Vec<String>,
+    /// The variable a leased pool directory is handed to the implementer in.
+    #[serde(default = "default_build_cache_env")]
+    pub build_cache_env: String,
 }
 
 impl Default for WorktreeConfig {
@@ -576,8 +584,14 @@ impl Default for WorktreeConfig {
         Self {
             auto_cleanup_merged: true,
             copy: default_worktree_copy(),
+            build_cache_pool: Vec::new(),
+            build_cache_env: default_build_cache_env(),
         }
     }
+}
+
+fn default_build_cache_env() -> String {
+    "CARGO_TARGET_DIR".into()
 }
 
 fn default_worktree_copy() -> Vec<String> {
@@ -1117,6 +1131,8 @@ struct ConfigFile {
 struct WorktreeConfigFile {
     auto_cleanup_merged: Option<bool>,
     copy: Option<Vec<String>>,
+    build_cache_pool: Option<Vec<String>>,
+    build_cache_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1668,6 +1684,22 @@ impl Config {
                     );
                 }
                 self.worktree.copy = v.clone();
+            }
+            if let Some(v) = &w.build_cache_pool {
+                self.worktree.build_cache_pool = v.clone();
+            }
+            if let Some(v) = &w.build_cache_env {
+                let ident = v
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                if !ident {
+                    anyhow::bail!(
+                        "[worktree].build_cache_env {v:?} must be an environment variable name"
+                    );
+                }
+                self.worktree.build_cache_env = v.clone();
             }
         }
         if let Some(p) = &file.providers {

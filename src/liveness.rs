@@ -240,6 +240,7 @@ mod tests {
             review: None,
             source: None,
             auth_fault: false,
+            build_cache: None,
         }
     }
 

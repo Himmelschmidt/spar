@@ -1,6 +1,7 @@
 mod api;
 mod backup;
 mod brief;
+mod buildpool;
 mod bus;
 mod checkpoint;
 mod cli;

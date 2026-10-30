@@ -164,6 +164,8 @@ struct PreparedSlot {
     _tmp: SlotTmp,
     /// This slot's fleet-wide claim on its account (O142); `None` without a shared path.
     _fleet_lease: Option<crate::fleet::SlotLease>,
+    /// The implementer's build-cache pool slot (O143), released when the dispatch ends.
+    _build_cache: Option<crate::buildpool::PoolLease>,
 }
 
 /// Refreshes a live slot's presence heartbeat while its child process runs, throttled
@@ -401,6 +403,8 @@ fn prepare_slot_execution(
     let tmp = SlotTmp::create(paths, &state.id, &job.slot_id, state.isolation);
     let mut env = wire_slot_presence(state, paths, &job, &cwd, &pref);
     env.extend(tmp.env());
+    let build_cache = lease_build_cache(state, paths, cfg, &job);
+    env.extend(build_cache.as_ref().map(|(_, kv)| kv.clone()));
     let owns_cwd = owns_cwd(state, &job.slot_id, &cwd);
     let session_provider = pref.cli_name().unwrap_or(job.provider.as_str()).to_string();
     let prior_session_id =
@@ -426,7 +430,59 @@ fn prepare_slot_execution(
         dry_run: state.dry_run,
         _tmp: tmp,
         _fleet_lease: fleet_lease,
+        _build_cache: build_cache.map(|(lease, _)| lease),
     })
+}
+
+/// Lease a build-cache pool directory for an implementer dispatch and record it on the
+/// slot (O143). Reviewers never get one: they build in their own checkout. An exhausted
+/// pool is warned about and the slot builds into its worktree's own target.
+fn lease_build_cache(
+    state: &mut RunState,
+    paths: &SparPaths,
+    cfg: &Config,
+    job: &SlotJob,
+) -> Option<(crate::buildpool::PoolLease, (String, String))> {
+    if job.role != SlotRole::Implementer || cfg.worktree.build_cache_pool.is_empty() {
+        return None;
+    }
+    let pool = crate::buildpool::expand(&cfg.worktree.build_cache_pool);
+    let prefer = state
+        .slots
+        .iter()
+        .find(|s| s.id == job.slot_id)
+        .and_then(|s| s.build_cache.clone());
+    let lease = crate::buildpool::acquire(
+        &pool,
+        prefer.as_deref(),
+        &state.id,
+        &job.slot_id,
+        &state.project_root,
+    );
+    let env = &cfg.worktree.build_cache_env;
+    let note = match &lease {
+        Some(l) => format!("build cache {env}={}", l.dir.display()),
+        None => {
+            let msg = format!(
+                "build cache pool exhausted (all {} leased); {} builds into its worktree's own target",
+                pool.len(),
+                job.slot_id
+            );
+            eprintln!("warning: {msg}");
+            msg
+        }
+    };
+    let _ = crate::events::append(
+        paths,
+        &state.id,
+        &crate::events::Event::slot_note(&job.slot_id, note),
+    );
+    if let Some(s) = state.slot_mut(&job.slot_id) {
+        s.build_cache = lease.as_ref().map(|l| l.dir.clone());
+    }
+    let lease = lease?;
+    let kv = (env.clone(), lease.dir.display().to_string());
+    Some((lease, kv))
 }
 
 /// Whether `cwd` is the slot's own recorded worktree.
@@ -2390,6 +2446,7 @@ pub fn run_slot(
         &crate::events::Event::slot(&job.slot_id, SlotStatus::Running),
     );
     let _ = crate::bus::heartbeat(paths, Some(&state.id), &job.slot_id, "running");
+    let build_cache = lease_build_cache(state, paths, cfg, job);
     state.save(paths)?;
 
     // The kill, not the budget: `timeouts.slot_secs` is soft since O50 and reaches the
@@ -2405,6 +2462,7 @@ pub fn run_slot(
 
     let mut presence_env = wire_slot_presence(state, paths, job, &cwd, &pref);
     presence_env.extend(tmp.env());
+    presence_env.extend(build_cache.as_ref().map(|(_, kv)| kv.clone()));
 
     // A backend `Err` (spawn/setup failure, not a completed dispatch) still writes a
     // log a rate-limit rejection could land in on some adapters, so it gets the same
@@ -4320,6 +4378,7 @@ pub fn init_slot_model(
         review: None,
         source: None,
         auth_fault: false,
+        build_cache: None,
     }
 }
 

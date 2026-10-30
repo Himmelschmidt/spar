@@ -483,6 +483,10 @@ pub struct SlotState {
     /// Reset at the start of every dispatch, like `quota_hit`.
     #[serde(default)]
     pub auth_fault: bool,
+    /// The build-cache pool directory this implementer leased (O143). Kept after the
+    /// dispatch ends so the next one prefers the same warm directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_cache: Option<PathBuf>,
 }
 
 impl SlotState {

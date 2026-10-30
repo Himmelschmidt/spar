@@ -1071,6 +1071,13 @@ pub fn reap_build_cache(state: &RunState, live: &LiveCwds) -> CacheReap {
                     .push(format!("{}: symlinked elsewhere", dir.display()));
                 continue;
             }
+            // A build-cache pool directory a live implementer holds (O143) is its build,
+            // in progress, whoever's worktree it sits in.
+            if crate::buildpool::is_leased(&dir) {
+                reap.skipped
+                    .push(format!("{}: leased build-cache pool slot", dir.display()));
+                continue;
+            }
             let bytes = dir_size(&dir);
             if std::fs::remove_dir_all(&dir).is_ok() {
                 reap.freed_bytes += bytes;
@@ -2466,6 +2473,49 @@ mod tests {
     /// A symlinked `target/` belongs to whatever the operator pointed it at. Removing it
     /// unlinks their setup and reports space that was never freed — `remove_dir_all` does
     /// not follow, so the real tree survives and the byte count would be a lie.
+    #[test]
+    fn reclaim_never_deletes_a_leased_pool_directory() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-spar-r1-impl");
+        let target = wt.join("target");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        std::fs::write(target.join("debug/x.rlib"), vec![0u8; 2048]).unwrap();
+        let mut state = RunState::new("r1", crate::cli::WorkflowKind::Loop, root);
+        state.worktrees.push(WorktreeRecord {
+            slot_id: "impl".into(),
+            path: wt.clone(),
+            branch: "spar/r1/impl".into(),
+        });
+
+        let lease = crate::buildpool::acquire(
+            std::slice::from_ref(&target),
+            None,
+            "r2",
+            "implementer",
+            &wt,
+        )
+        .unwrap();
+        let reap = reap_build_cache(&state, &LiveCwds(Vec::new()));
+        assert_eq!(reap.freed_bytes, 0);
+        assert!(
+            target.join("debug/x.rlib").is_file(),
+            "the leased build survives"
+        );
+        assert!(
+            reap.skipped.iter().any(|s| s.contains("leased")),
+            "{reap:?}"
+        );
+
+        drop(lease);
+        let reap = reap_build_cache(&state, &LiveCwds(Vec::new()));
+        assert!(
+            reap.freed_bytes > 0,
+            "released, it is ordinary build output again"
+        );
+    }
+
     #[test]
     fn reclaim_leaves_a_symlinked_cache_alone() {
         let tmp = tempdir().unwrap();
