@@ -326,6 +326,7 @@ spar run --workflow review -t "..." --providers cli:grok,cli:claude --base feat/
 spar confirm <run_id> [--winner <slot>]   # arena winner
 spar reconcile <run_id>                  # arena merge-good-parts + review
 spar ship <run_id> --confirm [--base <branch>]   # draft PR (never merges); adopts an open one
+spar ship <run_id> --override-gate --reason "…"  # ship over open findings (stuck/failed/quota/ceiling)
 spar sync-prs --run <id> | --all [--json] [--dry-run]   # merged PR -> done, closed -> stopped
 spar stop <run_id> [--json]              # halt dispatch, KEEP branch+worktree (resumable)
 spar stop --abandoned [--json]           # reap every run nobody is driving any more
@@ -639,6 +640,16 @@ phase the run moved to (or would, under `--dry-run`), `null` when left alone. `g
 is exit `1`; a per-run `gh` error is that row's `error` and makes the exit `1`.
 `[daemon] sync_prs = true` runs the same `--all` pass from the daemon, at most every five
 minutes, silently skipping when `gh` is missing or failing.
+
+**`spar ship <id> --override-gate --reason "<text>"` (O124)** ships a run whose gate never
+cleared: from `awaiting_round_extension`, `stuck`, `failed`, `quota`, or any ship, winner or
+reconcile gate. `--reason` is required (exit `1` without it) and it refuses while the run's
+orchestrator is alive (`spar stop` it first). It ships the same HEAD with the same push
+safety as a normal ship. Every finding of the last reviewed round, from the structured
+review records (severity, `file:line`, reviewer slot, round, `Reviewed-Commit`), goes in
+the PR body under **Shipped over open findings**, ahead of the summary. The override (who
+from `$USER` and `SPAR_AGENT_ID`, when, reason, the findings) is written to
+`artifacts/ship.md` under `## Gate override` and logged as an `info` event.
 
 ## Abandoned runs
 

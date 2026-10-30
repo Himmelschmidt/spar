@@ -1,5 +1,5 @@
 //! Ship against a fake `gh` on PATH and a bare-repo origin: adopting an existing PR
-//! (#164), `[ship] draft` and `sync-prs`.
+//! (#164), `[ship] draft`, `sync-prs` and `--override-gate` (#166).
 use assert_cmd::cargo::cargo_bin_cmd;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -477,4 +477,117 @@ fn daemon_tick_syncs_prs_when_enabled() {
     let _ = child.wait();
     assert_eq!(fx.state()["phase"], "done");
     assert_eq!(fx.state()["merge_commit"], "abc123");
+}
+
+fn stuck_with_findings(fx: &Fixture) {
+    fx.edit_state(|v| {
+        v["phase"] = Value::String("awaiting_round_extension".into());
+        v["review_history"] = serde_json::json!([
+            {"round": 3, "slot_id": "review-0-cli-grok", "review": {
+                "verdict": "request_changes",
+                "reviewed_commit": "0123456789abcdef0123456789abcdef01234567",
+                "findings": [
+                    {"severity": "major", "file": "src/lib.rs", "line": 42, "text": "unchecked unwrap"},
+                    {"severity": "minor", "text": "naming"}
+                ]
+            }}
+        ]);
+    });
+}
+
+/// #166 under `--dry-run`: a run at the round ceiling ships with every open finding in
+/// the PR body and the override recorded in ship.md and as an event.
+#[test]
+fn override_gate_ships_from_round_extension_with_findings() {
+    let fx = Fixture::new("");
+    stuck_with_findings(&fx);
+    fx.cmd()
+        .env("USER", "operator-x")
+        .args([
+            "ship",
+            &fx.run_id,
+            "--override-gate",
+            "--reason",
+            "ceiling hit, remaining findings are follow-ups",
+            "--json",
+        ])
+        .assert()
+        .success();
+    assert_eq!(fx.state()["phase"], "done");
+
+    let ship = fx.artifact("ship.md");
+    assert!(
+        ship.contains("## Gate override\n\nBy: operator-x\n"),
+        "{ship}"
+    );
+    assert!(
+        ship.contains("Reason: ceiling hit, remaining findings are follow-ups"),
+        "{ship}"
+    );
+    let body = &ship[ship.find("## PR body").unwrap()..];
+    let section = body.find("## Shipped over open findings").expect(body);
+    assert!(section < body.find("## Implementer summary").unwrap());
+    assert!(
+        body.contains(
+            "- **major** `src/lib.rs:42`: unchecked unwrap (review-0-cli-grok, round 3, Reviewed-Commit `0123456789ab`)"
+        ),
+        "{body}"
+    );
+    assert!(
+        body.contains("- **minor**: naming (review-0-cli-grok"),
+        "{body}"
+    );
+
+    let events = std::fs::read_to_string(
+        fx.root
+            .join(".spar/runs")
+            .join(&fx.run_id)
+            .join("events.jsonl"),
+    )
+    .unwrap();
+    assert!(
+        events.contains("ship gate overridden by operator-x from AwaitingRoundExtension"),
+        "{events}"
+    );
+}
+
+#[test]
+fn override_gate_ships_from_stuck_failed_and_quota() {
+    for phase in ["stuck", "failed", "quota"] {
+        let fx = Fixture::new("");
+        fx.edit_state(|v| v["phase"] = Value::String(phase.into()));
+        fx.cmd()
+            .args(["ship", &fx.run_id, "--override-gate", "--reason", "why"])
+            .assert()
+            .success();
+        assert_eq!(fx.state()["phase"], "done", "{phase}");
+    }
+}
+
+#[test]
+fn override_gate_requires_a_reason_and_a_settled_phase() {
+    let fx = Fixture::new("");
+    stuck_with_findings(&fx);
+    let out = fx
+        .cmd()
+        .args(["ship", &fx.run_id, "--override-gate"])
+        .assert()
+        .code(1);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(stderr.contains("--reason"), "{stderr}");
+    fx.cmd()
+        .args(["ship", &fx.run_id, "--reason", "x"])
+        .assert()
+        .code(1);
+    assert_eq!(fx.state()["phase"], "awaiting_round_extension");
+
+    // Without the override, the round-extension gate does not ship.
+    fx.cmd().args(["ship", &fx.run_id]).assert().code(1);
+
+    fx.edit_state(|v| v["phase"] = Value::String("dispatch".into()));
+    fx.cmd()
+        .args(["ship", &fx.run_id, "--override-gate", "--reason", "x"])
+        .assert()
+        .code(1);
+    assert_eq!(fx.state()["phase"], "dispatch");
 }

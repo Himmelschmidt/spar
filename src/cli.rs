@@ -418,6 +418,14 @@ pub enum Command {
         /// Only record confirmation without pushing
         #[arg(long)]
         confirm_only: bool,
+        /// Ship the implementer HEAD from a gate the review never cleared (round
+        /// extension, stuck, failed, quota or any ship gate). Needs `--reason`; every open
+        /// finding goes in the PR body and the override is recorded in `artifacts/ship.md`.
+        #[arg(long)]
+        override_gate: bool,
+        /// Why the gate is being overridden. Required with `--override-gate`.
+        #[arg(long)]
+        reason: Option<String>,
     },
 
     /// Settle shipped runs from GitHub: a merged PR moves its run to `done`, a closed

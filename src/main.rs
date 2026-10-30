@@ -430,16 +430,32 @@ fn run() -> Result<ExitCode> {
             base,
             confirm,
             confirm_only,
+            override_gate,
+            reason,
         } => {
             let (paths, _) = project_ctx()?;
             let cfg = Config::for_run(&paths, &run_id)?;
+            if override_gate {
+                if reason.is_none() {
+                    anyhow::bail!("--override-gate needs --reason \"<why>\"");
+                }
+                if confirm || confirm_only {
+                    anyhow::bail!("--override-gate ships without --confirm / --confirm-only");
+                }
+            } else if reason.is_some() {
+                anyhow::bail!("--reason only applies with --override-gate");
+            }
             if confirm || confirm_only {
                 ship::confirm_ship(&paths, &run_id, json)?;
                 if confirm_only {
                     return Ok(ExitCode::Success);
                 }
             }
-            ship::ship(&paths, &cfg, &run_id, json, base.as_deref())
+            let opts = ship::ShipOpts {
+                base: base.as_deref(),
+                override_reason: reason.as_deref(),
+            };
+            ship::ship(&paths, &cfg, &run_id, json, &opts)
         }
         Command::SyncPrs {
             run,
