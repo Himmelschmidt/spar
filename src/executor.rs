@@ -2580,12 +2580,19 @@ fn detect_and_pause_quota(
 /// mutation dropping `quota_resets_at` between the outcome and the call — the exact
 /// class of regression review rounds kept finding here — now has to happen inside this
 /// one tested function instead of silently at either caller.
+///
+/// A dispatch that ended by signal is never a quota hit and never touches the store: a
+/// guard, a ceiling or the operator killed it, and a log that happens to mention
+/// "quota" or "429" must not pause the provider for every run in the project (#174).
 fn quota_hit_for_outcome(
     paths: &SparPaths,
     provider: &str,
     log_path: &Path,
     outcome: &SlotOutcome,
 ) -> bool {
+    if process::ended_by_signal(outcome.signal, outcome.exit_code) {
+        return false;
+    }
     let log_text = process::tail_log(log_path, 8000);
     detect_and_pause_quota(
         paths,
@@ -6119,6 +6126,65 @@ mod tests {
             &log_path,
             &outcome
         ));
+    }
+
+    /// #174: a slot killed by a signal (or by a wrapper reporting `128 + signo`) whose log
+    /// mentions quota, a 429, capacity, even a full rejection line, must not pause the
+    /// provider for the whole project nor route the run to quota.
+    #[test]
+    fn quota_hit_for_outcome_ignores_a_dispatch_that_ended_by_signal() {
+        let cases = [
+            (Some(15), None),
+            (Some(9), None),
+            (None, Some(143)),
+            (None, Some(137)),
+        ];
+        for (signal, exit_code) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let paths = SparPaths::new(tmp.path());
+            let log_path = tmp.path().join("s1.log");
+            std::fs::write(
+                &log_path,
+                format!("{WEEKLY_LIMIT_LOG}checking quota, got 429, capacity low\n"),
+            )
+            .unwrap();
+            let outcome = SlotOutcome {
+                signal,
+                exit_code,
+                ..SlotOutcome::err("killed")
+            };
+            assert!(
+                !quota_hit_for_outcome(&paths, "cli:claude", &log_path, &outcome),
+                "signal {signal:?} / exit {exit_code:?} must not be a quota hit"
+            );
+            let store = crate::quota::QuotaStore::load(&paths).unwrap_or_default();
+            assert!(
+                store.is_usable("cli:claude"),
+                "signal {signal:?} / exit {exit_code:?} must leave the provider unpaused"
+            );
+        }
+    }
+
+    /// The same log on an ordinary non-zero exit still routes and pauses: the signal
+    /// gate must not swallow a real rejection.
+    #[test]
+    fn quota_hit_for_outcome_still_pauses_on_an_ordinary_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log_path = tmp.path().join("s1.log");
+        std::fs::write(&log_path, WEEKLY_LIMIT_LOG).unwrap();
+        let outcome = SlotOutcome {
+            exit_code: Some(1),
+            ..SlotOutcome::err("exit 1")
+        };
+        assert!(quota_hit_for_outcome(
+            &paths,
+            "cli:claude",
+            &log_path,
+            &outcome
+        ));
+        let store = crate::quota::QuotaStore::load(&paths).unwrap_or_default();
+        assert!(!store.is_usable("cli:claude"));
     }
 
     /// The AC-3 fix itself, at the level the bug actually reproduces: a stream that was

@@ -435,6 +435,13 @@ fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
     None
 }
 
+/// Whether a dispatch ended because something killed it rather than because it
+/// finished. Exit 143 and 137 count too: a CLI wrapper that traps SIGTERM/SIGKILL and
+/// exits `128 + signo` reports the kill as an exit code, not as a signal.
+pub fn ended_by_signal(signal: Option<i32>, exit_code: Option<i32>) -> bool {
+    signal.is_some() || matches!(exit_code, Some(137 | 143))
+}
+
 /// Spawn process; stream structured events into a human log + live stats file.
 /// `on_spawn` fires with the child pid the moment spawn succeeds, before the wait
 /// loop, so callers can record a live pid. `on_tick` fires on every wait-poll

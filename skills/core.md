@@ -66,7 +66,8 @@ agy's `--print-timeout` is also derived from the role's hard ceiling, so a long
 agy slot runs its full budget instead of dying at agy's 30-minute default.
 
 **Pause / cooldown.** A provider is paused manually (`spar provider pause <ref>`) or
-automatically when a slot hits a rate-limit signal. Pauses **auto-recover** ~30 min after
+automatically when a slot hits a rate-limit signal. A slot that was killed (signal, or exit
+143/137) never pauses its provider, whatever its log says. Pauses **auto-recover** ~30 min after
 they were set (or at an explicit cooldown reset), so the provider is re-probed rather than
 staying dead; `spar provider resume <ref>` clears one immediately. A paused provider is
 never silently swapped into another role: `plan`/`implement` exit `4` (quota) naming the
