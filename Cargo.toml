@@ -164,6 +164,10 @@ name = "reviewed_commit"
 path = "tests/scenarios/reviewed_commit.rs"
 
 [[test]]
+name = "provider_health"
+path = "tests/scenarios/provider_health.rs"
+
+[[test]]
 name = "pi_dispatch"
 path = "tests/scenarios/pi_dispatch.rs"
 
