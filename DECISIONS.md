@@ -28,7 +28,7 @@ Project-level product and architecture decisions. Status: `OPEN` | `LEANING` | `
 | O7 | Roles + peer are **v1 first-class** | DECIDED |
 | O8 | Plan: multi-provider + critic; **structured/big** for large features | DECIDED |
 | O9 | Gates **configurable**; lean high autonomy | DECIDED |
-| O10 | Ship: **draft PR**, never merge; force-with-lease only swarm branches | DECIDED |
+| O10 | Ship: **draft PR**, never merge; force-with-lease only swarm branches. Ship **never rewinds a remote branch**: it pushes the worktree's HEAD, fetches the remote tip first, refuses when that tip is not contained in HEAD, and leases on the tip it saw (a bare lease only checks the tracking ref, which any fetch moves). A worktree left on another branch ships its HEAD only when HEAD contains the run's branch | DECIDED |
 | O11 | Stream **everything** (logs/events) | DECIDED |
 | O12 | Headless default; tmux **namespaced opt-in only** | DECIDED |
 | O13 | Quota: **best-effort auto** + manual; Claude rate_limits-shaped signals | DECIDED |

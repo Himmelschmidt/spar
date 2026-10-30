@@ -260,11 +260,19 @@ fn detach_refuses_when_a_live_orchestrator_already_owns_the_run() {
         .assert()
         .code(0);
 
-    // Fabricate a live-looking owner: our own pid, so `alive()` reads true.
+    // A live owner, as a real orchestrator holds it: the flock plus our own pid.
     let lock_path = proj
         .join(".spar/runs")
         .join(&run_id)
         .join("orchestrator.lock");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    held.try_lock().unwrap();
     std::fs::write(&lock_path, std::process::id().to_string()).unwrap();
 
     spar_cmd()

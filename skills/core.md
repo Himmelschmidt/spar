@@ -249,6 +249,9 @@ touching `spar.toml`; see "Fleet shaping" below.
 `spar plan -t` is `--workflow plan`. `spar implement -t` is `--workflow loop`: a fresh brief
 straight into build/review with **no** planner, critic or test-contract, which is the cheap
 middle setting between `--workflow review` and the full `plan → approve → implement` path.
+`loop` builds a change against a fixed base; it is not for chasing a moving one. A run cannot be
+re-based after creation (O26), so "make PR #N mergeable" runs re-merge main every round and do not
+converge. Resolve conflicts by hand, or cap such a run at `--max-rounds 1 --fleet small`.
 `spar reconcile <id>` is an arena continuation, not a workflow: it adds a `reconciler` plus
 two more `reviewer` slots on the reconciled tree.
 
@@ -288,6 +291,10 @@ spar plan --run <run_id> -t "narrow it to the email path" [--json]
 # Named workflows
 spar run --workflow plan|loop|arena|roles|peer|review -t "..." --providers cli:claude,cli:grok [--dry-run] [--big]
 spar run --workflow arena -t "..." --select best --urgency normal --dry-run
+
+# An empty or whitespace-only task exits 1 before any run id is minted: `-t ""` and an
+# empty --brief with `error: task is empty`, an empty --spec with `brief body is empty`.
+# `plan --run <id>` with an empty directive exits 1 with `replan directive is empty`.
 
 # Independent concurrent multi-provider review (not split-stack peer):
 spar run --workflow review -t "Review PR #12 for auth bugs" --providers cli:claude,cli:grok
@@ -559,6 +566,19 @@ unpushed branch falls through to the repo default, with a note on stderr. `spar 
 --base <branch>` forces a target. The chosen target is recorded in `artifacts/ship.md`
 (`PR base:`), on the dry-run path too.
 
+`spar ship` pushes the slot worktree's **HEAD** to `spar/<id>/<slot>`, never the branch by
+name, and **never rewinds the remote branch**. Before pushing it fetches the remote branch;
+if the remote has commits HEAD lacks (someone pushed by hand), ship exits `1` with "remote
+<branch> has commits the run lacks": fast-forward the worktree onto `origin/<branch>` by hand
+and ship again. The push is leased on the exact tip it fetched, so a push landing in between
+also fails. If the worktree was left on another branch (a reviewer's, or detached), ship
+pushes HEAD when HEAD contains the run's branch and that branch has moved past the run's
+base (note on stderr), and refuses otherwise. A refusal exits `1`, leaves the phase at
+`awaiting_ship_confirm`, and records the reason in the run's `error`. The loop workflow also
+fast-forwards the implementer's branch back onto HEAD before each review panel when a slot
+left the worktree elsewhere, and only warns (stderr + event log) when that is not a
+fast-forward, the branch is still at the base, or it is checked out in another worktree.
+
 ## Abandoned runs
 
 A run is **abandoned** when it is still in a non-resting phase but no live orchestrator
@@ -582,6 +602,10 @@ children — so they keep running and keep spending tokens with nobody collectin
 - `spar resume <id>` picks an abandoned or stopped run back up without you having to know
   which of `implement --run` / a fresh dispatch applies — it refuses a human gate (naming
   the command that resolves it) and a run with a live orchestrator (naming its pid).
+  `implement --run <id>` (with or without `--detach` / `--reload-config`) refuses the same
+  way, exit 1, before it writes anything to the live run's `state.json`.
+- A foreground `spar plan` holds the run lock for its whole dispatch, so it never reads
+  abandoned while its planner works.
 - `spar daemon start` runs a per-project supervisor that pushes an alert the first time a
   run has read abandoned past `[daemon].abandon_after_secs` (60s by default), and restarts
   it if `[daemon].restart` is on (the default). It is opt-in — nothing starts it for you —
@@ -831,7 +855,7 @@ event/presence mirror live under `.spar/runs/<id>/bus/`.
 ## Observe
 
 ```bash
-spar status [run_id] [--json] [--all]   # --all = every registered project
+spar status [run_id] [--json] [--all]   # --all = every registered project; a run with a live orchestrator shows `pid=<n>`
 spar wait <run_id> [--timeout 8h] [--follow] [--json]
 spar logs <run_id> [slot] [-f|--follow]
 
