@@ -94,6 +94,13 @@ pub struct ProviderQuota {
     /// never start blocking a provider when this ships. Absence is the rule; no backfill.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sticky: bool,
+    /// Set when the pause came from a rejection spar can trust: an adapter's typed
+    /// verdict or a line-scoped strong signal (`mark_strong`). A pause written only by
+    /// `scrape_log_hint`'s broad needles ("429" in "429 passed") is weak: it still
+    /// steers the next run's seat choice, but never parks or reseats a live run
+    /// (O106). Legacy records read weak.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strong: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -130,6 +137,7 @@ impl QuotaStore {
             hint: None,
             updated_at: None,
             sticky: false,
+            strong: false,
         })
     }
 
@@ -190,6 +198,7 @@ impl QuotaStore {
                 hint: Some("manual pause".into()),
                 updated_at: Some(Utc::now()),
                 sticky: true,
+                strong: false,
             },
         );
     }
@@ -198,6 +207,7 @@ impl QuotaStore {
         if self.is_manually_paused(name) {
             return;
         }
+        let strong = self.is_quota_paused(name) && self.get(name).strong;
         self.providers.insert(
             name.into(),
             ProviderQuota {
@@ -207,6 +217,7 @@ impl QuotaStore {
                 hint: Some(hint.into()),
                 updated_at: Some(Utc::now()),
                 sticky: false,
+                strong,
             },
         );
     }
@@ -220,6 +231,7 @@ impl QuotaStore {
         if self.is_manually_paused(name) {
             return;
         }
+        let strong = self.is_quota_paused(name) && self.get(name).strong;
         self.providers.insert(
             name.into(),
             ProviderQuota {
@@ -233,8 +245,30 @@ impl QuotaStore {
                 hint: Some(hint.into()),
                 updated_at: Some(Utc::now()),
                 sticky: false,
+                strong,
             },
         );
+    }
+
+    /// Upgrade a live quota pause to strong: the rejection behind it was typed or a
+    /// line-scoped strong signal, not a broad needle.
+    pub fn mark_strong(&mut self, name: &str) {
+        if !self.is_quota_paused(name) {
+            return;
+        }
+        if let Some(q) = self.providers.get_mut(name) {
+            q.strong = true;
+        }
+    }
+
+    /// Whether a pause should stop a live run's next dispatch (O106): a manual pause,
+    /// or a quota pause from a trusted rejection. A weak, heuristic quota pause does not.
+    pub fn blocks_live_dispatch(&self, name: &str) -> bool {
+        if self.is_usable(name) {
+            return false;
+        }
+        let q = self.get(name);
+        q.status == ProviderStatus::PausedManual || q.strong
     }
 
     pub fn resume(&mut self, name: &str) {
@@ -247,6 +281,7 @@ impl QuotaStore {
                 hint: None,
                 updated_at: Some(Utc::now()),
                 sticky: false,
+                strong: false,
             },
         );
     }
@@ -763,6 +798,41 @@ mod tests {
     /// The primary checkout's real record: `cli:claude` paused by hand 1171 hours ago,
     /// before `sticky` existed. It was written expecting the 30-minute lapse, so it must
     /// keep lapsing rather than start blocking claude the day this ships.
+    #[test]
+    fn only_manual_and_strong_pauses_block_a_live_dispatch() {
+        let mut store = QuotaStore::default();
+        store.pause_quota("cli:codex", "possible quota signal: 429");
+        assert!(
+            !store.is_usable("cli:codex"),
+            "a weak pause still steers new runs"
+        );
+        assert!(!store.blocks_live_dispatch("cli:codex"));
+
+        store.mark_strong("cli:codex");
+        assert!(store.blocks_live_dispatch("cli:codex"));
+        store.pause_quota("cli:codex", "possible quota signal: quota");
+        assert!(
+            store.get("cli:codex").strong,
+            "a later broad scrape does not downgrade a live strong pause"
+        );
+
+        store.pause_manual("cli:grok", None);
+        assert!(store.blocks_live_dispatch("cli:grok"));
+
+        store.mark_strong("cli:claude");
+        assert!(!store.blocks_live_dispatch("cli:claude"), "nothing to mark");
+
+        let legacy: QuotaStore = serde_json::from_str(&format!(
+            r#"{{"providers":{{"cli:muse":{{"name":"cli:muse","status":"paused_quota","updated_at":"{}"}}}}}}"#,
+            Utc::now().to_rfc3339()
+        ))
+        .unwrap();
+        assert!(
+            !legacy.blocks_live_dispatch("cli:muse"),
+            "legacy records read weak"
+        );
+    }
+
     #[test]
     fn a_legacy_manual_pause_without_sticky_keeps_the_old_lapse() {
         let legacy: QuotaStore = serde_json::from_str(

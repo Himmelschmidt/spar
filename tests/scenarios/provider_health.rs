@@ -725,3 +725,70 @@ fn a_reviewer_whose_backup_also_cannot_run_parks_on_quota_with_no_verdict() {
         fx.quota()
     );
 }
+
+/// Review finding: the broad scrape pauses a provider on any "429" in a failed log, and
+/// the per-dispatch re-check then parked or reseated the very run that wrote it. A
+/// tester whose failing output says "429 passed" must leave the run and its seats alone.
+#[test]
+fn a_tester_log_saying_429_passed_neither_parks_the_run_nor_moves_a_seat() {
+    let fx = Fixture::new();
+    fx.cli("claude", &counted("claude", WRITE_ARTIFACT));
+    fx.cli(
+        "codex",
+        &counted(
+            "codex",
+            &format!(
+                "case \"${{SPAR_AGENT_ID#*:}}\" in review-*) ;; *) echo 'test result: ok. 429 passed; 1 failed' ; exit 1;; esac\n{WRITE_ARTIFACT}"
+            ),
+        ),
+    );
+    fx.cli(
+        "grok",
+        &format!("echo x >> \"$FAKE_COUNT_DIR/grok.count\"\n{WRITE_ARTIFACT}"),
+    );
+    let out = fx
+        .spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--role",
+            "implementer=cli:claude",
+            "--role",
+            "tester=cli:codex",
+            "--role",
+            "reviewer=cli:codex",
+            "--backup",
+            "reviewer=cli:grok",
+        ])
+        .assert()
+        .get_output()
+        .clone();
+    assert_ne!(out.status.code(), Some(4), "{out:?}");
+    let state = fx.state();
+    assert_ne!(state["phase"], "quota", "{state}");
+    let quota = fx.quota();
+    assert_eq!(
+        quota["providers"]["cli:codex"]["status"], "paused_quota",
+        "the broad scrape did pause codex, weakly: {quota}"
+    );
+    assert!(quota["providers"]["cli:codex"].get("strong").is_none());
+    let rev = fx.slot("reviewer");
+    assert_eq!(rev["id"], "review-0-cli-codex", "{rev}");
+    assert_eq!(rev["provider"], "cli:codex");
+    for slot in state["slots"].as_array().unwrap() {
+        assert_ne!(slot["source"], "backup", "no seat was moved: {slot}");
+    }
+    let events = fs::read_to_string(
+        fx.proj
+            .join(".spar/runs")
+            .join(fx.run_id())
+            .join("events.jsonl"),
+    )
+    .unwrap();
+    assert!(!events.contains("moved to its backup"), "{events}");
+    assert!(
+        events.contains("\"slot\":\"review-0-cli-codex\",\"status\":\"done\""),
+        "the codex reviewer dispatched after the weak pause: {events}"
+    );
+}

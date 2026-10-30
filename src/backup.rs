@@ -133,13 +133,27 @@ pub fn backup_eligible(
     if dry || !store.is_quota_paused(&key) {
         return false;
     }
-    let report = crate::probe::probe(paths, backup, false);
-    eprintln!(
-        "note: backup {key} was on a quota pause; probe says {:?} ({})",
-        report.verdict, report.store
-    );
+    if first_probe(&key) {
+        let report = crate::probe::probe(paths, backup, false);
+        eprintln!(
+            "note: backup {key} was on a quota pause; probe says {:?} ({})",
+            report.verdict, report.store
+        );
+    }
     let fresh = QuotaStore::load(paths).unwrap_or_default();
     is_provider_eligible(backup, &fresh, available)
+}
+
+static PROBED_BACKUPS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// True the first time this process asks to probe `key`: N seats sharing one quota-paused
+/// backup cost one probe, not N. Later askers re-read the store the probe wrote.
+fn first_probe(key: &str) -> bool {
+    PROBED_BACKUPS
+        .lock()
+        .map(|mut set| set.insert(key.to_string()))
+        .unwrap_or(false)
 }
 
 #[allow(dead_code)]
@@ -617,6 +631,14 @@ mod tests {
         assert!(StopCause::Environmental.engages_backup());
         assert!(!StopCause::Work.engages_backup());
         assert!(slot.parks_on_quota());
+    }
+
+    #[test]
+    fn a_backup_is_probed_at_most_once_per_process() {
+        assert!(first_probe("cli:memo-test"));
+        assert!(!first_probe("cli:memo-test"));
+        assert!(!first_probe("cli:memo-test"));
+        assert!(first_probe("cli:memo-test-other"));
     }
 
     #[test]

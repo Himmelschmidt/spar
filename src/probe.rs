@@ -87,6 +87,7 @@ fn apply(
         Verdict::Quota => {
             let hint = format!("probe: {}", detail.unwrap_or("limit rejected"));
             store.pause_quota_until(key, until, hint);
+            store.mark_strong(key);
             StoreChange {
                 written: true,
                 what: match until {

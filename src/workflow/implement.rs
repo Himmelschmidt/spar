@@ -2577,7 +2577,7 @@ pub fn execute_loop(
                     // verdict is recorded and no fix round is spent (O103).
                     drop_salvaged_verdict(paths, &state.id, &rev.id);
                     let msg = format!(
-                        "review slot `{}` could not run on {}: {reason}. provider marked unhealthy; no verdict recorded",
+                        "review slot `{}` could not run on {}: {reason}. the provider could not serve this reviewer; no verdict recorded",
                         rev.id, rev.provider
                     );
                     eprintln!("error: {msg}");
@@ -2923,10 +2923,12 @@ fn recheck_seat(
         return Ok(SeatCheck::Ready(slot_id.to_string()));
     }
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-    if crate::backup::is_provider_eligible(&slot.provider, &store, None) {
+    let key = crate::quota::normalize_key(&slot.provider);
+    // Only a pause a live run can trust stops it here: a weak heuristic pause ("429"
+    // in "429 passed") written by this very run must not park it or reseat it (O106).
+    if !store.blocks_live_dispatch(&key) {
         return Ok(SeatCheck::Ready(slot_id.to_string()));
     }
-    let key = crate::quota::normalize_key(&slot.provider);
     let ordinal = match slot.role {
         SlotRole::Reviewer => reviewer_ordinal(slot_id),
         _ => Some(0),
@@ -3387,6 +3389,32 @@ mod recheck_seat_tests {
             "a paused backup is no way out"
         );
         assert_eq!(st.slots[0].provider, "cli:claude");
+    }
+
+    /// The broad scrape paused codex because a test log said "429 passed". That pause is
+    /// weak: it must not park this run or move its seat.
+    #[test]
+    fn a_weak_heuristic_pause_never_moves_or_parks_a_live_seat() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut store = crate::quota::QuotaStore::default();
+        store.pause_quota("cli:codex", "possible quota signal: 429");
+        store.save(&paths).unwrap();
+        let mut st = state_with("review-0-cli-codex", "cli:codex", SlotRole::Reviewer);
+        let mut cfg = Config::default();
+        cfg.backups.reviewer = vec!["cli:grok".into()];
+        let got = recheck_seat(&mut st, &paths, &cfg, "review-0-cli-codex").unwrap();
+        assert!(matches!(got, SeatCheck::Ready(id) if id == "review-0-cli-codex"));
+        assert_eq!(st.slots[0].provider, "cli:codex");
+
+        let mut store = crate::quota::QuotaStore::load(&paths).unwrap();
+        store.mark_strong("cli:codex");
+        store.save(&paths).unwrap();
+        let got = recheck_seat(&mut st, &paths, &cfg, "review-0-cli-codex").unwrap();
+        assert!(
+            matches!(got, SeatCheck::Ready(id) if id == "review-0-cli-grok"),
+            "a strong pause still moves the seat"
+        );
     }
 
     #[test]

@@ -70,8 +70,8 @@ fault, a CLI that never started, or a native CLI that exited having run no tools
 codex unable to spawn `codex-code-mode-host`) is an infrastructure failure. spar retries
 that seat once on its declared `--backup` (renamed for the new vendor), else on the next
 eligible panel candidate. If that also cannot run, the run parks at `quota` (exit `4`)
-with `review slot ... could not run on <provider>: <reason>. provider marked unhealthy;
-no verdict recorded`, no fix round is spent, and the `request_changes` stub spar used to
+with `review slot ... could not run on <provider>: <reason>. the provider could not
+serve this reviewer; no verdict recorded`, no fix round is spent, and the `request_changes` stub spar used to
 salvage for it is removed. A reviewer that ran (tools > 0) and still produced no review
 keeps the old fail-closed `request_changes`.
 
@@ -89,8 +89,10 @@ skips it (O106): a stale pause no longer benches a working backup. A manually pa
 backup is never probed, and `--dry-run` runs never probe. Pause state is re-read before
 every implementer and reviewer dispatch, not only at run start: pausing a provider while
 a run is live moves its next seat to the declared backup (a reviewer seat is renamed for
-the new vendor) or parks the run at `quota` (exit `4`) when there is none. Like the
-run-start gate, this is skipped under `--dry-run`.
+the new vendor) or parks the run at `quota` (exit `4`) when there is none. Only a manual
+pause or a trusted quota pause (a typed or clear rejection line) does this; a heuristic
+pause from a stray "429" or "quota" in a failed log steers the next run but never parks
+or reseats a live one. Like the run-start gate, this is skipped under `--dry-run`.
 
 **Auth faults (O104).** A dispatch that dies on a refused credential (claude's `401 ...
 OAuth access token has been revoked` or `Please run /login`, codex `Not logged in`, muse

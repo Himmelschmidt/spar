@@ -212,18 +212,32 @@ pub trait ProviderAdapter: Send + Sync {
         let (available, path_str, version, readiness, readiness_message) = match path {
             Some(p) => {
                 let version = probe_version(&p, self.version_args());
-                let (mut readiness, mut readiness_message) = probe_readiness(
-                    &p,
-                    self.readiness_probe().as_deref(),
-                    self.readiness_env(),
-                    READINESS_TIMEOUT,
+                let probe = self.readiness_probe();
+                let cache_key = format!(
+                    "{}|{}|{:?}|{:?}",
+                    self.name(),
+                    p.display(),
+                    probe,
+                    self.readiness_env()
                 );
-                if readiness != Readiness::Unhealthy {
-                    if let Some(fault) = self.credential_fault() {
-                        readiness = Readiness::Unhealthy;
-                        readiness_message = Some(truncate_chars(&fault, READINESS_MESSAGE_CHARS));
+                let (readiness, readiness_message) = cached_readiness(cache_key, || {
+                    let (readiness, message) = probe_readiness(
+                        &p,
+                        probe.as_deref(),
+                        self.readiness_env(),
+                        READINESS_TIMEOUT,
+                    );
+                    if readiness == Readiness::Unhealthy {
+                        return (readiness, message);
                     }
-                }
+                    match self.credential_fault() {
+                        Some(fault) => (
+                            Readiness::Unhealthy,
+                            Some(truncate_chars(&fault, READINESS_MESSAGE_CHARS)),
+                        ),
+                        None => (readiness, message),
+                    }
+                });
                 (
                     true,
                     Some(p.display().to_string()),
@@ -389,6 +403,39 @@ pub trait ProviderAdapter: Send + Sync {
     fn hook_file_rel(&self) -> &'static str {
         ".claude/settings.json"
     }
+}
+
+/// How long a readiness verdict is reused within one process. `detect_all` runs on
+/// every run start, backup weighing and TUI roster refresh; without this each call
+/// re-spawns `claude auth status` and `codex login status` (O107).
+const READINESS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+type ReadinessEntry = (std::time::Instant, Readiness, Option<String>);
+
+static READINESS_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, ReadinessEntry>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// `compute`'s verdict for `key`, reused for `READINESS_CACHE_TTL`. The key carries the
+/// adapter, binary, argv and env, so a changed probe is never answered from cache.
+fn cached_readiness(
+    key: String,
+    compute: impl FnOnce() -> (Readiness, Option<String>),
+) -> (Readiness, Option<String>) {
+    if let Some((at, r, m)) = READINESS_CACHE
+        .lock()
+        .ok()
+        .and_then(|c| c.get(&key).cloned())
+    {
+        if at.elapsed() < READINESS_CACHE_TTL {
+            return (r, m);
+        }
+    }
+    let (r, m) = compute();
+    if let Ok(mut c) = READINESS_CACHE.lock() {
+        c.insert(key, (std::time::Instant::now(), r, m.clone()));
+    }
+    (r, m)
 }
 
 /// How long a readiness probe may run. Much longer than the 2s version bound:
@@ -973,6 +1020,20 @@ mod tests {
         assert_eq!(GrokAdapter.readiness_probe(), None);
         assert_eq!(AgyAdapter.readiness_probe(), None);
         assert_eq!(MuseAdapter.readiness_probe(), None);
+    }
+
+    #[test]
+    fn a_readiness_verdict_is_reused_within_the_ttl() {
+        let calls = std::cell::Cell::new(0);
+        let key = "test-adapter|/bin/sh|cache".to_string();
+        for _ in 0..3 {
+            let (r, _) = cached_readiness(key.clone(), || {
+                calls.set(calls.get() + 1);
+                (Readiness::Healthy, None)
+            });
+            assert_eq!(r, Readiness::Healthy);
+        }
+        assert_eq!(calls.get(), 1, "one spawn per TTL, not one per detect_all");
     }
 
     #[test]

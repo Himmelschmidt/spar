@@ -1919,6 +1919,7 @@ fn enrich_agy_stats(
                     .clone()
                     .unwrap_or_else(|| "agy quota exhausted".into()),
             );
+            store.mark_strong("cli:agy");
             let _ = store.save(paths);
             return true;
         }
@@ -2835,11 +2836,24 @@ fn detect_and_pause_quota(
                 }
             }
         }
+        mark_pause_strong(paths, &key);
         return true;
     }
     // `quota_recovered` was already handled above (before either scrape ran): reaching
     // here means it was false, or `structured` would have taken the branch above.
-    crate::quota::QuotaStore::scrape_strong_quota_signal(log_text).is_some()
+    let strong = crate::quota::QuotaStore::scrape_strong_quota_signal(log_text).is_some();
+    if strong {
+        mark_pause_strong(paths, &key);
+    }
+    strong
+}
+
+/// The pause just written stands on a typed or line-scoped rejection, so a live run
+/// may act on it (O106); the broad scrape's own pause stays weak.
+fn mark_pause_strong(paths: &SparPaths, key: &str) {
+    let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+    store.mark_strong(key);
+    let _ = store.save(paths);
 }
 
 /// The glue between a finished `SlotOutcome` and [`detect_and_pause_quota`], shared by
@@ -5757,6 +5771,39 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             "{:?}",
             store.get("cli:claude")
         );
+    }
+
+    /// A passing test count with a 429 in it is a broad-needle pause: weak. A real
+    /// rejection line marks the pause strong, which is what a live run acts on (O106).
+    #[test]
+    fn only_a_trusted_rejection_writes_a_strong_pause() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        assert!(!detect_and_pause_quota(
+            &paths,
+            "cli:codex",
+            "test result: ok. 429 passed; 0 failed\nerror: lint failed\n",
+            None,
+            None,
+            false
+        ));
+        let store = crate::quota::QuotaStore::load(&paths).unwrap();
+        assert!(
+            !store.is_usable("cli:codex"),
+            "the broad scrape still pauses"
+        );
+        assert!(!store.blocks_live_dispatch("cli:codex"));
+
+        assert!(detect_and_pause_quota(
+            &paths,
+            "cli:codex",
+            "You've hit your usage limit. Try again later.\n",
+            None,
+            None,
+            false
+        ));
+        let store = crate::quota::QuotaStore::load(&paths).unwrap();
+        assert!(store.blocks_live_dispatch("cli:codex"));
     }
 
     #[test]
