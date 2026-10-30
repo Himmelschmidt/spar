@@ -635,8 +635,8 @@ name, and **never rewinds the remote branch**. Before pushing it fetches the rem
 if the remote has commits HEAD lacks (someone pushed by hand), ship exits `1` with "remote
 <branch> has commits the run lacks". `spar ship <id> --adopt-remote` fast-forwards the
 worktree onto `origin/<branch>` and ships (O125); it refuses (exit `1`, nothing moved) when the
-worktree has uncommitted changes to tracked files or the remote is not a fast-forward of
-HEAD (the run has commits of its own on top), which is yours to reconcile by hand. The push is leased on the exact tip it fetched, so a push landing in between
+worktree has uncommitted changes to tracked files, is not on the run branch, or the remote
+is not a fast-forward of HEAD (the run has commits of its own on top), which is yours to reconcile by hand. The push is leased on the exact tip it fetched, so a push landing in between
 also fails. If the worktree was left on another branch (a reviewer's, or detached), ship
 pushes HEAD when HEAD contains the run's branch and that branch has moved past the run's
 base (note on stderr), and refuses otherwise. A refusal exits `1`, leaves the phase at
@@ -646,32 +646,42 @@ left the worktree elsewhere, and only warns (stderr + event log) when that is no
 fast-forward, the branch is still at the base, or it is checked out in another worktree.
 
 **An open PR is adopted, not re-created (O122).** After the push, ship asks
-`gh pr list --head <branch> --state open`. If a PR exists (an implementer opened it, or an
-earlier ship got that far), ship records its URL as `pr_url`, replaces its body with the
-run's, and the run goes to `done`; a body that fails to update is a warning, not a failure.
+`gh pr list --head <branch> --state open`. If a PR from this repo (not a fork) against the
+PR base exists (an implementer opened it, or an earlier ship got that far), ship records its
+URL as `pr_url`, replaces its body with the run's, and the run goes to `done`. It warns on
+stderr when the body it replaces is not the one spar last wrote (an edit by hand is lost);
+a body that fails to update is a warning, not a failure.
 Otherwise it runs `gh pr create`. New PRs open as drafts; `[ship] draft = false` opens them
 ready for review. An adopted PR keeps its own draft state.
 
-**`spar sync-prs --run <id> | --all [--json] [--dry-run]` (O123)** reads each shipped run's PR
-(its `pr_url`, else the newest PR for its branch) through `gh`. Merged: the run goes to
-`done` with `merged_at` and `merge_commit` recorded. Closed unmerged: `stopped`, with
-`pr_state: "CLOSED"`. Open, or no PR: left alone. A run is shipped when it has a `pr_url` or
-ship got as far as its commands; dry runs and runs with a live orchestrator are skipped.
-`--all` does not re-ask about a run it already settled. `--json` prints
+**`spar sync-prs --run <id> | --all [--json] [--dry-run]` (O123)** settles a run that pushed
+in its **current round** (`shipped_round`, `shipped_head`) and sits at `done` or
+`awaiting_ship_confirm`; anything else is left alone, as are dry runs and runs with a live
+orchestrator. A new round or a replan clears the old round's PR fields. The PR is the run's
+`pr_url`, else the newest same-repo PR for its branch against the shipped base, and in both
+cases only a PR whose head is the shipped commit (or contains it) counts. Merged: the run
+goes to `done` with `merged_at` and `merge_commit` recorded, plus a history row carrying
+both. Closed unmerged: `stopped`, with `pr_state: "CLOSED"`. Open, or no matching PR: left
+alone. `--all` does not re-ask about a run already merged, and a `gh` rate limit ends the
+pass. Operator-only: refused when `SPAR_AGENT_ID` or `SPAR_RUN_ID` is set.
+`cleanup --if-merged` counts a recorded merge of the shipped head as landed. `--json` prints
 `{"dry_run", "runs": [{run_id, phase, to, pr_url, pr_state, note, error}]}`; `to` is the
 phase the run moved to (or would, under `--dry-run`), `null` when left alone. `gh` missing
 is exit `1`; a per-run `gh` error is that row's `error` and makes the exit `1`.
 `[daemon] sync_prs = true` runs the same `--all` pass from the daemon, at most every five
-minutes, silently skipping when `gh` is missing or failing.
+minutes; each distinct error (`gh` missing, auth, rate limit) goes to stderr and the daemon
+log once.
 
 **`spar ship <id> --override-gate --reason "<text>"` (O124)** ships a run whose gate never
 cleared: from `awaiting_round_extension`, `stuck`, `failed`, `quota`, or any ship, winner or
-reconcile gate. `--reason` is required (exit `1` without it) and it refuses while the run's
-orchestrator is alive (`spar stop` it first). It ships the same HEAD with the same push
+reconcile gate. `--reason` is required (exit `1` without it); it refuses while the run's
+orchestrator is alive (`spar stop` it first) and inside a slot (operator-only). A ship that
+fails after the override puts the run back in the phase it came from. The override is kept
+on the run (`ship_override`) for the round, so a later re-ship keeps the findings section. It ships the same HEAD with the same push
 safety as a normal ship. Every finding of the last reviewed round, from the structured
 review records (severity, `file:line`, reviewer slot, round, `Reviewed-Commit`), goes in
 the PR body under **Shipped over open findings**, ahead of the summary. The override (who
-from `$USER` and `SPAR_AGENT_ID`, when, reason, the findings) is written to
+from `$USER`, when, reason, the findings) is written to
 `artifacts/ship.md` under `## Gate override` and logged as an `info` event.
 
 ## Checkpoints: the implementer's work survives its worktree

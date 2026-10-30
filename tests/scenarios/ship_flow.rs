@@ -50,8 +50,12 @@ echo "$*" >> "$FAKE_GH_LOG"
 case "$1 $2" in
   "--version "*) echo "gh version 0.0.0-fake" ;;
   "pr list") printf '%s' "${FAKE_GH_LIST:-[]}" ;;
-  "pr view") printf '%s' "$FAKE_GH_VIEW" ;;
-  "pr create") echo "https://github.com/o/r/pull/7" ;;
+  "pr view")
+    if [ -n "$FAKE_GH_VIEW_FAIL" ]; then echo "$FAKE_GH_VIEW_FAIL" >&2; exit 1; fi
+    printf '%s' "$FAKE_GH_VIEW" ;;
+  "pr create")
+    if [ -n "$FAKE_GH_CREATE_FAIL" ]; then echo "create failed" >&2; exit 1; fi
+    echo "https://github.com/o/r/pull/7" ;;
   "pr edit") echo "https://github.com/o/r/pull/5" ;;
   *) echo "fake gh: unexpected $*" >&2; exit 1 ;;
 esac
@@ -219,10 +223,7 @@ fn ship_adopts_an_open_pr_instead_of_failing_at_create() {
     let fx = Fixture::new("");
     fx.real_worktree();
     fx.cmd()
-        .env(
-            "FAKE_GH_LIST",
-            r#"[{"number":5,"url":"https://github.com/o/r/pull/5","state":"OPEN","isDraft":true}]"#,
-        )
+        .env("FAKE_GH_LIST", open_pr_list("implementer wrote this"))
         .args(["ship", &fx.run_id, "--confirm", "--json"])
         .assert()
         .success();
@@ -240,18 +241,61 @@ fn ship_adopts_an_open_pr_instead_of_failing_at_create() {
     );
     assert!(log.contains("pr edit 5 --body-file "), "{log}");
     assert!(!log.contains("pr create"), "{log}");
-    assert!(fx.artifact("ship.md").contains("adopted open PR #5"));
+    let ship_md = fx.artifact("ship.md");
+    assert!(ship_md.contains("adopted open PR #5"), "{ship_md}");
+    assert!(
+        ship_md.contains("body differs from what spar last wrote"),
+        "{ship_md}"
+    );
 
-    // A second ship of a done run adopts again rather than failing.
-    fx.cmd()
-        .env(
-            "FAKE_GH_LIST",
-            r#"[{"number":5,"url":"https://github.com/o/r/pull/5","state":"OPEN","isDraft":false}]"#,
-        )
+    // A second ship of a done run adopts again rather than failing, and a body that is
+    // still spar's own is replaced without a warning.
+    let ours = fx.artifact("pr-body.md");
+    let out = fx
+        .cmd()
+        .env("FAKE_GH_LIST", open_pr_list(&ours))
         .args(["ship", &fx.run_id, "--json"])
         .assert()
         .success();
     assert_eq!(fx.state()["phase"], "done");
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(!stderr.contains("body differs"), "{stderr}");
+}
+
+fn open_pr_list(body: &str) -> String {
+    serde_json::json!([{
+        "number": 5,
+        "url": "https://github.com/o/r/pull/5",
+        "state": "OPEN",
+        "isDraft": true,
+        "baseRefName": "main",
+        "isCrossRepository": false,
+        "body": body,
+    }])
+    .to_string()
+}
+
+/// A fork's PR on the same branch name, or one targeting another base, is not adopted.
+#[test]
+fn ship_does_not_adopt_a_fork_or_another_bases_pr() {
+    let fx = Fixture::new("");
+    fx.real_worktree();
+    let list = serde_json::json!([
+        {"number": 9, "url": "https://github.com/x/r/pull/9", "state": "OPEN",
+         "baseRefName": "main", "isCrossRepository": true},
+        {"number": 8, "url": "https://github.com/o/r/pull/8", "state": "OPEN",
+         "baseRefName": "release", "isCrossRepository": false},
+    ])
+    .to_string();
+    fx.cmd()
+        .env("FAKE_GH_LIST", list)
+        .args(["ship", &fx.run_id, "--confirm", "--json"])
+        .assert()
+        .success();
+    let log = fx.gh_log();
+    assert!(log.contains("pr create"), "{log}");
+    assert!(!log.contains("pr edit"), "{log}");
+    assert_eq!(fx.state()["pr_url"], "https://github.com/o/r/pull/7");
 }
 
 #[test]
@@ -350,22 +394,35 @@ fn adopt_remote_fast_forwards_then_ships() {
     assert_eq!(fx.state()["pr_url"], "https://github.com/o/r/pull/7");
 }
 
+const SHIPPED: &str = "1111111111111111111111111111111111111111";
+
+/// A real run whose current round shipped `SHIPPED` to a PR against `main`.
 fn shipped_run(fx: &Fixture, phase: &str) {
     fx.edit_state(|v| {
         v["dry_run"] = Value::Bool(false);
         v["phase"] = Value::String(phase.into());
         v["pr_url"] = Value::String("https://github.com/o/r/pull/5".into());
+        v["shipped_round"] = v["round"].clone();
+        v["shipped_head"] = Value::String(SHIPPED.into());
+        v["shipped_base"] = Value::String("main".into());
     });
 }
 
 fn pr_view(state: &str) -> String {
+    pr_json(state, 5, SHIPPED, false)
+}
+
+fn pr_json(state: &str, number: u32, head: &str, fork: bool) -> String {
     let merged = state == "MERGED";
     serde_json::json!({
-        "number": 5,
-        "url": "https://github.com/o/r/pull/5",
+        "number": number,
+        "url": format!("https://github.com/o/r/pull/{number}"),
         "state": state,
         "mergedAt": if merged { Value::String("2026-10-30T12:00:00Z".into()) } else { Value::Null },
         "mergeCommit": if merged { serde_json::json!({"oid": "abc123"}) } else { Value::Null },
+        "headRefOid": head,
+        "baseRefName": "main",
+        "isCrossRepository": fork,
     })
     .to_string()
 }
@@ -391,6 +448,147 @@ fn sync_prs_moves_a_merged_run_to_done() {
     assert!(fx
         .gh_log()
         .contains("pr view https://github.com/o/r/pull/5 --json"));
+    let history = std::fs::read_to_string(fx.root.join(".spar/history.jsonl")).unwrap();
+    let last: Value = serde_json::from_str(history.lines().last().unwrap()).unwrap();
+    assert_eq!(last["phase"], "done");
+    assert_eq!(last["merge_commit"], "abc123");
+    assert_eq!(last["merged_at"], "2026-10-30T12:00:00Z");
+}
+
+/// A run already `done` still gets a history row when its merge is recorded.
+#[test]
+fn sync_prs_records_a_merge_of_a_done_run_in_history() {
+    let fx = Fixture::new("");
+    shipped_run(&fx, "done");
+    fx.cmd()
+        .env("FAKE_GH_VIEW", pr_view("MERGED"))
+        .args(["sync-prs", "--all"])
+        .assert()
+        .success();
+    let history = std::fs::read_to_string(fx.root.join(".spar/history.jsonl")).unwrap();
+    let last: Value = serde_json::from_str(history.lines().last().unwrap()).unwrap();
+    assert_eq!(last["merge_commit"], "abc123", "{last}");
+}
+
+/// The recorded PR's head is an earlier round's commit: it does not settle this round.
+#[test]
+fn sync_prs_ignores_a_pr_that_does_not_hold_the_shipped_commit() {
+    let fx = Fixture::new("");
+    shipped_run(&fx, "awaiting_ship_confirm");
+    let stale = pr_json(
+        "MERGED",
+        5,
+        "2222222222222222222222222222222222222222",
+        false,
+    );
+    let out = fx
+        .cmd()
+        .env("FAKE_GH_VIEW", stale)
+        .args(["sync-prs", "--run", &fx.run_id, "--json"])
+        .assert()
+        .success();
+    let v: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert!(v["runs"][0]["to"].is_null(), "{v}");
+    assert_eq!(fx.state()["phase"], "awaiting_ship_confirm");
+}
+
+/// Only a run that shipped its current round, at the ship gate or done, is settled.
+#[test]
+fn sync_prs_never_moves_an_unshipped_or_in_flight_run() {
+    let fx = Fixture::new("");
+    shipped_run(&fx, "stuck");
+    let out = fx
+        .cmd()
+        .env("FAKE_GH_VIEW", pr_view("MERGED"))
+        .args(["sync-prs", "--run", &fx.run_id, "--json"])
+        .assert()
+        .success();
+    let v: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(v["runs"][0]["note"], "not done or at the ship gate", "{v}");
+    assert_eq!(fx.state()["phase"], "stuck");
+
+    fx.edit_state(|v| {
+        v["phase"] = Value::String("awaiting_ship_confirm".into());
+        v["round"] = serde_json::json!(v["round"].as_u64().unwrap() + 1);
+    });
+    let out = fx
+        .cmd()
+        .env("FAKE_GH_VIEW", pr_view("MERGED"))
+        .args(["sync-prs", "--run", &fx.run_id, "--json"])
+        .assert()
+        .success();
+    let v: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(
+        v["runs"][0]["note"], "has not shipped its current round",
+        "{v}"
+    );
+    assert_eq!(fx.state()["phase"], "awaiting_ship_confirm");
+    assert!(!fx.gh_log().contains("pr view"), "{}", fx.gh_log());
+}
+
+/// A rate-limited `gh` ends the `--all` pass instead of hammering the API per run.
+#[test]
+fn sync_prs_stops_the_pass_on_a_rate_limit() {
+    let fx = Fixture::new("");
+    shipped_run(&fx, "done");
+    let runs = fx.root.join(".spar/runs");
+    let twin = format!("{}b", fx.run_id);
+    copy_dir(&runs.join(&fx.run_id), &runs.join(&twin));
+    let twin_state = runs.join(&twin).join("state.json");
+    let mut v: Value =
+        serde_json::from_str(&std::fs::read_to_string(&twin_state).unwrap()).unwrap();
+    v["id"] = Value::String(twin.clone());
+    std::fs::write(&twin_state, v.to_string()).unwrap();
+
+    fx.cmd()
+        .env("FAKE_GH_VIEW_FAIL", "API rate limit exceeded for user")
+        .args(["sync-prs", "--all", "--json"])
+        .assert()
+        .code(1);
+    assert_eq!(fx.gh_log().matches("pr view").count(), 1, "{}", fx.gh_log());
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let dest = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &dest);
+        } else if entry.file_type().unwrap().is_file() {
+            std::fs::copy(entry.path(), dest).unwrap();
+        }
+    }
+}
+
+#[test]
+fn sync_prs_and_override_are_refused_inside_a_slot() {
+    let fx = Fixture::new("");
+    for var in ["SPAR_AGENT_ID", "SPAR_RUN_ID"] {
+        let out = fx
+            .cmd()
+            .env(var, "x")
+            .args(["sync-prs", "--all"])
+            .assert()
+            .code(1);
+        let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+        assert!(
+            stderr.contains("operator-only command; refused inside a slot"),
+            "{stderr}"
+        );
+        let out = fx
+            .cmd()
+            .env(var, "x")
+            .args(["ship", &fx.run_id, "--override-gate", "--reason", "x"])
+            .assert()
+            .code(1);
+        let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+        assert!(
+            stderr.contains("operator-only command; refused inside a slot"),
+            "{stderr}"
+        );
+    }
+    assert_eq!(fx.state()["phase"], "awaiting_ship_confirm");
 }
 
 #[test]
@@ -441,7 +639,8 @@ fn sync_prs_dry_run_reports_without_writing() {
     assert_eq!(std::fs::read_to_string(fx.state_path()).unwrap(), before);
 }
 
-/// A run with no PR recorded is found through its branch; a dry run is never synced.
+/// A run with no PR recorded is found through its branch, skipping a fork's PR and an
+/// earlier round's; a dry run is never synced.
 #[test]
 fn sync_prs_finds_the_pr_by_branch_and_skips_dry_runs() {
     let fx = Fixture::new("");
@@ -451,11 +650,21 @@ fn sync_prs_finds_the_pr_by_branch_and_skips_dry_runs() {
         .success();
     assert!(!fx.gh_log().contains("pr "), "{}", fx.gh_log());
 
+    shipped_run(&fx, "awaiting_ship_confirm");
     fx.edit_state(|v| {
-        v["dry_run"] = Value::Bool(false);
-        v["ship_commands"] = serde_json::json!(["git push"]);
+        v.as_object_mut().unwrap().remove("pr_url");
     });
-    let list = format!("[{}]", pr_view("MERGED"));
+    let list = format!(
+        "[{},{},{}]",
+        pr_json("MERGED", 9, SHIPPED, true),
+        pr_json(
+            "MERGED",
+            6,
+            "2222222222222222222222222222222222222222",
+            false
+        ),
+        pr_view("MERGED")
+    );
     fx.cmd()
         .env("FAKE_GH_LIST", list)
         .args(["sync-prs", "--all", "--json"])
@@ -656,4 +865,86 @@ fn override_gate_requires_a_reason_and_a_settled_phase() {
         .assert()
         .code(1);
     assert_eq!(fx.state()["phase"], "dispatch");
+}
+
+/// The orchestrator lock held by another process refuses the override; ship's own lock
+/// (taken after the check) never does, which the dry-run override tests above cover.
+#[test]
+fn override_gate_refuses_a_lock_held_by_another_process() {
+    let fx = Fixture::new("");
+    stuck_with_findings(&fx);
+    let lock = fx
+        .root
+        .join(".spar/runs")
+        .join(&fx.run_id)
+        .join("orchestrator.lock");
+    let ready = fx._tmp.path().join("locked");
+    let mut holder = Command::new("flock")
+        .arg("-x")
+        .arg(&lock)
+        .args(["sh", "-c", "echo $$ > \"$0\"; touch \"$1\"; sleep 30"])
+        .arg(&lock)
+        .arg(&ready)
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let out = fx
+        .cmd()
+        .args(["ship", &fx.run_id, "--override-gate", "--reason", "why"])
+        .assert()
+        .code(1);
+    let _ = holder.kill();
+    let _ = holder.wait();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(stderr.contains("live orchestrator"), "{stderr}");
+    assert_eq!(fx.state()["phase"], "awaiting_round_extension");
+}
+
+/// A failed override ship goes back to the phase it came from, so a plain `ship
+/// --confirm` cannot finish a stuck run; from the ship gate, the re-ship keeps the
+/// override's findings section.
+#[test]
+fn a_failed_override_restores_its_phase_and_a_reship_keeps_the_findings() {
+    let fx = Fixture::new("");
+    fx.real_worktree();
+    stuck_with_findings(&fx);
+    fx.cmd()
+        .env("FAKE_GH_CREATE_FAIL", "1")
+        .args(["ship", &fx.run_id, "--override-gate", "--reason", "ceiling"])
+        .assert()
+        .code(1);
+    let state = fx.state();
+    assert_eq!(state["phase"], "awaiting_round_extension");
+    assert_eq!(state["ship_override"]["reason"], "ceiling");
+    fx.cmd()
+        .args(["ship", &fx.run_id, "--confirm"])
+        .assert()
+        .code(1);
+    assert_eq!(fx.state()["phase"], "awaiting_round_extension");
+
+    fx.edit_state(|v| v["phase"] = Value::String("awaiting_ship_confirm".into()));
+    fx.cmd()
+        .env("FAKE_GH_CREATE_FAIL", "1")
+        .args([
+            "ship",
+            &fx.run_id,
+            "--override-gate",
+            "--reason",
+            "minors only",
+        ])
+        .assert()
+        .code(1);
+    assert_eq!(fx.state()["phase"], "awaiting_ship_confirm");
+    fx.cmd()
+        .args(["ship", &fx.run_id, "--confirm", "--json"])
+        .assert()
+        .success();
+    assert_eq!(fx.state()["phase"], "done");
+    let body = fx.artifact("pr-body.md");
+    assert!(body.contains("## Shipped over open findings"), "{body}");
+    assert!(body.contains(": minors only\n"), "{body}");
+    assert!(body.contains("unchecked unwrap"), "{body}");
 }

@@ -454,6 +454,7 @@ fn run() -> Result<ExitCode> {
             let (paths, _) = project_ctx()?;
             let cfg = Config::for_run(&paths, &run_id)?;
             if override_gate {
+                refuse_inside_slot("spar ship --override-gate")?;
                 if reason.is_none() {
                     anyhow::bail!("--override-gate needs --reason \"<why>\"");
                 }
@@ -1884,7 +1885,24 @@ fn attach_cmd(run_id: &str) -> Result<ExitCode> {
     Ok(ExitCode::Success)
 }
 
+/// A slot (or anything it spawns) inherits `SPAR_AGENT_ID` / `SPAR_RUN_ID`; these
+/// commands decide a run's fate and belong to the operator.
+fn refuse_inside_slot(command: &str) -> Result<()> {
+    let set = ["SPAR_AGENT_ID", "SPAR_RUN_ID"]
+        .into_iter()
+        .find(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
+    match set {
+        Some(var) => {
+            anyhow::bail!(
+                "`{command}`: operator-only command; refused inside a slot ({var} is set)"
+            )
+        }
+        None => Ok(()),
+    }
+}
+
 fn sync_prs_cmd(run_id: Option<&str>, all: bool, json: bool, dry_run: bool) -> Result<ExitCode> {
+    refuse_inside_slot("spar sync-prs")?;
     let (paths, _) = project_ctx()?;
     let scope = match (run_id, all) {
         (Some(_), true) => anyhow::bail!("pass --run <id> or --all, not both"),

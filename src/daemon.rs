@@ -126,6 +126,10 @@ pub struct DaemonState {
     /// GitHub API call per unsettled shipped run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_pr_sync: Option<DateTime<Utc>>,
+    /// PR-sync errors already reported, so a failure that repeats every pass is logged
+    /// once. Cleared by a pass with none.
+    #[serde(skip)]
+    pub pr_sync_errors: std::collections::HashSet<String>,
 }
 
 impl DaemonState {
@@ -135,6 +139,7 @@ impl DaemonState {
             started_at: Utc::now(),
             runs: HashMap::new(),
             last_pr_sync: None,
+            pr_sync_errors: Default::default(),
         }
     }
 
@@ -585,8 +590,7 @@ fn tick(paths: &SparPaths, cfg: &Config, book: &mut DaemonState) {
 const PR_SYNC_EVERY_SECS: i64 = 300;
 
 /// Settling a run on evidence of a merge or close is bookkeeping, not a human decision
-/// (O123). `gh` missing or failing is a silent skip: the explicit command is where it is
-/// reported.
+/// (O123). Errors (`gh` missing, auth, rate limit) are logged once each, not every pass.
 fn sync_prs(paths: &SparPaths, cfg: &Config, book: &mut DaemonState, now: DateTime<Utc>) {
     if !cfg.daemon.sync_prs {
         return;
@@ -598,9 +602,20 @@ fn sync_prs(paths: &SparPaths, cfg: &Config, book: &mut DaemonState, now: DateTi
         return;
     }
     book.last_pr_sync = Some(now);
-    let Ok(rows) = crate::prs::sync_prs(paths, crate::prs::SyncScope::All, true) else {
-        return;
+    let mut errors: Vec<String> = Vec::new();
+    let rows = match crate::prs::sync_prs(paths, crate::prs::SyncScope::All, true) {
+        Ok(rows) => rows,
+        Err(e) => {
+            errors.push(format!("sync-prs: {e:#}"));
+            Vec::new()
+        }
     };
+    for row in &rows {
+        if let Some(e) = &row.error {
+            errors.push(format!("sync-prs: run {}: {e}", row.run_id));
+        }
+    }
+    note_sync_errors(paths, book, errors);
     for row in rows {
         if let Some(to) = row.to.filter(|_| row.error.is_none()) {
             log_line(
@@ -613,6 +628,18 @@ fn sync_prs(paths: &SparPaths, cfg: &Config, book: &mut DaemonState, now: DateTi
                     row.pr_state.as_deref().unwrap_or("?")
                 ),
             );
+        }
+    }
+}
+
+fn note_sync_errors(paths: &SparPaths, book: &mut DaemonState, errors: Vec<String>) {
+    if errors.is_empty() {
+        book.pr_sync_errors.clear();
+    }
+    for e in errors {
+        if book.pr_sync_errors.insert(e.clone()) {
+            eprintln!("{e}");
+            log_line(paths, &e);
         }
     }
 }
@@ -1540,6 +1567,31 @@ mod tests {
                 "src/daemon.rs must never call `{banned}` — a supervisor is not an operator"
             );
         }
+    }
+
+    #[test]
+    fn a_repeated_pr_sync_error_is_logged_once() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        std::fs::create_dir_all(&paths.root).unwrap();
+        let mut book = DaemonState::new();
+        let err = || vec!["sync-prs: gh not found on PATH".to_string()];
+        note_sync_errors(&paths, &mut book, err());
+        note_sync_errors(&paths, &mut book, err());
+        let count = |p: &SparPaths| {
+            std::fs::read_to_string(p.workspace_logs_dir().join("daemon.log"))
+                .unwrap_or_default()
+                .matches("gh not found")
+                .count()
+        };
+        assert_eq!(count(&paths), 1);
+        note_sync_errors(&paths, &mut book, Vec::new());
+        note_sync_errors(&paths, &mut book, err());
+        assert_eq!(
+            count(&paths),
+            2,
+            "a recurrence after a clean pass is reported"
+        );
     }
 
     #[test]

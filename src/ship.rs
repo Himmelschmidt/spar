@@ -118,12 +118,7 @@ const PR_BODY_MAX: usize = 65_000;
 /// PR body: the shipped slot's summary, the OPEN questions it lists, and each reviewer's
 /// final verdict. Questions and verdicts come first so truncation only ever eats the tail
 /// of the summary.
-fn pr_body(
-    paths: &SparPaths,
-    state: &RunState,
-    branch: &str,
-    overridden: Option<&ShipOverride>,
-) -> String {
+fn pr_body(paths: &SparPaths, state: &RunState, branch: &str) -> String {
     let shipped = state
         .worktrees
         .iter()
@@ -138,7 +133,7 @@ fn pr_body(
         });
 
     let mut body = format!("Shipped by spar run `{}`.\n", state.id);
-    if let Some(o) = overridden {
+    if let Some(o) = &state.ship_override {
         body.push_str(&override_section(o));
     }
     if let Some((_, text)) = &summary {
@@ -277,17 +272,22 @@ fn overridable(phase: Phase) -> bool {
     )
 }
 
-struct OpenFinding {
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OpenFinding {
     slot_id: String,
     round: u32,
     reviewed_commit: Option<String>,
     finding: crate::workflow::review_result::Finding,
 }
 
-struct ShipOverride {
+/// A `--override-gate`, kept on the run for the round it shipped (O124).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ShipOverride {
     who: String,
     at: chrono::DateTime<chrono::Utc>,
     reason: String,
+    /// Phase the override shipped from; a failed ship goes back to it.
+    from_phase: Phase,
     findings: Vec<OpenFinding>,
 }
 
@@ -387,16 +387,13 @@ fn override_record(o: &ShipOverride) -> String {
 }
 
 fn operator() -> String {
-    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
-    match std::env::var("SPAR_AGENT_ID") {
-        Ok(agent) if !agent.is_empty() => format!("{user} (agent {agent})"),
-        _ => user,
-    }
+    std::env::var("USER").unwrap_or_else(|_| "unknown".into())
 }
 
-fn begin_override(paths: &SparPaths, state: &RunState, reason: &str) -> Result<ShipOverride> {
-    let reason = reason.trim();
-    if reason.is_empty() {
+/// Checked before ship takes the run lock: once it holds the lock, the lock's owner is
+/// ship itself and liveness reads as alive.
+fn check_override(paths: &SparPaths, state: &RunState, reason: &str) -> Result<()> {
+    if reason.trim().is_empty() {
         bail!("--override-gate needs a non-empty --reason");
     }
     if !overridable(state.phase) {
@@ -413,10 +410,22 @@ fn begin_override(paths: &SparPaths, state: &RunState, reason: &str) -> Result<S
             state.id
         );
     }
+    Ok(())
+}
+
+fn record_override(paths: &SparPaths, state: &mut RunState, reason: &str) -> Result<Phase> {
+    if !overridable(state.phase) {
+        bail!(
+            "run {} moved to phase {:?}; not overriding its gate",
+            state.id,
+            state.phase
+        );
+    }
     let o = ShipOverride {
         who: operator(),
         at: chrono::Utc::now(),
-        reason: reason.to_string(),
+        reason: reason.trim().to_string(),
+        from_phase: state.phase,
         findings: open_findings(state),
     };
     let mut message = format!(
@@ -431,7 +440,9 @@ fn begin_override(paths: &SparPaths, state: &RunState, reason: &str) -> Result<S
         message.push_str(&finding_line(f));
     }
     crate::events::append(paths, &state.id, &crate::events::Event::info(message))?;
-    Ok(o)
+    let from = o.from_phase;
+    state.ship_override = Some(o);
+    Ok(from)
 }
 
 pub fn ship(
@@ -445,11 +456,14 @@ pub fn ship(
     // then held through `Shipping`: a push that runs past `abandon_after_secs` must read
     // as owned, or the daemon restarts the run and re-dispatches its implementer while
     // the push is still going (O117).
-    RunState::load(paths, run_id)?;
+    let before = RunState::load(paths, run_id)?;
+    if let Some(reason) = opts.override_reason {
+        check_override(paths, &before, reason)?;
+    }
     let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
     let mut state = RunState::load(paths, run_id)?;
     let overridden = match opts.override_reason {
-        Some(reason) => Some(begin_override(paths, &state, reason)?),
+        Some(reason) => Some(record_override(paths, &mut state, reason)?),
         None => None,
     };
     if overridden.is_none()
@@ -488,7 +502,11 @@ pub fn ship(
     if cfg.auto_ship() || cfg.ship.auto_confirm {
         state.gates.ship_confirmed = true;
     }
-    let override_md = overridden.as_ref().map(override_record).unwrap_or_default();
+    let override_md = state
+        .ship_override
+        .as_ref()
+        .map(override_record)
+        .unwrap_or_default();
 
     // Determine branch/worktree to push
     let (branch, cwd) = select_branch_cwd(&state)?;
@@ -525,7 +543,7 @@ pub fn ship(
                 pr_base.as_deref().unwrap_or("(repo default)"),
                 commands.join("\n"),
                 pr_title(state.task.as_deref(), cfg.ship.title_max),
-                pr_body(paths, &state, &branch, overridden.as_ref())
+                pr_body(paths, &state, &branch)
             ),
         )?;
         state.set_phase(Phase::Done);
@@ -569,10 +587,8 @@ pub fn ship(
     );
 
     let commands = vec![push_cmd, list_cmd, pr_cmd];
-    std::fs::write(
-        &body_file,
-        pr_body(paths, &state, &branch, overridden.as_ref()),
-    )?;
+    let body = pr_body(paths, &state, &branch);
+    std::fs::write(&body_file, &body)?;
     state.ship_commands = Some(commands.clone());
     state.set_phase(Phase::Shipping);
     state.save(paths)?;
@@ -585,7 +601,12 @@ pub fn ship(
         .current_dir(&cwd)
         .status();
     match push_status {
-        Ok(s) if s.success() => executed.push(format!("pushed {branch}")),
+        Ok(s) if s.success() => {
+            executed.push(format!("pushed {branch}"));
+            state.shipped_round = Some(state.round);
+            state.shipped_head = worktree::git_out(&cwd, &["rev-parse", "HEAD"]);
+            state.shipped_base = pr_base.clone();
+        }
         Ok(s) => {
             failed = true;
             executed.push(format!("push failed (exit {:?})", s.code()));
@@ -597,21 +618,34 @@ pub fn ship(
     }
 
     if !failed {
-        match crate::prs::open_pr_for(&cwd, &branch) {
+        match crate::prs::open_pr_for(&cwd, &branch, pr_base.as_deref()) {
             Ok(Some(pr)) => {
                 executed.push(format!("adopted open PR #{}: {}", pr.number, pr.url));
-                // The PR exists and the branch is pushed; a body that did not update is
-                // not worth re-parking the run at the gate over (#164).
-                let body = body_file.display().to_string();
-                if let Err(e) = crate::prs::gh(
-                    &cwd,
-                    &["pr", "edit", &pr.number.to_string(), "--body-file", &body],
-                ) {
-                    eprintln!(
-                        "warning: adopted PR #{} but its body was not updated: {e}",
+                let current = pr.body.as_deref().unwrap_or("").trim();
+                let ours = crate::paths::short_hash(current);
+                if current != body.trim() && state.pr_body_hash.as_deref() != Some(ours.as_str()) {
+                    let note = format!(
+                        "PR #{} body differs from what spar last wrote; replacing it (old body not kept)",
                         pr.number
                     );
-                    executed.push(format!("body not updated: {e}"));
+                    eprintln!("warning: {note}");
+                    executed.push(note);
+                }
+                // The PR exists and the branch is pushed; a body that did not update is
+                // not worth re-parking the run at the gate over (#164).
+                let file = body_file.display().to_string();
+                match crate::prs::gh(
+                    &cwd,
+                    &["pr", "edit", &pr.number.to_string(), "--body-file", &file],
+                ) {
+                    Ok(_) => state.pr_body_hash = Some(crate::paths::short_hash(body.trim())),
+                    Err(e) => {
+                        eprintln!(
+                            "warning: adopted PR #{} but its body was not updated: {e}",
+                            pr.number
+                        );
+                        executed.push(format!("body not updated: {e}"));
+                    }
                 }
                 state.pr_url = Some(pr.url);
             }
@@ -640,6 +674,7 @@ pub fn ship(
                             .rev()
                             .find(|l| l.trim_start().starts_with("https://"))
                             .map(|l| l.trim().to_string());
+                        state.pr_body_hash = Some(crate::paths::short_hash(body.trim()));
                         executed.push(out);
                     }
                     Err(e) => {
@@ -667,8 +702,9 @@ pub fn ship(
     )?;
 
     if failed {
-        // leave commands for human; still not merge
-        state.set_phase(Phase::AwaitingShipConfirm);
+        // An override goes back where it came from: parking a stuck run at the ship
+        // gate would let a plain `ship --confirm` finish it.
+        state.set_phase(overridden.unwrap_or(Phase::AwaitingShipConfirm));
         state.error = Some("ship partial failure; see artifacts/ship.md".into());
         state.save(paths)?;
         if json {
@@ -707,6 +743,12 @@ fn push_args(
     adopt_remote: bool,
 ) -> Result<Vec<String>> {
     let on_branch = check_head_branch(cwd, branch, base)?;
+    if adopt_remote && !on_branch {
+        bail!(
+            "--adopt-remote fast-forwards only {branch}, and worktree {} is not on it; check out {branch} and retry",
+            cwd.display()
+        );
+    }
     let lease = remote_tip(cwd, remote, branch, adopt_remote)?;
     let mut args = vec![
         "push".to_string(),
@@ -1065,7 +1107,7 @@ mod tests {
         )
         .unwrap();
 
-        let body = pr_body(&paths, &state, "spar/rb1/impl", None);
+        let body = pr_body(&paths, &state, "spar/rb1/impl");
         assert!(body.starts_with("Shipped by spar run `rb1`."), "{body}");
         assert!(
             body.contains(
@@ -1094,7 +1136,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let (paths, mut state) = body_state(tmp.path());
         state.slots.clear();
-        let body = pr_body(&paths, &state, "spar/rb1/impl", None);
+        let body = pr_body(&paths, &state, "spar/rb1/impl");
         assert!(
             body.contains("_No implementer summary was written._"),
             "{body}"
@@ -1115,7 +1157,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let body = pr_body(&paths, &state, "spar/rb1/impl", None);
+        let body = pr_body(&paths, &state, "spar/rb1/impl");
         assert!(body.chars().count() <= 65_536, "{}", body.chars().count());
         assert!(body.contains("- keep me"));
         assert!(
@@ -1487,6 +1529,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn adopt_remote_refuses_a_worktree_left_on_another_branch() {
+        let tmp = tempdir().unwrap();
+        let (_origin, work, _) = remote_moved(tmp.path());
+        git_in(&work, &["checkout", "-q", "-b", "review-x"]);
+        let before = commit(&work, "reviewed");
+        let err = push_args(&work, "origin", BRANCH, None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not on it"), "{err}");
+        assert_eq!(git_in(&work, &["rev-parse", "HEAD"]), before);
+    }
+
     fn finding(
         severity: crate::workflow::review_result::Severity,
         file: Option<&str>,
@@ -1563,12 +1618,14 @@ mod tests {
     #[test]
     fn override_section_leads_the_pr_body() {
         let tmp = tempdir().unwrap();
-        let (paths, state) = body_state(tmp.path());
+        let (paths, mut state) = body_state(tmp.path());
         std::fs::write(paths.artifact("rb1", "summary-impl.md"), "did it\n").unwrap();
-        let o = ShipOverride {
+        assert!(!pr_body(&paths, &state, "spar/rb1/impl").contains("Shipped over"));
+        state.ship_override = Some(ShipOverride {
             who: "op".into(),
             at: chrono::Utc::now(),
             reason: "ceiling hit, minors only".into(),
+            from_phase: Phase::Stuck,
             findings: vec![OpenFinding {
                 slot_id: "review-1".into(),
                 round: 4,
@@ -1580,8 +1637,8 @@ mod tests {
                     "rename",
                 ),
             }],
-        };
-        let body = pr_body(&paths, &state, "spar/rb1/impl", Some(&o));
+        });
+        let body = pr_body(&paths, &state, "spar/rb1/impl");
         let section = body.find("## Shipped over open findings").expect(&body);
         assert!(section < body.find("## Implementer summary").unwrap());
         assert!(body.contains("overridden by op at "), "{body}");
@@ -1592,7 +1649,6 @@ mod tests {
             ),
             "{body}"
         );
-        assert!(!pr_body(&paths, &state, "spar/rb1/impl", None).contains("Shipped over"));
     }
 
     fn override_state(tmp: &Path, phase: Phase) -> (SparPaths, Config) {
