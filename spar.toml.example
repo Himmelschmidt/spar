@@ -115,6 +115,12 @@ timeout_secs = 7200
 # An `unverified` acceptance criterion blocks the ship like a `fail`. A criterion the
 # reviewer never mentioned always blocks, regardless of this setting.
 require_all_criteria = true
+# Lowest reviewer-finding severity a `request_changes` blocks on: critical | major | minor.
+# At "major" a request_changes carrying only minors ships with them in the PR body.
+block_on = "major"
+# From this round, reviewers re-judge the previous panel's findings and the diff since,
+# and file new non-critical findings under `## Follow-up` (never blocking). 0 disables.
+scoped_from_round = 3
 
 # Round-loop economy. A round is a COLD re-dispatch: truncated log, empty context, the
 # slot re-derives the repo before doing new work. Measured over 197 runs, one fix round is

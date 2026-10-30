@@ -40,6 +40,16 @@ pub enum Severity {
     Minor,
 }
 
+impl Severity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Severity::Critical => "critical",
+            Severity::Major => "major",
+            Severity::Minor => "minor",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Finding {
     pub severity: Severity,
@@ -52,6 +62,20 @@ pub struct Finding {
     /// Written by spar in place of a review it never got, not by a reviewer.
     #[serde(default)]
     pub synthetic: bool,
+    /// Listed under `## Follow-up`: work for later, never a ship blocker unless critical.
+    #[serde(default)]
+    pub follow_up: bool,
+}
+
+impl Finding {
+    /// Whether this finding holds the ship at threshold `block_on` (O118). A critical
+    /// blocks wherever the reviewer filed it: `## Follow-up` is for non-critical work.
+    pub fn blocks(&self, block_on: Severity) -> bool {
+        if self.synthetic {
+            return false;
+        }
+        self.severity == Severity::Critical || (!self.follow_up && self.severity <= block_on)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +112,26 @@ impl ReviewResult {
     /// gate.** Missing, unparseable, and `request_changes` all block.
     pub fn approves(&self) -> bool {
         self.verdict == Some(Verdict::Approve)
+    }
+
+    /// The verdict half of the implement ship gate, at severity threshold `block_on`
+    /// (O118). `approve` clears and a missing verdict blocks, as `approves` has it. A
+    /// `request_changes` blocks only when it carries a reviewer finding at or above
+    /// `block_on`, when spar wrote it (synthetic), or when it names no finding at all:
+    /// a reviewer asking for changes it never lists fails closed. One whose findings are
+    /// all below the threshold or under `## Follow-up` counts as approve-with-notes.
+    pub fn blocks(&self, block_on: Severity) -> bool {
+        match self.verdict {
+            Some(Verdict::Approve) => false,
+            None => true,
+            Some(Verdict::RequestChanges) => {
+                if self.synthetic {
+                    return true;
+                }
+                let mut real = self.findings.iter().filter(|f| !f.synthetic).peekable();
+                real.peek().is_none() || real.any(|f| f.blocks(block_on))
+            }
+        }
     }
 }
 
@@ -225,17 +269,24 @@ fn parse_findings(body: &str, synthetic: bool) -> Vec<Finding> {
         };
         let deeper = rest.starts_with('#');
         let heading = rest.trim_start_matches('#').trim();
+        let title = heading
+            .trim_matches(['*', '`', ':', ' '])
+            .to_ascii_lowercase();
+        let follow_up = ["follow-up", "follow up", "followup"]
+            .iter()
+            .any(|p| title.starts_with(p));
         // Reviewers group findings under `### Major` or title one `### major — ...`;
-        // either way a sub-heading inside Findings is still Findings.
-        if in_findings && deeper {
+        // either way a sub-heading inside Findings is still Findings. A `### Follow-up`
+        // there opens the follow-up list.
+        if in_findings && deeper && !follow_up {
             findings.heading(heading);
             continue;
         }
         findings.flush();
-        in_findings = heading
-            .trim_matches(['*', '`', ':', ' '])
-            .to_ascii_lowercase()
-            .starts_with("findings");
+        in_findings = follow_up || title.starts_with("findings");
+        findings.follow_up = follow_up;
+        // A bare bullet under Follow-up is still follow-up work; it reads as minor.
+        findings.group = follow_up.then_some(Severity::Minor);
     }
     findings.flush();
     let mut out = findings.done;
@@ -255,6 +306,8 @@ struct FindingsParser {
     /// plain bullets up to the next heading are its body.
     heading_body: bool,
     prev_blank: bool,
+    /// Inside `## Follow-up` rather than `## Findings`.
+    follow_up: bool,
 }
 
 impl FindingsParser {
@@ -279,6 +332,7 @@ impl FindingsParser {
             line: None,
             text: text.trim().to_string(),
             synthetic: false,
+            follow_up: self.follow_up,
         });
     }
 
@@ -504,6 +558,54 @@ fn cited_location(text: &str) -> Option<(String, u32)> {
         return Some((path.to_string(), line));
     }
     None
+}
+
+/// The last panel the gate read before `round`: every entry of the highest earlier
+/// round in `history`. Pass `u32::MAX` for the latest panel.
+pub fn panel_before(
+    history: &[crate::state::ReviewHistoryEntry],
+    round: u32,
+) -> Vec<&crate::state::ReviewHistoryEntry> {
+    let Some(last) = history.iter().map(|e| e.round).filter(|r| *r < round).max() else {
+        return Vec::new();
+    };
+    history.iter().filter(|e| e.round == last).collect()
+}
+
+/// A panel's reviewer findings with duplicates across reviewers folded: same severity,
+/// location and whitespace-normalized text, the way history counts them (O102).
+/// Synthetic findings are spar's, not a reviewer's, and are left out.
+pub fn panel_findings<'a>(
+    panel: &[&'a crate::state::ReviewHistoryEntry],
+) -> Vec<(&'a str, &'a Finding)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for e in panel {
+        for f in e.review.findings.iter().filter(|f| !f.synthetic) {
+            let text = f
+                .text
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+            if seen.insert((f.severity, f.file.clone(), f.line, f.follow_up, text)) {
+                out.push((e.slot_id.as_str(), f));
+            }
+        }
+    }
+    out
+}
+
+/// One finding as a markdown bullet: severity, follow-up mark, location, reviewer, text.
+/// Continuation lines are indented under the bullet.
+pub fn finding_line(slot_id: &str, f: &Finding) -> String {
+    let at = match (&f.file, f.line) {
+        (Some(file), Some(line)) => format!(" `{file}:{line}`"),
+        _ => String::new(),
+    };
+    let follow = if f.follow_up { " follow-up" } else { "" };
+    let text = f.text.lines().collect::<Vec<_>>().join("\n  ");
+    format!("- {}{follow}{at} ({slot_id}): {text}", f.severity.as_str())
 }
 
 /// Persist what the gate read from one reviewer: on the slot, in the run's per-round
@@ -1593,5 +1695,116 @@ The loop at src/resolver.rs:88 never stops.\n\
         assert_eq!(f[2].1.as_deref(), Some("src/resolver.rs"));
         assert_eq!(f[3].0, Severity::Minor);
         assert!(findings("## Findings\n- AC-1 (pass) — fine\n- R2 (note) — x\n").is_empty());
+    }
+    /// The shape real reviewers write when they ask for changes on polish alone: a
+    /// test gap, a stale comment, a name. O118: at the default `block_on = major` this
+    /// is approve-with-notes; at `minor` it blocks as it did before.
+    const MINORS_ONLY: &str = "## Verdict\nrequest_changes\n\nReviewed-Commit: 0123456789abcdef0123456789abcdef01234567\n\n## Acceptance\nAC-1: pass — cargo test ok\n\n## Findings\n- severity: minor — src/config.rs:880 comment still says require_all_criteria is the only knob\n- **F-2 (minor · test gap)** — nothing pins the empty list in src/ship.rs:140\n- severity: medium — rename `x` to `count`\n\n## Tests\ncargo test\n";
+
+    #[test]
+    fn minors_only_request_changes_is_approve_with_notes_at_major() {
+        let r = parse_review(MINORS_ONLY);
+        assert_eq!(r.verdict, Some(Verdict::RequestChanges));
+        assert_eq!(r.findings.len(), 3, "{:?}", r.findings);
+        assert!(!r.blocks(Severity::Major));
+        assert!(!r.blocks(Severity::Critical));
+        assert!(
+            r.blocks(Severity::Minor),
+            "block_on = minor restores the old gate"
+        );
+    }
+
+    #[test]
+    fn a_major_or_critical_finding_blocks_at_its_threshold() {
+        let major = MINORS_ONLY.replace(
+            "- severity: medium",
+            "### F3 (major, latent) — the retry at src/net.rs:40 never stops\n- severity: medium",
+        );
+        let r = parse_review(&major);
+        assert!(r.blocks(Severity::Major));
+        assert!(!r.blocks(Severity::Critical), "{:?}", r.findings);
+        let critical = MINORS_ONLY.replace(
+            "- severity: medium",
+            "- **critical** — data loss on retry\n- severity: medium",
+        );
+        assert!(parse_review(&critical).blocks(Severity::Critical));
+    }
+
+    /// Fail closed: a reviewer that asks for changes it never lists, or lists only as
+    /// bare notes, still blocks at any threshold.
+    #[test]
+    fn request_changes_with_no_parsable_finding_blocks() {
+        let bare = "## Verdict\nrequest_changes\n\n## Findings\n- the error path looks off\n";
+        let r = parse_review(bare);
+        assert!(r.findings.is_empty());
+        assert!(r.blocks(Severity::Critical));
+        assert!(parse_review("## Verdict\nrequest_changes\n").blocks(Severity::Critical));
+    }
+
+    #[test]
+    fn a_missing_verdict_blocks_and_approve_never_does() {
+        assert!(parse_review("## Findings\n- severity: minor — x\n").blocks(Severity::Critical));
+        let approve = "## Verdict\napprove\n\n## Findings\n- severity: major — x at src/a.rs:1\n";
+        assert!(!parse_review(approve).blocks(Severity::Minor));
+    }
+
+    /// spar's own stand-in carries a `major` finding, but it would block even as
+    /// minor: spar writing a review is not a reviewer clearing the change.
+    #[test]
+    fn a_synthetic_review_blocks_whatever_its_findings() {
+        let body = format!(
+            "{SYNTHETIC_REVIEW_MARKER}\n## Verdict\nrequest_changes\n\n## Findings\n- severity: minor — review slot failed\n"
+        );
+        let r = parse_review(&body);
+        assert!(r.synthetic);
+        assert!(r.blocks(Severity::Critical));
+    }
+
+    #[test]
+    fn follow_up_findings_are_parsed_and_never_block_unless_critical() {
+        let body = "## Verdict\nrequest_changes\n\n## Findings\n- severity: minor — prior F1 still open at src/a.rs:3\n\n## Follow-up\n- severity: major — the retry policy deserves its own brief\n- rename the helper\n- none\n\n## Tests\nok\n";
+        let r = parse_review(body);
+        assert_eq!(r.findings.len(), 3, "{:?}", r.findings);
+        assert!(!r.findings[0].follow_up);
+        assert!(r.findings[1].follow_up && r.findings[1].severity == Severity::Major);
+        assert!(r.findings[2].follow_up && r.findings[2].severity == Severity::Minor);
+        assert!(
+            !r.blocks(Severity::Major),
+            "a follow-up major is work for later"
+        );
+
+        let nested = "## Verdict\nrequest_changes\n\n## Findings\n### Follow-up\n- severity: major — later\n";
+        let r = parse_review(nested);
+        assert!(r.findings[0].follow_up, "{:?}", r.findings);
+        assert!(!r.blocks(Severity::Minor));
+
+        let misfiled =
+            "## Verdict\nrequest_changes\n\n## Follow-up\n- severity: critical — data loss\n";
+        assert!(parse_review(misfiled).blocks(Severity::Critical));
+    }
+
+    #[test]
+    fn panel_findings_take_the_latest_earlier_round_and_fold_duplicates() {
+        let entry = |round: u32, slot: &str, body: &str| crate::state::ReviewHistoryEntry {
+            round,
+            slot_id: slot.into(),
+            review: parse_review(body),
+        };
+        let history = vec![
+            entry(2, "r1", "## Verdict\nrequest_changes\n## Findings\n- severity: major — old\n"),
+            entry(3, "r1", "## Verdict\nrequest_changes\n## Findings\n- severity: major — Same   thing at src/a.rs:1\n"),
+            entry(3, "r2", "## Verdict\nrequest_changes\n## Findings\n- severity: major — same thing at src/a.rs:1\n- severity: minor — other\n"),
+        ];
+        let latest = panel_before(&history, u32::MAX);
+        assert_eq!(latest.len(), 2);
+        let f = panel_findings(&latest);
+        assert_eq!(f.len(), 2, "{f:?}");
+        assert_eq!(f[0].0, "r1");
+        assert_eq!(panel_before(&history, 3)[0].round, 2);
+        assert!(panel_before(&history, 2).is_empty());
+        assert_eq!(
+            finding_line(f[0].0, f[0].1),
+            "- major `src/a.rs:1` (r1): Same   thing at src/a.rs:1"
+        );
     }
 }

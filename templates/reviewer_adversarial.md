@@ -22,6 +22,7 @@ You did NOT write this code. Find real bugs, missing tests, and regressions.
 
 {{suite_guidance}}
 
+{{prior_findings}}
 ## Review format
 Write the artifact early and iteratively — partial findings are better than nothing if you run out of time.
 

@@ -595,7 +595,9 @@ clamped on a word boundary to `[ship] title_max` characters (default 72, `0` = n
 of spar's own), and never past GitHub's 256-character limit.
 The PR **body** is built from the run: OPEN questions from the shipped slot's summary
 (lines under an `Open questions` heading, or lines marked `OPEN`), each reviewer's final
-verdict and the commit it named, then the summary itself (`summary-<slot>.md`, else
+verdict and the commit it named, an **Open findings (non-blocking)** list (the last
+panel's reviewer findings from `review_history`: minors under `block_on`, follow-ups,
+notes on an approving review), then the summary itself (`summary-<slot>.md`, else
 `summary-impl.md`). A body over GitHub's limit is cut from the end of the summary with a
 note naming the full file. It is written to `artifacts/pr-body.md` and passed with
 `--body-file`; dry-run puts both into `artifacts/ship.md`.
@@ -968,7 +970,8 @@ read, reset when the slot is re-dispatched), appends it to the run's `review_his
   "acceptance": [{"id": "AC-1", "status": "pass" | "fail" | "unverified", "evidence": "..."}],
   "findings": [{"severity": "critical" | "major" | "minor",
                 "file": "src/x.rs" | null, "line": 12 | null,
-                "text": "...", "synthetic": false}],
+                "text": "...", "synthetic": false,
+                "follow_up": false}],          // listed under ## Follow-up: non-blocking unless critical
   "synthetic": false
 }
 ```
@@ -1417,6 +1420,8 @@ timeout_secs = 7200
 # Reviewer verdict / acceptance gate (review timeouts stay under [timeouts]).
 [review]
 require_all_criteria = true   # false ⇒ an `unverified` AC no longer blocks the ship
+block_on = "major"            # lowest finding severity a request_changes blocks on (critical|major|minor)
+scoped_from_round = 3         # from this round reviewers re-judge prior findings + the diff since; 0 = off
 # Plan-phase critic seat. `--without critic` is the per-run way to drop just this one;
 # this is the persistent file knob (there is no "absent [roles].plan_critic" signal for
 # it — that silently fell back to [providers].order instead of dropping the seat).
@@ -1473,6 +1478,8 @@ timeout_secs = 3600    # test_author's SOFT clock; hard_ceiling_multiple applies
 - **Frozen at round-loop entry:** `implement` reads `test-contract.md` once, when it starts the round loop, and every round for that `implement` invocation judges reviewers against that frozen list. An edit to the file mid-run does **not** take effect — it is not silently ignored either: it is detected each round and reported (`contract_modified: true` in `state.json` / `status --json`, an event, a bus broadcast, stderr, and a note in the reviewer prompt), but the gate still judges the frozen version. This is deliberate: the contract lives outside the repo (`.spar/runs/<id>/artifacts/`, invisible to `git status`/diff), and re-reading it live would let the slot under test edit the gate that bounds it. **To amend a contract, stop the run, edit `test-contract.md`, and re-run `spar implement --run <id>`** — re-entering `implement` re-reads and re-freezes against the file on disk, moving `contract_fingerprint` and clearing `contract_modified`. There is no separate amend command.
 - **Reviewer context:** reviewers get the full `plan.md` and `test-contract.md` in their prompt, so they can check the change against the agreed plan and each `AC-n` criterion rather than guessing intent.
 - **Review artifact schema (enforced):** each `artifacts/review-<slot>.md` is `## Verdict` / `## Acceptance` / `## Findings` / `## Tests` plus a `Reviewed-Commit: <sha>` line naming the `HEAD` the reviewer read (`git rev-parse HEAD` in the review worktree at diff-read time; short shas accepted as a prefix of the panel head). The verdict is read as an **anchored header** — the first non-blank line under the first `## Verdict` must be `approve` or `request_changes`; missing or unparseable is treated as `request_changes`. A verdict naming no commit, or a commit other than the head the panel was dispatched against, is not counted: fail closed exactly like a missing review, with a blocker naming both shas. `## Acceptance` carries one `AC-n: pass|fail|unverified — evidence` line per criterion in `test-contract.md`.
+- **Severity gate (O118):** a `request_changes` holds the ship only when it carries a reviewer finding at or above `[review] block_on` (default `major`; `critical` / `major` / `minor`), when spar wrote it (`synthetic`), or when it lists no severity-tagged finding at all (fail closed). A minors-only `request_changes` is **approve-with-notes**: the run reaches the ship gate and the minors go into the PR body. A finding under `## Follow-up` never blocks unless it is critical. `block_on = "minor"` is the old strict gate. Acceptance criteria gate separately and are unchanged.
+- **Scoped re-review (O119):** from round `[review] scoped_from_round` (default `3`, the first fix round of a planned run; `0` disables) the reviewer prompt carries the previous panel's findings, the commit it judged and the `--stat` of the diff since. Reviewers re-judge those findings and look for regressions; new non-critical findings go under `## Follow-up`. A round whose previous panel was synthetic, or named different commits, gets a full review instead.
 - **Acceptance gate:** a run cannot reach `awaiting_ship_confirm` while any contract `AC-n` is `fail`, is `unverified` (default; relax with `[review] require_all_criteria = false`), or is simply **absent** from a review — an unmentioned criterion always blocks. With no contract at all (`[spec] enabled = false`) the verdict alone gates.
 - **Suite channel (implement/loop):** the authoritative full-suite run; impl/review stay smoke/diff-only when it runs. Artifact: `artifacts/suite.md`, either way. Two forms:
   - **Built-in (preferred).** With `[suite].command` set, spar runs those commands itself in the implementer's worktree, in order, all of them even after one fails, output to `artifacts/suite.log`. **No `tester` slot is created and no tokens are spent.** The verdict is the exit codes: a non-zero exit **or a signal death** (a crash, an abort, the OOM killer) is `fail`; only a command that never reached a status at all — budget spent, or killed by `spar stop` — is `inconclusive`. A definite failure outranks an incomplete one, so a suite that really failed is never reported to reviewers as one that never ran. The whole list shares one budget, `[suite].timeout_secs` × `hard_ceiling_multiple` — the same wall the `tester` slot draws, so the knob means the same thing either way. It runs under the run's `isolation` setting, `bash -o pipefail -c` where bash exists (`sh -c` otherwise), and its child is reapable by `spar stop --abandoned` like any slot.

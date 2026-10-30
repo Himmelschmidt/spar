@@ -1,5 +1,6 @@
 use crate::bus::MessageBudget;
 use crate::paths::SparPaths;
+use crate::workflow::review_result::Severity;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -857,14 +858,35 @@ pub struct ReviewConfig {
     /// regardless of this setting.
     #[serde(default = "default_true")]
     pub require_all_criteria: bool,
+    /// Lowest reviewer-finding severity that lets a `request_changes` hold the ship
+    /// (O118). At the default `major`, a `request_changes` whose only reviewer findings
+    /// are minor counts as approve-with-notes. Acceptance criteria gate separately.
+    #[serde(default = "default_block_on")]
+    pub block_on: Severity,
+    /// From this round on, reviewers get the previous panel's findings and the diff
+    /// since the commit it judged, and file new non-critical findings under
+    /// `## Follow-up` (O119). `0` disables.
+    #[serde(default = "default_scoped_from_round")]
+    pub scoped_from_round: u32,
 }
 
 impl Default for ReviewConfig {
     fn default() -> Self {
         Self {
             require_all_criteria: true,
+            block_on: default_block_on(),
+            scoped_from_round: default_scoped_from_round(),
         }
     }
+}
+
+fn default_block_on() -> Severity {
+    Severity::Major
+}
+
+/// Round 3 is the first fix round of a planned run (plan 1, implement 2).
+fn default_scoped_from_round() -> u32 {
+    3
 }
 
 /// Pre-coding test-author channel (plan → before human gate).
@@ -1166,6 +1188,8 @@ where
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ReviewConfigFile {
     require_all_criteria: Option<bool>,
+    block_on: Option<Severity>,
+    scoped_from_round: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1769,6 +1793,12 @@ impl Config {
             if let Some(v) = r.require_all_criteria {
                 self.review.require_all_criteria = v;
             }
+            if let Some(v) = r.block_on {
+                self.review.block_on = v;
+            }
+            if let Some(v) = r.scoped_from_round {
+                self.review.scoped_from_round = v;
+            }
         }
         if let Some(c) = &file.critic {
             if let Some(v) = c.enabled {
@@ -2000,6 +2030,45 @@ mod tests {
         let bound = Config::for_run(&paths, "r1").unwrap();
         assert_eq!(bound.rounds.max, 5);
         assert_eq!(bound.rounds.carry_forward_chars, 900);
+    }
+
+    /// O118/O119: severity gating and scoped re-review are on by default, tunable per
+    /// project, and frozen onto a run with the rest of its config.
+    #[test]
+    fn review_gating_overlays_defaults_and_survives_the_snapshot() {
+        let tmp = tempdir().unwrap();
+        let d = Config::default();
+        assert_eq!(d.review.block_on, Severity::Major);
+        assert_eq!(d.review.scoped_from_round, 3);
+
+        std::fs::write(
+            tmp.path().join("spar.toml"),
+            "[review]\nblock_on = \"minor\"\nscoped_from_round = 0\n",
+        )
+        .unwrap();
+        let cfg = Config::load(tmp.path()).unwrap();
+        assert_eq!(cfg.review.block_on, Severity::Minor);
+        assert_eq!(cfg.review.scoped_from_round, 0);
+        assert!(cfg.review.require_all_criteria);
+
+        std::fs::write(
+            tmp.path().join("spar.toml"),
+            "[review]\nblock_on = \"nit\"\n",
+        )
+        .unwrap();
+        assert!(
+            Config::load(tmp.path()).is_err(),
+            "an unknown severity must not pass silently"
+        );
+
+        let paths = SparPaths::new(tmp.path());
+        let mut cfg = Config::default();
+        cfg.review.block_on = Severity::Critical;
+        cfg.review.scoped_from_round = 5;
+        cfg.save_snapshot(&paths, "r1").unwrap();
+        let bound = Config::for_run(&paths, "r1").unwrap();
+        assert_eq!(bound.review.block_on, Severity::Critical);
+        assert_eq!(bound.review.scoped_from_round, 5);
     }
 
     #[test]

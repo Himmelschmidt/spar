@@ -1168,6 +1168,11 @@ pub fn gate_evidence(paths: &SparPaths, run_id: &str) -> String {
                 .is_empty();
                 if block_empty && res.approves() {
                     out.push_str(&format!("review {} approves\n", r.id));
+                } else if block_empty && !res.blocks(cfg.review.block_on) {
+                    out.push_str(&format!(
+                        "review {} approves with notes (request_changes, non-blocking findings only)\n",
+                        r.id
+                    ));
                 } else if block_empty {
                     out.push_str(&format!("review {} requests changes\n", r.id));
                 }

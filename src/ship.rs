@@ -151,6 +151,14 @@ fn pr_body(paths: &SparPaths, state: &RunState, branch: &str) -> String {
             body.push('\n');
         }
     }
+    let open = open_findings(state);
+    if !open.is_empty() {
+        body.push_str("\n## Open findings (non-blocking)\n\n");
+        for line in open {
+            body.push_str(&line);
+            body.push('\n');
+        }
+    }
     body.push_str("\n## Implementer summary\n\n");
     match &summary {
         Some((_, text)) => body.push_str(text.trim()),
@@ -231,6 +239,18 @@ fn review_verdicts(paths: &SparPaths, state: &RunState) -> Vec<String> {
                 .unwrap_or_default();
             format!("- `{}` ({}): {verdict}{commit}", s.id, s.provider)
         })
+        .collect()
+}
+
+/// The last panel's reviewer findings, from the recorded reviews. The run reached the
+/// ship gate, so none of them held it: they are minors under `block_on`, follow-ups, or
+/// notes on an approving review, and they are the follow-up work this PR leaves (O118).
+fn open_findings(state: &RunState) -> Vec<String> {
+    use crate::workflow::review_result::{finding_line, panel_before, panel_findings};
+    let panel = panel_before(&state.review_history, u32::MAX);
+    panel_findings(&panel)
+        .into_iter()
+        .map(|(slot, f)| finding_line(slot, f))
         .collect()
 }
 
@@ -805,6 +825,46 @@ mod tests {
         assert!(open < body.find("## Implementer summary").unwrap());
     }
 
+    /// O118: the minors and follow-ups the last panel left go into the PR body, from the
+    /// recorded reviews, and before the summary so truncation cannot eat them.
+    #[test]
+    fn pr_body_lists_the_last_panels_open_findings() {
+        let tmp = tempdir().unwrap();
+        let (paths, mut state) = body_state(tmp.path());
+        let parse = crate::workflow::review_result::parse_review;
+        for (round, slot, body) in [
+            (2, "review-1", "## Verdict\nrequest_changes\n## Findings\n- severity: major — fixed long ago\n"),
+            (3, "review-1", "## Verdict\nrequest_changes\n## Findings\n- severity: minor — stale doc at src/a.rs:9\n"),
+            (3, "review-2", "## Verdict\napprove\n## Follow-up\n- severity: major — split the parser later\n"),
+        ] {
+            state.review_history.push(crate::state::ReviewHistoryEntry {
+                round,
+                slot_id: slot.into(),
+                review: parse(body),
+            });
+        }
+        let body = pr_body(&paths, &state, "spar/rb1/impl");
+        let section = body
+            .split("## Open findings (non-blocking)\n\n")
+            .nth(1)
+            .unwrap_or_else(|| panic!("{body}"));
+        assert!(
+            section.starts_with("- minor `src/a.rs:9` (review-1): stale doc"),
+            "{body}"
+        );
+        assert!(
+            section.contains("- major follow-up (review-2): split the parser later"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("fixed long ago"),
+            "an earlier round is not open: {body}"
+        );
+        assert!(
+            body.find("## Open findings").unwrap() < body.find("## Implementer summary").unwrap()
+        );
+    }
+
     #[test]
     fn pr_body_without_a_summary_or_reviews_says_so() {
         let tmp = tempdir().unwrap();
@@ -817,6 +877,7 @@ mod tests {
         );
         assert!(!body.contains("## Review"), "{body}");
         assert!(!body.contains("## Open questions"), "{body}");
+        assert!(!body.contains("## Open findings"), "{body}");
     }
 
     #[test]

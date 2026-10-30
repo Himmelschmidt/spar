@@ -12386,9 +12386,18 @@ fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: Option<&Confi
                 } else {
                     Vec::new()
                 };
-                let blocked = !res.approves() || !reasons.is_empty();
-                if !res.approves() {
+                let verdict_blocks = evidence
+                    .cfg
+                    .as_ref()
+                    .map_or(!res.approves(), |c| res.blocks(c.review.block_on));
+                let blocked = verdict_blocks || !reasons.is_empty();
+                if verdict_blocks {
                     reasons.insert(0, format!("verdict: {verdict_text}"));
+                } else if !res.approves() {
+                    reasons.insert(
+                        0,
+                        "verdict: request_changes (non-blocking findings only)".into(),
+                    );
                 }
                 let source = SourceId::Document {
                     path: path.to_string_lossy().into_owned(),

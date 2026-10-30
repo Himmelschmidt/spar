@@ -170,3 +170,7 @@ path = "tests/scenarios/pi_dispatch.rs"
 [[test]]
 name = "machine_readable"
 path = "tests/scenarios/machine_readable.rs"
+
+[[test]]
+name = "review_gating"
+path = "tests/scenarios/review_gating.rs"
