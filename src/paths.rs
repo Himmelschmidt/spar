@@ -89,6 +89,11 @@ impl SparPaths {
         self.root.join("daemon.json")
     }
 
+    /// Append-only run history (`.spar/history.jsonl`) that survives `cleanup --purge`.
+    pub fn history_file(&self) -> PathBuf {
+        self.root.join("history.jsonl")
+    }
+
     /// One spool file per run admitted to the concurrency queue (`.spar/queue/<id>`).
     pub fn queue_dir(&self) -> PathBuf {
         self.root.join("queue")

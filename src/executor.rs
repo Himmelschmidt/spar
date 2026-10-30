@@ -301,6 +301,7 @@ fn prepare_slot_execution(
         s.usage = None;
         s.quota_hit = false;
         s.reviewed_commit = None;
+        s.review = None;
         // Stamp the round at dispatch: slot ids are stable across re-dispatch (the
         // implementer keeps its worktree through fix rounds), so this is where a slot
         // joins the round that is running now (O45).
@@ -1922,7 +1923,8 @@ pub fn salvage_expected_artifact(
         .unwrap_or_else(|| process::tail_log(log_path, 6000));
     let body = match job.role {
         SlotRole::Reviewer => format!(
-            "## Verdict\nrequest_changes\n\n## Findings\n- severity: major — review slot interrupted ({reason}); partial transcript salvaged below\n\n## Tests\nsee partial transcript\n\n## Partial transcript\n\n```\n{tail}\n```\n"
+            "{}\n## Verdict\nrequest_changes\n\n## Findings\n- severity: major — review slot interrupted ({reason}); partial transcript salvaged below\n\n## Tests\nsee partial transcript\n\n## Partial transcript\n\n```\n{tail}\n```\n",
+            crate::workflow::review_result::SYNTHETIC_REVIEW_MARKER
         ),
         SlotRole::TestAuthor => format!(
             "## Scenarios\n- (interrupted: {reason})\n\n## Non-goals\n- n/a\n\n## How to run\n- unknown\n\n## Expected before implement\nskipped-reason\n\n## Notes\nPartial transcript:\n```\n{tail}\n```\n"
@@ -2109,6 +2111,7 @@ pub fn run_slot(
         s.usage = None;
         s.quota_hit = false;
         s.reviewed_commit = None;
+        s.review = None;
         // Stamp the round at dispatch: slot ids are stable across re-dispatch (the
         // implementer keeps its worktree through fix rounds), so this is where a slot
         // joins the round that is running now (O45).
@@ -3044,7 +3047,8 @@ fn write_dry_artifacts(
                 .map(|h| format!("Reviewed-Commit: {h}\n"))
                 .unwrap_or_default();
             let body = format!(
-                "## Verdict\n{verdict}\n\n{sha_line}{acceptance}## Findings\n- severity: minor — dry-run synthetic review from {}\n\n## Tests\nsuite channel (dry-run); no full suite here\n",
+                "{}\n## Verdict\n{verdict}\n\n{sha_line}{acceptance}## Findings\n- severity: minor — dry-run synthetic review from {}\n\n## Tests\nsuite channel (dry-run); no full suite here\n",
+                crate::workflow::review_result::SYNTHETIC_REVIEW_MARKER,
                 job.provider
             );
             if let Some(name) = &job.expected_artifact {
@@ -3930,6 +3934,7 @@ pub fn init_slot_model(
         round: 1,
         quota_hit: false,
         reviewed_commit: None,
+        review: None,
         source: None,
     }
 }

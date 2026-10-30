@@ -1717,7 +1717,10 @@ fn fold_units(
         group.sort_by(|a, b| {
             run_attention(b)
                 .cmp(&run_attention(a))
-                .then_with(|| wants_operator(b).cmp(&wants_operator(a)))
+                .then_with(|| {
+                    state::wants_operator(b.phase, b.abandoned)
+                        .cmp(&state::wants_operator(a.phase, a.abandoned))
+                })
                 .then(b.updated_at.cmp(&a.updated_at))
         });
         let ids: Vec<String> = group.iter().map(|r| r.id.clone()).collect();
@@ -12636,23 +12639,6 @@ fn run_attention(r: &state::RunSummary) -> Attention {
     }
 }
 
-/// Whether a single, unfolded run currently wants the operator: a live
-/// `Attention::Gate`/`Broken`, or `PlanApproved` — terminal and colored `OK` like `Done`
-/// (round-9 review: changing `run_attention` itself would have re-litigated
-/// `phase_color`/`sort_runs_by_attention` for behaviour no review flagged), but still a
-/// handoff nothing else will complete. This is the per-leg predicate `fold_units` counts
-/// into `wants`; Home's band, both rail flags and the attention cycle key read a folded
-/// row through `unit_wants_operator` instead, since `PlanApproved` is conditional on the
-/// *unit* having no active leg (U28), not on this one leg's phase alone —
-/// `unit_wants_operator_matches_wants_operator_on_every_fold_units_row` is what keeps the
-/// two predicates from disagreeing on any row `fold_units` can actually produce.
-/// `emit_attention_toasts` does not go through either: it diffs `run_attention` directly
-/// and so never toasts a `PlanApproved` handoff or a folded unit's wanting leg
-/// (pre-existing, flagged by review 3be317b2, not fixed here).
-fn wants_operator(r: &state::RunSummary) -> bool {
-    run_attention(r).needs_you() || r.phase == Phase::PlanApproved
-}
-
 /// Whether the *unit* a row stands for wants the operator (U28). A folded row (U15)
 /// carries its active leg's id and phase, so `wants_operator` on the row alone answers
 /// for that leg, not the group — reading `r.wants` (each leg that itself wants the
@@ -12666,7 +12652,7 @@ fn unit_wants_operator(r: &state::RunSummary) -> bool {
     if r.legs > 1 {
         r.wants > 0
     } else {
-        wants_operator(r)
+        state::wants_operator(r.phase, r.abandoned)
     }
 }
 
@@ -12676,7 +12662,7 @@ fn unit_wants_operator(r: &state::RunSummary) -> bool {
 /// whenever any leg wants the operator (U28), even if the active leg shown in `r` itself
 /// does not.
 fn attention_flag(r: &state::RunSummary, force: bool) -> Option<Color> {
-    if force || wants_operator(r) {
+    if force || state::wants_operator(r.phase, r.abandoned) {
         Some(if run_attention(r) == Attention::Gate {
             WARN
         } else {
@@ -12708,7 +12694,7 @@ fn runs_needing_attention(runs: &[state::RunSummary]) -> usize {
             if r.legs > 1 {
                 r.wants as usize
             } else {
-                usize::from(wants_operator(r))
+                usize::from(state::wants_operator(r.phase, r.abandoned))
             }
         })
         .sum()
@@ -13021,6 +13007,7 @@ mod labels {
             task: None,
             dry_run: false,
             abandoned: false,
+            live: Default::default(),
             parent_run: None,
             round: 1,
             legs: 1,
@@ -13771,6 +13758,7 @@ mod labels {
             task: task.map(str::to_string),
             dry_run: false,
             abandoned: false,
+            live: Default::default(),
             parent_run: None,
             round: 1,
             legs: 1,
@@ -15851,6 +15839,7 @@ mod render_stability {
                 task: Some("a queued run".into()),
                 dry_run: false,
                 abandoned: i % 7 == 0,
+                live: Default::default(),
                 parent_run: None,
                 round: 1,
                 legs: 1,
@@ -17660,6 +17649,7 @@ mod render_stability {
             task: Some(format!("brief for {id}")),
             dry_run: false,
             abandoned: false,
+            live: Default::default(),
             parent_run: None,
             round: 1,
             legs: 1,
@@ -19317,6 +19307,7 @@ mod folding {
             task: Some(format!("brief for {id}")),
             dry_run: false,
             abandoned: false,
+            live: Default::default(),
             parent_run: parent.map(str::to_string),
             round: 1,
             legs: 1,
@@ -19439,7 +19430,7 @@ mod folding {
             "a working sibling means nobody is actually waiting: {unit:?}"
         );
         assert!(
-            !wants_operator(unit),
+            !state::wants_operator(unit.phase, unit.abandoned),
             "the representative leg agrees — this is the only self-consistent answer"
         );
         assert_eq!(
@@ -19478,7 +19469,7 @@ mod folding {
         assert_eq!(unit.wants, 1);
         assert!(unit_wants_operator(unit), "{unit:?}");
         assert!(
-            wants_operator(unit),
+            state::wants_operator(unit.phase, unit.abandoned),
             "the representative leg agrees — this is the only self-consistent answer"
         );
         assert_eq!(runs_needing_attention(&rows), 1);
@@ -19791,7 +19782,7 @@ mod folding {
                         for row in &rows {
                             assert_eq!(
                                 unit_wants_operator(row),
-                                wants_operator(row),
+                                state::wants_operator(row.phase, row.abandoned),
                                 "diverged for root={root_phase:?}/{root_abandoned} \
                                  leg={leg_phase:?}/{leg_abandoned}: {row:?}"
                             );
@@ -19850,6 +19841,7 @@ mod home_ia {
             task: Some(format!("brief for {id}")),
             dry_run: false,
             abandoned: false,
+            live: Default::default(),
             parent_run: None,
             round: 1,
             legs: 1,
@@ -20598,7 +20590,7 @@ mod home_ia {
     }
 
     /// Independent coverage of the Home-band call site (`build_home_rows`, U28):
-    /// reverting its `unit_wants_operator(r)` check back to `wants_operator(r)` sinks
+    /// reverting its `unit_wants_operator(r)` check back to `wants_operator` sinks
     /// this row into RUNNING, since `Review` is an active phase and `wants_operator`
     /// alone says false. Driven through the real builder with a hand-set `legs`/
     /// `wants`, the same pattern `folding_never_hides_a_gate_from_home` already uses
@@ -21919,6 +21911,7 @@ mod home_ia {
                 task: Some(format!("brief for {id}")),
                 dry_run: false,
                 abandoned: false,
+                live: Default::default(),
                 parent_run: None,
                 round: 1,
                 legs: 1,
@@ -22387,6 +22380,7 @@ mod chat_acceptance {
             task: Some("run task".into()),
             dry_run: false,
             abandoned: false,
+            live: Default::default(),
             archived: false,
             parent_run: None,
             round: 1,

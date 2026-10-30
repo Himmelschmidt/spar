@@ -264,7 +264,13 @@ pub fn ship(
         let pr = Command::new("gh").args(&args).current_dir(&cwd).output();
         match pr {
             Ok(o) if o.status.success() => {
-                executed.push(String::from_utf8_lossy(&o.stdout).trim().to_string());
+                let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                state.pr_url = out
+                    .lines()
+                    .rev()
+                    .find(|l| l.trim_start().starts_with("https://"))
+                    .map(|l| l.trim().to_string());
+                executed.push(out);
             }
             Ok(o) => {
                 // print commands instead of hard-fail if pr exists

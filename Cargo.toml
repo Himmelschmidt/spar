@@ -166,3 +166,7 @@ path = "tests/scenarios/reviewed_commit.rs"
 [[test]]
 name = "pi_dispatch"
 path = "tests/scenarios/pi_dispatch.rs"
+
+[[test]]
+name = "machine_readable"
+path = "tests/scenarios/machine_readable.rs"
