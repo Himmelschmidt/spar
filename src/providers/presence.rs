@@ -171,7 +171,7 @@ fn install_hook_file(id: &SlotIdentity, inject_on_stop: bool, rel: &str) -> Resu
 /// staged. Worktrees share the main checkout's `info/exclude` via `$GIT_COMMON_DIR`, so
 /// resolve that first. Idempotent: a line already present is left untouched. A non-git
 /// directory has no index to protect, so it is a safe no-op.
-fn exclude_from_index(worktree: &Path, rel_path: &str) -> Result<()> {
+pub(crate) fn exclude_from_index(worktree: &Path, rel_path: &str) -> Result<()> {
     let out = Command::new("git")
         .args(["rev-parse", "--git-common-dir"])
         .current_dir(worktree)

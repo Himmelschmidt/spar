@@ -820,6 +820,7 @@ impl RunState {
                 );
             }
             crate::notify::route_lifecycle(paths, self, prev_phase);
+            crate::worktree::watch_primary_checkout(paths, self, prev_phase);
         }
         // Global index so `spar` from anywhere can find this project’s runs.
         // Dry runs are ephemeral verification fixtures (often in a temp dir), so they

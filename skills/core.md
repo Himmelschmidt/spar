@@ -814,6 +814,15 @@ main checkout when present. Every slot process gets `TMPDIR` / `TMP` / `TEMP` se
 ends, so slots never read each other's scratch files. Under `worktree-bwrap` the sandbox's
 own private `/tmp` is used instead.
 
+**Run outputs stay out of commits.** When spar cuts a slot worktree it adds `/artifacts/`
+and `/.spar/` to the repo's `info/exclude` (git only reads the common dir's copy for a
+linked worktree, so this covers the primary checkout too), unless the repo already tracks
+files there. **The primary checkout is watched:** spar records its `git status --porcelain`
+(minus `.spar/`) when a run leg starts and compares it when the leg reaches a gate or a
+terminal phase. A difference is a `warning:` on stderr and an `info` event naming the
+changed paths. Edits you make while the run is parked at a gate are not reported, and
+`isolation = "none"` is never checked (its slots work there on purpose).
+
 ## Swarm bus
 
 The bus is **workspace-scoped and keyed by a globally-unique `agent_id`**. Run-slot role

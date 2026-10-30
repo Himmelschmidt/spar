@@ -65,6 +65,12 @@ impl SparPaths {
             .join(crate::util::sanitize_slot(slot_id))
     }
 
+    /// `git status --porcelain` of the primary checkout, taken when a run leg starts and
+    /// compared when it stops (O110).
+    pub fn primary_status_file(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("primary-status.txt")
+    }
+
     pub fn quota_file(&self) -> PathBuf {
         self.root.join("quota.json")
     }

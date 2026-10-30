@@ -202,12 +202,100 @@ pub fn create_worktree(
             bail!("git worktree add failed for {}", path.display());
         }
     }
+    exclude_run_outputs(&path);
 
     Ok(WorktreeRecord {
         slot_id: slot_id.into(),
         path,
         branch,
     })
+}
+
+/// Keep spar's run outputs out of a slot's commits: agents write `artifacts/` and
+/// `.spar/` at the worktree root, and `git add -A` then puts them in the PR. git reads
+/// only the common dir's `info/exclude` for a linked worktree (its own `info/exclude` is
+/// ignored), so this applies to the whole repo, primary checkout included. A path the repo
+/// already tracks files under is a real project directory and is left visible.
+fn exclude_run_outputs(worktree: &Path) {
+    for dir in ["artifacts", ".spar"] {
+        if git_out(worktree, &["ls-files", "--", dir]).is_none_or(|s| !s.is_empty()) {
+            continue;
+        }
+        if let Err(e) =
+            crate::providers::presence::exclude_from_index(worktree, &format!("/{dir}/"))
+        {
+            eprintln!(
+                "note: could not exclude {dir}/ in {}: {e:#}",
+                worktree.display()
+            );
+        }
+    }
+}
+
+/// Warn when the primary checkout changed while a run leg was driving slots (#178).
+///
+/// Called on every phase change. A leg starts when the run leaves a waitable stop (or is
+/// created) for an active phase, and that is when `git status --porcelain` is captured;
+/// it ends at the next waitable stop, which is when it is compared. Time the run spends
+/// parked at a gate is the operator's, so their own edits then are never reported.
+/// `isolation = "none"` runs slots in the primary checkout on purpose and is skipped.
+pub fn watch_primary_checkout(
+    paths: &SparPaths,
+    state: &RunState,
+    prev: Option<crate::state::Phase>,
+) {
+    if state.isolation == IsolationMode::None {
+        return;
+    }
+    let active = !state.phase.is_waitable_stop();
+    let starting = active && prev.is_none_or(|p| p.is_waitable_stop());
+    let stopping = !active && prev.is_some_and(|p| !p.is_waitable_stop());
+    if !starting && !stopping {
+        return;
+    }
+    let Some(now) = git_out(
+        &state.project_root,
+        &["status", "--porcelain", "--", ":!.spar"],
+    ) else {
+        return;
+    };
+    let file = paths.primary_status_file(&state.id);
+    if starting {
+        let _ = std::fs::write(&file, &now);
+        return;
+    }
+    let Ok(before) = std::fs::read_to_string(&file) else {
+        return;
+    };
+    let before = before.trim();
+    if before == now {
+        return;
+    }
+    let changed: Vec<&str> = now
+        .lines()
+        .filter(|l| !before.lines().any(|b| b == *l))
+        .chain(before.lines().filter(|b| !now.lines().any(|l| l == *b)))
+        .map(str::trim)
+        .collect();
+    let shown = changed
+        .iter()
+        .take(5)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = changed.len().saturating_sub(5);
+    let more = if more > 0 {
+        format!(" and {more} more")
+    } else {
+        String::new()
+    };
+    let msg = format!(
+        "primary checkout {} changed while run {} was active ({shown}{more}); a slot may have written outside its worktree",
+        state.project_root.display(),
+        state.id
+    );
+    eprintln!("warning: {msg}");
+    let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg));
 }
 
 pub fn remove_worktree(project_root: &Path, record: &WorktreeRecord) -> Result<()> {
@@ -2125,6 +2213,93 @@ mod tests {
             "only the configured list is copied"
         );
         cleanup_run(&state, false).unwrap();
+    }
+
+    /// #178: run outputs an agent leaves at the worktree root never show up as changes,
+    /// and a project that tracks its own `artifacts/` keeps it visible.
+    #[test]
+    fn slot_worktrees_exclude_run_outputs_unless_the_repo_tracks_them() {
+        let tmp = tempdir().unwrap();
+        let (root, _wt, _) = repo_with_linked_worktree(tmp.path());
+        let rec = create_worktree(&root, "runexcl", "impl", None).unwrap();
+        for dir in ["artifacts", ".spar"] {
+            std::fs::create_dir_all(rec.path.join(dir)).unwrap();
+            std::fs::write(rec.path.join(dir).join("summary-impl.md"), "x").unwrap();
+        }
+        assert_eq!(
+            git_out(&rec.path, &["status", "--porcelain"]).unwrap(),
+            "",
+            "run outputs must not be stageable"
+        );
+        remove_worktree(&root, &rec).unwrap();
+
+        let tmp = tempdir().unwrap();
+        let (root, _wt, _) = repo_with_linked_worktree(tmp.path());
+        std::fs::create_dir_all(root.join("artifacts")).unwrap();
+        std::fs::write(root.join("artifacts/keep.txt"), "tracked").unwrap();
+        fixture_git(&root, &["add", "."]);
+        fixture_git(&root, &["commit", "-q", "-m", "track artifacts"]);
+        let rec = create_worktree(&root, "runexcl2", "impl", None).unwrap();
+        std::fs::write(rec.path.join("artifacts/new.txt"), "x").unwrap();
+        assert_eq!(
+            git_out(&rec.path, &["status", "--porcelain"]).unwrap(),
+            "?? artifacts/new.txt"
+        );
+        remove_worktree(&root, &rec).unwrap();
+    }
+
+    fn events_mentioning(paths: &SparPaths, run_id: &str, needle: &str) -> usize {
+        crate::events::read_all(paths, run_id)
+            .unwrap()
+            .iter()
+            .filter(|e| e.message.as_deref().is_some_and(|m| m.contains(needle)))
+            .count()
+    }
+
+    /// #178: a primary checkout that changes while slots run is warned once the leg
+    /// stops; edits made while the run is parked at a gate are the operator's and are not.
+    #[test]
+    fn a_primary_checkout_changed_during_a_leg_is_reported() {
+        use crate::state::Phase;
+        let tmp = tempdir().unwrap();
+        let (root, _wt, _) = repo_with_linked_worktree(tmp.path());
+        let paths = SparPaths::new(&root);
+        let mut state = RunState::new("runwatch", crate::cli::WorkflowKind::Loop, root.clone());
+        state.save(&paths).unwrap();
+
+        state.set_phase(Phase::AwaitingPlanApproval);
+        state.save(&paths).unwrap();
+        assert_eq!(events_mentioning(&paths, "runwatch", "primary checkout"), 0);
+
+        std::fs::write(root.join("README"), "operator edit at the gate").unwrap();
+        state.set_phase(Phase::PlanApproved);
+        state.save(&paths).unwrap();
+        state.set_phase(Phase::Dispatch);
+        state.save(&paths).unwrap();
+        state.set_phase(Phase::AwaitingShipConfirm);
+        state.save(&paths).unwrap();
+        assert_eq!(
+            events_mentioning(&paths, "runwatch", "primary checkout"),
+            0,
+            "edits made at a gate are not the run's"
+        );
+
+        state.set_phase(Phase::Shipping);
+        state.save(&paths).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        state.set_phase(Phase::Failed);
+        state.save(&paths).unwrap();
+        let events = crate::events::read_all(&paths, "runwatch").unwrap();
+        let hit = events
+            .iter()
+            .filter_map(|e| e.message.as_deref())
+            .find(|m| m.contains("primary checkout"))
+            .expect("drift reported");
+        assert!(hit.contains("?? Cargo.toml"), "{hit}");
+        assert!(
+            !hit.contains("README"),
+            "pre-existing changes are not news: {hit}"
+        );
     }
 
     #[test]
