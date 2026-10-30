@@ -1,8 +1,9 @@
-//! Private refs that keep a slot's work off the one box it was written on (O112, O113).
+//! Refs outside `refs/heads` that keep a slot's work past its worktree (O112, O113).
 //!
 //! `refs/spar-checkpoint/<run>/<slot>` holds the implementer's end state after every
-//! dispatch, uncommitted edits included, locally and on origin. `refs/spar-archive/<run>/<slot>`
-//! holds what `cleanup --force` was about to delete. Neither is a branch, so no PR targets
+//! dispatch, uncommitted edits included, in the local repo, and on origin only with
+//! `[checkpoint] push = true` (anyone who can read origin can then fetch it).
+//! `refs/spar-archive/<run>/<slot>` holds what `cleanup --force` was about to delete. Neither is a branch, so no PR targets
 //! them and `spar/<run>/<slot>` short names never resolve to them.
 
 use crate::paths::SparPaths;
@@ -91,35 +92,61 @@ pub fn push(dir: &Path, reference: &str, commit: &str) -> Result<(), String> {
     if git_out(dir, &["remote", "get-url", "origin"]).is_none() {
         return Err("no origin remote".into());
     }
-    let mut child = Command::new("git")
-        .current_dir(dir)
-        .args([
+    git_unattended(
+        dir,
+        &[
             "push",
             "--quiet",
             "origin",
             &format!("+{commit}:{reference}"),
-        ])
+        ],
+        PUSH_TIMEOUT,
+    )
+}
+
+/// Run a git command that talks to a remote without ever waiting on a person or a dead
+/// network: no stdin, no terminal or askpass prompt, ssh in batch mode (appended to the
+/// operator's own ssh command), and the whole process group (pre-push hooks included,
+/// which are kept) killed at `timeout`.
+pub fn git_unattended(dir: &Path, args: &[&str], timeout: Duration) -> Result<(), String> {
+    let ssh = std::env::var("GIT_SSH_COMMAND")
+        .ok()
+        .filter(|c| !c.trim().is_empty())
+        .or_else(|| git_out(dir, &["config", "core.sshCommand"]).filter(|c| !c.is_empty()))
+        .unwrap_or_else(|| "ssh".into());
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir)
+        .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_SSH_COMMAND", format!("{ssh} -o BatchMode=yes"))
+        .env("SSH_ASKPASS_REQUIRE", "never")
+        .env_remove("GIT_ASKPASS")
+        .env_remove("SSH_ASKPASS")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("git push: {e}"))?;
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("git {}: {e}", args[0]))?;
     let started = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(s)) if s.success() => return Ok(()),
-            Ok(Some(s)) => return Err(format!("git push to origin exited {s}")),
-            Ok(None) if started.elapsed() >= PUSH_TIMEOUT => {
-                let _ = child.kill();
+            Ok(Some(s)) => return Err(format!("git {} exited {s}", args[0])),
+            Ok(None) if started.elapsed() >= timeout => {
+                crate::process::terminate_tree(child.id(), true);
                 let _ = child.wait();
                 return Err(format!(
-                    "git push to origin timed out after {}s",
-                    PUSH_TIMEOUT.as_secs()
+                    "git {} timed out after {}s",
+                    args[0],
+                    timeout.as_secs()
                 ));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-            Err(e) => return Err(format!("git push: {e}")),
+            Err(e) => return Err(format!("git {}: {e}", args[0])),
         }
     }
 }
@@ -153,11 +180,18 @@ pub fn save_slot(
         }
         Some(commit) => {
             let short: String = commit.chars().take(8).collect();
-            match push(cwd, &reference, &commit) {
-                Ok(()) => format!("checkpoint {short} pushed to origin {reference}"),
-                Err(e) => {
-                    eprintln!("warning: checkpoint {reference} kept locally only: {e}");
-                    format!("checkpoint {short} kept locally at {reference}; not pushed: {e}")
+            let publish = crate::config::Config::for_run(paths, run_id)
+                .map(|c| c.checkpoint.push)
+                .unwrap_or(false);
+            if !publish {
+                format!("checkpoint {short} kept locally at {reference}")
+            } else {
+                match push(cwd, &reference, &commit) {
+                    Ok(()) => format!("checkpoint {short} pushed to origin {reference}"),
+                    Err(e) => {
+                        eprintln!("warning: checkpoint {reference} kept locally only: {e}");
+                        format!("checkpoint {short} kept locally at {reference}; not pushed: {e}")
+                    }
                 }
             }
         }
@@ -275,13 +309,45 @@ mod tests {
         );
     }
 
+    /// Freeze `[checkpoint] push = true` into the run's config, as a run created with it.
+    fn run_with_push(proj: &Path) -> SparPaths {
+        let paths = SparPaths::new(proj);
+        paths.ensure_run_dirs("r1").unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.checkpoint.push = true;
+        cfg.save_snapshot(&paths, "r1").unwrap();
+        paths
+    }
+
+    /// Review of #156: spar's own origin is public, so publishing work in progress is the
+    /// operator's call. By default the checkpoint is local and origin gets nothing.
     #[test]
-    fn save_slot_pushes_the_wip_checkpoint_to_a_private_ref_on_origin() {
+    fn save_slot_keeps_the_checkpoint_local_unless_push_is_enabled() {
         let tmp = tempdir().unwrap();
         let (proj, wt, origin) = project_with_origin(tmp.path());
         std::fs::write(wt.join("half.rs"), "fn half() {}\n").unwrap();
         let paths = SparPaths::new(&proj);
         paths.ensure_run_dirs("r1").unwrap();
+
+        let note = save_slot(&paths, "r1", "impl", &wt, Some("exit 137")).unwrap();
+        assert!(note.contains("kept locally"), "{note}");
+        let local = git(&proj, &["rev-parse", "refs/spar-checkpoint/r1/impl"]);
+        assert_eq!(
+            git(&proj, &["show", &format!("{local}:half.rs")]),
+            "fn half() {}"
+        );
+        assert!(
+            git(&origin, &["for-each-ref"]).is_empty(),
+            "nothing published"
+        );
+    }
+
+    #[test]
+    fn save_slot_pushes_the_wip_checkpoint_to_origin_when_enabled() {
+        let tmp = tempdir().unwrap();
+        let (proj, wt, origin) = project_with_origin(tmp.path());
+        std::fs::write(wt.join("half.rs"), "fn half() {}\n").unwrap();
+        let paths = run_with_push(&proj);
 
         let note = save_slot(&paths, "r1", "impl", &wt, Some("exit 137\nmore")).unwrap();
         assert!(note.contains("pushed to origin"), "{note}");
@@ -308,8 +374,7 @@ mod tests {
         let (proj, wt, _) = project_with_origin(tmp.path());
         git(&proj, &["remote", "remove", "origin"]);
         std::fs::write(wt.join("half.rs"), "x\n").unwrap();
-        let paths = SparPaths::new(&proj);
-        paths.ensure_run_dirs("r1").unwrap();
+        let paths = run_with_push(&proj);
 
         let note = save_slot(&paths, "r1", "impl", &wt, None).unwrap();
         assert!(note.contains("kept locally"), "{note}");
@@ -329,11 +394,58 @@ mod tests {
             &proj,
             &["remote", "set-url", "origin", gone.to_str().unwrap()],
         );
-        let paths = SparPaths::new(&proj);
-        paths.ensure_run_dirs("r1").unwrap();
+        let paths = run_with_push(&proj);
 
         let note = save_slot(&paths, "r1", "impl", &wt, None).unwrap();
         assert!(note.contains("not pushed"), "{note}");
+    }
+
+    /// A pre-push hook that outlives the timeout (here it forks a sleeper) must die with
+    /// git: the whole process group goes, not just the git pid.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_timed_out_push_kills_its_hooks_too() {
+        let tmp = tempdir().unwrap();
+        let (proj, wt, _) = project_with_origin(tmp.path());
+        let pidfile = tmp.path().join("hook.pid");
+        let hooks = proj.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("pre-push");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nsleep 60 &\necho $! > {}\nwait\n",
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let head = git(&wt, &["rev-parse", "HEAD"]);
+
+        let err = git_unattended(
+            &wt,
+            &[
+                "push",
+                "--quiet",
+                "origin",
+                &format!("+{head}:refs/spar-checkpoint/r1/impl"),
+            ],
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        let pid = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .to_string();
+        let gone = (0..40).any(|_| {
+            std::thread::sleep(Duration::from_millis(50));
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map(|s| s.split(") ").nth(1).is_some_and(|r| r.starts_with('Z')))
+                .unwrap_or(true)
+        });
+        assert!(gone, "the hook's child {pid} survived the timeout");
     }
 
     #[test]

@@ -349,6 +349,7 @@ fn prepare_slot_execution(
     // stale `<slot>.failed` doesn't outrank the live process during reconciliation.
     markers::clear_slot(paths, &state.id, &job.slot_id);
     let round = state.round;
+    state.dispatched_round = round;
     if let Some(s) = state.slot_mut(&job.slot_id) {
         s.status = SlotStatus::Running;
         // A dispatch's outcome fields describe *that* dispatch. Carried into the next
@@ -2253,6 +2254,7 @@ pub fn run_slot(
     // See prepare_slot_execution: clear a prior attempt's markers before going Running.
     markers::clear_slot(paths, &state.id, &job.slot_id);
     let round = state.round;
+    state.dispatched_round = round;
     if let Some(s) = state.slot_mut(&job.slot_id) {
         s.status = SlotStatus::Running;
         // A dispatch's outcome fields describe *that* dispatch. Carried into the next
@@ -5900,10 +5902,11 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         repo
     }
 
-    /// #156: a dead implementer's uncommitted round reaches origin before the slot is
-    /// marked failed, on a private ref, without moving the worktree's branch.
+    /// #156: a dead implementer's uncommitted round is checkpointed before the slot is
+    /// marked failed, without moving the worktree's branch, and reaches origin when the
+    /// run enabled `[checkpoint] push`.
     #[test]
-    fn salvage_checkpoints_a_dead_implementers_dirty_tree_to_origin() {
+    fn salvage_checkpoints_a_dead_implementers_dirty_tree_and_pushes_when_enabled() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         paths.ensure_run_dirs("r1").unwrap();
@@ -5915,6 +5918,9 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &repo,
             &["remote", "add", "origin", origin.to_str().unwrap()],
         );
+        let mut cfg = crate::config::Config::default();
+        cfg.checkpoint.push = true;
+        cfg.save_snapshot(&paths, "r1").unwrap();
         let head_before = git_output(&repo, &["rev-parse", "HEAD"]).unwrap();
         let log_path = paths.log_file("r1", "impl");
         std::fs::write(&log_path, "→ edit  foo.rs  success\n").unwrap();

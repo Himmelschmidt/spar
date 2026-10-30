@@ -803,8 +803,15 @@ fn unit_quote(value: &str) -> String {
 /// restarted orchestrators spawn those. `KillMode=process` because restarted
 /// orchestrators run in this unit's cgroup: stopping or restarting the supervisor must
 /// not take every run it ever restarted down with it.
-fn unit_file(exe: &Path, path_env: &str, spar_home: Option<&str>) -> String {
+///
+/// Secrets never go in the unit: API keys and proxy settings live in `env_file`, a
+/// user-owned `0600` file the unit reads (`-`: a missing file is not an error).
+fn unit_file(exe: &Path, path_env: &str, spar_home: Option<&str>, env_file: &Path) -> String {
     let mut env = format!("Environment={}\n", unit_quote(&format!("PATH={path_env}")));
+    env.push_str(&format!(
+        "EnvironmentFile=-{}\n",
+        env_file.display().to_string().replace('%', "%%")
+    ));
     if let Some(home) = spar_home {
         env.push_str(&format!(
             "Environment={}\n",
@@ -827,6 +834,34 @@ fn unit_file(exe: &Path, path_env: &str, spar_home: Option<&str>) -> String {
          WantedBy=default.target\n",
         unit_quote(&exe.display().to_string())
     )
+}
+
+/// `~/.config/spar/daemon.env`: where the operator puts what restarted runs need from
+/// their shell (provider API keys, `HTTPS_PROXY`, `NO_PROXY`).
+fn env_file_path() -> Result<PathBuf> {
+    dirs::config_dir()
+        .map(|d| d.join("spar").join("daemon.env"))
+        .context("no config dir: set HOME or XDG_CONFIG_HOME")
+}
+
+/// Create the env file empty and `0600` when missing; never touch an existing one.
+fn ensure_env_file(path: &Path) -> Result<bool> {
+    if path.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+        .with_context(|| format!("create {}", path.display()))?;
+    Ok(true)
 }
 
 fn write_unit(dir: &Path, body: &str) -> Result<PathBuf> {
@@ -864,9 +899,16 @@ pub fn install() -> Result<ExitCode> {
     let exe = fs::canonicalize(&exe).unwrap_or(exe);
     let path_env = std::env::var("PATH").unwrap_or_default();
     let spar_home = std::env::var("SPAR_HOME").ok().filter(|h| !h.is_empty());
+    let env_file = env_file_path()?;
+    if ensure_env_file(&env_file)? {
+        println!(
+            "created {} (0600): put provider API keys and proxy settings there, one KEY=value per line",
+            env_file.display()
+        );
+    }
     let unit = write_unit(
         &unit_dir()?,
-        &unit_file(&exe, &path_env, spar_home.as_deref()),
+        &unit_file(&exe, &path_env, spar_home.as_deref(), &env_file),
     )?;
     println!("wrote {}", unit.display());
     for args in [&["daemon-reload"][..], &["enable", "--now", UNIT_NAME][..]] {
@@ -1465,6 +1507,7 @@ mod tests {
             Path::new("/opt/spar bin/spar"),
             "/home/u/.local/bin:/usr/bin:50%",
             Some("/srv/spar-home"),
+            Path::new("/home/u/.config/spar/daemon.env"),
         );
         assert!(unit.contains(
             "ExecStart=\"/opt/spar bin/spar\" daemon start --foreground --all-projects\n"
@@ -1474,7 +1517,34 @@ mod tests {
         assert!(unit.contains("KillMode=process\n"));
         assert!(unit.contains("Restart=on-failure\n"));
         assert!(unit.contains("[Install]\nWantedBy=default.target\n"));
-        assert!(!unit_file(Path::new("/x"), "/usr/bin", None).contains("SPAR_HOME"));
+        assert!(unit.contains("EnvironmentFile=-/home/u/.config/spar/daemon.env\n"));
+        for secret in ["API_KEY", "PROXY", "TOKEN"] {
+            assert!(
+                !unit.contains(secret),
+                "no secret ever lands in the unit: {secret}"
+            );
+        }
+        assert!(
+            !unit_file(Path::new("/x"), "/usr/bin", None, Path::new("/e")).contains("SPAR_HOME")
+        );
+    }
+
+    /// Created `0600` when missing, and an existing file (holding keys) is never touched.
+    #[cfg(unix)]
+    #[test]
+    fn the_env_file_is_created_private_and_never_overwritten() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("spar/daemon.env");
+        assert!(ensure_env_file(&path).unwrap());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        std::fs::write(&path, "OPENAI_API_KEY=x\n").unwrap();
+        assert!(!ensure_env_file(&path).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "OPENAI_API_KEY=x\n"
+        );
     }
 
     #[test]

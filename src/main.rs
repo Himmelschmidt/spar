@@ -1534,7 +1534,7 @@ fn reconcile_state_cmd(
             phases.push(serde_json::json!({
                 "run_id": id,
                 "from": serde_json::to_value(from)?,
-                "to": serde_json::to_value(state::Phase::Stopped)?,
+                "to": serde_json::to_value(parked_phase(from))?,
             }));
         }
         let before: Vec<state::SlotStatus> = state.slots.iter().map(|s| s.status).collect();
@@ -1624,7 +1624,7 @@ fn reconcile_state_cmd(
 }
 
 /// Patch slot `status` (and `error`, where one was derived) into the run's existing
-/// `state.json` document, and with `parked_from`, its `phase` to `stopped`.
+/// `state.json` document, and with `parked_from`, its `phase` to `parked_phase`.
 ///
 /// Value-level rather than typed, so a field spar does not model survives the write; the
 /// document is re-read here rather than re-serialized from the caller's snapshot. Only
@@ -1651,8 +1651,8 @@ fn patch_state(
             slot["error"] = serde_json::Value::String(e.clone());
         }
     }
-    if parked_from.is_some() {
-        doc["phase"] = serde_json::to_value(state::Phase::Stopped)?;
+    if let Some(from) = parked_from {
+        doc["phase"] = serde_json::to_value(parked_phase(from))?;
     }
     std::fs::write(&file, serde_json::to_string_pretty(&doc)?)
         .map_err(|e| anyhow::anyhow!("write {}: {e}", file.display()))?;
@@ -1660,10 +1660,20 @@ fn patch_state(
         let _ = events::append(
             paths,
             run_id,
-            &events::Event::phase(state::Phase::Stopped, Some(from)),
+            &events::Event::phase(parked_phase(from), Some(from)),
         );
     }
     Ok(())
+}
+
+/// Where an abandoned in-flight run is parked. A run that died shipping already finished
+/// its rounds, so it goes back to the ship gate; `stopped` would make the next resume
+/// buy a new round for work that is done (O117).
+fn parked_phase(from: state::Phase) -> state::Phase {
+    match from {
+        state::Phase::Shipping => state::Phase::AwaitingShipConfirm,
+        _ => state::Phase::Stopped,
+    }
 }
 
 /// Observe-only: the returned state is reconciled against on-disk markers, never written back.
@@ -2275,6 +2285,27 @@ fn cleanup_one(
     if_merged: bool,
 ) -> Result<ExitCode> {
     let (paths, _) = project_ctx()?;
+    // What an earlier `--purge` left: `artifacts/` and no record. Nothing else is there to
+    // reap, and no record means no orchestrator could hold it.
+    if !paths.state_file(run_id).exists() && paths.run_dir(run_id).is_dir() {
+        if purge != Purge::Everything {
+            anyhow::bail!(
+                "run {run_id} has no record left, only {}; remove it with --purge-artifacts",
+                paths.artifacts_dir(run_id).display()
+            );
+        }
+        std::fs::remove_dir_all(paths.run_dir(run_id))?;
+        worktree::prune_empty_spar_parents(&paths)?;
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({ "run_id": run_id, "removed": 0, "purged": true, "worktrees": [] })
+            );
+        } else {
+            println!("purged the artifacts left for {run_id}");
+        }
+        return Ok(ExitCode::Success);
+    }
     let state = state::RunState::load(&paths, run_id)?;
     // Removing a live run's worktrees kills its agents (cleanup reaps by cwd), and
     // purging its record leaves an orchestrator writing into a directory that is gone.

@@ -218,6 +218,14 @@ fn purge_keeps_artifacts_unless_purge_artifacts() {
         .assert()
         .code(0);
     assert!(!proj.join(".spar/runs").join(&gone).exists());
+
+    // What `--purge` kept is still removable afterwards, with no record left to load.
+    spar_cmd()
+        .current_dir(&proj)
+        .args(["cleanup", &kept, "--purge-artifacts"])
+        .assert()
+        .code(0);
+    assert!(!run_dir.exists(), "the kept artifacts are removable later");
 }
 
 /// A fake `muse` for the ceiling test. The implementer commits its work and then hangs
@@ -680,10 +688,146 @@ fn resume_works_from_every_in_flight_phase() {
         assert_eq!(out.status.code(), Some(2), "{phase}: {out:?}");
         let st = read_state(&proj, &run_id);
         assert_eq!(st["phase"], "awaiting_ship_confirm", "{phase}");
-        if phase == "shipping" {
-            assert_eq!(st["round"], 1, "a mid-ship death re-runs nothing");
-        }
     }
+}
+
+/// Every implementer dispatch rewrites its prompt file; an unchanged one proves none ran.
+fn impl_prompt_stamp(proj: &Path, run_id: &str) -> (std::time::SystemTime, String) {
+    let p = proj.join(".spar/runs").join(run_id).join("prompt-impl.md");
+    (
+        std::fs::metadata(&p).unwrap().modified().unwrap(),
+        std::fs::read_to_string(&p).unwrap(),
+    )
+}
+
+/// A run that died in `shipping` goes back to the ship gate from every resume entry:
+/// `spar resume` and the daemon's `__internal_continue` alike. No implementer dispatch,
+/// no new round.
+#[test]
+fn a_run_that_died_shipping_returns_to_the_ship_gate_without_redispatch() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    init_repo(&proj);
+    for entry in [&["resume"][..], &["__internal_continue"][..]] {
+        let run_id = implement_dry_run(&proj);
+        set_phase(&proj, &run_id, "shipping");
+        let before = impl_prompt_stamp(&proj, &run_id);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut args: Vec<&str> = entry.to_vec();
+        args.push(&run_id);
+        let out = spar_cmd().current_dir(&proj).args(&args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{entry:?}: {out:?}");
+        let st = read_state(&proj, &run_id);
+        assert_eq!(st["phase"], "awaiting_ship_confirm", "{entry:?}");
+        assert_eq!(st["round"], 1, "{entry:?}");
+        assert_eq!(
+            impl_prompt_stamp(&proj, &run_id),
+            before,
+            "{entry:?} re-dispatched the implementer"
+        );
+    }
+}
+
+/// Review of #151: reconcile parked a dead `shipping` run at `stopped`, and the next
+/// resume bought a new round for finished work. It parks at the ship gate instead.
+#[test]
+fn reconcile_then_resume_keeps_a_dead_ship_at_the_ship_gate() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    init_repo(&proj);
+    let run_id = implement_dry_run(&proj);
+    set_phase(&proj, &run_id, "shipping");
+    let before = impl_prompt_stamp(&proj, &run_id);
+
+    spar_cmd()
+        .current_dir(&proj)
+        .args(["reconcile-state", &run_id, "--apply"])
+        .assert()
+        .code(0);
+    assert_eq!(read_state(&proj, &run_id)["phase"], "awaiting_ship_confirm");
+
+    let out = spar_cmd()
+        .current_dir(&proj)
+        .args(["resume", &run_id])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("spar ship"),
+        "resume names the ship command: {out:?}"
+    );
+    let st = read_state(&proj, &run_id);
+    assert_eq!(st["phase"], "awaiting_ship_confirm");
+    assert_eq!(st["round"], 1);
+    assert_eq!(impl_prompt_stamp(&proj, &run_id), before);
+}
+
+/// `ship` holds the run lock: a ship running past `abandon_after_secs` reads as owned,
+/// so nothing restarts the run under it, and a second driver is refused.
+#[test]
+fn ship_refuses_a_run_another_process_holds() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    init_repo(&proj);
+    let run_id = implement_dry_run(&proj);
+    let lock = proj
+        .join(".spar/runs")
+        .join(&run_id)
+        .join("orchestrator.lock");
+    let mut holder = Command::new("flock")
+        .args([lock.to_str().unwrap(), "sleep", "30"])
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let out = spar_cmd()
+        .current_dir(&proj)
+        .args(["ship", &run_id, "--confirm"])
+        .output()
+        .unwrap();
+    let _ = holder.kill();
+    let _ = holder.wait();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(read_state(&proj, &run_id)["phase"], "awaiting_ship_confirm");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("already has a running orchestrator"),
+        "{out:?}"
+    );
+}
+
+/// The daemon's entry (`__internal_continue`) continues an approved plan that died in
+/// flight into implementation; it never re-plans and asks for approval again.
+#[test]
+fn the_daemon_entry_continues_an_approved_plan_into_implementation() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    init_repo(&proj);
+    let out = spar_cmd()
+        .current_dir(&proj)
+        .args([
+            "plan",
+            "--task",
+            "hello",
+            "--providers",
+            "cli:claude",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2);
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    spar_cmd()
+        .current_dir(&proj)
+        .args(["approve", &run_id])
+        .assert()
+        .code(0);
+    set_phase(&proj, &run_id, "spec");
+
+    spar_cmd()
+        .current_dir(&proj)
+        .args(["__internal_continue", &run_id])
+        .assert()
+        .code(2);
+    assert_eq!(read_state(&proj, &run_id)["phase"], "awaiting_ship_confirm");
 }
 
 /// An approved plan whose orchestrator died in flight continues into implementation,

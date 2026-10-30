@@ -640,28 +640,36 @@ fast-forwards the implementer's branch back onto HEAD before each review panel w
 left the worktree elsewhere, and only warns (stderr + event log) when that is not a
 fast-forward, the branch is still at the base, or it is checked out in another worktree.
 
-## Checkpoints: the implementer's work leaves the box every round
+## Checkpoints: the implementer's work survives its worktree
 
 After every implementer dispatch, spar snapshots the slot worktree, commits **and**
-uncommitted edits, to the private ref `refs/spar-checkpoint/<run_id>/<slot>` and pushes it
-to `origin`. When the slot died (exit, signal, ceiling, transport), the snapshot is a WIP
-commit on top of the branch, taken before the slot is marked failed. The snapshot uses a
-throwaway index and `git commit-tree`: the worktree's branch, index and files never move.
-It is not a branch, so no PR targets it, and `spar/<id>/<slot>` never resolves to it.
+uncommitted edits, to the local ref `refs/spar-checkpoint/<run_id>/<slot>` in the project
+repo. When the slot died (exit, signal, ceiling, transport), the snapshot is a WIP commit on
+top of the branch, taken before the slot is marked failed. The snapshot uses a throwaway
+index and `git commit-tree`: the worktree's branch, index and files never move. It is not a
+branch, so no PR targets it, and `spar/<id>/<slot>` never resolves to it. The local ref is
+always written and outlives the worktree.
 
-The push is best-effort: no `origin`, no network or a 60s timeout prints a `warning:` on
-stderr and an event note, keeps the ref locally, and never fails the run. The agent still
-does not push; spar does.
+**Pushing it is opt-in: `[checkpoint] push = true`** (frozen into the run when it is
+created, like all config). It then also force-pushes the ref to `origin` after every
+dispatch. **That publishes every round's work in progress to anyone who can read origin**,
+which for a public repo is everyone; a later force-push does not retract the objects.
+Turn it on only for a private remote. The push is best-effort and unattended: stdin closed,
+no terminal or askpass prompt, ssh in `BatchMode` (appended to your `GIT_SSH_COMMAND` or
+`core.sshCommand`), pre-push hooks kept, and the whole process group killed after 60s. A
+failure prints a `warning:` on stderr and an event note, keeps the local ref, and never
+fails the run. The agent still does not push.
 
-Base a replacement run on a dead run's work from any box:
+Base a replacement run on a dead run's work:
 
 ```bash
 spar implement -t "..." --providers cli:claude --base refs/spar-checkpoint/<run_id>/impl
 ```
 
-`--base` fetches the ref from `origin` by name when it is not local (`origin/spar-checkpoint/…`
-and `spar-checkpoint/…` spellings work too). An unresolvable `--base [origin/]spar/<id>/<slot>`
-names the matching checkpoint ref in its error.
+`--base` uses the local ref first, and only when it is missing fetches it from `origin` by
+name (same unattended rules, 60s), which finds it only if that run pushed checkpoints.
+`origin/spar-checkpoint/…` and `spar-checkpoint/…` spellings work too. An unresolvable
+`--base [origin/]spar/<id>/<slot>` names the matching checkpoint ref in its error.
 
 ## Abandoned runs
 
@@ -694,20 +702,29 @@ children — so they keep running and keep spending tokens with nobody collectin
   `state.json`, and on an abandoned in-flight run names `spar resume` in its refusal.
 - A foreground `spar plan` holds the run lock for its whole dispatch, so it never reads
   abandoned while its planner works.
-- `spar reconcile-state --all --apply` parks every abandoned in-flight run at `stopped`
-  (and settles its dead slots) without signalling anything; `--json` lists them under
+- `spar reconcile-state --all --apply` parks every abandoned in-flight run at `stopped`,
+  except one that died in `shipping`, which goes back to `awaiting_ship_confirm` (its
+  rounds are done; `stopped` would make the next resume buy another), and settles its
+  dead slots without signalling anything; `--json` lists them under
   `phases`. A run whose slot processes still run is skipped with a reason: that is
   `spar stop --abandoned`'s job.
 - **The supervisor is the default: `spar daemon install` on every box.** It writes
   `~/.config/systemd/user/spar-daemon.service` (`$XDG_CONFIG_HOME` honoured) running
   `spar daemon start --foreground --all-projects` from the installed binary, with the
-  installing shell's `PATH` (and `SPAR_HOME`) frozen in, `Restart=on-failure`, and
+  installing shell's `PATH` (and `SPAR_HOME`) frozen in, `EnvironmentFile=-~/.config/spar/daemon.env`,
+  `Restart=on-failure`, and
   `KillMode=process` so stopping the unit never kills the orchestrators it restarted. It
   then runs `systemctl --user daemon-reload` and `enable --now`; if that fails the unit is
   left written, the commands are printed and it exits `1`. User units stop at logout and
   start at login unless lingering is on: install warns until you run `loginctl
   enable-linger $USER`, which is what makes it survive a reboot with nobody logged in.
   `spar daemon uninstall` disables and removes it. Nothing installs or starts it for you.
+  **Restarted runs need your provider keys:** the unit never contains secrets, so put
+  `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `XAI_API_KEY`, `OPENROUTER_API_KEY`, `HTTPS_PROXY`,
+  `NO_PROXY` and anything else your shell exports for the CLIs into
+  `~/.config/spar/daemon.env`, one `KEY=value` per line. Install creates it empty and
+  `0600` if missing and never overwrites it; `systemctl --user restart spar-daemon` after
+  editing it.
 - What the supervisor does, per project: pushes an alert the first time a run has read
   abandoned past `[daemon].abandon_after_secs` (60s by default), and restarts it if
   `[daemon].restart` is on (the default). One process covers every project in the
@@ -717,6 +734,11 @@ children — so they keep running and keep spending tokens with nobody collectin
   plan, confirms ship, merges, sweeps `cleanup`, or picks a fleet; it only ever restarts
   the same orchestrator a plain `spar resume` would have, and tells you when one is
   waiting. `spar daemon status` reports the project you stand in.
+- **A run that died shipping is never re-run.** `spar ship` holds the run lock through
+  `shipping`, so a slow push does not read as abandoned. If the ship process dies anyway,
+  every resume entry (`spar resume`, the daemon's restart) puts the run back at
+  `awaiting_ship_confirm` (exit `2`) without dispatching anything: run `spar ship <id>`
+  again. `spar ship` refuses a run another process holds.
 
 ### Budgets and nudges: nothing kills a slot on tokens (O50)
 
@@ -869,7 +891,8 @@ appends the run's line to `.spar/history.jsonl` first.
 `--purge` deletes the run record (state, logs, prompts, markers) and **keeps
 `.spar/runs/<id>/artifacts/`** (plan, reviews, suite report: what merge decisions are made
 from); `--json` reports `artifacts_kept: true`. `--purge-artifacts` implies `--purge` and
-deletes `artifacts/` as well. A run with only `artifacts/` left no longer lists anywhere.
+deletes `artifacts/` as well. A run with only `artifacts/` left no longer lists anywhere;
+`spar cleanup <id> --purge-artifacts` still removes those leftovers later.
 
 Rejecting a plan (`spar reject`) reaps that run's worktrees immediately — nothing can
 resume a rejected plan — while keeping `plan.md` and the critique that justified it.
@@ -1538,6 +1561,10 @@ enabled = true
 [rounds]
 max = 8
 carry_forward_chars = 4000
+# Implementer checkpoints are always kept locally at refs/spar-checkpoint/<id>/<slot>.
+# push = true also publishes them to origin, readable by anyone who can read origin.
+[checkpoint]
+push = false
 # Pre-coding acceptance tests (plan). Separate test-author agent; not planner/critic.
 [spec]
 enabled = true

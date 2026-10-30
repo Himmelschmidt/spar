@@ -162,18 +162,7 @@ pub fn resume(
     // Shipping is the operator's step, never a supervisor's (O70): a run that died
     // mid-ship goes back to the ship gate instead of re-running its rounds (O117).
     if state.phase == Phase::Shipping {
-        let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
-        let mut state = RunState::load(paths, run_id)?;
-        state.set_phase(Phase::AwaitingShipConfirm);
-        state.save(paths)?;
-        if json {
-            executor::emit_run_json(&state)?;
-        } else {
-            println!(
-                "run {run_id} died while shipping; back at the ship gate: spar ship {run_id} --confirm"
-            );
-        }
-        return Ok(ExitCode::HumanGate);
+        return park_interrupted_ship(paths, run_id, json);
     }
     // An approved plan run has finished planning, so an in-flight park continues into
     // implementation through `run_from_approved` rather than into a second plan round
@@ -369,14 +358,11 @@ pub fn run_loop(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<Exi
     run_with_task(task, None, opts, paths, cfg, None)
 }
 
-/// Whether any slot was dispatched in the run's current round. Dispatch stamps
-/// `slot.round`, moves the slot off `Pending` and saves, all before it spawns, so a round
-/// with no such slot never started anything.
+/// Whether any slot dispatch started in the run's current round. Dispatch stamps
+/// `dispatched_round` and saves before it spawns, so a round it never reached spent
+/// nothing.
 fn current_round_dispatched(state: &RunState) -> bool {
-    state
-        .slots
-        .iter()
-        .any(|s| s.round == state.round && s.status != SlotStatus::Pending)
+    state.dispatched_round >= state.round
 }
 
 fn run_from_approved(
@@ -535,7 +521,12 @@ fn run_from_approved(
     if let Some(m) = opts.max_rounds {
         state.max_rounds = m;
     }
-    if state.round_ceiling_reached() {
+    // A round that never dispatched is still the current round, not a spent one: an
+    // orchestrator killed between opening it and spawning anything (a launching shell
+    // that exited, a quota park before dispatch) cost nothing, so re-entry reuses it,
+    // and reusing it is not a step past the ceiling.
+    let reuse_round = state.round > 0 && !round_dispatched;
+    if !reuse_round && state.round_ceiling_reached() {
         escalate_round_ceiling(&mut state, paths)?;
         finish_out(&state, opts.json)?;
         return Ok(state.exit_code());
@@ -547,10 +538,7 @@ fn run_from_approved(
     if from_round_gate {
         state.error = None;
     }
-    // A round that never dispatched is still the current round, not a spent one: an
-    // orchestrator killed between opening it and spawning anything (a launching shell
-    // that exited, a quota park before dispatch) cost nothing, so re-entry reuses it.
-    let round = if state.round > 0 && !round_dispatched {
+    let round = if reuse_round {
         state.round
     } else {
         state.begin_round()
@@ -972,10 +960,10 @@ mod round_reuse_tests {
         st
     }
 
-    /// #179: only a slot stamped with the current round and moved off `Pending` proves
-    /// the round dispatched. A slot created at round 1 and never run does not.
+    /// #179: only a dispatch that started in the current round charges it. A slot put
+    /// back to `Pending` by a backup failover after it really ran still counts.
     #[test]
-    fn a_round_counts_as_dispatched_only_once_a_slot_ran_in_it() {
+    fn a_round_counts_as_dispatched_only_once_a_dispatch_started_in_it() {
         let mut st = run(crate::cli::WorkflowKind::Loop, Phase::Stopped);
         st.round = 1;
         st.slots.push(executor::init_slot(
@@ -984,8 +972,11 @@ mod round_reuse_tests {
             SlotRole::Implementer,
         ));
         assert!(!current_round_dispatched(&st), "created, never dispatched");
-        st.slots[0].status = SlotStatus::Failed;
-        assert!(current_round_dispatched(&st), "dispatched and died");
+        st.dispatched_round = 1;
+        assert!(
+            current_round_dispatched(&st),
+            "dispatched, then failed over to Pending"
+        );
         st.round = 2;
         assert!(
             !current_round_dispatched(&st),
@@ -3789,8 +3780,40 @@ fn detach_implement(state: &RunState, paths: &SparPaths, json: bool) -> Result<E
     }
 }
 
+/// A run whose orchestrator (or `spar ship`) died in `shipping` goes back to the ship
+/// gate: shipping is the operator's step, and every resume entry, the daemon's included,
+/// must route here rather than re-running the rounds that produced the work (O117).
+pub fn park_interrupted_ship(paths: &SparPaths, run_id: &str, json: bool) -> Result<ExitCode> {
+    let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
+    let mut state = RunState::load(paths, run_id)?;
+    if state.phase == Phase::Shipping {
+        state.set_phase(Phase::AwaitingShipConfirm);
+        state.save(paths)?;
+    }
+    if json {
+        executor::emit_run_json(&state)?;
+    } else {
+        println!(
+            "run {run_id} died while shipping; back at the ship gate: spar ship {run_id} --confirm"
+        );
+    }
+    Ok(state.exit_code())
+}
+
 pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<ExitCode> {
     let mut state = RunState::load(paths, run_id)?;
+    if state.phase == Phase::Shipping {
+        return park_interrupted_ship(paths, run_id, false);
+    }
+    // An approved plan has finished planning: continuing it is implementation, never a
+    // second plan round asking for the approval again (O117).
+    if state.workflow == crate::cli::WorkflowKind::Plan && state.gates.plan_approved {
+        let opts = CommonOpts {
+            dry_run: state.dry_run,
+            ..CommonOpts::default()
+        };
+        return run_from_approved(run_id, None, opts, paths, cfg);
+    }
     if state.workflow == crate::cli::WorkflowKind::Plan {
         return crate::workflow::plan::continue_run(paths, cfg, run_id);
     }

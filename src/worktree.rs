@@ -64,13 +64,16 @@ pub fn resolve_base(
             };
             return Ok(Some(RunBase { reference, commit }));
         }
-        // A checkpoint ref is pushed but never fetched by default refspecs, so a box
-        // replacing a dead run has to ask origin for it by name (O112).
+        // The local checkpoint first; then origin, which has it only when the run pushed
+        // checkpoints and which default refspecs never fetch, so it is asked by name (O112).
         if let Some(full) = checkpoint_ref_name(reference) {
-            let _ = git_out(
-                from,
-                &["fetch", "--quiet", "origin", &format!("+{full}:{full}")],
-            );
+            if verify(&full).is_none() {
+                let _ = crate::checkpoint::git_unattended(
+                    from,
+                    &["fetch", "--quiet", "origin", &format!("+{full}:{full}")],
+                    std::time::Duration::from_secs(60),
+                );
+            }
             if let Some(commit) = verify(&full) {
                 return Ok(Some(RunBase {
                     reference: full,
