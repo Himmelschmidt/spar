@@ -294,16 +294,21 @@ pub fn ship(
             eprintln!("note: run base {r} is not a branch on origin; PR targets the repo default");
         }
     }
+    let draft_arg = if cfg.ship.draft { " --draft" } else { "" };
+    let list_cmd = format!(
+        "cd {} && gh pr list --head {branch} --state open --json number,url,state,isDraft",
+        cwd.display()
+    );
     if state.dry_run {
         let push_cmd = format!(
             "git -C {} push --force-with-lease=refs/heads/{branch}:<fetched origin tip> origin HEAD:refs/heads/{branch}",
             cwd.display()
         );
         let pr_cmd = format!(
-            "cd {} && gh pr create --draft --head {branch}{base_arg} --title dry-run --body dry-run",
+            "cd {} && gh pr create{draft_arg} --head {branch}{base_arg} --title dry-run --body dry-run",
             cwd.display()
         );
-        let commands = vec![push_cmd, pr_cmd];
+        let commands = vec![push_cmd, list_cmd, pr_cmd];
         state.ship_commands = Some(commands.clone());
         std::fs::write(
             paths.artifact(run_id, "ship.md"),
@@ -343,19 +348,18 @@ pub fn ship(
     };
     let push_cmd = format!("git -C {} {}", cwd.display(), push_args.join(" "));
     let pr_cmd = format!(
-        "cd {} && gh pr create --draft --head {branch}{base_arg} --title {} --body-file {}",
+        "cd {} && gh pr create{draft_arg} --head {branch}{base_arg} --title {} --body-file {}",
         cwd.display(),
         shell_single_quote(&title),
         shell_single_quote(&body_file.display().to_string())
     );
 
-    let commands = vec![push_cmd, pr_cmd];
+    let commands = vec![push_cmd, list_cmd, pr_cmd];
     std::fs::write(&body_file, pr_body(paths, &state, &branch))?;
     state.ship_commands = Some(commands.clone());
     state.set_phase(Phase::Shipping);
     state.save(paths)?;
 
-    // Prefer printing if gh/git might fail; try execute
     let mut executed = Vec::new();
     let mut failed = false;
 
@@ -376,43 +380,59 @@ pub fn ship(
     }
 
     if !failed {
-        let mut args: Vec<String> = vec![
-            "pr".into(),
-            "create".into(),
-            // Ship opens a *draft* PR and never merges: the invariant is in
-            // `skills/core.md`, `docs/PRODUCT.md` and `docs/architecture-dual-backend.md`,
-            // but nothing passed the flag, so every shipped PR opened ready for review.
-            "--draft".into(),
-            "--head".into(),
-            branch.clone(),
-            "--title".into(),
-            title.clone(),
-            "--body-file".into(),
-            body_file.display().to_string(),
-        ];
-        if let Some(b) = &pr_base {
-            args.push("--base".into());
-            args.push(b.clone());
-        }
-        let pr = Command::new("gh").args(&args).current_dir(&cwd).output();
-        match pr {
-            Ok(o) if o.status.success() => {
-                let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                state.pr_url = out
-                    .lines()
-                    .rev()
-                    .find(|l| l.trim_start().starts_with("https://"))
-                    .map(|l| l.trim().to_string());
-                executed.push(out);
+        match crate::prs::open_pr_for(&cwd, &branch) {
+            Ok(Some(pr)) => {
+                executed.push(format!("adopted open PR #{}: {}", pr.number, pr.url));
+                // The PR exists and the branch is pushed; a body that did not update is
+                // not worth re-parking the run at the gate over (#164).
+                let body = body_file.display().to_string();
+                if let Err(e) = crate::prs::gh(
+                    &cwd,
+                    &["pr", "edit", &pr.number.to_string(), "--body-file", &body],
+                ) {
+                    eprintln!(
+                        "warning: adopted PR #{} but its body was not updated: {e}",
+                        pr.number
+                    );
+                    executed.push(format!("body not updated: {e}"));
+                }
+                state.pr_url = Some(pr.url);
             }
-            Ok(o) => {
-                // print commands instead of hard-fail if pr exists
-                let err = String::from_utf8_lossy(&o.stderr);
-                executed.push(format!("gh pr create: {err}"));
-                failed = true;
+            Ok(None) => {
+                let mut args: Vec<String> = vec!["pr".into(), "create".into()];
+                if cfg.ship.draft {
+                    args.push("--draft".into());
+                }
+                args.extend([
+                    "--head".into(),
+                    branch.clone(),
+                    "--title".into(),
+                    title.clone(),
+                    "--body-file".into(),
+                    body_file.display().to_string(),
+                ]);
+                if let Some(b) = &pr_base {
+                    args.push("--base".into());
+                    args.push(b.clone());
+                }
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                match crate::prs::gh(&cwd, &args) {
+                    Ok(out) => {
+                        state.pr_url = out
+                            .lines()
+                            .rev()
+                            .find(|l| l.trim_start().starts_with("https://"))
+                            .map(|l| l.trim().to_string());
+                        executed.push(out);
+                    }
+                    Err(e) => {
+                        executed.push(format!("gh pr create: {e}"));
+                        failed = true;
+                    }
+                }
             }
             Err(e) => {
-                executed.push(format!("gh missing or failed: {e}"));
+                executed.push(format!("gh pr list: {e}"));
                 failed = true;
             }
         }
@@ -451,7 +471,8 @@ pub fn ship(
     if json {
         executor::emit_run_json(&state)?;
     } else {
-        println!("shipped branch {branch} (PR created or updated). Never merged.");
+        let url = state.pr_url.as_deref().unwrap_or("(no URL printed)");
+        println!("shipped branch {branch}: {url}. Never merged.");
     }
     Ok(ExitCode::Success)
 }
@@ -564,7 +585,7 @@ fn remote_tip(cwd: &Path, remote: &str, branch: &str) -> Result<Option<String>> 
     Ok(Some(tip))
 }
 
-fn select_branch_cwd(state: &RunState) -> Result<(String, std::path::PathBuf)> {
+pub(crate) fn select_branch_cwd(state: &RunState) -> Result<(String, std::path::PathBuf)> {
     if let Some(winner) = state
         .gates
         .winner_confirmed

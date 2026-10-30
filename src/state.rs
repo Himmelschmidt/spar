@@ -152,9 +152,17 @@ pub struct RunState {
     /// earlier rounds' verdicts and findings for `.spar/history.jsonl`.
     #[serde(default)]
     pub review_history: Vec<ReviewHistoryEntry>,
-    /// URL `gh pr create` printed when `ship` opened the PR.
+    /// URL of the PR `ship` opened or adopted, or `sync-prs` found for the branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,
+    /// When `sync-prs` saw the PR merged (GitHub's `mergedAt`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_commit: Option<String>,
+    /// PR state (`MERGED` / `CLOSED`) as of the `sync-prs` that settled the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_state: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -689,6 +697,9 @@ impl RunState {
             pool_intent: Vec::new(),
             review_history: Vec::new(),
             pr_url: None,
+            merged_at: None,
+            merge_commit: None,
+            pr_state: None,
         }
     }
 

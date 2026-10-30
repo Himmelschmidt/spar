@@ -420,6 +420,22 @@ pub enum Command {
         confirm_only: bool,
     },
 
+    /// Settle shipped runs from GitHub: a merged PR moves its run to `done`, a closed
+    /// one to `stopped`. Open PRs are left alone. Reads PR state through `gh`.
+    SyncPrs {
+        /// One run. Omit with `--all`.
+        #[arg(long)]
+        run: Option<String>,
+        /// Every run with a recorded PR or a shipped branch.
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+        /// Report what would change without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Confirm arena winner (or use ranked default)
     Confirm {
         run_id: String,
@@ -517,7 +533,8 @@ pub enum Command {
     /// Per-project supervisor: restarts a dead orchestrator holding resumable work,
     /// pushes the `abandoned` lifecycle event, and enforces the cross-run concurrency
     /// cap. Opt-in, never auto-started. It never approves a plan, confirms ship,
-    /// merges, sweeps `cleanup`, or picks a fleet.
+    /// merges, sweeps `cleanup`, or picks a fleet. With `[daemon] sync_prs = true` it
+    /// also runs `sync-prs --all`, at most every five minutes.
     Daemon {
         #[command(subcommand)]
         cmd: DaemonCmd,

@@ -325,7 +325,8 @@ spar run --workflow review -t "..." --providers cli:grok,cli:claude --base feat/
 
 spar confirm <run_id> [--winner <slot>]   # arena winner
 spar reconcile <run_id>                  # arena merge-good-parts + review
-spar ship <run_id> --confirm [--base <branch>]   # draft PR (never merges)
+spar ship <run_id> --confirm [--base <branch>]   # draft PR (never merges); adopts an open one
+spar sync-prs --run <id> | --all [--json] [--dry-run]   # merged PR -> done, closed -> stopped
 spar stop <run_id> [--json]              # halt dispatch, KEEP branch+worktree (resumable)
 spar stop --abandoned [--json]           # reap every run nobody is driving any more
 spar cleanup <run_id> [--purge]          # remove worktrees (and --purge run data)
@@ -620,6 +621,25 @@ fast-forwards the implementer's branch back onto HEAD before each review panel w
 left the worktree elsewhere, and only warns (stderr + event log) when that is not a
 fast-forward, the branch is still at the base, or it is checked out in another worktree.
 
+**An open PR is adopted, not re-created (O122).** After the push, ship asks
+`gh pr list --head <branch> --state open`. If a PR exists (an implementer opened it, or an
+earlier ship got that far), ship records its URL as `pr_url`, replaces its body with the
+run's, and the run goes to `done`; a body that fails to update is a warning, not a failure.
+Otherwise it runs `gh pr create`. New PRs open as drafts; `[ship] draft = false` opens them
+ready for review. An adopted PR keeps its own draft state.
+
+**`spar sync-prs --run <id> | --all [--json] [--dry-run]` (O123)** reads each shipped run's PR
+(its `pr_url`, else the newest PR for its branch) through `gh`. Merged: the run goes to
+`done` with `merged_at` and `merge_commit` recorded. Closed unmerged: `stopped`, with
+`pr_state: "CLOSED"`. Open, or no PR: left alone. A run is shipped when it has a `pr_url` or
+ship got as far as its commands; dry runs and runs with a live orchestrator are skipped.
+`--all` does not re-ask about a run it already settled. `--json` prints
+`{"dry_run", "runs": [{run_id, phase, to, pr_url, pr_state, note, error}]}`; `to` is the
+phase the run moved to (or would, under `--dry-run`), `null` when left alone. `gh` missing
+is exit `1`; a per-run `gh` error is that row's `error` and makes the exit `1`.
+`[daemon] sync_prs = true` runs the same `--all` pass from the daemon, at most every five
+minutes, silently skipping when `gh` is missing or failing.
+
 ## Abandoned runs
 
 A run is **abandoned** when it is still in a non-resting phase but no live orchestrator
@@ -652,7 +672,8 @@ children — so they keep running and keep spending tokens with nobody collectin
   it if `[daemon].restart` is on (the default). It is opt-in — nothing starts it for you —
   and it never approves a plan, confirms ship, merges, sweeps `cleanup`, or picks a fleet;
   it only ever restarts the same orchestrator a plain `spar resume` would have, and tells
-  you when one is waiting. `spar daemon status` / `spar daemon stop`.
+  you when one is waiting. With `[daemon] sync_prs = true` it also settles runs whose PR
+  merged or closed (see `sync-prs`). `spar daemon status` / `spar daemon stop`.
 
 ### Budgets and nudges: nothing kills a slot on tokens (O50)
 
@@ -1011,8 +1032,9 @@ stderr and the purge or sweep goes on.
 Finding counts are per round, deduplicated within a round (same severity, location and
 whitespace-normalized text from two reviewers count once); `findings` sums the rounds.
 Synthetic findings count under `synthetic` only. `cost_usd` is `null` when no dispatch
-reported a cost. `pr_url` is what `gh pr create` printed at ship (also `pr_url` in
-`status --json`).
+reported a cost. `pr_url` is the PR ship opened or adopted, or `sync-prs` found (also
+`pr_url` in `status --json`, with `merged_at`, `merge_commit` and `pr_state` once
+`sync-prs` settled the run).
 
 ### TUI shape (humans)
 
@@ -1367,6 +1389,7 @@ auto_cleanup_merged = true   # reap at-rest runs already contained in their base
 copy = [".dbiso.env", ".envrc", ".env.example"]   # copied from the main checkout into every slot worktree; missing files skipped
 [ship]
 title_max = 72   # PR title clamp in characters; 0 = GitHub's 256 only
+draft = true     # open new PRs as drafts; false = ready for review
 [gates]
 plan = true
 winner = true
@@ -1448,6 +1471,7 @@ timeout_secs = 3600    # test_author's SOFT clock; hard_ceiling_multiple applies
 # restart = true               # restart a dead orchestrator holding resumable work
 # max_restarts = 2             # per run, per daemon lifetime
 # max_slots_per_bucket = 0     # cross-run concurrency cap, keyed on provider (model-free); 0 = off
+# sync_prs = false             # run `sync-prs --all` (calls gh) at most every 5 minutes
 # Dynamic model select (vals). Opt-in with --select; cache under ~/.spar/cache/vals/
 [model_select]
 # benches = ["swebench"]
@@ -1465,7 +1489,7 @@ timeout_secs = 3600    # test_author's SOFT clock; hard_ceiling_multiple applies
 
 - One run id plan → implement → ship.
 - Coding slots always use git worktrees; never check out feature branches on the primary tree.
-- Ship is draft PR only — never merge.
+- Ship opens a PR (draft unless `[ship] draft = false`) or adopts an open one, and never merges.
 - State lives under `.spar/` in the project root.
 - **Spec channel (plan):** after planner+critic, a `test-author` freezes acceptance tests (`artifacts/test-contract.md` + worktree tests) from plan/critique (bus is audit trail), **before** the plan approval gate. Implement brings those tests into the impl worktree (fail closed if author ran) by **merging the author branch**, then overlaying only the author's **uncommitted** work — tracked-but-modified plus untracked-not-ignored — on top. Committed author work is the merge's job, so the overlay never copies the author branch's revision of a file the implementer is working on, and build output never crosses between worktrees. A merge that fails is aborted **and fails the dispatch** (exit 1), because it is the only path committed acceptance tests take. Anything git ignores stays behind and is named on stderr, in the event log, on the bus, and in the implementer's own prompt, with the author worktree path: if an acceptance test needs an ignored fixture (`.env.test`, an ignored `tests/data/`), the implementer copies it across itself. Its provider follows the same precedence as every other role: CLI `--role test_author=…`, then an explicit `--providers`/`--select` pool, then `[roles].test_author`, then the run's own pool as a last resort. Disable with `[spec] enabled = false`.
 - **Criterion ids:** scenarios in `artifacts/test-contract.md` carry stable `AC-<n>` ids (numbered from 1, contiguous, never renumbered) plus a `verify:` hint naming a command, `file:line` + assertion, or observable behavior.

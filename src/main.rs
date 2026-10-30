@@ -24,6 +24,7 @@ mod paths;
 mod process;
 mod provider_ref;
 mod providers;
+mod prs;
 mod quota;
 mod record;
 mod registry;
@@ -440,6 +441,12 @@ fn run() -> Result<ExitCode> {
             }
             ship::ship(&paths, &cfg, &run_id, json, base.as_deref())
         }
+        Command::SyncPrs {
+            run,
+            all,
+            json,
+            dry_run,
+        } => sync_prs_cmd(run.as_deref(), all, json, dry_run),
         Command::Confirm {
             run_id,
             winner,
@@ -1749,6 +1756,48 @@ fn attach_cmd(run_id: &str) -> Result<ExitCode> {
         .unwrap_or_else(|| tmux::session_name(run_id));
     tmux::attach_command(&session)?;
     Ok(ExitCode::Success)
+}
+
+fn sync_prs_cmd(run_id: Option<&str>, all: bool, json: bool, dry_run: bool) -> Result<ExitCode> {
+    let (paths, _) = project_ctx()?;
+    let scope = match (run_id, all) {
+        (Some(_), true) => anyhow::bail!("pass --run <id> or --all, not both"),
+        (None, false) => anyhow::bail!("usage: spar sync-prs --run <id> | spar sync-prs --all"),
+        (Some(id), false) => prs::SyncScope::Run(id),
+        (None, true) => prs::SyncScope::All,
+    };
+    let rows = prs::sync_prs(&paths, scope, !dry_run)?;
+    let failed = rows.iter().any(|r| r.error.is_some());
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "dry_run": dry_run, "runs": rows }))?
+        );
+    } else {
+        for r in &rows {
+            let pr = r.pr_url.as_deref().unwrap_or("no PR");
+            match (&r.error, r.to) {
+                (Some(e), _) => println!("{}: error: {e}", r.run_id),
+                (None, Some(to)) if dry_run => {
+                    println!("{}: would move {:?} -> {to:?} ({pr})", r.run_id, r.phase)
+                }
+                (None, Some(to)) => println!("{}: {:?} -> {to:?} ({pr})", r.run_id, r.phase),
+                (None, None) => println!(
+                    "{}: unchanged, {} ({pr})",
+                    r.run_id,
+                    r.note.as_deref().unwrap_or("")
+                ),
+            }
+        }
+        if rows.is_empty() {
+            println!("no shipped runs to sync");
+        }
+    }
+    Ok(if failed {
+        ExitCode::Failure
+    } else {
+        ExitCode::Success
+    })
 }
 
 /// Delete build output inside finished runs' worktrees.

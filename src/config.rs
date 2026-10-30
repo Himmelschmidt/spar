@@ -127,6 +127,9 @@ pub struct DaemonConfig {
     pub max_restarts: u32,
     #[serde(default)]
     pub max_slots_per_bucket: u32,
+    /// Run `spar sync-prs --all` from the tick (O123). Off by default: it calls `gh`.
+    #[serde(default)]
+    pub sync_prs: bool,
 }
 
 impl Default for DaemonConfig {
@@ -137,6 +140,7 @@ impl Default for DaemonConfig {
             restart: true,
             max_restarts: default_daemon_max_restarts(),
             max_slots_per_bucket: 0,
+            sync_prs: false,
         }
     }
 }
@@ -341,6 +345,9 @@ pub struct ShipConfig {
     /// Longest PR title in characters, clamped on a word boundary. `0` never clamps.
     #[serde(default = "default_title_max")]
     pub title_max: usize,
+    /// Open new PRs as drafts. An adopted PR keeps whatever draft state it has.
+    #[serde(default = "default_true")]
+    pub draft: bool,
 }
 
 impl Default for ShipConfig {
@@ -348,6 +355,7 @@ impl Default for ShipConfig {
         Self {
             auto_confirm: false,
             title_max: default_title_max(),
+            draft: true,
         }
     }
 }
@@ -1101,6 +1109,7 @@ struct ProviderConfigFile {
 struct ShipConfigFile {
     auto_confirm: Option<bool>,
     title_max: Option<usize>,
+    draft: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1133,6 +1142,7 @@ struct DaemonConfigFile {
     restart: Option<bool>,
     max_restarts: Option<u32>,
     max_slots_per_bucket: Option<u32>,
+    sync_prs: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1629,6 +1639,9 @@ impl Config {
             if let Some(v) = s.title_max {
                 self.ship.title_max = v;
             }
+            if let Some(v) = s.draft {
+                self.ship.draft = v;
+            }
         }
         if let Some(t) = &file.timeouts {
             if let Some(v) = t.slot_secs {
@@ -1884,6 +1897,9 @@ impl Config {
             }
             if let Some(v) = d.max_slots_per_bucket {
                 self.daemon.max_slots_per_bucket = v;
+            }
+            if let Some(v) = d.sync_prs {
+                self.daemon.sync_prs = v;
             }
         }
         Ok(())
@@ -2604,6 +2620,19 @@ planner = "best"
         let mut cfg = Config::default();
         cfg.apply_file(&file, Trust::Project).unwrap();
         assert_eq!(cfg.ship.title_max, 0);
+    }
+
+    #[test]
+    fn ship_draft_and_daemon_sync_prs_read_from_the_file() {
+        let cfg = Config::default();
+        assert!(cfg.ship.draft);
+        assert!(!cfg.daemon.sync_prs);
+        let file: ConfigFile =
+            toml::from_str("[ship]\ndraft = false\n\n[daemon]\nsync_prs = true\n").unwrap();
+        let mut cfg = Config::default();
+        cfg.apply_file(&file, Trust::Project).unwrap();
+        assert!(!cfg.ship.draft);
+        assert!(cfg.daemon.sync_prs);
     }
 
     #[test]
