@@ -12372,7 +12372,10 @@ fn review_records(swarm: &SparPaths, full: Option<&RunState>, cfg: Option<&Confi
         }
         match std::fs::read_to_string(&path) {
             Ok(text) if !text.trim().is_empty() => {
-                let res = workflow::review_result::parse_review(&text);
+                let res = workflow::review_result::ReviewResult {
+                    scoped: s.review.as_ref().is_some_and(|r| r.scoped),
+                    ..workflow::review_result::parse_review(&text)
+                };
                 let verdict_text = match res.verdict {
                     Some(workflow::review_result::Verdict::Approve) => "approve",
                     Some(workflow::review_result::Verdict::RequestChanges) => "request_changes",

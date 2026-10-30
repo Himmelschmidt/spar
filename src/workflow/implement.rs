@@ -2546,7 +2546,10 @@ pub fn execute_loop(
             } else if let Some(text) = review_text {
                 // Fail closed: only an anchored `## Verdict` / approve clears the gate,
                 // and every contract criterion must be reported as passing (O19/O20).
-                let res = review_result::parse_review(&text);
+                let res = review_result::ReviewResult {
+                    scoped: !prior_findings.is_empty(),
+                    ..review_result::parse_review(&text)
+                };
                 review_result::record_review(state, paths, &rev.id, &res);
                 // The semantic layer above the mtime gate: a verdict that names no
                 // commit, or one about a commit that is not the panel head, is not
@@ -3528,9 +3531,10 @@ fn scoped_review_section(state: &RunState, cfg: &Config, review_cwd: &Path) -> S
     if panel.iter().any(|e| e.review.reviewed_commit != commit) {
         return String::new();
     }
+    // A critical filed under Follow-up blocked its round, so it is re-judged too.
     let prior: Vec<_> = review_result::panel_findings(&panel)
         .into_iter()
-        .filter(|(_, f)| !f.follow_up)
+        .filter(|(_, f)| !f.follow_up || f.severity == review_result::Severity::Critical)
         .collect();
     let stat = commit
         .as_deref()
@@ -3614,7 +3618,17 @@ fn blockers_from_disk(
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let res = review_result::parse_review(&text);
+        // Whether that review answered a scoped prompt is on its recorded entry.
+        let scoped = state
+            .review_history
+            .iter()
+            .filter(|e| e.slot_id == rev.id)
+            .max_by_key(|e| e.round)
+            .is_some_and(|e| e.review.scoped);
+        let res = review_result::ReviewResult {
+            scoped,
+            ..review_result::parse_review(&text)
+        };
         if res.blocks(cfg.review.block_on) {
             out.push(format!(
                 "review `{}` requested changes: {}",
@@ -4782,5 +4796,30 @@ mod carry_forward_tests {
         )
         .is_empty());
         assert!(scoped_review_section(&scoped_state(4, &[]), &cfg, cwd).is_empty());
+    }
+    /// A critical filed under Follow-up blocked its own round, so the next scoped
+    /// round must still re-judge it rather than drop it with the other follow-ups.
+    #[test]
+    fn scoped_review_keeps_a_critical_filed_under_follow_up() {
+        let body =
+            format!("{PRIOR}- severity: critical — the migration drops rows at src/m.rs:5\n");
+        let s = scoped_review_section(
+            &scoped_state(3, &[("rev-1", &body)]),
+            &Config::default(),
+            Path::new("/nonexistent"),
+        );
+        assert!(
+            s.contains("- critical follow-up `src/m.rs:5` (rev-1)"),
+            "{s}"
+        );
+        assert!(!s.contains("split the module"), "{s}");
+    }
+    #[test]
+    fn reviewer_template_carries_the_severity_rubric() {
+        let t = crate::templates::get("reviewer").unwrap();
+        assert!(t.contains("Severity rubric"), "{t}");
+        assert!(t.contains("Anything that makes the code do the wrong thing is major or above"));
+        assert!(t.contains("Minor never blocks the ship"));
+        assert!(t.contains("Be strict."));
     }
 }

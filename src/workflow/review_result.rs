@@ -68,13 +68,16 @@ pub struct Finding {
 }
 
 impl Finding {
-    /// Whether this finding holds the ship at threshold `block_on` (O118). A critical
-    /// blocks wherever the reviewer filed it: `## Follow-up` is for non-critical work.
-    pub fn blocks(&self, block_on: Severity) -> bool {
+    /// Whether this finding holds the ship at threshold `block_on` (O118). `scoped` is
+    /// whether the review came from a scoped round, the only rounds whose template
+    /// defines `## Follow-up` as non-blocking (O119); elsewhere a follow-up gates like
+    /// any finding. A critical blocks wherever the reviewer filed it.
+    pub fn blocks(&self, block_on: Severity, scoped: bool) -> bool {
         if self.synthetic {
             return false;
         }
-        self.severity == Severity::Critical || (!self.follow_up && self.severity <= block_on)
+        self.severity == Severity::Critical
+            || (!(scoped && self.follow_up) && self.severity <= block_on)
     }
 }
 
@@ -90,9 +93,17 @@ pub struct ReviewResult {
     pub reviewed_commit: Option<String>,
     #[serde(default)]
     pub acceptance: Vec<AcLine>,
-    /// Only items that name a severity. A bullet without one is a note, not a finding.
+    /// Only items that name a severity.
     #[serde(default)]
     pub findings: Vec<Finding>,
+    /// Items in a findings section that name no severity spar can read. A
+    /// `request_changes` carrying any blocks the ship: spar cannot tell they are minor.
+    #[serde(default)]
+    pub untagged: Vec<String>,
+    /// Set by the implement gate, not parsed: this review answered a scoped round's
+    /// prompt, so its `## Follow-up` findings are non-blocking (O119).
+    #[serde(default)]
+    pub scoped: bool,
     /// The artifact carries `SYNTHETIC_REVIEW_MARKER`: spar wrote it because the
     /// reviewer produced nothing usable.
     #[serde(default)]
@@ -116,20 +127,22 @@ impl ReviewResult {
 
     /// The verdict half of the implement ship gate, at severity threshold `block_on`
     /// (O118). `approve` clears and a missing verdict blocks, as `approves` has it. A
-    /// `request_changes` blocks only when it carries a reviewer finding at or above
-    /// `block_on`, when spar wrote it (synthetic), or when it names no finding at all:
-    /// a reviewer asking for changes it never lists fails closed. One whose findings are
-    /// all below the threshold or under `## Follow-up` counts as approve-with-notes.
+    /// `request_changes` blocks when spar wrote it (synthetic), when it names no finding
+    /// at all, when any item in a findings section names no readable severity, or when
+    /// a reviewer finding is at or above `block_on`. Each of the first three fails
+    /// closed: spar cannot show the change it asks for is minor. Only a review whose
+    /// every item parsed below the threshold (or under a scoped round's `## Follow-up`)
+    /// counts as approve-with-notes.
     pub fn blocks(&self, block_on: Severity) -> bool {
         match self.verdict {
             Some(Verdict::Approve) => false,
             None => true,
             Some(Verdict::RequestChanges) => {
-                if self.synthetic {
+                if self.synthetic || !self.untagged.is_empty() {
                     return true;
                 }
                 let mut real = self.findings.iter().filter(|f| !f.synthetic).peekable();
-                real.peek().is_none() || real.any(|f| f.blocks(block_on))
+                real.peek().is_none() || real.any(|f| f.blocks(block_on, self.scoped))
             }
         }
     }
@@ -232,7 +245,7 @@ pub fn parse_review(body: &str) -> ReviewResult {
     // Findings are a separate pass so nothing they parse can reach the verdict or the
     // acceptance lines the gate reads.
     out.synthetic = is_synthetic(body);
-    out.findings = parse_findings(body, out.synthetic);
+    (out.findings, out.untagged) = parse_findings(body, out.synthetic);
     out
 }
 
@@ -244,7 +257,68 @@ fn is_synthetic(body: &str) -> bool {
         .is_some_and(|l| l.trim() == SYNTHETIC_REVIEW_MARKER)
 }
 
-fn parse_findings(body: &str, synthetic: bool) -> Vec<Finding> {
+/// What a `##` section is to the findings pass, from its title.
+enum FindingsSection {
+    /// Not a list of findings.
+    No,
+    /// A findings list; bare bullets inherit the severity, when there is one.
+    Findings(Option<Severity>),
+    /// Exactly `Follow-up` (optionally `(non-blocking)`): the scoped round's list.
+    FollowUp,
+}
+
+fn findings_section(title: &str) -> FindingsSection {
+    let t = title
+        .trim_matches(['*', '`', ':', ' ', '_'])
+        .to_ascii_lowercase();
+    let base = t
+        .strip_suffix("(non-blocking)")
+        .or_else(|| t.strip_suffix("(non blocking)"))
+        .unwrap_or(&t)
+        .trim_end_matches([' ', ':']);
+    if matches!(base, "follow-up" | "follow up" | "followup") {
+        return FindingsSection::FollowUp;
+    }
+    if must_fix_group(&t) {
+        return FindingsSection::Findings(Some(Severity::Major));
+    }
+    const WORDS: [&str; 9] = [
+        "finding",
+        "issue",
+        "blocker",
+        "blocking",
+        "concern",
+        "problem",
+        "follow",
+        "regression",
+        "defect",
+    ];
+    if WORDS.iter().any(|w| t.contains(w)) {
+        return FindingsSection::Findings(None);
+    }
+    FindingsSection::No
+}
+
+/// `Must fix`, `Blocking issues`, `Blockers`: a heading that says its items block,
+/// read as major so a bare bullet under it gates.
+fn must_fix_group(title: &str) -> bool {
+    let t = title
+        .trim_matches(['*', '`', ':', ' ', '_'])
+        .to_ascii_lowercase();
+    matches!(
+        t.as_str(),
+        "must fix"
+            | "must-fix"
+            | "must fix before merge"
+            | "blocking"
+            | "blocking issues"
+            | "blocking findings"
+            | "blockers"
+            | "required changes"
+    )
+}
+
+fn parse_findings(body: &str, synthetic: bool) -> (Vec<Finding>, Vec<String>) {
     let mut findings = FindingsParser::default();
     let mut in_findings = false;
     // A salvaged transcript quotes the template's own `## Findings` block inside a
@@ -269,12 +343,8 @@ fn parse_findings(body: &str, synthetic: bool) -> Vec<Finding> {
         };
         let deeper = rest.starts_with('#');
         let heading = rest.trim_start_matches('#').trim();
-        let title = heading
-            .trim_matches(['*', '`', ':', ' '])
-            .to_ascii_lowercase();
-        let follow_up = ["follow-up", "follow up", "followup"]
-            .iter()
-            .any(|p| title.starts_with(p));
+        let section = findings_section(heading);
+        let follow_up = matches!(section, FindingsSection::FollowUp);
         // Reviewers group findings under `### Major` or title one `### major — ...`;
         // either way a sub-heading inside Findings is still Findings. A `### Follow-up`
         // there opens the follow-up list.
@@ -283,17 +353,21 @@ fn parse_findings(body: &str, synthetic: bool) -> Vec<Finding> {
             continue;
         }
         findings.flush();
-        in_findings = follow_up || title.starts_with("findings");
+        in_findings = !matches!(section, FindingsSection::No);
         findings.follow_up = follow_up;
-        // A bare bullet under Follow-up is still follow-up work; it reads as minor.
-        findings.group = follow_up.then_some(Severity::Minor);
+        findings.group = match section {
+            // A bare bullet under Follow-up is still follow-up work; it reads as minor.
+            FindingsSection::FollowUp => Some(Severity::Minor),
+            FindingsSection::Findings(group) => group,
+            FindingsSection::No => None,
+        };
     }
     findings.flush();
     let mut out = findings.done;
     for f in &mut out {
         f.synthetic = synthetic;
     }
-    out
+    (out, findings.untagged)
 }
 
 #[derive(Default)]
@@ -308,6 +382,8 @@ struct FindingsParser {
     prev_blank: bool,
     /// Inside `## Follow-up` rather than `## Findings`.
     follow_up: bool,
+    /// Items that name no severity spar can read.
+    untagged: Vec<String>,
 }
 
 impl FindingsParser {
@@ -347,8 +423,19 @@ impl FindingsParser {
             self.heading_body = true;
             return;
         }
+        if must_fix_group(title) {
+            self.group = Some(Severity::Major);
+            return;
+        }
+        if let Some((severity, rest)) = trailing_severity(title) {
+            self.group = None;
+            self.start(severity, rest);
+            self.heading_body = true;
+            return;
+        }
         let Some((severity, rest)) = split_severity(title, true) else {
             self.group = None;
+            self.untag(title);
             return;
         };
         let rest_word = rest
@@ -371,19 +458,21 @@ impl FindingsParser {
         let after_blank = std::mem::replace(&mut self.prev_blank, false);
         if indent < 2 {
             if let Some(item) = list_item(raw.trim_start()) {
-                let explicit = split_severity(item, false);
+                let explicit = split_severity(item, false).or_else(|| trailing_severity(item));
                 if self.heading_body && explicit.is_none() {
                     self.append(raw);
                     return;
                 }
                 self.flush();
+                if is_none_item(item) {
+                    return;
+                }
                 if let Some((severity, text)) = explicit {
                     self.start(severity, text);
                 } else if let Some(severity) = self.group {
-                    let bare = item.trim_matches(['.', ' ', '*', '_']).to_ascii_lowercase();
-                    if bare != "none" {
-                        self.start(severity, item);
-                    }
+                    self.start(severity, item);
+                } else {
+                    self.untag(item);
                 }
                 return;
             }
@@ -398,12 +487,46 @@ impl FindingsParser {
         self.append(raw);
     }
 
+    fn untag(&mut self, text: &str) {
+        let text = text.trim();
+        if !text.is_empty() && !is_none_item(text) {
+            self.untagged.push(text.to_string());
+        }
+    }
+
     fn append(&mut self, raw: &str) {
         if let Some(f) = self.current.as_mut() {
             f.text.push('\n');
             f.text.push_str(raw.trim());
         }
     }
+}
+
+/// `- none`, `- n/a`, `- nothing further`: the reviewer saying there is no finding.
+fn is_none_item(item: &str) -> bool {
+    let bare = item
+        .trim_matches(['.', ' ', '*', '_', '`', '(', ')'])
+        .to_ascii_lowercase();
+    matches!(
+        bare.as_str(),
+        "none" | "n/a" | "na" | "nothing" | "no findings" | "no issues"
+    ) || bare.starts_with("none ")
+        || bare.starts_with("nothing ")
+}
+
+/// A severity written last, in a closing parenthetical: `F1 — data loss (major)`,
+/// `stale comment (minor)`. Returns the severity and the text before it.
+fn trailing_severity(s: &str) -> Option<(Severity, &str)> {
+    let s = s.trim_end_matches(['*', '_', '`', ' ', '.']);
+    let inner_end = s.strip_suffix(')')?;
+    let open = inner_end.rfind('(')?;
+    let word = inner_end[open + 1..]
+        .trim()
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .next()?;
+    let severity = severity_word(word)?;
+    let text = s[..open].trim_end_matches(['*', '_', '`', ' ', '—', '–', '-', ':']);
+    Some((severity, text))
 }
 
 /// The text after a top-level list marker (`-`, `*`, `+`, `1.`, `1)`), if this is one.
@@ -472,13 +595,27 @@ fn split_severity(s: &str, bare_ok: bool) -> Option<(Severity, &str)> {
     ))
 }
 
-/// `medium` is folded into `minor` so the levels stay three (O100).
-const SEVERITY_WORDS: [(&str, Severity); 4] = [
+/// Other scales folded into the three levels so history buckets stay stable (O100).
+/// `medium`, `medium-high` and `high` are major: real `medium` findings were behaviour
+/// bugs (O118). `blocker` is critical, `low` minor. Longer words first, so
+/// `medium-high` is not read as `medium` followed by text.
+const SEVERITY_WORDS: [(&str, Severity); 8] = [
     ("critical", Severity::Critical),
+    ("blocker", Severity::Critical),
     ("major", Severity::Major),
+    ("medium-high", Severity::Major),
+    ("medium", Severity::Major),
+    ("high", Severity::Major),
     ("minor", Severity::Minor),
-    ("medium", Severity::Minor),
+    ("low", Severity::Minor),
 ];
+
+fn severity_word(word: &str) -> Option<Severity> {
+    SEVERITY_WORDS
+        .into_iter()
+        .find(|(w, _)| w.eq_ignore_ascii_case(word))
+        .map(|(_, sev)| sev)
+}
 
 fn strip_separator(s: &str) -> Option<&str> {
     let mut chars = s.chars();
@@ -504,10 +641,7 @@ fn labelled_severity(s: &str) -> Option<(Severity, &str)> {
         .trim()
         .split(|c: char| !c.is_ascii_alphabetic())
         .next()?;
-    let severity = SEVERITY_WORDS
-        .into_iter()
-        .find(|(w, _)| w.eq_ignore_ascii_case(word))
-        .map(|(_, sev)| sev)?;
+    let severity = severity_word(word)?;
     let rest = inner[close + 1..].trim_start_matches(['*', '_', '`', ']', ' ']);
     let rest = strip_separator(rest).unwrap_or(rest);
     Some((
@@ -1782,7 +1916,7 @@ None.\n";
     }
 
     /// Id-labelled findings with the severity in a parenthetical, and `medium`
-    /// folded into `minor`, as they appear in real reviews.
+    /// folded into `major` (O118), as they appear in real reviews.
     #[test]
     fn findings_labelled_and_medium_shapes() {
         let body = "## Verdict\nrequest_changes\n\n## Findings\n\
@@ -1799,18 +1933,18 @@ The loop at src/resolver.rs:88 never stops.\n\
         assert_eq!(f[0].0, Severity::Minor);
         assert_eq!(f[0].1.as_deref(), Some("src/a.rs"));
         assert!(f[0].3.starts_with("nothing pins"), "{:?}", f[0].3);
-        assert_eq!(f[1].0, Severity::Minor);
+        assert_eq!(f[1].0, Severity::Major);
         assert_eq!(f[2].0, Severity::Major);
         assert!(f[2].3.starts_with("resolver over-collects day 1"));
         assert!(f[2].3.contains("never stops") && f[2].3.contains("second detail"));
         assert_eq!(f[2].1.as_deref(), Some("src/resolver.rs"));
-        assert_eq!(f[3].0, Severity::Minor);
+        assert_eq!(f[3].0, Severity::Major);
         assert!(findings("## Findings\n- AC-1 (pass) — fine\n- R2 (note) — x\n").is_empty());
     }
     /// The shape real reviewers write when they ask for changes on polish alone: a
     /// test gap, a stale comment, a name. O118: at the default `block_on = major` this
     /// is approve-with-notes; at `minor` it blocks as it did before.
-    const MINORS_ONLY: &str = "## Verdict\nrequest_changes\n\nReviewed-Commit: 0123456789abcdef0123456789abcdef01234567\n\n## Acceptance\nAC-1: pass — cargo test ok\n\n## Findings\n- severity: minor — src/config.rs:880 comment still says require_all_criteria is the only knob\n- **F-2 (minor · test gap)** — nothing pins the empty list in src/ship.rs:140\n- severity: medium — rename `x` to `count`\n\n## Tests\ncargo test\n";
+    const MINORS_ONLY: &str = "## Verdict\nrequest_changes\n\nReviewed-Commit: 0123456789abcdef0123456789abcdef01234567\n\n## Acceptance\nAC-1: pass — cargo test ok\n\n## Findings\n- severity: minor — src/config.rs:880 comment still says require_all_criteria is the only knob\n- **F-2 (minor · test gap)** — nothing pins the empty list in src/ship.rs:140\n- severity: low — rename `x` to `count`\n\n## Tests\ncargo test\n";
 
     #[test]
     fn minors_only_request_changes_is_approve_with_notes_at_major() {
@@ -1828,15 +1962,15 @@ The loop at src/resolver.rs:88 never stops.\n\
     #[test]
     fn a_major_or_critical_finding_blocks_at_its_threshold() {
         let major = MINORS_ONLY.replace(
-            "- severity: medium",
-            "### F3 (major, latent) — the retry at src/net.rs:40 never stops\n- severity: medium",
+            "- severity: low",
+            "### F3 (major, latent) — the retry at src/net.rs:40 never stops\n- severity: low",
         );
         let r = parse_review(&major);
         assert!(r.blocks(Severity::Major));
         assert!(!r.blocks(Severity::Critical), "{:?}", r.findings);
         let critical = MINORS_ONLY.replace(
-            "- severity: medium",
-            "- **critical** — data loss on retry\n- severity: medium",
+            "- severity: low",
+            "- **critical** — data loss on retry\n- severity: low",
         );
         assert!(parse_review(&critical).blocks(Severity::Critical));
     }
@@ -1871,10 +2005,17 @@ The loop at src/resolver.rs:88 never stops.\n\
         assert!(r.blocks(Severity::Critical));
     }
 
+    fn scoped(body: &str) -> ReviewResult {
+        ReviewResult {
+            scoped: true,
+            ..parse_review(body)
+        }
+    }
+
     #[test]
     fn follow_up_findings_are_parsed_and_never_block_unless_critical() {
         let body = "## Verdict\nrequest_changes\n\n## Findings\n- severity: minor — prior F1 still open at src/a.rs:3\n\n## Follow-up\n- severity: major — the retry policy deserves its own brief\n- rename the helper\n- none\n\n## Tests\nok\n";
-        let r = parse_review(body);
+        let r = scoped(body);
         assert_eq!(r.findings.len(), 3, "{:?}", r.findings);
         assert!(!r.findings[0].follow_up);
         assert!(r.findings[1].follow_up && r.findings[1].severity == Severity::Major);
@@ -1885,13 +2026,102 @@ The loop at src/resolver.rs:88 never stops.\n\
         );
 
         let nested = "## Verdict\nrequest_changes\n\n## Findings\n### Follow-up\n- severity: major — later\n";
-        let r = parse_review(nested);
+        let r = scoped(nested);
         assert!(r.findings[0].follow_up, "{:?}", r.findings);
         assert!(!r.blocks(Severity::Minor));
 
         let misfiled =
             "## Verdict\nrequest_changes\n\n## Follow-up\n- severity: critical — data loss\n";
-        assert!(parse_review(misfiled).blocks(Severity::Critical));
+        assert!(scoped(misfiled).blocks(Severity::Critical));
+    }
+
+    /// Only a scoped round's template defines Follow-up as non-blocking. Elsewhere a
+    /// reviewer's Follow-up major gates like any finding.
+    #[test]
+    fn follow_up_outside_a_scoped_round_gates_like_findings() {
+        let body = "## Verdict\nrequest_changes\n\n## Findings\n- severity: minor — x\n\n## Follow-up (non-blocking)\n- severity: major — wrong total\n";
+        let r = parse_review(body);
+        assert!(r.findings[1].follow_up, "{:?}", r.findings);
+        assert!(r.blocks(Severity::Major));
+        assert!(!scoped(body).blocks(Severity::Major));
+    }
+
+    /// A heading that merely starts with "Follow-up" is not the follow-up list.
+    #[test]
+    fn follow_up_heading_must_match_exactly() {
+        let body = "## Verdict\nrequest_changes\n\n## Follow-up required before merge\n- severity: major — the migration drops rows\n";
+        let r = scoped(body);
+        assert_eq!(r.findings.len(), 1, "{:?}", r.findings);
+        assert!(!r.findings[0].follow_up);
+        assert!(r.blocks(Severity::Major));
+    }
+
+    /// Adversarial review of O118: each shape below sat next to a parsed minor and,
+    /// before the fix, vanished, so the minor alone made the review approve-with-notes.
+    #[test]
+    fn every_unparsed_or_unmapped_shape_beside_a_minor_blocks() {
+        let minor = "- severity: minor — stale comment at src/a.rs:1\n";
+        let shapes = [
+            (
+                "severity: high",
+                format!("## Findings\n{minor}- severity: high — total is wrong\n"),
+            ),
+            (
+                "**Blocker**",
+                format!("## Findings\n{minor}- **Blocker** — drops the lock\n"),
+            ),
+            (
+                "untagged bullet",
+                format!("## Findings\n{minor}- the retry never stops\n"),
+            ),
+            (
+                "severity last",
+                format!("## Findings\n{minor}### F1 — data loss on retry (major)\nbody\n"),
+            ),
+            (
+                "### Must fix",
+                format!("## Findings\n{minor}### Must fix\n- the retry never stops\n"),
+            ),
+            (
+                "## Blocking issues",
+                format!("## Findings\n{minor}\n## Blocking issues\n- the retry never stops\n"),
+            ),
+            (
+                "## Additional findings",
+                format!("## Findings\n{minor}\n## Additional findings\n- the retry never stops\n"),
+            ),
+            (
+                "medium",
+                format!("## Findings\n{minor}- severity: medium — F3: wrong rounding\n"),
+            ),
+            (
+                "medium-high",
+                format!("## Findings\n{minor}- **medium-high** — F4: double count\n"),
+            ),
+        ];
+        for (name, findings) in shapes {
+            let body = format!("## Verdict\nrequest_changes\n\n{findings}");
+            let r = parse_review(&body);
+            assert!(r.blocks(Severity::Major), "{name}: {r:?}");
+        }
+        let r = parse_review(&format!(
+            "## Verdict\nrequest_changes\n\n## Findings\n{minor}- **Blocker** — x\n"
+        ));
+        assert_eq!(r.findings[1].severity, Severity::Critical);
+        let r = parse_review(&format!(
+            "## Verdict\nrequest_changes\n\n## Findings\n{minor}### F1 — data loss (major)\n"
+        ));
+        assert_eq!(r.findings[1].severity, Severity::Major);
+        assert_eq!(r.findings[1].text, "F1 — data loss");
+        let r = parse_review(&format!(
+            "## Verdict\nrequest_changes\n\n## Findings\n{minor}- the retry never stops\n- none\n"
+        ));
+        assert_eq!(r.untagged, ["the retry never stops"]);
+        // The control: the minor alone, with a `none` bullet, is approve-with-notes.
+        let r = parse_review(&format!(
+            "## Verdict\nrequest_changes\n\n## Findings\n{minor}- none\n"
+        ));
+        assert!(!r.blocks(Severity::Major), "{r:?}");
     }
 
     #[test]

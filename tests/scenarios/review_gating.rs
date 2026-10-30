@@ -186,9 +186,42 @@ fn block_on_minor_holds_a_minors_only_panel() {
     assert_eq!(st["phase"], "awaiting_round_extension", "{st}");
 }
 
-/// A major still blocks at the default, and a major filed under Follow-up does not.
+/// A major still blocks at the default. A major under Follow-up gates too in a full
+/// review round, and is non-blocking only in a scoped round, whose prompt defines it.
 #[test]
-fn a_major_blocks_and_a_follow_up_does_not() {
+fn a_major_blocks_and_a_follow_up_only_clears_in_a_scoped_round() {
+    let tmp = tempdir().unwrap();
+    project(tmp.path(), "[rounds]\nmax = 2\n");
+    let run_id = planned_run(tmp.path());
+    implement(
+        tmp.path(),
+        &run_id,
+        &[("SPAR_FORCE_REVIEW_FINDING", "follow-up")],
+    )
+    .code(2);
+    assert_eq!(
+        state_json(tmp.path(), &run_id)["phase"],
+        "awaiting_round_extension",
+        "round 2 is a full review: its Follow-up major gates"
+    );
+
+    implement_with(
+        tmp.path(),
+        &run_id,
+        &[("SPAR_FORCE_REVIEW_FINDING", "follow-up")],
+        &["--max-rounds", "3"],
+    )
+    .code(2);
+    let st = state_json(tmp.path(), &run_id);
+    assert_eq!(st["phase"], "awaiting_ship_confirm", "{st}");
+    let review = &st["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["role"] == "reviewer")
+        .unwrap()["review"];
+    assert_eq!(review["scoped"], true, "{review}");
+
     let tmp = tempdir().unwrap();
     project(tmp.path(), "[rounds]\nmax = 3\n");
     let run_id = planned_run(tmp.path());
@@ -201,20 +234,6 @@ fn a_major_blocks_and_a_follow_up_does_not() {
     assert_eq!(
         state_json(tmp.path(), &run_id)["phase"],
         "awaiting_round_extension"
-    );
-
-    let tmp = tempdir().unwrap();
-    project(tmp.path(), "[rounds]\nmax = 3\n");
-    let run_id = planned_run(tmp.path());
-    implement(
-        tmp.path(),
-        &run_id,
-        &[("SPAR_FORCE_REVIEW_FINDING", "follow-up")],
-    )
-    .code(2);
-    assert_eq!(
-        state_json(tmp.path(), &run_id)["phase"],
-        "awaiting_ship_confirm"
     );
 }
 
@@ -446,6 +465,36 @@ fn rule_add_list_rm() {
     .stderr(predicates::str::contains("AC-9 is not a criterion"));
     rule(tmp.path(), &["add", "--project", "x", "--waive", "AC-1"]).code(1);
     rule(tmp.path(), &["add", "no target"]).code(2);
+
+    for (k, v) in [("SPAR_AGENT_ID", "impl"), ("SPAR_RUN_ID", run_id.as_str())] {
+        for args in [
+            vec![
+                "add",
+                "--run",
+                run_id.as_str(),
+                "waive it",
+                "--waive",
+                "AC-1",
+            ],
+            vec!["add", "--project", "me too"],
+            vec!["rm", "--run", run_id.as_str(), "R1"],
+            vec!["rm", "--project", "P1"],
+        ] {
+            spar_cmd()
+                .current_dir(tmp.path())
+                .env(k, v)
+                .arg("rule")
+                .args(&args)
+                .assert()
+                .code(1)
+                .stderr(predicates::str::contains("rulings are operator-only"));
+        }
+    }
+    assert_eq!(
+        rule_ids(tmp.path(), &run_id),
+        ["P1", "R1"],
+        "a refused slot changed nothing"
+    );
 
     rule(tmp.path(), &["rm", "--run", &run_id, "R1"]).success();
     assert_eq!(rule_ids(tmp.path(), &run_id), ["P1"]);

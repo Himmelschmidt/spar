@@ -1061,6 +1061,17 @@ fn rule_cmd(action: RuleCmd) -> Result<ExitCode> {
             run, project, json, ..
         } => (run.clone(), *project, *json),
     };
+    // Rulings override reviewers and can waive criteria, so a slot must not issue its
+    // own. spar exports these into every slot it dispatches (O121).
+    if !matches!(action, RuleCmd::List { .. })
+        && ["SPAR_AGENT_ID", "SPAR_RUN_ID"]
+            .iter()
+            .any(|k| std::env::var(k).is_ok_and(|v| !v.is_empty()))
+    {
+        anyhow::bail!(
+            "rulings are operator-only: `spar rule add` / `rm` refuse to run inside a spar slot"
+        );
+    }
     let paths = match &run {
         Some(id) => load_run_anywhere(id, paths::find_project_root().ok().as_deref())?.0,
         None if project => project_ctx()?.0,

@@ -1162,7 +1162,10 @@ pub fn gate_evidence(paths: &SparPaths, run_id: &str) -> String {
                 .unwrap_or_else(|| format!("review-{}.md", r.id));
             let path = paths.artifact(run_id, &artifact);
             if let Ok(text) = std::fs::read_to_string(&path) {
-                let res = crate::workflow::review_result::parse_review(&text);
+                let res = crate::workflow::review_result::ReviewResult {
+                    scoped: r.review.as_ref().is_some_and(|x| x.scoped),
+                    ..crate::workflow::review_result::parse_review(&text)
+                };
                 let block_empty = crate::workflow::implement::acceptance_block_reasons(
                     &evidence.criteria,
                     &res,
