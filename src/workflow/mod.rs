@@ -131,6 +131,37 @@ impl CommonOpts {
     }
 }
 
+/// What a NEW run's launch can refuse before it mints an id or writes `.spar/runs/`.
+/// A launch runs it first, so a refusal never leaves a half-made run behind, and
+/// `--validate-only` runs nothing else. `--select` is checked for shape only: ranking
+/// needs the bench cache, which is the launch's business, not a pre-check's.
+pub fn preflight(opts: &CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<()> {
+    if let Some(t) = &opts.task {
+        crate::runspec::validate_task(t).map_err(anyhow::Error::msg)?;
+    }
+    if !opts.providers.is_empty() && !opts.select.is_empty() {
+        anyhow::bail!("use either --providers or --select, not both");
+    }
+    for p in &opts.providers {
+        crate::providers::ensure_known(p)?;
+    }
+    if opts.providers.is_empty() && opts.select.is_empty() && cfg.roles.is_empty() {
+        anyhow::bail!(
+            "--providers is required (or set a [roles] block, or pass --select <profile>, e.g. --select value)"
+        );
+    }
+    crate::model_select::Urgency::parse(&opts.urgency)?;
+    cfg.ensure_known_providers()?;
+    if opts.base.is_some() {
+        crate::worktree::resolve_base(
+            &paths.project_root,
+            &std::env::current_dir()?,
+            opts.base.as_deref(),
+        )?;
+    }
+    Ok(())
+}
+
 pub fn run_named(
     kind: WorkflowKind,
     opts: CommonOpts,

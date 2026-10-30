@@ -1058,7 +1058,7 @@ fn ac23_without_rejects_unknown_names() {
         ])
         .assert()
         .failure()
-        .stderr(
+        .stdout(
             predicate::str::contains("critic")
                 .and(predicate::str::contains("spec"))
                 .and(predicate::str::contains("suite"))
@@ -1124,7 +1124,7 @@ fn ac25_without_is_refused_on_a_bound_run() {
         ])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("--reload-config"));
+        .stdout(predicate::str::contains("--reload-config"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1334,7 +1334,7 @@ fn ac33_fleet_rejects_an_unknown_preset() {
         ])
         .assert()
         .failure()
-        .stderr(
+        .stdout(
             predicate::str::contains("small")
                 .and(predicate::str::contains("standard"))
                 .and(predicate::str::contains("panic").not()),

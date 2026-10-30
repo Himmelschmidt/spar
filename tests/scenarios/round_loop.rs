@@ -588,10 +588,10 @@ fn max_rounds_zero_is_refused_on_the_flag() {
     let run_id = planned_run(tmp.path());
     implement(tmp.path(), &run_id, &["--max-rounds", "0"])
         .failure()
-        .stderr(predicate::str::contains(
+        .stdout(predicate::str::contains(
             "would remove the ceiling entirely",
         ))
-        .stderr(predicate::str::contains("[rounds] max = 0"));
+        .stdout(predicate::str::contains("[rounds] max = 0"));
     assert_eq!(
         state_json(tmp.path(), &run_id)["max_rounds"].as_u64(),
         Some(3),

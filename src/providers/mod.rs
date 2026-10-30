@@ -605,6 +605,28 @@ pub fn api_provider_supported(name: &str) -> bool {
     matches!(name, "openai" | "xai" | "anthropic" | "google" | "meta")
 }
 
+/// Refuse a provider spar has no adapter for, at launch rather than at first dispatch.
+/// Says nothing about PATH or keys: an installed-but-missing provider is a quota or
+/// usability question, not a typo.
+pub fn ensure_known(raw: &str) -> anyhow::Result<()> {
+    let pref = ProviderRef::parse(raw)?;
+    let known = match pref.backend {
+        ExecBackend::NativeCli => adapter_named(raw).is_some(),
+        ExecBackend::ApiSdk => api_provider_supported(&pref.name),
+    };
+    if known {
+        return Ok(());
+    }
+    let cli = all_adapters()
+        .iter()
+        .map(|a| format!("cli:{}", a.name()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::bail!(
+        "unknown provider {raw:?} (known: {cli}, api:openai, api:xai, api:anthropic, api:google, api:meta)"
+    )
+}
+
 /// Providers that are on PATH, as `cli:name` keys, optionally filtered by `order`.
 pub fn available_providers(order: &[String]) -> Vec<String> {
     if order.is_empty() {

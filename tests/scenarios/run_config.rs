@@ -273,7 +273,7 @@ fn role_on_a_resume_requires_reload_config() {
         ])
         .assert()
         .code(1)
-        .stderr(predicates::str::contains("--reload-config"));
+        .stdout(predicates::str::contains("--reload-config"));
 }
 
 fn frozen_suite(dir: &std::path::Path, run_id: &str) -> serde_json::Value {
@@ -342,7 +342,7 @@ fn suite_command_is_frozen_and_survives_reload_config() {
         ])
         .assert()
         .code(1)
-        .stderr(predicates::str::contains("--reload-config"));
+        .stdout(predicates::str::contains("--reload-config"));
 
     spar_cmd()
         .current_dir(dir)
@@ -404,7 +404,7 @@ fn suite_command_contradicting_without_suite_is_refused() {
         ])
         .assert()
         .code(1)
-        .stderr(predicates::str::contains("contradict"));
+        .stdout(predicates::str::contains("contradict"));
 }
 
 /// A pinned suite turned off with `--without suite` on one reload stays off on the next

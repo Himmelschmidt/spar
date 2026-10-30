@@ -1354,6 +1354,24 @@ neither mints nor repurposes a code.
 
 **`--dry-run`:** stubs agent processes only; writes `.spar/runs/<id>/`. Does **not** create real git worktrees (cwd under `.spar/…/cwd-*`). Live runs create sibling worktrees.
 
+**Launch refusals are data (O126).** Anything `plan` / `implement` / `run` refuses before
+a run exists (bad or unknown flags, an unknown provider in `--providers` / `--role` /
+`--backup` / `[roles]` / `[backups]`, a same-storage-key backup, an empty task, a `--base`
+that does not resolve, `--providers` with `--select`) exits **1**, never 2, and with
+`--json` prints on stdout:
+
+```json
+{"ok": false, "error": "backup for implementer has same provider storage key as primary (cli:claude); …", "run_id": null, "kind": "validation"}
+```
+
+`run_id` is `null` for a new launch and the targeted id for `--run <id>`. A paused
+provider is not a validation failure: that still creates a run parked in `quota` (exit 4).
+To pre-check without launching, add `--validate-only` (any of the three commands): it runs
+the same checks, writes nothing (no run dir, no brief intake, no `--reload-config`
+snapshot) and exits 0 with `{"ok": true, "run_id": null, "kind": "validation"}`. It does not
+rank `--select` (that needs the bench cache) or probe PATH and quota. Usage errors on any
+command exit 1, not clap's default 2.
+
 **Providers (four-rung precedence):** each slot's provider is resolved **CLI `--role` for
 that role > CLI `--providers` (positional) / `--select` pool > `[roles]` > `[providers].order`**.
 `--providers` is **positional** — index 0 is the planner/implementer, the rest are

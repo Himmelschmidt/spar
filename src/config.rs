@@ -1466,6 +1466,40 @@ impl Config {
         self.validate_backup_against_primary()
     }
 
+    /// Every provider `[roles]` / `[backups]` names (file or CLI overlay) has an adapter.
+    pub fn ensure_known_providers(&self) -> Result<()> {
+        let r = &self.roles;
+        let b = &self.backups;
+        let singles = [
+            ("roles", "planner", &r.planner),
+            ("roles", "plan_critic", &r.plan_critic),
+            ("roles", "implementer", &r.implementer),
+            ("roles", "tester", &r.tester),
+            ("roles", "test_author", &r.test_author),
+            ("backups", "planner", &b.planner),
+            ("backups", "plan_critic", &b.plan_critic),
+            ("backups", "implementer", &b.implementer),
+            ("backups", "tester", &b.tester),
+            ("backups", "test_author", &b.test_author),
+        ];
+        let reviewers = r
+            .reviewer
+            .iter()
+            .map(|v| ("roles", v))
+            .chain(b.reviewer.iter().map(|v| ("backups", v)));
+        for (table, key, v) in singles
+            .into_iter()
+            .filter_map(|(t, k, v)| v.as_ref().map(|v| (t, k, v)))
+            .chain(reviewers.map(|(t, v)| (t, "reviewer", v)))
+        {
+            if v.is_empty() {
+                continue;
+            }
+            crate::providers::ensure_known(v).with_context(|| format!("[{table}].{key}"))?;
+        }
+        Ok(())
+    }
+
     fn validate_backup_against_primary(&self) -> Result<()> {
         let check_single = |role: &str,
                             primary: &Option<String>,

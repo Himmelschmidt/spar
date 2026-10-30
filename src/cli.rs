@@ -113,6 +113,11 @@ pub enum Command {
         /// Structured plan-big task DAG under bus/tasks
         #[arg(long)]
         big: bool,
+        /// Check the launch (flags, roles, backups, providers, base, task) and report,
+        /// without creating a run. Exit 0 valid, 1 refused; `--json` prints
+        /// `{"ok": true|false, "error": …, "run_id": null, "kind": "validation"}`.
+        #[arg(long)]
+        validate_only: bool,
     },
 
     /// Approve a plan run so implement can proceed
@@ -230,6 +235,11 @@ pub enum Command {
         /// Stub agents only; still writes `.spar/` state. Does **not** create real git worktrees.
         #[arg(long)]
         dry_run: bool,
+        /// Check the launch (flags, roles, backups, providers, base, task) and report,
+        /// without creating a run. Exit 0 valid, 1 refused; `--json` prints
+        /// `{"ok": true|false, "error": …, "run_id": null, "kind": "validation"}`.
+        #[arg(long)]
+        validate_only: bool,
         /// Comma-separated `cli:…` or `api:…` (required unless `--select` or `[roles]` is
         /// set). positional: index 0 is the planner/implementer, the rest are reviewers.
         /// Overrides `[roles]` for the positions it covers.
@@ -286,6 +296,11 @@ pub enum Command {
         backend: Backend,
         #[arg(long)]
         dry_run: bool,
+        /// Check the launch (flags, roles, backups, providers, base, task) and report,
+        /// without creating a run. Exit 0 valid, 1 refused; `--json` prints
+        /// `{"ok": true|false, "error": …, "run_id": null, "kind": "validation"}`.
+        #[arg(long)]
+        validate_only: bool,
         /// Comma-separated `cli:…` or `api:…` (required unless `--select` or `[roles]` is
         /// set). positional: index 0 is the planner/implementer, the rest are reviewers.
         /// Overrides `[roles]` for the positions it covers.
