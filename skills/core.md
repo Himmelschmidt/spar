@@ -129,18 +129,26 @@ Model selection, highest precedence first:
   → `--model openrouter/google/gemini-2.5-flash`), even when the vendor is also a pi
   provider (`google`, `anthropic`, `openai`): the same ref never changes provider with
   whichever keys happen to be set. An explicit `openrouter/…` passes through unchanged. A
-  bare word (`claude-sonnet-4-5`) passes through to pi's own resolution, which is the way
-  to reach a non-OpenRouter pi provider. Discover tool-capable slugs with
-  `spar model list --provider openrouter`.
+  bare word (`claude-sonnet-4-5`) passes through to pi's own resolution. To reach a pi
+  provider directly, prefix pi's own `provider/id` with `direct:`; spar strips the prefix
+  and passes the rest untouched (`cli:pi@direct:anthropic/claude-sonnet-4-5` →
+  `--model anthropic/claude-sonnet-4-5`, which needs that provider's own key). Discover
+  tool-capable OpenRouter slugs with `spar model list --provider openrouter`.
 - `SPAR_PI_MODEL` → same routing, when no per-slot model is set.
 - Unset → pi's own settings pick the model.
 - OpenRouter models need `OPENROUTER_API_KEY` exported in spar's env (pi reads it).
 - Effort maps to `--thinking`: `none` → `off`, `minimal`..`max` pass through, `ultra` is
   refused. pi clamps a level to what the model supports.
 - Session: spar assigns the id (`--session-id`); a resume is the same flag on the same id.
+  Session files live under the run (`--session-dir .spar/runs/<id>/sessions/<slot>`), not
+  in `~/.pi`. pi never refuses a missing id: it recreates it empty and warns on stderr.
+  spar reads that warning on a resume and records a slot note that the round ran with
+  fresh context.
 - pi exits 0 when the provider fails a request. spar reads the final assistant message's
-  `stopReason`: `error` (or `aborted`) fails the slot with pi's `errorMessage`, which the
-  quota scrape also reads, so a `429 Too Many Requests` parks the run on quota.
+  `stopReason`: `error` (or `aborted`) fails the slot with pi's `errorMessage`. A
+  rate-limit message there (`429 Too Many Requests`) parks the run on quota. A request
+  that succeeds after an errored one (pi retries on its own) marks the earlier error
+  recovered, so its leftover log line cannot route a later unrelated failure to quota.
 
 ```bash
 spar run --workflow review -t "..." --providers cli:pi@google/gemini-2.5-flash  # -> openrouter/google/gemini-2.5-flash
@@ -663,7 +671,8 @@ slot is stuck on.**
   before starting any new major step. Thresholds are checked every 30 seconds, so a nudge
   lands at the next 30s boundary rather than the instant a budget is crossed.
 - **Live token visibility differs by adapter**, so token nudges are not uniformly prompt.
-  **pi** reports usage per model request and is exact live. **muse**'s stdout
+  **pi** reports usage per model request as each request ends, and a compaction's spend
+  when the compaction ends, so it lags by at most one request. **muse**'s stdout
   usage record excludes subagents, so spar tails its session log (`~/.local/share/muse/sessions/…`), which is
   appended as the turn runs, including its own subagent sessions; that is exact live too.
   **claude** reports per-message usage
@@ -967,11 +976,13 @@ rail's selection.
     terminal `result` record, which supersedes the per-message ones; **codex** by
     `turn.completed` (its only usage record, so it also stands in for the gauge);
     **pi** by summing each assistant `message_end`'s own `usage` (one per model request;
-    `reasoning` is already inside `output`, and the `message_update` copies are ignored);
+    `reasoning` is already inside `output`, and the `message_update` copies are ignored)
+    plus each `compaction_end`'s `result.usage` (billed, never counted into the gauge);
     **muse** from its session log after the slot exits. These reconcile against the
     provider's own numbers: a codex slot's `billed_tokens` equals its `token_count`
     `total_tokens`, a muse slot's equals the sum of its billed `goal_usage_attribution`
-    records, and a pi slot's equals the sum of its requests' `totalTokens`.
+    records, and a pi slot's equals the sum of `totalTokens` over its assistant requests
+    and compactions (verified live for requests; compaction is not yet verified live).
   - **Two adapters report a cached prompt as a slice of `input_tokens` rather than a
     sibling of it**, the opposite of Anthropic's convention: codex's `cached_input_tokens`
     and muse's `cached_tokens`. spar normalizes both on the way in, storing the uncached

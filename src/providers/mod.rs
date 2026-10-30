@@ -165,6 +165,11 @@ pub struct SpawnOpts {
     /// (e.g. agy's `--print-timeout`) derive it from this so the CLI's own kill lands no
     /// earlier than spar's. `None` = adapter default.
     pub timeout_secs: Option<u64>,
+    /// Run-scoped directory for this slot's vendor session files
+    /// (`SparPaths::sessions_dir`), for an adapter whose CLI otherwise keeps sessions
+    /// in the user's home. Stable across rounds, so a resume finds what the cold
+    /// dispatch wrote. `None` outside a run.
+    pub session_dir: Option<PathBuf>,
 }
 
 pub trait ProviderAdapter: Send + Sync {
@@ -261,6 +266,14 @@ pub trait ProviderAdapter: Send + Sync {
         _session_id: Option<&str>,
     ) -> bool {
         true
+    }
+
+    /// Whether a resume that exited 0 under the *requested* session id actually began
+    /// a new, empty session because the vendor no longer had the old one. Adapters that
+    /// mint a fresh id in that case are caught by the id mismatch instead; this is for
+    /// a CLI that silently recreates the same id (pi). Default `false`.
+    fn resume_started_fresh(&self, _log_text: &str, _requested: &str) -> bool {
+        false
     }
 
     /// Whether a failed dispatch's log carries this adapter's signature of a transient
@@ -687,6 +700,7 @@ mod tests {
             model: None,
             effort: None,
             timeout_secs: Some(60),
+            session_dir: None,
         });
         assert_eq!(
             env,
@@ -881,6 +895,7 @@ mod tests {
             model: None,
             effort: None,
             timeout_secs: None,
+            session_dir: None,
             session_id: None,
         };
         let mut resumed = Vec::new();

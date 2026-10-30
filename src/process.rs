@@ -1059,7 +1059,8 @@ fn stream_to_log(
         }
         // Counters are merged per line, not per log append: a usage record can carry a
         // whole model call's tokens and print nothing, so gating the merge on an append
-        // left the sidecar behind the stream by however many silent events came last. A live token budget reads that sidecar, so "behind" means "never fires".
+        // left the sidecar behind the stream by however many silent events came last. A
+        // live token budget reads that sidecar, so "behind" means "never fires".
         let chunk = c.feed(&line);
         let appended = chunk
             .as_ref()
@@ -1629,7 +1630,8 @@ impl StreamCoalescer {
     /// (`totalTokens == input + output + cacheRead + cacheWrite` on every captured
     /// record), so it is not added again. Text and tool calls also print from
     /// `message_end` and `tool_execution_*`, never from the `message_update` deltas,
-    /// whose `usage` and content repeat what `message_end` settles.
+    /// whose `usage` and content repeat what `message_end` settles. Compaction's own
+    /// request is billed from `compaction_end`.
     fn handle_pi(&mut self, v: &serde_json::Value) -> Option<String> {
         let ty = v.get("type").and_then(|x| x.as_str()).unwrap_or_default();
         match ty {
@@ -1676,6 +1678,19 @@ impl StreamCoalescer {
                 out.push_str(&format!("← ✗  {name}  {}\n", first_line(body, 100)));
                 Some(out)
             }
+            // Compaction is a summarization request whose usage appears nowhere else on
+            // the stream (`compaction_end.result.usage`, docs compaction.md). It is
+            // billed, but it is not the agent's working window, so it never moves the
+            // gauge.
+            "compaction_end" => {
+                let u = v.pointer("/result/usage")?;
+                self.add_pi_usage(u);
+                let reason = v
+                    .get("reason")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("compaction");
+                Some(format!("{}· compacted  {reason}\n", self.flush_buf()))
+            }
             "auto_retry_start" => {
                 let attempt = v.get("attempt").and_then(|x| x.as_u64()).unwrap_or(0);
                 let max = v.get("maxAttempts").and_then(|x| x.as_u64()).unwrap_or(0);
@@ -1698,23 +1713,28 @@ impl StreamCoalescer {
         }
     }
 
+    /// Add one pi `Usage` object to the billed components and the cost. Returns that
+    /// request's prompt footprint for the caller to peak over or not.
+    fn add_pi_usage(&mut self, u: &serde_json::Value) -> u64 {
+        let n = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or_default();
+        let (input, cache_read, cache_write) = (n("input"), n("cacheRead"), n("cacheWrite"));
+        self.input_tokens = self.input_tokens.saturating_add(input);
+        self.output_tokens = self.output_tokens.saturating_add(n("output"));
+        self.cache_read = self.cache_read.saturating_add(cache_read);
+        self.cache_write = self.cache_write.saturating_add(cache_write);
+        if let Some(cost) = u.pointer("/cost/total").and_then(|x| x.as_f64()) {
+            self.cost_usd = Some(self.cost_usd.unwrap_or(0.0) + cost);
+        }
+        input.saturating_add(cache_read).saturating_add(cache_write)
+    }
+
     fn absorb_pi_message(&mut self, msg: &serde_json::Value) -> Option<String> {
         if let Some(m) = msg.get("model").and_then(|x| x.as_str()) {
             self.model = Some(m.to_string());
         }
         if let Some(u) = msg.get("usage") {
-            let n = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or_default();
-            let (input, cache_read, cache_write) = (n("input"), n("cacheRead"), n("cacheWrite"));
-            self.input_tokens = self.input_tokens.saturating_add(input);
-            self.output_tokens = self.output_tokens.saturating_add(n("output"));
-            self.cache_read = self.cache_read.saturating_add(cache_read);
-            self.cache_write = self.cache_write.saturating_add(cache_write);
-            self.context_peak = self
-                .context_peak
-                .max(input.saturating_add(cache_read).saturating_add(cache_write));
-            if let Some(cost) = u.pointer("/cost/total").and_then(|x| x.as_f64()) {
-                self.cost_usd = Some(self.cost_usd.unwrap_or(0.0) + cost);
-            }
+            let prompt = self.add_pi_usage(u);
+            self.context_peak = self.context_peak.max(prompt);
         }
         let mut out = self.flush_buf();
         for block in msg
@@ -1745,9 +1765,24 @@ impl StreamCoalescer {
                     .unwrap_or(reason)
                     .to_string();
                 out.push_str(&format!("! {}\n", first_line(&err, 300)));
+                // pi's `errorMessage` is the provider's own API error, never model or
+                // agent text, so a rate-limit phrase in it is the typed verdict here.
+                if crate::quota::QuotaStore::scrape_strong_quota_signal(&err).is_some() {
+                    self.quota_rejected = Some("rate_limit".to_string());
+                }
                 self.provider_error = Some(err);
             }
-            _ => self.provider_error = None,
+            _ => {
+                // Same semantics as claude's `allowed` after `rejected`: a request that
+                // succeeds after an errored one means the earlier failure, and the
+                // `! …` line it left in the log, no longer describe this dispatch.
+                if self.provider_error.is_some() || self.quota_rejected.is_some() {
+                    self.quota_recovered = true;
+                }
+                self.provider_error = None;
+                self.quota_rejected = None;
+                self.quota_resets_at = None;
+            }
         }
         if out.is_empty() {
             None
@@ -3787,6 +3822,63 @@ mod tests {
         assert_eq!(c.provider_error.as_deref(), Some("429 Too Many Requests"));
         c.feed(r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input":10,"output":1,"cacheRead":0,"cacheWrite":0},"stopReason":"stop"}}"#);
         assert_eq!(c.provider_error, None);
+    }
+
+    #[test]
+    fn pi_compaction_usage_is_billed_but_never_moves_the_gauge() {
+        // Shaped per pi's docs/json.md `compaction_end`; the summarization request's
+        // usage appears nowhere else on the stream.
+        let compaction = r#"{"type":"compaction_end","reason":"threshold","result":{"summary":"Summary of conversation...","firstKeptEntryId":"abc123","tokensBefore":150000,"estimatedTokensAfter":32000,"usage":{"input":150000,"output":2000,"cacheRead":0,"cacheWrite":0,"totalTokens":152000,"cost":{"input":0.045,"output":0.005,"cacheRead":0,"cacheWrite":0,"total":0.05}},"details":{}},"aborted":false,"willRetry":false}"#;
+        let (c, out) = feed_pi(&format!("{PI_RUN1}{compaction}\n"));
+        let mut s = StreamStats::default();
+        c.merge_counters_into(&mut s);
+        assert_eq!(s.billed_tokens, 3209 + 3228 + 152000);
+        assert_eq!(s.input_tokens, 3132 + 529 + 150000);
+        assert_eq!(s.output_tokens, 77 + 1 + 2000);
+        assert_eq!(
+            s.context_tokens,
+            529 + 2698,
+            "compaction is not the working window"
+        );
+        assert!((s.cost_usd.unwrap() - (0.0011321 + 0.00024214 + 0.05)).abs() < 1e-12);
+        assert!(out.contains("· compacted  threshold"), "{out}");
+    }
+
+    #[test]
+    fn pi_failed_compaction_without_usage_bills_nothing() {
+        let mut c = StreamCoalescer::new_with_adapter(false, Some("cli:pi"));
+        c.feed(r#"{"type":"compaction_end","reason":"overflow","aborted":false,"willRetry":false,"errorMessage":"boom"}"#);
+        assert_eq!(c.billed_tokens(), 0);
+        assert_eq!(c.cost_usd, None);
+    }
+
+    #[test]
+    fn pi_recovered_429_is_marked_recovered_and_a_final_one_is_typed() {
+        let err = r#"{"type":"message_end","message":{"role":"assistant","content":[],"usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"stopReason":"error","errorMessage":"429 Too Many Requests"}}"#;
+        let ok = r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input":10,"output":1,"cacheRead":0,"cacheWrite":0},"stopReason":"stop"}}"#;
+        let mut c = StreamCoalescer::new_with_adapter(false, Some("cli:pi"));
+        c.feed(err);
+        assert_eq!(c.quota_rejected.as_deref(), Some("rate_limit"));
+        assert!(!c.quota_recovered);
+        c.feed(ok);
+        let mut s = StreamStats::default();
+        c.merge_counters_into(&mut s);
+        assert_eq!(s.quota_rejected, None);
+        assert!(
+            s.quota_recovered,
+            "the stale `! 429` line must not route to quota"
+        );
+        assert_eq!(s.provider_error, None);
+
+        // A 429 that is the final word is the provider's typed verdict.
+        c.feed(err);
+        c.merge_counters_into(&mut s);
+        assert_eq!(s.quota_rejected.as_deref(), Some("rate_limit"));
+
+        // A non-quota error is not typed as quota.
+        let mut c = StreamCoalescer::new_with_adapter(false, Some("cli:pi"));
+        c.feed(&err.replace("429 Too Many Requests", "400: bad model"));
+        assert_eq!(c.quota_rejected, None);
     }
 
     #[test]

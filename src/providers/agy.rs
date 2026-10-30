@@ -166,6 +166,7 @@ mod tests {
             model: model.map(str::to_string),
             effort: None,
             timeout_secs: None,
+            session_dir: None,
         }
     }
 

@@ -192,11 +192,55 @@ fn clean_replay_is_billed_and_carries_the_assigned_session() {
     let calls = fs::read_to_string(f.state.join("calls")).unwrap();
     let first = calls.lines().next().unwrap();
     assert!(
-        first.starts_with("--mode json --no-approve --session-id "),
+        first.starts_with("--mode json --no-approve --session-dir "),
+        "{first}"
+    );
+    // Sessions live under the run, per slot, never in the operator's ~/.pi.
+    let run_id = only_run_state(&f.proj)["id"].as_str().unwrap().to_string();
+    let slot_id = slot["id"].as_str().unwrap();
+    let dir = f
+        .proj
+        .join(".spar/runs")
+        .join(&run_id)
+        .join("sessions")
+        .join(slot_id);
+    assert!(
+        first.contains(&format!("--session-dir {} --session-id ", dir.display())),
         "{first}"
     );
     assert!(
         first.contains("--model openrouter/google/gemini-2.5-flash"),
         "{first}"
     );
+}
+
+#[test]
+fn a_recovered_429_then_a_missing_artifact_is_a_work_failure_not_quota() {
+    // pi retried past a 429 and the request then succeeded, but the slot wrote no
+    // artifact. The `! 429 Too Many Requests` line is still in the log; it must not
+    // park the run on quota or pause cli:pi.
+    let f = setup();
+    let stream = f.state.join("recovered.jsonl");
+    fs::write(
+        &stream,
+        concat!(
+            r#"{"type":"session","version":3,"id":"s1","timestamp":"t","cwd":"/w"}"#,
+            "\n",
+            r#"{"type":"message_end","message":{"role":"assistant","content":[],"usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"stopReason":"error","errorMessage":"429 Too Many Requests"}}"#,
+            "\n",
+            r#"{"type":"auto_retry_start","attempt":1,"maxAttempts":3,"delayMs":0,"errorMessage":"429 Too Many Requests"}"#,
+            "\n",
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"usage":{"input":100,"output":5,"cacheRead":0,"cacheWrite":0},"stopReason":"stop"}}"#,
+            "\n",
+            r#"{"type":"agent_settled","aborted":false}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    spar_implement(&f, &stream).code(1);
+    let slot = implementer(&only_run_state(&f.proj));
+    assert_eq!(slot["status"], "failed", "{slot}");
+    assert_ne!(slot["quota_hit"], true, "{slot}");
+    let err = slot["error"].as_str().unwrap_or_default();
+    assert!(err.contains("missing expected artifact"), "{slot}");
 }

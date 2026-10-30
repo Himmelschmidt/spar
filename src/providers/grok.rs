@@ -206,6 +206,7 @@ mod tests {
             model: None,
             effort: None,
             timeout_secs: None,
+            session_dir: None,
         });
         assert!(
             env.iter()
@@ -225,6 +226,7 @@ mod tests {
             model: None,
             effort: None,
             timeout_secs: None,
+            session_dir: None,
         }
     }
 
@@ -262,6 +264,7 @@ mod tests {
             model: None,
             effort: None,
             timeout_secs: None,
+            session_dir: None,
         };
         let cmd = GrokAdapter.build_headless(Path::new("grok"), &opts);
         let (_, args) = command_to_parts(&cmd);
@@ -353,6 +356,7 @@ mod tests {
             model: None,
             effort: None,
             timeout_secs: None,
+            session_dir: None,
         };
         let (_, args) = command_to_parts(&GrokAdapter.build_headless(Path::new("grok"), &opts));
         assert!(
@@ -383,6 +387,7 @@ mod tests {
             model: None,
             effort: Some(EffortLevel::Low),
             timeout_secs: None,
+            session_dir: None,
         };
         let (_, args) = command_to_parts(&GrokAdapter.build_interactive(Path::new("grok"), &opts));
         let i = args

@@ -325,6 +325,7 @@ mod tests {
             model: model.map(Into::into),
             effort: None,
             timeout_secs: None,
+            session_dir: None,
         }
     }
 

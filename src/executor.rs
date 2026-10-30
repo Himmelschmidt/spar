@@ -792,21 +792,34 @@ fn dispatch_with_resume_recovery(
                 );
                 gone.then(|| (requested.to_string(), captured.to_string()))
             }
+            (Some(requested), Some(captured))
+                if adapter.resume_started_fresh(
+                    &std::fs::read_to_string(&log_path).unwrap_or_default(),
+                    requested,
+                ) =>
+            {
+                Some((requested.to_string(), captured.to_string()))
+            }
             _ => None,
         }
     } else {
         None
     };
     if let Some((requested, captured)) = stale_resume {
+        let note = if requested == captured {
+            format!(
+                "resumed session {requested} was gone; the vendor recreated it empty, so this \
+                 round ran with fresh context"
+            )
+        } else {
+            format!(
+                "resumed session {requested} was gone; continued on new session {captured} with fresh context"
+            )
+        };
         let _ = crate::events::append(
             paths,
             run_id,
-            &crate::events::Event::slot_note(
-                slot_id,
-                format!(
-                    "resumed session {requested} was gone; continued on new session {captured} with fresh context"
-                ),
-            ),
+            &crate::events::Event::slot_note(slot_id, note),
         );
     }
     Ok(res)
@@ -937,6 +950,7 @@ fn execute_prepared(
         model: prep.job.model.clone(),
         effort: prep.job.effort,
         timeout_secs: Some(timeout.as_secs()),
+        session_dir: Some(prep.paths.sessions_dir(&prep.run_id, &prep.job.slot_id)),
     };
     let (mut cmd, used_resume) = build_dispatch_command(
         adapter.as_ref(),
@@ -1420,6 +1434,7 @@ fn recover_artifact(r: &ArtifactRecovery) -> bool {
         model: r.model.clone(),
         effort: r.effort,
         timeout_secs: Some(timeout.as_secs()),
+        session_dir: Some(r.paths.sessions_dir(r.run_id, r.slot_id)),
     };
     let cmd = adapter.build_headless(&bin, &opts);
     let (program, args) = providers::command_to_parts(&cmd);
@@ -3199,6 +3214,7 @@ fn run_headless(
         model: slot_model_for(Some(state), job),
         effort: slot_effort_for(cfg, Some(state), job),
         timeout_secs: Some(timeout.as_secs()),
+        session_dir: Some(paths.sessions_dir(&state.id, &job.slot_id)),
     };
     let prior_session_id =
         prior_session_for_role(paths, &state.id, &job.slot_id, cli_name, job.role);
@@ -3648,6 +3664,7 @@ fn run_tmux(
         // delegation; claude/grok/agy carry their own interactive arm).
         effort,
         timeout_secs: None,
+        session_dir: Some(paths.sessions_dir(&state.id, &job.slot_id)),
     };
     // The pane is teed to a log, never run through `StreamCoalescer`, so no id is
     // ever captured here (O65). An adapter that accepts a caller-supplied id gets
@@ -4203,6 +4220,7 @@ mod tests {
             model: None,
             effort: None,
             timeout_secs: None,
+            session_dir: None,
         }
     }
 
@@ -4945,6 +4963,79 @@ mod tests {
             env: vec![],
             timeout: Duration::from_secs(10),
         }
+    }
+
+    #[test]
+    fn pi_resume_that_recreated_its_session_is_noted_as_fresh_context() {
+        // pi exits 0 and reuses the requested id when the session file is gone, so the
+        // id-mismatch check never fires; its stderr warning is the only signal.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("run1").unwrap();
+        let log_path = tmp.path().join("slot.log");
+        let script = r#"echo "Warning: No project session found with id 'sid-1'; creating a new session with that id." >&2
+echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
+        let adapter = crate::providers::PiAdapter;
+        let mut opts = dispatch_opts("go");
+        let res = dispatch_with_resume_recovery(
+            &adapter,
+            Path::new("/bin/sh"),
+            &mut opts,
+            Some("sid-1"),
+            crate::config::IsolationMode::None,
+            shell_req(script, &log_path),
+            &paths,
+            "run1",
+            "impl",
+            "pi",
+            2,
+            &|_pid| {},
+            &|| {},
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(res.exit_code, Some(0));
+        let notes: Vec<String> = crate::events::read_all(&paths, "run1")
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| e.message)
+            .collect();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("resumed session sid-1 was gone")
+                    && n.contains("recreated it empty")),
+            "{notes:?}"
+        );
+
+        // The same warning on a resume of a different id is not this session's loss.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("run1").unwrap();
+        let log_path = tmp.path().join("slot.log");
+        let script = r#"echo "agent quoted: No project session found with id 'other'; creating a new session" >&2
+echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
+        dispatch_with_resume_recovery(
+            &adapter,
+            Path::new("/bin/sh"),
+            &mut dispatch_opts("go"),
+            Some("sid-1"),
+            crate::config::IsolationMode::None,
+            shell_req(script, &log_path),
+            &paths,
+            "run1",
+            "impl",
+            "pi",
+            2,
+            &|_pid| {},
+            &|| {},
+            &|_| {},
+        )
+        .unwrap();
+        assert!(crate::events::read_all(&paths, "run1")
+            .unwrap()
+            .iter()
+            .all(|e| e.message.as_deref().is_none_or(|m| !m.contains("was gone"))));
     }
 
     #[test]

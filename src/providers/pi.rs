@@ -20,15 +20,22 @@ fn pi_model(opts_model: Option<&str>) -> Option<String> {
         .map(|m| pi_model_arg(&m))
 }
 
+/// Prefix that hands the rest of a model to pi untouched, so pi's own
+/// `provider/id` reaches that provider directly: `cli:pi@direct:anthropic/claude-sonnet-4-5`.
+/// No OpenRouter slug starts with it (vendor names carry no `:`).
+const DIRECT_PREFIX: &str = "direct:";
+
 /// OpenRouter is the explicit route (O25, kept by O99). A `vendor/slug` is an
 /// OpenRouter id and gets `openrouter/` prepended, because pi would otherwise route
 /// it by its first segment: `google/…`, `anthropic/…` and `openai/…` are both
 /// OpenRouter vendors and pi provider ids, and the same ref must not change
 /// provider with whichever keys happen to be set. An explicit `openrouter/…`
-/// passes through. A bare word (`claude-sonnet-4-5`) has no vendor to route on and
-/// passes through to pi's own resolution, which is how a non-OpenRouter pi
-/// provider is reached.
+/// passes through, a bare word (`claude-sonnet-4-5`) passes to pi's own
+/// resolution, and `direct:<provider>/<id>` passes `<provider>/<id>` through as is.
 fn pi_model_arg(model: &str) -> String {
+    if let Some(native) = model.strip_prefix(DIRECT_PREFIX) {
+        return native.to_string();
+    }
     if model.contains('/') && !model.starts_with("openrouter/") {
         return format!("openrouter/{model}");
     }
@@ -54,6 +61,9 @@ impl PiAdapter {
         // Ignore project-local pi resources: a worktree's `.pi/` is the agent's
         // own output, not configuration spar vetted.
         cmd.arg("--no-approve");
+        if let Some(dir) = &opts.session_dir {
+            cmd.arg("--session-dir").arg(dir);
+        }
         if let Some(id) = session_id {
             cmd.arg("--session-id").arg(id);
         }
@@ -159,13 +169,21 @@ impl ProviderAdapter for PiAdapter {
     /// `--session-id` never refuses a missing id: it creates one (verified on 1.4.0,
     /// stderr `No project session found with id …; creating a new session`). A
     /// resume that failed before the `session` header is therefore not a lost
-    /// session.
+    /// session; one that succeeded on a fresh session is `resume_started_fresh`.
     fn resume_failure_is_missing_session(
         &self,
         _log_text: &str,
         _session_id: Option<&str>,
     ) -> bool {
         false
+    }
+
+    /// pi's warning on stderr, which the slot log carries `! `-prefixed. Pinned to
+    /// the requested id so agent prose quoting the warning cannot match.
+    fn resume_started_fresh(&self, log_text: &str, requested: &str) -> bool {
+        log_text.contains(&format!(
+            "No project session found with id '{requested}'; creating a new session"
+        ))
     }
 }
 
@@ -189,6 +207,7 @@ mod tests {
             model: model.map(Into::into),
             effort: None,
             timeout_secs: None,
+            session_dir: None,
         }
     }
 
@@ -274,6 +293,55 @@ mod tests {
             let a = args(&PiAdapter.build_headless(Path::new("pi"), &opts("x", Some(given))));
             assert_eq!(flag(&a, "--model").as_deref(), Some(want), "{given}");
         }
+    }
+
+    #[test]
+    fn direct_prefix_passes_a_pi_provider_id_through_untouched() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SPAR_PI_MODEL");
+        for (given, want) in [
+            (
+                "direct:anthropic/claude-sonnet-4-5",
+                "anthropic/claude-sonnet-4-5",
+            ),
+            ("direct:google/gemini-2.5-flash", "google/gemini-2.5-flash"),
+            ("direct:claude-sonnet-4-5", "claude-sonnet-4-5"),
+        ] {
+            let a = args(&PiAdapter.build_headless(Path::new("pi"), &opts("x", Some(given))));
+            assert_eq!(flag(&a, "--model").as_deref(), Some(want), "{given}");
+        }
+        std::env::set_var("SPAR_PI_MODEL", "direct:anthropic/claude-sonnet-4-5");
+        let probe = PiAdapter.readiness_probe().unwrap();
+        assert_eq!(
+            flag(&probe, "--model").as_deref(),
+            Some("anthropic/claude-sonnet-4-5")
+        );
+        std::env::remove_var("SPAR_PI_MODEL");
+    }
+
+    #[test]
+    fn session_dir_is_passed_on_fresh_and_resume() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SPAR_PI_MODEL");
+        let mut o = opts("x", None);
+        o.session_dir = Some(PathBuf::from("/r/.spar/runs/r1/sessions/impl"));
+        let fresh = args(&PiAdapter.build_headless(Path::new("pi"), &o));
+        let resumed = args(&PiAdapter.build_resume(Path::new("pi"), &o, "sid").unwrap());
+        for a in [fresh, resumed] {
+            assert_eq!(
+                flag(&a, "--session-dir").as_deref(),
+                Some("/r/.spar/runs/r1/sessions/impl"),
+                "{a:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_started_fresh_matches_only_the_requested_id() {
+        let log = "! Warning: No project session found with id 'sid-1'; creating a new session with that id.\n";
+        assert!(PiAdapter.resume_started_fresh(log, "sid-1"));
+        assert!(!PiAdapter.resume_started_fresh(log, "sid-2"));
+        assert!(!PiAdapter.resume_started_fresh("all fine\n", "sid-1"));
     }
 
     #[test]
