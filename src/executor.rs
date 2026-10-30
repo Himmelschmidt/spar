@@ -782,6 +782,7 @@ fn dispatch_with_resume_recovery(
         let (program, args) = providers::command_to_parts(&cmd);
         let (program, args) = sandbox::maybe_wrap(isolation, &cwd, &program, &args);
         let req = SpawnRequest {
+            stdin: adapter.prompt_stdin(opts),
             program,
             args,
             cwd: cwd.clone(),
@@ -913,6 +914,7 @@ fn cold_redispatch(
     let (program, args) = providers::command_to_parts(&cold);
     let (program, args) = sandbox::maybe_wrap(isolation, cwd, &program, &args);
     let cold_req = SpawnRequest {
+        stdin: adapter.prompt_stdin(opts),
         program,
         args,
         cwd: cwd.to_path_buf(),
@@ -1048,6 +1050,7 @@ fn execute_prepared(
     let mut dispatch_env = prep.env.clone();
     dispatch_env.extend(adapter.extra_env(&opts));
     let req = SpawnRequest {
+        stdin: adapter.prompt_stdin(&opts),
         program,
         args,
         cwd: prep.cwd.clone(),
@@ -1592,6 +1595,7 @@ fn recover_artifact(r: &ArtifactRecovery) -> bool {
     let mut recovery_env = r.env.to_vec();
     recovery_env.extend(adapter.extra_env(&opts));
     let req = SpawnRequest {
+        stdin: adapter.prompt_stdin(&opts),
         program,
         args,
         cwd: r.cwd.to_path_buf(),
@@ -3047,6 +3051,7 @@ fn run_dry(
         job.slot_id, job.role, job.provider
     );
     let req = SpawnRequest {
+        stdin: None,
         program: PathBuf::from("dry-run"),
         args: vec![],
         cwd: cwd.to_path_buf(),
@@ -3428,6 +3433,7 @@ fn run_headless(
     dispatch_env.extend(adapter.extra_env(&opts));
 
     let req = SpawnRequest {
+        stdin: adapter.prompt_stdin(&opts),
         program,
         args,
         cwd: cwd.to_path_buf(),
@@ -5186,6 +5192,7 @@ mod tests {
 
     fn shell_req(script: &str, log_path: &Path) -> SpawnRequest {
         SpawnRequest {
+            stdin: None,
             program: PathBuf::from("/bin/sh"),
             args: vec!["-c".into(), script.to_string()],
             cwd: PathBuf::from("/tmp"),
@@ -6904,6 +6911,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
 
         let log = tmp.path().join("child.log");
         let req = SpawnRequest {
+            stdin: None,
             program: PathBuf::from("/bin/sh"),
             args: vec![
                 "-c".into(),

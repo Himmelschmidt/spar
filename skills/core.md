@@ -256,6 +256,26 @@ positions.
   `test_author`, `implementer`, `tester`, `reviewer_adversarial`, `ranker`, `reconciler`,
   `peer_half` (+ `role_frontend` / `role_backend` notes appended for `--workflow roles`).
 
+### Finding a slot's process: by env, not argv (O128)
+
+Every native-cli slot process carries `SPAR_RUN_ID=<run>`, `SPAR_SLOT=<slot id>` (the short
+id, e.g. `impl-1`) and `SPAR_AGENT_ID=<run>:<slot>` in its environment. **Kill and wait by
+env, never by `pgrep -f`:** a pattern over argv also matches the agent, its orchestrator
+and your own wait loop.
+
+```bash
+for p in /proc/[0-9]*; do
+  tr '\0' '\n' < "$p/environ" 2>/dev/null | grep -qx "SPAR_RUN_ID=$RUN" && echo "${p#/proc/}"
+done
+```
+
+Prompts stay out of argv where the CLI allows it: `cli:claude` (`-p` with the prompt on
+stdin) and `cli:codex` (`exec … -- -`, and `exec resume <id> -- -`) read the slot's prompt
+file on stdin; `cli:muse` and `cli:grok` already pass `--prompt-file`. `cli:agy` and
+`cli:pi` still put the prompt in argv (not verified against their CLIs here), and a tmux
+pane always does. Keep long tasks out of spar's own argv too: `plan --spec <file|->` and
+`implement --spec <file|->` read the task (or a `--run` amendment) from a file or stdin.
+
 ## Workflows
 
 **`--providers` or `--select`** is required for `plan`, `implement`, and `run` (no silent default fleet) unless every dispatched role is pinned via `--role`.
@@ -309,6 +329,7 @@ spar reject <run_id> [--reason "..."] [--json]
 # a new ROUND on that run, never a second run.
 spar implement --run <run_id> --providers cli:claude,cli:grok,cli:agy [--dry-run] [--json] [--detach]
 spar implement -t "small task" --providers cli:claude [--dry-run]     # a fresh brief
+spar implement --spec brief.md --providers cli:claude                # same, task from a file (or - for stdin)
 spar implement -t "small task" --select value --urgency high --dry-run
 
 # Replan in place: a second plan round on the same run. `-t` is the directive for the

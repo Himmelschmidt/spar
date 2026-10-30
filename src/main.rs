@@ -336,6 +336,7 @@ fn run() -> Result<ExitCode> {
             new,
             plan,
             task,
+            spec,
             role,
             backup,
             effort,
@@ -357,6 +358,10 @@ fn run() -> Result<ExitCode> {
             big,
         } => {
             let prepared = (|| -> Result<_> {
+                let task = match &spec {
+                    Some(path) => Some(brief::read_spec_text(path)?),
+                    None => task,
+                };
                 let (paths, cfg) = implement_ctx(
                     run_id.as_deref(),
                     &role,
@@ -402,9 +407,9 @@ fn run() -> Result<ExitCode> {
                     None if plan.is_none() || new => workflow::preflight(&opts, &paths, &cfg)?,
                     None => {}
                 }
-                Ok((paths, cfg, opts))
+                Ok((paths, cfg, opts, task))
             })();
-            let (paths, cfg, opts) = match prepared {
+            let (paths, cfg, opts, task) = match prepared {
                 Ok(v) => v,
                 Err(e) => return launch_refused(e, json, run_id.as_deref()),
             };

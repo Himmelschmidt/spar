@@ -52,8 +52,11 @@ pub fn wire(adapter: &dyn ProviderAdapter, id: &SlotIdentity) -> PresenceWiring 
             id.project_root.display().to_string(),
         ),
     ];
+    // `SPAR_RUN_ID` + `SPAR_SLOT` tag every slot process so it can be found (and killed)
+    // through `/proc/<pid>/environ` instead of a `pgrep -f` over argv (#182).
     if let Some(run) = id.run_id {
         env.push(("SPAR_RUN_ID".to_string(), run.to_string()));
+        env.push(("SPAR_SLOT".to_string(), id.agent_id.to_string()));
     }
     // Only StopHookInject adapters (Claude, muse, grok) close the delivery loop
     // through the Stop hook; every other presence adapter gets lifecycle hooks
@@ -342,7 +345,10 @@ mod tests {
             spar_exe: &exe,
         };
         let w = wire(&ClaudeAdapter, &bare);
-        assert!(!w.env.iter().any(|(k, _)| k == "SPAR_RUN_ID"));
+        assert!(!w
+            .env
+            .iter()
+            .any(|(k, _)| k == "SPAR_RUN_ID" || k == "SPAR_SLOT"));
         let text = std::fs::read_to_string(settings_path(&wt)).unwrap();
         assert!(
             !text.contains("--run"),
@@ -369,6 +375,12 @@ mod tests {
             .env
             .iter()
             .any(|(k, v)| k == "SPAR_AGENT_ID" && v == "abc123:impl-1"));
+        // The kill-by-env pair (#182): run id and the short slot id.
+        assert!(w
+            .env
+            .iter()
+            .any(|(k, v)| k == "SPAR_RUN_ID" && v == "abc123"));
+        assert!(w.env.iter().any(|(k, v)| k == "SPAR_SLOT" && v == "impl-1"));
 
         let text = std::fs::read_to_string(settings_path(&wt)).unwrap();
         let v: Value = serde_json::from_str(&text).unwrap();

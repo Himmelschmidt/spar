@@ -170,6 +170,11 @@ pub enum Command {
         plan: Option<std::path::PathBuf>,
         #[arg(long, short = 't')]
         task: Option<String>,
+        /// Read the task (with `--run`, this round's amendment) from a file, or `-` for
+        /// stdin, instead of `-t`. Keeps a long brief out of argv, where `pgrep -f`
+        /// matches it. Unlike `plan --spec`, nothing is copied to `.spar/briefs/`.
+        #[arg(long, value_name = "FILE", conflicts_with = "task")]
+        spec: Option<PathBuf>,
         /// Assign a provider to a role for THIS run, without touching `spar.toml`:
         /// `--role planner=cli:grok --role reviewer=cli:claude@opus`. Repeatable;
         /// a `reviewer` list sets the panel size exactly, and outranks even an explicit

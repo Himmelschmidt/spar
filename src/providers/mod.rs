@@ -225,6 +225,13 @@ pub trait ProviderAdapter: Send + Sync {
         }
     }
     fn permission_args(&self, policy: TrustPolicy) -> Vec<String>;
+    /// The file a headless or resume dispatch must get on stdin, when this adapter
+    /// reads its prompt there instead of from argv. Paired with `build_headless` /
+    /// `build_resume`, which leave the prompt out of argv exactly when this is `Some`.
+    /// Default `None`: argv (or the adapter's own prompt-file flag) carries it.
+    fn prompt_stdin(&self, _opts: &SpawnOpts) -> Option<PathBuf> {
+        None
+    }
     fn build_headless(&self, bin: &Path, opts: &SpawnOpts) -> Command;
     fn build_interactive(&self, bin: &Path, opts: &SpawnOpts) -> Command;
 

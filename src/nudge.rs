@@ -556,6 +556,7 @@ mod tests {
             r#"echo '{"type":"message_end","message":{"role":"assistant","content":[],"usage":{"input":900,"output":100,"cacheRead":0,"cacheWrite":0},"stopReason":"toolUse"}}'"#
         );
         let req = crate::process::SpawnRequest {
+            stdin: None,
             program: "sh".into(),
             args: vec!["-c".into(), script],
             cwd: tmp.path().to_path_buf(),

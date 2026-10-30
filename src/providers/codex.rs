@@ -187,6 +187,66 @@ pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub struct CodexAdapter;
 
+impl CodexAdapter {
+    /// `codex exec [flags] [PROMPT]`, prompt as the trailing positional. With
+    /// `stdin_prompt` that positional is `-` and `prompt_stdin` feeds the prompt file
+    /// (`codex exec --help`: "If not provided as an argument (or if `-` is used),
+    /// instructions are read from stdin"). A tmux pane's stdin is its terminal, so the
+    /// interactive path always passes the text.
+    fn exec_command(&self, bin: &Path, opts: &SpawnOpts, stdin_prompt: bool) -> Command {
+        let mut cmd = Command::new(bin);
+        cmd.arg("exec");
+        cmd.arg("--json");
+        cmd.arg("--skip-git-repo-check");
+        for a in self.permission_args(opts.trust) {
+            cmd.arg(a);
+        }
+        // An explicit model is self-describing (it names its own provider), so it
+        // supersedes the profile; the profile is only the no-model default.
+        match codex_model(opts) {
+            Some(m) => {
+                for a in model_args(&m) {
+                    cmd.arg(a);
+                }
+            }
+            None => {
+                if let Some(p) = codex_profile() {
+                    cmd.arg("-p").arg(p);
+                }
+            }
+        }
+        for a in effort_args(opts) {
+            cmd.arg(a);
+        }
+        for a in &opts.extra_args {
+            cmd.arg(a);
+        }
+        // The provider's own final message, free artifact-salvage input:
+        // `-o/--output-last-message` writes the agent's last message to a path of
+        // spar's choosing (verified against codex 0.153.4). Slot-scoped under the
+        // run's `logs/`; `executor::salvage_expected_artifact` prefers it over the
+        // reconstructed log tail when the expected artifact is missing, subject to
+        // the O89 freshness rule. A salvage input only, never the artifact itself.
+        if let Some(path) = last_message_path_for_opts(opts) {
+            cmd.arg("--output-last-message").arg(path);
+        }
+        // `--` ends option parsing so a prompt starting with `-` (or matching a
+        // `codex exec` subcommand like `review`/`resume`) is taken literally.
+        cmd.arg("--");
+        cmd.arg(prompt_arg(opts, stdin_prompt));
+        cmd.current_dir(&opts.cwd);
+        cmd
+    }
+}
+
+/// The trailing prompt positional: `-` (read stdin) or the prompt text.
+fn prompt_arg(opts: &SpawnOpts, stdin_prompt: bool) -> String {
+    if stdin_prompt {
+        return "-".into();
+    }
+    resolved_prompt(opts)
+}
+
 impl ProviderAdapter for CodexAdapter {
     fn name(&self) -> &'static str {
         "codex"
@@ -264,51 +324,12 @@ impl ProviderAdapter for CodexAdapter {
         }
     }
 
+    fn prompt_stdin(&self, opts: &SpawnOpts) -> Option<std::path::PathBuf> {
+        opts.prompt_file.clone()
+    }
+
     fn build_headless(&self, bin: &Path, opts: &SpawnOpts) -> Command {
-        // `codex exec [flags] [PROMPT]` — prompt is the trailing positional. stdin is
-        // null (spar spawns detached), so codex takes the prompt from the argument.
-        let mut cmd = Command::new(bin);
-        cmd.arg("exec");
-        cmd.arg("--json");
-        cmd.arg("--skip-git-repo-check");
-        for a in self.permission_args(opts.trust) {
-            cmd.arg(a);
-        }
-        // An explicit model is self-describing (it names its own provider), so it
-        // supersedes the profile; the profile is only the no-model default.
-        match codex_model(opts) {
-            Some(m) => {
-                for a in model_args(&m) {
-                    cmd.arg(a);
-                }
-            }
-            None => {
-                if let Some(p) = codex_profile() {
-                    cmd.arg("-p").arg(p);
-                }
-            }
-        }
-        for a in effort_args(opts) {
-            cmd.arg(a);
-        }
-        for a in &opts.extra_args {
-            cmd.arg(a);
-        }
-        // The provider's own final message, free artifact-salvage input:
-        // `-o/--output-last-message` writes the agent's last message to a path of
-        // spar's choosing (verified against codex 0.153.4). Slot-scoped under the
-        // run's `logs/`; `executor::salvage_expected_artifact` prefers it over the
-        // reconstructed log tail when the expected artifact is missing, subject to
-        // the O89 freshness rule. A salvage input only, never the artifact itself.
-        if let Some(path) = last_message_path_for_opts(opts) {
-            cmd.arg("--output-last-message").arg(path);
-        }
-        // `--` ends option parsing so a prompt starting with `-` (or matching a
-        // `codex exec` subcommand like `review`/`resume`) is taken literally.
-        cmd.arg("--");
-        cmd.arg(resolved_prompt(opts));
-        cmd.current_dir(&opts.cwd);
-        cmd
+        self.exec_command(bin, opts, opts.prompt_file.is_some())
     }
 
     /// Resume is implemented, so the derived `Capabilities.resume` reports true.
@@ -364,8 +385,9 @@ impl ProviderAdapter for CodexAdapter {
             cmd.arg("--output-last-message").arg(path);
         }
         cmd.arg(session_id);
+        // `exec resume --help`: "If `-` is used, read from stdin".
         cmd.arg("--");
-        cmd.arg(resolved_prompt(opts));
+        cmd.arg(prompt_arg(opts, opts.prompt_file.is_some()));
         cmd.current_dir(&opts.cwd);
         Some(cmd)
     }
@@ -385,7 +407,7 @@ impl ProviderAdapter for CodexAdapter {
         // `build_resume`, and a codex slot forced onto `--backend tmux` re-dispatches
         // cold every round rather than silently pretending to continue a thread it
         // never captured.
-        self.build_headless(bin, opts)
+        self.exec_command(bin, opts, false)
     }
 
     // Verified against codex 0.152.0: a resume against a rollout that no longer exists
@@ -861,7 +883,16 @@ mod tests {
         // Still ahead of the `--` / prompt tail.
         let di = a.iter().position(|x| x == "--").expect("-- separator");
         assert!(i + 1 < di, "flag must precede the prompt tail: {a:?}");
-        assert_eq!(a.last().map(String::as_str), Some("do the thing"));
+        // With a prompt file the prompt rides stdin (#182), never argv.
+        assert_eq!(a.last().map(String::as_str), Some("-"));
+        assert!(!a.iter().any(|x| x == "do the thing"), "{a:?}");
+        assert_eq!(CodexAdapter.prompt_stdin(&o), o.prompt_file.clone());
+        let (_, pane) = command_to_parts(&CodexAdapter.build_interactive(Path::new("codex"), &o));
+        assert_eq!(
+            pane.last().map(String::as_str),
+            Some("do the thing"),
+            "a tmux pane's stdin is its terminal, so the pane keeps the text"
+        );
 
         let home = tempdir().unwrap();
         std::env::set_var("CODEX_HOME", home.path());
@@ -883,6 +914,7 @@ mod tests {
             i + 1 < si && si < di,
             "flag, session, separator order: {a:?}"
         );
+        assert_eq!(a.last().map(String::as_str), Some("-"));
     }
 
     #[test]

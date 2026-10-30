@@ -373,3 +373,52 @@ fn max_rounds_against_a_live_orchestrator_is_queued() {
     assert_eq!(st["round"].as_u64(), Some(round + 2), "{st}");
     assert!(!marker.exists(), "the queued extension is consumed once");
 }
+
+/// #182: `implement --spec` keeps a long brief out of spar's own argv, from a file or
+/// from stdin.
+#[test]
+fn implement_spec_reads_the_task_from_a_file_or_stdin() {
+    let sb = Sandbox::new();
+    let spec = sb.project.join("brief.md");
+    std::fs::write(&spec, "SPEC-FROM-FILE: add a hello function\n").unwrap();
+    for (arg, stdin) in [
+        (spec.to_str().unwrap(), None),
+        ("-", Some("SPEC-FROM-STDIN\n")),
+    ] {
+        let mut cmd = sb.spar();
+        cmd.args([
+            "implement",
+            "--spec",
+            arg,
+            "--providers",
+            "cli:claude",
+            "--dry-run",
+            "--json",
+        ]);
+        if let Some(body) = stdin {
+            cmd.write_stdin(body);
+        }
+        let out = cmd.output().unwrap();
+        let v = json(&out);
+        let id = v["run_id"].as_str().expect("run_id").to_string();
+        let task = sb.state(&id)["task"].as_str().unwrap().to_string();
+        let want = if stdin.is_some() {
+            "SPEC-FROM-STDIN"
+        } else {
+            "SPEC-FROM-FILE"
+        };
+        assert!(task.contains(want), "{task}");
+    }
+    sb.spar()
+        .args([
+            "implement",
+            "-t",
+            "x",
+            "--spec",
+            "-",
+            "--providers",
+            "cli:claude",
+        ])
+        .assert()
+        .code(1);
+}
