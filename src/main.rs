@@ -271,6 +271,16 @@ fn run() -> Result<ExitCode> {
             workflow::plan::reject(&paths, &run_id, reason, json)
         }
         Command::Brief { run_id, full, json } => brief_cmd(&run_id, full, json),
+        Command::Amend {
+            run_id,
+            contract,
+            json,
+        } => {
+            refuse_inside_slot("spar amend")?;
+            let (paths, _) = project_ctx()?;
+            let cfg = Config::for_run(&paths, &run_id)?;
+            workflow::plan::amend_contract(&paths, &cfg, &run_id, &contract, json)
+        }
         Command::Resume {
             run_id,
             detach,

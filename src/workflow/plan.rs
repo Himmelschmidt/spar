@@ -485,7 +485,7 @@ pub fn execute_plan(
     }
 
     if cfg.spec.enabled {
-        if let Err(e) = run_test_author(state, paths, cfg) {
+        if let Err(e) = run_test_author(state, paths, cfg, "") {
             if state.phase != Phase::Failed {
                 state.set_phase(Phase::Failed);
                 state.error = Some(e.to_string());
@@ -548,7 +548,14 @@ pub fn execute_plan(
     Ok(())
 }
 
-fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<()> {
+/// `amendment_section` is empty on a plan round and carries the operator's directive and
+/// the contract it changes on `spar amend` (O137).
+fn run_test_author(
+    state: &mut RunState,
+    paths: &SparPaths,
+    cfg: &Config,
+    amendment_section: &str,
+) -> Result<()> {
     let planner_slot = state
         .slots
         .iter()
@@ -641,6 +648,10 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
     seed_spec_bus(state, paths, &id, &planner_slot, critic_slot.as_deref())?;
 
     let mut extra = HashMap::new();
+    extra.insert(
+        "contract_amendment_section".into(),
+        amendment_section.to_string(),
+    );
     extra.insert("planner_slot".into(), planner_slot);
     if let Some(c) = &critic_slot {
         extra.insert("critic_slot".into(), c.clone());
@@ -1146,6 +1157,174 @@ pub fn replan(
         executor::emit_run_json(&state)?;
     }
     Ok(code)
+}
+
+/// `spar amend --run <id> --contract "<directive>"` (O137): re-run only the test author
+/// against the frozen contract plus the operator's directive, re-freeze what it writes,
+/// and leave the run parked where it was. Refuses a live orchestrator rather than
+/// stopping it: the run lock is taken before anything is read for writing, exactly as
+/// `implement --run` does, so a run somebody is driving is never amended under them.
+pub fn amend_contract(
+    paths: &SparPaths,
+    cfg: &Config,
+    run_id: &str,
+    directive: &str,
+    json: bool,
+) -> Result<ExitCode> {
+    if directive.trim().is_empty() {
+        anyhow::bail!("--contract directive is empty");
+    }
+    RunState::load(paths, run_id)?;
+    let lock = crate::runlock::RunLock::acquire(paths, run_id)?;
+    let mut state = RunState::load(paths, run_id)?;
+    let at_plan_gate = state.phase == Phase::AwaitingPlanApproval;
+    if !at_plan_gate && !crate::state::is_resumable(&state) {
+        anyhow::bail!(
+            "run {run_id} is {:?}; amend a run that is parked (stopped, failed, stuck, \
+             quota, or at a plan or round gate). `spar stop {run_id}` parks an in-flight one",
+            state.phase
+        );
+    }
+    if state.slots.iter().all(|s| s.role != SlotRole::TestAuthor) {
+        anyhow::bail!(
+            "run {run_id} has no test author: it was not planned with a spec phase, so \
+             there is no frozen contract to amend"
+        );
+    }
+    let contract = paths.artifact(run_id, "test-contract.md");
+    let old_body = std::fs::read_to_string(&contract).map_err(|_| {
+        anyhow::anyhow!("run {run_id} has no test-contract.md; there is no contract to amend")
+    })?;
+    let old = crate::workflow::implement::FrozenContract::freeze(&old_body);
+    let archived = format!(
+        "test-contract-amend{}.md",
+        state.contract_amendments.len() + 1
+    );
+    std::fs::write(paths.artifact(run_id, &archived), &old_body)?;
+    let phase = state.phase;
+    let error = state.error.clone();
+    // The author's branch and tree as they were, so a failed amendment does not leave
+    // half-rewritten tests for the next overlay to merge into the implementer (O53).
+    let author_tree = state
+        .slots
+        .iter()
+        .find(|s| s.role == SlotRole::TestAuthor)
+        .and_then(|a| state.worktrees.iter().find(|w| w.slot_id == a.id))
+        .map(|w| w.path.clone())
+        .filter(|p| !state.dry_run && p.is_dir());
+    let author_head = author_tree
+        .as_ref()
+        .and_then(|p| worktree::git_out(p, &["rev-parse", "HEAD"]));
+    let section = format!(
+        "## Contract amendment (operator directive)\n\
+         This run already has a frozen acceptance contract, printed below, and has been \
+         working against it. The operator has directed this change to it:\n\n{directive}\n\n\
+         Rewrite `{artifacts}/test-contract.md` and the acceptance tests in your worktree to \
+         carry out the directive and nothing more. Keep every criterion the directive does not \
+         touch, with its id and wording. Never renumber and never reuse an id: a criterion the \
+         directive removes is deleted, and a new one takes the next unused number. Commit the \
+         changed tests on your branch.\n\n### Current contract\n{old_body}\n",
+        artifacts = paths.artifacts_dir(run_id).display(),
+    );
+    if !json {
+        eprintln!("amending the contract of run {run_id}: dispatching the test author only");
+    }
+    let outcome = run_test_author(&mut state, paths, cfg, &section);
+    let rewritten = std::fs::read_to_string(&contract).unwrap_or_default();
+    let failure = match &outcome {
+        Err(e) => Some(e.to_string()),
+        Ok(()) if state.phase == Phase::Quota => Some(
+            state
+                .error
+                .clone()
+                .unwrap_or_else(|| "test author parked on quota".into()),
+        ),
+        Ok(()) if rewritten.trim().is_empty() => Some("test author wrote no contract".into()),
+        Ok(()) => None,
+    };
+    let quota = state.phase == Phase::Quota;
+    state.set_phase(phase);
+    state.error = error;
+    if let Some(why) = failure {
+        std::fs::write(&contract, &old_body)?;
+        if let (Some(tree), Some(head)) = (&author_tree, &author_head) {
+            let _ = worktree::git_out(tree, &["reset", "--hard", "--quiet", head]);
+            let _ = worktree::git_out(tree, &["clean", "-fdq"]);
+        }
+        state.save(paths)?;
+        let msg = format!("contract amendment failed, contract left as it was: {why}");
+        let _ = crate::events::append(paths, run_id, &crate::events::Event::info(msg.clone()));
+        drop(lock);
+        if json {
+            executor::emit_run_json(&state)?;
+        }
+        eprintln!("error: {msg}");
+        return Ok(if quota {
+            ExitCode::Quota
+        } else {
+            ExitCode::Failure
+        });
+    }
+    let new = crate::workflow::implement::FrozenContract::freeze(&rewritten);
+    state.contract_fingerprint = Some(new.fingerprint.clone());
+    state.contract_modified = false;
+    // The implementer resumes its own session across rounds (O63), and that
+    // conversation was steered by the contract this replaces. Judging roles and the
+    // test author dispatch cold already (O89), so theirs are never read.
+    let impl_ids: Vec<String> = state
+        .slots
+        .iter()
+        .filter(|s| s.role == SlotRole::Implementer)
+        .map(|s| s.id.clone())
+        .collect();
+    if let Ok(rd) = std::fs::read_dir(paths.markers_dir(run_id)) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".session_id")
+                && impl_ids
+                    .iter()
+                    .any(|id| name.starts_with(&format!("{id}.")))
+            {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    state
+        .contract_amendments
+        .push(crate::state::ContractAmendment {
+            at: chrono::Utc::now(),
+            round: state.round,
+            directive: directive.to_string(),
+            old_fingerprint: old.fingerprint.clone(),
+            new_fingerprint: new.fingerprint.clone(),
+            archived: archived.clone(),
+        });
+    let msg = format!(
+        "contract amended by the operator: {} criteria (fingerprint {}, was {}; previous kept \
+         at artifacts/{archived}). directive: {directive}",
+        new.criteria.len(),
+        new.fingerprint,
+        old.fingerprint
+    );
+    let _ = crate::events::append(paths, run_id, &crate::events::Event::info(msg.clone()));
+    state.save(paths)?;
+    drop(lock);
+    let next = if at_plan_gate {
+        format!("spar approve {run_id}")
+    } else {
+        format!("spar implement --run {run_id}")
+    };
+    if json {
+        executor::emit_run_json(&state)?;
+    } else {
+        println!("{msg}");
+        let shown = serde_json::to_value(phase)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        println!("run {run_id} is still {shown}; nothing was resumed. Continue with: {next}");
+    }
+    Ok(ExitCode::Success)
 }
 
 /// Move a finished round's plan and contract aside so the next round cannot be

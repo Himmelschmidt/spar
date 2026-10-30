@@ -190,6 +190,9 @@ pub struct RunState {
     /// that was retired stays named here, so the record answers who filled it before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub seat_reassignments: Vec<SeatReassignment>,
+    /// Every `spar amend --contract` applied to this run, oldest first (O137).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contract_amendments: Vec<ContractAmendment>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,6 +204,17 @@ pub struct SeatReassignment {
     pub from_provider: String,
     pub to_seat: String,
     pub to_provider: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractAmendment {
+    pub at: DateTime<Utc>,
+    pub round: u32,
+    pub directive: String,
+    pub old_fingerprint: String,
+    pub new_fingerprint: String,
+    /// Where the contract it replaced was kept: `artifacts/<archived>`.
+    pub archived: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -763,6 +777,7 @@ impl RunState {
             pr_body_hash: None,
             ship_override: None,
             seat_reassignments: Vec::new(),
+            contract_amendments: Vec::new(),
             pr_state: None,
         }
     }

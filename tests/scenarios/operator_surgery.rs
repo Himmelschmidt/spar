@@ -1,6 +1,8 @@
 //! Operator surgery on a run that already exists: moving a seat to another provider
-//! (`implement --reassign`, O136) and resuming a failed task-only run (O91). Every provider CLI is faked and `PATH` holds only the fake bin and
-//! the system dirs, so nothing here can reach a real, billed provider.
+//! (`implement --reassign`, O136), resuming a failed task-only run (O91) and amending a
+//! frozen contract (`spar amend`, O137). Every provider CLI is faked and `PATH` holds
+//! only the fake bin and the system dirs, so nothing here can reach a real, billed
+//! provider.
 use assert_cmd::Command as AssertCommand;
 use predicates::prelude::*;
 use std::fs;
@@ -389,4 +391,154 @@ fn reassign_is_refused_inside_a_slot_onto_a_paused_provider_and_under_a_live_orc
         st.get("seat_reassignments").is_none(),
         "nothing moved: {st}"
     );
+}
+
+/// A dry-run plan run parked at the plan gate, with a hand-written contract standing in
+/// for what a real test author froze.
+fn planned_run(fx: &Fixture) -> String {
+    fx.spar()
+        .args([
+            "plan",
+            "-t",
+            "add a feature",
+            "--providers",
+            "cli:claude",
+            "--dry-run",
+        ])
+        .assert()
+        .code(2);
+    assert_eq!(fx.state()["phase"], "awaiting_plan_approval");
+    fs::write(
+        fx.run_dir().join("artifacts/test-contract.md"),
+        "## Scenarios\n- [ ] AC-1: BASH-HARNESS journey passes — verify: `./journey.sh`\n",
+    )
+    .unwrap();
+    fx.run_id()
+}
+
+#[test]
+fn amend_reruns_only_the_test_author_refreezes_and_leaves_the_run_where_it_was() {
+    let fx = Fixture::new();
+    let id = planned_run(&fx);
+    let planner_prompt =
+        fs::read_to_string(fx.run_dir().join("prompt-planner-cli-claude.md")).unwrap();
+
+    fx.spar()
+        .args([
+            "amend",
+            "--run",
+            &id,
+            "--contract",
+            "PLAYWRIGHT-DIRECTIVE: verify the journey with Playwright",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("nothing was resumed"))
+        .stdout(predicate::str::contains(format!("spar approve {id}")));
+
+    let st = fx.state();
+    assert_eq!(st["phase"], "awaiting_plan_approval", "parked where it was");
+    let am = &st["contract_amendments"].as_array().unwrap()[0];
+    assert!(am["directive"]
+        .as_str()
+        .unwrap()
+        .starts_with("PLAYWRIGHT-DIRECTIVE"));
+    assert_ne!(am["old_fingerprint"], am["new_fingerprint"]);
+    assert_eq!(st["contract_fingerprint"], am["new_fingerprint"]);
+    let archived =
+        fs::read_to_string(fx.run_dir().join("artifacts/test-contract-amend1.md")).unwrap();
+    assert!(archived.contains("BASH-HARNESS"));
+    let author_prompt =
+        fs::read_to_string(fx.run_dir().join("prompt-test-author-cli-claude.md")).unwrap();
+    assert!(author_prompt.contains("PLAYWRIGHT-DIRECTIVE"));
+    assert!(
+        author_prompt.contains("BASH-HARNESS"),
+        "the author sees the contract it amends"
+    );
+    assert_eq!(
+        fs::read_to_string(fx.run_dir().join("prompt-planner-cli-claude.md")).unwrap(),
+        planner_prompt,
+        "the planner was not re-run"
+    );
+    let events = fs::read_to_string(fx.run_dir().join("events.jsonl")).unwrap();
+    assert!(events.contains("contract amended by the operator"));
+
+    fx.spar().args(["approve", &id]).assert().success();
+    fx.spar()
+        .args(["implement", "--run", &id, "--dry-run"])
+        .assert()
+        .stderr(predicate::str::contains("changed while the previous round").not())
+        .stderr(predicate::str::contains("contract re-frozen").not());
+    assert_eq!(fx.state()["contract_fingerprint"], am["new_fingerprint"]);
+
+    let markers = fx.run_dir().join("markers");
+    fs::write(
+        markers.join("impl.claude.session_id"),
+        "steered-by-old-contract",
+    )
+    .unwrap();
+    fs::write(
+        markers.join("review-0-cli-claude.claude.session_id"),
+        "judge",
+    )
+    .unwrap();
+    fx.spar()
+        .args(["amend", "--run", &id, "--contract", "drop AC-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "spar implement --run {id}"
+        )));
+    assert!(
+        !markers.join("impl.claude.session_id").exists(),
+        "the implementer re-reads the amended contract cold"
+    );
+    assert!(markers
+        .join("review-0-cli-claude.claude.session_id")
+        .exists());
+    assert_eq!(
+        fx.state()["contract_amendments"].as_array().unwrap().len(),
+        2
+    );
+}
+
+#[test]
+fn amend_is_refused_inside_a_slot_under_a_live_orchestrator_and_without_a_contract() {
+    let fx = Fixture::new();
+    let id = planned_run(&fx);
+    fx.spar()
+        .env("SPAR_RUN_ID", &id)
+        .args(["amend", "--run", &id, "--contract", "x"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "operator-only command; refused inside a slot",
+        ));
+
+    let lock = fx.run_dir().join("orchestrator.lock");
+    let mut holder = std::process::Command::new("flock")
+        .arg(&lock)
+        .args(["sleep", "30"])
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    fx.spar()
+        .args(["amend", "--run", &id, "--contract", "x"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "already has a running orchestrator",
+        ));
+    holder.kill().unwrap();
+    let _ = holder.wait();
+    assert!(fx.state().get("contract_amendments").is_none());
+
+    let other = Fixture::new();
+    let task_run = other.failed_task_run();
+    other
+        .spar()
+        .args(["amend", "--run", &task_run, "--contract", "x"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("has no test author"));
 }

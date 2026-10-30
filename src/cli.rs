@@ -559,6 +559,19 @@ pub enum Command {
         if_merged: bool,
     },
 
+    /// Amend a run's frozen acceptance contract: re-run only its test author with the
+    /// directive and the current contract, re-freeze the result, and leave the run parked
+    /// where it was (O137). Operator-only; refused while the run's orchestrator is alive.
+    Amend {
+        #[arg(long = "run")]
+        run_id: String,
+        /// What to change about how the run verifies its work.
+        #[arg(long)]
+        contract: String,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Operator rulings: settled points every later reviewer and implementer prompt
     /// carries. A run ruling may waive an acceptance criterion (O121).
     Rule {
