@@ -178,3 +178,7 @@ path = "tests/scenarios/work_safety.rs"
 [[test]]
 name = "stats"
 path = "tests/scenarios/stats.rs"
+
+[[test]]
+name = "provider_usage"
+path = "tests/scenarios/provider_usage.rs"

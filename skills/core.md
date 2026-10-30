@@ -9,7 +9,7 @@ spar skills list
 spar skills get core
 spar skills get fleet   # cheap OpenRouter coders + smart plan/review, assigned by [roles]
 spar doctor [--json]
-spar provider list [--json]
+spar provider list [--usage] [--json]
 spar model list|pick|refresh|cache [--json]
 spar model list --provider openrouter [--all] [--json]   # OpenRouter catalog, tool-capable by default
 ```
@@ -44,6 +44,24 @@ spar implement -t "..." --providers 'cli:codex@openai/gpt-4o-mini,api:openai@gpt
 
 Native CLI adapters: `cli:claude`, `cli:grok`, `cli:agy`, `cli:codex`, `cli:pi`, `cli:muse`. Run
 `spar provider list` to see which resolve on this box and their live pause/cooldown status.
+
+**Utilisation (O132).** `spar provider list --usage` adds each account's current window
+use where the CLI exposes it locally and without a model turn. muse: `muse usage --json`
+(5-hour and weekly `used_percent`, reset times, tier). codex: the newest `rate_limits`
+record in `$CODEX_HOME/sessions/**/*.jsonl` (default `~/.codex`), which is as fresh as the
+last codex turn on this box, so read `as_of`. claude: nothing; its `/usage` reads an
+account endpoint and there is no local, documented, non-billed source, so spar does not
+call it. Other adapters: nothing. With `--json` each provider gains `usage`:
+
+```json
+{"schema_version": 1, "status": "ok" | "unavailable" | "unsupported",
+ "source": "muse usage --json" | "codex session log <path>" | null, "as_of": "..." | null,
+ "windows": [{"name": "5h" | "weekly" | "<n>m", "used_percent": 27.0,
+              "resets_at": "..." | null, "window_minutes": 10080 | null}],
+ "plan": "pro" | null, "credits": "20047.55" | "unlimited" | null, "message": "why not" | null}
+```
+
+Without `--usage` nothing is probed and `usage` is absent.
 
 **Readiness.** A binary on PATH is not health: `spar doctor` and `spar provider list`
 also run each adapter's readiness probe (a local-only config/auth check, never a model

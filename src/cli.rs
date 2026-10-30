@@ -705,6 +705,10 @@ pub enum ProviderAction {
     List {
         #[arg(long)]
         json: bool,
+        /// Also read each account's current utilisation where the CLI exposes it
+        /// locally without a model turn (muse, codex)
+        #[arg(long)]
+        usage: bool,
     },
     Pause {
         name: String,

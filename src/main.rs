@@ -2438,8 +2438,12 @@ fn cleanup_one(
 
 fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
     match action {
-        cli::ProviderAction::List { json } => {
+        cli::ProviderAction::List { json, usage } => {
             let report = providers::detect_all();
+            let usages: Vec<Option<providers::usage::ProviderUsage>> = report
+                .iter()
+                .map(|p| usage.then(|| providers::usage::probe(&p.name, p.path.as_deref())))
+                .collect();
             let quota = paths::find_project_root()
                 .ok()
                 .and_then(|r| {
@@ -2450,7 +2454,8 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
             if json {
                 let enriched: Vec<serde_json::Value> = report
                     .iter()
-                    .map(|p| {
+                    .zip(&usages)
+                    .map(|(p, u)| {
                         let key = quota::normalize_key(&p.name);
                         let q = quota.get(&key);
                         // Effective status: a lapsed pause reads Available, so the
@@ -2459,7 +2464,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                         let hint = (status != quota::ProviderStatus::Available)
                             .then_some(q.hint)
                             .flatten();
-                        serde_json::json!({
+                        let mut v = serde_json::json!({
                             "name": p.name,
                             "available": p.available,
                             "path": p.path,
@@ -2469,12 +2474,16 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                             "capabilities": p.capabilities,
                             "quota_status": status,
                             "quota_hint": hint,
-                        })
+                        });
+                        if let Some(u) = u {
+                            v["usage"] = serde_json::json!(u);
+                        }
+                        v
                     })
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&enriched)?);
             } else {
-                for p in &report {
+                for (p, u) in report.iter().zip(&usages) {
                     let mark = if !p.available {
                         "missing"
                     } else if p.readiness == providers::Readiness::Unhealthy {
@@ -2508,6 +2517,9 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                             }
                             providers::Readiness::Unknown => {}
                         }
+                    }
+                    if let Some(u) = u {
+                        println!("         usage: {}", providers::usage::describe(u));
                     }
                 }
             }
