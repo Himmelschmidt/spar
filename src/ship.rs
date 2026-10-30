@@ -196,7 +196,19 @@ pub fn ship(
     let remote = "origin";
     let title = pr_title(state.task.as_deref());
 
-    let push_args = push_args(&cwd, remote, &branch)?;
+    let push_args = match push_args(&cwd, remote, &branch, state.base_commit.as_deref()) {
+        Ok(args) => args,
+        Err(e) => {
+            state.error = Some(format!("ship refused: {e}"));
+            state.save(paths)?;
+            if json {
+                executor::emit_run_json(&state)?;
+            } else {
+                eprintln!("ship refused: {e}");
+            }
+            return Ok(ExitCode::Failure);
+        }
+    };
     let push_cmd = format!("git -C {} {}", cwd.display(), push_args.join(" "));
     let pr_cmd = format!(
         "cd {} && gh pr create --draft --head {branch}{base_arg} --title {} --body {}",
@@ -294,6 +306,7 @@ pub fn ship(
         return Ok(ExitCode::Failure);
     }
 
+    state.error = None;
     state.set_phase(Phase::Done);
     state.save(paths)?;
     if json {
@@ -308,8 +321,8 @@ pub fn ship(
 /// points at) to `refs/heads/<branch>`, leased on the remote tip just fetched. Refuses
 /// rather than rewind a remote branch (O10): a lease against the local tracking ref alone
 /// passes after any fetch, which is how a hand-pushed branch got reset.
-fn push_args(cwd: &Path, remote: &str, branch: &str) -> Result<Vec<String>> {
-    let on_branch = check_head_branch(cwd, branch)?;
+fn push_args(cwd: &Path, remote: &str, branch: &str, base: Option<&str>) -> Result<Vec<String>> {
+    let on_branch = check_head_branch(cwd, branch, base)?;
     let lease = remote_tip(cwd, remote, branch)?;
     let mut args = vec![
         "push".to_string(),
@@ -328,13 +341,24 @@ fn push_args(cwd: &Path, remote: &str, branch: &str) -> Result<Vec<String>> {
 }
 
 /// `true` when HEAD is checked out on `branch`. A worktree left on another branch (a
-/// reviewer's, or detached) is shipped from HEAD only when HEAD contains `branch`.
-fn check_head_branch(cwd: &Path, branch: &str) -> Result<bool> {
+/// reviewer's, or detached) is shipped from HEAD only when HEAD contains `branch` and
+/// `branch` has moved past the run's base; otherwise any branch ahead of base would do.
+fn check_head_branch(cwd: &Path, branch: &str, base: Option<&str>) -> Result<bool> {
     let current = worktree::named_head(cwd);
     if current.as_deref() == Some(branch) {
         return Ok(true);
     }
     let shown = current.unwrap_or_else(|| "a detached HEAD".into());
+    let tip = worktree::git_out(
+        cwd,
+        &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+    );
+    if tip.is_some() && tip.as_deref() == base {
+        bail!(
+            "worktree {} is on {shown} and {branch} never advanced past the run base; check out the work to ship in {branch} and retry",
+            cwd.display()
+        );
+    }
     if !git_ok(
         cwd,
         &[
@@ -690,7 +714,9 @@ mod tests {
         // The stale local tracking ref is exactly what the old bare lease checked.
         commit(&work, "run-work");
 
-        let err = push_args(&work, "origin", BRANCH).unwrap_err().to_string();
+        let err = push_args(&work, "origin", BRANCH, None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("has commits the run lacks"), "{err}");
         assert_eq!(remote_tip_of(&origin), hand_tip, "remote must be untouched");
     }
@@ -703,7 +729,7 @@ mod tests {
         let pushed = remote_tip_of(&origin);
         let head = commit(&work, "more");
 
-        let args = push_args(&work, "origin", BRANCH).unwrap();
+        let args = push_args(&work, "origin", BRANCH, None).unwrap();
         assert!(
             args.contains(&format!("--force-with-lease=refs/heads/{BRANCH}:{pushed}")),
             "lease must name the observed tip: {args:?}"
@@ -720,7 +746,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let (origin, work) = origin_and_work(tmp.path());
         commit(&work, "run-work");
-        let args = push_args(&work, "origin", BRANCH).unwrap();
+        let args = push_args(&work, "origin", BRANCH, None).unwrap();
         assert!(args.contains(&format!("--force-with-lease=refs/heads/{BRANCH}:")));
 
         let other = tmp.path().join("other");
@@ -752,7 +778,7 @@ mod tests {
         git_in(&work, &["checkout", "-q", "-b", "review-x"]);
         let head = commit(&work, "reviewed");
 
-        let args = push_args(&work, "origin", BRANCH).unwrap();
+        let args = push_args(&work, "origin", BRANCH, None).unwrap();
         assert!(!args.contains(&"-u".to_string()), "{args:?}");
         assert!(args.contains(&format!("HEAD:refs/heads/{BRANCH}")));
         assert!(run_push(&work, &args));
@@ -767,8 +793,56 @@ mod tests {
         commit(&work, "impl-work");
         git_in(&work, &["checkout", "-q", "-b", "review-x", &base]);
 
-        let err = push_args(&work, "origin", BRANCH).unwrap_err().to_string();
+        let err = push_args(&work, "origin", BRANCH, None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("review-x"), "{err}");
         assert!(err.contains(BRANCH), "{err}");
+    }
+
+    /// The run branch never moved, so "HEAD contains it" holds for any branch ahead of
+    /// base: shipping main's tip as the run's work must be refused.
+    #[test]
+    fn push_refuses_when_the_branch_never_advanced_past_base() {
+        let tmp = tempdir().unwrap();
+        let (_origin, work) = origin_and_work(tmp.path());
+        let base = git_in(&work, &["rev-parse", "HEAD"]);
+        git_in(&work, &["checkout", "-q", "-b", "main"]);
+        commit(&work, "unrelated");
+
+        let err = push_args(&work, "origin", BRANCH, Some(&base))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("never advanced past the run base"), "{err}");
+    }
+
+    #[test]
+    fn refused_ship_records_the_error_and_keeps_the_phase() {
+        let tmp = tempdir().unwrap();
+        let (_origin, work) = origin_and_work(tmp.path());
+        let base = git_in(&work, &["rev-parse", "HEAD"]);
+        commit(&work, "impl-work");
+        git_in(&work, &["checkout", "-q", "-b", "review-x", &base]);
+
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = SparPaths::new(&root);
+        let mut state = RunState::new("r1", WorkflowKind::Loop, root.clone());
+        state.phase = Phase::AwaitingShipConfirm;
+        state.gates.ship_confirmed = true;
+        state.worktrees.push(crate::state::WorktreeRecord {
+            slot_id: "impl".into(),
+            path: work.clone(),
+            branch: BRANCH.into(),
+        });
+        state.save(&paths).unwrap();
+
+        let code = ship(&paths, &Config::default(), "r1", true, None).unwrap();
+        assert_eq!(code, ExitCode::Failure);
+        let after = RunState::load(&paths, "r1").unwrap();
+        assert_eq!(after.phase, Phase::AwaitingShipConfirm);
+        let err = after.error.unwrap_or_default();
+        assert!(err.starts_with("ship refused:"), "{err}");
+        assert!(err.contains("review-x"), "{err}");
     }
 }

@@ -2473,7 +2473,9 @@ pub fn execute_loop(
         // project_root) fails OPEN, loudly: failing closed there would brick such
         // runs permanently with no reviewer fault.
         if let Some(wt) = state.worktrees.iter().find(|w| w.slot_id == impl_slot.id) {
-            if let Some(msg) = worktree::restore_branch(&wt.path, &wt.branch) {
+            if let Some(msg) =
+                worktree::restore_branch(&wt.path, &wt.branch, state.base_commit.as_deref())
+            {
                 eprintln!("warning: {msg}");
                 let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg));
             }

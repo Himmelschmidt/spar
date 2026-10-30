@@ -88,41 +88,66 @@ pub(crate) fn named_head(dir: &Path) -> Option<String> {
 }
 
 /// Puts `dir` back on `branch` when a slot left it on another one (reviewers share the
-/// implementer's worktree). Repairs only a fast-forward, so no commit is ever dropped.
-/// `None` when there is nothing to report.
-pub fn restore_branch(dir: &Path, branch: &str) -> Option<String> {
+/// implementer's worktree). Repairs only a fast-forward, so no commit is ever dropped,
+/// and never when `branch` still sits at the run's `base` (HEAD may then be any branch
+/// that happens to be ahead of base, such as main). `None` when there is nothing to report.
+pub fn restore_branch(dir: &Path, branch: &str, base: Option<&str>) -> Option<String> {
     let head = git_out(dir, &["rev-parse", "--verify", "HEAD"])?;
     let current = named_head(dir);
     if current.as_deref() == Some(branch) {
         return None;
     }
     let shown = current.unwrap_or_else(|| "a detached HEAD".into());
+    let at = format!("worktree {} is on {shown}", dir.display());
     let branch_ref = format!("refs/heads/{branch}");
     let Some(old) = git_out(dir, &["rev-parse", "--verify", &branch_ref]) else {
-        return Some(format!(
-            "worktree {} is on {shown} and {branch} does not exist; left as is",
-            dir.display()
-        ));
+        return Some(format!("{at} and {branch} does not exist; left as is"));
     };
-    if git_out(dir, &["merge-base", "--is-ancestor", &old, &head]).is_none() {
+    if base.is_some_and(|b| b == old) {
         return Some(format!(
-            "worktree {} is on {shown}, which does not contain {branch}; left as is, \
-             ship will refuse until {branch} is an ancestor of HEAD",
-            dir.display()
+            "{at} and {branch} never advanced past the run base; left as is"
         ));
     }
-    let repaired = git_out(dir, &["update-ref", &branch_ref, &head, &old]).is_some()
-        && git_out(dir, &["checkout", "--quiet", branch]).is_some();
-    if !repaired {
+    if git_out(dir, &["merge-base", "--is-ancestor", &old, &head]).is_none() {
         return Some(format!(
-            "worktree {} is on {shown}; could not fast-forward {branch} to its HEAD",
-            dir.display()
+            "{at}, which does not contain {branch}; left as is, \
+             ship will refuse until {branch} is an ancestor of HEAD"
+        ));
+    }
+    if let Some(other) = checked_out_elsewhere(dir, &branch_ref) {
+        return Some(format!(
+            "{at} and {branch} is checked out in {}; left as is",
+            other.display()
+        ));
+    }
+    if git_out(dir, &["update-ref", &branch_ref, &head, &old]).is_none() {
+        return Some(format!(
+            "{at}; could not fast-forward {branch} to its HEAD; left as is"
+        ));
+    }
+    if git_out(dir, &["checkout", "--quiet", branch]).is_none() {
+        return Some(format!(
+            "{at}; fast-forwarded {branch} to its HEAD but could not check it out"
         ));
     }
     Some(format!(
         "worktree {} was on {shown}; fast-forwarded {branch} to its HEAD and checked it out",
         dir.display()
     ))
+}
+
+/// The other worktree that has `branch_ref` checked out, if any.
+fn checked_out_elsewhere(dir: &Path, branch_ref: &str) -> Option<PathBuf> {
+    let list = git_out(dir, &["worktree", "list", "--porcelain"])?;
+    let here = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    list.split("\n\n").find_map(|entry| {
+        let path = entry.lines().find_map(|l| l.strip_prefix("worktree "))?;
+        entry
+            .lines()
+            .any(|l| l.strip_prefix("branch ") == Some(branch_ref))
+            .then(|| PathBuf::from(path))
+            .filter(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()) != here)
+    })
 }
 
 /// Resolve the base and record it on the run. Prints it unless `json`, because a base
@@ -2141,7 +2166,7 @@ mod tests {
     fn restore_branch_is_silent_when_already_on_the_branch() {
         let tmp = tempdir().unwrap();
         let (dir, _) = restore_fixture(tmp.path());
-        assert_eq!(restore_branch(&dir, "spar/r1/impl"), None);
+        assert_eq!(restore_branch(&dir, "spar/r1/impl", None), None);
     }
 
     /// #158: a reviewer committed on its own branch in the implementer's worktree. The
@@ -2153,7 +2178,7 @@ mod tests {
         fixture_git(&dir, &["checkout", "-q", "-b", "review-x"]);
         let head = commit_file(&dir, "reviewed");
 
-        let note = restore_branch(&dir, "spar/r1/impl").expect("must report the repair");
+        let note = restore_branch(&dir, "spar/r1/impl", None).expect("must report the repair");
         assert!(note.contains("review-x"), "{note}");
         assert_eq!(named_head(&dir).as_deref(), Some("spar/r1/impl"));
         assert_eq!(fixture_git(&dir, &["rev-parse", "spar/r1/impl"]), head);
@@ -2168,10 +2193,65 @@ mod tests {
         fixture_git(&dir, &["checkout", "-q", "-b", "review-x", &base]);
         let side = commit_file(&dir, "side");
 
-        let note = restore_branch(&dir, "spar/r1/impl").expect("must warn");
+        let note = restore_branch(&dir, "spar/r1/impl", None).expect("must warn");
         assert!(note.contains("does not contain"), "{note}");
         assert_eq!(named_head(&dir).as_deref(), Some("review-x"));
         assert_eq!(fixture_git(&dir, &["rev-parse", "HEAD"]), side);
         assert_eq!(fixture_git(&dir, &["rev-parse", "spar/r1/impl"]), impl_tip);
+    }
+
+    #[test]
+    fn restore_branch_fast_forwards_from_a_detached_head() {
+        let tmp = tempdir().unwrap();
+        let (dir, _) = restore_fixture(tmp.path());
+        fixture_git(&dir, &["checkout", "-q", "--detach"]);
+        let head = commit_file(&dir, "detached-work");
+
+        let note = restore_branch(&dir, "spar/r1/impl", None).expect("must report the repair");
+        assert!(note.contains("detached HEAD"), "{note}");
+        assert_eq!(named_head(&dir).as_deref(), Some("spar/r1/impl"));
+        assert_eq!(fixture_git(&dir, &["rev-parse", "spar/r1/impl"]), head);
+    }
+
+    /// Moving a ref another worktree has checked out would rewrite that worktree's HEAD
+    /// under it, and the checkout here would then fail anyway.
+    #[test]
+    fn restore_branch_leaves_a_branch_checked_out_elsewhere_alone() {
+        let tmp = tempdir().unwrap();
+        let (dir, base) = restore_fixture(tmp.path());
+        fixture_git(&dir, &["checkout", "-q", "-b", "review-x"]);
+        commit_file(&dir, "reviewed");
+        let other = tmp.path().join("other");
+        fixture_git(
+            &dir,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                other.to_str().unwrap(),
+                "spar/r1/impl",
+            ],
+        );
+
+        let note = restore_branch(&dir, "spar/r1/impl", None).expect("must warn");
+        assert!(note.contains("is checked out in"), "{note}");
+        assert!(!note.contains("fast-forwarded"), "{note}");
+        assert_eq!(fixture_git(&dir, &["rev-parse", "spar/r1/impl"]), base);
+        assert_eq!(named_head(&dir).as_deref(), Some("review-x"));
+    }
+
+    /// The branch still at the run base: HEAD on main (ahead of base) is not the run's
+    /// work, so the branch must not be fast-forwarded onto it.
+    #[test]
+    fn restore_branch_leaves_a_branch_still_at_base_alone() {
+        let tmp = tempdir().unwrap();
+        let (dir, base) = restore_fixture(tmp.path());
+        fixture_git(&dir, &["checkout", "-q", "-b", "main"]);
+        commit_file(&dir, "unrelated");
+
+        let note = restore_branch(&dir, "spar/r1/impl", Some(&base)).expect("must warn");
+        assert!(note.contains("never advanced past the run base"), "{note}");
+        assert_eq!(fixture_git(&dir, &["rev-parse", "spar/r1/impl"]), base);
+        assert_eq!(named_head(&dir).as_deref(), Some("main"));
     }
 }
