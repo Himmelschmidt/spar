@@ -57,12 +57,18 @@ impl Fixture {
         fs::create_dir_all(&bin).unwrap();
         fs::create_dir_all(&home).unwrap();
         init_repo(&proj);
-        Self {
+        let fx = Self {
             _tmp: tmp,
             proj,
             bin,
             home,
+        };
+        // Every adapter is faked and `PATH` keeps only system dirs, so a seat a test
+        // did not script fails fast instead of reaching a real, billed CLI.
+        for name in ["claude", "grok", "agy", "codex", "pi", "muse"] {
+            fx.cli(name, "exit 1");
         }
+        fx
     }
 
     /// A fake CLI that answers `--version` and runs `body` for anything else. The body
@@ -86,14 +92,7 @@ impl Fixture {
     fn spar(&self) -> AssertCommand {
         let mut cmd = spar_cmd(&self.home);
         cmd.current_dir(&self.proj)
-            .env(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    self.bin.display(),
-                    std::env::var("PATH").unwrap_or_default()
-                ),
-            )
+            .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()))
             .env("FAKE_PROJECT_ROOT", &self.proj)
             .env("FAKE_COUNT_DIR", self.bin.as_os_str());
         cmd
@@ -449,7 +448,15 @@ fn a_quota_paused_backup_is_probed_and_used_when_it_answers() {
         "claude",
         &counted("claude", &format!("echo '{CLAUDE_REVOKED}'\nexit 1")),
     );
-    fx.cli("codex", &counted("codex", "echo OK\nexit 0"));
+    // The probe's one-word prompt gets an answer; the dispatch itself fails, so the
+    // run ends there: exactly one probe plus one dispatch.
+    fx.cli(
+        "codex",
+        &counted(
+            "codex",
+            "case \"$*\" in *\"single word OK\"*) echo OK; exit 0;; esac\necho boom >&2\nexit 1",
+        ),
+    );
     seed_quota_pause(&fx, "cli:codex", 13);
     fx.spar()
         .args([
