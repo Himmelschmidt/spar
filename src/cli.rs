@@ -610,6 +610,8 @@ pub enum BusCmd {
         run: Option<String>,
         #[arg(long, default_value = "human")]
         from: String,
+        /// An agent id, `broadcast`, `@human`, or `impl` (with `--run`: that run's
+        /// implementer)
         #[arg(long, default_value = "broadcast")]
         to: String,
         #[arg(long, short = 'm')]
@@ -622,6 +624,20 @@ pub enum BusCmd {
         conversation: Option<String>,
         #[arg(long)]
         turn: Option<String>,
+        /// Redeliver until the recipient runs `spar bus ack`, then escalate to @human
+        #[arg(long)]
+        requires_ack: bool,
+        /// Also carry the message in the implementer's carry-forward every dispatch
+        /// until it is withdrawn or acked. Needs `--run` and the run's implementer as `--to`
+        #[arg(long)]
+        persist: bool,
+        /// Withdraw an earlier message of yours from every inbox that has not taken it yet
+        #[arg(long, value_name = "MSG_ID")]
+        supersedes: Option<String>,
+        /// Withdraw this message once the run passes round N (default: the current
+        /// round). Needs `--run`
+        #[arg(long, value_name = "N", num_args = 0..=1)]
+        expires_after_round: Option<Option<u32>>,
     },
     /// List bus events (all runs + bare traffic; `--run` filters to one run)
     Log {

@@ -1040,8 +1040,9 @@ filter** on the drain: each unique id has its own inbox, so a slot never sees an
 run's messages, and a bare agent and a run slot can directed-message each other by id.
 
 ```bash
-spar bus send -m "hello" [--from human] [--to broadcast|agent] [--run <id>]
-spar bus log [--run <id>] [--json]
+spar bus send -m "hello" [--from human] [--to broadcast|agent|impl] [--run <id>]
+              [--requires-ack] [--persist] [--supersedes <msg_id>] [--expires-after-round [N]]
+spar bus log [--run <id>] [--json]                 # each message with per-recipient receipts
 spar bus presence [--run <id>]
 spar bus inbox <agent> [--claim] [--run <id>] [--json]
 spar bus reserve path/to/file --holder <agent> [--run <id>]
@@ -1050,12 +1051,49 @@ spar bus deliver <agent> [--run <id>]              # drain inbox + inject at tur
 spar bus ack <msg_id> --from <agent> [--run <id>]  # stop a requires_ack redelivery
 ```
 
+**Send options (O135).**
+
+- `--to impl` (with `--run`) resolves to that run's implementer slot; it errors when the
+  run has none or several (arena), naming them.
+- `--requires-ack` redelivers on backoff until the recipient runs `spar bus ack <id>
+  --from <agent>`, then escalates to `@human`.
+- `--persist` (with `--run`, to the implementer) also puts the message at the top of the
+  implementer's carry-forward on **every** dispatch, under "Operator messages", until it
+  is superseded, acked by the implementer, or expired. A relaunch or a new round cannot
+  drop it. Use it for rulings, not chatter: it repeats every dispatch.
+- `--supersedes <msg_id>` withdraws an earlier message **you** sent: every inbox copy not
+  yet taken is removed and its redelivery stops; a persisted one leaves the carry-forward.
+  A copy already delivered cannot be unread; `--json` reports
+  `withdrawal: {msg_id, withdrawn_from: [...], already_delivered: [...]}`.
+- `--expires-after-round [N]` (with `--run`; `N` defaults to the run's current round): once
+  the run passes round `N` the message is never delivered. A claim withdraws it, `inbox`
+  hides it, redelivery stops, and a persisted one leaves the carry-forward.
+
+**Receipts (O134).** `.spar/bus/receipts.jsonl` gets a line per recipient as a message
+moves: `queued` (written to the inbox), `delivered` (claimed into the agent's channel or
+put in a dispatch prompt), `read` (in the model's input: the agent claimed it itself with
+`inbox --claim`, a Stop hook injected it, it was in the carry-forward prompt, or the
+recipient acked it), `withdrawn` (superseded or expired). A poll file or codex queue is
+`delivered`, not `read`, until an ack. `bus log --json` returns each message with:
+
+```json
+{"schema_version": 1, "id": "...", "from": "human", "to": "impl", "...": "message fields",
+ "persist": true, "expires_after_round": 3, "refs": {"supersedes": "..."},
+ "receipts": [{"recipient": "ab12cd34:impl", "queued_at": "...", "delivered_at": "..." | null,
+               "read_at": "..." | null, "withdrawn_at": "..." | null}],
+ "superseded_by": "msg id" | null, "expired": false}
+```
+
+Each time is the earliest of its kind. `bus send --json` returns the message with
+`schema_version` (and `withdrawal` under `--supersedes`). The human `bus log` shows the
+message id and `[delivered n/m, read n/m; superseded by …; expired]`.
+
 A message to `@human` (or any `Blocked` agent) surfaces in the TUI's Activity tab (with a
 badge on the tab and the status line) and,
 if `[notify]` is configured, also fires an external notifier. A `requires_ack` message
 redelivers until acked, then escalates to `@human`.
 
-Layout: `.spar/bus/{events.jsonl,agents.jsonl,inbox/<agent>/,queue/,pending_ack/}`
+Layout: `.spar/bus/{events.jsonl,agents.jsonl,receipts.jsonl,inbox/<agent>/,queue/,pending_ack/}`
 (workspace, agent-keyed). Per-run `tasks/` + `reserves.json` and a back-compat
 event/presence mirror live under `.spar/runs/<id>/bus/`.
 

@@ -591,7 +591,48 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             surface,
             conversation,
             turn,
+            requires_ack,
+            persist,
+            supersedes,
+            expires_after_round,
         } => {
+            let needs_run = persist || expires_after_round.is_some();
+            if needs_run && run.is_none() {
+                anyhow::bail!("--persist and --expires-after-round need --run");
+            }
+            let run_state = match run.as_deref() {
+                Some(r) if needs_run || to == "impl" => Some(state::RunState::load(&paths, r)?),
+                _ => None,
+            };
+            let to = match &run_state {
+                Some(st) if to == "impl" => implementer_id(st)?,
+                _ => to,
+            };
+            if persist {
+                let st = run_state.as_ref().expect("loaded for --persist");
+                let short = to.strip_prefix(&format!("{}:", st.id)).unwrap_or(&to);
+                if !st
+                    .slots
+                    .iter()
+                    .any(|s| s.id == short && s.role == state::SlotRole::Implementer)
+                {
+                    anyhow::bail!(
+                        "--persist reaches the implementer's carry-forward; --to must be run {}'s implementer (try --to impl)",
+                        st.id
+                    );
+                }
+            }
+            let expires_after_round = expires_after_round
+                .map(|n| n.unwrap_or_else(|| run_state.as_ref().map_or(0, |st| st.round)));
+            if let Some(old) = supersedes.as_deref() {
+                let prior = bus::find_event(&paths, old)?
+                    .ok_or_else(|| anyhow::anyhow!("no bus message {old}"))?;
+                if bus::resolve_addr(prior.run.as_deref(), &prior.from)
+                    != bus::resolve_addr(run.as_deref(), &from)
+                {
+                    anyhow::bail!("{old} was sent by {}, not {from}", prior.from);
+                }
+            }
             let mut meta = std::collections::HashMap::new();
             if let Some(s) = surface.clone() {
                 meta.insert("surface".to_string(), s);
@@ -611,8 +652,13 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
                 body: message.clone(),
                 run: run.clone(),
                 subject: None,
-                refs: bus::MsgRefs::default(),
-                requires_ack: false,
+                refs: bus::MsgRefs {
+                    supersedes: supersedes.clone(),
+                    ..Default::default()
+                },
+                requires_ack,
+                persist,
+                expires_after_round,
                 meta: meta.clone(),
             };
             let is_conversation = surface.as_deref() == Some("chat")
@@ -628,26 +674,71 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
                 bus::MessageBudget::Normal
             };
             let msg = bus::send(&paths, msg, budget)?;
+            let withdrawal = supersedes
+                .as_deref()
+                .map(|old| bus::withdraw(&paths, old))
+                .transpose()?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&msg)?);
+                let mut v = serde_json::to_value(&msg)?;
+                v["schema_version"] = serde_json::json!(bus::LOG_SCHEMA);
+                if let Some(w) = &withdrawal {
+                    v["withdrawal"] = serde_json::to_value(w)?;
+                }
+                println!("{}", serde_json::to_string_pretty(&v)?);
             } else {
-                println!("sent {} → {}", msg.from, msg.to);
+                println!("sent {} → {} ({})", msg.from, msg.to, msg.id);
+                if let Some(w) = &withdrawal {
+                    println!(
+                        "withdrew {} from {} inbox(es); already delivered to: {}",
+                        w.msg_id,
+                        w.withdrawn_from.len(),
+                        if w.already_delivered.is_empty() {
+                            "none".into()
+                        } else {
+                            w.already_delivered.join(", ")
+                        }
+                    );
+                }
             }
             Ok(ExitCode::Success)
         }
         BusCmd::Log { run, json } => {
-            let events = bus::list_events(&paths, run.as_deref())?;
+            let entries = bus::log_entries(&paths, run.as_deref())?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&events)?);
+                println!("{}", serde_json::to_string_pretty(&entries)?);
             } else {
-                for e in events {
+                for e in entries {
+                    let total = e.receipts.len();
+                    let count = |f: fn(&bus::RecipientReceipt) -> bool| {
+                        e.receipts.iter().filter(|r| f(r)).count()
+                    };
+                    let mut notes = Vec::new();
+                    if total > 0 {
+                        notes.push(format!(
+                            "delivered {}/{total}, read {}/{total}",
+                            count(|r| r.delivered_at.is_some()),
+                            count(|r| r.read_at.is_some())
+                        ));
+                    }
+                    if let Some(by) = &e.superseded_by {
+                        notes.push(format!("superseded by {by}"));
+                    }
+                    if e.expired {
+                        notes.push("expired".into());
+                    }
+                    let notes = if notes.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", notes.join("; "))
+                    };
                     println!(
-                        "{} {} → {} ({:?}) {}",
-                        e.ts.format("%H:%M:%S"),
-                        e.from,
-                        e.to,
-                        e.kind,
-                        e.body.chars().take(100).collect::<String>()
+                        "{} {} {} → {} ({:?}){notes} {}",
+                        e.msg.ts.format("%H:%M:%S"),
+                        e.msg.id,
+                        e.msg.from,
+                        e.msg.to,
+                        e.msg.kind,
+                        e.msg.body.chars().take(100).collect::<String>()
                     );
                 }
             }
@@ -663,7 +754,17 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             // (`$SPAR_AGENT_ID`); resolve to the unique inbox key either way.
             let unique = bus::resolve_addr(run.as_deref(), &agent);
             let msgs = if claim {
-                bus::inbox_claim(&paths, &unique)?
+                let msgs = bus::inbox_claim(&paths, &unique, "inbox_claim")?;
+                for m in &msgs {
+                    bus::record_receipt(
+                        &paths,
+                        &m.id,
+                        &unique,
+                        bus::ReceiptEvent::Read,
+                        "inbox_claim",
+                    );
+                }
+                msgs
             } else {
                 bus::inbox(&paths, &unique)?
             };
@@ -723,6 +824,26 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             println!("released {path}");
             Ok(ExitCode::Success)
         }
+    }
+}
+
+/// `--to impl`: the run's one implementer slot.
+fn implementer_id(st: &state::RunState) -> Result<String> {
+    let ids: Vec<&str> = st
+        .slots
+        .iter()
+        .filter(|s| s.role == state::SlotRole::Implementer)
+        .map(|s| s.id.as_str())
+        .collect();
+    match ids.as_slice() {
+        [one] => Ok(one.to_string()),
+        [] => anyhow::bail!("run {} has no implementer slot", st.id),
+        many => anyhow::bail!(
+            "run {} has {} implementers ({}); name one with --to",
+            st.id,
+            many.len(),
+            many.join(", ")
+        ),
     }
 }
 
