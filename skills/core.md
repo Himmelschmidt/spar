@@ -9,7 +9,7 @@ spar skills list
 spar skills get core
 spar skills get fleet   # cheap OpenRouter coders + smart plan/review, assigned by [roles]
 spar doctor [--json]
-spar provider list [--json]
+spar provider list [--usage] [--json]
 spar model list|pick|refresh|cache [--json]
 spar model list --provider openrouter [--all] [--json]   # OpenRouter catalog, tool-capable by default
 ```
@@ -44,6 +44,24 @@ spar implement -t "..." --providers 'cli:codex@openai/gpt-4o-mini,api:openai@gpt
 
 Native CLI adapters: `cli:claude`, `cli:grok`, `cli:agy`, `cli:codex`, `cli:pi`, `cli:muse`. Run
 `spar provider list` to see which resolve on this box and their live pause/cooldown status.
+
+**Utilisation (O132).** `spar provider list --usage` adds each account's current window
+use where the CLI exposes it locally and without a model turn. muse: `muse usage --json`
+(5-hour and weekly `used_percent`, reset times, tier). codex: the newest `rate_limits`
+record in `$CODEX_HOME/sessions/**/*.jsonl` (default `~/.codex`), which is as fresh as the
+last codex turn on this box, so read `as_of`. claude: nothing; its `/usage` reads an
+account endpoint and there is no local, documented, non-billed source, so spar does not
+call it. Other adapters: nothing. With `--json` each provider gains `usage`:
+
+```json
+{"schema_version": 1, "status": "ok" | "unavailable" | "unsupported",
+ "source": "muse usage --json" | "codex session log <path>" | null, "as_of": "..." | null,
+ "windows": [{"name": "5h" | "weekly" | "<n>m", "used_percent": 27.0,
+              "resets_at": "..." | null, "window_minutes": 10080 | null}],
+ "plan": "pro" | null, "credits": "20047.55" | "unlimited" | null, "message": "why not" | null}
+```
+
+Without `--usage` nothing is probed and `usage` is absent.
 
 **Readiness.** A binary on PATH is not health: `spar doctor` and `spar provider list`
 also run each adapter's readiness probe (a local-only config/auth check, never a model
@@ -427,12 +445,16 @@ spar link <run_id> --undo                # and back out again
 spar brief <run_id> [--full] [--json]    # re-hydrate a fresh session: phase, gates, fleet,
                                          # brief, artifacts, open findings, the exact next
                                          # command. Read-only.
+spar amend --run <id> --contract "<directive>" [--accept-contract-edits] [--json]  # re-run only the test author on a
+                                         # parked run, re-freeze the contract; never resumes
 spar rule add --run <id> "<text>" [--waive AC-n]...  # operator ruling on a run (R<n>); --waive
                                          # takes a criterion out of its acceptance gate
 spar rule add --project "<text>"         # ruling for every run in the project (P<n>)
 spar rule list --run <id>|--project [--json]
 spar rule rm --run <id>|--project <rule-id>
 spar resume <run_id> [--detach] [--json] # pick a stopped or abandoned run back up
+spar implement --run <id> --reassign <role|seat>=<provider[@model]>  # move an existing seat
+                                         # to another provider, same worktree/branch (O136)
 spar daemon install                      # systemd user unit supervising every registered project
 spar daemon uninstall                    # stop, disable and remove it
 spar daemon start [--foreground]         # per-project supervisor: restart + abandoned alert + cap
@@ -1158,8 +1180,9 @@ filter** on the drain: each unique id has its own inbox, so a slot never sees an
 run's messages, and a bare agent and a run slot can directed-message each other by id.
 
 ```bash
-spar bus send -m "hello" [--from human] [--to broadcast|agent] [--run <id>]
-spar bus log [--run <id>] [--json]
+spar bus send -m "hello" [--from human] [--to broadcast|agent|impl] [--run <id>]
+              [--requires-ack] [--persist] [--supersedes <msg_id>] [--expires-after-round [N]]
+spar bus log [--run <id>] [--json]                 # each message with per-recipient receipts
 spar bus presence [--run <id>]
 spar bus inbox <agent> [--claim] [--run <id>] [--json]
 spar bus reserve path/to/file --holder <agent> [--run <id>]
@@ -1168,12 +1191,51 @@ spar bus deliver <agent> [--run <id>]              # drain inbox + inject at tur
 spar bus ack <msg_id> --from <agent> [--run <id>]  # stop a requires_ack redelivery
 ```
 
+**Send options (O135).**
+
+- `--to impl` needs `--run` and resolves to that run's implementer slot; it errors without
+  `--run`, or when the run has none or several (arena), naming them.
+- `--requires-ack` redelivers on backoff until the recipient runs `spar bus ack <id>
+  --from <agent>`, then escalates to `@human`.
+- `--persist` (with `--run`, to the implementer) also puts the message at the top of the
+  implementer's carry-forward on **every** dispatch, under "Operator messages", until it
+  is superseded, acked by the implementer, or expired. A relaunch or a new round cannot
+  drop it. Use it for rulings, not chatter: it repeats every dispatch.
+- `--supersedes <msg_id>` withdraws an earlier message **you** sent: every inbox copy not
+  yet taken is removed and its redelivery stops; a persisted one leaves the carry-forward.
+  A copy already delivered cannot be unread; `--json` reports
+  `withdrawal: {msg_id, withdrawn_from: [...], already_delivered: [...]}`.
+- `--expires-after-round [N]` (with `--run`; `N` defaults to the round a slot is dispatching
+  in, or the next round when the run waits at a gate, the first round anyone reads it in): once
+  the run passes round `N` the message is never delivered. A claim withdraws it, `inbox`
+  hides it, redelivery stops, and a persisted one leaves the carry-forward.
+
+**Receipts (O134).** `.spar/bus/receipts.jsonl` gets a line per recipient as a message
+moves: `queued` (written to the inbox), `delivered` (claimed into the agent's channel or
+put in a dispatch prompt), `read` (in the model's input: the agent claimed it itself with
+`inbox --claim`, a Stop hook injected it, it was in the carry-forward prompt, or the
+recipient acked it), `withdrawn` (superseded or expired). A poll file or codex queue is
+`delivered`, not `read`, until an ack. `bus log --json` returns each message with:
+
+```json
+{"schema_version": 1, "id": "...", "from": "human", "to": "impl", "...": "message fields",
+ "persist": true, "expires_after_round": 3, "refs": {"supersedes": "..."},
+ "receipts": [{"recipient": "ab12cd34:impl", "queued_at": "...", "delivered_at": "..." | null,
+               "read_at": "..." | null, "withdrawn_at": "..." | null}],
+ "superseded_by": "msg id" | null, "expired": false}
+```
+
+Each time is the earliest of its kind. `receipts.jsonl` rolls to `receipts.jsonl.1` at
+8 MiB (about the last 16 MiB are kept); `bus log` streams both. `bus send --json` returns the message with
+`schema_version` (and `withdrawal` under `--supersedes`). The human `bus log` shows the
+message id and `[delivered n/m, read n/m; superseded by …; expired]`.
+
 A message to `@human` (or any `Blocked` agent) surfaces in the TUI's Activity tab (with a
 badge on the tab and the status line) and,
 if `[notify]` is configured, also fires an external notifier. A `requires_ack` message
 redelivers until acked, then escalates to `@human`.
 
-Layout: `.spar/bus/{events.jsonl,agents.jsonl,inbox/<agent>/,queue/,pending_ack/}`
+Layout: `.spar/bus/{events.jsonl,agents.jsonl,receipts.jsonl,inbox/<agent>/,queue/,pending_ack/}`
 (workspace, agent-keyed). Per-run `tasks/` + `reserves.json` and a back-compat
 event/presence mirror live under `.spar/runs/<id>/bus/`.
 
@@ -1181,6 +1243,7 @@ event/presence mirror live under `.spar/runs/<id>/bus/`.
 
 ```bash
 spar status [run_id] [--json] [--all]   # --all = every registered project; a run with a live orchestrator shows `pid=<n>`
+spar stats [--since 7d] [--by model|role|provider|project] [--all-projects] [--json]
 spar wait <run_id> [--timeout 8h] [--follow] [--json]
 spar logs <run_id> [slot] [-f|--follow]
 
@@ -1264,27 +1327,104 @@ stderr and the purge or sweep goes on.
 
 ```json
 {
-  "schema_version": 1, "written_at": "...", "trigger": "terminal" | "purge",
+  "schema_version": 2, "written_at": "...", "trigger": "terminal" | "purge",
   "id": "ab12cd34", "task": "first line of the task", "workflow": "loop",
   "dry_run": false, "phase": "done",
-  "roles": [{"slot": "review-0-cli-codex", "role": "reviewer", "provider": "cli:codex", "model": null}],
+  "roles": [{"slot": "review-0-cli-codex", "role": "reviewer", "provider": "cli:codex",
+             "model": null, "source": "backup" | null, "parked_run": false}],
   "rounds": 3, "max_rounds": 5,
   "review_rounds": [{"round": 2,
-                     "verdicts": [{"slot": "review-0-cli-codex", "verdict": "request_changes", "synthetic": false}],
+                     "verdicts": [{"slot": "review-0-cli-codex", "verdict": "request_changes",
+                                   "synthetic": false, "blocking": 1}],
                      "findings": {"critical": 0, "major": 1, "minor": 2, "synthetic": 0}}],
   "findings": {"critical": 0, "major": 1, "minor": 2, "synthetic": 0},
   "billed_tokens": 1234567, "cost_usd": 4.2 | null,
   "pr_url": "https://github.com/..." | null,
-  "created_at": "...", "ended_at": "..."
+  "created_at": "...", "ended_at": "...",
+  "dispatches": [{"slot": "impl", "role": "implementer", "provider": "cli:claude",
+                  "model": "claude-opus-5", "billed_tokens": 900000, "cost_usd": 3.1 | null,
+                  "tools": 140, "context_tokens": 180000, "context_semantics": "peak"}],
+  "timing": {"rounds": [{"round": 1, "wall_secs": 2400}],
+             "slots": [{"slot": "impl", "round": 1 | null, "wall_secs": 1800}]},
+  "quota_parks": 0
 }
 ```
 
 Finding counts are per round, deduplicated within a round (same severity, location and
 whitespace-normalized text from two reviewers count once); `findings` sums the rounds.
-Synthetic findings count under `synthetic` only. `cost_usd` is `null` when no dispatch
-reported a cost. `pr_url` is the PR ship opened or adopted, or `sync-prs` found (also
-`pr_url` in `status --json`, with `merged_at`, `merge_commit` and `pr_state` once
-`sync-prs` settled the run).
+Synthetic findings count under `synthetic` only. `blocking` is one review's findings that
+held the ship under the run's `[review] block_on` (`block_on` on the row), with a scoped
+round's follow-ups exempt as the gate exempts them. `cost_usd` is `null` when no dispatch reported a cost. `pr_url` is
+the PR ship opened or adopted, or `sync-prs` found (also `pr_url` in `status --json`, with
+`merged_at`, `merge_commit` and `pr_state` once `sync-prs` settled the run). `dispatches` is
+the run's usage ledger, one entry per dispatch, with the model the provider reported.
+`timing.rounds` spans a round's first slot start to its last slot end (a gate wait is not
+counted); a slot timed from before phase events carried the round has `round: null`.
+A line written at `quota` or `plan_approved`, phases a run is usually resumed from, is
+`"compact": true`: no `dispatches` or `timing`, run-level totals only. The final terminal
+line and the purge line carry the full ledger.
+Schema 1 lines (before O131) have no `dispatches`, `timing`, `quota_parks`, `blocking`,
+`source` or `parked_run`; read them as empty. `parked_run` is a slot whose last
+dispatch failed on quota or a refused credential.
+
+**Quota events.** `.spar/quota-events.jsonl` gets one line per provider pause, automatic or
+`spar provider pause`:
+`{"schema_version": 1, "ts": "...", "provider": "cli:codex", "manual": false, "until": "..." | null, "hint": "..." | null}`.
+
+### Stats (O131)
+
+```bash
+spar stats [--since 7d] [--by model|role|provider|project] [--all-projects] [--include-dry-run] [--json]
+```
+
+Aggregates what spar already wrote: runs still under `.spar/runs/` are read from their own
+state and events (fresher than their history line), purged runs from `history.jsonl`,
+pauses from `quota-events.jsonl`. `--by` defaults to `provider` (the storage key,
+`cli:claude`). `--all-projects` reads every project in the local registry. `--since` keeps
+runs whose `ended_at` (last change, for a live run) and pauses whose `ts` fall inside the
+window. Dry runs are excluded unless `--include-dry-run`; `excluded_dry_runs` says how many.
+Runs read from a schema 1 or compact history line have no per-dispatch ledger: their
+`billed_tokens` and `cost_usd` go to `run_level_only` (`{"runs", "billed_tokens",
+"cost_usd"}`), never into a group's `usage`. A provider pause is logged once when it starts,
+not on every re-stated 429.
+Remote hosts are not read.
+
+```json
+{
+  "schema_version": 1, "generated_at": "...", "since": "..." | null, "by": "provider",
+  "projects": ["/path"], "runs": 12, "runs_from_history": 4, "runs_live": 8,
+  "excluded_dry_runs": 0,
+  "groups": [{
+    "key": "cli:codex", "runs": 9, "dispatches": 40,
+    "rounds": {"mean_per_run": 2.4, "mean_to_first_approve": 1.8 | null, "runs_with_approve": 6},
+    "outcomes": {"ship_gate": 6, "ceiling": 1, "stuck": 0, "failed": 1, "quota": 1, "other": 0},
+    "reviews": {"reviews": 18, "synthetic_reviews": 1, "blocking_findings": 9, "blocking_per_review": 0.5 | null},
+    "usage": {"billed_tokens": 123456789, "cost_usd": 12.5 | null,
+              "dispatches_with_cost": 10, "dispatches_without_cost": 30, "tool_calls": 2100},
+    "context": [{"semantics": "invocation_total", "dispatches": 40, "max": 9000000, "mean": 1200000.0}],
+    "wall_time": {"rounds_timed": 20, "round_secs_mean": 1500.0 | null, "round_secs_total": 30000,
+                  "slots_timed": 40, "slot_secs_mean": 600.0 | null, "slot_secs_total": 24000}
+  }],
+  "run_level_only": {"runs": 3, "billed_tokens": 4500000, "cost_usd": 2.1 | null},
+  "quota": [{"provider": "cli:codex", "pauses": 3, "manual_pauses": 0, "parks": 1, "backup_engagements": 2}]
+}
+```
+
+- A run counts in every group it had a seat or a dispatch in, so run-level numbers
+  (`runs`, `rounds`, `outcomes`) repeat across `--by role` groups. Dispatch numbers
+  (`usage`, `context`) belong to the dispatch's own group. Reviews and slot wall time go
+  to the reviewer's or slot's group; a slot no longer on the run reads `unknown`.
+- `outcomes`: `ship_gate` is `awaiting_ship_confirm`, `shipping` or `done`; `ceiling` is
+  `awaiting_round_extension`; `other` is anything else (in flight, stopped, a plan end).
+- `mean_to_first_approve`: the first round in which every reviewer approved and none was
+  synthetic, averaged over the runs that had one.
+- `cost_usd` sums only dispatches that reported a cost; `dispatches_without_cost` is how
+  many did not. `null` means none did, not zero.
+- `context` has one entry per `context_semantics`. Numbers measured differently are never
+  combined: a `peak` and an `invocation_total` are different quantities.
+- `quota` is per provider whatever `--by` is. `parks` are charged to providers whose slot
+  hit quota or a refused credential (`parked_run`; `unknown` when none was recorded), `backup_engagements` to the backup that
+  took the seat.
 
 ### TUI shape (humans)
 
@@ -1367,6 +1507,23 @@ rail's selection.
 - `status --json` and every run JSON carry **`base_ref` / `base_commit`** — the ref and commit
   all of the run's slot worktrees were cut from (see **Base ref** above), plus
   **`base_behind`** when the base was taken from a HEAD with an upstream.
+- **Cost per provider and per slot (O133).** `status <id> --json` carries `"cost"`, summed
+  from `usage[]`, and `status <id>` prints the same as a `cost:` block plus
+  `billed=… cost=…` on each slot line:
+
+  ```json
+  "cost": {"schema_version": 1,
+           "total": {"key": "total", "provider": null, "dispatches": 8, "billed_tokens": 40734919,
+                     "cost_usd": 7.54 | null, "dispatches_without_cost": 6, "cost_reported": "partial"},
+           "by_provider": [{"key": "cli:codex", "provider": "cli:codex", "cost_usd": null,
+                            "cost_reported": "none", ...}],
+           "by_slot": [{"key": "impl", "provider": "cli:muse", ...}]}
+  ```
+
+  `cost_reported` is `all`, `partial` or `none`; `none` means the adapter did not report a
+  cost (codex and muse today), and the human view says `cost not reported by <provider>`
+  rather than `$0.00`. There is no token or cost cap: a slot is never killed for spending
+  (O50, reaffirmed in O133).
 - **Tokens: `billed_tokens` is spend, `context_tokens` is a gauge.** Every entry in
   `"usage"` (the run's ledger, one entry per dispatch; sum it for the run total) and every
   `logs/<slot>.stats.json` carries both.
@@ -1462,8 +1619,8 @@ rail's selection.
   alone (10 min budget, no new work), logging to `<slot>.recovery.log` so the original
   transcript survives. An implementer whose worktree holds nothing — no commits past the
   base, no dirty tree — still fails with `missing expected artifact <name>`.
-  **Implementer only.** `tester` and `reviewer` slots run *in* the implementer's worktree,
-  so "has work" is always true for them and a recovered `suite.md` could set the
+  **Implementer only.** A `tester` runs *in* the implementer's worktree and a `reviewer`
+  in a checkout of the implementer's commit, so "has work" is always true for them and a recovered `suite.md` could set the
   authoritative gate green with no suite having run; a recovered `test-contract.md` would
   carry no `AC-n` and make the ship gate vacuous. Those roles fail closed, as before.
 - **The suite gate is checked for coverage.** When the suite's commands select specific
@@ -1643,6 +1800,15 @@ spar implement --run <id> --reload-config   # deliberately re-read spar.toml and
 
 `--reload-config` is the only way to change an existing run's config; it replaces the snapshot, so later resumes keep the reloaded values. `--role` on a `--run <id>` resume without it exits `1` rather than silently re-fleeting the run. Runs created before snapshots existed fall back to the live file.
 
+`--reload-config` re-points an existing seat's **model**, never its provider (O80): a seat id encodes its provider. To change **who** fills a seat that already exists, reassign it:
+
+```bash
+spar implement --run <id> --reassign implementer=cli:claude@sonnet
+spar implement --run <id> --reassign review-0-cli-codex=cli:claude@opus   # or reviewer=… when there is one
+```
+
+`--reassign <role|seat>=<provider[@model]>` is repeatable and operator-only (refused with exit `1` inside a slot, where `SPAR_AGENT_ID`/`SPAR_RUN_ID` are set). The target is `implementer`, `reviewer` or `tester` when the run has exactly one such seat, or a seat id. It is refused, exit `1` and nothing moved, while the run's orchestrator is alive (`spar stop <id>` first), onto a provider that is manually paused or paused on a trusted quota signal, onto an unknown adapter, when the run is not resumable, and when the seat does not exist yet (before the implement panel was dispatched use `--reload-config --role`). The seat keeps its worktree, branch, carry-forward brief, round count and review history; the implementer keeps the id `impl`, a reviewer or tester seat is renamed to name its new provider (`review-0-cli-codex` -> `review-0-cli-claude`, `suite-cli-codex` -> `suite-cli-claude`) and a reviewer's last review artifact follows it. The new provider starts cold. The seat is recorded as `source: "reassigned"` and a later `--reload-config` leaves it alone; every move is in `state.json` `seat_reassignments` (also in `spar status`) and an event. The run then re-enters exactly as a bare `implement --run <id>` would (it is the same command).
+
 **The source is the working file, not the base commit (O129).** The snapshot is taken from
 `spar.toml` in the primary checkout's working tree. When the run's base commit carries a
 `spar.toml` that differs from it (typically a primary checkout behind main, so a merged
@@ -1786,8 +1952,9 @@ timeout_secs = 3600    # test_author's SOFT clock; hard_ceiling_multiple applies
 - **Spec channel (plan):** after planner+critic, a `test-author` freezes acceptance tests (`artifacts/test-contract.md` + worktree tests) from plan/critique (bus is audit trail), **before** the plan approval gate. Implement brings those tests into the impl worktree (fail closed if author ran) by **merging the author branch**, then overlaying only the author's **uncommitted** work — tracked-but-modified plus untracked-not-ignored — on top. Committed author work is the merge's job, so the overlay never copies the author branch's revision of a file the implementer is working on, and build output never crosses between worktrees. A merge that fails is aborted **and fails the dispatch** (exit 1), because it is the only path committed acceptance tests take. Anything git ignores stays behind and is named on stderr, in the event log, on the bus, and in the implementer's own prompt, with the author worktree path: if an acceptance test needs an ignored fixture (`.env.test`, an ignored `tests/data/`), the implementer copies it across itself. Its provider follows the same precedence as every other role: CLI `--role test_author=…`, then an explicit `--providers`/`--select` pool, then `[roles].test_author`, then the run's own pool as a last resort. Disable with `[spec] enabled = false`.
 - **Criterion ids:** scenarios in `artifacts/test-contract.md` carry stable `AC-<n>` ids (numbered from 1, contiguous, never renumbered) plus a `verify:` hint naming a command, `file:line` + assertion, or observable behavior.
 - **What declares a criterion:** only a checklist/bare item (`- [ ] AC-1: ...`, `AC-1: ...`, `**AC-1:**` / `**AC-1**:`, bullet or ordered markers, with the colon required) or a heading (`### AC-1`, `### AC-1: text`, `### AC-1 - text`) counts. A mention anywhere else — prose in Notes/Non-goals, mid-sentence, or inside a fenced code block — never becomes a criterion, so an aside like "later rounds append AC-17 onward" cannot wedge the ship gate on an id no reviewer can report. If a contract mentions `AC-n` ids but declares none, spar warns loudly (stderr + event log, "declares no criteria") rather than silently disarming the gate.
-- **Frozen at round-loop entry:** `implement` reads `test-contract.md` once, when it starts the round loop, and every round for that `implement` invocation judges reviewers against that frozen list. An edit to the file mid-run does **not** take effect — it is not silently ignored either: it is detected each round and reported (`contract_modified: true` in `state.json` / `status --json`, an event, a bus broadcast, stderr, and a note in the reviewer prompt), but the gate still judges the frozen version. This is deliberate: the contract lives outside the repo (`.spar/runs/<id>/artifacts/`, invisible to `git status`/diff), and re-reading it live would let the slot under test edit the gate that bounds it. **To amend a contract, stop the run, edit `test-contract.md`, and re-run `spar implement --run <id>`** — re-entering `implement` re-reads and re-freezes against the file on disk, moving `contract_fingerprint` and clearing `contract_modified`. There is no separate amend command.
+- **Frozen at round-loop entry:** `implement` reads `test-contract.md` once, when it starts the round loop, and every round for that `implement` invocation judges reviewers against that frozen list. An edit to the file mid-run does **not** take effect — it is not silently ignored either: it is detected each round and reported (`contract_modified: true` in `state.json` / `status --json`, an event, a bus broadcast, stderr, and a note in the reviewer prompt), but the gate still judges the frozen version. This is deliberate: the contract lives outside the repo (`.spar/runs/<id>/artifacts/`, invisible to `git status`/diff), and re-reading it live would let the slot under test edit the gate that bounds it. **To amend a contract, use `spar amend --run <id> --contract "<directive>"` (O137).** It is operator-only (exit `1` inside a slot) and refuses, exit `1`, a run whose orchestrator is alive (`spar stop <id>` first) or that is not parked (stopped, failed, stuck, quota, or at the plan, round or ship gate), and a run with no test author (planned without the spec phase). It refuses, exit `1`, a `test-contract.md` edited after the freeze (`contract_modified`, or a fingerprint that no longer matches); `--accept-contract-edits` amends the edited text instead. The frozen text is kept at `artifacts/test-contract.frozen.md`. It reuses the run's current test-author seat and worktree; if that provider is paused it moves to `[backups].test_author` or refuses. A killed amend is rolled back (contract, author tree, phase) by the next `amend`, `resume` or `approve`. It re-runs **only** the test author, handing it the directive and the current contract (planner and critic are not re-run, the approval is kept), keeps the old contract at `artifacts/test-contract-amend<N>.md`, re-freezes what the author writes (`contract_fingerprint` moves, `contract_modified` clears), records the amendment in `state.json` `contract_amendments` (`directive`, `old_fingerprint`, `new_fingerprint`, `archived`) and as an event, and clears the implementer's session markers so its next dispatch reads the new contract cold (judging roles and the test author are already cold). It never resumes the run: it prints the command that continues it (`spar approve <id>` at the plan gate, else `spar implement --run <id>`), and the next `implement --run` carries the amended tests into the implementer worktree through the usual overlay. If the test author fails, the contract file and the author's branch are put back, the run's phase is untouched, and the exit is `1` (`4` when the author hit quota). Editing `test-contract.md` by hand and re-running `implement --run` still re-freezes, and a hand edit spar saw happen mid-round still needs `--accept-contract`.
 - **Reviewer context:** reviewers get the full `plan.md` and `test-contract.md` in their prompt, so they can check the change against the agreed plan and each `AC-n` criterion rather than guessing intent.
+- **Reviewers judge from detached checkouts of their own (O138).** In the implement loop each reviewer seat works in `../<repo>-spar-<id>-reviewers/<seat>/`, a `git worktree add --detach` checkout at the panel head (the implementer's `HEAD` when the panel starts), reused by that seat across rounds and forced onto each new panel head (anything the reviewer left there is discarded). A reviewer that checks out a branch or commits cannot move `spar/<id>/impl`, so `ship` and checkpoints read the work that was reviewed. Before the suite and the panel, spar commits whatever the implementer left uncommitted on `spar/<id>/impl` (tracked changes and untracked files, `.gitignore` respected; subject = the PR title, body `spar: uncommitted implementer work before review round N`), so the suite, every reviewer and `ship` see the same commit; a commit a hook refuses is a warning and the panel judges `HEAD`. Every reviewer seat of a run builds into one shared `CARGO_TARGET_DIR`, `../<repo>-spar-<id>-reviewers/target` (not under `isolation = "worktree-bwrap"`, where only the slot cwd is writable, so each seat builds into its own `target/`): the cost is one extra build cache per run (plus a source checkout per seat), on top of the implementer's, and a reviewer switching checkouts rebuilds the workspace crates while sharing the dependencies. `spar reclaim` reaps that `target/` with the run's other caches; `spar cleanup <id>` removes the whole directory and deregisters the checkouts. Dry runs, `isolation = "none"`, and a head that does not resolve keep reviewers in the implementer's tree; the branch repair before each panel stays as a safety net.
 - **Review artifact schema (enforced):** each `artifacts/review-<slot>.md` is `## Verdict` / `## Acceptance` / `## Findings` / `## Tests` plus a `Reviewed-Commit: <sha>` line naming the `HEAD` the reviewer read (`git rev-parse HEAD` in the review worktree at diff-read time; short shas accepted as a prefix of the panel head). The verdict is read as an **anchored header** — the first non-blank line under the first `## Verdict` must be `approve` or `request_changes`; missing or unparseable is treated as `request_changes`. A verdict naming no commit, or a commit other than the head the panel was dispatched against, is not counted: fail closed exactly like a missing review, with a blocker naming both shas. `## Acceptance` carries one `AC-n: pass|fail|unverified — evidence` line per criterion in `test-contract.md`.
 - **Severity gate (O118):** a `request_changes` holds the ship when it carries a reviewer finding at or above `[review] block_on` (default `major`; `critical` / `major` / `minor`), when spar wrote it (`synthetic`), when it lists no severity-tagged finding, or when any item in a findings-like section (`## Findings`, `## Blocking issues`, `## Additional findings`, ...) names no readable severity (`untagged`; fail closed). A `request_changes` whose every item parsed as minor is **approve-with-notes**: the run reaches the ship gate and the minors go into the PR body. A finding under `## Follow-up` is non-blocking only in a scoped round (the review's `scoped: true`), and never when critical. The reviewer template's rubric: wrong behaviour, data loss, security, a broken requirement or a regression is major or above; minor is polish only. `block_on = "minor"` is the old strict gate. Acceptance criteria gate separately and are unchanged.
 - **Stale findings (O120):** a finding describes the commit its reviewer read. At the round-ceiling park (`escalation.md` and stderr), in the PR body and in `spar brief` (`open_findings` in `--json`: each finding plus `reviewed_commit`, `touched_since` = `git log --oneline <reviewed>..HEAD -- <file>`, and `possibly_addressed`), each open finding from the last panel is listed with the commits since its review that touched its cited file. **Possibly addressed** means the file moved: check the finding at HEAD before fixing it. A hint, never a verdict; no model call.

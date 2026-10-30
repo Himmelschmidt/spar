@@ -1,27 +1,31 @@
 //! `.spar/history.jsonl`: one JSON line per run, written when a run reaches a terminal
 //! phase and again just before `cleanup --purge` deletes it, so trends outlive the run
 //! directory. Append-only; a run can have several lines and readers keep the one with
-//! the latest `written_at` per `id` (O102).
+//! the latest `written_at` per `id` (O102). Schema 2 adds the per-dispatch ledger, slot
+//! and round wall times and quota parks that `spar stats` reads (O131).
 
+use crate::events::{Event, EventKind};
 use crate::paths::SparPaths;
-use crate::state::RunState;
-use crate::workflow::review_result::{Finding, Severity};
+use crate::state::{ContextSemantics, Phase, RunState, SeatSource, SlotStatus};
+use crate::workflow::review_result::{Finding, Severity, Verdict};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use serde::Serialize;
-use std::collections::{BTreeMap, HashSet};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 
-pub const HISTORY_SCHEMA: u32 = 1;
+pub const HISTORY_SCHEMA: u32 = 2;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Trigger {
     Terminal,
     Purge,
+    /// Never written: `spar stats` builds this row from a run still on disk.
+    Live,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeverityCounts {
     pub critical: u32,
     pub major: u32,
@@ -40,29 +44,75 @@ impl SeverityCounts {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoleRow {
     pub slot: String,
-    pub role: &'static str,
+    pub role: String,
     pub provider: String,
     pub model: Option<String>,
+    #[serde(default)]
+    pub source: Option<SeatSource>,
+    /// The slot's last dispatch failed on quota or a refused credential, the failures
+    /// that park a run at `quota`.
+    #[serde(default)]
+    pub parked_run: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerdictRow {
     pub slot: String,
-    pub verdict: Option<crate::workflow::review_result::Verdict>,
+    pub verdict: Option<Verdict>,
     pub synthetic: bool,
+    /// Findings in this one review that held the ship under the run's `block_on`
+    /// (`Finding::blocks`), deduplicated within it.
+    #[serde(default)]
+    pub blocking: u32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoundRow {
     pub round: u32,
     pub verdicts: Vec<VerdictRow>,
     pub findings: SeverityCounts,
 }
 
-#[derive(Debug, Serialize)]
+/// One entry of `state.usage`, with the role its slot held.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchRow {
+    pub slot: String,
+    pub role: String,
+    pub provider: String,
+    pub model: Option<String>,
+    pub billed_tokens: u64,
+    pub cost_usd: Option<f64>,
+    pub tools: u32,
+    pub context_tokens: u64,
+    pub context_semantics: ContextSemantics,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlotTime {
+    pub slot: String,
+    /// `None` for events written before phase events carried the round.
+    pub round: Option<u32>,
+    pub wall_secs: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoundTime {
+    pub round: u32,
+    /// First slot start to last slot end in the round, so time parked at a gate is
+    /// not counted.
+    pub wall_secs: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Timing {
+    pub rounds: Vec<RoundTime>,
+    pub slots: Vec<SlotTime>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryRow {
     pub schema_version: u32,
     pub written_at: DateTime<Utc>,
@@ -71,7 +121,7 @@ pub struct HistoryRow {
     pub task: Option<String>,
     pub workflow: crate::cli::WorkflowKind,
     pub dry_run: bool,
-    pub phase: crate::state::Phase,
+    pub phase: Phase,
     pub roles: Vec<RoleRow>,
     pub rounds: u32,
     pub max_rounds: u32,
@@ -85,9 +135,115 @@ pub struct HistoryRow {
     pub merge_commit: Option<String>,
     pub created_at: DateTime<Utc>,
     pub ended_at: DateTime<Utc>,
+    #[serde(default)]
+    pub dispatches: Vec<DispatchRow>,
+    #[serde(default)]
+    pub timing: Timing,
+    /// Times the run entered the `quota` phase.
+    #[serde(default)]
+    pub quota_parks: u32,
+    /// `[review] block_on` the `blocking` counts were taken at.
+    #[serde(default)]
+    pub block_on: Option<Severity>,
+    /// Written at a phase a run is often resumed from (`quota`, `plan_approved`):
+    /// `dispatches` and `timing` are left out, so a run that parks many times does not
+    /// repeat its ledger. Read the run-level totals.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compact: bool,
 }
 
-pub fn row(state: &RunState, trigger: Trigger, now: DateTime<Utc>) -> HistoryRow {
+impl HistoryRow {
+    /// No per-dispatch ledger: a schema 1 line or a compact one.
+    pub fn run_level_only(&self) -> bool {
+        self.schema_version < 2 || self.compact
+    }
+}
+
+/// The role a slot id names, for usage entries whose slot was since renamed (a backup
+/// takes a seat under a new id).
+fn role_from_slot_id(id: &str) -> &'static str {
+    let prefixes = [
+        ("impl", "implementer"),
+        ("review-", "reviewer"),
+        ("planner", "planner"),
+        ("critic", "plan_critic"),
+        ("test-author", "test_author"),
+        ("suite-", "tester"),
+        ("ranker", "ranker"),
+        ("peer", "peer"),
+        ("reconcile-", "reconciler"),
+    ];
+    prefixes
+        .iter()
+        .find(|(p, _)| id.starts_with(p))
+        .map(|(_, r)| *r)
+        .unwrap_or("unknown")
+}
+
+fn normalized(f: &Finding) -> Finding {
+    Finding {
+        text: f
+            .text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase(),
+        ..f.clone()
+    }
+}
+
+fn timing(events: &[Event]) -> Timing {
+    let mut round = None;
+    let mut open: HashMap<&str, (DateTime<Utc>, Option<u32>)> = HashMap::new();
+    let mut slots = Vec::new();
+    let mut spans: BTreeMap<u32, (DateTime<Utc>, DateTime<Utc>)> = BTreeMap::new();
+    for ev in events {
+        if ev.kind == EventKind::Phase && ev.round.is_some() {
+            round = ev.round;
+        }
+        let (EventKind::Slot, Some(slot), Some(status)) = (ev.kind, ev.slot.as_deref(), ev.status)
+        else {
+            continue;
+        };
+        if status == SlotStatus::Running {
+            open.insert(slot, (ev.ts, round));
+            continue;
+        }
+        let Some((start, r)) = open.remove(slot) else {
+            continue;
+        };
+        slots.push(SlotTime {
+            slot: slot.to_string(),
+            round: r,
+            wall_secs: (ev.ts - start).num_seconds(),
+        });
+        if let Some(r) = r {
+            let span = spans.entry(r).or_insert((start, ev.ts));
+            span.0 = span.0.min(start);
+            span.1 = span.1.max(ev.ts);
+        }
+    }
+    Timing {
+        rounds: spans
+            .into_iter()
+            .map(|(round, (a, b))| RoundTime {
+                round,
+                wall_secs: (b - a).num_seconds(),
+            })
+            .collect(),
+        slots,
+    }
+}
+
+/// `block_on` is the run's `[review] block_on`, so `blocking` counts what the gate
+/// counted (O118).
+pub fn row(
+    state: &RunState,
+    events: &[Event],
+    block_on: Severity,
+    trigger: Trigger,
+    now: DateTime<Utc>,
+) -> HistoryRow {
     let mut rounds: BTreeMap<u32, RoundRow> = BTreeMap::new();
     let mut seen: HashSet<(u32, Finding)> = HashSet::new();
     for entry in &state.review_history {
@@ -96,21 +252,13 @@ pub fn row(state: &RunState, trigger: Trigger, now: DateTime<Utc>) -> HistoryRow
             verdicts: Vec::new(),
             findings: SeverityCounts::default(),
         });
-        r.verdicts.push(VerdictRow {
-            slot: entry.slot_id.clone(),
-            verdict: entry.review.verdict,
-            synthetic: entry.review.synthetic,
-        });
+        let mut own: HashSet<Finding> = HashSet::new();
+        let mut blocking = 0;
         for f in &entry.review.findings {
-            let key = Finding {
-                text: f
-                    .text
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ")
-                    .to_lowercase(),
-                ..f.clone()
-            };
+            let key = normalized(f);
+            if f.blocks(block_on, entry.review.scoped) && own.insert(key.clone()) {
+                blocking += 1;
+            }
             if !seen.insert((entry.round, key)) {
                 continue;
             }
@@ -125,12 +273,42 @@ pub fn row(state: &RunState, trigger: Trigger, now: DateTime<Utc>) -> HistoryRow
             };
             *bucket += 1;
         }
+        r.verdicts.push(VerdictRow {
+            slot: entry.slot_id.clone(),
+            verdict: entry.review.verdict,
+            synthetic: entry.review.synthetic,
+            blocking,
+        });
     }
     let mut findings = SeverityCounts::default();
     for r in rounds.values() {
         findings.add(r.findings);
     }
     let costs: Vec<f64> = state.usage.iter().filter_map(|u| u.cost_usd).collect();
+    let dispatches = state
+        .usage
+        .iter()
+        .map(|u| {
+            let slot = state.slots.iter().find(|s| s.id == u.slot_id);
+            DispatchRow {
+                slot: u.slot_id.clone(),
+                role: slot
+                    .map(|s| s.role.as_config_key())
+                    .unwrap_or_else(|| role_from_slot_id(&u.slot_id))
+                    .to_string(),
+                provider: u.provider.clone(),
+                model: u
+                    .model
+                    .clone()
+                    .or_else(|| slot.and_then(|s| s.model.clone())),
+                billed_tokens: u.billed_tokens,
+                cost_usd: u.cost_usd,
+                tools: u.tools,
+                context_tokens: u.context_tokens,
+                context_semantics: u.context_semantics,
+            }
+        })
+        .collect();
     HistoryRow {
         schema_version: HISTORY_SCHEMA,
         written_at: now,
@@ -150,9 +328,11 @@ pub fn row(state: &RunState, trigger: Trigger, now: DateTime<Utc>) -> HistoryRow
             .iter()
             .map(|s| RoleRow {
                 slot: s.id.clone(),
-                role: s.role.as_config_key(),
+                role: s.role.as_config_key().to_string(),
                 provider: s.provider.clone(),
                 model: s.model.clone(),
+                source: s.source,
+                parked_run: s.parks_on_quota(),
             })
             .collect(),
         rounds: state.round,
@@ -166,7 +346,49 @@ pub fn row(state: &RunState, trigger: Trigger, now: DateTime<Utc>) -> HistoryRow
         merge_commit: state.merge_commit.clone(),
         created_at: state.created_at,
         ended_at: state.updated_at,
+        dispatches,
+        timing: timing(events),
+        quota_parks: events
+            .iter()
+            .filter(|e| e.kind == EventKind::Phase && e.phase == Some(Phase::Quota))
+            .count() as u32,
+        block_on: Some(block_on),
+        compact: false,
     }
+}
+
+/// The run's gate threshold, from its frozen config.
+pub fn block_on(paths: &SparPaths, run_id: &str) -> Severity {
+    crate::config::Config::for_run(paths, run_id)
+        .map(|c| c.review.block_on)
+        .unwrap_or_else(|_| crate::config::Config::default().review.block_on)
+}
+
+/// Rows from `.spar/history.jsonl`, one per run id: the line with the latest
+/// `written_at`. Lines that do not parse are skipped.
+pub fn read_latest(paths: &SparPaths) -> Result<Vec<HistoryRow>> {
+    let path = paths.history_file();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let mut latest: HashMap<String, HistoryRow> = HashMap::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(row) = serde_json::from_str::<HistoryRow>(line) else {
+            continue;
+        };
+        if latest
+            .get(&row.id)
+            .is_some_and(|prev| prev.written_at >= row.written_at)
+        {
+            continue;
+        }
+        latest.insert(row.id.clone(), row);
+    }
+    let mut rows: Vec<HistoryRow> = latest.into_values().collect();
+    rows.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+    Ok(rows)
 }
 
 /// One `write` per line under `O_APPEND`, so concurrent writers never interleave
@@ -179,7 +401,20 @@ pub fn append(paths: &SparPaths, state: &RunState, trigger: Trigger) {
 }
 
 fn write_line(paths: &SparPaths, state: &RunState, trigger: Trigger) -> Result<()> {
-    let mut line = serde_json::to_string(&row(state, trigger, Utc::now()))?;
+    let events = crate::events::read_all(paths, &state.id).unwrap_or_default();
+    let mut row = row(
+        state,
+        &events,
+        block_on(paths, &state.id),
+        trigger,
+        Utc::now(),
+    );
+    if trigger == Trigger::Terminal && matches!(state.phase, Phase::Quota | Phase::PlanApproved) {
+        row.dispatches.clear();
+        row.timing = Timing::default();
+        row.compact = true;
+    }
+    let mut line = serde_json::to_string(&row)?;
     line.push('\n');
     std::fs::create_dir_all(&paths.root)?;
     let path = paths.history_file();
@@ -243,7 +478,7 @@ mod tests {
             usage(50, None),
             usage(25, Some(0.25)),
         ];
-        let row = row(&st, Trigger::Purge, Utc::now());
+        let row = row(&st, &[], Severity::Major, Trigger::Purge, Utc::now());
         assert_eq!(row.task.as_deref(), Some("Add history"));
         assert_eq!(row.review_rounds.len(), 2);
         let r1 = &row.review_rounds[0];
@@ -274,5 +509,188 @@ mod tests {
         assert_eq!(v["schema_version"], HISTORY_SCHEMA);
         assert_eq!(v["review_rounds"][1]["verdicts"][1]["verdict"], "approve");
         assert_eq!(v["phase"], "done");
+    }
+
+    fn ev(secs: i64, kind: EventKind) -> Event {
+        let mut e = Event::info("x");
+        e.ts = DateTime::from_timestamp(1_800_000_000 + secs, 0).unwrap();
+        e.kind = kind;
+        e.message = None;
+        e
+    }
+
+    fn phase_ev(secs: i64, phase: Phase, round: Option<u32>) -> Event {
+        let mut e = ev(secs, EventKind::Phase);
+        e.phase = Some(phase);
+        e.round = round;
+        e
+    }
+
+    fn slot_ev(secs: i64, slot: &str, status: SlotStatus) -> Event {
+        let mut e = ev(secs, EventKind::Slot);
+        e.slot = Some(slot.into());
+        e.status = Some(status);
+        e
+    }
+
+    /// Round wall time spans slot activity only, so the hour parked at a gate between
+    /// rounds is not charged; a slot with no round stamp is timed but not in a round.
+    #[test]
+    fn timing_spans_slot_activity_per_round_and_counts_quota_parks() {
+        let events = vec![
+            slot_ev(0, "planner", SlotStatus::Running),
+            slot_ev(30, "planner", SlotStatus::Done),
+            phase_ev(40, Phase::Dispatch, Some(1)),
+            slot_ev(50, "impl", SlotStatus::Running),
+            slot_ev(650, "impl", SlotStatus::Done),
+            slot_ev(650, "review-0-cli-codex", SlotStatus::Running),
+            slot_ev(800, "review-0-cli-codex", SlotStatus::Failed),
+            phase_ev(801, Phase::Quota, Some(1)),
+            phase_ev(4000, Phase::Dispatch, Some(2)),
+            slot_ev(4000, "impl", SlotStatus::Running),
+            slot_ev(4100, "impl", SlotStatus::Done),
+        ];
+        let st = RunState::new("r1", crate::cli::WorkflowKind::Loop, "/x".into());
+        let row = row(&st, &events, Severity::Major, Trigger::Live, Utc::now());
+        let slots: Vec<(&str, Option<u32>, i64)> = row
+            .timing
+            .slots
+            .iter()
+            .map(|t| (t.slot.as_str(), t.round, t.wall_secs))
+            .collect();
+        assert_eq!(
+            slots,
+            vec![
+                ("planner", None, 30),
+                ("impl", Some(1), 600),
+                ("review-0-cli-codex", Some(1), 150),
+                ("impl", Some(2), 100),
+            ]
+        );
+        let rounds: Vec<(u32, i64)> = row
+            .timing
+            .rounds
+            .iter()
+            .map(|r| (r.round, r.wall_secs))
+            .collect();
+        assert_eq!(rounds, vec![(1, 750), (2, 100)]);
+        assert_eq!(row.quota_parks, 1);
+    }
+
+    /// A dispatch whose slot was renamed by a backup still gets a role, from its id;
+    /// blocking counts one reviewer's own critical and major findings only.
+    #[test]
+    fn dispatches_carry_role_and_reviews_carry_blocking() {
+        let mut st = RunState::new("r1", crate::cli::WorkflowKind::Loop, "/x".into());
+        st.slots.push(crate::executor::init_slot(
+            "impl",
+            "cli:muse",
+            crate::state::SlotRole::Implementer,
+        ));
+        let mut gone = usage(10, None);
+        gone.slot_id = "review-1-cli-codex".into();
+        gone.provider = "cli:codex".into();
+        let mut own = usage(20, Some(0.1));
+        own.slot_id = "impl".into();
+        own.model = Some("muse-spark-1.3".into());
+        st.usage = vec![gone, own];
+        st.review_history = vec![entry(
+            1,
+            "review-1-cli-codex",
+            "## Verdict\nrequest_changes\n\n## Findings\n- severity: critical — a\n- severity: major — b\n- severity: major — b\n- severity: minor — c\n",
+        )];
+        let row = row(&st, &[], Severity::Major, Trigger::Live, Utc::now());
+        assert_eq!(row.dispatches[0].role, "reviewer");
+        assert_eq!(row.dispatches[1].role, "implementer");
+        assert_eq!(row.dispatches[1].model.as_deref(), Some("muse-spark-1.3"));
+        assert_eq!(row.review_rounds[0].verdicts[0].blocking, 2);
+    }
+
+    /// The latest `written_at` wins per id; a schema 1 line (no dispatches, timing or
+    /// parks) still reads.
+    #[test]
+    fn read_latest_keeps_the_newest_line_per_run_and_reads_schema_1() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        std::fs::create_dir_all(&paths.root).unwrap();
+        let v1 = |id: &str, at: &str, phase: &str| {
+            serde_json::json!({
+                "schema_version": 1, "written_at": at, "trigger": "terminal", "id": id,
+                "task": null, "workflow": "loop", "dry_run": false, "phase": phase,
+                "roles": [{"slot": "impl", "role": "implementer", "provider": "cli:claude", "model": null}],
+                "rounds": 1, "max_rounds": 5,
+                "review_rounds": [{"round": 1, "verdicts": [{"slot": "review-0", "verdict": "approve", "synthetic": false}],
+                                   "findings": {"critical": 0, "major": 0, "minor": 0, "synthetic": 0}}],
+                "findings": {"critical": 0, "major": 0, "minor": 0, "synthetic": 0},
+                "billed_tokens": 5, "cost_usd": null, "pr_url": null,
+                "created_at": "2026-10-01T00:00:00Z", "ended_at": at,
+            })
+            .to_string()
+        };
+        let lines = [
+            v1("a", "2026-10-02T00:00:00Z", "failed"),
+            v1("a", "2026-10-03T00:00:00Z", "done"),
+            v1("a", "2026-10-01T12:00:00Z", "stuck"),
+            "not json".into(),
+            v1("b", "2026-10-02T00:00:00Z", "quota"),
+        ];
+        std::fs::write(paths.history_file(), lines.join("\n") + "\n").unwrap();
+        let rows = read_latest(&paths).unwrap();
+        assert_eq!(rows.len(), 2);
+        let a = rows.iter().find(|r| r.id == "a").unwrap();
+        assert_eq!(a.phase, Phase::Done);
+        assert!(a.dispatches.is_empty());
+        assert_eq!(a.review_rounds[0].verdicts[0].blocking, 0);
+    }
+
+    /// `blocking` follows the gate: the run's `block_on` decides minors, and a scoped
+    /// round's follow-up major does not block while a critical always does.
+    #[test]
+    fn blocking_counts_what_the_gate_counts() {
+        let body = "## Verdict\nrequest_changes\n\n## Findings\n- severity: major — m at a.rs:1\n- severity: minor — n\n\n## Follow-up\n- severity: major — later\n- severity: critical — now\n";
+        let mut st = RunState::new("r1", crate::cli::WorkflowKind::Loop, "/x".into());
+        let mut scoped = entry(2, "review-0", body);
+        scoped.review.scoped = true;
+        st.review_history = vec![entry(1, "review-0", body), scoped];
+        let at = |b: Severity| {
+            let r = row(&st, &[], b, Trigger::Live, Utc::now());
+            (
+                r.review_rounds[0].verdicts[0].blocking,
+                r.review_rounds[1].verdicts[0].blocking,
+            )
+        };
+        assert_eq!(at(Severity::Major), (3, 2));
+        assert_eq!(at(Severity::Minor), (4, 3));
+        assert_eq!(at(Severity::Critical), (1, 1));
+        assert_eq!(
+            row(&st, &[], Severity::Minor, Trigger::Live, Utc::now()).block_on,
+            Some(Severity::Minor)
+        );
+    }
+
+    /// A run parked at `quota` (or handed off at `plan_approved`) writes a compact line
+    /// with no ledger; a final phase writes the full one.
+    #[test]
+    fn resumable_terminal_rows_are_compact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = RunState::new("r1", crate::cli::WorkflowKind::Loop, tmp.path().into());
+        st.usage = vec![usage(10, Some(0.5))];
+        st.phase = Phase::Quota;
+        append(&paths, &st, Trigger::Terminal);
+        st.phase = Phase::Done;
+        append(&paths, &st, Trigger::Terminal);
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(paths.history_file())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines[0]["compact"], true);
+        assert!(lines[0]["dispatches"].as_array().unwrap().is_empty());
+        assert_eq!(lines[0]["billed_tokens"], 10);
+        assert!(lines[1].get("compact").is_none());
+        assert_eq!(lines[1]["dispatches"].as_array().unwrap().len(), 1);
+        let rows = read_latest(&paths).unwrap();
+        assert!(!rows[0].run_level_only());
     }
 }

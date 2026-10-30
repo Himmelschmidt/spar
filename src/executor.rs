@@ -399,6 +399,7 @@ fn prepare_slot_execution(
     let tmp = SlotTmp::create(paths, &state.id, &job.slot_id, state.isolation);
     let mut env = wire_slot_presence(state, paths, &job, &cwd, &pref);
     env.extend(tmp.env());
+    env.extend(crate::worktree::reviewer_build_env(state, &cwd));
     let owns_cwd = owns_cwd(state, &job.slot_id, &cwd);
     let session_provider = pref.cli_name().unwrap_or(job.provider.as_str()).to_string();
     let prior_session_id =
@@ -2404,6 +2405,7 @@ pub fn run_slot(
 
     let mut presence_env = wire_slot_presence(state, paths, job, &cwd, &pref);
     presence_env.extend(tmp.env());
+    presence_env.extend(crate::worktree::reviewer_build_env(state, &cwd));
 
     // A backend `Err` (spawn/setup failure, not a completed dispatch) still writes a
     // log a rate-limit rejection could land in on some adapters, so it gets the same
@@ -4289,7 +4291,10 @@ fn slot_effort_for(
 /// refusal is spar's fault (never retried, never an agent failure) and names
 /// the accepted levels. api-sdk slots record effort without rendering it, so
 /// they never refuse; `None` is always fine.
-fn check_slot_effort(provider: &str, effort: Option<crate::effort::EffortLevel>) -> Result<()> {
+pub(crate) fn check_slot_effort(
+    provider: &str,
+    effort: Option<crate::effort::EffortLevel>,
+) -> Result<()> {
     let Some(e) = effort else {
         return Ok(());
     };
@@ -4343,6 +4348,7 @@ pub fn init_slot_model(
         review: None,
         source: None,
         auth_fault: false,
+        former_ids: Vec::new(),
     }
 }
 
@@ -4510,6 +4516,7 @@ fn source_label(source: SeatSource) -> &'static str {
         SeatSource::ModelSelect => "model-select",
         SeatSource::SuitePreferences => "suite-preferences",
         SeatSource::Backup => "backup",
+        SeatSource::Reassigned => "reassigned",
         SeatSource::Unknown => "unknown",
     }
 }

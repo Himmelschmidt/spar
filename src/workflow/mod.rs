@@ -42,6 +42,9 @@ pub struct CommonOpts {
     /// instead of keeping the provider they were minted with. Without this, `--role` on
     /// a run whose slots exist silently changes `config.json` and nothing else.
     pub reload_config: bool,
+    /// `--reassign <role|seat>=<provider>`: move existing seats of `--run <id>` to
+    /// another provider before this re-entry dispatches (O136).
+    pub reassign: Vec<String>,
 }
 
 impl Default for CommonOpts {
@@ -60,6 +63,7 @@ impl Default for CommonOpts {
             big: false,
             max_rounds: None,
             accept_contract: false,
+            reassign: Vec::new(),
         }
     }
 }
@@ -106,6 +110,7 @@ impl CommonOpts {
                     prev_phase: None,
                     slot: None,
                     status: None,
+                    round: None,
                     message: Some(format!(
                         "model-select: {}",
                         art.choices

@@ -5,6 +5,8 @@ You freeze the acceptance bar **before** product code is written. You are **not*
 ## Task
 {{task}}
 
+{{contract_amendment_section}}
+
 ## Plan + critique (read first)
 - Shared plan: {{artifacts_dir}}/plan.md
 - Critiques under {{artifacts_dir}}/plan-critique-*.md (if present)

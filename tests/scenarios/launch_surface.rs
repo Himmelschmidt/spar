@@ -858,3 +858,57 @@ fn env_capture_of_a_secret_name_is_refused() {
     assert!(v["error"].as_str().unwrap().contains("GITHUB_TOKEN"), "{v}");
     assert!(sb.runs().is_empty());
 }
+
+/// `--reassign` refusals are launch refusals too: JSON under `--json`, nothing moved.
+#[test]
+fn reassign_refusals_are_json() {
+    let sb = Sandbox::new();
+    let id = sb.run_at_ceiling(3);
+    let cases: Vec<(Vec<&str>, &str)> = vec![
+        (
+            vec![
+                "implement",
+                "--run",
+                &id,
+                "--reassign",
+                "implementer=cli:nosuch",
+            ],
+            "nosuch",
+        ),
+        (
+            vec![
+                "implement",
+                "-t",
+                "x",
+                "--reassign",
+                "implementer=cli:claude",
+            ],
+            "--run",
+        ),
+        (
+            vec![
+                "implement",
+                "--run",
+                &id,
+                "--reassign",
+                "review-9-cli-nobody=cli:claude",
+            ],
+            "review-9",
+        ),
+    ];
+    for (args, needle) in cases {
+        let mut full = args.clone();
+        full.extend(["--dry-run", "--json"]);
+        let out = sb.spar().args(&full).output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "{full:?}: {out:?}");
+        let v = json(&out);
+        assert_eq!(v["kind"], "validation", "{full:?}: {v}");
+        assert!(
+            v["error"].as_str().unwrap_or_default().contains(needle),
+            "{full:?}: {v}"
+        );
+    }
+    assert!(sb.state(&id)["seat_reassignments"]
+        .as_array()
+        .is_none_or(|a| a.is_empty()));
+}

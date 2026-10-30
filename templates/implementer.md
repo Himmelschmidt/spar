@@ -34,7 +34,7 @@ Implement the task in your isolated worktree. Do not modify the primary checkout
    Do not restate the task, the plan or the contract — the next round is handed all three. Do not argue with a review verdict or claim a criterion passes: no reviewer and no gate ever reads this file.
 7. Write done marker `{{markers_dir}}/{{slot_id}}.done` or `.failed`
 
-Do not merge. Do not push: spar checkpoints your work (commits and uncommitted edits) after every turn. Prefer small commits on branch `{{branch}}`.
+Do not merge. Do not push: spar checkpoints your work (commits and uncommitted edits) after every turn. Commit your work on branch `{{branch}}`, in small commits. Reviewers judge a checkout of your last commit; spar commits anything you leave uncommitted before the review panel, under a generic message, so commit yourself to keep your own history.
 
 Do **not** use `pkill -f`, `pgrep -f`, or `killall` on any token derived from the task or a test name: your own process's argv contains the full task text, so those patterns match and kill YOU. Kill stray processes by pid instead.
 

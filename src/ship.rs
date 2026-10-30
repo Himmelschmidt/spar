@@ -81,7 +81,7 @@ fn exact_ref(cwd: &std::path::Path, git_ref: &str) -> bool {
 /// Take the first non-blank line instead, strip its heading marker, and clamp to `max`
 /// characters (`[ship] title_max`, `0` = only GitHub's own limit) on a word boundary. An
 /// inline `-t` task that already fits is passed through unchanged.
-fn pr_title(task: Option<&str>, max: usize) -> String {
+pub(crate) fn pr_title(task: Option<&str>, max: usize) -> String {
     const FALLBACK: &str = "spar change";
     // GitHub rejects a PR title over 256 characters, whatever the setting says.
     const GITHUB_MAX: usize = 256;
@@ -144,6 +144,18 @@ fn pr_body(paths: &SparPaths, state: &RunState, branch: &str, cwd: &Path) -> Str
                 body.push_str(&q);
                 body.push('\n');
             }
+        }
+    }
+    if !state.contract_amendments.is_empty() {
+        body.push_str("\n## Contract amendments\n\n");
+        for a in &state.contract_amendments {
+            body.push_str(&format!(
+                "- round {}: {} (contract `{}` -> `{}`)\n",
+                a.round,
+                a.directive.lines().next().unwrap_or(""),
+                a.old_fingerprint,
+                a.new_fingerprint
+            ));
         }
     }
     let reviews = review_verdicts(paths, state);

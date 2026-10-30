@@ -232,6 +232,14 @@ pub enum Command {
         /// first: this is how a criterion gets deleted on the way to the ship gate.
         #[arg(long)]
         accept_contract: bool,
+        /// Move an existing seat of `--run <id>` to another provider:
+        /// `--reassign implementer=cli:claude@sonnet` or
+        /// `--reassign review-0-cli-codex=cli:claude@opus`. Repeatable. The seat keeps its
+        /// worktree, branch, carry-forward, round count and review history; a reviewer
+        /// or tester seat is renamed to name its new provider (O136). Refused while the run's
+        /// orchestrator is alive, onto a paused provider, and inside a slot.
+        #[arg(long = "reassign", value_name = "ROLE|SEAT=PROVIDER")]
+        reassign: Vec<String>,
         /// Ref to cut every slot worktree from (branch, tag or sha), for a NEW run.
         /// Default: the HEAD of the directory spar was invoked from. A run's base is
         /// fixed at creation, so `--run <id>` only accepts a base it already has.
@@ -337,6 +345,24 @@ pub enum Command {
         /// Include archived runs, which are hidden by default
         #[arg(long)]
         archived: bool,
+    },
+
+    /// Aggregate run history: rounds, outcomes, review findings, cost, wall time and
+    /// quota events, grouped by model, role, provider or project
+    Stats {
+        /// Only runs that ended (or last changed) within this window: `7d`, `12h`, `30m`
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long, value_enum, default_value = "provider")]
+        by: crate::stats::GroupBy,
+        /// Every project in the local registry, not just this one
+        #[arg(long)]
+        all_projects: bool,
+        /// Count `--dry-run` runs too
+        #[arg(long)]
+        include_dry_run: bool,
+        #[arg(long)]
+        json: bool,
     },
 
     /// Delete regenerable build output (`target/`, `node_modules`) inside finished runs'
@@ -577,6 +603,23 @@ pub enum Command {
         if_merged: bool,
     },
 
+    /// Amend a run's frozen acceptance contract: re-run only its test author with the
+    /// directive and the current contract, re-freeze the result, and leave the run parked
+    /// where it was (O137). Operator-only; refused while the run's orchestrator is alive.
+    Amend {
+        #[arg(long = "run")]
+        run_id: String,
+        /// What to change about how the run verifies its work.
+        #[arg(long)]
+        contract: String,
+        /// Amend a `test-contract.md` that was edited after it was frozen, starting from
+        /// the edited text. Without it spar refuses: the implementer can write to it.
+        #[arg(long)]
+        accept_contract_edits: bool,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Operator rulings: settled points every later reviewer and implementer prompt
     /// carries. A run ruling may waive an acceptance criterion (O121).
     Rule {
@@ -694,6 +737,8 @@ pub enum BusCmd {
         run: Option<String>,
         #[arg(long, default_value = "human")]
         from: String,
+        /// An agent id, `broadcast`, `@human`, or `impl` (needs `--run`: that run's
+        /// implementer)
         #[arg(long, default_value = "broadcast")]
         to: String,
         #[arg(long, short = 'm')]
@@ -706,6 +751,20 @@ pub enum BusCmd {
         conversation: Option<String>,
         #[arg(long)]
         turn: Option<String>,
+        /// Redeliver until the recipient runs `spar bus ack`, then escalate to @human
+        #[arg(long)]
+        requires_ack: bool,
+        /// Also carry the message in the implementer's carry-forward every dispatch
+        /// until it is withdrawn or acked. Needs `--run` and the run's implementer as `--to`
+        #[arg(long)]
+        persist: bool,
+        /// Withdraw an earlier message of yours from every inbox that has not taken it yet
+        #[arg(long, value_name = "MSG_ID")]
+        supersedes: Option<String>,
+        /// Withdraw this message once the run passes round N (default: the round a slot
+        /// is dispatching in, else the next round). Needs `--run`
+        #[arg(long, value_name = "N", num_args = 0..=1)]
+        expires_after_round: Option<Option<u32>>,
     },
     /// List bus events (all runs + bare traffic; `--run` filters to one run)
     Log {
@@ -789,6 +848,10 @@ pub enum ProviderAction {
     List {
         #[arg(long)]
         json: bool,
+        /// Also read each account's current utilisation where the CLI exposes it
+        /// locally without a model turn (muse, codex)
+        #[arg(long)]
+        usage: bool,
     },
     Pause {
         name: String,
