@@ -1,8 +1,8 @@
 //! Operator surgery on a run that already exists: moving a seat to another provider
 //! (`implement --reassign`, O136), resuming a failed task-only run (O91) and amending a
-//! frozen contract (`spar amend`, O137). Every provider CLI is faked and `PATH` holds
-//! only the fake bin and the system dirs, so nothing here can reach a real, billed
-//! provider.
+//! frozen contract (`spar amend`, O137), and reviewers judging from detached checkouts
+//! of their own (O138). Every provider CLI is faked and `PATH` holds only the fake bin
+//! and the system dirs, so nothing here can reach a real, billed provider.
 use assert_cmd::Command as AssertCommand;
 use predicates::prelude::*;
 use std::fs;
@@ -541,4 +541,123 @@ fn amend_is_refused_inside_a_slot_under_a_live_orchestrator_and_without_a_contra
         .assert()
         .code(1)
         .stderr(predicate::str::contains("has no test author"));
+}
+
+/// A fake `muse`: the implementer commits `work.txt` and writes its summary; a reviewer
+/// records where it ran and what `CARGO_TARGET_DIR` it was given, approves the commit it
+/// was shown, then misbehaves the way #158's incidents did by switching to a branch of
+/// its own and committing on it.
+const MISBEHAVING_REVIEWER_MUSE: &str = r#"PROMPT_FILE=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--prompt-file" ]; then PROMPT_FILE="$a"; fi
+  prev="$a"
+done
+NAME=$(basename "$PROMPT_FILE" .md)
+NAME=${NAME#prompt-}
+ART="$(dirname "$PROMPT_FILE")/artifacts"
+mkdir -p "$ART"
+echo '{"schema_version":1,"stream":{"kind":"session","id":"sess-r"},"record_type":"event","payload_type":"run.model.configured","payload":{"kind":"run_model_configured","model_id":"m"}}'
+case "$NAME" in
+  impl)
+    echo work > work.txt
+    git add work.txt
+    git commit -qm work
+    printf '# Summary\nCommitted work.txt.\n' > "$ART/summary-impl.md"
+    ;;
+  review-*)
+    pwd > "$ART/where-$NAME"
+    printf '%s' "$CARGO_TARGET_DIR" > "$ART/target-$NAME"
+    SHA=$(git rev-parse HEAD)
+    printf '## Verdict\napprove\n\nReviewed-Commit: %s\n' "$SHA" > "$ART/review-$NAME.md"
+    git checkout -q -b review-evil
+    echo evil > evil.txt
+    git add evil.txt
+    git commit -qm evil
+    ;;
+esac
+exit 0"#;
+
+#[test]
+fn reviewers_judge_from_detached_checkouts_and_never_move_the_implementer_branch() {
+    let fx = Fixture::new();
+    fx.cli("muse", MISBEHAVING_REVIEWER_MUSE);
+    fx.spar()
+        .args([
+            "implement",
+            "-t",
+            "add work",
+            "--providers",
+            "cli:muse",
+            "--fleet",
+            "small",
+            "--without",
+            "suite",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(" was on ").not());
+    let id = fx.run_id();
+    let st = fx.state();
+    assert_eq!(st["phase"], "awaiting_ship_confirm", "{st}");
+    let impl_wt = st["worktrees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["slot_id"] == "impl")
+        .unwrap()["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let impl_wt = PathBuf::from(impl_wt);
+    assert_eq!(
+        git(&impl_wt, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        format!("spar/{id}/impl"),
+        "the implementer's worktree stays on its branch"
+    );
+    let impl_head = git(&impl_wt, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        git(&fx.proj, &["log", "-1", "--format=%s", &impl_head]),
+        "work"
+    );
+
+    let area = fx
+        .proj
+        .parent()
+        .unwrap()
+        .join(format!("proj-spar-{id}-reviewers"));
+    let seat = st["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["role"] == "reviewer")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let artifacts = fx.run_dir().join("artifacts");
+    let where_ran = fs::read_to_string(artifacts.join(format!("where-{seat}"))).unwrap();
+    assert_eq!(
+        PathBuf::from(where_ran.trim()).canonicalize().unwrap(),
+        area.join(&seat).canonicalize().unwrap(),
+        "the reviewer ran in its own checkout"
+    );
+    assert_eq!(
+        fs::read_to_string(artifacts.join(format!("target-{seat}"))).unwrap(),
+        area.join("target").display().to_string(),
+        "one shared build dir per run"
+    );
+    let review = fs::read_to_string(artifacts.join(format!("review-{seat}.md"))).unwrap();
+    assert!(
+        review.contains(&impl_head),
+        "the checkout was at the panel head"
+    );
+    assert!(
+        git(&fx.proj, &["worktree", "list"]).contains("-reviewers"),
+        "the checkout is a registered worktree"
+    );
+
+    fx.spar().args(["cleanup", &id]).output().unwrap();
+    assert!(!area.exists(), "cleanup removes the reviewer checkouts");
+    assert!(!git(&fx.proj, &["worktree", "list"]).contains("-reviewers"));
 }

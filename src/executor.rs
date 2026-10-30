@@ -399,6 +399,7 @@ fn prepare_slot_execution(
     let tmp = SlotTmp::create(paths, &state.id, &job.slot_id, state.isolation);
     let mut env = wire_slot_presence(state, paths, &job, &cwd, &pref);
     env.extend(tmp.env());
+    env.extend(crate::worktree::reviewer_build_env(state, &cwd));
     let owns_cwd = owns_cwd(state, &job.slot_id, &cwd);
     let session_provider = pref.cli_name().unwrap_or(job.provider.as_str()).to_string();
     let prior_session_id =
@@ -2399,6 +2400,7 @@ pub fn run_slot(
 
     let mut presence_env = wire_slot_presence(state, paths, job, &cwd, &pref);
     presence_env.extend(tmp.env());
+    presence_env.extend(crate::worktree::reviewer_build_env(state, &cwd));
 
     // A backend `Err` (spawn/setup failure, not a completed dispatch) still writes a
     // log a rate-limit rejection could land in on some adapters, so it gets the same

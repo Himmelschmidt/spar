@@ -1976,7 +1976,8 @@ pub fn execute_loop(
         crate::state::ORPHANED_SLOT,
     )?;
 
-    // Only isolate the implementer; reviewers share its cwd.
+    // Only the implementer gets a branch; reviewers judge from detached checkouts cut
+    // at each panel head (O138).
     let impl_ids: Vec<String> = state
         .slots
         .iter()
@@ -2739,12 +2740,20 @@ pub fn execute_loop(
                 .find(|s| s.id == rev_id)
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("reviewer `{rev_id}` vanished"))?;
+            let rev_cwd = reviewer_cwd(
+                state,
+                paths,
+                cfg,
+                &rev.id,
+                panel_head.as_deref(),
+                &review_cwd,
+            );
             if let Some(s) = state.slot_mut(&rev.id) {
                 s.status = SlotStatus::Pending;
-                s.cwd = Some(review_cwd.clone());
+                s.cwd = Some(rev_cwd.clone());
             }
             let mut extra = HashMap::new();
-            extra.insert("review_cwd".into(), review_cwd.display().to_string());
+            extra.insert("review_cwd".into(), rev_cwd.display().to_string());
             if !suite_body.is_empty() {
                 extra.insert("suite_body".into(), suite_body.clone());
             }
@@ -2786,10 +2795,15 @@ pub fn execute_loop(
                     cfg,
                     infra.is_some(),
                 )? {
+                    let rev_cwd =
+                        reviewer_cwd(state, paths, cfg, &id, panel_head.as_deref(), &review_cwd);
                     if let Some(s) = state.slot_mut(&id) {
                         s.status = SlotStatus::Pending;
                         s.error = None;
+                        s.cwd = Some(rev_cwd.clone());
                     }
+                    job.extra_vars
+                        .insert("review_cwd".into(), rev_cwd.display().to_string());
                     rev = state
                         .slots
                         .iter()
@@ -3059,6 +3073,43 @@ pub fn execute_loop(
         state.begin_round();
         state.set_phase(Phase::Fix);
         state.save(paths)?;
+    }
+}
+
+/// The tree reviewer `seat` judges from: its own detached checkout at the panel head
+/// (O138), so a reviewer that checks out or commits anything moves nothing the
+/// implementer or `ship` reads (#158). The implementer's tree when there is no real
+/// worktree to detach from (dry run, `isolation = "none"`, a head that did not resolve),
+/// and, loudly, when the checkout cannot be made: `restore_branch` stays the net there.
+fn reviewer_cwd(
+    state: &RunState,
+    paths: &SparPaths,
+    cfg: &Config,
+    seat: &str,
+    panel_head: Option<&str>,
+    review_cwd: &Path,
+) -> PathBuf {
+    let Some(head) = panel_head else {
+        return review_cwd.to_path_buf();
+    };
+    let real_worktree = state
+        .worktrees
+        .iter()
+        .any(|w| w.path == review_cwd && !w.path.starts_with(state.project_root.join(".spar")));
+    if state.dry_run || !real_worktree {
+        return review_cwd.to_path_buf();
+    }
+    match worktree::reviewer_checkout(state, seat, head, &cfg.worktree.copy) {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = format!(
+                "reviewer `{seat}` judges from the implementer's worktree: its own checkout \
+                 failed ({e:#})"
+            );
+            eprintln!("warning: {msg}");
+            let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg));
+            review_cwd.to_path_buf()
+        }
     }
 }
 

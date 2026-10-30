@@ -123,8 +123,8 @@ pub(crate) fn named_head(dir: &Path) -> Option<String> {
     (!branch.is_empty() && branch != "HEAD").then_some(branch)
 }
 
-/// Puts `dir` back on `branch` when a slot left it on another one (reviewers share the
-/// implementer's worktree). Repairs only a fast-forward, so no commit is ever dropped,
+/// Puts `dir` back on `branch` when a slot left it on another one. Reviewers judge from
+/// detached checkouts of their own (O138), so this is the safety net, not the mechanism. Repairs only a fast-forward, so no commit is ever dropped,
 /// and never when `branch` still sits at the run's `base` (HEAD may then be any branch
 /// that happens to be ahead of base, such as main). `None` when there is nothing to report.
 pub fn restore_branch(dir: &Path, branch: &str, base: Option<&str>) -> Option<String> {
@@ -307,6 +307,111 @@ pub fn create_worktree(
         slot_id: slot_id.into(),
         path,
         branch,
+    })
+}
+
+/// Where a run's reviewers judge from (O138): `../<repo>-spar-<run>-reviewers/`, one
+/// detached checkout per seat plus the `target/` they all build into.
+pub fn reviewer_area(project_root: &Path, run_id: &str) -> Result<PathBuf> {
+    worktree_path(project_root, run_id, "reviewers")
+}
+
+/// A detached checkout of `head` for reviewer `seat`, so nothing a reviewer runs can move
+/// the implementer's branch (#158). Reused across rounds and forced onto each round's
+/// panel head; whatever the reviewer left in it last round is discarded.
+pub fn reviewer_checkout(
+    state: &RunState,
+    seat: &str,
+    head: &str,
+    copy: &[String],
+) -> Result<PathBuf> {
+    let root = &state.project_root;
+    let area = reviewer_area(root, &state.id)?;
+    let path = area.join(sanitize_slot(seat));
+    if path.join(".git").exists() {
+        if git_out(&path, &["checkout", "--quiet", "--force", "--detach", head]).is_none() {
+            bail!(
+                "could not move reviewer checkout {} to {head}",
+                path.display()
+            );
+        }
+        let _ = git_out(&path, &["clean", "-fdq"]);
+        return Ok(path);
+    }
+    std::fs::create_dir_all(&area)?;
+    if path.exists() {
+        std::fs::remove_dir_all(&path)?;
+    }
+    let _ = git_quiet(root, &["worktree", "prune"]);
+    let path_s = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {}", path.display()))?;
+    if !git_quiet(
+        root,
+        &["worktree", "add", "--quiet", "--detach", path_s, head],
+    )? {
+        bail!("git worktree add --detach failed for {}", path.display());
+    }
+    seed_env_files(root, &path, copy)?;
+    Ok(path)
+}
+
+/// `CARGO_TARGET_DIR` for a reviewer working in one of the run's reviewer checkouts: one
+/// `target/` per run shared by every seat, rather than one per checkout. Not under bwrap,
+/// which leaves only the slot's own cwd writable.
+pub fn reviewer_build_env(state: &RunState, cwd: &Path) -> Vec<(String, String)> {
+    if matches!(state.isolation, IsolationMode::WorktreeBwrap) {
+        return Vec::new();
+    }
+    let Ok(area) = reviewer_area(&state.project_root, &state.id) else {
+        return Vec::new();
+    };
+    if cwd == area || !cwd.starts_with(&area) {
+        return Vec::new();
+    }
+    vec![(
+        "CARGO_TARGET_DIR".to_string(),
+        area.join("target").display().to_string(),
+    )]
+}
+
+/// Remove the run's reviewer checkouts and their shared build dir. They hold nothing a
+/// reviewer is meant to keep, so there is no unsaved-work veto here.
+fn remove_reviewer_area(state: &RunState) -> Option<WorktreeCleanup> {
+    let root = &state.project_root;
+    let area = reviewer_area(root, &state.id).ok()?;
+    if !area.is_dir() || !reapable_worktree(root, &area) {
+        return None;
+    }
+    let killed = crate::process::pids_with_cwd_under(&area);
+    if !killed.is_empty() {
+        crate::process::terminate_all(&killed);
+    }
+    if let Ok(rd) = std::fs::read_dir(&area) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.join(".git").is_file() {
+                let _ = git_quiet(
+                    root,
+                    &[
+                        "worktree",
+                        "remove",
+                        "--force",
+                        p.to_str().unwrap_or_default(),
+                    ],
+                );
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&area);
+    let _ = git_quiet(root, &["worktree", "prune"]);
+    Some(WorktreeCleanup {
+        slot_id: "reviewers".into(),
+        path: area.clone(),
+        killed,
+        removed: !area.exists(),
+        skipped: None,
+        archived: None,
     })
 }
 
@@ -1046,19 +1151,24 @@ pub fn reap_build_cache(state: &RunState, live: &LiveCwds) -> CacheReap {
         dirs: Vec::new(),
         skipped: Vec::new(),
     };
-    for rec in &state.worktrees {
-        if !rec.path.is_dir() || !reapable_worktree(&state.project_root, &rec.path) {
+    let trees = state
+        .worktrees
+        .iter()
+        .map(|r| r.path.clone())
+        .chain(reviewer_area(&state.project_root, &state.id).ok());
+    for tree in trees {
+        if !tree.is_dir() || !reapable_worktree(&state.project_root, &tree) {
             continue;
         }
-        if live.inside(&rec.path) {
+        if live.inside(&tree) {
             reap.skipped.push(format!(
                 "{}: a live process is working here",
-                rec.path.display()
+                tree.display()
             ));
             continue;
         }
         for name in CACHE_DIRS {
-            let dir = rec.path.join(name);
+            let dir = tree.join(name);
             if !dir.is_dir() || !is_build_cache(&dir, name) {
                 continue;
             }
@@ -1271,6 +1381,7 @@ pub fn cleanup_run(state: &RunState, force: bool) -> Result<Vec<WorktreeCleanup>
             archived,
         });
     }
+    report.extend(remove_reviewer_area(state));
     Ok(report)
 }
 
@@ -1637,6 +1748,69 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// #158: a reviewer works in a detached checkout of its own, reused and forced onto
+    /// each round's panel head, so nothing it does moves the implementer's branch.
+    #[test]
+    fn reviewer_checkouts_are_detached_reused_and_never_move_the_impl_branch() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        fixture_git(&root, &["init", "-q"]);
+        fixture_git(&root, &["config", "user.email", "t@t.com"]);
+        fixture_git(&root, &["config", "user.name", "t"]);
+        std::fs::write(root.join("README"), "x").unwrap();
+        fixture_git(&root, &["add", "."]);
+        fixture_git(&root, &["commit", "-q", "-m", "init"]);
+        let mut state = RunState::new("r1", crate::cli::WorkflowKind::Loop, root.clone());
+        let rec = create_worktree(&root, "r1", "impl", None).unwrap();
+        state.worktrees.push(rec.clone());
+        let commit = |msg: &str| {
+            std::fs::write(rec.path.join(format!("{msg}.txt")), msg).unwrap();
+            fixture_git(&rec.path, &["add", "."]);
+            fixture_git(&rec.path, &["commit", "-q", "-m", msg]);
+            fixture_git(&rec.path, &["rev-parse", "HEAD"])
+        };
+        let head1 = commit("one");
+
+        let rc = reviewer_checkout(&state, "review-0-cli-codex", &head1, &[]).unwrap();
+        let area = reviewer_area(&root, "r1").unwrap();
+        assert_eq!(rc, area.join("review-0-cli-codex"));
+        assert_eq!(fixture_git(&rc, &["rev-parse", "HEAD"]), head1);
+        assert_eq!(named_head(&rc), None, "detached");
+
+        fixture_git(&rc, &["checkout", "-q", "-b", "review-x"]);
+        std::fs::write(rc.join("evil.txt"), "evil").unwrap();
+        fixture_git(&rc, &["add", "."]);
+        fixture_git(&rc, &["commit", "-q", "-m", "evil"]);
+        std::fs::write(rc.join("scratch.txt"), "left behind").unwrap();
+        assert_eq!(named_head(&rec.path).as_deref(), Some("spar/r1/impl"));
+        assert_eq!(fixture_git(&rec.path, &["rev-parse", "HEAD"]), head1);
+
+        let head2 = commit("two");
+        let again = reviewer_checkout(&state, "review-0-cli-codex", &head2, &[]).unwrap();
+        assert_eq!(again, rc, "reused across rounds");
+        assert_eq!(fixture_git(&rc, &["rev-parse", "HEAD"]), head2);
+        assert_eq!(named_head(&rc), None);
+        assert!(!rc.join("evil.txt").exists());
+        assert!(!rc.join("scratch.txt").exists());
+
+        assert_eq!(
+            reviewer_build_env(&state, &rc),
+            vec![(
+                "CARGO_TARGET_DIR".to_string(),
+                area.join("target").display().to_string()
+            )]
+        );
+        assert!(reviewer_build_env(&state, &rec.path).is_empty());
+        state.isolation = IsolationMode::WorktreeBwrap;
+        assert!(reviewer_build_env(&state, &rc).is_empty());
+
+        let report = cleanup_run(&state, false).unwrap();
+        assert!(report.iter().any(|r| r.slot_id == "reviewers" && r.removed));
+        assert!(!area.exists());
+        assert!(!fixture_git(&root, &["worktree", "list"]).contains("reviewers"));
     }
 
     /// A repo with production source, plus a test-author and an implementer worktree cut
