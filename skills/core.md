@@ -291,6 +291,10 @@ spar plan --run <run_id> -t "narrow it to the email path" [--json]
 spar run --workflow plan|loop|arena|roles|peer|review -t "..." --providers cli:claude,cli:grok [--dry-run] [--big]
 spar run --workflow arena -t "..." --select best --urgency normal --dry-run
 
+# An empty or whitespace-only task exits 1 before any run id is minted: `-t ""` and an
+# empty --brief with `error: task is empty`, an empty --spec with `brief body is empty`.
+# `plan --run <id>` with an empty directive exits 1 with `replan directive is empty`.
+
 # Independent concurrent multi-provider review (not split-stack peer):
 spar run --workflow review -t "Review PR #12 for auth bugs" --providers cli:claude,cli:grok
 
@@ -593,6 +597,10 @@ children — so they keep running and keep spending tokens with nobody collectin
 - `spar resume <id>` picks an abandoned or stopped run back up without you having to know
   which of `implement --run` / a fresh dispatch applies — it refuses a human gate (naming
   the command that resolves it) and a run with a live orchestrator (naming its pid).
+  `implement --run <id>` (with or without `--detach` / `--reload-config`) refuses the same
+  way, exit 1, before it writes anything to the live run's `state.json`.
+- A foreground `spar plan` holds the run lock for its whole dispatch, so it never reads
+  abandoned while its planner works.
 - `spar daemon start` runs a per-project supervisor that pushes an alert the first time a
   run has read abandoned past `[daemon].abandon_after_secs` (60s by default), and restarts
   it if `[daemon].restart` is on (the default). It is opt-in — nothing starts it for you —
@@ -842,7 +850,7 @@ event/presence mirror live under `.spar/runs/<id>/bus/`.
 ## Observe
 
 ```bash
-spar status [run_id] [--json] [--all]   # --all = every registered project
+spar status [run_id] [--json] [--all]   # --all = every registered project; a run with a live orchestrator shows `pid=<n>`
 spar wait <run_id> [--timeout 8h] [--follow] [--json]
 spar logs <run_id> [slot] [-f|--follow]
 
