@@ -118,7 +118,7 @@ const PR_BODY_MAX: usize = 65_000;
 /// PR body: the shipped slot's summary, the OPEN questions it lists, and each reviewer's
 /// final verdict. Questions and verdicts come first so truncation only ever eats the tail
 /// of the summary.
-fn pr_body(paths: &SparPaths, state: &RunState, branch: &str) -> String {
+fn pr_body(paths: &SparPaths, state: &RunState, branch: &str, cwd: &Path) -> String {
     let shipped = state
         .worktrees
         .iter()
@@ -151,6 +151,16 @@ fn pr_body(paths: &SparPaths, state: &RunState, branch: &str) -> String {
         body.push_str("\n## Review\n\n");
         for line in reviews {
             body.push_str(&line);
+            body.push('\n');
+        }
+    }
+    // The run reached the ship gate, so none of these held it: minors under `block_on`,
+    // follow-ups, notes on an approving review. They are the work this PR leaves (O118).
+    let open = crate::workflow::review_result::open_findings(state, cwd);
+    if !open.is_empty() {
+        body.push_str("\n## Open findings (non-blocking)\n\n");
+        for f in open {
+            body.push_str(&f.line());
             body.push('\n');
         }
     }
@@ -543,7 +553,7 @@ pub fn ship(
                 pr_base.as_deref().unwrap_or("(repo default)"),
                 commands.join("\n"),
                 pr_title(state.task.as_deref(), cfg.ship.title_max),
-                pr_body(paths, &state, &branch)
+                pr_body(paths, &state, &branch, &cwd)
             ),
         )?;
         state.set_phase(Phase::Done);
@@ -587,7 +597,7 @@ pub fn ship(
     );
 
     let commands = vec![push_cmd, list_cmd, pr_cmd];
-    let body = pr_body(paths, &state, &branch);
+    let body = pr_body(paths, &state, &branch, &cwd);
     std::fs::write(&body_file, &body)?;
     state.ship_commands = Some(commands.clone());
     state.set_phase(Phase::Shipping);
@@ -1107,7 +1117,7 @@ mod tests {
         )
         .unwrap();
 
-        let body = pr_body(&paths, &state, "spar/rb1/impl");
+        let body = pr_body(&paths, &state, "spar/rb1/impl", tmp.path());
         assert!(body.starts_with("Shipped by spar run `rb1`."), "{body}");
         assert!(
             body.contains(
@@ -1131,18 +1141,59 @@ mod tests {
         assert!(open < body.find("## Implementer summary").unwrap());
     }
 
+    /// O118: the minors and follow-ups the last panel left go into the PR body, from the
+    /// recorded reviews, and before the summary so truncation cannot eat them.
+    #[test]
+    fn pr_body_lists_the_last_panels_open_findings() {
+        let tmp = tempdir().unwrap();
+        let (paths, mut state) = body_state(tmp.path());
+        let parse = crate::workflow::review_result::parse_review;
+        for (round, slot, body) in [
+            (2, "review-1", "## Verdict\nrequest_changes\n## Findings\n- severity: major — fixed long ago\n"),
+            (3, "review-1", "## Verdict\nrequest_changes\n## Findings\n- severity: minor — stale doc at src/a.rs:9\n"),
+            (3, "review-2", "## Verdict\napprove\n## Follow-up\n- severity: major — split the parser later\n"),
+        ] {
+            state.review_history.push(crate::state::ReviewHistoryEntry {
+                round,
+                slot_id: slot.into(),
+                review: parse(body),
+            });
+        }
+        let body = pr_body(&paths, &state, "spar/rb1/impl", tmp.path());
+        let section = body
+            .split("## Open findings (non-blocking)\n\n")
+            .nth(1)
+            .unwrap_or_else(|| panic!("{body}"));
+        assert!(
+            section.starts_with("- minor `src/a.rs:9` (review-1): stale doc"),
+            "{body}"
+        );
+        assert!(
+            section.contains("- major follow-up (review-2): split the parser later"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("fixed long ago"),
+            "an earlier round is not open: {body}"
+        );
+        assert!(
+            body.find("## Open findings").unwrap() < body.find("## Implementer summary").unwrap()
+        );
+    }
+
     #[test]
     fn pr_body_without_a_summary_or_reviews_says_so() {
         let tmp = tempdir().unwrap();
         let (paths, mut state) = body_state(tmp.path());
         state.slots.clear();
-        let body = pr_body(&paths, &state, "spar/rb1/impl");
+        let body = pr_body(&paths, &state, "spar/rb1/impl", tmp.path());
         assert!(
             body.contains("_No implementer summary was written._"),
             "{body}"
         );
         assert!(!body.contains("## Review"), "{body}");
         assert!(!body.contains("## Open questions"), "{body}");
+        assert!(!body.contains("## Open findings"), "{body}");
     }
 
     #[test]
@@ -1157,7 +1208,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let body = pr_body(&paths, &state, "spar/rb1/impl");
+        let body = pr_body(&paths, &state, "spar/rb1/impl", tmp.path());
         assert!(body.chars().count() <= 65_536, "{}", body.chars().count());
         assert!(body.contains("- keep me"));
         assert!(
@@ -1554,6 +1605,7 @@ mod tests {
             line,
             text: text.into(),
             synthetic: false,
+            follow_up: false,
         }
     }
 
@@ -1620,7 +1672,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let (paths, mut state) = body_state(tmp.path());
         std::fs::write(paths.artifact("rb1", "summary-impl.md"), "did it\n").unwrap();
-        assert!(!pr_body(&paths, &state, "spar/rb1/impl").contains("Shipped over"));
+        assert!(!pr_body(&paths, &state, "spar/rb1/impl", tmp.path()).contains("Shipped over"));
         state.ship_override = Some(ShipOverride {
             who: "op".into(),
             at: chrono::Utc::now(),
@@ -1638,7 +1690,7 @@ mod tests {
                 ),
             }],
         });
-        let body = pr_body(&paths, &state, "spar/rb1/impl");
+        let body = pr_body(&paths, &state, "spar/rb1/impl", tmp.path());
         let section = body.find("## Shipped over open findings").expect(&body);
         assert!(section < body.find("## Implementer summary").unwrap());
         assert!(body.contains("overridden by op at "), "{body}");

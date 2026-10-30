@@ -12,6 +12,8 @@ You did NOT write this code. Find real bugs, missing tests, and regressions.
 {{test_contract_body}}
 {{contract_drift_note}}
 
+{{operator_rulings}}
+
 ## Paths
 - Code under review (worktree): {{review_cwd}}
 - Write review to: {{artifacts_dir}}/review-{{slot_id}}.md
@@ -22,6 +24,7 @@ You did NOT write this code. Find real bugs, missing tests, and regressions.
 
 {{suite_guidance}}
 
+{{prior_findings}}
 ## Review format
 Write the artifact early and iteratively — partial findings are better than nothing if you run out of time.
 
@@ -46,6 +49,7 @@ Rules:
 - At the moment you read the diff, run `git rev-parse HEAD` in the code-under-review worktree and paste the full sha on the `Reviewed-Commit:` line. A verdict that names no commit cannot be counted: the gate treats it exactly like a missing review.
 - Every `AC-n` in the acceptance contract above must appear in `## Acceptance` **exactly once**. A criterion you omit blocks the ship exactly like a `fail`.
 - `unverified` means you could not check it — not that it looks fine. By default it blocks.
+- Severity rubric. **critical**: data loss, a security hole, or a crash or corruption on a normal path. **major**: any other wrong behaviour, a broken or unmet requirement, a regression, a missing test for behaviour the change claims. **minor**: only polish, naming, style, comments, or an optional test gap. Anything that makes the code do the wrong thing is major or above, however small the fix. Minor never blocks the ship; spar lists minors in the PR body for later. Tag every finding with one of these three words.
 - Evidence is mandatory for `pass`.
 - Keep long command output out of your context: redirect any build or test run to `{{artifacts_dir}}/check-{{slot_id}}.log` (slot-scoped: other slots share this dir) and read back the tail, or grep it for the failure. Read enough of it to cite real lines — thin reading is not grounds for `unverified`.
 - Write `## Verdict` once, and put `approve` or `request_changes` on the line under it. Do not restate this format block in your output.
