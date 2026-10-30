@@ -557,6 +557,19 @@ unpushed branch falls through to the repo default, with a note on stderr. `spar 
 --base <branch>` forces a target. The chosen target is recorded in `artifacts/ship.md`
 (`PR base:`), on the dry-run path too.
 
+`spar ship` pushes the slot worktree's **HEAD** to `spar/<id>/<slot>`, never the branch by
+name, and **never rewinds the remote branch**. Before pushing it fetches the remote branch;
+if the remote has commits HEAD lacks (someone pushed by hand), ship exits `1` with "remote
+<branch> has commits the run lacks": fast-forward the worktree onto `origin/<branch>` by hand
+and ship again. The push is leased on the exact tip it fetched, so a push landing in between
+also fails. If the worktree was left on another branch (a reviewer's, or detached), ship
+pushes HEAD when HEAD contains the run's branch and that branch has moved past the run's
+base (note on stderr), and refuses otherwise. A refusal exits `1`, leaves the phase at
+`awaiting_ship_confirm`, and records the reason in the run's `error`. The loop workflow also
+fast-forwards the implementer's branch back onto HEAD before each review panel when a slot
+left the worktree elsewhere, and only warns (stderr + event log) when that is not a
+fast-forward, the branch is still at the base, or it is checked out in another worktree.
+
 ## Abandoned runs
 
 A run is **abandoned** when it is still in a non-resting phase but no live orchestrator
