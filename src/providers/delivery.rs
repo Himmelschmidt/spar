@@ -100,7 +100,13 @@ pub fn deliver(
         });
     }
 
-    let msgs = bus::inbox_claim(paths, agent)?;
+    let via = match strategy {
+        DeliveryStrategy::StopHookInject => "stop_hook",
+        DeliveryStrategy::NativeQueuePollFallback => "native_queue",
+        DeliveryStrategy::PollFile => "poll_file",
+        DeliveryStrategy::None => unreachable!("None handled above"),
+    };
+    let msgs = bus::inbox_claim(paths, agent, via)?;
     if msgs.is_empty() {
         return Ok(Delivery {
             strategy,
@@ -114,6 +120,9 @@ pub fn deliver(
 
     let (action, payload) = match strategy {
         DeliveryStrategy::StopHookInject => {
+            for m in &msgs {
+                bus::record_receipt(paths, &m.id, agent, bus::ReceiptEvent::Read, via);
+            }
             (DeliveryAction::StopHookBlock, Some(block_payload(&msgs)))
         }
         DeliveryStrategy::NativeQueuePollFallback => {
@@ -365,6 +374,8 @@ pub fn nudge(
                         subject: Some("spar nudge".into()),
                         refs: bus::MsgRefs::default(),
                         requires_ack: false,
+                        persist: false,
+                        expires_after_round: None,
                         meta: std::collections::HashMap::new(),
                     },
                     // Nudges are spar's own control channel; they must not be dropped
@@ -477,7 +488,7 @@ mod tests {
         assert_eq!(d.delivered, 0);
         assert_eq!(d.pending, 2);
         // The agent must still be able to claim them itself.
-        assert_eq!(bus::inbox_claim(&paths, &ub).unwrap().len(), 2);
+        assert_eq!(bus::inbox_claim(&paths, &ub, "test").unwrap().len(), 2);
     }
 
     #[test]
@@ -500,7 +511,7 @@ mod tests {
         assert_eq!(d.delivered, 2);
         assert!(!poll_file(&paths, Some("r1"), &ub).exists());
         // But the drain is real (exactly-once): nothing remains to claim.
-        assert!(bus::inbox_claim(&paths, &ub).unwrap().is_empty());
+        assert!(bus::inbox_claim(&paths, &ub, "test").unwrap().is_empty());
     }
 
     #[test]

@@ -241,6 +241,7 @@ mod tests {
             source: None,
             auth_fault: false,
             build_cache: None,
+            former_ids: Vec::new(),
         }
     }
 

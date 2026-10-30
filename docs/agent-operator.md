@@ -58,6 +58,10 @@ caught, which is what the sweep is for.
   phase of that run reads the snapshot, so another agent's edit cannot change its fleet,
   timeouts, spec/suite channels, or ship gate. `spar implement --run <id> --reload-config`
   re-reads the file and re-freezes; `--role` on a resume without it exits `1`.
+- **`--reassign <role|seat>=<provider>`** on `implement --run <id>` moves a seat that already
+  exists to another provider on the same worktree and branch (a reload only changes a
+  seat's model). Operator-only; refused while the run's orchestrator is alive and onto a
+  paused provider (O136).
 
 ## Base ref
 

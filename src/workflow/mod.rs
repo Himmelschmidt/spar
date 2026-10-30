@@ -45,6 +45,9 @@ pub struct CommonOpts {
     /// `--key`: the idempotency key a NEW run is minted with. Checked before minting by
     /// `runkey::guard`; never applied to a run that already exists.
     pub key: Option<String>,
+    /// `--reassign <role|seat>=<provider>`: move existing seats of `--run <id>` to
+    /// another provider before this re-entry dispatches (O136).
+    pub reassign: Vec<String>,
 }
 
 impl Default for CommonOpts {
@@ -64,6 +67,7 @@ impl Default for CommonOpts {
             max_rounds: None,
             accept_contract: false,
             key: None,
+            reassign: Vec::new(),
         }
     }
 }
@@ -110,6 +114,7 @@ impl CommonOpts {
                     prev_phase: None,
                     slot: None,
                     status: None,
+                    round: None,
                     message: Some(format!(
                         "model-select: {}",
                         art.choices

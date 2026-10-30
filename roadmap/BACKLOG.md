@@ -119,9 +119,10 @@ that for finished runs. These two reduce how much gets created in the first plac
 - **Non-building roles do not need a build-capable worktree** — planner, plan_critic and
   reviewers emit markdown and produced no `target/` in any tree on the box, ever.
   Lower payoff than it looks, and partly already done:
-  - In the **loop** workflow reviewers already share the implementer's cwd
-    (`implement.rs`, "Only isolate the implementer; reviewers share its cwd") — only the
-    standalone `review` workflow cuts one per reviewer (`review.rs`).
+  - In the **loop** workflow reviewers now get a detached checkout each, sharing one
+    per-run `CARGO_TARGET_DIR` (O138), so they cost a source checkout per seat plus one
+    reviewer build cache per run; the standalone `review` workflow cuts one worktree per
+    reviewer (`review.rs`).
   - What remains is planner + plan_critic + standalone-review reviewers at ~40 MB each:
     tens of MB, so the value is preventing a future accidental compile, not reclaiming.
   - Not free: dropping the worktree makes cwd fall back to `project_root`, which is the

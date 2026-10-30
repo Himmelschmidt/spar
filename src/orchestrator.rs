@@ -207,6 +207,8 @@ pub fn say(
         subject: None,
         refs: crate::bus::MsgRefs::default(),
         requires_ack: false,
+        persist: false,
+        expires_after_round: None,
         meta,
     };
     crate::bus::send(paths, msg, crate::bus::MessageBudget::Chatty)
@@ -1260,6 +1262,8 @@ mod tests {
             subject: None,
             refs: crate::bus::MsgRefs::default(),
             requires_ack: false,
+            persist: false,
+            expires_after_round: None,
             meta: meta.clone(),
         };
         assert!(is_conversation_message(&msg));
@@ -1308,6 +1312,8 @@ mod tests {
             subject: None,
             refs: crate::bus::MsgRefs::default(),
             requires_ack: false,
+            persist: false,
+            expires_after_round: None,
             meta: meta.clone(),
         };
         crate::bus::send(&paths, reply, crate::bus::MessageBudget::Chatty).unwrap();
@@ -1381,6 +1387,8 @@ mod tests {
             subject: None,
             refs: crate::bus::MsgRefs::default(),
             requires_ack: false,
+            persist: false,
+            expires_after_round: None,
             meta: meta.clone(),
         };
         crate::bus::send(&paths, human_to_agent, crate::bus::MessageBudget::Chatty).unwrap();
@@ -1407,6 +1415,8 @@ mod tests {
                 subject: None,
                 refs: crate::bus::MsgRefs::default(),
                 requires_ack: false,
+                persist: false,
+                expires_after_round: None,
                 meta: stale_meta,
             },
             crate::bus::MessageBudget::Chatty,
@@ -1433,6 +1443,8 @@ mod tests {
                 subject: None,
                 refs: crate::bus::MsgRefs::default(),
                 requires_ack: false,
+                persist: false,
+                expires_after_round: None,
                 meta: correct_meta.clone(),
             },
             crate::bus::MessageBudget::Chatty,
@@ -1452,6 +1464,8 @@ mod tests {
                 subject: None,
                 refs: crate::bus::MsgRefs::default(),
                 requires_ack: false,
+                persist: false,
+                expires_after_round: None,
                 meta: correct_meta.clone(),
             },
             crate::bus::MessageBudget::Chatty,

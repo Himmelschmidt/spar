@@ -211,6 +211,33 @@ pub struct QuotaStore {
     /// Keys this process changed, which `save` merges into the fleet file.
     #[serde(skip)]
     touched: std::collections::BTreeSet<String>,
+    /// Pauses made since load, appended to `quota-events.jsonl` by `save`.
+    #[serde(skip)]
+    pending: Vec<QuotaEvent>,
+}
+
+pub const QUOTA_EVENTS_SCHEMA: u32 = 1;
+
+/// One line of `.spar/quota-events.jsonl`: a provider paused, by an operator or on a
+/// quota signal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaEvent {
+    pub schema_version: u32,
+    pub ts: DateTime<Utc>,
+    pub provider: String,
+    pub manual: bool,
+    #[serde(default)]
+    pub until: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub hint: Option<String>,
+}
+
+pub fn read_events(paths: &SparPaths) -> Vec<QuotaEvent> {
+    std::fs::read_to_string(paths.quota_events_file())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
 }
 
 impl QuotaStore {
@@ -232,11 +259,25 @@ impl QuotaStore {
         Ok(store)
     }
 
-    pub fn save(&self, paths: &SparPaths) -> Result<()> {
+    pub fn save(&mut self, paths: &SparPaths) -> Result<()> {
         paths.ensure_swarm_root()?;
         let file = paths.quota_file();
         let text = serde_json::to_string_pretty(self)?;
         std::fs::write(&file, text).with_context(|| format!("write {}", file.display()))?;
+        if !self.pending.is_empty() {
+            let mut lines = String::new();
+            for ev in self.pending.drain(..) {
+                lines.push_str(&serde_json::to_string(&ev)?);
+                lines.push('\n');
+            }
+            let path = paths.quota_events_file();
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, lines.as_bytes()))
+                .with_context(|| format!("append {}", path.display()))?;
+        }
         if self.touched.is_empty() {
             return Ok(());
         }
@@ -258,6 +299,24 @@ impl QuotaStore {
             crate::fleet::warn_once(&e);
         }
         Ok(())
+    }
+
+    /// Logs a pause only when it starts one: a provider already held by a live pause of
+    /// the same kind is the same pause re-stated, not a new event.
+    fn note_pause(&mut self, name: &str, manual: bool, until: Option<DateTime<Utc>>, hint: &str) {
+        let held = !self.is_usable(name);
+        let was_manual = self.get(name).status == ProviderStatus::PausedManual;
+        if held && was_manual == manual {
+            return;
+        }
+        self.pending.push(QuotaEvent {
+            schema_version: QUOTA_EVENTS_SCHEMA,
+            ts: Utc::now(),
+            provider: name.into(),
+            manual,
+            until,
+            hint: Some(hint.into()),
+        });
     }
 
     fn insert(&mut self, mut q: ProviderQuota) {
@@ -323,6 +382,7 @@ impl QuotaStore {
     }
 
     pub fn pause_manual(&mut self, name: &str, until: Option<DateTime<Utc>>) {
+        self.note_pause(name, true, until, "manual pause");
         self.insert(ProviderQuota {
             name: name.into(),
             status: ProviderStatus::PausedManual,
@@ -340,11 +400,13 @@ impl QuotaStore {
             return;
         }
         let strong = self.is_quota_paused(name) && self.get(name).strong;
+        let hint = hint.into();
+        self.note_pause(name, false, None, &hint);
         self.insert(ProviderQuota {
             name: name.into(),
             status: ProviderStatus::PausedQuota,
             cooldown_until: None,
-            hint: Some(hint.into()),
+            hint: Some(hint),
             updated_at: Some(Utc::now()),
             sticky: false,
             strong,
@@ -362,6 +424,8 @@ impl QuotaStore {
             return;
         }
         let strong = self.is_quota_paused(name) && self.get(name).strong;
+        let hint = hint.into();
+        self.note_pause(name, false, until, &hint);
         self.insert(ProviderQuota {
             name: name.into(),
             status: if until.is_some() {
@@ -370,7 +434,7 @@ impl QuotaStore {
                 ProviderStatus::PausedQuota
             },
             cooldown_until: until,
-            hint: Some(hint.into()),
+            hint: Some(hint),
             updated_at: Some(Utc::now()),
             sticky: false,
             strong,
@@ -900,6 +964,36 @@ pub fn ensure_usable(paths: &SparPaths, names: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// Each pause, quota or manual, lands one line in `quota-events.jsonl` on save;
+    /// re-stating a live pause (another 429, a typed reset), a resume or a second save
+    /// adds none.
+    #[test]
+    fn pauses_are_logged_once_on_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::SparPaths::new(tmp.path());
+        let mut store = super::QuotaStore::default();
+        store.pause_quota("cli:codex", "429");
+        store.pause_quota("cli:codex", "429 again");
+        store.pause_quota_until(
+            "cli:codex",
+            Some(Utc::now() + chrono::Duration::hours(1)),
+            "typed",
+        );
+        store.pause_manual("cli:claude", None);
+        store.save(&paths).unwrap();
+        let mut again = super::QuotaStore::load(&paths).unwrap();
+        again.pause_quota("cli:codex", "still limited");
+        again.save(&paths).unwrap();
+        store.resume("cli:codex");
+        store.save(&paths).unwrap();
+        let evs = super::read_events(&paths);
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[0].provider, "cli:codex");
+        assert!(!evs[0].manual);
+        assert_eq!(evs[0].hint.as_deref(), Some("429"));
+        assert!(evs[1].manual);
+        assert_eq!(evs[1].schema_version, super::QUOTA_EVENTS_SCHEMA);
+    }
 
     /// A stated reset gives a wall-clock time and no calendar day. Inferring the next
     /// occurrence is sound for a five-hour window and a fabrication for a weekly one,

@@ -9,6 +9,7 @@ mod muse;
 pub mod muse_telemetry;
 mod pi;
 pub mod presence;
+pub mod usage;
 
 use crate::provider_ref::{ExecBackend, ProviderRef};
 use serde::Serialize;

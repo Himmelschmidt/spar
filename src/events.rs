@@ -22,6 +22,10 @@ pub struct Event {
     pub status: Option<SlotStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// The run's round when a phase event was written. Slot events carry none; they
+    /// belong to the round of the phase event before them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +47,7 @@ impl Event {
             slot: None,
             status: None,
             message: None,
+            round: None,
         }
     }
 
@@ -55,6 +60,7 @@ impl Event {
             slot: Some(slot.into()),
             status: Some(status),
             message: None,
+            round: None,
         }
     }
 
@@ -67,6 +73,7 @@ impl Event {
             slot: None,
             status: None,
             message: Some(message.into()),
+            round: None,
         }
     }
 
@@ -82,6 +89,7 @@ impl Event {
             slot: Some(slot.into()),
             status: None,
             message: Some(message.into()),
+            round: None,
         }
     }
 
@@ -94,6 +102,7 @@ impl Event {
             slot: None,
             status: None,
             message: Some(message.into()),
+            round: None,
         }
     }
 
