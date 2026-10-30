@@ -61,8 +61,9 @@ impl ProviderAdapter for MuseAdapter {
     }
 
     // `muse exec --json` emits an event-envelope JSONL (`payload_type` + `stream`) which
-    // the stream coalescer renders, but it carries **no** token usage. Usage lands only
-    // in muse's session log, which `muse_telemetry` sums after the slot exits.
+    // the stream coalescer renders. Since muse 1.4.14 it carries one `run.usage` record,
+    // but for the main session only (`children_included: false`), so spar ignores it and
+    // `muse_telemetry` sums muse's session log, subagents included, after the slot exits.
     // Presence and injection ride muse's project hook file (`.muse/hooks.json`), wired
     // by `providers::presence` from the same four transitions as Claude
     // (`UserPromptSubmit`/`PreToolUse` to `working`, `Notification` to `blocked`,

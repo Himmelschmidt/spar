@@ -67,8 +67,10 @@ impl FromStr for EffortLevel {
 
 /// The rungs `cli_name` accepts, or `None` when the CLI takes a free string
 /// (opencode's `--variant`) or spar knows no vocabulary for the name. Verified
-/// against the versions on this box: `claude --help`, grok's vendored docs
-/// (`none` through `max`), `muse exec --help`, `agy --help`.
+/// against the versions on this box: `claude --help`, `muse exec --help`, and
+/// `agy --help` (agy 1.4.9 lists `low|medium|high|xhigh|max`). grok 1.0.70
+/// gates the flag client-side and refuses anything else before spawning a
+/// turn: `unknown effort level 'bogus'; use one of: xhigh, high, medium, low`.
 ///
 /// **codex is the union, and it is the honest limit of what this table can
 /// express.** codex has no client-side gate — it forwards `-c
@@ -84,14 +86,14 @@ impl FromStr for EffortLevel {
 pub fn accepted_levels(cli_name: &str) -> Option<&'static [&'static str]> {
     match cli_name {
         "claude" => Some(&["low", "medium", "high", "xhigh", "max"]),
-        "grok" => Some(&["none", "minimal", "low", "medium", "high", "xhigh", "max"]),
+        "grok" => Some(&["low", "medium", "high", "xhigh"]),
         "muse" => Some(&[
             "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
         ]),
         "codex" => Some(&[
             "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
         ]),
-        "agy" => Some(&["low", "medium", "high"]),
+        "agy" => Some(&["low", "medium", "high", "xhigh", "max"]),
         _ => None,
     }
 }
@@ -151,20 +153,25 @@ mod tests {
         );
         assert_eq!(
             accepted_levels("grok"),
-            Some(&["none", "minimal", "low", "medium", "high", "xhigh", "max"][..])
+            Some(&["low", "medium", "high", "xhigh"][..])
         );
         assert_eq!(accepted_levels("muse"), Some(EffortLevel::all()));
         assert_eq!(
             accepted_levels("codex"),
             Some(&["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"][..])
         );
-        assert_eq!(accepted_levels("agy"), Some(&["low", "medium", "high"][..]));
+        assert_eq!(
+            accepted_levels("agy"),
+            Some(&["low", "medium", "high", "xhigh", "max"][..])
+        );
         assert_eq!(accepted_levels("opencode"), None);
     }
 
     #[test]
     fn check_accepts_in_vocab() {
         check_compatible("agy", EffortLevel::Low).unwrap();
+        check_compatible("agy", EffortLevel::Max).unwrap();
+        check_compatible("grok", EffortLevel::Xhigh).unwrap();
         check_compatible("codex", EffortLevel::Xhigh).unwrap();
         // Probed live against codex 0.153.4 with `-m gpt-5.6-terra`: both
         // completed normally. codex validates per model, server-side.
@@ -176,18 +183,34 @@ mod tests {
 
     #[test]
     fn check_refuses_out_of_vocab_naming_levels() {
-        // grok's only out-of-vocab rung: canonical levels run none..max.
-        let err = check_compatible("grok", EffortLevel::Ultra).unwrap_err();
-        assert_eq!(
-            format!("{err:#}"),
-            "effort 'ultra' not accepted by cli:grok (takes: none, minimal, low, medium, high, xhigh, max)"
-        );
         let err = check_compatible("agy", EffortLevel::Ultra).unwrap_err();
         assert_eq!(
             format!("{err:#}"),
-            "effort 'ultra' not accepted by cli:agy (takes: low, medium, high)"
+            "effort 'ultra' not accepted by cli:agy (takes: low, medium, high, xhigh, max)"
         );
         let err = check_compatible("claude", EffortLevel::None).unwrap_err();
         assert!(format!("{err:#}").contains("cli:claude"), "{err:#}");
+    }
+
+    /// grok 1.0.70 exits with this before any turn starts, so a rung spar passed
+    /// through would fail the dispatch as if the agent had failed.
+    #[test]
+    fn grok_refuses_every_rung_its_cli_rejects() {
+        let grok_says = "--effort/--reasoning-effort: unknown effort level 'bogus'; use one of: xhigh, high, medium, low";
+        for rung in EffortLevel::all() {
+            let level: EffortLevel = rung.parse().unwrap();
+            let cli_takes = grok_says.contains(&format!(" {rung},"))
+                || grok_says.ends_with(&format!(" {rung}"));
+            assert_eq!(
+                check_compatible("grok", level).is_ok(),
+                cli_takes,
+                "grok rung {rung}"
+            );
+        }
+        let err = check_compatible("grok", EffortLevel::Max).unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "effort 'max' not accepted by cli:grok (takes: low, medium, high, xhigh)"
+        );
     }
 }

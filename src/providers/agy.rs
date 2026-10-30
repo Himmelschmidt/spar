@@ -11,17 +11,16 @@ impl ProviderAdapter for AgyAdapter {
         "agy"
     }
 
-    // No turn-boundary push spar drives (verified against agy 1.2.5: still no
-    // `hooks` subcommand), so messages wait for the next turn and presence is
-    // degraded to the process/output heuristic. Note 1.2.5 does add a real
-    // injection channel spar deliberately does not wire: `--input-format
-    // stream-json` reads one NDJSON message per line from stdin and runs a turn
-    // for each, which would make `DeliveryStrategy::None` no longer forced.
-    // But spar spawns detached with stdin null and never feeds it, so the
-    // channel stays unused. `--output-format stream-json` (build_headless below)
-    // does give us a structured event stream, but it's parsed for telemetry
-    // (StreamCoalescer::handle_agy in process.rs), not a channel for mid-turn
-    // injection. Also deliberately not wired, each its own decision: `--effort`,
+    // No turn-boundary push spar drives, so messages wait for the next turn and
+    // presence is degraded to the process/output heuristic. agy does have hooks
+    // (agy 1.4.9 changelog: workspace `<workspace>/.agents/hooks.json` with
+    // `Stop`, pre-tool and `PostToolUse` events), but spar has not probed their
+    // stdin shape or block semantics, so they stay unwired. `--input-format
+    // stream-json` is a second unwired channel: it reads one NDJSON message per
+    // line from stdin and runs a turn for each, but spar spawns detached with
+    // stdin null. `--output-format stream-json` (build_headless below) is parsed
+    // for telemetry (StreamCoalescer::handle_agy in process.rs), not a channel
+    // for mid-turn injection. Also deliberately not wired, each its own decision:
     // `--json-schema`, `--add-dir`, `--sandbox`, `--conversation`/`--continue`
     // (see `supports_resume`). `cli:agy` is out of both fleets on this machine.
     fn delivery_strategy(&self) -> DeliveryStrategy {
@@ -75,13 +74,12 @@ impl ProviderAdapter for AgyAdapter {
         // as `--print <value>`, and put caller `extra_args` LAST — a stray positional there
         // is then a harmless trailing arg, not something that swallows `--print`.
         let mut cmd = Command::new(bin);
-        // Print timeout = the resolved slot budget so agy runs the full wall clock the
-        // orchestrator granted it, not the short built-in default (5m0s on agy 1.2.5)
-        // that silently kills long slots. Shave a small margin so agy hits its own
-        // timeout and exits cleanly a beat before spar's process backstop (same
-        // budget) SIGKILLs it mid-write. Go durations require a unit ("1800" alone
-        // is rejected as `missing unit in duration`); fall back to 1800s when no
-        // budget was supplied.
+        // Print timeout = the resolved slot budget, shaved by a small margin so agy
+        // hits its own timeout and exits cleanly a beat before spar's process
+        // backstop (same budget) SIGKILLs it mid-write. agy's own default has been
+        // unlimited since 1.2.6 (`--print-timeout` 0s on 1.4.9); the flag is still
+        // passed so the two deadlines agree. Go durations require a unit ("1800" alone is rejected as `missing
+        // unit in duration`); fall back to 1800s when no budget was supplied.
         let print_timeout = opts
             .timeout_secs
             .map(|s| format!("{}s", if s > 20 { s - 10 } else { s }))

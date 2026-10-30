@@ -1520,8 +1520,10 @@ impl StreamCoalescer {
         None
     }
 
-    /// muse's stream carries no token counts at all; `providers::muse_telemetry` recovers
-    /// those from the session log after the slot exits, keyed by the session id captured here.
+    /// muse 1.4.14's stream carries one `run.usage` record, main session only
+    /// (`children_included: false`), which this does not read; `providers::muse_telemetry`
+    /// recovers usage from the session log after the slot exits, keyed by the session id
+    /// captured here.
     fn handle_muse(&mut self, payload_type: &str, v: &serde_json::Value) -> Option<String> {
         match payload_type {
             "run.model.configured" => {
@@ -3514,7 +3516,7 @@ mod tests {
             "output deltas must coalesce, not break mid-word: {out:?}"
         );
         assert!(out.contains("· done  ·  1 tools"));
-        // muse reports no usage on stdout; muse_telemetry fills these in post-exit.
+        // spar reads no usage from muse's stdout; muse_telemetry fills these in post-exit.
         assert_eq!(c.input_tokens, 0);
         assert_eq!(c.output_tokens, 0);
     }
