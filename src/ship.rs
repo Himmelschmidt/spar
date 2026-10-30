@@ -258,6 +258,8 @@ pub struct ShipOpts<'a> {
     pub base: Option<&'a str>,
     /// `--override-gate --reason`: ship from a phase the gate never cleared (O124).
     pub override_reason: Option<&'a str>,
+    /// `--adopt-remote`: fast-forward the worktree to a remote tip that moved (O125).
+    pub adopt_remote: bool,
 }
 
 /// Phases `--override-gate` ships from: the normal gates plus the ones a run reaches when
@@ -533,7 +535,13 @@ pub fn ship(
     let title = pr_title(state.task.as_deref(), cfg.ship.title_max);
     let body_file = paths.artifact(run_id, "pr-body.md");
 
-    let push_args = match push_args(&cwd, remote, &branch, state.base_commit.as_deref()) {
+    let push_args = match push_args(
+        &cwd,
+        remote,
+        &branch,
+        state.base_commit.as_deref(),
+        opts.adopt_remote,
+    ) {
         Ok(args) => args,
         Err(e) => {
             state.error = Some(format!("ship refused: {e}"));
@@ -683,10 +691,17 @@ pub fn ship(
 /// `git push` arguments that ship the worktree's HEAD (not whatever the branch name
 /// points at) to `refs/heads/<branch>`, leased on the remote tip just fetched. Refuses
 /// rather than rewind a remote branch (O10): a lease against the local tracking ref alone
-/// passes after any fetch, which is how a hand-pushed branch got reset.
-fn push_args(cwd: &Path, remote: &str, branch: &str, base: Option<&str>) -> Result<Vec<String>> {
+/// passes after any fetch, which is how a hand-pushed branch got reset. With
+/// `adopt_remote`, a remote tip ahead of HEAD is fast-forwarded into the worktree first.
+fn push_args(
+    cwd: &Path,
+    remote: &str,
+    branch: &str,
+    base: Option<&str>,
+    adopt_remote: bool,
+) -> Result<Vec<String>> {
     let on_branch = check_head_branch(cwd, branch, base)?;
-    let lease = remote_tip(cwd, remote, branch)?;
+    let lease = remote_tip(cwd, remote, branch, adopt_remote)?;
     let mut args = vec![
         "push".to_string(),
         format!(
@@ -744,8 +759,14 @@ fn check_head_branch(cwd: &Path, branch: &str, base: Option<&str>) -> Result<boo
 }
 
 /// The remote's current tip of `branch`, fetched, or `None` when the branch does not
-/// exist there. Errors when that tip is not contained in HEAD.
-fn remote_tip(cwd: &Path, remote: &str, branch: &str) -> Result<Option<String>> {
+/// exist there. Errors when that tip is not contained in HEAD, unless `adopt_remote`
+/// and the worktree can fast-forward to it.
+fn remote_tip(
+    cwd: &Path,
+    remote: &str,
+    branch: &str,
+    adopt_remote: bool,
+) -> Result<Option<String>> {
     let out = Command::new("git")
         .args([
             "ls-remote",
@@ -778,14 +799,47 @@ fn remote_tip(cwd: &Path, remote: &str, branch: &str) -> Result<Option<String>> 
     let Some(tip) = worktree::git_out(cwd, &["rev-parse", "--verify", &tracking]) else {
         bail!("could not resolve {tracking} after fetch");
     };
-    if !git_ok(cwd, &["merge-base", "--is-ancestor", &tip, "HEAD"]) {
+    if git_ok(cwd, &["merge-base", "--is-ancestor", &tip, "HEAD"]) {
+        return Ok(Some(tip));
+    }
+    if !adopt_remote {
         bail!(
-            "remote {branch} has commits the run lacks; fast-forward the worktree by hand \
-             (git -C {} merge --ff-only {remote}/{branch}) and retry ship",
+            "remote {branch} has commits the run lacks; adopt them with `spar ship <id> --adopt-remote`, \
+             which fast-forwards the worktree {} to {remote}/{branch}",
             cwd.display()
         );
     }
+    fast_forward(cwd, &tip, &format!("{remote}/{branch}"))?;
     Ok(Some(tip))
+}
+
+/// `--adopt-remote`: move the worktree to `tip` only when that is a fast-forward of a
+/// clean worktree. Anything else would drop the run's commits or the operator's edits.
+fn fast_forward(cwd: &Path, tip: &str, shown: &str) -> Result<()> {
+    if !git_ok(cwd, &["merge-base", "--is-ancestor", "HEAD", tip]) {
+        bail!(
+            "{shown} and worktree {} have diverged; --adopt-remote only fast-forwards, reconcile them by hand",
+            cwd.display()
+        );
+    }
+    let status = worktree::git_out(cwd, &["status", "--porcelain", "--untracked-files=no"]);
+    match status.as_deref() {
+        Some("") => {}
+        Some(_) => bail!(
+            "worktree {} has uncommitted changes; commit or stash them before --adopt-remote",
+            cwd.display()
+        ),
+        None => bail!("could not read the status of worktree {}", cwd.display()),
+    }
+    if !git_ok(cwd, &["merge", "--ff-only", "--quiet", tip]) {
+        bail!("git merge --ff-only {shown} failed in {}", cwd.display());
+    }
+    eprintln!(
+        "note: fast-forwarded worktree {} to {shown} ({})",
+        cwd.display(),
+        &tip[..tip.len().min(12)]
+    );
+    Ok(())
 }
 
 pub(crate) fn select_branch_cwd(state: &RunState) -> Result<(String, std::path::PathBuf)> {
@@ -1199,7 +1253,7 @@ mod tests {
         // The stale local tracking ref is exactly what the old bare lease checked.
         commit(&work, "run-work");
 
-        let err = push_args(&work, "origin", BRANCH, None)
+        let err = push_args(&work, "origin", BRANCH, None, false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("has commits the run lacks"), "{err}");
@@ -1214,7 +1268,7 @@ mod tests {
         let pushed = remote_tip_of(&origin);
         let head = commit(&work, "more");
 
-        let args = push_args(&work, "origin", BRANCH, None).unwrap();
+        let args = push_args(&work, "origin", BRANCH, None, false).unwrap();
         assert!(
             args.contains(&format!("--force-with-lease=refs/heads/{BRANCH}:{pushed}")),
             "lease must name the observed tip: {args:?}"
@@ -1231,7 +1285,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let (origin, work) = origin_and_work(tmp.path());
         commit(&work, "run-work");
-        let args = push_args(&work, "origin", BRANCH, None).unwrap();
+        let args = push_args(&work, "origin", BRANCH, None, false).unwrap();
         assert!(args.contains(&format!("--force-with-lease=refs/heads/{BRANCH}:")));
 
         let other = tmp.path().join("other");
@@ -1263,7 +1317,7 @@ mod tests {
         git_in(&work, &["checkout", "-q", "-b", "review-x"]);
         let head = commit(&work, "reviewed");
 
-        let args = push_args(&work, "origin", BRANCH, None).unwrap();
+        let args = push_args(&work, "origin", BRANCH, None, false).unwrap();
         assert!(!args.contains(&"-u".to_string()), "{args:?}");
         assert!(args.contains(&format!("HEAD:refs/heads/{BRANCH}")));
         assert!(run_push(&work, &args));
@@ -1278,7 +1332,7 @@ mod tests {
         commit(&work, "impl-work");
         git_in(&work, &["checkout", "-q", "-b", "review-x", &base]);
 
-        let err = push_args(&work, "origin", BRANCH, None)
+        let err = push_args(&work, "origin", BRANCH, None, false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("review-x"), "{err}");
@@ -1295,7 +1349,7 @@ mod tests {
         git_in(&work, &["checkout", "-q", "-b", "main"]);
         commit(&work, "unrelated");
 
-        let err = push_args(&work, "origin", BRANCH, Some(&base))
+        let err = push_args(&work, "origin", BRANCH, Some(&base), false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("never advanced past the run base"), "{err}");
@@ -1330,6 +1384,7 @@ mod tests {
             &ShipOpts {
                 base: None,
                 override_reason: None,
+                adopt_remote: false,
             },
         )
         .unwrap();
@@ -1339,6 +1394,91 @@ mod tests {
         let err = after.error.unwrap_or_default();
         assert!(err.starts_with("ship refused:"), "{err}");
         assert!(err.contains("review-x"), "{err}");
+    }
+
+    /// A remote that moved past the run, fetched into a clean worktree with nothing of
+    /// its own on top: `(origin, work, hand_tip)`.
+    fn remote_moved(tmp: &Path) -> (PathBuf, PathBuf, String) {
+        let (origin, work) = origin_and_work(tmp);
+        git_in(&work, &["push", "-q", "origin", BRANCH]);
+        git_in(
+            tmp,
+            &[
+                "clone",
+                "-q",
+                "-b",
+                BRANCH,
+                origin.to_str().unwrap(),
+                "hand",
+            ],
+        );
+        let hand = tmp.join("hand");
+        git_in(&hand, &["config", "user.email", "h@h.com"]);
+        git_in(&hand, &["config", "user.name", "h"]);
+        let hand_tip = commit(&hand, "by-hand");
+        git_in(&hand, &["push", "-q", "origin", BRANCH]);
+        (origin, work, hand_tip)
+    }
+
+    #[test]
+    fn refusal_names_adopt_remote() {
+        let tmp = tempdir().unwrap();
+        let (_origin, work, _) = remote_moved(tmp.path());
+        let err = push_args(&work, "origin", BRANCH, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--adopt-remote"), "{err}");
+    }
+
+    /// #163: `--adopt-remote` fast-forwards the worktree to the hand-pushed tip and the
+    /// push that follows is a no-op, never a rewind.
+    #[test]
+    fn adopt_remote_fast_forwards_a_clean_worktree() {
+        let tmp = tempdir().unwrap();
+        let (origin, work, hand_tip) = remote_moved(tmp.path());
+
+        let args = push_args(&work, "origin", BRANCH, None, true).unwrap();
+        assert_eq!(git_in(&work, &["rev-parse", "HEAD"]), hand_tip);
+        assert!(
+            args.contains(&format!(
+                "--force-with-lease=refs/heads/{BRANCH}:{hand_tip}"
+            )),
+            "{args:?}"
+        );
+        assert!(run_push(&work, &args));
+        assert_eq!(remote_tip_of(&origin), hand_tip);
+    }
+
+    #[test]
+    fn adopt_remote_refuses_when_not_a_fast_forward() {
+        let tmp = tempdir().unwrap();
+        let (origin, work, hand_tip) = remote_moved(tmp.path());
+        let ours = commit(&work, "run-work");
+
+        let err = push_args(&work, "origin", BRANCH, None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("diverged"), "{err}");
+        assert_eq!(git_in(&work, &["rev-parse", "HEAD"]), ours);
+        assert_eq!(remote_tip_of(&origin), hand_tip);
+    }
+
+    #[test]
+    fn adopt_remote_refuses_a_dirty_worktree() {
+        let tmp = tempdir().unwrap();
+        let (_origin, work, _) = remote_moved(tmp.path());
+        let before = git_in(&work, &["rev-parse", "HEAD"]);
+        std::fs::write(work.join("base"), "edited").unwrap();
+
+        let err = push_args(&work, "origin", BRANCH, None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("uncommitted changes"), "{err}");
+        assert_eq!(git_in(&work, &["rev-parse", "HEAD"]), before);
+        assert_eq!(
+            std::fs::read_to_string(work.join("base")).unwrap(),
+            "edited"
+        );
     }
 
     fn finding(
@@ -1467,6 +1607,7 @@ mod tests {
         ShipOpts {
             base: None,
             override_reason: Some(reason),
+            adopt_remote: false,
         }
     }
 
@@ -1504,6 +1645,7 @@ mod tests {
             &ShipOpts {
                 base: None,
                 override_reason: None,
+                adopt_remote: false
             }
         )
         .is_err());

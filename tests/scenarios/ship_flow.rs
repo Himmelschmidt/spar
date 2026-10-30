@@ -1,5 +1,6 @@
 //! Ship against a fake `gh` on PATH and a bare-repo origin: adopting an existing PR
-//! (#164), `[ship] draft`, `sync-prs` and `--override-gate` (#166).
+//! (#164), `[ship] draft`, `sync-prs`, `--override-gate` (#166) and `--adopt-remote`
+//! (#163).
 use assert_cmd::cargo::cargo_bin_cmd;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -59,6 +60,7 @@ esac
 struct Fixture {
     _tmp: tempfile::TempDir,
     root: PathBuf,
+    origin: PathBuf,
     bin: PathBuf,
     log: PathBuf,
     run_id: String,
@@ -135,6 +137,7 @@ impl Fixture {
         Fixture {
             _tmp: tmp,
             root,
+            origin,
             bin,
             log,
             run_id,
@@ -282,6 +285,69 @@ fn ship_draft_false_creates_a_ready_pr() {
         create.starts_with(&format!("pr create --head spar/{}/impl", fx.run_id)),
         "{create}"
     );
+}
+
+/// #163: the remote branch moved under the run. Plain ship refuses and leaves it alone;
+/// `--adopt-remote` fast-forwards the worktree to it and ships.
+#[test]
+fn adopt_remote_fast_forwards_then_ships() {
+    let fx = Fixture::new("");
+    let wt = fx.real_worktree();
+    let branch = format!("spar/{}/impl", fx.run_id);
+    git(
+        &wt,
+        &["push", "-q", "origin", &format!("HEAD:refs/heads/{branch}")],
+    );
+    let hand = fx._tmp.path().join("hand");
+    git(
+        fx._tmp.path(),
+        &[
+            "clone",
+            "-q",
+            "-b",
+            &branch,
+            fx.origin.to_str().unwrap(),
+            hand.to_str().unwrap(),
+        ],
+    );
+    git(&hand, &["config", "user.email", "h@h.com"]);
+    git(&hand, &["config", "user.name", "h"]);
+    std::fs::write(hand.join("hand.txt"), "by hand\n").unwrap();
+    git(&hand, &["add", "hand.txt"]);
+    git(&hand, &["commit", "-q", "-m", "by hand"]);
+    git(&hand, &["push", "-q", "origin", &branch]);
+    let hand_tip = git(&hand, &["rev-parse", "HEAD"]);
+
+    let out = fx
+        .cmd()
+        .args(["ship", &fx.run_id, "--confirm", "--json"])
+        .assert()
+        .code(1);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    let state = fx.state();
+    assert!(
+        state["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("--adopt-remote"),
+        "{state}\n{stderr}"
+    );
+    assert_eq!(
+        git(&fx.origin, &["rev-parse", &format!("refs/heads/{branch}")]),
+        hand_tip
+    );
+
+    fx.cmd()
+        .args(["ship", &fx.run_id, "--adopt-remote", "--json"])
+        .assert()
+        .success();
+    assert_eq!(git(&wt, &["rev-parse", "HEAD"]), hand_tip);
+    assert_eq!(
+        git(&fx.origin, &["rev-parse", &format!("refs/heads/{branch}")]),
+        hand_tip
+    );
+    assert_eq!(fx.state()["phase"], "done");
+    assert_eq!(fx.state()["pr_url"], "https://github.com/o/r/pull/7");
 }
 
 fn shipped_run(fx: &Fixture, phase: &str) {

@@ -426,6 +426,10 @@ pub enum Command {
         /// Why the gate is being overridden. Required with `--override-gate`.
         #[arg(long)]
         reason: Option<String>,
+        /// When the remote branch has commits the run lacks, fast-forward the worktree to
+        /// it (refused if dirty or not a fast-forward) and ship.
+        #[arg(long)]
+        adopt_remote: bool,
     },
 
     /// Settle shipped runs from GitHub: a merged PR moves its run to `done`, a closed

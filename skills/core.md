@@ -327,6 +327,7 @@ spar confirm <run_id> [--winner <slot>]   # arena winner
 spar reconcile <run_id>                  # arena merge-good-parts + review
 spar ship <run_id> --confirm [--base <branch>]   # draft PR (never merges); adopts an open one
 spar ship <run_id> --override-gate --reason "…"  # ship over open findings (stuck/failed/quota/ceiling)
+spar ship <run_id> --adopt-remote               # fast-forward onto a hand-pushed branch, then ship
 spar sync-prs --run <id> | --all [--json] [--dry-run]   # merged PR -> done, closed -> stopped
 spar stop <run_id> [--json]              # halt dispatch, KEEP branch+worktree (resumable)
 spar stop --abandoned [--json]           # reap every run nobody is driving any more
@@ -612,8 +613,10 @@ unpushed branch falls through to the repo default, with a note on stderr. `spar 
 `spar ship` pushes the slot worktree's **HEAD** to `spar/<id>/<slot>`, never the branch by
 name, and **never rewinds the remote branch**. Before pushing it fetches the remote branch;
 if the remote has commits HEAD lacks (someone pushed by hand), ship exits `1` with "remote
-<branch> has commits the run lacks": fast-forward the worktree onto `origin/<branch>` by hand
-and ship again. The push is leased on the exact tip it fetched, so a push landing in between
+<branch> has commits the run lacks". `spar ship <id> --adopt-remote` fast-forwards the
+worktree onto `origin/<branch>` and ships (O125); it refuses (exit `1`, nothing moved) when the
+worktree has uncommitted changes to tracked files or the remote is not a fast-forward of
+HEAD (the run has commits of its own on top), which is yours to reconcile by hand. The push is leased on the exact tip it fetched, so a push landing in between
 also fails. If the worktree was left on another branch (a reviewer's, or detached), ship
 pushes HEAD when HEAD contains the run's branch and that branch has moved past the run's
 base (note on stderr), and refuses otherwise. A refusal exits `1`, leaves the phase at

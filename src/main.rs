@@ -432,6 +432,7 @@ fn run() -> Result<ExitCode> {
             confirm_only,
             override_gate,
             reason,
+            adopt_remote,
         } => {
             let (paths, _) = project_ctx()?;
             let cfg = Config::for_run(&paths, &run_id)?;
@@ -454,6 +455,7 @@ fn run() -> Result<ExitCode> {
             let opts = ship::ShipOpts {
                 base: base.as_deref(),
                 override_reason: reason.as_deref(),
+                adopt_remote,
             };
             ship::ship(&paths, &cfg, &run_id, json, &opts)
         }
