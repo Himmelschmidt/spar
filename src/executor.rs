@@ -87,6 +87,7 @@ pub fn run_slots_parallel(
                 // routing a template bug to `Phase::Quota` instead of `Phase::Failed`.
                 if let Some(s) = state.slot_mut(&job.slot_id) {
                     s.quota_hit = false;
+                    s.auth_fault = false;
                 }
                 let _ =
                     mark_slot_failed(state, paths, &job.slot_id, &e.to_string(), None, None, None);
@@ -300,6 +301,7 @@ fn prepare_slot_execution(
         s.error = None;
         s.usage = None;
         s.quota_hit = false;
+        s.auth_fault = false;
         s.reviewed_commit = None;
         // Stamp the round at dispatch: slot ids are stable across re-dispatch (the
         // implementer keeps its worktree through fix rounds), so this is where a slot
@@ -546,6 +548,29 @@ fn transient_retry_log_path(log_path: &Path, attempt: usize) -> PathBuf {
     log_path.with_file_name(format!("{stem}.transient-retry-{attempt}.log"))
 }
 
+/// How long an auth-rejected dispatch waits before its one retry. Long enough for a
+/// token refresh elsewhere to land, short enough not to matter when it does not.
+/// `SPAR_AUTH_RETRY_WAIT_SECS` is a test seam, like `SPAR_TRANSIENT_RETRY_BACKOFF_SECS`.
+const AUTH_RETRY_WAIT_SECS: u64 = 20;
+
+fn auth_retry_wait() -> Duration {
+    let secs = std::env::var("SPAR_AUTH_RETRY_WAIT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(AUTH_RETRY_WAIT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// `<run_dir>/logs/<slot>.auth-retry.log`: the rejected attempt's log, kept before the
+/// retry truncates the shared one.
+fn auth_retry_log_path(log_path: &Path) -> PathBuf {
+    let stem = log_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("slot");
+    log_path.with_file_name(format!("{stem}.auth-retry.log"))
+}
+
 /// Name a lost-session cold retry the way a fresh cold dispatch of this round is
 /// named: assigning adapters derive this round's id and pre-write it, so every
 /// cold dispatch is named — including retries, which matter most for traceability
@@ -763,6 +788,48 @@ fn dispatch_with_resume_recovery(
         )?;
         last_used_resume = false;
         last_resume_attempt = None;
+    }
+    // An auth rejection is most often a token another process just refreshed out from
+    // under this one; the new token lands within seconds. One re-dispatch after a short
+    // wait (O104), resuming the session when one was captured. A second rejection is a
+    // dead credential and is the caller's to route: backup, else park.
+    if !res.timed_out
+        && res.signal.is_none()
+        && res.exit_code != Some(0)
+        && !adapter.is_usage_error(res.exit_code)
+        && crate::backup::scrape_auth_signal(&process::tail_log(&log_path, 8000)).is_some()
+    {
+        let wait = auth_retry_wait();
+        let _ = std::fs::copy(&log_path, auth_retry_log_path(&log_path));
+        if let Some(sid) = res.stats.session_id.clone() {
+            let _ = markers::write_session_id(paths, run_id, slot_id, session_provider, &sid);
+        }
+        let _ = crate::events::append(
+            paths,
+            run_id,
+            &crate::events::Event::slot_note(
+                slot_id,
+                format!(
+                    "provider rejected the credential: waiting {}s for a refreshed token, then retrying once",
+                    wait.as_secs()
+                ),
+            ),
+        );
+        sleep(wait);
+        let prior = markers::read_session_id(paths, run_id, slot_id, session_provider);
+        let (cmd, _) = build_dispatch_command(adapter, bin, &mut *opts, prior.as_deref());
+        let (program, args) = providers::command_to_parts(&cmd);
+        let (program, args) = sandbox::maybe_wrap(isolation, &cwd, &program, &args);
+        let req = SpawnRequest {
+            program,
+            args,
+            cwd: cwd.clone(),
+            log_path: log_path.clone(),
+            env: env.clone(),
+            timeout,
+        };
+        res =
+            process::run_captured_with_adapter(&req, Some(sink), Some(tick), Some(adapter.name()))?;
     }
     // Persisted regardless of this dispatch's own outcome: a captured thread id is what
     // lets the *next* round resume instead of a cold dispatch (O63), and that is worth
@@ -1797,10 +1864,12 @@ fn apply_parallel_outcome(
             // `quota_hit_for_outcome`.
             let quota_hit =
                 quota_hit_for_outcome(paths, &prep.job.provider, &prep.log_path, &result);
+            let err = result.error.unwrap_or_else(|| "failed".into());
+            let auth = auth_fault_for(&prep.log_path, &err, quota_hit);
             if let Some(s) = state.slot_mut(slot_id) {
                 s.quota_hit = quota_hit;
+                s.auth_fault = auth.is_some();
             }
-            let err = result.error.unwrap_or_else(|| "failed".into());
             salvage_expected_artifact(
                 paths,
                 &state.id,
@@ -1849,8 +1918,10 @@ fn apply_parallel_outcome(
                 &log_text,
                 &e.to_string(),
             );
+            let auth = auth_fault_for(&prep.log_path, &e.to_string(), quota_hit);
             if let Some(s) = state.slot_mut(slot_id) {
                 s.quota_hit = quota_hit;
+                s.auth_fault = auth.is_some();
             }
             mark_slot_failed(state, paths, slot_id, &e.to_string(), None, None, None)?;
         }
@@ -2119,6 +2190,7 @@ pub fn run_slot(
         s.error = None;
         s.usage = None;
         s.quota_hit = false;
+        s.auth_fault = false;
         s.reviewed_commit = None;
         // Stamp the round at dispatch: slot ids are stable across re-dispatch (the
         // implementer keeps its worktree through fix rounds), so this is where a slot
@@ -2171,8 +2243,10 @@ pub fn run_slot(
             // stream to have parsed a `rate_limit_event` out of, so there is no typed
             // reset instant to thread through.
             let quota_hit = detect_and_pause_quota_with_err(paths, provider, &log_text, err_text);
+            let auth = auth_fault_for(log_path, err_text, quota_hit);
             if let Some(s) = state.slot_mut(slot_id) {
                 s.quota_hit = quota_hit;
+                s.auth_fault = auth.is_some();
             }
         };
     let result = if pref.is_api() {
@@ -2292,6 +2366,7 @@ pub fn run_slot(
         }
     };
 
+    let mut auth_rejection = None;
     if result.ok {
         markers::write_dispatch_verdict(
             paths,
@@ -2328,6 +2403,7 @@ pub fn run_slot(
         // `quota_hit_for_outcome`.
         let quota_hit = quota_hit_for_outcome(paths, &job.provider, &log_path, &result);
         let err = result.error.as_deref().unwrap_or("failed");
+        auth_rejection = auth_fault_for(&log_path, err, quota_hit);
         salvage_expected_artifact(
             paths,
             &state.id,
@@ -2370,6 +2446,7 @@ pub fn run_slot(
         );
         if let Some(s) = state.slot_mut(&job.slot_id) {
             s.quota_hit = quota_hit;
+            s.auth_fault = auth_rejection.is_some();
         }
     }
     let _ = crate::bus::heartbeat(
@@ -2379,6 +2456,13 @@ pub fn run_slot(
         if result.ok { "done" } else { "failed" },
     );
     state.save(paths)?;
+    if let Some(line) = auth_rejection {
+        bail!(
+            "slot {} failed: auth: {} rejected the credential ({line})",
+            job.slot_id,
+            job.provider
+        );
+    }
     if !result.ok {
         bail!(
             "slot {} failed: {}",
@@ -2508,6 +2592,14 @@ fn detect_and_pause_quota(
     if quota_recovered && structured.is_none() {
         return false;
     }
+    // A refused credential is not a spent quota (O104): pausing for a quota window
+    // would bench a provider whose refreshed token lands seconds later.
+    if structured.is_none()
+        && crate::backup::scrape_auth_signal(log_text).is_some()
+        && crate::quota::QuotaStore::scrape_strong_quota_signal(log_text).is_none()
+    {
+        return false;
+    }
     if let Some(hint) = crate::quota::QuotaStore::scrape_log_hint(log_text) {
         let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
         store.pause_quota(&key, hint);
@@ -2625,14 +2717,24 @@ fn detect_and_pause_quota_with_err(
 }
 
 /// `state.slots` lookup used by every caller that maps a `run_slot` failure onto
-/// `Phase::Quota` vs `Phase::Failed` (see `detect_and_pause_quota`'s doc comment for
-/// the discriminator itself).
-pub fn slot_quota_hit(state: &RunState, slot_id: &str) -> bool {
+/// `Phase::Quota` vs `Phase::Failed`: a quota hit (see `detect_and_pause_quota`'s doc
+/// comment for that discriminator) or an auth fault (O104).
+pub fn slot_parks_on_quota(state: &RunState, slot_id: &str) -> bool {
     state
         .slots
         .iter()
         .find(|s| s.id == slot_id)
-        .is_some_and(|s| s.quota_hit)
+        .is_some_and(|s| s.parks_on_quota())
+}
+
+/// The auth rejection a failed dispatch ended on, from its log tail or its error text.
+/// `None` when the failure was a quota hit: that is the more specific verdict.
+fn auth_fault_for(log_path: &Path, err_text: &str, quota_hit: bool) -> Option<String> {
+    if quota_hit {
+        return None;
+    }
+    crate::backup::scrape_auth_signal(&process::tail_log(log_path, 8000))
+        .or_else(|| crate::backup::scrape_auth_signal(err_text))
 }
 
 struct SlotOutcome {
@@ -3914,6 +4016,7 @@ pub fn init_slot_model(
         quota_hit: false,
         reviewed_commit: None,
         source: None,
+        auth_fault: false,
     }
 }
 
@@ -5212,6 +5315,133 @@ mod tests {
             "no retry means no preserved sibling log"
         );
         assert!(markers::read_session_id(&paths, "run1", "slotZ", "shell").is_none());
+    }
+
+    /// The real claude wording from the 2026-10-24 incident (#174).
+    const CLAUDE_REVOKED: &str = r#"API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked. Please obtain a new token or refresh your existing token."}}"#;
+
+    fn dispatch_shell(
+        adapter: &ShellAdapter,
+        paths: &SparPaths,
+        log_path: &Path,
+        slot: &str,
+        waits: &std::cell::RefCell<Vec<Duration>>,
+    ) -> process::SpawnResult {
+        let mut opts = dispatch_opts("go");
+        dispatch_with_resume_recovery(
+            adapter,
+            Path::new("/bin/sh"),
+            &mut opts,
+            None,
+            crate::config::IsolationMode::None,
+            shell_req(&adapter.script, log_path),
+            paths,
+            "run1",
+            slot,
+            "shell",
+            1,
+            &|_pid| {},
+            &|| {},
+            &|d| {
+                waits.borrow_mut().push(d);
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_auth_rejection_waits_once_and_retries_into_the_refreshed_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log_path = tmp.path().join("slot.log");
+        let ctr = tmp.path().join("attempts");
+        let adapter = ShellAdapter::cold(&format!(
+            r#"n=$(cat "{ctr}" 2>/dev/null || echo 0); echo $((n+1)) > "{ctr}"; if [ "$n" -lt 1 ]; then echo '{CLAUDE_REVOKED}'; exit 1; fi; echo ok; exit 0"#,
+            ctr = ctr.display()
+        ));
+        let waits = std::cell::RefCell::new(Vec::new());
+        let res = dispatch_shell(&adapter, &paths, &log_path, "slotA", &waits);
+        assert_eq!(
+            res.exit_code,
+            Some(0),
+            "the second attempt has the new token"
+        );
+        assert_eq!(
+            *waits.borrow(),
+            vec![Duration::from_secs(AUTH_RETRY_WAIT_SECS)]
+        );
+        let kept = std::fs::read_to_string(auth_retry_log_path(&log_path)).unwrap();
+        assert!(kept.contains("access token has been revoked"));
+        let events = std::fs::read_to_string(crate::events::events_file(&paths, "run1")).unwrap();
+        assert!(events.contains("rejected the credential"));
+    }
+
+    #[test]
+    fn a_second_auth_rejection_is_returned_after_exactly_one_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log_path = tmp.path().join("slot.log");
+        let ctr = tmp.path().join("attempts");
+        let adapter = ShellAdapter::cold(&format!(
+            r#"n=$(cat "{ctr}" 2>/dev/null || echo 0); echo $((n+1)) > "{ctr}"; echo 'Not logged in' >&2; exit 1"#,
+            ctr = ctr.display()
+        ));
+        let waits = std::cell::RefCell::new(Vec::new());
+        let res = dispatch_shell(&adapter, &paths, &log_path, "slotB", &waits);
+        assert_eq!(res.exit_code, Some(1));
+        assert_eq!(waits.borrow().len(), 1);
+        assert_eq!(std::fs::read_to_string(&ctr).unwrap().trim(), "2");
+    }
+
+    #[test]
+    fn an_ordinary_failure_is_not_retried_as_auth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log_path = tmp.path().join("slot.log");
+        let adapter = ShellAdapter::cold(
+            "echo \"thread 'main' panicked at src/auth.rs:401:9\"; echo 'error: process exited 1' >&2; exit 1",
+        );
+        let waits = std::cell::RefCell::new(Vec::new());
+        let res = dispatch_shell(&adapter, &paths, &log_path, "slotC", &waits);
+        assert_eq!(res.exit_code, Some(1));
+        assert!(waits.borrow().is_empty());
+        assert!(!auth_retry_log_path(&log_path).exists());
+    }
+
+    #[test]
+    fn an_auth_rejection_never_pauses_the_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log = format!("working on billing capacity\n{CLAUDE_REVOKED}\n");
+        assert!(!detect_and_pause_quota(
+            &paths,
+            "cli:claude",
+            &log,
+            None,
+            None,
+            false
+        ));
+        let store = crate::quota::QuotaStore::load(&paths).unwrap();
+        assert!(
+            store.is_usable("cli:claude"),
+            "{:?}",
+            store.get("cli:claude")
+        );
+    }
+
+    #[test]
+    fn a_failed_dispatch_records_the_auth_fault_and_names_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("slot.log");
+        std::fs::write(&log_path, format!("· thinking\n{CLAUDE_REVOKED}\n")).unwrap();
+        let line = auth_fault_for(&log_path, "exit 1", false).expect("auth fault");
+        assert!(line.contains("401"));
+        assert!(
+            auth_fault_for(&log_path, "exit 1", true).is_none(),
+            "a quota hit is the more specific verdict"
+        );
+        std::fs::write(&log_path, "· done\n").unwrap();
+        assert!(auth_fault_for(&log_path, "spawn failed: invalid_grant", false).is_some());
     }
 
     #[test]

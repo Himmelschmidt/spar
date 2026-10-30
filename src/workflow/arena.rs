@@ -219,7 +219,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
         .cloned()
         .collect();
     if !implementers.is_empty() && failed_implementers.len() == implementers.len() {
-        let any_plain_failed = failed_implementers.iter().any(|s| !s.quota_hit);
+        let any_plain_failed = failed_implementers.iter().any(|s| !s.parks_on_quota());
         if any_plain_failed {
             state.set_phase(Phase::Failed);
             state.error = Some("all arena implementers failed".into());
@@ -268,7 +268,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
             // ranking step — that tolerance predates this fix and is out of scope. A
             // rate limit is different: it isn't a bad ranking, it's no ranking at all,
             // and silently presenting a fallback winner as if ranked would hide that.
-            if executor::slot_quota_hit(state, &ranker.id) {
+            if executor::slot_parks_on_quota(state, &ranker.id) {
                 state.error = Some(e.to_string());
                 state.set_phase(Phase::Quota);
                 state.save(paths)?;
@@ -423,7 +423,7 @@ pub fn reconcile(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> R
         effort: None,
     };
     if let Err(e) = executor::run_slot(&mut state, paths, cfg, &job) {
-        let quota_hit = executor::slot_quota_hit(&state, &recon_id);
+        let quota_hit = executor::slot_parks_on_quota(&state, &recon_id);
         state.set_phase(if quota_hit {
             Phase::Quota
         } else {
@@ -467,7 +467,7 @@ pub fn reconcile(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> R
             effort: None,
         };
         if let Err(e) = executor::run_slot(&mut state, paths, cfg, &job) {
-            let quota_hit = executor::slot_quota_hit(&state, &job.slot_id);
+            let quota_hit = executor::slot_parks_on_quota(&state, &job.slot_id);
             state.set_phase(if quota_hit {
                 Phase::Quota
             } else {

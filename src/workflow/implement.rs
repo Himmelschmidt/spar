@@ -1979,7 +1979,7 @@ pub fn execute_loop(
             effort: None,
         };
         if let Err(e) = executor::run_slot(state, paths, cfg, &impl_job) {
-            let quota_hit = executor::slot_quota_hit(state, &impl_job.slot_id);
+            let quota_hit = executor::slot_parks_on_quota(state, &impl_job.slot_id);
             if quota_hit {
                 if let Some(backup_raw) =
                     crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
@@ -2014,9 +2014,7 @@ pub fn execute_loop(
                         &store,
                         available.as_ref(),
                     );
-                    if cause == crate::backup::StopCause::Environmental
-                        && slot_state.source != Some(SeatSource::Backup)
-                    {
+                    if cause.engages_backup() && slot_state.source != Some(SeatSource::Backup) {
                         let backup_key = crate::provider_ref::ProviderRef::parse(&backup_raw)
                             .map(|r| r.storage_key())
                             .unwrap_or_else(|_| backup_raw.clone());
@@ -2063,7 +2061,7 @@ pub fn execute_loop(
                             };
                             if let Err(e2) = executor::run_slot(state, paths, cfg, &retry_job) {
                                 let quota_hit2 =
-                                    executor::slot_quota_hit(state, &retry_job.slot_id);
+                                    executor::slot_parks_on_quota(state, &retry_job.slot_id);
                                 return fail(state, paths, e2, quota_hit2);
                             }
                             // Retry succeeded, continue to review phase
@@ -2107,7 +2105,7 @@ pub fn execute_loop(
                     &store,
                     available.as_ref(),
                 );
-                if cause == crate::backup::StopCause::Environmental {
+                if cause.engages_backup() {
                     if let Some(backup_raw) =
                         crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
                     {
@@ -2157,7 +2155,7 @@ pub fn execute_loop(
                                 };
                                 if let Err(e2) = executor::run_slot(state, paths, cfg, &retry_job) {
                                     let quota_hit2 =
-                                        executor::slot_quota_hit(state, &retry_job.slot_id);
+                                        executor::slot_parks_on_quota(state, &retry_job.slot_id);
                                     return fail(state, paths, e2, quota_hit2);
                                 }
                             } else {
@@ -2302,7 +2300,7 @@ pub fn execute_loop(
                     effort: None,
                 };
                 let suite_ok = executor::run_slot(state, paths, cfg, &suite_job).is_ok();
-                if !suite_ok && executor::slot_quota_hit(state, &tester.id) {
+                if !suite_ok && executor::slot_parks_on_quota(state, &tester.id) {
                     // A rate-limited tester must park the run, not read as an
                     // inconclusive suite that burns a fix round against the same
                     // paused provider.
@@ -2527,7 +2525,7 @@ pub fn execute_loop(
                     review_ok = executor::run_slot(state, paths, cfg, &job).is_ok();
                 }
             }
-            if !review_ok && executor::slot_quota_hit(state, &rev.id) {
+            if !review_ok && executor::slot_parks_on_quota(state, &rev.id) {
                 // Both the original provider and (if rotation found one) its
                 // replacement are rate-limited: park the run rather than reading
                 // this as "request changes" and burning a fix round against a
@@ -2774,7 +2772,7 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
         let cause =
             crate::backup::dispatch_stop_cause(&slot_state, &cur, &store, available_opt.as_ref());
         if has_backup {
-            if cause == crate::backup::StopCause::Environmental {
+            if cause.engages_backup() {
                 if let Some(backup_raw) =
                     crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
                 {

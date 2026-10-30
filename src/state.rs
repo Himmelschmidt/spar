@@ -405,6 +405,22 @@ pub struct SlotState {
     /// for state written before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<SeatSource>,
+    /// Set when this dispatch's failure was the provider refusing its credential (401,
+    /// a revoked token, "not logged in") after spar's one short-wait retry (O104). An
+    /// infrastructure fault, not a verdict on the work: it engages the declared backup
+    /// and otherwise parks the run at `Phase::Quota`, but never pauses the provider.
+    /// Reset at the start of every dispatch, like `quota_hit`.
+    #[serde(default)]
+    pub auth_fault: bool,
+}
+
+impl SlotState {
+    /// Whether this slot's failure parks the run at `Phase::Quota` rather than failing
+    /// it: the provider could not serve the dispatch (quota or auth), so nothing about
+    /// the work is known.
+    pub fn parks_on_quota(&self) -> bool {
+        self.quota_hit || self.auth_fault
+    }
 }
 
 /// Where a seat's provider was resolved from, in precedence order. Feature 011: the

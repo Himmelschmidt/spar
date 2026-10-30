@@ -55,6 +55,17 @@ parseable config with an expired key still reports healthy and fails at dispatch
 is all a local-only, no-quota check can see. An `unhealthy` provider is still eligible
 for dispatch; doctor warns, it does not exclude.
 
+**Auth faults (O104).** A dispatch that dies on a refused credential (claude's `401 ...
+OAuth access token has been revoked` or `Please run /login`, codex `Not logged in`, muse
+``not logged in: run `muse login` first``, grok `You are not authenticated.`,
+`invalid_grant`) is an auth fault, not a work failure and not a quota hit. spar waits
+20s and re-dispatches once (a token refreshed elsewhere usually lands within seconds),
+then moves the seat to its `--backup` like any environmental stop, and otherwise parks
+the run at `quota` (exit `4`) with `auth: <provider> rejected the credential (...)` in
+`error`. The slot carries `auth_fault: true`. An auth fault never pauses the provider:
+fix the login, then `implement --run <id>`. Only the last 15 non-empty log lines are
+read, so an agent discussing login code mid-turn is not mistaken for one.
+
 **agy note.** agy runs headless with `--output-format stream-json`, so spar parses its tools,
 text and tokens directly from that structured stream. What the stream doesn't carry — the
 account's quota buckets and the context-window snapshot — spar still recovers by teeing agy's

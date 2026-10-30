@@ -330,9 +330,7 @@ pub fn execute_plan(
                     &store,
                     available.as_ref(),
                 );
-                if cause == crate::backup::StopCause::Environmental
-                    && slot_state.source != Some(SeatSource::Backup)
-                {
+                if cause.engages_backup() && slot_state.source != Some(SeatSource::Backup) {
                     if let Some(raw) = crate::backup::backup_for_role(job.role, 0, cfg) {
                         if crate::backup::is_provider_eligible(&raw, &store, available.as_ref()) {
                             let cur_key = crate::provider_ref::ProviderRef::parse(&job.provider)
@@ -390,7 +388,10 @@ pub fn execute_plan(
                                             handled_via_backup = true;
                                         }
                                         Err(e2) => {
-                                            if executor::slot_quota_hit(state, &retry_job.slot_id) {
+                                            if executor::slot_parks_on_quota(
+                                                state,
+                                                &retry_job.slot_id,
+                                            ) {
                                                 state.error = Some(e2.to_string());
                                                 state.set_phase(Phase::Quota);
                                                 state.save(paths)?;
@@ -418,7 +419,7 @@ pub fn execute_plan(
             if handled_via_backup {
                 continue;
             }
-            if executor::slot_quota_hit(state, &job.slot_id) {
+            if executor::slot_parks_on_quota(state, &job.slot_id) {
                 state.error = Some(e.to_string());
                 state.set_phase(Phase::Quota);
                 state.save(paths)?;
@@ -658,8 +659,7 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
                 &store,
                 available.as_ref(),
             );
-            if cause == crate::backup::StopCause::Environmental
-                && slot_state.source != Some(crate::state::SeatSource::Backup)
+            if cause.engages_backup() && slot_state.source != Some(crate::state::SeatSource::Backup)
             {
                 if let Some(raw) = crate::backup::backup_for_role(SlotRole::TestAuthor, 0, cfg) {
                     if crate::backup::is_provider_eligible(&raw, &store, available.as_ref()) {
@@ -695,7 +695,7 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
                                         handled = true;
                                     }
                                     Err(e2) => {
-                                        if executor::slot_quota_hit(state, &id) {
+                                        if executor::slot_parks_on_quota(state, &id) {
                                             state.error = Some(format!("test-author failed: {e2}"));
                                             state.set_phase(Phase::Quota);
                                             state.save(paths)?;
@@ -717,7 +717,7 @@ fn run_test_author(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Res
             // retry succeeded, continue without error
         } else {
             state.error = Some(format!("test-author failed: {e}"));
-            if executor::slot_quota_hit(state, &id) {
+            if executor::slot_parks_on_quota(state, &id) {
                 state.set_phase(Phase::Quota);
                 state.save(paths)?;
                 return Ok(());

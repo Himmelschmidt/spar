@@ -238,6 +238,7 @@ mod tests {
             quota_hit: false,
             reviewed_commit: None,
             source: None,
+            auth_fault: false,
         }
     }
 

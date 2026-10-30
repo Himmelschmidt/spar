@@ -247,9 +247,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
             &store,
             available.as_ref(),
         );
-        if cause != crate::backup::StopCause::Environmental
-            || slot_state.source == Some(crate::state::SeatSource::Backup)
-        {
+        if !cause.engages_backup() || slot_state.source == Some(crate::state::SeatSource::Backup) {
             continue;
         }
         let backup_raw = match crate::backup::backup_for_role(SlotRole::Reviewer, idx, cfg) {
@@ -354,8 +352,8 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
         .filter(|s| s.status == SlotStatus::Failed)
         .collect();
     let all_failed = !state.slots.is_empty() && failed.len() == state.slots.len();
-    let any_quota_failed = failed.iter().any(|s| s.quota_hit);
-    let any_plain_failed = failed.iter().any(|s| !s.quota_hit);
+    let any_quota_failed = failed.iter().any(|s| s.parks_on_quota());
+    let any_plain_failed = failed.iter().any(|s| !s.parks_on_quota());
     // Checked ahead of the approve/request_changes tally: `salvage_expected_artifact`
     // (executor.rs) writes a synthetic `request_changes` verdict for every interrupted
     // reviewer, so `changes == 0` never holds once any reviewer fails and the tally

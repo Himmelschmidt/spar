@@ -5,7 +5,88 @@ use crate::state::SlotState;
 #[allow(dead_code)]
 pub enum StopCause {
     Environmental,
+    /// The provider refused the credential (O104). Engages the backup like any
+    /// environmental stop, but is told apart so it never pauses the provider for a
+    /// quota window and parks with reason "auth".
+    Auth,
     Work,
+}
+
+impl StopCause {
+    pub fn engages_backup(self) -> bool {
+        matches!(self, StopCause::Environmental | StopCause::Auth)
+    }
+}
+
+/// How many trailing non-empty lines of a dead dispatch's log are read for an auth
+/// rejection. The provider's own refusal is the last thing a dead dispatch prints; an
+/// agent that quoted these phrases earlier in its turn (reviewing login code, say) did
+/// not lose its credential.
+const AUTH_SCAN_LINES: usize = 15;
+
+/// The provider refused the credential, as the CLIs actually word it: claude's `API
+/// Error: 401 {"type":"authentication_error","message":"OAuth access token has been
+/// revoked..."}` and "Please run /login", codex's `Not logged in` and failed token
+/// refresh, muse's ``not logged in: run `muse login` first`` and `[auth]: credentials
+/// rejected`, grok's `You are not authenticated.`, and an OAuth `invalid_grant`.
+fn is_auth_line(lower: &str) -> bool {
+    const PHRASES: &[&str] = &[
+        "token has been revoked",
+        "oauth token has expired",
+        "authentication_error",
+        "invalid_grant",
+        "not logged in",
+        "please login",
+        "please log in",
+        "please run /login",
+        "you are not authenticated",
+        "credentials rejected",
+        "token could not be refreshed",
+        "refresh token was already used",
+        "invalid api key",
+        "invalid x-api-key",
+        "401 unauthorized",
+    ];
+    PHRASES.iter().any(|p| lower.contains(p)) || names_http_401(lower)
+}
+
+/// A 401 named as an HTTP status, not a bare number: `401` alone is a line number, a
+/// test count or a byte offset far more often than it is a status.
+fn names_http_401(lower: &str) -> bool {
+    [
+        "http 401",
+        "status 401",
+        "status: 401",
+        "status code 401",
+        "status code: 401",
+        "\"status\":401",
+        "\"status\": 401",
+        "\"code\":401",
+        "\"code\": 401",
+        "error 401",
+        "error: 401",
+    ]
+    .iter()
+    .any(|p| {
+        lower.match_indices(p).any(|(i, _)| {
+            !lower[i + p.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
+        })
+    })
+}
+
+/// The last auth-rejection line in the tail of `text`, if any. Used on a failed
+/// dispatch's log, its error string, and a probe's raw output.
+pub fn scrape_auth_signal(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(AUTH_SCAN_LINES);
+    lines[start..]
+        .iter()
+        .rev()
+        .find(|l| is_auth_line(&l.to_ascii_lowercase()))
+        .map(|l| l.trim().chars().take(300).collect())
 }
 
 pub fn is_provider_eligible(
@@ -98,6 +179,9 @@ pub fn dispatch_stop_cause(
     }
     if slot.quota_hit {
         return StopCause::Environmental;
+    }
+    if slot.auth_fault {
+        return StopCause::Auth;
     }
     if let Some(err) = &slot.error {
         let lower = err.to_ascii_lowercase();
@@ -440,6 +524,69 @@ mod tests {
             dispatch_stop_cause(&env_slot, "cli:claude", &store, None),
             StopCause::Environmental
         );
+    }
+
+    #[test]
+    fn auth_signal_matches_the_real_wordings() {
+        for line in [
+            r#"API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked. Please obtain a new token or refresh your existing token."}}"#,
+            "Invalid API key \u{b7} Please run /login",
+            "Not logged in",
+            "muse usage: not logged in: run `muse login` first",
+            "! transport error [auth]: credentials rejected",
+            "You are not authenticated.",
+            r#"{"error":"invalid_grant","error_description":"Invalid refresh token"}"#,
+            "Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.",
+            "unexpected status 401 Unauthorized: Missing bearer or basic authentication in header",
+            "HTTP 401",
+        ] {
+            assert!(scrape_auth_signal(line).is_some(), "{line:?} must read as auth");
+        }
+    }
+
+    #[test]
+    fn auth_signal_ignores_ordinary_failures() {
+        for line in [
+            "thread 'main' panicked at src/auth.rs:401:9",
+            "test result: ok. 401 passed; 0 failed",
+            "error at line 401 of the fixture",
+            "HTTP 4010 bytes sent",
+            "! rate limit  seven_day  rejected",
+            "the login form now renders",
+        ] {
+            assert!(scrape_auth_signal(line).is_none(), "{line:?} is not auth");
+        }
+    }
+
+    #[test]
+    fn auth_signal_reads_only_the_tail_of_a_log() {
+        let mut log =
+            String::from("reviewing: the handler returns 401 Unauthorized when not logged in\n");
+        for i in 0..AUTH_SCAN_LINES {
+            log.push_str(&format!("-> edit src/handler_{i}.rs\n"));
+        }
+        log.push_str("error: tests failed\n");
+        assert!(
+            scrape_auth_signal(&log).is_none(),
+            "an agent discussing auth early in its turn did not lose its credential"
+        );
+        log.push_str("Not logged in\n");
+        assert_eq!(scrape_auth_signal(&log).as_deref(), Some("Not logged in"));
+    }
+
+    #[test]
+    fn an_auth_fault_is_its_own_stop_cause_and_engages_the_backup() {
+        let store = QuotaStore::default();
+        let mut slot = slot_with_quota(false);
+        slot.status = SlotStatus::Failed;
+        slot.auth_fault = true;
+        slot.error = Some("exit 1".into());
+        let cause = dispatch_stop_cause(&slot, "cli:claude", &store, None);
+        assert_eq!(cause, StopCause::Auth);
+        assert!(cause.engages_backup());
+        assert!(StopCause::Environmental.engages_backup());
+        assert!(!StopCause::Work.engages_backup());
+        assert!(slot.parks_on_quota());
     }
 
     #[test]
