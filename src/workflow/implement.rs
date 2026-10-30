@@ -1848,7 +1848,12 @@ pub fn execute_loop(
     // paid for — is a fresh process, and an in-memory list would leave it running blind
     // on the most expensive round of the run. Nothing in the implementer's prompt tells
     // it to go read `review-*.md` on its own.
-    let mut blockers: Vec<String> = blockers_from_disk(state, paths, &frozen.criteria, cfg);
+    let mut blockers: Vec<String> = blockers_from_disk(
+        state,
+        paths,
+        &crate::rules::unwaived(&frozen.criteria, &crate::rules::for_run(paths, &state.id)),
+        cfg,
+    );
 
     loop {
         // Stop boundary: before the implementer (and every fix-round re-dispatch).
@@ -2408,6 +2413,18 @@ pub fn execute_loop(
             let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg));
         }
         let prior_findings = scoped_review_section(state, cfg, &review_cwd);
+        // Read per panel, so a waiver added while the run is live counts from the next
+        // gate on. The contract stays frozen (O43); the waiver is the operator's (O121).
+        let rulings = crate::rules::for_run(paths, &state.id);
+        let criteria = crate::rules::unwaived(&frozen.criteria, &rulings);
+        for (id, r) in crate::rules::waived(&rulings) {
+            if !frozen.criteria.iter().any(|c| c == id) {
+                continue;
+            }
+            let msg = format!("{id} waived by operator ruling {}: {}", r.id, r.text);
+            eprintln!("note: {msg}");
+            let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg));
+        }
         for rev in &reviewers {
             // Stop boundary: before each reviewer job.
             if should_stop(paths, &state.id) {
@@ -2612,9 +2629,9 @@ pub fn execute_loop(
                         ),
                     );
                 }
-                if acceptance_blocks_ship(&frozen.criteria, &res, cfg) {
+                if acceptance_blocks_ship(&criteria, &res, cfg) {
                     any_request_changes = true;
-                    let reasons = acceptance_block_reasons(&frozen.criteria, &res, cfg);
+                    let reasons = acceptance_block_reasons(&criteria, &res, cfg);
                     // Into the next round's prompt, not only onto the bus: without this
                     // the fix round's implementer prompt is byte-identical to round 1's
                     // and never learns which criterion it failed.

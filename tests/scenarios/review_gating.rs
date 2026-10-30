@@ -379,3 +379,139 @@ fn the_pr_body_marks_findings_whose_file_moved() {
     assert!(ship.contains("possibly addressed: 1 commit(s)"), "{ship}");
     assert!(ship.contains("tidy the doc comment"), "{ship}");
 }
+
+fn rule(dir: &Path, args: &[&str]) -> assert_cmd::assert::Assert {
+    spar_cmd().current_dir(dir).arg("rule").args(args).assert()
+}
+
+fn rule_ids(dir: &Path, run_id: &str) -> Vec<String> {
+    let out = rule(dir, &["list", "--run", run_id, "--json"]).success();
+    let v: serde_json::Value = serde_json::from_slice(out.get_output().stdout.as_slice()).unwrap();
+    v.as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// O121. Rulings are added, listed and removed on a run and on the project, and a run's
+/// `status --json` lists the ones in force.
+#[test]
+fn rule_add_list_rm() {
+    let tmp = tempdir().unwrap();
+    project(tmp.path(), "");
+    let run_id = planned_run(tmp.path());
+
+    let out = rule(
+        tmp.path(),
+        &[
+            "add",
+            "--run",
+            &run_id,
+            "AC-2 is void: retired guard",
+            "--waive",
+            "ac-2",
+            "--json",
+        ],
+    )
+    .success();
+    let r: serde_json::Value = serde_json::from_slice(out.get_output().stdout.as_slice()).unwrap();
+    assert_eq!(r["id"], "R1");
+    assert_eq!(r["scope"], "run");
+    assert_eq!(r["waives"], serde_json::json!(["AC-2"]));
+    rule(tmp.path(), &["add", "--project", "dates are UTC"]).success();
+    assert!(tmp.path().join(".spar/rules/rules.json").is_file());
+
+    assert_eq!(rule_ids(tmp.path(), &run_id), ["P1", "R1"]);
+    let status = spar_cmd()
+        .current_dir(tmp.path())
+        .args(["status", &run_id, "--json"])
+        .assert()
+        .success();
+    let status: serde_json::Value =
+        serde_json::from_slice(status.get_output().stdout.as_slice()).unwrap();
+    let ids: Vec<&str> = status["rulings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["P1", "R1"], "{status}");
+
+    rule(
+        tmp.path(),
+        &["add", "--run", &run_id, "x", "--waive", "AC-9"],
+    )
+    .code(1)
+    .stderr(predicates::str::contains("AC-9 is not a criterion"));
+    rule(tmp.path(), &["add", "--project", "x", "--waive", "AC-1"]).code(1);
+    rule(tmp.path(), &["add", "no target"]).code(2);
+
+    rule(tmp.path(), &["rm", "--run", &run_id, "R1"]).success();
+    assert_eq!(rule_ids(tmp.path(), &run_id), ["P1"]);
+    rule(tmp.path(), &["rm", "--run", &run_id, "R1"]).code(1);
+    rule(tmp.path(), &["rm", "--project", "P1"]).success();
+    assert!(rule_ids(tmp.path(), &run_id).is_empty());
+}
+
+/// O121. A criterion the reviewer leaves unverified holds the run at the ceiling. A
+/// waiver added to the parked run counts from the next dispatch: the prompts carry the
+/// ruling, the gate stops counting the criterion, and the run reaches the ship gate.
+#[test]
+fn a_waived_criterion_stops_counting_at_the_acceptance_gate() {
+    let tmp = tempdir().unwrap();
+    project(tmp.path(), "[rounds]\nmax = 2\n");
+    let run_id = planned_run(tmp.path());
+    let unverified = [("SPAR_FORCE_AC_STATUS", "unverified")];
+    implement(tmp.path(), &run_id, &unverified).code(2);
+    assert_eq!(
+        state_json(tmp.path(), &run_id)["phase"],
+        "awaiting_round_extension"
+    );
+
+    rule(
+        tmp.path(),
+        &[
+            "add",
+            "--run",
+            &run_id,
+            "AC-2 is void: client-side, another unit owns it",
+            "--waive",
+            "AC-2",
+        ],
+    )
+    .success();
+    implement_with(tmp.path(), &run_id, &unverified, &["--max-rounds", "3"])
+        .code(2)
+        .stderr(predicates::str::contains(
+            "AC-2 waived by operator ruling R1: AC-2 is void",
+        ));
+    let st = state_json(tmp.path(), &run_id);
+    assert_eq!(st["phase"], "awaiting_ship_confirm", "{st}");
+
+    let reviewer = reviewer_slots(tmp.path(), &run_id).remove(0);
+    let prompt = last_prompt(tmp.path(), &run_id, &reviewer);
+    assert!(prompt.contains("## Operator rulings"), "{prompt}");
+    assert!(prompt.contains("- R1: AC-2 is void"), "{prompt}");
+    assert!(prompt.contains("[waives AC-2]"), "{prompt}");
+    let implementer = st["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["role"] == "implementer")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let prompt = last_prompt(tmp.path(), &run_id, &implementer);
+    assert!(prompt.contains("- R1: AC-2 is void"), "{prompt}");
+    assert!(!prompt.contains("{{"), "{prompt}");
+
+    let brief = spar_cmd()
+        .current_dir(tmp.path())
+        .args(["brief", &run_id])
+        .assert()
+        .success();
+    let brief = String::from_utf8_lossy(brief.get_output().stdout.as_slice()).to_string();
+    assert!(brief.contains("AC-2 waived by R1: AC-2 is void"), "{brief}");
+}

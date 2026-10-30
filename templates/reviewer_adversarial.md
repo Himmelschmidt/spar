@@ -12,6 +12,8 @@ You did NOT write this code. Find real bugs, missing tests, and regressions.
 {{test_contract_body}}
 {{contract_drift_note}}
 
+{{operator_rulings}}
+
 ## Paths
 - Code under review (worktree): {{review_cwd}}
 - Write review to: {{artifacts_dir}}/review-{{slot_id}}.md

@@ -324,6 +324,11 @@ fn prepare_slot_execution(
         branch: &branch,
         nudge_file: &nudge_s,
     });
+    // Read per dispatch, so a ruling added to a live run reaches its next dispatch (O121).
+    vars.insert(
+        "operator_rulings".into(),
+        crate::rules::prompt_section(&crate::rules::for_run(paths, &state.id)),
+    );
     for (k, v) in &job.extra_vars {
         vars.insert(k.clone(), v.clone());
     }
@@ -2141,6 +2146,11 @@ pub fn run_slot(
         branch: &branch,
         nudge_file: &nudge_s,
     });
+    // Read per dispatch, so a ruling added to a live run reaches its next dispatch (O121).
+    vars.insert(
+        "operator_rulings".into(),
+        crate::rules::prompt_section(&crate::rules::for_run(paths, &state.id)),
+    );
     for (k, v) in &job.extra_vars {
         vars.insert(k.clone(), v.clone());
     }

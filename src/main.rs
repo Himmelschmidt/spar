@@ -27,6 +27,7 @@ mod providers;
 mod quota;
 mod record;
 mod registry;
+mod rules;
 mod runlock;
 mod runspec;
 mod sandbox;
@@ -51,7 +52,7 @@ mod structured_views_contract;
 
 use anyhow::Result;
 use clap::Parser;
-use cli::{BusCmd, Cli, Command, SkillsCmd};
+use cli::{BusCmd, Cli, Command, RuleCmd, SkillsCmd};
 use config::Config;
 use exit_codes::ExitCode;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -505,6 +506,7 @@ fn run() -> Result<ExitCode> {
             undo,
             json,
         } => link_cmd(&run_id, parent.as_deref(), undo, json),
+        Command::Rule { action } => rule_cmd(action),
         Command::Skills { action } => match action {
             SkillsCmd::List { json } => skills::run(skills::SkillsAction::List { json }),
             SkillsCmd::Get { name } => skills::run(skills::SkillsAction::Get { name }),
@@ -1048,6 +1050,83 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> 
     Ok(ExitCode::Success)
 }
 
+/// `spar rule`: operator rulings on a run or the project (O121).
+fn rule_cmd(action: RuleCmd) -> Result<ExitCode> {
+    let (run, project, json) = match &action {
+        RuleCmd::Add {
+            run, project, json, ..
+        }
+        | RuleCmd::List { run, project, json }
+        | RuleCmd::Rm {
+            run, project, json, ..
+        } => (run.clone(), *project, *json),
+    };
+    let paths = match &run {
+        Some(id) => load_run_anywhere(id, paths::find_project_root().ok().as_deref())?.0,
+        None if project => project_ctx()?.0,
+        None => anyhow::bail!("pass --run <id> or --project"),
+    };
+    let target = match &run {
+        Some(id) => rules::Target::Run(id),
+        None => rules::Target::Project,
+    };
+    match action {
+        RuleCmd::Add { text, waive, .. } => {
+            let ruling = rules::add(&paths, target, &text, &waive)?;
+            if let rules::Target::Run(id) = target {
+                let _ = events::append(
+                    &paths,
+                    id,
+                    &events::Event::info(format!(
+                        "operator ruling {} recorded{}: {}",
+                        ruling.id,
+                        if ruling.waives.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" (waives {})", ruling.waives.join(", "))
+                        },
+                        ruling.text
+                    )),
+                );
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&ruling)?);
+            } else {
+                println!("{}", rules::line(&ruling));
+                println!("takes effect at the next reviewer or implementer dispatch");
+            }
+        }
+        RuleCmd::List { .. } => {
+            let all = rules::list(&paths, target)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&all)?);
+            } else if all.is_empty() {
+                println!("no rulings");
+            } else {
+                for r in &all {
+                    println!("{}", rules::line(r));
+                }
+            }
+        }
+        RuleCmd::Rm { rule_id, .. } => {
+            let removed = rules::remove(&paths, target, &rule_id)?;
+            if let rules::Target::Run(id) = target {
+                let _ = events::append(
+                    &paths,
+                    id,
+                    &events::Event::info(format!("operator ruling {} removed", removed.id)),
+                );
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&removed)?);
+            } else {
+                println!("removed {}", rules::line(&removed));
+            }
+        }
+    }
+    Ok(ExitCode::Success)
+}
+
 /// `spar brief <id>`: re-hydrate a fresh session on a run's own state, in one call.
 /// Read-only — uses `load_for_display`, same as `status`, and never writes.
 fn brief_cmd(run_id: &str, full: bool, json: bool) -> Result<ExitCode> {
@@ -1105,6 +1184,8 @@ fn brief_cmd(run_id: &str, full: bool, json: bool) -> Result<ExitCode> {
         .collect();
 
     let next = notify::next_command(&state);
+    let rulings = rules::for_run(&paths, &state.id);
+    let waived = rules::waived(&rulings);
     let open_findings = workflow::review_result::open_findings(
         &state,
         &workflow::review_result::findings_cwd(&state),
@@ -1131,6 +1212,8 @@ fn brief_cmd(run_id: &str, full: bool, json: bool) -> Result<ExitCode> {
             "error": state.error,
             "artifacts": artifacts.iter().map(|(n, p)| serde_json::json!({"name": n, "path": p})).collect::<Vec<_>>(),
             "ac_ids": ac_ids,
+            "waived": waived.iter().map(|(id, r)| serde_json::json!({"id": id, "rule": r.id, "text": r.text})).collect::<Vec<_>>(),
+            "rulings": rulings,
             "open_findings": open_findings,
             "recent_events": events,
             "next_command": next,
@@ -1196,6 +1279,15 @@ fn brief_cmd(run_id: &str, full: bool, json: bool) -> Result<ExitCode> {
     if !ac_ids.is_empty() {
         println!("acceptance criteria: {}", ac_ids.join(", "));
     }
+    for (id, r) in &waived {
+        println!("  {id} waived by {}: {}", r.id, r.text);
+    }
+    if !rulings.is_empty() {
+        println!("operator rulings:");
+        for r in &rulings {
+            println!("  {}", rules::line(r));
+        }
+    }
     if !open_findings.is_empty() {
         println!("open findings (last review panel; check each at HEAD):");
         for f in &open_findings {
@@ -1253,6 +1345,10 @@ fn run_status_json(
             Vec::new()
         };
         obj.insert("orphan_pids".into(), serde_json::json!(orphans));
+        obj.insert(
+            "rulings".into(),
+            serde_json::to_value(rules::for_run(swarm, &state.id))?,
+        );
     }
     liveness::enrich_status_json(&mut v, &state.slots, cfg, swarm, &state.id);
     Ok(v)

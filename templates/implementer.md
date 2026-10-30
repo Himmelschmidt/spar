@@ -6,6 +6,7 @@ Implement the task in your isolated worktree. Do not modify the primary checkout
 {{task}}
 
 {{amendment_section}}
+{{operator_rulings}}
 {{carry_forward_section}}
 ## Plan (if any)
 {{plan_body}}

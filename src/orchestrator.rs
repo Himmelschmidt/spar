@@ -310,7 +310,10 @@ pub fn collect_gate_evidence_with_fallback(
     let st = crate::state::RunState::load(paths, run_id).ok();
     let contract_path = paths.artifact(run_id, "test-contract.md");
     let contract_body = std::fs::read_to_string(&contract_path).unwrap_or_default();
-    let criteria = crate::workflow::review_result::parse_contract_criteria(&contract_body);
+    let criteria = crate::rules::unwaived(
+        &crate::workflow::review_result::parse_contract_criteria(&contract_body),
+        &crate::rules::for_run(paths, run_id),
+    );
     let mut block_reasons: Vec<(String, Vec<String>)> = Vec::new();
     if let (Some(cfg), Some(st)) = (cfg.as_ref(), st.as_ref()) {
         let reviewers: Vec<&crate::state::SlotState> = st
