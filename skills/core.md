@@ -1536,6 +1536,14 @@ spar implement --run <id> --reload-config   # deliberately re-read spar.toml and
 
 `--reload-config` is the only way to change an existing run's config; it replaces the snapshot, so later resumes keep the reloaded values. `--role` on a `--run <id>` resume without it exits `1` rather than silently re-fleeting the run. Runs created before snapshots existed fall back to the live file.
 
+**The source is the working file, not the base commit (O129).** The snapshot is taken from
+`spar.toml` in the primary checkout's working tree. When the run's base commit carries a
+`spar.toml` that differs from it (typically a primary checkout behind main, so a merged
+config change is missing), the launch warns on stderr (`warning: spar.toml in … differs
+from base …'s copy`) and records `config_source_drift: true` in `state.json`, run JSON and
+`status --json`. It is a warning only: pull the primary checkout, or `--reload-config`
+after pulling, to pick up the base's config.
+
 ## Config knobs (`spar.toml`)
 
 ```toml

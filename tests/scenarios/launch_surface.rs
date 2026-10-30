@@ -374,6 +374,11 @@ fn max_rounds_against_a_live_orchestrator_is_queued() {
     assert!(!marker.exists(), "the queued extension is consumed once");
 }
 
+fn run_config(sb: &Sandbox, id: &str) -> serde_json::Value {
+    let p = sb.project.join(".spar/runs").join(id).join("config.json");
+    serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+}
+
 /// #182: `implement --spec` keeps a long brief out of spar's own argv, from a file or
 /// from stdin.
 #[test]
@@ -421,4 +426,47 @@ fn implement_spec_reads_the_task_from_a_file_or_stdin() {
         ])
         .assert()
         .code(1);
+}
+
+/// #189: a base commit whose spar.toml differs from the working file is flagged, and
+/// the run still froze the working file.
+#[test]
+fn a_base_with_different_spar_toml_is_flagged_not_followed() {
+    let sb = Sandbox::new();
+    std::fs::write(sb.project.join("spar.toml"), "max_agents = 2\n").unwrap();
+    sb.git(&["add", "spar.toml"]);
+    sb.git(&["commit", "-q", "-m", "config"]);
+    let launch = |sb: &Sandbox| {
+        sb.spar()
+            .args([
+                "implement",
+                "-t",
+                "x",
+                "--providers",
+                "cli:claude",
+                "--dry-run",
+                "--json",
+            ])
+            .output()
+            .unwrap()
+    };
+
+    let out = launch(&sb);
+    let v = json(&out);
+    assert_eq!(v["config_source_drift"], false, "{v}");
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("differs from base"));
+
+    std::fs::write(sb.project.join("spar.toml"), "max_agents = 3\n").unwrap();
+    let out = launch(&sb);
+    let v = json(&out);
+    assert_eq!(v["config_source_drift"], true, "{v}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("differs from base"), "{stderr}");
+    let id = v["run_id"].as_str().unwrap();
+    assert_eq!(sb.state(id)["config_source_drift"], true);
+    assert_eq!(
+        run_config(&sb, id)["max_agents"],
+        3,
+        "the working file still wins"
+    );
 }

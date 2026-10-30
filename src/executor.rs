@@ -4211,6 +4211,7 @@ pub fn emit_run_json(state: &RunState) -> Result<()> {
         "base_ref": state.base_ref,
         "base_commit": state.base_commit,
         "base_behind": state.base_behind,
+        "config_source_drift": state.config_source_drift,
         "parent_run": state.parent_run,
         "child_run": state.child_run,
         "usage": state.usage,
