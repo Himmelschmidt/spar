@@ -2033,10 +2033,8 @@ impl StreamCoalescer {
             (None, Some(cached)) => (input.saturating_sub(cached), cached),
             (None, None) => (input, 0),
         };
-        // codex 0.163.0's `turn.completed` names the counter `cache_write_input_tokens`.
         let cache_write = u
             .get("cache_creation_input_tokens")
-            .or_else(|| u.get("cache_write_input_tokens"))
             .and_then(|x| x.as_u64())
             .unwrap_or_default()
             .max(
@@ -3160,32 +3158,6 @@ mod tests {
             r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_b","type":"step-finish","cost":0.02,"tokens":{"input":5,"output":1,"cache":{"read":0,"write":0}}}}"#,
         );
         assert!((c.cost_usd.unwrap() - 0.03).abs() < 1e-9);
-    }
-
-    #[test]
-    fn codex_cache_write_reads_the_0_163_field_name() {
-        // Captured from codex-cli 0.163.0. Every local record carries the new field
-        // at zero, so the non-zero reading below is this shape with one value changed.
-        let real = r#"{"type":"turn.completed","usage":{"input_tokens":38898,"cached_input_tokens":31488,"cache_write_input_tokens":0,"output_tokens":48,"reasoning_output_tokens":0}}"#;
-        let mut c = StreamCoalescer::new_with_adapter(false, None);
-        c.feed(r#"{"type":"thread.started","thread_id":"01a18e08-08e6-7c43-879a-97498f19271a"}"#);
-        c.feed(real);
-        assert_eq!(c.input_tokens, 38898 - 31488);
-        assert_eq!(c.cache_read, 31488);
-        assert_eq!(c.cache_write, 0);
-        assert_eq!(c.output_tokens, 48);
-
-        let mut c = StreamCoalescer::new_with_adapter(false, None);
-        c.feed(&real.replace(
-            r#""cache_write_input_tokens":0"#,
-            r#""cache_write_input_tokens":512"#,
-        ));
-        assert_eq!(c.cache_write, 512);
-        assert_eq!(
-            c.input_tokens,
-            38898 - 31488,
-            "input accounting is untouched by the cache-write counter"
-        );
     }
 
     #[test]

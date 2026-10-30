@@ -288,7 +288,8 @@ pub fn scrape_agy_stated_reset(
         .map(str::to_ascii_lowercase)
         .find(|l| is_agy_quota_rejection(l) && l.contains("resets in "))?;
     let after = &lower[lower.find("resets in ")? + "resets in ".len()..];
-    let Some(until) = parse_go_duration(after).map(|d| Utc::now() + d) else {
+    let Some(until) = parse_go_duration(after).and_then(|d| Utc::now().checked_add_signed(d))
+    else {
         return Some((
             "cli:agy".into(),
             None,
@@ -327,7 +328,10 @@ fn parse_go_duration(s: &str) -> Option<chrono::Duration> {
         total = total.checked_add(n.take()?.checked_mul(unit)?)?;
         seen = true;
     }
-    (seen && n.is_none() && total > 0).then(|| chrono::Duration::seconds(total))
+    if !seen || n.is_some() || total <= 0 {
+        return None;
+    }
+    chrono::Duration::try_seconds(total)
 }
 
 /// Parse Claude-style `rate_limits.five_hour` JSON fragments from logs/statusline, or
@@ -925,6 +929,12 @@ mod tests {
             until.is_none(),
             "a fractional duration falls back, not rounds"
         );
+        for absurd in ["Resets in 9999999999999h.", "Resets in 99999999999h."] {
+            let (_, until, _) =
+                scrape_agy_stated_reset("cli:agy", &format!("Individual quota reached. {absurd}"))
+                    .expect("still a hit");
+            assert!(until.is_none(), "{absurd} must fall back, not panic");
+        }
     }
 
     #[test]
