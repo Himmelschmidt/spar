@@ -118,7 +118,7 @@ const PR_BODY_MAX: usize = 65_000;
 /// PR body: the shipped slot's summary, the OPEN questions it lists, and each reviewer's
 /// final verdict. Questions and verdicts come first so truncation only ever eats the tail
 /// of the summary.
-fn pr_body(paths: &SparPaths, state: &RunState, branch: &str) -> String {
+fn pr_body(paths: &SparPaths, state: &RunState, branch: &str, cwd: &Path) -> String {
     let shipped = state
         .worktrees
         .iter()
@@ -151,11 +151,13 @@ fn pr_body(paths: &SparPaths, state: &RunState, branch: &str) -> String {
             body.push('\n');
         }
     }
-    let open = open_findings(state);
+    // The run reached the ship gate, so none of these held it: minors under `block_on`,
+    // follow-ups, notes on an approving review. They are the work this PR leaves (O118).
+    let open = crate::workflow::review_result::open_findings(state, cwd);
     if !open.is_empty() {
         body.push_str("\n## Open findings (non-blocking)\n\n");
-        for line in open {
-            body.push_str(&line);
+        for f in open {
+            body.push_str(&f.line());
             body.push('\n');
         }
     }
@@ -242,18 +244,6 @@ fn review_verdicts(paths: &SparPaths, state: &RunState) -> Vec<String> {
         .collect()
 }
 
-/// The last panel's reviewer findings, from the recorded reviews. The run reached the
-/// ship gate, so none of them held it: they are minors under `block_on`, follow-ups, or
-/// notes on an approving review, and they are the follow-up work this PR leaves (O118).
-fn open_findings(state: &RunState) -> Vec<String> {
-    use crate::workflow::review_result::{finding_line, panel_before, panel_findings};
-    let panel = panel_before(&state.review_history, u32::MAX);
-    panel_findings(&panel)
-        .into_iter()
-        .map(|(slot, f)| finding_line(slot, f))
-        .collect()
-}
-
 fn git_ok(cwd: &std::path::Path, args: &[&str]) -> bool {
     Command::new("git")
         .args(args)
@@ -332,7 +322,7 @@ pub fn ship(
                 pr_base.as_deref().unwrap_or("(repo default)"),
                 commands.join("\n"),
                 pr_title(state.task.as_deref(), cfg.ship.title_max),
-                pr_body(paths, &state, &branch)
+                pr_body(paths, &state, &branch, &cwd)
             ),
         )?;
         state.set_phase(Phase::Done);
@@ -370,7 +360,7 @@ pub fn ship(
     );
 
     let commands = vec![push_cmd, pr_cmd];
-    std::fs::write(&body_file, pr_body(paths, &state, &branch))?;
+    std::fs::write(&body_file, pr_body(paths, &state, &branch, &cwd))?;
     state.ship_commands = Some(commands.clone());
     state.set_phase(Phase::Shipping);
     state.save(paths)?;
@@ -801,7 +791,7 @@ mod tests {
         )
         .unwrap();
 
-        let body = pr_body(&paths, &state, "spar/rb1/impl");
+        let body = pr_body(&paths, &state, "spar/rb1/impl", tmp.path());
         assert!(body.starts_with("Shipped by spar run `rb1`."), "{body}");
         assert!(
             body.contains(
@@ -843,7 +833,7 @@ mod tests {
                 review: parse(body),
             });
         }
-        let body = pr_body(&paths, &state, "spar/rb1/impl");
+        let body = pr_body(&paths, &state, "spar/rb1/impl", tmp.path());
         let section = body
             .split("## Open findings (non-blocking)\n\n")
             .nth(1)
@@ -870,7 +860,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let (paths, mut state) = body_state(tmp.path());
         state.slots.clear();
-        let body = pr_body(&paths, &state, "spar/rb1/impl");
+        let body = pr_body(&paths, &state, "spar/rb1/impl", tmp.path());
         assert!(
             body.contains("_No implementer summary was written._"),
             "{body}"
@@ -892,7 +882,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let body = pr_body(&paths, &state, "spar/rb1/impl");
+        let body = pr_body(&paths, &state, "spar/rb1/impl", tmp.path());
         assert!(body.chars().count() <= 65_536, "{}", body.chars().count());
         assert!(body.contains("- keep me"));
         assert!(

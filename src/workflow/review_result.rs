@@ -608,6 +608,117 @@ pub fn finding_line(slot_id: &str, f: &Finding) -> String {
     format!("- {}{follow}{at} ({slot_id}): {text}", f.severity.as_str())
 }
 
+/// A finding from the last panel, with what has happened to its file since (O120).
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenFinding {
+    pub slot_id: String,
+    /// The commit the finding's reviewer judged.
+    pub reviewed_commit: Option<String>,
+    #[serde(flatten)]
+    pub finding: Finding,
+    /// `git log --oneline <reviewed_commit>..HEAD -- <file>`, newest first. `None` when
+    /// the finding cites no file, its review named no commit, or git could not answer.
+    pub touched_since: Option<Vec<String>>,
+    /// Its cited file changed after the review, so the finding may describe code that
+    /// is gone. A hint for whoever picks it up, never a verdict.
+    pub possibly_addressed: bool,
+}
+
+impl OpenFinding {
+    pub fn line(&self) -> String {
+        let mut out = finding_line(&self.slot_id, &self.finding);
+        let (Some(commits), Some(file), Some(sha)) = (
+            &self.touched_since,
+            &self.finding.file,
+            &self.reviewed_commit,
+        ) else {
+            return out;
+        };
+        if commits.is_empty() {
+            return out;
+        }
+        out.push_str(&format!(
+            "\n  possibly addressed: {} commit(s) since `{}` touched `{file}`:",
+            commits.len(),
+            &sha[..sha.len().min(8)]
+        ));
+        for c in commits.iter().take(5) {
+            out.push_str(&format!("\n    {c}"));
+        }
+        if commits.len() > 5 {
+            out.push_str(&format!("\n    (+{} more)", commits.len() - 5));
+        }
+        out
+    }
+}
+
+/// The last panel's reviewer findings, each checked against the commits since its
+/// review that touched its cited file, in `cwd` (the implementer's worktree). No model
+/// call: one `git log` per distinct (commit, file).
+pub fn open_findings(state: &RunState, cwd: &std::path::Path) -> Vec<OpenFinding> {
+    let panel = panel_before(&state.review_history, u32::MAX);
+    let mut cache: std::collections::HashMap<(String, String), Option<Vec<String>>> =
+        std::collections::HashMap::new();
+    panel_findings(&panel)
+        .into_iter()
+        .map(|(slot, f)| {
+            let reviewed_commit = panel
+                .iter()
+                .find(|e| e.slot_id == slot)
+                .and_then(|e| e.review.reviewed_commit.clone());
+            let touched_since = match (&reviewed_commit, &f.file) {
+                (Some(sha), Some(file)) => cache
+                    .entry((sha.clone(), file.clone()))
+                    .or_insert_with(|| commits_touching(cwd, sha, file))
+                    .clone(),
+                _ => None,
+            };
+            OpenFinding {
+                slot_id: slot.to_string(),
+                reviewed_commit,
+                finding: f.clone(),
+                possibly_addressed: touched_since.as_ref().is_some_and(|c| !c.is_empty()),
+                touched_since,
+            }
+        })
+        .collect()
+}
+
+fn commits_touching(cwd: &std::path::Path, since: &str, file: &str) -> Option<Vec<String>> {
+    let out = std::process::Command::new("git")
+        // Findings cite repo-relative paths; `:(top)` keeps them so from any cwd.
+        .args([
+            "log",
+            "--oneline",
+            &format!("{since}..HEAD"),
+            "--",
+            &format!(":(top){file}"),
+        ])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// Where a run's open findings are checked: the implementer's worktree, else the
+/// project root.
+pub fn findings_cwd(state: &RunState) -> std::path::PathBuf {
+    state
+        .slots
+        .iter()
+        .filter(|s| s.role == crate::state::SlotRole::Implementer)
+        .find_map(|s| state.worktrees.iter().find(|w| w.slot_id == s.id))
+        .map_or_else(|| state.project_root.clone(), |w| w.path.clone())
+}
+
 /// Persist what the gate read from one reviewer: on the slot, in the run's per-round
 /// review history, and as `artifacts/review-<slot>.json` beside the markdown.
 pub fn record_review(state: &mut RunState, paths: &SparPaths, slot_id: &str, res: &ReviewResult) {
@@ -1806,5 +1917,57 @@ The loop at src/resolver.rs:88 never stops.\n\
             finding_line(f[0].0, f[0].1),
             "- major `src/a.rs:1` (r1): Same   thing at src/a.rs:1"
         );
+    }
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// O120: a finding whose cited file a later commit touched is possibly addressed;
+    /// one whose file did not move, or that cites no file, is not.
+    #[test]
+    fn open_findings_mark_the_ones_whose_file_moved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q"]);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "a\n").unwrap();
+        std::fs::write(dir.join("src/b.rs"), "b\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-q", "-m", "init"]);
+        let reviewed = git(dir, &["rev-parse", "HEAD"]);
+        std::fs::write(dir.join("src/a.rs"), "a2\n").unwrap();
+        git(dir, &["commit", "-q", "-am", "fix a"]);
+
+        let mut state = RunState::new("r1", crate::cli::WorkflowKind::Loop, dir.into());
+        state.review_history.push(crate::state::ReviewHistoryEntry {
+            round: 2,
+            slot_id: "rev".into(),
+            review: parse_review(&format!(
+                "## Verdict\nrequest_changes\n\nReviewed-Commit: {reviewed}\n\n## Findings\n- severity: major — off by one at src/a.rs:1\n- severity: minor — naming at src/b.rs:1\n- severity: minor — no location\n"
+            )),
+        });
+        let open = open_findings(&state, &dir.join("src"));
+        assert_eq!(open.len(), 3);
+        assert!(open[0].possibly_addressed);
+        assert_eq!(open[0].touched_since.as_ref().unwrap().len(), 1);
+        assert!(
+            open[0]
+                .line()
+                .contains("possibly addressed: 1 commit(s) since"),
+            "{}",
+            open[0].line()
+        );
+        assert!(open[0].line().contains("fix a"));
+        assert!(!open[1].possibly_addressed);
+        assert_eq!(open[1].touched_since.as_deref(), Some(&[][..]));
+        assert!(!open[1].line().contains("possibly"));
+        assert!(!open[2].possibly_addressed && open[2].touched_since.is_none());
     }
 }

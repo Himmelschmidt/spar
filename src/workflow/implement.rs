@@ -3462,10 +3462,22 @@ fn escalate_round_ceiling(state: &mut RunState, paths: &SparPaths) -> Result<()>
     // `print_run_human` shows the phase but not `error`, so without this an operator
     // running implement interactively sees a phase name and no way out of it.
     eprintln!("{msg}");
+    // Findings describe the commit their reviewer read; one whose file moved since may
+    // already be fixed, and whoever takes the run over should check it at HEAD (O120).
+    let open = review_result::open_findings(state, &review_result::findings_cwd(state));
+    let mut findings = String::new();
+    if !open.is_empty() {
+        findings.push_str("\n## Open findings\n\n");
+        for f in &open {
+            findings.push_str(&f.line());
+            findings.push('\n');
+        }
+        eprint!("{findings}");
+    }
     std::fs::write(
         paths.artifact(&state.id, "escalation.md"),
         format!(
-            "# Escalation: round ceiling\n\n{msg}\n\nFix rounds this leg: {}\nSuite: {:?}\n",
+            "# Escalation: round ceiling\n\n{msg}\n\nFix rounds this leg: {}\nSuite: {:?}\n{findings}",
             state.fix_rounds, state.suite_outcome
         ),
     )?;

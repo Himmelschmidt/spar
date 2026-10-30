@@ -274,3 +274,108 @@ fn scoped_re_review_can_be_turned_off() {
     let prompt = last_prompt(tmp.path(), &run_id, &slot);
     assert!(!prompt.contains("Scoped re-review"), "{prompt}");
 }
+
+fn commit_file(dir: &Path, rel: &str, subject: &str) {
+    let path = dir.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, format!("{subject}\n")).unwrap();
+    for args in [vec!["add", rel], vec!["commit", "-q", "-m", subject]] {
+        assert!(Command::new("git")
+            .args(&args)
+            .current_dir(dir)
+            .status()
+            .unwrap()
+            .success());
+    }
+}
+
+fn brief_json(dir: &Path, run_id: &str) -> serde_json::Value {
+    let out = spar_cmd()
+        .current_dir(dir)
+        .args(["brief", run_id, "--json"])
+        .assert()
+        .success();
+    serde_json::from_slice(out.get_output().stdout.as_slice()).unwrap()
+}
+
+/// O120. At the ceiling each open finding is listed; once a commit touches its cited
+/// file, `spar brief` marks it possibly addressed and names the commit. No model call.
+#[test]
+fn stale_findings_are_listed_at_the_ceiling_and_marked_in_brief() {
+    let tmp = tempdir().unwrap();
+    project(tmp.path(), "[rounds]\nmax = 2\n");
+    let run_id = planned_run(tmp.path());
+    implement(
+        tmp.path(),
+        &run_id,
+        &[("SPAR_FORCE_REVIEW_FINDING", "major")],
+    )
+    .code(2)
+    .stderr(predicates::str::contains("## Open findings"));
+    let escalation =
+        std::fs::read_to_string(run_dir(tmp.path(), &run_id).join("artifacts/escalation.md"))
+            .unwrap();
+    assert!(escalation.contains("## Open findings"), "{escalation}");
+    assert!(
+        escalation.contains("- major `src/lib.rs:1`"),
+        "{escalation}"
+    );
+    assert!(!escalation.contains("possibly addressed"), "{escalation}");
+
+    let v = brief_json(tmp.path(), &run_id);
+    let open = v["open_findings"].as_array().unwrap();
+    assert!(!open.is_empty(), "{v}");
+    assert!(open.iter().all(|f| f["possibly_addressed"] == false), "{v}");
+    assert_eq!(open[0]["file"], "src/lib.rs");
+
+    commit_file(tmp.path(), "src/lib.rs", "fix the retry");
+    commit_file(tmp.path(), "src/other.rs", "unrelated");
+    let v = brief_json(tmp.path(), &run_id);
+    let f = &v["open_findings"][0];
+    assert_eq!(f["possibly_addressed"], true, "{v}");
+    let touched = f["touched_since"].as_array().unwrap();
+    assert_eq!(
+        touched.len(),
+        1,
+        "only commits touching the cited file: {v}"
+    );
+    assert!(
+        touched[0].as_str().unwrap().ends_with("fix the retry"),
+        "{v}"
+    );
+
+    let text = spar_cmd()
+        .current_dir(tmp.path())
+        .args(["brief", &run_id])
+        .assert()
+        .success();
+    let text = String::from_utf8_lossy(text.get_output().stdout.as_slice()).to_string();
+    assert!(text.contains("open findings"), "{text}");
+    assert!(text.contains("possibly addressed: 1 commit(s)"), "{text}");
+}
+
+/// O120 at ship: a minor the panel left, whose file a later commit touched, reaches
+/// the PR body marked possibly addressed.
+#[test]
+fn the_pr_body_marks_findings_whose_file_moved() {
+    let tmp = tempdir().unwrap();
+    project(tmp.path(), "[rounds]\nmax = 4\n");
+    let run_id = planned_run(tmp.path());
+    implement(
+        tmp.path(),
+        &run_id,
+        &[("SPAR_FORCE_REVIEW_FINDING", "minor")],
+    )
+    .code(2);
+    commit_file(tmp.path(), "src/lib.rs", "tidy the doc comment");
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["ship", &run_id, "--confirm", "--json"])
+        .assert()
+        .success();
+    let ship =
+        std::fs::read_to_string(run_dir(tmp.path(), &run_id).join("artifacts/ship.md")).unwrap();
+    assert!(ship.contains("## Open findings (non-blocking)"), "{ship}");
+    assert!(ship.contains("possibly addressed: 1 commit(s)"), "{ship}");
+    assert!(ship.contains("tidy the doc comment"), "{ship}");
+}

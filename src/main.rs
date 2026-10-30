@@ -1105,6 +1105,10 @@ fn brief_cmd(run_id: &str, full: bool, json: bool) -> Result<ExitCode> {
         .collect();
 
     let next = notify::next_command(&state);
+    let open_findings = workflow::review_result::open_findings(
+        &state,
+        &workflow::review_result::findings_cwd(&state),
+    );
 
     if json {
         let v = serde_json::json!({
@@ -1127,6 +1131,7 @@ fn brief_cmd(run_id: &str, full: bool, json: bool) -> Result<ExitCode> {
             "error": state.error,
             "artifacts": artifacts.iter().map(|(n, p)| serde_json::json!({"name": n, "path": p})).collect::<Vec<_>>(),
             "ac_ids": ac_ids,
+            "open_findings": open_findings,
             "recent_events": events,
             "next_command": next,
         });
@@ -1190,6 +1195,12 @@ fn brief_cmd(run_id: &str, full: bool, json: bool) -> Result<ExitCode> {
     }
     if !ac_ids.is_empty() {
         println!("acceptance criteria: {}", ac_ids.join(", "));
+    }
+    if !open_findings.is_empty() {
+        println!("open findings (last review panel; check each at HEAD):");
+        for f in &open_findings {
+            println!("  {}", f.line().replace('\n', "\n  "));
+        }
     }
     println!("recent events:");
     for e in &events {
