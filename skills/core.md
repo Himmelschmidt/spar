@@ -66,7 +66,8 @@ agy's `--print-timeout` is also derived from the role's hard ceiling, so agy exi
 cleanly just before spar's own backstop would kill it (agy's own default is unlimited).
 
 **Pause / cooldown.** A provider is paused manually (`spar provider pause <ref>`) or
-automatically when a slot hits a rate-limit signal. Pauses **auto-recover** ~30 min after
+automatically when a slot hits a rate-limit signal. A slot that was killed (signal, or exit
+143/137) never pauses its provider on log text; only an adapter's typed rejection counts. Pauses **auto-recover** ~30 min after
 they were set (or at an explicit cooldown reset), so the provider is re-probed rather than
 staying dead; `spar provider resume <ref>` clears one immediately. A paused provider is
 never silently swapped into another role: `plan`/`implement` exit `4` (quota) naming the
@@ -235,7 +236,7 @@ positions.
 `--fleet small|standard` and `--without critic,spec,suite` shape the seats for one run without
 touching `spar.toml`; see "Fleet shaping" below.
 
-**Run composition (009).** The new-run form is the run's single partial specification. Workflow is optional (`plan` / `implement` / `review` / `arena`) — leaving it unset lets the Chat orchestrator propose one. Each workflow shows its dispatched roles: `plan` is `planner` plus enabled `plan_critic`/`test_author`; `implement` is `implementer` plus the exact reviewer panel plus `tester` only when no deterministic suite replaces it; `review` is the exact reviewer panel; `arena` is a positional pool of `max_agents.max(2)` contenders. The six assignable roles remain the only role rows; `ranker`, `reconciler` and `peer` keep taking fleet positions. Models are opaque free text with local suggestions (`@model` on any `provider@model` ref, stored as storage key plus optional model via the `Pin` boundary — a conflicting `@model` plus separate model is rejected and a double-model ref never emits). `--role ROLE=PROVIDER[@MODEL]` is repeatable and outranks the pool; `--backup ROLE=PROVIDER[@MODEL]` declares a per-role, per-ordinal fallback. A backup fires only for an environmental stop — quota pause, rate limit, or provider unavailable — never on a nonzero work exit, timeout, missing artifact, or adverse review, and it persists as `SeatSource::Backup`. It replaces O52's blind implementer rotation only on that cause and only while not yet consumed; arena never accepts or emits `--role` or `--backup` and retains its positional quota semantics. `--backup` is new-run-only; `plan --run` and `implement --run` without `--reload-config` reject it. A backup whose canonical storage key equals its primary is rejected even when models differ. Operator defaults that prefill a newly opened form live at `registry::spar_home()/defaults.json`, never in the project's `spar.toml`; a run still freezes its resolved fleet into `.spar/runs/<id>/config.json` (O27) so deleting or corrupting defaults after launch cannot alter a continuation.
+**Run composition (009).** The new-run form is the run's single partial specification. Workflow is optional (`plan` / `implement` / `review` / `arena`) — leaving it unset lets the Chat orchestrator propose one. Each workflow shows its dispatched roles: `plan` is `planner` plus enabled `plan_critic`/`test_author`; `implement` is `implementer` plus the exact reviewer panel plus `tester` only when no deterministic suite replaces it; `review` is the exact reviewer panel; `arena` is a positional pool of `max_agents.max(2)` contenders. The six assignable roles remain the only role rows; `ranker`, `reconciler` and `peer` keep taking fleet positions. Models are opaque free text with local suggestions (`@model` on any `provider@model` ref, stored as storage key plus optional model via the `Pin` boundary — a conflicting `@model` plus separate model is rejected and a double-model ref never emits). `--role ROLE=PROVIDER[@MODEL]` is repeatable and outranks the pool; `--backup ROLE=PROVIDER[@MODEL]` declares a per-role, per-ordinal fallback. A backup fires only for an environmental stop — quota pause, rate limit, or provider unavailable — never on a nonzero work exit, timeout, missing artifact, or adverse review, and it persists as `SeatSource::Backup`. A slot that ended by signal (or exit 143/137) is judged only on the adapter's typed rejection, never on its log text. It replaces O52's blind implementer rotation only on that cause and only while not yet consumed; arena never accepts or emits `--role` or `--backup` and retains its positional quota semantics. `--backup` is new-run-only; `plan --run` and `implement --run` without `--reload-config` reject it. A backup whose canonical storage key equals its primary is rejected even when models differ. Operator defaults that prefill a newly opened form live at `registry::spar_home()/defaults.json`, never in the project's `spar.toml`; a run still freezes its resolved fleet into `.spar/runs/<id>/config.json` (O27) so deleting or corrupting defaults after launch cannot alter a continuation.
 
 | `--workflow` | Slots | Ends at |
 |---|---|---|
@@ -249,6 +250,9 @@ touching `spar.toml`; see "Fleet shaping" below.
 `spar plan -t` is `--workflow plan`. `spar implement -t` is `--workflow loop`: a fresh brief
 straight into build/review with **no** planner, critic or test-contract, which is the cheap
 middle setting between `--workflow review` and the full `plan → approve → implement` path.
+`loop` builds a change against a fixed base; it is not for chasing a moving one. A run cannot be
+re-based after creation (O26), so "make PR #N mergeable" runs re-merge main every round and do not
+converge. Resolve conflicts by hand, or cap such a run at `--max-rounds 1 --fleet small`.
 `spar reconcile <id>` is an arena continuation, not a workflow: it adds a `reconciler` plus
 two more `reviewer` slots on the reconciled tree.
 
@@ -288,6 +292,10 @@ spar plan --run <run_id> -t "narrow it to the email path" [--json]
 # Named workflows
 spar run --workflow plan|loop|arena|roles|peer|review -t "..." --providers cli:claude,cli:grok [--dry-run] [--big]
 spar run --workflow arena -t "..." --select best --urgency normal --dry-run
+
+# An empty or whitespace-only task exits 1 before any run id is minted: `-t ""` and an
+# empty --brief with `error: task is empty`, an empty --spec with `brief body is empty`.
+# `plan --run <id>` with an empty directive exits 1 with `replan directive is empty`.
 
 # Independent concurrent multi-provider review (not split-stack peer):
 spar run --workflow review -t "Review PR #12 for auth bugs" --providers cli:claude,cli:grok
@@ -428,7 +436,8 @@ on — never a restatement of the plan or contract, which the next round is hand
   backend 404 after real work is retried with backoff through that same resume instead
   of failing the slot. A resume the vendor answers with a fresh session (exit 0, a new
   id) is noted in the run's events, not retried. O52's general default is unchanged
-  for every other provider.
+  for every other provider. Whatever the provider, reviewer, tester, plan-critic and
+  test-author slots never resume: they dispatch cold every round and every replan (O89).
 
 For legs that already exist, `spar link <leg> --to <run>` records the grouping
 (`parent_run`). spar never infers it — pairing runs by task text would merge unrelated
@@ -484,10 +493,13 @@ run-routing decision above never does, for the false-positive reason just descri
 That parsed cooldown is capped at the *next occurrence* of the stated time-of-day (~24h
 out), not the actual weekly rollover — a big improvement over the default, but a weekly
 pause is still re-probed daily rather than left alone for the full week, since Claude's
-line carries no date. codex and opencode have no provider-specific reset parser, so a
-mid-dispatch limit on them falls back to the generic-rejection-phrase match (untested
-against any real captured output from those CLIs — treat as unverified, not confirmed)
-and the generic cooldown; muse and grok are the same, also unverified. agy's rejection
+line carries no date. codex, opencode, muse and grok have no provider-specific reset
+parser, so a limit on them falls back to the generic-rejection-phrase match and the
+generic cooldown. muse's dispatch-time 429, "Subscription quota exhausted", is matched
+from the text reported in real fleet incidents (any line with "quota exhausted"), as is an
+HTTP 402 ("402 Payment Required", or `402` framed as a status). codex's "You've hit your usage
+limit" is matched but still untested against captured codex output; grok and opencode
+rely on the generic phrases alone and remain unverified. agy's rejection
 states a relative reset ("Resets in 125h56m29s."), which spar turns into an exact
 cooldown (whole h/m/s components only; anything else, or a reset 8 days or more out,
 falls back to the generic one). agy also has a second signal: near-exhausted quota is
@@ -560,6 +572,19 @@ unpushed branch falls through to the repo default, with a note on stderr. `spar 
 --base <branch>` forces a target. The chosen target is recorded in `artifacts/ship.md`
 (`PR base:`), on the dry-run path too.
 
+`spar ship` pushes the slot worktree's **HEAD** to `spar/<id>/<slot>`, never the branch by
+name, and **never rewinds the remote branch**. Before pushing it fetches the remote branch;
+if the remote has commits HEAD lacks (someone pushed by hand), ship exits `1` with "remote
+<branch> has commits the run lacks": fast-forward the worktree onto `origin/<branch>` by hand
+and ship again. The push is leased on the exact tip it fetched, so a push landing in between
+also fails. If the worktree was left on another branch (a reviewer's, or detached), ship
+pushes HEAD when HEAD contains the run's branch and that branch has moved past the run's
+base (note on stderr), and refuses otherwise. A refusal exits `1`, leaves the phase at
+`awaiting_ship_confirm`, and records the reason in the run's `error`. The loop workflow also
+fast-forwards the implementer's branch back onto HEAD before each review panel when a slot
+left the worktree elsewhere, and only warns (stderr + event log) when that is not a
+fast-forward, the branch is still at the base, or it is checked out in another worktree.
+
 ## Abandoned runs
 
 A run is **abandoned** when it is still in a non-resting phase but no live orchestrator
@@ -583,6 +608,10 @@ children — so they keep running and keep spending tokens with nobody collectin
 - `spar resume <id>` picks an abandoned or stopped run back up without you having to know
   which of `implement --run` / a fresh dispatch applies — it refuses a human gate (naming
   the command that resolves it) and a run with a live orchestrator (naming its pid).
+  `implement --run <id>` (with or without `--detach` / `--reload-config`) refuses the same
+  way, exit 1, before it writes anything to the live run's `state.json`.
+- A foreground `spar plan` holds the run lock for its whole dispatch, so it never reads
+  abandoned while its planner works.
 - `spar daemon start` runs a per-project supervisor that pushes an alert the first time a
   run has read abandoned past `[daemon].abandon_after_secs` (60s by default), and restarts
   it if `[daemon].restart` is on (the default). It is opt-in — nothing starts it for you —
@@ -832,7 +861,7 @@ event/presence mirror live under `.spar/runs/<id>/bus/`.
 ## Observe
 
 ```bash
-spar status [run_id] [--json] [--all]   # --all = every registered project
+spar status [run_id] [--json] [--all]   # --all = every registered project; a run with a live orchestrator shows `pid=<n>`
 spar wait <run_id> [--timeout 8h] [--follow] [--json]
 spar logs <run_id> [slot] [-f|--follow]
 

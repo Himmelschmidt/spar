@@ -174,6 +174,9 @@ fn run() -> Result<ExitCode> {
                     (None, None, Some(path)) => brief::read_spec_text(path)?,
                     _ => anyhow::bail!("plan --run requires exactly one of -t / --spec / --brief"),
                 };
+                if directive.trim().is_empty() {
+                    anyhow::bail!("replan directive is empty");
+                }
                 let (paths, _) = project_ctx()?;
                 let cfg = Config::for_run(&paths, &id)?;
                 return workflow::plan::replan(&paths, &cfg, &id, directive, json);
@@ -814,6 +817,13 @@ fn implement_ctx(
     cfg.apply_role_overrides(role)?;
     cfg.apply_backup_overrides(backup)?;
     cfg.apply_effort_overrides(effort)?;
+    if let Some(owner) = runlock::RunLock::owner(&paths, run_id).filter(|o| o.alive()) {
+        return Err(runlock::OrchestratorBusy {
+            run_id: run_id.to_string(),
+            owner_pid: owner.pid,
+        }
+        .into());
+    }
     cfg.save_snapshot(&paths, run_id)?;
     eprintln!("config: re-read spar.toml for run {run_id}");
     Ok((paths, cfg))
@@ -986,6 +996,13 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> 
                 last_proj = proj;
             }
             let dry = if summary.dry_run { " dry" } else { "" };
+            let orch = summary
+                .project_root
+                .as_ref()
+                .and_then(|root| runlock::RunLock::owner(&paths::SparPaths::new(root), &summary.id))
+                .filter(|t| t.alive())
+                .map(|t| format!(" pid={}", t.pid))
+                .unwrap_or_default();
             let abandoned = if summary.abandoned { " ABANDONED" } else { "" };
             let arch = if summary.archived { " archived" } else { "" };
             let task = summary
@@ -994,7 +1011,7 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> 
                 .map(|t| format!("  {}", truncate_cli(t, 40)))
                 .unwrap_or_default();
             println!(
-                "    {}  {:?}{}{abandoned}{arch}{task}",
+                "    {}  {:?}{}{orch}{abandoned}{arch}{task}",
                 summary.id, summary.phase, dry
             );
         }
