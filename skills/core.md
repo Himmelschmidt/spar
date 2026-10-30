@@ -48,12 +48,15 @@ failed, with the probe's own one-line message, e.g. a broken opencode config),
 `missing` (not on PATH). `--json` carries the same verdict as `readiness` with values
 `healthy` / `unhealthy` / `unknown`, plus `readiness_message` (ANSI-stripped, capped at
 300 chars) when unhealthy. `doctor` exits failure only when no usable provider remains,
-so one unhealthy provider alongside working ones does not block a run. Today only
-`cli:opencode` wires a probe (`opencode models`); the other adapters report unknown and
-stay available. Limit: the probe catches broken config, not dead credentials — a
-parseable config with an expired key still reports healthy and fails at dispatch, which
-is all a local-only, no-quota check can see. An `unhealthy` provider is still eligible
-for dispatch; doctor warns, it does not exclude.
+so one unhealthy provider alongside working ones does not block a run. Probes wired
+(O107): `cli:opencode` runs `opencode models` (broken config, not dead credentials);
+`cli:claude` runs `claude auth status` with nonessential traffic off (logged out) and
+reads its `.credentials.json` for an expired refresh token; `cli:codex` runs `codex
+login status` (logged out). grok, muse and agy have no local check that fails on a dead
+login, so they report unknown; use `spar provider probe <ref>` for a real call. Limit:
+no local probe sees a token revoked server-side; that surfaces at dispatch as an auth
+fault. An `unhealthy` provider is still eligible for dispatch; doctor warns, it does not
+exclude.
 
 **A reviewer that cannot run is not a verdict (O103).** In the implement loop, a
 reviewer dispatch that fails because the provider could not serve it (rate limit, auth

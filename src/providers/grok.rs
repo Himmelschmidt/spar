@@ -52,8 +52,10 @@ impl ProviderAdapter for GrokAdapter {
     // support only, not auth or config; `grok models` exits 0 even when logged
     // out ("You are not authenticated", verified), so it cannot distinguish a
     // dispatchable box from a broken one; `grok inspect` is per-directory
-    // (project trust) and per-worktree checks are out of scope. Default
-    // (Unknown) stands.
+    // (project trust) and per-worktree checks are out of scope. Re-checked on
+    // 1.0.70: still no `login status`, and `grok models` still exits 0 while
+    // printing "You are not authenticated." Default (Unknown) stands; `spar
+    // provider probe cli:grok` makes a real call when one is needed.
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {

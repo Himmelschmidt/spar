@@ -194,6 +194,18 @@ pub trait ProviderAdapter: Send + Sync {
     fn readiness_probe(&self) -> Option<&[&'static str]> {
         None
     }
+    /// Environment the readiness probe runs under, e.g. to switch off a CLI's
+    /// telemetry so the probe stays off the network.
+    fn readiness_env(&self) -> &[(&'static str, &'static str)] {
+        &[]
+    }
+    /// A credential fault read from the CLI's own local files that its probe
+    /// command does not report (claude's `auth status` says logged in with an
+    /// expired refresh token). `Some(message)` makes readiness `Unhealthy`.
+    /// File reads only: no spawn, no network, no writes.
+    fn credential_fault(&self) -> Option<String> {
+        None
+    }
     fn resolve_binary(&self) -> Option<PathBuf> {
         self.binary_names()
             .iter()
@@ -204,8 +216,18 @@ pub trait ProviderAdapter: Send + Sync {
         let (available, path_str, version, readiness, readiness_message) = match path {
             Some(p) => {
                 let version = probe_version(&p, self.version_args());
-                let (readiness, readiness_message) =
-                    probe_readiness(&p, self.readiness_probe(), READINESS_TIMEOUT);
+                let (mut readiness, mut readiness_message) = probe_readiness(
+                    &p,
+                    self.readiness_probe(),
+                    self.readiness_env(),
+                    READINESS_TIMEOUT,
+                );
+                if readiness != Readiness::Unhealthy {
+                    if let Some(fault) = self.credential_fault() {
+                        readiness = Readiness::Unhealthy;
+                        readiness_message = Some(truncate_chars(&fault, READINESS_MESSAGE_CHARS));
+                    }
+                }
                 (
                     true,
                     Some(p.display().to_string()),
@@ -386,6 +408,7 @@ pub(crate) const READINESS_MESSAGE_CHARS: usize = 300;
 fn probe_readiness(
     bin: &PathBuf,
     probe: Option<&[&str]>,
+    env: &[(&str, &str)],
     timeout: std::time::Duration,
 ) -> (Readiness, Option<String>) {
     let Some(args) = probe else {
@@ -393,6 +416,7 @@ fn probe_readiness(
     };
     let mut cmd = std::process::Command::new(bin);
     cmd.args(args);
+    cmd.envs(env.iter().copied());
     let Some(output) = run_with_timeout(&mut cmd, timeout) else {
         return (Readiness::Unknown, None);
     };
@@ -806,6 +830,7 @@ mod tests {
         let (readiness, message) = probe_readiness(
             &bin,
             Some(&["-c", "sleep 30"]),
+            &[],
             std::time::Duration::from_millis(100),
         );
         assert_eq!(readiness, Readiness::Unknown);
@@ -822,6 +847,7 @@ mod tests {
                 "-c",
                 "printf '\\033[91m\\033[1mError: \\033[0mbroken\\n' >&2; exit 1",
             ]),
+            &[],
             std::time::Duration::from_secs(10),
         );
         assert_eq!(readiness, Readiness::Unhealthy);
@@ -834,6 +860,7 @@ mod tests {
         let (readiness, message) = probe_readiness(
             &bin,
             Some(&["-c", "head -c 1000 /dev/zero | tr '\\0' 'x' >&2; exit 1"]),
+            &[],
             std::time::Duration::from_secs(10),
         );
         assert_eq!(readiness, Readiness::Unhealthy);
@@ -849,6 +876,7 @@ mod tests {
         let (readiness, message) = probe_readiness(
             &bin,
             Some(&["-c", "kill -9 $$"]),
+            &[],
             std::time::Duration::from_secs(10),
         );
         assert_eq!(readiness, Readiness::Unknown);
@@ -863,6 +891,7 @@ mod tests {
         let (readiness, message) = probe_readiness(
             &bin,
             Some(&["-c", "seq 1 200000; exit 3"]),
+            &[],
             std::time::Duration::from_secs(20),
         );
         assert_eq!(readiness, Readiness::Unhealthy);
@@ -917,14 +946,75 @@ mod tests {
         assert_eq!(resumed, vec!["codex".to_string(), "muse".to_string()]);
     }
 
+    /// Probes are wired only where the CLI has a local check that fails on a dead
+    /// login. grok, muse and agy have none (see each adapter's comment).
     #[test]
-    fn only_opencode_wires_a_probe() {
+    fn probes_are_wired_only_where_the_cli_has_a_local_credential_check() {
         assert_eq!(OpencodeAdapter.readiness_probe(), Some(&["models"][..]));
-        assert_eq!(ClaudeAdapter.readiness_probe(), None);
+        assert_eq!(
+            ClaudeAdapter.readiness_probe(),
+            Some(&["auth", "status"][..])
+        );
+        assert_eq!(
+            ClaudeAdapter.readiness_env(),
+            &[("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")]
+        );
+        assert_eq!(
+            CodexAdapter.readiness_probe(),
+            Some(&["login", "status"][..])
+        );
         assert_eq!(GrokAdapter.readiness_probe(), None);
         assert_eq!(AgyAdapter.readiness_probe(), None);
-        assert_eq!(CodexAdapter.readiness_probe(), None);
         assert_eq!(MuseAdapter.readiness_probe(), None);
+    }
+
+    #[test]
+    fn readiness_env_reaches_the_probe() {
+        let bin = which::which("sh").expect("sh on PATH for probe tests");
+        let (readiness, _) = probe_readiness(
+            &bin,
+            Some(&["-c", "[ \"$SPAR_PROBE_ENV\" = on ]"]),
+            &[("SPAR_PROBE_ENV", "on")],
+            std::time::Duration::from_secs(10),
+        );
+        assert_eq!(readiness, Readiness::Healthy);
+    }
+
+    struct FaultyCredentials;
+
+    impl ProviderAdapter for FaultyCredentials {
+        fn name(&self) -> &'static str {
+            "faulty"
+        }
+        fn binary_names(&self) -> &[&'static str] {
+            &["sh"]
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+        fn readiness_probe(&self) -> Option<&[&'static str]> {
+            Some(&["-c", "exit 0"])
+        }
+        fn credential_fault(&self) -> Option<String> {
+            Some("login expired".into())
+        }
+        fn permission_args(&self, _policy: TrustPolicy) -> Vec<String> {
+            Vec::new()
+        }
+        fn build_headless(&self, bin: &Path, _opts: &SpawnOpts) -> Command {
+            Command::new(bin)
+        }
+        fn build_interactive(&self, bin: &Path, _opts: &SpawnOpts) -> Command {
+            Command::new(bin)
+        }
+    }
+
+    #[test]
+    fn a_credential_fault_overrides_a_passing_probe() {
+        let r = FaultyCredentials.detect();
+        assert!(r.available);
+        assert_eq!(r.readiness, Readiness::Unhealthy);
+        assert_eq!(r.readiness_message.as_deref(), Some("login expired"));
     }
 
     #[test]

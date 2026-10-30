@@ -219,15 +219,16 @@ impl ProviderAdapter for CodexAdapter {
         &["codex"]
     }
 
-    // No readiness probe. Tried `codex doctor --json` (config + auth + runtime
-    // health, verified against codex 0.153.4): it is too slow for a probe
-    // (~7s once, over 25s another time on this box) and it performs network
-    // reachability checks (provider endpoints, Responses websocket), which a
-    // local-only probe must not do; bare `codex doctor` hangs with no output
-    // outside a TTY. Anything built on `codex exec` is out regardless: exec
-    // appends a `[projects."<cwd>"]` trust_level entry to the user's config
-    // for every new directory, the exact kind of state mutation a probe must
-    // not have. Default (Unknown) stands.
+    // `codex login status` reads the stored login: "Logged in using ChatGPT",
+    // exit 0, or "Not logged in", exit 1 (verified on 0.163.0 with a real and
+    // an empty HOME), in ~0.1s, writing nothing beyond what `--version`
+    // already does. It cannot see a token revoked server-side; that surfaces
+    // at dispatch as an auth fault (O104). Not used: `codex doctor --json`
+    // (slow, does network reachability checks) and anything built on `codex
+    // exec` (it appends a trust entry to the user's config per directory).
+    fn readiness_probe(&self) -> Option<&[&'static str]> {
+        Some(&["login", "status"])
+    }
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
