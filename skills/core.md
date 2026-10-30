@@ -792,6 +792,13 @@ stderr and never fails a run. This is not `auto_cleanup` (still `false` by defau
 that one deletes resumable work on a phase check, this one only deletes what git says is
 already in the base branch. Set it `false` to keep every worktree until you sweep by hand.
 
+**What a slot worktree starts with.** Tracked files at the run's base, plus the files
+`[worktree] copy` names (default `.dbiso.env`, `.envrc`, `.env.example`) copied from the
+main checkout when present. Every slot process gets `TMPDIR` / `TMP` / `TEMP` set to
+`.spar/runs/<id>/tmp/<slot>`, created before the spawn and deleted when that dispatch
+ends, so slots never read each other's scratch files. Under `worktree-bwrap` the sandbox's
+own private `/tmp` is used instead.
+
 ## Swarm bus
 
 The bus is **workspace-scoped and keyed by a globally-unique `agent_id`**. Run-slot role

@@ -57,6 +57,14 @@ impl SparPaths {
         self.run_dir(run_id).join("logs")
     }
 
+    /// A slot's private `TMPDIR`. Run-scoped so two slots, or two runs, never share
+    /// scratch files, and so a leftover lands on the project volume rather than `/tmp`.
+    pub fn slot_tmp_dir(&self, run_id: &str, slot_id: &str) -> PathBuf {
+        self.run_dir(run_id)
+            .join("tmp")
+            .join(crate::util::sanitize_slot(slot_id))
+    }
+
     pub fn quota_file(&self) -> PathBuf {
         self.root.join("quota.json")
     }
