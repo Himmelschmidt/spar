@@ -2581,19 +2581,20 @@ fn detect_and_pause_quota(
 /// class of regression review rounds kept finding here — now has to happen inside this
 /// one tested function instead of silently at either caller.
 ///
-/// A dispatch that ended by signal is never a quota hit and never touches the store: a
-/// guard, a ceiling or the operator killed it, and a log that happens to mention
-/// "quota" or "429" must not pause the provider for every run in the project (#174).
+/// A dispatch that ended by signal is judged on its typed verdicts only, never on log
+/// text: something killed it, and a log that happens to mention "quota" or "429" must
+/// not pause the provider for every run in the project (#174).
 fn quota_hit_for_outcome(
     paths: &SparPaths,
     provider: &str,
     log_path: &Path,
     outcome: &SlotOutcome,
 ) -> bool {
-    if process::ended_by_signal(outcome.signal, outcome.exit_code) {
-        return false;
-    }
-    let log_text = process::tail_log(log_path, 8000);
+    let log_text = if process::ended_by_signal(outcome.signal, outcome.exit_code) {
+        String::new()
+    } else {
+        process::tail_log(log_path, 8000)
+    };
     detect_and_pause_quota(
         paths,
         provider,
@@ -6163,6 +6164,27 @@ mod tests {
                 "signal {signal:?} / exit {exit_code:?} must leave the provider unpaused"
             );
         }
+    }
+
+    /// #153 end to end: muse's dispatch-time rejection in the log makes the outcome a
+    /// quota hit, which is what engages the backup seat.
+    #[test]
+    fn quota_hit_for_outcome_routes_muses_subscription_quota_exhausted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log_path = tmp.path().join("s1.log");
+        std::fs::write(
+            &log_path,
+            "starting turn\n429 Subscription quota exhausted\n",
+        )
+        .unwrap();
+        let outcome = SlotOutcome {
+            exit_code: Some(1),
+            ..SlotOutcome::err("exit 1")
+        };
+        assert!(quota_hit_for_outcome(
+            &paths, "cli:muse", &log_path, &outcome
+        ));
     }
 
     /// The same log on an ordinary non-zero exit still routes and pauses: the signal

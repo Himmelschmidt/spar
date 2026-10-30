@@ -147,19 +147,10 @@ pub fn dispatch_stop_cause(
             return StopCause::Environmental;
         }
     }
-    // `slot.error` is usually just "exit 1"; the provider's rejection is in the log. Same
-    // narrow scrape that routes a run to quota, so a stray "429" or "quota" in the
-    // agent's own work does not read as one. A killed dispatch's log says nothing about
-    // why it was killed.
-    if crate::process::ended_by_signal(slot.signal, slot.exit_code) {
-        return StopCause::Work;
-    }
-    let Some(log_path) = &slot.log_path else {
-        return StopCause::Work;
-    };
-    let tail = crate::process::tail_log(log_path, 8000);
-    if QuotaStore::scrape_strong_quota_signal(&tail).is_some() {
-        return StopCause::Environmental;
+    if let Ok(pref) = crate::provider_ref::ProviderRef::parse(provider) {
+        if pref.backend == crate::provider_ref::ExecBackend::ApiSdk {
+            return StopCause::Work;
+        }
     }
     StopCause::Work
 }
@@ -277,58 +268,6 @@ mod tests {
         set.insert("cli:claude".to_string());
         assert!(is_provider_eligible("cli:claude", &store, Some(&set)));
         assert!(!is_provider_eligible("cli:grok", &store, Some(&set)));
-    }
-
-    fn failed_slot_with_log(log: &str) -> (tempfile::TempDir, SlotState) {
-        let tmp = tempfile::tempdir().unwrap();
-        let log_path = tmp.path().join("impl.log");
-        std::fs::write(&log_path, log).unwrap();
-        let mut slot = crate::executor::init_slot("impl", "cli:muse", SlotRole::Implementer);
-        slot.status = SlotStatus::Failed;
-        slot.error = Some("exit 1".into());
-        slot.exit_code = Some(1);
-        slot.log_path = Some(log_path);
-        (tmp, slot)
-    }
-
-    /// #153: muse's dispatch-time 429 fails the slot with only "exit 1" in its error;
-    /// the rejection is in the log, and it must engage the backup seat.
-    #[test]
-    fn a_quota_rejection_in_the_log_tail_is_environmental() {
-        let (_tmp, slot) =
-            failed_slot_with_log("starting turn\n429 Subscription quota exhausted\n");
-        assert_eq!(
-            dispatch_stop_cause(&slot, "cli:muse", &QuotaStore::default(), None),
-            StopCause::Environmental
-        );
-    }
-
-    /// The log scrape is the narrow one: a `429` and the word "quota" in the agent's own
-    /// work are not a rejection.
-    #[test]
-    fn quota_words_in_the_log_tail_without_a_rejection_are_work() {
-        let (_tmp, slot) =
-            failed_slot_with_log("editing src/quota.rs\npanicked at src/x.rs:429:7\nexit 1\n");
-        assert_eq!(
-            dispatch_stop_cause(&slot, "cli:muse", &QuotaStore::default(), None),
-            StopCause::Work
-        );
-    }
-
-    /// #174: a killed slot's log does not say why it was killed, so even a rejection line
-    /// there does not make the stop environmental.
-    #[test]
-    fn a_signal_ended_dispatch_is_never_classed_environmental_from_its_log() {
-        for (signal, exit_code) in [(Some(15), None), (None, Some(143))] {
-            let (_tmp, mut slot) = failed_slot_with_log("429 Subscription quota exhausted\n");
-            slot.signal = signal;
-            slot.exit_code = exit_code;
-            assert_eq!(
-                dispatch_stop_cause(&slot, "cli:muse", &QuotaStore::default(), None),
-                StopCause::Work,
-                "signal {signal:?} / exit {exit_code:?}"
-            );
-        }
     }
 
     #[test]

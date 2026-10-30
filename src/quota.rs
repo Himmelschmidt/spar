@@ -277,7 +277,7 @@ impl QuotaStore {
                 || contains_phrase(&lower, "hit your usage limit")
                 // muse's dispatch-time 429 reads "Subscription quota exhausted" (#153).
                 || lower.contains("quota exhausted")
-                || lower.contains("payment required")
+                || lower.contains("402 payment required")
                 || names_http_402(&lower);
             if hit {
                 return Some(line.trim().to_string());

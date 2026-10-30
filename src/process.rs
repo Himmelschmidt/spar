@@ -435,8 +435,7 @@ fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
     None
 }
 
-/// Whether a dispatch ended because something killed it rather than because it
-/// finished. Exit 143 and 137 count too: a CLI wrapper that traps SIGTERM/SIGKILL and
+/// Whether a dispatch ended by signal (a kill or a crash) rather than by exiting. Exit 143 and 137 count too: a CLI wrapper that traps SIGTERM/SIGKILL and
 /// exits `128 + signo` reports the kill as an exit code, not as a signal.
 pub fn ended_by_signal(signal: Option<i32>, exit_code: Option<i32>) -> bool {
     signal.is_some() || matches!(exit_code, Some(137 | 143))
