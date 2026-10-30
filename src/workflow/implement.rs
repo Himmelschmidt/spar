@@ -3156,13 +3156,14 @@ fn move_seat(
     Ok(slot_id.to_string())
 }
 
-/// The id a seat takes when `provider` fills it: a reviewer's id names its provider
-/// (O80), every other seat keeps its own.
+/// The id a seat takes when `provider` fills it: reviewer and tester ids name their
+/// provider (O80), the implementer keeps `impl`.
 fn moved_seat_id(role: SlotRole, slot_id: &str, provider: &str) -> String {
     match (role, reviewer_ordinal(slot_id)) {
         (SlotRole::Reviewer, Some(ordinal)) => {
             format!("review-{ordinal}-{}", sanitize_slot(provider))
         }
+        (SlotRole::Tester, _) => format!("suite-{}", sanitize_slot(provider)),
         _ => slot_id.to_string(),
     }
 }

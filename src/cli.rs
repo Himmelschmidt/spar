@@ -220,7 +220,7 @@ pub enum Command {
         /// `--reassign implementer=cli:claude@sonnet` or
         /// `--reassign review-0-cli-codex=cli:claude@opus`. Repeatable. The seat keeps its
         /// worktree, branch, carry-forward, round count and review history; a reviewer
-        /// seat is renamed to name its new provider (O136). Refused while the run's
+        /// or tester seat is renamed to name its new provider (O136). Refused while the run's
         /// orchestrator is alive, onto a paused provider, and inside a slot.
         #[arg(long = "reassign", value_name = "ROLE|SEAT=PROVIDER")]
         reassign: Vec<String>,
