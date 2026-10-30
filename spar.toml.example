@@ -22,6 +22,9 @@ auto_archive_after = "14d"
 # deletes work git says is already in the base branch. Squash merges are not ancestors
 # and are never reaped this way.
 auto_cleanup_merged = true
+# Gitignored files copied from the main checkout into every slot worktree spar cuts, in
+# every isolation mode. Paths are project-relative; a missing file is skipped.
+copy = [".dbiso.env", ".envrc", ".env.example"]
 
 [providers]
 # Mix CLI + API: "cli:claude", "cli:grok", "api:openai", "api:xai", ...

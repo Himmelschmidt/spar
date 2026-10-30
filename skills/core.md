@@ -1200,6 +1200,7 @@ auto_reclaim = true    # drop a run's target/ + node_modules when it finishes
 auto_archive_after = "14d"
 [worktree]
 auto_cleanup_merged = true   # reap at-rest runs already contained in their base, at launch
+copy = [".dbiso.env", ".envrc", ".env.example"]   # copied from the main checkout into every slot worktree; missing files skipped
 [gates]
 plan = true
 winner = true

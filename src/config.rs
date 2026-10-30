@@ -537,14 +537,26 @@ pub struct WorktreeConfig {
     /// a phase check, this one only deletes work git says is already in the base branch.
     #[serde(default = "default_true")]
     pub auto_cleanup_merged: bool,
+    /// Project-relative files copied from the primary checkout into every slot worktree
+    /// spar cuts. A git worktree carries only tracked files, so gitignored local config
+    /// (`.envrc`, a DB env file) is otherwise missing there. Absent files are skipped.
+    #[serde(default = "default_worktree_copy")]
+    pub copy: Vec<String>,
 }
 
 impl Default for WorktreeConfig {
     fn default() -> Self {
         Self {
             auto_cleanup_merged: true,
+            copy: default_worktree_copy(),
         }
     }
+}
+
+fn default_worktree_copy() -> Vec<String> {
+    [".dbiso.env", ".envrc", ".env.example"]
+        .map(String::from)
+        .to_vec()
 }
 
 /// Dedicated full-suite channel (cheap/dumb model). Separate from smart review/impl.
@@ -1039,6 +1051,7 @@ struct ConfigFile {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct WorktreeConfigFile {
     auto_cleanup_merged: Option<bool>,
+    copy: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1527,6 +1540,22 @@ impl Config {
         if let Some(w) = &file.worktree {
             if let Some(v) = w.auto_cleanup_merged {
                 self.worktree.auto_cleanup_merged = v;
+            }
+            if let Some(v) = &w.copy {
+                // Copied out of the primary checkout, so an entry must stay inside it.
+                use std::path::Component;
+                if let Some(bad) = v.iter().find(|p| {
+                    let p = Path::new(p.as_str());
+                    p.as_os_str().is_empty()
+                        || !p
+                            .components()
+                            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+                }) {
+                    anyhow::bail!(
+                        "[worktree].copy entry {bad:?} must be a relative path inside the project"
+                    );
+                }
+                self.worktree.copy = v.clone();
             }
         }
         if let Some(p) = &file.providers {
@@ -2468,6 +2497,29 @@ planner = "best"
         let mut cfg = Config::default();
         cfg.apply_file(&file, Trust::Project).unwrap();
         assert!(!cfg.worktree.auto_cleanup_merged);
+    }
+
+    #[test]
+    fn worktree_copy_defaults_to_env_files_and_is_overridable() {
+        assert_eq!(
+            Config::default().worktree.copy,
+            vec![".dbiso.env", ".envrc", ".env.example"]
+        );
+        let file: ConfigFile =
+            toml::from_str("[worktree]\ncopy = [\".db.env\", \"config/local.toml\"]\n").unwrap();
+        let mut cfg = Config::default();
+        cfg.apply_file(&file, Trust::Project).unwrap();
+        assert_eq!(cfg.worktree.copy, vec![".db.env", "config/local.toml"]);
+    }
+
+    #[test]
+    fn worktree_copy_rejects_paths_outside_the_project() {
+        for bad in ["/etc/passwd", "../secret", "a/../../b", ""] {
+            let file: ConfigFile =
+                toml::from_str(&format!("[worktree]\ncopy = [{bad:?}]\n")).unwrap();
+            let mut cfg = Config::default();
+            assert!(cfg.apply_file(&file, Trust::Project).is_err(), "{bad}");
+        }
     }
 
     #[test]

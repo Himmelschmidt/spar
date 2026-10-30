@@ -220,19 +220,21 @@ fn git_quiet(project_root: &Path, args: &[&str]) -> Result<bool> {
     Ok(status.success())
 }
 
-/// Copy optional env seed files into a worktree when present.
-pub fn seed_env_files(project_root: &Path, worktree: &Path) -> Result<()> {
-    for name in [".dbiso.env", ".envrc", ".env.example"] {
+/// Copy `[worktree].copy` from the primary checkout into a fresh worktree. A file that is
+/// missing, or already present in the worktree (tracked there), is left alone.
+pub fn seed_env_files(project_root: &Path, worktree: &Path, names: &[String]) -> Result<()> {
+    for name in names {
         let src = project_root.join(name);
-        if src.is_file() {
-            let dst = worktree.join(name);
-            if !dst.exists() {
-                std::fs::copy(&src, &dst)
-                    .with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
-            }
+        let dst = worktree.join(name);
+        if !src.is_file() || dst.exists() {
+            continue;
         }
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(&src, &dst)
+            .with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
     }
-    // optional: run dbiso up if present and mode wants db
     Ok(())
 }
 
@@ -351,14 +353,13 @@ pub fn prepare_isolation(
                         state.base_commit.as_deref(),
                     )?
                 };
-                if matches!(
-                    state.isolation,
-                    IsolationMode::WorktreeDb | IsolationMode::WorktreeBwrap
-                ) {
-                    seed_env_files(&state.project_root, &rec.path)?;
-                    if matches!(state.isolation, IsolationMode::WorktreeDb) {
-                        maybe_dbiso(&state.project_root, &rec.path)?;
-                    }
+                let copy = cfg.as_ref().map_or_else(
+                    || crate::config::WorktreeConfig::default().copy,
+                    |c| c.worktree.copy.clone(),
+                );
+                seed_env_files(&state.project_root, &rec.path, &copy)?;
+                if matches!(state.isolation, IsolationMode::WorktreeDb) {
+                    maybe_dbiso(&state.project_root, &rec.path)?;
                 }
                 if let Some(slot) = state.slot_mut(sid) {
                     slot.cwd = Some(rec.path.clone());
@@ -2063,6 +2064,47 @@ mod tests {
             "live slot must be cut from the run's base, not the main checkout"
         );
         assert!(rec.path.join("feature.txt").is_file());
+        cleanup_run(&state, false).unwrap();
+    }
+
+    /// #176: gitignored local config reaches every slot worktree, in plain `worktree`
+    /// isolation too, from the list `[worktree].copy` names. Missing entries are skipped.
+    #[test]
+    fn prepare_isolation_copies_configured_files_into_slot_worktrees() {
+        let tmp = tempdir().unwrap();
+        let (root, _wt, _) = repo_with_linked_worktree(tmp.path());
+        std::fs::write(
+            root.join("spar.toml"),
+            "[worktree]\ncopy = [\".db.env\", \"conf/local.env\", \"missing.env\"]\n",
+        )
+        .unwrap();
+        std::fs::write(root.join(".db.env"), "DATABASE_URL=x\n").unwrap();
+        std::fs::create_dir_all(root.join("conf")).unwrap();
+        std::fs::write(root.join("conf/local.env"), "K=v\n").unwrap();
+        std::fs::write(root.join(".envrc"), "not listed\n").unwrap();
+
+        let mut state = RunState::new("runcopy1", crate::cli::WorkflowKind::Loop, root.clone());
+        state.isolation = IsolationMode::Worktree;
+        state.dry_run = false;
+        state.base_commit = git_out(&root, &["rev-parse", "HEAD"]);
+        let paths = SparPaths::new(&root);
+        paths.ensure_run_dirs(&state.id).unwrap();
+        prepare_isolation(&mut state, &paths, &["impl".to_string()]).unwrap();
+
+        let wt = &state.worktrees.first().expect("slot worktree").path;
+        assert_eq!(
+            std::fs::read_to_string(wt.join(".db.env")).unwrap(),
+            "DATABASE_URL=x\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join("conf/local.env")).unwrap(),
+            "K=v\n"
+        );
+        assert!(!wt.join("missing.env").exists());
+        assert!(
+            !wt.join(".envrc").exists(),
+            "only the configured list is copied"
+        );
         cleanup_run(&state, false).unwrap();
     }
 

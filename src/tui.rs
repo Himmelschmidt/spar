@@ -11704,6 +11704,10 @@ fn spawn_agent_command(
         .and_then(|s| s.base_commit);
     let record =
         crate::worktree::create_worktree(&project_root, &run.id, &agent_id, base.as_deref())?;
+    let copy = crate::config::Config::for_run(&paths, &run.id)
+        .map(|c| c.worktree.copy)
+        .unwrap_or_else(|_| crate::config::WorktreeConfig::default().copy);
+    crate::worktree::seed_env_files(&project_root, &record.path, &copy)?;
 
     let run_id = run.id.clone();
     let provider_s = provider.to_string();
