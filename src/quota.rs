@@ -340,7 +340,7 @@ fn parse_go_duration(s: &str) -> Option<chrono::Duration> {
 /// (America/New_York)". Returns (provider_name, cooldown_until, hint).
 ///
 /// Gated on `provider` actually being a claude adapter: both shapes are specific to
-/// the Claude CLI's own output, and a codex/grok/opencode log that happens to contain
+/// the Claude CLI's own output, and a codex/grok/pi log that happens to contain
 /// "resets " next to a limit phrase must not pause `cli:claude` (a provider that is
 /// fine) instead of, or in addition to, the one that actually failed.
 pub fn scrape_claude_rate_limits(

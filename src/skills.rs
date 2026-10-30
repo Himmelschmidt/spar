@@ -88,7 +88,7 @@ mod tests {
     fn fleet_skill_served_and_listed() {
         assert!(catalog().iter().any(|s| s.name == "fleet"));
         assert!(FLEET_SKILL.contains("[roles]"));
-        assert!(FLEET_SKILL.contains("cli:opencode"));
+        assert!(FLEET_SKILL.contains("cli:pi"));
         assert!(get("fleet").is_ok());
         // Every listed skill must resolve in get(), or `skills list` lies.
         for s in catalog() {

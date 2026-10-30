@@ -86,12 +86,19 @@ pub struct StreamStats {
     pub last_log_at: Option<String>,
     /// Whole-dispatch USD spend (this one spawned process, one `stats.json`), as the
     /// provider itself computed it: claude's terminal `result.total_cost_usd` (an
-    /// absolute overwrite) or opencode's per-step `part.cost` (summed the same way
+    /// absolute overwrite) or pi's per-request `usage.cost.total` (summed the same way
     /// its token deltas are). One field for both so a caller never needs to know
     /// which adapter produced it. A run's total is the sum over its dispatches; see
     /// `state::SlotUsage::cost_usd`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    /// The provider's own error on the dispatch's final model request, when the
+    /// stream reports one in-band and the CLI still exits 0 (pi: an assistant
+    /// message ending `stopReason: "error"`). A later successful request clears it,
+    /// so a retried failure does not outlive its recovery. Set means the dispatch
+    /// failed whatever the exit code says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_error: Option<String>,
     /// claude's terminal `result.subagent_stats`: how many Task-tool subagents this
     /// dispatch spawned and how they ended. No other adapter reports this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -303,8 +310,8 @@ impl StreamStats {
 /// read, so a caller that only has the finished file (tmux's `tee`d pane output, which
 /// `run_tmux` never pipes through a live coalescer) can recover the same numbers after
 /// the fact. Only meaningful for a provider whose pane runs the same structured stream as
-/// headless (opencode's `run --format json`); other adapters' interactive TUI output is
-/// not JSON, so the coalescer degrades every line to inert text and this returns zeros.
+/// headless (pi's `--mode json`); other adapters' interactive TUI output is not JSON, so
+/// the coalescer degrades every line to inert text and this returns zeros.
 pub fn stats_from_log(log_path: &Path, adapter: Option<&str>) -> StreamStats {
     let mut stats = StreamStats::default();
     let Ok(text) = std::fs::read_to_string(log_path) else {
@@ -1050,10 +1057,9 @@ fn stream_to_log(
         if let Ok(mut s) = stats.lock() {
             s.lines_in += 1;
         }
-        // Counters are merged per line, not per log append: opencode's `step_finish`
-        // carries a whole model call's tokens and prints nothing, so gating the merge on
-        // an append left the sidecar behind the stream by however many silent events came
-        // last. A live token budget reads that sidecar, so "behind" means "never fires".
+        // Counters are merged per line, not per log append: a usage record can carry a
+        // whole model call's tokens and print nothing, so gating the merge on an append
+        // left the sidecar behind the stream by however many silent events came last. A live token budget reads that sidecar, so "behind" means "never fires".
         let chunk = c.feed(&line);
         let appended = chunk
             .as_ref()
@@ -1070,9 +1076,8 @@ fn stream_to_log(
         }
     }
     // The final merge is unconditional. Counters used to ride along with a log append,
-    // so an event that updates them without printing anything (opencode's terminal
-    // `step_finish`, which is where its last call's tokens live) never reached the
-    // sidecar at all.
+    // so an event that updates them without printing anything (a final usage record)
+    // never reached the sidecar at all.
     let tail = c.finish();
     let appended = tail
         .as_ref()
@@ -1125,9 +1130,7 @@ struct StreamCoalescer {
     subagent_stats: Option<SubagentStats>,
     model_usage: std::collections::BTreeMap<String, ModelUsage>,
     text_chars: u64,
-    /// opencode double-emits every event in dash and underscore spellings with the
-    /// same `part.id`; keyed by `(normalized type, part.id)` to count each once.
-    seen_opencode: std::collections::HashSet<String>,
+    provider_error: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1148,8 +1151,8 @@ enum UsageScope {
 
 /// True for grok's terminal `end` record: `type == "end"` with a top-level `usage`
 /// object and grok's camelCase `sessionId`. That key is unique to grok on this stream
-/// (claude uses `session_id`, opencode `sessionID`, and opencode/muse/agy lines never
-/// carry a top-level `usage` object, so `absorb_usage` already no-ops for them) — a
+/// (claude uses `session_id`, and muse/agy lines never carry a top-level `usage`
+/// object, so `absorb_usage` already no-ops for them; pi is gated off earlier) — a
 /// bare `{"type":"end"}` with no `usage`/`sessionId` is not one, and neither is any
 /// other adapter's `end`. The `type` check lives here, not at the call site, so a
 /// future caller reusing this helper cannot get a broader gate than documented.
@@ -1157,6 +1160,36 @@ fn is_grok_end(v: &serde_json::Value) -> bool {
     v.get("type").and_then(|x| x.as_str()) == Some("end")
         && v.get("usage").is_some_and(|u| u.is_object())
         && v.get("sessionId").and_then(|x| x.as_str()).is_some()
+}
+
+/// True for a line of pi's `--mode json` stream. Keyed on pi's own event names plus
+/// the field that makes each one pi's: the `session` header's `version`, a message
+/// event's `message.role` or `assistantMessageEvent`, a tool event's `toolCallId`.
+/// The lifecycle names (`agent_settled`, `turn_start`, …) are pi-only on every stream
+/// spar parses; claude's `message_start` only ever appears nested in `stream_event`.
+fn is_pi_event(v: &serde_json::Value) -> bool {
+    let Some(ty) = v.get("type").and_then(|x| x.as_str()) else {
+        return false;
+    };
+    match ty {
+        "session" => v.get("version").is_some() && v.get("id").is_some_and(|x| x.is_string()),
+        "message_start" | "message_end" | "turn_end" => v.pointer("/message/role").is_some(),
+        "message_update" => v.get("assistantMessageEvent").is_some(),
+        "tool_execution_start" | "tool_execution_update" | "tool_execution_end" => {
+            v.get("toolCallId").is_some()
+        }
+        "agent_start"
+        | "agent_end"
+        | "agent_settled"
+        | "turn_start"
+        | "auto_retry_start"
+        | "auto_retry_end"
+        | "compaction_start"
+        | "compaction_end"
+        | "queue_update"
+        | "thinking_level_changed" => true,
+        _ => false,
+    }
 }
 
 impl StreamCoalescer {
@@ -1196,7 +1229,7 @@ impl StreamCoalescer {
             subagent_stats: None,
             model_usage: std::collections::BTreeMap::new(),
             text_chars: 0,
-            seen_opencode: std::collections::HashSet::new(),
+            provider_error: None,
         }
     }
 
@@ -1224,6 +1257,13 @@ impl StreamCoalescer {
             return Some(out);
         };
 
+        // pi's `--mode json` envelope, gated before `absorb_usage`: its
+        // `message_update` lines carry a top-level `usage` that is the same request's
+        // running total `message_end` reports, so reading both would double count.
+        if is_pi_event(&v) {
+            return self.handle_pi(&v);
+        }
+
         // Grok's `end` record carries the turn's final cumulative usage (byte-equal
         // to the earlier `usage` record), so it supersedes the accumulation instead
         // of adding to it. Gated on `is_grok_end` so no other adapter's `end` is
@@ -1236,21 +1276,12 @@ impl StreamCoalescer {
         };
         self.absorb_usage(&v, scope);
         if grok_end {
-            // Grok's resume/session handle (camelCase; claude uses `session_id`,
-            // opencode `sessionID`). Makes a grok slot checkable against
+            // Grok's resume/session handle (camelCase; claude uses `session_id`).
+            // Makes a grok slot checkable against
             // `~/.grok/sessions/` and `grok usage <session>`.
             if let Some(id) = v.get("sessionId").and_then(|x| x.as_str()) {
                 self.session_id = Some(id.to_string());
             }
-        }
-
-        // opencode `run --format json` NDJSON. Each line carries a top-level `sessionID`
-        // and a `part` object; that pair is unique to opencode and gates it off before
-        // the shared `type`-matched branches below (opencode reuses type strings like
-        // "text"/"tool_use" that Grok's stream also uses). Returned unconditionally so an
-        // opencode line never falls through to another provider's parser.
-        if v.get("sessionID").is_some() && v.get("part").is_some() {
-            return self.handle_opencode(&v);
         }
 
         // `muse exec --json` event envelope. Every line carries `payload_type` plus a
@@ -1316,8 +1347,8 @@ impl StreamCoalescer {
                         let model = v.get("model").and_then(|x| x.as_str()).unwrap_or("claude");
                         self.model = Some(model.to_string());
                         // claude's resume handle, captured for parity with muse's and
-                        // opencode's session ids: makes a claude slot checkable against
-                        // its own transcript, same as the other two adapters already are.
+                        // pi's session ids: makes a claude slot checkable against its
+                        // own transcript, same as the other adapters already are.
                         if let Some(id) = v.get("session_id").and_then(|x| x.as_str()) {
                             self.session_id = Some(id.to_string());
                         }
@@ -1469,8 +1500,8 @@ impl StreamCoalescer {
             match ty {
                 // The thread id is spar's handle onto this codex session: it is what
                 // `codex exec resume <id>` and `codex queue --thread <id>` both take,
-                // so it is captured into `session_id` the same way opencode's
-                // `sessionID` is, even though nothing here is a token count.
+                // so it is captured into `session_id` the same way pi's session
+                // header is, even though nothing here is a token count.
                 "thread.started" => {
                     if let Some(id) = v.get("thread_id").and_then(|x| x.as_str()) {
                         self.session_id = Some(id.to_string());
@@ -1591,92 +1622,137 @@ impl StreamCoalescer {
         }
     }
 
-    fn handle_opencode(&mut self, v: &serde_json::Value) -> Option<String> {
-        let part = v.get("part")?;
-        // opencode keeps its own per-session token ledger, so recording the id makes a
-        // slot's numbers checkable against `opencode.db` afterwards.
-        if self.session_id.is_none() {
-            if let Some(id) = v.get("sessionID").and_then(|x| x.as_str()) {
-                self.session_id = Some(id.to_string());
-            }
-        }
-        // opencode republishes `PartUpdated` for a part it already sent (every consumer
-        // in its own bundle upserts parts by `messageID:partID` rather than appending),
-        // so one `part.id` can legitimately arrive more than once. Since every field is
-        // summed below, a repeat would bill the step twice; the dedupe is what makes the
-        // sum safe. The key includes the type so `step_start:X` and `step_finish:X`
-        // (same part.id, distinct events) are not collapsed.
-        //
-        // The `-` to `_` normalization is belt and braces: the json emitter writes five
-        // hardcoded underscore literals (`tool_use`, `step_start`, `step_finish`, `text`,
-        // `reasoning`) and the dash spelling appears only on `part.type`, so no top-level
-        // `type` observed carries a dash.
-        let ptype = v.get("type").and_then(|x| x.as_str())?.replace('-', "_");
-        let pid = part.get("id").and_then(|x| x.as_str()).unwrap_or_default();
-        if !self.seen_opencode.insert(format!("{ptype}:{pid}")) {
-            return None;
-        }
-        match ptype.as_str() {
-            // One opencode step is one LLM call and every field on it is that call's
-            // own delta, never a running total: opencode's session ledger is the plain
-            // sum of its steps (verified against `opencode.db`, where `tokens.total`
-            // per step is likewise input + output + reasoning + cache read + write).
-            // Summing is only safe because the republish dedupe above runs first.
-            "step_finish" => {
-                if let Some(tok) = part.get("tokens") {
-                    let n = |k: &str| tok.get(k).and_then(|x| x.as_u64()).unwrap_or_default();
-                    let ptr = |k: &str| tok.pointer(k).and_then(|x| x.as_u64()).unwrap_or_default();
-                    let (input, cache_read, cache_write) =
-                        (n("input"), ptr("/cache/read"), ptr("/cache/write"));
-                    self.input_tokens = self.input_tokens.saturating_add(input);
-                    // Reasoning is billed at output rates and opencode reports it
-                    // outside `output`, so it belongs in the output component.
-                    self.output_tokens = self
-                        .output_tokens
-                        .saturating_add(n("output"))
-                        .saturating_add(n("reasoning"));
-                    self.cache_read = self.cache_read.saturating_add(cache_read);
-                    self.cache_write = self.cache_write.saturating_add(cache_write);
-                    self.context_peak = self
-                        .context_peak
-                        .max(input.saturating_add(cache_read).saturating_add(cache_write));
-                }
-                // Each step's `cost` is that call's own delta, like its `tokens` — sum
-                // rather than overwrite, same as opencode's other billed components.
-                if let Some(cost) = part.get("cost").and_then(|x| x.as_f64()) {
-                    self.cost_usd = Some(self.cost_usd.unwrap_or(0.0) + cost);
+    /// pi `--mode json` (verified against pi 1.4.0 on OpenRouter). Each assistant
+    /// `message_end` is one model request and its `usage` is that request's own
+    /// numbers, never a running total, so every billed component sums and the gauge
+    /// is the largest single request. `reasoning` is already inside `output`
+    /// (`totalTokens == input + output + cacheRead + cacheWrite` on every captured
+    /// record), so it is not added again. Text and tool calls also print from
+    /// `message_end` and `tool_execution_*`, never from the `message_update` deltas,
+    /// whose `usage` and content repeat what `message_end` settles.
+    fn handle_pi(&mut self, v: &serde_json::Value) -> Option<String> {
+        let ty = v.get("type").and_then(|x| x.as_str()).unwrap_or_default();
+        match ty {
+            "session" => {
+                if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
+                    self.session_id = Some(id.to_string());
                 }
                 None
             }
-            "text" => {
-                let text = part
-                    .get("text")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or_default();
-                if text.is_empty() {
+            "message_end" => {
+                let msg = v.get("message")?;
+                if msg.get("role").and_then(|x| x.as_str()) != Some("assistant") {
                     return None;
                 }
-                let mut out = self.flush_buf();
-                out.push_str(text);
-                if !text.ends_with('\n') {
-                    out.push('\n');
-                }
-                self.note_text(text);
-                Some(out)
+                self.absorb_pi_message(msg)
             }
-            "tool" | "tool_use" => {
+            "tool_execution_start" => {
                 self.tools += 1;
                 let mut out = self.flush_buf();
-                if let Some(name) = part.get("tool").and_then(|x| x.as_str()) {
+                let name = v.get("toolName").and_then(|x| x.as_str()).unwrap_or("tool");
+                let detail = ["/args/command", "/args/path", "/args/file_path"]
+                    .iter()
+                    .find_map(|p| v.pointer(p).and_then(|x| x.as_str()))
+                    .map(|s| first_line(s, 90))
+                    .unwrap_or_default();
+                if detail.is_empty() {
                     out.push_str(&format!("→ {name}\n"));
-                }
-                if out.is_empty() {
-                    None
                 } else {
-                    Some(out)
+                    out.push_str(&format!("→ {name}  {detail}\n"));
                 }
+                Some(out)
+            }
+            "tool_execution_end" => {
+                if v.get("isError").and_then(|x| x.as_bool()) != Some(true) {
+                    return None;
+                }
+                self.tool_errors += 1;
+                let mut out = self.flush_buf();
+                let name = v.get("toolName").and_then(|x| x.as_str()).unwrap_or("tool");
+                let body = v
+                    .pointer("/result/content/0/text")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default();
+                out.push_str(&format!("← ✗  {name}  {}\n", first_line(body, 100)));
+                Some(out)
+            }
+            "auto_retry_start" => {
+                let attempt = v.get("attempt").and_then(|x| x.as_u64()).unwrap_or(0);
+                let max = v.get("maxAttempts").and_then(|x| x.as_u64()).unwrap_or(0);
+                Some(format!("{}· retry  {attempt}/{max}\n", self.flush_buf()))
+            }
+            "agent_settled" => {
+                let mut out = self.flush_buf();
+                out.push_str(&format!(
+                    "· done  ·  {} tools  ·  {}\n",
+                    self.tools,
+                    format_tokens(
+                        self.input_tokens,
+                        self.effective_output_tokens(),
+                        self.cache_read
+                    )
+                ));
+                Some(out)
             }
             _ => None,
+        }
+    }
+
+    fn absorb_pi_message(&mut self, msg: &serde_json::Value) -> Option<String> {
+        if let Some(m) = msg.get("model").and_then(|x| x.as_str()) {
+            self.model = Some(m.to_string());
+        }
+        if let Some(u) = msg.get("usage") {
+            let n = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or_default();
+            let (input, cache_read, cache_write) = (n("input"), n("cacheRead"), n("cacheWrite"));
+            self.input_tokens = self.input_tokens.saturating_add(input);
+            self.output_tokens = self.output_tokens.saturating_add(n("output"));
+            self.cache_read = self.cache_read.saturating_add(cache_read);
+            self.cache_write = self.cache_write.saturating_add(cache_write);
+            self.context_peak = self
+                .context_peak
+                .max(input.saturating_add(cache_read).saturating_add(cache_write));
+            if let Some(cost) = u.pointer("/cost/total").and_then(|x| x.as_f64()) {
+                self.cost_usd = Some(self.cost_usd.unwrap_or(0.0) + cost);
+            }
+        }
+        let mut out = self.flush_buf();
+        for block in msg
+            .get("content")
+            .and_then(|x| x.as_array())
+            .into_iter()
+            .flatten()
+        {
+            if block.get("type").and_then(|x| x.as_str()) != Some("text") {
+                continue;
+            }
+            let text = block.get("text").and_then(|x| x.as_str()).unwrap_or("");
+            if text.is_empty() {
+                continue;
+            }
+            out.push_str(text);
+            if !text.ends_with('\n') {
+                out.push('\n');
+            }
+            self.note_text(text);
+        }
+        match msg.get("stopReason").and_then(|x| x.as_str()) {
+            Some(reason @ ("error" | "aborted")) => {
+                let err = msg
+                    .get("errorMessage")
+                    .and_then(|x| x.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(reason)
+                    .to_string();
+                out.push_str(&format!("! {}\n", first_line(&err, 300)));
+                self.provider_error = Some(err);
+            }
+            _ => self.provider_error = None,
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
         }
     }
 
@@ -1684,7 +1760,7 @@ impl StreamCoalescer {
     /// of the per-step usages (verified on a live multi-step run), confirming each
     /// `step_update.usage` is that step's own delta, not a running total — so, unlike
     /// claude's Request-scope usage, input/output are summed here rather than maxed,
-    /// the same shape as opencode's `step_finish`.
+    /// the same shape as pi's assistant `message_end`.
     ///
     /// Known gaps, not fixed here:
     /// * a `step_type: "subagent"` step carries no usage of its own, and the `result`
@@ -2145,6 +2221,7 @@ impl StreamCoalescer {
         if self.cost_usd.is_some() {
             s.cost_usd = self.cost_usd;
         }
+        s.provider_error = self.provider_error.clone();
         if self.subagent_stats.is_some() {
             s.subagent_stats = self.subagent_stats.clone();
         }
@@ -3149,18 +3226,6 @@ mod tests {
     }
 
     #[test]
-    fn opencode_sums_per_step_cost_into_one_field() {
-        let mut c = StreamCoalescer::new_with_adapter(false, None);
-        c.feed(
-            r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_a","type":"step-finish","cost":0.01,"tokens":{"input":10,"output":2,"cache":{"read":0,"write":0}}}}"#,
-        );
-        c.feed(
-            r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_b","type":"step-finish","cost":0.02,"tokens":{"input":5,"output":1,"cache":{"read":0,"write":0}}}}"#,
-        );
-        assert!((c.cost_usd.unwrap() - 0.03).abs() < 1e-9);
-    }
-
-    #[test]
     fn codex_jsonl_text_and_usage() {
         // Real `codex exec --json` event sequence (captured from codex-cli 0.144.4).
         let mut c = StreamCoalescer::new_with_adapter(false, None);
@@ -3343,17 +3408,6 @@ mod tests {
         let mut stats = StreamStats::default();
         c.merge_counters_into(&mut stats);
         assert_eq!(stats.context_tokens, 39 + 259 + 36571);
-        assert_eq!(stats.context_semantics, ContextSemantics::Peak);
-    }
-
-    #[test]
-    fn opencode_step_deltas_are_labeled_peak() {
-        use crate::state::ContextSemantics;
-        let mut c = StreamCoalescer::new_with_adapter(false, Some("opencode"));
-        c.feed(r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_a","type":"step-finish","tokens":{"input":12738,"output":19,"cache":{"read":1920,"write":0}}}}"#);
-        let mut stats = StreamStats::default();
-        c.merge_counters_into(&mut stats);
-        assert_eq!(stats.context_tokens, 12738 + 1920);
         assert_eq!(stats.context_semantics, ContextSemantics::Peak);
     }
 
@@ -3647,116 +3701,117 @@ mod tests {
         assert!(out.contains("final answer"), "fallback response: {out:?}");
     }
 
-    #[test]
-    fn opencode_jsonl_dedupes_a_republished_part() {
-        // Real `opencode run --format json` events (captured from opencode 1.17.4). The
-        // top-level `type` is always the underscore spelling the emitter hardcodes; the
-        // dash spelling lives on `part.type`. What repeats is the *part*: opencode
-        // republishes `PartUpdated` for an id it already sent, so the same `prt_f1`
-        // arrives twice and must be billed once. Real single-step tokens: input 12738,
-        // output 19, cache.read 1920.
-        let mut c = StreamCoalescer::new_with_adapter(false, None);
+    const PI_RUN1: &str = include_str!("../tests/fixtures/pi/run1.jsonl");
+    const PI_RESUME: &str = include_str!("../tests/fixtures/pi/run2-resume.jsonl");
+    const PI_BAD_MODEL: &str = include_str!("../tests/fixtures/pi/run3-badmodel.jsonl");
+
+    fn feed_pi(stream: &str) -> (StreamCoalescer, String) {
+        let mut c = StreamCoalescer::new_with_adapter(false, Some("cli:pi"));
         let mut out = String::new();
-        let finish = r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_f1","type":"step-finish","tokens":{"total":14677,"input":12738,"output":19,"reasoning":0,"cache":{"write":0,"read":1920}},"cost":0.07}}"#;
-        for line in [
-            r#"{"type":"step_start","sessionID":"ses_1","part":{"id":"prt_s1","type":"step-start"}}"#,
-            r#"{"type":"tool_use","sessionID":"ses_1","part":{"type":"tool","tool":"write","callID":"call_1","state":{"status":"completed"}}}"#,
-            finish,
-            finish,
-            r#"{"type":"text","sessionID":"ses_1","part":{"id":"prt_t1","type":"text","text":"DONE"}}"#,
-        ] {
+        for line in stream.lines() {
             if let Some(chunk) = c.feed(line) {
                 out.push_str(&chunk);
             }
         }
         out.push_str(&c.finish().unwrap_or_default());
-        assert!(out.contains("DONE"), "assistant text: {out:?}");
-        assert!(out.contains("→ write"), "tool marker: {out:?}");
+        (c, out)
+    }
+
+    #[test]
+    fn pi_sums_each_assistant_request_once() {
+        // Real pi 1.4.0 capture: one bash call, two assistant requests. Every
+        // `message_update` repeats its request's usage on a top-level `usage`, and
+        // `turn_end`/`agent_end` repeat the messages, so any of them read as usage
+        // would double count.
+        let (c, _) = feed_pi(PI_RUN1);
+        let mut s = StreamStats::default();
+        c.merge_counters_into(&mut s);
+        assert_eq!(s.input_tokens, 3132 + 529);
+        assert_eq!(
+            s.output_tokens,
+            77 + 1,
+            "reasoning is already inside output"
+        );
+        assert_eq!(s.cache_read_tokens, 2698);
+        assert_eq!(s.cache_write_tokens, 0);
+        assert_eq!(s.billed_tokens, 3209 + 3228, "sum of pi's own totalTokens");
+        assert_eq!(s.context_tokens, 529 + 2698, "largest single request");
+        assert_eq!(s.context_semantics, crate::state::ContextSemantics::Peak);
+        assert!((s.cost_usd.unwrap() - (0.0011321 + 0.00024214)).abs() < 1e-12);
+        assert_eq!(s.model.as_deref(), Some("google/gemini-2.5-flash"));
+        assert_eq!(s.provider_error, None);
+    }
+
+    #[test]
+    fn pi_captures_session_text_and_tools() {
+        let (c, out) = feed_pi(PI_RUN1);
+        assert_eq!(c.session_id.as_deref(), Some("spar-cap-01"));
         assert_eq!(c.tools, 1);
-        // Load-bearing now that every field sums: without it the republished step is
-        // billed twice.
-        assert_eq!(c.output_tokens, 19, "output must count once, not double");
-        assert_eq!(c.input_tokens, 12738, "input must count once, not double");
-        assert_eq!(c.cache_read, 1920, "cache.read must count once, not double");
-        assert_eq!(
-            c.cost_usd,
-            Some(0.07),
-            "cost must count once too, not double-billed like tokens would be"
+        assert_eq!(c.tool_errors, 0);
+        assert!(
+            out.contains("→ bash  echo hello-from-pi > out.txt && cat out.txt"),
+            "{out}"
         );
-        assert_eq!(
-            c.session_id.as_deref(),
-            Some("ses_1"),
-            "session id makes the slot checkable against opencode's own ledger"
-        );
+        assert!(out.lines().any(|l| l == "done"), "{out}");
+        assert!(out.contains("· done  ·  1 tools"), "{out}");
+        assert!(!out.contains("You are an expert coding assistant"), "{out}");
     }
 
     #[test]
-    fn opencode_dash_spelling_on_a_top_level_type_would_still_dedupe() {
-        // No opencode build observed emits a dash-spelled top-level `type` -- the json
-        // writer uses five hardcoded underscore literals -- so the `-` to `_` mapping is
-        // defensive. Pinned rather than deleted: if a future build did emit both, the
-        // dedupe key has to fold them together or every step bills twice.
-        let mut c = StreamCoalescer::new_with_adapter(false, None);
-        for line in [
-            r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_f1","type":"step-finish","tokens":{"input":12738,"output":19,"cache":{"read":1920,"write":0}}}}"#,
-            r#"{"type":"step-finish","sessionID":"ses_1","part":{"id":"prt_f1","type":"step-finish","tokens":{"input":12738,"output":19,"cache":{"read":1920,"write":0}}}}"#,
-        ] {
-            c.feed(line);
-        }
-        assert_eq!(c.input_tokens, 12738);
-        assert_eq!(c.output_tokens, 19);
-        assert_eq!(c.cache_read, 1920);
+    fn pi_resume_reports_the_same_session() {
+        let (c, out) = feed_pi(PI_RESUME);
+        assert_eq!(c.session_id.as_deref(), Some("spar-cap-01"));
+        assert_eq!(c.input_tokens, 3189);
+        assert!(out.contains("out.txt"), "{out}");
     }
 
     #[test]
-    fn opencode_sums_step_deltas() {
-        // Two distinct steps (different part.id). Every opencode step field is that
-        // call's own delta: opencode.db's session totals equal the sum of its steps
-        // (ses_fc0c768c2f: 20 steps, cache_read 2,550,766 = sum, max only 170,295), so
-        // maxing under-reported the cache-heavy fields by an order of magnitude.
-        let mut c = StreamCoalescer::new_with_adapter(false, None);
-        for line in [
-            r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_a","type":"step-finish","tokens":{"input":12738,"output":19,"cache":{"read":1920,"write":0}}}}"#,
-            r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_b","type":"step-finish","tokens":{"input":97,"output":2,"cache":{"read":14592,"write":0}}}}"#,
-        ] {
-            c.feed(line);
-        }
-        assert_eq!(c.input_tokens, 12835);
-        assert_eq!(c.output_tokens, 21);
-        assert_eq!(c.cache_read, 16512);
-        // The gauge is the biggest single call, not the running total.
-        assert_eq!(c.context_tokens(), 14689, "97 + 14592 beats 12738 + 1920");
-        assert_eq!(c.billed_tokens(), 12835 + 21 + 16512);
+    fn pi_error_stop_reason_is_a_provider_error_on_exit_zero() {
+        // pi exits 0 on a provider error; the only signal is the final assistant
+        // message's `stopReason`. It must reach the sidecar and the log, where the
+        // quota scrape reads it.
+        let (c, out) = feed_pi(PI_BAD_MODEL);
+        let mut s = StreamStats::default();
+        c.merge_counters_into(&mut s);
+        let err = s.provider_error.expect("error stopReason is captured");
+        assert!(err.starts_with("400: "), "{err}");
+        assert!(err.contains("not a valid model ID"), "{err}");
+        assert!(out.contains("! 400: "), "{out}");
+        assert_eq!(s.session_id.as_deref(), Some("spar-cap-02"));
     }
 
     #[test]
-    fn opencode_sums_reasoning_as_output_and_dedupes_each_step() {
-        // Each step republished once, as opencode's `PartUpdated` really does.
-        // `tokens.total` in opencode.db is input + output + reasoning + cache read +
-        // write, so reasoning is billed and is not already inside `output`.
-        let step = |id: &str, input: u64, out: u64, reason: u64, cr: u64| {
-            format!(
-                r#"{{"type":"step_finish","sessionID":"ses_1","part":{{"id":"{id}","type":"step-finish","tokens":{{"input":{input},"output":{out},"reasoning":{reason},"cache":{{"read":{cr},"write":0}}}}}}}}"#
-            )
-        };
-        let mut c = StreamCoalescer::new_with_adapter(false, None);
+    fn pi_later_success_clears_an_earlier_error() {
+        let mut c = StreamCoalescer::new_with_adapter(false, Some("cli:pi"));
+        c.feed(r#"{"type":"message_end","message":{"role":"assistant","content":[],"usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"stopReason":"error","errorMessage":"429 Too Many Requests"}}"#);
+        assert_eq!(c.provider_error.as_deref(), Some("429 Too Many Requests"));
+        c.feed(r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input":10,"output":1,"cacheRead":0,"cacheWrite":0},"stopReason":"stop"}}"#);
+        assert_eq!(c.provider_error, None);
+    }
+
+    #[test]
+    fn pi_tool_error_is_counted() {
+        let mut c = StreamCoalescer::new_with_adapter(false, Some("cli:pi"));
+        c.feed(r#"{"type":"tool_execution_start","toolCallId":"t1","toolName":"read","args":{"path":"missing.txt"}}"#);
+        let out = c
+            .feed(r#"{"type":"tool_execution_end","toolCallId":"t1","toolName":"read","result":{"content":[{"type":"text","text":"ENOENT: no such file"}]},"isError":true}"#)
+            .unwrap();
+        assert_eq!(c.tools, 1);
+        assert_eq!(c.tool_errors, 1);
+        assert!(out.contains("✗  read  ENOENT"), "{out}");
+    }
+
+    #[test]
+    fn pi_gate_does_not_claim_other_streams() {
         for line in [
-            step("prt_a", 15193, 23, 363, 1920),
-            step("prt_a", 15193, 23, 363, 1920),
-            step("prt_b", 18932, 177, 502, 64),
-            step("prt_b", 18932, 177, 502, 64),
+            r#"{"type":"stream_event","event":{"type":"message_start"}}"#,
+            r#"{"type":"end","sessionId":"s","usage":{"input_tokens":1}}"#,
+            r#"{"type":"turn.completed","usage":{"input_tokens":1}}"#,
+            r#"{"type":"message_end"}"#,
         ] {
-            c.feed(&line);
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(!is_pi_event(&v), "{line}");
         }
-        assert_eq!(c.input_tokens, 15193 + 18932);
-        assert_eq!(
-            c.output_tokens,
-            23 + 363 + 177 + 502,
-            "reasoning bills as output"
-        );
-        assert_eq!(c.cache_read, 1920 + 64);
-        // opencode's own `tokens.total` per step, summed.
-        assert_eq!(c.billed_tokens(), 17499 + 19675);
     }
 
     #[test]
@@ -3815,19 +3870,17 @@ mod tests {
 
     #[test]
     fn last_event_without_log_output_still_lands_in_the_sidecar() {
-        // Counters used to be written only alongside a log append. opencode's terminal
-        // `step_finish` prints nothing, so the last call's tokens never reached
-        // `stats.json`, and a stream of nothing but step_finish reported all zeros.
+        // Counters used to be written only alongside a log append. A usage record that
+        // prints nothing (here pi's final assistant message with no text) never reached
+        // `stats.json`, so the last request's tokens went missing.
         let tmp = tempdir().unwrap();
         let log = tmp.path().join("slot.log");
         let stats = std::sync::Arc::new(std::sync::Mutex::new(StreamStats::default()));
         let stream = concat!(
-            r#"{"type":"text","sessionID":"ses_1","part":{"id":"prt_t","type":"text","text":"DONE"}}"#,
-            "
-",
-            r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_f","type":"step-finish","tokens":{"input":12738,"output":19,"cache":{"read":1920,"write":0}}}}"#,
-            "
-",
+            r#"{"type":"session","version":3,"id":"ses_1","timestamp":"t","cwd":"/w"}"#,
+            "\n",
+            r#"{"type":"message_end","message":{"role":"assistant","content":[],"usage":{"input":12738,"output":19,"cacheRead":1920,"cacheWrite":0},"stopReason":"stop"}}"#,
+            "\n",
         );
         let writer = LogWriter::create(&log).unwrap();
         stream_to_log(
@@ -3845,33 +3898,19 @@ mod tests {
     }
 
     #[test]
-    fn stats_from_log_recovers_a_tmuxd_opencode_stream() {
+    fn stats_from_log_recovers_a_tmuxd_pi_stream() {
         // `run_tmux` never runs a live coalescer over the pane's output; it only tees the
         // raw stream to `log_path` (plus a trailing `tee`-added `EXIT:$?` line). This is
         // the post-hoc reconstruction that closes that gap, fed the same shape of file.
         let tmp = tempdir().unwrap();
         let log = tmp.path().join("slot.log");
-        std::fs::write(
-            &log,
-            concat!(
-                r#"{"type":"text","sessionID":"ses_1","part":{"id":"prt_t","type":"text","text":"DONE"}}"#,
-                "\n",
-                r#"{"type":"step_finish","sessionID":"ses_1","part":{"id":"prt_f","type":"step-finish","tokens":{"input":12738,"output":19,"cache":{"read":1920,"write":0}}}}"#,
-                "\n",
-                "EXIT:0\n",
-            ),
-        )
-        .unwrap();
-        let s = stats_from_log(&log, Some("opencode"));
-        assert_eq!(s.input_tokens, 12738);
-        assert_eq!(s.cache_read_tokens, 1920);
-        assert_eq!(s.billed_tokens, 12738 + 1920 + s.output_tokens);
-        assert_eq!(s.session_id.as_deref(), Some("ses_1"));
-        assert_eq!(
-            s.context_semantics,
-            crate::state::ContextSemantics::Peak,
-            "the tmux recovery path is opencode-only, so its gauge is a peak"
-        );
+        std::fs::write(&log, format!("{PI_RUN1}EXIT:0\n")).unwrap();
+        let s = stats_from_log(&log, Some("cli:pi"));
+        assert_eq!(s.input_tokens, 3132 + 529);
+        assert_eq!(s.cache_read_tokens, 2698);
+        assert_eq!(s.tools, 1);
+        assert_eq!(s.session_id.as_deref(), Some("spar-cap-01"));
+        assert_eq!(s.context_semantics, crate::state::ContextSemantics::Peak);
     }
 
     #[test]

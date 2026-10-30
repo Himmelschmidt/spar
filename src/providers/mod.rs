@@ -7,8 +7,7 @@ pub mod delivery;
 mod grok;
 mod muse;
 pub mod muse_telemetry;
-mod opencode;
-pub mod opencode_telemetry;
+mod pi;
 pub mod presence;
 
 use crate::provider_ref::{ExecBackend, ProviderRef};
@@ -21,7 +20,7 @@ pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
 pub use grok::GrokAdapter;
 pub use muse::MuseAdapter;
-pub use opencode::OpencodeAdapter;
+pub use pi::PiAdapter;
 
 /// How the orchestrator hands a queued message to a *running* adapter at its next
 /// turn boundary. The orchestrator asks the adapter for this; it never branches on
@@ -38,10 +37,6 @@ pub enum DeliveryStrategy {
     /// whenever no session id is captured yet (thread id not seen) as well as whenever
     /// a push with one fails; see W10.
     NativeQueuePollFallback,
-    /// opencode: `client.session.prompt()` / `prompt_async` into the live session.
-    /// Declared for matrix completeness; constructed once the opencode adapter lands.
-    #[allow(dead_code)]
-    SdkPrompt,
     /// No push channel into the running process, so spar writes to a slot-scoped file
     /// and the role prompt tells the agent to read it before it starts any new major
     /// step. That is the only moment a nudge is actionable anyway, so it needs no polling
@@ -63,10 +58,6 @@ pub enum PresenceSource {
     /// Declared for matrix completeness; constructed once that adapter path lands.
     #[allow(dead_code)]
     HttpPush,
-    /// Server-sent events bus (opencode `GET /event`: session.idle / tool.execute.* / permission.ask).
-    /// Declared for matrix completeness; constructed once the opencode adapter lands.
-    #[allow(dead_code)]
-    Sse,
     /// No event stream — presence is degraded to a process/output heuristic.
     None,
 }
@@ -191,7 +182,7 @@ pub trait ProviderAdapter: Send + Sync {
     /// local-state reads, never a model call, never quota, never a mutation of
     /// the user's state. It runs under `READINESS_TIMEOUT`; a timeout (or a
     /// spawn failure) is `Unknown`, never `Unhealthy`.
-    fn readiness_probe(&self) -> Option<&[&'static str]> {
+    fn readiness_probe(&self) -> Option<Vec<String>> {
         None
     }
     fn resolve_binary(&self) -> Option<PathBuf> {
@@ -205,7 +196,7 @@ pub trait ProviderAdapter: Send + Sync {
             Some(p) => {
                 let version = probe_version(&p, self.version_args());
                 let (readiness, readiness_message) =
-                    probe_readiness(&p, self.readiness_probe(), READINESS_TIMEOUT);
+                    probe_readiness(&p, self.readiness_probe().as_deref(), READINESS_TIMEOUT);
                 (
                     true,
                     Some(p.display().to_string()),
@@ -366,10 +357,10 @@ pub trait ProviderAdapter: Send + Sync {
 }
 
 /// How long a readiness probe may run. Much longer than the 2s version bound:
-/// `opencode models` startup on this box varies from ~2s warm to ~10s cold,
-/// so anything under that reports Unknown on a slow day and the probe never
-/// catches a broken config. Only adapters with a probe pay this, and only up
-/// to the bound. A timeout still reports `Unknown`, never `Unhealthy`.
+/// a Node CLI's cold start on a loaded box can blow through 2s, and a probe
+/// that times out never catches anything. Only adapters with a probe pay this,
+/// and only up to the bound. A timeout still reports `Unknown`, never
+/// `Unhealthy`.
 pub(crate) const READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Longest `readiness_message` kept, in chars. The first-line rule bounds lines
@@ -383,9 +374,9 @@ pub(crate) const READINESS_MESSAGE_CHARS: usize = 300;
 /// put errors), ANSI-stripped and capped at `READINESS_MESSAGE_CHARS`. A
 /// timeout, a spawn failure, or death by signal with no output to judge it by
 /// is `Unknown`: the probe could not run, so there is no verdict.
-fn probe_readiness(
+fn probe_readiness<S: AsRef<std::ffi::OsStr>>(
     bin: &PathBuf,
-    probe: Option<&[&str]>,
+    probe: Option<&[S]>,
     timeout: std::time::Duration,
 ) -> (Readiness, Option<String>) {
     let Some(args) = probe else {
@@ -550,7 +541,7 @@ pub fn all_adapters() -> Vec<Box<dyn ProviderAdapter>> {
         Box::new(GrokAdapter),
         Box::new(AgyAdapter),
         Box::new(CodexAdapter),
-        Box::new(OpencodeAdapter),
+        Box::new(PiAdapter),
         Box::new(MuseAdapter),
     ]
 }
@@ -753,8 +744,9 @@ mod tests {
         fn capabilities(&self) -> Capabilities {
             Capabilities::default()
         }
-        fn readiness_probe(&self) -> Option<&[&'static str]> {
+        fn readiness_probe(&self) -> Option<Vec<String>> {
             self.probe
+                .map(|p| p.iter().map(|s| s.to_string()).collect())
         }
         fn permission_args(&self, _policy: TrustPolicy) -> Vec<String> {
             Vec::new()
@@ -815,7 +807,7 @@ mod tests {
     #[test]
     fn failing_probe_message_is_ansi_stripped() {
         let bin = which::which("sh").expect("sh on PATH for probe tests");
-        // opencode's real failure shape: color codes around the message.
+        // A CLI's colored failure shape: color codes around the message.
         let (readiness, message) = probe_readiness(
             &bin,
             Some(&[
@@ -873,7 +865,7 @@ mod tests {
     fn reported_resume_matches_the_resume_implementation_on_every_adapter() {
         // The reported `Capabilities.resume` is derived from
         // `supports_resume`, which itself must agree with `build_resume`: only
-        // codex and muse implement it, so only they may report true. This pins
+        // codex, muse and pi implement it, so only they may report true. This pins
         // all three together so the flag cannot drift from the code again.
         let _guard = codex::ENV_LOCK.lock().unwrap();
         // Hermetic: codex's `build_resume` reads the profile model from
@@ -914,12 +906,12 @@ mod tests {
         }
         std::env::remove_var("CODEX_HOME");
         resumed.sort();
-        assert_eq!(resumed, vec!["codex".to_string(), "muse".to_string()]);
+        assert_eq!(resumed, vec!["codex", "muse", "pi"]);
     }
 
     #[test]
-    fn only_opencode_wires_a_probe() {
-        assert_eq!(OpencodeAdapter.readiness_probe(), Some(&["models"][..]));
+    fn only_pi_wires_a_probe() {
+        assert!(PiAdapter.readiness_probe().is_some());
         assert_eq!(ClaudeAdapter.readiness_probe(), None);
         assert_eq!(GrokAdapter.readiness_probe(), None);
         assert_eq!(AgyAdapter.readiness_probe(), None);

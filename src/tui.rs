@@ -1978,6 +1978,7 @@ fn build_snapshot(sel: &Selection, cache: &mut LogCache, cfg: &Config) -> Snapsh
                         chars_out: 0,
                         last_log_at: None,
                         cost_usd: u.cost_usd,
+                        provider_error: None,
                         subagent_stats: u.subagent_stats.clone(),
                         model_usage: u.model_usage.clone(),
                     })
@@ -16635,8 +16636,8 @@ mod render_stability {
         .collect();
         assert_eq!(narrow, ["opus", "sonnet", "haiku"], "tiers collapsed at 6");
         assert_ne!(
-            label(Some("google/gemini-3.7-flash"), "cli:opencode", 6),
-            label(Some("google/gemini-3.7-pro"), "cli:opencode", 6),
+            label(Some("google/gemini-3.7-flash"), "cli:pi", 6),
+            label(Some("google/gemini-3.7-pro"), "cli:pi", 6),
         );
         // A release date is dropped; a version number is not.
         assert_eq!(
@@ -16648,21 +16649,21 @@ mod render_stability {
             "3-5-haiku"
         );
         // Same family, different tier: the labels must differ.
-        let flash = label(Some("google/gemini-3.7-flash"), "cli:opencode", 12);
-        let pro = label(Some("google/gemini-3.7-pro"), "cli:opencode", 12);
+        let flash = label(Some("google/gemini-3.7-flash"), "cli:pi", 12);
+        let pro = label(Some("google/gemini-3.7-pro"), "cli:pi", 12);
         assert_ne!(flash, pro, "flash and pro rendered the same");
         assert!(flash.ends_with("flash"), "{flash}");
         assert!(pro.ends_with("pro"), "{pro}");
         assert!(flash.starts_with("gemini"), "room for both at 12: {flash}");
         // No model recorded: name the adapter, never an empty cell.
-        assert_eq!(label(None, "cli:opencode", 12), "opencode");
+        assert_eq!(label(None, "cli:pi", 12), "pi");
         assert_eq!(label(None, "cli:claude", 12), "claude");
         // What the provider says it served beats what was asked for.
-        let mut s = crate::executor::init_slot("s", "cli:opencode", SlotRole::Reviewer);
+        let mut s = crate::executor::init_slot("s", "cli:pi", SlotRole::Reviewer);
         s.model = Some("anthropic/claude-opus-4.8".into());
         s.usage = Some(crate::state::SlotUsage {
             slot_id: "s".into(),
-            provider: "cli:opencode".into(),
+            provider: "cli:pi".into(),
             input_tokens: 0,
             output_tokens: 0,
             cache_read_tokens: 0,
