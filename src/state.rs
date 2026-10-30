@@ -28,6 +28,10 @@ pub struct RunState {
     /// run created from a bare `-t`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub brief: Option<PathBuf>,
+    /// Idempotency key (`--key`, or the brief slug for `plan --brief`). While a run
+    /// holding a key is unfinished (`holds_key`), a new run with the same key is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
@@ -395,6 +399,17 @@ impl Phase {
         )
     }
 
+    /// Whether a run at this phase still holds its idempotency key. Finished and
+    /// dead-ended runs release it; everything resumable (a gate, `plan_approved`,
+    /// `stopped`, `quota`) keeps it, because a second run there is the duplicate the key
+    /// exists to stop.
+    pub fn holds_key(&self) -> bool {
+        !matches!(
+            self,
+            Phase::Done | Phase::PlanRejected | Phase::Failed | Phase::Stuck | Phase::Escalated
+        )
+    }
+
     pub fn is_waitable_stop(&self) -> bool {
         // Stopped is resumable (not terminal, not a gate) but `wait` must return.
         self.is_terminal() || self.is_gate() || matches!(self, Phase::Stopped)
@@ -638,6 +653,8 @@ pub struct RunSummary {
     pub updated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     #[serde(default)]
     pub dry_run: bool,
     /// In flight, but no live orchestrator owns it — computed at read time.
@@ -698,6 +715,7 @@ impl RunState {
             task: None,
             amendment: None,
             brief: None,
+            key: None,
             created_at: now,
             updated_at: now,
             slots: Vec::new(),
@@ -1387,6 +1405,7 @@ pub fn list_runs(paths: &SparPaths) -> Result<Vec<RunSummary>> {
             phase: state.phase,
             updated_at: state.updated_at,
             task: state.task,
+            key: state.key,
             dry_run: state.dry_run,
             parent_run: state.parent_run,
             round: state.round,

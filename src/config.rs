@@ -1966,8 +1966,57 @@ enum Trust {
     Project,
 }
 
-fn user_config_path() -> Option<PathBuf> {
+#[cfg(not(test))]
+pub fn user_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("spar").join("config.toml"))
+}
+
+/// Unit tests never read the developer's real user config: it can name a shared quota
+/// store or remote hosts, and an in-process test must not write to either.
+#[cfg(test)]
+pub fn user_config_path() -> Option<PathBuf> {
+    TEST_USER_CONFIG.with(|p| p.borrow().clone())
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_USER_CONFIG: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub fn set_test_user_config(path: Option<PathBuf>) {
+    TEST_USER_CONFIG.with(|p| *p.borrow_mut() = path);
+}
+
+/// Sections only the operator's own `~/.config/spar/config.toml` may set. They name other
+/// machines and shared filesystems, which a repo-local `spar.toml` has no business
+/// choosing, and they describe the box rather than a run, so they are never snapshotted.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct UserConfig {
+    #[serde(default)]
+    pub registry: RegistryConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RegistryConfig {
+    /// ssh hosts whose runs `spar status --all-hosts` lists and the `--key` check consults.
+    #[serde(default)]
+    pub remotes: Vec<String>,
+}
+
+impl UserConfig {
+    pub fn load() -> Result<Self> {
+        let Some(path) = user_config_path() else {
+            return Ok(Self::default());
+        };
+        if !path.is_file() {
+            return Ok(Self::default());
+        }
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("read config {}", path.display()))?;
+        toml::from_str(&text).with_context(|| format!("parse config {}", path.display()))
+    }
 }
 
 fn load_file(path: &Path) -> Result<ConfigFile> {
@@ -1981,6 +2030,22 @@ fn load_file(path: &Path) -> Result<ConfigFile> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn user_config_reads_registry_remotes_and_ignores_config_sections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "max_agents = 3\n[registry]\nremotes = [\"box2\", \"box3\"]\n",
+        )
+        .unwrap();
+        set_test_user_config(Some(path));
+        let user = UserConfig::load().unwrap();
+        set_test_user_config(None);
+        assert_eq!(user.registry.remotes, vec!["box2", "box3"]);
+        assert!(UserConfig::load().unwrap().registry.remotes.is_empty());
+    }
 
     /// AC-5. A repeated positional `--backup reviewer=` states the CLI's whole
     /// reviewer backup list; it must not append after the ones the project file

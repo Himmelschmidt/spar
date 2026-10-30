@@ -1145,6 +1145,7 @@ event/presence mirror live under `.spar/runs/<id>/bus/`.
 
 ```bash
 spar status [run_id] [--json] [--all]   # --all = every registered project; a run with a live orchestrator shows `pid=<n>`
+spar status --hosts h1,h2 | --all-hosts [--json]   # runs on other boxes over ssh (O140)
 spar wait <run_id> [--timeout 8h] [--follow] [--json]
 spar logs <run_id> [slot] [-f|--follow]
 
@@ -1152,6 +1153,46 @@ spar logs <run_id> [slot] [-f|--follow]
 # `.spar/runs/`; project list is ~/.spar/registry.json (or $SPAR_HOME).
 # Projects appear when you use spar there — no hardcoded scan paths.
 ```
+
+### Idempotency keys and cross-host status (O140)
+
+```bash
+spar implement -t "…" --key pr-1234 [--key-scope local|fleet] ...   # also on plan / run
+spar plan --brief .spar/briefs/<slug>.md ...      # key defaults to <slug>
+spar status --hosts box2,box3 [--json] [--archived]
+spar status --all-hosts [--json]                   # this host + every [registry] remotes host
+```
+
+- `--key <k>` is stored on the run (`key` in `state.json` and `status --json`). A new
+  run is refused while an unfinished run in the project holds the same key: exit `1`,
+  the holder's id on stderr, and with `--json` stdout is
+  `{"error": "...", "kind": "duplicate", "run_id": "<holder>", "host": null|"<host>"}`.
+  Unfinished means anything but `done` / `plan_rejected` / `failed` / `stuck` /
+  `escalated`, and not archived: a gate, `plan_approved`, `stopped` and `quota` hold
+  the key. Resume or stop the holder; a key never moves to an existing run
+  (`--key` with `implement --run` / `plan --run` is refused).
+- `plan --brief .spar/briefs/<slug>.md` without `--key` uses `<slug>` as the key.
+  `--spec` (which writes a new brief) and `-t` set no key unless you pass one.
+- Remotes live in the **user** config only (`~/.config/spar/config.toml`), never
+  `spar.toml`:
+
+  ```toml
+  [registry]
+  remotes = ["box2", "box3"]
+  ```
+
+  Each host is queried with `ssh -o BatchMode=yes -o ConnectTimeout=10 <host> spar
+  status --all --json` (stdin closed, 20s ceiling), so `spar` must be on the remote's
+  non-interactive `PATH` and the key loaded in your agent. `--hosts`/`--all-hosts`
+  `--json` prints `{"hosts": [{"host", "ok", "runs"|"error"}], "runs": [<row> + "host"]}`;
+  a host that does not answer is listed as unreachable and the command still exits `0`.
+- With remotes configured the key check is fleet-wide by default (`--key-scope fleet`):
+  a remote run holds the key when its `project_name` (the checkout's directory name)
+  matches this project's. An unreachable host prints a warning and the launch
+  **proceeds**: the check covered only the hosts that answered.
+- **Check-then-act, not a lock.** Two launches in the same instant both see no holder
+  and both start. The key stops relaunches, requeues and second boxes, not a
+  simultaneous race.
 
 **Subscribe, don't poll.** When you are waiting on a run, block on `wait` instead
 of spinning on `status` — you don't have to remember to check back:

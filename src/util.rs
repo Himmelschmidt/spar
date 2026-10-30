@@ -48,6 +48,14 @@ pub fn sanitize_slot(s: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+pub fn hostname() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .or_else(|_| std::fs::read_to_string("/etc/hostname"))
+        .ok()
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+}
+
 pub fn env_truthy(name: &str) -> bool {
     match std::env::var(name) {
         Ok(v) => matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),

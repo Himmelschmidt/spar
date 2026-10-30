@@ -31,6 +31,7 @@ mod quota;
 mod record;
 mod registry;
 mod rules;
+mod runkey;
 mod runlock;
 mod runspec;
 mod sandbox;
@@ -146,6 +147,8 @@ fn run() -> Result<ExitCode> {
             fleet,
             without,
             suite_command,
+            key,
+            key_scope,
             base,
             detach,
             json,
@@ -175,6 +178,7 @@ fn run() -> Result<ExitCode> {
                     (fleet.is_some(), "--fleet"),
                     (!without.is_empty(), "--without"),
                     (!suite_command.is_empty(), "--suite-command"),
+                    (key.is_some(), "--key"),
                     (base.is_some(), "--base"),
                     (big, "--big"),
                     (detach, "--detach"),
@@ -213,6 +217,17 @@ fn run() -> Result<ExitCode> {
             cfg.apply_backup_overrides(&backup)?;
             cfg.apply_effort_overrides(&effort)?;
             cfg.apply_suite_command(&suite_command, &without)?;
+            // A brief on disk is the work's identity already (O41), so its slug is the
+            // natural key when the operator names none.
+            let key = key.or_else(|| {
+                brief
+                    .as_deref()
+                    .and_then(|p| p.file_stem())
+                    .map(|s| s.to_string_lossy().into_owned())
+            });
+            if let Some(code) = runkey::guard(&paths, key.as_deref(), key_scope, json)? {
+                return Ok(code);
+            }
             let (task_text, brief_path) = match (spec, brief, task) {
                 (Some(path), None, None) => {
                     let b = brief::intake(&paths, &path)?;
@@ -254,6 +269,7 @@ fn run() -> Result<ExitCode> {
                 // `plan` / `run` mint their config fresh; there is no frozen one to
                 // reload against, so seats are resolved for the first time either way.
                 reload_config: false,
+                key,
             };
             workflow::plan::run(task_text, brief_path, opts, &paths, &cfg)
         }
@@ -293,6 +309,8 @@ fn run() -> Result<ExitCode> {
             reload_config,
             max_rounds,
             accept_contract,
+            key,
+            key_scope,
             base,
             detach,
             json,
@@ -303,6 +321,9 @@ fn run() -> Result<ExitCode> {
             urgency,
             big,
         } => {
+            if let (Some(id), Some(_)) = (&run_id, &key) {
+                anyhow::bail!("--key names a new run; run {id} already exists and keeps the key it was created with");
+            }
             let (paths, cfg) = implement_ctx(
                 run_id.as_deref(),
                 &role,
@@ -327,7 +348,15 @@ fn run() -> Result<ExitCode> {
                 max_rounds,
                 accept_contract,
                 reload_config,
+                key,
             };
+            if opts.key.is_some() {
+                if let Some(code) =
+                    runkey::guard(&paths, opts.key.as_deref(), key_scope, opts.json)?
+                {
+                    return Ok(code);
+                }
+            }
             workflow::implement::run_from_cli(run_id, plan, task, new, opts, &paths, &cfg)
         }
         Command::Run {
@@ -338,6 +367,8 @@ fn run() -> Result<ExitCode> {
             effort,
             fleet,
             without,
+            key,
+            key_scope,
             base,
             detach,
             json,
@@ -405,7 +436,11 @@ fn run() -> Result<ExitCode> {
                 // `plan` / `run` mint their config fresh; there is no frozen one to
                 // reload against, so seats are resolved for the first time either way.
                 reload_config: false,
+                key,
             };
+            if let Some(code) = runkey::guard(&paths, opts.key.as_deref(), key_scope, json)? {
+                return Ok(code);
+            }
             workflow::run_named(workflow, opts, &paths, &cfg)
         }
         Command::Status {
@@ -413,7 +448,17 @@ fn run() -> Result<ExitCode> {
             json,
             all,
             archived,
-        } => status_cmd(run_id, json, all, archived),
+            hosts,
+            all_hosts,
+        } => {
+            if !hosts.is_empty() || all_hosts {
+                if run_id.is_some() {
+                    anyhow::bail!("--hosts / --all-hosts list runs; drop the run id");
+                }
+                return fleet_status_cmd(hosts, all_hosts, json, archived);
+            }
+            status_cmd(run_id, json, all, archived)
+        }
         Command::Wait {
             run_id,
             timeout,
@@ -947,6 +992,100 @@ fn auto_archive_at_launch() {
         ),
         _ => {}
     }
+}
+
+/// Runs across hosts (O140). Observe-only like `status`: an unreachable host is reported
+/// in place and the command still exits 0.
+fn fleet_status_cmd(
+    hosts: Vec<String>,
+    all_hosts: bool,
+    json: bool,
+    archived: bool,
+) -> Result<ExitCode> {
+    let remotes = if all_hosts {
+        let remotes = config::UserConfig::load()?.registry.remotes;
+        if remotes.is_empty() {
+            anyhow::bail!(
+                "no [registry] remotes in {}; name hosts with --hosts h1,h2",
+                config::user_config_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "the user config".into())
+            );
+        }
+        remotes
+    } else {
+        hosts
+    };
+    let mut report: Vec<serde_json::Value> = Vec::new();
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    if all_hosts {
+        let local = util::hostname().unwrap_or_else(|| "localhost".into());
+        let mut runs = registry::list_all_runs()?;
+        if !archived {
+            runs.retain(|r| !r.archived);
+        }
+        report.push(serde_json::json!({"host": local, "ok": true, "runs": runs.len()}));
+        for r in runs {
+            let mut v = serde_json::to_value(r)?;
+            v["host"] = serde_json::json!(local);
+            rows.push(v);
+        }
+    }
+    for answer in registry::query_remotes(&remotes, archived) {
+        match answer.runs {
+            Ok(runs) => {
+                report
+                    .push(serde_json::json!({"host": answer.host, "ok": true, "runs": runs.len()}));
+                for mut v in runs.into_iter().filter(|v| v.is_object()) {
+                    v["host"] = serde_json::json!(answer.host);
+                    rows.push(v);
+                }
+            }
+            Err(e) => {
+                report.push(serde_json::json!({"host": answer.host, "ok": false, "error": e}))
+            }
+        }
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({"hosts": report, "runs": rows}))?
+        );
+        return Ok(ExitCode::Success);
+    }
+    for h in &report {
+        let host = h["host"].as_str().unwrap_or("?");
+        if h["ok"] != true {
+            println!(
+                "[{host}] unreachable: {}",
+                h["error"].as_str().unwrap_or("?")
+            );
+            continue;
+        }
+        println!("[{host}] {} run(s)", h["runs"]);
+        for r in rows.iter().filter(|r| r["host"] == host) {
+            let key = r["key"]
+                .as_str()
+                .map(|k| format!(" key={k}"))
+                .unwrap_or_default();
+            let task: String = r["task"]
+                .as_str()
+                .unwrap_or("")
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(60)
+                .collect();
+            println!(
+                "  {} {} {}{key}  {task}",
+                r["id"].as_str().unwrap_or("?"),
+                r["phase"].as_str().unwrap_or("?"),
+                r["project_name"].as_str().unwrap_or("·"),
+            );
+        }
+    }
+    Ok(ExitCode::Success)
 }
 
 fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> Result<ExitCode> {

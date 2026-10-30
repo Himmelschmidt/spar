@@ -42,6 +42,9 @@ pub struct CommonOpts {
     /// instead of keeping the provider they were minted with. Without this, `--role` on
     /// a run whose slots exist silently changes `config.json` and nothing else.
     pub reload_config: bool,
+    /// `--key`: the idempotency key a NEW run is minted with. Checked before minting by
+    /// `runkey::guard`; never applied to a run that already exists.
+    pub key: Option<String>,
 }
 
 impl Default for CommonOpts {
@@ -60,6 +63,7 @@ impl Default for CommonOpts {
             big: false,
             max_rounds: None,
             accept_contract: false,
+            key: None,
         }
     }
 }

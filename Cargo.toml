@@ -186,3 +186,7 @@ path = "tests/scenarios/review_gating.rs"
 [[test]]
 name = "work_safety"
 path = "tests/scenarios/work_safety.rs"
+
+[[test]]
+name = "fleet_scale"
+path = "tests/scenarios/fleet_scale.rs"
