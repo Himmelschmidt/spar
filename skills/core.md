@@ -55,6 +55,17 @@ parseable config with an expired key still reports healthy and fails at dispatch
 is all a local-only, no-quota check can see. An `unhealthy` provider is still eligible
 for dispatch; doctor warns, it does not exclude.
 
+**A reviewer that cannot run is not a verdict (O103).** In the implement loop, a
+reviewer dispatch that fails because the provider could not serve it (rate limit, auth
+fault, a CLI that never started, or a native CLI that exited having run no tools, e.g.
+codex unable to spawn `codex-code-mode-host`) is an infrastructure failure. spar retries
+that seat once on its declared `--backup` (renamed for the new vendor), else on the next
+eligible panel candidate. If that also cannot run, the run parks at `quota` (exit `4`)
+with `review slot ... could not run on <provider>: <reason>. provider marked unhealthy;
+no verdict recorded`, no fix round is spent, and the `request_changes` stub spar used to
+salvage for it is removed. A reviewer that ran (tools > 0) and still produced no review
+keeps the old fail-closed `request_changes`.
+
 **Probing quota state (O105).** `.spar/quota.json` records failures; it can be stale.
 `spar provider list` (and `--json`: `paused_since`, `pause_age_secs`, `paused_until`)
 shows the age and end of every pause, including ones on `api:` refs. `spar provider

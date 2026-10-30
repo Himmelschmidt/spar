@@ -1959,6 +1959,10 @@ pub fn hard_ceiling_for_role(cfg: &Config, role: SlotRole) -> Duration {
 /// Also synthesizes a missing implementer carry-forward brief (see
 /// `salvage_carry_forward`): without it the next round opens cold on a half-edited
 /// worktree with no record that the tree is dirty.
+/// The finding a salvaged reviewer stub carries, so the review loop can tell a stub
+/// spar wrote from a review the slot wrote.
+pub const REVIEW_SALVAGE_FINDING: &str = "review slot interrupted";
+
 pub fn salvage_expected_artifact(
     paths: &SparPaths,
     run_id: &str,
@@ -2004,7 +2008,7 @@ pub fn salvage_expected_artifact(
         .unwrap_or_else(|| process::tail_log(log_path, 6000));
     let body = match job.role {
         SlotRole::Reviewer => format!(
-            "## Verdict\nrequest_changes\n\n## Findings\n- severity: major — review slot interrupted ({reason}); partial transcript salvaged below\n\n## Tests\nsee partial transcript\n\n## Partial transcript\n\n```\n{tail}\n```\n"
+            "## Verdict\nrequest_changes\n\n## Findings\n- severity: major — {REVIEW_SALVAGE_FINDING} ({reason}); partial transcript salvaged below\n\n## Tests\nsee partial transcript\n\n## Partial transcript\n\n```\n{tail}\n```\n"
         ),
         SlotRole::TestAuthor => format!(
             "## Scenarios\n- (interrupted: {reason})\n\n## Non-goals\n- n/a\n\n## How to run\n- unknown\n\n## Expected before implement\nskipped-reason\n\n## Notes\nPartial transcript:\n```\n{tail}\n```\n"

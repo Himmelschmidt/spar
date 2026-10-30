@@ -603,3 +603,118 @@ fn a_pause_set_mid_run_with_no_backup_parks_before_the_reviewer_dispatches() {
         "{err}"
     );
 }
+
+/// The box2 incident (#155): codex could not spawn its `codex-code-mode-host` sibling,
+/// did zero tool calls, and the slot was salvaged as a blocking major. Here the backup
+/// takes the seat and the panel approves: no fix round, no fake verdict.
+#[test]
+fn a_reviewer_that_cannot_run_is_retried_on_its_backup_not_counted_as_a_verdict() {
+    let fx = Fixture::new();
+    fx.cli("claude", &counted("claude", WRITE_ARTIFACT));
+    fx.cli(
+        "codex",
+        &counted(
+            "codex",
+            "echo 'Error: failed to spawn codex-code-mode-host: No such file or directory (os error 2)' >&2\nexit 1",
+        ),
+    );
+    fx.cli(
+        "grok",
+        &format!("echo x >> \"$FAKE_COUNT_DIR/grok.count\"\n{WRITE_ARTIFACT}"),
+    );
+    fx.spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--role",
+            "implementer=cli:claude",
+            "--role",
+            "reviewer=cli:codex",
+            "--backup",
+            "reviewer=cli:grok",
+            "--without",
+            "suite",
+        ])
+        .assert()
+        .code(2);
+    let state = fx.state();
+    assert_eq!(state["phase"], "awaiting_ship_confirm", "{state}");
+    assert_eq!(
+        state["fix_rounds"], 0,
+        "no round was spent on the broken CLI"
+    );
+    let rev = fx.slot("reviewer");
+    assert_eq!(rev["id"], "review-0-cli-grok");
+    assert_eq!(rev["source"], "backup");
+    assert_eq!(fx.count("codex"), 1);
+    assert_eq!(fx.count("grok"), 1);
+    let stub = fx
+        .proj
+        .join(".spar/runs")
+        .join(fx.run_id())
+        .join("artifacts/review-review-0-cli-codex.md");
+    assert!(
+        !stub.exists(),
+        "no verdict is recorded for a CLI that never ran"
+    );
+}
+
+#[test]
+fn a_reviewer_whose_backup_also_cannot_run_parks_on_quota_with_no_verdict() {
+    let fx = Fixture::new();
+    fx.cli("claude", &counted("claude", WRITE_ARTIFACT));
+    fx.cli(
+        "codex",
+        &counted(
+            "codex",
+            "echo 'Error: failed to spawn codex-code-mode-host: No such file or directory (os error 2)' >&2\nexit 1",
+        ),
+    );
+    fx.cli(
+        "grok",
+        "echo x >> \"$FAKE_COUNT_DIR/grok.count\"\necho 'You are not authenticated.' >&2\nexit 1",
+    );
+    fx.spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--role",
+            "implementer=cli:claude",
+            "--role",
+            "reviewer=cli:codex",
+            "--backup",
+            "reviewer=cli:grok",
+            "--without",
+            "suite",
+        ])
+        .assert()
+        .code(4);
+    let state = fx.state();
+    assert_eq!(state["phase"], "quota");
+    assert_eq!(state["fix_rounds"], 0);
+    let err = state["error"].as_str().unwrap();
+    assert!(
+        err.contains("could not run") && err.contains("no verdict recorded"),
+        "{err}"
+    );
+    assert_eq!(fx.count("grok"), 2, "the auth retry ran once on the backup");
+    let artifacts = fx
+        .proj
+        .join(".spar/runs")
+        .join(fx.run_id())
+        .join("artifacts");
+    for entry in fs::read_dir(&artifacts).unwrap().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        assert!(
+            !name.starts_with("review-"),
+            "fake verdict left behind: {name}"
+        );
+    }
+    assert!(
+        fx.quota()["providers"].get("cli:grok").is_none(),
+        "auth never pauses: {}",
+        fx.quota()
+    );
+}
