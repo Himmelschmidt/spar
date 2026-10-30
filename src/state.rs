@@ -45,6 +45,11 @@ pub struct RunState {
     /// Commit `base_ref` resolved to. This is what worktrees actually branch from.
     #[serde(default)]
     pub base_commit: Option<String>,
+    /// Commits the invoking HEAD was behind its upstream tracking branch when the base
+    /// was taken from it (no `--base`). `None` when `--base` was given or there is no
+    /// upstream to compare against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_behind: Option<u32>,
     /// Spawn mode for native-cli: auto|headless|tmux
     #[serde(default)]
     pub backend: Backend,
@@ -629,6 +634,7 @@ impl RunState {
             project_root,
             base_ref: None,
             base_commit: None,
+            base_behind: None,
             backend: Backend::Auto,
             isolation: IsolationMode::Worktree,
             dry_run: false,

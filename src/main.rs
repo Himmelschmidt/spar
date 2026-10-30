@@ -876,7 +876,14 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> 
             println!("run: {}", state.id);
             println!("project: {}", swarm.project_root.display());
             if let (Some(r), Some(c)) = (&state.base_ref, &state.base_commit) {
-                println!("base: {r} ({})", c.chars().take(8).collect::<String>());
+                let behind = match state.base_behind {
+                    Some(n) if n > 0 => format!(", {n} behind upstream at launch"),
+                    _ => String::new(),
+                };
+                println!(
+                    "base: {r} ({}{behind})",
+                    c.chars().take(8).collect::<String>()
+                );
             }
             println!("phase: {:?}", state.phase);
             // Looking a run up by id is the documented way to reach an archived one, so it

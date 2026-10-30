@@ -530,6 +530,12 @@ The base is a **commit**: uncommitted changes in your working tree are not in it
 is falling back to `project_root`'s HEAD) — those warnings are stderr-only, `--json` included,
 so a headless driver has to read stderr to see them. Commit first if the slots need the work.
 
+With no `--base`, spar also counts how far the invoking HEAD is **behind its upstream
+tracking branch** (`HEAD..@{u}`, as of your last fetch; spar does not fetch). Above zero it
+warns on stderr, `--json` included, and records the count as **`base_behind`** in the run
+JSON and `state.json`. It is absent with `--base` or when the branch has no upstream. The
+default base does not change: pass `--base origin/main` to build on the upstream (O110).
+
 Assert it before you trust a run — every run reports it:
 
 ```bash
@@ -939,7 +945,8 @@ rail's selection.
   transparency.
 
 - `status --json` and every run JSON carry **`base_ref` / `base_commit`** — the ref and commit
-  all of the run's slot worktrees were cut from (see **Base ref** above).
+  all of the run's slot worktrees were cut from (see **Base ref** above), plus
+  **`base_behind`** when the base was taken from a HEAD with an upstream.
 - **Tokens: `billed_tokens` is spend, `context_tokens` is a gauge.** Every entry in
   `"usage"` (the run's ledger, one entry per dispatch; sum it for the run total) and every
   `logs/<slot>.stats.json` carries both.

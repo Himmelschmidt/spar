@@ -114,9 +114,28 @@ pub fn apply_run_base(state: &mut RunState, requested: Option<&str>, json: bool)
             cwd.display()
         );
     }
+    // An explicit `--base` is the operator's choice of commit; only a base taken
+    // implicitly from the invoking HEAD can be silently stale (O110).
+    state.base_behind = requested.is_none().then(|| behind_upstream(&cwd)).flatten();
+    if let Some(n) = state.base_behind.filter(|n| *n > 0) {
+        let upstream = git_out(&cwd, &["rev-parse", "--abbrev-ref", "@{u}"])
+            .unwrap_or_else(|| "its upstream".into());
+        eprintln!(
+            "warning: base {} is {n} commit(s) behind {upstream}; pass --base {upstream} to build on it",
+            base.reference
+        );
+    }
     state.base_ref = Some(base.reference);
     state.base_commit = Some(base.commit);
     Ok(())
+}
+
+/// Commits `dir`'s HEAD is behind its upstream tracking branch, as of the last fetch.
+/// `None` with no upstream (detached HEAD, local-only branch).
+fn behind_upstream(dir: &Path) -> Option<u32> {
+    git_out(dir, &["rev-list", "--count", "HEAD..@{u}"])?
+        .parse()
+        .ok()
 }
 
 fn same_repo(a: &Path, b: &Path) -> bool {
