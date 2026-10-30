@@ -422,6 +422,34 @@ pub enum Command {
         /// Only record confirmation without pushing
         #[arg(long)]
         confirm_only: bool,
+        /// Ship the implementer HEAD from a gate the review never cleared (round
+        /// extension, stuck, failed, quota or any ship gate). Needs `--reason`; every open
+        /// finding goes in the PR body and the override is recorded in `artifacts/ship.md`.
+        #[arg(long)]
+        override_gate: bool,
+        /// Why the gate is being overridden. Required with `--override-gate`.
+        #[arg(long)]
+        reason: Option<String>,
+        /// When the remote branch has commits the run lacks, fast-forward the worktree to
+        /// it (refused if dirty or not a fast-forward) and ship.
+        #[arg(long)]
+        adopt_remote: bool,
+    },
+
+    /// Settle shipped runs from GitHub: a merged PR moves its run to `done`, a closed
+    /// one to `stopped`. Open PRs are left alone. Reads PR state through `gh`.
+    SyncPrs {
+        /// One run. Omit with `--all`.
+        #[arg(long)]
+        run: Option<String>,
+        /// Every run with a recorded PR or a shipped branch.
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+        /// Report what would change without writing.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Confirm arena winner (or use ranked default)
@@ -540,7 +568,8 @@ pub enum Command {
     /// `abandoned` lifecycle event, and enforces the cross-run concurrency cap.
     /// `spar daemon install` makes it a systemd user unit; nothing starts it silently.
     /// It never approves a plan, confirms ship, merges, sweeps `cleanup`, or picks a
-    /// fleet.
+    /// fleet. With `[daemon] sync_prs = true` it also runs `sync-prs --all`, at most
+    /// every five minutes.
     Daemon {
         #[command(subcommand)]
         cmd: DaemonCmd,

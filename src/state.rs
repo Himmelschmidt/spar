@@ -158,9 +158,34 @@ pub struct RunState {
     /// earlier rounds' verdicts and findings for `.spar/history.jsonl`.
     #[serde(default)]
     pub review_history: Vec<ReviewHistoryEntry>,
-    /// URL `gh pr create` printed when `ship` opened the PR.
+    /// URL of the PR `ship` opened or adopted, or `sync-prs` found for the branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,
+    /// When `sync-prs` saw the PR merged (GitHub's `mergedAt`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_commit: Option<String>,
+    /// PR state (`MERGED` / `CLOSED`) as of the `sync-prs` that settled the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_state: Option<String>,
+    /// Round whose work `ship` last pushed. `sync-prs` settles only a run that shipped
+    /// in its current round.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shipped_round: Option<u32>,
+    /// Commit that push sent; a PR settles the run only when its head is or contains it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shipped_head: Option<String>,
+    /// PR base the ship targeted, `None` for the repo default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shipped_base: Option<String>,
+    /// FNV-1a of the PR body spar last wrote, to notice a body edited by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_body_hash: Option<String>,
+    /// `--override-gate` for the current round, kept so a re-ship keeps the
+    /// "Shipped over open findings" section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ship_override: Option<crate::ship::ShipOverride>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -712,6 +737,14 @@ impl RunState {
             pool_intent: Vec::new(),
             review_history: Vec::new(),
             pr_url: None,
+            merged_at: None,
+            merge_commit: None,
+            shipped_round: None,
+            shipped_head: None,
+            shipped_base: None,
+            pr_body_hash: None,
+            ship_override: None,
+            pr_state: None,
         }
     }
 
@@ -726,6 +759,16 @@ impl RunState {
     pub fn begin_round(&mut self) -> u32 {
         self.round = self.round.saturating_add(1);
         self.archived_at = None;
+        // A PR and its merge belong to the round that shipped; a new round's work has
+        // not shipped yet and must not be settled by the old PR.
+        self.pr_url = None;
+        self.merged_at = None;
+        self.merge_commit = None;
+        self.pr_state = None;
+        self.shipped_round = None;
+        self.shipped_head = None;
+        self.shipped_base = None;
+        self.ship_override = None;
         self.touch();
         self.round
     }
@@ -1636,6 +1679,30 @@ mod tests {
         assert!(state.round_ceiling_reached());
         state.max_rounds = 0;
         assert!(!state.round_ceiling_reached(), "0 disables the ceiling");
+    }
+
+    /// A new round has not shipped: an earlier round's PR must not settle it (O123).
+    #[test]
+    fn begin_round_forgets_the_previous_rounds_pr() {
+        let mut state = RunState::new("r1", WorkflowKind::Loop, PathBuf::from("/x"));
+        state.pr_url = Some("https://github.com/o/r/pull/5".into());
+        state.merged_at = Some(Utc::now());
+        state.merge_commit = Some("abc".into());
+        state.pr_state = Some("MERGED".into());
+        state.shipped_round = Some(1);
+        state.shipped_head = Some("abc".into());
+        state.shipped_base = Some("main".into());
+        state.pr_body_hash = Some("deadbeef".into());
+        state.begin_round();
+        assert!(state.pr_url.is_none());
+        assert!(state.merged_at.is_none());
+        assert!(state.merge_commit.is_none());
+        assert!(state.pr_state.is_none());
+        assert!(state.shipped_round.is_none());
+        assert!(state.shipped_head.is_none());
+        assert!(state.shipped_base.is_none());
+        assert!(state.ship_override.is_none());
+        assert_eq!(state.pr_body_hash.as_deref(), Some("deadbeef"));
     }
 
     /// Runs written before the ceiling existed have no `max_rounds`; they must load with

@@ -10,6 +10,9 @@
 //! `providers::pick_providers`, `state::archive_sweep`, or set `state.gates.*` — a
 //! supervisor is a claim about which process happens to be driving a run, never about
 //! who is allowed to decide its fate.
+//!
+//! One narrow exception (O123): with `[daemon] sync_prs` it runs `prs::sync_prs`, which
+//! records a merge or close a human already made on GitHub.
 
 use crate::config::Config;
 use crate::exit_codes::ExitCode;
@@ -119,6 +122,14 @@ pub struct DaemonState {
     pub started_at: DateTime<Utc>,
     #[serde(default)]
     pub runs: HashMap<String, RunBookkeeping>,
+    /// Last `[daemon] sync_prs` pass. Throttled well below the tick: each pass costs a
+    /// GitHub API call per unsettled shipped run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_pr_sync: Option<DateTime<Utc>>,
+    /// PR-sync errors already reported, so a failure that repeats every pass is logged
+    /// once. Cleared by a pass with none.
+    #[serde(skip)]
+    pub pr_sync_errors: std::collections::HashSet<String>,
 }
 
 impl DaemonState {
@@ -127,6 +138,8 @@ impl DaemonState {
             pid: PidToken::capture(std::process::id()).encode(),
             started_at: Utc::now(),
             runs: HashMap::new(),
+            last_pr_sync: None,
+            pr_sync_errors: Default::default(),
         }
     }
 
@@ -571,6 +584,64 @@ fn tick(paths: &SparPaths, cfg: &Config, book: &mut DaemonState) {
     }
 
     drain_queue(paths, cfg);
+    sync_prs(paths, cfg, book, now);
+}
+
+const PR_SYNC_EVERY_SECS: i64 = 300;
+
+/// Settling a run on evidence of a merge or close is bookkeeping, not a human decision
+/// (O123). Errors (`gh` missing, auth, rate limit) are logged once each, not every pass.
+fn sync_prs(paths: &SparPaths, cfg: &Config, book: &mut DaemonState, now: DateTime<Utc>) {
+    if !cfg.daemon.sync_prs {
+        return;
+    }
+    if book
+        .last_pr_sync
+        .is_some_and(|t| now - t < chrono::Duration::seconds(PR_SYNC_EVERY_SECS))
+    {
+        return;
+    }
+    book.last_pr_sync = Some(now);
+    let mut errors: Vec<String> = Vec::new();
+    let rows = match crate::prs::sync_prs(paths, crate::prs::SyncScope::All, true) {
+        Ok(rows) => rows,
+        Err(e) => {
+            errors.push(format!("sync-prs: {e:#}"));
+            Vec::new()
+        }
+    };
+    for row in &rows {
+        if let Some(e) = &row.error {
+            errors.push(format!("sync-prs: run {}: {e}", row.run_id));
+        }
+    }
+    note_sync_errors(paths, book, errors);
+    for row in rows {
+        if let Some(to) = row.to.filter(|_| row.error.is_none()) {
+            log_line(
+                paths,
+                &format!(
+                    "run {} {:?} -> {to:?}: PR {} {}",
+                    row.run_id,
+                    row.phase,
+                    row.pr_url.as_deref().unwrap_or("?"),
+                    row.pr_state.as_deref().unwrap_or("?")
+                ),
+            );
+        }
+    }
+}
+
+fn note_sync_errors(paths: &SparPaths, book: &mut DaemonState, errors: Vec<String>) {
+    if errors.is_empty() {
+        book.pr_sync_errors.clear();
+    }
+    for e in errors {
+        if book.pr_sync_errors.insert(e.clone()) {
+            eprintln!("{e}");
+            log_line(paths, &e);
+        }
+    }
 }
 
 /// Admit queued runs, oldest first, as capacity frees up. FIFO so a wide run cannot be
@@ -1496,6 +1567,51 @@ mod tests {
                 "src/daemon.rs must never call `{banned}` — a supervisor is not an operator"
             );
         }
+    }
+
+    #[test]
+    fn a_repeated_pr_sync_error_is_logged_once() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        std::fs::create_dir_all(&paths.root).unwrap();
+        let mut book = DaemonState::new();
+        let err = || vec!["sync-prs: gh not found on PATH".to_string()];
+        note_sync_errors(&paths, &mut book, err());
+        note_sync_errors(&paths, &mut book, err());
+        let count = |p: &SparPaths| {
+            std::fs::read_to_string(p.workspace_logs_dir().join("daemon.log"))
+                .unwrap_or_default()
+                .matches("gh not found")
+                .count()
+        };
+        assert_eq!(count(&paths), 1);
+        note_sync_errors(&paths, &mut book, Vec::new());
+        note_sync_errors(&paths, &mut book, err());
+        assert_eq!(
+            count(&paths),
+            2,
+            "a recurrence after a clean pass is reported"
+        );
+    }
+
+    #[test]
+    fn pr_sync_runs_only_when_enabled_and_at_most_every_five_minutes() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut cfg = Config::default();
+        let mut book = DaemonState::new();
+        let t0 = Utc::now();
+        sync_prs(&paths, &cfg, &mut book, t0);
+        assert!(book.last_pr_sync.is_none());
+
+        cfg.daemon.sync_prs = true;
+        sync_prs(&paths, &cfg, &mut book, t0);
+        assert_eq!(book.last_pr_sync, Some(t0));
+        sync_prs(&paths, &cfg, &mut book, t0 + chrono::Duration::seconds(299));
+        assert_eq!(book.last_pr_sync, Some(t0));
+        let t1 = t0 + chrono::Duration::seconds(300);
+        sync_prs(&paths, &cfg, &mut book, t1);
+        assert_eq!(book.last_pr_sync, Some(t1));
     }
 
     /// #151: the unit runs the all-projects supervisor from this exact binary, carries

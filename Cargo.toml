@@ -176,6 +176,10 @@ name = "machine_readable"
 path = "tests/scenarios/machine_readable.rs"
 
 [[test]]
+name = "ship_flow"
+path = "tests/scenarios/ship_flow.rs"
+
+[[test]]
 name = "review_gating"
 path = "tests/scenarios/review_gating.rs"
 
