@@ -151,7 +151,7 @@ These must not depend on backend:
 | Workflow | Behavior |
 |----------|----------|
 | **Plan** | Multi-provider plan + real critic/synthesize; **structured plan-big style** when large (`--big` / flag) |
-| **Implement** | 1 implementer + ≥2 adversarial reviewers; stuck: fix → rotate provider → widen reviewers → stuck |
+| **Implement** | 1 implementer + adversarial reviewers (2 by default; a pinned `--role reviewer=` list sets the size exactly, `--fleet small` narrows to 1); stuck: fix → rotate provider → widen reviewers → stuck |
 | **Arena** | N implementers; finish **`winner`** *or* **`reconcile`** (merge-good-parts agent → multi-review → ship) |
 | **Roles / peer** | First-class v1; worktrees + mailbox protocol; multi-review before ship |
 | **Ship** | Confirm per gates; draft PR |
@@ -225,7 +225,7 @@ Track A (native-cli) is the default day-to-day path; Track B (api-sdk) is first-
 | API shape | In-tree runtime + official SDKs; opt-in / mixable |
 | Run identity | One id end-to-end |
 | Isolation | Always worktree; bwrap per-provider later (none on by default yet); fail-closed cleanup |
-| Implement default | 1 impl + ≥2 reviewers |
+| Implement default | 1 impl + 2 reviewers (pinned list sets the size; `small` = 1) |
 | Arena finish | `winner` or `reconcile` then review |
 | Roles/peer | v1 first-class |
 | Ship | Draft PR, never merge; lease force only on swarm branches |
