@@ -321,6 +321,24 @@ pub enum Command {
         archived: bool,
     },
 
+    /// Aggregate run history: rounds, outcomes, review findings, cost, wall time and
+    /// quota events, grouped by model, role, provider or project
+    Stats {
+        /// Only runs that ended (or last changed) within this window: `7d`, `12h`, `30m`
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long, value_enum, default_value = "provider")]
+        by: crate::stats::GroupBy,
+        /// Every project in the local registry, not just this one
+        #[arg(long)]
+        all_projects: bool,
+        /// Count `--dry-run` runs too
+        #[arg(long)]
+        include_dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Delete regenerable build output (`target/`, `node_modules`) inside finished runs'
     /// worktrees. Keeps the worktree, its branch and every commit — this is not `cleanup`
     Reclaim {
@@ -693,6 +711,8 @@ pub enum BusCmd {
         run: Option<String>,
         #[arg(long, default_value = "human")]
         from: String,
+        /// An agent id, `broadcast`, `@human`, or `impl` (needs `--run`: that run's
+        /// implementer)
         #[arg(long, default_value = "broadcast")]
         to: String,
         #[arg(long, short = 'm')]
@@ -705,6 +725,20 @@ pub enum BusCmd {
         conversation: Option<String>,
         #[arg(long)]
         turn: Option<String>,
+        /// Redeliver until the recipient runs `spar bus ack`, then escalate to @human
+        #[arg(long)]
+        requires_ack: bool,
+        /// Also carry the message in the implementer's carry-forward every dispatch
+        /// until it is withdrawn or acked. Needs `--run` and the run's implementer as `--to`
+        #[arg(long)]
+        persist: bool,
+        /// Withdraw an earlier message of yours from every inbox that has not taken it yet
+        #[arg(long, value_name = "MSG_ID")]
+        supersedes: Option<String>,
+        /// Withdraw this message once the run passes round N (default: the round a slot
+        /// is dispatching in, else the next round). Needs `--run`
+        #[arg(long, value_name = "N", num_args = 0..=1)]
+        expires_after_round: Option<Option<u32>>,
     },
     /// List bus events (all runs + bare traffic; `--run` filters to one run)
     Log {
@@ -788,6 +822,10 @@ pub enum ProviderAction {
     List {
         #[arg(long)]
         json: bool,
+        /// Also read each account's current utilisation where the CLI exposes it
+        /// locally without a model turn (muse, codex)
+        #[arg(long)]
+        usage: bool,
     },
     Pause {
         name: String,

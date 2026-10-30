@@ -102,6 +102,13 @@ pub struct BusMessage {
     pub refs: MsgRefs,
     #[serde(default)]
     pub requires_ack: bool,
+    /// Carried into the implementer's carry-forward every dispatch until withdrawn or
+    /// acked, so a relaunch cannot drop it (O135).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub persist: bool,
+    /// Withdrawn once the run's round passes this one (O135).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_after_round: Option<u32>,
     #[serde(default)]
     pub meta: HashMap<String, String>,
 }
@@ -118,6 +125,9 @@ pub struct MsgRefs {
     /// `requires_ack` message it clears.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
+    /// Id of the message this one withdraws (`bus send --supersedes`, O135).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,6 +269,8 @@ pub fn join(
             subject: Some("join".into()),
             refs: MsgRefs::default(),
             requires_ack: false,
+            persist: false,
+            expires_after_round: None,
             meta: HashMap::new(),
         },
         MessageBudget::Chatty,
@@ -459,6 +471,13 @@ pub fn send(paths: &SparPaths, msg: BusMessage, budget: MessageBudget) -> Result
     if msg.kind == MsgKind::Ack {
         if let Some(target) = msg.refs.reply_to.as_deref() {
             clear_pending_ack(paths, target)?;
+            record_receipt(
+                paths,
+                target,
+                &resolve_addr(msg.run.as_deref(), &msg.from),
+                ReceiptEvent::Read,
+                "ack",
+            );
         }
     } else if msg.requires_ack {
         record_pending_ack(paths, &msg)?;
@@ -520,6 +539,8 @@ pub fn ack(paths: &SparPaths, run: Option<&str>, from: &str, msg_id: &str) -> Re
                 ..Default::default()
             },
             requires_ack: false,
+            persist: false,
+            expires_after_round: None,
             meta: HashMap::new(),
         },
         MessageBudget::Chatty,
@@ -547,6 +568,8 @@ pub fn chat(
             subject: None,
             refs: MsgRefs::default(),
             requires_ack: false,
+            persist: false,
+            expires_after_round: None,
             meta: HashMap::new(),
         },
         budget,
@@ -587,6 +610,7 @@ fn deliver_inbox(paths: &SparPaths, msg: &BusMessage) -> Result<()> {
         fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}-{}.json", msg.ts.timestamp_millis(), msg.id));
         fs::write(&path, serde_json::to_string_pretty(msg)?)?;
+        record_receipt(paths, &msg.id, &t, ReceiptEvent::Queued, "inbox");
     }
     Ok(())
 }
@@ -651,6 +675,7 @@ pub fn inbox(paths: &SparPaths, agent: &str) -> Result<Vec<BusMessage>> {
     if !dir.is_dir() {
         return Ok(Vec::new());
     }
+    let mut rounds = RunRounds::default();
     let mut out: Vec<BusMessage> = Vec::new();
     for e in fs::read_dir(&dir)? {
         let e = e?;
@@ -658,7 +683,9 @@ pub fn inbox(paths: &SparPaths, agent: &str) -> Result<Vec<BusMessage>> {
             continue;
         }
         if let Ok(m) = serde_json::from_str::<BusMessage>(&fs::read_to_string(e.path())?) {
-            out.push(m);
+            if !rounds.expired(paths, &m) {
+                out.push(m);
+            }
         }
     }
     out.sort_by_key(|m| m.ts);
@@ -675,11 +702,12 @@ pub fn inbox(paths: &SparPaths, agent: &str) -> Result<Vec<BusMessage>> {
 /// directory already isolates one agent's traffic — two concurrent runs' same-role slots
 /// have distinct ids (`rA:impl` vs `rB:impl`) and therefore distinct inboxes — so the
 /// drain keys purely on the id with no run-tag filter.
-pub fn inbox_claim(paths: &SparPaths, agent: &str) -> Result<Vec<BusMessage>> {
+pub fn inbox_claim(paths: &SparPaths, agent: &str, via: &str) -> Result<Vec<BusMessage>> {
     let dir = inbox_dir(paths, agent);
     if !dir.is_dir() {
         return Ok(Vec::new());
     }
+    let mut rounds = RunRounds::default();
     let claimed_dir = dir.join("claimed");
     fs::create_dir_all(&claimed_dir)?;
     let mut sources: Vec<PathBuf> = Vec::new();
@@ -703,12 +731,19 @@ pub fn inbox_claim(paths: &SparPaths, agent: &str) -> Result<Vec<BusMessage>> {
         let Ok(m) = serde_json::from_str::<BusMessage>(&contents) else {
             continue;
         };
+        if rounds.expired(paths, &m) {
+            if fs::remove_file(&src).is_ok() {
+                record_receipt(paths, &m.id, agent, ReceiptEvent::Withdrawn, "expired");
+            }
+            continue;
+        }
         let dest = claimed_dir.join(name);
         // Whoever moves the inode owns the message. A concurrent claimer that
         // already moved it gets ENOENT here and is skipped.
         if fs::rename(&src, &dest).is_err() {
             continue;
         }
+        record_receipt(paths, &m.id, agent, ReceiptEvent::Delivered, via);
         out.push(m);
     }
     out.sort_by_key(|m| m.ts);
@@ -908,12 +943,17 @@ pub fn tick_acks(paths: &SparPaths, policy: &AckPolicy, now: DateTime<Utc>) -> R
         .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
         .collect();
     files.sort();
+    let mut rounds = RunRounds::default();
     let mut out = AckTick::default();
     for f in files {
         let Ok(mut rec) = serde_json::from_str::<PendingAck>(&fs::read_to_string(&f)?) else {
             continue;
         };
         if rec.next_at > now {
+            continue;
+        }
+        if rounds.expired(paths, &rec.msg) {
+            remove_file_if_present(&f)?;
             continue;
         }
         if rec.attempts >= policy.max_retries {
@@ -960,6 +1000,8 @@ fn escalate_unacked(
             ..Default::default()
         },
         requires_ack: false,
+        persist: false,
+        expires_after_round: None,
         meta,
     };
     send(paths, esc, MessageBudget::Chatty)?;
@@ -1003,6 +1045,273 @@ pub fn unresolved_alerts(paths: &SparPaths, run: Option<&str>) -> Result<Vec<Bus
             out.push(m);
         }
     }
+    out.sort_by_key(|m| m.ts);
+    Ok(out)
+}
+
+// ── receipts, withdrawal, round expiry, persisted messages (O134, O135) ───────
+
+pub const RECEIPT_SCHEMA: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptEvent {
+    /// Written to the recipient's inbox.
+    Queued,
+    /// Left the inbox for the recipient's channel, or entered a dispatch prompt.
+    Delivered,
+    /// In the model's input: the agent claimed it itself, a Stop hook injected it, it
+    /// was in the dispatch prompt, or the recipient acked it.
+    Read,
+    /// Taken back before delivery: superseded or expired.
+    Withdrawn,
+}
+
+/// One line of `.spar/bus/receipts.jsonl`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Receipt {
+    pub schema_version: u32,
+    pub msg_id: String,
+    pub recipient: String,
+    pub event: ReceiptEvent,
+    pub ts: DateTime<Utc>,
+    pub via: String,
+}
+
+pub fn receipts_path(paths: &SparPaths) -> PathBuf {
+    bus_root(paths).join("receipts.jsonl")
+}
+
+/// `receipts.jsonl` is rotated to `receipts.jsonl.1` past this size, so the two files
+/// keep roughly the last 16 MiB of receipts.
+pub const RECEIPTS_ROTATE_BYTES: u64 = 8 * 1024 * 1024;
+
+fn rotated_receipts_path(paths: &SparPaths) -> PathBuf {
+    bus_root(paths).join("receipts.jsonl.1")
+}
+
+fn rotate_receipts(paths: &SparPaths, limit: u64) {
+    let path = receipts_path(paths);
+    if fs::metadata(&path).is_ok_and(|m| m.len() >= limit) {
+        let _ = fs::rename(&path, rotated_receipts_path(paths));
+    }
+}
+
+/// Best effort: a receipt that cannot be written never fails the delivery it records.
+pub fn record_receipt(
+    paths: &SparPaths,
+    msg_id: &str,
+    recipient: &str,
+    event: ReceiptEvent,
+    via: &str,
+) {
+    let r = Receipt {
+        schema_version: RECEIPT_SCHEMA,
+        msg_id: msg_id.into(),
+        recipient: recipient.into(),
+        event,
+        ts: Utc::now(),
+        via: via.into(),
+    };
+    rotate_receipts(paths, RECEIPTS_ROTATE_BYTES);
+    if let Err(e) = append_jsonl(&receipts_path(paths), &r) {
+        eprintln!("warning: bus receipt for {msg_id} not recorded: {e:#}");
+    }
+}
+
+/// Each run's current round, read once per pass.
+#[derive(Default)]
+struct RunRounds(HashMap<String, Option<u32>>);
+
+impl RunRounds {
+    fn expired(&mut self, paths: &SparPaths, msg: &BusMessage) -> bool {
+        let (Some(limit), Some(run)) = (msg.expires_after_round, msg.run.as_deref()) else {
+            return false;
+        };
+        let round = *self.0.entry(run.to_string()).or_insert_with(|| {
+            crate::state::RunState::load(paths, run)
+                .ok()
+                .map(|s| s.round)
+        });
+        round.is_some_and(|r| r > limit)
+    }
+}
+
+/// Per-recipient receipt times for one message; each is the earliest of its kind.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RecipientReceipt {
+    pub recipient: String,
+    pub queued_at: Option<DateTime<Utc>>,
+    pub delivered_at: Option<DateTime<Utc>>,
+    pub read_at: Option<DateTime<Utc>>,
+    pub withdrawn_at: Option<DateTime<Utc>>,
+}
+
+pub const LOG_SCHEMA: u32 = 1;
+
+/// One `bus log --json` entry: the message plus what happened to it.
+#[derive(Debug, Clone, Serialize)]
+pub struct LogEntry {
+    pub schema_version: u32,
+    #[serde(flatten)]
+    pub msg: BusMessage,
+    pub receipts: Vec<RecipientReceipt>,
+    pub superseded_by: Option<String>,
+    pub expired: bool,
+}
+
+/// Streams the rotated file then the live one, one line at a time.
+fn receipts_by_message(paths: &SparPaths) -> HashMap<String, Vec<RecipientReceipt>> {
+    let rows = [rotated_receipts_path(paths), receipts_path(paths)]
+        .into_iter()
+        .filter_map(|p| File::open(p).ok())
+        .flat_map(|f| std::io::BufReader::new(f).lines().map_while(|l| l.ok()))
+        .filter_map(|l| serde_json::from_str::<Receipt>(&l).ok());
+    let mut out: HashMap<String, Vec<RecipientReceipt>> = HashMap::new();
+    for r in rows {
+        let list = out.entry(r.msg_id).or_default();
+        let i = match list.iter().position(|x| x.recipient == r.recipient) {
+            Some(i) => i,
+            None => {
+                list.push(RecipientReceipt {
+                    recipient: r.recipient,
+                    ..Default::default()
+                });
+                list.len() - 1
+            }
+        };
+        let slot = match r.event {
+            ReceiptEvent::Queued => &mut list[i].queued_at,
+            ReceiptEvent::Delivered => &mut list[i].delivered_at,
+            ReceiptEvent::Read => &mut list[i].read_at,
+            ReceiptEvent::Withdrawn => &mut list[i].withdrawn_at,
+        };
+        if slot.is_none_or(|t| r.ts < t) {
+            *slot = Some(r.ts);
+        }
+    }
+    for list in out.values_mut() {
+        for r in list.iter_mut() {
+            if r.read_at.is_some() && r.delivered_at.is_none() {
+                r.delivered_at = r.read_at;
+            }
+        }
+    }
+    out
+}
+
+/// `bus log --json`: every event with its receipts, what superseded it, and whether
+/// its round has passed.
+pub fn log_entries(paths: &SparPaths, run: Option<&str>) -> Result<Vec<LogEntry>> {
+    let all = list_events(paths, None)?;
+    let superseded: HashMap<String, String> = all
+        .iter()
+        .filter_map(|m| m.refs.supersedes.clone().map(|old| (old, m.id.clone())))
+        .collect();
+    let mut receipts = receipts_by_message(paths);
+    let mut rounds = RunRounds::default();
+    Ok(all
+        .into_iter()
+        .filter(|m| run.is_none() || m.run.as_deref() == run)
+        .map(|m| LogEntry {
+            schema_version: LOG_SCHEMA,
+            receipts: receipts.remove(&m.id).unwrap_or_default(),
+            superseded_by: superseded.get(&m.id).cloned(),
+            expired: rounds.expired(paths, &m),
+            msg: m,
+        })
+        .collect())
+}
+
+/// What `--supersedes` took back.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Withdrawal {
+    pub msg_id: String,
+    /// Recipients whose undelivered copy was removed.
+    pub withdrawn_from: Vec<String>,
+    /// Recipients that already had it; a message cannot be unread.
+    pub already_delivered: Vec<String>,
+}
+
+pub fn find_event(paths: &SparPaths, msg_id: &str) -> Result<Option<BusMessage>> {
+    Ok(list_events(paths, None)?
+        .into_iter()
+        .find(|m| m.id == msg_id))
+}
+
+/// Remove every undelivered copy of `msg_id` and stop its redelivery. A persisted
+/// message is dropped from carry-forward by `persisted_for` reading `supersedes`.
+pub fn withdraw(paths: &SparPaths, msg_id: &str) -> Result<Withdrawal> {
+    clear_pending_ack(paths, msg_id)?;
+    let mut out = Withdrawal {
+        msg_id: msg_id.into(),
+        ..Default::default()
+    };
+    let suffix = format!("-{msg_id}.json");
+    let Ok(agents) = fs::read_dir(bus_root(paths).join("inbox")) else {
+        return Ok(out);
+    };
+    let mut agents: Vec<PathBuf> = agents.flatten().map(|e| e.path()).collect();
+    agents.sort();
+    for dir in agents {
+        let agent = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let named = |d: &std::path::Path| -> Vec<PathBuf> {
+            fs::read_dir(d)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .is_some_and(|n| n.to_string_lossy().ends_with(&suffix))
+                })
+                .collect()
+        };
+        let pending = named(&dir);
+        if !named(&dir.join("claimed")).is_empty() {
+            out.already_delivered.push(agent.clone());
+        }
+        if pending.is_empty() {
+            continue;
+        }
+        for p in pending {
+            remove_file_if_present(&p)?;
+        }
+        record_receipt(paths, msg_id, &agent, ReceiptEvent::Withdrawn, "superseded");
+        out.withdrawn_from.push(agent);
+    }
+    Ok(out)
+}
+
+/// Persisted messages to `slot` in `run` that still stand: not superseded, not past
+/// their round, not acked by the slot. Oldest first.
+///
+/// Withdrawals and acks are read from the whole workspace log: a `--supersedes` or an
+/// ack sent without `--run` (to `run:slot`) carries no run tag but still counts.
+pub fn persisted_for(paths: &SparPaths, run: &str, slot: &str) -> Result<Vec<BusMessage>> {
+    let all = list_events(paths, None)?;
+    let me = agent_ref(Some(run), slot);
+    let gone: HashSet<&str> = all
+        .iter()
+        .filter_map(|m| m.refs.supersedes.as_deref())
+        .chain(
+            all.iter()
+                .filter(|m| m.kind == MsgKind::Ack && resolve_addr(m.run.as_deref(), &m.from) == me)
+                .filter_map(|m| m.refs.reply_to.as_deref()),
+        )
+        .collect();
+    let mut rounds = RunRounds::default();
+    let mut out: Vec<BusMessage> = all
+        .iter()
+        .filter(|m| m.persist && m.run.as_deref() == Some(run))
+        .filter(|m| resolve_addr(Some(run), &m.to) == me)
+        .filter(|m| !gone.contains(m.id.as_str()))
+        .filter(|m| !rounds.expired(paths, m))
+        .cloned()
+        .collect();
     out.sort_by_key(|m| m.ts);
     Ok(out)
 }
@@ -1303,11 +1612,11 @@ mod tests {
         assert_eq!(inbox(&paths, &ub).unwrap().len(), 2);
 
         // First claim drains everything; second claim sees nothing.
-        let first = inbox_claim(&paths, &ub).unwrap();
+        let first = inbox_claim(&paths, &ub, "test").unwrap();
         assert_eq!(first.len(), 2);
         assert_eq!(first[0].body, "hello");
         assert_eq!(first[1].body, "world");
-        assert!(inbox_claim(&paths, &ub).unwrap().is_empty());
+        assert!(inbox_claim(&paths, &ub, "test").unwrap().is_empty());
 
         // Peek after claim is also empty (claimed/ is excluded).
         assert!(inbox(&paths, &ub).unwrap().is_empty());
@@ -1340,10 +1649,10 @@ mod tests {
         chat(&paths, Some("rB"), "a", "b", "for B", MessageBudget::Normal).unwrap();
 
         // Each unique id drains only its own message; neither can reach the other's.
-        let b = inbox_claim(&paths, &ub).unwrap();
+        let b = inbox_claim(&paths, &ub, "test").unwrap();
         assert_eq!(b.len(), 1);
         assert_eq!(b[0].body, "for B");
-        let a = inbox_claim(&paths, &ua).unwrap();
+        let a = inbox_claim(&paths, &ua, "test").unwrap();
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].body, "for A");
     }
@@ -1438,6 +1747,8 @@ mod tests {
                 subject: None,
                 refs: MsgRefs::default(),
                 requires_ack: true,
+                persist: false,
+                expires_after_round: None,
                 meta: HashMap::new(),
             },
             MessageBudget::Chatty,
@@ -1468,7 +1779,7 @@ mod tests {
         let m = req_ack(&paths, "a", "b", "please confirm");
         let ub = agent_ref(Some("r1"), "b");
         // Original delivery landed once.
-        assert_eq!(inbox_claim(&paths, &ub).unwrap().len(), 1);
+        assert_eq!(inbox_claim(&paths, &ub, "test").unwrap().len(), 1);
 
         // The original send scheduled the first redelivery a default backoff out, so
         // tick from far enough ahead that it (and every base_backoff-0 retry) is due.
@@ -1479,10 +1790,18 @@ mod tests {
         let now = Utc::now() + Duration::seconds(120);
         let t1 = tick_acks(&paths, &policy, now).unwrap();
         assert_eq!((t1.redelivered, t1.escalated), (1, 0));
-        assert_eq!(inbox_claim(&paths, &ub).unwrap().len(), 1, "redeliver 1");
+        assert_eq!(
+            inbox_claim(&paths, &ub, "test").unwrap().len(),
+            1,
+            "redeliver 1"
+        );
         let t2 = tick_acks(&paths, &policy, now).unwrap();
         assert_eq!((t2.redelivered, t2.escalated), (1, 0));
-        assert_eq!(inbox_claim(&paths, &ub).unwrap().len(), 1, "redeliver 2");
+        assert_eq!(
+            inbox_claim(&paths, &ub, "test").unwrap().len(),
+            1,
+            "redeliver 2"
+        );
 
         // Third due tick: retries spent → escalate to @human, drop the pending record.
         let t3 = tick_acks(&paths, &policy, now).unwrap();
@@ -1567,6 +1886,8 @@ mod tests {
                     subject: None,
                     refs: MsgRefs::default(),
                     requires_ack: false,
+                    persist: false,
+                    expires_after_round: None,
                     meta: HashMap::new(),
                 },
                 MessageBudget::Chatty,
@@ -1588,6 +1909,8 @@ mod tests {
                 subject: None,
                 refs: MsgRefs::default(),
                 requires_ack: false,
+                persist: false,
+                expires_after_round: None,
                 meta: HashMap::new(),
             },
             MessageBudget::Chatty,
@@ -1618,6 +1941,8 @@ mod tests {
             subject: None,
             refs: MsgRefs::default(),
             requires_ack: false,
+            persist: false,
+            expires_after_round: None,
             meta,
         };
         assert!(
@@ -1641,6 +1966,8 @@ mod tests {
             subject: None,
             refs: MsgRefs::default(),
             requires_ack: false,
+            persist: false,
+            expires_after_round: None,
             meta: HashMap::new(),
         };
         assert!(is_human_alert(&ordinary));
@@ -1662,6 +1989,8 @@ mod tests {
             subject: None,
             refs: MsgRefs::default(),
             requires_ack: false,
+            persist: false,
+            expires_after_round: None,
             meta: forged_meta,
         };
         assert!(
@@ -1794,10 +2123,10 @@ mod tests {
         .unwrap();
 
         // Each lands via the recipient's own real drain, keyed purely by unique id.
-        let got_slot = inbox_claim(&paths, &slot_id).unwrap();
+        let got_slot = inbox_claim(&paths, &slot_id, "test").unwrap();
         assert_eq!(got_slot.len(), 1);
         assert_eq!(got_slot[0].body, "hi slot");
-        let got_bare = inbox_claim(&paths, "bare").unwrap();
+        let got_bare = inbox_claim(&paths, "bare", "test").unwrap();
         assert_eq!(got_bare.len(), 1);
         assert_eq!(got_bare[0].body, "hi bare");
 
@@ -1828,6 +2157,8 @@ mod tests {
             subject: None,
             refs: MsgRefs::default(),
             requires_ack: false,
+            persist: false,
+            expires_after_round: None,
             meta: HashMap::new(),
         };
         // Append an out-of-window record, then a recent one (log stays time-ordered).
@@ -1885,5 +2216,249 @@ mod tests {
         assert_eq!(count_bare_events(&events_path(&paths), 100).unwrap(), 5);
         // The per-run budget unit is the bounded mirror's line count.
         assert_eq!(count_lines(&run_events_path(&paths, "r1")).unwrap(), 5);
+    }
+
+    fn directed(paths: &SparPaths, run: &str, from: &str, to: &str, body: &str) -> BusMessage {
+        let msg = BusMessage {
+            id: new_id(),
+            ts: Utc::now(),
+            from: from.into(),
+            to: to.into(),
+            kind: MsgKind::Chat,
+            body: body.into(),
+            run: Some(run.into()),
+            subject: None,
+            refs: MsgRefs::default(),
+            requires_ack: false,
+            persist: false,
+            expires_after_round: None,
+            meta: HashMap::new(),
+        };
+        send(paths, msg, MessageBudget::Chatty).unwrap()
+    }
+
+    fn receipt<'a>(entries: &'a [LogEntry], id: &str) -> &'a RecipientReceipt {
+        &entries.iter().find(|e| e.msg.id == id).unwrap().receipts[0]
+    }
+
+    /// Queued on send, delivered when claimed, read on the recipient's own ack; each
+    /// stamp is per recipient and shown in the log.
+    #[test]
+    fn receipts_track_queue_delivery_and_read_per_recipient() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let m = directed(&paths, "r1", "human", "impl", "merge main");
+        let entries = log_entries(&paths, Some("r1")).unwrap();
+        let r = receipt(&entries, &m.id);
+        assert_eq!(r.recipient, "r1:impl");
+        assert!(r.queued_at.is_some());
+        assert!(r.delivered_at.is_none() && r.read_at.is_none());
+
+        assert_eq!(
+            inbox_claim(&paths, "r1:impl", "poll_file").unwrap().len(),
+            1
+        );
+        let entries = log_entries(&paths, Some("r1")).unwrap();
+        let r = receipt(&entries, &m.id);
+        assert!(r.delivered_at.is_some());
+        assert!(r.read_at.is_none(), "a poll file is not proof of reading");
+
+        ack(&paths, Some("r1"), "impl", &m.id).unwrap();
+        let entries = log_entries(&paths, Some("r1")).unwrap();
+        let r = receipt(&entries, &m.id);
+        assert!(r.read_at.unwrap() >= r.delivered_at.unwrap());
+        assert_eq!(
+            entries
+                .iter()
+                .find(|e| e.msg.id == m.id)
+                .unwrap()
+                .schema_version,
+            LOG_SCHEMA
+        );
+    }
+
+    /// Superseding removes copies nobody has taken, reports who already had it, stops
+    /// its redelivery, and the log links old to new.
+    #[test]
+    fn withdraw_takes_back_only_undelivered_copies() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut old = directed(&paths, "r1", "human", "impl", "use approach A");
+        old.requires_ack = true;
+        record_pending_ack(&paths, &old).unwrap();
+        let _ = directed(&paths, "r1", "human", "review-0", "unrelated");
+        assert_eq!(inbox(&paths, "r1:impl").unwrap().len(), 1);
+
+        let w = withdraw(&paths, &old.id).unwrap();
+        assert_eq!(w.withdrawn_from, vec!["r1:impl".to_string()]);
+        assert!(w.already_delivered.is_empty());
+        assert!(inbox(&paths, "r1:impl").unwrap().is_empty());
+        assert_eq!(
+            inbox(&paths, "r1:review-0").unwrap().len(),
+            1,
+            "other mail stays"
+        );
+        assert!(!pending_ack_dir(&paths)
+            .join(format!("{}.json", old.id))
+            .exists());
+
+        let delivered = directed(&paths, "r1", "human", "impl", "use approach B");
+        inbox_claim(&paths, "r1:impl", "stop_hook").unwrap();
+        let w = withdraw(&paths, &delivered.id).unwrap();
+        assert!(w.withdrawn_from.is_empty());
+        assert_eq!(w.already_delivered, vec!["r1:impl".to_string()]);
+
+        let mut newer = BusMessage {
+            refs: MsgRefs {
+                supersedes: Some(old.id.clone()),
+                ..Default::default()
+            },
+            ..delivered.clone()
+        };
+        newer.id = new_id();
+        let newer = send(&paths, newer, MessageBudget::Chatty).unwrap();
+        let entries = log_entries(&paths, Some("r1")).unwrap();
+        let e = entries.iter().find(|e| e.msg.id == old.id).unwrap();
+        assert_eq!(e.superseded_by.as_deref(), Some(newer.id.as_str()));
+        assert!(e.receipts[0].withdrawn_at.is_some());
+    }
+
+    /// Past its round a message is never delivered: a claim withdraws it, a peek hides
+    /// it, its redelivery stops, and the log says so.
+    #[test]
+    fn a_message_expires_when_the_run_passes_its_round() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st =
+            crate::state::RunState::new("r1", crate::cli::WorkflowKind::Loop, tmp.path().into());
+        st.round = 2;
+        st.save(&paths).unwrap();
+        let mut stale = directed(&paths, "r1", "human", "impl", "round 1 only");
+        stale.expires_after_round = Some(1);
+        stale.requires_ack = true;
+        stale.id = new_id();
+        let stale = send(&paths, stale, MessageBudget::Chatty).unwrap();
+        let mut live = stale.clone();
+        live.id = new_id();
+        live.expires_after_round = Some(2);
+        live.requires_ack = false;
+        send(&paths, live.clone(), MessageBudget::Chatty).unwrap();
+
+        let peek: Vec<String> = inbox(&paths, "r1:impl")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert!(
+            peek.contains(&live.id) && !peek.contains(&stale.id),
+            "{peek:?}"
+        );
+        let t = tick_acks(
+            &paths,
+            &AckPolicy {
+                base_backoff: Duration::zero(),
+                max_retries: 0,
+            },
+            Utc::now() + Duration::seconds(120),
+        )
+        .unwrap();
+        assert_eq!(
+            (t.redelivered, t.escalated),
+            (0, 0),
+            "expired: no redelivery or escalation"
+        );
+        let got: Vec<String> = inbox_claim(&paths, "r1:impl", "test")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert!(
+            got.contains(&live.id) && !got.contains(&stale.id),
+            "{got:?}"
+        );
+        let entries = log_entries(&paths, Some("r1")).unwrap();
+        let e = entries.iter().find(|e| e.msg.id == stale.id).unwrap();
+        assert!(e.expired);
+        assert!(e.receipts[0].withdrawn_at.is_some());
+        assert!(e.receipts[0].delivered_at.is_none());
+    }
+
+    /// A persisted message stands until superseded, acked by the slot, or expired, and
+    /// only the addressed slot gets it.
+    #[test]
+    fn persisted_messages_stand_until_withdrawn_acked_or_expired() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st =
+            crate::state::RunState::new("r1", crate::cli::WorkflowKind::Loop, tmp.path().into());
+        st.round = 3;
+        st.save(&paths).unwrap();
+        let persist = |body: &str, expires: Option<u32>| {
+            let mut m = directed(&paths, "r1", "human", "impl", "seed");
+            m.id = new_id();
+            m.body = body.into();
+            m.persist = true;
+            m.expires_after_round = expires;
+            send(&paths, m, MessageBudget::Chatty).unwrap()
+        };
+        let keep = persist("ruling: keep the API", None);
+        let replaced = persist("ruling: old", None);
+        let acked = persist("ruling: done", None);
+        let _expired = persist("ruling: round 2", Some(2));
+        let mut other = directed(&paths, "r1", "human", "review-0", "x");
+        other.id = new_id();
+        other.persist = true;
+        send(&paths, other, MessageBudget::Chatty).unwrap();
+        let mut sup = directed(&paths, "r1", "human", "impl", "ruling: new");
+        sup.id = new_id();
+        sup.refs.supersedes = Some(replaced.id.clone());
+        send(&paths, sup, MessageBudget::Chatty).unwrap();
+        ack(&paths, Some("r1"), "impl", &acked.id).unwrap();
+
+        let ids: Vec<String> = persisted_for(&paths, "r1", "impl")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, vec![keep.id]);
+    }
+
+    /// A `--supersedes` or ack sent without `--run` (to `run:slot`) still takes a
+    /// persisted message out of the carry-forward.
+    #[test]
+    fn a_withdrawal_without_a_run_tag_still_counts() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut a = directed(&paths, "r1", "human", "impl", "seed");
+        a.id = new_id();
+        a.persist = true;
+        let a = send(&paths, a, MessageBudget::Chatty).unwrap();
+        let mut b = a.clone();
+        b.id = new_id();
+        let b = send(&paths, b, MessageBudget::Chatty).unwrap();
+        let mut sup = a.clone();
+        sup.id = new_id();
+        sup.run = None;
+        sup.persist = false;
+        sup.to = "r1:impl".into();
+        sup.refs.supersedes = Some(a.id.clone());
+        send(&paths, sup, MessageBudget::Chatty).unwrap();
+        ack(&paths, None, "r1:impl", &b.id).unwrap();
+        assert!(persisted_for(&paths, "r1", "impl").unwrap().is_empty());
+    }
+
+    /// Past the size limit the live file rolls to `.1`, and the log still reads both.
+    #[test]
+    fn receipts_rotate_and_both_files_are_read() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let m = directed(&paths, "r1", "human", "impl", "x");
+        rotate_receipts(&paths, 1);
+        assert!(rotated_receipts_path(&paths).is_file());
+        inbox_claim(&paths, "r1:impl", "test").unwrap();
+        let entries = log_entries(&paths, Some("r1")).unwrap();
+        let r = receipt(&entries, &m.id);
+        assert!(r.queued_at.is_some(), "from the rotated file");
+        assert!(r.delivered_at.is_some(), "from the live file");
     }
 }
