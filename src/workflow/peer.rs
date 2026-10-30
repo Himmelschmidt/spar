@@ -218,8 +218,8 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
         .iter()
         .filter(|s| s.status == crate::state::SlotStatus::Failed)
         .collect();
-    let any_quota_failed = failed.iter().any(|s| s.quota_hit);
-    let any_plain_failed = failed.iter().any(|s| !s.quota_hit);
+    let any_quota_failed = failed.iter().any(|s| s.parks_on_quota());
+    let any_plain_failed = failed.iter().any(|s| !s.parks_on_quota());
     if !state.slots.is_empty() && any_quota_failed && !any_plain_failed {
         state.set_phase(Phase::Quota);
         state.error = Some("a peer slot failed: rate limit".into());

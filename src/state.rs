@@ -108,6 +108,12 @@ pub struct RunState {
     /// minting another run. `1` for every run created before rounds existed.
     #[serde(default = "one_round")]
     pub round: u32,
+    /// The latest round in which a slot dispatch started, stamped (and saved) before the
+    /// spawn. Re-entry reuses `round` when this is behind it: nothing was spent in that
+    /// round (O115). Explicit rather than read off slot statuses, because a backup
+    /// failover puts a slot that really ran back to `Pending` in the same round.
+    #[serde(default)]
+    pub dispatched_round: u32,
     /// When this run was archived, if it was. Archiving hides a finished run from
     /// listings; it deletes nothing and is reversible. Distinct from cleanup, which
     /// reclaims worktrees and leaves the record, and from `--purge`, which deletes it.
@@ -430,6 +436,22 @@ pub struct SlotState {
     /// for state written before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<SeatSource>,
+    /// Set when this dispatch's failure was the provider refusing its credential (401,
+    /// a revoked token, "not logged in") after spar's one short-wait retry (O104). An
+    /// infrastructure fault, not a verdict on the work: it engages the declared backup
+    /// and otherwise parks the run at `Phase::Quota`, but never pauses the provider.
+    /// Reset at the start of every dispatch, like `quota_hit`.
+    #[serde(default)]
+    pub auth_fault: bool,
+}
+
+impl SlotState {
+    /// Whether this slot's failure parks the run at `Phase::Quota` rather than failing
+    /// it: the provider could not serve the dispatch (quota or auth), so nothing about
+    /// the work is known.
+    pub fn parks_on_quota(&self) -> bool {
+        self.quota_hit || self.auth_fault
+    }
 }
 
 /// Where a seat's provider was resolved from, in precedence order. Feature 011: the
@@ -684,6 +706,7 @@ impl RunState {
             contract_fingerprint: None,
             contract_modified: false,
             round: 1,
+            dispatched_round: 0,
             projected_fleet: Vec::new(),
             pool_origin: PoolOrigin::default(),
             pool_intent: Vec::new(),
@@ -831,6 +854,7 @@ impl RunState {
         let tmp = file.with_extension(format!("tmp.{}", std::process::id()));
         std::fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
         std::fs::rename(&tmp, &file).with_context(|| format!("replace {}", file.display()))?;
+        crate::runlock::note_state_written(paths, &self.id);
 
         if prev_phase != Some(self.phase) {
             let _ = crate::events::append(
