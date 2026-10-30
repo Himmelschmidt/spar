@@ -22,6 +22,9 @@ auto_archive_after = "14d"
 # deletes work git says is already in the base branch. Squash merges are not ancestors
 # and are never reaped this way.
 auto_cleanup_merged = true
+# Gitignored files copied from the main checkout into every slot worktree spar cuts, in
+# every isolation mode. Paths are project-relative; a missing file is skipped.
+copy = [".dbiso.env", ".envrc", ".env.example"]
 
 [providers]
 # Mix CLI + API: "cli:claude", "cli:grok", "api:openai", "api:xai", ...
@@ -34,6 +37,9 @@ ship = true
 
 [ship]
 auto_confirm = false
+# PR title is the task's first line, clamped on a word boundary. 0 leaves only GitHub's
+# own 256-character limit.
+title_max = 72
 
 [timeouts]
 # SOFT since O50: where spar starts asking a slot to land its work, not where it is killed.
@@ -120,6 +126,13 @@ require_all_criteria = true
 [rounds]
 max = 8
 carry_forward_chars = 4000
+
+# Implementer checkpoints: after every dispatch the worktree (commits and uncommitted edits)
+# is kept at the local ref refs/spar-checkpoint/<id>/<slot>. `push = true` also publishes
+# it to origin, where ANYONE who can read origin can fetch it (a force-push does not
+# retract objects). Leave it off for a public remote.
+[checkpoint]
+push = false
 
 # Plan-phase critic. `--without critic` is the per-run way to drop just this seat.
 [critic]

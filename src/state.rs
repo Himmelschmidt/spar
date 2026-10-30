@@ -45,6 +45,11 @@ pub struct RunState {
     /// Commit `base_ref` resolved to. This is what worktrees actually branch from.
     #[serde(default)]
     pub base_commit: Option<String>,
+    /// Commits the invoking HEAD was behind its upstream tracking branch when the base
+    /// was taken from it (no `--base`). `None` when `--base` was given or there is no
+    /// upstream to compare against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_behind: Option<u32>,
     /// Spawn mode for native-cli: auto|headless|tmux
     #[serde(default)]
     pub backend: Backend,
@@ -103,6 +108,12 @@ pub struct RunState {
     /// minting another run. `1` for every run created before rounds existed.
     #[serde(default = "one_round")]
     pub round: u32,
+    /// The latest round in which a slot dispatch started, stamped (and saved) before the
+    /// spawn. Re-entry reuses `round` when this is behind it: nothing was spent in that
+    /// round (O115). Explicit rather than read off slot statuses, because a backup
+    /// failover puts a slot that really ran back to `Pending` in the same round.
+    #[serde(default)]
+    pub dispatched_round: u32,
     /// When this run was archived, if it was. Archiving hides a finished run from
     /// listings; it deletes nothing and is reversible. Distinct from cleanup, which
     /// reclaims worktrees and leaves the record, and from `--purge`, which deletes it.
@@ -669,6 +680,7 @@ impl RunState {
             project_root,
             base_ref: None,
             base_commit: None,
+            base_behind: None,
             backend: Backend::Auto,
             isolation: IsolationMode::Worktree,
             dry_run: false,
@@ -694,6 +706,7 @@ impl RunState {
             contract_fingerprint: None,
             contract_modified: false,
             round: 1,
+            dispatched_round: 0,
             projected_fleet: Vec::new(),
             pool_origin: PoolOrigin::default(),
             pool_intent: Vec::new(),
@@ -841,6 +854,7 @@ impl RunState {
         let tmp = file.with_extension(format!("tmp.{}", std::process::id()));
         std::fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
         std::fs::rename(&tmp, &file).with_context(|| format!("replace {}", file.display()))?;
+        crate::runlock::note_state_written(paths, &self.id);
 
         if prev_phase != Some(self.phase) {
             let _ = crate::events::append(
@@ -859,6 +873,7 @@ impl RunState {
             if self.phase.is_terminal() {
                 crate::history::append(paths, self, crate::history::Trigger::Terminal);
             }
+            crate::worktree::watch_primary_checkout(paths, self, prev_phase);
         }
         // Global index so `spar` from anywhere can find this project’s runs.
         // Dry runs are ephemeral verification fixtures (often in a temp dir), so they

@@ -1,6 +1,14 @@
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
+/// 32-bit FNV-1a as 8 hex chars. Stable across Rust releases, unlike `DefaultHasher`.
+fn short_hash(s: &str) -> String {
+    let h = s.bytes().fold(0x811c_9dc5_u32, |h, b| {
+        (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+    });
+    format!("{h:08x}")
+}
+
 /// Layout under `<project>/.spar/`.
 #[derive(Debug, Clone)]
 pub struct SparPaths {
@@ -61,6 +69,21 @@ impl SparPaths {
     /// home so they are scoped to the run and cleaned up with it.
     pub fn sessions_dir(&self, run_id: &str, slot_id: &str) -> PathBuf {
         self.run_dir(run_id).join("sessions").join(slot_id)
+    }
+
+    /// A slot's private `TMPDIR`. Run-scoped so two slots, or two runs, never share
+    /// scratch files, and so a leftover lands on the project volume rather than `/tmp`.
+    /// Named by a hash of the slot id, not the id itself: reviewer ids embed provider
+    /// names, and a tool binding a unix socket here must stay under the 108-byte
+    /// `sun_path` limit.
+    pub fn slot_tmp_dir(&self, run_id: &str, slot_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("tmp").join(short_hash(slot_id))
+    }
+
+    /// `git status --porcelain` of the primary checkout, taken when a run leg starts and
+    /// compared when it stops (O110).
+    pub fn primary_status_file(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("primary-status.txt")
     }
 
     pub fn quota_file(&self) -> PathBuf {
@@ -136,6 +159,7 @@ impl SparPaths {
     }
 
     pub fn ensure_run_dirs(&self, run_id: &str) -> Result<()> {
+        crate::runlock::ensure_not_removed(self, run_id)?;
         for dir in [
             self.run_dir(run_id),
             self.artifacts_dir(run_id),

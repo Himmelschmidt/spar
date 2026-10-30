@@ -11,6 +11,45 @@ pub struct OrchestratorBusy {
     pub owner_pid: u32,
 }
 
+/// The run this process holds was deleted from disk (a purge, an `rm -rf`) while it
+/// was being driven. The orchestrator stops rather than recreate it (O115).
+#[derive(Debug, thiserror::Error)]
+#[error("run {run_id} was removed from disk while this orchestrator held it; exiting without recreating it")]
+pub struct RunRemoved {
+    pub run_id: String,
+}
+
+/// Runs whose lock this process holds: the lock file's path, and whether `state.json`
+/// has existed since. A lock file that vanished, or a state file that existed and then
+/// vanished, means the run was deleted under us.
+static HELD: std::sync::Mutex<Vec<(PathBuf, bool)>> = std::sync::Mutex::new(Vec::new());
+
+/// `Err(RunRemoved)` when this process holds `run_id`'s lock and the run has been
+/// deleted since. Runs this process does not hold always pass.
+pub fn ensure_not_removed(paths: &SparPaths, run_id: &str) -> Result<()> {
+    let lock = lock_path(paths, run_id);
+    let held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((_, state_seen)) = held.iter().find(|(p, _)| *p == lock) else {
+        return Ok(());
+    };
+    if !lock.exists() || (*state_seen && !paths.state_file(run_id).is_file()) {
+        return Err(RunRemoved {
+            run_id: run_id.to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Record that the held run's `state.json` exists, so its later disappearance is noticed.
+pub fn note_state_written(paths: &SparPaths, run_id: &str) {
+    let lock = lock_path(paths, run_id);
+    let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = held.iter_mut().find(|(p, _)| *p == lock) {
+        entry.1 = true;
+    }
+}
+
 /// Single-orchestrator guard for a run id, backed by an advisory (`flock`) lock
 /// on `orchestrator.lock`.
 ///
@@ -93,6 +132,9 @@ impl RunLock {
                 );
             }
         }
+        HELD.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((path.clone(), paths.state_file(run_id).is_file()));
         Ok(RunLock {
             path,
             pid: me,
@@ -113,6 +155,10 @@ impl Drop for RunLock {
             let _ = self.file.set_len(0);
         }
         let _ = self.file.unlock();
+        let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = held.iter().position(|(p, _)| *p == self.path) {
+            held.remove(i);
+        }
     }
 }
 
@@ -156,6 +202,27 @@ mod tests {
             .downcast_ref::<OrchestratorBusy>()
             .expect("busy error carrying owner pid");
         assert_eq!(busy.owner_pid, std::process::id());
+    }
+
+    /// #179: a run purged under a live orchestrator must not be recreated by its next
+    /// write; the orchestrator gets `RunRemoved` and stops.
+    #[test]
+    fn a_held_run_deleted_from_disk_reports_removed() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let held = RunLock::acquire(&paths, "r1").unwrap();
+        ensure_not_removed(&paths, "r1").unwrap();
+        fs::write(paths.state_file("r1"), "{}").unwrap();
+        note_state_written(&paths, "r1");
+        fs::remove_file(paths.state_file("r1")).unwrap();
+        let err = ensure_not_removed(&paths, "r1").unwrap_err();
+        assert!(err.downcast_ref::<RunRemoved>().is_some(), "{err}");
+
+        fs::remove_dir_all(paths.run_dir("r1")).unwrap();
+        assert!(paths.ensure_run_dirs("r1").is_err(), "must not recreate it");
+        assert!(!paths.run_dir("r1").exists());
+        drop(held);
+        paths.ensure_run_dirs("r1").unwrap();
     }
 
     #[test]

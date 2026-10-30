@@ -166,8 +166,9 @@ fn install_hook_file(id: &SlotIdentity, inject_on_stop: bool, rel: &str) -> Resu
 /// Add `rel_path` to the worktree's git exclude file so an untracked copy is never
 /// staged. Worktrees share the main checkout's `info/exclude` via `$GIT_COMMON_DIR`, so
 /// resolve that first. Idempotent: a line already present is left untouched. A non-git
-/// directory has no index to protect, so it is a safe no-op.
-fn exclude_from_index(worktree: &Path, rel_path: &str) -> Result<()> {
+/// directory has no index to protect, so it is a safe no-op. `true` when the line was
+/// added by this call.
+pub(crate) fn exclude_from_index(worktree: &Path, rel_path: &str) -> Result<bool> {
     let out = Command::new("git")
         .args(["rev-parse", "--git-common-dir"])
         .current_dir(worktree)
@@ -175,7 +176,7 @@ fn exclude_from_index(worktree: &Path, rel_path: &str) -> Result<()> {
     let out = match out {
         Ok(o) if o.status.success() => o,
         // git missing or not a repository: nothing can be staged, so nothing to exclude.
-        _ => return Ok(()),
+        _ => return Ok(false),
     };
     let common_dir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
     // A relative git-common-dir resolves against the worktree.
@@ -189,7 +190,7 @@ fn exclude_from_index(worktree: &Path, rel_path: &str) -> Result<()> {
     let exclude = info.join("exclude");
     let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
     if existing.lines().any(|l| l.trim() == rel_path) {
-        return Ok(());
+        return Ok(false);
     }
     let mut text = existing;
     if !text.is_empty() && !text.ends_with('\n') {
@@ -198,7 +199,7 @@ fn exclude_from_index(worktree: &Path, rel_path: &str) -> Result<()> {
     text.push_str(rel_path);
     text.push('\n');
     std::fs::write(&exclude, text).with_context(|| format!("write {}", exclude.display()))?;
-    Ok(())
+    Ok(true)
 }
 
 /// If `rel_path` is tracked in the worktree's index, set its `--skip-worktree` bit so git

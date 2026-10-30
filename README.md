@@ -309,7 +309,7 @@ Stop vs cleanup:
 ```bash
 spar stop <run_id>              # halt dispatch, KEEP branch+worktree (resumable)
 spar cleanup <run_id>           # remove worktrees
-spar cleanup <run_id> --purge   # also drop run data under .spar/
+spar cleanup <run_id> --purge   # also drop the run record (keeps artifacts/; --purge-artifacts drops them)
 ```
 
 `spar stop` signals the orchestrator then the slot process groups and sets

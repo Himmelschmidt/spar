@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Single-daemon-per-project guard: same `flock` + `PidToken` mechanics as `RunLock`,
@@ -729,6 +729,228 @@ pub fn start(paths: &SparPaths, foreground: bool) -> Result<ExitCode> {
     Ok(ExitCode::Success)
 }
 
+/// `spar daemon start --all-projects`: one process supervising every project in the
+/// registry (O117), which is what the systemd unit runs. Each project still gets exactly
+/// one supervisor: this takes that project's `DaemonLock` and skips any project whose
+/// lock another daemon holds. Projects registered later are picked up on the next pass;
+/// `spar daemon stop` in a project releases that project for the life of this process.
+pub fn supervise_all() -> Result<ExitCode> {
+    crate::process::install_shutdown_handler();
+    let mut held: Vec<(SparPaths, DaemonLock, DaemonState, std::time::Instant)> = Vec::new();
+    let mut released: Vec<PathBuf> = Vec::new();
+    eprintln!("spar daemon: supervising every registered project");
+    while !crate::process::shutdown_requested() {
+        for project in crate::registry::projects() {
+            let root = project.root;
+            if released.contains(&root)
+                || held.iter().any(|(p, ..)| p.project_root == root)
+                || !root.join(".spar").is_dir()
+            {
+                continue;
+            }
+            let paths = SparPaths::new(&root);
+            let Ok(lock) = DaemonLock::acquire(&paths) else {
+                continue;
+            };
+            let _ = fs::remove_file(stop_marker(&paths));
+            let book = DaemonState::new();
+            let _ = book.save(&paths);
+            log_line(&paths, "daemon started (all projects)");
+            held.push((paths, lock, book, std::time::Instant::now()));
+        }
+        let now = std::time::Instant::now();
+        held.retain_mut(|(paths, _, book, next)| {
+            if stop_marker(paths).is_file() || !paths.root.is_dir() {
+                let _ = fs::remove_file(stop_marker(paths));
+                log_line(paths, "daemon stopping");
+                released.push(paths.project_root.clone());
+                return false;
+            }
+            if now < *next {
+                return true;
+            }
+            let cfg = Config::load(&paths.project_root).unwrap_or_default();
+            tick(paths, &cfg, book);
+            let _ = book.save(paths);
+            *next = now + Duration::from_secs(cfg.daemon.tick_secs.max(1));
+            true
+        });
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    Ok(ExitCode::Success)
+}
+
+pub const UNIT_NAME: &str = "spar-daemon.service";
+
+/// `~/.config/systemd/user` (or `$XDG_CONFIG_HOME/systemd/user`).
+fn unit_dir() -> Result<PathBuf> {
+    dirs::config_dir()
+        .map(|d| d.join("systemd").join("user"))
+        .context("no config dir: set HOME or XDG_CONFIG_HOME")
+}
+
+/// systemd unescapes `\`, `"` inside quotes and expands `%` specifiers in these lines.
+fn unit_quote(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%");
+    format!("\"{escaped}\"")
+}
+
+/// The user unit. `PATH` (and `SPAR_HOME` when set) are frozen from the installing
+/// shell: a user manager's default `PATH` has none of the provider CLIs on it, and
+/// restarted orchestrators spawn those. `KillMode=process` because restarted
+/// orchestrators run in this unit's cgroup: stopping or restarting the supervisor must
+/// not take every run it ever restarted down with it.
+///
+/// Secrets never go in the unit: API keys and proxy settings live in `env_file`, a
+/// user-owned `0600` file the unit reads (`-`: a missing file is not an error).
+fn unit_file(exe: &Path, path_env: &str, spar_home: Option<&str>, env_file: &Path) -> String {
+    let mut env = format!("Environment={}\n", unit_quote(&format!("PATH={path_env}")));
+    env.push_str(&format!(
+        "EnvironmentFile=-{}\n",
+        env_file.display().to_string().replace('%', "%%")
+    ));
+    if let Some(home) = spar_home {
+        env.push_str(&format!(
+            "Environment={}\n",
+            unit_quote(&format!("SPAR_HOME={home}"))
+        ));
+    }
+    format!(
+        "[Unit]\n\
+         Description=spar supervisor: restarts abandoned runs in every registered project\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart={} daemon start --foreground --all-projects\n\
+         Restart=on-failure\n\
+         RestartSec=10\n\
+         KillMode=process\n\
+         {env}\
+         \n\
+         [Install]\n\
+         WantedBy=default.target\n",
+        unit_quote(&exe.display().to_string())
+    )
+}
+
+/// `~/.config/spar/daemon.env`: where the operator puts what restarted runs need from
+/// their shell (provider API keys, `HTTPS_PROXY`, `NO_PROXY`).
+fn env_file_path() -> Result<PathBuf> {
+    dirs::config_dir()
+        .map(|d| d.join("spar").join("daemon.env"))
+        .context("no config dir: set HOME or XDG_CONFIG_HOME")
+}
+
+/// Create the env file empty and `0600` when missing; never touch an existing one.
+fn ensure_env_file(path: &Path) -> Result<bool> {
+    if path.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+        .with_context(|| format!("create {}", path.display()))?;
+    Ok(true)
+}
+
+fn write_unit(dir: &Path, body: &str) -> Result<PathBuf> {
+    fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let path = dir.join(UNIT_NAME);
+    fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
+    Ok(path)
+}
+
+fn remove_unit(dir: &Path) -> Result<Option<PathBuf>> {
+    let path = dir.join(UNIT_NAME);
+    if !path.exists() {
+        return Ok(None);
+    }
+    fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+    Ok(Some(path))
+}
+
+fn systemctl(args: &[&str]) -> std::result::Result<(), String> {
+    match std::process::Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .status()
+    {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!("systemctl --user {} exited {s}", args.join(" "))),
+        Err(e) => Err(format!("systemctl --user {}: {e}", args.join(" "))),
+    }
+}
+
+/// `spar daemon install`: write the user unit and enable it now. Explicit by design:
+/// nothing else installs or starts it (O117).
+pub fn install() -> Result<ExitCode> {
+    let exe = std::env::current_exe().context("locate the spar binary")?;
+    let exe = fs::canonicalize(&exe).unwrap_or(exe);
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    let spar_home = std::env::var("SPAR_HOME").ok().filter(|h| !h.is_empty());
+    let env_file = env_file_path()?;
+    if ensure_env_file(&env_file)? {
+        println!(
+            "created {} (0600): put provider API keys and proxy settings there, one KEY=value per line",
+            env_file.display()
+        );
+    }
+    let unit = write_unit(
+        &unit_dir()?,
+        &unit_file(&exe, &path_env, spar_home.as_deref(), &env_file),
+    )?;
+    println!("wrote {}", unit.display());
+    for args in [&["daemon-reload"][..], &["enable", "--now", UNIT_NAME][..]] {
+        if let Err(e) = systemctl(args) {
+            eprintln!("error: {e}");
+            eprintln!(
+                "the unit is written but not running; enable it with: systemctl --user daemon-reload && systemctl --user enable --now {UNIT_NAME}"
+            );
+            return Ok(ExitCode::Failure);
+        }
+    }
+    println!("enabled {UNIT_NAME}: supervising every project in the spar registry");
+    let user = std::env::var("USER").unwrap_or_default();
+    let linger = std::process::Command::new("loginctl")
+        .args(["show-user", &user, "--property=Linger"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    if linger.as_deref() != Some("Linger=yes") {
+        eprintln!(
+            "warning: without lingering, user units stop at logout and start only at login; \
+             to survive a reboot with nobody logged in run: loginctl enable-linger {user}"
+        );
+    }
+    Ok(ExitCode::Success)
+}
+
+/// `spar daemon uninstall`: stop and disable the unit, then remove its file.
+pub fn uninstall() -> Result<ExitCode> {
+    if let Err(e) = systemctl(&["disable", "--now", UNIT_NAME]) {
+        eprintln!("warning: {e}");
+    }
+    match remove_unit(&unit_dir()?)? {
+        Some(path) => println!("removed {}", path.display()),
+        None => println!("no {UNIT_NAME} installed"),
+    }
+    if let Err(e) = systemctl(&["daemon-reload"]) {
+        eprintln!("warning: {e}");
+    }
+    Ok(ExitCode::Success)
+}
+
 pub fn stop(paths: &SparPaths) -> Result<ExitCode> {
     let Some(owner) = DaemonLock::owner(paths) else {
         println!("no daemon running for this project");
@@ -1274,6 +1496,67 @@ mod tests {
                 "src/daemon.rs must never call `{banned}` — a supervisor is not an operator"
             );
         }
+    }
+
+    /// #151: the unit runs the all-projects supervisor from this exact binary, carries
+    /// the installing shell's PATH (provider CLIs live there), and stopping it must not
+    /// kill the orchestrators it restarted.
+    #[test]
+    fn the_unit_file_runs_the_all_projects_supervisor() {
+        let unit = unit_file(
+            Path::new("/opt/spar bin/spar"),
+            "/home/u/.local/bin:/usr/bin:50%",
+            Some("/srv/spar-home"),
+            Path::new("/home/u/.config/spar/daemon.env"),
+        );
+        assert!(unit.contains(
+            "ExecStart=\"/opt/spar bin/spar\" daemon start --foreground --all-projects\n"
+        ));
+        assert!(unit.contains("Environment=\"PATH=/home/u/.local/bin:/usr/bin:50%%\"\n"));
+        assert!(unit.contains("Environment=\"SPAR_HOME=/srv/spar-home\"\n"));
+        assert!(unit.contains("KillMode=process\n"));
+        assert!(unit.contains("Restart=on-failure\n"));
+        assert!(unit.contains("[Install]\nWantedBy=default.target\n"));
+        assert!(unit.contains("EnvironmentFile=-/home/u/.config/spar/daemon.env\n"));
+        for secret in ["API_KEY", "PROXY", "TOKEN"] {
+            assert!(
+                !unit.contains(secret),
+                "no secret ever lands in the unit: {secret}"
+            );
+        }
+        assert!(
+            !unit_file(Path::new("/x"), "/usr/bin", None, Path::new("/e")).contains("SPAR_HOME")
+        );
+    }
+
+    /// Created `0600` when missing, and an existing file (holding keys) is never touched.
+    #[cfg(unix)]
+    #[test]
+    fn the_env_file_is_created_private_and_never_overwritten() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("spar/daemon.env");
+        assert!(ensure_env_file(&path).unwrap());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        std::fs::write(&path, "OPENAI_API_KEY=x\n").unwrap();
+        assert!(!ensure_env_file(&path).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "OPENAI_API_KEY=x\n"
+        );
+    }
+
+    #[test]
+    fn install_writes_and_uninstall_removes_the_unit() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("systemd/user");
+        let path = write_unit(&dir, "unit body").unwrap();
+        assert_eq!(path, dir.join("spar-daemon.service"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "unit body");
+        assert_eq!(remove_unit(&dir).unwrap(), Some(path.clone()));
+        assert!(!path.exists());
+        assert_eq!(remove_unit(&dir).unwrap(), None);
     }
 
     /// D9, behavioural half: a tick over a run parked at a gate must not touch it.
