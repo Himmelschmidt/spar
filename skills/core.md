@@ -71,14 +71,57 @@ failed, with the probe's own one-line message, e.g. pi with no OpenRouter key),
 `missing` (not on PATH). `--json` carries the same verdict as `readiness` with values
 `healthy` / `unhealthy` / `unknown`, plus `readiness_message` (ANSI-stripped, capped at
 300 chars) when unhealthy. `doctor` exits failure only when no usable provider remains,
-so one unhealthy provider alongside working ones does not block a run. Today only
-`cli:pi` wires a probe (`pi auth check --provider openrouter --json --no-refresh`, or
-`--model <SPAR_PI_MODEL routed>` when that is set; detection is per adapter, so it cannot
-see a slot's own `@model`); the other adapters report unknown and stay available. Limit:
-the probe catches a missing credential, not a dead one: a key the provider would reject
-still reports healthy and fails at dispatch, which is all a local-only, no-quota check
-can see. An `unhealthy` provider is still eligible
-for dispatch; doctor warns, it does not exclude.
+so one unhealthy provider alongside working ones does not block a run. Probes wired:
+`cli:pi` runs `pi auth check --provider openrouter --json --no-refresh` (or `--model
+<SPAR_PI_MODEL routed>` when that is set; detection is per adapter, so it cannot see a
+slot's own `@model`), which catches a missing key, not a dead one; (O107) `cli:claude` runs `claude auth status` with nonessential traffic off (logged out) and
+reads its `.credentials.json` for an expired refresh token; `cli:codex` runs `codex
+login status` (logged out). grok, muse and agy have no local check that fails on a dead
+login, so they report unknown; use `spar provider probe <ref>` for a real call. Limit:
+no local probe sees a token revoked server-side; that surfaces at dispatch as an auth
+fault. An `unhealthy` provider is still eligible for dispatch; doctor warns, it does not
+exclude.
+
+**A reviewer that cannot run is not a verdict (O103).** In the implement loop, a
+reviewer dispatch that fails because the provider could not serve it (rate limit, auth
+fault, a CLI that never started, or a native CLI that exited having run no tools, e.g.
+codex unable to spawn `codex-code-mode-host`) is an infrastructure failure. spar retries
+that seat once on its declared `--backup` (renamed for the new vendor), else on the next
+eligible panel candidate. If that also cannot run, the run parks at `quota` (exit `4`)
+with `review slot ... could not run on <provider>: <reason>. the provider could not
+serve this reviewer; no verdict recorded`, no fix round is spent, and the `request_changes` stub spar used to
+salvage for it is removed. A reviewer that ran (tools > 0) and still produced no review
+keeps the old fail-closed `request_changes`.
+
+**Probing quota state (O105).** `.spar/quota.json` records failures; it can be stale.
+`spar provider list` (and `--json`: `paused_since`, `pause_age_secs`, `paused_until`)
+shows the age and end of every pause, including ones on `api:` refs. `spar provider
+probe <ref>` (or `--all` for every installed CLI) makes one tiny real call through the
+adapter (`Reply with the single word OK`, the ref's `@model` if any, 120s cap) and
+writes the answer: `healthy` clears a quota pause, `quota` pauses (until the stated
+reset when claude states one), `auth` and `failed` leave the store alone. A manual pause
+is never cleared by a probe. `--dry-run` (or `SPAR_DRY_RUN=1`) prints the call each
+probe would make and spawns nothing. Exit is `0` whatever the verdicts; read them from
+`--json`. A declared `--backup` held on a quota pause gets the same probe before a run
+skips it (O106): a stale pause no longer benches a working backup. A manually paused
+backup is never probed, and `--dry-run` runs never probe. Pause state is re-read before
+every implementer and reviewer dispatch, not only at run start: pausing a provider while
+a run is live moves its next seat to the declared backup (a reviewer seat is renamed for
+the new vendor) or parks the run at `quota` (exit `4`) when there is none. Only a manual
+pause or a trusted quota pause (a typed or clear rejection line) does this; a heuristic
+pause from a stray "429" or "quota" in a failed log steers the next run but never parks
+or reseats a live one. Like the run-start gate, this is skipped under `--dry-run`.
+
+**Auth faults (O104).** A dispatch that dies on a refused credential (claude's `401 ...
+OAuth access token has been revoked` or `Please run /login`, codex `Not logged in`, muse
+``not logged in: run `muse login` first``, grok `You are not authenticated.`,
+`invalid_grant`) is an auth fault, not a work failure and not a quota hit. spar waits
+20s and re-dispatches once (a token refreshed elsewhere usually lands within seconds),
+then moves the seat to its `--backup` like any environmental stop, and otherwise parks
+the run at `quota` (exit `4`) with `auth: <provider> rejected the credential (...)` in
+`error`. The slot carries `auth_fault: true`. An auth fault never pauses the provider:
+fix the login, then `implement --run <id>`. Only the last 15 non-empty log lines are
+read, so an agent discussing login code mid-turn is not mistaken for one.
 
 **agy note.** agy runs headless with `--output-format stream-json`, so spar parses its tools,
 text and tokens directly from that structured stream. What the stream doesn't carry — the
@@ -92,9 +135,13 @@ cleanly just before spar's own backstop would kill it (agy's own default is unli
 
 **Pause / cooldown.** A provider is paused manually (`spar provider pause <ref>`) or
 automatically when a slot hits a rate-limit signal. A slot that was killed (signal, or exit
-143/137) never pauses its provider on log text; only an adapter's typed rejection counts. Pauses **auto-recover** ~30 min after
+143/137) never pauses its provider on log text; only an adapter's typed rejection counts. Quota pauses **auto-recover** ~30 min after
 they were set (or at an explicit cooldown reset), so the provider is re-probed rather than
-staying dead; `spar provider resume <ref>` clears one immediately. A paused provider is
+staying dead; a manual pause never lapses on that timer: it holds until its `--until`, or
+until `spar provider resume <ref>`, and a quota event never overwrites it (O105). Only
+pauses set by this version are sticky (the record carries `sticky: true`); a manual pause
+written before it keeps the old ~30-minute lapse.
+`spar provider resume <ref>` clears either immediately. A paused provider is
 never silently swapped into another role: `plan`/`implement` exit `4` (quota) naming the
 paused ref so per-role assignment stays exactly what you specified.
 
@@ -350,7 +397,10 @@ spar run --workflow review -t "..." --providers cli:grok,cli:claude --base feat/
 
 spar confirm <run_id> [--winner <slot>]   # arena winner
 spar reconcile <run_id>                  # arena merge-good-parts + review
-spar ship <run_id> --confirm [--base <branch>]   # draft PR (never merges)
+spar ship <run_id> --confirm [--base <branch>]   # draft PR (never merges); adopts an open one
+spar ship <run_id> --override-gate --reason "…"  # ship over open findings (stuck/failed/quota/ceiling)
+spar ship <run_id> --adopt-remote               # fast-forward onto a hand-pushed branch, then ship
+spar sync-prs --run <id> | --all [--json] [--dry-run]   # merged PR -> done, closed -> stopped
 spar stop <run_id> [--json]              # halt dispatch, KEEP branch+worktree (resumable)
 spar stop --abandoned [--json]           # reap every run nobody is driving any more
 spar cleanup <run_id> [--purge]          # remove worktrees (--purge: run record, KEEPS artifacts/)
@@ -648,8 +698,10 @@ unpushed branch falls through to the repo default, with a note on stderr. `spar 
 `spar ship` pushes the slot worktree's **HEAD** to `spar/<id>/<slot>`, never the branch by
 name, and **never rewinds the remote branch**. Before pushing it fetches the remote branch;
 if the remote has commits HEAD lacks (someone pushed by hand), ship exits `1` with "remote
-<branch> has commits the run lacks": fast-forward the worktree onto `origin/<branch>` by hand
-and ship again. The push is leased on the exact tip it fetched, so a push landing in between
+<branch> has commits the run lacks". `spar ship <id> --adopt-remote` fast-forwards the
+worktree onto `origin/<branch>` and ships (O125); it refuses (exit `1`, nothing moved) when the
+worktree has uncommitted changes to tracked files, is not on the run branch, or the remote
+is not a fast-forward of HEAD (the run has commits of its own on top), which is yours to reconcile by hand. The push is leased on the exact tip it fetched, so a push landing in between
 also fails. If the worktree was left on another branch (a reviewer's, or detached), ship
 pushes HEAD when HEAD contains the run's branch and that branch has moved past the run's
 base (note on stderr), and refuses otherwise. A refusal exits `1`, leaves the phase at
@@ -657,6 +709,45 @@ base (note on stderr), and refuses otherwise. A refusal exits `1`, leaves the ph
 fast-forwards the implementer's branch back onto HEAD before each review panel when a slot
 left the worktree elsewhere, and only warns (stderr + event log) when that is not a
 fast-forward, the branch is still at the base, or it is checked out in another worktree.
+
+**An open PR is adopted, not re-created (O122).** After the push, ship asks
+`gh pr list --head <branch> --state open`. If a PR from this repo (not a fork) against the
+PR base exists (an implementer opened it, or an earlier ship got that far), ship records its
+URL as `pr_url`, replaces its body with the run's, and the run goes to `done`. It warns on
+stderr when the body it replaces is not the one spar last wrote (an edit by hand is lost);
+a body that fails to update is a warning, not a failure.
+Otherwise it runs `gh pr create`. New PRs open as drafts; `[ship] draft = false` opens them
+ready for review. An adopted PR keeps its own draft state.
+
+**`spar sync-prs --run <id> | --all [--json] [--dry-run]` (O123)** settles a run that pushed
+in its **current round** (`shipped_round`, `shipped_head`) and sits at `done` or
+`awaiting_ship_confirm`; anything else is left alone, as are dry runs and runs with a live
+orchestrator. A new round or a replan clears the old round's PR fields. The PR is the run's
+`pr_url`, else the newest same-repo PR for its branch against the shipped base, and in both
+cases only a PR whose head is the shipped commit (or contains it) counts. Merged: the run
+goes to `done` with `merged_at` and `merge_commit` recorded, plus a history row carrying
+both. Closed unmerged: `stopped`, with `pr_state: "CLOSED"`. Open, or no matching PR: left
+alone. `--all` does not re-ask about a run already merged, and a `gh` rate limit ends the
+pass. Operator-only: refused when `SPAR_AGENT_ID` or `SPAR_RUN_ID` is set.
+`cleanup --if-merged` counts a recorded merge of the shipped head as landed. `--json` prints
+`{"dry_run", "runs": [{run_id, phase, to, pr_url, pr_state, note, error}]}`; `to` is the
+phase the run moved to (or would, under `--dry-run`), `null` when left alone. `gh` missing
+is exit `1`; a per-run `gh` error is that row's `error` and makes the exit `1`.
+`[daemon] sync_prs = true` runs the same `--all` pass from the daemon, at most every five
+minutes; each distinct error (`gh` missing, auth, rate limit) goes to stderr and the daemon
+log once.
+
+**`spar ship <id> --override-gate --reason "<text>"` (O124)** ships a run whose gate never
+cleared: from `awaiting_round_extension`, `stuck`, `failed`, `quota`, or any ship, winner or
+reconcile gate. `--reason` is required (exit `1` without it); it refuses while the run's
+orchestrator is alive (`spar stop` it first) and inside a slot (operator-only). A ship that
+fails after the override puts the run back in the phase it came from. The override is kept
+on the run (`ship_override`) for the round, so a later re-ship keeps the findings section. It ships the same HEAD with the same push
+safety as a normal ship. Every finding of the last reviewed round, from the structured
+review records (severity, `file:line`, reviewer slot, round, `Reviewed-Commit`), goes in
+the PR body under **Shipped over open findings**, ahead of the summary. The override (who
+from `$USER`, when, reason, the findings) is written to
+`artifacts/ship.md` under `## Gate override` and logged as an `info` event.
 
 ## Checkpoints: the implementer's work survives its worktree
 
@@ -751,7 +842,8 @@ children — so they keep running and keep spending tokens with nobody collectin
   left to it. `spar daemon stop` in a project releases that project. It never approves a
   plan, confirms ship, merges, sweeps `cleanup`, or picks a fleet; it only ever restarts
   the same orchestrator a plain `spar resume` would have, and tells you when one is
-  waiting. `spar daemon status` reports the project you stand in.
+  waiting. With `[daemon] sync_prs = true` it also settles runs whose PR merged or
+  closed (see `sync-prs`). `spar daemon status` reports the project you stand in.
 - **A run that died shipping is never re-run.** `spar ship` holds the run lock through
   `shipping`, so a slow push does not read as abandoned. If the ship process dies anyway,
   every resume entry (`spar resume`, the daemon's restart) puts the run back at
@@ -1186,7 +1278,7 @@ stderr and the purge or sweep goes on.
   "id": "ab12cd34", "task": "first line of the task", "workflow": "loop",
   "dry_run": false, "phase": "done",
   "roles": [{"slot": "review-0-cli-codex", "role": "reviewer", "provider": "cli:codex",
-             "model": null, "source": "backup" | null, "quota_hit": false}],
+             "model": null, "source": "backup" | null, "parked_run": false}],
   "rounds": 3, "max_rounds": 5,
   "review_rounds": [{"round": 2,
                      "verdicts": [{"slot": "review-0-cli-codex", "verdict": "request_changes",
@@ -1209,12 +1301,14 @@ Finding counts are per round, deduplicated within a round (same severity, locati
 whitespace-normalized text from two reviewers count once); `findings` sums the rounds.
 Synthetic findings count under `synthetic` only. `blocking` is one review's own critical
 plus major findings. `cost_usd` is `null` when no dispatch reported a cost. `pr_url` is
-what `gh pr create` printed at ship (also `pr_url` in `status --json`). `dispatches` is
+the PR ship opened or adopted, or `sync-prs` found (also `pr_url` in `status --json`, with
+`merged_at`, `merge_commit` and `pr_state` once `sync-prs` settled the run). `dispatches` is
 the run's usage ledger, one entry per dispatch, with the model the provider reported.
 `timing.rounds` spans a round's first slot start to its last slot end (a gate wait is not
 counted); a slot timed from before phase events carried the round has `round: null`.
 Schema 1 lines (before O131) have no `dispatches`, `timing`, `quota_parks`, `blocking`,
-`source` or `quota_hit`; read them as empty.
+`source` or `parked_run`; read them as empty. `parked_run` is a slot whose last
+dispatch failed on quota or a refused credential.
 
 **Quota events.** `.spar/quota-events.jsonl` gets one line per provider pause, automatic or
 `spar provider pause`:
@@ -1267,7 +1361,7 @@ Remote hosts are not read.
 - `context` has one entry per `context_semantics`. Numbers measured differently are never
   combined: a `peak` and an `invocation_total` are different quantities.
 - `quota` is per provider whatever `--by` is. `parks` are charged to providers whose slot
-  hit quota (`unknown` when none was recorded), `backup_engagements` to the backup that
+  hit quota or a refused credential (`parked_run`; `unknown` when none was recorded), `backup_engagements` to the backup that
   took the seat.
 
 ### TUI shape (humans)
@@ -1640,6 +1734,7 @@ auto_cleanup_merged = true   # reap at-rest runs already contained in their base
 copy = [".dbiso.env", ".envrc", ".env.example"]   # copied from the main checkout into every slot worktree; missing files skipped
 [ship]
 title_max = 72   # PR title clamp in characters; 0 = GitHub's 256 only
+draft = true     # open new PRs as drafts; false = ready for review
 [gates]
 plan = true
 winner = true
@@ -1725,6 +1820,7 @@ timeout_secs = 3600    # test_author's SOFT clock; hard_ceiling_multiple applies
 # restart = true               # restart a dead orchestrator holding resumable work
 # max_restarts = 2             # per run, per daemon lifetime
 # max_slots_per_bucket = 0     # cross-run concurrency cap, keyed on provider (model-free); 0 = off
+# sync_prs = false             # run `sync-prs --all` (calls gh) at most every 5 minutes
 # Dynamic model select (vals). Opt-in with --select; cache under ~/.spar/cache/vals/
 [model_select]
 # benches = ["swebench"]
@@ -1742,7 +1838,7 @@ timeout_secs = 3600    # test_author's SOFT clock; hard_ceiling_multiple applies
 
 - One run id plan → implement → ship.
 - Coding slots always use git worktrees; never check out feature branches on the primary tree.
-- Ship is draft PR only — never merge.
+- Ship opens a PR (draft unless `[ship] draft = false`) or adopts an open one, and never merges.
 - State lives under `.spar/` in the project root.
 - **Spec channel (plan):** after planner+critic, a `test-author` freezes acceptance tests (`artifacts/test-contract.md` + worktree tests) from plan/critique (bus is audit trail), **before** the plan approval gate. Implement brings those tests into the impl worktree (fail closed if author ran) by **merging the author branch**, then overlaying only the author's **uncommitted** work — tracked-but-modified plus untracked-not-ignored — on top. Committed author work is the merge's job, so the overlay never copies the author branch's revision of a file the implementer is working on, and build output never crosses between worktrees. A merge that fails is aborted **and fails the dispatch** (exit 1), because it is the only path committed acceptance tests take. Anything git ignores stays behind and is named on stderr, in the event log, on the bus, and in the implementer's own prompt, with the author worktree path: if an acceptance test needs an ignored fixture (`.env.test`, an ignored `tests/data/`), the implementer copies it across itself. Its provider follows the same precedence as every other role: CLI `--role test_author=…`, then an explicit `--providers`/`--select` pool, then `[roles].test_author`, then the run's own pool as a last resort. Disable with `[spec] enabled = false`.
 - **Criterion ids:** scenarios in `artifacts/test-contract.md` carry stable `AC-<n>` ids (numbered from 1, contiguous, never renumbered) plus a `verify:` hint naming a command, `file:line` + assertion, or observable behavior.

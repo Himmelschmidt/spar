@@ -105,7 +105,7 @@ pub struct QuotaRow {
     pub pauses: u32,
     pub manual_pauses: u32,
     /// Times a run entered the `quota` phase, charged to the providers whose slot hit
-    /// quota (`unknown` when none was recorded).
+    /// quota or a refused credential (`unknown` when none was recorded).
     pub parks: u32,
     /// Seats a declared backup took over, charged to the backup.
     pub backup_engagements: u32,
@@ -440,7 +440,7 @@ pub fn report(
                 .row
                 .roles
                 .iter()
-                .filter(|r| r.quota_hit)
+                .filter(|r| r.parked_run)
                 .map(|r| crate::quota::normalize_key(&r.provider))
                 .collect();
             hit.sort();
@@ -752,8 +752,8 @@ mod tests {
             "schema_version": 2, "written_at": ended, "trigger": "terminal", "id": id,
             "task": "t", "workflow": "loop", "dry_run": false, "phase": phase,
             "roles": [
-                {"slot": "impl", "role": "implementer", "provider": "cli:claude", "model": "opus", "source": null, "quota_hit": false},
-                {"slot": "review-0-cli-codex", "role": "reviewer", "provider": "cli:codex", "model": null, "source": "backup", "quota_hit": true}
+                {"slot": "impl", "role": "implementer", "provider": "cli:claude", "model": "opus", "source": null, "parked_run": false},
+                {"slot": "review-0-cli-codex", "role": "reviewer", "provider": "cli:codex", "model": null, "source": "backup", "parked_run": true}
             ],
             "rounds": 2, "max_rounds": 3, "review_rounds": review_rounds,
             "findings": {"critical": 0, "major": 0, "minor": 0, "synthetic": 0},

@@ -21,7 +21,7 @@ pub const HISTORY_SCHEMA: u32 = 2;
 pub enum Trigger {
     Terminal,
     Purge,
-    /// Never written: `spar stats` builds this row from a run not yet in history.
+    /// Never written: `spar stats` builds this row from a run still on disk.
     Live,
 }
 
@@ -52,9 +52,10 @@ pub struct RoleRow {
     pub model: Option<String>,
     #[serde(default)]
     pub source: Option<SeatSource>,
-    /// The slot's last dispatch ended on a quota signal.
+    /// The slot's last dispatch failed on quota or a refused credential, the failures
+    /// that park a run at `quota`.
     #[serde(default)]
-    pub quota_hit: bool,
+    pub parked_run: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +129,9 @@ pub struct HistoryRow {
     pub billed_tokens: u64,
     pub cost_usd: Option<f64>,
     pub pr_url: Option<String>,
+    /// Set once `sync-prs` saw the PR merged (O123).
+    pub merged_at: Option<DateTime<Utc>>,
+    pub merge_commit: Option<String>,
     pub created_at: DateTime<Utc>,
     pub ended_at: DateTime<Utc>,
     #[serde(default)]
@@ -307,7 +311,7 @@ pub fn row(state: &RunState, events: &[Event], trigger: Trigger, now: DateTime<U
                 provider: s.provider.clone(),
                 model: s.model.clone(),
                 source: s.source,
-                quota_hit: s.quota_hit,
+                parked_run: s.parks_on_quota(),
             })
             .collect(),
         rounds: state.round,
@@ -317,6 +321,8 @@ pub fn row(state: &RunState, events: &[Event], trigger: Trigger, now: DateTime<U
         billed_tokens: state.usage.iter().map(|u| u.billed_tokens).sum(),
         cost_usd: (!costs.is_empty()).then(|| costs.iter().sum()),
         pr_url: state.pr_url.clone(),
+        merged_at: state.merged_at,
+        merge_commit: state.merge_commit.clone(),
         created_at: state.created_at,
         ended_at: state.updated_at,
         dispatches,

@@ -4,9 +4,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// A pause with no explicit `cooldown_until` auto-recovers this long after it was
-/// set: the provider is re-probed by the next run rather than staying dead forever.
-/// If it is still rate-limited the run re-pauses it with a fresh window.
+/// A quota pause with no explicit `cooldown_until` auto-recovers this long after it
+/// was set: the provider is re-probed by the next run rather than staying dead forever.
+/// If it is still rate-limited the run re-pauses it with a fresh window. Manual pauses
+/// never lapse on this timer (O105).
 const DEFAULT_COOLDOWN_MINS: i64 = 30;
 
 /// `lower.contains(phrase)` but only accepts a word boundary immediately after the
@@ -87,6 +88,19 @@ pub struct ProviderQuota {
     pub hint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<DateTime<Utc>>,
+    /// Written `true` by `provider pause`: the pause holds until its `--until` or
+    /// `provider resume` (O105). A `paused_manual` record without it predates that rule
+    /// and keeps the old auto-lapse, so pauses operators set expecting it to lapse
+    /// never start blocking a provider when this ships. Absence is the rule; no backfill.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sticky: bool,
+    /// Set when the pause came from a rejection spar can trust: an adapter's typed
+    /// verdict or a line-scoped strong signal (`mark_strong`). A pause written only by
+    /// `scrape_log_hint`'s broad needles ("429" in "429 passed") is weak: it still
+    /// steers the next run's seat choice, but never parks or reseats a live run
+    /// (O106). Legacy records read weak.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strong: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -174,6 +188,8 @@ impl QuotaStore {
             cooldown_until: None,
             hint: None,
             updated_at: None,
+            sticky: false,
+            strong: false,
         })
     }
 
@@ -182,9 +198,12 @@ impl QuotaStore {
         match q.status {
             ProviderStatus::Available => true,
             ProviderStatus::Cooldown => q.cooldown_until.is_none_or(|until| Utc::now() >= until),
-            // Pauses auto-recover: an explicit `cooldown_until` wins, otherwise the
-            // pause lapses DEFAULT_COOLDOWN_MINS after it was set so the provider is
-            // retried instead of staying unusable indefinitely.
+            // An operator's pause holds until its own `--until`, or until `provider
+            // resume` when it has none: the operator said stop, and a timer that
+            // quietly undoes that is how a removed provider got dispatched again.
+            ProviderStatus::PausedManual if q.sticky => {
+                q.cooldown_until.is_some_and(|until| Utc::now() >= until)
+            }
             ProviderStatus::PausedManual | ProviderStatus::PausedQuota => match q.cooldown_until {
                 Some(until) => Utc::now() >= until,
                 None => q.updated_at.is_some_and(|set| {
@@ -192,6 +211,22 @@ impl QuotaStore {
                 }),
             },
         }
+    }
+
+    /// Whether the provider is held by an operator's pause that has not lapsed. Quota
+    /// writers consult this so a rate-limit event never replaces the operator's
+    /// decision, and probes consult it so they never clear one.
+    pub fn is_manually_paused(&self, name: &str) -> bool {
+        self.get(name).status == ProviderStatus::PausedManual && !self.is_usable(name)
+    }
+
+    /// Whether the provider is held by a quota pause that has not lapsed: the only kind
+    /// of pause a probe may clear.
+    pub fn is_quota_paused(&self, name: &str) -> bool {
+        matches!(
+            self.get(name).status,
+            ProviderStatus::PausedQuota | ProviderStatus::Cooldown
+        ) && !self.is_usable(name)
     }
 
     /// Status as a run would see it: a pause that has lapsed (auto-recovered) reads
@@ -206,25 +241,26 @@ impl QuotaStore {
     }
 
     pub fn pause_manual(&mut self, name: &str, until: Option<DateTime<Utc>>) {
-        let status = if until.is_some() {
-            ProviderStatus::Cooldown
-        } else {
-            ProviderStatus::PausedManual
-        };
         self.note_pause(name, true, until, "manual pause");
         self.providers.insert(
             name.into(),
             ProviderQuota {
                 name: name.into(),
-                status,
+                status: ProviderStatus::PausedManual,
                 cooldown_until: until,
                 hint: Some("manual pause".into()),
                 updated_at: Some(Utc::now()),
+                sticky: true,
+                strong: false,
             },
         );
     }
 
     pub fn pause_quota(&mut self, name: &str, hint: impl Into<String>) {
+        if self.is_manually_paused(name) {
+            return;
+        }
+        let strong = self.is_quota_paused(name) && self.get(name).strong;
         let hint = hint.into();
         self.note_pause(name, false, None, &hint);
         self.providers.insert(
@@ -235,6 +271,8 @@ impl QuotaStore {
                 cooldown_until: None,
                 hint: Some(hint),
                 updated_at: Some(Utc::now()),
+                sticky: false,
+                strong,
             },
         );
     }
@@ -245,6 +283,10 @@ impl QuotaStore {
         until: Option<DateTime<Utc>>,
         hint: impl Into<String>,
     ) {
+        if self.is_manually_paused(name) {
+            return;
+        }
+        let strong = self.is_quota_paused(name) && self.get(name).strong;
         let hint = hint.into();
         self.note_pause(name, false, until, &hint);
         self.providers.insert(
@@ -259,8 +301,31 @@ impl QuotaStore {
                 cooldown_until: until,
                 hint: Some(hint),
                 updated_at: Some(Utc::now()),
+                sticky: false,
+                strong,
             },
         );
+    }
+
+    /// Upgrade a live quota pause to strong: the rejection behind it was typed or a
+    /// line-scoped strong signal, not a broad needle.
+    pub fn mark_strong(&mut self, name: &str) {
+        if !self.is_quota_paused(name) {
+            return;
+        }
+        if let Some(q) = self.providers.get_mut(name) {
+            q.strong = true;
+        }
+    }
+
+    /// Whether a pause should stop a live run's next dispatch (O106): a manual pause,
+    /// or a quota pause from a trusted rejection. A weak, heuristic quota pause does not.
+    pub fn blocks_live_dispatch(&self, name: &str) -> bool {
+        if self.is_usable(name) {
+            return false;
+        }
+        let q = self.get(name);
+        q.status == ProviderStatus::PausedManual || q.strong
     }
 
     pub fn resume(&mut self, name: &str) {
@@ -272,6 +337,8 @@ impl QuotaStore {
                 cooldown_until: None,
                 hint: None,
                 updated_at: Some(Utc::now()),
+                sticky: false,
+                strong: false,
             },
         );
     }
@@ -775,19 +842,162 @@ mod tests {
     }
 
     #[test]
-    fn pause_auto_recovers_after_cooldown() {
-        // A pause with no explicit cooldown lapses once DEFAULT_COOLDOWN_MINS has
+    fn quota_pause_auto_recovers_after_cooldown() {
+        // A quota pause with no explicit cooldown lapses once DEFAULT_COOLDOWN_MINS has
         // passed since it was set: the provider is re-probed, not dead forever.
         let mut store = QuotaStore::default();
-        store.pause_manual("cli:claude", None);
+        store.pause_quota("cli:claude", "possible quota signal: rate limit");
         assert!(!store.is_usable("cli:claude"), "fresh pause is unusable");
 
         let stale = Utc::now() - chrono::Duration::minutes(DEFAULT_COOLDOWN_MINS + 1);
         store.providers.get_mut("cli:claude").unwrap().updated_at = Some(stale);
         assert!(
             store.is_usable("cli:claude"),
-            "pause older than the cooldown auto-recovers"
+            "quota pause older than the cooldown auto-recovers"
         );
+    }
+
+    #[test]
+    fn manual_pause_without_until_never_lapses() {
+        let mut store = QuotaStore::default();
+        store.pause_manual("cli:grok", None);
+        let a_week_ago = Utc::now() - chrono::Duration::days(7);
+        store.providers.get_mut("cli:grok").unwrap().updated_at = Some(a_week_ago);
+        assert!(!store.is_usable("cli:grok"));
+        assert_eq!(
+            store.effective_status("cli:grok"),
+            ProviderStatus::PausedManual
+        );
+        store.resume("cli:grok");
+        assert!(store.is_usable("cli:grok"), "only resume lifts it");
+    }
+
+    /// The primary checkout's real record: `cli:claude` paused by hand 1171 hours ago,
+    /// before `sticky` existed. It was written expecting the 30-minute lapse, so it must
+    /// keep lapsing rather than start blocking claude the day this ships.
+    #[test]
+    fn only_manual_and_strong_pauses_block_a_live_dispatch() {
+        let mut store = QuotaStore::default();
+        store.pause_quota("cli:codex", "possible quota signal: 429");
+        assert!(
+            !store.is_usable("cli:codex"),
+            "a weak pause still steers new runs"
+        );
+        assert!(!store.blocks_live_dispatch("cli:codex"));
+
+        store.mark_strong("cli:codex");
+        assert!(store.blocks_live_dispatch("cli:codex"));
+        store.pause_quota("cli:codex", "possible quota signal: quota");
+        assert!(
+            store.get("cli:codex").strong,
+            "a later broad scrape does not downgrade a live strong pause"
+        );
+
+        store.pause_manual("cli:grok", None);
+        assert!(store.blocks_live_dispatch("cli:grok"));
+
+        store.mark_strong("cli:claude");
+        assert!(!store.blocks_live_dispatch("cli:claude"), "nothing to mark");
+
+        let legacy: QuotaStore = serde_json::from_str(&format!(
+            r#"{{"providers":{{"cli:muse":{{"name":"cli:muse","status":"paused_quota","updated_at":"{}"}}}}}}"#,
+            Utc::now().to_rfc3339()
+        ))
+        .unwrap();
+        assert!(
+            !legacy.blocks_live_dispatch("cli:muse"),
+            "legacy records read weak"
+        );
+    }
+
+    #[test]
+    fn a_legacy_manual_pause_without_sticky_keeps_the_old_lapse() {
+        let legacy: QuotaStore = serde_json::from_str(
+            r#"{"providers":{"cli:claude":{"name":"cli:claude","status":"paused_manual","hint":"manual pause","updated_at":"2026-09-11T03:00:00Z"}}}"#,
+        )
+        .unwrap();
+        assert!(!legacy.get("cli:claude").sticky);
+        assert!(legacy.is_usable("cli:claude"));
+        assert!(!legacy.is_manually_paused("cli:claude"));
+        assert_eq!(
+            legacy.effective_status("cli:claude"),
+            ProviderStatus::Available
+        );
+
+        let mut fresh = legacy.clone();
+        fresh.providers.get_mut("cli:claude").unwrap().updated_at = Some(Utc::now());
+        assert!(
+            !fresh.is_usable("cli:claude"),
+            "a legacy pause still holds for its first 30 minutes"
+        );
+    }
+
+    #[test]
+    fn provider_pause_writes_sticky_and_it_round_trips() {
+        let mut store = QuotaStore::default();
+        store.pause_manual("cli:grok", None);
+        let text = serde_json::to_string(&store).unwrap();
+        assert!(text.contains("\"sticky\":true"), "{text}");
+        let back: QuotaStore = serde_json::from_str(&text).unwrap();
+        assert!(back.get("cli:grok").sticky);
+
+        store.pause_quota("cli:codex", "q");
+        let text = serde_json::to_string(&store.providers["cli:codex"]).unwrap();
+        assert!(
+            !text.contains("sticky"),
+            "quota pauses do not carry the field: {text}"
+        );
+    }
+
+    #[test]
+    fn manual_pause_with_until_lapses_at_until_and_stays_manual_until_then() {
+        let mut store = QuotaStore::default();
+        let until = Utc::now() + chrono::Duration::days(60);
+        store.pause_manual("cli:grok", Some(until));
+        assert_eq!(store.get("cli:grok").status, ProviderStatus::PausedManual);
+        assert_eq!(store.get("cli:grok").cooldown_until, Some(until));
+        assert!(store.is_manually_paused("cli:grok"));
+        assert!(!store.is_quota_paused("cli:grok"));
+
+        store.providers.get_mut("cli:grok").unwrap().cooldown_until =
+            Some(Utc::now() - chrono::Duration::seconds(1));
+        assert!(store.is_usable("cli:grok"));
+        assert!(!store.is_manually_paused("cli:grok"));
+    }
+
+    /// The 2026-10-22 shape: grok paused by hand until 2027, then a live run's slot hit
+    /// a rate limit. The quota write used to replace the record, turning a pause that
+    /// held until 2027 into one that lapsed in thirty minutes.
+    #[test]
+    fn a_quota_event_never_overwrites_a_manual_pause() {
+        let mut store = QuotaStore::default();
+        let until = DateTime::parse_from_rfc3339("2027-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        store.pause_manual("cli:grok", Some(until));
+        store.pause_quota("cli:grok", "possible quota signal: 429");
+        store.pause_quota_until(
+            "cli:grok",
+            Some(Utc::now() + chrono::Duration::minutes(5)),
+            "grok rate limit rejected",
+        );
+        let q = store.get("cli:grok");
+        assert_eq!(q.status, ProviderStatus::PausedManual);
+        assert_eq!(q.cooldown_until, Some(until));
+        assert_eq!(q.hint.as_deref(), Some("manual pause"));
+
+        store.pause_manual("cli:claude", None);
+        store.pause_quota("cli:claude", "possible quota signal: quota");
+        assert_eq!(store.get("cli:claude").status, ProviderStatus::PausedManual);
+    }
+
+    #[test]
+    fn a_lapsed_manual_pause_can_be_replaced_by_a_quota_pause() {
+        let mut store = QuotaStore::default();
+        store.pause_manual("cli:codex", Some(Utc::now() - chrono::Duration::minutes(1)));
+        store.pause_quota("cli:codex", "possible quota signal: usage limit");
+        assert_eq!(store.get("cli:codex").status, ProviderStatus::PausedQuota);
+        assert!(store.is_quota_paused("cli:codex"));
     }
 
     #[test]
@@ -807,10 +1017,10 @@ mod tests {
     #[test]
     fn effective_status_reflects_auto_recovery() {
         let mut store = QuotaStore::default();
-        store.pause_manual("cli:claude", None);
+        store.pause_quota("cli:claude", "possible quota signal: rate limit");
         assert_eq!(
             store.effective_status("cli:claude"),
-            ProviderStatus::PausedManual,
+            ProviderStatus::PausedQuota,
             "fresh pause shows its real status"
         );
 

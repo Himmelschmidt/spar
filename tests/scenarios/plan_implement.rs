@@ -1034,6 +1034,30 @@ fn quota_exit_when_all_paused() {
 fn quota_partial_pause_fails_loud_without_collapse() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
+    // Fake every adapter and keep the real CLIs (and their credential probes) off PATH
+    // and out of HOME: `provider list` runs readiness probes, which must not reach the
+    // operator's real `claude`/`codex`.
+    let fake_root = tempdir().unwrap();
+    let bin = fake_root.path().join("bin");
+    let home = fake_root.path().join("home");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    for name in ["claude", "grok", "agy", "codex", "pi", "muse"] {
+        let p = bin.join(name);
+        std::fs::write(
+            &p,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo fake; exit 0; fi\nexit 1\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path_env = format!("{}:/usr/bin:/bin", bin.display());
+    let spar_cmd = || {
+        let mut c = spar_cmd();
+        c.env("PATH", &path_env).env("HOME", &home);
+        c
+    };
 
     // The paused ref has to be one that actually resolves on this box. `pick_providers`
     // filters by presence before the quota gate, so pausing a provider that is not on

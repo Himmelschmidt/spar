@@ -4669,12 +4669,11 @@ fn apply_proposal_to_roster(proposal: &crate::orchestrator::Proposal, nr: &mut N
         {
             let available = crate::runspec::Pin::parse(&prov)
                 .map(|pin| {
-                    crate::providers::detect_all().iter().any(|r| {
-                        format!("cli:{}", r.name) == crate::quota::normalize_key(&pin.provider)
-                            && r.available
-                    }) || crate::provider_ref::ProviderRef::parse(&prov)
-                        .map(|r| r.is_api())
-                        .unwrap_or(false)
+                    crate::providers::adapter_named(&pin.provider)
+                        .is_some_and(|a| a.resolve_binary().is_some())
+                        || crate::provider_ref::ProviderRef::parse(&prov)
+                            .map(|r| r.is_api())
+                            .unwrap_or(false)
                 })
                 .unwrap_or(false);
             let reason = if available {
