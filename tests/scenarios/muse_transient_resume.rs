@@ -107,7 +107,7 @@ if [ "$RESUMED" = "0" ]; then
   echo "cold" >> "$SPAR_TEST_MUSE_STATE/calls"
   echo '{"schema_version":1,"stream":{"kind":"session","id":"sess-e2e-1"},"record_type":"event","payload_type":"run.model.configured","payload":{"kind":"run_model_configured","model_id":"muse-spark-1.3-contributor"}}'
   echo '{"stream":{"kind":"session","id":"sess-e2e-1"},"payload_type":"tool.result","payload":{"kind":"tool_result","call_id":"c1","correlation_facts":{"outcome":"success","tool_name":"edit"},"edit_facts":{"path":"hello.txt","tool_name":"edit"}}}'
-  echo 'model `muse-spark-1.3-contributor` does not exist or you lack access [request_id=e2e]' >&2
+  echo "${SPAR_TEST_MUSE_COLD_ERROR:-model \`muse-spark-1.3-contributor\` does not exist or you lack access [request_id=e2e]}" >&2
   exit 1
 fi
 echo "resume:$SID" >> "$SPAR_TEST_MUSE_STATE/calls"
@@ -333,4 +333,59 @@ fn muse_first_call_404_fails_without_retry() {
     );
     let st = state_json(&proj, &run_id);
     assert_eq!(st["phase"], "failed", "{st}");
+}
+
+/// #180: muse's "runtime command acknowledgement timed out" after real work resumes the
+/// same session inside the same dispatch, so the run completes in round 1 instead of
+/// burning a round per transport death.
+#[test]
+fn muse_ack_timeout_resumes_without_charging_a_round() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    fs::create_dir_all(&proj).unwrap();
+    init_repo(&proj);
+    let bin = tmp.path().join("bin");
+    install_fake_muse(&bin);
+    let state = tmp.path().join("muse-state");
+    fs::create_dir_all(&state).unwrap();
+
+    let mut cmd = spar_cmd();
+    live_env(&mut cmd, &bin, &state);
+    cmd.env(
+        "SPAR_TEST_MUSE_COLD_ERROR",
+        "runtime command acknowledgement timed out after 30s",
+    );
+    let out = cmd
+        .current_dir(&proj)
+        .env("SPAR_HOME", spar_home_dir())
+        .args([
+            "implement",
+            "-t",
+            "add a hello function",
+            "--providers",
+            "cli:muse",
+            "--fleet",
+            "small",
+            "--json",
+        ])
+        .assert()
+        .code(predicate::in_iter([0, 2]));
+    let run_id = run_id_from_json(&out);
+
+    let calls = std::fs::read_to_string(state.join("calls")).unwrap();
+    for pair in calls.lines().collect::<Vec<_>>().chunks(2) {
+        assert_eq!(pair, ["cold", "resume:sess-e2e-1"], "{calls}");
+    }
+    let st = state_json(&proj, &run_id);
+    assert_eq!(
+        st["round"], 1,
+        "a resumed transport death is not a round: {st}"
+    );
+    let impl_slot = st["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["role"] == "implementer")
+        .expect("implementer slot");
+    assert_eq!(impl_slot["status"], "done", "{impl_slot}");
 }

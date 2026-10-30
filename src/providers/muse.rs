@@ -23,6 +23,14 @@ pub const TRANSIENT_MODEL_ACCESS_MESSAGE: &str = "does not exist or you lack acc
 /// prose after it, which is muse's own wording and not a contract.
 pub const TRANSIENT_TRANSPORT_MESSAGE: &str = "transport error [net-timeout]";
 
+/// muse's runtime losing its own command channel mid-dispatch, observed on 2026-09-17
+/// killing run `5d2bf03a`'s rounds 16 to 18 alongside `net-timeout`: "runtime command
+/// acknowledgement timed out after 30s", exit 1, during long foreground commands. The
+/// work is in the session and the worktree; the transport is what failed, so it takes
+/// the same resume ladder as `net-timeout` (O114). Matched without the duration, which
+/// is muse's setting rather than part of the signature.
+pub const TRANSIENT_ACK_MESSAGE: &str = "runtime command acknowledgement timed out";
+
 /// Model override (`--model`). spar's per-slot model (`--select` or a `cli:muse@<model>`
 /// ref) wins; otherwise `SPAR_MUSE_MODEL`; otherwise none, so muse's own
 /// `settings.json` picks the model (currently `muse-spark-1.2-contributor`). Leaving the
@@ -203,7 +211,8 @@ impl ProviderAdapter for MuseAdapter {
         log_text.lines().any(|l| {
             l.starts_with("! ")
                 && (l.contains(TRANSIENT_MODEL_ACCESS_MESSAGE)
-                    || l.contains(TRANSIENT_TRANSPORT_MESSAGE))
+                    || l.contains(TRANSIENT_TRANSPORT_MESSAGE)
+                    || l.contains(TRANSIENT_ACK_MESSAGE))
         })
     }
 
@@ -710,6 +719,21 @@ mod tests {
             !MuseAdapter
                 .dispatch_failure_is_transient("! transport error [auth]: credentials rejected\n"),
             "a different transport error kind is not this signature"
+        );
+    }
+
+    /// #180: the ack timeout killed three consecutive rounds of one run. It is the
+    /// transport failing, not the work, so it resumes like `net-timeout`.
+    #[test]
+    fn a_runtime_ack_timeout_after_real_work_is_transient() {
+        assert!(MuseAdapter.dispatch_failure_is_transient(
+            "→ bash  cargo test  success\n! runtime command acknowledgement timed out after 30s\n"
+        ));
+        assert!(
+            !MuseAdapter.dispatch_failure_is_transient(
+                "runtime command acknowledgement timed out after 30s\n"
+            ),
+            "unanchored: an agent echoing the sentence must not buy the backoff schedule"
         );
     }
 

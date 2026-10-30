@@ -227,7 +227,7 @@ fn purge_appends_a_history_row_first() {
     let run_id = implemented_run(tmp.path(), true);
     spar_cmd()
         .current_dir(tmp.path())
-        .args(["cleanup", &run_id, "--purge", "--force", "--json"])
+        .args(["cleanup", &run_id, "--purge-artifacts", "--force", "--json"])
         .assert()
         .success();
     assert!(!tmp.path().join(".spar/runs").join(&run_id).exists());
@@ -408,7 +408,7 @@ fn an_unwritable_history_never_blocks_a_purge() {
     std::fs::create_dir_all(tmp.path().join(".spar/history.jsonl")).unwrap();
     let out = spar_cmd()
         .current_dir(tmp.path())
-        .args(["cleanup", &run_id, "--purge", "--force", "--json"])
+        .args(["cleanup", &run_id, "--purge-artifacts", "--force", "--json"])
         .assert()
         .success();
     assert_eq!(json(&out)["purged"], true);
@@ -431,7 +431,7 @@ fn an_unwritable_history_never_stops_a_sweep() {
     std::fs::create_dir_all(tmp.path().join(".spar/history.jsonl")).unwrap();
     let out = spar_cmd()
         .current_dir(tmp.path())
-        .args(["cleanup", "--all", "--purge", "--json"])
+        .args(["cleanup", "--all", "--purge-artifacts", "--json"])
         .assert()
         .success();
     let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();

@@ -21,6 +21,11 @@ spar model list --provider openrouter [--all] [--json]   # OpenRouter catalog, t
 | Human | `spar` (no subcommand) → product TUI, landing on Home (scoped to the current repo when run inside one) |
 | Outer agent | subcommands + `--json` + exit codes |
 
+**Install the supervisor on every box that runs spar**, once: `spar daemon install`. It
+writes and enables a systemd user unit that restarts orchestrators which died (OOM, a
+killed shell, a reboot) in every registered project. Without it a dead orchestrator
+leaves a phantom run that nothing picks back up. See **Abandoned runs**.
+
 ## Dual backend
 
 Providers are `cli:name` (subscription CLIs) or `api:name` (OpenAI-compatible SDKs):
@@ -194,9 +199,11 @@ reported one.
 Resume and transient retry (DECISIONS O86). A muse slot's next round calls
 `muse exec --session-id <id>` instead of a cold dispatch when an earlier round captured
 a session id. If a dispatch exits 1 with muse's backend-404 text
-(`does not exist or you lack access`) after at least one completed tool call, spar waits
-it out (roughly 60s/150s/300s, resuming the same session each retry) instead of failing
-the slot; the same text with zero tool calls fails immediately. A resume against a
+(`does not exist or you lack access`), a transport timeout (`transport error
+[net-timeout]`) or a lost command channel (`runtime command acknowledgement timed out`)
+after at least one completed tool call, spar waits it out (roughly 60s/150s/300s, resuming
+the same session each retry, inside the same dispatch, so no round is charged) instead of
+failing the slot; the same text with zero tool calls fails immediately. A resume against a
 session muse no longer has is detected from its session log and retried cold once.
 muse's stream timeouts follow the slot ceiling, exit 2 is reported as spar's bad command
 line (never the agent's fault), and an implementer slot killed mid-dispatch still leaves
@@ -328,11 +335,15 @@ spar reconcile <run_id>                  # arena merge-good-parts + review
 spar ship <run_id> --confirm [--base <branch>]   # draft PR (never merges)
 spar stop <run_id> [--json]              # halt dispatch, KEEP branch+worktree (resumable)
 spar stop --abandoned [--json]           # reap every run nobody is driving any more
-spar cleanup <run_id> [--purge]          # remove worktrees (and --purge run data)
-spar cleanup <run_id> --force            # remove even if it holds unsaved work
+spar cleanup <run_id> [--purge]          # remove worktrees (--purge: run record, KEEPS artifacts/)
+spar cleanup <run_id> --purge-artifacts  # …and artifacts/ too
+spar cleanup <run_id> --if-merged        # refuse unless the work landed (squash-aware), then reap
+spar cleanup <run_id> --force            # archive unsaved work to refs/spar-archive/<id>/<slot>, then remove
 spar cleanup --all [--older-than 7d]     # sweep finished runs project-wide
 spar reclaim <run_id> | --all [--json]   # delete build output, KEEP the worktree
-spar reconcile-state <run_id> | --all    # settle slots a dead orchestrator left `running`
+spar reclaim --all --halted              # …also gated (awaiting_*) and abandoned in-flight runs
+spar reconcile-state <run_id> | --all    # settle slots a dead orchestrator left `running`,
+                                         # and park its in-flight phase at `stopped`
 spar reconcile-state <run_id> --apply    # …and write it (bare form only reports)
 spar archive <run_id> [--undo] [--json]  # hide a finished run from listings
 spar archive --all [--older-than 14d]    # done/plan_rejected AND stopped/failed/stuck/quota
@@ -345,9 +356,12 @@ spar link <run_id> --undo                # and back out again
 spar brief <run_id> [--full] [--json]    # re-hydrate a fresh session: phase, gates, fleet,
                                          # brief, artifacts, the exact next command. Read-only.
 spar resume <run_id> [--detach] [--json] # pick a stopped or abandoned run back up
+spar daemon install                      # systemd user unit supervising every registered project
+spar daemon uninstall                    # stop, disable and remove it
 spar daemon start [--foreground]         # per-project supervisor: restart + abandoned alert + cap
+spar daemon start --all-projects         # every registered project, foreground (what the unit runs)
 spar daemon status [--json]
-spar daemon stop
+spar daemon stop                         # release this project (the all-projects process keeps the rest)
 spar bus send --run <run> --from <id> --to <to> --surface chat --conversation <cid> --turn <tid> --message "..."  # orchestrator turn reply
 ```
 
@@ -402,6 +416,12 @@ it may spend on its own.
 ```bash
 spar implement --run <id> --max-rounds 12   # buy more rounds; sticky on the run
 ```
+
+**A round that never dispatched is not charged.** `implement --run` re-entering a run whose
+current round never stamped a slot (the orchestrator died between opening the round and
+spawning anything, or the round parked at `quota` before dispatch) reuses that round
+number instead of opening another. Any slot dispatched in the round, even one that then
+died, makes the next re-entry a new round.
 
 - Re-entering `implement` at the ceiling with no flag gates again **before dispatching
   anything**, so a bounced re-entry costs nothing and claims no round.
@@ -620,6 +640,37 @@ fast-forwards the implementer's branch back onto HEAD before each review panel w
 left the worktree elsewhere, and only warns (stderr + event log) when that is not a
 fast-forward, the branch is still at the base, or it is checked out in another worktree.
 
+## Checkpoints: the implementer's work survives its worktree
+
+After every implementer dispatch, spar snapshots the slot worktree, commits **and**
+uncommitted edits, to the local ref `refs/spar-checkpoint/<run_id>/<slot>` in the project
+repo. When the slot died (exit, signal, ceiling, transport), the snapshot is a WIP commit on
+top of the branch, taken before the slot is marked failed. The snapshot uses a throwaway
+index and `git commit-tree`: the worktree's branch, index and files never move. It is not a
+branch, so no PR targets it, and `spar/<id>/<slot>` never resolves to it. The local ref is
+always written and outlives the worktree.
+
+**Pushing it is opt-in: `[checkpoint] push = true`** (frozen into the run when it is
+created, like all config). It then also force-pushes the ref to `origin` after every
+dispatch. **That publishes every round's work in progress to anyone who can read origin**,
+which for a public repo is everyone; a later force-push does not retract the objects.
+Turn it on only for a private remote. The push is best-effort and unattended: stdin closed,
+no terminal or askpass prompt, ssh in `BatchMode` (appended to your `GIT_SSH_COMMAND` or
+`core.sshCommand`), pre-push hooks kept, and the whole process group killed after 60s. A
+failure prints a `warning:` on stderr and an event note, keeps the local ref, and never
+fails the run. The agent still does not push.
+
+Base a replacement run on a dead run's work:
+
+```bash
+spar implement -t "..." --providers cli:claude --base refs/spar-checkpoint/<run_id>/impl
+```
+
+`--base` uses the local ref first, and only when it is missing fetches it from `origin` by
+name (same unattended rules, 60s), which finds it only if that run pushed checkpoints.
+`origin/spar-checkpoint/…` and `spar-checkpoint/…` spellings work too. An unresolvable
+`--base [origin/]spar/<id>/<slot>` names the matching checkpoint ref in its error.
+
 ## Abandoned runs
 
 A run is **abandoned** when it is still in a non-resting phase but no live orchestrator
@@ -640,19 +691,54 @@ children — so they keep running and keep spending tokens with nobody collectin
 - On **SIGINT/SIGTERM** an orchestrating `spar` signals its slot groups before it exits,
   so a polite kill no longer orphans anything. `SIGKILL` cannot be caught: that is what
   the three above are for.
-- `spar resume <id>` picks an abandoned or stopped run back up without you having to know
-  which of `implement --run` / a fresh dispatch applies — it refuses a human gate (naming
-  the command that resolves it) and a run with a live orchestrator (naming its pid).
-  `implement --run <id>` (with or without `--detach` / `--reload-config`) refuses the same
-  way, exit 1, before it writes anything to the live run's `state.json`.
+- `spar resume <id>` picks an abandoned or stopped run back up from any non-terminal
+  phase without you having to know which of `implement --run` / a fresh dispatch applies.
+  An approved plan that died mid-flight continues into implementation (never a second plan
+  round); a run that died in `shipping` goes back to `awaiting_ship_confirm` (exit `2`)
+  instead of re-running its rounds, since shipping is yours. It refuses a human gate
+  (naming the command that resolves it) and a run with a live orchestrator (naming its
+  pid). `implement --run <id>` (with or without `--detach` / `--reload-config`) refuses a
+  live orchestrator the same way, exit 1, before it writes anything to the live run's
+  `state.json`, and on an abandoned in-flight run names `spar resume` in its refusal.
 - A foreground `spar plan` holds the run lock for its whole dispatch, so it never reads
   abandoned while its planner works.
-- `spar daemon start` runs a per-project supervisor that pushes an alert the first time a
-  run has read abandoned past `[daemon].abandon_after_secs` (60s by default), and restarts
-  it if `[daemon].restart` is on (the default). It is opt-in — nothing starts it for you —
-  and it never approves a plan, confirms ship, merges, sweeps `cleanup`, or picks a fleet;
-  it only ever restarts the same orchestrator a plain `spar resume` would have, and tells
-  you when one is waiting. `spar daemon status` / `spar daemon stop`.
+- `spar reconcile-state --all --apply` parks every abandoned in-flight run at `stopped`,
+  except one that died in `shipping`, which goes back to `awaiting_ship_confirm` (its
+  rounds are done; `stopped` would make the next resume buy another), and settles its
+  dead slots without signalling anything; `--json` lists them under
+  `phases`. A run whose slot processes still run is skipped with a reason: that is
+  `spar stop --abandoned`'s job.
+- **The supervisor is the default: `spar daemon install` on every box.** It writes
+  `~/.config/systemd/user/spar-daemon.service` (`$XDG_CONFIG_HOME` honoured) running
+  `spar daemon start --foreground --all-projects` from the installed binary, with the
+  installing shell's `PATH` (and `SPAR_HOME`) frozen in, `EnvironmentFile=-~/.config/spar/daemon.env`,
+  `Restart=on-failure`, and
+  `KillMode=process` so stopping the unit never kills the orchestrators it restarted. It
+  then runs `systemctl --user daemon-reload` and `enable --now`; if that fails the unit is
+  left written, the commands are printed and it exits `1`. User units stop at logout and
+  start at login unless lingering is on: install warns until you run `loginctl
+  enable-linger $USER`, which is what makes it survive a reboot with nobody logged in.
+  `spar daemon uninstall` disables and removes it. Nothing installs or starts it for you.
+  **Restarted runs need your provider keys:** the unit never contains secrets, so put
+  `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `XAI_API_KEY`, `OPENROUTER_API_KEY`, `HTTPS_PROXY`,
+  `NO_PROXY` and anything else your shell exports for the CLIs into
+  `~/.config/spar/daemon.env`, one `KEY=value` per line. Install creates it empty and
+  `0600` if missing and never overwrites it; `systemctl --user restart spar-daemon` after
+  editing it.
+- What the supervisor does, per project: pushes an alert the first time a run has read
+  abandoned past `[daemon].abandon_after_secs` (60s by default), and restarts it if
+  `[daemon].restart` is on (the default). One process covers every project in the
+  registry (`~/.spar/registry.json`), picking up new ones as they appear, and still takes
+  each project's `.spar/daemon.lock`, so a project with its own `spar daemon start` is
+  left to it. `spar daemon stop` in a project releases that project. It never approves a
+  plan, confirms ship, merges, sweeps `cleanup`, or picks a fleet; it only ever restarts
+  the same orchestrator a plain `spar resume` would have, and tells you when one is
+  waiting. `spar daemon status` reports the project you stand in.
+- **A run that died shipping is never re-run.** `spar ship` holds the run lock through
+  `shipping`, so a slow push does not read as abandoned. If the ship process dies anyway,
+  every resume entry (`spar resume`, the daemon's restart) puts the run back at
+  `awaiting_ship_confirm` (exit `2`) without dispatching anything: run `spar ship <id>`
+  again. `spar ship` refuses a run another process holds.
 
 ### Budgets and nudges: nothing kills a slot on tokens (O50)
 
@@ -687,6 +773,13 @@ slot is stuck on.**
 - A slot the ceiling killed records `error: "hard ceiling: killed after …"` and
   **`"ceiling_kill": true`** in `status --json`, which is how you tell it from a crash
   (`exit 143`, a signal) without parsing prose. Exit codes are unchanged.
+- **The ceiling is a clock, not a verdict.** Before an implementer the ceiling killed is
+  marked failed, spar checks whether it finished anyway: an expected artifact written
+  during this dispatch keeps the slot `done`; new commits since the dispatch began earn the
+  same artifact-only recovery turn a clean exit without its artifact gets (below). Either
+  way the slot note reads `killed at the hard ceiling after finishing its work; kept as
+  done` and the round goes on to review. A dirty tree alone is not enough (that is a round
+  cut short; its checkpoint keeps it). Implementer only, like the recovery turn.
 - Delivery is per-adapter and you never choose it. **claude** takes nudges through its
   inbox, which its `Stop` hook drains at the turn boundary. **grok** takes them through
   the same `Stop`-hook injection that **claude** uses: spar writes a project hook file
@@ -752,8 +845,9 @@ settle that, and you do not have to do anything to get the first two:
 - **`spar reconcile-state`** backfills runs that were already left that way. It reports
   by default and writes only with `--apply`; `--all` scans the project. It **skips any
   run with a live orchestrator** (listed under `skipped` in `--json`) because that
-  orchestrator is the authority on its own slots. It rewrites **only** `slots[].status`
-  and `slots[].error` (never a worktree, branch, log or artifact) and is deliberately not
+  orchestrator is the authority on its own slots. It rewrites **only** `slots[].status`,
+  `slots[].error` and, for an in-flight run nobody drives, `phase` (to `stopped`, keeping
+  `updated_at`), never a worktree, branch, log or artifact, and is deliberately not
   part of `spar cleanup`, which does remove worktrees. It always exits `0`.
 
 A slot's `exit_code` / `signal` / `pid` / `usage` describe its **last dispatch** and are
@@ -772,6 +866,19 @@ directory going away. Slots die with their orchestrator, not with your shell. If
 left with no owner, `spar status` marks it `ABANDONED` and `spar resume <id>` picks it
 back up; `spar daemon` does that for you.
 
+**Without `--detach` and without a terminal, the orchestrator dies with your shell.**
+`plan`, `implement`, `run` and `resume` print `warning: stdin is not a terminal and
+--detach was not given: this orchestrator dies with the shell that launched it …` on
+stderr in that case (`timeout N spar …`, `ssh box 'spar resume …'`, an agent's tool call).
+They do not detach for you: `--detach` changes what the exit code reports, so that stays
+your choice. Dry runs do not warn.
+
+**A run deleted under its orchestrator stays deleted.** `spar cleanup <id>` (with or without
+`--purge`) refuses, exit `1`, while the run's orchestrator is alive: `spar stop <id>` first.
+If the run dir or its `state.json` disappears anyway, the orchestrator's next write fails
+with `run <id> was removed from disk while this orchestrator held it` and it exits `1`
+without recreating the run or dispatching anything more.
+
 **Worktrees are not reclaimed on their own.** A successful run ends at the **ship gate**,
 not at `done`, and `auto_cleanup` is off by default, so a project accumulates one worktree
 per slot per run until you sweep. `spar cleanup --all` reaps every run nothing can resume
@@ -781,6 +888,11 @@ evidence nobody is coming back for them. A run **in flight is never swept**, aba
 not: park it first (`spar stop`, or `spar stop --abandoned`). Run data under
 `.spar/runs/<id>` survives a sweep unless you pass `--purge`; only worktrees go. A purge
 appends the run's line to `.spar/history.jsonl` first.
+`--purge` deletes the run record (state, logs, prompts, markers) and **keeps
+`.spar/runs/<id>/artifacts/`** (plan, reviews, suite report: what merge decisions are made
+from); `--json` reports `artifacts_kept: true`. `--purge-artifacts` implies `--purge` and
+deletes `artifacts/` as well. A run with only `artifacts/` left no longer lists anywhere;
+`spar cleanup <id> --purge-artifacts` still removes those leftovers later.
 
 Rejecting a plan (`spar reject`) reaps that run's worktrees immediately — nothing can
 resume a rejected plan — while keeping `plan.md` and the critique that justified it.
@@ -832,7 +944,21 @@ commits the run's base does not contain, and the worktree is skipped with a reas
 `remove_worktree` runs `git worktree remove --force` *and* `git branch -D`, so an unmerged
 commit is as gone as an unsaved edit. The check lives at the removal itself, so every
 evidence path inherits it. `spar cleanup <id> --force` overrides for a run you name;
-there is deliberately no `--all --force`.
+there is deliberately no `--all --force`. `--force` no longer destroys that work: before
+deleting a worktree it would have refused, it snapshots the dirty tree plus every commit
+its HEAD and branch reach into one commit at `refs/spar-archive/<run_id>/<slot>` in the
+project repo (`archived` in `--json`, `archived <path> to <ref>` in text). A worktree that
+cannot be archived is kept. Recover with `git checkout -b rescue refs/spar-archive/<id>/impl`.
+
+**Reap after a merge with `--if-merged`, not `gh pr view … && spar cleanup`.** `spar cleanup
+<id> --if-merged` exits `1` and removes nothing unless every worktree is clean and every
+commit its branch and HEAD reach is in the run's base (`base_ref`, local or `origin/`) by
+one of: ancestry; a **merged** PR for the branch (`gh pr view <branch> --json
+state,headRefOid`) whose head contains it; or patch-id containment, commit by commit
+(rebase merge) or as one combined diff (squash merge). A branch contained in another branch
+that landed counts as landed. `gh` missing or failing just skips that evidence. When it
+passes, it reaps the way `--force` does, archive included. Only with a run id; the sweep's
+evidence stays `--merged` (ancestry), so squash-merged runs are reaped by id.
 
 **Age is never evidence for a run parked at a gate.** `awaiting_plan_approval` and friends
 are blocked on *you*: idle time there measures how busy you were, not whether the run was
@@ -843,6 +969,12 @@ finished run's worktrees and keeps the worktree, its branch, every commit and an
 uncommitted changes. Because it destroys nothing a build cannot regenerate it needs no
 evidence, no age threshold and no confirmation — which is exactly why it is a separate
 command and not a `cleanup` flag. It skips any tree with a live process working in it.
+By default it covers finished and `stopped` runs. **`--halted`** also covers every run
+nothing is driving: parked at a human gate (`awaiting_*`) or in flight with no live
+orchestrator (abandoned). A run whose orchestrator is alive is never touched, and
+`reclaim <id>` on a gated or abandoned run without `--halted` exits `1` naming the flag.
+`--halted` is manual only: no timer or `auto_*` knob runs it. Schedule it yourself if you
+want it hourly.
 `auto_reclaim` (default **true**) does the same for a run's own worktrees when its
 orchestrator finishes. Measured: 457 GB of 587 GB under one projects dir was build output,
 and the largest single object on the machine was a *stopped* run's target dir.
@@ -851,7 +983,7 @@ and the largest single object on the machine was a *stopped* run's target dir.
 also reaps at-rest runs whose every slot branch is already contained in the run's own
 `base_ref` — the work is in the base branch, so there is nothing left to lose. It still
 cannot touch a run in flight. Containment is **ancestry**, so a **squash-merged** branch
-reads as unmerged and needs `--older-than` or an explicit run id.
+reads as unmerged and needs `--older-than` or `spar cleanup <id> --if-merged`.
 
 **This also runs on its own.** `[worktree] auto_cleanup_merged` (default **true**) reaps
 merged at-rest runs project-wide just before a launch cuts new slot worktrees — the
@@ -1429,6 +1561,10 @@ enabled = true
 [rounds]
 max = 8
 carry_forward_chars = 4000
+# Implementer checkpoints are always kept locally at refs/spar-checkpoint/<id>/<slot>.
+# push = true also publishes them to origin, readable by anyone who can read origin.
+[checkpoint]
+push = false
 # Pre-coding acceptance tests (plan). Separate test-author agent; not planner/critic.
 [spec]
 enabled = true
@@ -1440,7 +1576,7 @@ timeout_secs = 3600    # test_author's SOFT clock; hard_ceiling_multiple applies
 [notify]
 # command = "..."   # shell out; message on argv/stdin
 # webhook = "..."   # POST message json
-# Per-project supervisor (`spar daemon start`). Opt-in, never auto-started. Safe from a
+# Supervisor (`spar daemon install`, or `spar daemon start` per project). Never auto-started. Safe from a
 # repo spar.toml: no command execution, no outbound request, unlike [notify].
 [daemon]
 # tick_secs = 15               # supervision loop period
