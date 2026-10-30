@@ -114,7 +114,7 @@ fn dry_run_status_reports_pid_liveness() {
 #[cfg(unix)]
 #[test]
 fn foreground_workflows_acquire_orchestrator_lock() {
-    for workflow in ["review", "arena", "roles", "peer"] {
+    for workflow in ["plan", "review", "arena", "roles", "peer"] {
         assert_foreground_lock(workflow);
     }
 }
@@ -246,10 +246,29 @@ fn assert_foreground_lock(workflow: &str) {
         std::thread::sleep(Duration::from_millis(20));
     };
     let sv: Value = serde_json::from_slice(&st).unwrap();
+    let listing = spar_cmd()
+        .current_dir(&proj)
+        .args(["status"])
+        .output()
+        .unwrap();
 
     let _ = child.kill();
     let _ = child.wait();
 
+    let listing = String::from_utf8_lossy(&listing.stdout);
+    assert!(
+        listing.contains(&format!("{run_id}  ")) && listing.contains(&format!(" pid={pid}")),
+        "the human status line must name the live {workflow} orchestrator pid: {listing}"
+    );
+    assert!(
+        !listing.contains("ABANDONED"),
+        "a {workflow} run with a live orchestrator must not read abandoned: {listing}"
+    );
+    assert_eq!(
+        sv["abandoned"],
+        Value::Bool(false),
+        "a {workflow} run with a live orchestrator must not read abandoned: {sv}"
+    );
     assert_eq!(
         sv["orchestrator_pid"].as_u64(),
         Some(pid),

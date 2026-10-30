@@ -96,6 +96,14 @@ pub fn run(
         return Ok(ExitCode::Failure);
     }
     paths.ensure_run_dirs(&state.id)?;
+    // A detached plan is driven by the child it spawns, which takes the lock itself.
+    // In the foreground this process is the orchestrator: without the lock the run
+    // reads abandoned for the whole planner dispatch, and the daemon may restart it.
+    let _lock = if opts.detach {
+        None
+    } else {
+        Some(crate::runlock::RunLock::acquire(paths, &state.id)?)
+    };
     let _ = bus::ensure_bus(paths);
     let _ = bus::join(paths, Some(&state.id), "orchestrator", None, None);
     state.save(paths)?;

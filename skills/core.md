@@ -826,7 +826,7 @@ event/presence mirror live under `.spar/runs/<id>/bus/`.
 ## Observe
 
 ```bash
-spar status [run_id] [--json] [--all]   # --all = every registered project
+spar status [run_id] [--json] [--all]   # --all = every registered project; a run with a live orchestrator shows `pid=<n>`
 spar wait <run_id> [--timeout 8h] [--follow] [--json]
 spar logs <run_id> [slot] [-f|--follow]
 

@@ -986,6 +986,13 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> 
                 last_proj = proj;
             }
             let dry = if summary.dry_run { " dry" } else { "" };
+            let orch = summary
+                .project_root
+                .as_ref()
+                .and_then(|root| runlock::RunLock::owner(&paths::SparPaths::new(root), &summary.id))
+                .filter(|t| t.alive())
+                .map(|t| format!(" pid={}", t.pid))
+                .unwrap_or_default();
             let abandoned = if summary.abandoned { " ABANDONED" } else { "" };
             let arch = if summary.archived { " archived" } else { "" };
             let task = summary
@@ -994,7 +1001,7 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> 
                 .map(|t| format!("  {}", truncate_cli(t, 40)))
                 .unwrap_or_default();
             println!(
-                "    {}  {:?}{}{abandoned}{arch}{task}",
+                "    {}  {:?}{}{orch}{abandoned}{arch}{task}",
                 summary.id, summary.phase, dry
             );
         }
