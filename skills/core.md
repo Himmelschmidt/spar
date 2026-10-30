@@ -498,12 +498,15 @@ spar implement --run <id> --max-rounds +2   # two rounds past the current one (O
 **Extending (O127).** The value must land above the run's current round (a round opened
 but never dispatched may be the ceiling itself); anything lower would re-park at once,
 so it is refused, exit `1` (a validation refusal, JSON under `--json`). Sent while an
-orchestrator still holds the run, a bare `implement --run <id> --max-rounds …` (no `-t`,
-`--providers`, `--select`, `--base`, `--reload-config`, `--accept-contract`) is
+orchestrator still holds an **in-flight** run, a bare `implement --run <id> --max-rounds …`
+(no `-t`, `--providers`, `--select`, `--base`, `--reload-config`, `--accept-contract`) is
 **queued**, not refused busy: exit `0`, JSON `{"run_id", "queued_max_rounds", "owner_pid",
-"round"}`, and a `markers/max-rounds.queued` file the loop reads just before its next
-ceiling check (or the next re-entry reads, if the orchestrator exits first). A queued
-value only ever raises the ceiling. `spar doctor` recommends a `[notify]` sink when any
+"round"}`, and a `markers/max-rounds.queued` file the loop reads before its next ceiling
+check and once more right after saving the gate (or the next re-entry reads, if the
+orchestrator exits first). A run **already parked** at a gate whose orchestrator is still
+finishing up is not queued: the command waits up to 10s for the lock and applies the
+extension normally, or exits `1` with the busy error (JSON under `--json`). A queued value
+only ever raises the ceiling. `spar doctor` recommends a `[notify]` sink when any
 run has sat at a human gate for over an hour with none configured.
 
 **A round that never dispatched is not charged.** `implement --run` re-entering a run whose
@@ -1755,6 +1758,9 @@ timeout_secs = 3600    # test_author's SOFT clock; hard_ceiling_multiple applies
 # re-entry (implement --run, resume, plan --run, reconcile, daemon restarts), warning on
 # stderr (names only) when the re-entering shell differs. Only variables set at creation
 # are recorded. Names containing KEY, TOKEN, SECRET or PASSWORD are refused at load (O130).
+# config.json is written 0600 when it holds captured values; nothing prints them. A slot's
+# own env beats captured env, which beats the shell. tmux panes get them via `-e`.
+# `implement --run <id> --reload-config --recapture-env` re-captures from the current shell.
 [env]
 # capture = ["CARGO_TARGET_DIR", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
 #            "https_proxy", "http_proxy", "all_proxy", "no_proxy"]   # the default

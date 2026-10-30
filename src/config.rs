@@ -1387,8 +1387,30 @@ impl Config {
     pub fn save_snapshot(&self, paths: &SparPaths, run_id: &str) -> Result<()> {
         paths.ensure_run_dirs(run_id)?;
         let path = paths.run_config_file(run_id);
-        std::fs::write(&path, serde_json::to_string_pretty(self)?)
-            .with_context(|| format!("write run config {}", path.display()))
+        let text = serde_json::to_string_pretty(self)?;
+        // Captured `[env]` values can carry proxy credentials: owner-only, set at creation
+        // of a temp file and renamed in, so the file is never readable wider in between.
+        let mode = if self.env.captured.is_empty() {
+            0o644
+        } else {
+            0o600
+        };
+        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(mode)
+                .open(&tmp)
+                .with_context(|| format!("write run config {}", tmp.display()))?;
+            f.write_all(text.as_bytes())
+                .with_context(|| format!("write run config {}", tmp.display()))?;
+        }
+        std::fs::rename(&tmp, &path).with_context(|| format!("write run config {}", path.display()))
     }
 
     /// Overlay `--role <role>=<provider>` onto `[roles]`, so a run's fleet can be chosen

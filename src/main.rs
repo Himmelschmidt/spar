@@ -254,18 +254,12 @@ fn run() -> Result<ExitCode> {
                 cfg.apply_backup_overrides(&backup)?;
                 cfg.apply_effort_overrides(&effort)?;
                 cfg.apply_suite_command(&suite_command, &without)?;
-                let (task_text, brief_path) = match (spec, brief, task) {
-                    // A pre-check must not leave a brief behind, so it reads the spec
-                    // without intaking it.
-                    (Some(path), None, None) if validate_only => {
-                        (brief::read_spec_text(&path)?, None)
-                    }
+                // `--spec` is read now and copied into `.spar/briefs/` only after the
+                // pre-check passes, so neither a refusal nor `--validate-only` leaves one.
+                let (task_text, brief_path, spec_body) = match (spec, brief, task) {
                     (Some(path), None, None) => {
-                        let b = brief::intake(&paths, &path)?;
-                        if !json {
-                            eprintln!("brief {} written to {}", b.slug, b.path.display());
-                        }
-                        (b.body, Some(b.path))
+                        let body = brief::read_spec_text(&path)?;
+                        (body.clone(), None, Some(body))
                     }
                     (None, Some(path), None) => {
                         if path == std::path::Path::new("-") {
@@ -279,9 +273,9 @@ fn run() -> Result<ExitCode> {
                             .strip_prefix(&paths.project_root)
                             .map(|p| p.to_path_buf())
                             .unwrap_or(path.clone());
-                        (body, Some(rel))
+                        (body, Some(rel), None)
                     }
-                    (None, None, Some(t)) => (t, None),
+                    (None, None, Some(t)) => (t, None, None),
                     _ => unreachable!("exactly one of task/spec/brief"),
                 };
                 let opts = CommonOpts {
@@ -302,6 +296,16 @@ fn run() -> Result<ExitCode> {
                     reload_config: false,
                 };
                 workflow::preflight(&opts, &paths, &cfg)?;
+                let brief_path = match spec_body {
+                    Some(body) if !validate_only => {
+                        let b = brief::intake_body(&paths, &body)?;
+                        if !json {
+                            eprintln!("brief {} written to {}", b.slug, b.path.display());
+                        }
+                        Some(b.path)
+                    }
+                    _ => brief_path,
+                };
                 Ok((paths, cfg, task_text, brief_path, opts))
             })();
             let (paths, cfg, task_text, brief_path, opts) = match prepared {
@@ -349,6 +353,7 @@ fn run() -> Result<ExitCode> {
             without,
             suite_command,
             reload_config,
+            recapture_env,
             max_rounds,
             accept_contract,
             base,
@@ -376,6 +381,7 @@ fn run() -> Result<ExitCode> {
                     &suite_command,
                     fleet.as_deref(),
                     reload_config,
+                    recapture_env,
                     !validate_only,
                 )?;
                 let opts = CommonOpts {
@@ -421,10 +427,19 @@ fn run() -> Result<ExitCode> {
             if validate_only {
                 return launch_validated(json, run_id.as_deref());
             }
-            if run_id.is_some() {
-                cfg.reapply_captured_env();
-            }
-            workflow::implement::run_from_cli(run_id, plan, task, new, opts, &paths, &cfg)
+            let target = run_id.clone();
+            // A round extension refused or found busy after the pre-check is still a
+            // refusal: nothing was dispatched, so `--json` gets the same shape.
+            workflow::implement::run_from_cli(run_id, plan, task, new, opts, &paths, &cfg).or_else(
+                |e| {
+                    if e.is::<workflow::implement::RoundExtensionRefused>()
+                        || e.is::<runlock::OrchestratorBusy>()
+                    {
+                        return launch_refused(e, json, target.as_deref());
+                    }
+                    Err(e)
+                },
+            )
         }
         Command::Run {
             workflow,
@@ -702,10 +717,7 @@ fn usage_error(e: clap::Error) -> Result<ExitCode> {
         e.exit();
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let launch = args
-        .iter()
-        .find(|a| !a.starts_with('-'))
-        .is_some_and(|c| matches!(c.as_str(), "plan" | "implement" | "run"));
+    let launch = subcommand_of(&args).is_some_and(|c| matches!(c, "plan" | "implement" | "run"));
     if launch && args.iter().any(|a| a == "--json") {
         let msg = e.render().to_string();
         let msg = msg.trim().trim_start_matches("error: ");
@@ -713,6 +725,23 @@ fn usage_error(e: clap::Error) -> Result<ExitCode> {
     }
     let _ = e.print();
     Ok(ExitCode::Failure)
+}
+
+/// The subcommand in a raw argv clap could not parse: the first positional, skipping
+/// the global flags and the values `--cwd` / `--task` take (`spar --cwd /p plan …`).
+fn subcommand_of(args: &[String]) -> Option<&str> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--cwd" || a == "--task" {
+            it.next();
+            continue;
+        }
+        if a.starts_with('-') {
+            continue;
+        }
+        return Some(a);
+    }
+    None
 }
 
 /// A launch refused before it made a run. `--json` callers get one parseable shape on
@@ -1009,6 +1038,7 @@ fn implement_ctx(
     suite_command: &[String],
     fleet: Option<&str>,
     reload_config: bool,
+    recapture_env: bool,
     persist: bool,
 ) -> Result<(paths::SparPaths, Config)> {
     let (paths, mut cfg) = project_ctx()?;
@@ -1076,9 +1106,12 @@ fn implement_ctx(
     cfg.carry_cli_suite_command(&frozen);
     // A reload re-reads the file, not the shell: the environment stays the one the run
     // was created in, and only a name newly added to `[env].capture` is taken from now.
-    for (k, v) in frozen.env.captured {
-        if cfg.env.capture.contains(&k) {
-            cfg.env.captured.insert(k, v);
+    // `--recapture-env` is the deliberate exception: this shell's values replace them.
+    if !recapture_env {
+        for (k, v) in frozen.env.captured {
+            if cfg.env.capture.contains(&k) {
+                cfg.env.captured.insert(k, v);
+            }
         }
     }
     if let Some(preset) = fleet {

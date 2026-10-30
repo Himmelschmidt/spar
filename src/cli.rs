@@ -211,6 +211,10 @@ pub enum Command {
         /// the project file says now.
         #[arg(long)]
         reload_config: bool,
+        /// With `--reload-config`: also re-capture `[env]` from this shell, replacing the
+        /// values the run was created with. Without it a reload keeps them (O130).
+        #[arg(long, requires = "reload_config")]
+        recapture_env: bool,
         /// Raise this run's round ceiling to N, or to N past its current round with
         /// `+N`, and keep going. A run that reaches `[rounds] max` parks at the
         /// `awaiting_round_extension` gate (exit 2) rather than buying another cold

@@ -243,7 +243,12 @@ pub fn apply_run_base(state: &mut RunState, requested: Option<&str>, json: bool)
 /// primary checkout days behind main runs a merged config change nowhere (#189). Absent
 /// on both sides is no drift; absent on one side is.
 fn config_source_drift(project_root: &Path, commit: &str) -> bool {
-    let at_base = git_out(project_root, &["show", &format!("{commit}:spar.toml")]);
+    // A project nested inside its repo keeps `spar.toml` under that prefix in the tree.
+    let prefix = git_out(project_root, &["rev-parse", "--show-prefix"]).unwrap_or_default();
+    let at_base = git_out(
+        project_root,
+        &["show", &format!("{commit}:{prefix}spar.toml")],
+    );
     let working = std::fs::read_to_string(project_root.join("spar.toml"))
         .ok()
         .map(|s| s.trim().to_string());

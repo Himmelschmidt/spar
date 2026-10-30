@@ -4015,6 +4015,21 @@ fn tmux_refused_assigned_outcome(
     })
 }
 
+/// The slot's own env plus every captured `[env]` value it does not set itself: slot
+/// env beats captured env, captured env beats whatever the process would inherit.
+fn slot_env_over_captured(
+    slot: &[(String, String)],
+    captured: &std::collections::BTreeMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut out = slot.to_vec();
+    for (k, v) in captured {
+        if !slot.iter().any(|(s, _)| s == k) {
+            out.push((k.clone(), v.clone()));
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_tmux(
     state: &mut RunState,
@@ -4085,7 +4100,14 @@ fn run_tmux(
     let cmdline = format!("{} {}", program.display(), args.join(" "));
     let shell = tmux::shell_wrap(&program, &args, log_path);
 
-    tmux::spawn_window(&session, &job.slot_id, cwd, &shell, env)?;
+    // A pane is a child of the shared tmux server, whose environment froze when the
+    // server started, not of this orchestrator: the run's captured `[env]` has to ride
+    // `-e` explicitly. The slot's own env wins over it (O130).
+    let captured = Config::for_run(paths, &state.id)
+        .map(|c| c.env.captured)
+        .unwrap_or_default();
+    let pane_env = slot_env_over_captured(env, &captured);
+    tmux::spawn_window(&session, &job.slot_id, cwd, &shell, &pane_env)?;
     // pi's pane runs its headless JSON stream (`interactive: false`), so the teed log
     // replays through the coalescer.
     let replays_stream = cli_name == "pi";
@@ -5353,6 +5375,29 @@ mod tests {
         fn is_usage_error(&self, code: Option<i32>) -> bool {
             self.usage_error_2 && code == Some(2)
         }
+    }
+
+    /// O130 precedence for a tmux pane: the slot's own value (a per-slot
+    /// CARGO_TARGET_DIR) wins; a captured value fills only what the slot leaves unset.
+    #[test]
+    fn slot_env_beats_captured_env_in_a_pane() {
+        let slot = vec![("CARGO_TARGET_DIR".to_string(), "/pool/slot-1".to_string())];
+        let captured = std::collections::BTreeMap::from([
+            ("CARGO_TARGET_DIR".to_string(), "/shared/target".to_string()),
+            (
+                "HTTPS_PROXY".to_string(),
+                "http://proxy.invalid:3128".to_string(),
+            ),
+        ]);
+        let env = slot_env_over_captured(&slot, &captured);
+        let get = |k: &str| {
+            env.iter()
+                .filter(|(e, _)| e == k)
+                .map(|(_, v)| v.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(get("CARGO_TARGET_DIR"), ["/pool/slot-1"]);
+        assert_eq!(get("HTTPS_PROXY"), ["http://proxy.invalid:3128"]);
     }
 
     fn shell_req(script: &str, log_path: &Path) -> SpawnRequest {
