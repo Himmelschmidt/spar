@@ -313,6 +313,24 @@ pub enum Command {
         archived: bool,
     },
 
+    /// Aggregate run history: rounds, outcomes, review findings, cost, wall time and
+    /// quota events, grouped by model, role, provider or project
+    Stats {
+        /// Only runs that ended (or last changed) within this window: `7d`, `12h`, `30m`
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long, value_enum, default_value = "provider")]
+        by: crate::stats::GroupBy,
+        /// Every project in the local registry, not just this one
+        #[arg(long)]
+        all_projects: bool,
+        /// Count `--dry-run` runs too
+        #[arg(long)]
+        include_dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Delete regenerable build output (`target/`, `node_modules`) inside finished runs'
     /// worktrees. Keeps the worktree, its branch and every commit — this is not `cleanup`
     Reclaim {

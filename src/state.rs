@@ -841,11 +841,9 @@ impl RunState {
         crate::runlock::note_state_written(paths, &self.id);
 
         if prev_phase != Some(self.phase) {
-            let _ = crate::events::append(
-                paths,
-                &self.id,
-                &crate::events::Event::phase(self.phase, prev_phase),
-            );
+            let mut ev = crate::events::Event::phase(self.phase, prev_phase);
+            ev.round = Some(self.round);
+            let _ = crate::events::append(paths, &self.id, &ev);
             if self.phase.is_gate() {
                 let _ = crate::events::append(
                     paths,

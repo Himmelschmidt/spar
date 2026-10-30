@@ -93,6 +93,33 @@ pub struct ProviderQuota {
 pub struct QuotaStore {
     #[serde(default)]
     pub providers: HashMap<String, ProviderQuota>,
+    /// Pauses made since load, appended to `quota-events.jsonl` by `save`.
+    #[serde(skip)]
+    pending: Vec<QuotaEvent>,
+}
+
+pub const QUOTA_EVENTS_SCHEMA: u32 = 1;
+
+/// One line of `.spar/quota-events.jsonl`: a provider paused, by an operator or on a
+/// quota signal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaEvent {
+    pub schema_version: u32,
+    pub ts: DateTime<Utc>,
+    pub provider: String,
+    pub manual: bool,
+    #[serde(default)]
+    pub until: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub hint: Option<String>,
+}
+
+pub fn read_events(paths: &SparPaths) -> Vec<QuotaEvent> {
+    std::fs::read_to_string(paths.quota_events_file())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
 }
 
 impl QuotaStore {
@@ -107,12 +134,37 @@ impl QuotaStore {
         Ok(serde_json::from_str(&text)?)
     }
 
-    pub fn save(&self, paths: &SparPaths) -> Result<()> {
+    pub fn save(&mut self, paths: &SparPaths) -> Result<()> {
         paths.ensure_swarm_root()?;
         let file = paths.quota_file();
         let text = serde_json::to_string_pretty(self)?;
         std::fs::write(&file, text).with_context(|| format!("write {}", file.display()))?;
-        Ok(())
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let mut lines = String::new();
+        for ev in self.pending.drain(..) {
+            lines.push_str(&serde_json::to_string(&ev)?);
+            lines.push('\n');
+        }
+        let path = paths.quota_events_file();
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, lines.as_bytes()))
+            .with_context(|| format!("append {}", path.display()))
+    }
+
+    fn note_pause(&mut self, name: &str, manual: bool, until: Option<DateTime<Utc>>, hint: &str) {
+        self.pending.push(QuotaEvent {
+            schema_version: QUOTA_EVENTS_SCHEMA,
+            ts: Utc::now(),
+            provider: name.into(),
+            manual,
+            until,
+            hint: Some(hint.into()),
+        });
     }
 
     pub fn get(&self, name: &str) -> ProviderQuota {
@@ -159,6 +211,7 @@ impl QuotaStore {
         } else {
             ProviderStatus::PausedManual
         };
+        self.note_pause(name, true, until, "manual pause");
         self.providers.insert(
             name.into(),
             ProviderQuota {
@@ -172,13 +225,15 @@ impl QuotaStore {
     }
 
     pub fn pause_quota(&mut self, name: &str, hint: impl Into<String>) {
+        let hint = hint.into();
+        self.note_pause(name, false, None, &hint);
         self.providers.insert(
             name.into(),
             ProviderQuota {
                 name: name.into(),
                 status: ProviderStatus::PausedQuota,
                 cooldown_until: None,
-                hint: Some(hint.into()),
+                hint: Some(hint),
                 updated_at: Some(Utc::now()),
             },
         );
@@ -190,6 +245,8 @@ impl QuotaStore {
         until: Option<DateTime<Utc>>,
         hint: impl Into<String>,
     ) {
+        let hint = hint.into();
+        self.note_pause(name, false, until, &hint);
         self.providers.insert(
             name.into(),
             ProviderQuota {
@@ -200,7 +257,7 @@ impl QuotaStore {
                     ProviderStatus::PausedQuota
                 },
                 cooldown_until: until,
-                hint: Some(hint.into()),
+                hint: Some(hint),
                 updated_at: Some(Utc::now()),
             },
         );
@@ -629,6 +686,26 @@ pub fn ensure_usable(paths: &SparPaths, names: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// Each pause, quota or manual, lands one line in `quota-events.jsonl` on save;
+    /// a resume or a second save of the same store adds none.
+    #[test]
+    fn pauses_are_logged_once_on_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::SparPaths::new(tmp.path());
+        let mut store = super::QuotaStore::default();
+        store.pause_quota("cli:codex", "429");
+        store.pause_manual("cli:claude", None);
+        store.save(&paths).unwrap();
+        store.resume("cli:codex");
+        store.save(&paths).unwrap();
+        let evs = super::read_events(&paths);
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[0].provider, "cli:codex");
+        assert!(!evs[0].manual);
+        assert_eq!(evs[0].hint.as_deref(), Some("429"));
+        assert!(evs[1].manual);
+        assert_eq!(evs[1].schema_version, super::QUOTA_EVENTS_SCHEMA);
+    }
 
     /// A stated reset gives a wall-clock time and no calendar day. Inferring the next
     /// occurrence is sound for a five-hour window and a fabrication for a weekly one,

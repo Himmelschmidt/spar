@@ -35,6 +35,7 @@ mod session_id;
 mod ship;
 mod skills;
 mod state;
+mod stats;
 mod suite;
 mod tasks;
 mod templates;
@@ -411,6 +412,13 @@ fn run() -> Result<ExitCode> {
             all,
             archived,
         } => status_cmd(run_id, json, all, archived),
+        Command::Stats {
+            since,
+            by,
+            all_projects,
+            include_dry_run,
+            json,
+        } => stats_cmd(since.as_deref(), by, all_projects, include_dry_run, json),
         Command::Wait {
             run_id,
             timeout,
@@ -918,6 +926,36 @@ fn auto_archive_at_launch() {
         ),
         _ => {}
     }
+}
+
+fn stats_cmd(
+    since: Option<&str>,
+    by: stats::GroupBy,
+    all_projects: bool,
+    include_dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    let now = chrono::Utc::now();
+    let since = since
+        .map(|s| -> Result<_> { Ok(now - chrono::Duration::from_std(util::parse_duration(s)?)?) })
+        .transpose()?;
+    let projects: Vec<std::path::PathBuf> = if all_projects {
+        registry::ensure_known(paths::find_project_root().ok().as_deref())
+            .projects
+            .into_iter()
+            .map(|p| p.root)
+            .filter(|r| r.is_dir())
+            .collect()
+    } else {
+        vec![paths::find_project_root()?]
+    };
+    let report = stats::report(&projects, since, by, include_dry_run, now)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        stats::print_human(&report);
+    }
+    Ok(ExitCode::Success)
 }
 
 fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> Result<ExitCode> {

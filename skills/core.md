@@ -1045,6 +1045,7 @@ event/presence mirror live under `.spar/runs/<id>/bus/`.
 
 ```bash
 spar status [run_id] [--json] [--all]   # --all = every registered project; a run with a live orchestrator shows `pid=<n>`
+spar stats [--since 7d] [--by model|role|provider|project] [--all-projects] [--json]
 spar wait <run_id> [--timeout 8h] [--follow] [--json]
 spar logs <run_id> [slot] [-f|--follow]
 
@@ -1125,26 +1126,93 @@ stderr and the purge or sweep goes on.
 
 ```json
 {
-  "schema_version": 1, "written_at": "...", "trigger": "terminal" | "purge",
+  "schema_version": 2, "written_at": "...", "trigger": "terminal" | "purge",
   "id": "ab12cd34", "task": "first line of the task", "workflow": "loop",
   "dry_run": false, "phase": "done",
-  "roles": [{"slot": "review-0-cli-codex", "role": "reviewer", "provider": "cli:codex", "model": null}],
+  "roles": [{"slot": "review-0-cli-codex", "role": "reviewer", "provider": "cli:codex",
+             "model": null, "source": "backup" | null, "quota_hit": false}],
   "rounds": 3, "max_rounds": 5,
   "review_rounds": [{"round": 2,
-                     "verdicts": [{"slot": "review-0-cli-codex", "verdict": "request_changes", "synthetic": false}],
+                     "verdicts": [{"slot": "review-0-cli-codex", "verdict": "request_changes",
+                                   "synthetic": false, "blocking": 1}],
                      "findings": {"critical": 0, "major": 1, "minor": 2, "synthetic": 0}}],
   "findings": {"critical": 0, "major": 1, "minor": 2, "synthetic": 0},
   "billed_tokens": 1234567, "cost_usd": 4.2 | null,
   "pr_url": "https://github.com/..." | null,
-  "created_at": "...", "ended_at": "..."
+  "created_at": "...", "ended_at": "...",
+  "dispatches": [{"slot": "impl", "role": "implementer", "provider": "cli:claude",
+                  "model": "claude-opus-5", "billed_tokens": 900000, "cost_usd": 3.1 | null,
+                  "tools": 140, "context_tokens": 180000, "context_semantics": "peak"}],
+  "timing": {"rounds": [{"round": 1, "wall_secs": 2400}],
+             "slots": [{"slot": "impl", "round": 1 | null, "wall_secs": 1800}]},
+  "quota_parks": 0
 }
 ```
 
 Finding counts are per round, deduplicated within a round (same severity, location and
 whitespace-normalized text from two reviewers count once); `findings` sums the rounds.
-Synthetic findings count under `synthetic` only. `cost_usd` is `null` when no dispatch
-reported a cost. `pr_url` is what `gh pr create` printed at ship (also `pr_url` in
-`status --json`).
+Synthetic findings count under `synthetic` only. `blocking` is one review's own critical
+plus major findings. `cost_usd` is `null` when no dispatch reported a cost. `pr_url` is
+what `gh pr create` printed at ship (also `pr_url` in `status --json`). `dispatches` is
+the run's usage ledger, one entry per dispatch, with the model the provider reported.
+`timing.rounds` spans a round's first slot start to its last slot end (a gate wait is not
+counted); a slot timed from before phase events carried the round has `round: null`.
+Schema 1 lines (before O131) have no `dispatches`, `timing`, `quota_parks`, `blocking`,
+`source` or `quota_hit`; read them as empty.
+
+**Quota events.** `.spar/quota-events.jsonl` gets one line per provider pause, automatic or
+`spar provider pause`:
+`{"schema_version": 1, "ts": "...", "provider": "cli:codex", "manual": false, "until": "..." | null, "hint": "..." | null}`.
+
+### Stats (O131)
+
+```bash
+spar stats [--since 7d] [--by model|role|provider|project] [--all-projects] [--include-dry-run] [--json]
+```
+
+Aggregates what spar already wrote: runs still under `.spar/runs/` are read from their own
+state and events (fresher than their history line), purged runs from `history.jsonl`,
+pauses from `quota-events.jsonl`. `--by` defaults to `provider` (the storage key,
+`cli:claude`). `--all-projects` reads every project in the local registry. `--since` keeps
+runs whose `ended_at` (last change, for a live run) and pauses whose `ts` fall inside the
+window. Dry runs are excluded unless `--include-dry-run`; `excluded_dry_runs` says how many.
+Remote hosts are not read.
+
+```json
+{
+  "schema_version": 1, "generated_at": "...", "since": "..." | null, "by": "provider",
+  "projects": ["/path"], "runs": 12, "runs_from_history": 4, "runs_live": 8,
+  "excluded_dry_runs": 0,
+  "groups": [{
+    "key": "cli:codex", "runs": 9, "dispatches": 40,
+    "rounds": {"mean_per_run": 2.4, "mean_to_first_approve": 1.8 | null, "runs_with_approve": 6},
+    "outcomes": {"ship_gate": 6, "ceiling": 1, "stuck": 0, "failed": 1, "quota": 1, "other": 0},
+    "reviews": {"reviews": 18, "synthetic_reviews": 1, "blocking_findings": 9, "blocking_per_review": 0.5 | null},
+    "usage": {"billed_tokens": 123456789, "cost_usd": 12.5 | null,
+              "dispatches_with_cost": 10, "dispatches_without_cost": 30, "tool_calls": 2100},
+    "context": [{"semantics": "invocation_total", "dispatches": 40, "max": 9000000, "mean": 1200000.0}],
+    "wall_time": {"rounds_timed": 20, "round_secs_mean": 1500.0 | null, "round_secs_total": 30000,
+                  "slots_timed": 40, "slot_secs_mean": 600.0 | null, "slot_secs_total": 24000}
+  }],
+  "quota": [{"provider": "cli:codex", "pauses": 3, "manual_pauses": 0, "parks": 1, "backup_engagements": 2}]
+}
+```
+
+- A run counts in every group it had a seat or a dispatch in, so run-level numbers
+  (`runs`, `rounds`, `outcomes`) repeat across `--by role` groups. Dispatch numbers
+  (`usage`, `context`) belong to the dispatch's own group. Reviews and slot wall time go
+  to the reviewer's or slot's group; a slot no longer on the run reads `unknown`.
+- `outcomes`: `ship_gate` is `awaiting_ship_confirm`, `shipping` or `done`; `ceiling` is
+  `awaiting_round_extension`; `other` is anything else (in flight, stopped, a plan end).
+- `mean_to_first_approve`: the first round in which every reviewer approved and none was
+  synthetic, averaged over the runs that had one.
+- `cost_usd` sums only dispatches that reported a cost; `dispatches_without_cost` is how
+  many did not. `null` means none did, not zero.
+- `context` has one entry per `context_semantics`. Numbers measured differently are never
+  combined: a `peak` and an `invocation_total` are different quantities.
+- `quota` is per provider whatever `--by` is. `parks` are charged to providers whose slot
+  hit quota (`unknown` when none was recorded), `backup_engagements` to the backup that
+  took the seat.
 
 ### TUI shape (humans)
 
