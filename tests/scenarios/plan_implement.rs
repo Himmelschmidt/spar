@@ -1619,3 +1619,31 @@ fn empty_task_is_refused_before_any_run_exists() {
     let minted = std::fs::read_dir(&runs).map(|d| d.count()).unwrap_or(0);
     assert_eq!(minted, 0, "a refused launch must not leave a run behind");
 }
+
+#[test]
+fn empty_replan_directive_is_refused_and_leaves_the_run_alone() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let plan = spar_cmd()
+        .current_dir(tmp.path())
+        .args(["plan", "-t", "add a hello world module"])
+        .args(["--providers", "cli:claude", "--dry-run", "--json"])
+        .assert()
+        .code(2);
+    let stdout = String::from_utf8_lossy(plan.get_output().stdout.as_slice());
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    let run_id = v["run_id"].as_str().expect("run_id");
+    let state_path = tmp
+        .path()
+        .join(".spar/runs")
+        .join(run_id)
+        .join("state.json");
+    let before = std::fs::read_to_string(&state_path).unwrap();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["plan", "--run", run_id, "-t", "   "])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("replan directive is empty"));
+    assert_eq!(std::fs::read_to_string(&state_path).unwrap(), before);
+}

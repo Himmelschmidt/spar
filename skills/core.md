@@ -288,8 +288,9 @@ spar plan --run <run_id> -t "narrow it to the email path" [--json]
 spar run --workflow plan|loop|arena|roles|peer|review -t "..." --providers cli:claude,cli:grok [--dry-run] [--big]
 spar run --workflow arena -t "..." --select best --urgency normal --dry-run
 
-# An empty or whitespace-only task (`-t ""`, or an empty --spec/--brief body) exits 1
-# with `error: task is empty` before any run id is minted.
+# An empty or whitespace-only task exits 1 before any run id is minted: `-t ""` and an
+# empty --brief with `error: task is empty`, an empty --spec with `brief body is empty`.
+# `plan --run <id>` with an empty directive exits 1 with `replan directive is empty`.
 
 # Independent concurrent multi-provider review (not split-stack peer):
 spar run --workflow review -t "Review PR #12 for auth bugs" --providers cli:claude,cli:grok
@@ -581,7 +582,7 @@ children — so they keep running and keep spending tokens with nobody collectin
   which of `implement --run` / a fresh dispatch applies — it refuses a human gate (naming
   the command that resolves it) and a run with a live orchestrator (naming its pid).
   `implement --run <id>` (with or without `--detach` / `--reload-config`) refuses the same
-  way, exit 1, before it writes anything to the live run's `state.json` or `config.json`.
+  way, exit 1, before it writes anything to the live run's `state.json`.
 - A foreground `spar plan` holds the run lock for its whole dispatch, so it never reads
   abandoned while its planner works.
 - `spar daemon start` runs a per-project supervisor that pushes an alert the first time a

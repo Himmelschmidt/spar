@@ -174,6 +174,9 @@ fn run() -> Result<ExitCode> {
                     (None, None, Some(path)) => brief::read_spec_text(path)?,
                     _ => anyhow::bail!("plan --run requires exactly one of -t / --spec / --brief"),
                 };
+                if directive.trim().is_empty() {
+                    anyhow::bail!("replan directive is empty");
+                }
                 let (paths, _) = project_ctx()?;
                 let cfg = Config::for_run(&paths, &id)?;
                 return workflow::plan::replan(&paths, &cfg, &id, directive, json);
