@@ -1015,6 +1015,7 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> 
                 );
             }
             println!("slots: {}", state.slots.len());
+            let cost = stats::run_cost(&state);
             let hb_map = bus::heartbeat_map(&swarm, Some(&state.id));
             for slot in &state.slots {
                 let hb = hb_map
@@ -1035,10 +1036,37 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> 
                 } else {
                     ""
                 };
+                let spend = cost
+                    .by_slot
+                    .iter()
+                    .find(|c| c.key == slot.id)
+                    .map(|c| {
+                        format!(
+                            " billed={} cost={}",
+                            stats::tokens(c.billed_tokens),
+                            match c.cost_usd {
+                                Some(usd) => format!("${usd:.2}"),
+                                None => "not reported".into(),
+                            }
+                        )
+                    })
+                    .unwrap_or_default();
                 println!(
-                    "  - {} provider={} role={:?} status={:?}{pid_s} silent={silent}{stall}{zombie}",
+                    "  - {} provider={} role={:?} status={:?}{pid_s} silent={silent}{stall}{zombie}{spend}",
                     slot.id, slot.provider, slot.role, slot.status
                 );
+            }
+            if cost.total.dispatches > 0 {
+                println!("cost:");
+                for line in cost.by_provider.iter().chain([&cost.total]) {
+                    println!(
+                        "  {:<14} {} dispatch(es)  {} billed  {}",
+                        line.key,
+                        line.dispatches,
+                        stats::tokens(line.billed_tokens),
+                        stats::describe_cost(line)
+                    );
+                }
             }
             if let Some(w) = &state.winner_slot {
                 println!("winner: {w}");
@@ -1326,6 +1354,7 @@ fn run_status_json(
             Vec::new()
         };
         obj.insert("orphan_pids".into(), serde_json::json!(orphans));
+        obj.insert("cost".into(), serde_json::to_value(stats::run_cost(state))?);
     }
     liveness::enrich_status_json(&mut v, &state.slots, cfg, swarm, &state.id);
     Ok(v)

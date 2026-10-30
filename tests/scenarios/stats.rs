@@ -113,6 +113,17 @@ fn a_run_counts_live_then_from_history_with_the_same_numbers() {
     init_repo(tmp.path());
     let run_id = implemented_run(&env, tmp.path());
 
+    let status = json(
+        &spar(&env, tmp.path())
+            .args(["status", &run_id, "--json"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(status["cost"]["schema_version"], 1, "{status}");
+    assert_eq!(status["cost"]["total"]["cost_reported"], "none");
+    assert!(status["cost"]["by_provider"].as_array().is_some());
+    assert!(status["cost"]["by_slot"].as_array().is_some());
+
     let hidden = stats(&env, tmp.path(), &[]);
     assert_eq!(hidden["schema_version"], 1);
     assert_eq!(hidden["runs"], 0, "{hidden}");

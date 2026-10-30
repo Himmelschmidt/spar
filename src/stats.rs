@@ -468,7 +468,7 @@ pub fn report(
     })
 }
 
-fn tokens(n: u64) -> String {
+pub fn tokens(n: u64) -> String {
     match n {
         n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1e6),
         n if n >= 1_000 => format!("{:.1}k", n as f64 / 1e3),
@@ -587,6 +587,127 @@ pub fn print_human(r: &Report) {
                 q.provider, q.pauses, q.manual_pauses, q.parks, q.backup_engagements
             );
         }
+    }
+}
+
+pub const COST_SCHEMA: u32 = 1;
+
+/// Whether a group's dispatches reported a cost: `all`, `partial` or `none`. An adapter
+/// that never reports one reads `none` on every dispatch, never a zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostReported {
+    All,
+    Partial,
+    None,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CostLine {
+    pub key: String,
+    /// `null` on the run total only.
+    pub provider: Option<String>,
+    pub dispatches: u32,
+    pub billed_tokens: u64,
+    pub cost_usd: Option<f64>,
+    pub dispatches_without_cost: u32,
+    pub cost_reported: CostReported,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RunCost {
+    pub schema_version: u32,
+    pub total: CostLine,
+    pub by_provider: Vec<CostLine>,
+    pub by_slot: Vec<CostLine>,
+}
+
+fn cost_line<'a>(
+    key: String,
+    provider: Option<String>,
+    usage: impl Iterator<Item = &'a crate::state::SlotUsage>,
+) -> CostLine {
+    let mut line = CostLine {
+        key,
+        provider,
+        dispatches: 0,
+        billed_tokens: 0,
+        cost_usd: None,
+        dispatches_without_cost: 0,
+        cost_reported: CostReported::None,
+    };
+    for u in usage {
+        line.dispatches += 1;
+        line.billed_tokens += u.billed_tokens;
+        match u.cost_usd {
+            Some(c) => line.cost_usd = Some(line.cost_usd.unwrap_or(0.0) + c),
+            None => line.dispatches_without_cost += 1,
+        }
+    }
+    line.cost_reported = match (line.cost_usd, line.dispatches_without_cost) {
+        (None, _) => CostReported::None,
+        (Some(_), 0) => CostReported::All,
+        (Some(_), _) => CostReported::Partial,
+    };
+    line
+}
+
+/// A run's spend from its usage ledger, per provider and per slot (O133).
+pub fn run_cost(state: &RunState) -> RunCost {
+    let mut providers: Vec<String> = state
+        .usage
+        .iter()
+        .map(|u| crate::quota::normalize_key(&u.provider))
+        .collect();
+    providers.sort();
+    providers.dedup();
+    let mut slots: Vec<(&str, &str)> = Vec::new();
+    for u in &state.usage {
+        if !slots.iter().any(|(s, _)| *s == u.slot_id) {
+            slots.push((&u.slot_id, &u.provider));
+        }
+    }
+    RunCost {
+        schema_version: COST_SCHEMA,
+        total: cost_line("total".into(), None, state.usage.iter()),
+        by_provider: providers
+            .into_iter()
+            .map(|p| {
+                let usage = state
+                    .usage
+                    .iter()
+                    .filter(|u| crate::quota::normalize_key(&u.provider) == p);
+                cost_line(p.clone(), Some(p.clone()), usage)
+            })
+            .collect(),
+        by_slot: slots
+            .into_iter()
+            .map(|(slot, provider)| {
+                let usage = state.usage.iter().filter(|u| u.slot_id == slot);
+                cost_line(
+                    slot.to_string(),
+                    Some(crate::quota::normalize_key(provider)),
+                    usage,
+                )
+            })
+            .collect(),
+    }
+}
+
+/// `$1.23`, or the plain statement that the adapter did not report one.
+pub fn describe_cost(line: &CostLine) -> String {
+    match line.cost_reported {
+        CostReported::All => format!("${:.2}", line.cost_usd.unwrap_or(0.0)),
+        CostReported::Partial => format!(
+            "${:.2} ({} of {} dispatches reported no cost)",
+            line.cost_usd.unwrap_or(0.0),
+            line.dispatches_without_cost,
+            line.dispatches
+        ),
+        CostReported::None => match &line.provider {
+            Some(p) => format!("cost not reported by {p}"),
+            None => "no dispatch reported a cost".into(),
+        },
     }
 }
 
@@ -805,5 +926,62 @@ mod tests {
         .unwrap();
         assert_eq!(project.groups.len(), 1);
         assert_eq!(project.groups[0].dispatches, 3);
+    }
+
+    fn usage(
+        slot: &str,
+        provider: &str,
+        billed: u64,
+        cost: Option<f64>,
+    ) -> crate::state::SlotUsage {
+        serde_json::from_value(json!({
+            "slot_id": slot, "provider": provider, "input_tokens": 0, "output_tokens": 0,
+            "billed_tokens": billed, "cost_usd": cost,
+        }))
+        .unwrap()
+    }
+
+    /// Per provider and per slot, an adapter that reports no cost reads `none` and says
+    /// so, never `$0.00`; a mixed slot is `partial` with the count missing.
+    #[test]
+    fn run_cost_separates_unreported_from_zero() {
+        let mut st = RunState::new("r1", crate::cli::WorkflowKind::Loop, "/x".into());
+        st.usage = vec![
+            usage("impl", "cli:claude@opus", 100, Some(1.25)),
+            usage("review-0-cli-codex", "cli:codex", 50, None),
+            usage("impl", "cli:claude", 100, None),
+            usage("review-0-cli-codex", "codex", 25, None),
+        ];
+        let c = run_cost(&st);
+        assert_eq!(c.schema_version, COST_SCHEMA);
+        assert_eq!(c.total.dispatches, 4);
+        assert_eq!(c.total.billed_tokens, 275);
+        assert_eq!(c.total.cost_usd, Some(1.25));
+        assert_eq!(c.total.cost_reported, CostReported::Partial);
+        assert_eq!(
+            describe_cost(&c.total),
+            "$1.25 (3 of 4 dispatches reported no cost)"
+        );
+        let codex = c.by_provider.iter().find(|l| l.key == "cli:codex").unwrap();
+        assert_eq!(codex.dispatches, 2);
+        assert_eq!(codex.cost_usd, None);
+        assert_eq!(codex.cost_reported, CostReported::None);
+        assert_eq!(describe_cost(codex), "cost not reported by cli:codex");
+        let claude = c
+            .by_provider
+            .iter()
+            .find(|l| l.key == "cli:claude")
+            .unwrap();
+        assert_eq!(claude.cost_reported, CostReported::Partial);
+        assert_eq!(c.by_slot.len(), 2);
+        assert_eq!(c.by_slot[0].key, "impl");
+        assert_eq!(c.by_slot[0].provider.as_deref(), Some("cli:claude"));
+        assert_eq!(c.by_slot[1].billed_tokens, 75);
+        let empty = run_cost(&RunState::new(
+            "r2",
+            crate::cli::WorkflowKind::Loop,
+            "/x".into(),
+        ));
+        assert_eq!(describe_cost(&empty.total), "no dispatch reported a cost");
     }
 }

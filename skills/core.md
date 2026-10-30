@@ -1313,6 +1313,23 @@ rail's selection.
 - `status --json` and every run JSON carry **`base_ref` / `base_commit`** — the ref and commit
   all of the run's slot worktrees were cut from (see **Base ref** above), plus
   **`base_behind`** when the base was taken from a HEAD with an upstream.
+- **Cost per provider and per slot (O133).** `status <id> --json` carries `"cost"`, summed
+  from `usage[]`, and `status <id>` prints the same as a `cost:` block plus
+  `billed=… cost=…` on each slot line:
+
+  ```json
+  "cost": {"schema_version": 1,
+           "total": {"key": "total", "provider": null, "dispatches": 8, "billed_tokens": 40734919,
+                     "cost_usd": 7.54 | null, "dispatches_without_cost": 6, "cost_reported": "partial"},
+           "by_provider": [{"key": "cli:codex", "provider": "cli:codex", "cost_usd": null,
+                            "cost_reported": "none", ...}],
+           "by_slot": [{"key": "impl", "provider": "cli:muse", ...}]}
+  ```
+
+  `cost_reported` is `all`, `partial` or `none`; `none` means the adapter did not report a
+  cost (codex and muse today), and the human view says `cost not reported by <provider>`
+  rather than `$0.00`. There is no token or cost cap: a slot is never killed for spending
+  (O50, reaffirmed in O133).
 - **Tokens: `billed_tokens` is spend, `context_tokens` is a gauge.** Every entry in
   `"usage"` (the run's ledger, one entry per dispatch; sum it for the run total) and every
   `logs/<slot>.stats.json` carries both.
