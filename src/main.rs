@@ -11,6 +11,7 @@ mod effort;
 mod events;
 mod executor;
 mod exit_codes;
+mod history;
 mod liveness;
 mod mailbox;
 mod markers;
@@ -176,6 +177,9 @@ fn run() -> Result<ExitCode> {
                     (None, None, Some(path)) => brief::read_spec_text(path)?,
                     _ => anyhow::bail!("plan --run requires exactly one of -t / --spec / --brief"),
                 };
+                if directive.trim().is_empty() {
+                    anyhow::bail!("replan directive is empty");
+                }
                 let (paths, _) = project_ctx()?;
                 let cfg = Config::for_run(&paths, &id)?;
                 return workflow::plan::replan(&paths, &cfg, &id, directive, json);
@@ -831,6 +835,13 @@ fn implement_ctx(
     cfg.apply_role_overrides(role)?;
     cfg.apply_backup_overrides(backup)?;
     cfg.apply_effort_overrides(effort)?;
+    if let Some(owner) = runlock::RunLock::owner(&paths, run_id).filter(|o| o.alive()) {
+        return Err(runlock::OrchestratorBusy {
+            run_id: run_id.to_string(),
+            owner_pid: owner.pid,
+        }
+        .into());
+    }
     cfg.apply_suite_command(suite_command, without)?;
     cfg.save_snapshot(&paths, run_id)?;
     eprintln!("config: re-read spar.toml for run {run_id}");
@@ -1011,6 +1022,13 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> 
                 last_proj = proj;
             }
             let dry = if summary.dry_run { " dry" } else { "" };
+            let orch = summary
+                .project_root
+                .as_ref()
+                .and_then(|root| runlock::RunLock::owner(&paths::SparPaths::new(root), &summary.id))
+                .filter(|t| t.alive())
+                .map(|t| format!(" pid={}", t.pid))
+                .unwrap_or_default();
             let abandoned = if summary.abandoned { " ABANDONED" } else { "" };
             let arch = if summary.archived { " archived" } else { "" };
             let task = summary
@@ -1019,7 +1037,7 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> 
                 .map(|t| format!("  {}", truncate_cli(t, 40)))
                 .unwrap_or_default();
             println!(
-                "    {}  {:?}{}{abandoned}{arch}{task}",
+                "    {}  {:?}{}{orch}{abandoned}{arch}{task}",
                 summary.id, summary.phase, dry
             );
         }
@@ -1211,10 +1229,9 @@ fn run_status_json(
                 None => serde_json::Value::Null,
             },
         );
-        obj.insert(
-            "orchestrator_alive".into(),
-            serde_json::Value::Bool(orch.map(|t| t.alive()).unwrap_or(false)),
-        );
+        if let serde_json::Value::Object(live) = serde_json::to_value(state.liveness(swarm))? {
+            obj.extend(live);
+        }
         let abandoned = state.abandoned(swarm);
         obj.insert("abandoned".into(), serde_json::Value::Bool(abandoned));
         // Only meaningful when nobody owns the run: these are slot processes still
@@ -2005,6 +2022,7 @@ fn cleanup_sweep(
         let kept_any = cleaned.iter().any(|c| c.skipped.is_some());
         if purge && !kept_any {
             let dir = paths.run_dir(&summary.id);
+            history::append(&paths, &state, history::Trigger::Purge);
             if dir.is_dir() {
                 std::fs::remove_dir_all(&dir)?;
             }
@@ -2100,6 +2118,7 @@ fn cleanup_one(run_id: &str, json: bool, purge: bool, force: bool) -> Result<Exi
     let purged = purge && !kept_any;
     if purged {
         let dir = paths.run_dir(run_id);
+        history::append(&paths, &state, history::Trigger::Purge);
         if dir.is_dir() {
             std::fs::remove_dir_all(&dir)?;
         }

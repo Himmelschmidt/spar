@@ -110,6 +110,7 @@ pub fn spawn_agent(req: &SpawnRequest) -> Result<(String, String)> {
         model: None,
         effort: None,
         timeout_secs: None,
+        session_dir: None,
     };
     let cmd = adapter.build_interactive(&bin, &opts);
     let (program, args) = providers::command_to_parts(&cmd);

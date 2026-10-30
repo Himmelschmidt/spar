@@ -147,6 +147,21 @@ pub struct RunState {
     /// nothing narrower to lose).
     #[serde(default)]
     pub pool_intent: Vec<String>,
+    /// Every review the gate read, one entry per (round, reviewer slot), latest read
+    /// wins. `SlotState::review` only holds the current dispatch's; this is what keeps
+    /// earlier rounds' verdicts and findings for `.spar/history.jsonl`.
+    #[serde(default)]
+    pub review_history: Vec<ReviewHistoryEntry>,
+    /// URL `gh pr create` printed when `ship` opened the PR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewHistoryEntry {
+    pub round: u32,
+    pub slot_id: String,
+    pub review: crate::workflow::review_result::ReviewResult,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,7 +207,7 @@ pub fn context_semantics_for_provider(provider: &str) -> ContextSemantics {
     let base = provider.split('@').next().unwrap_or(provider);
     let bare = base.strip_prefix("cli:").unwrap_or(base);
     match bare {
-        "claude" | "opencode" | "muse" => ContextSemantics::Peak,
+        "claude" | "pi" | "muse" => ContextSemantics::Peak,
         "codex" | "grok" => ContextSemantics::InvocationTotal,
         // agy is out of both fleets and its sidecar semantics are undetermined;
         // anything else unlisted fails closed the same way.
@@ -405,6 +420,11 @@ pub struct SlotState {
     /// Reset at dispatch alongside the other per-dispatch fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewed_commit: Option<String>,
+    /// What the gate parsed from this reviewer's artifact: verdict, the commit it
+    /// names (whether or not it matched), per-AC status and findings. `null` until the
+    /// gate reads a review; reset at dispatch.
+    #[serde(default)]
+    pub review: Option<crate::workflow::review_result::ReviewResult>,
     /// Which precedence rung this seat's provider was resolved from (feature 011).
     /// `None` for slots created outside the fleet resolver (arena/peer/roles/review) or
     /// for state written before this field existed.
@@ -523,12 +543,14 @@ impl SlotRole {
     /// fresh judgment of the current commit, and reopening the session that
     /// already delivered the verdict cannot re-judge it (the slot answers
     /// "already complete" and the previous round's artifact stands as this
-    /// round's). Every other role's work is cumulative across rounds, so they
-    /// keep resume.
+    /// round's). The test author is excluded for the same reason: a replan
+    /// archives its contract, and a resumed session that remembers writing it
+    /// answers "already complete" without writing a fresh one. Every other
+    /// role's work is cumulative across rounds, so they keep resume.
     pub fn resumes_across_rounds(&self) -> bool {
         !matches!(
             self,
-            SlotRole::Reviewer | SlotRole::Tester | SlotRole::PlanCritic
+            SlotRole::Reviewer | SlotRole::Tester | SlotRole::PlanCritic | SlotRole::TestAuthor
         )
     }
 
@@ -574,6 +596,8 @@ pub struct RunSummary {
     /// In flight, but no live orchestrator owns it — computed at read time.
     #[serde(default)]
     pub abandoned: bool,
+    #[serde(flatten, default)]
+    pub live: RunLiveness,
     /// Hidden from default listings. The record and its artifacts are untouched.
     #[serde(default)]
     pub archived: bool,
@@ -663,6 +687,8 @@ impl RunState {
             projected_fleet: Vec::new(),
             pool_origin: PoolOrigin::default(),
             pool_intent: Vec::new(),
+            review_history: Vec::new(),
+            pr_url: None,
         }
     }
 
@@ -820,6 +846,9 @@ impl RunState {
                 );
             }
             crate::notify::route_lifecycle(paths, self, prev_phase);
+            if self.phase.is_terminal() {
+                crate::history::append(paths, self, crate::history::Trigger::Terminal);
+            }
             crate::worktree::watch_primary_checkout(paths, self, prev_phase);
         }
         // Global index so `spar` from anywhere can find this project’s runs.
@@ -951,6 +980,96 @@ pub fn is_queued(paths: &SparPaths, run_id: &str) -> bool {
     }
     let _ = std::fs::remove_file(&path);
     false
+}
+
+/// The scripting surface for "is this run occupying anything, and who has to act".
+/// Phase names are not stable for scripts; these are (O101).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunLiveness {
+    /// A live process holds the run lock.
+    #[serde(default)]
+    pub orchestrator_alive: bool,
+    /// The run occupies, or is about to occupy, provider capacity: its orchestrator is
+    /// alive, or it sits in the daemon's admission queue waiting on a provider bucket.
+    #[serde(default)]
+    pub holds_seat: bool,
+    /// Nothing moves until a human acts: a gate, the `plan_approved` handoff, or a
+    /// run that is broken (failed, stuck, escalated, quota, abandoned).
+    #[serde(default)]
+    pub needs_human: bool,
+    /// `implement --run` / `spar resume` would pick it up now. Never true while it
+    /// holds a seat.
+    #[serde(default)]
+    pub resumable: bool,
+}
+
+impl RunState {
+    pub fn liveness(&self, paths: &SparPaths) -> RunLiveness {
+        let orchestrator_alive = orchestrator_alive(paths, &self.id);
+        let queued = is_queued(paths, &self.id);
+        let holds_seat = orchestrator_alive || queued;
+        let abandoned = !queued && is_abandoned(self.phase, orchestrator_alive);
+        RunLiveness {
+            orchestrator_alive,
+            holds_seat,
+            needs_human: wants_operator(self.phase, abandoned),
+            resumable: !holds_seat && is_resumable(self),
+        }
+    }
+}
+
+/// Whether `implement --run` / `spar resume` may pick this run back up.
+///
+/// The hazard this gates is a `--workflow plan` run being driven through to ship
+/// without its plan ever being approved, so every phase clause that is not the
+/// `plan_approved` gate itself is qualified by `WorkflowKind::Loop`, which has no
+/// approval step at all.
+pub fn is_resumable(state: &RunState) -> bool {
+    state.gates.plan_approved
+        || state.phase == Phase::PlanApproved
+        // The round-ceiling gate is lifted by re-entering implement, so a run parked
+        // there has to be resumable even when no plan gate ever ran (`--workflow loop`).
+        || state.phase == Phase::AwaitingRoundExtension
+        // A slot that died mid-dispatch from a rate limit parks here (executor::run_slot
+        // via `fail`'s quota_hit branch); re-entering must pick the run back up rather
+        // than forcing `--new` and abandoning the frozen contract and round history.
+        // But `Phase::Quota` is also where `workflow/plan.rs` parks a *plan* run that
+        // never got approved (its own pre-dispatch gate, or a paused planner/test-author
+        // mid-plan) — accepting that unconditionally would walk straight past the
+        // `plan_approved` gate above and let `implement --run` drive an unapproved plan
+        // through to ship on a salvaged placeholder plan.md. An *approved* run's own
+        // `Phase::Quota` park is already covered by the `plan_approved` disjunct above,
+        // so the only case this clause needs to add is `--workflow loop` (`implement -t`
+        // directly), which has no approval step at all.
+        || (state.phase == Phase::Quota && state.workflow == WorkflowKind::Loop)
+        // `Phase::Stopped` has the identical hazard: `spar stop` parks a plan run here
+        // pre-approval just as readily as it parks an approved or loop-workflow run, and
+        // accepting it unconditionally would let `implement --run` (or `spar resume`)
+        // drive an unapproved plan through to ship. An *approved* stopped run is already
+        // covered by the `plan_approved` disjunct above, so the only case this clause
+        // needs to add is `--workflow loop`, which has no approval step at all.
+        || (state.phase == Phase::Stopped && state.workflow == WorkflowKind::Loop)
+        // `Failed`/`Stuck` are terminal parks a re-dispatch is meant to pick back up —
+        // the block below this gate already clears their dead slot verdicts for exactly
+        // that. An approved run reaches it through the `plan_approved` disjunct; a
+        // `--workflow loop` run has no approval step, so without this clause its
+        // implementer dying (a transport timeout, a stuck ladder) left the run
+        // permanently unresumable, and `spar resume` refused it by naming a plan gate
+        // that workflow does not have.
+        || (matches!(state.phase, Phase::Failed | Phase::Stuck)
+            && state.workflow == WorkflowKind::Loop)
+}
+
+/// Whether a run wants the operator: a human gate, the `PlanApproved` handoff nothing
+/// else will complete, or a run that is broken or abandoned. The TUI's attention
+/// flags and `needs_human` both read this.
+pub fn wants_operator(phase: Phase, abandoned: bool) -> bool {
+    abandoned
+        || phase.is_gate()
+        || matches!(
+            phase,
+            Phase::Failed | Phase::Stuck | Phase::Escalated | Phase::Quota | Phase::PlanApproved
+        )
 }
 
 /// Whether `spar cleanup --all` may reap this run's worktrees.
@@ -1186,28 +1305,32 @@ pub fn list_runs(paths: &SparPaths) -> Result<Vec<RunSummary>> {
             continue;
         }
         let id = entry.file_name().to_string_lossy().into_owned();
-        match RunState::load(paths, &id) {
-            Ok(state) => out.push(RunSummary {
-                abandoned: state.abandoned(paths),
-                archived: state.is_archived(),
-                id: state.id,
-                workflow: state.workflow,
-                phase: state.phase,
-                updated_at: state.updated_at,
-                task: state.task,
-                dry_run: state.dry_run,
-                parent_run: state.parent_run,
-                round: state.round,
-                legs: 1,
-                wants: 0,
-                unit_id: None,
-                base_ref: state.base_ref,
-                base_commit: state.base_commit,
-                project_root: None,
-                project_name: None,
-            }),
-            Err(_) => continue,
-        }
+        let Ok(state) = RunState::load(paths, &id) else {
+            continue;
+        };
+        let live = state.liveness(paths);
+        out.push(RunSummary {
+            // `RunState::abandoned` without asking the lock and the queue twice: a
+            // run holding no seat is neither alive nor queued.
+            abandoned: !live.holds_seat && is_abandoned(state.phase, false),
+            live,
+            archived: state.is_archived(),
+            id: state.id,
+            workflow: state.workflow,
+            phase: state.phase,
+            updated_at: state.updated_at,
+            task: state.task,
+            dry_run: state.dry_run,
+            parent_run: state.parent_run,
+            round: state.round,
+            legs: 1,
+            wants: 0,
+            unit_id: None,
+            base_ref: state.base_ref,
+            base_commit: state.base_commit,
+            project_root: None,
+            project_name: None,
+        });
     }
     out.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
     Ok(out)
@@ -1240,8 +1363,8 @@ mod tests {
             ("cli:claude", Peak),
             ("claude", Peak),
             ("cli:claude@opus", Peak),
-            ("cli:opencode", Peak),
-            ("opencode", Peak),
+            ("cli:pi", Peak),
+            ("pi", Peak),
             ("cli:muse", Peak),
             ("muse", Peak),
             ("api:openai", Peak),
@@ -1408,10 +1531,9 @@ mod tests {
     }
 
     #[test]
-    fn only_judging_roles_skip_resume_across_rounds() {
+    fn only_judging_roles_and_the_test_author_skip_resume_across_rounds() {
         for role in [
             SlotRole::Planner,
-            SlotRole::TestAuthor,
             SlotRole::Implementer,
             SlotRole::Ranker,
             SlotRole::Peer,
@@ -1422,10 +1544,15 @@ mod tests {
                 "{role:?} is cumulative across rounds and keeps resume"
             );
         }
-        for role in [SlotRole::Reviewer, SlotRole::Tester, SlotRole::PlanCritic] {
+        for role in [
+            SlotRole::Reviewer,
+            SlotRole::Tester,
+            SlotRole::PlanCritic,
+            SlotRole::TestAuthor,
+        ] {
             assert!(
                 !role.resumes_across_rounds(),
-                "{role:?} judges the current commit and must dispatch cold"
+                "{role:?} must dispatch cold every round"
             );
         }
     }
@@ -2004,5 +2131,135 @@ mod tests {
         assert_eq!(s.pid, Some(4242));
         assert_eq!(s.exit_code, None);
         assert_eq!(s.signal, Some(9));
+    }
+}
+
+#[cfg(test)]
+mod resumable_tests {
+    use super::*;
+
+    fn run(workflow: crate::cli::WorkflowKind, phase: Phase) -> RunState {
+        let mut st = RunState::new("r1", workflow, std::path::PathBuf::from("/x"));
+        st.phase = phase;
+        st
+    }
+
+    /// The bug this guards: a `--workflow loop` run whose implementer died mid-dispatch
+    /// (observed as a muse `net-timeout` on the meta stream) parked at `Failed` and could
+    /// never be picked back up, stranding a worktree full of real work. `Failed`/`Stuck`
+    /// are exactly the parks the clear-dead-verdicts block below the gate exists for.
+    #[test]
+    fn a_failed_or_stuck_loop_run_is_resumable() {
+        for phase in [Phase::Failed, Phase::Stuck] {
+            assert!(
+                is_resumable(&run(crate::cli::WorkflowKind::Loop, phase)),
+                "{phase:?}"
+            );
+        }
+    }
+
+    /// The hazard the gate exists for: an unapproved plan must never be resumable, in any
+    /// phase, or `implement --run` drives it through to ship on a plan no human accepted.
+    #[test]
+    fn an_unapproved_plan_run_is_never_resumable() {
+        for phase in [
+            Phase::Failed,
+            Phase::Stuck,
+            Phase::Quota,
+            Phase::Stopped,
+            Phase::Dispatch,
+        ] {
+            assert!(
+                !is_resumable(&run(crate::cli::WorkflowKind::Plan, phase)),
+                "{phase:?}"
+            );
+        }
+    }
+
+    /// Approval is what admits a plan run, not its phase.
+    #[test]
+    fn an_approved_plan_run_is_resumable_from_a_terminal_park() {
+        let mut st = run(crate::cli::WorkflowKind::Plan, Phase::Failed);
+        st.gates.plan_approved = true;
+        assert!(is_resumable(&st));
+    }
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+
+    /// `needs_human` is the TUI's attention rule: gates, the plan handoff and broken
+    /// runs want a person; work in flight and finished work do not.
+    #[test]
+    fn wants_operator_covers_gates_handoff_and_broken_runs() {
+        for phase in [
+            Phase::AwaitingPlanApproval,
+            Phase::AwaitingShipConfirm,
+            Phase::AwaitingRoundExtension,
+            Phase::PlanApproved,
+            Phase::Failed,
+            Phase::Stuck,
+            Phase::Escalated,
+            Phase::Quota,
+        ] {
+            assert!(wants_operator(phase, false), "{phase:?}");
+        }
+        for phase in [Phase::Dispatch, Phase::Review, Phase::Done, Phase::Stopped] {
+            assert!(!wants_operator(phase, false), "{phase:?}");
+        }
+        assert!(wants_operator(Phase::Dispatch, true));
+    }
+
+    /// A queued run holds a seat and is neither abandoned nor resumable, even at
+    /// `Init` with no orchestrator.
+    #[test]
+    fn a_queued_run_holds_a_seat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let st = RunState::new("q1", WorkflowKind::Loop, tmp.path().into());
+        st.save(&paths).unwrap();
+        assert_eq!(
+            st.liveness(&paths),
+            RunLiveness {
+                orchestrator_alive: false,
+                holds_seat: false,
+                needs_human: true,
+                resumable: false,
+            },
+            "an unqueued Init run with no orchestrator is abandoned"
+        );
+        std::fs::create_dir_all(paths.queue_dir()).unwrap();
+        std::fs::write(paths.queue_file("q1"), "{}").unwrap();
+        let live = st.liveness(&paths);
+        assert!(
+            live.holds_seat && !live.needs_human && !live.resumable,
+            "{live:?}"
+        );
+    }
+
+    /// A `state.json` written before reviews, history and the PR url were recorded
+    /// still loads, with those empty.
+    #[test]
+    fn a_pre_review_record_state_loads() {
+        let st: RunState = serde_json::from_value(serde_json::json!({
+            "id": "old1",
+            "workflow": "loop",
+            "phase": "done",
+            "created_at": "2026-09-01T00:00:00Z",
+            "updated_at": "2026-09-01T00:00:00Z",
+            "slots": [{
+                "id": "review-0-cli-claude",
+                "provider": "cli:claude",
+                "role": "reviewer",
+                "status": "done",
+                "reviewed_commit": "abcdef1"
+            }]
+        }))
+        .unwrap();
+        assert!(st.review_history.is_empty());
+        assert!(st.pr_url.is_none());
+        assert!(st.slots[0].review.is_none());
+        assert_eq!(st.slots[0].reviewed_commit.as_deref(), Some("abcdef1"));
     }
 }

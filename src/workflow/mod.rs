@@ -137,6 +137,9 @@ pub fn run_named(
     paths: &SparPaths,
     cfg: &Config,
 ) -> Result<ExitCode> {
+    if let Some(t) = &opts.task {
+        crate::runspec::validate_task(t).map_err(anyhow::Error::msg)?;
+    }
     match kind {
         WorkflowKind::Plan => {
             let task = opts

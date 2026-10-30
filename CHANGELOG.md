@@ -4,6 +4,15 @@ All notable changes to spar are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- **The pi coding agent replaces OpenCode as the recommended way to run OpenRouter
+  models.** OpenCode is no longer supported; point those roles at pi instead. pi
+  runs carry their token usage, dollar cost, tool calls and a session id, and a
+  later round picks up the same pi session.
+- **A pi run whose model request fails now fails the slot**, even though pi itself
+  reports success, and a rate-limit failure pauses the provider like any other.
+
 ### Added
 
 - **You can now compose a run before starting it**: pick the workflow, then assign

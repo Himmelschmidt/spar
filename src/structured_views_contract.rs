@@ -140,7 +140,7 @@ fn document_parser_preserves_sections_and_reports_missing_documents() {
 
 #[test]
 fn path_shortening_reaches_tool_names_no_adapter_but_claude_emits() {
-    // codex, grok, muse and opencode never write `Bash`/`Read`/`Edit` — they write
+    // codex, grok, muse and pi never write `Bash`/`Read`/`Edit` — they write
     // their own tool names (`write_file`, `run_command`, `command_execution`, …),
     // which `ToolKind::classify` has no entry for and falls to `ToolKind::Other`.
     // Shortening must not be gated on recognising the tool name (AC-12).
