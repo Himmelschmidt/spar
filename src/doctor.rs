@@ -56,8 +56,7 @@ pub fn run(json: bool) -> Result<ExitCode> {
     let providers = providers::detect_all();
     if !providers.iter().any(|p| p.available) {
         notes.push(
-            "no first-class providers found on PATH (claude, grok, agy, codex, opencode, muse)"
-                .into(),
+            "no first-class providers found on PATH (claude, grok, agy, codex, pi, muse)".into(),
         );
     }
     for p in providers
@@ -300,7 +299,7 @@ mod tests {
     #[test]
     fn all_unhealthy_is_not_usable() {
         let ps = vec![
-            report("opencode", true, Readiness::Unhealthy),
+            report("pi", true, Readiness::Unhealthy),
             report("claude", false, Readiness::Unknown),
         ];
         assert!(!has_usable_provider(&ps));
@@ -309,7 +308,7 @@ mod tests {
     #[test]
     fn one_healthy_among_unhealthy_is_usable() {
         let ps = vec![
-            report("opencode", true, Readiness::Unhealthy),
+            report("pi", true, Readiness::Unhealthy),
             report("muse", true, Readiness::Healthy),
         ];
         assert!(has_usable_provider(&ps));
@@ -330,7 +329,7 @@ mod tests {
     #[test]
     fn exit_ok_with_one_healthy_beside_unhealthy() {
         let ps = vec![
-            report("opencode", true, Readiness::Unhealthy),
+            report("pi", true, Readiness::Unhealthy),
             report("muse", true, Readiness::Healthy),
         ];
         assert!(doctor_ok(true, &ps));
@@ -338,7 +337,7 @@ mod tests {
 
     #[test]
     fn exit_fails_when_no_usable_provider_remains() {
-        let ps = vec![report("opencode", true, Readiness::Unhealthy)];
+        let ps = vec![report("pi", true, Readiness::Unhealthy)];
         assert!(!doctor_ok(true, &ps));
     }
 

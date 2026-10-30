@@ -1593,3 +1593,57 @@ fn ambient_spar_project_root_does_not_capture_runs() {
     assert_eq!(leaked, 0, "run leaked into ambient SPAR_PROJECT_ROOT");
     assert!(made > 0, "run did not land in the test's own project");
 }
+
+/// An empty or whitespace task is refused on every CLI launch path before a run id is
+/// minted, by the same rule the TUI's launch validator applies (O81).
+#[test]
+fn empty_task_is_refused_before_any_run_exists() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let launches: [&[&str]; 4] = [
+        &["plan", "-t", ""],
+        &["plan", "-t", "   \n\t"],
+        &["implement", "-t", "  "],
+        &["run", "--workflow", "loop", "-t", ""],
+    ];
+    for args in launches {
+        spar_cmd()
+            .current_dir(tmp.path())
+            .args(args)
+            .args(["--providers", "cli:claude", "--dry-run"])
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains("task is empty"));
+    }
+    let runs = tmp.path().join(".spar/runs");
+    let minted = std::fs::read_dir(&runs).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(minted, 0, "a refused launch must not leave a run behind");
+}
+
+#[test]
+fn empty_replan_directive_is_refused_and_leaves_the_run_alone() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let plan = spar_cmd()
+        .current_dir(tmp.path())
+        .args(["plan", "-t", "add a hello world module"])
+        .args(["--providers", "cli:claude", "--dry-run", "--json"])
+        .assert()
+        .code(2);
+    let stdout = String::from_utf8_lossy(plan.get_output().stdout.as_slice());
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    let run_id = v["run_id"].as_str().expect("run_id");
+    let state_path = tmp
+        .path()
+        .join(".spar/runs")
+        .join(run_id)
+        .join("state.json");
+    let before = std::fs::read_to_string(&state_path).unwrap();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["plan", "--run", run_id, "-t", "   "])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("replan directive is empty"));
+    assert_eq!(std::fs::read_to_string(&state_path).unwrap(), before);
+}

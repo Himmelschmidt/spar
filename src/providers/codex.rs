@@ -420,6 +420,7 @@ mod tests {
             model: model.map(Into::into),
             effort: None,
             timeout_secs: None,
+            session_dir: None,
         }
     }
 
@@ -914,6 +915,7 @@ mod tests {
             model: None,
             effort: None,
             timeout_secs: None,
+            session_dir: None,
             session_id: None,
         };
         assert_eq!(

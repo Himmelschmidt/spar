@@ -202,7 +202,7 @@ pub fn context_semantics_for_provider(provider: &str) -> ContextSemantics {
     let base = provider.split('@').next().unwrap_or(provider);
     let bare = base.strip_prefix("cli:").unwrap_or(base);
     match bare {
-        "claude" | "opencode" | "muse" => ContextSemantics::Peak,
+        "claude" | "pi" | "muse" => ContextSemantics::Peak,
         "codex" | "grok" => ContextSemantics::InvocationTotal,
         // agy is out of both fleets and its sidecar semantics are undetermined;
         // anything else unlisted fails closed the same way.
@@ -538,12 +538,14 @@ impl SlotRole {
     /// fresh judgment of the current commit, and reopening the session that
     /// already delivered the verdict cannot re-judge it (the slot answers
     /// "already complete" and the previous round's artifact stands as this
-    /// round's). Every other role's work is cumulative across rounds, so they
-    /// keep resume.
+    /// round's). The test author is excluded for the same reason: a replan
+    /// archives its contract, and a resumed session that remembers writing it
+    /// answers "already complete" without writing a fresh one. Every other
+    /// role's work is cumulative across rounds, so they keep resume.
     pub fn resumes_across_rounds(&self) -> bool {
         !matches!(
             self,
-            SlotRole::Reviewer | SlotRole::Tester | SlotRole::PlanCritic
+            SlotRole::Reviewer | SlotRole::Tester | SlotRole::PlanCritic | SlotRole::TestAuthor
         )
     }
 
@@ -1354,8 +1356,8 @@ mod tests {
             ("cli:claude", Peak),
             ("claude", Peak),
             ("cli:claude@opus", Peak),
-            ("cli:opencode", Peak),
-            ("opencode", Peak),
+            ("cli:pi", Peak),
+            ("pi", Peak),
             ("cli:muse", Peak),
             ("muse", Peak),
             ("api:openai", Peak),
@@ -1522,10 +1524,9 @@ mod tests {
     }
 
     #[test]
-    fn only_judging_roles_skip_resume_across_rounds() {
+    fn only_judging_roles_and_the_test_author_skip_resume_across_rounds() {
         for role in [
             SlotRole::Planner,
-            SlotRole::TestAuthor,
             SlotRole::Implementer,
             SlotRole::Ranker,
             SlotRole::Peer,
@@ -1536,10 +1537,15 @@ mod tests {
                 "{role:?} is cumulative across rounds and keeps resume"
             );
         }
-        for role in [SlotRole::Reviewer, SlotRole::Tester, SlotRole::PlanCritic] {
+        for role in [
+            SlotRole::Reviewer,
+            SlotRole::Tester,
+            SlotRole::PlanCritic,
+            SlotRole::TestAuthor,
+        ] {
             assert!(
                 !role.resumes_across_rounds(),
-                "{role:?} judges the current commit and must dispatch cold"
+                "{role:?} must dispatch cold every round"
             );
         }
     }

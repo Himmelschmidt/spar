@@ -25,6 +25,9 @@ pub fn run_from_cli(
     paths: &SparPaths,
     cfg: &Config,
 ) -> Result<ExitCode> {
+    if let Some(t) = &task {
+        crate::runspec::validate_task(t).map_err(anyhow::Error::msg)?;
+    }
     if let Some(id) = run_id {
         return run_from_approved(&id, task, opts, paths, cfg);
     }
@@ -92,7 +95,7 @@ pub fn resume(
     detach: bool,
     json: bool,
 ) -> Result<ExitCode> {
-    let mut state = RunState::load(paths, run_id)?;
+    let state = RunState::load(paths, run_id)?;
     if let Some(owner) = crate::runlock::RunLock::owner(paths, run_id) {
         if owner.alive() {
             return Err(crate::runlock::OrchestratorBusy {
@@ -145,9 +148,12 @@ pub fn resume(
             crate::cli::WorkflowKind::Plan | crate::cli::WorkflowKind::Loop
         )
     {
+        let lock = crate::runlock::RunLock::acquire(paths, run_id)?;
+        let mut state = RunState::load(paths, run_id)?;
         let _ = std::fs::remove_file(paths.marker(run_id, "stopped"));
         restore_interrupted_slots(&mut state);
         state.save(paths)?;
+        drop(lock);
         if detach {
             return detach_implement(&state, paths, json);
         }
@@ -349,6 +355,11 @@ fn run_from_approved(
     paths: &SparPaths,
     cfg: &Config,
 ) -> Result<ExitCode> {
+    // Loaded once before the lock only so a mistyped id fails without the lock minting
+    // a run directory for it. Everything below mutates the run, so it all happens under
+    // the lock: a live orchestrator refuses us before its state.json can be overwritten.
+    RunState::load(paths, run_id)?;
+    let lock = crate::runlock::RunLock::acquire(paths, run_id)?;
     let mut state = RunState::load(paths, run_id)?;
     let resumable = crate::state::is_resumable(&state);
     if !resumable {
@@ -566,12 +577,12 @@ fn run_from_approved(
     if state.slots.iter().all(|s| s.role != SlotRole::Implementer) {
         bail!("no implementer slot after provider pick");
     }
+    state.save(paths)?;
     if opts.detach {
-        state.save(paths)?;
+        // The detached child takes the lock itself, and flock refuses a second holder.
+        drop(lock);
         return detach_implement(&state, paths, opts.json);
     }
-    let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
-    state.save(paths)?;
     execute_loop(&mut state, paths, cfg, opts.accept_contract)?;
     maybe_auto_ship_or_cleanup(&mut state, paths, cfg)?;
     finish_out(&state, opts.json)?;
@@ -2379,6 +2390,14 @@ pub fn execute_loop(
         // head. Unresolvable (review_cwd falls back to a possibly non-repo
         // project_root) fails OPEN, loudly: failing closed there would brick such
         // runs permanently with no reviewer fault.
+        if let Some(wt) = state.worktrees.iter().find(|w| w.slot_id == impl_slot.id) {
+            if let Some(msg) =
+                worktree::restore_branch(&wt.path, &wt.branch, state.base_commit.as_deref())
+            {
+                eprintln!("warning: {msg}");
+                let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg));
+            }
+        }
         let panel_head = worktree::git_out(&review_cwd, &["rev-parse", "HEAD"]);
         if panel_head.is_none() {
             let msg = format!(
