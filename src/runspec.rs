@@ -117,6 +117,15 @@ pub struct RunSpec {
     pub legacy_providers: Vec<String>,
 }
 
+/// The task rule every launch path shares (O81): the TUI through `validate_for_launch`,
+/// the CLI before it mints a run id.
+pub fn validate_task(task: &str) -> Result<(), String> {
+    if task.trim().is_empty() {
+        return Err("task is empty".to_string());
+    }
+    Ok(())
+}
+
 pub fn spec_rows(workflow: SpecWorkflow, cfg: &Config) -> Vec<(SlotRole, usize)> {
     match workflow {
         SpecWorkflow::Plan => {
@@ -212,9 +221,7 @@ impl RunSpec {
         let wf = self
             .workflow
             .ok_or_else(|| "workflow is not set".to_string())?;
-        if self.task.trim().is_empty() {
-            return Err("task is empty".to_string());
-        }
+        validate_task(&self.task)?;
         if wf == SpecWorkflow::Arena {
             let expected = spec_rows(wf, cfg).len();
             if self.arena_pool.len() != expected {

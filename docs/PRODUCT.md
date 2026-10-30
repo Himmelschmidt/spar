@@ -79,7 +79,7 @@ See [architecture-dual-backend.md](./architecture-dual-backend.md).
 | Workflow | Product meaning |
 |----------|-----------------|
 | **Plan** | Multi-provider plan + real critic; structured/big mode like plan-big |
-| **Implement** | 1 implementer + ≥2 adversarial reviewers; stuck policy |
+| **Implement** | 1 implementer + adversarial reviewers (2 by default; a pinned `--role reviewer=` list sets the size exactly, `--fleet small` narrows to 1); stuck policy |
 | **Arena** | N implementers → **winner** *or* **reconcile** (+ review) → ship |
 | **Roles / peer** | Split stack, mailbox/bus, contracts |
 | **Ship** | Draft PR, never merge; force-with-lease only on swarm branches |

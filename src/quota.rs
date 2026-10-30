@@ -28,6 +28,33 @@ fn contains_phrase(lower: &str, phrase: &str) -> bool {
     false
 }
 
+/// A 402 only where the line frames it as an HTTP status, never a bare number: a
+/// `402` in a line number, a count or a path would otherwise read as a billing stop.
+fn names_http_402(lower: &str) -> bool {
+    [
+        "http 402",
+        "status 402",
+        "status: 402",
+        "status code 402",
+        "status code: 402",
+        "\"status\":402",
+        "\"status\": 402",
+        "\"code\":402",
+        "\"code\": 402",
+        "error 402",
+        "error: 402",
+    ]
+    .iter()
+    .any(|p| {
+        lower.match_indices(p).any(|(i, _)| {
+            !lower[i + p.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
+        })
+    })
+}
+
 fn word_boundary_after_phrase(after: &str) -> bool {
     let mut chars = after.chars();
     match chars.next() {
@@ -252,7 +279,11 @@ impl QuotaStore {
                 // "5-hour limit" in its usage-limit messages (changelog). The full
                 // sentence is inferred from the weekly one; no live capture yet.
                 || contains_phrase(&lower, "hit your 5-hour limit")
-                || is_agy_quota_rejection(&lower);
+                || is_agy_quota_rejection(&lower)
+                // muse's dispatch-time 429 reads "Subscription quota exhausted" (#153).
+                || lower.contains("quota exhausted")
+                || lower.contains("402 payment required")
+                || names_http_402(&lower);
             if hit {
                 return Some(line.trim().to_string());
             }
@@ -906,6 +937,52 @@ mod tests {
             assert!(
                 QuotaStore::scrape_strong_quota_signal(prose).is_none(),
                 "false positive on: {prose}"
+            );
+        }
+    }
+
+    /// muse's dispatch-time rejection, verbatim from the 2026-10 fleet incidents
+    /// (#153): a 429 whose text is "Subscription quota exhausted". Before this it was
+    /// read as an ordinary failure, so the run failed instead of moving to its backup.
+    #[test]
+    fn strong_quota_signal_matches_muses_subscription_quota_exhausted() {
+        assert!(QuotaStore::scrape_strong_quota_signal("Subscription quota exhausted").is_some());
+        assert!(
+            QuotaStore::scrape_strong_quota_signal("429 Subscription quota exhausted").is_some()
+        );
+        assert!(QuotaStore::scrape_strong_quota_signal("error: quota exhausted").is_some());
+    }
+
+    /// A 402 is a billing stop when the line frames it as an HTTP status.
+    #[test]
+    fn strong_quota_signal_matches_an_http_402() {
+        for line in [
+            "402 Payment Required",
+            "HTTP 402",
+            "request failed with status 402",
+            "API Error: 402",
+            "{\"error\":{\"code\":402,\"message\":\"insufficient balance\"}}",
+        ] {
+            assert!(
+                QuotaStore::scrape_strong_quota_signal(line).is_some(),
+                "{line:?} must route as quota"
+            );
+        }
+    }
+
+    /// A 402 that is a line number, a count or part of a longer number is not one.
+    #[test]
+    fn strong_quota_signal_ignores_a_402_that_is_not_an_http_status() {
+        for line in [
+            "thread 'main' panicked at src/quota.rs:402:5: error in parser",
+            "error at line 402 of the fixture",
+            "test result: ok. 402 passed; 0 failed",
+            "HTTP 4020 bytes sent",
+            "the quota is not exhausted yet",
+        ] {
+            assert!(
+                QuotaStore::scrape_strong_quota_signal(line).is_none(),
+                "{line:?} must not route as quota"
             );
         }
     }
