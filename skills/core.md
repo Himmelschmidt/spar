@@ -66,7 +66,8 @@ agy's `--print-timeout` is also derived from the role's hard ceiling, so a long
 agy slot runs its full budget instead of dying at agy's 30-minute default.
 
 **Pause / cooldown.** A provider is paused manually (`spar provider pause <ref>`) or
-automatically when a slot hits a rate-limit signal. Pauses **auto-recover** ~30 min after
+automatically when a slot hits a rate-limit signal. A slot that was killed (signal, or exit
+143/137) never pauses its provider on log text; only an adapter's typed rejection counts. Pauses **auto-recover** ~30 min after
 they were set (or at an explicit cooldown reset), so the provider is re-probed rather than
 staying dead; `spar provider resume <ref>` clears one immediately. A paused provider is
 never silently swapped into another role: `plan`/`implement` exit `4` (quota) naming the
@@ -234,7 +235,7 @@ positions.
 `--fleet small|standard` and `--without critic,spec,suite` shape the seats for one run without
 touching `spar.toml`; see "Fleet shaping" below.
 
-**Run composition (009).** The new-run form is the run's single partial specification. Workflow is optional (`plan` / `implement` / `review` / `arena`) — leaving it unset lets the Chat orchestrator propose one. Each workflow shows its dispatched roles: `plan` is `planner` plus enabled `plan_critic`/`test_author`; `implement` is `implementer` plus the exact reviewer panel plus `tester` only when no deterministic suite replaces it; `review` is the exact reviewer panel; `arena` is a positional pool of `max_agents.max(2)` contenders. The six assignable roles remain the only role rows; `ranker`, `reconciler` and `peer` keep taking fleet positions. Models are opaque free text with local suggestions (`@model` on any `provider@model` ref, stored as storage key plus optional model via the `Pin` boundary — a conflicting `@model` plus separate model is rejected and a double-model ref never emits). `--role ROLE=PROVIDER[@MODEL]` is repeatable and outranks the pool; `--backup ROLE=PROVIDER[@MODEL]` declares a per-role, per-ordinal fallback. A backup fires only for an environmental stop — quota pause, rate limit, or provider unavailable — never on a nonzero work exit, timeout, missing artifact, or adverse review, and it persists as `SeatSource::Backup`. It replaces O52's blind implementer rotation only on that cause and only while not yet consumed; arena never accepts or emits `--role` or `--backup` and retains its positional quota semantics. `--backup` is new-run-only; `plan --run` and `implement --run` without `--reload-config` reject it. A backup whose canonical storage key equals its primary is rejected even when models differ. Operator defaults that prefill a newly opened form live at `registry::spar_home()/defaults.json`, never in the project's `spar.toml`; a run still freezes its resolved fleet into `.spar/runs/<id>/config.json` (O27) so deleting or corrupting defaults after launch cannot alter a continuation.
+**Run composition (009).** The new-run form is the run's single partial specification. Workflow is optional (`plan` / `implement` / `review` / `arena`) — leaving it unset lets the Chat orchestrator propose one. Each workflow shows its dispatched roles: `plan` is `planner` plus enabled `plan_critic`/`test_author`; `implement` is `implementer` plus the exact reviewer panel plus `tester` only when no deterministic suite replaces it; `review` is the exact reviewer panel; `arena` is a positional pool of `max_agents.max(2)` contenders. The six assignable roles remain the only role rows; `ranker`, `reconciler` and `peer` keep taking fleet positions. Models are opaque free text with local suggestions (`@model` on any `provider@model` ref, stored as storage key plus optional model via the `Pin` boundary — a conflicting `@model` plus separate model is rejected and a double-model ref never emits). `--role ROLE=PROVIDER[@MODEL]` is repeatable and outranks the pool; `--backup ROLE=PROVIDER[@MODEL]` declares a per-role, per-ordinal fallback. A backup fires only for an environmental stop — quota pause, rate limit, or provider unavailable — never on a nonzero work exit, timeout, missing artifact, or adverse review, and it persists as `SeatSource::Backup`. A slot that ended by signal (or exit 143/137) is judged only on the adapter's typed rejection, never on its log text. It replaces O52's blind implementer rotation only on that cause and only while not yet consumed; arena never accepts or emits `--role` or `--backup` and retains its positional quota semantics. `--backup` is new-run-only; `plan --run` and `implement --run` without `--reload-config` reject it. A backup whose canonical storage key equals its primary is rejected even when models differ. Operator defaults that prefill a newly opened form live at `registry::spar_home()/defaults.json`, never in the project's `spar.toml`; a run still freezes its resolved fleet into `.spar/runs/<id>/config.json` (O27) so deleting or corrupting defaults after launch cannot alter a continuation.
 
 | `--workflow` | Slots | Ends at |
 |---|---|---|
@@ -434,7 +435,8 @@ on — never a restatement of the plan or contract, which the next round is hand
   backend 404 after real work is retried with backoff through that same resume instead
   of failing the slot. A resume the vendor answers with a fresh session (exit 0, a new
   id) is noted in the run's events, not retried. O52's general default is unchanged
-  for every other provider.
+  for every other provider. Whatever the provider, reviewer, tester, plan-critic and
+  test-author slots never resume: they dispatch cold every round and every replan (O89).
 
 For legs that already exist, `spar link <leg> --to <run>` records the grouping
 (`parent_run`). spar never infers it — pairing runs by task text would merge unrelated
@@ -487,10 +489,13 @@ run-routing decision above never does, for the false-positive reason just descri
 That parsed cooldown is capped at the *next occurrence* of the stated time-of-day (~24h
 out), not the actual weekly rollover — a big improvement over the default, but a weekly
 pause is still re-probed daily rather than left alone for the full week, since Claude's
-line carries no date. codex and opencode have no provider-specific reset parser, so a
-mid-dispatch limit on them falls back to the generic-rejection-phrase match (untested
-against any real captured output from those CLIs — treat as unverified, not confirmed)
-and the generic cooldown; muse and grok are the same, also unverified. agy is the one
+line carries no date. codex, opencode, muse and grok have no provider-specific reset
+parser, so a limit on them falls back to the generic-rejection-phrase match and the
+generic cooldown. muse's dispatch-time 429, "Subscription quota exhausted", is matched
+from the text reported in real fleet incidents (any line with "quota exhausted"), as is an
+HTTP 402 ("402 Payment Required", or `402` framed as a status). codex's "You've hit your usage
+limit" is matched but still untested against captured codex output; grok and opencode
+rely on the generic phrases alone and remain unverified. agy is the one
 adapter with its own adapter-specific signal: near-exhausted quota is read from its
 statusline telemetry (not its log, which is ~empty) and both the cooldown *and* the
 quota-routing decision come from that telemetry directly, independent of the log-based
