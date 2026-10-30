@@ -1865,7 +1865,13 @@ fn apply_parallel_outcome(
             let quota_hit =
                 quota_hit_for_outcome(paths, &prep.job.provider, &prep.log_path, &result);
             let err = result.error.unwrap_or_else(|| "failed".into());
-            let auth = auth_fault_for(&prep.log_path, &err, quota_hit);
+            let auth = auth_fault_for(
+                &prep.log_path,
+                &err,
+                quota_hit,
+                result.exit_code,
+                result.signal,
+            );
             if let Some(s) = state.slot_mut(slot_id) {
                 s.quota_hit = quota_hit;
                 s.auth_fault = auth.is_some();
@@ -1918,7 +1924,7 @@ fn apply_parallel_outcome(
                 &log_text,
                 &e.to_string(),
             );
-            let auth = auth_fault_for(&prep.log_path, &e.to_string(), quota_hit);
+            let auth = auth_fault_for(&prep.log_path, &e.to_string(), quota_hit, None, None);
             if let Some(s) = state.slot_mut(slot_id) {
                 s.quota_hit = quota_hit;
                 s.auth_fault = auth.is_some();
@@ -2247,7 +2253,7 @@ pub fn run_slot(
             // stream to have parsed a `rate_limit_event` out of, so there is no typed
             // reset instant to thread through.
             let quota_hit = detect_and_pause_quota_with_err(paths, provider, &log_text, err_text);
-            let auth = auth_fault_for(log_path, err_text, quota_hit);
+            let auth = auth_fault_for(log_path, err_text, quota_hit, None, None);
             if let Some(s) = state.slot_mut(slot_id) {
                 s.quota_hit = quota_hit;
                 s.auth_fault = auth.is_some();
@@ -2407,7 +2413,7 @@ pub fn run_slot(
         // `quota_hit_for_outcome`.
         let quota_hit = quota_hit_for_outcome(paths, &job.provider, &log_path, &result);
         let err = result.error.as_deref().unwrap_or("failed");
-        auth_rejection = auth_fault_for(&log_path, err, quota_hit);
+        auth_rejection = auth_fault_for(&log_path, err, quota_hit, result.exit_code, result.signal);
         salvage_expected_artifact(
             paths,
             &state.id,
@@ -2732,9 +2738,17 @@ pub fn slot_parks_on_quota(state: &RunState, slot_id: &str) -> bool {
 }
 
 /// The auth rejection a failed dispatch ended on, from its log tail or its error text.
-/// `None` when the failure was a quota hit: that is the more specific verdict.
-fn auth_fault_for(log_path: &Path, err_text: &str, quota_hit: bool) -> Option<String> {
-    if quota_hit {
+/// `None` when the failure was a quota hit (the more specific verdict), and when the CLI
+/// exited 0 or was killed: a refused credential is a non-zero exit, and an implementer
+/// whose own test output says "401 Unauthorized" before it forgot its summary is not one.
+fn auth_fault_for(
+    log_path: &Path,
+    err_text: &str,
+    quota_hit: bool,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+) -> Option<String> {
+    if quota_hit || exit_code == Some(0) || signal.is_some() {
         return None;
     }
     crate::backup::scrape_auth_signal(&process::tail_log(log_path, 8000))
@@ -5438,14 +5452,24 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let log_path = tmp.path().join("slot.log");
         std::fs::write(&log_path, format!("· thinking\n{CLAUDE_REVOKED}\n")).unwrap();
-        let line = auth_fault_for(&log_path, "exit 1", false).expect("auth fault");
+        let line = auth_fault_for(&log_path, "exit 1", false, Some(1), None).expect("auth fault");
         assert!(line.contains("401"));
         assert!(
-            auth_fault_for(&log_path, "exit 1", true).is_none(),
+            auth_fault_for(&log_path, "exit 1", true, Some(1), None).is_none(),
             "a quota hit is the more specific verdict"
         );
+        assert!(
+            auth_fault_for(&log_path, "missing expected artifact", false, Some(0), None).is_none(),
+            "a clean exit is not a refused credential"
+        );
+        assert!(
+            auth_fault_for(&log_path, "killed", false, None, Some(15)).is_none(),
+            "a kill is not a refused credential"
+        );
         std::fs::write(&log_path, "· done\n").unwrap();
-        assert!(auth_fault_for(&log_path, "spawn failed: invalid_grant", false).is_some());
+        assert!(
+            auth_fault_for(&log_path, "spawn failed: invalid_grant", false, None, None).is_some()
+        );
     }
 
     #[test]
