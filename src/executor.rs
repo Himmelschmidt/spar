@@ -233,7 +233,14 @@ impl SlotTmp {
         }
         let dir = paths.slot_tmp_dir(run_id, slot_id);
         match std::fs::create_dir_all(&dir) {
-            Ok(()) => Self(Some(dir)),
+            Ok(()) => {
+                let _ = crate::events::append(
+                    paths,
+                    run_id,
+                    &crate::events::Event::slot_note(slot_id, format!("TMPDIR {}", dir.display())),
+                );
+                Self(Some(dir))
+            }
             Err(e) => {
                 eprintln!(
                     "warning: {slot_id}: TMPDIR {} not created ({e}); the slot uses the system default",
@@ -253,6 +260,13 @@ impl SlotTmp {
             .into_iter()
             .map(|k| (k.to_string(), dir.clone()))
             .collect()
+    }
+
+    /// Leave the directory in place: its process may outlive the dispatch (a tmux pane
+    /// that was not confirmed dead), and deleting a live process's scratch breaks it.
+    /// Removed with the run's directory instead.
+    fn keep(&mut self) {
+        self.0 = None;
     }
 }
 
@@ -2200,11 +2214,11 @@ pub fn run_slot(
     // dispatch as the nudge threshold instead.
     let timeout = hard_ceiling_for_role(cfg, job.role);
 
+    let mut tmp = SlotTmp::create(paths, &state.id, &job.slot_id, state.isolation);
     if state.dry_run {
         return run_dry(state, paths, job, &cwd, &log_path, &prompt);
     }
 
-    let tmp = SlotTmp::create(paths, &state.id, &job.slot_id, state.isolation);
     let mut presence_env = wire_slot_presence(state, paths, job, &cwd, &pref);
     presence_env.extend(tmp.env());
 
@@ -2266,8 +2280,15 @@ pub fn run_slot(
                     &presence_env,
                     effort,
                 ) {
-                    Ok(r) => r,
+                    Ok(r) => {
+                        // Only `ok` means the marker landed and the pane is gone.
+                        if !r.ok {
+                            tmp.keep();
+                        }
+                        r
+                    }
                     Err(e) => {
+                        tmp.keep();
                         salvage_expected_artifact(
                             paths,
                             &state.id,
@@ -6515,6 +6536,47 @@ mod tests {
 
         drop(prep);
         assert!(!dir.exists(), "removed when the dispatch is done");
+    }
+
+    /// The single-job `run_slot` path: the TMPDIR mapping is recorded, the directory name
+    /// is a short hash (unix sockets cap paths at 108 bytes), and it is gone afterwards.
+    #[test]
+    fn run_slot_records_a_short_tmpdir_and_removes_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let cfg = Config::default();
+        let mut state = RunState::new(
+            "r-tmpslot",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.dry_run = true;
+        let slot_id = "review-1-cli-opencode-openrouter-anthropic-claude-opus";
+        state.slots.push(init_slot_model(
+            slot_id,
+            "cli:claude",
+            SlotRole::Implementer,
+            None,
+        ));
+        state.save(&paths).unwrap();
+        let mut job = impl_job(slot_id);
+        job.template = "implementer".into();
+        run_slot(&mut state, &paths, &cfg, &job).unwrap();
+
+        let dir = paths.slot_tmp_dir("r-tmpslot", slot_id);
+        let name = dir.file_name().unwrap().to_str().unwrap();
+        assert_eq!(name.len(), 8, "{name}");
+        assert!(name.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(dir, paths.slot_tmp_dir("r-tmpslot", slot_id), "stable");
+        let recorded = crate::events::read_all(&paths, "r-tmpslot")
+            .unwrap()
+            .into_iter()
+            .any(|e| {
+                e.slot.as_deref() == Some(slot_id)
+                    && e.message.as_deref() == Some(&format!("TMPDIR {}", dir.display()))
+            });
+        assert!(recorded, "slot -> TMPDIR mapping is in the event log");
+        assert!(!dir.exists(), "removed when the dispatch returns");
     }
 
     /// A dispatch's outcome fields describe *that* dispatch. Carried into the next one

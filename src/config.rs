@@ -1561,7 +1561,8 @@ impl Config {
         }
         self.suite.command = frozen.suite.command.clone();
         self.suite.command_from_cli = true;
-        self.suite.enabled = true;
+        // As frozen: a pin a later reload turned off with `--without suite` stays off.
+        self.suite.enabled = frozen.suite.enabled;
     }
 
     /// Apply `--fleet <preset>` as the *base*: `--without` and `--role` are applied after
@@ -2580,6 +2581,12 @@ planner = "best"
         assert_eq!(reloaded.suite.command, vec!["cargo test -p ui"]);
         assert!(reloaded.suite.command_from_cli);
 
+        let mut disabled = frozen.clone();
+        disabled.suite.enabled = false;
+        let mut reloaded = Config::default();
+        reloaded.carry_cli_suite_command(&disabled);
+        assert!(!reloaded.suite.enabled, "a pin turned off stays off");
+
         let mut from_file = Config::default();
         from_file.suite.command = vec!["make check".into()];
         let mut reloaded = Config::default();
@@ -2588,6 +2595,15 @@ planner = "best"
             reloaded.suite.command.is_empty(),
             "file state is re-read, not carried"
         );
+    }
+
+    #[test]
+    fn ship_title_max_reads_from_the_file() {
+        assert_eq!(Config::default().ship.title_max, 72);
+        let file: ConfigFile = toml::from_str("[ship]\ntitle_max = 0\n").unwrap();
+        let mut cfg = Config::default();
+        cfg.apply_file(&file, Trust::Project).unwrap();
+        assert_eq!(cfg.ship.title_max, 0);
     }
 
     #[test]

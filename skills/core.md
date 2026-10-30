@@ -554,7 +554,8 @@ is fixed when the run is created. Passing `--base` there with a different commit
 into the implementer, onto a different base). Plan a new run to change the base.
 
 The PR **title** is the task's first non-blank line with any heading marker stripped,
-clamped on a word boundary to `[ship] title_max` characters (default 72, `0` = never).
+clamped on a word boundary to `[ship] title_max` characters (default 72, `0` = no clamp
+of spar's own), and never past GitHub's 256-character limit.
 The PR **body** is built from the run: OPEN questions from the shipped slot's summary
 (lines under an `Open questions` heading, or lines marked `OPEN`), each reviewer's final
 verdict and the commit it named, then the summary itself (`summary-<slot>.md`, else
@@ -810,15 +811,17 @@ already in the base branch. Set it `false` to keep every worktree until you swee
 **What a slot worktree starts with.** Tracked files at the run's base, plus the files
 `[worktree] copy` names (default `.dbiso.env`, `.envrc`, `.env.example`) copied from the
 main checkout when present. Every slot process gets `TMPDIR` / `TMP` / `TEMP` set to
-`.spar/runs/<id>/tmp/<slot>`, created before the spawn and deleted when that dispatch
-ends, so slots never read each other's scratch files. Under `worktree-bwrap` the sandbox's
+`.spar/runs/<id>/tmp/<hash8>` (a short hash of the slot id, kept short for unix socket
+paths; the mapping is the slot's `TMPDIR <path>` event), created before the spawn and
+deleted when that dispatch ends, so slots never read each other's scratch files. A tmux
+slot whose pane may still be alive keeps its directory until the run directory goes. Under `worktree-bwrap` the sandbox's
 own private `/tmp` is used instead.
 
-**Run outputs stay out of commits.** When spar cuts a slot worktree it adds `/artifacts/`
-and `/.spar/` to the repo's `info/exclude` (git only reads the common dir's copy for a
-linked worktree, so this covers the primary checkout too), unless the repo already tracks
-files there. **The primary checkout is watched:** spar records its `git status --porcelain`
-(minus `.spar/`) when a run leg starts and compares it when the leg reaches a gate or a
+**spar's run store stays out of commits.** When spar cuts a slot worktree it adds `/.spar/`
+to the repo's `info/exclude` (git only reads the common dir's copy for a linked worktree,
+so this covers the primary checkout too) and says so once on stderr, unless the repo
+already tracks files there. `artifacts/` is not excluded. **The primary checkout is watched:** spar records its `git status --porcelain`
+(minus `.spar/`) when a run leg starts work (not while queued) and compares it when the leg reaches a gate or a
 terminal phase. A difference is a `warning:` on stderr and an `info` event naming the
 changed paths. Edits you make while the run is parked at a gate are not reported, and
 `isolation = "none"` is never checked (its slots work there on purpose).
@@ -1183,7 +1186,7 @@ touching `spar.toml`, on `plan`, `implement` and `run`. Composition order: prese
 deterministic suite, replacing `[suite].command` and turning the suite channel on even under
 `--fleet small`. It is frozen into `config.json`, and unlike the other run flags it is
 **kept across `--reload-config`**: a reload re-reads `spar.toml` but carries the run's
-`--suite-command` over unless the flag is given again. On an existing `--run <id>` it needs
+`--suite-command` over, on or off as frozen, unless the flag is given again. On an existing `--run <id>` it needs
 `--reload-config`, and combined with `--without suite` it is refused (O109).
 
 **Run JSON carries a `fleet` array**, one entry per seat: `{seat, role, provider, model,
@@ -1241,7 +1244,7 @@ auto_archive_after = "14d"
 auto_cleanup_merged = true   # reap at-rest runs already contained in their base, at launch
 copy = [".dbiso.env", ".envrc", ".env.example"]   # copied from the main checkout into every slot worktree; missing files skipped
 [ship]
-title_max = 72   # PR title clamp in characters; 0 never clamps
+title_max = 72   # PR title clamp in characters; 0 = GitHub's 256 only
 [gates]
 plan = true
 winner = true

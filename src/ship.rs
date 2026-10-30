@@ -77,10 +77,17 @@ fn exact_ref(cwd: &std::path::Path, git_ref: &str) -> bool {
 /// document, so the first 72 characters of it are the heading marker, the heading, and
 /// the start of the first paragraph, cut mid-word — which is what ends up naming the PR.
 /// Take the first non-blank line instead, strip its heading marker, and clamp to `max`
-/// characters (`[ship] title_max`, `0` = never) on a word boundary. An inline `-t` task
-/// that already fits is passed through unchanged.
+/// characters (`[ship] title_max`, `0` = only GitHub's own limit) on a word boundary. An
+/// inline `-t` task that already fits is passed through unchanged.
 fn pr_title(task: Option<&str>, max: usize) -> String {
     const FALLBACK: &str = "spar change";
+    // GitHub rejects a PR title over 256 characters, whatever the setting says.
+    const GITHUB_MAX: usize = 256;
+    let max = if max == 0 {
+        GITHUB_MAX
+    } else {
+        max.min(GITHUB_MAX)
+    };
     let Some(line) = task.and_then(|t| t.lines().map(str::trim).find(|l| !l.is_empty())) else {
         return FALLBACK.into();
     };
@@ -90,7 +97,7 @@ fn pr_title(task: Option<&str>, max: usize) -> String {
     if line.is_empty() {
         return FALLBACK.into();
     }
-    if max == 0 || line.chars().count() <= max {
+    if line.chars().count() <= max {
         return line.to_string();
     }
     let cut: String = line.chars().take(max.saturating_sub(1)).collect();
@@ -593,6 +600,16 @@ mod tests {
     fn pr_title_clamp_is_configurable_and_zero_never_clamps() {
         let long = format!("# {}\n\nbody", "word ".repeat(30).trim_end());
         assert_eq!(pr_title(Some(&long), 0), "word ".repeat(30).trim_end());
+        let huge = "word ".repeat(100);
+        for max in [0, 1000] {
+            let title = pr_title(Some(&huge), max);
+            assert!(
+                title.chars().count() <= 256,
+                "{max}: {}",
+                title.chars().count()
+            );
+            assert!(title.ends_with('\u{2026}'));
+        }
         let title = pr_title(Some(&long), 20);
         assert_eq!(title, "word word word…");
     }

@@ -37,7 +37,8 @@ ship = true
 
 [ship]
 auto_confirm = false
-# PR title is the task's first line, clamped on a word boundary. 0 never clamps.
+# PR title is the task's first line, clamped on a word boundary. 0 leaves only GitHub's
+# own 256-character limit.
 title_max = 72
 
 [timeouts]

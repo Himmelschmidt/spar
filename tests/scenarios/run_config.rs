@@ -406,3 +406,54 @@ fn suite_command_contradicting_without_suite_is_refused() {
         .code(1)
         .stderr(predicates::str::contains("contradict"));
 }
+
+/// A pinned suite turned off with `--without suite` on one reload stays off on the next
+/// plain reload, instead of the carried pin switching it back on.
+#[test]
+fn a_suite_pin_disabled_on_reload_stays_disabled() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    init_repo(dir);
+    write_roles(dir, "cli:grok");
+    let plan = spar_cmd()
+        .current_dir(dir)
+        .args([
+            "plan",
+            "--task",
+            "task A",
+            "--dry-run",
+            "--json",
+            "--suite-command",
+            "pnpm test ui",
+        ])
+        .assert()
+        .code(2);
+    let run_id = json_of(&plan)["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    spar_cmd()
+        .current_dir(dir)
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+
+    let reload = |extra: &[&str]| {
+        let mut args = vec![
+            "implement",
+            "--run",
+            run_id.as_str(),
+            "--dry-run",
+            "--json",
+            "--reload-config",
+        ];
+        args.extend_from_slice(extra);
+        spar_cmd().current_dir(dir).args(&args).assert().code(2);
+        frozen_suite(dir, &run_id)
+    };
+    let suite = reload(&["--without", "suite"]);
+    assert_eq!(suite["enabled"], serde_json::json!(false));
+    let suite = reload(&[]);
+    assert_eq!(suite["enabled"], serde_json::json!(false), "{suite}");
+    assert_eq!(suite["command"], serde_json::json!(["pnpm test ui"]));
+}
