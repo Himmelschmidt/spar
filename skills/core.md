@@ -585,6 +585,29 @@ fast-forwards the implementer's branch back onto HEAD before each review panel w
 left the worktree elsewhere, and only warns (stderr + event log) when that is not a
 fast-forward, the branch is still at the base, or it is checked out in another worktree.
 
+## Checkpoints: the implementer's work leaves the box every round
+
+After every implementer dispatch, spar snapshots the slot worktree, commits **and**
+uncommitted edits, to the private ref `refs/spar-checkpoint/<run_id>/<slot>` and pushes it
+to `origin`. When the slot died (exit, signal, ceiling, transport), the snapshot is a WIP
+commit on top of the branch, taken before the slot is marked failed. The snapshot uses a
+throwaway index and `git commit-tree`: the worktree's branch, index and files never move.
+It is not a branch, so no PR targets it, and `spar/<id>/<slot>` never resolves to it.
+
+The push is best-effort: no `origin`, no network or a 60s timeout prints a `warning:` on
+stderr and an event note, keeps the ref locally, and never fails the run. The agent still
+does not push; spar does.
+
+Base a replacement run on a dead run's work from any box:
+
+```bash
+spar implement -t "..." --providers cli:claude --base refs/spar-checkpoint/<run_id>/impl
+```
+
+`--base` fetches the ref from `origin` by name when it is not local (`origin/spar-checkpoint/…`
+and `spar-checkpoint/…` spellings work too). An unresolvable `--base [origin/]spar/<id>/<slot>`
+names the matching checkpoint ref in its error.
+
 ## Abandoned runs
 
 A run is **abandoned** when it is still in a non-resting phase but no live orchestrator

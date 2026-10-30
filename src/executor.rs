@@ -1780,6 +1780,9 @@ fn apply_parallel_outcome(
             if let Some(u) = result.usage {
                 state.usage.push(u);
             }
+            if prep.job.role == SlotRole::Implementer {
+                crate::checkpoint::save_slot(paths, &state.id, slot_id, &prep.cwd, None);
+            }
             // Artifact presence is already enforced in `execute_prepared`; a slot that
             // reaches here with `ok` has its expected artifact.
             let _ = crate::events::append(
@@ -1898,6 +1901,11 @@ pub fn salvage_expected_artifact(
     cwd: &Path,
     carry_forward_chars: usize,
 ) {
+    // Before anything marks the slot failed: a dead implementer's dirty tree is the one
+    // copy of its round, and the box it sits on may be the next thing to die (O112).
+    if job.role == SlotRole::Implementer {
+        crate::checkpoint::save_slot(paths, run_id, &job.slot_id, cwd, Some(reason));
+    }
     // First, unconditionally: a missing implementer brief is synthesized even when the
     // primary artifact already exists (the agent may have written its summary and died
     // before the brief), and `salvage_carry_forward` itself no-ops for other roles and
@@ -2318,6 +2326,9 @@ pub fn run_slot(
         }
         if let Some(u) = result.usage {
             state.usage.push(u);
+        }
+        if job.role == SlotRole::Implementer {
+            crate::checkpoint::save_slot(paths, &state.id, &job.slot_id, &cwd, None);
         }
         let _ = crate::events::append(
             paths,
@@ -5603,6 +5614,48 @@ mod tests {
         std::fs::write(repo.join("foo.rs"), "fn main() { println!(\"hi\"); }\n").unwrap();
         std::fs::write(repo.join("new.rs"), "new file\n").unwrap();
         repo
+    }
+
+    /// #156: a dead implementer's uncommitted round reaches origin before the slot is
+    /// marked failed, on a private ref, without moving the worktree's branch.
+    #[test]
+    fn salvage_checkpoints_a_dead_implementers_dirty_tree_to_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("r1").unwrap();
+        let repo = dirty_repo(tmp.path());
+        let origin = tmp.path().join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "-q", "--bare"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        let head_before = git_output(&repo, &["rev-parse", "HEAD"]).unwrap();
+        let log_path = paths.log_file("r1", "impl");
+        std::fs::write(&log_path, "→ edit  foo.rs  success\n").unwrap();
+
+        salvage_expected_artifact(
+            &paths,
+            "r1",
+            &impl_job("impl"),
+            &log_path,
+            "transport error",
+            &repo,
+            4000,
+        );
+
+        let pushed = git_output(&origin, &["rev-parse", "refs/spar-checkpoint/r1/impl"])
+            .expect("checkpoint on origin");
+        assert_eq!(
+            git_output(&origin, &["show", &format!("{pushed}:new.rs")]).as_deref(),
+            Some("new file")
+        );
+        assert_eq!(
+            git_output(&repo, &["rev-parse", "HEAD"]).as_deref(),
+            Some(head_before.as_str())
+        );
+        assert!(git_output(&repo, &["status", "--porcelain"]).is_some_and(|s| s.contains("new.rs")));
     }
 
     #[test]

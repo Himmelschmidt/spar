@@ -53,23 +53,38 @@ pub fn resolve_base(
         // `HEAD` (and anything relative to it) is per-worktree, so `--base HEAD` from a
         // linked worktree must mean *that* worktree's HEAD.
         let from = if in_repo { cwd } else { project_root };
-        let commit = git_out(
-            from,
-            &["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
-        )
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "--base {reference} does not resolve to a commit in {}",
-                from.display()
-            )
-        })?;
-        // Record what `HEAD` *is*: a run whose base_ref is the literal "HEAD" reads as
-        // detached later, and `ship` then declines to target the branch it came from.
-        let reference = match reference {
-            "HEAD" => named_head(from).unwrap_or_else(|| reference.to_string()),
-            other => other.to_string(),
-        };
-        return Ok(Some(RunBase { reference, commit }));
+        let verify =
+            |r: &str| git_out(from, &["rev-parse", "--verify", &format!("{r}^{{commit}}")]);
+        if let Some(commit) = verify(reference) {
+            // Record what `HEAD` *is*: a run whose base_ref is the literal "HEAD" reads as
+            // detached later, and `ship` then declines to target the branch it came from.
+            let reference = match reference {
+                "HEAD" => named_head(from).unwrap_or_else(|| reference.to_string()),
+                other => checkpoint_ref_name(other).unwrap_or_else(|| other.to_string()),
+            };
+            return Ok(Some(RunBase { reference, commit }));
+        }
+        // A checkpoint ref is pushed but never fetched by default refspecs, so a box
+        // replacing a dead run has to ask origin for it by name (O112).
+        if let Some(full) = checkpoint_ref_name(reference) {
+            let _ = git_out(
+                from,
+                &["fetch", "--quiet", "origin", &format!("+{full}:{full}")],
+            );
+            if let Some(commit) = verify(&full) {
+                return Ok(Some(RunBase {
+                    reference: full,
+                    commit,
+                }));
+            }
+        }
+        let hint = slot_branch_checkpoint(reference)
+            .map(|c| format!("; if that run died before ship, its work may be at --base {c}"))
+            .unwrap_or_default();
+        bail!(
+            "--base {reference} does not resolve to a commit in {}{hint}",
+            from.display()
+        );
     }
     if !in_repo {
         return Ok(None);
@@ -79,6 +94,24 @@ pub fn resolve_base(
     };
     let reference = named_head(cwd).unwrap_or_else(|| commit.clone()); // else detached
     Ok(Some(RunBase { reference, commit }))
+}
+
+/// `refs/spar-checkpoint/<run>/<slot>` for any spelling of it an operator might type:
+/// full, without `refs/`, or as if it were a remote-tracking ref under `origin/`.
+fn checkpoint_ref_name(reference: &str) -> Option<String> {
+    let bare = reference.strip_prefix("refs/").unwrap_or(reference);
+    let bare = bare.strip_prefix("origin/").unwrap_or(bare);
+    bare.starts_with("spar-checkpoint/")
+        .then(|| format!("refs/{bare}"))
+}
+
+/// The checkpoint ref matching a slot branch (`[origin/]spar/<run>/<slot>`), the ref an
+/// operator reaches for when the branch itself was never pushed.
+fn slot_branch_checkpoint(reference: &str) -> Option<String> {
+    let bare = reference.strip_prefix("origin/").unwrap_or(reference);
+    let rest = bare.strip_prefix("spar/")?;
+    let (run, slot) = rest.split_once('/')?;
+    Some(crate::checkpoint::checkpoint_ref(run, slot))
 }
 
 /// The branch name checked out in `dir`, or `None` when detached.
@@ -2067,6 +2100,53 @@ mod tests {
         assert_eq!(base.reference, "feat");
         assert_eq!(base.commit, feat_head);
         assert!(resolve_base(&root, &wt, Some("no/such/ref")).is_err());
+    }
+
+    /// #156: a replacement run on another box bases on the dead run's checkpoint. It was
+    /// pushed to origin and never fetched here, so `--base` fetches it by name, in any
+    /// spelling, and a missing slot branch names the checkpoint to use instead.
+    #[test]
+    fn base_resolves_a_checkpoint_ref_only_origin_has() {
+        let tmp = tempdir().unwrap();
+        let (root, wt, feat_head) = repo_with_linked_worktree(tmp.path());
+        let origin = tmp.path().join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        fixture_git(&origin, &["init", "-q", "--bare"]);
+        fixture_git(
+            &root,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        fixture_git(&root, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+        fixture_git(
+            &wt,
+            &["push", "-q", "origin", "HEAD:refs/spar-checkpoint/r9/impl"],
+        );
+
+        let clone = tmp.path().join("clone");
+        fixture_git(
+            tmp.path(),
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        for spelling in [
+            "refs/spar-checkpoint/r9/impl",
+            "origin/spar-checkpoint/r9/impl",
+            "spar-checkpoint/r9/impl",
+        ] {
+            let base = resolve_base(&clone, &clone, Some(spelling))
+                .unwrap()
+                .unwrap();
+            assert_eq!(base.commit, feat_head, "{spelling}");
+            assert_eq!(base.reference, "refs/spar-checkpoint/r9/impl");
+        }
+        let err = resolve_base(&clone, &clone, Some("origin/spar/r9/impl"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("refs/spar-checkpoint/r9/impl"), "{err}");
     }
 
     /// `--base HEAD` must record the branch, not the literal ref: a base_ref of "HEAD"

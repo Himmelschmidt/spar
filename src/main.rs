@@ -2,6 +2,7 @@ mod api;
 mod backup;
 mod brief;
 mod bus;
+mod checkpoint;
 mod cli;
 mod config;
 mod daemon;
