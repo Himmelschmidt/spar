@@ -33,7 +33,7 @@ pub struct CommonOpts {
     pub big: bool,
     /// `--max-rounds`: raise this run's round ceiling (O52). `None` leaves it where the
     /// run froze it. Only `implement` offers it; every other entry point passes `None`.
-    pub max_rounds: Option<u32>,
+    pub max_rounds: Option<crate::cli::MaxRounds>,
     /// `--accept-contract`: adopt a `test-contract.md` that drifted under the previous
     /// round. Without it, a re-entry that would re-freeze a tampered contract refuses.
     pub accept_contract: bool,

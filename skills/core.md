@@ -415,7 +415,19 @@ it may spend on its own.
 
 ```bash
 spar implement --run <id> --max-rounds 12   # buy more rounds; sticky on the run
+spar implement --run <id> --max-rounds +2   # two rounds past the current one (O127)
 ```
+
+**Extending (O127).** The value must land above the run's current round (a round opened
+but never dispatched may be the ceiling itself); anything lower would re-park at once,
+so it is refused, exit `1` (a validation refusal, JSON under `--json`). Sent while an
+orchestrator still holds the run, a bare `implement --run <id> --max-rounds …` (no `-t`,
+`--providers`, `--select`, `--base`, `--reload-config`, `--accept-contract`) is
+**queued**, not refused busy: exit `0`, JSON `{"run_id", "queued_max_rounds", "owner_pid",
+"round"}`, and a `markers/max-rounds.queued` file the loop reads just before its next
+ceiling check (or the next re-entry reads, if the orchestrator exits first). A queued
+value only ever raises the ceiling. `spar doctor` recommends a `[notify]` sink when any
+run has sat at a human gate for over an hour with none configured.
 
 **A round that never dispatched is not charged.** `implement --run` re-entering a run whose
 current round never stamped a slot (the orchestrator died between opening the round and
@@ -1634,7 +1646,7 @@ timeout_secs = 3600    # test_author's SOFT clock; hard_ceiling_multiple applies
   - **Agent tester.** With `[suite].command` empty, a cheap `tester` slot discovers how the repo runs its tests and reports. Its provider comes from `[roles].tester` (falls through to model-select/fleet if unset/unusable). This is the fallback for a repo that has not declared its commands, and the one path where the gate depends on a model reporting its own result honestly.
 
   Independent `review` workflow does not spawn a tester by default.
-- **Round ceiling:** `state.round` is bounded by `[rounds] max` (default 8). Hitting it is a **gate** (exit 2, phase `awaiting_round_extension`), lifted with `implement --run <id> --max-rounds <N>` (>= 1; sticky; clears `error`). The rotate/widen/`stuck` ladder resolves **first**, so exit 3 always beats the gate, and a lift preserves the ladder's progress rather than re-buying it.
+- **Round ceiling:** `state.round` is bounded by `[rounds] max` (default 8). Hitting it is a **gate** (exit 2, phase `awaiting_round_extension`), lifted with `implement --run <id> --max-rounds <N|+N>` (above the current round; sticky; clears `error`; queued while an orchestrator is live). The rotate/widen/`stuck` ladder resolves **first**, so exit 3 always beats the gate, and a lift preserves the ladder's progress rather than re-buying it.
 - **Contract re-freeze is guarded:** a re-entry that would adopt a `test-contract.md` spar saw drift mid-round refuses with exit `1` unless `--accept-contract` is passed. Re-freezes are announced on stderr, not just in `events.jsonl`.
 - **Carry-forward:** the implementer writes `artifacts/carry-forward-<slot>.md`, which seeds the next round's implementer prompt (blockers first, capped at `[rounds] carry_forward_chars`, consumed on read). It never reaches a reviewer or the acceptance gate.
 - **Human TUI `/spawn`:** `/spawn <cli:provider> <prompt>` launches an agent into a pane on spar's own `tmux -L spar` socket, joined to the selected run's bus — watch and steer it in Main's **Shell** tab without leaving spar.

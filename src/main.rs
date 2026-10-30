@@ -385,7 +385,14 @@ fn run() -> Result<ExitCode> {
                 };
                 match &run_id {
                     Some(id) => {
-                        state::RunState::load(&paths, id)?;
+                        let st = state::RunState::load(&paths, id)?;
+                        if let Some(mr) = max_rounds {
+                            workflow::implement::check_round_extension(
+                                &st,
+                                mr.resolve(st.round),
+                                !workflow::implement::current_round_dispatched(&st),
+                            )?;
+                        }
                         if let Some(t) = &task {
                             runspec::validate_task(t).map_err(anyhow::Error::msg)?;
                         }

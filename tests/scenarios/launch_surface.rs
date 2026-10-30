@@ -240,3 +240,136 @@ fn usage_errors_exit_one() {
     let out = sb.spar().args(["--help"]).output().unwrap();
     assert_eq!(out.status.code(), Some(0), "{out:?}");
 }
+
+impl Sandbox {
+    /// A dry-run plan, approved, then implemented up to its `[rounds] max` gate.
+    fn run_at_ceiling(&self, max: u32) -> String {
+        std::fs::write(
+            self.project.join("spar.toml"),
+            format!("[rounds]\nmax = {max}\n"),
+        )
+        .unwrap();
+        let out = self
+            .spar()
+            .args([
+                "plan",
+                "-t",
+                "add a hello function",
+                "--providers",
+                "cli:claude,cli:grok",
+                "--dry-run",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{out:?}");
+        let id = json(&out)["run_id"].as_str().unwrap().to_string();
+        self.spar()
+            .args(["approve", &id, "--json"])
+            .assert()
+            .success();
+        self.implement(&id, &[]).code(2);
+        assert_eq!(self.state(&id)["phase"], "awaiting_round_extension");
+        id
+    }
+
+    fn implement(&self, id: &str, extra: &[&str]) -> assert_cmd::assert::Assert {
+        let mut args = vec!["implement", "--run", id, "--dry-run", "--json"];
+        args.extend_from_slice(extra);
+        self.spar()
+            .env("SPAR_FORCE_REQUEST_CHANGES", "1")
+            .args(&args)
+            .assert()
+    }
+
+    fn state(&self, id: &str) -> serde_json::Value {
+        let p = self.project.join(".spar/runs").join(id).join("state.json");
+        serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+    }
+}
+
+/// #165: `+N` is relative to the round the run is on, so a launcher need not read the
+/// state first to buy two more rounds.
+#[test]
+fn max_rounds_plus_n_is_relative_to_the_current_round() {
+    let sb = Sandbox::new();
+    let id = sb.run_at_ceiling(3);
+    let round = sb.state(&id)["round"].as_u64().unwrap();
+    sb.implement(&id, &["--max-rounds", "+2"]).code(2);
+    let st = sb.state(&id);
+    assert_eq!(st["max_rounds"].as_u64(), Some(round + 2), "{st}");
+    assert_eq!(st["round"].as_u64(), Some(round + 2), "{st}");
+}
+
+/// #165: a ceiling at or below the current round used to re-park silently.
+#[test]
+fn max_rounds_at_or_below_the_current_round_is_refused() {
+    let sb = Sandbox::new();
+    let id = sb.run_at_ceiling(3);
+    let round = sb.state(&id)["round"].as_u64().unwrap().to_string();
+    let out = sb
+        .implement(&id, &["--max-rounds", &round])
+        .code(1)
+        .get_output()
+        .clone();
+    let v = json(&out);
+    assert_eq!(v["kind"], "validation", "{v}");
+    assert_eq!(v["run_id"], id.as_str(), "{v}");
+    assert!(v["error"].as_str().unwrap().contains("at or below"), "{v}");
+    let st = sb.state(&id);
+    assert_eq!(st["phase"], "awaiting_round_extension", "{st}");
+    assert_eq!(st["max_rounds"].as_u64(), Some(3), "{st}");
+    sb.implement(&id, &["--max-rounds", "+0"]).code(1);
+}
+
+/// #165: an extension sent while an orchestrator holds the run is queued for it
+/// instead of failing busy, and a later re-entry still honours it.
+#[test]
+fn max_rounds_against_a_live_orchestrator_is_queued() {
+    use std::io::Write;
+    let sb = Sandbox::new();
+    let id = sb.run_at_ceiling(3);
+    let round = sb.state(&id)["round"].as_u64().unwrap();
+    let lock_path = sb
+        .project
+        .join(".spar/runs")
+        .join(&id)
+        .join("orchestrator.lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    lock.try_lock().unwrap();
+    (&lock)
+        .write_all(std::process::id().to_string().as_bytes())
+        .unwrap();
+
+    let out = sb
+        .implement(&id, &["--max-rounds", "+2"])
+        .code(0)
+        .get_output()
+        .clone();
+    let v = json(&out);
+    assert_eq!(v["queued_max_rounds"].as_u64(), Some(round + 2), "{v}");
+    assert_eq!(sb.state(&id)["max_rounds"].as_u64(), Some(3));
+    let marker = sb
+        .project
+        .join(".spar/runs")
+        .join(&id)
+        .join("markers/max-rounds.queued");
+    assert!(marker.is_file(), "queued marker missing");
+
+    // Anything beyond the extension still needs the lock.
+    sb.implement(&id, &["--max-rounds", "+2", "-t", "also this"])
+        .code(1);
+
+    drop(lock);
+    sb.implement(&id, &[]).code(2);
+    let st = sb.state(&id);
+    assert_eq!(st["max_rounds"].as_u64(), Some(round + 2), "{st}");
+    assert_eq!(st["round"].as_u64(), Some(round + 2), "{st}");
+    assert!(!marker.exists(), "the queued extension is consumed once");
+}
