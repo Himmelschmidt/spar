@@ -231,6 +231,7 @@ fn run() -> Result<ExitCode> {
                 if validate_only {
                     return launch_validated(json, Some(&id));
                 }
+                cfg.reapply_captured_env();
                 return workflow::plan::replan(&paths, &cfg, &id, directive, json);
             }
             let prepared = (|| -> Result<_> {
@@ -329,6 +330,7 @@ fn run() -> Result<ExitCode> {
         } => {
             let (paths, _) = project_ctx()?;
             let cfg = Config::for_run(&paths, &run_id)?;
+            cfg.reapply_captured_env();
             workflow::implement::resume(&paths, &cfg, &run_id, detach, json)
         }
         Command::Implement {
@@ -415,6 +417,9 @@ fn run() -> Result<ExitCode> {
             };
             if validate_only {
                 return launch_validated(json, run_id.as_deref());
+            }
+            if run_id.is_some() {
+                cfg.reapply_captured_env();
             }
             workflow::implement::run_from_cli(run_id, plan, task, new, opts, &paths, &cfg)
         }
@@ -571,6 +576,7 @@ fn run() -> Result<ExitCode> {
         Command::Reconcile { run_id, json } => {
             let (paths, _) = project_ctx()?;
             let cfg = Config::for_run(&paths, &run_id)?;
+            cfg.reapply_captured_env();
             workflow::arena::reconcile(&paths, &cfg, &run_id, json)
         }
         Command::Bus { action } => bus_cmd(action),
@@ -652,6 +658,7 @@ fn run() -> Result<ExitCode> {
         Command::InternalContinue { run_id } => {
             let (paths, _) = project_ctx()?;
             let cfg = Config::for_run(&paths, &run_id)?;
+            cfg.reapply_captured_env();
             workflow::implement::continue_run(&paths, &cfg, &run_id)
         }
     }
@@ -1036,7 +1043,15 @@ fn implement_ctx(
     }
     // Before the flags, so this invocation's `--without suite` or `--suite-command`
     // still wins over the carried pin.
-    cfg.carry_cli_suite_command(&Config::for_run(&paths, run_id)?);
+    let frozen = Config::for_run(&paths, run_id)?;
+    cfg.carry_cli_suite_command(&frozen);
+    // A reload re-reads the file, not the shell: the environment stays the one the run
+    // was created in, and only a name newly added to `[env].capture` is taken from now.
+    for (k, v) in frozen.env.captured {
+        if cfg.env.capture.contains(&k) {
+            cfg.env.captured.insert(k, v);
+        }
+    }
     if let Some(preset) = fleet {
         cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
     }

@@ -96,6 +96,79 @@ pub struct Config {
     /// daemon is a project-level service, not a run, so O27 does not apply to it).
     #[serde(default)]
     pub daemon: DaemonConfig,
+    /// `[env]`: shell variables a run records at creation and re-applies on every
+    /// re-entry, so a resume from another shell (or the daemon) sees the same proxy and
+    /// build dirs the run started with (O130).
+    #[serde(default)]
+    pub env: EnvConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvConfig {
+    #[serde(default = "default_env_capture")]
+    pub capture: Vec<String>,
+    /// The values of `capture` that were set in the creating shell. Filled by
+    /// `Config::load`, so it is whatever this process saw; a run's snapshot keeps the
+    /// creation-time values.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub captured: std::collections::BTreeMap<String, String>,
+}
+
+impl Default for EnvConfig {
+    fn default() -> Self {
+        Self {
+            capture: default_env_capture(),
+            captured: Default::default(),
+        }
+    }
+}
+
+fn default_env_capture() -> Vec<String> {
+    [
+        "CARGO_TARGET_DIR",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "https_proxy",
+        "http_proxy",
+        "all_proxy",
+        "no_proxy",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+impl EnvConfig {
+    /// A run's config.json is plain text on disk: a capture list must never be the way
+    /// a credential lands there.
+    fn validate(names: &[String]) -> Result<()> {
+        for name in names {
+            if name.trim().is_empty() || name.contains('=') {
+                anyhow::bail!("[env].capture: {name:?} is not a variable name");
+            }
+            let upper = name.to_ascii_uppercase();
+            if ["KEY", "TOKEN", "SECRET", "PASSWORD"]
+                .iter()
+                .any(|w| upper.contains(w))
+            {
+                anyhow::bail!(
+                    "[env].capture: refusing {name:?}: names containing KEY, TOKEN, SECRET or \
+                     PASSWORD are never recorded in a run's config.json"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn capture_now(&mut self) {
+        self.captured = self
+            .capture
+            .iter()
+            .filter_map(|k| std::env::var(k).ok().map(|v| (k.clone(), v)))
+            .collect();
+    }
 }
 
 /// Operator-configured external sink for `@human` / `Blocked` alerts. spar ships no
@@ -1030,6 +1103,7 @@ impl Default for Config {
             model_select: ModelSelectConfig::default(),
             notify: NotifyConfig::default(),
             daemon: DaemonConfig::default(),
+            env: EnvConfig::default(),
         }
     }
 }
@@ -1081,6 +1155,13 @@ struct ConfigFile {
     model_select: Option<ModelSelectConfigFile>,
     notify: Option<NotifyConfigFile>,
     daemon: Option<DaemonConfigFile>,
+    env: Option<EnvConfigFile>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvConfigFile {
+    capture: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1223,7 +1304,30 @@ impl Config {
         if project_path.is_file() {
             cfg.apply_file(&load_file(&project_path)?, Trust::Project)?;
         }
+        cfg.env.capture_now();
         Ok(cfg)
+    }
+
+    /// Put a run's creation-time `[env]` values back into this process before it
+    /// dispatches again, so its slots, suite commands and API calls inherit them
+    /// whatever shell (or daemon) re-entered the run. Names only in the warning: a proxy
+    /// URL can carry credentials.
+    pub fn reapply_captured_env(&self) {
+        let mut differ = Vec::new();
+        for (k, v) in &self.env.captured {
+            if std::env::var(k).ok().as_deref() == Some(v.as_str()) {
+                continue;
+            }
+            differ.push(k.as_str());
+            std::env::set_var(k, v);
+        }
+        if differ.is_empty() {
+            return;
+        }
+        eprintln!(
+            "warning: [env] {} differ from the shell this run was created in; using the values captured at creation",
+            differ.join(", ")
+        );
     }
 
     /// The config a run is bound to. `spar.toml` is one mutable file per project, read
@@ -1941,6 +2045,10 @@ impl Config {
             if let Some(v) = d.max_slots_per_bucket {
                 self.daemon.max_slots_per_bucket = v;
             }
+        }
+        if let Some(capture) = file.env.as_ref().and_then(|e| e.capture.clone()) {
+            EnvConfig::validate(&capture)?;
+            self.env.capture = capture;
         }
         Ok(())
     }
@@ -2695,5 +2803,58 @@ planner = "best"
         cfg.apply_file(&file, Trust::User).unwrap();
         assert_eq!(cfg.notify.command.as_deref(), Some("ntfy publish"));
         assert_eq!(cfg.notify.webhook.as_deref(), Some("http://hooks.example"));
+    }
+
+    /// O130: a capture list is never how a credential reaches config.json.
+    #[test]
+    fn env_capture_refuses_secret_looking_names() {
+        for name in [
+            "AWS_SECRET_ACCESS_KEY",
+            "gh_token",
+            "DB_PASSWORD",
+            "OPENAI_API_KEY",
+        ] {
+            let mut cfg = Config::default();
+            let file: ConfigFile =
+                toml::from_str(&format!("[env]\ncapture = [\"HTTPS_PROXY\", \"{name}\"]\n"))
+                    .unwrap();
+            let err = cfg.apply_file(&file, Trust::Project).unwrap_err();
+            assert!(format!("{err:#}").contains(name), "{err:#}");
+        }
+        let mut cfg = Config::default();
+        let file: ConfigFile = toml::from_str("[env]\ncapture = [\"CARGO_TARGET_DIR\"]\n").unwrap();
+        cfg.apply_file(&file, Trust::Project).unwrap();
+        assert_eq!(cfg.env.capture, vec!["CARGO_TARGET_DIR".to_string()]);
+        assert!(toml::from_str::<ConfigFile>("[env]\ncapure = []\n").is_err());
+        EnvConfig::validate(&default_env_capture()).unwrap();
+    }
+
+    /// O130: capture records only what is set, survives the snapshot round trip, and
+    /// re-applies over a shell that lost it.
+    #[test]
+    fn env_capture_round_trips_and_reapplies() {
+        let name = "SPAR_TEST_O130_CAPTURE";
+        let unset = "SPAR_TEST_O130_UNSET";
+        std::env::set_var(name, "http://proxy.invalid:3128");
+        std::env::remove_var(unset);
+        let mut cfg = Config::default();
+        cfg.env.capture = vec![name.into(), unset.into()];
+        cfg.env.capture_now();
+        assert_eq!(cfg.env.captured.len(), 1, "{:?}", cfg.env.captured);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        cfg.save_snapshot(&paths, "r1").unwrap();
+        let bound = Config::for_run(&paths, "r1").unwrap();
+        assert_eq!(
+            bound.env.captured.get(name).map(String::as_str),
+            Some("http://proxy.invalid:3128")
+        );
+
+        std::env::set_var(name, "changed");
+        bound.reapply_captured_env();
+        assert_eq!(std::env::var(name).unwrap(), "http://proxy.invalid:3128");
+        assert!(std::env::var(unset).is_err());
+        std::env::remove_var(name);
     }
 }

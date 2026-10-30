@@ -470,3 +470,73 @@ fn a_base_with_different_spar_toml_is_flagged_not_followed() {
         "the working file still wins"
     );
 }
+
+/// #173: the creating shell's proxy is frozen into the run and comes back on a
+/// re-entry from a shell without it, with a warning naming the variable only.
+#[test]
+fn captured_env_is_recorded_and_reapplied_on_reentry() {
+    let sb = Sandbox::new();
+    std::fs::write(sb.project.join("spar.toml"), "[rounds]\nmax = 3\n").unwrap();
+    let proxy = "http://user:pw@proxy.invalid:3128";
+    let out = sb
+        .spar()
+        .env("HTTPS_PROXY", proxy)
+        .env("CARGO_TARGET_DIR", "/nonexistent/target")
+        .args([
+            "plan",
+            "-t",
+            "add a hello function",
+            "--providers",
+            "cli:claude,cli:grok",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let id = json(&out)["run_id"].as_str().unwrap().to_string();
+    let cfg = run_config(&sb, &id);
+    assert_eq!(cfg["env"]["captured"]["HTTPS_PROXY"], proxy, "{cfg}");
+    assert_eq!(
+        cfg["env"]["captured"]["CARGO_TARGET_DIR"],
+        "/nonexistent/target"
+    );
+    sb.spar()
+        .args(["approve", &id, "--json"])
+        .assert()
+        .success();
+
+    let out = sb.implement(&id, &[]).get_output().clone();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("[env]") && stderr.contains("HTTPS_PROXY"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("pw@"), "values never printed: {stderr}");
+}
+
+#[test]
+fn env_capture_of_a_secret_name_is_refused() {
+    let sb = Sandbox::new();
+    std::fs::write(
+        sb.project.join("spar.toml"),
+        "[env]\ncapture = [\"GITHUB_TOKEN\"]\n",
+    )
+    .unwrap();
+    let out = sb
+        .spar()
+        .args([
+            "plan",
+            "-t",
+            "x",
+            "--providers",
+            "cli:claude",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v = json(&out);
+    assert!(v["error"].as_str().unwrap().contains("GITHUB_TOKEN"), "{v}");
+    assert!(sb.runs().is_empty());
+}

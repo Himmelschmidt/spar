@@ -1643,6 +1643,13 @@ timeout_secs = 3600    # test_author's SOFT clock; hard_ceiling_multiple applies
 # restart = true               # restart a dead orchestrator holding resumable work
 # max_restarts = 2             # per run, per daemon lifetime
 # max_slots_per_bucket = 0     # cross-run concurrency cap, keyed on provider (model-free); 0 = off
+# Shell variables a run records in its config.json at creation and re-applies on every
+# re-entry (implement --run, resume, plan --run, reconcile, daemon restarts), warning on
+# stderr (names only) when the re-entering shell differs. Only variables set at creation
+# are recorded. Names containing KEY, TOKEN, SECRET or PASSWORD are refused at load (O130).
+[env]
+# capture = ["CARGO_TARGET_DIR", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
+#            "https_proxy", "http_proxy", "all_proxy", "no_proxy"]   # the default
 # Dynamic model select (vals). Opt-in with --select; cache under ~/.spar/cache/vals/
 [model_select]
 # benches = ["swebench"]
