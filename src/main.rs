@@ -814,6 +814,13 @@ fn implement_ctx(
     cfg.apply_role_overrides(role)?;
     cfg.apply_backup_overrides(backup)?;
     cfg.apply_effort_overrides(effort)?;
+    if let Some(owner) = runlock::RunLock::owner(&paths, run_id).filter(|o| o.alive()) {
+        return Err(runlock::OrchestratorBusy {
+            run_id: run_id.to_string(),
+            owner_pid: owner.pid,
+        }
+        .into());
+    }
     cfg.save_snapshot(&paths, run_id)?;
     eprintln!("config: re-read spar.toml for run {run_id}");
     Ok((paths, cfg))

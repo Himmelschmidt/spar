@@ -577,6 +577,10 @@ children — so they keep running and keep spending tokens with nobody collectin
 - `spar resume <id>` picks an abandoned or stopped run back up without you having to know
   which of `implement --run` / a fresh dispatch applies — it refuses a human gate (naming
   the command that resolves it) and a run with a live orchestrator (naming its pid).
+  `implement --run <id>` (with or without `--detach` / `--reload-config`) refuses the same
+  way, exit 1, before it writes anything to the live run's `state.json` or `config.json`.
+- A foreground `spar plan` holds the run lock for its whole dispatch, so it never reads
+  abandoned while its planner works.
 - `spar daemon start` runs a per-project supervisor that pushes an alert the first time a
   run has read abandoned past `[daemon].abandon_after_secs` (60s by default), and restarts
   it if `[daemon].restart` is on (the default). It is opt-in — nothing starts it for you —
