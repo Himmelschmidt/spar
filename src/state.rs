@@ -186,6 +186,21 @@ pub struct RunState {
     /// "Shipped over open findings" section.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ship_override: Option<crate::ship::ShipOverride>,
+    /// Every `implement --reassign` applied to this run, oldest first (O136). The seat
+    /// that was retired stays named here, so the record answers who filled it before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seat_reassignments: Vec<SeatReassignment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeatReassignment {
+    pub at: DateTime<Utc>,
+    pub round: u32,
+    pub role: SlotRole,
+    pub from_seat: String,
+    pub from_provider: String,
+    pub to_seat: String,
+    pub to_provider: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -492,6 +507,9 @@ pub enum SeatSource {
     ModelSelect,
     SuitePreferences,
     Backup,
+    /// The operator moved this seat to another provider with `implement --reassign`
+    /// (O136). A `--reload-config` re-point leaves it alone.
+    Reassigned,
     /// A slot with no recorded provenance — pre-011 `state.json`, or a code path that has
     /// not been threaded onto a real `SeatSource` yet. Never guess `ProvidersOrder`: that
     /// claims a specific rung the seat may never have taken.
@@ -744,6 +762,7 @@ impl RunState {
             shipped_base: None,
             pr_body_hash: None,
             ship_override: None,
+            seat_reassignments: Vec::new(),
             pr_state: None,
         }
     }

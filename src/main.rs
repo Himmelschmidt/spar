@@ -254,6 +254,7 @@ fn run() -> Result<ExitCode> {
                 // `plan` / `run` mint their config fresh; there is no frozen one to
                 // reload against, so seats are resolved for the first time either way.
                 reload_config: false,
+                reassign: Vec::new(),
             };
             workflow::plan::run(task_text, brief_path, opts, &paths, &cfg)
         }
@@ -293,6 +294,7 @@ fn run() -> Result<ExitCode> {
             reload_config,
             max_rounds,
             accept_contract,
+            reassign,
             base,
             detach,
             json,
@@ -303,6 +305,12 @@ fn run() -> Result<ExitCode> {
             urgency,
             big,
         } => {
+            if !reassign.is_empty() {
+                refuse_inside_slot("spar implement --reassign")?;
+                if run_id.is_none() {
+                    anyhow::bail!("--reassign moves a seat of an existing run; pass --run <id>");
+                }
+            }
             let (paths, cfg) = implement_ctx(
                 run_id.as_deref(),
                 &role,
@@ -327,6 +335,7 @@ fn run() -> Result<ExitCode> {
                 max_rounds,
                 accept_contract,
                 reload_config,
+                reassign,
             };
             workflow::implement::run_from_cli(run_id, plan, task, new, opts, &paths, &cfg)
         }
@@ -405,6 +414,7 @@ fn run() -> Result<ExitCode> {
                 // `plan` / `run` mint their config fresh; there is no frozen one to
                 // reload against, so seats are resolved for the first time either way.
                 reload_config: false,
+                reassign: Vec::new(),
             };
             workflow::run_named(workflow, opts, &paths, &cfg)
         }

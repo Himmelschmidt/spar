@@ -412,6 +412,8 @@ spar rule add --project "<text>"         # ruling for every run in the project (
 spar rule list --run <id>|--project [--json]
 spar rule rm --run <id>|--project <rule-id>
 spar resume <run_id> [--detach] [--json] # pick a stopped or abandoned run back up
+spar implement --run <id> --reassign <role|seat>=<provider[@model]>  # move an existing seat
+                                         # to another provider, same worktree/branch (O136)
 spar daemon install                      # systemd user unit supervising every registered project
 spar daemon uninstall                    # stop, disable and remove it
 spar daemon start [--foreground]         # per-project supervisor: restart + abandoned alert + cap
@@ -1588,6 +1590,15 @@ spar implement --run <id> --reload-config   # deliberately re-read spar.toml and
 ```
 
 `--reload-config` is the only way to change an existing run's config; it replaces the snapshot, so later resumes keep the reloaded values. `--role` on a `--run <id>` resume without it exits `1` rather than silently re-fleeting the run. Runs created before snapshots existed fall back to the live file.
+
+`--reload-config` re-points an existing seat's **model**, never its provider (O80): a seat id encodes its provider. To change **who** fills a seat that already exists, reassign it:
+
+```bash
+spar implement --run <id> --reassign implementer=cli:claude@sonnet
+spar implement --run <id> --reassign review-0-cli-codex=cli:claude@opus   # or reviewer=… when there is one
+```
+
+`--reassign <role|seat>=<provider[@model]>` is repeatable and operator-only (refused with exit `1` inside a slot, where `SPAR_AGENT_ID`/`SPAR_RUN_ID` are set). The target is `implementer`, `reviewer` or `tester` when the run has exactly one such seat, or a seat id. It is refused, exit `1` and nothing moved, while the run's orchestrator is alive (`spar stop <id>` first), onto a provider that is manually paused or paused on a trusted quota signal, onto an unknown adapter, when the run is not resumable, and when the seat does not exist yet (before the implement panel was dispatched use `--reload-config --role`). The seat keeps its worktree, branch, carry-forward brief, round count and review history; the implementer keeps the id `impl`, a reviewer seat is renamed to name its new provider (`review-0-cli-codex` -> `review-0-cli-claude`) and its last review artifact follows it. The new provider starts cold. The seat is recorded as `source: "reassigned"` and a later `--reload-config` leaves it alone; every move is in `state.json` `seat_reassignments` and an event. The run then re-enters exactly as a bare `implement --run <id>` would (it is the same command).
 
 ## Config knobs (`spar.toml`)
 

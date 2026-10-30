@@ -216,6 +216,14 @@ pub enum Command {
         /// first: this is how a criterion gets deleted on the way to the ship gate.
         #[arg(long)]
         accept_contract: bool,
+        /// Move an existing seat of `--run <id>` to another provider:
+        /// `--reassign implementer=cli:claude@sonnet` or
+        /// `--reassign review-0-cli-codex=cli:claude@opus`. Repeatable. The seat keeps its
+        /// worktree, branch, carry-forward, round count and review history; a reviewer
+        /// seat is renamed to name its new provider (O136). Refused while the run's
+        /// orchestrator is alive, onto a paused provider, and inside a slot.
+        #[arg(long = "reassign", value_name = "ROLE|SEAT=PROVIDER")]
+        reassign: Vec<String>,
         /// Ref to cut every slot worktree from (branch, tag or sha), for a NEW run.
         /// Default: the HEAD of the directory spar was invoked from. A run's base is
         /// fixed at creation, so `--run <id>` only accepts a base it already has.
