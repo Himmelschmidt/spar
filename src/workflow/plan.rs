@@ -836,6 +836,8 @@ fn seed_spec_bus(
                     ..Default::default()
                 },
                 requires_ack: false,
+                persist: false,
+                expires_after_round: None,
                 meta: HashMap::new(),
             },
             budget,

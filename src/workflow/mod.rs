@@ -106,6 +106,7 @@ impl CommonOpts {
                     prev_phase: None,
                     slot: None,
                     status: None,
+                    round: None,
                     message: Some(format!(
                         "model-select: {}",
                         art.choices

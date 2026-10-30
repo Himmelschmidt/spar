@@ -1957,6 +1957,21 @@ pub fn execute_loop(
         }
 
         let brief = take_carry_forward(paths, &state.id, &impl_slot.id);
+        let persisted =
+            crate::bus::persisted_for(paths, &state.id, &impl_slot.id).unwrap_or_default();
+        let unique = crate::bus::agent_ref(Some(&state.id), &impl_slot.id);
+        for m in &persisted {
+            for event in [
+                crate::bus::ReceiptEvent::Delivered,
+                crate::bus::ReceiptEvent::Read,
+            ] {
+                crate::bus::record_receipt(paths, &m.id, &unique, event, "carry_forward");
+            }
+        }
+        let persisted: Vec<String> = persisted
+            .iter()
+            .map(|m| format!("from {} (message {}): {}", m.from, m.id, m.body))
+            .collect();
         let mut extra = HashMap::new();
         extra.insert("plan_body".into(), plan_body.clone());
         extra.insert("test_contract_body".into(), test_contract_body.clone());
@@ -1965,6 +1980,7 @@ pub fn execute_loop(
             "carry_forward_section".into(),
             carry_forward_section(
                 state.round,
+                &persisted,
                 &blockers,
                 brief.as_deref(),
                 cfg.rounds.carry_forward_chars,
@@ -4257,11 +4273,12 @@ fn take_carry_forward(paths: &SparPaths, run_id: &str, slot_id: &str) -> Option<
 /// carrying more every round is the quadratic problem this exists to avoid.
 fn carry_forward_section(
     round: u32,
+    persisted: &[String],
     blockers: &[String],
     brief: Option<&str>,
     max_chars: usize,
 ) -> String {
-    if blockers.is_empty() && brief.is_none() {
+    if persisted.is_empty() && blockers.is_empty() && brief.is_none() {
         return String::new();
     }
     let mut out = format!(
@@ -4270,6 +4287,17 @@ fn carry_forward_section(
          this round re-deriving what the last one already learned. The acceptance gate \
          never reads it.\n\n"
     );
+    if !persisted.is_empty() {
+        // First, so the cap cannot cut an operator ruling; these stand until the sender
+        // withdraws them, which is the point of `--persist`.
+        out.push_str(
+            "### Operator messages (they stand until withdrawn; follow them over your own notes)\n",
+        );
+        for m in persisted {
+            out.push_str(&format!("- {}\n", clamp_line(m, max_chars / 4)));
+        }
+        out.push('\n');
+    }
     if !blockers.is_empty() {
         out.push_str("### What blocked the ship last round\n");
         for b in blockers {
@@ -5126,7 +5154,25 @@ mod carry_forward_tests {
     use super::*;
 
     fn brief_of(round: u32, blockers: &[String], brief: Option<&str>, max: usize) -> String {
-        carry_forward_section(round, blockers, brief, max)
+        carry_forward_section(round, &[], blockers, brief, max)
+    }
+
+    /// An operator's persisted message leads the section and survives the cap that
+    /// eats the slot's own notes: a relaunch must not drop it (O135).
+    #[test]
+    fn persisted_messages_lead_and_survive_truncation() {
+        let persisted = vec!["from human (message abc): merge main first".to_string()];
+        let essay = "my own plan, which differs\n".repeat(400);
+        let out = carry_forward_section(2, &persisted, &[], Some(&essay), 1200);
+        let ruling = out
+            .find("merge main first")
+            .expect("persisted message kept");
+        assert!(
+            ruling < out.find("my own plan").unwrap_or(usize::MAX),
+            "{out}"
+        );
+        assert!(out.contains("Operator messages"), "{out}");
+        assert!(!carry_forward_section(1, &persisted, &[], None, 4000).is_empty());
     }
 
     /// A first round has nothing to carry, and an empty section must render as nothing

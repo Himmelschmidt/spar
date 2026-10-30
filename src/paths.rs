@@ -90,6 +90,11 @@ impl SparPaths {
         self.root.join("quota.json")
     }
 
+    /// Append-only log of provider pauses (`spar stats` counts them).
+    pub fn quota_events_file(&self) -> PathBuf {
+        self.root.join("quota-events.jsonl")
+    }
+
     /// Where `spar plan --spec` / stdin intake writes what was asked for, so it
     /// outlives the file (or terminal) it came from. Never a run-scoped dir: a brief
     /// is written before a run id exists, on the create path.

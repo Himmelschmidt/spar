@@ -9,7 +9,7 @@ spar skills list
 spar skills get core
 spar skills get fleet   # cheap OpenRouter coders + smart plan/review, assigned by [roles]
 spar doctor [--json]
-spar provider list [--json]
+spar provider list [--usage] [--json]
 spar model list|pick|refresh|cache [--json]
 spar model list --provider openrouter [--all] [--json]   # OpenRouter catalog, tool-capable by default
 ```
@@ -44,6 +44,24 @@ spar implement -t "..." --providers 'cli:codex@openai/gpt-4o-mini,api:openai@gpt
 
 Native CLI adapters: `cli:claude`, `cli:grok`, `cli:agy`, `cli:codex`, `cli:pi`, `cli:muse`. Run
 `spar provider list` to see which resolve on this box and their live pause/cooldown status.
+
+**Utilisation (O132).** `spar provider list --usage` adds each account's current window
+use where the CLI exposes it locally and without a model turn. muse: `muse usage --json`
+(5-hour and weekly `used_percent`, reset times, tier). codex: the newest `rate_limits`
+record in `$CODEX_HOME/sessions/**/*.jsonl` (default `~/.codex`), which is as fresh as the
+last codex turn on this box, so read `as_of`. claude: nothing; its `/usage` reads an
+account endpoint and there is no local, documented, non-billed source, so spar does not
+call it. Other adapters: nothing. With `--json` each provider gains `usage`:
+
+```json
+{"schema_version": 1, "status": "ok" | "unavailable" | "unsupported",
+ "source": "muse usage --json" | "codex session log <path>" | null, "as_of": "..." | null,
+ "windows": [{"name": "5h" | "weekly" | "<n>m", "used_percent": 27.0,
+              "resets_at": "..." | null, "window_minutes": 10080 | null}],
+ "plan": "pro" | null, "credits": "20047.55" | "unlimited" | null, "message": "why not" | null}
+```
+
+Without `--usage` nothing is probed and `usage` is absent.
 
 **Readiness.** A binary on PATH is not health: `spar doctor` and `spar provider list`
 also run each adapter's readiness probe (a local-only config/auth check, never a model
@@ -1122,8 +1140,9 @@ filter** on the drain: each unique id has its own inbox, so a slot never sees an
 run's messages, and a bare agent and a run slot can directed-message each other by id.
 
 ```bash
-spar bus send -m "hello" [--from human] [--to broadcast|agent] [--run <id>]
-spar bus log [--run <id>] [--json]
+spar bus send -m "hello" [--from human] [--to broadcast|agent|impl] [--run <id>]
+              [--requires-ack] [--persist] [--supersedes <msg_id>] [--expires-after-round [N]]
+spar bus log [--run <id>] [--json]                 # each message with per-recipient receipts
 spar bus presence [--run <id>]
 spar bus inbox <agent> [--claim] [--run <id>] [--json]
 spar bus reserve path/to/file --holder <agent> [--run <id>]
@@ -1132,12 +1151,51 @@ spar bus deliver <agent> [--run <id>]              # drain inbox + inject at tur
 spar bus ack <msg_id> --from <agent> [--run <id>]  # stop a requires_ack redelivery
 ```
 
+**Send options (O135).**
+
+- `--to impl` needs `--run` and resolves to that run's implementer slot; it errors without
+  `--run`, or when the run has none or several (arena), naming them.
+- `--requires-ack` redelivers on backoff until the recipient runs `spar bus ack <id>
+  --from <agent>`, then escalates to `@human`.
+- `--persist` (with `--run`, to the implementer) also puts the message at the top of the
+  implementer's carry-forward on **every** dispatch, under "Operator messages", until it
+  is superseded, acked by the implementer, or expired. A relaunch or a new round cannot
+  drop it. Use it for rulings, not chatter: it repeats every dispatch.
+- `--supersedes <msg_id>` withdraws an earlier message **you** sent: every inbox copy not
+  yet taken is removed and its redelivery stops; a persisted one leaves the carry-forward.
+  A copy already delivered cannot be unread; `--json` reports
+  `withdrawal: {msg_id, withdrawn_from: [...], already_delivered: [...]}`.
+- `--expires-after-round [N]` (with `--run`; `N` defaults to the round a slot is dispatching
+  in, or the next round when the run waits at a gate, the first round anyone reads it in): once
+  the run passes round `N` the message is never delivered. A claim withdraws it, `inbox`
+  hides it, redelivery stops, and a persisted one leaves the carry-forward.
+
+**Receipts (O134).** `.spar/bus/receipts.jsonl` gets a line per recipient as a message
+moves: `queued` (written to the inbox), `delivered` (claimed into the agent's channel or
+put in a dispatch prompt), `read` (in the model's input: the agent claimed it itself with
+`inbox --claim`, a Stop hook injected it, it was in the carry-forward prompt, or the
+recipient acked it), `withdrawn` (superseded or expired). A poll file or codex queue is
+`delivered`, not `read`, until an ack. `bus log --json` returns each message with:
+
+```json
+{"schema_version": 1, "id": "...", "from": "human", "to": "impl", "...": "message fields",
+ "persist": true, "expires_after_round": 3, "refs": {"supersedes": "..."},
+ "receipts": [{"recipient": "ab12cd34:impl", "queued_at": "...", "delivered_at": "..." | null,
+               "read_at": "..." | null, "withdrawn_at": "..." | null}],
+ "superseded_by": "msg id" | null, "expired": false}
+```
+
+Each time is the earliest of its kind. `receipts.jsonl` rolls to `receipts.jsonl.1` at
+8 MiB (about the last 16 MiB are kept); `bus log` streams both. `bus send --json` returns the message with
+`schema_version` (and `withdrawal` under `--supersedes`). The human `bus log` shows the
+message id and `[delivered n/m, read n/m; superseded by …; expired]`.
+
 A message to `@human` (or any `Blocked` agent) surfaces in the TUI's Activity tab (with a
 badge on the tab and the status line) and,
 if `[notify]` is configured, also fires an external notifier. A `requires_ack` message
 redelivers until acked, then escalates to `@human`.
 
-Layout: `.spar/bus/{events.jsonl,agents.jsonl,inbox/<agent>/,queue/,pending_ack/}`
+Layout: `.spar/bus/{events.jsonl,agents.jsonl,receipts.jsonl,inbox/<agent>/,queue/,pending_ack/}`
 (workspace, agent-keyed). Per-run `tasks/` + `reserves.json` and a back-compat
 event/presence mirror live under `.spar/runs/<id>/bus/`.
 
@@ -1145,6 +1203,7 @@ event/presence mirror live under `.spar/runs/<id>/bus/`.
 
 ```bash
 spar status [run_id] [--json] [--all]   # --all = every registered project; a run with a live orchestrator shows `pid=<n>`
+spar stats [--since 7d] [--by model|role|provider|project] [--all-projects] [--json]
 spar wait <run_id> [--timeout 8h] [--follow] [--json]
 spar logs <run_id> [slot] [-f|--follow]
 
@@ -1228,27 +1287,104 @@ stderr and the purge or sweep goes on.
 
 ```json
 {
-  "schema_version": 1, "written_at": "...", "trigger": "terminal" | "purge",
+  "schema_version": 2, "written_at": "...", "trigger": "terminal" | "purge",
   "id": "ab12cd34", "task": "first line of the task", "workflow": "loop",
   "dry_run": false, "phase": "done",
-  "roles": [{"slot": "review-0-cli-codex", "role": "reviewer", "provider": "cli:codex", "model": null}],
+  "roles": [{"slot": "review-0-cli-codex", "role": "reviewer", "provider": "cli:codex",
+             "model": null, "source": "backup" | null, "parked_run": false}],
   "rounds": 3, "max_rounds": 5,
   "review_rounds": [{"round": 2,
-                     "verdicts": [{"slot": "review-0-cli-codex", "verdict": "request_changes", "synthetic": false}],
+                     "verdicts": [{"slot": "review-0-cli-codex", "verdict": "request_changes",
+                                   "synthetic": false, "blocking": 1}],
                      "findings": {"critical": 0, "major": 1, "minor": 2, "synthetic": 0}}],
   "findings": {"critical": 0, "major": 1, "minor": 2, "synthetic": 0},
   "billed_tokens": 1234567, "cost_usd": 4.2 | null,
   "pr_url": "https://github.com/..." | null,
-  "created_at": "...", "ended_at": "..."
+  "created_at": "...", "ended_at": "...",
+  "dispatches": [{"slot": "impl", "role": "implementer", "provider": "cli:claude",
+                  "model": "claude-opus-5", "billed_tokens": 900000, "cost_usd": 3.1 | null,
+                  "tools": 140, "context_tokens": 180000, "context_semantics": "peak"}],
+  "timing": {"rounds": [{"round": 1, "wall_secs": 2400}],
+             "slots": [{"slot": "impl", "round": 1 | null, "wall_secs": 1800}]},
+  "quota_parks": 0
 }
 ```
 
 Finding counts are per round, deduplicated within a round (same severity, location and
 whitespace-normalized text from two reviewers count once); `findings` sums the rounds.
-Synthetic findings count under `synthetic` only. `cost_usd` is `null` when no dispatch
-reported a cost. `pr_url` is the PR ship opened or adopted, or `sync-prs` found (also
-`pr_url` in `status --json`, with `merged_at`, `merge_commit` and `pr_state` once
-`sync-prs` settled the run).
+Synthetic findings count under `synthetic` only. `blocking` is one review's findings that
+held the ship under the run's `[review] block_on` (`block_on` on the row), with a scoped
+round's follow-ups exempt as the gate exempts them. `cost_usd` is `null` when no dispatch reported a cost. `pr_url` is
+the PR ship opened or adopted, or `sync-prs` found (also `pr_url` in `status --json`, with
+`merged_at`, `merge_commit` and `pr_state` once `sync-prs` settled the run). `dispatches` is
+the run's usage ledger, one entry per dispatch, with the model the provider reported.
+`timing.rounds` spans a round's first slot start to its last slot end (a gate wait is not
+counted); a slot timed from before phase events carried the round has `round: null`.
+A line written at `quota` or `plan_approved`, phases a run is usually resumed from, is
+`"compact": true`: no `dispatches` or `timing`, run-level totals only. The final terminal
+line and the purge line carry the full ledger.
+Schema 1 lines (before O131) have no `dispatches`, `timing`, `quota_parks`, `blocking`,
+`source` or `parked_run`; read them as empty. `parked_run` is a slot whose last
+dispatch failed on quota or a refused credential.
+
+**Quota events.** `.spar/quota-events.jsonl` gets one line per provider pause, automatic or
+`spar provider pause`:
+`{"schema_version": 1, "ts": "...", "provider": "cli:codex", "manual": false, "until": "..." | null, "hint": "..." | null}`.
+
+### Stats (O131)
+
+```bash
+spar stats [--since 7d] [--by model|role|provider|project] [--all-projects] [--include-dry-run] [--json]
+```
+
+Aggregates what spar already wrote: runs still under `.spar/runs/` are read from their own
+state and events (fresher than their history line), purged runs from `history.jsonl`,
+pauses from `quota-events.jsonl`. `--by` defaults to `provider` (the storage key,
+`cli:claude`). `--all-projects` reads every project in the local registry. `--since` keeps
+runs whose `ended_at` (last change, for a live run) and pauses whose `ts` fall inside the
+window. Dry runs are excluded unless `--include-dry-run`; `excluded_dry_runs` says how many.
+Runs read from a schema 1 or compact history line have no per-dispatch ledger: their
+`billed_tokens` and `cost_usd` go to `run_level_only` (`{"runs", "billed_tokens",
+"cost_usd"}`), never into a group's `usage`. A provider pause is logged once when it starts,
+not on every re-stated 429.
+Remote hosts are not read.
+
+```json
+{
+  "schema_version": 1, "generated_at": "...", "since": "..." | null, "by": "provider",
+  "projects": ["/path"], "runs": 12, "runs_from_history": 4, "runs_live": 8,
+  "excluded_dry_runs": 0,
+  "groups": [{
+    "key": "cli:codex", "runs": 9, "dispatches": 40,
+    "rounds": {"mean_per_run": 2.4, "mean_to_first_approve": 1.8 | null, "runs_with_approve": 6},
+    "outcomes": {"ship_gate": 6, "ceiling": 1, "stuck": 0, "failed": 1, "quota": 1, "other": 0},
+    "reviews": {"reviews": 18, "synthetic_reviews": 1, "blocking_findings": 9, "blocking_per_review": 0.5 | null},
+    "usage": {"billed_tokens": 123456789, "cost_usd": 12.5 | null,
+              "dispatches_with_cost": 10, "dispatches_without_cost": 30, "tool_calls": 2100},
+    "context": [{"semantics": "invocation_total", "dispatches": 40, "max": 9000000, "mean": 1200000.0}],
+    "wall_time": {"rounds_timed": 20, "round_secs_mean": 1500.0 | null, "round_secs_total": 30000,
+                  "slots_timed": 40, "slot_secs_mean": 600.0 | null, "slot_secs_total": 24000}
+  }],
+  "run_level_only": {"runs": 3, "billed_tokens": 4500000, "cost_usd": 2.1 | null},
+  "quota": [{"provider": "cli:codex", "pauses": 3, "manual_pauses": 0, "parks": 1, "backup_engagements": 2}]
+}
+```
+
+- A run counts in every group it had a seat or a dispatch in, so run-level numbers
+  (`runs`, `rounds`, `outcomes`) repeat across `--by role` groups. Dispatch numbers
+  (`usage`, `context`) belong to the dispatch's own group. Reviews and slot wall time go
+  to the reviewer's or slot's group; a slot no longer on the run reads `unknown`.
+- `outcomes`: `ship_gate` is `awaiting_ship_confirm`, `shipping` or `done`; `ceiling` is
+  `awaiting_round_extension`; `other` is anything else (in flight, stopped, a plan end).
+- `mean_to_first_approve`: the first round in which every reviewer approved and none was
+  synthetic, averaged over the runs that had one.
+- `cost_usd` sums only dispatches that reported a cost; `dispatches_without_cost` is how
+  many did not. `null` means none did, not zero.
+- `context` has one entry per `context_semantics`. Numbers measured differently are never
+  combined: a `peak` and an `invocation_total` are different quantities.
+- `quota` is per provider whatever `--by` is. `parks` are charged to providers whose slot
+  hit quota or a refused credential (`parked_run`; `unknown` when none was recorded), `backup_engagements` to the backup that
+  took the seat.
 
 ### TUI shape (humans)
 
@@ -1331,6 +1467,23 @@ rail's selection.
 - `status --json` and every run JSON carry **`base_ref` / `base_commit`** — the ref and commit
   all of the run's slot worktrees were cut from (see **Base ref** above), plus
   **`base_behind`** when the base was taken from a HEAD with an upstream.
+- **Cost per provider and per slot (O133).** `status <id> --json` carries `"cost"`, summed
+  from `usage[]`, and `status <id>` prints the same as a `cost:` block plus
+  `billed=… cost=…` on each slot line:
+
+  ```json
+  "cost": {"schema_version": 1,
+           "total": {"key": "total", "provider": null, "dispatches": 8, "billed_tokens": 40734919,
+                     "cost_usd": 7.54 | null, "dispatches_without_cost": 6, "cost_reported": "partial"},
+           "by_provider": [{"key": "cli:codex", "provider": "cli:codex", "cost_usd": null,
+                            "cost_reported": "none", ...}],
+           "by_slot": [{"key": "impl", "provider": "cli:muse", ...}]}
+  ```
+
+  `cost_reported` is `all`, `partial` or `none`; `none` means the adapter did not report a
+  cost (codex and muse today), and the human view says `cost not reported by <provider>`
+  rather than `$0.00`. There is no token or cost cap: a slot is never killed for spending
+  (O50, reaffirmed in O133).
 - **Tokens: `billed_tokens` is spend, `context_tokens` is a gauge.** Every entry in
   `"usage"` (the run's ledger, one entry per dispatch; sum it for the run total) and every
   `logs/<slot>.stats.json` carries both.

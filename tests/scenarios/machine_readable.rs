@@ -234,7 +234,7 @@ fn purge_appends_a_history_row_first() {
     let rows = history(tmp.path());
     let row = rows.last().expect("a history row");
     assert_eq!(row["trigger"], "purge");
-    assert_eq!(row["schema_version"], 1);
+    assert_eq!(row["schema_version"], 2);
     assert_eq!(row["id"], run_id.as_str());
     assert_eq!(row["task"], "add a hello function");
     assert_eq!(row["workflow"], "loop");

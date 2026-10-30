@@ -38,6 +38,7 @@ mod session_id;
 mod ship;
 mod skills;
 mod state;
+mod stats;
 mod suite;
 mod tasks;
 mod templates;
@@ -414,6 +415,13 @@ fn run() -> Result<ExitCode> {
             all,
             archived,
         } => status_cmd(run_id, json, all, archived),
+        Command::Stats {
+            since,
+            by,
+            all_projects,
+            include_dry_run,
+            json,
+        } => stats_cmd(since.as_deref(), by, all_projects, include_dry_run, json),
         Command::Wait {
             run_id,
             timeout,
@@ -612,7 +620,67 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             surface,
             conversation,
             turn,
+            requires_ack,
+            persist,
+            supersedes,
+            expires_after_round,
         } => {
+            let needs_run = persist || expires_after_round.is_some();
+            if needs_run && run.is_none() {
+                anyhow::bail!("--persist and --expires-after-round need --run");
+            }
+            if to == "impl" && run.is_none() {
+                anyhow::bail!("--to impl needs --run to know whose implementer");
+            }
+            let run_state = match run.as_deref() {
+                Some(r) if needs_run || to == "impl" => Some(state::RunState::load(&paths, r)?),
+                _ => None,
+            };
+            let to = match &run_state {
+                Some(st) if to == "impl" => implementer_id(st)?,
+                _ => to,
+            };
+            if persist {
+                let st = run_state.as_ref().expect("loaded for --persist");
+                let short = to.strip_prefix(&format!("{}:", st.id)).unwrap_or(&to);
+                if !st
+                    .slots
+                    .iter()
+                    .any(|s| s.id == short && s.role == state::SlotRole::Implementer)
+                {
+                    anyhow::bail!(
+                        "--persist reaches the implementer's carry-forward; --to must be run {}'s implementer (try --to impl)",
+                        st.id
+                    );
+                }
+            }
+            // A bare flag means "this round": the one a slot is dispatching in, or, when
+            // the run waits at a gate between rounds, the next one, which is the first
+            // round anyone can read it in.
+            let expires_after_round = expires_after_round.map(|n| {
+                n.unwrap_or_else(|| {
+                    run_state.as_ref().map_or(0, |st| {
+                        let dispatching = st
+                            .slots
+                            .iter()
+                            .any(|s| s.status == state::SlotStatus::Running);
+                        if dispatching {
+                            st.round
+                        } else {
+                            st.round + 1
+                        }
+                    })
+                })
+            });
+            if let Some(old) = supersedes.as_deref() {
+                let prior = bus::find_event(&paths, old)?
+                    .ok_or_else(|| anyhow::anyhow!("no bus message {old}"))?;
+                if bus::resolve_addr(prior.run.as_deref(), &prior.from)
+                    != bus::resolve_addr(run.as_deref(), &from)
+                {
+                    anyhow::bail!("{old} was sent by {}, not {from}", prior.from);
+                }
+            }
             let mut meta = std::collections::HashMap::new();
             if let Some(s) = surface.clone() {
                 meta.insert("surface".to_string(), s);
@@ -632,8 +700,13 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
                 body: message.clone(),
                 run: run.clone(),
                 subject: None,
-                refs: bus::MsgRefs::default(),
-                requires_ack: false,
+                refs: bus::MsgRefs {
+                    supersedes: supersedes.clone(),
+                    ..Default::default()
+                },
+                requires_ack,
+                persist,
+                expires_after_round,
                 meta: meta.clone(),
             };
             let is_conversation = surface.as_deref() == Some("chat")
@@ -649,26 +722,71 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
                 bus::MessageBudget::Normal
             };
             let msg = bus::send(&paths, msg, budget)?;
+            let withdrawal = supersedes
+                .as_deref()
+                .map(|old| bus::withdraw(&paths, old))
+                .transpose()?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&msg)?);
+                let mut v = serde_json::to_value(&msg)?;
+                v["schema_version"] = serde_json::json!(bus::LOG_SCHEMA);
+                if let Some(w) = &withdrawal {
+                    v["withdrawal"] = serde_json::to_value(w)?;
+                }
+                println!("{}", serde_json::to_string_pretty(&v)?);
             } else {
-                println!("sent {} → {}", msg.from, msg.to);
+                println!("sent {} → {} ({})", msg.from, msg.to, msg.id);
+                if let Some(w) = &withdrawal {
+                    println!(
+                        "withdrew {} from {} inbox(es); already delivered to: {}",
+                        w.msg_id,
+                        w.withdrawn_from.len(),
+                        if w.already_delivered.is_empty() {
+                            "none".into()
+                        } else {
+                            w.already_delivered.join(", ")
+                        }
+                    );
+                }
             }
             Ok(ExitCode::Success)
         }
         BusCmd::Log { run, json } => {
-            let events = bus::list_events(&paths, run.as_deref())?;
+            let entries = bus::log_entries(&paths, run.as_deref())?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&events)?);
+                println!("{}", serde_json::to_string_pretty(&entries)?);
             } else {
-                for e in events {
+                for e in entries {
+                    let total = e.receipts.len();
+                    let count = |f: fn(&bus::RecipientReceipt) -> bool| {
+                        e.receipts.iter().filter(|r| f(r)).count()
+                    };
+                    let mut notes = Vec::new();
+                    if total > 0 {
+                        notes.push(format!(
+                            "delivered {}/{total}, read {}/{total}",
+                            count(|r| r.delivered_at.is_some()),
+                            count(|r| r.read_at.is_some())
+                        ));
+                    }
+                    if let Some(by) = &e.superseded_by {
+                        notes.push(format!("superseded by {by}"));
+                    }
+                    if e.expired {
+                        notes.push("expired".into());
+                    }
+                    let notes = if notes.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", notes.join("; "))
+                    };
                     println!(
-                        "{} {} → {} ({:?}) {}",
-                        e.ts.format("%H:%M:%S"),
-                        e.from,
-                        e.to,
-                        e.kind,
-                        e.body.chars().take(100).collect::<String>()
+                        "{} {} {} → {} ({:?}){notes} {}",
+                        e.msg.ts.format("%H:%M:%S"),
+                        e.msg.id,
+                        e.msg.from,
+                        e.msg.to,
+                        e.msg.kind,
+                        e.msg.body.chars().take(100).collect::<String>()
                     );
                 }
             }
@@ -684,7 +802,17 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             // (`$SPAR_AGENT_ID`); resolve to the unique inbox key either way.
             let unique = bus::resolve_addr(run.as_deref(), &agent);
             let msgs = if claim {
-                bus::inbox_claim(&paths, &unique)?
+                let msgs = bus::inbox_claim(&paths, &unique, "inbox_claim")?;
+                for m in &msgs {
+                    bus::record_receipt(
+                        &paths,
+                        &m.id,
+                        &unique,
+                        bus::ReceiptEvent::Read,
+                        "inbox_claim",
+                    );
+                }
+                msgs
             } else {
                 bus::inbox(&paths, &unique)?
             };
@@ -744,6 +872,26 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             println!("released {path}");
             Ok(ExitCode::Success)
         }
+    }
+}
+
+/// `--to impl`: the run's one implementer slot.
+fn implementer_id(st: &state::RunState) -> Result<String> {
+    let ids: Vec<&str> = st
+        .slots
+        .iter()
+        .filter(|s| s.role == state::SlotRole::Implementer)
+        .map(|s| s.id.as_str())
+        .collect();
+    match ids.as_slice() {
+        [one] => Ok(one.to_string()),
+        [] => anyhow::bail!("run {} has no implementer slot", st.id),
+        many => anyhow::bail!(
+            "run {} has {} implementers ({}); name one with --to",
+            st.id,
+            many.len(),
+            many.join(", ")
+        ),
     }
 }
 
@@ -949,6 +1097,36 @@ fn auto_archive_at_launch() {
     }
 }
 
+fn stats_cmd(
+    since: Option<&str>,
+    by: stats::GroupBy,
+    all_projects: bool,
+    include_dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    let now = chrono::Utc::now();
+    let since = since
+        .map(|s| -> Result<_> { Ok(now - chrono::Duration::from_std(util::parse_duration(s)?)?) })
+        .transpose()?;
+    let projects: Vec<std::path::PathBuf> = if all_projects {
+        registry::ensure_known(paths::find_project_root().ok().as_deref())
+            .projects
+            .into_iter()
+            .map(|p| p.root)
+            .filter(|r| r.is_dir())
+            .collect()
+    } else {
+        vec![paths::find_project_root()?]
+    };
+    let report = stats::report(&projects, since, by, include_dry_run, now)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        stats::print_human(&report);
+    }
+    Ok(ExitCode::Success)
+}
+
 fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> Result<ExitCode> {
     let local_root = paths::find_project_root().ok();
 
@@ -1006,6 +1184,7 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> 
                 );
             }
             println!("slots: {}", state.slots.len());
+            let cost = stats::run_cost(&state);
             let hb_map = bus::heartbeat_map(&swarm, Some(&state.id));
             for slot in &state.slots {
                 let hb = hb_map
@@ -1026,10 +1205,37 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> 
                 } else {
                     ""
                 };
+                let spend = cost
+                    .by_slot
+                    .iter()
+                    .find(|c| c.key == slot.id)
+                    .map(|c| {
+                        format!(
+                            " billed={} cost={}",
+                            stats::tokens(c.billed_tokens),
+                            match c.cost_usd {
+                                Some(usd) => format!("${usd:.2}"),
+                                None => "not reported".into(),
+                            }
+                        )
+                    })
+                    .unwrap_or_default();
                 println!(
-                    "  - {} provider={} role={:?} status={:?}{pid_s} silent={silent}{stall}{zombie}",
+                    "  - {} provider={} role={:?} status={:?}{pid_s} silent={silent}{stall}{zombie}{spend}",
                     slot.id, slot.provider, slot.role, slot.status
                 );
+            }
+            if cost.total.dispatches > 0 {
+                println!("cost:");
+                for line in cost.by_provider.iter().chain([&cost.total]) {
+                    println!(
+                        "  {:<14} {} dispatch(es)  {} billed  {}",
+                        line.key,
+                        line.dispatches,
+                        stats::tokens(line.billed_tokens),
+                        stats::describe_cost(line)
+                    );
+                }
             }
             if let Some(w) = &state.winner_slot {
                 println!("winner: {w}");
@@ -1429,6 +1635,7 @@ fn run_status_json(
             Vec::new()
         };
         obj.insert("orphan_pids".into(), serde_json::json!(orphans));
+        obj.insert("cost".into(), serde_json::to_value(stats::run_cost(state))?);
         obj.insert(
             "rulings".into(),
             serde_json::to_value(rules::for_run(swarm, &state.id))?,
@@ -2653,8 +2860,12 @@ fn pause_line(store: &quota::QuotaStore, key: &str) -> Option<String> {
 
 fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
     match action {
-        cli::ProviderAction::List { json } => {
+        cli::ProviderAction::List { json, usage } => {
             let report = providers::detect_all();
+            let usages: Vec<Option<providers::usage::ProviderUsage>> = report
+                .iter()
+                .map(|p| usage.then(|| providers::usage::probe(&p.name, p.path.as_deref())))
+                .collect();
             let quota = paths::find_project_root()
                 .ok()
                 .and_then(|r| {
@@ -2665,7 +2876,8 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
             if json {
                 let enriched: Vec<serde_json::Value> = report
                     .iter()
-                    .map(|p| {
+                    .zip(&usages)
+                    .map(|(p, u)| {
                         let key = quota::normalize_key(&p.name);
                         let q = quota.get(&key);
                         // Effective status: a lapsed pause reads Available, so the
@@ -2674,7 +2886,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                         let paused = status != quota::ProviderStatus::Available;
                         let hint = paused.then_some(q.hint).flatten();
                         let since = q.updated_at.filter(|_| paused);
-                        serde_json::json!({
+                        let mut v = serde_json::json!({
                             "name": p.name,
                             "available": p.available,
                             "path": p.path,
@@ -2687,7 +2899,11 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                             "paused_since": since,
                             "pause_age_secs": since.map(|t| (chrono::Utc::now() - t).num_seconds().max(0)),
                             "paused_until": q.cooldown_until.filter(|_| paused),
-                        })
+                        });
+                        if let Some(u) = u {
+                            v["usage"] = serde_json::json!(u);
+                        }
+                        v
                     })
                     .chain(stray_pauses(&quota, &report).into_iter().map(|q| {
                         let status = quota.effective_status(&q.name);
@@ -2704,7 +2920,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&enriched)?);
             } else {
-                for p in &report {
+                for (p, u) in report.iter().zip(&usages) {
                     let mark = if !p.available {
                         "missing"
                     } else if p.readiness == providers::Readiness::Unhealthy {
@@ -2742,6 +2958,9 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                             }
                             providers::Readiness::Unknown => {}
                         }
+                    }
+                    if let Some(u) = u {
+                        println!("         usage: {}", providers::usage::describe(u));
                     }
                 }
                 for q in stray_pauses(&quota, &report) {
