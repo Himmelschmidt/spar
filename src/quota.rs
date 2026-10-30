@@ -61,6 +61,12 @@ pub struct ProviderQuota {
     pub hint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<DateTime<Utc>>,
+    /// Written `true` by `provider pause`: the pause holds until its `--until` or
+    /// `provider resume` (O105). A `paused_manual` record without it predates that rule
+    /// and keeps the old auto-lapse, so pauses operators set expecting it to lapse
+    /// never start blocking a provider when this ships. Absence is the rule; no backfill.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sticky: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -96,6 +102,7 @@ impl QuotaStore {
             cooldown_until: None,
             hint: None,
             updated_at: None,
+            sticky: false,
         })
     }
 
@@ -107,10 +114,10 @@ impl QuotaStore {
             // An operator's pause holds until its own `--until`, or until `provider
             // resume` when it has none: the operator said stop, and a timer that
             // quietly undoes that is how a removed provider got dispatched again.
-            ProviderStatus::PausedManual => {
+            ProviderStatus::PausedManual if q.sticky => {
                 q.cooldown_until.is_some_and(|until| Utc::now() >= until)
             }
-            ProviderStatus::PausedQuota => match q.cooldown_until {
+            ProviderStatus::PausedManual | ProviderStatus::PausedQuota => match q.cooldown_until {
                 Some(until) => Utc::now() >= until,
                 None => q.updated_at.is_some_and(|set| {
                     Utc::now() >= set + chrono::Duration::minutes(DEFAULT_COOLDOWN_MINS)
@@ -155,6 +162,7 @@ impl QuotaStore {
                 cooldown_until: until,
                 hint: Some("manual pause".into()),
                 updated_at: Some(Utc::now()),
+                sticky: true,
             },
         );
     }
@@ -171,6 +179,7 @@ impl QuotaStore {
                 cooldown_until: None,
                 hint: Some(hint.into()),
                 updated_at: Some(Utc::now()),
+                sticky: false,
             },
         );
     }
@@ -196,6 +205,7 @@ impl QuotaStore {
                 cooldown_until: until,
                 hint: Some(hint.into()),
                 updated_at: Some(Utc::now()),
+                sticky: false,
             },
         );
     }
@@ -209,6 +219,7 @@ impl QuotaStore {
                 cooldown_until: None,
                 hint: None,
                 updated_at: Some(Utc::now()),
+                sticky: false,
             },
         );
     }
@@ -637,6 +648,48 @@ mod tests {
         );
         store.resume("cli:grok");
         assert!(store.is_usable("cli:grok"), "only resume lifts it");
+    }
+
+    /// The primary checkout's real record: `cli:claude` paused by hand 1171 hours ago,
+    /// before `sticky` existed. It was written expecting the 30-minute lapse, so it must
+    /// keep lapsing rather than start blocking claude the day this ships.
+    #[test]
+    fn a_legacy_manual_pause_without_sticky_keeps_the_old_lapse() {
+        let legacy: QuotaStore = serde_json::from_str(
+            r#"{"providers":{"cli:claude":{"name":"cli:claude","status":"paused_manual","hint":"manual pause","updated_at":"2026-09-11T03:00:00Z"}}}"#,
+        )
+        .unwrap();
+        assert!(!legacy.get("cli:claude").sticky);
+        assert!(legacy.is_usable("cli:claude"));
+        assert!(!legacy.is_manually_paused("cli:claude"));
+        assert_eq!(
+            legacy.effective_status("cli:claude"),
+            ProviderStatus::Available
+        );
+
+        let mut fresh = legacy.clone();
+        fresh.providers.get_mut("cli:claude").unwrap().updated_at = Some(Utc::now());
+        assert!(
+            !fresh.is_usable("cli:claude"),
+            "a legacy pause still holds for its first 30 minutes"
+        );
+    }
+
+    #[test]
+    fn provider_pause_writes_sticky_and_it_round_trips() {
+        let mut store = QuotaStore::default();
+        store.pause_manual("cli:grok", None);
+        let text = serde_json::to_string(&store).unwrap();
+        assert!(text.contains("\"sticky\":true"), "{text}");
+        let back: QuotaStore = serde_json::from_str(&text).unwrap();
+        assert!(back.get("cli:grok").sticky);
+
+        store.pause_quota("cli:codex", "q");
+        let text = serde_json::to_string(&store.providers["cli:codex"]).unwrap();
+        assert!(
+            !text.contains("sticky"),
+            "quota pauses do not carry the field: {text}"
+        );
     }
 
     #[test]

@@ -111,7 +111,9 @@ agy slot runs its full budget instead of dying at agy's 30-minute default.
 automatically when a slot hits a rate-limit signal. Quota pauses **auto-recover** ~30 min after
 they were set (or at an explicit cooldown reset), so the provider is re-probed rather than
 staying dead; a manual pause never lapses on that timer: it holds until its `--until`, or
-until `spar provider resume <ref>`, and a quota event never overwrites it (O105).
+until `spar provider resume <ref>`, and a quota event never overwrites it (O105). Only
+pauses set by this version are sticky (the record carries `sticky: true`); a manual pause
+written before it keeps the old ~30-minute lapse.
 `spar provider resume <ref>` clears either immediately. A paused provider is
 never silently swapped into another role: `plan`/`implement` exit `4` (quota) naming the
 paused ref so per-role assignment stays exactly what you specified.
