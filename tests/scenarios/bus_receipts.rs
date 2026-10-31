@@ -2,7 +2,8 @@
 //! in `bus log --json`, `--to impl`, `--requires-ack`, `--persist` into the implementer's
 //! carry-forward, `--supersedes` and `--expires-after-round`. Dry-run backend; PATH holds
 //! only git and HOME is a temp dir, so no provider CLI runs.
-use assert_cmd::cargo::cargo_bin_cmd;
+
+mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::{tempdir, TempDir};
@@ -30,7 +31,7 @@ fn which_git() -> PathBuf {
 }
 
 fn spar(env: &Env, dir: &Path) -> assert_cmd::Command {
-    let mut c = cargo_bin_cmd!("spar");
+    let mut c = common::spar();
     c.current_dir(dir)
         .env("PATH", &env.bin)
         .env("HOME", env.home.path())

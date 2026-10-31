@@ -2,6 +2,8 @@
 //! (O103), sticky manual pauses and `provider probe` (O105), and per-dispatch pause
 //! re-checks (O106). Fake CLIs on `PATH` stand in for providers where a failure has to
 //! happen; `--dry-run` covers what needs no spawn at all.
+
+mod common;
 use assert_cmd::Command as AssertCommand;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,7 +13,7 @@ use tempfile::tempdir;
 const CLAUDE_REVOKED: &str = r#"API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked. Please obtain a new token or refresh your existing token."}}"#;
 
 fn spar_cmd(home: &Path) -> AssertCommand {
-    let mut cmd = AssertCommand::cargo_bin("spar").unwrap();
+    let mut cmd = common::spar();
     cmd.env_remove("SPAR_PROJECT_ROOT");
     cmd.env_remove("SPAR_RUN_ID");
     cmd.env_remove("SPAR_AGENT_ID");

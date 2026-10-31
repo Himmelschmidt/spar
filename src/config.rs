@@ -642,6 +642,14 @@ pub struct WorktreeConfig {
     /// (`.envrc`, a DB env file) is otherwise missing there. Absent files are skipped.
     #[serde(default = "default_worktree_copy")]
     pub copy: Vec<String>,
+    /// Shared build directories an implementer leases one of per dispatch (O143). `~/`
+    /// and one `{a..b}` range per entry are expanded. Empty: every worktree builds into
+    /// its own target.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub build_cache_pool: Vec<String>,
+    /// The variable a leased pool directory is handed to the implementer in.
+    #[serde(default = "default_build_cache_env")]
+    pub build_cache_env: String,
 }
 
 impl Default for WorktreeConfig {
@@ -649,8 +657,14 @@ impl Default for WorktreeConfig {
         Self {
             auto_cleanup_merged: true,
             copy: default_worktree_copy(),
+            build_cache_pool: Vec::new(),
+            build_cache_env: default_build_cache_env(),
         }
     }
+}
+
+fn default_build_cache_env() -> String {
+    "CARGO_TARGET_DIR".into()
 }
 
 fn default_worktree_copy() -> Vec<String> {
@@ -1198,6 +1212,8 @@ struct EnvConfigFile {
 struct WorktreeConfigFile {
     auto_cleanup_merged: Option<bool>,
     copy: Option<Vec<String>>,
+    build_cache_pool: Option<Vec<String>>,
+    build_cache_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1829,6 +1845,22 @@ impl Config {
                 }
                 self.worktree.copy = v.clone();
             }
+            if let Some(v) = &w.build_cache_pool {
+                self.worktree.build_cache_pool = v.clone();
+            }
+            if let Some(v) = &w.build_cache_env {
+                let ident = v
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                if !ident {
+                    anyhow::bail!(
+                        "[worktree].build_cache_env {v:?} must be an environment variable name"
+                    );
+                }
+                self.worktree.build_cache_env = v.clone();
+            }
         }
         if let Some(p) = &file.providers {
             if let Some(order) = &p.order {
@@ -2130,8 +2162,78 @@ enum Trust {
     Project,
 }
 
-fn user_config_path() -> Option<PathBuf> {
+#[cfg(not(test))]
+pub fn user_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("spar").join("config.toml"))
+}
+
+/// Unit tests never read the developer's real user config: it can name a shared quota
+/// store or remote hosts, and an in-process test must not write to either.
+#[cfg(test)]
+pub fn user_config_path() -> Option<PathBuf> {
+    TEST_USER_CONFIG.with(|p| p.borrow().clone())
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_USER_CONFIG: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub fn set_test_user_config(path: Option<PathBuf>) {
+    TEST_USER_CONFIG.with(|p| *p.borrow_mut() = path);
+}
+
+/// Sections only the operator's own `~/.config/spar/config.toml` may set. They name other
+/// machines and shared filesystems, which a repo-local `spar.toml` has no business
+/// choosing, and they describe the box rather than a run, so they are never snapshotted.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct UserConfig {
+    #[serde(default)]
+    pub registry: RegistryConfig,
+    #[serde(default)]
+    pub quota: QuotaConfig,
+    /// Account label per provider (`"cli:claude" = "acct-a"`): boxes logged into the
+    /// same account share a fleet pause and a fleet slot count, different accounts don't.
+    #[serde(default)]
+    pub accounts: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct QuotaConfig {
+    /// A directory on a filesystem every box mounts. Empty: per-project quota only.
+    #[serde(default)]
+    pub shared_path: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RegistryConfig {
+    /// ssh hosts whose runs `spar status --all-hosts` lists and the `--key` check consults.
+    #[serde(default)]
+    pub remotes: Vec<String>,
+}
+
+impl UserConfig {
+    pub fn load() -> Result<Self> {
+        let Some(path) = user_config_path() else {
+            return Ok(Self::default());
+        };
+        if !path.is_file() {
+            return Ok(Self::default());
+        }
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("read config {}", path.display()))?;
+        let mut cfg: Self =
+            toml::from_str(&text).with_context(|| format!("parse config {}", path.display()))?;
+        // Scenario tests set this: whatever HOME a test ends up with, its spawns never
+        // write the fleet quota store or ssh to real hosts.
+        if crate::util::env_truthy("SPAR_TEST_ISOLATED") {
+            cfg.quota.shared_path.clear();
+            cfg.registry.remotes.clear();
+        }
+        Ok(cfg)
+    }
 }
 
 fn load_file(path: &Path) -> Result<ConfigFile> {
@@ -2145,6 +2247,22 @@ fn load_file(path: &Path) -> Result<ConfigFile> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn user_config_reads_registry_remotes_and_ignores_config_sections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "max_agents = 3\n[registry]\nremotes = [\"box2\", \"box3\"]\n",
+        )
+        .unwrap();
+        set_test_user_config(Some(path));
+        let user = UserConfig::load().unwrap();
+        set_test_user_config(None);
+        assert_eq!(user.registry.remotes, vec!["box2", "box3"]);
+        assert!(UserConfig::load().unwrap().registry.remotes.is_empty());
+    }
 
     /// AC-5. A repeated positional `--backup reviewer=` states the CLI's whole
     /// reviewer backup list; it must not append after the ones the project file

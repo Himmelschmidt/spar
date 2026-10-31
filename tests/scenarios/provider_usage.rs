@@ -1,7 +1,8 @@
 //! `spar provider list --usage` (O132) against fixtures: a fake `muse` on an otherwise
 //! empty PATH answers `usage --json`, and HOME holds a codex session log. No real
 //! provider CLI can run.
-use assert_cmd::cargo::cargo_bin_cmd;
+
+mod common;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tempfile::tempdir;
@@ -35,7 +36,7 @@ fn usage_reads_muse_and_codex_and_says_why_claude_has_none() {
     let project = tempdir().unwrap();
     std::fs::create_dir_all(project.path().join(".spar")).unwrap();
 
-    let out = cargo_bin_cmd!("spar")
+    let out = common::spar()
         .current_dir(project.path())
         .env("PATH", &bin)
         .env("HOME", home.path())
@@ -84,7 +85,7 @@ fn usage_reads_muse_and_codex_and_says_why_claude_has_none() {
         .unwrap()
         .contains("non-billed"));
 
-    let plain = cargo_bin_cmd!("spar")
+    let plain = common::spar()
         .current_dir(project.path())
         .env("PATH", &bin)
         .env("HOME", home.path())
@@ -102,7 +103,7 @@ fn usage_reads_muse_and_codex_and_says_why_claude_has_none() {
         "no probe without --usage: {v}"
     );
 
-    let human = cargo_bin_cmd!("spar")
+    let human = common::spar()
         .current_dir(project.path())
         .env("PATH", &bin)
         .env("HOME", home.path())

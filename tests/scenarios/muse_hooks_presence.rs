@@ -12,7 +12,8 @@
 //! A live test at the bottom runs the real `muse` binary (echo provider, no API
 //! cost) against a spar-shaped hook file and asserts the hooks actually fire.
 //! It runs only when `SPAR_TEST_REAL_MUSE=1` with `muse` on `PATH`.
-use assert_cmd::cargo::cargo_bin_cmd;
+
+mod common;
 use predicates::prelude::predicate;
 use std::fs;
 use std::process::Command;
@@ -30,7 +31,7 @@ fn spar_home_dir() -> std::path::PathBuf {
 }
 
 fn spar_cmd() -> assert_cmd::Command {
-    let mut c = cargo_bin_cmd!("spar");
+    let mut c = common::spar();
     c.env("SPAR_HOME", spar_home_dir());
     c.env_remove("SPAR_PROJECT_ROOT");
     c.env_remove("SPAR_RUN_ID");

@@ -42,6 +42,9 @@ pub struct CommonOpts {
     /// instead of keeping the provider they were minted with. Without this, `--role` on
     /// a run whose slots exist silently changes `config.json` and nothing else.
     pub reload_config: bool,
+    /// `--key`: the idempotency key a NEW run is minted with. Checked before minting by
+    /// `runkey::guard`; never applied to a run that already exists.
+    pub key: Option<String>,
     /// `--reassign <role|seat>=<provider>`: move existing seats of `--run <id>` to
     /// another provider before this re-entry dispatches (O136).
     pub reassign: Vec<String>,
@@ -63,6 +66,7 @@ impl Default for CommonOpts {
             big: false,
             max_rounds: None,
             accept_contract: false,
+            key: None,
             reassign: Vec::new(),
         }
     }

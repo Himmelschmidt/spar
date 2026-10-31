@@ -27,6 +27,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         paths.project_root.clone(),
     );
     state.task = Some(task);
+    state.key = opts.key.clone();
     state.backend = opts.backend;
     worktree::apply_run_base(&mut state, opts.base.as_deref(), opts.json)?;
     cfg.save_snapshot(paths, &state.id)?;

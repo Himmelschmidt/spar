@@ -4,6 +4,8 @@
 //! Every spawn here runs with `PATH` holding only `git`, and `HOME` /
 //! `XDG_CONFIG_HOME` inside the test's own tempdir, so no provider CLI and no user
 //! config on the host can ever be reached, whatever a test gets wrong.
+
+mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
@@ -58,7 +60,7 @@ impl Sandbox {
     }
 
     fn spar_std(&self) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_spar"));
+        let mut c = common::spar_std();
         c.current_dir(&self.project)
             .env("PATH", &self.bin)
             .env("HOME", &self.home)

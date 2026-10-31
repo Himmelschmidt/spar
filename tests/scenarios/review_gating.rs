@@ -1,6 +1,7 @@
 //! Review gating scenarios (dry-run, no live AI): severity-aware gating and scoped
 //! re-review (O118, O119), stale findings (O120), operator rulings and AC waivers (O121).
-use assert_cmd::cargo::cargo_bin_cmd;
+
+mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::tempdir;
@@ -17,7 +18,7 @@ fn spar_home_dir() -> PathBuf {
 }
 
 fn spar_cmd() -> assert_cmd::Command {
-    let mut c = cargo_bin_cmd!("spar");
+    let mut c = common::spar();
     c.env("SPAR_HOME", spar_home_dir());
     c.env_remove("SPAR_PROJECT_ROOT");
     c.env_remove("SPAR_RUN_ID");

@@ -175,7 +175,7 @@ pub(crate) fn canonicalize_best_effort(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
-fn project_name(root: &Path) -> String {
+pub(crate) fn project_name(root: &Path) -> String {
     root.file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(".")
@@ -246,6 +246,140 @@ pub fn list_project_runs(project_root: &Path) -> Result<Vec<RunSummary>> {
     Ok(runs)
 }
 
+/// The checkout's identity across boxes: its `origin` URL, normalized so the ssh and
+/// https spellings of one repository agree (`github.com/acme/app`). `None` without one.
+pub fn repo_identity(root: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["config", "--get", "remote.origin.url"])
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    normalize_repo_url(String::from_utf8_lossy(&out.stdout).trim())
+}
+
+fn normalize_repo_url(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches('/');
+    if url.is_empty() {
+        return None;
+    }
+    let rest = match url.split_once("://") {
+        Some((_, rest)) => rest.to_string(),
+        None => match url.split_once(':') {
+            Some((host, path)) if !host.contains('/') => format!("{host}/{path}"),
+            _ => url.to_string(),
+        },
+    };
+    let rest = rest.rsplit_once('@').map_or(rest.as_str(), |(_, r)| r);
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+    let path = path.trim_matches('/').trim_end_matches(".git");
+    Some(format!("{host}/{path}"))
+}
+
+/// A remote that does not answer inside this is reported unreachable, never waited on.
+const REMOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// One host's answer to `spar status --all --json`.
+pub struct HostRuns {
+    pub host: String,
+    pub runs: std::result::Result<Vec<serde_json::Value>, String>,
+}
+
+/// Query every host in parallel over ssh. Each answer is that host's own registry
+/// (`status --all`), so a host lists what it knows, not what this box knows.
+pub fn query_remotes(hosts: &[String], archived: bool) -> Vec<HostRuns> {
+    let handles: Vec<_> = hosts
+        .iter()
+        .map(|h| {
+            let host = h.clone();
+            std::thread::spawn(move || HostRuns {
+                runs: query_remote(&host, archived),
+                host,
+            })
+        })
+        .collect();
+    handles
+        .into_iter()
+        .zip(hosts)
+        .map(|(h, host)| {
+            h.join().unwrap_or_else(|_| HostRuns {
+                host: host.clone(),
+                runs: Err("query thread panicked".into()),
+            })
+        })
+        .collect()
+}
+
+fn query_remote(host: &str, archived: bool) -> std::result::Result<Vec<serde_json::Value>, String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    if host.is_empty() || host.starts_with('-') {
+        return Err(format!("{host:?} is not a host name"));
+    }
+    let mut args = vec![
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "--",
+        host,
+        "spar",
+        "status",
+        "--all",
+        "--json",
+    ];
+    if archived {
+        args.push("--archived");
+    }
+    let mut child = Command::new("ssh")
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn ssh: {e}"))?;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let out = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stdout.read_to_string(&mut s);
+        s
+    });
+    let err = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stderr.read_to_string(&mut s);
+        s
+    });
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if start.elapsed() >= REMOTE_TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("no answer within {}s", REMOTE_TIMEOUT.as_secs()));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(e) => return Err(format!("wait for ssh: {e}")),
+        }
+    };
+    let stdout = out.join().unwrap_or_default();
+    let stderr = err.join().unwrap_or_default();
+    if !status.success() {
+        let last = stderr.lines().rev().find(|l| !l.trim().is_empty());
+        return Err(format!(
+            "ssh exited {}: {}",
+            status.code().map_or("by signal".into(), |c| c.to_string()),
+            last.unwrap_or("no output").trim()
+        ));
+    }
+    serde_json::from_str(&stdout).map_err(|e| format!("unreadable status output: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +387,29 @@ mod tests {
 
     fn set_home_override(home: &Path) {
         HOME_OVERRIDE.with(|h| *h.borrow_mut() = Some(home.to_path_buf()));
+    }
+
+    #[test]
+    fn repo_urls_normalize_across_spellings() {
+        for url in [
+            "git@github.com:Acme/app.git",
+            "ssh://git@github.com:22/Acme/app.git",
+            "https://github.com/Acme/app",
+            "https://user@GitHub.com/Acme/app.git/",
+        ] {
+            assert_eq!(
+                normalize_repo_url(url).as_deref(),
+                Some("github.com/Acme/app"),
+                "{url}"
+            );
+        }
+        assert_eq!(normalize_repo_url(""), None);
+    }
+
+    #[test]
+    fn a_host_that_looks_like_an_option_is_refused_before_ssh() {
+        let err = query_remote("-oProxyCommand=evil", false).unwrap_err();
+        assert!(err.contains("not a host"), "{err}");
     }
 
     #[test]

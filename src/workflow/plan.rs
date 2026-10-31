@@ -31,6 +31,7 @@ pub fn run(
         paths.project_root.clone(),
     );
     state.task = Some(task.clone());
+    state.key = opts.key.clone();
     // Stored project-root-relative, like every other path on `state` — an absolute
     // path would strand `spar brief` the moment the project moves or is restored
     // somewhere else.

@@ -3,6 +3,8 @@
 //! frozen contract (`spar amend`, O137), and reviewers judging from detached checkouts
 //! of their own (O138). Every provider CLI is faked and `PATH` holds only the fake bin
 //! and the system dirs, so nothing here can reach a real, billed provider.
+
+mod common;
 use assert_cmd::Command as AssertCommand;
 use predicates::prelude::*;
 use std::fs;
@@ -81,7 +83,7 @@ impl Fixture {
     }
 
     fn spar(&self) -> AssertCommand {
-        let mut cmd = AssertCommand::cargo_bin("spar").unwrap();
+        let mut cmd = common::spar();
         cmd.current_dir(&self.proj)
             .env_remove("SPAR_PROJECT_ROOT")
             .env_remove("SPAR_RUN_ID")

@@ -1,6 +1,7 @@
 mod api;
 mod backup;
 mod brief;
+mod buildpool;
 mod bus;
 mod checkpoint;
 mod cli;
@@ -12,6 +13,7 @@ mod effort;
 mod events;
 mod executor;
 mod exit_codes;
+mod fleet;
 mod history;
 mod liveness;
 mod mailbox;
@@ -31,6 +33,7 @@ mod quota;
 mod record;
 mod registry;
 mod rules;
+mod runkey;
 mod runlock;
 mod runspec;
 mod sandbox;
@@ -169,6 +172,9 @@ fn run() -> Result<ExitCode> {
             fleet,
             without,
             suite_command,
+            key,
+            no_key,
+            key_scope,
             base,
             detach,
             json,
@@ -200,6 +206,7 @@ fn run() -> Result<ExitCode> {
                         (fleet.is_some(), "--fleet"),
                         (!without.is_empty(), "--without"),
                         (!suite_command.is_empty(), "--suite-command"),
+                        (key.is_some(), "--key"),
                         (base.is_some(), "--base"),
                         (big, "--big"),
                         (detach, "--detach"),
@@ -259,6 +266,15 @@ fn run() -> Result<ExitCode> {
                 cfg.apply_backup_overrides(&backup)?;
                 cfg.apply_effort_overrides(&effort)?;
                 cfg.apply_suite_command(&suite_command, &without)?;
+                // An intaken brief (O41) is the work's identity already, so its slug is
+                // the natural key when the operator names none. Any other file is not.
+                let key = match (key, no_key) {
+                    (_, true) => None,
+                    (Some(k), false) => Some(k),
+                    (None, false) => brief
+                        .as_deref()
+                        .and_then(|p| brief::intaken_slug(&paths, p)),
+                };
                 // `--spec` is read now and copied into `.spar/briefs/` only after the
                 // pre-check passes, so neither a refusal nor `--validate-only` leaves one.
                 let (task_text, brief_path, spec_body) = match (spec, brief, task) {
@@ -299,9 +315,15 @@ fn run() -> Result<ExitCode> {
                     // `plan` / `run` mint their config fresh; there is no frozen one to
                     // reload against, so seats are resolved for the first time either way.
                     reload_config: false,
+                    key,
                     reassign: Vec::new(),
                 };
                 workflow::preflight(&opts, &paths, &cfg)?;
+                if let Some(code) =
+                    runkey::guard(&paths, opts.key.as_deref(), key_scope, json, dry_run)?
+                {
+                    return Ok(Err(code));
+                }
                 let brief_path = match spec_body {
                     Some(body) if !validate_only => {
                         let b = brief::intake_body(&paths, &body)?;
@@ -312,10 +334,11 @@ fn run() -> Result<ExitCode> {
                     }
                     _ => brief_path,
                 };
-                Ok((paths, cfg, task_text, brief_path, opts))
+                Ok(Ok((paths, cfg, task_text, brief_path, opts)))
             })();
             let (paths, cfg, task_text, brief_path, opts) = match prepared {
-                Ok(v) => v,
+                Ok(Ok(v)) => v,
+                Ok(Err(code)) => return Ok(code),
                 Err(e) => return launch_refused(e, json, None),
             };
             if validate_only {
@@ -380,6 +403,8 @@ fn run() -> Result<ExitCode> {
             recapture_env,
             max_rounds,
             accept_contract,
+            key,
+            key_scope,
             reassign,
             base,
             detach,
@@ -393,6 +418,9 @@ fn run() -> Result<ExitCode> {
             big,
         } => {
             let prepared = (|| -> Result<_> {
+                if let (Some(id), Some(_)) = (&run_id, &key) {
+                    anyhow::bail!("--key names a new run; run {id} already exists and keeps the key it was created with");
+                }
                 if !reassign.is_empty() {
                     refuse_inside_slot("spar implement --reassign")?;
                     if run_id.is_none() {
@@ -431,6 +459,7 @@ fn run() -> Result<ExitCode> {
                     max_rounds,
                     accept_contract,
                     reload_config,
+                    key,
                     reassign,
                 };
                 workflow::implement::parse_reassignments(&opts.reassign, &paths)?;
@@ -459,6 +488,13 @@ fn run() -> Result<ExitCode> {
                 Ok(v) => v,
                 Err(e) => return launch_refused(e, json, run_id.as_deref()),
             };
+            if run_id.is_none() {
+                if let Some(code) =
+                    runkey::guard(&paths, opts.key.as_deref(), key_scope, json, opts.dry_run)?
+                {
+                    return Ok(code);
+                }
+            }
             if validate_only {
                 return launch_validated(json, run_id.as_deref());
             }
@@ -485,6 +521,8 @@ fn run() -> Result<ExitCode> {
             effort,
             fleet,
             without,
+            key,
+            key_scope,
             base,
             detach,
             json,
@@ -554,6 +592,7 @@ fn run() -> Result<ExitCode> {
                     // `plan` / `run` mint their config fresh; there is no frozen one to
                     // reload against, so seats are resolved for the first time either way.
                     reload_config: false,
+                    key,
                     reassign: Vec::new(),
                 };
                 workflow::preflight(&opts, &paths, &cfg)?;
@@ -563,6 +602,11 @@ fn run() -> Result<ExitCode> {
                 Ok(v) => v,
                 Err(e) => return launch_refused(e, json, None),
             };
+            if let Some(code) =
+                runkey::guard(&paths, opts.key.as_deref(), key_scope, json, opts.dry_run)?
+            {
+                return Ok(code);
+            }
             if validate_only {
                 return launch_validated(json, None);
             }
@@ -573,7 +617,17 @@ fn run() -> Result<ExitCode> {
             json,
             all,
             archived,
-        } => status_cmd(run_id, json, all, archived),
+            hosts,
+            all_hosts,
+        } => {
+            if !hosts.is_empty() || all_hosts {
+                if run_id.is_some() {
+                    anyhow::bail!("--hosts / --all-hosts list runs; drop the run id");
+                }
+                return fleet_status_cmd(hosts, all_hosts, json, archived);
+            }
+            status_cmd(run_id, json, all, archived)
+        }
         Command::Stats {
             since,
             by,
@@ -1347,6 +1401,120 @@ fn auto_archive_at_launch() {
     }
 }
 
+/// Listing rows as JSON with `project_repo` (the normalized origin URL, one `git` call
+/// per project), which another box's `--key` check matches on (O140).
+fn with_repo_ids(runs: Vec<state::RunSummary>) -> Result<Vec<serde_json::Value>> {
+    let mut ids: std::collections::HashMap<std::path::PathBuf, Option<String>> =
+        std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(runs.len());
+    for r in runs {
+        let repo = r.project_root.as_ref().and_then(|root| {
+            ids.entry(root.clone())
+                .or_insert_with(|| registry::repo_identity(root))
+                .clone()
+        });
+        let mut v = serde_json::to_value(r)?;
+        if let Some(repo) = repo {
+            v["project_repo"] = serde_json::json!(repo);
+        }
+        out.push(v);
+    }
+    Ok(out)
+}
+
+/// Runs across hosts (O140). Observe-only like `status`: an unreachable host is reported
+/// in place and the command still exits 0.
+fn fleet_status_cmd(
+    hosts: Vec<String>,
+    all_hosts: bool,
+    json: bool,
+    archived: bool,
+) -> Result<ExitCode> {
+    let remotes = if all_hosts {
+        let remotes = config::UserConfig::load()?.registry.remotes;
+        if remotes.is_empty() {
+            anyhow::bail!(
+                "no [registry] remotes in {}; name hosts with --hosts h1,h2",
+                config::user_config_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "the user config".into())
+            );
+        }
+        remotes
+    } else {
+        hosts
+    };
+    let mut report: Vec<serde_json::Value> = Vec::new();
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    if all_hosts {
+        let local = util::hostname().unwrap_or_else(|| "localhost".into());
+        let mut runs = registry::list_all_runs()?;
+        if !archived {
+            runs.retain(|r| !r.archived);
+        }
+        report.push(serde_json::json!({"host": local, "ok": true, "runs": runs.len()}));
+        for mut v in with_repo_ids(runs)? {
+            v["host"] = serde_json::json!(local);
+            rows.push(v);
+        }
+    }
+    for answer in registry::query_remotes(&remotes, archived) {
+        match answer.runs {
+            Ok(runs) => {
+                report
+                    .push(serde_json::json!({"host": answer.host, "ok": true, "runs": runs.len()}));
+                for mut v in runs.into_iter().filter(|v| v.is_object()) {
+                    v["host"] = serde_json::json!(answer.host);
+                    rows.push(v);
+                }
+            }
+            Err(e) => {
+                report.push(serde_json::json!({"host": answer.host, "ok": false, "error": e}))
+            }
+        }
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({"hosts": report, "runs": rows}))?
+        );
+        return Ok(ExitCode::Success);
+    }
+    for h in &report {
+        let host = h["host"].as_str().unwrap_or("?");
+        if h["ok"] != true {
+            println!(
+                "[{host}] unreachable: {}",
+                h["error"].as_str().unwrap_or("?")
+            );
+            continue;
+        }
+        println!("[{host}] {} run(s)", h["runs"]);
+        for r in rows.iter().filter(|r| r["host"] == host) {
+            let key = r["key"]
+                .as_str()
+                .map(|k| format!(" key={k}"))
+                .unwrap_or_default();
+            let task: String = r["task"]
+                .as_str()
+                .unwrap_or("")
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(60)
+                .collect();
+            println!(
+                "  {} {} {}{key}  {task}",
+                r["id"].as_str().unwrap_or("?"),
+                r["phase"].as_str().unwrap_or("?"),
+                r["project_name"].as_str().unwrap_or("·"),
+            );
+        }
+    }
+    Ok(ExitCode::Success)
+}
+
 fn stats_cmd(
     since: Option<&str>,
     by: stats::GroupBy,
@@ -1539,7 +1707,7 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> 
     };
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&runs)?);
+        println!("{}", serde_json::to_string_pretty(&with_repo_ids(runs)?)?);
     } else if runs.is_empty() {
         if use_all {
             println!(
@@ -3092,11 +3260,11 @@ fn stray_pauses(
         .map(|p| quota::normalize_key(&p.name))
         .collect();
     let mut stray: Vec<quota::ProviderQuota> = store
-        .providers
-        .values()
-        .filter(|q| !listed.contains(&q.name))
-        .filter(|q| store.effective_status(&q.name) != quota::ProviderStatus::Available)
-        .cloned()
+        .names()
+        .into_iter()
+        .filter(|name| !listed.contains(name))
+        .filter(|name| store.effective_status(name) != quota::ProviderStatus::Available)
+        .map(|name| store.get(&name))
         .collect();
     stray.sort_by(|a, b| a.name.cmp(&b.name));
     stray

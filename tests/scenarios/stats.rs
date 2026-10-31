@@ -1,7 +1,8 @@
 //! `spar stats` (O131): aggregates from `.spar/history.jsonl` and live run state. A
 //! dry-run run is counted live while in flight and from history once purged, with the
 //! same numbers. PATH holds only git and HOME is a temp dir, so no provider CLI runs.
-use assert_cmd::cargo::cargo_bin_cmd;
+
+mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::{tempdir, TempDir};
@@ -29,7 +30,7 @@ fn which_git() -> PathBuf {
 }
 
 fn spar(env: &Env, dir: &Path) -> assert_cmd::Command {
-    let mut c = cargo_bin_cmd!("spar");
+    let mut c = common::spar();
     c.current_dir(dir)
         .env("PATH", &env.bin)
         .env("HOME", env.home.path())

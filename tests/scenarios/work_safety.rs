@@ -1,7 +1,8 @@
 //! Work safety and run lifecycle: cleanup that cannot destroy unlanded work, a round that
 //! is only charged when it dispatched, orchestrators that notice their run was removed,
 //! reclaim over halted runs, and reconcile/resume over abandoned ones.
-use assert_cmd::cargo::cargo_bin_cmd;
+
+mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::tempdir;
@@ -18,7 +19,7 @@ fn spar_home_dir() -> PathBuf {
 }
 
 fn spar_cmd() -> assert_cmd::Command {
-    let mut c = cargo_bin_cmd!("spar");
+    let mut c = common::spar();
     c.env("SPAR_HOME", spar_home_dir());
     c.env_remove("SPAR_PROJECT_ROOT");
     c.env_remove("SPAR_RUN_ID");
@@ -897,7 +898,7 @@ fn the_all_projects_supervisor_restarts_an_abandoned_run_in_a_registered_project
     let elsewhere = tmp.path().join("elsewhere");
     std::fs::create_dir_all(&elsewhere).unwrap();
 
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("spar"))
+    let mut child = common::spar_std()
         .current_dir(&elsewhere)
         .env("SPAR_HOME", &home)
         .env_remove("SPAR_PROJECT_ROOT")

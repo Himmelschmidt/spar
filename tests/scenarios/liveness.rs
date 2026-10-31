@@ -1,5 +1,6 @@
 //! Slot liveness surfaced through `spar status --json`.
-use assert_cmd::cargo::cargo_bin_cmd;
+
+mod common;
 use predicates::prelude::*;
 use serde_json::Value;
 use std::process::Command;
@@ -19,7 +20,7 @@ fn spar_home_dir() -> std::path::PathBuf {
 }
 
 fn spar_cmd() -> assert_cmd::Command {
-    let mut c = cargo_bin_cmd!("spar");
+    let mut c = common::spar();
     c.env("SPAR_HOME", spar_home_dir());
     // spar exports these into every slot (providers/presence.rs), so when the suite runs
     // *inside* a spar worktree the child would resolve the primary checkout instead of
@@ -151,8 +152,7 @@ fn assert_foreground_lock(workflow: &str) {
         std::env::var("PATH").unwrap_or_default()
     );
 
-    let exe = assert_cmd::cargo::cargo_bin("spar");
-    let mut child = Command::new(&exe)
+    let mut child = common::spar_std()
         .current_dir(&proj)
         .env("SPAR_HOME", spar_home_dir())
         .env("PATH", &path_env)

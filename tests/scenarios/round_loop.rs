@@ -5,7 +5,8 @@
 //! 26 and 34. These cover the two halves of the fix — a ceiling that escalates to a
 //! human instead of looping, and a compact brief that carries between rounds so a cold
 //! re-dispatch does not re-derive what the last one already learned.
-use assert_cmd::cargo::cargo_bin_cmd;
+
+mod common;
 use predicates::prelude::*;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -25,7 +26,7 @@ fn spar_home_dir() -> PathBuf {
 }
 
 fn spar_cmd() -> assert_cmd::Command {
-    let mut c = cargo_bin_cmd!("spar");
+    let mut c = common::spar();
     c.env("SPAR_HOME", spar_home_dir());
     // spar exports these into every slot (providers/presence.rs), so when the suite runs
     // *inside* a spar worktree the child would resolve the primary checkout instead of

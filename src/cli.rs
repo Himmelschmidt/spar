@@ -29,6 +29,13 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
+/// Where the `--key` idempotency check looks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum KeyScope {
+    Local,
+    Fleet,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Check providers, tmux, git, and project layout
@@ -97,6 +104,17 @@ pub enum Command {
         /// flag. Frozen into the run's config and kept across `--reload-config`.
         #[arg(long = "suite-command", value_name = "CMD")]
         suite_command: Vec<String>,
+        /// Idempotency key: refuse to start while an unfinished run with this key
+        /// exists. `--brief .spar/briefs/<slug>.md` defaults it to `<slug>`.
+        #[arg(long, conflicts_with = "no_key")]
+        key: Option<String>,
+        /// Start without a key, even from an intaken brief.
+        #[arg(long)]
+        no_key: bool,
+        /// Where the `--key` check looks: `local` (this project) or `fleet` (also every
+        /// `[registry] remotes` host). Default: `fleet` when remotes are configured.
+        #[arg(long, value_enum)]
+        key_scope: Option<KeyScope>,
         /// Ref to cut every slot worktree from (branch, tag or sha).
         /// Default: the HEAD of the directory spar was invoked from.
         #[arg(long)]
@@ -232,6 +250,14 @@ pub enum Command {
         /// first: this is how a criterion gets deleted on the way to the ship gate.
         #[arg(long)]
         accept_contract: bool,
+        /// Idempotency key: refuse to start while an unfinished run with this key
+        /// exists. `plan --brief` defaults it to the brief's slug.
+        #[arg(long)]
+        key: Option<String>,
+        /// Where the `--key` check looks: `local` (this project) or `fleet` (also every
+        /// `[registry] remotes` host). Default: `fleet` when remotes are configured.
+        #[arg(long, value_enum)]
+        key_scope: Option<KeyScope>,
         /// Move an existing seat of `--run <id>` to another provider:
         /// `--reassign implementer=cli:claude@sonnet` or
         /// `--reassign review-0-cli-codex=cli:claude@opus`. Repeatable. The seat keeps its
@@ -303,6 +329,14 @@ pub enum Command {
         /// Applied before `--role`, so an explicit role flag still wins.
         #[arg(long, value_delimiter = ',')]
         without: Vec<String>,
+        /// Idempotency key: refuse to start while an unfinished run with this key
+        /// exists. `plan --brief` defaults it to the brief's slug.
+        #[arg(long)]
+        key: Option<String>,
+        /// Where the `--key` check looks: `local` (this project) or `fleet` (also every
+        /// `[registry] remotes` host). Default: `fleet` when remotes are configured.
+        #[arg(long, value_enum)]
+        key_scope: Option<KeyScope>,
         /// Ref to cut every slot worktree from (branch, tag or sha).
         /// Default: the HEAD of the directory spar was invoked from.
         #[arg(long)]
@@ -345,6 +379,13 @@ pub enum Command {
         /// Include archived runs, which are hidden by default
         #[arg(long)]
         archived: bool,
+        /// List runs on these ssh hosts (each runs `spar status --all --json`), merged
+        /// with a `host` field. Comma-separated.
+        #[arg(long, value_delimiter = ',', conflicts_with = "all_hosts")]
+        hosts: Vec<String>,
+        /// This host's runs plus every `[registry] remotes` host's.
+        #[arg(long)]
+        all_hosts: bool,
     },
 
     /// Aggregate run history: rounds, outcomes, review findings, cost, wall time and

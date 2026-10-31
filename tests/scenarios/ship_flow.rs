@@ -1,7 +1,8 @@
 //! Ship against a fake `gh` on PATH and a bare-repo origin: adopting an existing PR
 //! (#164), `[ship] draft`, `sync-prs`, `--override-gate` (#166) and `--adopt-remote`
 //! (#163).
-use assert_cmd::cargo::cargo_bin_cmd;
+
+mod common;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -19,7 +20,7 @@ fn spar_home_dir() -> PathBuf {
 }
 
 fn spar_cmd() -> assert_cmd::Command {
-    let mut c = cargo_bin_cmd!("spar");
+    let mut c = common::spar();
     c.env("SPAR_HOME", spar_home_dir());
     c.env("GIT_CONFIG_GLOBAL", "/dev/null");
     c.env("GIT_CONFIG_SYSTEM", "/dev/null");
@@ -719,7 +720,7 @@ fn sync_prs_needs_a_run_or_all() {
 fn daemon_tick_syncs_prs_when_enabled() {
     let fx = Fixture::new("[daemon]\nsync_prs = true\ntick_secs = 1\n");
     shipped_run(&fx, "awaiting_ship_confirm");
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_spar"));
+    let mut daemon = common::spar_std();
     daemon
         .current_dir(&fx.root)
         .env("SPAR_HOME", spar_home_dir())

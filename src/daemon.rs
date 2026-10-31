@@ -271,10 +271,18 @@ fn with_admission_lock<T>(paths: &SparPaths, f: impl FnOnce() -> T) -> Result<T>
 /// a reservation for `run_id` before returning, so the very next decision — in this
 /// loop iteration or a concurrent process — already sees the capacity as taken.
 fn try_admit(paths: &SparPaths, run_id: &str, demand: &HashMap<String, u32>, cap: u32) -> bool {
+    // Read before the lock: the shared path can hang, and every launcher in the project
+    // waits on this lock.
+    let elsewhere = crate::fleet::remote_slots(paths);
     with_admission_lock(paths, || {
         let mut reservations = load_reservations(paths);
         let real_by_run = real_supply_by_run(paths);
-        let effective = effective_supply(&real_by_run, &reservations, Some(run_id));
+        let mut effective = effective_supply(&real_by_run, &reservations, Some(run_id));
+        // Slots other boxes and projects hold on the same accounts (O142). Their
+        // reservations are not visible here, only their running slots' leases.
+        for (bucket, n) in elsewhere {
+            *effective.entry(bucket).or_insert(0) += n;
+        }
         if !fits(demand, &effective, cap) {
             return false;
         }
@@ -1050,9 +1058,11 @@ pub fn status(paths: &SparPaths, json: bool) -> Result<ExitCode> {
         .filter_map(|e| e.file_name().to_str().map(String::from))
         .collect();
     let in_use = bucket_supply_in_use(paths);
+    let elsewhere = crate::fleet::remote_slots(paths);
 
     if json {
         let v = serde_json::json!({
+            "in_use_elsewhere": elsewhere,
             "running": owner.is_some(),
             "pid": owner.as_ref().map(|t| t.pid),
             "started_at": book.started_at,
@@ -1084,6 +1094,12 @@ pub fn status(paths: &SparPaths, json: bool) -> Result<ExitCode> {
     if !in_use.is_empty() {
         println!("in use:");
         for (bucket, n) in &in_use {
+            println!("  - {bucket}: {n}");
+        }
+    }
+    if !elsewhere.is_empty() {
+        println!("in use on other boxes and projects (shared quota path):");
+        for (bucket, n) in &elsewhere {
             println!("  - {bucket}: {n}");
         }
     }
@@ -1186,6 +1202,38 @@ mod tests {
         let mut m = HashMap::new();
         m.insert(bucket.to_string(), n);
         m
+    }
+
+    #[test]
+    fn try_admit_counts_slots_other_boxes_hold_on_the_same_account() {
+        let tmp = tempdir().unwrap();
+        let shared = tmp.path().join("shared");
+        std::fs::create_dir_all(shared.join("slots")).unwrap();
+        let cfg = tmp.path().join("config.toml");
+        std::fs::write(
+            &cfg,
+            format!("[quota]\nshared_path = \"{}\"\n", shared.display()),
+        )
+        .unwrap();
+        let paths = SparPaths::new(tmp.path().join("proj"));
+        let demand = demand_of("cli:claude", 1);
+        let lease = serde_json::json!({
+            "host": "some-other-box",
+            "pid": 1,
+            "project_root": "/elsewhere",
+            "run_id": "x",
+            "slot_id": "implementer",
+            "account": "cli:claude",
+            "heartbeat_at": Utc::now(),
+        });
+        std::fs::write(shared.join("slots/other.json"), lease.to_string()).unwrap();
+
+        crate::config::set_test_user_config(Some(cfg));
+        let admitted_at_one = try_admit(&paths, "r1", &demand, 1);
+        let admitted_at_two = try_admit(&paths, "r2", &demand, 2);
+        crate::config::set_test_user_config(None);
+        assert!(!admitted_at_one, "the other box's slot fills a cap of one");
+        assert!(admitted_at_two);
     }
 
     #[test]

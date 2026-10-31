@@ -188,6 +188,10 @@ name = "work_safety"
 path = "tests/scenarios/work_safety.rs"
 
 [[test]]
+name = "fleet_scale"
+path = "tests/scenarios/fleet_scale.rs"
+
+[[test]]
 name = "stats"
 path = "tests/scenarios/stats.rs"
 

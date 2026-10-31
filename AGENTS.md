@@ -65,9 +65,12 @@ until you add the block.
 `--dry-run` / `SPAR_DRY_RUN=1` is the test backend: real `.spar/` layout,
 no provider spawn.
 
-Tests that spawn the `spar` binary must `env_remove` `SPAR_PROJECT_ROOT` /
-`SPAR_RUN_ID` / `SPAR_AGENT_ID`. Without that, a child inside a spar
-worktree writes real runs into the primary checkout.
+Scenario tests spawn the `spar` binary only through `tests/scenarios/common`
+(`common::spar()` / `common::spar_std()`). It removes `SPAR_PROJECT_ROOT` /
+`SPAR_RUN_ID` / `SPAR_AGENT_ID` (without that, a child inside a spar worktree
+writes real runs into the primary checkout), points HOME, XDG_CONFIG_HOME and
+SPAR_HOME at a per-test temp dir, and sets `SPAR_TEST_ISOLATED=1` so the binary
+ignores user-config `[quota] shared_path` and `[registry] remotes`.
 
 Don't extend `mailbox.rs`. `bus.rs` replaced it.
 

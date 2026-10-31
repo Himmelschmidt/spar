@@ -4,7 +4,8 @@
 //! this, with 12 runs actually waiting on a human buried among them.
 //!
 //! These cover the CLI surface an outer agent drives, on real run stores.
-use assert_cmd::cargo::cargo_bin_cmd;
+
+mod common;
 use std::process::Command;
 use tempfile::tempdir;
 
@@ -20,7 +21,7 @@ fn spar_home_dir() -> std::path::PathBuf {
 }
 
 fn spar_cmd() -> assert_cmd::Command {
-    let mut c = cargo_bin_cmd!("spar");
+    let mut c = common::spar();
     c.env("SPAR_HOME", spar_home_dir());
     // spar exports these into every slot; without stripping them a suite run *inside* a
     // spar worktree resolves the primary checkout and writes real runs into it.

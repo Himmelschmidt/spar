@@ -101,12 +101,116 @@ pub struct ProviderQuota {
     /// (O106). Legacy records read weak.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub strong: bool,
+    /// Per-account write counter (O141): every write is one past the highest version
+    /// this box had seen for the key, so "written after seeing that pause" is decided by
+    /// the counter, not by two boxes' clocks. 0 on records that predate it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub version: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
+impl ProviderQuota {
+    fn available(name: &str) -> Self {
+        Self {
+            name: name.into(),
+            status: ProviderStatus::Available,
+            cooldown_until: None,
+            hint: None,
+            updated_at: None,
+            sticky: false,
+            strong: false,
+            version: 0,
+        }
+    }
+
+    /// When this record stops holding the provider; `None` when it holds until resumed.
+    fn lapses_at(&self) -> Option<DateTime<Utc>> {
+        match self.status {
+            ProviderStatus::Available => Some(DateTime::<Utc>::MIN_UTC),
+            ProviderStatus::Cooldown => {
+                Some(self.cooldown_until.unwrap_or(DateTime::<Utc>::MIN_UTC))
+            }
+            // An operator's pause holds until its own `--until`, or until `provider
+            // resume` when it has none: the operator said stop, and a timer that
+            // quietly undoes that is how a removed provider got dispatched again.
+            ProviderStatus::PausedManual if self.sticky => self.cooldown_until,
+            ProviderStatus::PausedManual | ProviderStatus::PausedQuota => {
+                self.cooldown_until.or_else(|| {
+                    self.updated_at
+                        .map(|set| set + chrono::Duration::minutes(DEFAULT_COOLDOWN_MINS))
+                })
+            }
+        }
+    }
+
+    fn holds(&self, now: DateTime<Utc>) -> bool {
+        self.lapses_at().is_none_or(|at| now < at)
+    }
+}
+
+/// Combine two records for one account (O141). A pause that has lapsed counts for
+/// nothing. Between two live pauses, a manual one beats a quota one, the longest-lived
+/// manual pause wins, and among quota pauses the strong one wins, then the longest.
+/// Between a live pause and `available`, the higher `version` wins: a `provider resume`
+/// written after its box saw the pause clears it fleet-wide, and a pause written after
+/// its box saw the resume holds. At equal versions (concurrent writes, or records from
+/// before the counter) the resume wins unless the pause is newer by more than the clock
+/// skew allowance. The result carries the higher version.
+pub fn merge(a: ProviderQuota, b: ProviderQuota, now: DateTime<Utc>) -> ProviderQuota {
+    let version = a.version.max(b.version);
+    let skew = chrono::Duration::seconds(crate::fleet::CLOCK_SKEW_SECS);
+    let resume_wins = |pause: &ProviderQuota, other: &ProviderQuota| {
+        other.status == ProviderStatus::Available
+            && match other.version.cmp(&pause.version) {
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Less => false,
+                std::cmp::Ordering::Equal => match (pause.updated_at, other.updated_at) {
+                    (Some(p), Some(r)) => p <= r + skew,
+                    (_, r) => r.is_some(),
+                },
+            }
+    };
+    let mut out = match (a.holds(now), b.holds(now)) {
+        (false, false) => {
+            if (b.version, b.updated_at) > (a.version, a.updated_at) {
+                b
+            } else {
+                a
+            }
+        }
+        (true, false) if resume_wins(&a, &b) => b,
+        (true, false) => a,
+        (false, true) if resume_wins(&b, &a) => a,
+        (false, true) => b,
+        (true, true) => {
+            let manual = |q: &ProviderQuota| q.status == ProviderStatus::PausedManual;
+            let longest = |q: &ProviderQuota| q.lapses_at().unwrap_or(DateTime::<Utc>::MAX_UTC);
+            let rank = |q: &ProviderQuota| (manual(q), manual(q) || q.strong, longest(q));
+            if rank(&b) > rank(&a) {
+                b
+            } else {
+                a
+            }
+        }
+    };
+    out.version = version;
+    out
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QuotaStore {
     #[serde(default)]
     pub providers: HashMap<String, ProviderQuota>,
+    /// The fleet file's records for this box's accounts, by storage key (O141). Read on
+    /// load and merged into every answer, never written to the project file.
+    #[serde(skip)]
+    fleet: HashMap<String, ProviderQuota>,
+    /// Keys this process changed, which `save` merges into the fleet file.
+    #[serde(skip)]
+    touched: std::collections::BTreeSet<String>,
     /// Pauses made since load, appended to `quota-events.jsonl` by `save`.
     #[serde(skip)]
     pending: Vec<QuotaEvent>,
@@ -140,12 +244,19 @@ impl QuotaStore {
     pub fn load(paths: &SparPaths) -> Result<Self> {
         paths.ensure_swarm_root()?;
         let file = paths.quota_file();
-        if !file.is_file() {
-            return Ok(Self::default());
+        let mut store: Self = if file.is_file() {
+            let text = std::fs::read_to_string(&file)
+                .with_context(|| format!("read {}", file.display()))?;
+            serde_json::from_str(&text)?
+        } else {
+            Self::default()
+        };
+        if let Some(shared) = crate::fleet::Shared::open() {
+            store.fleet =
+                crate::fleet::with_timeout("read fleet quota", move || read_fleet(&shared))
+                    .unwrap_or_default();
         }
-        let text =
-            std::fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
-        Ok(serde_json::from_str(&text)?)
+        Ok(store)
     }
 
     pub fn save(&mut self, paths: &SparPaths) -> Result<()> {
@@ -153,21 +264,41 @@ impl QuotaStore {
         let file = paths.quota_file();
         let text = serde_json::to_string_pretty(self)?;
         std::fs::write(&file, text).with_context(|| format!("write {}", file.display()))?;
-        if self.pending.is_empty() {
+        if !self.pending.is_empty() {
+            let mut lines = String::new();
+            for ev in self.pending.drain(..) {
+                lines.push_str(&serde_json::to_string(&ev)?);
+                lines.push('\n');
+            }
+            let path = paths.quota_events_file();
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, lines.as_bytes()))
+                .with_context(|| format!("append {}", path.display()))?;
+        }
+        if self.touched.is_empty() {
             return Ok(());
         }
-        let mut lines = String::new();
-        for ev in self.pending.drain(..) {
-            lines.push_str(&serde_json::to_string(&ev)?);
-            lines.push('\n');
+        let Some(shared) = crate::fleet::Shared::open() else {
+            return Ok(());
+        };
+        let changed: Vec<(String, ProviderQuota)> = self
+            .touched
+            .iter()
+            .filter_map(|name| {
+                let q = self.providers.get(name)?;
+                Some((shared.account_key(name), q.clone()))
+            })
+            .collect();
+        let published = crate::fleet::with_timeout("write fleet quota", move || {
+            publish(&shared, changed).map_err(|e| format!("{e:#}"))
+        });
+        if let Some(Err(e)) = published {
+            crate::fleet::warn_once(&e);
         }
-        let path = paths.quota_events_file();
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .and_then(|mut f| std::io::Write::write_all(&mut f, lines.as_bytes()))
-            .with_context(|| format!("append {}", path.display()))
+        Ok(())
     }
 
     /// Logs a pause only when it starts one: a provider already held by a live pause of
@@ -188,36 +319,39 @@ impl QuotaStore {
         });
     }
 
+    fn insert(&mut self, mut q: ProviderQuota) {
+        let seen = [self.providers.get(&q.name), self.fleet.get(&q.name)]
+            .into_iter()
+            .flatten()
+            .map(|r| r.version)
+            .max()
+            .unwrap_or(0);
+        q.version = seen + 1;
+        self.touched.insert(q.name.clone());
+        self.providers.insert(q.name.clone(), q);
+    }
+
+    /// Every key with a record, here or in the fleet file.
+    pub fn names(&self) -> std::collections::BTreeSet<String> {
+        self.providers
+            .keys()
+            .chain(self.fleet.keys())
+            .cloned()
+            .collect()
+    }
+
     pub fn get(&self, name: &str) -> ProviderQuota {
-        self.providers.get(name).cloned().unwrap_or(ProviderQuota {
-            name: name.into(),
-            status: ProviderStatus::Available,
-            cooldown_until: None,
-            hint: None,
-            updated_at: None,
-            sticky: false,
-            strong: false,
-        })
+        let local = self.providers.get(name).cloned();
+        let fleet = self.fleet.get(name).cloned();
+        match (local, fleet) {
+            (Some(l), Some(f)) => merge(l, f, Utc::now()),
+            (Some(q), None) | (None, Some(q)) => q,
+            (None, None) => ProviderQuota::available(name),
+        }
     }
 
     pub fn is_usable(&self, name: &str) -> bool {
-        let q = self.get(name);
-        match q.status {
-            ProviderStatus::Available => true,
-            ProviderStatus::Cooldown => q.cooldown_until.is_none_or(|until| Utc::now() >= until),
-            // An operator's pause holds until its own `--until`, or until `provider
-            // resume` when it has none: the operator said stop, and a timer that
-            // quietly undoes that is how a removed provider got dispatched again.
-            ProviderStatus::PausedManual if q.sticky => {
-                q.cooldown_until.is_some_and(|until| Utc::now() >= until)
-            }
-            ProviderStatus::PausedManual | ProviderStatus::PausedQuota => match q.cooldown_until {
-                Some(until) => Utc::now() >= until,
-                None => q.updated_at.is_some_and(|set| {
-                    Utc::now() >= set + chrono::Duration::minutes(DEFAULT_COOLDOWN_MINS)
-                }),
-            },
-        }
+        !self.get(name).holds(Utc::now())
     }
 
     /// Whether the provider is held by an operator's pause that has not lapsed. Quota
@@ -249,18 +383,16 @@ impl QuotaStore {
 
     pub fn pause_manual(&mut self, name: &str, until: Option<DateTime<Utc>>) {
         self.note_pause(name, true, until, "manual pause");
-        self.providers.insert(
-            name.into(),
-            ProviderQuota {
-                name: name.into(),
-                status: ProviderStatus::PausedManual,
-                cooldown_until: until,
-                hint: Some("manual pause".into()),
-                updated_at: Some(Utc::now()),
-                sticky: true,
-                strong: false,
-            },
-        );
+        self.insert(ProviderQuota {
+            name: name.into(),
+            status: ProviderStatus::PausedManual,
+            cooldown_until: until,
+            hint: Some("manual pause".into()),
+            updated_at: Some(Utc::now()),
+            sticky: true,
+            strong: false,
+            version: 0,
+        });
     }
 
     pub fn pause_quota(&mut self, name: &str, hint: impl Into<String>) {
@@ -270,18 +402,16 @@ impl QuotaStore {
         let strong = self.is_quota_paused(name) && self.get(name).strong;
         let hint = hint.into();
         self.note_pause(name, false, None, &hint);
-        self.providers.insert(
-            name.into(),
-            ProviderQuota {
-                name: name.into(),
-                status: ProviderStatus::PausedQuota,
-                cooldown_until: None,
-                hint: Some(hint),
-                updated_at: Some(Utc::now()),
-                sticky: false,
-                strong,
-            },
-        );
+        self.insert(ProviderQuota {
+            name: name.into(),
+            status: ProviderStatus::PausedQuota,
+            cooldown_until: None,
+            hint: Some(hint),
+            updated_at: Some(Utc::now()),
+            sticky: false,
+            strong,
+            version: 0,
+        });
     }
 
     pub fn pause_quota_until(
@@ -296,22 +426,20 @@ impl QuotaStore {
         let strong = self.is_quota_paused(name) && self.get(name).strong;
         let hint = hint.into();
         self.note_pause(name, false, until, &hint);
-        self.providers.insert(
-            name.into(),
-            ProviderQuota {
-                name: name.into(),
-                status: if until.is_some() {
-                    ProviderStatus::Cooldown
-                } else {
-                    ProviderStatus::PausedQuota
-                },
-                cooldown_until: until,
-                hint: Some(hint),
-                updated_at: Some(Utc::now()),
-                sticky: false,
-                strong,
+        self.insert(ProviderQuota {
+            name: name.into(),
+            status: if until.is_some() {
+                ProviderStatus::Cooldown
+            } else {
+                ProviderStatus::PausedQuota
             },
-        );
+            cooldown_until: until,
+            hint: Some(hint),
+            updated_at: Some(Utc::now()),
+            sticky: false,
+            strong,
+            version: 0,
+        });
     }
 
     /// Upgrade a live quota pause to strong: the rejection behind it was typed or a
@@ -320,9 +448,9 @@ impl QuotaStore {
         if !self.is_quota_paused(name) {
             return;
         }
-        if let Some(q) = self.providers.get_mut(name) {
-            q.strong = true;
-        }
+        let mut q = self.get(name);
+        q.strong = true;
+        self.insert(q);
     }
 
     /// Whether a pause should stop a live run's next dispatch (O106): a manual pause,
@@ -336,18 +464,16 @@ impl QuotaStore {
     }
 
     pub fn resume(&mut self, name: &str) {
-        self.providers.insert(
-            name.into(),
-            ProviderQuota {
-                name: name.into(),
-                status: ProviderStatus::Available,
-                cooldown_until: None,
-                hint: None,
-                updated_at: Some(Utc::now()),
-                sticky: false,
-                strong: false,
-            },
-        );
+        self.insert(ProviderQuota {
+            name: name.into(),
+            status: ProviderStatus::Available,
+            cooldown_until: None,
+            hint: None,
+            updated_at: Some(Utc::now()),
+            sticky: false,
+            strong: false,
+            version: 0,
+        });
     }
 
     /// Best-effort scan of log text for quota / rate-limit language. Deliberately
@@ -421,6 +547,84 @@ impl QuotaStore {
         }
         None
     }
+}
+
+/// Merge `changed` (account key, record) into the fleet file under its lock, replacing
+/// the file by rename so a reader on another box never sees a torn write. A file that
+/// does not parse is moved aside and the fleet starts again from these records.
+fn publish(shared: &crate::fleet::Shared, changed: Vec<(String, ProviderQuota)>) -> Result<()> {
+    let lock_path = shared.quota_lock();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("open {}", lock_path.display()))?;
+    lock.lock()
+        .with_context(|| format!("lock {}", lock_path.display()))?;
+    let file = shared.quota_file();
+    let mut fleet: QuotaStore = match std::fs::read_to_string(&file) {
+        Ok(text) => match serde_json::from_str(&text) {
+            Ok(f) => f,
+            Err(e) => {
+                let aside =
+                    file.with_extension(format!("corrupt-{}", Utc::now().format("%Y%m%dT%H%M%S")));
+                std::fs::rename(&file, &aside)
+                    .with_context(|| format!("move aside {}", file.display()))?;
+                eprintln!(
+                    "warning: {} did not parse ({e}); moved to {} and started fresh",
+                    file.display(),
+                    aside.display()
+                );
+                QuotaStore::default()
+            }
+        },
+        Err(_) => QuotaStore::default(),
+    };
+    let now = Utc::now();
+    for (key, mine) in changed {
+        let merged = match fleet.providers.remove(&key) {
+            Some(theirs) => merge(theirs, mine, now),
+            None => mine,
+        };
+        fleet.providers.insert(key, merged);
+    }
+    let tmp = crate::fleet::unique_tmp(&file);
+    std::fs::write(&tmp, serde_json::to_string_pretty(&fleet)?)
+        .with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &file).with_context(|| format!("replace {}", file.display()))?;
+    let _ = lock.unlock();
+    Ok(())
+}
+
+/// The fleet file's records for the accounts this box uses, keyed by local storage key.
+fn read_fleet(shared: &crate::fleet::Shared) -> HashMap<String, ProviderQuota> {
+    let file = shared.quota_file();
+    let text = match std::fs::read_to_string(&file) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(e) => {
+            crate::fleet::warn_once(&format!("read {}: {e}", file.display()));
+            return HashMap::new();
+        }
+    };
+    let fleet: QuotaStore = match serde_json::from_str(&text) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::fleet::warn_once(&format!("parse {}: {e}", file.display()));
+            return HashMap::new();
+        }
+    };
+    fleet
+        .providers
+        .into_iter()
+        .filter_map(|(account, mut q)| {
+            let storage = shared.storage_key_for(&account)?;
+            q.name = storage.clone();
+            Some((storage, q))
+        })
+        .collect()
 }
 
 /// agy 1.4.9's quota rejection, captured live (exit 3): the result's `error` is
@@ -820,6 +1024,205 @@ mod tests {
     }
     use super::*;
     use tempfile::tempdir;
+
+    fn rec(status: ProviderStatus, age_mins: i64, until_mins: Option<i64>) -> ProviderQuota {
+        let now = Utc::now();
+        ProviderQuota {
+            name: "cli:claude".into(),
+            status,
+            cooldown_until: until_mins.map(|m| now + chrono::Duration::minutes(m)),
+            hint: None,
+            updated_at: Some(now - chrono::Duration::minutes(age_mins)),
+            sticky: status == ProviderStatus::PausedManual,
+            strong: false,
+            version: 0,
+        }
+    }
+
+    #[test]
+    fn merge_keeps_the_longest_manual_pause_and_the_strongest_quota_pause() {
+        let now = Utc::now();
+        let short = rec(ProviderStatus::PausedManual, 1, Some(60));
+        let forever = rec(ProviderStatus::PausedManual, 5, None);
+        assert!(merge(short.clone(), forever.clone(), now)
+            .cooldown_until
+            .is_none());
+        assert!(merge(forever, short, now).cooldown_until.is_none());
+
+        let weak = rec(ProviderStatus::Cooldown, 1, Some(300));
+        let mut strong = rec(ProviderStatus::PausedQuota, 2, Some(10));
+        strong.strong = true;
+        assert!(merge(weak.clone(), strong.clone(), now).strong);
+        assert!(merge(strong.clone(), weak.clone(), now).strong);
+
+        let manual = rec(ProviderStatus::PausedManual, 10, Some(5));
+        assert_eq!(
+            merge(strong, manual.clone(), now).status,
+            ProviderStatus::PausedManual,
+            "an operator's pause outranks any quota pause"
+        );
+
+        let lapsed = rec(ProviderStatus::PausedManual, 10, Some(-1));
+        assert_eq!(
+            merge(lapsed, weak.clone(), now).status,
+            ProviderStatus::Cooldown
+        );
+    }
+
+    #[test]
+    fn merge_lets_a_later_resume_clear_a_pause_but_not_an_earlier_one() {
+        let now = Utc::now();
+        let pause = rec(ProviderStatus::PausedManual, 10, None);
+        let resumed = rec(ProviderStatus::Available, 1, None);
+        assert_eq!(
+            merge(pause.clone(), resumed.clone(), now).status,
+            ProviderStatus::Available
+        );
+        assert_eq!(
+            merge(resumed, pause.clone(), now).status,
+            ProviderStatus::Available
+        );
+        let stale = rec(ProviderStatus::Available, 60, None);
+        assert_eq!(
+            merge(stale, pause, now).status,
+            ProviderStatus::PausedManual
+        );
+    }
+
+    #[test]
+    fn versions_decide_resume_against_pause_and_skew_only_breaks_ties() {
+        let now = Utc::now();
+        let mut pause = rec(ProviderStatus::PausedQuota, 0, Some(60));
+        let mut resume = rec(ProviderStatus::Available, 0, None);
+        resume.updated_at = Some(now + chrono::Duration::minutes(10));
+        pause.version = 3;
+        resume.version = 2;
+        let got = merge(pause.clone(), resume.clone(), now);
+        assert_eq!(
+            got.status,
+            ProviderStatus::PausedQuota,
+            "a pause written after its box saw the resume holds, whatever the clocks say"
+        );
+        assert_eq!(got.version, 3);
+
+        resume.version = 4;
+        resume.updated_at = Some(now - chrono::Duration::minutes(10));
+        assert_eq!(
+            merge(pause.clone(), resume.clone(), now).status,
+            ProviderStatus::Available,
+            "a resume that saw the pause clears it, even stamped by a slow clock"
+        );
+
+        pause.version = 0;
+        resume.version = 0;
+        resume.updated_at = Some(now - chrono::Duration::seconds(30));
+        pause.updated_at = Some(now);
+        assert_eq!(
+            merge(pause.clone(), resume.clone(), now).status,
+            ProviderStatus::Available,
+            "inside the skew allowance a concurrent resume wins"
+        );
+        resume.updated_at = Some(now - chrono::Duration::minutes(5));
+        assert_eq!(
+            merge(pause, resume, now).status,
+            ProviderStatus::PausedQuota,
+            "a pause newer than the resume by more than the allowance wins"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_fleet_file_is_moved_aside_and_rebuilt() {
+        let tmp = tempdir().unwrap();
+        let shared = crate::fleet::Shared::at(tmp.path(), &[]);
+        std::fs::write(shared.quota_file(), "{not json").unwrap();
+        let mut q = rec(ProviderStatus::PausedManual, 0, None);
+        q.version = 1;
+        publish(&shared, vec![("cli:claude".into(), q)]).unwrap();
+        let rebuilt: QuotaStore =
+            serde_json::from_str(&std::fs::read_to_string(shared.quota_file()).unwrap()).unwrap();
+        assert!(rebuilt.providers.contains_key("cli:claude"));
+        let aside: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("corrupt-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "the unreadable file is kept for inspection");
+    }
+
+    #[test]
+    fn a_shared_store_carries_pauses_between_projects_keyed_by_account() {
+        let tmp = tempdir().unwrap();
+        let shared_dir = tmp.path().join("shared");
+        std::fs::create_dir_all(&shared_dir).unwrap();
+        let cfg = tmp.path().join("config.toml");
+        let write_cfg = |label: &str| {
+            std::fs::write(
+                &cfg,
+                format!(
+                    "[quota]\nshared_path = \"{}\"\n[accounts]\n\"cli:claude\" = \"{label}\"\n",
+                    shared_dir.display()
+                ),
+            )
+            .unwrap();
+        };
+        write_cfg("acct-a");
+        crate::config::set_test_user_config(Some(cfg.clone()));
+        let a = SparPaths::new(tmp.path().join("a"));
+        let b = SparPaths::new(tmp.path().join("b"));
+
+        let mut store = QuotaStore::load(&a).unwrap();
+        store.pause_quota("cli:claude", "limit");
+        store.mark_strong("cli:claude");
+        store.save(&a).unwrap();
+        let fleet = std::fs::read_to_string(shared_dir.join("quota.json")).unwrap();
+        assert!(fleet.contains("cli:claude#acct-a"), "{fleet}");
+
+        let seen = QuotaStore::load(&b).unwrap();
+        assert!(!seen.is_usable("cli:claude"), "project b sees a's pause");
+        assert!(seen.blocks_live_dispatch("cli:claude"), "strength travels");
+        assert!(seen.is_usable("cli:codex"));
+
+        write_cfg("acct-b");
+        assert!(
+            QuotaStore::load(&b).unwrap().is_usable("cli:claude"),
+            "another account is not paused"
+        );
+
+        write_cfg("acct-a");
+        let mut b_store = QuotaStore::load(&b).unwrap();
+        b_store.resume("cli:claude");
+        b_store.save(&b).unwrap();
+        assert!(
+            QuotaStore::load(&a).unwrap().is_usable("cli:claude"),
+            "a resume on one project clears the fleet pause, overriding a's own record"
+        );
+
+        crate::config::set_test_user_config(Some(tmp.path().join("missing.toml")));
+        assert!(QuotaStore::load(&b).unwrap().is_usable("cli:claude"));
+        crate::config::set_test_user_config(None);
+    }
+
+    #[test]
+    fn an_unavailable_shared_path_falls_back_to_the_project_file() {
+        let tmp = tempdir().unwrap();
+        let cfg = tmp.path().join("config.toml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "[quota]\nshared_path = \"{}\"\n",
+                tmp.path().join("not-mounted").display()
+            ),
+        )
+        .unwrap();
+        crate::config::set_test_user_config(Some(cfg));
+        let paths = SparPaths::new(tmp.path().join("p"));
+        let mut store = QuotaStore::load(&paths).unwrap();
+        store.pause_manual("cli:claude", None);
+        store.save(&paths).unwrap();
+        crate::config::set_test_user_config(None);
+        assert!(!QuotaStore::load(&paths).unwrap().is_usable("cli:claude"));
+        assert!(!tmp.path().join("not-mounted").exists(), "never created");
+    }
 
     #[test]
     fn pause_resume() {

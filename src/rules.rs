@@ -154,11 +154,7 @@ pub fn add(paths: &SparPaths, target: Target<'_>, text: &str, waive: &[String]) 
                 .or_else(|_| std::env::var("LOGNAME"))
                 .ok()
                 .filter(|u| !u.is_empty()),
-            host: std::fs::read_to_string("/proc/sys/kernel/hostname")
-                .or_else(|_| std::fs::read_to_string("/etc/hostname"))
-                .ok()
-                .map(|h| h.trim().to_string())
-                .filter(|h| !h.is_empty()),
+            host: crate::util::hostname(),
             source: "cli".into(),
         };
         file.next_id += 1;

@@ -1243,6 +1243,7 @@ event/presence mirror live under `.spar/runs/<id>/bus/`.
 
 ```bash
 spar status [run_id] [--json] [--all]   # --all = every registered project; a run with a live orchestrator shows `pid=<n>`
+spar status --hosts h1,h2 | --all-hosts [--json]   # runs on other boxes over ssh (O140)
 spar stats [--since 7d] [--by model|role|provider|project] [--all-projects] [--json]
 spar wait <run_id> [--timeout 8h] [--follow] [--json]
 spar logs <run_id> [slot] [-f|--follow]
@@ -1251,6 +1252,146 @@ spar logs <run_id> [slot] [-f|--follow]
 # `.spar/runs/`; project list is ~/.spar/registry.json (or $SPAR_HOME).
 # Projects appear when you use spar there — no hardcoded scan paths.
 ```
+
+### Idempotency keys and cross-host status (O140)
+
+```bash
+spar implement -t "…" --key pr-1234 [--key-scope local|fleet] ...   # also on plan / run
+spar plan --brief .spar/briefs/<slug>.md ...      # key defaults to <slug>; --no-key for none
+spar status --hosts box2,box3 [--json] [--archived]
+spar status --all-hosts [--json]                   # this host + every [registry] remotes host
+```
+
+- `--key <k>` is stored on the run (`key` in `state.json` and `status --json`). A new
+  run is refused while an unfinished run in the project holds the same key: exit `1`,
+  the holder's id on stderr, and with `--json` stdout is
+  `{"error": "...", "kind": "duplicate", "run_id": "<holder>", "host": null|"<host>"}`.
+  Unfinished means anything but `done` / `plan_rejected` / `failed` / `stuck` /
+  `escalated`, and not archived: a gate, `plan_approved`, `stopped` and `quota` hold
+  the key. Resume or stop the holder; a key never moves to an existing run
+  (`--key` with `implement --run` / `plan --run` is refused).
+- `plan --brief .spar/briefs/<slug>.md` without `--key` uses `<slug>` as the key, but
+  only for a file directly in this project's `.spar/briefs/`; any other `--brief`
+  path, `--spec` and `-t` set no key unless you pass one. `--no-key` opts out.
+- **Dry runs never check or hold keys**: `--dry-run` launches pass the check and a
+  dry run's key blocks nothing.
+- Remotes live in the **user** config only (`~/.config/spar/config.toml`), never
+  `spar.toml`:
+
+  ```toml
+  [registry]
+  remotes = ["box2", "box3"]
+  ```
+
+  Each host is queried with `ssh -o BatchMode=yes -o ConnectTimeout=10 -- <host> spar
+  status --all --json` (stdin closed, 20s ceiling; a host entry starting with `-` is
+  refused), so `spar` must be on the remote's
+  non-interactive `PATH` and the key loaded in your agent. `--hosts`/`--all-hosts`
+  `--json` prints `{"hosts": [{"host", "ok", "runs"|"error"}], "runs": [<row> + "host"]}`;
+  a host that does not answer is listed as unreachable and the command still exits `0`.
+- With remotes configured the key check is fleet-wide by default (`--key-scope fleet`):
+  a remote run holds the key when its project is this one: the normalized `origin`
+  URL (`project_repo` in `status --json` listings) when both sides have one, else the
+  canonical checkout directory name. A host whose output has no `key` field runs an
+  older spar; the check warns that it cannot see that host's runs. An unreachable host prints a warning and the launch
+  **proceeds**: the check covered only the hosts that answered.
+- **Check-then-act, not a lock.** Two launches in the same instant both see no holder
+  and both start. The key stops relaunches, requeues and second boxes, not a
+  simultaneous race.
+
+### Shared quota store and a fleet-wide slot cap (O141, O142)
+
+Boxes that share provider logins can share pauses, cooldowns and the daemon's
+concurrency cap through a directory every box mounts. User config only:
+
+```toml
+# ~/.config/spar/config.toml
+[quota]
+shared_path = "/mnt/fleet/spar"     # a directory; "" (default) = per-project .spar/quota.json only
+
+[accounts]                          # optional: which login each provider uses on this box
+"cli:claude" = "acct-a"
+```
+
+- Records are keyed by **account**: the provider bucket (`cli:claude`, model-free) plus
+  the `[accounts]` label, written `cli:claude#acct-a`. Boxes with the same label share
+  a pause; a box on `acct-b` is not paused by `acct-a`'s limit. No label = the bare
+  bucket, shared by every box without one.
+- Every quota read (`provider list`, seat choice, per-dispatch re-checks) merges the
+  project's `.spar/quota.json` with the shared `quota.json`. Every write still goes to
+  the project file, and the changed keys are merged into the shared file under
+  `quota.lock` and replaced by atomic rename.
+- **Merge rule, per account:** a lapsed pause counts for nothing; a manual pause beats
+  a quota pause; the longest-lived manual pause wins; the strongest quota pause wins
+  (strong over weak, then the longest). Between a pause and a resume, each record's
+  `version` (one past the highest the writing box had seen) decides: a resume written
+  after its box saw the pause clears it fleet-wide, a pause written after the resume
+  holds. At equal versions the resume wins unless the pause is newer by more than 60s
+  of allowed clock skew. Consequence: shortening a fleet manual pause takes
+  `provider resume` first.
+- A shared `quota.json` that does not parse is moved to `quota.corrupt-<timestamp>`
+  with a warning and rebuilt from the next write.
+- With a shared path, every live (non-dry) dispatch on every box writes a heartbeat
+  lease `<shared_path>/slots/<host>-<pid>-<run>-<slot>.json`, refreshed every 30s and
+  removed when the slot exits ("this host" is hostname plus `/etc/machine-id`). A
+  daemon enforcing `[daemon] max_slots_per_bucket`
+  adds the live leases of other boxes and other projects on the same account to its
+  local count, so the cap is fleet-wide. Admission is still check-then-act: a launch
+  on another box counts only once its slot runs. A lease not
+  refreshed for 120s stops counting and is deleted 60s later (the clock-skew margin);
+  one from this machine whose pid is dead is deleted at once. The daemon reads these
+  before taking its admission lock. `spar daemon status` shows them as `in_use_elsewhere`.
+- If `shared_path` is set but the directory is missing (an unmounted share), spar
+  never creates it: it uses the project file only and warns once per command.
+- **Hung mounts.** Every shared-path access runs on a helper thread with a 4s
+  deadline. A miss (a hard-mounted NFS server that stopped answering) falls back to
+  the project file, warns once, and leaves the share alone for 60s before trying
+  again. The abandoned thread can stay stuck in the kernel until the mount recovers;
+  prefer `soft` or `intr` NFS mount options on boxes that run spar.
+- **Filesystem caveats.** A path only, no URL store. NFS: `flock` needs a lock daemon
+  (NFSv4 has one; v3 needs `lockd`), and attribute caching can delay another box's
+  write by a few seconds. sshfs: no cross-host locks at all, so two simultaneous writers
+  can lose one update (the next write re-merges). syncthing: no locks and eventual
+  delivery; a pause reaches other boxes after the sync interval, and a conflicting
+  write lands as a `.sync-conflict` file spar ignores. Leases compare timestamps
+  across hosts and lapse times, and the merge allows only 60s of skew, so clock sync
+  (NTP) is required on every box, for both the quota merge and the leases.
+
+### Build-cache pool (O143, O144)
+
+```toml
+[worktree]                      # spar.toml or the user config
+build_cache_pool = ["~/projects/run-target-{1..10}"]   # `~/` and one {a..b} range per entry
+build_cache_env = "CARGO_TARGET_DIR"                   # default
+```
+
+- Each implementer dispatch leases a free pool directory and gets
+  `CARGO_TARGET_DIR=<dir>` (or your `build_cache_env`), so fix rounds, resumes and
+  extended runs rebuild incrementally in a warm target instead of compiling the
+  workspace from scratch in a fresh worktree `target/`.
+- **Free** means no live lease. The lease is `<dir>.spar-lease` beside the directory,
+  carrying the orchestrator's pid and start time (the run lock's liveness model): a
+  crashed orchestrator's slot is free again at once. It is released when the slot
+  exits and re-leased on every dispatch, preferring the directory the slot used last
+  (recorded as `build_cache` on the slot in `state.json`), so a resume or
+  `implement --run <id> --max-rounds N` lands back in its own warm build when it can.
+- Pool exhausted: a warning on stderr and in the event log, `build_cache` cleared, and
+  the implementer gets `<build_cache_env>=<worktree>/target`, so it builds into its
+  own target even if spar itself was started with that variable set. The slot's env
+  always wins over the orchestrator's.
+- A lease outlives its dispatch while something may still build there: a process
+  whose cwd is inside the slot's worktree, or a tmux pane that did not end cleanly.
+  The lease passes to those processes and frees itself when the last one exits.
+- Reviewers, testers and every other role never lease: they build in their own
+  checkout and target, and their env is untouched.
+- `spar reclaim` never deletes a directory whose lease is held by a live process. Pool
+  directories outside run worktrees are not reclaim's to touch at all.
+- **Caveat:** one target shared across worktrees shares build-script output. A crate
+  that bakes `CARGO_MANIFEST_DIR` (or another absolute path) into generated code, an
+  `include!` of `OUT_DIR` content, or a `build.rs` without `rerun-if-changed` can
+  carry the *previous* worktree's paths into this build. If tests read fixtures
+  through such a path, or a build looks stale, run that crate's `cargo clean -p` in
+  the leased target or leave the pool unset for that project.
 
 **Subscribe, don't poll.** When you are waiting on a run, block on `wait` instead
 of spinning on `status` — you don't have to remember to check back:
@@ -1829,6 +1970,8 @@ auto_archive_after = "14d"
 [worktree]
 auto_cleanup_merged = true   # reap at-rest runs already contained in their base, at launch
 copy = [".dbiso.env", ".envrc", ".env.example"]   # copied from the main checkout into every slot worktree; missing files skipped
+build_cache_pool = []        # e.g. ["~/projects/run-target-{1..10}"]: implementers lease one per dispatch (O143)
+build_cache_env = "CARGO_TARGET_DIR"   # the variable the leased directory is handed in
 [ship]
 title_max = 72   # PR title clamp in characters; 0 = GitHub's 256 only
 draft = true     # open new PRs as drafts; false = ready for review
@@ -1919,6 +2062,7 @@ timeout_secs = 3600    # test_author's SOFT clock; hard_ceiling_multiple applies
 # restart = true               # restart a dead orchestrator holding resumable work
 # max_restarts = 2             # per run, per daemon lifetime
 # max_slots_per_bucket = 0     # cross-run concurrency cap, keyed on provider (model-free); 0 = off
+#                              # fleet-wide when the user config sets [quota] shared_path (O142)
 # sync_prs = false             # run `sync-prs --all` (calls gh) at most every 5 minutes
 # Shell variables a run records in its config.json at creation and re-applies on every
 # re-entry (implement --run, resume, plan --run, reconcile, daemon restarts), warning on

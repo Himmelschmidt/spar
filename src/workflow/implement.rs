@@ -37,6 +37,11 @@ pub fn run_from_cli(
         // work across two ids 35 times.
         // `--new` says this is separate work, so it wins over the trace.
         if let Some(id) = run_id_for_plan(&plan_path, paths).filter(|_| !new) {
+            if opts.key.is_some() {
+                bail!(
+                    "--key names a new run; this plan belongs to run {id}, which keeps its own key"
+                );
+            }
             if !opts.json {
                 eprintln!("continuing run {id} (it wrote this plan)");
             }
@@ -1844,6 +1849,7 @@ fn run_with_task(
         paths.project_root.clone(),
     );
     state.task = Some(task.clone());
+    state.key = opts.key.clone();
     state.backend = opts.backend;
     worktree::apply_run_base(&mut state, opts.base.as_deref(), opts.json)?;
     cfg.save_snapshot(paths, &state.id)?;
