@@ -4,16 +4,44 @@ All notable changes to spar are recorded here.
 
 ## [Unreleased]
 
-### Changed
-
-- **The pi coding agent replaces OpenCode as the recommended way to run OpenRouter
-  models.** OpenCode is no longer supported; point those roles at pi instead. pi
-  runs carry their token usage, dollar cost, tool calls and a session id, and a
-  later round picks up the same pi session.
-- **A pi run whose model request fails now fails the slot**, even though pi itself
-  reports success, and a rate-limit failure pauses the provider like any other.
+## [0.0.5] - 2026-10-31
 
 ### Added
+
+- **Reviews only block shipping on findings that matter.** A review that asks for
+  changes over minor points no longer holds a run at the gate; major findings, and any
+  finding spar cannot classify, still do. From the third round on, reviewers look at
+  what changed since their last pass instead of starting over, and findings the fix
+  already addressed are marked stale.
+- **Standing rulings for a project.** You can record a decision once (for example,
+  that a criterion is waived) and every later review sees it, instead of re-arguing it
+  each round.
+- **Shipping is safe to repeat.** Shipping a run that already has a pull request picks
+  that request up instead of opening a second one, pull requests can be opened ready
+  for review instead of as drafts, merged pull requests can be synced back to their
+  runs, and a gate can be overridden with a recorded reason.
+- **Usage and cost you can read.** A new stats command summarises past runs, provider
+  listings can show recent usage, run status shows cost so far, and every finished run
+  is appended to a project history.
+- **Reviews, seats and run history are available as structured data**, so scripts and
+  other tools can read a run's verdicts, findings and seat state without parsing text.
+- **Seats and contracts can change mid-run.** You can move a seat to a different
+  agent, or amend a run's test contract, without restarting it.
+- **Launching is easier to script.** A launch can be checked without starting
+  anything, repeating a launch with the same key returns the existing run instead of
+  starting a duplicate, and extra rounds can be added to a run that is still going.
+- **Provider health checks.** A probe command tests whether each provider is actually
+  usable right now, and spar re-checks a paused provider before every dispatch instead
+  of trusting a stale pause.
+- **Fleet-wide awareness across machines.** Several machines can share one record of
+  provider limits, and status can list runs on your other machines.
+- **The optional supervisor can be installed as a system service.**
+- **Each role can be given its own thinking level**, so planners can think harder than
+  the agents doing routine work.
+- **Faster worktree setup.** Chosen untracked files (local settings, for example) are
+  copied into each agent's checkout, and build caches can be shared between checkouts.
+- **Messages between agents can require acknowledgement**, be addressed to the
+  implementer, persist across rounds, replace earlier messages, or expire.
 
 - **You can now compose a run before starting it**: pick the workflow, then assign
   each role its own agent and model, and give any of them a declared stand-in for
@@ -25,36 +53,11 @@ All notable changes to spar are recorded here.
   rather than in any project, so per-role choices cannot leak between projects
   that share a checkout.
 
-
-### Added
-
 - **You can now talk to spar inside spar.** A conversation tab lets you brief a
   run by describing what you want, have a fleet proposed, and launch it — or, with
   a run selected, ask about a decision it is waiting on and argue it either way
   against the same evidence the review screen shows. It proposes; approving,
   shipping and choosing a fleet stay yours.
-
-
-### Fixed
-
-- **Reloading a run's settings can no longer quietly change which agent reviews
-  it.** A recent fix that let you re-assign a seat mid-run could, when re-stating
-  a review panel, point both reviewer seats at the same agent — turning a
-  deliberate two-vendor review into the same vendor twice, without saying so, and
-  then blaming the wrong vendor when one hit a rate limit. Reloading now adjusts
-  only which model a seat uses; changing who fills a seat is a separate operation,
-  and a mismatch is refused outright rather than written.
-
-- **Changing which agent or model a run uses now actually changes it.** Asking a
-  run that had already started to reload its settings updated the saved settings
-  but left the existing seats on whatever they were first given, so the run
-  carried on using the old one — and reported the old one back to you while doing
-  it. Seats that have not started yet are now re-assigned properly; a seat that is
-  mid-flight is deliberately left alone, since that is the one whose assignment is
-  already in use.
-
-
-### Added
 
 - **Runs now survive the session that started them.** Starting a run in the
   background gives it a session of its own, so closing the terminal, an aborted
@@ -84,13 +87,17 @@ All notable changes to spar are recorded here.
 
 ### Changed
 
+- **The pi coding agent replaces OpenCode as the recommended way to run OpenRouter
+  models.** OpenCode is no longer supported; point those roles at pi instead. pi
+  runs carry their token usage, dollar cost, tool calls and a session id, and a
+  later round picks up the same pi session.
+- **A pi run whose model request fails now fails the slot**, even though pi itself
+  reports success, and a rate-limit failure pauses the provider like any other.
+
 - **Archiving everything now reaches runs that halted.** Stopped, failed, stuck
   and out-of-capacity runs are archived along with the finished ones, instead of
   having to be named one at a time. Runs waiting on your decision are still left
   alone unless you ask for them specifically, and archiving remains reversible.
-
-
-### Changed
 
 - **The dashboard has a look of its own.** It now paints its own background rather
   than borrowing the terminal's, which lets panels, quoted output and highlights sit
@@ -121,6 +128,59 @@ All notable changes to spar are recorded here.
   none selected.
 - **Text that arrives already lined up into columns stays lined up.** The log view was
   collapsing runs of spaces, which turned aligned output into prose.
+
+- **A mistyped command now exits with the general failure code** rather than the code
+  reserved for a human decision, so scripts can tell the two apart.
+- **Progress checkpoints stay on your machine** unless you opt in to pushing them, so
+  unfinished work is no longer published to a shared remote.
+- **Uncommitted work from the implementer is committed before review**, so reviewers
+  always judge what was actually written.
+- **Task text no longer appears in the system process list**; prompts are handed to
+  the agents privately.
+- **Pull requests open as drafts and take their title from the brief's heading.**
+
+### Fixed
+
+- **Shipping can no longer rewind a remote branch.** If someone pushed to the branch
+  after spar last looked, shipping stops instead of overwriting their work, and it
+  refuses to ship a branch with nothing on it.
+- **Two commands acting on the same run at once can no longer corrupt it**, and an
+  empty task or an empty change request is refused up front.
+- **An agent you stopped yourself is no longer mistaken for a provider outage**, and
+  more providers' out-of-quota messages are recognised, so the right seats pause.
+- **A reviewer whose provider fails now retries on its stand-in** instead of counting
+  as a vote, a pause you set by hand stays until you lift it, and login failures are
+  reported as login failures rather than as outages.
+- **Provider support caught up with the current versions of each agent**, including
+  thinking levels, quota messages and token accounting that had drifted.
+- **Grok and Muse runs are wired up properly**: hooks, folder trust and usage
+  accounting now reach those agents, and Muse rides out brief backend failures by
+  resuming instead of restarting.
+- **A failed or stuck run can be resumed.**
+- **A review must name the exact commit it judged**, so a verdict on stale code can no
+  longer pass the gate.
+- **Each agent gets its own temporary directory and a clean environment**, and spar
+  warns when a run's base has fallen behind or your main checkout has drifted.
+- **Cleanup can no longer lose work**: runs are archived before a forced cleanup, and
+  cleanup can be limited to runs whose pull requests merged.
+- **The doctor command checks that each agent is actually configured to work with
+  spar**, not just that it is installed.
+
+- **Reloading a run's settings can no longer quietly change which agent reviews
+  it.** A recent fix that let you re-assign a seat mid-run could, when re-stating
+  a review panel, point both reviewer seats at the same agent — turning a
+  deliberate two-vendor review into the same vendor twice, without saying so, and
+  then blaming the wrong vendor when one hit a rate limit. Reloading now adjusts
+  only which model a seat uses; changing who fills a seat is a separate operation,
+  and a mismatch is refused outright rather than written.
+
+- **Changing which agent or model a run uses now actually changes it.** Asking a
+  run that had already started to reload its settings updated the saved settings
+  but left the existing seats on whatever they were first given, so the run
+  carried on using the old one — and reported the old one back to you while doing
+  it. Seats that have not started yet are now re-assigned properly; a seat that is
+  mid-flight is deliberately left alone, since that is the one whose assignment is
+  already in use.
 
 ## [0.0.4] - 2026-09-10
 
