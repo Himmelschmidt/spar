@@ -2519,6 +2519,9 @@ fn events_cmd(
 ) -> Result<ExitCode> {
     let (paths, _) = project_ctx()?;
     if let Some(id) = &run_id {
+        if !events::valid_run_id(id) {
+            anyhow::bail!("invalid run id: {id}");
+        }
         if !paths.run_dir(id).is_dir() {
             anyhow::bail!("no run {id} in this project");
         }
@@ -2531,19 +2534,25 @@ fn events_cmd(
     };
     let mut out = std::io::stdout().lock();
     loop {
-        for line in feed.poll(&paths)? {
+        let polled = feed.poll(&paths, |line| {
             let text = if json {
                 serde_json::to_string(&line)?
             } else {
                 format!("{} {}", line.run_id, line.event.display_line())
             };
-            match writeln!(out, "{text}").and_then(|_| out.flush()) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                    return Ok(ExitCode::Success)
-                }
-                Err(e) => return Err(e.into()),
-            }
+            writeln!(out, "{text}")?;
+            out.flush()?;
+            Ok(())
+        });
+        if let Err(e) = polled {
+            let closed = e
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe);
+            return if closed {
+                Ok(ExitCode::Success)
+            } else {
+                Err(e)
+            };
         }
         if !follow {
             return Ok(ExitCode::Success);

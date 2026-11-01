@@ -179,15 +179,19 @@ read from each run's `.spar/runs/<id>/events.jsonl`. One object per line:
 {"run_id":"3d3d6f59","cursor":"…","ts":"2026-11-01T12:00:00Z","type":"phase","phase":"dispatch","prev_phase":"plan_approved","round":1}
 ```
 
-`type` is `phase`, `slot`, `gate` or `info`; `phase`, `prev_phase`, `slot`, `status`,
-`message` and `round` appear when set. Fields are only added, never renamed.
+`type` is `phase`, `slot`, `gate`, `info`, `archived`, `unarchived` or `abandoned`
+(daemon-detected; `phase` is where the run was left); `phase`, `prev_phase`, `slot`,
+`status`, `message` and `round` appear when set. Fields and types are only added, never
+renamed, so ignore a `type` you don't know.
 
 - Without `--follow` it prints the backlog of every non-archived run, ordered by `ts`,
-  and exits `0`. With `--follow` it starts at the tail (`--since now`) and keeps going,
+  and exits `0`. A run archived while you were seeing it is shown through its `archived`
+  event, then hidden until `unarchived`. With `--follow` it starts at the tail (`--since now`) and keeps going,
   picking up runs created after it started.
 - **Resume:** pass the `cursor` of the last line you handled to `--since`. The cursor is
   opaque and records a position in every run, so the replay has no gaps and no repeats,
-  even for runs created after it was issued.
+  even for runs created after it was issued. It grows about 15 bytes per run, so with
+  several thousand runs it approaches the ~128 KiB single-argument limit.
 - One run's events keep their file order; across runs a late event can carry an
   earlier `ts` than one already printed.
 - `--run <id>` limits the feed to one run (shown even if archived). An unknown id or a

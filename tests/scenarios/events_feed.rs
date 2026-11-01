@@ -84,6 +84,29 @@ fn tags(lines: &[Value]) -> Vec<String> {
 
 /// A dry-run plan, marked done and archived through the CLI.
 fn archived_run(proj: &Path) -> String {
+    let id = done_run(proj);
+    archive(proj, &id, &[]);
+    id
+}
+
+fn archive(proj: &Path, id: &str, extra: &[&str]) {
+    common::spar()
+        .current_dir(proj)
+        .args(["archive", id, "--json"])
+        .args(extra)
+        .assert()
+        .code(0);
+}
+
+fn last_cursor(lines: &[Value]) -> String {
+    lines.last().unwrap()["cursor"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// A dry-run plan, marked done. No provider spawns.
+fn done_run(proj: &Path) -> String {
     let out = common::spar()
         .current_dir(proj)
         .args([
@@ -104,11 +127,6 @@ fn archived_run(proj: &Path) -> String {
         serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
     state["phase"] = Value::String("done".into());
     std::fs::write(&state_path, state.to_string()).unwrap();
-    common::spar()
-        .current_dir(proj)
-        .args(["archive", &id, "--json"])
-        .assert()
-        .code(0);
     id
 }
 
@@ -196,6 +214,39 @@ fn backlog_merges_runs_by_time_and_skips_archived_runs() {
         .args(["events", "--since", "garbage"])
         .assert()
         .code(1);
+    common::spar()
+        .current_dir(&proj)
+        .args(["events", "--run", "../.."])
+        .assert()
+        .code(1);
+}
+
+/// A client watching a run sees it get archived, sees nothing more from it while it
+/// stays archived, and sees it come back.
+#[test]
+fn archiving_a_watched_run_is_an_event_and_hides_what_follows() {
+    let (_tmp, proj) = project();
+    let id = done_run(&proj);
+    let cursor = last_cursor(&events(&proj, &[]));
+
+    archive(&proj, &id, &[]);
+    let after = events(&proj, &["--since", &cursor]);
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0]["run_id"], id.as_str());
+    assert_eq!(after[0]["type"], "archived");
+
+    let cursor = last_cursor(&after);
+    append_raw(&proj, &id, &line(1, "while archived"));
+    assert!(events(&proj, &["--since", &cursor]).is_empty());
+    let read_past = events(&proj, &[]);
+    assert!(
+        read_past.iter().all(|l| l["run_id"] != id.as_str()),
+        "a run archived before the feed read it is skipped whole"
+    );
+
+    archive(&proj, &id, &["--undo"]);
+    let back = events(&proj, &["--since", &cursor]);
+    assert_eq!(back.last().unwrap()["type"], "unarchived");
 }
 
 #[test]
@@ -203,7 +254,19 @@ fn follow_starts_at_the_tail_and_picks_up_a_new_run() {
     let (_tmp, proj) = project();
     append_raw(&proj, "aaaa0001", &line(1, "old"));
     let follower = Follower::start(&proj, &[]);
-    std::thread::sleep(Duration::from_millis(600));
+    // Lines written before the follower took its tail are never shown, so keep writing
+    // until one comes through: from then on its position is established.
+    let mut ping = 0;
+    let first = loop {
+        append_raw(&proj, "aaaa0001", &line(2, &format!("ping{ping}")));
+        if let Ok(l) = follower.rx.recv_timeout(Duration::from_millis(500)) {
+            break l;
+        }
+        ping += 1;
+        assert!(ping < 40, "follower never emitted");
+    };
+    assert_ne!(first["message"], "old");
+    while follower.rx.recv_timeout(Duration::from_millis(400)).is_ok() {}
     append_raw(&proj, "cccc0003", &line(2, "fresh"));
     let got = follower.next();
     assert_eq!(got["run_id"], "cccc0003");

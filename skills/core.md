@@ -1425,22 +1425,30 @@ spar events --run <id> --json            # one run (shown even if archived)
 ```
 
 Each `--json` line is one object: `run_id`, `cursor`, then the event's own fields
-(`ts`, `type` = `phase` | `slot` | `gate` | `info`, and as present `phase`,
-`prev_phase`, `slot`, `status`, `message`, `round`). Text mode prints
-`<run_id> <time> <event>`. Fields are only ever added, never renamed.
+(`ts`, `type`, and as present `phase`, `prev_phase`, `slot`, `status`, `message`,
+`round`). `type` is `phase`, `slot`, `gate`, `info`, `archived`, `unarchived` or
+`abandoned` (the daemon found no live orchestrator; `phase` is where the run was left).
+Text mode prints `<run_id> <time> <event>`. Fields and types are only ever added, never
+renamed; ignore a `type` you don't know.
 
 - **Resume:** keep the `cursor` of the last line you processed and pass it to
   `--since`. You get exactly what you missed: nothing twice, nothing dropped, across all
   runs, including runs created after that cursor. Treat the cursor as opaque; it is
   only valid for the same project, and resuming without `--run` replays from scratch
-  any run a `--run` cursor never saw.
+  any run a `--run` cursor never saw. The cursor grows by roughly 15 bytes per run in
+  the project, so past several thousand runs it nears the ~128 KiB limit on a single
+  command-line argument and `--since "$CURSOR"` fails to exec. Purge old runs before
+  that; an archived run keeps its entry.
 - `--since now` (the default with `--follow`) starts at the tail. Without `--follow`
   and without `--since`, it starts at the beginning of every run.
 - Order is by `ts` within a batch, but one run's events always keep their file order,
   and an event written late can carry an earlier `ts` than one already printed. Don't
   sort on `ts` and drop "older" ones.
-- New run directories are picked up as they appear. Archived runs are skipped.
-- A run the daemon finds abandoned gets an `info` event saying so.
+- New run directories are picked up as they appear.
+- Archived runs: a run you were already seeing is shown up to and including its
+  `archived` event, then nothing more from it while it stays archived; `unarchived`
+  marks its return. A run archived before the feed ever read it is skipped whole.
+  `--run` shows an archived run in full.
 - Exit `0` when the backlog is printed (or the reader closes the pipe); `1` for an
   unknown `--run` or a malformed cursor. Provider pause state is not an event: poll
   `spar provider list --json`.
