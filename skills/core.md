@@ -123,6 +123,24 @@ the run at `quota` (exit `4`) with `auth: <provider> rejected the credential (..
 fix the login, then `implement --run <id>`. Only the last 15 non-empty log lines are
 read, so an agent discussing login code mid-turn is not mistaken for one.
 
+**Failure classifier (O148, opt-in).** With `[classifier] enabled = true` in the user
+config (`~/.config/spar/config.toml`; ignored from a repo `spar.toml`), spar asks a typed
+classifier (`typesafe/jev-1.14` via OpenRouter's System One API) about a failed dispatch
+its own rules read as the agent's work: a non-zero exit or missing artifact with no quota,
+auth or transient match and no signal. Kills, halts, the hard ceiling, usage errors and
+typed quota events are never sent. At probability >= `threshold` (0.7) a `quota` answer
+pauses the provider (strong) and takes the backup path, `auth` takes the O104 path
+(short-wait retry, then backup or park), and `transient` takes the retry loop (still only
+after at least one tool call). When the rules read quota or auth from log text and the
+classifier says the work failed at >= `veto_threshold` (0.9), the verdict becomes a weak
+pause: the run is not parked. Below threshold, on timeout (5s, two retries), an error or a
+missing key, spar's own verdict stands. The request carries the provider, role, exit
+code, signal, tool count, spar's error and the last 4 KB of the log with secrets
+redacted. Every call appends a `classifier` event to `events.jsonl` (`model`, `choice`,
+`probability`, `probabilities`, `acted`, `action`, `regex_verdict`, `latency_ms`,
+`cost_usd`, `cached`, `error`), and the slot's last one is `slots[].classifier` in
+`status --json`. `spar doctor` shows whether it is on and the key is readable.
+
 **agy note.** agy runs headless with `--output-format stream-json`, so spar parses its tools,
 text and tokens directly from that structured stream. What the stream doesn't carry — the
 account's quota buckets and the context-window snapshot — spar still recovers by teeing agy's
@@ -1424,8 +1442,9 @@ spar events --tail-cursor --json         # {"cursor": "..."} for the current end
 
 Each `--json` line is one object: `run_id`, `cursor`, then the event's own fields
 (`ts`, `type`, and as present `phase`, `prev_phase`, `slot`, `status`, `message`,
-`round`). `type` is `phase`, `slot`, `gate`, `info`, `archived`, `unarchived` or
-`abandoned` (the daemon found no live orchestrator; `phase` is where the run was left).
+`round`). `type` is `phase`, `slot`, `gate`, `info`, `archived`, `unarchived`,
+`abandoned` (the daemon found no live orchestrator; `phase` is where the run was left) or
+`classifier` (O148; `slot` plus a `classifier` object).
 Text mode prints `<run_id> <time> <event>`. Fields and types are only ever added, never
 renamed; ignore a `type` you don't know.
 
@@ -2054,6 +2073,15 @@ timeout_secs = 3600    # test_author's SOFT clock; hard_ceiling_multiple applies
 [notify]
 # command = "..."   # shell out; message on argv/stdin
 # webhook = "..."   # POST message json
+# Failure classifier (O148; user-level config only, off by default). Advisory: asked
+# only where spar's rules read a failure as work; any error leaves their verdict.
+[classifier]
+# enabled = false
+# model = "typesafe/jev-1.14"
+# threshold = 0.7          # act on quota / auth / transient at this probability
+# veto_threshold = 0.9     # downgrade a text-read quota/auth verdict to a weak pause
+# timeout_secs = 5         # per attempt, two retries
+# key_file = "~/.config/spar/openrouter.key"   # else OPENROUTER_API_KEY; never inline
 # Supervisor (`spar daemon install`, or `spar daemon start` per project). Never auto-started. Safe from a
 # repo spar.toml: no command execution, no outbound request, unlike [notify].
 [daemon]

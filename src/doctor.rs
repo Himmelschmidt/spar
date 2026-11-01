@@ -17,7 +17,31 @@ struct DoctorReport {
     tmux: ToolCheck,
     bwrap: ToolCheck,
     providers: Vec<providers::ProviderReport>,
+    classifier: ClassifierCheck,
     notes: Vec<String>,
+}
+
+/// `[classifier]` (O148): whether it is on and its key can be read. Never the key.
+#[derive(Debug, Serialize)]
+struct ClassifierCheck {
+    enabled: bool,
+    model: String,
+    key_readable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_error: Option<String>,
+}
+
+fn check_classifier(cfg: &crate::config::ClassifierConfig) -> ClassifierCheck {
+    let key = crate::classifier::key_source(cfg);
+    ClassifierCheck {
+        enabled: cfg.enabled,
+        model: cfg.model.clone(),
+        key_readable: key.is_ok(),
+        key_source: key.as_ref().ok().cloned(),
+        key_error: key.err().map(|e| format!("{e:#}")),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -125,6 +149,13 @@ pub fn run(json: bool) -> Result<ExitCode> {
         }
     }
 
+    let classifier = check_classifier(&cfg.classifier);
+    if classifier.enabled && !classifier.key_readable {
+        notes.push(format!(
+            "classifier enabled but its key is unreadable ({}); failures route on spar's rules alone",
+            classifier.key_error.as_deref().unwrap_or("unknown")
+        ));
+    }
     let ok = doctor_ok(git.available, &providers);
     let report = DoctorReport {
         ok,
@@ -136,6 +167,7 @@ pub fn run(json: bool) -> Result<ExitCode> {
         tmux,
         bwrap,
         providers,
+        classifier,
         notes,
     };
 
@@ -207,6 +239,15 @@ fn print_human(r: &DoctorReport) {
     print_tool(&r.git);
     print_tool(&r.tmux);
     print_tool(&r.bwrap);
+    let c = &r.classifier;
+    println!(
+        "  classifier:    {}",
+        match (c.enabled, &c.key_source) {
+            (false, _) => "off".to_string(),
+            (true, Some(src)) => format!("on, {} (key from {src})", c.model),
+            (true, None) => format!("on, {} (key unreadable)", c.model),
+        }
+    );
     println!("  providers:");
     for p in &r.providers {
         let mark = if !p.available {

@@ -4,6 +4,7 @@ mod brief;
 mod buildpool;
 mod bus;
 mod checkpoint;
+mod classifier;
 mod cli;
 mod config;
 mod daemon;

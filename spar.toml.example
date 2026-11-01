@@ -177,3 +177,15 @@ timeout_secs = 3600
 # [env]
 # capture = ["CARGO_TARGET_DIR", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
 #            "https_proxy", "http_proxy", "all_proxy", "no_proxy"]
+
+# Failure classifier (O148). USER CONFIG ONLY (~/.config/spar/config.toml): a repo
+# spar.toml cannot turn it on, since it sends redacted log tails to OpenRouter with your
+# key. Off by default. Advisory: asked only where spar's rules read a failure as the
+# agent's own work; errors, timeouts and a missing key leave spar's verdict unchanged.
+# [classifier]
+# enabled = true
+# model = "typesafe/jev-1.14"
+# threshold = 0.7          # act on a quota / auth / transient answer at this probability
+# veto_threshold = 0.9     # a text-read quota/auth verdict the classifier calls work becomes a weak pause
+# timeout_secs = 5         # per attempt; up to two retries
+# key_file = "~/.config/spar/openrouter.key"   # else OPENROUTER_API_KEY; never put the key here

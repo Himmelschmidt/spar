@@ -150,6 +150,14 @@ spar wait "$RUN_ID" --timeout 2h --json
 
 API keys: `OPENAI_API_KEY`, `XAI_API_KEY`, optional `*_BASE_URL` / `*_MODEL`.
 
+Failure classifier (O148): opt-in `[classifier]` in `~/.config/spar/config.toml` only.
+When on, a failure spar's rules read as work is also put to `typesafe/jev-1.14`; at
+>= 0.7 a quota answer pauses the provider and takes the backup (exit `4` with none), an
+auth answer takes the O104 path, a transient one the retry loop. A text-read quota or
+auth verdict the classifier calls work at >= 0.9 becomes a weak pause instead of parking.
+Errors, timeouts and a missing key change nothing. Key: `key_file` or
+`OPENROUTER_API_KEY`; `spar doctor` reports whether it is readable.
+
 ## Arena
 
 ```bash
@@ -179,8 +187,10 @@ read from each run's `.spar/runs/<id>/events.jsonl`. One object per line:
 {"run_id":"3d3d6f59","cursor":"…","ts":"2026-11-01T12:00:00Z","type":"phase","phase":"dispatch","prev_phase":"plan_approved","round":1}
 ```
 
-`type` is `phase`, `slot`, `gate`, `info`, `archived`, `unarchived` or `abandoned`
-(daemon-detected; `phase` is where the run was left); `phase`, `prev_phase`, `slot`,
+`type` is `phase`, `slot`, `gate`, `info`, `archived`, `unarchived`, `abandoned`
+(daemon-detected; `phase` is where the run was left) or `classifier` (O148: `slot` and a
+`classifier` object with `model`, `choice`, `probability`, `probabilities`, `acted`,
+`action`, `regex_verdict`, `latency_ms`, `cost_usd`, `cached`, `error`); `phase`, `prev_phase`, `slot`,
 `status`, `message` and `round` appear when set. Fields and types are only added, never
 renamed, so ignore a `type` you don't know.
 

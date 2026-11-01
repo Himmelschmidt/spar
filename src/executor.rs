@@ -88,6 +88,7 @@ pub fn run_slots_parallel(
                 if let Some(s) = state.slot_mut(&job.slot_id) {
                     s.quota_hit = false;
                     s.auth_fault = false;
+                    s.classifier = None;
                 }
                 let _ =
                     mark_slot_failed(state, paths, &job.slot_id, &e.to_string(), None, None, None);
@@ -373,6 +374,7 @@ fn prepare_slot_execution(
         s.usage = None;
         s.quota_hit = false;
         s.auth_fault = false;
+        s.classifier = None;
         s.reviewed_commit = None;
         s.review = None;
         // Stamp the round at dispatch: slot ids are stable across re-dispatch (the
@@ -836,14 +838,19 @@ fn dispatch_with_resume_recovery(
     // being briefly sick.
     let backoff = transient_backoff_secs();
     let mut retries = 0usize;
+    let advise = |res: &process::SpawnResult| {
+        classifier_dispatch_advice(adapter, paths, run_id, slot_id, res, &log_path)
+    };
+    let mut advice = advise(&res);
     while retries < backoff.len()
         && !res.timed_out
         && res.signal.is_none()
         && res.exit_code != Some(0)
         && !adapter.is_usage_error(res.exit_code)
         && res.stats.tools >= 1
-        && adapter
+        && (adapter
             .dispatch_failure_is_transient(&std::fs::read_to_string(&log_path).unwrap_or_default())
+            || advice == Some(crate::classifier::Action::Retry))
     {
         let wait = Duration::from_secs(backoff[retries]);
         let _ = std::fs::copy(&log_path, transient_retry_log_path(&log_path, retries + 1));
@@ -893,6 +900,7 @@ fn dispatch_with_resume_recovery(
         last_used_resume = retry_used_resume;
         last_resume_attempt = prior;
         retries += 1;
+        advice = advise(&res);
     }
     // A session can die between transient attempts: the loop above only retries the
     // transient signature, so a retry that died pre-session with a missing-session
@@ -929,6 +937,7 @@ fn dispatch_with_resume_recovery(
         )?;
         last_used_resume = false;
         last_resume_attempt = None;
+        advice = advise(&res);
     }
     // An auth rejection is most often a token another process just refreshed out from
     // under this one; the new token lands within seconds. One re-dispatch after a short
@@ -938,7 +947,8 @@ fn dispatch_with_resume_recovery(
         && res.signal.is_none()
         && res.exit_code != Some(0)
         && !adapter.is_usage_error(res.exit_code)
-        && crate::backup::scrape_auth_signal(&process::tail_log(&log_path, 8000)).is_some()
+        && (crate::backup::scrape_auth_signal(&process::tail_log(&log_path, 8000)).is_some()
+            || advice == Some(crate::classifier::Action::Auth))
     {
         let wait = auth_retry_wait();
         let _ = std::fs::copy(&log_path, auth_retry_log_path(&log_path));
@@ -2084,7 +2094,7 @@ fn apply_parallel_outcome(
             // `quota_hit_for_outcome`.
             let quota_hit =
                 quota_hit_for_outcome(paths, &prep.job.provider, &prep.log_path, &result);
-            let err = result.error.unwrap_or_else(|| "failed".into());
+            let err = result.error.clone().unwrap_or_else(|| "failed".into());
             let auth = auth_fault_for(
                 &prep.log_path,
                 &err,
@@ -2092,9 +2102,20 @@ fn apply_parallel_outcome(
                 result.exit_code,
                 result.signal,
             );
+            let (quota_hit, auth, classified) = classifier_verdict(
+                paths,
+                &state.id,
+                &prep.job,
+                &prep.log_path,
+                &result,
+                &err,
+                quota_hit,
+                auth,
+            );
             if let Some(s) = state.slot_mut(slot_id) {
                 s.quota_hit = quota_hit;
                 s.auth_fault = auth.is_some();
+                s.classifier = classified;
             }
             salvage_expected_artifact(
                 paths,
@@ -2433,6 +2454,7 @@ pub fn run_slot(
         s.usage = None;
         s.quota_hit = false;
         s.auth_fault = false;
+        s.classifier = None;
         s.reviewed_commit = None;
         s.review = None;
         // Stamp the round at dispatch: slot ids are stable across re-dispatch (the
@@ -2670,6 +2692,17 @@ pub fn run_slot(
         let quota_hit = quota_hit_for_outcome(paths, &job.provider, &log_path, &result);
         let err = result.error.as_deref().unwrap_or("failed");
         auth_rejection = auth_fault_for(&log_path, err, quota_hit, result.exit_code, result.signal);
+        let (quota_hit, auth, classified) = classifier_verdict(
+            paths,
+            &state.id,
+            job,
+            &log_path,
+            &result,
+            err,
+            quota_hit,
+            auth_rejection,
+        );
+        auth_rejection = auth;
         salvage_expected_artifact(
             paths,
             &state.id,
@@ -2713,6 +2746,7 @@ pub fn run_slot(
         if let Some(s) = state.slot_mut(&job.slot_id) {
             s.quota_hit = quota_hit;
             s.auth_fault = auth_rejection.is_some();
+            s.classifier = classified;
         }
     }
     let _ = crate::bus::heartbeat(
@@ -3036,6 +3070,173 @@ fn auth_fault_for(
     }
     crate::backup::scrape_auth_signal(&process::tail_log(log_path, 8000))
         .or_else(|| crate::backup::scrape_auth_signal(err_text))
+}
+
+/// O148, inside the dispatch: whether the classifier turns a failure the regexes read as
+/// work into a transient retry or the O104 auth retry. Asked only about a non-zero exit
+/// that no rule already explains; `None` whenever it is off, silent or below threshold.
+fn classifier_dispatch_advice(
+    adapter: &dyn providers::ProviderAdapter,
+    paths: &SparPaths,
+    run_id: &str,
+    slot_id: &str,
+    res: &process::SpawnResult,
+    log_path: &Path,
+) -> Option<crate::classifier::Action> {
+    if res.timed_out
+        || process::ended_by_signal(res.signal, res.exit_code)
+        || res.exit_code == Some(0)
+        || adapter.is_usage_error(res.exit_code)
+        || res.stats.quota_rejected.is_some()
+    {
+        return None;
+    }
+    let cfg = crate::config::Config::for_run(paths, run_id)
+        .ok()?
+        .classifier;
+    if !cfg.enabled {
+        return None;
+    }
+    let tail = process::tail_log(log_path, 8000);
+    if crate::quota::QuotaStore::scrape_strong_quota_signal(&tail).is_some()
+        || crate::backup::scrape_auth_signal(&tail).is_some()
+        || adapter
+            .dispatch_failure_is_transient(&std::fs::read_to_string(log_path).unwrap_or_default())
+    {
+        return None;
+    }
+    let state = RunState::load(paths, run_id).ok()?;
+    let slot = state.slots.iter().find(|s| s.id == slot_id)?;
+    let failure = crate::classifier::FailureState::new(
+        &slot.provider,
+        slot.role.as_config_key(),
+        res.exit_code,
+        res.signal,
+        Some(res.stats.tools),
+        Some(&describe_exit(res.exit_code, res.signal)),
+        log_path,
+    );
+    let rec = crate::classifier::consult(
+        &cfg,
+        paths,
+        run_id,
+        slot_id,
+        adapter.name(),
+        &failure,
+        crate::classifier::Site::Dispatch {
+            tool_calls: res.stats.tools >= 1,
+        },
+        crate::classifier::RegexVerdict::Work,
+    )?;
+    Some(rec.action)
+}
+
+/// O148, on a failed dispatch's final verdict: the classifier fills the gap where the
+/// regexes concluded "work" (quota becomes a strong pause, auth an auth fault) and may
+/// veto a quota or auth verdict read from text, which becomes a weak pause. Never asked
+/// about what spar settled from its own state: a kill, a halt, the hard ceiling, a
+/// usage error or a typed quota event.
+#[allow(clippy::too_many_arguments)]
+fn classifier_verdict(
+    paths: &SparPaths,
+    run_id: &str,
+    job: &SlotJob,
+    log_path: &Path,
+    outcome: &SlotOutcome,
+    err: &str,
+    quota_hit: bool,
+    auth: Option<String>,
+) -> (bool, Option<String>, Option<crate::classifier::Record>) {
+    use crate::classifier::{Action, RegexVerdict};
+    let unchanged = (quota_hit, auth.clone(), None);
+    let cli_name = ProviderRef::parse(&job.provider)
+        .ok()
+        .and_then(|p| p.cli_name().map(str::to_string));
+    let adapter = cli_name.as_deref().and_then(providers::adapter_named);
+    if process::ended_by_signal(outcome.signal, outcome.exit_code)
+        || crate::nudge::is_ceiling_kill(err)
+        || err.contains(crate::state::STOPPED_SLOT)
+        || adapter
+            .as_ref()
+            .is_some_and(|a| a.is_usage_error(outcome.exit_code))
+        || (quota_hit && (outcome.quota_rejected.is_some() || outcome.agy_quota_hit))
+    {
+        return unchanged;
+    }
+    let Some(cfg) = crate::config::Config::for_run(paths, run_id)
+        .ok()
+        .map(|c| c.classifier)
+        .filter(|c| c.enabled)
+    else {
+        return unchanged;
+    };
+    let regex = if quota_hit {
+        RegexVerdict::Quota
+    } else if auth.is_some() {
+        RegexVerdict::Auth
+    } else {
+        RegexVerdict::Work
+    };
+    let failure = crate::classifier::FailureState::new(
+        &job.provider,
+        job.role.as_config_key(),
+        outcome.exit_code,
+        outcome.signal,
+        outcome.usage.as_ref().map(|u| u.tools),
+        Some(err),
+        log_path,
+    );
+    let Some(rec) = crate::classifier::consult(
+        &cfg,
+        paths,
+        run_id,
+        &job.slot_id,
+        cli_name.as_deref().unwrap_or(job.provider.as_str()),
+        &failure,
+        crate::classifier::Site::Verdict,
+        regex,
+    ) else {
+        return unchanged;
+    };
+    let key = crate::quota::normalize_key(&job.provider);
+    let p = rec.probability.unwrap_or(0.0);
+    let (quota_hit, auth) = match rec.action {
+        Action::PauseQuota => {
+            let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+            store.pause_quota(
+                &key,
+                format!("classifier {} read a quota rejection ({p:.2})", rec.model),
+            );
+            store.mark_strong(&key);
+            let _ = store.save(paths);
+            (true, auth)
+        }
+        Action::Auth => (
+            quota_hit,
+            Some(format!(
+                "classifier {} read a credential rejection ({p:.2})",
+                rec.model
+            )),
+        ),
+        Action::WeakPause => {
+            let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+            if store.is_usable(&key) {
+                store.pause_quota(
+                    &key,
+                    format!(
+                        "{key} {} text vetoed by classifier {} ({p:.2} work)",
+                        if quota_hit { "quota" } else { "auth" },
+                        rec.model
+                    ),
+                );
+            }
+            store.mark_weak(&key);
+            let _ = store.save(paths);
+            (false, None)
+        }
+        Action::Retry | Action::None => (quota_hit, auth),
+    };
+    (quota_hit, auth, Some(rec))
 }
 
 struct SlotOutcome {
@@ -4422,6 +4623,7 @@ pub fn init_slot_model(
         auth_fault: false,
         build_cache: None,
         former_ids: Vec::new(),
+        classifier: None,
     }
 }
 
@@ -8111,5 +8313,234 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             events.contains("review-1") && events.contains("tools == 0"),
             "one line must name the slot and the cause for later greps: {events}"
         );
+    }
+
+    fn classifier_run(
+        tmp: &Path,
+        answer: (&str, f64),
+    ) -> (SparPaths, crate::classifier::tests::FakeSystemOne) {
+        let paths = SparPaths::new(tmp);
+        paths.ensure_run_dirs("run1").unwrap();
+        let fake = crate::classifier::tests::fake_system_one(
+            200,
+            crate::classifier::tests::answer_body(answer.0, answer.1),
+            Duration::ZERO,
+        );
+        let cfg = Config {
+            classifier: crate::classifier::tests::enabled_cfg(
+                &fake.base_url,
+                &tmp.join("classifier.key"),
+            ),
+            ..Default::default()
+        };
+        cfg.save_snapshot(&paths, "run1").unwrap();
+        let mut state = RunState::new("run1", crate::cli::WorkflowKind::Loop, tmp.to_path_buf());
+        state
+            .slots
+            .push(init_slot("impl", "cli:muse", SlotRole::Implementer));
+        state.save(&paths).unwrap();
+        (paths, fake)
+    }
+
+    fn failed_with(exit_code: Option<i32>, signal: Option<i32>, err: &str) -> SlotOutcome {
+        SlotOutcome {
+            exit_code,
+            signal,
+            ..SlotOutcome::err(err)
+        }
+    }
+
+    /// O148 gap-fill: a wording no regex knows, read as quota at >= 0.7, pauses the
+    /// provider strong; below the threshold nothing changes.
+    #[test]
+    fn classifier_fills_a_quota_gap_with_a_strong_pause() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (paths, fake) = classifier_run(tmp.path(), ("quota_or_rate_limit", 0.86));
+        let log_path = tmp.path().join("impl.log");
+        std::fs::write(
+            &log_path,
+            "! your monthly allotment of agent minutes is spent\n",
+        )
+        .unwrap();
+        let job = impl_job("impl");
+        let outcome = failed_with(Some(1), None, "exit 1");
+        let (quota, auth, rec) = classifier_verdict(
+            &paths, "run1", &job, &log_path, &outcome, "exit 1", false, None,
+        );
+        assert!(quota && auth.is_none());
+        assert_eq!(rec.unwrap().action, crate::classifier::Action::PauseQuota);
+        let store = crate::quota::QuotaStore::load(&paths).unwrap();
+        assert!(store.blocks_live_dispatch("cli:muse"), "a strong pause");
+        assert_eq!(fake.bodies.lock().unwrap().len(), 1);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (paths, _fake) = classifier_run(tmp.path(), ("quota_or_rate_limit", 0.6));
+        let log_path = tmp.path().join("impl.log");
+        std::fs::write(
+            &log_path,
+            "! your monthly allotment of agent minutes is spent\n",
+        )
+        .unwrap();
+        let (quota, auth, rec) = classifier_verdict(
+            &paths, "run1", &job, &log_path, &outcome, "exit 1", false, None,
+        );
+        assert!(!quota && auth.is_none(), "below threshold: today's verdict");
+        assert!(!rec.unwrap().acted);
+        assert!(crate::quota::QuotaStore::load(&paths)
+            .unwrap()
+            .is_usable("cli:muse"));
+    }
+
+    /// O148 veto: quota read from text, the classifier sure it is the work, becomes a
+    /// weak pause; the pause is kept, the routing to `Phase::Quota` is not.
+    #[test]
+    fn classifier_veto_downgrades_a_text_quota_verdict_to_a_weak_pause() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (paths, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.95));
+        let log_path = tmp.path().join("impl.log");
+        std::fs::write(&log_path, WEEKLY_LIMIT_LOG).unwrap();
+        let job = impl_job("impl");
+        let outcome = failed_with(Some(1), None, "exit 1");
+        assert!(quota_hit_for_outcome(
+            &paths, "cli:muse", &log_path, &outcome
+        ));
+        assert!(crate::quota::QuotaStore::load(&paths)
+            .unwrap()
+            .blocks_live_dispatch("cli:muse"));
+        let (quota, auth, rec) = classifier_verdict(
+            &paths, "run1", &job, &log_path, &outcome, "exit 1", true, None,
+        );
+        assert!(!quota && auth.is_none());
+        let rec = rec.unwrap();
+        assert_eq!(rec.action, crate::classifier::Action::WeakPause);
+        assert_eq!(rec.regex_verdict, crate::classifier::RegexVerdict::Quota);
+        let store = crate::quota::QuotaStore::load(&paths).unwrap();
+        assert!(!store.is_usable("cli:muse"), "the pause stays");
+        assert!(!store.blocks_live_dispatch("cli:muse"), "but weak");
+
+        let (quota, auth, _) = classifier_verdict(
+            &paths,
+            "run1",
+            &job,
+            &log_path,
+            &outcome,
+            "exit 1",
+            false,
+            Some("not logged in".into()),
+        );
+        assert!(
+            !quota && auth.is_none(),
+            "a text auth verdict is vetoed too"
+        );
+    }
+
+    /// What spar settles from its own state never reaches the classifier: a kill, a
+    /// halt, the hard ceiling, a usage error, a typed quota event.
+    #[test]
+    fn classifier_is_never_asked_about_state_decided_failures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (paths, fake) = classifier_run(tmp.path(), ("quota_or_rate_limit", 0.99));
+        let log_path = tmp.path().join("impl.log");
+        std::fs::write(&log_path, "something odd\n").unwrap();
+        let job = impl_job("impl");
+        let ceiling = crate::nudge::ceiling_error(
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+            "timeouts.slot_secs",
+        );
+        let typed = SlotOutcome {
+            quota_rejected: Some("five_hour".into()),
+            ..failed_with(Some(1), None, "exit 1")
+        };
+        let cases = [
+            (
+                failed_with(None, Some(9), "killed"),
+                "killed".to_string(),
+                false,
+            ),
+            (
+                failed_with(Some(143), None, "exit 143"),
+                "exit 143".into(),
+                false,
+            ),
+            (failed_with(Some(1), None, &ceiling), ceiling.clone(), false),
+            (
+                failed_with(Some(1), None, crate::state::STOPPED_SLOT),
+                crate::state::STOPPED_SLOT.into(),
+                false,
+            ),
+            (failed_with(Some(2), None, "usage"), "usage".into(), false),
+            (typed, "exit 1".into(), true),
+        ];
+        for (outcome, err, quota_hit) in cases {
+            let (quota, auth, rec) = classifier_verdict(
+                &paths, "run1", &job, &log_path, &outcome, &err, quota_hit, None,
+            );
+            assert_eq!((quota, auth, rec), (quota_hit, None, None), "{err}");
+        }
+        assert!(fake.bodies.lock().unwrap().is_empty());
+    }
+
+    /// O148 inside the dispatch: an unknown wording after real work, read as transient,
+    /// takes the existing retry loop; with zero tool calls it does not.
+    #[test]
+    fn classifier_transient_answer_takes_the_retry_loop_after_tool_calls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (paths, fake) = classifier_run(tmp.path(), ("transient_infra", 0.9));
+        let log_path = tmp.path().join("slot.log");
+        let ctr = tmp.path().join("attempts");
+        let script = format!(
+            r#"n=$(cat "{ctr}" 2>/dev/null || echo 0); echo $((n+1)) > "{ctr}"; echo '{{"type":"tool_call","name":"edit"}}'; if [ "$n" -lt 1 ]; then echo 'upstream wobble, please hold' >&2; exit 1; fi; exit 0"#,
+            ctr = ctr.display(),
+        );
+        let adapter = ShellAdapter::cold(&script);
+        let waits = std::cell::RefCell::new(Vec::new());
+        let res = dispatch_with_resume_recovery(
+            &adapter,
+            Path::new("/bin/sh"),
+            &mut dispatch_opts("go"),
+            None,
+            crate::config::IsolationMode::None,
+            shell_req(&script, &log_path),
+            &paths,
+            "run1",
+            "impl",
+            "shell",
+            1,
+            &|_pid| {},
+            &|| {},
+            &|d| waits.borrow_mut().push(d),
+        )
+        .unwrap();
+        assert_eq!(res.exit_code, Some(0));
+        assert_eq!(waits.borrow().len(), 1);
+        assert_eq!(fake.bodies.lock().unwrap().len(), 1);
+        let events = std::fs::read_to_string(crate::events::events_file(&paths, "run1")).unwrap();
+        assert!(events.contains("\"type\":\"classifier\"") && events.contains("\"retry\""));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (paths, _fake) = classifier_run(tmp.path(), ("transient_infra", 0.9));
+        let log_path = tmp.path().join("slot.log");
+        let script = "echo 'upstream wobble, please hold' >&2; exit 1";
+        let waits = std::cell::RefCell::new(Vec::new());
+        let res = dispatch_with_resume_recovery(
+            &ShellAdapter::cold(script),
+            Path::new("/bin/sh"),
+            &mut dispatch_opts("go"),
+            None,
+            crate::config::IsolationMode::None,
+            shell_req(script, &log_path),
+            &paths,
+            "run1",
+            "impl",
+            "shell",
+            1,
+            &|_pid| {},
+            &|| {},
+            &|d| waits.borrow_mut().push(d),
+        )
+        .unwrap();
+        assert_eq!(res.exit_code, Some(1));
+        assert!(waits.borrow().is_empty(), "zero tool calls never retry");
     }
 }

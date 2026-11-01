@@ -556,6 +556,10 @@ pub struct SlotState {
     /// oldest first, so lookups keyed on the id it judged under still find it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub former_ids: Vec<String>,
+    /// The failure classifier's last word on this dispatch's routing (O148). Reset at
+    /// dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier: Option<crate::classifier::Record>,
 }
 
 impl SlotState {
