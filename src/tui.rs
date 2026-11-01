@@ -12082,6 +12082,14 @@ fn activity_feed(
                     e.message.clone().unwrap_or_default(),
                     RecordKind::Note,
                 ),
+                events::EventKind::Archived
+                | events::EventKind::Unarchived
+                | events::EventKind::Abandoned => (
+                    st.id.clone(),
+                    "info".to_string(),
+                    e.display_line(),
+                    RecordKind::Note,
+                ),
             };
             out.push(activity_record(Some(e.ts), actor, event, detail, kind));
         }

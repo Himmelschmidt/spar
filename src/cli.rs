@@ -462,6 +462,23 @@ pub enum Command {
         json: bool,
     },
 
+    /// Stream lifecycle events from every run in the project as one feed
+    Events {
+        /// Only this run's events (archived or not).
+        #[arg(long = "run", value_name = "RUN")]
+        run_id: Option<String>,
+        /// Keep tailing until killed; picks up runs created after it starts.
+        #[arg(long)]
+        follow: bool,
+        /// Resume after a `cursor` from an earlier line, or `now` for the tail. Defaults
+        /// to `now` with `--follow`, to the start of every run without it.
+        #[arg(long, value_name = "CURSOR")]
+        since: Option<String>,
+        /// One JSON object per line: run_id, cursor and the event's fields.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Block until a run reaches a terminal or gate phase
     Wait {
         run_id: String,
