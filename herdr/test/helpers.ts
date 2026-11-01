@@ -61,12 +61,15 @@ export interface FakeHerdr {
 	setWorld(world: World): void;
 }
 
-export function installHerdr(world: World = { workspaces: [], tabs: [], panes: [] }): FakeHerdr {
+// Each call is its own herdr server (own socket); pass `stateDir` to share the per-user
+// plugin state directory between servers.
+export function installHerdr(world: World = { workspaces: [], tabs: [], panes: [] }, stateDir?: string): FakeHerdr {
 	const dir = scratch("spar-herdr-herdr-");
 	writeFileSync(join(dir, "world.json"), JSON.stringify(world));
 	process.env.FAKE_HERDR_DIR = dir;
 	process.env.HERDR_BIN_PATH = FAKE_HERDR;
-	process.env.HERDR_PLUGIN_STATE_DIR = scratch("spar-herdr-state-");
+	process.env.HERDR_SOCKET_PATH = join(dir, "herdr.sock");
+	process.env.HERDR_PLUGIN_STATE_DIR = stateDir ?? scratch("spar-herdr-state-");
 	process.env.HERDR_PLUGIN_CONFIG_DIR = scratch("spar-herdr-config-");
 	return {
 		dir,

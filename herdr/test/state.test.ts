@@ -43,3 +43,19 @@ test("the project allow-list matches a root or a name; empty means every project
 	assert.equal(inScope({ ...base, projects: ["alpha"] }, run), true);
 	assert.equal(inScope({ ...base, projects: ["beta"] }, run), false);
 });
+
+test("config clamps a zero or negative sync interval so the board cannot spin", async () => {
+	const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+	const { tmpdir } = await import("node:os");
+	const { join } = await import("node:path");
+	const { loadConfig } = await import("../src/config.ts");
+	const dir = mkdtempSync(join(tmpdir(), "spar-herdr-cfg-"));
+	process.env.HERDR_PLUGIN_CONFIG_DIR = dir;
+	writeFileSync(join(dir, "config.json"), JSON.stringify({ sync_interval_secs: 0, recent_hours: -3 }));
+	const config = loadConfig();
+	assert.equal(config.sync_interval_secs, 60);
+	writeFileSync(join(dir, "config.json"), JSON.stringify({ sync_interval_secs: -5 }));
+	assert.equal(loadConfig().sync_interval_secs, 10);
+	assert.equal(config.recent_hours, 0);
+	rmSync(dir, { recursive: true, force: true });
+});

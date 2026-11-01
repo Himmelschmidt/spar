@@ -1,8 +1,8 @@
 import { act, terminalIo } from "./act.ts";
-import { loadConfig } from "./config.ts";
+import { loadConfig, withLock } from "./config.ts";
 import { notify } from "./herdr.ts";
 import { ensureBoard, followLog, openActPopup, openSeatLogs, runBoard } from "./panes.ts";
-import { describeSync, reapRestored, sync } from "./sync.ts";
+import { describeSync, reapRestored, sync, syncOnce } from "./sync.ts";
 import { runView } from "./view.ts";
 
 function env(name: string): string {
@@ -20,11 +20,15 @@ async function main(command: string | undefined): Promise<void> {
 			await notify("spar sync", text.replace(/^spar sync: /, ""));
 			return;
 		}
-		case "startup":
-			process.stdout.write(`spar startup: closed ${await reapRestored()} restored pane(s)\n`);
-			process.stdout.write(`${describeSync(await sync(config))}\n`);
+		case "startup": {
+			const result = await withLock(async () => {
+				process.stdout.write(`spar startup: closed ${await reapRestored()} restored pane(s)\n`);
+				return syncOnce(config);
+			});
+			process.stdout.write(`${describeSync(result)}\n`);
 			if (config.board_on_startup) await ensureBoard();
 			return;
+		}
 		case "board-open":
 			return ensureBoard();
 		case "board":

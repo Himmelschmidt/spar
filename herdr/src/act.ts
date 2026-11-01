@@ -246,8 +246,14 @@ export async function act(io: Io, config: Config, id?: string, root?: string): P
 		for (const l of wrap(effect(verb, run, input), io.width, 0)) io.print(l);
 		const yes = await io.ask("Type yes to run it, anything else cancels: ");
 		if (yes === undefined) return ran;
-		if (yes.toLowerCase() !== "yes" && yes.toLowerCase() !== "y") {
+		if (yes !== "yes") {
 			io.print("Cancelled, nothing ran.");
+			continue;
+		}
+		// The run may have moved while the operator read and typed.
+		const now = await sparJson<RunStatus>(["status", id, "--json"], root);
+		if (!now.ok || !actionsFor(now.value).includes(verb) || now.value.phase !== run.phase) {
+			io.print(now.ok ? `The run moved to ${now.value.phase}${now.value.holds_seat ? " and is running" : ""}; ${verb} no longer applies. Nothing ran.` : `spar status ${id}: ${now.message}. Nothing ran.`);
 			continue;
 		}
 		let raw: Raw;

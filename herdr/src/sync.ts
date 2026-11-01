@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { basename } from "node:path";
 import { type Config, inScope, loadState, type RunPane, type State, saveState, withLock } from "./config.ts";
-import { herdr, layoutOf, openPane, type Snapshot, snapshot, splitTarget } from "./herdr.ts";
+import { herdr, layoutOf, openPane, type PaneInfo, SOURCE, type Snapshot, snapshot, splitTarget } from "./herdr.ts";
 import { type RunRow, relevant, sparJson } from "./spar.ts";
 
 export const RUN_TAB = "spar";
@@ -49,26 +49,41 @@ function runTab(workspace: string, snap: Snapshot, state: State): string | undef
 	return snap.tabs.find((t) => t.workspace_id === workspace && t.label === RUN_TAB)?.tab_id;
 }
 
+// Tags the pane as this run's at once, so ownership never waits on the view's first report.
+async function claim(pane: PaneInfo, id: string): Promise<PaneInfo> {
+	await herdr(["pane", "report-metadata", pane.pane_id, "--source", SOURCE, "--token", `spar_run=${id}`]);
+	return { ...pane, label: RUN_LABEL, tokens: { spar_run: id } };
+}
+
 async function openRunPane(run: RunRow, root: string, workspace: string, snap: Snapshot, state: State): Promise<string> {
 	const env = { SPAR_HERDR_RUN: run.id, SPAR_HERDR_ROOT: root };
 	const tab = runTab(workspace, snap, state);
 	const inTab = tab ? snap.panes.find((p) => p.tab_id === tab) : undefined;
 	if (!tab || !inTab) {
-		const pane = await openPane({ entrypoint: "run", env, cwd: root, placement: "tab", workspace });
+		const pane = await claim(await openPane({ entrypoint: "run", env, cwd: root, placement: "tab", workspace }), run.id);
 		await herdr(["tab", "rename", pane.tab_id, RUN_TAB]);
 		snap.tabs.push({ tab_id: pane.tab_id, workspace_id: workspace, label: RUN_TAB });
 		snap.panes.push(pane);
 		return pane.pane_id;
 	}
 	const split = splitTarget(await layoutOf(inTab.pane_id)) ?? { target: inTab.pane_id, direction: "right" as const };
-	const pane = await openPane({ entrypoint: "run", env, cwd: root, placement: "split", target: split.target, direction: split.direction });
+	const pane = await claim(await openPane({ entrypoint: "run", env, cwd: root, placement: "split", target: split.target, direction: split.direction }), run.id);
 	snap.panes.push(pane);
 	return pane.pane_id;
 }
 
+export const RUN_LABEL = "spar run";
+
+// A pane is this plugin's run pane for `id` only if it says so itself. Pane ids are per
+// server and get reused, so an id from the state file alone proves nothing.
+export function owns(pane: PaneInfo | undefined, id: string): boolean {
+	return pane?.tokens?.spar_run === id && pane.label === RUN_LABEL;
+}
+
 // Brings herdr in line with spar: every relevant run has exactly one run pane, in a `spar`
 // tab of its project's workspace. A pane whose run stopped mattering is closed once it is
-// seen (herdr's `idle`, not its unseen `done`) and not focused.
+// seen (herdr's `idle`, not its unseen `done`) and not focused. A run whose pane the
+// operator closed stays closed until the run moves.
 export async function syncOnce(config: Config, now = new Date()): Promise<SyncResult> {
 	const runs = await listRuns(config);
 	const result: SyncResult = { runs, opened: [], adopted: [], closed: [], workspaces: [], errors: [] };
@@ -78,14 +93,25 @@ export async function syncOnce(config: Config, now = new Date()): Promise<SyncRe
 	const state = loadState();
 	const live = new Map(snap.panes.map((p) => [p.pane_id, p]));
 
+	const byId = new Map(runs.map((r) => [r.id, r]));
+
 	for (const [id, entry] of Object.entries(state.runs)) {
-		if (!live.has(entry.pane_id)) delete state.runs[id];
+		const pane = live.get(entry.pane_id);
+		if (owns(pane, id)) continue;
+		delete state.runs[id];
+		// Gone, not replaced: the operator closed it, or its view exited with the run.
+		const run = byId.get(id);
+		if (!pane && run) state.dismissed[id] = run.updated_at;
 	}
 	for (const pane of snap.panes) {
 		const id = pane.tokens?.spar_run;
-		if (!id || state.runs[id]) continue;
-		state.runs[id] = { pane_id: pane.pane_id, root: pane.tokens?.spar_root ?? pane.cwd ?? "" };
+		const run = id ? byId.get(id) : undefined;
+		if (!id || !run || state.runs[id] || !owns(pane, id)) continue;
+		state.runs[id] = { pane_id: pane.pane_id, root: run.project_root! };
 		result.adopted.push(id);
+	}
+	for (const id of Object.keys(state.dismissed)) {
+		if (byId.get(id)?.updated_at !== state.dismissed[id]) delete state.dismissed[id];
 	}
 	for (const [id, entry] of Object.entries(state.runs)) {
 		if (wanted.has(id)) continue;
@@ -101,7 +127,7 @@ export async function syncOnce(config: Config, now = new Date()): Promise<SyncRe
 		result.closed.push(id);
 	}
 
-	const missing = [...wanted.values()].filter((r) => !state.runs[r.id]);
+	const missing = [...wanted.values()].filter((r) => !state.runs[r.id] && !state.dismissed[r.id]);
 	const byRoot = new Map<string, RunRow[]>();
 	for (const run of missing) byRoot.set(run.project_root!, [...(byRoot.get(run.project_root!) ?? []), run]);
 	for (const [root, group] of byRoot) {
@@ -123,19 +149,31 @@ export async function syncOnce(config: Config, now = new Date()): Promise<SyncRe
 
 // The manifest titles of this plugin's long-lived panes. herdr restores a pane after a
 // server restart as a plain shell under the same id and label; its process is gone.
-const PANE_TITLES = new Set(["spar run", "spar board", "spar seat log"]);
+const PANE_TITLES = new Set([RUN_LABEL, "spar board", "spar seat log"]);
 
 // Run at startup: a pane with one of those titles but none of the tokens its process
 // reports is such a shell, and is closed so sync can reopen the run panes. Panes that
-// survived a live handoff still carry their tokens and are left alone.
+// survived a live handoff still carry their tokens and are left alone. Mappings without a
+// live owned pane are forgotten here, not counted as closed by the operator: on a new
+// server nobody closed them.
 export async function reapRestored(): Promise<number> {
 	const snap = await snapshot();
 	let closed = 0;
+	const gone = new Set<string>();
 	for (const pane of snap.panes) {
 		if (!pane.label || !PANE_TITLES.has(pane.label)) continue;
 		if (Object.keys(pane.tokens ?? {}).some((k) => k.startsWith("spar_"))) continue;
-		if ((await herdr(["pane", "close", pane.pane_id])).ok) closed++;
+		if ((await herdr(["pane", "close", pane.pane_id])).ok) {
+			closed++;
+			gone.add(pane.pane_id);
+		}
 	}
+	const state = loadState();
+	const live = new Map(snap.panes.filter((p) => !gone.has(p.pane_id)).map((p) => [p.pane_id, p]));
+	for (const [id, entry] of Object.entries(state.runs)) {
+		if (!owns(live.get(entry.pane_id), id)) delete state.runs[id];
+	}
+	saveState(state);
 	return closed;
 }
 

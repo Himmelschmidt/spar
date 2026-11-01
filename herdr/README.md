@@ -51,7 +51,7 @@ Optional. `config.json` in the plugin's config directory
 | `projects` | every project | Allow-list of project roots or project names (as `spar status --all --json` reports them). |
 | `recent_hours` | `24` | How long a run that no longer needs you or holds a seat keeps a pane. |
 | `board_on_startup` | `true` | Open the board pane from the startup hook. |
-| `sync_interval_secs` | `60` | How often the board re-syncs when no event arrives. |
+| `sync_interval_secs` | `60` | How often the board re-syncs when no event arrives (at least 10). |
 
 ## What it does
 
@@ -76,15 +76,21 @@ The pane exits, and herdr closes it, when the run is archived or gone. spar erro
 shown in the pane and retried with backoff from 2 s to 60 s.
 
 **Sync.** `spar: sync runs` brings herdr in line with `spar status --all --json`: one pane
-per relevant run, never two (the mapping lives in the plugin state directory, and panes
-are checked against `herdr api snapshot`; a pane carrying a run's tokens is adopted). A run
-pane whose run stopped mattering is closed once it is seen (herdr `idle`, not the unseen
-`done`) and not focused.
+per relevant run, never two. Each run pane is tagged with a `spar_run` token the moment it
+opens, and sync only ever closes or adopts a pane that carries that token for the run and
+the `spar run` title; a pane id remembered in state proves nothing on its own. State (the
+pane mapping, workspaces, the board pane) lives in the plugin state directory in one file
+per herdr server, keyed by its socket, because pane ids are per server. A run pane whose
+run stopped mattering is closed once it is seen (herdr `idle`, not the unseen `done`) and
+not focused. If you close a run pane yourself, it stays closed until the run moves (its
+`updated_at` changes). The project root is never carried in a token (herdr cuts token
+values at 80 characters); the actions ask spar for it by run id.
 
 **Board.** herdr startup hooks are one-shot, so something long-lived has to notice new
 runs. The board pane (a `spar board` tab) follows `spar events --follow` in every project
 spar knows about and re-syncs on every phase, gate, abandonment or archive event, and on a
-timer for projects that appear later. It also lists the relevant runs, needing you first.
+timer for projects that appear later. It also lists the relevant runs, needing you first, and says so when `spar events` is
+unavailable (a spar too old to have it); the feeds keep retrying with backoff.
 Without the board, new runs only appear when you run the sync action. The startup hook
 opens it unless `board_on_startup` is false.
 
@@ -99,7 +105,7 @@ the run panes and the board.
 |---|---|---|
 | `spar.monitor.sync` (`spar: sync runs`) | any | One sync now. |
 | `spar.monitor.board` (`spar: open board`) | any | Opens the board if it is not open. |
-| `spar.monitor.act` (`spar: act on run`) | pane | A popup for the run in the focused pane: what the gate is about (findings, arena candidates, artifacts, with the full brief on `b`), a numbered menu of only the verbs valid for the run's phase, then the exact command and its effect, and it runs only after you type `yes`. Ship runs `spar ship <id> --confirm`; your typed yes is the confirmation. Ship, override, reconcile and cleanup run detached, so closing the popup does not stop them. From a pane that is not a run pane, it lists the runs that need you. |
+| `spar.monitor.act` (`spar: act on run`) | pane | A popup for the run in the focused pane: what the gate is about (findings, arena candidates, artifacts, with the full brief on `b`), a numbered menu of only the verbs valid for the run's phase, then the exact command and its effect, and it runs only after you type exactly `yes`. It re-reads the run after you confirm and runs nothing if the verb no longer applies. Ship runs `spar ship <id> --confirm`; your typed yes is the confirmation. Ship, override, reconcile and cleanup run detached, so closing the popup does not stop them. From a pane that is not a run pane, it lists the runs that need you. |
 | `spar.monitor.logs` (`spar: seat logs`) | pane | A `logs <id>` tab with one pane per seat of the current round (at most 6), each following `spar logs <id> <seat> --follow`. |
 
 The verbs per phase mirror `pi/extensions/spar/gates.ts`. spar is the authority: it

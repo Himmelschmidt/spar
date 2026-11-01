@@ -62,7 +62,8 @@ switch (cmd) {
 	}
 	case "plugin pane": {
 		const env = Object.fromEntries(opts("--env").map((e) => [e.slice(0, e.indexOf("=")), e.slice(e.indexOf("=") + 1)]));
-		const extra = { entrypoint: opt("--entrypoint"), env };
+		const titles = { run: "spar run", board: "spar board", logs: "spar seat log" };
+		const extra = { entrypoint: opt("--entrypoint"), label: titles[opt("--entrypoint")], env };
 		const placement = opt("--placement");
 		if (!placement) {
 			world.popups = [...(world.popups ?? []), extra];
@@ -100,7 +101,8 @@ switch (cmd) {
 	case "pane report-metadata": {
 		const p = pane(args[2]);
 		if (!p) fail("pane_not_found");
-		p.tokens = { ...(p.tokens ?? {}), ...Object.fromEntries(opts("--token").map((t) => [t.slice(0, t.indexOf("=")), t.slice(t.indexOf("=") + 1)])) };
+		// herdr cuts token values at 80 characters.
+		p.tokens = { ...(p.tokens ?? {}), ...Object.fromEntries(opts("--token").map((t) => [t.slice(0, t.indexOf("=")), t.slice(t.indexOf("=") + 1, t.indexOf("=") + 81)])) };
 		ok({ type: "ok" });
 	}
 	default:

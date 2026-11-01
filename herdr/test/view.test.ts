@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { afterEach, test } from "node:test";
 import type { Brief } from "../src/spar.ts";
 import { renderView } from "../src/view.ts";
-import { wrap } from "../src/wrap.ts";
+import { displayWidth, wrap } from "../src/wrap.ts";
 import { cleanup, installHerdr, installSpar, MAIN, status } from "./helpers.ts";
 
 afterEach(cleanup);
@@ -65,6 +65,13 @@ test("a short pane drops events first and keeps the header and next command", ()
 	assert.ok(!lines.some((l) => l.text === "recent"));
 });
 
+test("wrap measures display width: wide characters take two columns", () => {
+	assert.equal(displayWidth("\x1b[1m漢字\x1b[22m ab"), 7);
+	const lines = wrap(`task: ${"漢字テスト".repeat(10)}`, 20);
+	for (const l of lines) assert.ok(displayWidth(l) <= 20, `${displayWidth(l)}: ${l}`);
+	assert.equal(lines.join("").replace(/\s|task:/g, ""), "漢字テスト".repeat(10));
+});
+
 test("wrap never exceeds the width and keeps indentation", () => {
 	assert.deepEqual(wrap("  alpha beta gamma", 12, 2), ["  alpha beta", "    gamma"]);
 	for (const l of wrap(`x ${"y".repeat(50)} z`, 10)) assert.ok(l.length <= 10);
@@ -111,7 +118,7 @@ test("the run view reports blocked at a gate, then exits when the run disappears
 	assert.deepEqual(reports[0]!.slice(0, 3), ["pane", "report-agent", "w1:p1"]);
 	assert.equal(reports[0]![reports[0]!.indexOf("--state") + 1], "blocked");
 	const pane = herdr.world().panes[0]!;
-	assert.deepEqual(pane.tokens, { summary: "awaiting_plan_approval", spar_run: "r1", spar_root: ROOT });
+	assert.deepEqual(pane.tokens, { summary: "awaiting_plan_approval", spar_run: "r1" });
 });
 
 test("the run view exits at once when the run is archived", async () => {
@@ -127,6 +134,17 @@ test("the run view backs off on spar errors instead of spinning", async () => {
 	const child = spawn(process.execPath, [MAIN, "run"], { env: { ...process.env, SPAR_HERDR_RUN: "r1", SPAR_HERDR_ROOT: ROOT }, stdio: "ignore" });
 	await new Promise((r) => setTimeout(r, 4_000));
 	child.kill("SIGTERM");
+	// Backoff starts at 2 s and doubles; a loop without it would make hundreds of calls.
 	const calls = spar.argv().filter((a) => a[0] === "status").length;
-	assert.ok(calls >= 2 && calls <= 3, `${calls} status calls in 4s`);
+	assert.ok(calls >= 1 && calls <= 5, `${calls} status calls in 4s`);
+});
+
+test("a spar without `spar events` is reported, not retried silently", async () => {
+	const { Feed } = await import("../src/feed.ts");
+	installSpar({ "events --tail-cursor --json": { __exit: 2, __stderr: "error: unrecognized subcommand 'events'" } });
+	const errors: string[] = [];
+	const feed = new Feed({ cwd: ROOT, onEvent: () => {}, onError: (m) => errors.push(m), minBackoffMs: 50 });
+	await feed.start();
+	feed.stop();
+	assert.match(errors[0] ?? "", /unrecognized subcommand 'events'/);
 });

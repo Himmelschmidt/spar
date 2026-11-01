@@ -63,7 +63,7 @@ test("ship passes --confirm once the human confirms in the popup", async () => {
 		"ship r1 --confirm --json": { phase: "done", pr_url: "https://example.test/pr/1" },
 	});
 	installHerdr();
-	const io = scripted(["1", "y", "q"]);
+	const io = scripted(["1", "yes", "q"]);
 	assert.deepEqual(await act(io, config, "r1", ROOT), ["ship"]);
 	assert.deepEqual(spar.argv().find((a) => a[0] === "ship"), ["ship", "r1", "--confirm", "--json"]);
 	assert.match(plain(io), /pr\/1/);
@@ -90,4 +90,29 @@ test("with no run in context the popup offers the runs that need you", async () 
 	assert.match(text, /1\) NEEDS YOU awaiting_plan_approval r1/);
 	assert.doesNotMatch(text, /r2/);
 	assert.match(text, /1\) approve/);
+});
+
+test("only a typed yes confirms; y and YES do not", async () => {
+	const spar = installSpar({
+		"status r1 --json": status("r1", { phase: "awaiting_plan_approval", needs_human: true }),
+		"brief r1 --json": BRIEF,
+		"approve r1 --json": { phase: "plan_approved" },
+	});
+	installHerdr();
+	assert.deepEqual(await act(scripted(["1", "y", "1", "YES", "q"]), config, "r1", ROOT), []);
+	assert.ok(!spar.argv().some((a) => a[0] === "approve"));
+});
+
+test("a verb the run moved past while the operator typed does not run", async () => {
+	const gate = status("r1", { phase: "awaiting_plan_approval", needs_human: true });
+	const spar = installSpar({
+		"status r1 --json": { __seq: [gate, { ...gate, phase: "plan_approved" }] },
+		"brief r1 --json": BRIEF,
+		"approve r1 --json": { phase: "plan_approved" },
+	});
+	installHerdr();
+	const io = scripted(["1", "yes", "q"]);
+	assert.deepEqual(await act(io, config, "r1", ROOT), []);
+	assert.ok(!spar.argv().some((a) => a[0] === "approve"));
+	assert.match(plain(io), /moved to plan_approved; approve no longer applies/);
 });

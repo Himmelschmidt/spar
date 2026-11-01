@@ -1,10 +1,11 @@
 import { spawn } from "node:child_process";
 import { homedir } from "node:os";
+import { createInterface } from "node:readline";
 import { type Config, loadState, saveState, withLock } from "./config.ts";
 import { Feed } from "./feed.ts";
 import { herdr, layoutOf, openPane, PLUGIN_ID, type PaneInfo, pluginContext, SOURCE, snapshot, splitTarget } from "./herdr.ts";
-import { firstLine, flag, isRunId, type RunRow, type RunStatus, sparBin, sparJson } from "./spar.ts";
-import { describeSync, type SyncResult, syncOnce } from "./sync.ts";
+import { clean, firstLine, flag, isRunId, type RunRow, type RunStatus, relevant, sparBin, sparJson } from "./spar.ts";
+import { describeSync, owns, type SyncResult, syncOnce } from "./sync.ts";
 import { age } from "./view.ts";
 import { wrap } from "./wrap.ts";
 
@@ -14,21 +15,22 @@ export interface FocusedRun {
 	workspace: string;
 }
 
-// The run shown in the pane the action was invoked on: the tokens its run view reported,
-// else the plugin's own pane mapping.
+// The run shown in the pane the action was invoked on, if that pane is one of this plugin's
+// run panes. The project root comes from spar by run id: herdr cuts token values at 80
+// characters, so a root carried in a token can be wrong.
 export async function focusedRun(): Promise<FocusedRun | undefined> {
 	const paneId = pluginContext().focused_pane_id ?? process.env.HERDR_PANE_ID;
 	if (!paneId) return undefined;
 	const got = await herdr(["pane", "get", paneId]);
 	if (!got.ok) return undefined;
 	const pane = got.result.pane as PaneInfo | undefined;
-	if (!pane) return undefined;
-	const tokens = pane.tokens ?? {};
-	if (tokens.spar_run && tokens.spar_root && isRunId(tokens.spar_run)) {
-		return { id: tokens.spar_run, root: tokens.spar_root, workspace: pane.workspace_id };
-	}
-	const mapped = Object.entries(loadState().runs).find(([, r]) => r.pane_id === paneId);
-	return mapped ? { id: mapped[0], root: mapped[1].root, workspace: pane.workspace_id } : undefined;
+	const id = pane?.tokens?.spar_run;
+	if (!pane || !id || !isRunId(id) || !owns(pane, id)) return undefined;
+	const status = await sparJson<RunStatus>(["status", id, "--json"], homedir());
+	if (!status.ok) throw new Error(`spar status ${id}: ${status.message}`);
+	const root = status.value.project_root;
+	if (!root) throw new Error(`spar status ${id} names no project root`);
+	return { id, root, workspace: pane.workspace_id };
 }
 
 export async function openActPopup(): Promise<void> {
@@ -70,7 +72,12 @@ export async function followLog(id: string, root: string, slot: string): Promise
 	const pane = process.env.HERDR_PANE_ID;
 	if (pane) await herdr(["pane", "report-metadata", pane, "--source", SOURCE, "--title", `${id} ${slot}`, "--token", `spar_log=${id}/${slot}`]);
 	process.stdout.write(`spar logs ${id} ${slot} --follow\n`);
-	const child = spawn(sparBin(), ["logs", id, slot, "--follow"], { cwd: root, stdio: ["ignore", "inherit", "inherit"] });
+	// Line by line through `clean`: a seat's raw output could otherwise carry escape
+	// sequences that repaint the pane or spoof the agent state herdr reads from it.
+	const child = spawn(sparBin(), ["logs", id, slot, "--follow"], { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
+	for (const stream of [child.stdout, child.stderr]) {
+		createInterface({ input: stream }).on("line", (line) => process.stdout.write(`${clean(line)}\n`));
+	}
 	const quit = () => {
 		child.kill("SIGTERM");
 		process.exit(0);
@@ -88,7 +95,8 @@ export async function ensureBoard(): Promise<void> {
 	const state = loadState();
 	if (state.board_pane) {
 		const got = await herdr(["pane", "get", state.board_pane]);
-		if (got.ok && (got.result.pane as PaneInfo | undefined)?.tokens?.spar_board) return;
+		const pane = got.ok ? (got.result.pane as PaneInfo | undefined) : undefined;
+		if (pane?.tokens?.spar_board && pane.label === "spar board") return;
 	}
 	const snap = await snapshot();
 	const workspace = pluginContext().workspace_id ?? snap.focused_workspace_id ?? snap.workspaces[0]?.workspace_id;
@@ -124,6 +132,7 @@ export async function runBoard(config: Config): Promise<void> {
 		saveState(state);
 	}
 	const feeds = new Map<string, Feed>();
+	const feedErrors = new Map<string, string>();
 	let runs: RunRow[] = [];
 	let last = "syncing...";
 	let timer: NodeJS.Timeout | undefined;
@@ -134,7 +143,8 @@ export async function runBoard(config: Config): Promise<void> {
 	const draw = () => {
 		const width = Math.max(20, process.stdout.columns || 80);
 		const height = Math.max(3, process.stdout.rows || 24);
-		process.stdout.write(`\x1b[H\x1b[2J${boardLines(runs, last, new Date(), width).slice(0, height).join("\n")}`);
+		const status = feedErrors.size ? `${last}\nspar events unavailable (${process.env.SPAR_BIN || "spar"} too old?): ${[...feedErrors.values()][0]}` : last;
+		process.stdout.write(`\x1b[H\x1b[2J${boardLines(runs, status, new Date(), width).slice(0, height).join("\n")}`);
 	};
 	const schedule = (ms: number) => {
 		const at = Date.now() + ms;
@@ -156,10 +166,20 @@ export async function runBoard(config: Config): Promise<void> {
 			const result: SyncResult | undefined = await withLock(() => syncOnce(config));
 			if (result) {
 				const now = new Date();
-				runs = result.runs.filter((r) => flag(r, now) !== "" || now.getTime() - Date.parse(r.updated_at) < config.recent_hours * 3_600_000);
+				runs = result.runs.filter((r) => relevant(r, now, config.recent_hours * 3_600_000));
 				for (const root of new Set(result.runs.map((r) => r.project_root!))) {
 					if (feeds.has(root)) continue;
-					const feed = new Feed({ cwd: root, onEvent: (e) => ["phase", "gate", "abandoned", "archived"].includes(e.type) && schedule(2_000) });
+					const feed = new Feed({
+						cwd: root,
+						onEvent: (e) => {
+							feedErrors.delete(root);
+							if (["phase", "gate", "abandoned", "archived"].includes(e.type)) schedule(2_000);
+						},
+						onError: (message) => {
+							feedErrors.set(root, message);
+							draw();
+						},
+					});
 					feeds.set(root, feed);
 					void feed.start();
 				}

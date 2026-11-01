@@ -134,7 +134,7 @@ export interface Reported {
 	phase?: string;
 }
 
-export async function report(pane: string, status: RunStatus, root: string, now: Date, last: Reported): Promise<void> {
+export async function report(pane: string, status: RunStatus, now: Date, last: Reported): Promise<void> {
 	const state = agentState(status, now);
 	if (state === last.state && status.phase === last.phase) return;
 	const agent = await herdr(["pane", "report-agent", pane, "--source", SOURCE, "--agent", AGENT, "--state", state, "--message", status.phase]);
@@ -154,8 +154,6 @@ export async function report(pane: string, status: RunStatus, root: string, now:
 		`summary=${status.phase}`,
 		"--token",
 		`spar_run=${status.id}`,
-		"--token",
-		`spar_root=${root}`,
 	]);
 	if (agent.ok && meta.ok) {
 		last.state = state;
@@ -231,7 +229,7 @@ export async function runView(id: string, root: string): Promise<void> {
 			if (status.archived_at) return finish(0);
 			const b = await sparJson<Brief>(["brief", id, "--json"], root);
 			if (b.ok) brief = b.value;
-			if (pane) await report(pane, status, root, new Date(), reported);
+			if (pane) await report(pane, status, new Date(), reported);
 		} else if (next.notFound && ++missing >= MISSING_CONFIRMATIONS) {
 			return finish(0);
 		} else {

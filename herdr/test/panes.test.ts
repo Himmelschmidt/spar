@@ -16,7 +16,7 @@ function runPaneWorld() {
 	return installHerdr({
 		workspaces: [{ workspace_id: "w1", label: "alpha" }],
 		tabs: [{ tab_id: "w1:t1", workspace_id: "w1", label: "spar" }],
-		panes: [{ pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", cwd: ROOT, tokens: { spar_run: "r1", spar_root: ROOT } }],
+		panes: [{ pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", cwd: ROOT, label: "spar run", tokens: { spar_run: "r1" } }],
 	});
 }
 
@@ -24,6 +24,7 @@ test("seat logs open one pane per current-round seat in a logs tab", async () =>
 	installSpar({
 		"status r1 --json": status("r1", {
 			round: 2,
+			project_root: ROOT,
 			slots: [
 				{ id: "impl", role: "implementer", provider: "cli:muse", status: "running", round: 2 },
 				{ id: "review-0", role: "reviewer", provider: "cli:claude", status: "done", round: 2 },
@@ -48,8 +49,25 @@ test("seat logs refuse a pane that is not a run pane", async () => {
 });
 
 test("act opens the popup entrypoint for the focused run", async () => {
-	installSpar({});
+	installSpar({ "status r1 --json": status("r1", { project_root: ROOT }) });
 	const herdr = runPaneWorld();
 	await openActPopup();
 	assert.deepEqual(herdr.world().popups, [{ entrypoint: "act", env: { SPAR_HERDR_RUN: "r1", SPAR_HERDR_ROOT: ROOT } }]);
+});
+
+test("the root comes from spar by run id, not from a token herdr may cut at 80 characters", async () => {
+	const root = `${ROOT}/${"deep/".repeat(20)}project`;
+	installSpar({ "status r1 --json": status("r1", { project_root: root }) });
+	const herdr = runPaneWorld();
+	await openActPopup();
+	assert.equal(herdr.world().popups![0]!.env.SPAR_HERDR_ROOT, root);
+	assert.ok(root.length > 80);
+});
+
+test("a user pane is never taken for a run pane", async () => {
+	installSpar({ "status r1 --json": status("r1", { project_root: ROOT }) });
+	process.env.HERDR_PLUGIN_CONTEXT_JSON = JSON.stringify({ focused_pane_id: "w1:p1" });
+	const herdr = installHerdr({ workspaces: [], tabs: [], panes: [{ pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1", tokens: { spar_run: "r1" } }] });
+	await openActPopup();
+	assert.deepEqual(herdr.world().popups, [{ entrypoint: "act", env: {} }]);
 });
