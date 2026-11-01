@@ -25,9 +25,8 @@ test("parses O146 event lines and skips anything else", () => {
 	assert.equal(parseFeedLine(JSON.stringify({ type: "phase" })), undefined);
 });
 
-test("feed args resume from the last cursor", () => {
-	assert.deepEqual(feedArgs(undefined), ["events", "--follow", "--json"]);
-	assert.deepEqual(feedArgs("1,r1:42,r2:7"), ["events", "--follow", "--json", "--since", "1,r1:42,r2:7"]);
+test("feed args follow from a cursor and die with their parent", () => {
+	assert.deepEqual(feedArgs("1,r1:42,r2:7"), ["events", "--follow", "--json", "--exit-on-stdin-eof", "--since", "1,r1:42,r2:7"]);
 });
 
 test("reconnects with --since the last cursor after the child exits, and stop kills it", async () => {
@@ -49,7 +48,11 @@ test("reconnects with --since the last cursor after the child exits, and stop ki
 	}
 	assert.deepEqual(
 		fake.calls().filter((c) => c.startsWith("events")),
-		["events --follow --json", "events --follow --json --since 1,r1:20"],
+		[
+			"events --tail-cursor --json",
+			"events --follow --json --exit-on-stdin-eof --since 1",
+			"events --follow --json --exit-on-stdin-eof --since 1,r1:20",
+		],
 	);
 	assert.equal(connects, 2);
 	assert.equal(feed.cursor, "1,r1:30");
@@ -61,4 +64,91 @@ test("reconnects with --since the last cursor after the child exits, and stop ki
 	await until(() => !alive(pid));
 	assert.equal(feed.running, false);
 	await until(() => process.listenerCount("exit") === exitListeners);
+});
+
+test("a follower that drops before its first event resumes from the tail cursor, not from now", async () => {
+	const fake = installFake({
+		"events --tail-cursor --json": { cursor: "1,r1:5" },
+		events: [{ lines: [] }, { lines: [event("1,r1:9")], hold: true }],
+	});
+	const seen: FeedEvent[] = [];
+	const feed = new EventFeed({ cwd: fake.dir, onEvent: (e) => seen.push(e), minBackoffMs: 10 });
+	await feed.start();
+	try {
+		await until(() => seen.length === 1);
+	} finally {
+		feed.stop();
+	}
+	assert.deepEqual(
+		fake.calls().filter((c) => c.startsWith("events")),
+		[
+			"events --tail-cursor --json",
+			"events --follow --json --exit-on-stdin-eof --since 1,r1:5",
+			"events --follow --json --exit-on-stdin-eof --since 1,r1:5",
+		],
+	);
+});
+
+test("the follower exits when its parent's stdin pipe closes", async () => {
+	const fake = installFake({ events: [{ lines: [], hold: true }] });
+	const feed = new EventFeed({ cwd: fake.dir, onEvent: () => {}, minBackoffMs: 10_000 });
+	await feed.start();
+	await until(() => fake.pid(0) !== undefined);
+	const pid = fake.pid(0)!;
+	const child = (feed as unknown as { child: import("node:child_process").ChildProcess }).child;
+	child.stdin!.end();
+	try {
+		await until(() => !alive(pid));
+	} finally {
+		feed.stop();
+	}
+});
+
+test("a failed tail-cursor read retries instead of following from now", async () => {
+	const fake = installFake({
+		"events --tail-cursor --json": { __seq: [{ __exit: 1, __stderr: "error: boom" }, { cursor: "1,r1:3" }] },
+		events: [{ lines: [], hold: true }],
+	});
+	const feed = new EventFeed({ cwd: fake.dir, onEvent: () => {}, minBackoffMs: 10 });
+	await feed.start();
+	try {
+		await until(() => fake.calls().some((c) => c.startsWith("events --follow")));
+	} finally {
+		feed.stop();
+	}
+	assert.deepEqual(
+		fake.calls().filter((c) => c.startsWith("events")),
+		["events --tail-cursor --json", "events --tail-cursor --json", "events --follow --json --exit-on-stdin-eof --since 1,r1:3"],
+	);
+});
+
+test("lines already buffered when the feed stops are not delivered", async () => {
+	const fake = installFake({ events: [{ lines: [event("1,r1:1"), event("1,r1:2"), event("1,r1:3")], hold: true }] });
+	const seen: FeedEvent[] = [];
+	const feed = new EventFeed({
+		cwd: fake.dir,
+		onEvent: (e) => {
+			seen.push(e);
+			feed.stop();
+		},
+	});
+	await feed.start();
+	await until(() => seen.length > 0);
+	await new Promise((r) => setTimeout(r, 100));
+	assert.equal(seen.length, 1);
+});
+
+test("a cursor too long to exec stops the feed once with a message instead of crashing", async () => {
+	const fake = installFake({ events: [{ lines: [], hold: true }] });
+	const fatal: string[] = [];
+	const feed = new EventFeed({ cwd: fake.dir, onEvent: () => {}, onFatal: (m) => fatal.push(m), minBackoffMs: 10 });
+	feed.cursor = `1,${"r".repeat(200_000)}:1`;
+	await feed.start();
+	await new Promise((r) => setTimeout(r, 100));
+	assert.equal(fatal.length, 1);
+	assert.match(fatal[0]!, /^spar: the events feed stopped: its resume cursor is too long/);
+	assert.equal(feed.running, false);
+	assert.deepEqual(fake.calls().filter((c) => c.startsWith("events")), []);
+	await feed.start();
+	assert.equal(fatal.length, 1);
 });

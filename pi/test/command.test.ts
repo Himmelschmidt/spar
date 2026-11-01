@@ -85,14 +85,15 @@ test("/spar <unknown id> reports the spar error", async () => {
 	assert.equal(out, "spar: error: no fake response for \"status zzzz --json\"\n");
 });
 
-test("argument completion offers run ids, waiting runs first", async () => {
+test("argument completion offers run ids, waiting runs first, then verbs", async () => {
 	const f = fake();
 	process.chdir(f.dir);
 	const items = await load().getArgumentCompletions!("");
 	assert.deepEqual(
-		items?.map((i) => i.value),
-		["bbbb2222", "aaaa1111"],
+		items?.slice(0, 3).map((i) => i.value),
+		["bbbb2222", "aaaa1111", "approve "],
 	);
+	assert.equal(items?.length, 2 + 12);
 	assert.deepEqual(
 		(await load().getArgumentCompletions!("aa"))?.map((i) => i.value),
 		["aaaa1111"],

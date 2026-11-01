@@ -624,8 +624,17 @@ fn run() -> Result<ExitCode> {
             run_id,
             follow,
             since,
+            tail_cursor,
+            exit_on_stdin_eof,
             json,
-        } => events_cmd(run_id, follow, since.as_deref(), json),
+        } => events_cmd(
+            run_id,
+            follow,
+            since.as_deref(),
+            tail_cursor,
+            exit_on_stdin_eof,
+            json,
+        ),
         Command::Wait {
             run_id,
             timeout,
@@ -2179,8 +2188,11 @@ fn stop_one(run_id: &str, json: bool) -> Result<ExitCode> {
     let state = state::RunState::load_for_display(&paths, run_id)?;
 
     // A finished or gated run is already at rest: never downgrade it to Stopped or
-    // drop a resumable marker that would make a later `implement --run` redo work.
-    if phase_at_rest(state.phase) {
+    // drop a resumable marker that would make a later `implement --run` redo work. A gate
+    // with a live lock holder is not at rest: `spar reconcile` parks the run at
+    // `awaiting_reconcile` while it dispatches, and stopping it must reap that.
+    let live_at_gate = state.phase.is_gate() && state::orchestrator_alive(&paths, run_id);
+    if phase_at_rest(state.phase) && !live_at_gate {
         if json {
             let v = run_status_json(&paths, &cfg, &state)?;
             println!("{}", serde_json::to_string_pretty(&v)?);
@@ -2211,6 +2223,11 @@ fn stop_one(run_id: &str, json: bool) -> Result<ExitCode> {
         if json {
             let v = run_status_json(&paths, &cfg, &state)?;
             println!("{}", serde_json::to_string_pretty(&v)?);
+        } else if live_at_gate {
+            println!(
+                "stopped the process driving run {run_id}; run left at {:?}",
+                state.phase
+            );
         } else {
             println!(
                 "run {run_id} finished at {:?} before stop took effect; left as-is",
@@ -2490,6 +2507,8 @@ fn events_cmd(
     run_id: Option<String>,
     follow: bool,
     since: Option<&str>,
+    tail_cursor: bool,
+    exit_on_stdin_eof: bool,
     json: bool,
 ) -> Result<ExitCode> {
     let (paths, _) = project_ctx()?;
@@ -2500,6 +2519,21 @@ fn events_cmd(
         if !paths.run_dir(id).is_dir() {
             anyhow::bail!("no run {id} in this project");
         }
+    }
+    if tail_cursor {
+        let cursor = events::Feed::at_tail(&paths, run_id)?.cursor();
+        if json {
+            println!("{}", serde_json::json!({ "cursor": cursor }));
+        } else {
+            println!("{cursor}");
+        }
+        return Ok(ExitCode::Success);
+    }
+    if exit_on_stdin_eof {
+        std::thread::spawn(|| {
+            let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+            std::process::exit(0);
+        });
     }
     let mut feed = match since {
         Some("now") => events::Feed::at_tail(&paths, run_id)?,

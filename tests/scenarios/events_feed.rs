@@ -335,3 +335,96 @@ fn resume_from_cursor_has_no_loss_or_duplicates_under_concurrent_appends() {
     written.sort();
     assert_eq!(deduped, written, "no loss");
 }
+
+/// `--tail-cursor` names the current end of every log without printing an event, so a
+/// follower started `--since` it misses nothing, even a run created in between.
+#[test]
+fn tail_cursor_starts_a_follower_with_no_gap() {
+    let (_tmp, proj) = project();
+    append_raw(&proj, "aaaa0001", &line(1, "a0"));
+    append_raw(&proj, "bbbb0002", &line(2, "b0"));
+    let backlog = events(&proj, &[]);
+
+    let out = common::spar()
+        .current_dir(&proj)
+        .args(["events", "--tail-cursor", "--json"])
+        .assert()
+        .code(0);
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    let v: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v.as_object().unwrap().len(), 1, "{v}");
+    let cursor = v["cursor"].as_str().unwrap().to_string();
+    assert_eq!(cursor, last_cursor(&backlog));
+
+    append_raw(&proj, "aaaa0001", &line(3, "a1"));
+    append_raw(&proj, "cccc0003", &line(4, "c0"));
+    let follower = Follower::start(&proj, &["--since", &cursor]);
+    assert_eq!(tags(&[follower.next()]), ["aaaa0001/a1"]);
+    assert_eq!(tags(&[follower.next()]), ["cccc0003/c0"]);
+
+    let plain = common::spar()
+        .current_dir(&proj)
+        .args(["events", "--tail-cursor"])
+        .assert()
+        .code(0);
+    assert_eq!(
+        String::from_utf8_lossy(&plain.get_output().stdout).trim(),
+        last_cursor(&events(&proj, &[]))
+    );
+    for conflict in [["--follow"], ["--since=now"]] {
+        common::spar()
+            .current_dir(&proj)
+            .args(["events", "--tail-cursor"])
+            .args(conflict)
+            .assert()
+            .code(1);
+    }
+}
+
+#[test]
+fn follow_exits_on_stdin_eof_only_when_asked() {
+    let (_tmp, proj) = project();
+    let spawn = |extra: &[&str]| {
+        common::spar_std()
+            .current_dir(&proj)
+            .args(["events", "--follow", "--json"])
+            .args(extra)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    let wait = |child: &mut std::process::Child, secs: u64| {
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(secs) {
+            if let Some(status) = child.try_wait().unwrap() {
+                return Some(status);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        None
+    };
+
+    let mut asked = spawn(&["--exit-on-stdin-eof"]);
+    let mut plain = spawn(&[]);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(asked.try_wait().unwrap().is_none(), "still following");
+    drop(asked.stdin.take());
+    drop(plain.stdin.take());
+    let status = wait(&mut asked, 10).expect("exited on stdin EOF");
+    assert!(status.success(), "{status:?}");
+    assert!(
+        wait(&mut plain, 1).is_none(),
+        "keeps following without the flag"
+    );
+    let _ = plain.kill();
+    let _ = plain.wait();
+
+    common::spar()
+        .current_dir(&proj)
+        .args(["events", "--exit-on-stdin-eof"])
+        .assert()
+        .code(1);
+}

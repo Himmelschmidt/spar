@@ -8,16 +8,22 @@ const line = args.join(" ");
 fs.appendFileSync(path.join(dir, "calls.log"), `${line}\n`);
 const responses = JSON.parse(fs.readFileSync(path.join(dir, "responses.json"), "utf8"));
 
-if (args[0] === "events") {
+if (args[0] === "events" && args.includes("--follow")) {
 	const previous = fs
 		.readFileSync(path.join(dir, "calls.log"), "utf8")
 		.split("\n")
-		.filter((l) => l.startsWith("events")).length - 1;
+		.filter((l) => l.startsWith("events --follow")).length - 1;
 	const sessions = responses.events ?? [];
 	const session = sessions[Math.min(previous, sessions.length - 1)] ?? { lines: [] };
 	fs.writeFileSync(path.join(dir, `events-${previous}.pid`), String(process.pid));
 	for (const l of session.lines) process.stdout.write(`${typeof l === "string" ? l : JSON.stringify(l)}\n`);
-	if (session.hold) setInterval(() => {}, 1000);
+	if (session.hold) {
+		const timer = setInterval(() => {}, 1000);
+		if (args.includes("--exit-on-stdin-eof")) {
+			process.stdin.on("end", () => clearInterval(timer));
+			process.stdin.resume();
+		}
+	}
 	return;
 }
 
@@ -37,7 +43,10 @@ if (value && typeof value === "object" && Array.isArray(value.__seq)) {
 	value = value.__seq[Math.min(n, value.__seq.length - 1)];
 }
 if (value && typeof value === "object" && "__exit" in value) {
-	process.stderr.write(`${value.__stderr ?? "error"}\n`);
+	if (value.__stdout !== undefined) {
+		process.stdout.write(typeof value.__stdout === "string" ? value.__stdout : JSON.stringify(value.__stdout));
+	}
+	if (value.__stderr !== null) process.stderr.write(`${value.__stderr ?? "error"}\n`);
 	process.exit(value.__exit);
 }
 process.stdout.write(JSON.stringify(value));

@@ -1,7 +1,7 @@
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder, getSelectListTheme } from "@earendil-works/pi-coding-agent";
-import { Container, Key, matchesKey, SelectList, Text, truncateToWidth } from "@earendil-works/pi-tui";
-import type { ListRow, Paint } from "./format.ts";
+import { Container, Key, type KeyId, matchesKey, SelectList, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { actionLines, type ListRow, type Paint } from "./format.ts";
 
 export function themePaint(theme: Theme): Paint {
 	return (tone, text) => theme.fg(tone, text);
@@ -50,16 +50,29 @@ export function pickRun(
 	}, OVERLAY);
 }
 
-export type DetailResult = "back" | "close";
+export interface DetailAction {
+	key: KeyId;
+	label: string;
+	id: string;
+}
 
-export function showDetail(ctx: ExtensionContext, build: (paint: Paint) => string[]): Promise<DetailResult> {
+export type DetailResult = "back" | "close" | { action: string };
+
+export function showDetail(
+	ctx: ExtensionContext,
+	build: (paint: Paint) => string[],
+	actions: DetailAction[] = [],
+): Promise<DetailResult> {
 	return ctx.ui.custom<DetailResult>((tui, theme, keybindings, done) => {
 		const lines = build(themePaint(theme));
 		let top = 0;
-		const viewport = () => Math.max(3, overlayRows(tui.terminal.rows) - 3);
+		let actionRows = actions.length ? 1 : 0;
+		const viewport = () => Math.max(3, overlayRows(tui.terminal.rows) - 3 - actionRows);
 		const maxTop = () => Math.max(0, lines.length - viewport());
 		return {
 			render(width: number): string[] {
+				const hint = actionLines(actions, width, (key) => theme.fg("accent", key)).map((l) => truncateToWidth(l, width));
+				actionRows = hint.length;
 				const height = viewport();
 				const rule = theme.fg("accent", "-".repeat(width));
 				const shown = lines.slice(top, top + height).map((l) => truncateToWidth(l, width));
@@ -67,6 +80,7 @@ export function showDetail(ctx: ExtensionContext, build: (paint: Paint) => strin
 				return [
 					rule,
 					...shown,
+					...hint,
 					truncateToWidth(theme.fg("dim", `${more} up/down scroll, pgup/pgdn page, b back, esc closes`), width),
 					rule,
 				];
@@ -78,6 +92,8 @@ export function showDetail(ctx: ExtensionContext, build: (paint: Paint) => strin
 					return done("close");
 				}
 				if (matchesKey(data, "b")) return done("back");
+				const action = actions.find((a) => matchesKey(data, a.key));
+				if (action) return done({ action: action.id });
 				if (keybindings.matches(data, "tui.select.up")) top = Math.max(0, top - 1);
 				else if (keybindings.matches(data, "tui.select.down")) top = Math.min(maxTop(), top + 1);
 				else if (keybindings.matches(data, "tui.select.pageUp")) top = Math.max(0, top - page);

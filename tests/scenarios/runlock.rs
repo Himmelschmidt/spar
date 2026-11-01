@@ -284,3 +284,109 @@ fn detach_reentry_proceeds_once_the_lock_is_free() {
     let v: Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(v["run_id"], Value::String(run_id));
 }
+
+fn arena_at_winner_confirm(dir: &std::path::Path) -> String {
+    let out = spar_cmd()
+        .current_dir(dir)
+        .args([
+            "run",
+            "--workflow",
+            "arena",
+            "--task",
+            "add a hello world module",
+            "--providers",
+            "cli:claude,cli:codex",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["phase"], "awaiting_winner_confirm");
+    v["run_id"].as_str().unwrap().to_string()
+}
+
+/// `confirm` rewrites the run's phase and winner; while `spar reconcile` holds the lock
+/// (the run parked at `awaiting_reconcile` under it) it must refuse, not race it.
+#[test]
+fn confirm_refuses_while_the_run_lock_is_held() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let run_id = arena_at_winner_confirm(tmp.path());
+    let state_path = tmp
+        .path()
+        .join(".spar/runs")
+        .join(&run_id)
+        .join("state.json");
+    let before = std::fs::read(&state_path).unwrap();
+    let lock = hold_run_lock(tmp.path(), &run_id);
+
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["confirm", &run_id, "--json"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "already has a running orchestrator",
+        ));
+    assert_eq!(before, std::fs::read(&state_path).unwrap());
+
+    drop(lock);
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["confirm", &run_id, "--json"])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("awaiting_ship_confirm"));
+}
+
+/// A gate whose lock holder is alive is not at rest: `spar stop` reaps the holder and
+/// leaves the run at its gate. With no live holder it stays a no-op.
+#[test]
+fn stop_reaps_a_live_process_holding_a_gate() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let run_id = arena_at_winner_confirm(tmp.path());
+    let lock_path = tmp
+        .path()
+        .join(".spar/runs")
+        .join(&run_id)
+        .join("orchestrator.lock");
+
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["stop", &run_id])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("nothing to stop"));
+
+    let mut holder = Command::new("sleep").arg("60").spawn().unwrap();
+    std::fs::write(&lock_path, holder.id().to_string()).unwrap();
+    let out = spar_cmd()
+        .current_dir(tmp.path())
+        .args(["stop", &run_id, "--json"])
+        .assert()
+        .code(0)
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["phase"], "awaiting_winner_confirm");
+    let start = std::time::Instant::now();
+    while holder.try_wait().unwrap().is_none() {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(15),
+            "holder still alive"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(!tmp
+        .path()
+        .join(".spar/runs")
+        .join(&run_id)
+        .join("markers/stopped")
+        .exists());
+}
