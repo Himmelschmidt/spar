@@ -183,10 +183,13 @@ pub(crate) fn project_name(root: &Path) -> String {
 }
 
 /// Load registry; optionally register the cwd project. No filesystem path scans.
+/// `current` is registered only once spar has initialized it (it has a `.spar/`): read
+/// commands resolve any git checkout as a project, and must not enroll every repo they
+/// are run in.
 pub fn ensure_known(current: Option<&Path>) -> Registry {
     let mut reg = Registry::load().unwrap_or_default();
     let _ = reg.prune_missing();
-    if let Some(root) = current {
+    if let Some(root) = current.filter(|r| SparPaths::new(*r).root.is_dir()) {
         let _ = reg.touch_project(root, None);
     }
     Registry::load().unwrap_or(reg)
@@ -432,6 +435,24 @@ mod tests {
             .projects
             .iter()
             .any(|p| p.root == canonicalize_best_effort(&proj)));
+    }
+
+    #[test]
+    fn ensure_known_skips_a_checkout_spar_never_initialized() {
+        let tmp = tempdir().unwrap();
+        set_home_override(&tmp.path().join("spar-home"));
+
+        let bare = tmp.path().join("bare-repo");
+        std::fs::create_dir_all(bare.join(".git")).unwrap();
+        assert!(ensure_known(Some(&bare)).projects.is_empty());
+        assert!(
+            !registry_path().exists(),
+            "a read must not write the registry"
+        );
+
+        std::fs::create_dir_all(bare.join(".spar")).unwrap();
+        let reg = ensure_known(Some(&bare));
+        assert_eq!(reg.projects.len(), 1);
     }
 
     #[test]

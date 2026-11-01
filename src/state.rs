@@ -756,6 +756,10 @@ pub struct RunSummary {
     /// How many rounds this run has been through (O45). `1` unless it was continued.
     #[serde(default = "one_round")]
     pub round: u32,
+    /// The run's total reported spend (`stats::run_cost(..).total.cost_usd`), so a run
+    /// list needs no per-run `status <id>` call. `null` when no dispatch reported a cost.
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
     /// Filled when listing across projects (global home).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_root: Option<PathBuf>,
@@ -963,11 +967,13 @@ impl RunState {
 
     pub fn save(&self, paths: &SparPaths) -> Result<()> {
         paths.ensure_run_dirs(&self.id)?;
-        let prev_phase = if paths.state_file(&self.id).is_file() {
-            RunState::load(paths, &self.id).ok().map(|s| s.phase)
+        let prev = if paths.state_file(&self.id).is_file() {
+            RunState::load(paths, &self.id).ok()
         } else {
             None
         };
+        let prev_phase = prev.as_ref().map(|s| s.phase);
+        let prev_archived = prev.is_some_and(|s| s.archived_at.is_some());
         let file = paths.state_file(&self.id);
         let text = serde_json::to_string_pretty(self)?;
         // Written through a temp file in the same directory, then renamed: `state.json`
@@ -980,6 +986,17 @@ impl RunState {
         std::fs::rename(&tmp, &file).with_context(|| format!("replace {}", file.display()))?;
         crate::runlock::note_state_written(paths, &self.id);
 
+        // Archiving moves no phase, so without these a feed client would keep showing an
+        // archived run forever (O146).
+        match (prev_archived, self.archived_at) {
+            (false, Some(at)) => {
+                let _ = crate::events::append(paths, &self.id, &crate::events::Event::archived(at));
+            }
+            (true, None) => {
+                let _ = crate::events::append(paths, &self.id, &crate::events::Event::unarchived());
+            }
+            _ => {}
+        }
         if prev_phase != Some(self.phase) {
             let mut ev = crate::events::Event::phase(self.phase, prev_phase);
             ev.round = Some(self.round);
@@ -1454,7 +1471,9 @@ pub fn list_runs(paths: &SparPaths) -> Result<Vec<RunSummary>> {
             continue;
         };
         let live = state.liveness(paths);
+        let cost_usd = crate::stats::run_cost(&state).total.cost_usd;
         out.push(RunSummary {
+            cost_usd,
             // `RunState::abandoned` without asking the lock and the queue twice: a
             // run holding no seat is neither alive nor queued.
             abandoned: !live.holds_seat && is_abandoned(state.phase, false),

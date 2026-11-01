@@ -4629,7 +4629,7 @@ pub fn wait_run(
         if follow && !json {
             let (off, evs) = crate::events::read_from_offset(paths, run_id, event_off)?;
             event_off = off;
-            for ev in evs {
+            for (_, ev) in evs {
                 println!("{}", ev.display_line());
             }
             if last_phase != Some(state.phase) {

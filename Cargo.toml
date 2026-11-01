@@ -203,5 +203,9 @@ name = "launch_surface"
 path = "tests/scenarios/launch_surface.rs"
 
 [[test]]
+name = "events_feed"
+path = "tests/scenarios/events_feed.rs"
+
+[[test]]
 name = "bare_spar"
 path = "tests/scenarios/bare_spar.rs"

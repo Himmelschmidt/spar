@@ -600,7 +600,11 @@ fn run() -> Result<ExitCode> {
             archived,
             hosts,
             all_hosts,
+            here,
         } => {
+            if here {
+                return status_here_cmd(json);
+            }
             if !hosts.is_empty() || all_hosts {
                 if run_id.is_some() {
                     anyhow::bail!("--hosts / --all-hosts list runs; drop the run id");
@@ -616,6 +620,12 @@ fn run() -> Result<ExitCode> {
             include_dry_run,
             json,
         } => stats_cmd(since.as_deref(), by, all_projects, include_dry_run, json),
+        Command::Events {
+            run_id,
+            follow,
+            since,
+            json,
+        } => events_cmd(run_id, follow, since.as_deref(), json),
         Command::Wait {
             run_id,
             timeout,
@@ -1492,6 +1502,26 @@ fn stats_cmd(
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         stats::print_human(&report);
+    }
+    Ok(ExitCode::Success)
+}
+
+/// `spar status --here`: which project this directory is, and whether spar has
+/// initialized it. Any git checkout resolves as a project root, but only one holding a
+/// `.spar/` has ever run spar.
+fn status_here_cmd(json: bool) -> Result<ExitCode> {
+    let root = paths::find_project_root().ok();
+    let initialized = root
+        .as_ref()
+        .is_some_and(|r| paths::SparPaths::new(r).root.is_dir());
+    if json {
+        let v = serde_json::json!({"project_root": root, "spar_initialized": initialized});
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        match &root {
+            Some(r) => println!("project: {} (spar_initialized: {initialized})", r.display()),
+            None => println!("not inside a project"),
+        }
     }
     Ok(ExitCode::Success)
 }
@@ -2453,6 +2483,56 @@ fn truncate_cli(s: &str, max: usize) -> String {
     } else {
         let t: String = s.chars().take(max.saturating_sub(1)).collect();
         format!("{t}…")
+    }
+}
+
+fn events_cmd(
+    run_id: Option<String>,
+    follow: bool,
+    since: Option<&str>,
+    json: bool,
+) -> Result<ExitCode> {
+    let (paths, _) = project_ctx()?;
+    if let Some(id) = &run_id {
+        if !events::valid_run_id(id) {
+            anyhow::bail!("invalid run id: {id}");
+        }
+        if !paths.run_dir(id).is_dir() {
+            anyhow::bail!("no run {id} in this project");
+        }
+    }
+    let mut feed = match since {
+        Some("now") => events::Feed::at_tail(&paths, run_id)?,
+        None if follow => events::Feed::at_tail(&paths, run_id)?,
+        Some(cursor) => events::Feed::from_cursor(cursor, run_id)?,
+        None => events::Feed::from_cursor("", run_id)?,
+    };
+    let mut out = std::io::stdout().lock();
+    loop {
+        let polled = feed.poll(&paths, |line| {
+            let text = if json {
+                serde_json::to_string(&line)?
+            } else {
+                format!("{} {}", line.run_id, line.event.display_line())
+            };
+            writeln!(out, "{text}")?;
+            out.flush()?;
+            Ok(())
+        });
+        if let Err(e) = polled {
+            let closed = e
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe);
+            return if closed {
+                Ok(ExitCode::Success)
+            } else {
+                Err(e)
+            };
+        }
+        if !follow {
+            return Ok(ExitCode::Success);
+        }
+        std::thread::sleep(Duration::from_millis(250));
     }
 }
 

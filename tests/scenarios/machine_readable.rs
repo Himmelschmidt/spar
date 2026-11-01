@@ -453,3 +453,63 @@ fn an_unwritable_history_never_stops_a_sweep() {
     );
     assert!(!tmp.path().join(".spar/runs").join(&run_id).exists());
 }
+
+/// The front-end probe (O145): `status --here` names the project and whether spar has
+/// initialized it, and neither it nor a plain `status --json` registers a checkout spar
+/// has never run in. List rows carry `cost_usd` so a run list needs no per-run call.
+#[test]
+fn status_here_probes_without_registering_and_rows_carry_cost() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path().join("repo");
+    std::fs::create_dir_all(&dir).unwrap();
+    init_repo(&dir);
+    let home = tmp.path().join("home");
+    let cmd = || {
+        let mut c = spar_cmd();
+        c.env("SPAR_HOME", &home).current_dir(&dir);
+        c
+    };
+
+    let here = cmd()
+        .args(["status", "--here", "--json"])
+        .assert()
+        .success();
+    let v = json(&here);
+    assert_eq!(v["spar_initialized"], false);
+    let root = PathBuf::from(v["project_root"].as_str().unwrap());
+    assert_eq!(
+        std::fs::canonicalize(root).unwrap(),
+        std::fs::canonicalize(&dir).unwrap()
+    );
+    let list = cmd().args(["status", "--json"]).assert().success();
+    assert_eq!(json(&list), serde_json::json!([]));
+    assert!(
+        !home.join("registry.json").exists(),
+        "a read in an uninitialized checkout must not register it"
+    );
+
+    cmd()
+        .args([
+            "plan",
+            "--task",
+            "t",
+            "--providers",
+            "cli:claude",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2);
+    let here = cmd()
+        .args(["status", "--here", "--json"])
+        .assert()
+        .success();
+    assert_eq!(json(&here)["spar_initialized"], true);
+    let rows = json(&cmd().args(["status", "--json"]).assert().success());
+    let row = &rows.as_array().unwrap()[0];
+    assert!(
+        row.get("cost_usd")
+            .is_some_and(|c| c.is_null() || c.is_f64()),
+        "{row}"
+    );
+}

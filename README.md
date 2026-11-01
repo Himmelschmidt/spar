@@ -171,8 +171,14 @@ spar provider list
 
 ### Human (pi)
 
-The human front end is the `spar-pi` package under `pi/`: a pi extension that reads
-and acts only through `spar <cmd> --json` (O145). Bare `spar` prints help.
+The TUI was removed (O145). The human front end is `spar-pi`, a [pi](https://pi.dev)
+package under [`pi/`](pi/README.md) that reads and acts only through
+`spar <cmd> --json`: a footer with runs in flight, runs waiting on you, paused providers
+and today's cost, plus `/spar` (run list) and `/spar <id>` (run detail).
+
+```bash
+pi -e /path/to/spar/pi
+```
 
 ### Path A — plan, then implement (one run id)
 
