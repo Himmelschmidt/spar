@@ -1,0 +1,18 @@
+{
+  "name": "spar-herdr",
+  "version": "0.1.0",
+  "private": true,
+  "description": "herdr plugin that monitors spar runs: one agent pane per run, gate popup, seat logs",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "typescript": "7.0.2"
+  }
+}

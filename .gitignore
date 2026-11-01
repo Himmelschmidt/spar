@@ -6,3 +6,4 @@
 .env.*
 !.env.example
 pi/node_modules/
+herdr/node_modules/
