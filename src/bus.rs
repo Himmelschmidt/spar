@@ -1430,6 +1430,28 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn human_alert_covers_broadcast_blocked_and_plain_human_chat() {
+        let msg = |to: &str, kind: MsgKind| BusMessage {
+            id: new_id(),
+            ts: Utc::now(),
+            from: "r1:planner".into(),
+            to: to.into(),
+            kind,
+            body: "x".into(),
+            run: Some("r1".into()),
+            subject: None,
+            refs: MsgRefs::default(),
+            requires_ack: false,
+            persist: false,
+            expires_after_round: None,
+            meta: HashMap::new(),
+        };
+        assert!(is_human_alert(&msg("broadcast", MsgKind::Blocked)));
+        assert!(is_human_alert(&msg(HUMAN, MsgKind::Chat)));
+        assert!(!is_human_alert(&msg("broadcast", MsgKind::Chat)));
+    }
+
+    #[test]
     fn send_inbox_reserve() {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
