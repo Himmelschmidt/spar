@@ -5,7 +5,8 @@ import { Text } from "@earendil-works/pi-tui";
 import { type Static, type TSchema, Type } from "typebox";
 import { clean, firstLine, hasControls, jsonLines, parseJson, runSpar, type SparRun } from "./exec.ts";
 import { sortRuns } from "./format.ts";
-import { judgeBash } from "./guard.ts";
+import { actionsFor, VERBS } from "./gates.ts";
+import { type BashVerdict, judgeBash, slashFor } from "./guard.ts";
 import { type BriefDetail, type FleetSeat, modelText, type Outcome, renderDetails, type RunDetail, type StatsDetail, type ToolDetails } from "./renderers.ts";
 import { type BusMessage, isRunId, type Provider, type RunRow, type SparEvent } from "./spar.ts";
 
@@ -41,7 +42,7 @@ export function exitMeaning(code: number | null, phase: string | null): string {
 		case 1:
 			return "failed, or stopped by the operator";
 		case 2:
-			return `waiting on the human at a gate (${phase ?? "gate"}). Gates are the operator's to clear: tell them and give them the next command; do not try to clear it yourself`;
+			return `waiting on the human at a gate (${phase ?? "gate"}). Gates are the operator's to clear: tell them and give them the /spar command; do not try to clear it yourself`;
 		case 3:
 			return "stuck or escalated: the run cannot progress on its own. Read spar_brief and report to the operator";
 		case 4:
@@ -231,6 +232,12 @@ async function nextCommand(id: string, ctx: ExtensionContext, signal: AbortSigna
 async function outcomeOf(run: SparRun, json: RunJson, ctx: ExtensionContext, signal: AbortSignal | undefined): Promise<Outcome> {
 	const id = json.id ?? json.run_id ?? null;
 	const phase = json.phase ?? null;
+	let operator: string[] | undefined;
+	if (id && run.code !== 0) {
+		const status = await runSpar(["status", id, "--json"], ctx.cwd, { signal, timeoutMs: OBSERVE_TIMEOUT_MS });
+		const row = status.code === 0 ? parseJson<RunRow>(status.stdout) : undefined;
+		if (row) operator = operatorActions(row);
+	}
 	return {
 		run_id: id,
 		phase,
@@ -240,6 +247,7 @@ async function outcomeOf(run: SparRun, json: RunJson, ctx: ExtensionContext, sig
 		dry_run: json.dry_run,
 		fleet: json.fleet ?? undefined,
 		next_command: id ? await nextCommand(id, ctx, signal) : undefined,
+		operator_actions: operator,
 	};
 }
 
@@ -251,14 +259,26 @@ export function launchKey(toolCallId: string): string {
 	return `pi-${toolCallId.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 80)}`;
 }
 
-const OPERATOR_PATH = "The operator clears gates from /spar (the gate dialogs) or with the command spar_brief names.";
+const OPERATOR_PATH = `The operator acts from pi with /spar <verb> <run-id> (${Object.keys(VERBS).join(", ")}), each behind their own confirmation.`;
+
+// The /spar gate commands that apply to this run now (gates.ts decides), for the model to
+// hand to the operator. `rule` applies to every run, so it is only named when nothing else does.
+export function operatorActions(run: RunRow): string[] {
+	const verbs = actionsFor(run);
+	const named = verbs.filter((v) => v !== "rule");
+	return (named.length ? named : verbs).map((v) => `/spar ${v} ${run.id}`);
+}
+
+function operatorPath(run: RunRow): string {
+	return `The operator can act with: ${operatorActions(run).join(", ")} (each asks them to confirm).`;
+}
 
 // A run waiting on the operator, stopped or abandoned is theirs to move: `implement --run`
 // on it would re-dispatch past their decision.
 function blockedRun(run: RunDetail): string | undefined {
-	if (run.phase.startsWith("awaiting_")) return `run ${run.id} is waiting on the operator at ${run.phase}. ${OPERATOR_PATH}`;
-	if (run.phase === "stopped") return `run ${run.id} was stopped; resuming it is the operator's call. ${OPERATOR_PATH}`;
-	if (run.abandoned) return `run ${run.id} is abandoned (no orchestrator); resuming it is the operator's call. ${OPERATOR_PATH}`;
+	if (run.phase.startsWith("awaiting_")) return `run ${run.id} is waiting on the operator at ${run.phase}. ${operatorPath(run)}`;
+	if (run.phase === "stopped") return `run ${run.id} was stopped; resuming it is the operator's call. ${operatorPath(run)}`;
+	if (run.abandoned) return `run ${run.id} is abandoned (no orchestrator); resuming it is the operator's call. ${operatorPath(run)}`;
 	if (run.holds_seat) return `run ${run.id} is already running; use spar_wait or spar_status`;
 	return undefined;
 }
@@ -644,7 +664,7 @@ export async function guardBash(pi: ExtensionAPI, command: string, ctx: Extensio
 			? "an operator action (a gate, ship, stop, resume, cleanup, ruling or similar)"
 			: "a launch that spends money (prefer spar_plan, spar_implement or spar_review, which validate and show the fleet)";
 	if (!ctx.hasUI) {
-		return { block: true, reason: `blocked: this bash command runs spar ${what}, and there is no operator UI to confirm it. ${OPERATOR_PATH}` };
+		return { block: true, reason: `blocked: this bash command runs spar ${what}, and there is no operator UI to confirm it. ${slashHint(verdict)}` };
 	}
 	const shown = verdict.commands.map((c) => display(c)).join("\n");
 	const choice = await ctx.ui.select(
@@ -653,5 +673,11 @@ export async function guardBash(pi: ExtensionAPI, command: string, ctx: Extensio
 		{ signal: ctx.signal },
 	);
 	if (choice === "Run it") return undefined;
-	return { block: true, reason: `the operator declined this spar command. ${verdict.kind === "operator" ? OPERATOR_PATH : "Ask them before launching."}` };
+	return { block: true, reason: `the operator declined this spar command. ${verdict.kind === "operator" ? slashHint(verdict) : "Ask them before launching."}` };
+}
+
+function slashHint(verdict: BashVerdict): string {
+	const forms = verdict.commands.map(slashFor).filter((f): f is string => f !== undefined);
+	if (forms.length) return `Gate actions are the operator's: they run ${[...new Set(forms)].join(", ")} themselves, behind their own confirmation.`;
+	return verdict.kind === "operator" ? OPERATOR_PATH : "Use spar_plan, spar_implement or spar_review instead.";
 }

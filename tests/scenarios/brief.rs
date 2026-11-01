@@ -248,3 +248,79 @@ fn two_briefs_with_the_same_title_never_collide() {
         "# Same Title\n\nsecond\n"
     );
 }
+
+/// A valid already-intaken brief launches without being copied again, and the
+/// new run records that exact durable path.
+#[test]
+fn plan_brief_uses_the_existing_brief_once_and_verbatim() {
+    let tmp = tempdir().unwrap();
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    init_repo(&project);
+
+    let brief_dir = project.join(".spar/briefs");
+    std::fs::create_dir_all(&brief_dir).unwrap();
+    let brief = brief_dir.join("chat-intake.md");
+    let body = "# Chat intake\n\nKeep this body byte-for-byte.\n";
+    std::fs::write(&brief, body).unwrap();
+
+    let launched = spar_cmd()
+        .current_dir(&project)
+        .args([
+            "plan",
+            "--brief",
+            ".spar/briefs/chat-intake.md",
+            "--providers",
+            "cli:claude",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2)
+        .stdout(predicates::str::contains("\"run_id\""));
+    let run_id = json_of(&launched)["run_id"].as_str().unwrap().to_string();
+
+    assert_eq!(std::fs::read_to_string(&brief).unwrap(), body);
+    assert!(
+        !brief_dir.join("chat-intake-2.md").exists(),
+        "plan --brief must consume the intaken brief, not intake a duplicate"
+    );
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(project.join(".spar/runs").join(run_id).join("state.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["brief"], ".spar/briefs/chat-intake.md");
+    assert_eq!(state["task"], body);
+}
+
+/// The pre-intaken brief contract is exclusive with both existing task inputs.
+#[test]
+fn plan_brief_is_exclusive_with_task_and_spec() {
+    let tmp = tempdir().unwrap();
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    init_repo(&project);
+    let brief = tmp.path().join("brief.md");
+    let spec = tmp.path().join("spec.md");
+    std::fs::write(&brief, "# Brief\n\nbody\n").unwrap();
+    std::fs::write(&spec, "# Spec\n\nbody\n").unwrap();
+
+    for args in [
+        vec!["plan", "-t", "task", "--brief", brief.to_str().unwrap()],
+        vec![
+            "plan",
+            "--spec",
+            spec.to_str().unwrap(),
+            "--brief",
+            brief.to_str().unwrap(),
+        ],
+    ] {
+        spar_cmd()
+            .current_dir(&project)
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains("--brief"));
+    }
+}

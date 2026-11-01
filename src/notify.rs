@@ -1,9 +1,9 @@
-//! External `@human` notifier — the opt-in sink beside the always-on TUI panel.
+//! External `@human` notifier: the opt-in push sink for `@human` alerts.
 //!
 //! spar ships no notifier of its own: the operator wires their own sink in the
 //! `[notify]` config section, either a `command` spar shells out to or a `webhook`
 //! URL it POSTs the message JSON to. With neither configured this is a no-op and the
-//! TUI panel remains the only sink. Routing is fire-and-forget: a broken notifier
+//! alert is only on the bus (`spar bus inbox @human`). Routing is fire-and-forget: a broken notifier
 //! must never fail the `send` that triggered it.
 
 use crate::bus::BusMessage;

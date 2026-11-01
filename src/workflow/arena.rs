@@ -319,6 +319,11 @@ pub fn confirm_winner(
     slot: Option<String>,
     json: bool,
 ) -> Result<ExitCode> {
+    // Loaded first so a mistyped id fails without the lock minting a run dir. Then
+    // serialized with every other writer: a confirm racing a running `spar reconcile`
+    // would rewrite the state that reconcile is driving.
+    RunState::load(paths, run_id)?;
+    let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
     let mut state = RunState::load(paths, run_id)?;
     if state.phase != Phase::AwaitingWinnerConfirm && state.phase != Phase::AwaitingReconcile {
         anyhow::bail!(
@@ -357,7 +362,7 @@ pub fn reconcile(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> R
             state.phase
         );
     }
-    // Single-flight: a second `spar reconcile` (e.g. a re-tapped TUI button) fails
+    // Single-flight: a second `spar reconcile` (e.g. a retried command) fails
     // fast with OrchestratorBusy instead of racing state/worktrees of the first.
     let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
     state.arena_finish = Some(crate::state::ArenaFinish::Reconcile);

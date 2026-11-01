@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { classify, judgeBash, sparInvocations } from "../extensions/spar/guard.ts";
+import { buildArgv, VERBS, type Verb } from "../extensions/spar/gates.ts";
+import { classify, judgeBash, slashFor, sparInvocations } from "../extensions/spar/guard.ts";
 import { guardBash, UNATTENDED_ENV, UNATTENDED_FLAG } from "../extensions/spar/tools.ts";
 
 afterEach(() => {
@@ -119,4 +120,19 @@ test("unattended launches pass bash launches through, never operator actions", a
 	assert.equal(await guardBash(pi({ [UNATTENDED_FLAG]: true }), "spar plan -t x --providers cli:claude", ctx()), undefined);
 	process.env[UNATTENDED_ENV] = "1";
 	assert.equal((await guardBash(pi(), "spar approve ab12", ctx()))?.block, true);
+});
+
+test("every gate the /spar dialogs run is operator-only to the bash guard, and maps back to its /spar form", () => {
+	const input = { reason: "why", winner: "impl-1", rounds: 2, text: "keep the API", waive: ["AC-1"], seat: "impl", provider: "cli:claude" };
+	for (const verb of Object.keys(VERBS) as Verb[]) {
+		const argv = buildArgv(verb, "ab12", input);
+		assert.equal(classify(argv), "operator", `${verb}: ${argv.join(" ")}`);
+		assert.equal(slashFor(argv), `/spar ${verb} ab12`, verb);
+		assert.equal(judgeBash(`spar ${argv.map((a) => `'${a}'`).join(" ")}`).kind, "operator", verb);
+	}
+});
+
+test("a blocked bash gate names the /spar command the operator runs", async () => {
+	const blocked = await guardBash(pi(), "spar ship ab12 --override-gate --reason r", ctx());
+	assert.match(blocked!.reason, /they run \/spar override ab12 themselves/);
 });

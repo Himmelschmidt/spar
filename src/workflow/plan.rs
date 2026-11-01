@@ -19,7 +19,7 @@ pub fn run(
     paths: &SparPaths,
     cfg: &Config,
 ) -> Result<ExitCode> {
-    crate::runspec::validate_task(&task).map_err(anyhow::Error::msg)?;
+    crate::workflow::validate_task(&task).map_err(anyhow::Error::msg)?;
     let dry = opts.resolve_dry_run();
     if dry {
         std::env::set_var("SPAR_DRY_RUN", "1");
@@ -358,7 +358,7 @@ pub fn execute_plan(
                                 .map(|r| r.storage_key())
                                 .unwrap_or_else(|_| raw.clone());
                             if cur_key != backup_key {
-                                if let Ok(pin) = crate::runspec::Pin::parse(&raw) {
+                                if let Ok(pin) = crate::provider_ref::Pin::parse(&raw) {
                                     let prefix = match job.role {
                                         crate::state::SlotRole::Planner => "planner",
                                         crate::state::SlotRole::PlanCritic => "critic",
@@ -607,7 +607,7 @@ fn resolve_test_author(
                 paths,
                 state.dry_run,
             ) {
-                if let Ok(pin) = crate::runspec::Pin::parse(&backup_raw) {
+                if let Ok(pin) = crate::provider_ref::Pin::parse(&backup_raw) {
                     provider = pin.display();
                     source = crate::state::SeatSource::Backup;
                     model = pin.model;
@@ -664,7 +664,7 @@ fn run_test_author(
         }
     };
     worktree::prepare_isolation(state, paths, std::slice::from_ref(&id))?;
-    // After isolation so status/TUI show Spec for the author wall-clock, not PrepareIsolation.
+    // After isolation so status shows Spec for the author wall-clock, not PrepareIsolation.
     state.set_phase(Phase::Spec);
     state.save(paths)?;
 
@@ -734,7 +734,7 @@ fn run_test_author(
                             .map(|r| r.storage_key())
                             .unwrap_or_else(|_| raw.clone());
                         if cur_key != backup_key {
-                            if let Ok(pin) = crate::runspec::Pin::parse(&raw) {
+                            if let Ok(pin) = crate::provider_ref::Pin::parse(&raw) {
                                 if let Some(s) = state.slot_mut(&id) {
                                     s.provider = pin.provider.clone();
                                     s.model = pin.model.clone();
@@ -1276,7 +1276,7 @@ fn amend_author_seat(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> R
             seat.id
         );
     };
-    let pin = crate::runspec::Pin::parse(&raw)?;
+    let pin = crate::provider_ref::Pin::parse(&raw)?;
     let new_id = format!("test-author-{}", sanitize_slot(&pin.display()));
     if new_id != seat.id && state.slots.iter().any(|s| s.id == new_id) {
         anyhow::bail!(

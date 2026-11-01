@@ -75,7 +75,7 @@ test("observe tools pass exact argv without a shell", async () => {
 		"status --json": [row("aaaa1111"), row("bbbb2222", { needs_human: true })],
 		"status aaaa1111 --json": status("aaaa1111"),
 		"brief aaaa1111 --json": { run: "aaaa1111", next_command: "spar ship aaaa1111", open_findings: [], recent_events: [] },
-		events: [{ lines: [] }],
+		"events --run=aaaa1111 --json": { __text: "" },
 		"logs aaaa1111 impl": { __text: "a\nb\n" },
 		"provider list --json": [{ name: "claude", quota_status: "available" }],
 		"stats --json": { groups: [] },
@@ -294,8 +294,8 @@ test("implement --run shows the run's own seats, and refuses a run at a gate, st
 	assert.match(c.asked[0]!, /Gates: ship waits for you/);
 	assert.match(c.asked[0]!, /implementer cli:muse@spark {2}\[impl, cli-role\]/);
 	for (const [id, why] of [
-		["eeee5555", /waiting on the operator at awaiting_ship_confirm\. The operator clears gates from \/spar/],
-		["ffff6666", /was stopped; resuming it is the operator's call/],
+		["eeee5555", /waiting on the operator at awaiting_ship_confirm\. The operator can act with: \/spar ship eeee5555 \(each asks them to confirm\)/],
+		["ffff6666", /was stopped; resuming it is the operator's call\. The operator can act with: \/spar rule ffff6666/],
 		["abab7777", /is abandoned/],
 	] as const) {
 		const { res, text } = await call(load({ [UNATTENDED_FLAG]: true }), "spar_implement", { run: id }, ctx(f.dir));
@@ -316,11 +316,14 @@ test("exit codes map to what the model should do", async () => {
 		"wait eeee5555 --timeout=10m --json": { __exit: 2, __stdout: { id: "eeee5555", phase: "awaiting_ship_confirm" } },
 		"wait ffff6666 --timeout=10m --json": { __exit: 4, __stdout: { id: "ffff6666", phase: "quota", error: "all paused" } },
 		"brief eeee5555 --json": { run: "eeee5555", next_command: "spar ship eeee5555 --confirm", open_findings: [], recent_events: [] },
+		"status eeee5555 --json": status("eeee5555", { phase: "awaiting_ship_confirm", needs_human: true }),
+		"status ffff6666 --json": status("ffff6666", { phase: "quota", resumable: true }),
 		"brief ffff6666 --json": { run: "ffff6666", next_command: "spar resume ffff6666", open_findings: [], recent_events: [] },
 	});
 	let { res, text } = await call(load(), "spar_wait", { run: "eeee5555" }, ctx(f.dir));
 	assert.equal(res.isError, undefined, "a gate is a result, not a tool failure");
 	assert.match(text, /exit 2: waiting on the human at a gate \(awaiting_ship_confirm\)/);
+	assert.match(text, /operator: \/spar ship eeee5555\n/);
 	assert.match(text, /next: spar ship eeee5555 --confirm/);
 	({ text } = await call(load(), "spar_wait", { run: "ffff6666" }, ctx(f.dir)));
 	assert.match(text, /exit 4: no usable providers/);
@@ -366,8 +369,8 @@ test("a missing binary and a failing command are tool errors", async () => {
 
 test("logs and events are bounded to the tail", async () => {
 	const lines = Array.from({ length: 500 }, (_, i) => `line ${i}`).join("\n");
-	const events = Array.from({ length: 50 }, (_, i) => ({ run_id: "aaaa1111", cursor: "c", ts: new Date(0).toISOString(), type: "info", message: `e${i}` }));
-	const f = installFake({ "logs aaaa1111": { __text: `${lines}\n` }, events: [{ lines: events }] });
+	const events = Array.from({ length: 50 }, (_, i) => JSON.stringify({ run_id: "aaaa1111", cursor: "c", ts: new Date(0).toISOString(), type: "info", message: `e${i}` })).join("\n");
+	const f = installFake({ "logs aaaa1111": { __text: `${lines}\n` }, "events --run=aaaa1111 --json": { __text: `${events}\n` } });
 	const logs = await call(load(), "spar_logs", { run: "aaaa1111" }, ctx(f.dir));
 	assert.equal(logs.details.kind === "logs" && logs.details.lines.length, 80);
 	assert.match(logs.text, /last 80 of 500 lines\n/);

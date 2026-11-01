@@ -50,6 +50,7 @@ export interface Outcome {
 	fleet?: FleetSeat[];
 	next_command?: string;
 	gates_off?: string[];
+	operator_actions?: string[];
 }
 
 export type ToolDetails =
@@ -187,6 +188,7 @@ function outcomeLines(outcome: Outcome, paint: Paint): string[] {
 		lines.push(paint("accent", "fleet"));
 		lines.push(...fleetLines(outcome.fleet, paint));
 	}
+	if (outcome.operator_actions?.length) lines.push(`${paint("accent", "operator:")} ${outcome.operator_actions.join("  |  ")}`);
 	if (outcome.next_command) lines.push(`${paint("accent", "next:")} ${outcome.next_command}`);
 	return lines;
 }

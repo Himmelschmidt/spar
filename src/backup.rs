@@ -208,7 +208,7 @@ pub fn resolve_with_backup(
     if !backup_eligible(&backup_raw, store, available, paths, dry) {
         return Some((prov, src));
     }
-    let parsed = crate::runspec::Pin::parse(&backup_raw).ok()?;
+    let parsed = crate::provider_ref::Pin::parse(&backup_raw).ok()?;
     Some((parsed.display(), crate::state::SeatSource::Backup))
 }
 

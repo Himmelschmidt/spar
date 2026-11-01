@@ -61,11 +61,12 @@
 ## Milestone 7: pi front end
 
 - [ ] **pi front end** (event feed, footer and run views, gates as dialogs, agent tools; TUI deleted at gates) - see `features/012-pi-front-end.md`  
+- [ ] **TUI removed** (`src/tui.rs` and its conversation, composition, structured-view and motion modules deleted; bare `spar` prints help), merged once gates land as pi dialogs  
 
 ## Later
 
 - Multi-machine / remote workers  
 - More native API SDKs (Anthropic messages API, Google, Meta)  
 - bwrap profiles per untrusted model  
-- Streaming token SSE into TUI  
+- Streaming token SSE into the pi front end  
 - **Dynamic model select** (vals-backed) — see `features/001-model-select.md`

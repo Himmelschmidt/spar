@@ -24,6 +24,11 @@ export interface FooterOptions {
 	cwd: string;
 	paint: Paint;
 	setStatus: (text: string | undefined) => void;
+	onEvent?: (event: FeedEvent) => void;
+	onFatal?: (message: string) => void;
+	// The first successful status read, and when the feed took its starting cursor: a run
+	// last changed before then has no event coming for the state it is already in.
+	onFirstRuns?: (runs: RunRow[], feedStart: Date) => void;
 	debounceMs?: number;
 	refreshMs?: number;
 	providerPollMs?: number;
@@ -43,6 +48,7 @@ export class Footer {
 	private timers: NodeJS.Timeout[] = [];
 	private refreshing: Promise<void> | undefined;
 	private refreshAgain = false;
+	private feedStart: Date | undefined;
 	private probeBackoffMs: number;
 	private readonly options: FooterOptions;
 
@@ -62,6 +68,8 @@ export class Footer {
 		this.feed = new EventFeed({
 			cwd: this.options.cwd,
 			onEvent: (event) => {
+				if (this.stopped) return;
+				this.options.onEvent?.(event);
 				if (this.runs) {
 					this.runs = applyEvent(this.runs, event);
 					this.render();
@@ -71,13 +79,18 @@ export class Footer {
 			onConnect: () => {
 				if (connects++ > 0) this.scheduleRefresh();
 			},
+			onFatal: (message) => {
+				if (!this.stopped) this.options.onFatal?.(message);
+			},
 			minBackoffMs: this.options.feedBackoffMs,
 		});
-		this.feed.start();
+		this.feedStart = new Date();
+		await this.feed.start();
+		if (this.stopped) return;
 		this.every(this.options.refreshMs ?? 60_000, () => this.scheduleRefresh());
-		this.every(this.options.providerPollMs ?? 300_000, () => void this.pollProviders());
-		void this.refresh();
-		void this.pollProviders();
+		this.every(this.options.providerPollMs ?? 300_000, () => this.pollProviders().catch(() => {}));
+		this.refresh().catch(() => {});
+		this.pollProviders().catch(() => {});
 	}
 
 	stop(): void {
@@ -101,7 +114,7 @@ export class Footer {
 		this.probeBackoffMs = Math.min(delay * 2, this.options.probeMaxBackoffMs ?? 600_000);
 		this.probeTimer = setTimeout(() => {
 			this.probeTimer = undefined;
-			void this.start();
+			this.start().catch(() => {});
 		}, delay);
 		this.probeTimer.unref();
 	}
@@ -116,7 +129,7 @@ export class Footer {
 		if (this.stopped || this.debounce) return;
 		this.debounce = setTimeout(() => {
 			this.debounce = undefined;
-			void this.refresh();
+			this.refresh().catch(() => {});
 		}, this.options.debounceMs ?? 500);
 		this.debounce.unref();
 	}
@@ -132,7 +145,11 @@ export class Footer {
 				this.refreshAgain = false;
 				const runs = await sparJson<RunRow[]>(["status", "--json"], this.options.cwd);
 				if (this.stopped) return;
-				if (runs.ok) this.runs = runs.value;
+				if (runs.ok) {
+					const first = this.runs === undefined;
+					this.runs = runs.value;
+					if (first && this.feedStart) this.options.onFirstRuns?.(runs.value, this.feedStart);
+				}
 				const since = `${minutesSinceLocalMidnight(new Date())}m`;
 				const stats = await sparJson<Stats>(["stats", "--since", since, "--json"], this.options.cwd);
 				if (this.stopped) return;

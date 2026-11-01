@@ -9,9 +9,9 @@
 ## Goals
 
 1. Agents (and humans) can **coordinate** without sharing one chat context window.  
-2. Same protocol for **native-cli**, **api-sdk**, **orchestrator**, and **human (TUI)**.  
+2. Same protocol for **native-cli**, **api-sdk**, **orchestrator**, and **human** (CLI or the pi front end).  
 3. **Workspace-scoped, keyed by `agent_id`** (W5); a run is an optional tag for
-   grouping/filtering, not the address. Durable; streamable into the product TUI.  
+   grouping/filtering, not the address. Durable; streamable to any front end.  
 4. Typed messages + optional task DAG — not only free-form chat.  
 5. Orchestrator remains authority on spawn/ship/gates; bus is coordination, not anarchy.
 
@@ -22,7 +22,7 @@
 The bus is a single **workspace-level** store keyed by a **globally-unique** `agent_id`.
 Run-slot role ids (`orchestrator`, `impl-1`, …) repeat across concurrent runs, so a run
 slot's bus id is run-qualified to `run:slot` (`SPAR_AGENT_ID` carries this qualified id);
-a bare agent (spawned from the Composer with `SPAR_AGENT_ID` but no run) keeps its own
+a bare agent (with `SPAR_AGENT_ID` but no run) keeps its own
 already-unique id. Presence rows and inbox directories are keyed by this unique id, so a
 bare agent and a run slot address each other directly by id. `run` is demoted to an
 optional message/presence tag; run-scoped views (`--run <id>`) filter by it, but delivery
@@ -83,7 +83,7 @@ other across scopes.
 | api-sdk | Immediate **steer** into agent loop (interrupt-after-tool or queue) |
 | native-cli | Inbox + best-effort inject / include unread on next turn; optional namespaced tmux poke |
 | orchestrator | Watcher on `events.jsonl` |
-| human | TUI bus panel + optional notify on `@human` / stuck |
+| human | `@human` inbox (read by the pi front end) + optional notify on `@human` / stuck |
 
 ---
 
@@ -107,10 +107,11 @@ other across scopes.
 | Fleet | Pi subprocesses | **Heterogeneous** CLI + API |
 | Orchestration | Optional crew self-mesh | **Strong orchestrator** + peer talk |
 | Protocol | Tool actions + free text | **Typed kinds** + free chat |
-| UI | Pi overlay | **Product TUI** control room |
+| UI | Pi overlay | pi package over the CLI (O145) |
 
 ---
 
-## TUI integration
+## Front end integration
 
-Bus is a first-class pane: presence list, unread, thread view, composer `@slot` / `@all` / `@human`. Activity feed merges tool activity when backends can emit it.
+The pi front end (`pi/`, O145) reads the bus only through `spar bus ... --json` and the
+event feed; it never opens `.spar/bus/` itself.

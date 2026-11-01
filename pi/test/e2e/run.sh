@@ -83,6 +83,7 @@ export SPAR_PI_SCRIPT='[[{"name":"spar_plan","arguments":{"task":"add a second l
 expect "$out/noui.txt" "not launched: no operator UI to confirm a launch" noui
 expect "$out/noui.txt" "## bash (error)" noui
 expect "$out/noui.txt" "blocked: this bash command runs spar an operator action" noui
+expect "$out/noui.txt" "they run /spar approve abcd1234 themselves" noui
 equal "$(runs)" "" "runs after"
 
 step "rpc: the operator cancels one launch, launches the next, refuses a bash approve"
@@ -97,7 +98,8 @@ expect "$out/rpc.txt" "exit 2: waiting on the human at a gate (awaiting_plan_app
 expect "$out/rpc.txt" "The model wants to run spar through bash: an operator action" rpc
 expect "$out/rpc.txt" "the operator declined this spar command" rpc
 expect "$out/rpc.txt" "refused: run " rpc
-expect "$out/rpc.txt" "is waiting on the operator at awaiting_plan_approval" rpc
+expect "$out/rpc.txt" "is waiting on the operator at awaiting_plan_approval. The operator can act with: /spar approve " rpc
+expect "$out/rpc.txt" "operator: /spar approve " rpc
 expect "$out/rpc.txt" "sent " rpc
 expect "$out/rpc.txt" "pi -> broadcast: note from pi" rpc
 equal "$(runs)" "plan:awaiting_plan_approval:true" "runs after"

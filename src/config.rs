@@ -87,7 +87,7 @@ pub struct Config {
     pub auto_archive_after: String,
     #[serde(default)]
     pub model_select: ModelSelectConfig,
-    /// Optional external `@human` notifier. Empty by default — the TUI alert panel
+    /// Optional external `@human` notifier. Empty by default: the `@human` bus inbox
     /// is the always-on baseline; this is the operator's opt-in push sink.
     #[serde(default)]
     pub notify: NotifyConfig,
@@ -174,7 +174,7 @@ impl EnvConfig {
 
 /// Operator-configured external sink for `@human` / `Blocked` alerts. spar ships no
 /// notifier of its own; set exactly one of these to wire your own (ntfy, Slack, a
-/// script). Neither set ⇒ only the TUI panel fires.
+/// script). Neither set ⇒ alerts stay on the bus only.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NotifyConfig {
     /// Shell command spar runs on each alert (summary on `$1`, message JSON on stdin).
@@ -578,7 +578,7 @@ pub struct TimeoutConfig {
     /// Renudge cadence past the soft budget. `0` nudges exactly once.
     #[serde(default = "default_time_nudge_secs")]
     pub nudge_every_secs: u64,
-    /// Running slot with no log output for this long ⇒ `stalled` in status/TUI.
+    /// Running slot with no log output for this long ⇒ `stalled` in status.
     /// `0` disables the stall flag (last_log_at still reported).
     #[serde(default = "default_stall_warn_secs")]
     pub stall_warn_secs: u64,
@@ -1452,7 +1452,7 @@ impl Config {
                      reviewer, tester, test_author)"
                 )
             })?;
-            let pin = crate::runspec::Pin::parse(provider)
+            let pin = crate::provider_ref::Pin::parse(provider)
                 .with_context(|| format!("invalid provider in --role {role}: {provider:?}"))?;
             let canonical = pin.display();
             match slot {
@@ -1577,7 +1577,7 @@ impl Config {
                      reviewer, tester, test_author)"
                 )
             })?;
-            let pin = crate::runspec::Pin::parse(provider).with_context(|| {
+            let pin = crate::provider_ref::Pin::parse(provider).with_context(|| {
                 format!("invalid provider in --backup {role_raw}: {provider:?}")
             })?;
             let canonical = pin.display();

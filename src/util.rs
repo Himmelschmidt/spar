@@ -72,9 +72,33 @@ pub fn env_truthy(name: &str) -> bool {
     }
 }
 
+/// `0.8s`, `12s`, `1m02s`, `1h05m`.
+pub fn fmt_elapsed(d: Duration) -> String {
+    let ms = d.as_millis();
+    if ms < 1000 {
+        return format!("{:.1}s", ms as f64 / 1000.0);
+    }
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fmt_elapsed_scales_with_magnitude() {
+        assert_eq!(fmt_elapsed(Duration::from_millis(800)), "0.8s");
+        assert_eq!(fmt_elapsed(Duration::from_secs(12)), "12s");
+        assert_eq!(fmt_elapsed(Duration::from_secs(62)), "1m02s");
+        assert_eq!(fmt_elapsed(Duration::from_secs(3900)), "1h05m");
+    }
 
     #[test]
     fn duration_units() {

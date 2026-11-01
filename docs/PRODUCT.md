@@ -1,7 +1,7 @@
 # spar — Product vision
 
-**Not a Pi extension. Not a thin orchestrator wrapper.**  
-A **first-class coding-agent product** in the same class as Claude Code, Grok Build, and Antigravity (`agy`) — with multi-agent, multi-provider, dual-backend, and a real control-room TUI as the default surface.
+**Not a thin orchestrator wrapper.**  
+A **first-class coding-agent product** in the same class as Claude Code, Grok Build, and Antigravity (`agy`), with multi-agent, multi-provider and dual-backend orchestration behind one CLI. The engine is the `spar` binary; the human front end is a pi package (`pi/`, O145) that drives it through `spar <cmd> --json`.
 
 ---
 
@@ -15,7 +15,7 @@ A **first-class coding-agent product** in the same class as Claude Code, Grok Bu
 
 | | Claude / Grok / agy | Pi + messenger | **spar** |
 |--|---------------------|----------------|-----------------|
-| Primary UX | Single-agent TUI | Single-agent + optional multi ext | **Fleet-native TUI** |
+| Primary UX | Single-agent TUI | Single-agent + optional multi ext | **Fleet-native CLI + pi front end** |
 | Providers | One vendor | Multi-model, one harness | **Multi-vendor + dual backend** (CLI sub + API SDK) |
 | Multi-agent | Subagents / best-of | Extension mesh + crew | **First-class workflows + swarm bus** |
 | Isolation | Often same tree | Same folder + file reserves | **Always worktrees** |
@@ -26,41 +26,16 @@ You still use Claude/Grok/agy as **workers** (native-cli backend). spar is the *
 
 ---
 
-## Default experience: first-class TUI
+## Default experience: pi front end over the CLI
 
-Launch:
+Humans work in pi with the `spar-pi` package (`pi/`, O145): a footer with runs in flight,
+runs waiting on the operator, paused providers and cost; `/spar` run views; human gates as
+pi dialogs; and model-callable tools. The package is a thin client: it reads and acts only
+through `spar <cmd> --json`, so the CLI stays the single engine and the one contract
+agents and humans share. Bare `spar` prints help.
 
-```bash
-spar                 # open product TUI in current repo
-spar .               # explicit cwd
-spar --task "..."    # start with a task
-```
-
-The TUI is not `dashboard` as an afterthought. It **is** the app (like `claude` / `grok` / `agy`).
-
-### TUI pillars (parity with best-in-class agents)
-
-1. **Home** — cross-project landing view, four bands: what needs me, running, finished since last look, start something new  
-2. **Fleet panel** — every slot: role, provider, backend (cli|api), status, model, quota, worktree/branch  
-3. **Stream** — live agent output (all slots); follow one or multiplex  
-4. **Bus / chat** — swarm bus feed, DMs, broadcast, human as peer (Pi-messenger UX, better protocol)  
-5. **Artifacts** — plan.md, reviews, rankings, PR links; open in pager  
-6. **Actions** — approve plan, winner vs reconcile, ship draft PR, pause provider, cleanup  
-7. **Composer** — talk to orchestrator *or* inject to a slot (steer when backend allows)  
-8. **Doctor / providers** — who’s installed, API keys present, quota cooldowns  
-
-Headless/CLI remains first-class for **outer agents** (`--json`, `wait --follow`, skills). Humans default to TUI.
-
-### Quality bar for “nice”
-
-- Fast redraw, clear hierarchy, no wall of dump  
-- Keyboard-first (vim-ish or agent-cli familiar bindings)  
-- Streaming that feels live, not “refresh status every 2s” only  
-- Dark theme that doesn’t look like a debug console  
-- Split panes that survive resize  
-- Unread badges on bus; stuck/quota callouts  
-
-Implementation stack: **Rust + ratatui** (product TUI is the default binary mode).
+Headless/CLI is first-class for **outer agents** (`--json`, `wait --follow`, skills) and is
+what the pi package itself calls.
 
 ---
 
@@ -91,8 +66,8 @@ First-class **run-scoped** agent-to-agent communication:
 - Presence, heartbeat, stuck  
 - Typed messages (chat, blocked, contract, review_finding, ack, …)  
 - Path reservations  
-- Activity feed (dashboard + `events.jsonl`)  
-- Delivery: steer (API) / inbox+inject (CLI) / human (TUI)  
+- Activity feed (`events.jsonl`, `wait --follow --json`)  
+- Delivery: steer (API) / inbox+inject (CLI) / human (`@human` inbox + notifier)  
 - Message budgets to prevent chat storms  
 - Optional task DAG + waves for large features  
 
@@ -118,24 +93,24 @@ Configurable knobs: plan / winner / ship / full-auto levels. Default lean autono
 ### Quota & cost
 
 - Best-effort CLI limit scrape (Claude `rate_limits.five_hour.*`, etc.)  
-- API token/$ in status + TUI  
+- API token/$ in `status`  
 - Pause/resume providers; exit 4 when none usable  
 
 ---
 
 ## What “done product” feels like (north star demos)
 
-1. **You open `spar` in a repo**, type a goal, watch plan multi-provider stream in TUI, approve with one key, implement+dual-review runs, draft PR opens.  
+1. **You open pi in a repo**, type a goal, watch the plan run in the spar footer, approve in a dialog, implement+dual-review runs, draft PR opens.  
 2. **Arena + reconcile:** three providers implement; you choose reconcile; merge agent + review; ship one branch.  
-3. **Peer FE/BE:** two worktrees, bus contract messages, dashboard shows blocked/unblocked, joint review, PR.  
-4. **Outer agent:** Claude in another pane runs `spar plan --json` via skill, never needs the TUI.  
-5. **API day:** same TUI, slots on `api:anthropic` + `cli:grok`, usage meters visible.  
+3. **Peer FE/BE:** two worktrees, bus contract messages, the bus shows blocked/unblocked, joint review, PR.  
+4. **Outer agent:** Claude in another pane runs `spar plan --json` via skill, never needs a front end.  
+5. **API day:** same front end, slots on `api:anthropic` + `cli:grok`, usage meters visible.  
 
 ---
 
 ## Non-goals
 
-- Being a plugin inside Pi / Claude / Grok  
+- Being an engine that lives inside Pi / Claude / Grok (the pi package is a front end only)  
 - Replacing every single-agent daily driver for tiny edits (those CLIs stay great)  
 - Auto-merging to main  
 - Multi-machine cluster (later, maybe)  
@@ -145,18 +120,18 @@ Configurable knobs: plan / winner / ship / full-auto levels. Default lean autono
 
 ## Relationship to current codebase
 
-`main` has an **orchestrator skeleton** (workflows, dry-run, providers, ship, thin TUI stub).  
+`main` has an **orchestrator skeleton** (workflows, dry-run, providers, ship, dry-run test backend).  
 
 The product pivot:
 
 | Was | Becomes |
 |-----|---------|
-| CLI-first + optional dashboard | **TUI-first product** + headless/CLI for agents |
+| CLI-first + optional dashboard | **CLI engine** + pi front end for humans (the TUI was removed, O145) |
 | Thin mailbox | **Swarm bus** |
 | native-cli only story | **Dual backend** (API track planned) |
 | “tool to manage sessions” | **Agent product that owns the fleet** |
 
-Evolution, not rewrite: keep `.spar/`, workflows, adapters; promote TUI and bus to the center.
+Evolution, not rewrite: keep `.spar/`, workflows, adapters; promote the bus to the center; humans reach it through pi.
 
 ---
 

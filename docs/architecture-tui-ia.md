@@ -1,7 +1,8 @@
 # TUI information architecture: nouns, Home, and gate evidence
 
 **Status:** DECIDED (product planning)  
-**Decisions:** U6-U13. Supersedes U3 in part. Extends U1, U4, U5, X2.
+**Decisions:** U6-U13. Supersedes U3 in part. Extends U1, U4, U5, X2.  
+**Historical:** the TUI was removed per O145; humans use the pi package under `pi/`.
 
 ---
 

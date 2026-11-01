@@ -2,13 +2,13 @@
 name = "spar"
 version = "0.0.5"
 edition = "2021"
-description = "Multi-agent coding product: fleet TUI, dual backends, plan/review/arena/ship"
+description = "Multi-agent coding orchestrator: dual backends, plan/review/arena/ship"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/Himmelschmidt/spar"
 homepage = "https://github.com/Himmelschmidt/spar"
 documentation = "https://github.com/Himmelschmidt/spar#readme"
-keywords = ["agents", "orchestration", "cli", "tui"]
+keywords = ["agents", "orchestration", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 # Note: the crates.io name `spar` is taken by an unrelated project.
 # Install from this git repository (see README).
@@ -22,19 +22,14 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10.4"
 clap = { version = "4", features = ["derive", "env"] }
-crossterm = "0.28"
 dirs = "6"
-portable-pty = "0.9"
-ratatui = "0.29"
 rustix = { version = "1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 toml = "0.8"
-tui-term = "0.2"
 ureq = { version = "3.3.0", features = ["json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
-vt100 = "0.15"
 which = "7"
 
 [dev-dependencies]
@@ -136,10 +131,6 @@ name = "daemon"
 path = "tests/scenarios/daemon.rs"
 
 [[test]]
-name = "orchestrator_conversation"
-path = "tests/scenarios/orchestrator_conversation.rs"
-
-[[test]]
 name = "run_composition"
 path = "tests/scenarios/run_composition.rs"
 
@@ -214,3 +205,7 @@ path = "tests/scenarios/launch_surface.rs"
 [[test]]
 name = "events_feed"
 path = "tests/scenarios/events_feed.rs"
+
+[[test]]
+name = "bare_spar"
+path = "tests/scenarios/bare_spar.rs"

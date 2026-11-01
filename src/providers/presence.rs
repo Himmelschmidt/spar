@@ -15,7 +15,7 @@ pub struct SlotIdentity<'a> {
     /// The slot's short role id. `wire` run-qualifies it to the unique `run:slot` bus id
     /// for the exported `SPAR_AGENT_ID`; the baked hook commands keep the short id + `--run`.
     pub agent_id: &'a str,
-    /// Run this agent belongs to, or `None` for a bare (run-less) Composer agent.
+    /// Run this agent belongs to, or `None` for a bare (run-less) agent.
     /// Threaded onto its `spar bus` hook commands as `--run <id>` when present.
     pub run_id: Option<&'a str>,
     /// Primary checkout that owns `.spar/runs/<id>`; heartbeats resolve against it.
@@ -327,7 +327,7 @@ mod tests {
         }
     }
 
-    /// A bare (run-less) Composer agent wires the same hooks but with no run: the
+    /// A bare (run-less) agent wires the same hooks but with no run: the
     /// `spar bus` commands omit `--run` and no `SPAR_RUN_ID` env is exported (W5).
     #[test]
     fn bare_agent_hooks_omit_run() {

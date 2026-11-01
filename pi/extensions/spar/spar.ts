@@ -10,6 +10,12 @@ export function isRunId(value: string): boolean {
 	return RUN_ID.test(value);
 }
 
+// spar's needs_human is true at every gate, including awaiting_reconcile while a
+// reconcile is running under it. A run something is driving does not need you yet.
+export function needsYou(run: { needs_human: boolean; holds_seat: boolean }): boolean {
+	return run.needs_human && !run.holds_seat;
+}
+
 export const STALE_MS = 7 * 86_400_000;
 
 export function isStale(run: { updated_at: string }, now: Date): boolean {

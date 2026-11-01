@@ -199,3 +199,35 @@ export function judgeBash(command: string): BashVerdict {
 	if (commands.length === 0) return { kind: "none", commands };
 	return { kind: commands.some((c) => classify(c) === "operator") ? "operator" : "launch", commands };
 }
+
+// The /spar gate command (gates.ts) that does what this spar argv does, when there is one.
+export function slashFor(args: string[]): string | undefined {
+	const words = args.filter((a) => !a.startsWith("-"));
+	const value = (flag: string) => {
+		const i = args.findIndex((a) => a === flag || a.startsWith(`${flag}=`));
+		if (i === -1) return undefined;
+		return args[i]!.includes("=") ? args[i]!.slice(flag.length + 1) : args[i + 1];
+	};
+	const [sub] = words;
+	const id = (sub === "rule" || sub === "implement" ? value("--run") : words[1]) ?? "<run-id>";
+	switch (sub) {
+		case "approve":
+		case "reject":
+		case "confirm":
+		case "reconcile":
+		case "resume":
+		case "stop":
+		case "cleanup":
+			return `/spar ${sub} ${id}`;
+		case "ship":
+			return `/spar ${args.some((a) => a.startsWith("--override-gate")) ? "override" : "ship"} ${id}`;
+		case "rule":
+			return words[1] === "add" ? `/spar rule ${id}` : undefined;
+		case "implement":
+			if (value("--reassign") !== undefined) return `/spar reassign ${id}`;
+			if (value("--max-rounds") !== undefined) return `/spar extend ${id}`;
+			return undefined;
+		default:
+			return undefined;
+	}
+}
