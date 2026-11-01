@@ -8,7 +8,7 @@
 //! this unique id, so directed delivery keys purely on it — there is no run-tag filter
 //! on drain. `run` survives only as an optional tag carried on each
 //! [`BusMessage`]/[`Presence`] for grouping and run-scoped views (`Some(run)` filters,
-//! `None` is the whole workspace). Bare agents spawned from the Composer (with a
+//! `None` is the whole workspace). Bare agents (with a
 //! `SPAR_AGENT_ID` but no run) get a first-class inbox + presence exactly like a run
 //! slot, and a bare agent and a run slot address each other by their unique ids.
 //!
@@ -26,7 +26,7 @@ use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 /// Reserved recipient id for messages that need a human's attention. Every such
-/// message is surfaced in the TUI alert panel (always on, zero config) and, if the
+/// message lands in the `@human` inbox (always on, zero config) and, if the
 /// operator wired one, pushed to an external notifier (`[notify]` in config).
 pub const HUMAN: &str = "@human";
 
@@ -430,22 +430,7 @@ pub fn send(paths: &SparPaths, msg: BusMessage, budget: MessageBudget) -> Result
     check_loop(&recent, &msg, guard)?;
     // Budget check and both appends happen under one lock so two senders can't both
     // read a below-cap count and both write (TOCTOU across processes).
-    // Unauthenticated chat surface claims are downgraded: an agent that sets
-    // meta.surface="chat" without proving it is the conversation's agent (from ==
-    // agent_ref(run, conversation) and turn present) does not get the uncapped
-    // Chatty budget. Human-origin messages are exempt — they are the operator
-    // side of the conversation and must not be capped at 200 (008 finding).
-    let effective_budget = if budget == MessageBudget::Chatty
-        && msg.meta.get("surface").map(|v| v.as_str()) == Some("chat")
-        && msg.from != HUMAN
-        && msg.from != "human"
-        && !is_conversation_message(&msg)
-    {
-        MessageBudget::Normal
-    } else {
-        budget
-    };
-    append_event_checked(paths, &msg, effective_budget.max_messages(), run)?;
+    append_event_checked(paths, &msg, budget.max_messages(), run)?;
     deliver_inbox(paths, &msg)?;
     // also mirror to legacy mailbox for tools that still read it (run-scoped only)
     if let Some(r) = run {
@@ -483,40 +468,14 @@ pub fn send(paths: &SparPaths, msg: BusMessage, budget: MessageBudget) -> Result
         record_pending_ack(paths, &msg)?;
     }
     if is_human_alert(&msg) {
-        // The TUI sink reads the bus directly, so only the external notifier is a push.
         crate::notify::route_human_alert(paths, &msg);
     }
     Ok(msg)
 }
 
-pub fn is_conversation_message(msg: &BusMessage) -> bool {
-    if msg.meta.get("surface").map(|v| v.as_str()) != Some("chat") {
-        return false;
-    }
-    let Some(conv) = msg.meta.get("conversation") else {
-        return false;
-    };
-    if conv.is_empty() || !conv.starts_with("talk-") {
-        return false;
-    }
-    let Some(turn) = msg.meta.get("turn") else {
-        return false;
-    };
-    if turn.is_empty() {
-        return false;
-    }
-    let expected = agent_ref(msg.run.as_deref(), conv);
-    msg.from == expected
-}
-
 /// A message the human needs to see: addressed to [`HUMAN`], or any `Blocked`
 /// report (an agent that stalled is a human-relevant event even when broadcast).
-/// Conversation replies (surface=chat) are not alerts: they are the transcript's
-/// normal turn traffic, not an interruption the operator did not ask for.
 pub fn is_human_alert(msg: &BusMessage) -> bool {
-    if is_conversation_message(msg) {
-        return false;
-    }
     msg.to == HUMAN || msg.kind == MsgKind::Blocked
 }
 
@@ -930,7 +889,7 @@ pub fn tick_acks(paths: &SparPaths, policy: &AckPolicy, now: DateTime<Utc>) -> R
         return Ok(AckTick::default());
     }
     // Several pulses tick the same run concurrently: `spar bus deliver` (one per
-    // agent finishing a turn), the `spar wait` loop, and the TUI refresh thread.
+    // agent finishing a turn), and the `spar wait` loop.
     // Serialize the whole read-modify-remove/write pass under one exclusive lock so
     // a record is escalated-and-removed or redelivered by exactly one process —
     // never double-escalated, and never resurrected by a redeliver write racing
@@ -1006,47 +965,6 @@ fn escalate_unacked(
     };
     send(paths, esc, MessageBudget::Chatty)?;
     Ok(())
-}
-
-/// Human-facing alerts still awaiting attention: `@human` messages with no `Ack`,
-/// plus every agent still `Blocked` (no later `Unblocked` from it). Powers the TUI
-/// alert panel/badge.
-pub fn unresolved_alerts(paths: &SparPaths, run: Option<&str>) -> Result<Vec<BusMessage>> {
-    let evs = list_events(paths, run)?;
-    let acked: HashSet<String> = evs
-        .iter()
-        .filter(|m| m.kind == MsgKind::Ack)
-        .filter_map(|m| m.refs.reply_to.clone())
-        .collect();
-    let mut blocked: HashMap<String, BusMessage> = HashMap::new();
-    for m in &evs {
-        match m.kind {
-            MsgKind::Blocked => {
-                blocked.insert(m.from.clone(), m.clone());
-            }
-            MsgKind::Unblocked => {
-                blocked.remove(&m.from);
-            }
-            _ => {}
-        }
-    }
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut out: Vec<BusMessage> = Vec::new();
-    for m in evs
-        .iter()
-        .filter(|m| m.to == HUMAN && !acked.contains(&m.id) && !is_conversation_message(m))
-    {
-        if seen.insert(m.id.clone()) {
-            out.push(m.clone());
-        }
-    }
-    for m in blocked.into_values() {
-        if !acked.contains(&m.id) && seen.insert(m.id.clone()) {
-            out.push(m);
-        }
-    }
-    out.sort_by_key(|m| m.ts);
-    Ok(out)
 }
 
 // ── receipts, withdrawal, round expiry, persisted messages (O134, O135) ───────
@@ -1512,6 +1430,28 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn human_alert_covers_broadcast_blocked_and_plain_human_chat() {
+        let msg = |to: &str, kind: MsgKind| BusMessage {
+            id: new_id(),
+            ts: Utc::now(),
+            from: "r1:planner".into(),
+            to: to.into(),
+            kind,
+            body: "x".into(),
+            run: Some("r1".into()),
+            subject: None,
+            refs: MsgRefs::default(),
+            requires_ack: false,
+            persist: false,
+            expires_after_round: None,
+            meta: HashMap::new(),
+        };
+        assert!(is_human_alert(&msg("broadcast", MsgKind::Blocked)));
+        assert!(is_human_alert(&msg(HUMAN, MsgKind::Chat)));
+        assert!(!is_human_alert(&msg("broadcast", MsgKind::Chat)));
+    }
+
+    #[test]
     fn send_inbox_reserve() {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
@@ -1848,155 +1788,6 @@ mod tests {
         let t = tick_acks(&paths, &policy, Utc::now()).unwrap();
         assert_eq!((t.redelivered, t.escalated), (0, 0));
         assert!(inbox(&paths, HUMAN).unwrap().is_empty());
-    }
-
-    #[test]
-    fn unresolved_alerts_tracks_blocked_and_human() {
-        let tmp = tempdir().unwrap();
-        let paths = SparPaths::new(tmp.path());
-        join(
-            &paths,
-            Some("r1"),
-            "a",
-            Some("cli:claude"),
-            Some("native-cli"),
-        )
-        .unwrap();
-        join(
-            &paths,
-            Some("r1"),
-            "b",
-            Some("cli:grok"),
-            Some("native-cli"),
-        )
-        .unwrap();
-
-        // A Blocked report surfaces; an Unblocked from the same agent clears it.
-        let blocked = |body: &str| {
-            send(
-                &paths,
-                BusMessage {
-                    id: new_id(),
-                    ts: Utc::now(),
-                    from: "a".into(),
-                    to: "broadcast".into(),
-                    kind: MsgKind::Blocked,
-                    body: body.into(),
-                    run: Some("r1".into()),
-                    subject: None,
-                    refs: MsgRefs::default(),
-                    requires_ack: false,
-                    persist: false,
-                    expires_after_round: None,
-                    meta: HashMap::new(),
-                },
-                MessageBudget::Chatty,
-            )
-            .unwrap()
-        };
-        blocked("stuck on tests");
-        assert_eq!(unresolved_alerts(&paths, Some("r1")).unwrap().len(), 1);
-        send(
-            &paths,
-            BusMessage {
-                id: new_id(),
-                ts: Utc::now(),
-                from: "a".into(),
-                to: "broadcast".into(),
-                kind: MsgKind::Unblocked,
-                body: "resolved".into(),
-                run: Some("r1".into()),
-                subject: None,
-                refs: MsgRefs::default(),
-                requires_ack: false,
-                persist: false,
-                expires_after_round: None,
-                meta: HashMap::new(),
-            },
-            MessageBudget::Chatty,
-        )
-        .unwrap();
-        assert!(unresolved_alerts(&paths, Some("r1")).unwrap().is_empty());
-    }
-
-    /// A conversation reply is addressed to the operator, but it is the transcript's
-    /// normal turn traffic, not an interruption or an unresolved red badge. Ordinary
-    /// `@human` and `Blocked` messages retain both alert paths.
-    #[test]
-    fn conversation_replies_are_not_alerts_but_normal_human_messages_are() {
-        let tmp = tempdir().unwrap();
-        let paths = SparPaths::new(tmp.path());
-        let mut meta = HashMap::new();
-        meta.insert("surface".into(), "chat".into());
-        meta.insert("conversation".into(), "talk-1".into());
-        meta.insert("turn".into(), "turn-1".into());
-        let conversation = BusMessage {
-            id: new_id(),
-            ts: Utc::now(),
-            from: "r1:talk-1".into(),
-            to: HUMAN.into(),
-            kind: MsgKind::Chat,
-            body: "What should the brief cover?".into(),
-            run: Some("r1".into()),
-            subject: None,
-            refs: MsgRefs::default(),
-            requires_ack: false,
-            persist: false,
-            expires_after_round: None,
-            meta,
-        };
-        assert!(
-            !is_human_alert(&conversation),
-            "conversation replies must not trigger external human alerts"
-        );
-        send(&paths, conversation, MessageBudget::Chatty).unwrap();
-        assert!(
-            unresolved_alerts(&paths, Some("r1")).unwrap().is_empty(),
-            "conversation replies must not appear as unresolved attention"
-        );
-
-        let ordinary = BusMessage {
-            id: new_id(),
-            ts: Utc::now(),
-            from: "r1:planner".into(),
-            to: HUMAN.into(),
-            kind: MsgKind::Chat,
-            body: "I need an operator decision.".into(),
-            run: Some("r1".into()),
-            subject: None,
-            refs: MsgRefs::default(),
-            requires_ack: false,
-            persist: false,
-            expires_after_round: None,
-            meta: HashMap::new(),
-        };
-        assert!(is_human_alert(&ordinary));
-        send(&paths, ordinary, MessageBudget::Chatty).unwrap();
-        assert_eq!(unresolved_alerts(&paths, Some("r1")).unwrap().len(), 1);
-
-        let mut forged_meta = HashMap::new();
-        forged_meta.insert("surface".into(), "chat".into());
-        forged_meta.insert("conversation".into(), "planner".into());
-        forged_meta.insert("turn".into(), "turn-1".into());
-        let forged = BusMessage {
-            id: new_id(),
-            ts: Utc::now(),
-            from: "r1:planner".into(),
-            to: HUMAN.into(),
-            kind: MsgKind::Chat,
-            body: "silenced".into(),
-            run: Some("r1".into()),
-            subject: None,
-            refs: MsgRefs::default(),
-            requires_ack: false,
-            persist: false,
-            expires_after_round: None,
-            meta: forged_meta,
-        };
-        assert!(
-            is_human_alert(&forged),
-            "a slot must not silence its own Blocked/chat alerts by forging surface=chat with its own short id"
-        );
     }
 
     #[test]

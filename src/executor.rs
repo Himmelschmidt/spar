@@ -1943,7 +1943,7 @@ fn provider_is_agy(provider: &str) -> bool {
 
 /// muse emits no token counts on stdout at all; usage lives only in its session log.
 /// Sum that (including the subagent sessions muse fans out per turn) and rewrite the
-/// slot's stats sidecar so `stats.json` and the TUI reflect real spend.
+/// slot's stats sidecar so `stats.json` reflects real spend.
 fn enrich_muse_stats(stats: &mut process::StreamStats, provider: &str, log_path: &Path) {
     let is_muse = ProviderRef::parse(provider)
         .ok()
@@ -3997,18 +3997,13 @@ enum TmuxDecision {
     Failed,
 }
 
-/// Truncate `log_path` and drop any stale `.idx` sidecar before an api-sdk slot's own
-/// `append_log` (`src/api/runtime.rs`) starts writing to it. That writer never touches the
-/// index — it has no `LogWriter`/`stream_to_log` of its own — so a sidecar left over from
-/// an earlier native dispatch of this same slot id, or a re-dispatch reusing this slot's log
-/// path, would otherwise get bisected against api-sdk's freshly-appended text and stamp its
-/// records with another dispatch's timestamps (AC-8).
+/// Truncate `log_path` before an api-sdk slot's own `append_log` (`src/api/runtime.rs`)
+/// starts appending to it, so a re-dispatch reusing this slot's log starts clean.
 fn reset_api_slot_log(log_path: &Path) {
     if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::File::create(log_path);
-    let _ = std::fs::remove_file(process::log_index_path(log_path));
 }
 
 /// A `done` marker only means success once the agent's pane process has exited.
@@ -4700,21 +4695,15 @@ mod tests {
     use super::*;
     use crate::providers::ProviderAdapter;
 
-    /// AC-8: api-sdk's own `append_log` (`src/api/runtime.rs`) never writes the offset
-    /// index at all, so a stale `.idx` from an earlier native dispatch of this slot id
-    /// must be cleared before it starts appending, or the TUI would bisect api-sdk's
-    /// freshly-appended text against another dispatch's timestamps.
     #[test]
-    fn reset_api_slot_log_truncates_log_and_drops_a_stale_offset_index() {
+    fn reset_api_slot_log_truncates_the_log() {
         let tmp = tempfile::tempdir().unwrap();
         let log_path = tmp.path().join("slot.log");
         std::fs::write(&log_path, "leftover transcript from a prior round\n").unwrap();
-        std::fs::write(process::log_index_path(&log_path), "0 1700000000000\n").unwrap();
 
         reset_api_slot_log(&log_path);
 
         assert_eq!(std::fs::read_to_string(&log_path).unwrap(), "");
-        assert!(!process::log_index_path(&log_path).exists());
     }
 
     fn dispatch_opts(prompt: &str) -> SpawnOpts {

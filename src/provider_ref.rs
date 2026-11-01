@@ -126,9 +126,52 @@ fn split_model(raw: &str, rest: &str) -> Result<(String, Option<String>)> {
     Ok((name.to_string(), Some(model.to_string())))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pin {
+    pub provider: String,
+    pub model: Option<String>,
+}
+
+impl Pin {
+    pub fn parse(raw: &str) -> Result<Self> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            bail!("empty provider");
+        }
+        let pref = ProviderRef::parse(raw)?;
+        Ok(Self {
+            provider: pref.storage_key(),
+            model: pref.model,
+        })
+    }
+
+    pub fn display(&self) -> String {
+        match &self.model {
+            Some(m) => format!("{}@{}", self.provider, m),
+            None => self.provider.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pin_parses_and_roundtrips() {
+        let p = Pin::parse("cli:claude@opus").unwrap();
+        assert_eq!(p.provider, "cli:claude");
+        assert_eq!(p.model.as_deref(), Some("opus"));
+        assert_eq!(p.display(), "cli:claude@opus");
+        let q = Pin::parse(&p.display()).unwrap();
+        assert_eq!(p, q);
+    }
+
+    #[test]
+    fn pin_rejects_invalid_provider() {
+        assert!(Pin::parse("invalid").is_err());
+        assert!(Pin::parse("cli:claude@").is_err());
+    }
 
     #[test]
     fn requires_prefix() {

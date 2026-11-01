@@ -756,25 +756,6 @@ pub struct RunSummary {
     /// How many rounds this run has been through (O45). `1` unless it was continued.
     #[serde(default = "one_round")]
     pub round: u32,
-    /// How many runs this row stands for once legs are folded in (U15). `1` normally;
-    /// only a listing surface sets it higher. Never serialized: it is a property of a
-    /// rendered list, not of a run, and on disk or in `--json` it could only ever be
-    /// the constant 1.
-    #[serde(skip)]
-    pub legs: u32,
-    /// How many of those legs want the operator. Only meaningful on a folded row
-    /// (`legs > 1`): a unit with two runs at gates must still be counted twice, or
-    /// folding becomes a way to hide a gate. Never serialized, for the same reason as
-    /// `legs`.
-    #[serde(skip)]
-    pub wants: u32,
-    /// Identity of the folded unit this row stands for (U15), stable regardless of
-    /// which leg `fold_units` picks as the loudest representative from one snapshot
-    /// to the next. `None` for a row that was never folded. A cursor or cache keyed
-    /// on a folded row must use this, not `id` — `id` follows whichever leg is
-    /// currently loudest and can change between snapshots (AC-28).
-    #[serde(skip)]
-    pub unit_id: Option<String>,
     /// The run's total reported spend (`stats::run_cost(..).total.cost_usd`), so a run
     /// list needs no per-run `status <id>` call. `null` when no dispatch reported a cost.
     #[serde(default)]
@@ -913,7 +894,7 @@ impl RunState {
         Ok(state)
     }
 
-    /// Load for observation (`status`, TUI). `state.json` is only as fresh as the last
+    /// Load for observation (`status`, `wait`). `state.json` is only as fresh as the last
     /// orchestrator write, so an orchestrator that died mid-phase leaves slots frozen at
     /// `running` forever; their markers on disk say otherwise. Reconciles in memory only —
     /// a read-only command never rewrites the run.
@@ -996,7 +977,7 @@ impl RunState {
         let file = paths.state_file(&self.id);
         let text = serde_json::to_string_pretty(self)?;
         // Written through a temp file in the same directory, then renamed: `state.json`
-        // has no lock on the read side (`status`, `wait`, the TUI, every slot's own
+        // has no lock on the read side (`status`, `wait`, every slot's own
         // `SPAR_RUN_ID` lookup), so a plain truncate-and-write hands any concurrent
         // reader a half-written file. `spar wait` died on exactly that mid-run, on
         // `parse run state …: EOF while parsing a value at line 1 column 0`.
@@ -1243,8 +1224,7 @@ pub fn is_resumable(state: &RunState) -> bool {
 }
 
 /// Whether a run wants the operator: a human gate, the `PlanApproved` handoff nothing
-/// else will complete, or a run that is broken or abandoned. The TUI's attention
-/// flags and `needs_human` both read this.
+/// else will complete, or a run that is broken or abandoned. `needs_human` reads this.
 pub fn wants_operator(phase: Phase, abandoned: bool) -> bool {
     abandoned
         || phase.is_gate()
@@ -1508,9 +1488,6 @@ pub fn list_runs(paths: &SparPaths) -> Result<Vec<RunSummary>> {
             dry_run: state.dry_run,
             parent_run: state.parent_run,
             round: state.round,
-            legs: 1,
-            wants: 0,
-            unit_id: None,
             base_ref: state.base_ref,
             base_commit: state.base_commit,
             project_root: None,
@@ -1645,7 +1622,7 @@ mod tests {
         assert!(live_slot_pids(&paths, &state).is_empty());
     }
 
-    /// `state.json` is read without a lock by `status`, `wait` and the TUI while an
+    /// `state.json` is read without a lock by `status` and `wait` while an
     /// orchestrator is writing it. A truncate-and-write save hands those readers a
     /// half-written file; this reads the run flat out while it is saved 300 times and
     /// insists every read that lands is a whole run.
@@ -2398,7 +2375,7 @@ mod resumable_tests {
 mod liveness_tests {
     use super::*;
 
-    /// `needs_human` is the TUI's attention rule: gates, the plan handoff and broken
+    /// `needs_human` is the attention rule: gates, the plan handoff and broken
     /// runs want a person; work in flight and finished work do not.
     #[test]
     fn wants_operator_covers_gates_handoff_and_broken_runs() {

@@ -2,7 +2,6 @@ mod agy;
 pub mod agy_telemetry;
 mod claude;
 pub(crate) mod codex;
-pub mod conversation_turn;
 pub mod delivery;
 mod grok;
 mod muse;
@@ -414,7 +413,7 @@ pub trait ProviderAdapter: Send + Sync {
 }
 
 /// How long a readiness verdict is reused within one process. `detect_all` runs on
-/// every run start, backup weighing and TUI roster refresh; without this each call
+/// every run start and backup weighing; without this each call
 /// re-spawns `claude auth status` and `codex login status` (O107).
 const READINESS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 

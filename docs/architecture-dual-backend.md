@@ -11,7 +11,7 @@
 1. **Subscription CLIs** (Claude Code, Grok Build, Antigravity/`agy`, …) are cheap relative to API billing and match how you already work, but third-party HTTP harnesses are often against provider TOS. Orchestration must drive **native CLIs**, not reimplement their APIs.
 2. **API SDKs** (OpenAI, Anthropic, xAI, Google, Meta, …) give clean streaming, tools, structured output, and usage metering. As API prices fall, a first-class API path becomes desirable—not as a replacement product, but as a **second lane** behind the same swarm.
 
-Spawning CLI sessions is “hacky” only at the **adapter** layer. The product is multi-agent orchestration (plan, implement, review, arena, reconcile, roles/peer, ship, dashboard).
+Spawning CLI sessions is “hacky” only at the **adapter** layer. The product is multi-agent orchestration (plan, implement, review, arena, reconcile, roles/peer, ship).
 
 ---
 
@@ -21,7 +21,7 @@ Spawning CLI sessions is “hacky” only at the **adapter** layer. The product 
 ┌─────────────────────────────────────────────────────────────────┐
 │  Outer agent / human                                            │
 │  spar skills (agent-browser style) + AGENTS.md blurb     │
-│  CLI (--json, wait --follow) · nice TUI dashboard               │
+│  CLI (--json, wait --follow) · pi front end (pi/, O145)         │
 └────────────────────────────┬────────────────────────────────────┘
                              │
 ┌────────────────────────────▼────────────────────────────────────┐
@@ -55,7 +55,7 @@ Spawning CLI sessions is “hacky” only at the **adapter** layer. The product 
 
 | Layer | Owns | Does **not** own |
 |-------|------|------------------|
-| **Orchestrator** | Run lifecycle, workflows, isolation, gates, review policy, arena/reconcile, roles/peer, ship, dashboard events | Provider wire protocols |
+| **Orchestrator** | Run lifecycle, workflows, isolation, gates, review policy, arena/reconcile, roles/peer, ship, run events | Provider wire protocols |
 | **Backend** | How a slot “thinks and acts” (CLI process vs API agent loop), streaming into the run log, usage/quota signals | Whether to arena vs implement; worktree policy |
 | **Adapter** | One provider on one backend (e.g. `claude` native-cli, `anthropic` api-sdk) | Cross-run scheduling |
 
@@ -86,7 +86,7 @@ Dry-run remains a test backend: real `.spar/` layout, no provider spawn.
 |---------|----------|
 | Runtime | **In-tree thin tool loop** (not a heavy third-party agent framework dependency for core) |
 | Providers | OpenAI, Anthropic, xAI, Google, Meta, … via official SDKs as added |
-| Streaming | Token/events into the **same** run log / event stream the dashboard tails |
+| Streaming | Token/events into the **same** run log / event stream `wait --follow` and the pi front end read |
 | Usage | Record input/output tokens (and optional cost estimate) per slot on the run |
 | Tools | Shared tool surface orchestrator configures (fs, git-safe commands, tests)—API agents do not bypass worktree cwd |
 | Selection | Opt-in: config / CLI / per-slot; mixable with native-cli in one run |
@@ -141,7 +141,7 @@ These must not depend on backend:
 4. **Artifacts / mailbox / markers / logs / events** under `.spar/runs/<id>/`.
 5. **Gates** configurable (`plan`, `winner`, `ship`, autonomy levels).
 6. **Exit codes:** 0 ok, 1 fail, 2 human gate, 3 stuck, 4 quota.
-7. **Stream everything** — process or API tokens → followable logs + dashboard.
+7. **Stream everything:** process or API tokens → followable logs + events.
 8. **Ship:** draft PR default, never merge; force-with-lease only on spar-owned branches.
 
 ---
@@ -164,7 +164,7 @@ Two implementers in the *default* loop is overkill; multi-implementer lives in *
 
 - `spar skills list` / `skills get core` (and workflow skills)
 - Short **AGENTS.md** blurb: use spar for multi-provider orchestration; load core skill first; don’t invent API harnesses for subscription CLIs
-- Dashboard and CLI both first-class for humans; outer agents prefer CLI + JSON + stream
+- Humans use the pi package (`pi/`), which calls the same CLI; outer agents use CLI + JSON + stream
 
 ---
 
@@ -173,24 +173,18 @@ Two implementers in the *default* loop is overkill; multi-implementer lives in *
 | Backend | Signal | Action |
 |---------|--------|--------|
 | native-cli | Best-effort (Claude `rate_limits.five_hour.used_percentage` / `resets_at`, log phrases, errors) | Pause provider until reset; schedule others; exit 4 if none |
-| api-sdk | SDK usage / HTTP 429 | Pause or backoff; surface tokens/$ in status + dashboard |
+| api-sdk | SDK usage / HTTP 429 | Pause or backoff; surface tokens/$ in status |
 | both | Manual `provider pause/resume` | Always honored |
 
 Context-window % (Claude statusline `context_window.used_percentage`) is **not** the same as rate limit; log it, don’t auto-pause solely on context pressure unless configured later.
 
 ---
 
-## Dashboard
+## Human front end
 
-First-class **nice** TUI control room (not a thin `status` skin):
-
-- Phase, gates, run id  
-- Per-slot: backend, provider, role, state, activity, quota/cost badge  
-- Live log/event stream  
-- Arena candidates + reconcile status  
-- Actions: approve, winner vs reconcile, ship, pause provider  
-
-Outer agents need not use it; humans should want to.
+The TUI was removed (O145). Humans use the `spar-pi` package under `pi/`: a thin client
+that reads and acts only through `spar <cmd> --json`. A view it needs that the CLI cannot
+answer is a CLI change, so the front end never forks the engine.
 
 ---
 
@@ -208,7 +202,7 @@ Outer agents need not use it; humans should want to.
 
 | Track | Focus |
 |-------|--------|
-| **A — Orchestrator + native-cli** | Current plan M0–M6 refined by discussion decisions (one run id, gates knobs, stream, arena reconcile, roles/peer, nice dashboard, safe cleanup) |
+| **A: Orchestrator + native-cli** | Current plan M0-M6 refined by discussion decisions (one run id, gates knobs, stream, arena reconcile, roles/peer, safe cleanup) |
 | **B — api-sdk lane** | Runtime + first provider + usage; then multi-SDK; then mixed fleets |
 | **C — Polish** | Skills + AGENTS.md discovery, quota scrapers per provider, cost UX |
 
@@ -230,5 +224,5 @@ Track A (native-cli) is the default day-to-day path; Track B (api-sdk) is first-
 | Roles/peer | v1 first-class |
 | Ship | Draft PR, never merge; lease force only on swarm branches |
 | Discovery | Skills + AGENTS.md like agent-browser |
-| Dashboard | Nice, first-class TUI |
+| Human front end | pi package over the CLI (O145); TUI removed |
 | Quota | Best-effort auto + manual; Claude statusline-shaped signals where available |

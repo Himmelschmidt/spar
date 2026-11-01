@@ -5,25 +5,16 @@ use std::path::PathBuf;
 #[command(
     name = "spar",
     version,
-    about = "Multi-agent coding product: fleet TUI, dual backends, plan/review/arena/ship",
+    about = "Multi-agent coding orchestrator: dual backends, plan/review/arena/ship",
     long_about = "First-class multi-agent coding product.\n\
-         Humans: `spar` opens the fleet TUI in the current git repo.\n\
+         Humans: the pi package under `pi/` (spar-pi) is the front end.\n\
          Outer agents: subcommands + --json + `spar skills get core`.\n\
          State lives in .spar/ under the project root."
 )]
 pub struct Cli {
-    /// Project directory for TUI (default: cwd). Only when no subcommand.
+    /// Run as if spar was started in this directory
     #[arg(long, global = true)]
     pub cwd: Option<PathBuf>,
-
-    /// Pre-fill the TUI's new-run surface with a task (TUI mode only)
-    #[arg(long = "task", global = true)]
-    pub task: Option<String>,
-
-    /// Use full mouse capture (motion/drag). Default is a minimal click+wheel mode
-    /// that also works on mobile terminals like Termux, where the full set is dropped.
-    #[arg(long = "full-mouse", global = true)]
-    pub full_mouse: bool,
 
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -517,9 +508,6 @@ pub enum Command {
     /// Attach to tmux session for a run (tmux backend)
     Attach { run_id: String },
 
-    /// Live TUI dashboard (same as bare `spar`)
-    Dashboard,
-
     /// Provider inventory and quota controls
     Provider {
         #[command(subcommand)]
@@ -801,7 +789,7 @@ pub enum SkillsCmd {
 
 /// Swarm bus (W5): workspace-scoped, keyed by `agent_id`. `--run <id>` is an optional
 /// grouping tag — pass it to scope a message/view to one run; omit it for bare
-/// (run-less) Composer agents, which are addressable exactly like run slots.
+/// (run-less) agents, which are addressable exactly like run slots.
 #[derive(Debug, Subcommand)]
 pub enum BusCmd {
     /// Send a chat message
@@ -818,12 +806,6 @@ pub enum BusCmd {
         message: String,
         #[arg(long)]
         json: bool,
-        #[arg(long)]
-        surface: Option<String>,
-        #[arg(long)]
-        conversation: Option<String>,
-        #[arg(long)]
-        turn: Option<String>,
         /// Redeliver until the recipient runs `spar bus ack`, then escalate to @human
         #[arg(long)]
         requires_ack: bool,

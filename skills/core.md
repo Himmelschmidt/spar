@@ -1,6 +1,6 @@
 # spar core skill
 
-**spar** is a multi-agent coding product (fleet TUI + headless CLI). Outer agents drive it via CLI; humans use the TUI.
+**spar** is a multi-agent coding product with a headless CLI. Outer agents drive it via CLI; humans use the pi package under `pi/` (`spar-pi`, O145), which itself only calls `spar <cmd> --json`.
 
 ## Discovery
 
@@ -18,7 +18,7 @@ spar model list --provider openrouter [--all] [--json]   # OpenRouter catalog, t
 
 | Who | How |
 |-----|-----|
-| Human | `spar` (no subcommand) → product TUI, landing on Home (scoped to the current repo when run inside one) |
+| Human | the `spar-pi` package (`pi/`); bare `spar` prints help |
 | Outer agent | subcommands + `--json` + exit codes |
 
 **Install the supervisor on every box that runs spar**, once: `spar daemon install`. It
@@ -463,12 +463,7 @@ spar daemon start [--foreground]         # per-project supervisor: restart + aba
 spar daemon start --all-projects         # every registered project, foreground (what the unit runs)
 spar daemon status [--json]
 spar daemon stop                         # release this project (the all-projects process keeps the rest)
-spar bus send --run <run> --from <id> --to <to> --surface chat --conversation <cid> --turn <tid> --message "..."  # orchestrator turn reply
 ```
-
-### TUI Chat
-
-The TUI hosts a resident orchestrator in Main's **Chat** tab (`f(rail selection)` like every other tab): at Home it interviews into a brief, proposes a workflow and fleet with a ````spar-proposal` TOML block that completes the run's partial `RunSpec` (it may propose only blank fields — workflow, task, `[roles]`, `[backups]` — and never silently drops a legacy `providers` list, which is retained visibly until an explicit workflow/role mapping is completed), and launches through the same one-shot `validate_for_launch` + `argv` path a manual form uses (confirmation and manual `Enter` share that validator, so an incomplete spec may open Chat but never spawns an orchestration process). On a selected run it consults the gate against the Review tab's evidence. Transcript is `bus` messages with `surface=chat`, `conversation` and `turn` metadata, rendered as records with immutable bus-event identities. The raw bus palette verb is `:msg`, not `:chat`. Home leads with creation: the first element is the create prompt, with running and waiting runs alongside (amending U7); the `⚑N need you` roll-up, the rail flags and the Gate/Broken toast become the only escalation and are load-bearing, sharing one uncapped `home_needs_you` count that never reads zero while something waits.
 
 ### A run is a unit of work, not an invocation
 
@@ -596,8 +591,8 @@ on — never a restatement of the plan or contract, which the next round is hand
 
 For legs that already exist, `spar link <leg> --to <run>` records the grouping
 (`parent_run`). spar never infers it — pairing runs by task text would merge unrelated
-issues. The TUI then shows one row per unit of work; `status --json` still lists every
-run and carries `parent_run`, so nothing is hidden from an outer agent.
+issues. `status --json` lists every run and carries `parent_run`, so a front end can
+fold legs into one row per unit of work.
 
 **`spar stop`** halts a run without discarding work: it writes a `stopped` marker,
 signals the orchestrator then the slot process groups (SIGTERM → grace → SIGKILL),
@@ -928,8 +923,7 @@ Both nudges ask for the same artifact shape, and the role prompts carry it too, 
 incomplete summary has a defined form: **what was completed, what was not reached, what the
 slot is stuck on.**
 
-- Every nudge is an `Info` event tagged with the slot, so `wait --follow --json` and the TUI
-  surface it.
+- Every nudge is an `Info` event tagged with the slot, so `wait --follow --json` surfaces it.
 - A slot the ceiling killed records `error: "hard ceiling: killed after …"` and
   **`"ceiling_kill": true`** in `status --json`, which is how you tell it from a crash
   (`exit 143`, a signal) without parsing prose. Exit codes are unchanged.
@@ -1066,8 +1060,8 @@ outside the run's worktrees. `--json` reports `worktrees[]` with `killed` pids a
 **Archiving is the third state, between listed forever and deleted.** `cleanup` reclaims
 worktrees and *keeps* the run record — that is where `plan.md`, `test-contract.md`, the
 reviews, `suite.md` and `stats.json` live — so a project that drives spar from the CLI
-accumulates one row per run forever. `spar archive <id>` hides a run from `status` and the
-TUI rail while deleting nothing; `--undo` brings it back, `spar status --archived` lists
+accumulates one row per run forever. `spar archive <id>` hides a run from `status` while
+deleting nothing; `--undo` brings it back, `spar status --archived` lists
 them, and the id stays addressable (`spar status <archived-id>` works). Only `--purge`
 deletes anything.
 
@@ -1232,8 +1226,8 @@ Each time is the earliest of its kind. `receipts.jsonl` rolls to `receipts.jsonl
 `schema_version` (and `withdrawal` under `--supersedes`). The human `bus log` shows the
 message id and `[delivered n/m, read n/m; superseded by …; expired]`.
 
-A message to `@human` (or any `Blocked` agent) surfaces in the TUI's Activity tab (with a
-badge on the tab and the status line) and,
+A message to `@human` (or any `Blocked` agent) lands in the `@human` inbox
+(`spar bus inbox @human`) and,
 if `[notify]` is configured, also fires an external notifier. A `requires_ack` message
 redelivers until acked, then escalates to `@human`.
 
@@ -1478,7 +1472,7 @@ spar grows, and a hard-coded "live" list goes stale. Read the booleans.
 |---|---|
 | `orchestrator_alive` | a live process holds the run lock |
 | `holds_seat` | the run occupies, or is about to occupy, provider capacity: orchestrator alive, or queued in the daemon's admission queue waiting on a provider bucket. Count these as live; never re-brief one |
-| `needs_human` | nothing moves until a person acts: a human gate, the `plan_approved` handoff, or a broken run (`failed`, `stuck`, `escalated`, `quota`, abandoned). The TUI's `⚑ need you` flags read the same rule |
+| `needs_human` | nothing moves until a person acts: a human gate, the `plan_approved` handoff, or a broken run (`failed`, `stuck`, `escalated`, `quota`, abandoned). Front ends read the same rule |
 | `resumable` | `implement --run` / `spar resume` would pick it up now. Never true while `holds_seat` |
 
 List rows also carry `cost_usd`: the run's total reported spend, `null` when no dispatch
@@ -1633,83 +1627,7 @@ Remote hosts are not read.
   hit quota or a refused credential (`parked_run`; `unknown` when none was recorded), `backup_engagements` to the backup that
   took the seat.
 
-### TUI shape (humans)
-
-A **rail** + **one main area**, with no pane borders: chrome bands (breadcrumb, run
-stepper, labels + rule) sit above one body split by a single seam. Main always shows the
-rail's selection.
-
-- Header: brand + breadcrumb + phase, the `⚑N need you` roll-up, and gate buttons in a
-  fixed right-hand zone on 80 columns and up (their x never moves between gates; below
-  80 they right-align).
-- Stepper: the pipeline **for that workflow** — loop/plan is
-  `plan ─ critique ─ spec ─ build ─ tests ─ review ─ ship`, arena is
-  `build ─ rank ─ reconcile ─ review ─ ship`, roles/peer is `peers ─ ship`. Read off the
-  slots that actually ran: `●` done · `◐` live · `○` pending · `·` skipped (a disabled
-  channel or unused role, i.e. never coming) · `✗` failed · `⏸` halted (stopped, quota
-  or abandoned) · `⚑` on the step a gate is holding (plan gate on critique, winner gate
-  on rank, reconcile gate on reconcile, ship gate on ship). Meters on the right read the
-  run's usage ledger, the same numbers `status --json` reports. Folds away under 14 rows.
-- The run list shows **units of work**: a run linked as a leg folds into its parent's
-  row, which carries the parent's brief, the active leg's id and phase, and the group's
-  loudest attention — including how many of its legs want you, so folding can never hide
-  a gate. The band names the round and the leg count. Drilling in stays scoped to the leg
-  the row acts on: its agents, its worktrees, its tmux panes.
-- Rail rows lead with two fixed columns: the selection bar, then the attention flag.
-  They are separate facts — on a project where every run wants you, one shared column
-  meant the cursor was invisible. The phase is named for the width the column has
-  (`ship gate`, `plan gate`, `running`), not truncated from a sentence.
-- Rail: `Home ▸ runs ▸ agents` drill-down, rooted at **Home** — the cross-project
-  landing view. `Enter` pushes a level, `Esc` pops one (never quits, and never past
-  Home). `Enter` on an agent **takes it over** in the Shell tab. `/` filters the rail
-  (Esc clears). The rail is **attention-sorted**: runs at a gate or broken fly a `⚑`
-  and float to the top (and roll up to their project row); a re-sort travels rather
-  than teleports.
-- Home has four bands, always in this order and always present even when empty:
-  **needs you** (runs at a gate, ranked by wait time), **running**, **finished since
-  last look** (a watermark of what landed while you were away), **start something
-  new**. `p` still opens the flat Projects list; `n` opens Chat (Home: new conversation, run: gate consultation) — the token-free manual path is `:plan <task>`; `P` toggles Home's scope between the current project and everything
-  registered.
-- Main tabs: `Log · Activity · Diff · Plan · Review · Chat · Shell` on the labels row, marked
-  by an accent underline on the rule beneath them, switched with `[` / `]` (Activity
-  carries the `@human` alert badge). Every tab but Shell renders typed, folded records
-  (feature 010) through one shared record view, not a raw string: Log is the parsed
-  tool-call/result/thought/prose stream (with real elapsed times where a byte-offset
-  time index exists); Activity is the phase/agent/bus/alert timeline; Diff is the
-  selected slot's real worktree diff, split one record per file, with a global
-  "since you last looked" watermark marking files changed since you last viewed
-  the tab (a slot with no worktree says so rather than falling back to an
-  artifact dump); Plan shows `plan.md`,
-  the plan critique and `test-contract.md` as documents; Review shows one row per
-  `AC-n` criterion plus each reviewer's verdict, sourced from the same gate function
-  `ship` calls. A tool result and a reasoning block are folded by default — `Space`
-  expands the record under the cursor, `A` toggles every record at once, and `R`
-  drops Log/Diff back to the byte-for-byte raw view when a parse ever hides
-  something you need (unavailable on Activity/Plan/Review, which have no single
-  raw source).
-  `J`/`K` move the record cursor to the next/previous record head, `t`/`T` to the
-  next/previous tool call, `e`/`E` to the next/previous error, `}`/`{` to the next/
-  previous phase or document boundary, and `f` toggles Activity's selected-slot filter.
-  At narrow widths (and, once seven tabs stop fitting the wide strip's own padding, at
-  wide widths too) every tab abbreviates uniformly (`Log · Act · Diff · Plan · Rev ·
-  C · Sh`) rather than dropping a tab off the strip.
-- Focus: `1` rail · `2` main (Tab cycles the two). `+` / `_` zoom Main.
-- `:` opens the **command palette** — `approve`/`reject`/`ship`/`confirm`/`reconcile`/
-  `takeover`/`implement`/`plan`/`spawn`/`msg`, Tab-completes run ids.
-- **`a` jumps to the next run that needs you** (or tap the `⚑N need you` status token);
-  the status line rolls up how many runs want you across the fleet. `r`/`s` reject/ship
-  at a gate; approve = tap the button or `:approve`.
-- `p` = Projects · `n` chat · `P` toggle Home scope · `w` log wrap ·
-  `g`/`G` top/bottom · `?` help · **`q` quits**.
-- Shell tab = a real tmux client: **every key goes to the agent** (incl. `Ctrl+C`);
-  `F12` (or `C-a d`) hands focus back to spar. Focusing it full-screen is **Driving
-  mode** — green banner, rail and every band but the footer collapsed, pane edge to edge.
-- Width bands: `<80` cols Main only (rail folds away, tappable tab strip — phone/SSH);
-  `80–119` rail (26 cols) + Main; `>=120` rail 32, the rest of the extra width to Main.
-- Colour: spar paints its own page (`theme::BG`/`BG_OVERLAY` as the ground, U29) —
-  raised bands, sunken output blocks (the tool-output/diff-hunk surface), and the
-  fading gutter of a live block are all mixed against it, at the cost of host-theme
-  transparency.
+### Base, cost and token fields in run JSON
 
 - `status --json` and every run JSON carry **`base_ref` / `base_commit`** — the ref and commit
   all of the run's slot worktrees were cut from (see **Base ref** above), plus
@@ -1747,7 +1665,7 @@ rail's selection.
     not grow just because a run made more calls. Do **not** sum it and do not read it as
     spend. Every entry carries **`context_semantics`** beside it saying what the number
     actually measures: `peak`, `invocation_total`, or `unknown`. Only `peak` is
-    comparable to a window; the TUI mutes anything else to a plain number.
+    comparable to a window.
   - Conventions per adapter, since the wire formats differ: **claude** is settled by the
     terminal `result` record, which supersedes the per-message ones; **codex** by
     `turn.completed` (its only usage record, so it also stands in for the gauge);
@@ -2050,7 +1968,7 @@ slot_secs = 5400            # SOFT per-slot wall clock: nudges start here, nothi
 # review_secs = 5400        # optional; defaults to slot_secs
 hard_ceiling_multiple = 3.0 # the only kill, as a multiple of the role's soft budget
 nudge_every_secs = 600      # re-ask a slot past its soft clock whether it is progressing
-stall_warn_secs = 300  # running slot silent this long ⇒ stalled in status/TUI (0 = off)
+stall_warn_secs = 300  # running slot silent this long ⇒ stalled in status (0 = off)
 wait = "8h"
 # Per-role SOFT budget on one dispatch's billed tokens. Tokens never kill a slot.
 [budget]
@@ -2180,4 +2098,3 @@ timeout_secs = 3600    # test_author's SOFT clock; hard_ceiling_multiple applies
 - **Round ceiling:** `state.round` is bounded by `[rounds] max` (default 8). Hitting it is a **gate** (exit 2, phase `awaiting_round_extension`), lifted with `implement --run <id> --max-rounds <N|+N>` (above the current round; sticky; clears `error`; queued while an orchestrator is live). The rotate/widen/`stuck` ladder resolves **first**, so exit 3 always beats the gate, and a lift preserves the ladder's progress rather than re-buying it.
 - **Contract re-freeze is guarded:** a re-entry that would adopt a `test-contract.md` spar saw drift mid-round refuses with exit `1` unless `--accept-contract` is passed. Re-freezes are announced on stderr, not just in `events.jsonl`.
 - **Carry-forward:** the implementer writes `artifacts/carry-forward-<slot>.md`, which seeds the next round's implementer prompt (blockers first, capped at `[rounds] carry_forward_chars`, consumed on read). It never reaches a reviewer or the acceptance gate.
-- **Human TUI `/spawn`:** `/spawn <cli:provider> <prompt>` launches an agent into a pane on spar's own `tmux -L spar` socket, joined to the selected run's bus — watch and steer it in Main's **Shell** tab without leaving spar.
