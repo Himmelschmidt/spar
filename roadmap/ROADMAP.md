@@ -58,6 +58,10 @@
   panel not a padded one, the resolved fleet visible at gates, `--without` and `--fleet`
   presets) - see `features/011-fleet-shaping.md`  
 
+## Milestone 7: pi front end
+
+- [ ] **pi front end** (event feed, footer and run views, gates as dialogs, agent tools; TUI deleted at gates) - see `features/012-pi-front-end.md`  
+
 ## Later
 
 - Multi-machine / remote workers  
