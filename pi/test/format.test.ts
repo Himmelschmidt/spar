@@ -47,9 +47,10 @@ test("footer omits empty parts", () => {
 
 test("list rows carry id, phase, round, age, flag, cost and workflow", () => {
 	const now = new Date();
+	const hourAgo = new Date(now.getTime() - 3600_000).toISOString();
 	const runs = [
-		row("aaaa1111", { round: 3, cost_usd: 12.5 }),
-		row("bbbb2222", { needs_human: true, phase: "awaiting_ship_confirm" }),
+		row("aaaa1111", { round: 3, cost_usd: 12.5, updated_at: hourAgo }),
+		row("bbbb2222", { needs_human: true, phase: "awaiting_ship_confirm", updated_at: hourAgo }),
 		row("cccc3333", { needs_human: true, updated_at: new Date(now.getTime() - 9 * DAY).toISOString() }),
 	];
 	const rows = listRows(runs, now);
