@@ -587,7 +587,6 @@ impl SlotState {
         }
         self.status = SlotStatus::Pending;
         self.error = None;
-        self.pid = None;
         self.exit_code = None;
         self.signal = None;
         self.usage = None;

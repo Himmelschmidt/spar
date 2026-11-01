@@ -4162,7 +4162,12 @@ mod rotate_reviewer_tests {
         assert_eq!(s.model.as_deref(), Some("gpt-5.6-terra"));
         assert_eq!(s.status, SlotStatus::Pending);
         assert!(!s.quota_hit && !s.auth_fault);
-        assert!(s.usage.is_none() && s.exit_code.is_none() && s.pid.is_none());
+        assert!(s.usage.is_none() && s.exit_code.is_none());
+        assert_eq!(
+            s.pid,
+            Some(42),
+            "a live process stays visible to stop --abandoned"
+        );
         assert_eq!(reviewer_infra_fault(s), None);
     }
 
