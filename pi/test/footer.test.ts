@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
-import { Footer } from "../extensions/spar/footer.ts";
+import { applyEvent, Footer } from "../extensions/spar/footer.ts";
 import { plain } from "../extensions/spar/format.ts";
 import { alive, cleanup, installFake, installNoSpar, restorePath, row, until } from "./helpers.ts";
 
@@ -89,4 +89,17 @@ test("footer stays quiet when spar is not installed", async () => {
 	footer.stop();
 	restorePath();
 	assert.deepEqual(texts, []);
+});
+
+test("archived runs leave the counts and abandoned runs stop counting as running", () => {
+	const runs = [row("a", { holds_seat: true }), row("b", { needs_human: true })];
+	const ev = (run_id: string, type: string) => ({ run_id, cursor: "1", ts: "2026-11-01T10:00:00Z", type });
+	assert.deepEqual(
+		applyEvent(runs, ev("b", "archived")).map((r) => r.id),
+		["a"],
+	);
+	const abandoned = applyEvent(runs, { ...ev("a", "abandoned"), phase: "review" });
+	assert.equal(abandoned[0]!.holds_seat, false);
+	assert.equal(abandoned[0]!.abandoned, true);
+	assert.equal(applyEvent(runs, ev("a", "phase")), runs);
 });

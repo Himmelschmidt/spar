@@ -77,6 +77,7 @@ test("detail groups findings by severity and ends with the next command", () => 
 		recent_events: [
 			{ ts: new Date().toISOString(), type: "phase", prev_phase: "review", phase: "awaiting_ship_confirm", round: 2 },
 			{ ts: new Date().toISOString(), type: "slot", slot: "impl", status: "done" },
+			{ ts: new Date().toISOString(), type: "abandoned", phase: "review" },
 		],
 	};
 	const lines = detailLines(
@@ -101,6 +102,7 @@ test("detail groups findings by severity and ends with the next command", () => 
 	assert.match(text, /- bug \(review-0, follow-up\)/);
 	assert.match(text, /phase review -> awaiting_ship_confirm \(round 2\)/);
 	assert.match(text, /slot impl done/);
+	assert.match(text, /abandoned in review/);
 	assert.match(text, /orchestrator -> broadcast: suite green$/m);
 	assert.equal(lines.at(-1), "next: spar ship r1");
 });

@@ -1,4 +1,4 @@
-import { EventFeed } from "./feed.ts";
+import { EventFeed, type FeedEvent } from "./feed.ts";
 import { footerText, isPaused, type Paint } from "./format.ts";
 import {
 	type Here,
@@ -9,6 +9,16 @@ import {
 	sparJson,
 	statsCost,
 } from "./spar.ts";
+
+// Applied at once so the footer moves before the debounced re-read confirms it: an
+// archived run leaves the counts, and an abandoned one is no longer running.
+export function applyEvent(runs: RunRow[], event: FeedEvent): RunRow[] {
+	if (event.type === "archived") return runs.filter((r) => r.id !== event.run_id);
+	if (event.type === "abandoned") {
+		return runs.map((r) => (r.id === event.run_id ? { ...r, holds_seat: false, abandoned: true } : r));
+	}
+	return runs;
+}
 
 export interface FooterOptions {
 	cwd: string;
@@ -51,7 +61,13 @@ export class Footer {
 		let connects = 0;
 		this.feed = new EventFeed({
 			cwd: this.options.cwd,
-			onEvent: () => this.scheduleRefresh(),
+			onEvent: (event) => {
+				if (this.runs) {
+					this.runs = applyEvent(this.runs, event);
+					this.render();
+				}
+				this.scheduleRefresh();
+			},
 			onConnect: () => {
 				if (connects++ > 0) this.scheduleRefresh();
 			},

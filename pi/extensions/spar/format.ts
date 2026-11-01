@@ -100,6 +100,11 @@ export function describeEvent(e: SparEvent): string {
 			return `phase ${e.prev_phase ? `${e.prev_phase} -> ` : ""}${e.phase ?? "?"}${e.round !== undefined ? ` (round ${e.round})` : ""}`;
 		case "slot":
 			return `slot ${e.slot ?? "?"} ${e.status ?? ""}${e.message ? `: ${firstLine(e.message)}` : ""}`.trimEnd();
+		case "archived":
+		case "unarchived":
+			return e.type;
+		case "abandoned":
+			return `abandoned${e.phase ? ` in ${e.phase}` : ""}`;
 		case "gate":
 			return `gate ${e.phase ?? ""} ${firstLine(e.message)}`.replace(/\s+/g, " ").trim();
 		default:
