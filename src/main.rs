@@ -635,6 +635,12 @@ fn run() -> Result<ExitCode> {
             include_dry_run,
             json,
         } => stats_cmd(since.as_deref(), by, all_projects, include_dry_run, json),
+        Command::Events {
+            run_id,
+            follow,
+            since,
+            json,
+        } => events_cmd(run_id, follow, since.as_deref(), json),
         Command::Wait {
             run_id,
             timeout,
@@ -2502,6 +2508,47 @@ fn truncate_cli(s: &str, max: usize) -> String {
     } else {
         let t: String = s.chars().take(max.saturating_sub(1)).collect();
         format!("{t}…")
+    }
+}
+
+fn events_cmd(
+    run_id: Option<String>,
+    follow: bool,
+    since: Option<&str>,
+    json: bool,
+) -> Result<ExitCode> {
+    let (paths, _) = project_ctx()?;
+    if let Some(id) = &run_id {
+        if !paths.run_dir(id).is_dir() {
+            anyhow::bail!("no run {id} in this project");
+        }
+    }
+    let mut feed = match since {
+        Some("now") => events::Feed::at_tail(&paths, run_id)?,
+        None if follow => events::Feed::at_tail(&paths, run_id)?,
+        Some(cursor) => events::Feed::from_cursor(cursor, run_id)?,
+        None => events::Feed::from_cursor("", run_id)?,
+    };
+    let mut out = std::io::stdout().lock();
+    loop {
+        for line in feed.poll(&paths)? {
+            let text = if json {
+                serde_json::to_string(&line)?
+            } else {
+                format!("{} {}", line.run_id, line.event.display_line())
+            };
+            match writeln!(out, "{text}").and_then(|_| out.flush()) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                    return Ok(ExitCode::Success)
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if !follow {
+            return Ok(ExitCode::Success);
+        }
+        std::thread::sleep(Duration::from_millis(250));
     }
 }
 

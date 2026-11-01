@@ -169,6 +169,30 @@ spar bus log --run "$RUN_ID"
 spar run --workflow peer --task "$TASK" --providers cli:claude,cli:grok --json
 ```
 
+## Event feed
+
+`spar events --follow --json` streams every run's lifecycle events in the project as
+one feed (phase changes, gates, slot status, slot notes, daemon-detected abandonment),
+read from each run's `.spar/runs/<id>/events.jsonl`. One object per line:
+
+```json
+{"run_id":"3d3d6f59","cursor":"…","ts":"2026-11-01T12:00:00Z","type":"phase","phase":"dispatch","prev_phase":"plan_approved","round":1}
+```
+
+`type` is `phase`, `slot`, `gate` or `info`; `phase`, `prev_phase`, `slot`, `status`,
+`message` and `round` appear when set. Fields are only added, never renamed.
+
+- Without `--follow` it prints the backlog of every non-archived run, ordered by `ts`,
+  and exits `0`. With `--follow` it starts at the tail (`--since now`) and keeps going,
+  picking up runs created after it started.
+- **Resume:** pass the `cursor` of the last line you handled to `--since`. The cursor is
+  opaque and records a position in every run, so the replay has no gaps and no repeats,
+  even for runs created after it was issued.
+- One run's events keep their file order; across runs a late event can carry an
+  earlier `ts` than one already printed.
+- `--run <id>` limits the feed to one run (shown even if archived). An unknown id or a
+  malformed cursor exits `1`.
+
 ## Status JSON
 
 `status` / `wait` print full `RunState` (`id` field). Workflow emits also include `run_id` (alias of `id`).

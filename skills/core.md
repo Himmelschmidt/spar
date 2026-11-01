@@ -1246,6 +1246,7 @@ spar status [run_id] [--json] [--all]   # --all = every registered project; a ru
 spar status --hosts h1,h2 | --all-hosts [--json]   # runs on other boxes over ssh (O140)
 spar stats [--since 7d] [--by model|role|provider|project] [--all-projects] [--json]
 spar wait <run_id> [--timeout 8h] [--follow] [--json]
+spar events [--run <id>] [--follow] [--since <cursor>|now] [--json]   # every run's events, one feed (O146)
 spar logs <run_id> [slot] [-f|--follow]
 
 # Global home: open `spar` from anywhere. Runs stay under each project’s
@@ -1410,6 +1411,39 @@ run is never reported stuck) caps the block and returns exit `3` if it
 lapses. Poll `status --json` / `status --all` only when you genuinely can't block —
 e.g. supervising several runs at once, where you background one `wait --follow` per
 run and reconcile as each returns.
+
+### One feed for every run: `spar events` (O146)
+
+A front end or supervisor watching many runs tails one stream instead of one `wait`
+per run:
+
+```bash
+spar events --follow --json              # from now; keeps going until killed
+spar events --json                       # backlog of every run, ordered by time, then exits
+spar events --follow --json --since "$CURSOR"   # resume after a disconnect
+spar events --run <id> --json            # one run (shown even if archived)
+```
+
+Each `--json` line is one object: `run_id`, `cursor`, then the event's own fields
+(`ts`, `type` = `phase` | `slot` | `gate` | `info`, and as present `phase`,
+`prev_phase`, `slot`, `status`, `message`, `round`). Text mode prints
+`<run_id> <time> <event>`. Fields are only ever added, never renamed.
+
+- **Resume:** keep the `cursor` of the last line you processed and pass it to
+  `--since`. You get exactly what you missed: nothing twice, nothing dropped, across all
+  runs, including runs created after that cursor. Treat the cursor as opaque; it is
+  only valid for the same project, and resuming without `--run` replays from scratch
+  any run a `--run` cursor never saw.
+- `--since now` (the default with `--follow`) starts at the tail. Without `--follow`
+  and without `--since`, it starts at the beginning of every run.
+- Order is by `ts` within a batch, but one run's events always keep their file order,
+  and an event written late can carry an earlier `ts` than one already printed. Don't
+  sort on `ts` and drop "older" ones.
+- New run directories are picked up as they appear. Archived runs are skipped.
+- A run the daemon finds abandoned gets an `info` event saying so.
+- Exit `0` when the backlog is printed (or the reader closes the pipe); `1` for an
+  unknown `--run` or a malformed cursor. Provider pause state is not an event: poll
+  `spar provider list --json`.
 
 ### Scripting surface: booleans, structured reviews, history (O100, O101, O102)
 

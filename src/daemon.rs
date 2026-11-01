@@ -539,6 +539,14 @@ fn tick(paths: &SparPaths, cfg: &Config, book: &mut DaemonState) {
         }
 
         if !entry.abandoned_notified {
+            let _ = crate::events::append(
+                paths,
+                &summary.id,
+                &crate::events::Event::info(format!(
+                    "abandoned in {:?}: no live orchestrator; resume with: spar resume {}",
+                    state.phase, summary.id
+                )),
+            );
             crate::notify::route_abandoned(paths, &state);
             entry.abandoned_notified = true;
             log_line(paths, &format!("run {} abandoned; notified", summary.id));
