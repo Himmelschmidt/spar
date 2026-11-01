@@ -2326,11 +2326,8 @@ pub fn execute_loop(
                                 let pin = crate::provider_ref::Pin::parse(&backup_raw)
                                     .map(|p| p.display())
                                     .unwrap_or(backup_raw.clone());
-                                crate::workflow::implement::set_slot_provider(s, pin);
+                                s.point_at(&pin);
                                 s.source = Some(SeatSource::Backup);
-                                s.status = crate::state::SlotStatus::Pending;
-                                s.error = None;
-                                s.quota_hit = false;
                             }
                             state.save(paths)?;
                             // Retry the implementer with backup in the same round
@@ -2423,11 +2420,8 @@ pub fn execute_loop(
                                     let pin = crate::provider_ref::Pin::parse(&backup_raw)
                                         .map(|p| p.display())
                                         .unwrap_or(backup_raw);
-                                    crate::workflow::implement::set_slot_provider(s, pin);
+                                    s.point_at(&pin);
                                     s.source = Some(SeatSource::Backup);
-                                    s.status = crate::state::SlotStatus::Pending;
-                                    s.error = None;
-                                    s.quota_hit = false;
                                 }
                                 state.save(paths)?;
                                 let retry_impl_slot = state
@@ -3262,17 +3256,13 @@ fn move_seat(
         .map(|s| s.role)
         .ok_or_else(|| anyhow::anyhow!("unknown slot {slot_id}"))?;
     if let Some(s) = state.slot_mut(slot_id) {
-        set_slot_provider(s, pin.display());
+        s.point_at(&pin.display());
         // A level the old CLI took may not exist on the new one; the dispatch then
         // resolves the role's level from config.
         if executor::check_slot_effort(&pin.display(), s.effort).is_err() {
             s.effort = None;
         }
         s.source = Some(source);
-        s.status = SlotStatus::Pending;
-        s.error = None;
-        s.quota_hit = false;
-        s.auth_fault = false;
     }
     let new_id = moved_seat_id(role, slot_id, &pin.provider);
     if new_id != slot_id && state.slots.iter().all(|s| s.id != new_id) {
@@ -3469,10 +3459,8 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
                             .unwrap_or(backup_raw.clone());
                         let impl_id = slot_state.id.clone();
                         if let Some(s) = state.slot_mut(&impl_id) {
-                            set_slot_provider(s, backup_pin);
+                            s.point_at(&backup_pin);
                             s.source = Some(SeatSource::Backup);
-                            s.status = SlotStatus::Pending;
-                            s.error = None;
                         }
                         state.save(paths)?;
                         return Ok(true);
@@ -3485,7 +3473,7 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
         }
     }
     // Candidate order: [roles].implementer, then [providers].order, then the live fleet.
-    // Rotation must report the rung it actually drew from (`set_slot_provider` only
+    // Rotation must report the rung it actually drew from (`SlotState::point_at` only
     // touches provider/model), not leave the slot claiming its original source.
     let implementer_role_source = if cfg
         .cli_role_keys
@@ -3531,33 +3519,11 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
     };
     let impl_id = slot_state.id.clone();
     if let Some(s) = state.slot_mut(&impl_id) {
-        set_slot_provider(s, next);
+        s.point_at(&next);
         s.source = Some(source);
-        s.status = SlotStatus::Pending;
-        s.error = None;
     }
     state.save(paths)?;
     Ok(true)
-}
-
-/// Point a slot at a different provider, applying the same `provider` / `model` split
-/// `init_slot_model` does: `provider` stays model-free (it keys the quota bucket and slot
-/// naming) and any `@model` moves to `model`.
-///
-/// Assigning the raw ref instead leaves the *previous* provider's model in place, so the
-/// new CLI is handed a `--model` belonging to the old one and `status` reports a
-/// `provider@model` pair that does not exist.
-fn set_slot_provider(slot: &mut SlotState, provider: String) {
-    match crate::provider_ref::ProviderRef::parse(&provider) {
-        Ok(pref) => {
-            slot.provider = pref.storage_key();
-            slot.model = pref.model;
-        }
-        Err(_) => {
-            slot.provider = provider;
-            slot.model = None;
-        }
-    }
 }
 
 /// Add an extra adversarial reviewer from a provider not already reviewing.
@@ -3759,11 +3725,9 @@ fn try_rotate_reviewer_provider(
         return Ok(None);
     };
     if let Some(s) = state.slot_mut(rev_id) {
-        set_slot_provider(s, next);
+        s.point_at(&next);
         s.source = Some(source);
         s.cwd = Some(review_cwd.to_path_buf());
-        s.status = SlotStatus::Pending;
-        s.error = None;
     }
     state.save(paths)?;
     Ok(Some(rev_id.to_string()))
@@ -4160,6 +4124,46 @@ mod rotate_reviewer_tests {
                 .is_some();
         assert!(changed);
         assert_eq!(st.slots[0].provider, "api:openai");
+    }
+
+    /// Run 52588b2c's seat: a claude dispatch hit its weekly limit, then the seat was
+    /// rotated to codex. The record must not name codex while still carrying claude's
+    /// verdict, or `reviewer_infra_fault` reports codex as rate-limited (O149).
+    #[test]
+    fn rotation_drops_the_previous_providers_verdict() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = state_with_reviewer("cli:claude");
+        {
+            let s = &mut st.slots[0];
+            s.status = SlotStatus::Failed;
+            s.quota_hit = true;
+            s.auth_fault = true;
+            s.exit_code = Some(1);
+            s.pid = Some(42);
+            s.error = Some("exit 1".into());
+            s.usage = Some(
+                serde_json::from_value(serde_json::json!({
+                    "slot_id": "review-0",
+                    "provider": "cli:claude",
+                    "input_tokens": 0,
+                    "output_tokens": 15,
+                }))
+                .unwrap(),
+            );
+        }
+        let mut cfg = Config::default();
+        cfg.roles.reviewer = vec!["cli:claude".into(), "cli:codex@gpt-5.6-terra".into()];
+        try_rotate_reviewer_provider(&mut st, &paths, "review-0", tmp.path(), &cfg, false)
+            .unwrap()
+            .expect("rotates to the other pin");
+        let s = &st.slots[0];
+        assert_eq!(s.provider, "cli:codex");
+        assert_eq!(s.model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(s.status, SlotStatus::Pending);
+        assert!(!s.quota_hit && !s.auth_fault);
+        assert!(s.usage.is_none() && s.exit_code.is_none() && s.pid.is_none());
+        assert_eq!(reviewer_infra_fault(s), None);
     }
 
     /// `--fleet small` (a preset-only panel narrowing, no `[roles].reviewer` pin) must not

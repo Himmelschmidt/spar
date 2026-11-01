@@ -358,6 +358,7 @@ fn prepare_slot_execution(
     // Drop any prior attempt's terminal/pid markers before this slot goes Running, so a
     // stale `<slot>.failed` doesn't outrank the live process during reconciliation.
     markers::clear_slot(paths, &state.id, &job.slot_id);
+    reset_slot_log(&log_path);
     let round = state.round;
     state.dispatched_round = round;
     if let Some(s) = state.slot_mut(&job.slot_id) {
@@ -1083,7 +1084,6 @@ fn execute_prepared(
                 .unwrap_or_else(|| PathBuf::from(n))
         });
         let model = prep.job.model.clone();
-        reset_api_slot_log(&prep.log_path);
         let (ok, err, usage) = crate::api::run_api_slot(&crate::api::runtime::ApiSlotRequest {
             provider_name: &prep.pref.name,
             prompt: &prep.prompt,
@@ -2416,8 +2416,10 @@ pub fn run_slot(
     // catches a rung the CLI does not offer without spawning anything.
     let effort = slot_effort_for(cfg, Some(state), job);
     check_slot_effort(&job.provider, effort)?;
-    // See prepare_slot_execution: clear a prior attempt's markers before going Running.
+    // See prepare_slot_execution: clear a prior attempt's markers and log before going
+    // Running.
     markers::clear_slot(paths, &state.id, &job.slot_id);
+    reset_slot_log(&log_path);
     let round = state.round;
     state.dispatched_round = round;
     if let Some(s) = state.slot_mut(&job.slot_id) {
@@ -3552,7 +3554,6 @@ fn run_api(
         .as_ref()
         .map(|n| paths.artifact(&state.id, n));
     let model = slot_model_for(Some(state), job);
-    reset_api_slot_log(log_path);
     let (ok, err, usage) = api::run_api_slot(&api::runtime::ApiSlotRequest {
         provider_name: &pref.name,
         prompt,
@@ -3997,13 +3998,18 @@ enum TmuxDecision {
     Failed,
 }
 
-/// Truncate `log_path` before an api-sdk slot's own `append_log` (`src/api/runtime.rs`)
-/// starts appending to it, so a re-dispatch reusing this slot's log starts clean.
-fn reset_api_slot_log(log_path: &Path) {
+/// Empty the slot's log and drop its stats sidecar before a dispatch, whatever its
+/// backend. The log is keyed by slot id, not provider, so after a rotation, backup or
+/// `--reassign` the file still holds the previous provider's transcript. A dispatch that
+/// fails before its CLI writes a line (binary not on PATH, a spawn error) would otherwise
+/// have that transcript scraped as its own: another provider's weekly limit pausing the
+/// one that never ran (O149). api-sdk slots append to it, so they need it empty too.
+fn reset_slot_log(log_path: &Path) {
     if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::File::create(log_path);
+    let _ = std::fs::remove_file(process::StreamStats::stats_path(log_path));
 }
 
 /// A `done` marker only means success once the agent's pane process has exited.
@@ -4696,14 +4702,17 @@ mod tests {
     use crate::providers::ProviderAdapter;
 
     #[test]
-    fn reset_api_slot_log_truncates_the_log() {
+    fn reset_slot_log_truncates_the_log_and_drops_its_stats() {
         let tmp = tempfile::tempdir().unwrap();
         let log_path = tmp.path().join("slot.log");
+        let stats = process::StreamStats::stats_path(&log_path);
         std::fs::write(&log_path, "leftover transcript from a prior round\n").unwrap();
+        std::fs::write(&stats, "{}").unwrap();
 
-        reset_api_slot_log(&log_path);
+        reset_slot_log(&log_path);
 
         assert_eq!(std::fs::read_to_string(&log_path).unwrap(), "");
+        assert!(!stats.exists());
     }
 
     fn dispatch_opts(prompt: &str) -> SpawnOpts {

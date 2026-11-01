@@ -565,6 +565,35 @@ impl SlotState {
     pub fn parks_on_quota(&self) -> bool {
         self.quota_hit || self.auth_fault
     }
+
+    /// Put `provider` (`cli:x` or `cli:x@model`) in this seat, pending its first
+    /// dispatch. `provider` stays model-free (it keys the quota bucket and slot naming)
+    /// and any `@model` moves to `model`, so the new CLI is never handed the old one's
+    /// `--model`.
+    ///
+    /// Every outcome field of the last dispatch is dropped with the old provider (O149):
+    /// a seat that names one provider while carrying another's `quota_hit`, `auth_fault`
+    /// or usage reports that failure against a provider that never ran.
+    pub fn point_at(&mut self, provider: &str) {
+        match crate::provider_ref::ProviderRef::parse(provider) {
+            Ok(pref) => {
+                self.provider = pref.storage_key();
+                self.model = pref.model;
+            }
+            Err(_) => {
+                self.provider = provider.to_string();
+                self.model = None;
+            }
+        }
+        self.status = SlotStatus::Pending;
+        self.error = None;
+        self.pid = None;
+        self.exit_code = None;
+        self.signal = None;
+        self.usage = None;
+        self.quota_hit = false;
+        self.auth_fault = false;
+    }
 }
 
 /// Where a seat's provider was resolved from, in precedence order. Feature 011: the
