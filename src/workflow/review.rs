@@ -95,7 +95,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     for (i, prov) in state.providers.iter().enumerate() {
         let mut provider = prov.clone();
         let mut source = sources.get(i).copied();
-        let mut model = crate::runspec::Pin::parse(&provider)
+        let mut model = crate::provider_ref::Pin::parse(&provider)
             .ok()
             .and_then(|p| p.model);
         let backup_pin =
@@ -109,7 +109,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
                         paths,
                         dry,
                     ) {
-                        if let Ok(bpin) = crate::runspec::Pin::parse(&backup_raw) {
+                        if let Ok(bpin) = crate::provider_ref::Pin::parse(&backup_raw) {
                             provider = bpin.display();
                             source = Some(crate::state::SeatSource::Backup);
                             model = bpin.model.clone();
@@ -278,7 +278,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
         if cur_key == backup_key {
             continue;
         }
-        let pin = match crate::runspec::Pin::parse(&backup_raw) {
+        let pin = match crate::provider_ref::Pin::parse(&backup_raw) {
             Ok(p) => p,
             Err(_) => continue,
         };

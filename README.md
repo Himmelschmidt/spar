@@ -1,10 +1,10 @@
 # spar
 
-**spar** runs a *fleet* of coding agents against a git repo — plan, implement, review, compete (arena), and ship a draft PR — from a terminal TUI or a headless CLI.
+**spar** runs a *fleet* of coding agents against a git repo (plan, implement, review, compete in an arena, and ship a draft PR) from a headless CLI.
 
 You keep using Claude Code, Grok Build, Antigravity (`agy`), and/or API models as **workers**. spar is the orchestrator and control room.
 
-Humans: open `spar` (TUI).  
+Humans: the pi package under `pi/` (`spar-pi`) is the front end; bare `spar` prints help.  
 Outer agents (Claude, Grok, …): drive it with CLI + `--json` after reading the built-in skill.
 
 > **v0.0.1 — early release.** Dry-run workflows are solid for learning the flow. Live runs need real provider CLIs and/or API keys. APIs and UX may still change.
@@ -73,7 +73,7 @@ If you use Claude Code, Grok, Antigravity, or similar with a **global** instruct
 ## spar (multi-agent coding)
 
 Use **spar** for multi-provider plan / implement / review / arena fleets.
-Humans: `spar` (TUI). Outer agents: CLI + `--json`.
+Humans: the `spar-pi` package (`pi/`). Outer agents: CLI + `--json`.
 
 ```bash
 spar skills get core          # full operator skill — read this first
@@ -116,7 +116,7 @@ From any **git project** you want spar to work on:
 ```bash
 cd /path/to/your/project
 spar doctor          # providers, git, optional tools
-spar                 # fleet TUI
+spar status          # runs in this project
 ```
 
 ### Dry-run (no live agents, no real worktrees)
@@ -169,12 +169,10 @@ spar provider list
 
 ## Everyday usage
 
-### Human (TUI)
+### Human (pi)
 
-```bash
-spar                 # product TUI in current repo
-spar --task "…"      # open TUI with a seeded task
-```
+The human front end is the `spar-pi` package under `pi/`: a pi extension that reads
+and acts only through `spar <cmd> --json` (O145). Bare `spar` prints help.
 
 ### Path A — plan, then implement (one run id)
 

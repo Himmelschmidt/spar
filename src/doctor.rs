@@ -264,7 +264,7 @@ fn has_usable_provider(providers: &[providers::ProviderReport]) -> bool {
 const GATE_UNSEEN_AFTER: chrono::Duration = chrono::Duration::hours(1);
 
 /// Runs parked at a human gate past `GATE_UNSEEN_AFTER` with no `[notify]` sink
-/// configured: the TUI alert panel only helps someone who has it open (#165).
+/// configured: a bus alert only helps someone who is looking at it (#165).
 fn gate_notify_hint(
     paths: &SparPaths,
     cfg: &Config,

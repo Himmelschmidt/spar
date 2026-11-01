@@ -26,7 +26,7 @@ pub fn run_from_cli(
     cfg: &Config,
 ) -> Result<ExitCode> {
     if let Some(t) = &task {
-        crate::runspec::validate_task(t).map_err(anyhow::Error::msg)?;
+        crate::workflow::validate_task(t).map_err(anyhow::Error::msg)?;
     }
     if let Some(id) = run_id {
         return run_from_approved(&id, task, opts, paths, cfg);
@@ -321,7 +321,7 @@ fn repoint_existing_seats(state: &mut RunState, cfg: &Config) -> Result<()> {
 #[derive(Debug, Clone)]
 pub struct Reassignment {
     target: String,
-    pin: crate::runspec::Pin,
+    pin: crate::provider_ref::Pin,
 }
 
 /// Parse `--reassign` and refuse a provider the run could not dispatch anyway: unknown,
@@ -338,7 +338,7 @@ pub fn parse_reassignments(raw: &[String], paths: &SparPaths) -> Result<Vec<Reas
         if target.is_empty() {
             bail!("--reassign {r:?}: name a role (implementer, reviewer, tester) or a seat id");
         }
-        let pin = crate::runspec::Pin::parse(provider)
+        let pin = crate::provider_ref::Pin::parse(provider)
             .map_err(|e| anyhow::anyhow!("--reassign {r:?}: {e}"))?;
         let pref = crate::provider_ref::ProviderRef::parse(&pin.provider)?;
         if let Some(cli) = pref.cli_name() {
@@ -423,8 +423,8 @@ fn reassign_target(state: &RunState, target: &str) -> Result<String> {
 fn resolve_reassignments(
     state: &RunState,
     wanted: &[Reassignment],
-) -> Result<Vec<(String, crate::runspec::Pin)>> {
-    let mut out: Vec<(String, crate::runspec::Pin)> = Vec::new();
+) -> Result<Vec<(String, crate::provider_ref::Pin)>> {
+    let mut out: Vec<(String, crate::provider_ref::Pin)> = Vec::new();
     for r in wanted {
         let seat = reassign_target(state, &r.target)?;
         if out.iter().any(|(s, _)| *s == seat) {
@@ -464,7 +464,7 @@ fn reassign_seat(
     state: &mut RunState,
     paths: &SparPaths,
     seat: &str,
-    pin: &crate::runspec::Pin,
+    pin: &crate::provider_ref::Pin,
 ) -> Result<crate::state::SeatReassignment> {
     let slot = state
         .slots
@@ -472,7 +472,7 @@ fn reassign_seat(
         .find(|s| s.id == seat)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("unknown seat {seat}"))?;
-    let from_provider = crate::runspec::Pin {
+    let from_provider = crate::provider_ref::Pin {
         provider: slot.provider.clone(),
         model: slot.model.clone(),
     }
@@ -1000,7 +1000,7 @@ fn prepare_implement_slots(
                     paths,
                     dry,
                 ) {
-                    if let Ok(pin) = crate::runspec::Pin::parse(&backup_raw) {
+                    if let Ok(pin) = crate::provider_ref::Pin::parse(&backup_raw) {
                         provider = pin.display();
                         source = crate::state::SeatSource::Backup;
                         model = pin.model.clone();
@@ -2323,7 +2323,7 @@ pub fn execute_loop(
                             )
                         {
                             if let Some(s) = state.slot_mut(&impl_job.slot_id) {
-                                let pin = crate::runspec::Pin::parse(&backup_raw)
+                                let pin = crate::provider_ref::Pin::parse(&backup_raw)
                                     .map(|p| p.display())
                                     .unwrap_or(backup_raw.clone());
                                 crate::workflow::implement::set_slot_provider(s, pin);
@@ -2420,7 +2420,7 @@ pub fn execute_loop(
                                     .unwrap_or_else(|_| impl_slot.provider.clone());
                             if backup_key != cur_key {
                                 if let Some(s) = state.slot_mut(&impl_job.slot_id) {
-                                    let pin = crate::runspec::Pin::parse(&backup_raw)
+                                    let pin = crate::provider_ref::Pin::parse(&backup_raw)
                                         .map(|p| p.display())
                                         .unwrap_or(backup_raw);
                                     crate::workflow::implement::set_slot_provider(s, pin);
@@ -3252,7 +3252,7 @@ fn move_seat(
     state: &mut RunState,
     paths: &SparPaths,
     slot_id: &str,
-    pin: &crate::runspec::Pin,
+    pin: &crate::provider_ref::Pin,
     source: SeatSource,
 ) -> Result<String> {
     let role = state
@@ -3303,7 +3303,7 @@ fn move_seat_to_backup(
     slot_id: &str,
     backup_raw: &str,
 ) -> Result<String> {
-    let pin = crate::runspec::Pin::parse(backup_raw)?;
+    let pin = crate::provider_ref::Pin::parse(backup_raw)?;
     let id = move_seat(state, paths, slot_id, &pin, SeatSource::Backup)?;
     state.save(paths)?;
     Ok(id)
@@ -3464,7 +3464,7 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
                         )
                         && slot_state.source != Some(SeatSource::Backup)
                     {
-                        let backup_pin = crate::runspec::Pin::parse(&backup_raw)
+                        let backup_pin = crate::provider_ref::Pin::parse(&backup_raw)
                             .map(|p| p.display())
                             .unwrap_or(backup_raw.clone());
                         let impl_id = slot_state.id.clone();
@@ -3807,7 +3807,7 @@ mod moved_seat_tests {
             .expect("claude refuses some level");
         slot.effort = Some(refused);
         state.slots.push(slot);
-        let pin = crate::runspec::Pin::parse("cli:claude").unwrap();
+        let pin = crate::provider_ref::Pin::parse("cli:claude").unwrap();
         let id = move_seat(
             &mut state,
             &paths,

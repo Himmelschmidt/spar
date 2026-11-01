@@ -4,6 +4,9 @@
 **Decisions:** P7, O38-O42, X9, X10  
 **Supersedes:** nothing. Extends B1 (notify sink), Z2 (abandoned is computed), O1 (one run id).
 
+The TUI this document refers to was removed per O145; its human role passes to the pi
+package under `pi/`.
+
 ---
 
 ## The symptom
@@ -92,7 +95,7 @@ Strict prohibitions, because a supervisor is not an operator:
 - Never sweep `cleanup`.
 - Never choose a fleet.
 
-Every one of those stays a human decision, made through the TUI or CLI. The daemon's whole
+Every one of those stays a human decision, made through the CLI or the pi front end (`pi/`, O145). The daemon's whole
 job is to make sure the human is told when a decision is waiting, not to make it for them.
 
 ---

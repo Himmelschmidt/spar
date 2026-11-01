@@ -7,7 +7,6 @@ mod checkpoint;
 mod cli;
 mod config;
 mod daemon;
-mod defaults;
 mod doctor;
 mod effort;
 mod events;
@@ -19,10 +18,8 @@ mod liveness;
 mod mailbox;
 mod markers;
 mod model_select;
-mod motion;
 mod notify;
 mod nudge;
-mod orchestrator;
 mod paths;
 mod probe;
 mod process;
@@ -30,12 +27,10 @@ mod provider_ref;
 mod providers;
 mod prs;
 mod quota;
-mod record;
 mod registry;
 mod rules;
 mod runkey;
 mod runlock;
-mod runspec;
 mod sandbox;
 mod session_id;
 mod ship;
@@ -45,17 +40,10 @@ mod stats;
 mod suite;
 mod tasks;
 mod templates;
-mod terminal;
-mod theme;
 mod tmux;
-mod tui;
 mod util;
 mod workflow;
-mod workspace;
 mod worktree;
-
-#[cfg(test)]
-mod structured_views_contract;
 
 use anyhow::Result;
 use clap::Parser;
@@ -92,22 +80,15 @@ fn run() -> Result<ExitCode> {
         Err(e) => return usage_error(e),
     };
 
+    let Some(command) = cli.command else {
+        <Cli as clap::CommandFactory>::command().print_help()?;
+        return Ok(ExitCode::Success);
+    };
     if let Some(cwd) = &cli.cwd {
-        if cli.command.is_some() {
-            std::env::set_current_dir(cwd)?;
-        }
+        std::env::set_current_dir(cwd)?;
     }
 
-    let Some(command) = cli.command else {
-        return tui::run_with(tui::TuiOpts {
-            task_seed: cli.task.clone(),
-            cwd: cli.cwd.clone(),
-            full_mouse: cli.full_mouse,
-        });
-    };
-
-    // Orchestrating commands reap their slots on SIGINT/SIGTERM. Never the TUI: there
-    // Ctrl+C is the agent's, not spar's.
+    // Orchestrating commands reap their slots on SIGINT/SIGTERM.
     let validate_only = matches!(
         command,
         Command::Plan {
@@ -474,7 +455,7 @@ fn run() -> Result<ExitCode> {
                             )?;
                         }
                         if let Some(t) = &task {
-                            runspec::validate_task(t).map_err(anyhow::Error::msg)?;
+                            workflow::validate_task(t).map_err(anyhow::Error::msg)?;
                         }
                     }
                     // A `--plan` without `--new` continues the run that wrote it, which
@@ -651,11 +632,6 @@ fn run() -> Result<ExitCode> {
             follow,
         } => logs_cmd(&run_id, slot.as_deref(), follow),
         Command::Attach { run_id } => attach_cmd(&run_id),
-        Command::Dashboard => tui::run_with(tui::TuiOpts {
-            task_seed: cli.task.clone(),
-            cwd: cli.cwd.clone(),
-            full_mouse: cli.full_mouse,
-        }),
         Command::Provider { action } => provider_cmd(action),
         Command::Model { action } => {
             let cfg = match project_ctx() {
@@ -826,11 +802,11 @@ fn usage_error(e: clap::Error) -> Result<ExitCode> {
 }
 
 /// The subcommand in a raw argv clap could not parse: the first positional, skipping
-/// the global flags and the values `--cwd` / `--task` take (`spar --cwd /p plan …`).
+/// the global flags and the value `--cwd` takes (`spar --cwd /p plan …`).
 fn subcommand_of(args: &[String]) -> Option<&str> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        if a == "--cwd" || a == "--task" {
+        if a == "--cwd" {
             it.next();
             continue;
         }
@@ -902,9 +878,6 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             to,
             message,
             json,
-            surface,
-            conversation,
-            turn,
             requires_ack,
             persist,
             supersedes,
@@ -966,16 +939,6 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
                     anyhow::bail!("{old} was sent by {}, not {from}", prior.from);
                 }
             }
-            let mut meta = std::collections::HashMap::new();
-            if let Some(s) = surface.clone() {
-                meta.insert("surface".to_string(), s);
-            }
-            if let Some(c) = conversation.clone() {
-                meta.insert("conversation".to_string(), c);
-            }
-            if let Some(t) = turn.clone() {
-                meta.insert("turn".to_string(), t);
-            }
             let msg = bus::BusMessage {
                 id: bus::new_id(),
                 ts: chrono::Utc::now(),
@@ -992,21 +955,9 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
                 requires_ack,
                 persist,
                 expires_after_round,
-                meta: meta.clone(),
+                meta: std::collections::HashMap::new(),
             };
-            let is_conversation = surface.as_deref() == Some("chat")
-                && conversation
-                    .as_deref()
-                    .map(|v| !v.is_empty())
-                    .unwrap_or(false)
-                && turn.as_deref().map(|v| !v.is_empty()).unwrap_or(false)
-                && from == bus::agent_ref(run.as_deref(), conversation.as_deref().unwrap_or(""));
-            let budget = if is_conversation {
-                bus::MessageBudget::Chatty
-            } else {
-                bus::MessageBudget::Normal
-            };
-            let msg = bus::send(&paths, msg, budget)?;
+            let msg = bus::send(&paths, msg, bus::MessageBudget::Normal)?;
             let withdrawal = supersedes
                 .as_deref()
                 .map(|old| bus::withdraw(&paths, old))
@@ -1235,7 +1186,7 @@ fn bus_deliver(
     };
     // A turn boundary is one of the swarm's delivery pulses: advance any unacked-message
     // redeliveries first so a due redelivery lands in this same drain. This is not the
-    // only pulse — the wait loop and TUI refresh also tick acks, so redelivery/escalation
+    // only pulse: the wait loop also ticks acks, so redelivery/escalation
     // advances in runs with no Stop-hook slot (claude, muse or grok, whose Stop
     // hook is the only pulse here).
     bus::tick_acks(paths, &bus::AckPolicy::default(), chrono::Utc::now())?;
@@ -2097,7 +2048,7 @@ fn stop_cmd(run_id: Option<&str>, abandoned: bool, json: bool) -> Result<ExitCod
 }
 
 /// Reap every run that is in flight with no live orchestrator. Explicit by design: a
-/// read command must never kill processes, and a human driving a slot through the TUI
+/// read command must never kill processes, and a human driving a slot through `spar attach`
 /// holds no run lock, so their run reads as abandoned too.
 fn stop_abandoned(json: bool) -> Result<ExitCode> {
     let (paths, _) = project_ctx()?;
@@ -3283,7 +3234,7 @@ fn pause_line(store: &quota::QuotaStore, key: &str) -> Option<String> {
             let secs = (chrono::Utc::now() - t).num_seconds().max(0) as u64;
             format!(
                 "paused {} ago",
-                record::fmt_elapsed(std::time::Duration::from_secs(secs))
+                util::fmt_elapsed(std::time::Duration::from_secs(secs))
             )
         })
         .unwrap_or_else(|| "paused (age unknown)".into());

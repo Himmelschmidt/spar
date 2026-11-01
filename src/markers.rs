@@ -35,7 +35,7 @@ pub fn terminal_marker(paths: &SparPaths, run_id: &str, slot_id: &str) -> Option
 
 /// Remove a slot's terminal markers so a re-dispatched slot isn't reported with a prior
 /// attempt's verdict. Called at (re-)dispatch, before the slot runs: a stale `<slot>.failed`
-/// otherwise outranks the live process (reconciliation keys off markers) and `status`/TUI
+/// otherwise outranks the live process (reconciliation keys off markers) and `status` would
 /// show the working slot as `failed` for its entire life. Best-effort — a missing marker is
 /// the expected case on a first dispatch.
 ///

@@ -1,6 +1,7 @@
 # spar
 
-Multi-agent coding orchestrator. Rust, single binary, TUI-first.
+Multi-agent coding orchestrator. Rust, single binary, CLI-first; the human
+front end is the pi package under `pi/` (O145).
 
 **This file is for agents working ON spar.** To *use* spar, read
 `spar skills get core` or `docs/agent-operator.md`. Do not learn the CLI

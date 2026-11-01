@@ -125,6 +125,8 @@ Workspace initiative (2026-07-13). See `roadmap/workspace-initiative-plan.md` fo
 
 TUI restructure (2026-07-14). See `roadmap/tui-redesign-plan.md` for the staged build.
 
+The TUI was removed per O145 (2026-11-01); these rows are kept as history.
+
 | ID | Decision | Status |
 |----|----------|--------|
 | U1 | TUI is a **rail + one main area** (content = f(selection × tab)), not N co-equal Tab-cycled panels. Rail is a `projects ▸ runs ▸ agents` drill-down (`Enter` pushes, `Esc` pops, breadcrumb in a single status line); Log/Activity/Diff/Shell are **tabs over Main**. Focus targets cut 6 → 3 (Rail/Main/Composer) with direct keys `1/2/3`. Chrome cut from 10 rows to 2. Researched against k9s / lazygit / lazydocker / herdr / claude-squad, which all use this shape; an N-way focus ring destroys spatial memory | DECIDED |
