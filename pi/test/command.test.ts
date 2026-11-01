@@ -13,6 +13,8 @@ function load(): Command {
 	let command: Command | undefined;
 	const pi = {
 		on: () => () => {},
+		registerTool: () => {},
+		registerFlag: () => {},
 		registerCommand: (name: string, options: Command) => {
 			if (name === "spar") command = options;
 		},

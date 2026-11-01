@@ -1,8 +1,8 @@
 # spar-pi
 
-spar's human front end as a [pi](https://pi.dev) package (DECISIONS.md O145, roadmap
-feature 012). This is layer 1: read-only visibility. Gates (layer 2) and model-callable
-tools (layer 3) come later.
+spar's front end as a [pi](https://pi.dev) package (DECISIONS.md O145, roadmap feature
+012). Layer 1 is read-only visibility for the operator; layer 3 is model-callable tools and
+a skill, so the pi session can drive spar the way an outer agent does (O147).
 
 It is a thin client. Everything it shows comes from `spar <cmd> --json` child processes run
 in the session's working directory; it never reads or writes `.spar/` itself. The `spar`
@@ -96,6 +96,74 @@ Outside the interactive terminal (`pi -p "/spar"`, RPC, JSON mode) both commands
 plain-text version instead: to stdout in print mode, as a notification over RPC, to stderr
 in JSON mode.
 
+## Tools for the model
+
+Each tool runs `spar <cmd> --json` in the session's directory with an argv array (no shell;
+free text goes as `--flag=value`, and run and slot ids that could read as flags are
+refused). The model gets concise text; the transcript renders the same data from the
+result's `details`: runs as a table, findings grouped by severity, events and bus messages
+one per line, long tables cut at the edge rather than wrapped.
+
+| Tool | spar command | Notes |
+|---|---|---|
+| `spar_status` | `status [<id>] [--all] --json` | list (50 most relevant) or one run with seats and projected seats |
+| `spar_brief` | `brief <id> --json` | findings by severity, recent events, the exact next command |
+| `spar_events` | `events --run <id> --json` | backlog only, last 30 (at most 200) |
+| `spar_logs` | `logs <id> [slot]` | last 80 lines (at most 400), long lines cut |
+| `spar_providers` | `provider list --json [--usage]` | |
+| `spar_stats` | `stats --json [--since] [--by]` | |
+| `spar_plan` | `plan --task=... --detach --json` | confirmed launch |
+| `spar_implement` | `implement [--run=<id>] [--task=...] --detach --json` | confirmed launch |
+| `spar_review` | `run --workflow=review --task=... --detach --json` | confirmed launch |
+| `spar_wait` | `wait <id> --timeout=<n>m --json` | 10 minutes by default, 120 at most; abort kills it |
+| `spar_bus_send` | `bus send --message=... --to=... [--run] --json` | no `--persist` |
+| `spar_bus_log` | `bus log [--run] --json` | last 20 |
+| `spar_skill` | `skills get core` | section list, or one section by heading |
+
+Launches take `providers`, `roles`, `backups`, `effort`, `fleet`, `without`, `base` and
+`dry_run`, mapped to the flags of the same names.
+
+Exit codes are reported, not hidden: 2 (a human gate), 3 (stuck) and 4 (no usable
+providers) are results with the meaning spelled out and `next_command` from `spar brief`
+attached, not tool failures. A wait that runs out is reported as "still working". A
+refused launch, a declined one, a missing binary or a failing read is a tool error.
+
+### What the model cannot do
+
+Approve, reject, ship (including `--override-gate`), confirm, reconcile, round extensions,
+`rule add`, `cleanup`, `--reassign`, `amend` and `bus send --persist` are not tools, with or
+without a dialog. They are the operator's: a confirm dialog the model can raise whenever it
+likes teaches the operator to click yes. When a run waits on one, the tools say so and hand
+over the command.
+
+### Launch confirmation
+
+`spar_plan`, `spar_implement` and `spar_review` spend money, so each one:
+
+1. runs the same argv with `--validate-only`; a refusal is returned to the model and the
+   operator is never asked;
+2. asks the operator with `ctx.ui.confirm`: task, providers, roles, backups, effort, fleet
+   preset, `--without`, base, the full command, and for `implement --run` the run's own
+   seats; for a new run, seats the flags do not pin come from `spar.toml`, which the
+   dialog says (`--validate-only` does not report a fleet yet);
+3. fails closed when there is no dialog-capable UI (print and JSON mode);
+4. launches detached and returns the run id, phase, exit meaning, the resolved fleet and
+   the next command.
+
+To let the model launch without asking, for one session only:
+
+```bash
+pi -e /path/to/spar/pi --spar-unattended-launch
+# or
+SPAR_PI_UNATTENDED_LAUNCH=1 pi -e /path/to/spar/pi
+```
+
+### Skill
+
+`skills/spar/SKILL.md` tells the model when to reach for spar, that gates are the
+operator's, and to read the rest of the CLI from `spar_skill`, which serves
+`spar skills get core` from the installed binary so the skill cannot drift from it.
+
 ## Develop
 
 ```bash
@@ -104,6 +172,17 @@ npm install
 npm run typecheck
 npm test
 ```
+
+End to end, in real pi with a scripted model that bills nothing
+(`test/e2e/scripted-provider.ts`, built on pi-ai's faux provider; `rpc-confirm.ts` plays
+the operator over RPC):
+
+```bash
+test/e2e/run.sh /path/to/a/spar/project /path/to/new/scratch-dir
+```
+
+It runs only read-only spar commands in the project, and launches only in a scratch git
+repo it creates and deletes, under `SPAR_DRY_RUN=1`. `SPAR_PI_BIN` picks the spar binary.
 
 Tests use node's built-in runner and a fake `spar` (`test/fake-spar.cjs`) put first on
 `PATH`, which answers from canned JSON and canned event streams, so no test needs a real

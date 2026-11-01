@@ -2,7 +2,7 @@
   "name": "spar-pi",
   "version": "0.0.1",
   "private": true,
-  "description": "spar's human front end for the pi coding agent: run footer, run list and run detail",
+  "description": "spar's front end for the pi coding agent: run footer, run views, and model-callable spar tools",
   "type": "module",
   "engines": {
     "node": ">=22.18.0"
@@ -13,6 +13,9 @@
   "pi": {
     "extensions": [
       "./extensions/spar/index.ts"
+    ],
+    "skills": [
+      "./skills"
     ]
   },
   "scripts": {
@@ -20,13 +23,17 @@
     "test": "node --test test/*.test.ts"
   },
   "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   },
   "devDependencies": {
+    "@earendil-works/pi-ai": "1.4.0",
     "@earendil-works/pi-coding-agent": "1.4.0",
     "@earendil-works/pi-tui": "1.4.0",
     "@types/node": "24.19.2",
+    "typebox": "1.3.27",
     "typescript": "7.0.2"
   }
 }

@@ -6,6 +6,7 @@ const dir = process.env.FAKE_SPAR_DIR;
 const args = process.argv.slice(2);
 const line = args.join(" ");
 fs.appendFileSync(path.join(dir, "calls.log"), `${line}\n`);
+fs.appendFileSync(path.join(dir, "argv.jsonl"), `${JSON.stringify(args)}\n`);
 const responses = JSON.parse(fs.readFileSync(path.join(dir, "responses.json"), "utf8"));
 
 if (args[0] === "events") {
@@ -36,8 +37,17 @@ if (value && typeof value === "object" && Array.isArray(value.__seq)) {
 		.filter((l) => l === line).length - 1;
 	value = value.__seq[Math.min(n, value.__seq.length - 1)];
 }
+if (value && typeof value === "object" && value.__hold) {
+	setInterval(() => {}, 1000);
+	return;
+}
 if (value && typeof value === "object" && "__exit" in value) {
-	process.stderr.write(`${value.__stderr ?? "error"}\n`);
+	if ("__stdout" in value) process.stdout.write(JSON.stringify(value.__stdout));
+	else process.stderr.write(`${value.__stderr ?? "error"}\n`);
 	process.exit(value.__exit);
+}
+if (value && typeof value === "object" && "__text" in value) {
+	process.stdout.write(value.__text);
+	return;
 }
 process.stdout.write(JSON.stringify(value));
