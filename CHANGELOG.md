@@ -4,6 +4,12 @@ All notable changes to spar are recorded here.
 
 ## [Unreleased]
 
+## [0.0.8] - 2026-11-01
+
+### Fixed
+
+- **Security fixes in the library spar uses for secure connections.**
+
 ## [0.0.7] - 2026-11-01
 
 ### Added
