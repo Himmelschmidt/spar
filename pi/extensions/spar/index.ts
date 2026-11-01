@@ -2,6 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { AttentionTracker } from "./attention.ts";
 import { Footer } from "./footer.ts";
+import { registerTools } from "./tools.ts";
 import { detailLines, listRows, listText, plain, sortRuns } from "./format.ts";
 import { actionsFor, isVerb, performAction, report, setReporter, VERBS, verbCommand, verbCompletions } from "./gates.ts";
 import { type Brief, type BusMessage, isRunId, isStale, needsYou, type RunRow, type RunStatus, sparJson } from "./spar.ts";
@@ -12,6 +13,7 @@ const STATUS_KEY = "spar";
 export default function (pi: ExtensionAPI) {
 	let footer: Footer | undefined;
 	let cwd = process.cwd();
+	registerTools(pi);
 
 	pi.on("session_start", async (_event, ctx) => {
 		footer?.stop();

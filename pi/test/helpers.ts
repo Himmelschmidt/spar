@@ -17,6 +17,7 @@ function scratch(prefix: string): string {
 export interface Fake {
 	dir: string;
 	calls(): string[];
+	argv(): string[][];
 	pid(session: number): number | undefined;
 }
 
@@ -31,6 +32,10 @@ export function installFake(responses: Record<string, unknown>): Fake {
 	return {
 		dir,
 		calls: () => readFileSync(join(dir, "calls.log"), "utf8").split("\n").filter(Boolean),
+		argv: () =>
+			existsSync(join(dir, "argv.jsonl"))
+				? readFileSync(join(dir, "argv.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as string[])
+				: [],
 		pid: (session) => {
 			const file = join(dir, `events-${session}.pid`);
 			return existsSync(file) ? Number(readFileSync(file, "utf8")) : undefined;
