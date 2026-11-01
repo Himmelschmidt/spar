@@ -26,6 +26,9 @@ pub struct Event {
     /// belong to the round of the phase event before them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub round: Option<u32>,
+    /// A `classifier` event's consultation (O148).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier: Option<crate::classifier::Record>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +45,8 @@ pub enum EventKind {
     /// `spar daemon` found no live orchestrator for an in-flight run; `phase` is where
     /// it was left.
     Abandoned,
+    /// The failure classifier was consulted about a slot (O148).
+    Classifier,
 }
 
 impl Event {
@@ -55,6 +60,7 @@ impl Event {
             status: None,
             message: None,
             round: None,
+            classifier: None,
         }
     }
 
@@ -68,6 +74,7 @@ impl Event {
             status: Some(status),
             message: None,
             round: None,
+            classifier: None,
         }
     }
 
@@ -81,6 +88,7 @@ impl Event {
             status: None,
             message: Some(message.into()),
             round: None,
+            classifier: None,
         }
     }
 
@@ -97,6 +105,7 @@ impl Event {
             status: None,
             message: Some(message.into()),
             round: None,
+            classifier: None,
         }
     }
 
@@ -110,6 +119,7 @@ impl Event {
             status: None,
             message: Some(message.into()),
             round: None,
+            classifier: None,
         }
     }
 
@@ -132,6 +142,14 @@ impl Event {
         }
     }
 
+    pub fn classifier(slot: impl Into<String>, record: crate::classifier::Record) -> Self {
+        Self {
+            slot: Some(slot.into()),
+            classifier: Some(record),
+            ..Self::bare(EventKind::Classifier)
+        }
+    }
+
     fn bare(kind: EventKind) -> Self {
         Self {
             ts: Utc::now(),
@@ -142,6 +160,7 @@ impl Event {
             status: None,
             message: None,
             round: None,
+            classifier: None,
         }
     }
 
@@ -177,6 +196,20 @@ impl Event {
             EventKind::Abandoned => {
                 let phase = self.phase.map(|p| format!("{p:?}")).unwrap_or_default();
                 format!("{t} abandoned in {phase}")
+            }
+            EventKind::Classifier => {
+                let slot = self.slot.as_deref().unwrap_or("?");
+                match &self.classifier {
+                    Some(c) => format!(
+                        "{t} {slot} classifier {} {:.2} ({:?})",
+                        c.choice
+                            .map(|c| format!("{c:?}"))
+                            .unwrap_or_else(|| "error".into()),
+                        c.probability.unwrap_or(0.0),
+                        c.action
+                    ),
+                    None => format!("{t} {slot} classifier"),
+                }
             }
         }
     }

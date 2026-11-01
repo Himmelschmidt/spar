@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { actionLines, detailLines, footerText, listRows, listText, plain, sortRuns } from "../extensions/spar/format.ts";
+import { actionLines, describeEvent, detailLines, footerText, listRows, listText, plain, sortRuns } from "../extensions/spar/format.ts";
 import type { Brief } from "../extensions/spar/spar.ts";
 import { minutesSinceLocalMidnight, statsCost } from "../extensions/spar/spar.ts";
 import { row, status } from "./helpers.ts";
@@ -144,4 +144,21 @@ test("the detail's action hint wraps instead of cutting keys off", () => {
 test("a run something is driving does not need you, even at a gate", () => {
 	const runs = [row("a", { phase: "awaiting_reconcile", needs_human: true, holds_seat: true }), row("b", { phase: "plan_approved", needs_human: true })];
 	assert.equal(footerText({ runs, paused: [], costToday: undefined, now: new Date() }, plain), "spar | 1 running | 1 need you");
+});
+
+test("a classifier event names the slot, the answer, its probability and whether spar acted", () => {
+	const base = { ts: "2026-11-01T12:00:00Z", type: "classifier", slot: "impl" };
+	const record = { model: "typesafe/jev-1.14", regex_verdict: "work", latency_ms: 180 };
+	assert.equal(
+		describeEvent({ ...base, classifier: { ...record, choice: "quota_or_rate_limit", probability: 0.971, acted: true, action: "pause_quota" } }),
+		"classifier impl: quota_or_rate_limit 0.97 (acted: pause_quota)",
+	);
+	assert.equal(
+		describeEvent({ ...base, classifier: { ...record, choice: "genuine_failure", probability: 0.4, acted: false, action: "none" } }),
+		"classifier impl: genuine_failure 0.40 (not acted)",
+	);
+	assert.equal(
+		describeEvent({ ...base, classifier: { ...record, acted: false, action: "none", error: "classifier unreachable\nmore" } }),
+		"classifier impl: error classifier unreachable",
+	);
 });

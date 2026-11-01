@@ -3,6 +3,7 @@ pub mod agy_telemetry;
 mod claude;
 pub(crate) mod codex;
 pub mod delivery;
+pub mod failure_question;
 mod grok;
 mod muse;
 pub mod muse_telemetry;

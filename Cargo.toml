@@ -209,3 +209,7 @@ path = "tests/scenarios/events_feed.rs"
 [[test]]
 name = "bare_spar"
 path = "tests/scenarios/bare_spar.rs"
+
+[[test]]
+name = "classifier_routing"
+path = "tests/scenarios/classifier_routing.rs"

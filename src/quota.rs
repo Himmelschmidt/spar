@@ -453,6 +453,17 @@ impl QuotaStore {
         self.insert(q);
     }
 
+    /// Downgrade a live quota pause to weak: the classifier vetoed the text that made
+    /// it strong (O148). The pause itself stays.
+    pub fn mark_weak(&mut self, name: &str) {
+        if !self.is_quota_paused(name) {
+            return;
+        }
+        let mut q = self.get(name);
+        q.strong = false;
+        self.insert(q);
+    }
+
     /// Whether a pause should stop a live run's next dispatch (O106): a manual pause,
     /// or a quota pause from a trusted rejection. A weak, heuristic quota pause does not.
     pub fn blocks_live_dispatch(&self, name: &str) -> bool {

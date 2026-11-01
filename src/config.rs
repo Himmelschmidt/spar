@@ -102,6 +102,63 @@ pub struct Config {
     /// build dirs the run started with (O130).
     #[serde(default)]
     pub env: EnvConfig,
+    /// `[classifier]`: the advisory typed failure classifier (O148). User config only.
+    #[serde(default)]
+    pub classifier: ClassifierConfig,
+}
+
+/// `[classifier]` (O148). Off by default. Holds where the key lives, never the key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassifierConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_classifier_model")]
+    pub model: String,
+    #[serde(default = "default_classifier_threshold")]
+    pub threshold: f64,
+    #[serde(default = "default_classifier_veto_threshold")]
+    pub veto_threshold: f64,
+    #[serde(default = "default_classifier_timeout_secs")]
+    pub timeout_secs: u64,
+    /// File holding the OpenRouter key. Unset: `OPENROUTER_API_KEY`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_file: Option<PathBuf>,
+    #[serde(default = "default_classifier_base_url")]
+    pub base_url: String,
+}
+
+impl Default for ClassifierConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: default_classifier_model(),
+            threshold: default_classifier_threshold(),
+            veto_threshold: default_classifier_veto_threshold(),
+            timeout_secs: default_classifier_timeout_secs(),
+            key_file: None,
+            base_url: default_classifier_base_url(),
+        }
+    }
+}
+
+fn default_classifier_model() -> String {
+    "typesafe/jev-1.14".into()
+}
+
+fn default_classifier_threshold() -> f64 {
+    0.7
+}
+
+fn default_classifier_veto_threshold() -> f64 {
+    0.9
+}
+
+fn default_classifier_timeout_secs() -> u64 {
+    5
+}
+
+fn default_classifier_base_url() -> String {
+    "https://openrouter.ai/api/v1".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1148,6 +1205,7 @@ impl Default for Config {
             notify: NotifyConfig::default(),
             daemon: DaemonConfig::default(),
             env: EnvConfig::default(),
+            classifier: ClassifierConfig::default(),
         }
     }
 }
@@ -1200,6 +1258,19 @@ struct ConfigFile {
     notify: Option<NotifyConfigFile>,
     daemon: Option<DaemonConfigFile>,
     env: Option<EnvConfigFile>,
+    classifier: Option<ClassifierConfigFile>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClassifierConfigFile {
+    enabled: Option<bool>,
+    model: Option<String>,
+    threshold: Option<f64>,
+    veto_threshold: Option<f64>,
+    timeout_secs: Option<u64>,
+    key_file: Option<String>,
+    base_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -2122,6 +2193,12 @@ impl Config {
                     self.notify.webhook = Some(v.clone());
                 }
             }
+            // Same trust reason as [notify]: it sends log tails off the box with the
+            // operator's key, so a cloned repo must not be able to turn it on or point it
+            // at another host.
+            if let Some(c) = &file.classifier {
+                apply_classifier(&mut self.classifier, c)?;
+            }
         }
         // `[daemon]` tunes a supervision loop's timing and a numeric concurrency cap —
         // no command execution, no outbound request — so unlike `[notify]` it is safe
@@ -2234,6 +2311,39 @@ impl UserConfig {
         }
         Ok(cfg)
     }
+}
+
+fn apply_classifier(cfg: &mut ClassifierConfig, file: &ClassifierConfigFile) -> Result<()> {
+    if let Some(v) = file.enabled {
+        cfg.enabled = v;
+    }
+    if let Some(v) = &file.model {
+        cfg.model = v.clone();
+    }
+    for (name, v) in [
+        ("threshold", file.threshold),
+        ("veto_threshold", file.veto_threshold),
+    ] {
+        if v.is_some_and(|p| !(0.0..=1.0).contains(&p)) {
+            anyhow::bail!("[classifier].{name} must be between 0 and 1");
+        }
+    }
+    if let Some(v) = file.threshold {
+        cfg.threshold = v;
+    }
+    if let Some(v) = file.veto_threshold {
+        cfg.veto_threshold = v;
+    }
+    if let Some(v) = file.timeout_secs {
+        cfg.timeout_secs = v.max(1);
+    }
+    if let Some(v) = &file.key_file {
+        cfg.key_file = Some(crate::util::expand_home(v));
+    }
+    if let Some(v) = &file.base_url {
+        cfg.base_url = v.clone();
+    }
+    Ok(())
 }
 
 fn load_file(path: &Path) -> Result<ConfigFile> {
@@ -2984,6 +3094,34 @@ planner = "best"
             reloaded.suite.command.is_empty(),
             "file state is re-read, not carried"
         );
+    }
+
+    #[test]
+    fn classifier_comes_from_user_config_only_and_is_frozen_with_the_run() {
+        let file: ConfigFile =
+            toml::from_str("[classifier]\nenabled = true\nkey_file = \"~/k\"\nthreshold = 0.8\n")
+                .unwrap();
+        let mut cfg = Config::default();
+        assert!(!cfg.classifier.enabled, "off by default");
+        cfg.apply_file(&file, Trust::Project).unwrap();
+        assert!(
+            !cfg.classifier.enabled,
+            "a project spar.toml cannot turn it on"
+        );
+        cfg.apply_file(&file, Trust::User).unwrap();
+        assert!(cfg.classifier.enabled);
+        assert_eq!(cfg.classifier.threshold, 0.8);
+        assert_eq!(cfg.classifier.veto_threshold, 0.9);
+        assert_eq!(cfg.classifier.model, "typesafe/jev-1.14");
+        assert!(!cfg.classifier.key_file.as_ref().unwrap().starts_with("~"));
+
+        let frozen: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert!(frozen.classifier.enabled);
+        assert_eq!(frozen.classifier.key_file, cfg.classifier.key_file);
+
+        let bad: ConfigFile = toml::from_str("[classifier]\nveto_threshold = 1.5\n").unwrap();
+        assert!(Config::default().apply_file(&bad, Trust::User).is_err());
+        assert!(toml::from_str::<ConfigFile>("[classifier]\nkey = \"sk-x\"\n").is_err());
     }
 
     #[test]

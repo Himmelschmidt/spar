@@ -115,6 +115,7 @@ impl CommonOpts {
                     slot: None,
                     status: None,
                     round: None,
+                    classifier: None,
                     message: Some(format!(
                         "model-select: {}",
                         art.choices

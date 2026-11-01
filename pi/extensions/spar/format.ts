@@ -107,6 +107,14 @@ export function describeEvent(e: SparEvent): string {
 			return `abandoned${e.phase ? ` in ${e.phase}` : ""}`;
 		case "gate":
 			return `gate ${e.phase ?? ""} ${firstLine(e.message)}`.replace(/\s+/g, " ").trim();
+		case "classifier": {
+			const c = e.classifier;
+			const slot = e.slot ?? "?";
+			if (!c) return `classifier ${slot}`;
+			if (!c.choice) return `classifier ${slot}: error ${firstLine(c.error)}`.trimEnd();
+			const p = c.probability !== undefined ? ` ${c.probability.toFixed(2)}` : "";
+			return `classifier ${slot}: ${c.choice}${p} (${c.acted ? `acted: ${c.action}` : "not acted"})`;
+		}
 		default:
 			return `${e.type}${e.slot ? ` ${e.slot}` : ""}: ${firstLine(e.message)}`;
 	}
