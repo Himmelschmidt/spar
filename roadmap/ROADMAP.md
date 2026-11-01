@@ -63,6 +63,10 @@
 - [x] **pi front end** (event feed, footer and run views, gates as dialogs, agent tools; TUI deleted at gates) - see `features/012-pi-front-end.md`  
 - [x] **TUI removed** (`src/tui.rs` and its conversation, composition, structured-view and motion modules deleted; bare `spar` prints help)  
 
+## Milestone 8: herdr monitor (in progress)
+
+- [ ] **herdr monitor** (run panes as herdr agents, sync and board, gate popup, seat logs; optional, alongside pi) - see `features/013-herdr-monitor.md`  
+
 ## Later
 
 - Multi-machine / remote workers  
