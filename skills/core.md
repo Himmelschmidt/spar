@@ -416,13 +416,15 @@ spar run --workflow review -t "Review PR #12 for auth bugs" --providers cli:clau
 spar plan -t "..." --providers cli:claude --base origin/main
 spar run --workflow review -t "..." --providers cli:grok,cli:claude --base feat/checkout
 
-spar confirm <run_id> [--winner <slot>]   # arena winner
+spar confirm <run_id> [--winner <slot>]   # arena winner; exit 1 while a reconcile holds the run
 spar reconcile <run_id>                  # arena merge-good-parts + review
 spar ship <run_id> --confirm [--base <branch>]   # draft PR (never merges); adopts an open one
 spar ship <run_id> --override-gate --reason "…"  # ship over open findings (stuck/failed/quota/ceiling)
 spar ship <run_id> --adopt-remote               # fast-forward onto a hand-pushed branch, then ship
 spar sync-prs --run <id> | --all [--json] [--dry-run]   # merged PR -> done, closed -> stopped
 spar stop <run_id> [--json]              # halt dispatch, KEEP branch+worktree (resumable)
+                                         # at a gate: no-op, unless a live process holds it
+                                         # (a running reconcile): reaped, run left at the gate
 spar stop --abandoned [--json]           # reap every run nobody is driving any more
 spar cleanup <run_id> [--purge]          # remove worktrees (--purge: run record, KEEPS artifacts/)
 spar cleanup <run_id> --purge-artifacts  # …and artifacts/ too

@@ -1,4 +1,4 @@
-import { type Brief, type BusMessage, type CostLine, type Finding, isStale, type Provider, type RunRow, type RunStatus, type SparEvent } from "./spar.ts";
+import { type Brief, type BusMessage, type CostLine, type Finding, isStale, needsYou, type Provider, type RunRow, type RunStatus, type SparEvent } from "./spar.ts";
 
 export type Tone = "accent" | "warning" | "error" | "success" | "muted" | "dim";
 export type Paint = (tone: Tone, text: string) => string;
@@ -17,7 +17,7 @@ export interface FooterState {
 
 export function footerText(state: FooterState, paint: Paint): string {
 	const running = state.runs.filter((r) => r.holds_seat).length;
-	const waiting = state.runs.filter((r) => r.needs_human && !isStale(r, state.now)).length;
+	const waiting = state.runs.filter((r) => needsYou(r) && !isStale(r, state.now)).length;
 	const parts = [paint("accent", "spar"), `${running} running`];
 	if (waiting > 0) parts.push(paint("warning", `${waiting} need you`));
 	if (state.paused.length > 0) parts.push(paint("error", `paused ${state.paused.map((p) => p.name).join(",")}`));
@@ -26,7 +26,7 @@ export function footerText(state: FooterState, paint: Paint): string {
 }
 
 export function sortRuns<T extends RunRow>(runs: T[], now: Date): T[] {
-	const rank = (r: RunRow) => (r.needs_human && !isStale(r, now) ? 0 : r.holds_seat ? 1 : r.needs_human ? 2 : 3);
+	const rank = (r: RunRow) => (needsYou(r) && !isStale(r, now) ? 0 : r.holds_seat ? 1 : needsYou(r) ? 2 : 3);
 	return [...runs].sort((a, b) => rank(a) - rank(b) || Date.parse(b.updated_at) - Date.parse(a.updated_at));
 }
 
@@ -40,7 +40,7 @@ export function costLabel(cost: CostLine | undefined): string {
 }
 
 export function runFlag(run: RunRow, now: Date): string {
-	if (run.needs_human) return isStale(run, now) ? "stale" : "NEEDS YOU";
+	if (needsYou(run)) return isStale(run, now) ? "stale" : "NEEDS YOU";
 	return run.holds_seat ? "running" : "";
 }
 

@@ -3,8 +3,8 @@ import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { AttentionTracker } from "./attention.ts";
 import { Footer } from "./footer.ts";
 import { detailLines, listRows, listText, plain, sortRuns } from "./format.ts";
-import { actionsFor, isVerb, performAction, VERBS, verbCommand, verbCompletions } from "./gates.ts";
-import { type Brief, type BusMessage, isRunId, isStale, type RunRow, type RunStatus, sparJson } from "./spar.ts";
+import { actionsFor, isVerb, performAction, report, setReporter, VERBS, verbCommand, verbCompletions } from "./gates.ts";
+import { type Brief, type BusMessage, isRunId, isStale, needsYou, type RunRow, type RunStatus, sparJson } from "./spar.ts";
 import { pickRun, showDetail, themePaint } from "./ui.ts";
 
 const STATUS_KEY = "spar";
@@ -17,7 +17,9 @@ export default function (pi: ExtensionAPI) {
 		footer?.stop();
 		footer = undefined;
 		cwd = ctx.cwd;
+		setReporter(undefined);
 		if (!ctx.hasUI) return;
+		setReporter((text, level) => ctx.ui.notify(text, level));
 		const attention = new AttentionTracker();
 		const current = new Footer({
 			cwd: ctx.cwd,
@@ -26,14 +28,16 @@ export default function (pi: ExtensionAPI) {
 			onFirstRuns: (runs, feedStart) => attention.seed(runs, feedStart),
 			onEvent: (event) => {
 				const alert = attention.onEvent(event);
-				if (alert) ctx.ui.notify(alert.message, alert.level);
+				if (alert) report(alert.message, alert.level);
 			},
+			onFatal: (message) => report(message, "warning"),
 		});
 		footer = current;
-		void current.start();
+		current.start().catch(() => {});
 	});
 
 	pi.on("session_shutdown", async () => {
+		setReporter(undefined);
 		footer?.stop();
 		footer = undefined;
 	});
@@ -48,7 +52,7 @@ export default function (pi: ExtensionAPI) {
 			const items: AutocompleteItem[] = sortRuns(runs, now)
 				.filter((r) => r.id.startsWith(prefix.trim()))
 				.map((r) => {
-					const flag = r.needs_human ? (isStale(r, now) ? ", needs you (stale)" : ", needs you") : "";
+					const flag = needsYou(r) ? (isStale(r, now) ? ", needs you (stale)" : ", needs you") : "";
 					return { value: r.id, label: r.id, description: `${r.phase}${flag}` };
 				});
 			items.push(...(gated ?? []));
@@ -58,8 +62,8 @@ export default function (pi: ExtensionAPI) {
 			const id = args.trim().split(/\s+/)[0] ?? "";
 			if (isVerb(id)) {
 				const result = await verbCommand(ctx, id, args.trim().slice(id.length));
-				if (result?.kind === "started") void result.done.then(() => footer?.refresh());
-				void footer?.refresh();
+				if (result?.kind === "started") afterJob(result.done);
+				refreshFooter();
 				return;
 			}
 			if (id && !isRunId(id)) {
@@ -84,15 +88,23 @@ export default function (pi: ExtensionAPI) {
 				if (typeof choice === "object") {
 					if (isVerb(choice.action)) {
 						const result = await performAction(ctx, choice.action, detail.status);
-						if (result.kind === "started") void result.done.then(() => footer?.refresh());
+						if (result.kind === "started") afterJob(result.done);
 					}
 					continue;
 				}
 				next = choice === "back" ? await chooseRun(ctx) : undefined;
 			}
-			void footer?.refresh();
+			refreshFooter();
 		},
 	});
+
+	function refreshFooter(): void {
+		footer?.refresh().catch(() => {});
+	}
+
+	function afterJob(done: Promise<unknown>): void {
+		done.then(refreshFooter, () => {});
+	}
 }
 
 async function listRuns(cwd: string): Promise<RunRow[] | undefined> {
@@ -111,8 +123,8 @@ async function chooseRun(ctx: ExtensionContext): Promise<string | undefined> {
 		return undefined;
 	}
 	const now = new Date();
-	const waiting = runs.value.filter((r) => r.needs_human && !isStale(r, now)).length;
-	const stale = runs.value.filter((r) => r.needs_human && isStale(r, now)).length;
+	const waiting = runs.value.filter((r) => needsYou(r) && !isStale(r, now)).length;
+	const stale = runs.value.filter((r) => needsYou(r) && isStale(r, now)).length;
 	return pickRun(ctx, listRows(runs.value, now), waiting, stale);
 }
 

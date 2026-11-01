@@ -1,5 +1,5 @@
 import type { FeedEvent } from "./feed.ts";
-import type { RunRow } from "./spar.ts";
+import { needsYou, type RunRow } from "./spar.ts";
 
 export interface Alert {
 	runId: string;
@@ -16,11 +16,14 @@ const GATES = new Set([
 	"awaiting_round_extension",
 ]);
 const BROKEN = new Set(["failed", "stuck", "escalated", "quota"]);
+// The approval handoff: spar counts it as needing the operator (nothing implements an
+// approved plan until someone resumes it), and so does the footer.
+const HANDOFF = "plan_approved";
 
 function attentionKey(phase: string | undefined, abandoned: boolean): string | undefined {
 	if (!phase) return abandoned ? "abandoned" : undefined;
 	if (abandoned) return `abandoned:${phase}`;
-	if (GATES.has(phase) || BROKEN.has(phase)) return phase;
+	if (GATES.has(phase) || BROKEN.has(phase) || phase === HANDOFF) return phase;
 	return undefined;
 }
 
@@ -30,6 +33,7 @@ function describe(key: string): string {
 		return `abandoned${phase ? ` in ${phase}` : ""}, no live orchestrator`;
 	}
 	if (GATES.has(key)) return `waiting at ${key}`;
+	if (key === HANDOFF) return "plan approved, waiting to be implemented (resume it)";
 	return key;
 }
 
@@ -43,7 +47,7 @@ export class AttentionTracker {
 	seed(runs: RunRow[], before: Date): void {
 		for (const run of runs) {
 			if (this.known.has(run.id) || Date.parse(run.updated_at) >= before.getTime()) continue;
-			const key = run.needs_human ? attentionKey(run.phase, run.abandoned) : undefined;
+			const key = needsYou(run) ? attentionKey(run.phase, run.abandoned) : undefined;
 			if (key) this.known.set(run.id, key);
 		}
 	}
@@ -66,7 +70,7 @@ export class AttentionTracker {
 		return {
 			runId: event.run_id,
 			message: `spar: run ${event.run_id} needs you: ${describe(key)}. /spar ${event.run_id}`,
-			level: GATES.has(key) ? "warning" : "error",
+			level: GATES.has(key) || key === HANDOFF ? "warning" : "error",
 		};
 	}
 }

@@ -5,9 +5,13 @@ import {
 	type ActionResult,
 	actionsFor,
 	buildArgv,
+	cliCommand,
 	type GateContext,
 	type GateRun,
+	nextRound,
 	performAction,
+	report,
+	setReporter,
 	verbCommand,
 	verbCompletions,
 } from "../extensions/spar/gates.ts";
@@ -24,6 +28,7 @@ interface Script {
 function fakeCtx(cwd: string, script: Script = {}, mode = "tui") {
 	const dialogs: string[] = [];
 	const notes: { text: string; level: string }[] = [];
+	setReporter((text, level) => notes.push({ text, level }));
 	const ctx: GateContext = {
 		cwd,
 		mode,
@@ -65,16 +70,21 @@ async function finished(r: ActionResult) {
 
 test("each phase offers the actions valid there", () => {
 	const at = (phase: string, over = {}) => actionsFor(row("r1", { phase, ...over }));
-	assert.deepEqual(at("awaiting_plan_approval"), ["approve", "reject", "rule", "reassign"]);
-	assert.deepEqual(at("awaiting_ship_confirm"), ["ship", "override", "rule", "reassign"]);
-	assert.deepEqual(at("awaiting_winner_confirm"), ["override", "confirm", "reconcile", "rule", "reassign"]);
-	assert.deepEqual(at("awaiting_reconcile"), ["override", "confirm", "reconcile", "rule", "reassign"]);
-	assert.deepEqual(at("awaiting_round_extension", { resumable: true }), ["override", "extend", "rule", "reassign"]);
+	assert.deepEqual(at("awaiting_plan_approval"), ["approve", "reject", "rule"]);
+	assert.deepEqual(at("awaiting_ship_confirm"), ["ship", "rule"]);
+	assert.deepEqual(at("awaiting_winner_confirm"), ["confirm", "reconcile", "rule"]);
+	assert.deepEqual(at("awaiting_reconcile"), ["override", "confirm", "reconcile", "rule"]);
+	assert.deepEqual(at("awaiting_reconcile", { holds_seat: true }), ["stop", "rule"], "a running reconcile");
+	assert.deepEqual(at("awaiting_ship_confirm", { holds_seat: true }), ["rule"], "a ship in progress");
+	assert.deepEqual(at("shipping", { holds_seat: true }), ["rule"]);
+	assert.deepEqual(at("awaiting_round_extension", { resumable: true }), ["override", "extend", "rule"]);
 	assert.deepEqual(at("stuck", { resumable: true }), ["override", "resume", "rule", "reassign"]);
+	assert.deepEqual(at("stuck", { resumable: false }), ["override", "rule"]);
 	assert.deepEqual(at("stopped", { resumable: true }), ["resume", "rule", "reassign"]);
-	assert.deepEqual(at("stopped", { resumable: false }), ["rule", "reassign"]);
+	assert.deepEqual(at("stopped", { resumable: false }), ["rule"]);
+	assert.deepEqual(at("plan_approved", { resumable: true }), ["resume", "rule", "reassign"]);
 	assert.deepEqual(at("review", { holds_seat: true }), ["stop", "rule"]);
-	assert.deepEqual(at("dispatch", { abandoned: true, resumable: true }), ["resume", "stop", "rule", "reassign"]);
+	assert.deepEqual(at("dispatch", { abandoned: true, resumable: true }), ["resume", "stop", "rule"]);
 	assert.deepEqual(at("done"), ["rule", "cleanup"]);
 	assert.deepEqual(at("plan_rejected"), ["rule"]);
 });
@@ -217,13 +227,12 @@ test("ship at the ship gate runs in the background and reports a failure with sp
 	assert.deepEqual(f.calls(), ["ship r1 --confirm --json"]);
 });
 
-test("ship where the gate refuses offers an override that requires a reason", async () => {
+test("override needs a reason and says why a plain ship is refused", async () => {
 	const f = installFake({ "ship r1 --override-gate": { id: "r1", phase: "done", pr_url: "https://example/pr/1" } });
-	const { ctx, dialogs, notes } = fakeCtx(f.dir, { confirm: [true, true], input: ["flaky test, tracked in #9"] });
-	const out = await finished(await performAction(ctx, "ship", run("awaiting_round_extension")));
+	const { ctx, dialogs, notes } = fakeCtx(f.dir, { input: ["flaky test, tracked in #9"] });
+	const out = await finished(await performAction(ctx, "override", run("awaiting_round_extension")));
 	assert.equal(out.ok, true);
-	assert.match(dialogs[0]!, /^confirm: The ship gate refuses run r1\n/);
-	assert.match(dialogs[2]!, /Runs: spar ship r1 --override-gate '--reason=flaky test, tracked in #9' --json/);
+	assert.match(dialogs[1]!, /Runs: spar ship r1 --override-gate '--reason=flaky test, tracked in #9' --json\n\nAt awaiting_round_extension a plain ship is refused/);
 	assert.deepEqual(f.calls(), ["ship r1 --override-gate --reason=flaky test, tracked in #9 --json"]);
 	assert.equal(notes.at(-1)!.text, "spar override r1: done, phase done, https://example/pr/1");
 
@@ -232,6 +241,29 @@ test("ship where the gate refuses offers an override that requires a reason", as
 	assert.equal((await performAction(blank.ctx, "override", run("stuck"))).kind, "cancelled");
 	assert.equal(blank.notes[0]!.text, "spar: an override needs a reason; nothing ran");
 	assert.deepEqual(g.calls(), []);
+});
+
+test("a run with a background job of ours in flight offers no gate verbs until it ends", async () => {
+	const f = installFake({ "ship r1 --confirm --json": { id: "r1", phase: "done" } });
+	const { ctx } = fakeCtx(f.dir);
+	const started = await performAction(ctx, "ship", run("awaiting_ship_confirm"));
+	assert.deepEqual(actionsFor(row("r1", { phase: "awaiting_ship_confirm" })), ["rule"]);
+	await finished(started);
+	assert.deepEqual(actionsFor(row("r1", { phase: "awaiting_ship_confirm" })), ["ship", "rule"]);
+});
+
+test("a background result with no live session is dropped, and a throwing UI is contained", async () => {
+	const f = installFake({ "reconcile r1 --json": { id: "r1", phase: "awaiting_ship_confirm" } });
+	const { ctx, notes } = fakeCtx(f.dir);
+	const started = await performAction(ctx, "reconcile", run("awaiting_reconcile"));
+	setReporter(undefined);
+	assert.equal((await finished(started)).ok, true);
+	assert.equal(notes.length, 1, "only the start notice");
+	setReporter(() => {
+		throw new Error("This extension ctx is stale");
+	});
+	assert.doesNotThrow(() => report("late", "info"));
+	setReporter(undefined);
 });
 
 test("confirm offers the ranked default or a pick among implementers", async () => {
@@ -265,7 +297,8 @@ test("rule takes text and waived criteria; reassign picks a seat and a provider"
 	assert.equal((await performAction(badWaive.ctx, "rule", run("review"))).kind, "cancelled");
 
 	const move = fakeCtx(f.dir, { select: ["impl  implementer  cli:muse@muse-spark"], input: ["cli:claude@sonnet"] });
-	await performAction(move.ctx, "reassign", run("stopped"));
+	await performAction(move.ctx, "reassign", run("stopped", { round: 2, dispatched_round: 2 }));
+	assert.match(move.dialogs[2]!, /continues, detached, and starts round 3\.$/);
 	assert.match(move.dialogs[0]!, /^select: Reassign which seat of run r1\? \[impl  implementer  cli:muse@muse-spark \| review-0-cli-claude/);
 	assert.deepEqual(f.calls(), [
 		"rule add --run r1 --waive AC-2 --waive AC-5 --json -- -1 is fine here",
@@ -287,8 +320,22 @@ test("/spar <verb> refuses without a dialog-capable UI instead of acting", async
 	} finally {
 		process.stdout.write = original;
 	}
-	assert.match(out, /^spar: \/spar approve needs a confirmation dialog, which this mode \(print\) has no way to show; nothing ran/);
+	assert.match(out, /^spar: \/spar approve needs a confirmation dialog, which this mode \(print\) has no way to show; nothing ran\. .*run it yourself: spar approve r1\n$/);
 	assert.deepEqual(f.calls(), []);
+});
+
+test("refusals name the real spar command for every verb", () => {
+	assert.equal(cliCommand("ship", "r1"), "spar ship r1 --confirm");
+	assert.equal(cliCommand("override", "r1"), "spar ship r1 --override-gate --reason=<why>");
+	assert.equal(cliCommand("rule", "r1"), 'spar rule add --run r1 [--waive AC-<n>] -- "<text>"');
+	assert.equal(cliCommand("reassign", "r1"), "spar implement --run r1 --reassign <seat>=<provider> --detach");
+	assert.equal(cliCommand("extend", "r1"), "spar implement --run r1 --max-rounds +<N> --detach");
+	assert.equal(cliCommand("cleanup", "r1"), "spar cleanup r1 --if-merged");
+});
+
+test("reassign names the round it starts", () => {
+	assert.equal(nextRound(run("stopped", { round: 2, dispatched_round: 2 })), "starts round 3");
+	assert.equal(nextRound(run("stopped", { round: 2, dispatched_round: 1 })), "re-runs round 2, which never dispatched");
 });
 
 test("/spar <verb> <id> checks the phase, then dialogs; preset text skips the input", async () => {

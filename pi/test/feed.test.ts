@@ -121,3 +121,34 @@ test("a failed tail-cursor read retries instead of following from now", async ()
 		["events --tail-cursor --json", "events --tail-cursor --json", "events --follow --json --exit-on-stdin-eof --since 1,r1:3"],
 	);
 });
+
+test("lines already buffered when the feed stops are not delivered", async () => {
+	const fake = installFake({ events: [{ lines: [event("1,r1:1"), event("1,r1:2"), event("1,r1:3")], hold: true }] });
+	const seen: FeedEvent[] = [];
+	const feed = new EventFeed({
+		cwd: fake.dir,
+		onEvent: (e) => {
+			seen.push(e);
+			feed.stop();
+		},
+	});
+	await feed.start();
+	await until(() => seen.length > 0);
+	await new Promise((r) => setTimeout(r, 100));
+	assert.equal(seen.length, 1);
+});
+
+test("a cursor too long to exec stops the feed once with a message instead of crashing", async () => {
+	const fake = installFake({ events: [{ lines: [], hold: true }] });
+	const fatal: string[] = [];
+	const feed = new EventFeed({ cwd: fake.dir, onEvent: () => {}, onFatal: (m) => fatal.push(m), minBackoffMs: 10 });
+	feed.cursor = `1,${"r".repeat(200_000)}:1`;
+	await feed.start();
+	await new Promise((r) => setTimeout(r, 100));
+	assert.equal(fatal.length, 1);
+	assert.match(fatal[0]!, /^spar: the events feed stopped: its resume cursor is too long/);
+	assert.equal(feed.running, false);
+	assert.deepEqual(fake.calls().filter((c) => c.startsWith("events")), []);
+	await feed.start();
+	assert.equal(fatal.length, 1);
+});

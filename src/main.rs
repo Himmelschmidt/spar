@@ -2237,8 +2237,11 @@ fn stop_one(run_id: &str, json: bool) -> Result<ExitCode> {
     let state = state::RunState::load_for_display(&paths, run_id)?;
 
     // A finished or gated run is already at rest: never downgrade it to Stopped or
-    // drop a resumable marker that would make a later `implement --run` redo work.
-    if phase_at_rest(state.phase) {
+    // drop a resumable marker that would make a later `implement --run` redo work. A gate
+    // with a live lock holder is not at rest: `spar reconcile` parks the run at
+    // `awaiting_reconcile` while it dispatches, and stopping it must reap that.
+    let live_at_gate = state.phase.is_gate() && state::orchestrator_alive(&paths, run_id);
+    if phase_at_rest(state.phase) && !live_at_gate {
         if json {
             let v = run_status_json(&paths, &cfg, &state)?;
             println!("{}", serde_json::to_string_pretty(&v)?);
@@ -2269,6 +2272,11 @@ fn stop_one(run_id: &str, json: bool) -> Result<ExitCode> {
         if json {
             let v = run_status_json(&paths, &cfg, &state)?;
             println!("{}", serde_json::to_string_pretty(&v)?);
+        } else if live_at_gate {
+            println!(
+                "stopped the process driving run {run_id}; run left at {:?}",
+                state.phase
+            );
         } else {
             println!(
                 "run {run_id} finished at {:?} before stop took effect; left as-is",

@@ -39,8 +39,10 @@ TypeScript directly.
 A status line, for example `spar | 1 running | 3 need you | paused codex | $12.40 today`:
 
 - **running**: runs whose orchestrator holds a seat (`holds_seat`).
-- **need you**: runs waiting on the operator (`needs_human`) that changed in the last 7
-  days. Older ones still show in `/spar`, marked `stale`.
+- **need you**: runs waiting on the operator (`needs_human`) that nothing is driving
+  (not `holds_seat`: a running reconcile sits at a gate but does not need you yet) and
+  that changed in the last 7 days. Older ones still show in `/spar`, marked `stale`. The
+  same rule decides the `NEEDS YOU` flag and the alerts below.
 - **paused**: providers whose `quota_status` is not `available` in `spar provider list --json`.
 - **today**: summed `cost_usd` from `spar stats --since <minutes since local midnight>m --json`.
   That counts the whole cost of every run that ended or changed today, not only what was
@@ -71,12 +73,19 @@ exits when pi is SIGKILLed. It runs only in modes with a UI (interactive and RPC
 ### Alerts
 
 The same feed raises one `ctx.ui.notify` when a run newly enters a state that needs you:
-a gate (plan approval, winner confirm, ship confirm, round extension; a warning), or
-stuck, escalated, quota, failed or abandoned (an error). Each run alerts once per state it
+a gate (plan approval, winner confirm, ship confirm, round extension) or the approved-plan
+handoff (`plan_approved`, which waits for a resume), as a warning; or stuck, escalated,
+quota, failed or abandoned, as an error. Each run alerts once per state it
 enters; the `gate` event that follows a phase event, or a restarted daemon reporting the
 same abandonment again, is no repeat, and leaving for a state that needs nobody re-arms
 it. Runs already waiting when pi starts stay quiet. `awaiting_reconcile` never alerts:
-only `spar reconcile` sets it, as it starts.
+only `spar reconcile` sets it, as it starts, while it holds the run.
+
+Alerts and background results go to whichever pi session is live when they land. After
+`/new`, `/reload`, a fork or a session switch they reach the new session; with no session
+they are dropped. If the feed cannot run at all (its resume cursor outgrew the argument
+limit, past several thousand runs) it stops with one warning and the footer keeps
+polling.
 
 ### `/spar`
 
@@ -123,25 +132,29 @@ meaning (`1` failed, `2` human gate, `3` stuck, `4` quota) and spar's stderr or 
 | `a` | approve | `awaiting_plan_approval` | `spar approve <id> --json` |
 | `x` | reject | `awaiting_plan_approval` | `spar reject <id> [--reason=<text>] --json` (reason optional) |
 | `s` | ship | `awaiting_ship_confirm` | `spar ship <id> --confirm --json`, in the background |
-| `o` | override | ship gate, winner confirm, round extension, stuck, failed, quota | `spar ship <id> --override-gate --reason=<text> --json` (reason required), in the background |
+| `o` | override | where a plain ship is refused: `awaiting_round_extension`, `awaiting_reconcile`, stuck, failed, quota | `spar ship <id> --override-gate --reason=<text> --json` (reason required), in the background |
 | `c` | confirm | `awaiting_winner_confirm`, `awaiting_reconcile` | `spar confirm <id> [--winner <slot>] --json`: the ranked default or a pick among the implementers |
 | `m` | reconcile | `awaiting_winner_confirm`, `awaiting_reconcile` | `spar reconcile <id> --json`, in the background |
 | `e` | extend | `awaiting_round_extension` | `spar implement --run <id> --max-rounds +N --detach --json` (N defaults to 1) |
 | `r` | resume | `resumable`, not at a gate | `spar resume <id> --detach --json` |
-| `k` | stop | in flight (not at rest) | `spar stop <id> --json` |
+| `k` | stop | in flight, except `shipping`; or a running reconcile | `spar stop <id> --json` |
 | `u` | rule | any run | `spar rule add --run <id> [--waive AC-n]... --json -- <text>` |
-| `n` | reassign | not holding a seat, not finished | `spar implement --run <id> --reassign <seat>=<provider> --detach --json` |
+| `n` | reassign | `resumable` and stopped, failed, stuck, quota or `plan_approved` | `spar implement --run <id> --reassign <seat>=<provider> --detach --json`; the dialog says which round it starts |
 | `d` | cleanup | `done` | `spar cleanup <id> --if-merged --json`, in the background |
 
-The mapping is a hint, not a rule: spar decides, and a refusal is shown as it came.
-`ship` on a run whose review never cleared (round extension, stuck, failed, quota) says the
-gate refuses it and offers the override instead. After an action the detail reloads.
+Every verb but stop and rule needs a run nothing is driving (`holds_seat` false), and a
+run with a background job of this pi still going offers only stop and rule until the job
+reports. The mapping is a hint, not a rule: spar decides, and a refusal is shown as it
+came. Reject is not final: the plan and critique stay, and `spar approve` can still
+approve a rejected run; what goes is its worktrees that hold no work. After an action the
+detail reloads.
 
 Nothing blocks pi for long. `extend`, `resume` and `reassign` use spar's own `--detach` and
 return once the orchestrator is up. `ship`, `override`, `reconcile` and `cleanup` run as a
 detached child in a session of its own, with output in a temp directory, so they finish
-even if pi exits; the result arrives as a notification, and on failure names the
-directory with the full output.
+even if pi exits. The result arrives as a notification; a success removes the directory,
+a failure names it so the full output can be read. If pi exits before the job ends, the
+result is not reported anywhere: check `spar status <id>`.
 
 The same actions are subcommands: `/spar <verb> <id> [text]`, for example
 `/spar approve 3d3d6f59`, `/spar reject 3d3d6f59 scope is wrong`,
@@ -150,7 +163,7 @@ The same actions are subcommands: `/spar <verb> <id> [text]`, for example
 input; the confirmation is still asked. Without an id it asks which run, among those the
 verb applies to. Verbs complete after `/spar `, and after a verb, the ids it applies to.
 They need a dialog: over RPC they use pi's dialog protocol; in print and JSON mode they
-refuse and run nothing.
+refuse, run nothing, and name the spar command to run by hand.
 
 ## Develop
 

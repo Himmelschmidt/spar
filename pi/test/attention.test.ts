@@ -55,6 +55,7 @@ test("quiet for runs already waiting at startup, but not for runs that changed a
 	t.seed(
 		[
 			row("old", { phase: "awaiting_plan_approval", needs_human: true }),
+			row("driven", { phase: "awaiting_reconcile", needs_human: true, holds_seat: true }),
 			row("gone", { phase: "dispatch", needs_human: true, abandoned: true }),
 			row("fresh", { phase: "awaiting_plan_approval", needs_human: true, updated_at: new Date(start.getTime() + 5).toISOString() }),
 		],
@@ -63,5 +64,9 @@ test("quiet for runs already waiting at startup, but not for runs that changed a
 	assert.equal(t.onEvent(ev("old", "gate", "awaiting_plan_approval")), undefined);
 	assert.equal(t.onEvent(ev("gone", "abandoned", "dispatch")), undefined);
 	assert.ok(t.onEvent(ev("fresh", "phase", "awaiting_plan_approval")));
-	assert.ok(t.onEvent(ev("old", "phase", "plan_approved")) === undefined);
+	assert.deepEqual(t.onEvent(ev("old", "phase", "plan_approved")), {
+		runId: "old",
+		message: "spar: run old needs you: plan approved, waiting to be implemented (resume it). /spar old",
+		level: "warning",
+	});
 });

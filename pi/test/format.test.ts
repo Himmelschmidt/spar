@@ -140,3 +140,8 @@ test("the detail's action hint wraps instead of cutting keys off", () => {
 	assert.deepEqual(actionLines([...actions], 41, plainKey), ["actions: o override+ship", "  c confirm winner  m reconcile  u rule"]);
 	assert.deepEqual(actionLines([], 40, plainKey), []);
 });
+
+test("a run something is driving does not need you, even at a gate", () => {
+	const runs = [row("a", { phase: "awaiting_reconcile", needs_human: true, holds_seat: true }), row("b", { phase: "plan_approved", needs_human: true })];
+	assert.equal(footerText({ runs, paused: [], costToday: undefined, now: new Date() }, plain), "spar | 1 running | 1 need you");
+});

@@ -35,6 +35,8 @@ export interface FeedOptions {
 	cwd: string;
 	onEvent: (event: FeedEvent) => void;
 	onConnect?: () => void;
+	// The feed cannot run at all and has stopped for good; called once.
+	onFatal?: (message: string) => void;
 	minBackoffMs?: number;
 	maxBackoffMs?: number;
 }
@@ -85,17 +87,24 @@ export class EventFeed {
 	private spawnChild(cursor: string): void {
 		// stdin is a pipe that only closes when pi dies, which ends a follower started
 		// with --exit-on-stdin-eof even when pi is SIGKILLed.
-		const child = spawn(sparBin(), feedArgs(cursor), {
-			cwd: this.options.cwd,
-			stdio: ["pipe", "pipe", "ignore"],
-			windowsHide: true,
-		});
+		let child: ChildProcess;
+		try {
+			child = spawn(sparBin(), feedArgs(cursor), {
+				cwd: this.options.cwd,
+				stdio: ["pipe", "pipe", "ignore"],
+				windowsHide: true,
+			});
+		} catch (error) {
+			this.fatal(error as NodeJS.ErrnoException);
+			return;
+		}
 		const killOnExit = () => child.kill("SIGTERM");
 		process.once("exit", killOnExit);
 		this.child = child;
 		this.options.onConnect?.();
 
 		createInterface({ input: child.stdout! }).on("line", (line) => {
+			if (this.stopped) return;
 			const event = parseFeedLine(line);
 			if (!event) return;
 			this.cursor = event.cursor;
@@ -103,16 +112,27 @@ export class EventFeed {
 			this.options.onEvent(event);
 		});
 
-		let missing = false;
+		let failure: NodeJS.ErrnoException | undefined;
 		child.on("error", (error: NodeJS.ErrnoException) => {
-			if (error.code === "ENOENT") missing = true;
+			failure = error;
 		});
 		child.on("close", () => {
 			process.removeListener("exit", killOnExit);
 			if (this.child === child) this.child = undefined;
-			if (missing) this.stopped = true;
+			if (failure?.code === "ENOENT") this.stopped = true;
+			if (failure?.code === "E2BIG") this.fatal(failure);
 			this.scheduleRestart();
 		});
+	}
+
+	private fatal(error: NodeJS.ErrnoException): void {
+		if (this.stopped) return;
+		this.stopped = true;
+		const why =
+			error.code === "E2BIG"
+				? "its resume cursor is too long to pass as an argument (a cursor grows with every run; purge old runs)"
+				: error.message;
+		this.options.onFatal?.(`spar: the events feed stopped: ${why}. Alerts are off; the footer still re-reads status every 60 s.`);
 	}
 
 	private scheduleRestart(): void {
@@ -121,7 +141,7 @@ export class EventFeed {
 		this.backoffMs = Math.min(this.backoffMs * 2, this.maxBackoffMs);
 		this.timer = setTimeout(() => {
 			this.timer = undefined;
-			void this.start();
+			this.start().catch(() => {});
 		}, delay);
 		this.timer.unref();
 	}

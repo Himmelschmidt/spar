@@ -49,42 +49,52 @@ const GATES = new Set([
 	"awaiting_round_extension",
 ]);
 const AT_REST = new Set([...GATES, "done", "plan_rejected", "plan_approved", "stopped", "failed", "stuck", "quota", "escalated"]);
-// Mirrors `ship::overridable`.
-const OVERRIDABLE = new Set([
-	"awaiting_ship_confirm",
-	"awaiting_winner_confirm",
-	"awaiting_reconcile",
-	"awaiting_round_extension",
-	"stuck",
-	"failed",
-	"quota",
-]);
+// Where a plain `spar ship --confirm` is refused and `ship::overridable` allows the
+// override. Not the ship gate (a plain ship works) nor winner confirm (confirm works).
+const OVERRIDE_PHASES = new Set(["awaiting_reconcile", "awaiting_round_extension", "stuck", "failed", "quota"]);
+// Where `implement --run --reassign` is accepted: a parked, resumable run. Not the plan
+// gate, which spar refuses.
+const REASSIGN_PHASES = new Set(["stopped", "failed", "stuck", "quota", "plan_approved"]);
+
+// Runs with a background job of ours (ship, override, reconcile, cleanup) still going.
+const inFlight = new Set<string>();
+
+export function busy(id: string): boolean {
+	return inFlight.has(id);
+}
 
 // What the operator can do from here. A hint for the UI only: spar is the authority and
-// refuses anything this gets wrong, and that refusal is shown.
+// refuses anything this gets wrong, and that refusal is shown. Gate verbs need a run
+// nobody is driving; a run holding a seat only offers stop and rule.
 export function actionsFor(run: RunRow): Verb[] {
 	const verbs = new Set<Verb>();
-	switch (run.phase) {
-		case "awaiting_plan_approval":
-			verbs.add("approve").add("reject");
-			break;
-		case "awaiting_ship_confirm":
-			verbs.add("ship");
-			break;
-		case "awaiting_winner_confirm":
-		case "awaiting_reconcile":
-			verbs.add("confirm").add("reconcile");
-			break;
-		case "awaiting_round_extension":
-			verbs.add("extend");
-			break;
+	const free = !run.holds_seat && !inFlight.has(run.id);
+	if (free) {
+		switch (run.phase) {
+			case "awaiting_plan_approval":
+				verbs.add("approve").add("reject");
+				break;
+			case "awaiting_ship_confirm":
+				verbs.add("ship");
+				break;
+			case "awaiting_winner_confirm":
+			case "awaiting_reconcile":
+				verbs.add("confirm").add("reconcile");
+				break;
+			case "awaiting_round_extension":
+				verbs.add("extend");
+				break;
+		}
+		if (OVERRIDE_PHASES.has(run.phase)) verbs.add("override");
+		if (run.resumable && !GATES.has(run.phase)) verbs.add("resume");
+		if (run.resumable && REASSIGN_PHASES.has(run.phase)) verbs.add("reassign");
+		if (run.phase === "done") verbs.add("cleanup");
 	}
-	if (OVERRIDABLE.has(run.phase) && !run.holds_seat) verbs.add("override");
-	if (run.resumable && !GATES.has(run.phase)) verbs.add("resume");
-	if (!AT_REST.has(run.phase)) verbs.add("stop");
+	// Shipping is a push in progress: stopping it half-way is not an operator action spar
+	// offers. A running reconcile holds its run at awaiting_reconcile, which stop reaps.
+	const inFlightPhase = !AT_REST.has(run.phase) && run.phase !== "shipping";
+	if (inFlightPhase || (run.phase === "awaiting_reconcile" && run.holds_seat)) verbs.add("stop");
 	verbs.add("rule");
-	if (!run.holds_seat && run.phase !== "done" && run.phase !== "plan_rejected") verbs.add("reassign");
-	if (run.phase === "done") verbs.add("cleanup");
 	return ORDER.filter((v) => verbs.has(v));
 }
 
@@ -263,7 +273,7 @@ export function outcome(verb: Verb, id: string, raw: Raw): Outcome {
 		.filter(Boolean)
 		.join("\n");
 	let text = `${head} failed (${code})${detail ? `\n${detail}` : ""}`;
-	if ((verb === "ship" || verb === "override") && phase && phase !== "awaiting_ship_confirm" && OVERRIDABLE.has(phase)) {
+	if ((verb === "ship" || verb === "override") && phase && OVERRIDE_PHASES.has(phase)) {
 		text += `\nrun is at ${phase}; ship over the gate with /spar override ${id}`;
 	}
 	return { ok, phase, text };
@@ -271,6 +281,7 @@ export function outcome(verb: Verb, id: string, raw: Raw): Outcome {
 
 export interface GateRun extends RunStatus {
 	winner_slot?: string | null;
+	dispatched_round?: number;
 }
 
 interface Planned {
@@ -286,6 +297,13 @@ export interface GateContext {
 	hasUI: boolean;
 	mode: string;
 	ui: Ui;
+}
+
+// Mirrors implement's re-entry: a round opened but never dispatched is reused, anything
+// else begins the next one.
+export function nextRound(run: GateRun): string {
+	const reuse = run.round > 0 && (run.dispatched_round ?? 0) < run.round;
+	return reuse ? `re-runs round ${run.round}, which never dispatched` : `starts round ${run.round + 1}`;
 }
 
 async function ask(ui: Ui, title: string, placeholder: string, preset: string): Promise<string | undefined> {
@@ -307,23 +325,11 @@ async function plan(ctx: GateContext, verb: Verb, run: GateRun, preset: string):
 			return done(
 				buildArgv(verb, id, { reason }),
 				`Reject the plan for run ${id}?`,
-				"Moves the run to plan_rejected and removes its worktrees. Nothing can resume a rejected plan.",
+				`Moves the run to plan_rejected and removes its worktrees that hold no work; one with uncommitted changes or unmerged commits is kept. The plan and critique stay in the run's artifacts, and spar approve ${id} can still approve it later.`,
 			);
 		}
-		case "ship": {
-			if (run.phase !== "awaiting_ship_confirm") {
-				if (!OVERRIDABLE.has(run.phase)) {
-					ui.notify(`spar: run ${id} is at ${run.phase}; it cannot be shipped from there`, "error");
-					return undefined;
-				}
-				const over = await ui.confirm(
-					`The ship gate refuses run ${id}`,
-					`The run is at ${run.phase}: its review never cleared, so a plain ship is refused.\n\nShip it over the gate instead? That needs a reason, and every open finding goes in the PR body.`,
-				);
-				return over ? plan(ctx, "override", run, preset) : undefined;
-			}
+		case "ship":
 			return done(buildArgv(verb, id), `Ship run ${id}?`, "Pushes the run's branch and opens a draft PR. It never merges. Runs in the background.");
-		}
 		case "override": {
 			const reason = await ask(ui, `Override the gate on run ${id}: reason (required)`, "why this ships over its gate", preset);
 			if (reason === undefined) return undefined;
@@ -334,7 +340,7 @@ async function plan(ctx: GateContext, verb: Verb, run: GateRun, preset: string):
 			return done(
 				buildArgv(verb, id, { reason }),
 				`Ship run ${id} over its gate?`,
-				`From ${run.phase}. Pushes the implementer HEAD and opens a draft PR listing every open finding; the override is recorded. Runs in the background.`,
+				`At ${run.phase} a plain ship is refused: the review never cleared. This pushes the implementer HEAD and opens a draft PR listing every open finding; the override is recorded. Runs in the background.`,
 			);
 		}
 		case "confirm": {
@@ -427,7 +433,7 @@ async function plan(ctx: GateContext, verb: Verb, run: GateRun, preset: string):
 			return done(
 				buildArgv(verb, id, { seat, provider }),
 				`Move seat ${seat} of run ${id} to ${provider}?`,
-				"The seat keeps its worktree, branch and history; the new provider starts cold. Then the run continues, detached.",
+				`The seat keeps its worktree, branch and history; the new provider starts cold. Then the run continues, detached, and ${nextRound(run)}.`,
 			);
 		}
 		case "cleanup":
@@ -436,6 +442,26 @@ async function plan(ctx: GateContext, verb: Verb, run: GateRun, preset: string):
 				`Clean up run ${id}?`,
 				"Removes the run's worktrees only if its work is in its base (merged, squash-merged or rebased). Refused otherwise. Runs in the background.",
 			);
+	}
+}
+
+export type Report = (text: string, level: "info" | "warning" | "error") => void;
+
+let reporter: Report | undefined;
+
+// Background jobs and feed alerts outlive the command or session that started them, and a
+// ctx from a replaced session throws on use. They report here instead; session_start points
+// this at the live session's UI and session_shutdown clears it, so a result that lands with
+// no session is dropped.
+export function setReporter(next: Report | undefined): void {
+	reporter = next;
+}
+
+export function report(text: string, level: "info" | "warning" | "error"): void {
+	try {
+		reporter?.(text, level);
+	} catch {
+		// A UI torn down between the check and the call: nobody to tell.
 	}
 }
 
@@ -455,12 +481,14 @@ export async function performAction(ctx: GateContext, verb: Verb, run: GateRun, 
 	}
 	if (BACKGROUND.has(planned.verb)) {
 		const job = runBackground(planned.args, ctx.cwd);
+		inFlight.add(run.id);
 		ctx.ui.notify(`spar: started in the background: ${command}`, "info");
 		const done = job.done.then((raw) => {
+			inFlight.delete(run.id);
 			const result = outcome(planned.verb, run.id, raw);
+			if (!result.ok) result.text += `\noutput kept in ${job.dir}`;
+			report(result.text, result.ok ? "info" : "error");
 			if (result.ok) rmSync(job.dir, { recursive: true, force: true });
-			else result.text += `\noutput kept in ${job.dir}`;
-			ctx.ui.notify(result.text, result.ok ? "info" : "error");
 			return result;
 		});
 		return { kind: "started", done };
@@ -468,6 +496,24 @@ export async function performAction(ctx: GateContext, verb: Verb, run: GateRun, 
 	const result = outcome(planned.verb, run.id, await runSpar(planned.args, ctx.cwd, TIMEOUT_MS[planned.verb]));
 	ctx.ui.notify(result.text, result.ok ? "info" : "error");
 	return { kind: "ran", outcome: result };
+}
+
+export function cliCommand(verb: Verb, id: string): string {
+	const commands: Record<Verb, string> = {
+		approve: `spar approve ${id}`,
+		reject: `spar reject ${id} [--reason=<why>]`,
+		ship: `spar ship ${id} --confirm`,
+		override: `spar ship ${id} --override-gate --reason=<why>`,
+		confirm: `spar confirm ${id} [--winner <slot>]`,
+		reconcile: `spar reconcile ${id}`,
+		extend: `spar implement --run ${id} --max-rounds +<N> --detach`,
+		resume: `spar resume ${id} --detach`,
+		stop: `spar stop ${id}`,
+		rule: `spar rule add --run ${id} [--waive AC-<n>] -- "<text>"`,
+		reassign: `spar implement --run ${id} --reassign <seat>=<provider> --detach`,
+		cleanup: `spar cleanup ${id} --if-merged`,
+	};
+	return commands[verb];
 }
 
 function say(ctx: GateContext, text: string): void {
@@ -492,9 +538,10 @@ export function usage(verb: Verb): string {
 // without dialogs (print, JSON) refuses instead of acting unconfirmed.
 export async function verbCommand(ctx: GateContext, verb: Verb, args: string): Promise<ActionResult | undefined> {
 	if (!ctx.hasUI) {
+		const id = args.trim().split(/\s+/)[0] || "<id>";
 		say(
 			ctx,
-			`spar: /spar ${verb} needs a confirmation dialog, which this mode (${ctx.mode}) has no way to show; nothing ran. Use interactive or RPC mode, or run spar ${verb === "extend" ? "implement --run <id> --max-rounds +N" : verb} yourself.`,
+			`spar: /spar ${verb} needs a confirmation dialog, which this mode (${ctx.mode}) has no way to show; nothing ran. Use interactive or RPC mode, or run it yourself: ${cliCommand(verb, isRunId(id) ? id : "<id>")}`,
 		);
 		return undefined;
 	}
@@ -530,7 +577,7 @@ export async function verbCommand(ctx: GateContext, verb: Verb, args: string): P
 	if (!valid.includes(verb)) {
 		say(
 			ctx,
-			`spar: run ${id} is at ${status.value.phase}${status.value.holds_seat ? " and running" : ""}; ${verb} does not apply. From here: ${valid.join(", ")}`,
+			`spar: run ${id} is at ${status.value.phase}${status.value.holds_seat ? " and running" : ""}${busy(id) ? ", with a background job from this pi still going" : ""}; ${verb} does not apply. From here: ${valid.join(", ")}`,
 		);
 		return undefined;
 	}
