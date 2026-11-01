@@ -58,10 +58,10 @@
   panel not a padded one, the resolved fleet visible at gates, `--without` and `--fleet`
   presets) - see `features/011-fleet-shaping.md`  
 
-## Milestone 7: pi front end
+## Milestone 7: pi front end (done)
 
-- [ ] **pi front end** (event feed, footer and run views, gates as dialogs, agent tools; TUI deleted at gates) - see `features/012-pi-front-end.md`  
-- [ ] **TUI removed** (`src/tui.rs` and its conversation, composition, structured-view and motion modules deleted; bare `spar` prints help), merged once gates land as pi dialogs  
+- [x] **pi front end** (event feed, footer and run views, gates as dialogs, agent tools; TUI deleted at gates) - see `features/012-pi-front-end.md`  
+- [x] **TUI removed** (`src/tui.rs` and its conversation, composition, structured-view and motion modules deleted; bare `spar` prints help)  
 
 ## Later
 

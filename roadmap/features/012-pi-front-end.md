@@ -1,7 +1,7 @@
 ---
 id: 12
 title: pi front end
-status: planned
+status: done
 milestone: 7
 effort: L
 priority: high
