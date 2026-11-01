@@ -79,10 +79,16 @@ impl FailureState {
             exit_code,
             signal,
             tool_calls,
-            spar_error: spar_error.map(redact),
-            log_tail: log_tail(&crate::process::tail_log(log_path, 2 * LOG_TAIL_BYTES)),
+            spar_error: spar_error.map(|e| no_panic(|| redact(e))),
+            log_tail: no_panic(|| log_tail(&crate::process::tail_log(log_path, LOG_TAIL_BYTES))),
         }
     }
+}
+
+/// Redaction runs on untrusted text in the orchestrator thread: a bug in it must cost
+/// the classifier its input, never the run.
+fn no_panic(f: impl FnOnce() -> String) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_default()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -169,7 +175,11 @@ pub fn consult(
         return None;
     }
     let started = Instant::now();
-    let record = match classify(cfg, adapter, state) {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        classify(cfg, adapter, state)
+    }))
+    .unwrap_or_else(|_| Err(anyhow::anyhow!("classifier panicked")));
+    let record = match outcome {
         Ok(answer) => {
             let action = decide(cfg, site, regex, &answer);
             Record {
@@ -258,54 +268,115 @@ struct WireUsage {
     cost: Option<f64>,
 }
 
-type Memo = std::sync::Mutex<std::collections::HashMap<u64, Answer>>;
+type Memo = std::sync::Mutex<std::collections::HashMap<u64, std::result::Result<Answer, String>>>;
 
-/// Identical requests get the identical answer without a second call: the retry loop
-/// and the final verdict can ask about the same log.
+/// Answers (and failures) by request, so the dispatch and verdict sites asking about
+/// the same log pay for one call. Keyed on what the answer depends on: the model, the
+/// endpoint, the vendor's criteria, the exit, the signal and the log tail.
 fn memo() -> &'static Memo {
     static MEMO: std::sync::OnceLock<Memo> = std::sync::OnceLock::new();
     MEMO.get_or_init(Default::default)
 }
 
+/// While open, no call is made to that endpoint: an outage costs one failed consult
+/// per `BREAKER_OPEN`, not one per failed dispatch.
+const BREAKER_OPEN: Duration = Duration::from_secs(300);
+
+type Breaker = std::sync::Mutex<std::collections::HashMap<String, Instant>>;
+
+fn breaker() -> &'static Breaker {
+    static BREAKER: std::sync::OnceLock<Breaker> = std::sync::OnceLock::new();
+    BREAKER.get_or_init(Default::default)
+}
+
+fn breaker_open(base_url: &str) -> bool {
+    breaker()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(base_url).copied())
+        .is_some_and(|until| Instant::now() < until)
+}
+
+fn trip_breaker(base_url: &str) {
+    if let Ok(mut m) = breaker().lock() {
+        m.insert(base_url.to_string(), Instant::now() + BREAKER_OPEN);
+    }
+}
+
+fn memo_key(cfg: &ClassifierConfig, adapter: &str, state: &FailureState) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (
+        &cfg.model,
+        &cfg.base_url,
+        adapter,
+        state.exit_code,
+        state.signal,
+        &state.log_tail,
+    )
+        .hash(&mut h);
+    h.finish()
+}
+
 /// One System One call (`POST <base_url>/systemone`, pi-ai's `typesafe-system-one`
-/// shape). Up to `MAX_RETRIES` retries on a transport error, 408, 409, 429 or 5xx.
+/// shape). Retries a transport error, 408, 409, 429 or 5xx while the total budget
+/// (`timeout_secs` + 1) lasts, at most `MAX_RETRIES` times. A transport failure opens
+/// the breaker for this endpoint.
 pub fn classify(cfg: &ClassifierConfig, adapter: &str, state: &FailureState) -> Result<Answer> {
+    let key = memo_key(cfg, adapter, state);
+    if let Some(hit) = memo().lock().ok().and_then(|m| m.get(&key).cloned()) {
+        return match hit {
+            Ok(a) => Ok(Answer {
+                cached: true,
+                latency_ms: 0,
+                cost_usd: None,
+                ..a
+            }),
+            Err(e) => bail!("{e} (cached)"),
+        };
+    }
+    if breaker_open(&cfg.base_url) {
+        bail!("classifier skipped: endpoint failed within the last 5 minutes");
+    }
+    let result = call(cfg, adapter, state);
+    if let Ok(mut m) = memo().lock() {
+        m.insert(
+            key,
+            result
+                .as_ref()
+                .map(Clone::clone)
+                .map_err(|e| format!("{e:#}")),
+        );
+    }
+    result
+}
+
+fn call(cfg: &ClassifierConfig, adapter: &str, state: &FailureState) -> Result<Answer> {
     let body = serde_json::to_string(&Request {
         model: &cfg.model,
         state,
         questions: failure_question::questions(adapter),
     })?;
-    let memo_key = {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        (&cfg.base_url, &body).hash(&mut h);
-        h.finish()
-    };
-    if let Some(hit) = memo().lock().ok().and_then(|m| m.get(&memo_key).cloned()) {
-        return Ok(Answer {
-            cached: true,
-            latency_ms: 0,
-            cost_usd: None,
-            ..hit
-        });
-    }
-    let key = read_key(cfg)?;
+    let api_key = read_key(cfg)?;
     let url = format!("{}/systemone", cfg.base_url.trim_end_matches('/'));
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(cfg.timeout_secs)))
-        .http_status_as_error(false)
-        .build()
-        .into();
+    let per_attempt = Duration::from_secs(cfg.timeout_secs);
+    let budget = per_attempt + Duration::from_secs(1);
     let started = Instant::now();
     let mut attempt = 0;
     let text = loop {
+        let left = budget.saturating_sub(started.elapsed());
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(per_attempt.min(left)))
+            .http_status_as_error(false)
+            .build()
+            .into();
         let sent = agent
             .post(&url)
-            .header("Authorization", &format!("Bearer {key}"))
+            .header("Authorization", &format!("Bearer {api_key}"))
             .header("Content-Type", "application/json")
             .header("X-OpenRouter-Title", "spar")
             .send(&body);
-        let retry_reason = match sent {
+        let (reason, transport) = match sent {
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 let text = resp.into_body().read_to_string().unwrap_or_default();
@@ -318,17 +389,22 @@ pub fn classify(cfg: &ClassifierConfig, adapter: &str, state: &FailureState) -> 
                         truncate(&text, 200)
                     );
                 }
-                format!("HTTP {status}")
+                (format!("HTTP {status}"), false)
             }
-            Err(e) => e.to_string(),
+            Err(e) => (e.to_string(), true),
         };
-        if attempt >= MAX_RETRIES {
+        let backoff = Duration::from_millis(250 << attempt);
+        let out_of_time = started.elapsed() + backoff + Duration::from_millis(250) >= budget;
+        if attempt >= MAX_RETRIES || out_of_time {
+            if transport {
+                trip_breaker(&cfg.base_url);
+            }
             bail!(
-                "classifier unreachable after {} attempts: {retry_reason}",
+                "classifier unreachable after {} attempts: {reason}",
                 attempt + 1
             );
         }
-        std::thread::sleep(Duration::from_millis(250 << attempt));
+        std::thread::sleep(backoff);
         attempt += 1;
     };
     let latency_ms = started.elapsed().as_millis() as u64;
@@ -344,53 +420,62 @@ pub fn classify(cfg: &ClassifierConfig, adapter: &str, state: &FailureState) -> 
         serde_json::from_value(serde_json::Value::String(wire.choice.clone()))
             .with_context(|| format!("classifier returned unknown label {:?}", wire.choice))?;
     let probability = wire.probabilities.get(&wire.choice).copied().unwrap_or(0.0);
-    let answer = Answer {
+    Ok(Answer {
         choice,
         probability,
         probabilities: wire.probabilities.clone(),
         cost_usd: parsed.usage.and_then(|u| u.cost),
         latency_ms,
         cached: false,
-    };
-    if let Ok(mut m) = memo().lock() {
-        m.insert(memo_key, answer.clone());
-    }
-    Ok(answer)
+    })
 }
 
 fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-/// The last `LOG_TAIL_BYTES` of `text` after redaction, cut on a char boundary.
+/// The last `LOG_TAIL_BYTES` of `text`, redacted. The cut comes first and drops the
+/// partial line (or word) it lands in, so no secret is redacted whole and then cut, or
+/// cut so its recognizable start is lost; redaction can only lengthen a line slightly,
+/// so the result is trimmed again from the front on line boundaries.
 pub fn log_tail(text: &str) -> String {
-    let red = redact(text);
-    let mut start = red.len().saturating_sub(LOG_TAIL_BYTES);
-    while !red.is_char_boundary(start) {
+    let cut = tail_bytes(text, LOG_TAIL_BYTES);
+    let cut = if cut.len() < text.len() {
+        drop_partial_head(cut)
+    } else {
+        cut
+    };
+    let mut red = redact(cut);
+    while red.len() > LOG_TAIL_BYTES {
+        match red.find('\n') {
+            Some(i) => red = red[i + 1..].to_string(),
+            None => {
+                red = tail_bytes(&red, LOG_TAIL_BYTES).to_string();
+                break;
+            }
+        }
+    }
+    red
+}
+
+fn tail_bytes(text: &str, n: usize) -> &str {
+    let mut start = text.len().saturating_sub(n);
+    while !text.is_char_boundary(start) {
         start += 1;
     }
-    red[start..].to_string()
+    &text[start..]
+}
+
+fn drop_partial_head(cut: &str) -> &str {
+    let at = match cut.find('\n') {
+        Some(i) if i < 1024 => i,
+        _ => cut.find(char::is_whitespace).unwrap_or(cut.len()),
+    };
+    let rest = &cut[at..];
+    &rest[rest.chars().next().map_or(0, char::len_utf8)..]
 }
 
 const REDACTED: &str = "<redacted>";
-
-const SECRET_KEYS: &[&str] = &[
-    "password",
-    "passwd",
-    "pwd",
-    "secret",
-    "client_secret",
-    "api_key",
-    "apikey",
-    "api-key",
-    "access_token",
-    "refresh_token",
-    "id_token",
-    "auth_token",
-    "token",
-    "authorization",
-    "private_key",
-];
 
 const TOKEN_PREFIXES: &[&str] = &[
     "sk-",
@@ -415,120 +500,170 @@ const TOKEN_PREFIXES: &[&str] = &[
     "npm_",
 ];
 
-/// Strips what looks like a secret: key=value pairs under a secret-sounding key, bearer
-/// tokens, URL passwords (database URLs), JWTs, vendor-prefixed keys and long mixed-case
-/// alphanumeric tokens. Errs toward removing too much.
+/// Strips what looks like a secret: the value of any key or flag whose name says
+/// secret (`*password*`, `*passwd`, `*pwd`, `*token`, `*secret*`, `*_key`, `*-key`,
+/// `*apikey`, `authorization`), bearer tokens, URL passwords (database
+/// URLs), JWTs, vendor-prefixed keys and long base64 or hex runs. Errs toward removing
+/// too much. Works on chars, never byte offsets, so no input can make it panic.
 pub fn redact(text: &str) -> String {
-    text.lines().map(redact_line).collect::<Vec<_>>().join("\n")
+    text.split('\n')
+        .map(redact_line)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn redact_line(line: &str) -> String {
-    let line = redact_url_passwords(line);
-    let line = redact_after_keyword(&line);
-    redact_tokens(&line)
+    let chars: Vec<char> = line.chars().collect();
+    let chars = redact_url_passwords(&chars);
+    let chars = redact_keyed_values(&chars);
+    redact_tokens(&chars)
 }
 
-fn is_word(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+fn is_ident(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')
 }
 
-fn is_value(c: char) -> bool {
-    !c.is_whitespace() && !matches!(c, '"' | '\'' | ',' | ';' | '&' | '}' | ')' | ']' | '`')
+fn is_quote(c: char) -> bool {
+    matches!(c, '"' | '\'' | '`')
+}
+
+fn ends_value(c: char) -> bool {
+    c.is_whitespace() || is_quote(c) || matches!(c, ',' | ';' | '&' | '}' | ')' | ']' | '<' | '>')
 }
 
 /// `scheme://user:pass@host` keeps the user and host.
-fn redact_url_passwords(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    while let Some(i) = rest.find("://") {
-        let (head, tail) = rest.split_at(i + 3);
-        out.push_str(head);
-        let end = tail
-            .find(|c: char| c.is_whitespace() || matches!(c, '/' | '"' | '\'' | '`'))
-            .unwrap_or(tail.len());
-        let authority = &tail[..end];
-        match (authority.rfind('@'), authority.find(':')) {
-            (Some(at), Some(colon)) if colon < at => {
-                out.push_str(&authority[..=colon]);
-                out.push_str(REDACTED);
-                out.push_str(&authority[at..]);
-            }
-            _ => out.push_str(authority),
+fn redact_url_passwords(chars: &[char]) -> Vec<char> {
+    let mut out = Vec::with_capacity(chars.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let scheme_end = i + 3 <= chars.len() && chars[i..i + 3] == [':', '/', '/'];
+        if !scheme_end {
+            out.push(chars[i]);
+            i += 1;
+            continue;
         }
-        rest = &tail[end..];
+        out.extend_from_slice(&chars[i..i + 3]);
+        i += 3;
+        let start = i;
+        while i < chars.len()
+            && !(chars[i].is_whitespace() || chars[i] == '/' || is_quote(chars[i]))
+        {
+            i += 1;
+        }
+        let authority = &chars[start..i];
+        let at = authority.iter().rposition(|&c| c == '@');
+        let colon = authority.iter().position(|&c| c == ':');
+        match (at, colon) {
+            (Some(at), Some(colon)) if colon < at => {
+                out.extend_from_slice(&authority[..=colon]);
+                out.extend(REDACTED.chars());
+                out.extend_from_slice(&authority[at..]);
+            }
+            _ => out.extend_from_slice(authority),
+        }
     }
-    out.push_str(rest);
     out
 }
 
-/// `password=x`, `"api_key": "x"`, `Authorization: Bearer x`, `bearer x`.
-fn redact_after_keyword(line: &str) -> String {
-    let lower = line.to_ascii_lowercase();
-    let bytes = line.as_bytes();
-    let mut cuts: Vec<(usize, usize)> = Vec::new();
-    let mut search = 0;
-    while search < lower.len() {
-        let Some((pos, key)) = SECRET_KEYS
-            .iter()
-            .chain(std::iter::once(&"bearer"))
-            .filter_map(|k| lower[search..].find(k).map(|p| (search + p, *k)))
-            .min_by_key(|(p, k)| (*p, std::cmp::Reverse(k.len())))
-        else {
-            break;
-        };
-        let end_key = pos + key.len();
-        search = end_key;
-        let before_ok = pos == 0 || !is_word(bytes[pos - 1] as char);
-        let after_ok = end_key >= bytes.len() || !is_word(bytes[end_key] as char);
-        if !before_ok || !after_ok {
+fn secret_name(ident: &str) -> bool {
+    let k = ident.trim_start_matches('-').to_ascii_lowercase();
+    let k = k.trim_end_matches(['.', '-', '_']);
+    if k.is_empty() {
+        return false;
+    }
+    k.contains("password")
+        || k.contains("passwd")
+        || k.contains("secret")
+        || k.contains("apikey")
+        || k.contains("api_key")
+        || k.contains("api-key")
+        || k.contains("private_key")
+        || k == "pwd"
+        || k.ends_with("_pwd")
+        || k == "token"
+        || k.ends_with("token")
+        || k.ends_with("_key")
+        || k.ends_with("-key")
+        || k == "authorization"
+        || k == "bearer"
+}
+
+/// `NAME=value`, `NAME: value`, `"name": "value"`, `--name value`, `--name=value` and
+/// `Bearer value`, for a secret-sounding name. A quoted value is taken to its closing
+/// quote.
+fn redact_keyed_values(chars: &[char]) -> Vec<char> {
+    let mut out = Vec::with_capacity(chars.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if !is_ident(chars[i]) || (i > 0 && is_ident(chars[i - 1])) {
+            out.push(chars[i]);
+            i += 1;
             continue;
         }
-        let mut i = end_key;
-        let skip = |i: &mut usize, pred: &dyn Fn(char) -> bool| {
-            while *i < bytes.len() && pred(bytes[*i] as char) {
-                *i += 1;
-            }
-        };
-        skip(&mut i, &|c| c == '"' || c == '\'');
-        skip(&mut i, &|c| c == ' ' || c == '\t');
-        if key == "bearer" {
-            if i == end_key {
-                continue;
-            }
-        } else {
-            if i >= bytes.len() || !matches!(bytes[i], b'=' | b':') {
-                continue;
-            }
-            i += 1;
-            skip(&mut i, &|c| c == ' ' || c == '\t' || c == '"' || c == '\'');
-            let scheme = lower[i..].starts_with("bearer ") || lower[i..].starts_with("basic ");
-            if scheme {
-                i += 6;
-                skip(&mut i, &|c| c == ' ');
-            }
-        }
         let start = i;
-        while i < bytes.len() && is_value(bytes[i] as char) {
+        while i < chars.len() && is_ident(chars[i]) {
             i += 1;
         }
-        if i > start {
-            cuts.push((start, i));
-            search = i;
+        let ident: String = chars[start..i].iter().collect();
+        out.extend_from_slice(&chars[start..i]);
+        if !secret_name(&ident) {
+            continue;
         }
+        let flag = ident.starts_with("--");
+        let bearer = ident.eq_ignore_ascii_case("bearer");
+        let mut j = i;
+        while j < chars.len() && is_quote(chars[j]) {
+            j += 1;
+        }
+        while j < chars.len() && matches!(chars[j], ' ' | '\t') {
+            j += 1;
+        }
+        let sep = j < chars.len() && matches!(chars[j], '=' | ':');
+        if sep {
+            j += 1;
+        } else if !(flag || bearer) || j == i {
+            continue;
+        }
+        while j < chars.len() && matches!(chars[j], ' ' | '\t') {
+            j += 1;
+        }
+        let quote = (j < chars.len() && is_quote(chars[j])).then(|| chars[j]);
+        if quote.is_some() {
+            j += 1;
+        }
+        let scheme: String = chars[j..chars.len().min(j + 7)].iter().collect();
+        let scheme = scheme.to_ascii_lowercase();
+        if !bearer && (scheme.starts_with("bearer ") || scheme.starts_with("basic ")) {
+            j += scheme.find(' ').unwrap_or(0) + 1;
+            while j < chars.len() && chars[j] == ' ' {
+                j += 1;
+            }
+        }
+        let vstart = j;
+        match quote {
+            Some(q) => {
+                while j < chars.len() && chars[j] != q {
+                    j += 1;
+                }
+            }
+            None => {
+                while j < chars.len() && !ends_value(chars[j]) {
+                    j += 1;
+                }
+            }
+        }
+        if j == vstart {
+            continue;
+        }
+        out.extend_from_slice(&chars[i..vstart]);
+        out.extend(REDACTED.chars());
+        i = j;
     }
-    let mut out = String::with_capacity(line.len());
-    let mut last = 0;
-    for (s, e) in cuts {
-        out.push_str(&line[last..s]);
-        out.push_str(REDACTED);
-        last = e;
-    }
-    out.push_str(&line[last..]);
     out
 }
 
 fn is_token_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+' | '/')
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+' | '/' | '=')
 }
 
 fn looks_secret(word: &str) -> bool {
@@ -539,17 +674,19 @@ fn looks_secret(word: &str) -> bool {
         return true;
     }
     let core = word.trim_matches(|c: char| !c.is_ascii_alphanumeric());
-    core.len() >= 32
-        && core
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        && core.chars().any(|c| c.is_ascii_digit())
-        && core.chars().any(|c| c.is_ascii_uppercase())
-        && core.chars().any(|c| c.is_ascii_lowercase())
+    let run = core
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '-'));
+    let hex = core.chars().all(|c| c.is_ascii_hexdigit());
+    let digits = core.chars().filter(char::is_ascii_digit).count();
+    let mixed = digits > 0 && core.chars().any(|c| c.is_ascii_alphabetic());
+    let cased = core.chars().any(|c| c.is_ascii_uppercase())
+        && core.chars().any(|c| c.is_ascii_lowercase());
+    core.len() >= 32 && mixed && (hex || (run && (cased || digits * 10 >= core.len())))
 }
 
-fn redact_tokens(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
+fn redact_tokens(chars: &[char]) -> String {
+    let mut out = String::with_capacity(chars.len());
     let mut word = String::new();
     let flush = |word: &mut String, out: &mut String| {
         if looks_secret(word) {
@@ -559,7 +696,7 @@ fn redact_tokens(line: &str) -> String {
         }
         word.clear();
     };
-    for c in line.chars() {
+    for &c in chars {
         if is_token_char(c) {
             word.push(c);
         } else {
@@ -817,11 +954,31 @@ pub mod tests {
         .unwrap();
         assert_eq!(rec.action, Action::None);
         assert!(rec.error.is_some());
-        assert_eq!(
-            slow.bodies.lock().unwrap().len(),
-            1 + MAX_RETRIES,
-            "a timeout is retried twice"
+        let sent = slow.bodies.lock().unwrap().len();
+        assert!((1..=1 + MAX_RETRIES).contains(&sent), "{sent} attempts");
+        assert!(
+            rec.latency_ms <= 2500,
+            "the whole consult stays inside timeout + 1s: {}ms",
+            rec.latency_ms
         );
+        let started = Instant::now();
+        let rec = consult(
+            &cfg,
+            &paths,
+            run,
+            "s1",
+            "claude",
+            &state("another failure, same dead endpoint"),
+            Site::Verdict,
+            RegexVerdict::Work,
+        )
+        .unwrap();
+        assert!(
+            rec.error.unwrap().contains("skipped"),
+            "the breaker is open"
+        );
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert_eq!(slow.bodies.lock().unwrap().len(), sent, "no new request");
 
         let broken = fake_system_one(400, "{}".into(), Duration::ZERO);
         let cfg = enabled_cfg(&broken.base_url, &tmp.path().join("key"));
@@ -965,42 +1122,116 @@ pub mod tests {
     #[test]
     fn redaction_strips_keys_tokens_passwords_and_db_urls() {
         let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
-        let input = [
-            "Authorization: Bearer abc123def456ghi789",
-            "export OPENAI_API_KEY=sk-proj-AbCdEf0123456789xyzXYZ",
-            "postgres://app:hunter2@db.internal:5432/main",
-            "{\"password\": \"correct horse\", \"user\": \"bob\"}",
-            &format!("token {jwt} expired"),
-            "key ghp_0123456789abcdefABCDEF0123456789abcd",
-            "API Error: 401 OAuth access token has been revoked",
-            "commit 4f2a9c1e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39 ok",
-            "secret=s3cr3t&next=1",
-        ]
-        .join("\n");
-        let out = redact(&input);
-        for leak in [
-            "abc123def456ghi789",
-            "sk-proj-AbCdEf0123456789xyzXYZ",
-            "hunter2",
-            "correct horse",
-            jwt,
-            "ghp_0123456789abcdefABCDEF0123456789abcd",
-            "s3cr3t",
-        ] {
+        let cases: &[(&str, &str)] = &[
+            (
+                "Authorization: Bearer abc123def456ghi789",
+                "abc123def456ghi789",
+            ),
+            (
+                "curl -H 'authorization: bearer zzTopSecret9'",
+                "zzTopSecret9",
+            ),
+            ("bearer qwertyuiop12", "qwertyuiop12"),
+            (
+                "export OPENAI_API_KEY=sk-proj-AbCdEf0123456789xyzXYZ",
+                "sk-proj-AbCdEf0123456789xyzXYZ",
+            ),
+            ("postgres://app:hunter2@db.internal:5432/main", "hunter2"),
+            (
+                "{\"password\": \"correct horse\", \"user\": \"bob\"}",
+                "correct horse",
+            ),
+            ("secret=s3cr3t&next=1", "s3cr3t"),
+            ("DATABASE_PASSWORD=pa55word", "pa55word"),
+            ("export PGPASSWORD=letmein", "letmein"),
+            ("GITHUB_TOKEN=abc", "abc"),
+            ("MY_TOKEN: shorty", "shorty"),
+            (
+                "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                "wJalrXUtnFEMI",
+            ),
+            (
+                "x-api-key: 9f86d081884c7d659a2feaa0c55ad015",
+                "9f86d081884c7d659a2feaa0c55ad015",
+            ),
+            ("psql --password hunter3", "hunter3"),
+            ("tool --api-key=k3y-value", "k3y-value"),
+            ("STRIPE_KEY: rk_test_x", "rk_test_x"),
+            (
+                "key ghp_0123456789abcdefABCDEF0123456789abcd",
+                "ghp_0123456789abcdefABCDEF0123456789abcd",
+            ),
+            (
+                "blob ZXhhbXBsZTEyMzQ1Njc4OTBleGFtcGxlMTIzNDU2Nzg5MA==",
+                "ZXhhbXBsZTEyMzQ1Njc4OTBleGFtcGxlMTIzNDU2Nzg5MA",
+            ),
+        ];
+        for (line, leak) in cases {
+            let out = redact(line);
             assert!(!out.contains(leak), "leaked {leak}: {out}");
+            assert!(out.contains(REDACTED), "{out}");
         }
-        assert!(out.contains("postgres://app:<redacted>@db.internal:5432/main"));
-        assert!(out.contains("API Error: 401 OAuth access token has been revoked"));
-        assert!(out.contains("4f2a9c1e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39"));
-        assert!(out.contains("\"user\": \"bob\""));
-        assert!(out.contains("next=1"));
+        let out = redact(&format!("token {jwt} expired"));
+        assert!(!out.contains(jwt), "{out}");
+
+        let kept = [
+            "API Error: 401 OAuth access token has been revoked",
+            "[auth]: credentials rejected",
+            "not logged in: run `muse login` first",
+            "You've hit your weekly limit · resets 12am (America/New_York)",
+            "test quota::tests::rate_limit_exceeded_returns_retry_after ... FAILED",
+            "input_tokens: 1200, max_tokens: 4096",
+        ];
+        for line in kept {
+            assert_eq!(redact(line), line);
+        }
+        assert_eq!(
+            redact("postgres://app:hunter2@db.internal:5432/main"),
+            "postgres://app:<redacted>@db.internal:5432/main"
+        );
+        assert!(redact("{\"password\": \"x\", \"user\": \"bob\"}").contains("\"user\": \"bob\""));
     }
 
     #[test]
-    fn log_tail_is_the_last_4k_on_a_char_boundary() {
-        let text = format!("{}{}", "é".repeat(3000), "end");
+    fn redaction_never_panics_on_non_ascii() {
+        for line in [
+            "password=voilà ok",
+            "secret: x\u{a0}y",
+            "token=\u{85}abc",
+            "Authorization: Bearer é",
+            "--password\u{a0}hunter2",
+            "postgres://ü:ß@höst/db",
+            "ключ api_key: значение",
+            "password=",
+            "bearer",
+            "x://",
+            "😀 secret=😀😀 eyJ😀.a.b",
+        ] {
+            let _ = redact(line);
+        }
+        assert!(!redact("password=voilà ok").contains("voilà"));
+        assert!(redact("secret: x\u{a0}y").starts_with("secret: <redacted>"));
+    }
+
+    #[test]
+    fn log_tail_cuts_first_then_redacts_and_drops_the_partial_line() {
+        let text = format!("{}\nend", "é".repeat(3000));
         let tail = log_tail(&text);
+        assert_eq!(tail, "end", "the cut line is dropped whole");
+
+        let secret = "sk-proj-AbCdEf0123456789xyzXYZ";
+        let filler = "x".repeat(LOG_TAIL_BYTES - 10);
+        let text = format!("OPENAI_API_KEY={secret}\n{filler}\nlast line");
+        let tail = log_tail(&text);
+        assert!(
+            !tail.contains("AbCdEf0123456789"),
+            "no half-token survives the cut"
+        );
+        assert!(tail.ends_with("last line"));
+
+        let many = "password=a\n".repeat(LOG_TAIL_BYTES / 11);
+        let tail = log_tail(&many);
         assert!(tail.len() <= LOG_TAIL_BYTES);
-        assert!(tail.ends_with("end"));
+        assert!(!tail.contains("password=a\n"));
     }
 }
