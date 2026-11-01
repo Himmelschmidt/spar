@@ -1,7 +1,9 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
+import { AttentionTracker } from "./attention.ts";
 import { Footer } from "./footer.ts";
 import { detailLines, listRows, listText, plain, sortRuns } from "./format.ts";
+import { actionsFor, isVerb, performAction, VERBS, verbCommand, verbCompletions } from "./gates.ts";
 import { type Brief, type BusMessage, isRunId, isStale, type RunRow, type RunStatus, sparJson } from "./spar.ts";
 import { pickRun, showDetail, themePaint } from "./ui.ts";
 
@@ -16,10 +18,16 @@ export default function (pi: ExtensionAPI) {
 		footer = undefined;
 		cwd = ctx.cwd;
 		if (!ctx.hasUI) return;
+		const attention = new AttentionTracker();
 		const current = new Footer({
 			cwd: ctx.cwd,
 			paint: themePaint(ctx.ui.theme),
 			setStatus: (text) => ctx.ui.setStatus(STATUS_KEY, text),
+			onFirstRuns: (runs, feedStart) => attention.seed(runs, feedStart),
+			onEvent: (event) => {
+				const alert = attention.onEvent(event);
+				if (alert) ctx.ui.notify(alert.message, alert.level);
+			},
 		});
 		footer = current;
 		void current.start();
@@ -31,9 +39,11 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("spar", {
-		description: "spar runs: /spar lists them, /spar <id> shows one",
+		description: "spar runs: /spar lists them, /spar <id> shows one, /spar <verb> <id> acts on one",
 		getArgumentCompletions: async (prefix) => {
 			const runs = footer?.runs ?? (await listRuns(cwd)) ?? [];
+			const gated = verbCompletions(prefix, runs);
+			if (gated && /\s/.test(prefix)) return gated.length ? gated : null;
 			const now = new Date();
 			const items: AutocompleteItem[] = sortRuns(runs, now)
 				.filter((r) => r.id.startsWith(prefix.trim()))
@@ -41,10 +51,17 @@ export default function (pi: ExtensionAPI) {
 					const flag = r.needs_human ? (isStale(r, now) ? ", needs you (stale)" : ", needs you") : "";
 					return { value: r.id, label: r.id, description: `${r.phase}${flag}` };
 				});
+			items.push(...(gated ?? []));
 			return items.length ? items : null;
 		},
 		handler: async (args, ctx) => {
 			const id = args.trim().split(/\s+/)[0] ?? "";
+			if (isVerb(id)) {
+				const result = await verbCommand(ctx, id, args.trim().slice(id.length));
+				if (result?.kind === "started") void result.done.then(() => footer?.refresh());
+				void footer?.refresh();
+				return;
+			}
 			if (id && !isRunId(id)) {
 				const message = `spar: "${id}" is not a run id. Usage: /spar [run-id]`;
 				if (ctx.mode === "tui") ctx.ui.notify(message, "error");
@@ -62,7 +79,15 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(detail, "error");
 					return;
 				}
-				const choice = await showDetail(ctx, (paint) => detailLines({ ...detail, now: new Date() }, paint));
+				const actions = actionsFor(detail.status).map((v) => ({ key: VERBS[v].key, label: VERBS[v].label, id: v }));
+				const choice = await showDetail(ctx, (paint) => detailLines({ ...detail, now: new Date() }, paint), actions);
+				if (typeof choice === "object") {
+					if (isVerb(choice.action)) {
+						const result = await performAction(ctx, choice.action, detail.status);
+						if (result.kind === "started") void result.done.then(() => footer?.refresh());
+					}
+					continue;
+				}
 				next = choice === "back" ? await chooseRun(ctx) : undefined;
 			}
 			void footer?.refresh();

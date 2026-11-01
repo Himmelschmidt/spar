@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { detailLines, footerText, listRows, listText, plain, sortRuns } from "../extensions/spar/format.ts";
+import { actionLines, detailLines, footerText, listRows, listText, plain, sortRuns } from "../extensions/spar/format.ts";
 import type { Brief } from "../extensions/spar/spar.ts";
 import { minutesSinceLocalMidnight, statsCost } from "../extensions/spar/spar.ts";
 import { row, status } from "./helpers.ts";
@@ -125,4 +125,18 @@ test("today is measured from local midnight", () => {
 	const d = new Date(2026, 9, 15, 2, 30, 0);
 	assert.equal(minutesSinceLocalMidnight(d), 150);
 	assert.equal(minutesSinceLocalMidnight(new Date(2026, 9, 15, 0, 0, 0)), 1);
+});
+
+test("the detail's action hint wraps instead of cutting keys off", () => {
+	const actions = [
+		{ key: "o", label: "override+ship", id: "override" },
+		{ key: "c", label: "confirm winner", id: "confirm" },
+		{ key: "m", label: "reconcile", id: "reconcile" },
+		{ key: "u", label: "rule", id: "rule" },
+	] as const;
+	const plainKey = (k: string) => k;
+	assert.deepEqual(actionLines([...actions], 200, plainKey), ["actions: o override+ship  c confirm winner  m reconcile  u rule"]);
+	assert.deepEqual(actionLines([...actions], 42, plainKey), ["actions: o override+ship  c confirm winner", "  m reconcile  u rule"]);
+	assert.deepEqual(actionLines([...actions], 41, plainKey), ["actions: o override+ship", "  c confirm winner  m reconcile  u rule"]);
+	assert.deepEqual(actionLines([], 40, plainKey), []);
 });

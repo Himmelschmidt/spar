@@ -643,8 +643,17 @@ fn run() -> Result<ExitCode> {
             run_id,
             follow,
             since,
+            tail_cursor,
+            exit_on_stdin_eof,
             json,
-        } => events_cmd(run_id, follow, since.as_deref(), json),
+        } => events_cmd(
+            run_id,
+            follow,
+            since.as_deref(),
+            tail_cursor,
+            exit_on_stdin_eof,
+            json,
+        ),
         Command::Wait {
             run_id,
             timeout,
@@ -2539,6 +2548,8 @@ fn events_cmd(
     run_id: Option<String>,
     follow: bool,
     since: Option<&str>,
+    tail_cursor: bool,
+    exit_on_stdin_eof: bool,
     json: bool,
 ) -> Result<ExitCode> {
     let (paths, _) = project_ctx()?;
@@ -2549,6 +2560,21 @@ fn events_cmd(
         if !paths.run_dir(id).is_dir() {
             anyhow::bail!("no run {id} in this project");
         }
+    }
+    if tail_cursor {
+        let cursor = events::Feed::at_tail(&paths, run_id)?.cursor();
+        if json {
+            println!("{}", serde_json::json!({ "cursor": cursor }));
+        } else {
+            println!("{cursor}");
+        }
+        return Ok(ExitCode::Success);
+    }
+    if exit_on_stdin_eof {
+        std::thread::spawn(|| {
+            let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+            std::process::exit(0);
+        });
     }
     let mut feed = match since {
         Some("now") => events::Feed::at_tail(&paths, run_id)?,

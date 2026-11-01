@@ -24,6 +24,10 @@ export interface FooterOptions {
 	cwd: string;
 	paint: Paint;
 	setStatus: (text: string | undefined) => void;
+	onEvent?: (event: FeedEvent) => void;
+	// The first successful status read, and when the feed took its starting cursor: a run
+	// last changed before then has no event coming for the state it is already in.
+	onFirstRuns?: (runs: RunRow[], feedStart: Date) => void;
 	debounceMs?: number;
 	refreshMs?: number;
 	providerPollMs?: number;
@@ -43,6 +47,7 @@ export class Footer {
 	private timers: NodeJS.Timeout[] = [];
 	private refreshing: Promise<void> | undefined;
 	private refreshAgain = false;
+	private feedStart: Date | undefined;
 	private probeBackoffMs: number;
 	private readonly options: FooterOptions;
 
@@ -62,6 +67,7 @@ export class Footer {
 		this.feed = new EventFeed({
 			cwd: this.options.cwd,
 			onEvent: (event) => {
+				this.options.onEvent?.(event);
 				if (this.runs) {
 					this.runs = applyEvent(this.runs, event);
 					this.render();
@@ -73,7 +79,9 @@ export class Footer {
 			},
 			minBackoffMs: this.options.feedBackoffMs,
 		});
-		this.feed.start();
+		this.feedStart = new Date();
+		await this.feed.start();
+		if (this.stopped) return;
 		this.every(this.options.refreshMs ?? 60_000, () => this.scheduleRefresh());
 		this.every(this.options.providerPollMs ?? 300_000, () => void this.pollProviders());
 		void this.refresh();
@@ -132,7 +140,11 @@ export class Footer {
 				this.refreshAgain = false;
 				const runs = await sparJson<RunRow[]>(["status", "--json"], this.options.cwd);
 				if (this.stopped) return;
-				if (runs.ok) this.runs = runs.value;
+				if (runs.ok) {
+					const first = this.runs === undefined;
+					this.runs = runs.value;
+					if (first && this.feedStart) this.options.onFirstRuns?.(runs.value, this.feedStart);
+				}
 				const since = `${minutesSinceLocalMidnight(new Date())}m`;
 				const stats = await sparJson<Stats>(["stats", "--since", since, "--json"], this.options.cwd);
 				if (this.stopped) return;

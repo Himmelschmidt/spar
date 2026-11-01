@@ -1247,7 +1247,7 @@ spar status --here [--json]   # {"project_root", "spar_initialized"}: the projec
 spar status --hosts h1,h2 | --all-hosts [--json]   # runs on other boxes over ssh (O140)
 spar stats [--since 7d] [--by model|role|provider|project] [--all-projects] [--json]
 spar wait <run_id> [--timeout 8h] [--follow] [--json]
-spar events [--run <id>] [--follow] [--since <cursor>|now] [--json]   # every run's events, one feed (O146)
+spar events [--run <id>] [--follow] [--since <cursor>|now] [--tail-cursor] [--exit-on-stdin-eof] [--json]   # every run's events, one feed (O146)
 spar logs <run_id> [slot] [-f|--follow]
 
 # Global home: open `spar` from anywhere. Runs stay under each project’s
@@ -1423,6 +1423,7 @@ spar events --follow --json              # from now; keeps going until killed
 spar events --json                       # backlog of every run, ordered by time, then exits
 spar events --follow --json --since "$CURSOR"   # resume after a disconnect
 spar events --run <id> --json            # one run (shown even if archived)
+spar events --tail-cursor --json         # {"cursor": "..."} for the current end, then exits
 ```
 
 Each `--json` line is one object: `run_id`, `cursor`, then the event's own fields
@@ -1442,6 +1443,15 @@ renamed; ignore a `type` you don't know.
   that; an archived run keeps its entry.
 - `--since now` (the default with `--follow`) starts at the tail. Without `--follow`
   and without `--since`, it starts at the beginning of every run.
+- **Start with no gap:** `--since now` has no cursor until the first event, so a
+  follower that drops before then cannot resume exactly. Take
+  `spar events --tail-cursor --json` first (one line, `{"cursor": "..."}`, no events;
+  plain text without `--json`) and start `--follow --since <that cursor>`; every later
+  restart passes the last cursor seen, or that one if none came. Not with `--follow` or
+  `--since`.
+- `--exit-on-stdin-eof` (with `--follow` only): exit `0` when stdin reaches end of
+  file. Spawn the follower with a stdin pipe and it dies with its parent, even a
+  SIGKILLed one, instead of tailing forever as an orphan.
 - Order is by `ts` within a batch, but one run's events always keep their file order,
   and an event written late can carry an earlier `ts` than one already printed. Don't
   sort on `ts` and drop "older" ones.

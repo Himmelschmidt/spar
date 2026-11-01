@@ -474,6 +474,16 @@ pub enum Command {
         /// to `now` with `--follow`, to the start of every run without it.
         #[arg(long, value_name = "CURSOR")]
         since: Option<String>,
+        /// Print the cursor for the current end of every log and exit, without printing
+        /// any event (`{"cursor": "..."}` with `--json`). A client takes it before its
+        /// first `--follow --since <cursor>`, so a follower that drops before its first
+        /// event resumes with no gap.
+        #[arg(long, conflicts_with_all = ["follow", "since"])]
+        tail_cursor: bool,
+        /// With `--follow`: exit when stdin reaches end of file, so a child spawned with a
+        /// stdin pipe dies with its parent, even a SIGKILLed one.
+        #[arg(long, requires = "follow")]
+        exit_on_stdin_eof: bool,
         /// One JSON object per line: run_id, cursor and the event's fields.
         #[arg(long)]
         json: bool,

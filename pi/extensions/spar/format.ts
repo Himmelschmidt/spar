@@ -207,3 +207,23 @@ export function detailLines({ status, brief, bus, now }: DetailInput, paint: Pai
 	lines.push(`${paint("accent", "next:")} ${brief?.next_command ?? `spar brief ${status.id}`}`);
 	return lines;
 }
+
+// Wrapped rather than truncated: a key cut off the hint is a key nobody knows to press.
+export function actionLines(actions: { key: string; label: string }[], width: number, paintKey: (key: string) => string): string[] {
+	const lines: string[] = [];
+	let line = "";
+	let used = 0;
+	for (const a of actions) {
+		const lead = lines.length === 0 && used === 0 ? "actions: " : "  ";
+		const size = a.key.length + 1 + a.label.length;
+		if (used > 0 && used + lead.length + size > width) {
+			lines.push(line);
+			line = "";
+			used = 0;
+		}
+		line += `${lead}${paintKey(a.key)} ${a.label}`;
+		used += lead.length + size;
+	}
+	if (line) lines.push(line);
+	return lines;
+}

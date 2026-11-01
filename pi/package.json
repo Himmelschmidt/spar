@@ -2,7 +2,7 @@
   "name": "spar-pi",
   "version": "0.0.1",
   "private": true,
-  "description": "spar's human front end for the pi coding agent: run footer, run list and run detail",
+  "description": "spar's human front end for the pi coding agent: run footer, run list, run detail and gate dialogs",
   "type": "module",
   "engines": {
     "node": ">=22.18.0"

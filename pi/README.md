@@ -1,12 +1,14 @@
 # spar-pi
 
 spar's human front end as a [pi](https://pi.dev) package (DECISIONS.md O145, roadmap
-feature 012). This is layer 1: read-only visibility. Gates (layer 2) and model-callable
-tools (layer 3) come later.
+feature 012). Layer 1 is visibility (footer, run list, run detail); layer 2 is the human
+gates as pi dialogs. Model-callable tools (layer 3) come later.
 
 It is a thin client. Everything it shows comes from `spar <cmd> --json` child processes run
 in the session's working directory; it never reads or writes `.spar/` itself. The `spar`
-binary must be on `PATH` (or set `SPAR_PI_BIN` to a different binary, such as a dev build).
+binary must be on `PATH` (or set `SPAR_PI_BIN` to a different binary, such as a dev build). It needs
+a spar with `spar events --tail-cursor` and `--exit-on-stdin-eof`; an older one leaves the
+footer on its 60 s status poll.
 
 ## Load it
 
@@ -49,8 +51,11 @@ It starts in `session_start` and is stopped in `session_shutdown`. First it asks
 a `.spar/`). If not, or if `spar` is missing, it shows nothing and asks again after 30 s,
 doubling to 10 minutes, so a project initialized mid-session lights up without a restart.
 
-Once initialized, a long-lived `spar events --follow --json` child (O146) is started
-before the first status read, so nothing that happens in between is missed. Each event
+Once initialized, it takes `spar events --tail-cursor --json` (the cursor for the current
+end of every run's log) and starts a long-lived `spar events --follow --json --since
+<that cursor>` child (O146) before the first status read, so nothing that happens in
+between is missed, and a child that dies before its first event resumes from that cursor
+rather than from a later "now". Each event
 triggers a debounced re-read of `spar status --json` and `spar stats`; `archived` and
 `abandoned` events also update the counts at once (an archived run leaves them, an
 abandoned one stops counting as running). If the child exits it is restarted with
@@ -60,9 +65,18 @@ up without an event. Provider pauses are not events, and `spar provider list --j
 probes every CLI, so it is polled every 5 minutes.
 
 The events child is killed on `session_shutdown` and, as a backstop, on pi's process
-`exit`. Its stdin is a pipe, so it would also die with a SIGKILLed pi if `spar events`
-exited on stdin EOF; it does not yet. It runs only in modes with a UI (interactive and
-RPC).
+`exit`. It runs with `--exit-on-stdin-eof` and a stdin pipe only pi holds, so it also
+exits when pi is SIGKILLed. It runs only in modes with a UI (interactive and RPC).
+
+### Alerts
+
+The same feed raises one `ctx.ui.notify` when a run newly enters a state that needs you:
+a gate (plan approval, winner confirm, ship confirm, round extension; a warning), or
+stuck, escalated, quota, failed or abandoned (an error). Each run alerts once per state it
+enters; the `gate` event that follows a phase event, or a restarted daemon reporting the
+same abandonment again, is no repeat, and leaving for a state that needs nobody re-arms
+it. Runs already waiting when pi starts stay quiet. `awaiting_reconcile` never alerts:
+only `spar reconcile` sets it, as it starts.
 
 ### `/spar`
 
@@ -95,6 +109,48 @@ id (`/spar --all`) is refused rather than passed to spar.
 Outside the interactive terminal (`pi -p "/spar"`, RPC, JSON mode) both commands print a
 plain-text version instead: to stdout in print mode, as a notification over RPC, to stderr
 in JSON mode.
+
+## Gates
+
+The run detail shows the actions valid for the run on an `actions:` line, one key each.
+Every action opens a dialog that states the exact command it will run, runs it only after
+you confirm, and shows the result: `done` with the new phase, or the exit code, its
+meaning (`1` failed, `2` human gate, `3` stuck, `4` quota) and spar's stderr or JSON
+`error` in full. Ids and text go to spar as separate arguments, never through a shell.
+
+| Key | Verb | Offered when | Runs |
+| --- | --- | --- | --- |
+| `a` | approve | `awaiting_plan_approval` | `spar approve <id> --json` |
+| `x` | reject | `awaiting_plan_approval` | `spar reject <id> [--reason=<text>] --json` (reason optional) |
+| `s` | ship | `awaiting_ship_confirm` | `spar ship <id> --confirm --json`, in the background |
+| `o` | override | ship gate, winner confirm, round extension, stuck, failed, quota | `spar ship <id> --override-gate --reason=<text> --json` (reason required), in the background |
+| `c` | confirm | `awaiting_winner_confirm`, `awaiting_reconcile` | `spar confirm <id> [--winner <slot>] --json`: the ranked default or a pick among the implementers |
+| `m` | reconcile | `awaiting_winner_confirm`, `awaiting_reconcile` | `spar reconcile <id> --json`, in the background |
+| `e` | extend | `awaiting_round_extension` | `spar implement --run <id> --max-rounds +N --detach --json` (N defaults to 1) |
+| `r` | resume | `resumable`, not at a gate | `spar resume <id> --detach --json` |
+| `k` | stop | in flight (not at rest) | `spar stop <id> --json` |
+| `u` | rule | any run | `spar rule add --run <id> [--waive AC-n]... --json -- <text>` |
+| `n` | reassign | not holding a seat, not finished | `spar implement --run <id> --reassign <seat>=<provider> --detach --json` |
+| `d` | cleanup | `done` | `spar cleanup <id> --if-merged --json`, in the background |
+
+The mapping is a hint, not a rule: spar decides, and a refusal is shown as it came.
+`ship` on a run whose review never cleared (round extension, stuck, failed, quota) says the
+gate refuses it and offers the override instead. After an action the detail reloads.
+
+Nothing blocks pi for long. `extend`, `resume` and `reassign` use spar's own `--detach` and
+return once the orchestrator is up. `ship`, `override`, `reconcile` and `cleanup` run as a
+detached child in a session of its own, with output in a temp directory, so they finish
+even if pi exits; the result arrives as a notification, and on failure names the
+directory with the full output.
+
+The same actions are subcommands: `/spar <verb> <id> [text]`, for example
+`/spar approve 3d3d6f59`, `/spar reject 3d3d6f59 scope is wrong`,
+`/spar extend 3d3d6f59 2`, `/spar rule 3d3d6f59 keep the API`,
+`/spar reassign 3d3d6f59 impl=cli:claude@sonnet`. Text after the id fills the dialog's
+input; the confirmation is still asked. Without an id it asks which run, among those the
+verb applies to. Verbs complete after `/spar `, and after a verb, the ids it applies to.
+They need a dialog: over RPC they use pi's dialog protocol; in print and JSON mode they
+refuse and run nothing.
 
 ## Develop
 
@@ -135,8 +191,13 @@ Not reused, and why:
   over pi's own session data or files, not a table fed by an external CLI.
 - **UI component libraries** (`@agimon-ai/po-ui`): alpha, and pulls in a runtime spar-pi
   does not need. pi-tui already has the list and text components.
-- **`questionnaire.ts`, `notify.ts`, `todo.ts` examples**: their jobs (composing a run,
-  alerting at a gate, branch-aware state) belong to layer 2, where they get a second look.
+- **`questionnaire.ts`, `notify.ts`, `todo.ts` examples**: looked at again for layer 2.
+  The gates need one confirm, sometimes one input or one pick, which pi's built-in
+  `ctx.ui.confirm` / `input` / `select` already are, and those also work over RPC, where a
+  custom questionnaire component would not. `notify.ts` sends desktop notifications from
+  the agent loop; spar's alerts come from the events feed and go through
+  `ctx.ui.notify`. `todo.ts`'s branch-aware state has no counterpart: gate state lives in
+  spar.
 
 The scrollable detail view is about 40 lines written here. pi-tui's `ScrollView` needs
 layout integration that an overlay component doesn't get.
