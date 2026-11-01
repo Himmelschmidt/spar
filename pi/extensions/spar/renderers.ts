@@ -49,6 +49,7 @@ export interface Outcome {
 	dry_run?: boolean;
 	fleet?: FleetSeat[];
 	next_command?: string;
+	gates_off?: string[];
 }
 
 export type ToolDetails =
@@ -181,6 +182,7 @@ function outcomeLines(outcome: Outcome, paint: Paint): string[] {
 		`${paint(tone, `exit ${outcome.exit_code ?? "?"}`)}: ${outcome.meaning}`,
 	];
 	if (outcome.error) lines.push(paint("error", `error: ${first(outcome.error)}`));
+	if (outcome.gates_off?.length) lines.push(paint("warning", `gates the config passes without the operator: ${outcome.gates_off.join("; ")}`));
 	if (outcome.fleet?.length) {
 		lines.push(paint("accent", "fleet"));
 		lines.push(...fleetLines(outcome.fleet, paint));

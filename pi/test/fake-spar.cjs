@@ -38,6 +38,7 @@ if (value && typeof value === "object" && Array.isArray(value.__seq)) {
 	value = value.__seq[Math.min(n, value.__seq.length - 1)];
 }
 if (value && typeof value === "object" && value.__hold) {
+	if (value.__hold === "ignore-term") process.on("SIGTERM", () => {});
 	setInterval(() => {}, 1000);
 	return;
 }

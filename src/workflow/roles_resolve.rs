@@ -170,7 +170,7 @@ pub fn resolve_seat(
 
 /// Split a resolved ref into `(storage_key, model)`, matching `executor::init_slot_model`:
 /// an explicit `@model` on the ref beats a model chosen elsewhere (e.g. model-select).
-fn split_model(raw: &str, fallback_model: Option<String>) -> (String, Option<String>) {
+pub(crate) fn split_model(raw: &str, fallback_model: Option<String>) -> (String, Option<String>) {
     match ProviderRef::parse(raw) {
         Ok(pref) => (pref.storage_key(), pref.model.or(fallback_model)),
         Err(_) => (raw.to_string(), fallback_model),
@@ -289,6 +289,120 @@ pub fn project_implement_fleet(
         })
     };
     build_implement_seats(cfg, pool, pool_origin, true, &model_for)
+}
+
+/// The seats a NEW launch of `kind` would fill, for `--validate-only` (O147): the pool the
+/// launch resolves (`model_select::resolve_providers`, the plan gate's own projection for
+/// the implement panel) without the availability, quota and backup checks dispatch runs,
+/// so a seat whose provider is paused shows its primary here. `None` for `--select`,
+/// which ranks the bench cache at launch, and for the positional workflows (arena, peer,
+/// roles), whose seats are not role-resolved.
+pub fn launch_fleet(
+    kind: crate::cli::WorkflowKind,
+    opts: &CommonOpts,
+    cfg: &Config,
+) -> anyhow::Result<Option<Vec<FleetSeat>>> {
+    use crate::cli::WorkflowKind;
+    if !opts.select.is_empty() {
+        return Ok(None);
+    }
+    let urgency = crate::model_select::Urgency::parse(&opts.urgency)?;
+    let origin = pool_origin_for(opts);
+    let resolve = |n: usize, roles: &[&str]| -> anyhow::Result<Vec<String>> {
+        Ok(crate::model_select::resolve_providers(
+            &opts.providers,
+            None,
+            urgency,
+            n,
+            roles,
+            cfg,
+            true,
+        )?
+        .providers)
+    };
+    let seat = |role: SlotRole, id: String, raw: String, source: SeatSource, projected: bool| {
+        let (provider, model) = split_model(&raw, None);
+        FleetSeat {
+            seat: id,
+            role,
+            provider,
+            model,
+            source,
+            projected,
+        }
+    };
+    let implement_panel = |pool: &[String], projected: bool| {
+        let mut out = project_implement_fleet(cfg, pool, origin, true, None, None);
+        out.extend(crate::workflow::implement::project_tester_seat(
+            cfg, true, pool, origin, None, None,
+        ));
+        for s in &mut out {
+            s.projected = projected;
+        }
+        out
+    };
+    Ok(match kind {
+        WorkflowKind::Plan => {
+            let mut specs = vec![(SlotRole::Planner, "planner")];
+            if cfg.critic.enabled {
+                specs.push((SlotRole::PlanCritic, "critic"));
+            }
+            let mut roles: Vec<&str> = specs.iter().map(|(r, _)| r.as_config_key()).collect();
+            if cfg.spec.enabled {
+                roles.push(SlotRole::TestAuthor.as_config_key());
+            }
+            let requested = resolve(roles.len(), &roles)?;
+            let pool =
+                crate::providers::pick_providers(&requested, roles.len(), Some(&requested), true);
+            let mut out = Vec::new();
+            for (idx, (role, prefix)) in specs.into_iter().enumerate() {
+                if let Some((raw, source)) = resolve_seat(role, idx, idx, &pool, origin, cfg) {
+                    let id = format!("{prefix}-{}", sanitize_slot(&raw));
+                    out.push(seat(role, id, raw, source, false));
+                }
+            }
+            if cfg.spec.enabled {
+                let used: Vec<String> = out.iter().map(|s| s.provider.clone()).collect();
+                let (raw, source) =
+                    crate::workflow::plan::resolve_spec_provider(cfg, true, &pool, origin, &used)?;
+                let id = format!("test-author-{}", sanitize_slot(&raw));
+                out.push(seat(SlotRole::TestAuthor, id, raw, source, false));
+            }
+            out.extend(implement_panel(&requested, true));
+            Some(out)
+        }
+        WorkflowKind::Loop => {
+            let n = pool_width(cfg);
+            let roles: Vec<&str> = std::iter::once(SlotRole::Implementer.as_config_key())
+                .chain(std::iter::repeat(SlotRole::Reviewer.as_config_key()))
+                .take(n)
+                .collect();
+            Some(implement_panel(&resolve(n, &roles)?, false))
+        }
+        WorkflowKind::Review => {
+            let n = if opts.providers.is_empty() {
+                panel_size(cfg)
+            } else {
+                opts.providers.len()
+            };
+            let roles: Vec<&str> = (0..n).map(|_| SlotRole::Reviewer.as_config_key()).collect();
+            let requested = resolve(n, &roles)?;
+            let pool = crate::providers::pick_providers(&requested, n, Some(&requested), true);
+            let sources =
+                resolve_seat_sources(SlotRole::Reviewer, pool.len(), &requested, origin, cfg);
+            let out = pool
+                .iter()
+                .enumerate()
+                .map(|(i, raw)| {
+                    let id = format!("review-{i}-{}", sanitize_slot(raw));
+                    let source = sources.get(i).copied().unwrap_or(SeatSource::Unknown);
+                    seat(SlotRole::Reviewer, id, raw.clone(), source, false)
+                })
+                .collect();
+            Some(out)
+        }
+        WorkflowKind::Arena | WorkflowKind::Peer | WorkflowKind::Roles => None,
+    })
 }
 
 #[cfg(test)]

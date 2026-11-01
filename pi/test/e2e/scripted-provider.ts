@@ -24,14 +24,14 @@ interface Call {
 
 // Test-only: a model that bills nothing and emits the tool calls in SPAR_PI_SCRIPT, one
 // assistant turn per step, then echoes every tool result it saw so print mode shows them.
-// An argument "$LAST_RUN" becomes the run id of the latest launch result.
+// "$LAST_RUN" in a string argument becomes the run id of the latest launch result.
 export default function (pi: ExtensionAPI) {
 	const steps = JSON.parse(process.env.SPAR_PI_SCRIPT ?? "[]") as Call[][];
 	const faux = fauxProvider({ provider: "scripted", api: "scripted", models: [{ id: "scripted", name: "Scripted" }] });
 	const responses: FauxResponseStep[] = steps.map((calls, step) => (context) => {
 		const run = lastRun(context.messages);
 		const bind = (args: Record<string, unknown>) =>
-			Object.fromEntries(Object.entries(args).map(([k, v]) => [k, v === "$LAST_RUN" ? run : v]));
+			Object.fromEntries(Object.entries(args).map(([k, v]) => [k, typeof v === "string" && run ? v.replaceAll("$LAST_RUN", run) : v]));
 		return fauxAssistantMessage(
 			calls.map((c, i) => fauxToolCall(c.name, bind(c.arguments) as never, { id: `s${step}c${i}` })),
 			{ stopReason: "toolUse" },

@@ -1860,9 +1860,25 @@ that does not resolve, `--providers` with `--select`) exits **1**, never 2, and 
 provider is not a validation failure: that still creates a run parked in `quota` (exit 4).
 To pre-check without launching, add `--validate-only` (any of the three commands): it runs
 the same checks, writes nothing (no run dir, no brief intake, no `--reload-config`
-snapshot) and exits 0 with `{"ok": true, "run_id": null, "kind": "validation"}`. It does not
-rank `--select` (that needs the bench cache) or probe PATH and quota. Usage errors on any
-command exit 1, not clap's default 2.
+snapshot) and exits 0 with `{"ok": true, "run_id": null, "kind": "validation", "fleet": [...],
+"gates": {...}}`. It does not rank `--select` (that needs the bench cache) or probe PATH and
+quota. Usage errors on any command exit 1, not clap's default 2.
+
+The `--validate-only` JSON also says what the launch would do (O147), so a front end can show
+it before anyone confirms:
+
+- `fleet`: the seats, in the run JSON `fleet` shape (`{seat, role, provider, model, source,
+  projected}`), resolved by the same functions the launch uses: plan-phase seats plus the
+  projected implement panel for `plan`, the implement panel for `implement -t` and
+  `--workflow loop`, the reviewers for `--workflow review`, and the run's own seats for
+  `implement --run <id>` and `plan --run <id>`. Availability, quota pauses and backups are
+  not applied, so a paused primary shows as itself. `null` with `--select` and for arena,
+  peer and roles.
+- `gates`: `autonomy` plus `auto_plan`, `auto_winner`, `auto_ship`, true when the config
+  (`autonomy`, `[gates]`, `[ship].auto_confirm`) would pass that gate without the operator.
+- `implement --run <id> --validate-only` also refuses, as data, a run that is not resumable
+  and one a live orchestrator is driving (unless the call only raises `--max-rounds`),
+  the same refusals the launch reaches under the run lock.
 
 **Providers (four-rung precedence):** each slot's provider is resolved **CLI `--role` for
 that role > CLI `--providers` (positional) / `--select` pool > `[roles]` > `[providers].order`**.

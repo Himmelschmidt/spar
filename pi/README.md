@@ -115,8 +115,8 @@ one per line, long tables cut at the edge rather than wrapped.
 | `spar_plan` | `plan --task=... --detach --json` | confirmed launch |
 | `spar_implement` | `implement [--run=<id>] [--task=...] --detach --json` | confirmed launch |
 | `spar_review` | `run --workflow=review --task=... --detach --json` | confirmed launch |
-| `spar_wait` | `wait <id> --timeout=<n>m --json` | 10 minutes by default, 120 at most; abort kills it |
-| `spar_bus_send` | `bus send --message=... --to=... [--run] --json` | no `--persist` |
+| `spar_wait` | `wait <id> --timeout=<n>m --json` | 10 minutes by default, 120 at most; abort kills it; a spar that does not return is an error |
+| `spar_bus_send` | `bus send --message=... --from=pi --to=... [--run] --json` | sent as `pi`; no `--persist` |
 | `spar_bus_log` | `bus log [--run] --json` | last 20 |
 | `spar_skill` | `skills get core` | section list, or one section by heading |
 
@@ -131,32 +131,51 @@ refused launch, a declined one, a missing binary or a failing read is a tool err
 ### What the model cannot do
 
 Approve, reject, ship (including `--override-gate`), confirm, reconcile, round extensions,
-`rule add`, `cleanup`, `--reassign`, `amend` and `bus send --persist` are not tools, with or
-without a dialog. They are the operator's: a confirm dialog the model can raise whenever it
-likes teaches the operator to click yes. When a run waits on one, the tools say so and hand
-over the command.
+`rule add`, `cleanup`, `--reassign`, `amend`, `stop`, `resume` and `bus send --persist` are
+not tools, with or without a dialog. They are the operator's: a confirm dialog the model can
+raise whenever it likes teaches the operator to click yes. When a run waits on one, the
+tools say so and hand over the command; the operator clears it from `/spar`.
+`spar_implement` with `run` refuses a run waiting at a gate, stopped, abandoned or already
+running, for the same reason.
 
 ### Launch confirmation
 
 `spar_plan`, `spar_implement` and `spar_review` spend money, so each one:
 
-1. runs the same argv with `--validate-only`; a refusal is returned to the model and the
-   operator is never asked;
-2. asks the operator with `ctx.ui.confirm`: task, providers, roles, backups, effort, fleet
-   preset, `--without`, base, the full command, and for `implement --run` the run's own
-   seats; for a new run, seats the flags do not pin come from `spar.toml`, which the
-   dialog says (`--validate-only` does not report a fleet yet);
-3. fails closed when there is no dialog-capable UI (print and JSON mode);
-4. launches detached and returns the run id, phase, exit meaning, the resolved fleet and
-   the next command.
+1. refuses a task or flag containing control characters (escape sequences, `\r`);
+2. runs the same argv with `--validate-only`. A refusal goes back to the model and the
+   operator is never asked. Otherwise spar reports the seats the launch would fill and
+   which gates its config passes on its own (`autonomy`, `[gates]`, `[ship].auto_confirm`);
+3. asks the operator in a select whose first, default entry is Cancel (then Launch, and
+   View full task). It shows a loud warning when the config passes a gate the launch
+   reaches without them, the seats, and the whole command, never truncated;
+4. fails closed when there is no dialog-capable UI (print and JSON mode);
+5. launches detached, with `--key=pi-<tool call id>` on a new run, and returns the run id,
+   phase, exit meaning, the fleet, any gate the config skips and the next command. A launch
+   cancelled or timed out after spar started is reported as "may have launched".
 
-To let the model launch without asking, for one session only:
+To let the model launch without asking, for one session only (operator actions still need
+the operator):
 
 ```bash
 pi -e /path/to/spar/pi --spar-unattended-launch
 # or
 SPAR_PI_UNATTENDED_LAUNCH=1 pi -e /path/to/spar/pi
 ```
+
+### spar through bash
+
+pi's own `bash` tool can run spar too, so a `tool_call` hook reads each bash command for
+`spar` (or a path ending in `/spar`) at a command position: after `;`, `&&`, `||`, `|`,
+`&`, `(`, `$(` and backticks, past env assignments and wrappers such as `env`, `sudo`,
+`timeout` and `nohup`, and inside quoted strings (`bash -c "..."`). Read-only subcommands
+pass. Launches and every other subcommand need the operator in the same Cancel-first
+select, showing the exact command; with no UI they are blocked. This is a heuristic: it
+does not see spar behind a variable, alias, function, script or another interpreter, nor
+through the `powershell` tool.
+
+Output that comes back from spar (logs, the skill text, errors, strings inside JSON) has
+escape sequences and control characters removed before the model or the terminal sees it.
 
 ### Skill
 
@@ -182,7 +201,10 @@ test/e2e/run.sh /path/to/a/spar/project /path/to/new/scratch-dir
 ```
 
 It runs only read-only spar commands in the project, and launches only in a scratch git
-repo it creates and deletes, under `SPAR_DRY_RUN=1`. `SPAR_PI_BIN` picks the spar binary.
+repo it creates and deletes, under `SPAR_DRY_RUN=1`. It checks what each step prints and
+which runs exist afterwards, and exits non-zero on a mismatch. `SPAR_PI_BIN` picks the
+spar binary (it needs `spar events` and the `--validate-only` fleet report), `PI_BIN` the
+pi binary, which must be 1.4.0.
 
 Tests use node's built-in runner and a fake `spar` (`test/fake-spar.cjs`) put first on
 `PATH`, which answers from canned JSON and canned event streams, so no test needs a real

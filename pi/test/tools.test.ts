@@ -19,20 +19,23 @@ function load(flags: Record<string, boolean> = {}): Tools {
 	return sparTools(pi);
 }
 
-function ctx(cwd: string, ui?: { confirm?: (title: string, body: string) => Promise<boolean> }): ExtensionContext & { asked: string[] } {
+function ctx(cwd: string, ui?: { answers: string[] }): ExtensionContext & { asked: string[]; options: string[][] } {
 	const asked: string[] = [];
+	const options: string[][] = [];
 	return {
 		cwd,
 		hasUI: ui !== undefined,
 		mode: ui ? "tui" : "print",
 		asked,
+		options,
 		ui: {
-			confirm: async (title: string, body: string) => {
-				asked.push(`${title}\n${body}`);
-				return ui?.confirm ? ui.confirm(title, body) : false;
+			select: async (title: string, opts: string[]) => {
+				asked.push(title);
+				options.push(opts);
+				return ui?.answers.shift();
 			},
 		},
-	} as unknown as ExtensionContext & { asked: string[] };
+	} as unknown as ExtensionContext & { asked: string[]; options: string[][] };
 }
 
 async function call(tools: Tools, name: string, params: unknown, c: ExtensionContext, signal?: AbortSignal) {
@@ -103,7 +106,7 @@ test("observe tools pass exact argv without a shell", async () => {
 		["provider", "list", "--json", "--usage"],
 		["stats", "--json", "--since=7d", "--by=model"],
 		["bus", "log", "--json", "--run=aaaa1111"],
-		["bus", "send", "--message=--persist; rm -rf /", "--to=impl", "--json", "--run=aaaa1111", "--requires-ack"],
+		["bus", "send", "--message=--persist; rm -rf /", "--from=pi", "--to=impl", "--json", "--run=aaaa1111", "--requires-ack"],
 		["skills", "get", "core"],
 	]);
 });
@@ -148,17 +151,29 @@ test("the command shown to the operator is shell-quoted", () => {
 });
 
 const PLAN = { task: "add a line", providers: ["cli:claude"] };
-const PLAN_ARGS = planArgs(PLAN);
+const keyed = (args: string[]) => [...args.slice(0, -2), "--key=pi-call-1", "--key-scope=local", ...args.slice(-2)];
+const PLAN_ARGS = keyed(planArgs(PLAN));
 const launched = {
 	id: "cccc3333",
 	phase: "planning",
 	dry_run: false,
 	fleet: [{ seat: "planner-cli-claude", role: "planner", provider: "cli:claude", model: null, source: "cli-providers", projected: false }],
 };
+const MANUAL = { autonomy: "manual", auto_plan: false, auto_winner: false, auto_ship: false };
+const validated = (gates = MANUAL) => ({
+	ok: true,
+	run_id: null,
+	kind: "validation",
+	gates,
+	fleet: [
+		{ seat: "planner-cli-claude", role: "planner", provider: "cli:claude", model: null, source: "cli-providers", projected: false },
+		{ seat: "review-0-cli-codex", role: "reviewer", provider: "cli:codex", model: "terra", source: "cli-role", projected: true },
+	],
+});
 
-function launchFake(args = PLAN_ARGS) {
+function launchFake(args = PLAN_ARGS, gates = MANUAL) {
 	return installFake({
-		[line([...args, "--validate-only"])]: { ok: true, run_id: null, kind: "validation" },
+		[line([...args, "--validate-only"])]: validated(gates),
 		[line(args)]: launched,
 		"brief cccc3333 --json": { run: "cccc3333", next_command: "spar wait cccc3333", open_findings: [], recent_events: [] },
 	});
@@ -174,37 +189,61 @@ test("launch without a UI fails closed: validated, never launched", async () => 
 	assert.deepEqual(f.calls(), [line([...PLAN_ARGS, "--validate-only"])]);
 });
 
-test("launch the operator declines is not run, and the dialog shows the fleet and the command", async () => {
-	const params = { ...PLAN, roles: ["reviewer=cli:codex"], fleet: "small" as const };
-	const f = launchFake(planArgs(params));
-	const c = ctx(f.dir, { confirm: async () => false });
+test("the launch dialog: Cancel first, resolved seats, gates, the whole command; cancelling launches nothing", async () => {
+	const task = `add a line\n${Array.from({ length: 10 }, (_, i) => `step ${i}`).join("\n")}`;
+	const params = { ...PLAN, task, roles: ["reviewer=cli:codex@terra"], fleet: "small" as const };
+	const f = launchFake(keyed(planArgs(params)));
+	const c = ctx(f.dir, { answers: ["View full task", "Back", "Cancel"] });
 	const { res, text } = await call(load(), "spar_plan", params, c);
 	assert.equal(res.isError, true);
 	assert.match(text, /operator declined/);
-	assert.equal(c.asked.length, 1);
-	assert.match(c.asked[0]!, /^Launch spar plan\?/);
-	assert.match(c.asked[0]!, /spends money/);
-	assert.match(c.asked[0]!, /providers: cli:claude/);
-	assert.match(c.asked[0]!, /roles: reviewer=cli:codex/);
-	assert.match(c.asked[0]!, /fleet preset: small/);
-	assert.match(c.asked[0]!, /spar plan --task='add a line' --providers=cli:claude/);
-	assert.ok(!f.calls().some((l) => !l.endsWith("--validate-only")), "only the validation ran");
+	assert.equal(c.asked.length, 3);
+	const dialog = c.asked[0]!;
+	assert.deepEqual(c.options[0], ["Cancel", "Launch", "View full task"]);
+	assert.match(dialog, /^Launch spar plan\?\n\nGates: plan approval and ship wait for you \(autonomy manual\)/);
+	assert.match(dialog, /spends money/);
+	assert.match(dialog, /step 4\n {6}\(\+5 more lines: choose View full task\)/);
+	assert.match(dialog, /planner cli:claude {2}\[planner-cli-claude, cli-providers\]/);
+	assert.match(dialog, /reviewer cli:codex@terra \(later phase\)/);
+	assert.ok(dialog.includes(`step 9' --providers=cli:claude --role=reviewer=cli:codex@terra --fleet=small --key=pi-call-1`), dialog);
+	assert.match(c.asked[1]!, /^Full task\n\nadd a line\n[\s\S]*step 9$/);
+	assert.deepEqual(f.argv().map((a) => a.at(-1)), ["--validate-only"], "only the validation ran");
+});
+
+test("gates the config passes on its own are a loud warning in the dialog and the result", async () => {
+	const gates = { autonomy: "semi", auto_plan: true, auto_winner: false, auto_ship: true };
+	const f = launchFake(PLAN_ARGS, gates);
+	const c = ctx(f.dir, { answers: ["Launch"] });
+	const { text } = await call(load(), "spar_plan", PLAN, c);
+	assert.match(c.asked[0]!, /WARNING: this project's config passes these gates WITHOUT you: plan approval; ship \(pushes a branch and opens a draft PR\) \(autonomy semi\)/);
+	assert.match(text, /gates the config passes without the operator: plan approval; ship/);
+});
+
+test("control characters in a launch are refused before spar or the operator sees them", async () => {
+	const f = installFake({});
+	const c = ctx(f.dir, { answers: ["Launch"] });
+	const { res, text } = await call(load(), "spar_plan", { ...PLAN, task: "ok\x1b[2J\x1b[Hhidden" }, c);
+	assert.equal(res.isError, true);
+	assert.match(text, /control characters/);
+	assert.doesNotMatch(text, /\x1b/);
+	assert.equal(c.asked.length, 0);
+	assert.deepEqual(f.calls(), []);
 });
 
 test("a refused launch never asks the operator", async () => {
 	const f = installFake({
 		[line([...PLAN_ARGS, "--validate-only"])]: { __exit: 1, __stdout: { ok: false, error: "unknown provider cli:nope", run_id: null, kind: "validation" } },
 	});
-	const c = ctx(f.dir, { confirm: async () => true });
+	const c = ctx(f.dir, { answers: ["Launch"] });
 	const { res, text } = await call(load(), "spar_plan", PLAN, c);
 	assert.equal(res.isError, true);
 	assert.match(text, /refused: unknown provider cli:nope/);
 	assert.equal(c.asked.length, 0);
 });
 
-test("a confirmed launch runs detached and reports run id, fleet and next command", async () => {
+test("a confirmed launch runs detached with an idempotency key and reports run id, fleet and next command", async () => {
 	const f = launchFake();
-	const c = ctx(f.dir, { confirm: async () => true });
+	const c = ctx(f.dir, { answers: ["Launch"] });
 	const { res, text, details } = await call(load(), "spar_plan", PLAN, c);
 	assert.equal(res.isError, undefined);
 	assert.equal(details.kind, "launch");
@@ -213,6 +252,15 @@ test("a confirmed launch runs detached and reports run id, fleet and next comman
 	assert.match(text, /planner {2}now {2}cli:claude {2}planner-cli-claude {2}cli-providers/);
 	assert.match(text, /next: spar wait cccc3333/);
 	assert.deepEqual(f.argv()[1], PLAN_ARGS);
+	assert.ok(PLAN_ARGS.includes("--key=pi-call-1"));
+});
+
+test("a launch cancelled after spar started says it may have launched", async () => {
+	const f = installFake({ [line([...PLAN_ARGS, "--validate-only"])]: validated(), [line(PLAN_ARGS)]: { __hold: true } });
+	const controller = new AbortController();
+	const c = ctx(f.dir, { answers: ["Launch"] });
+	setTimeout(() => controller.abort(), 400);
+	await assert.rejects(call(load(), "spar_plan", PLAN, c, controller.signal), /may have launched. Check spar_status/);
 });
 
 test("the unattended flag or env skips the dialog, even with no UI", async () => {
@@ -226,19 +274,35 @@ test("the unattended flag or env skips the dialog, even with no UI", async () =>
 	assert.equal(res.isError, undefined);
 });
 
-test("implement --run shows the run's own seats in the dialog", async () => {
+test("implement --run shows the run's own seats, and refuses a run at a gate, stopped or abandoned", async () => {
 	const args = implementArgs({ run: "dddd4444" });
+	assert.ok(!args.some((a) => a.startsWith("--key")), "an existing run keeps its own key");
 	const f = installFake({
-		[line([...args, "--validate-only"])]: { ok: true },
-		"status dddd4444 --json": {
-			...status("dddd4444", { phase: "plan_approved" }),
-			fleet: [{ seat: "impl", role: "implementer", provider: "cli:muse", model: "spark", projected: true }],
+		[line([...args, "--validate-only"])]: {
+			ok: true,
+			gates: MANUAL,
+			fleet: [{ seat: "impl", role: "implementer", provider: "cli:muse", model: "spark", source: "cli-role", projected: false }],
 		},
+		"status dddd4444 --json": status("dddd4444", { phase: "plan_approved" }),
+		"status eeee5555 --json": status("eeee5555", { phase: "awaiting_ship_confirm", needs_human: true }),
+		"status ffff6666 --json": status("ffff6666", { phase: "stopped" }),
+		"status abab7777 --json": status("abab7777", { phase: "implement", abandoned: true }),
 	});
-	const c = ctx(f.dir, { confirm: async () => false });
+	const c = ctx(f.dir, { answers: ["Cancel"] });
 	await call(load(), "spar_implement", { run: "dddd4444" }, c);
 	assert.match(c.asked[0]!, /continues run dddd4444 \(loop, phase plan_approved, round 1\)/);
-	assert.match(c.asked[0]!, /implementer impl cli:muse@spark \(projected\)/);
+	assert.match(c.asked[0]!, /Gates: ship waits for you/);
+	assert.match(c.asked[0]!, /implementer cli:muse@spark {2}\[impl, cli-role\]/);
+	for (const [id, why] of [
+		["eeee5555", /waiting on the operator at awaiting_ship_confirm\. The operator clears gates from \/spar/],
+		["ffff6666", /was stopped; resuming it is the operator's call/],
+		["abab7777", /is abandoned/],
+	] as const) {
+		const { res, text } = await call(load({ [UNATTENDED_FLAG]: true }), "spar_implement", { run: id }, ctx(f.dir));
+		assert.equal(res.isError, true, id);
+		assert.match(text, why);
+	}
+	assert.ok(!f.calls().some((l) => /^implement --run=(eeee|ffff|abab)/.test(l)), "no validation or launch for a refused run");
 });
 
 test("exit codes map to what the model should do", async () => {
@@ -347,4 +411,41 @@ test("renderers: runs table, findings by severity, events as lines", () => {
 	assert.match(brief, /critical \(1\)\n {4}- src\/a\.rs:3 data loss \(r1\)\n {2}minor \(1\)\n {4}- nit \(r0\)/);
 	assert.match(brief, /phase review -> awaiting_ship_confirm/);
 	assert.match(brief, /next: spar ship bbbb2222 --confirm$/);
+});
+
+test("a child that ignores SIGTERM is killed after the grace period", async () => {
+	const f = installFake({ "wait abcd1234": { __hold: "ignore-term" } });
+	const started = Date.now();
+	const run = await runSpar(["wait", "abcd1234"], f.dir, { timeoutMs: 300, killGraceMs: 300 });
+	assert.equal(run.timedOut, true);
+	assert.ok(Date.now() - started < 3_000);
+});
+
+test("wait: only spar's own timeout means still working; exit 3 otherwise is stuck", async () => {
+	const f = installFake({
+		"wait abcd1234": { __exit: 3, __stdout: { id: "abcd1234", phase: "stuck", error: "escalated" } },
+		"brief abcd1234 --json": { run: "abcd1234", next_command: "spar brief abcd1234", open_findings: [], recent_events: [] },
+	});
+	const { details, text } = await call(load(), "spar_wait", { run: "abcd1234" }, ctx(f.dir));
+	assert.equal(details.kind === "wait" && details.waitedTimeout, false);
+	assert.match(text, /exit 3: stuck/);
+});
+
+test("escape sequences and carriage returns from spar never reach the model or the screen", async () => {
+	const f = installFake({
+		"logs aaaa1111": { __text: "\x1b[31mred\x1b[0m\r\nprogress 10%\rprogress 99%\n\x1b]0;title\x07done\n" },
+		"brief aaaa1111 --json": { run: "aaaa1111", next_command: "spar ship\x1b[2K aaaa1111", open_findings: [{ slot_id: "r", severity: "major", text: "bad\x1b[8mhidden" }], recent_events: [] },
+		"skills get core": { __text: "# x\n\x1b[1mbold\x1b[0m\n## A\nb\n" },
+		"status zzzz --json": { __exit: 1, __stderr: "\x1b[31merror:\x1b[0m no run" },
+	});
+	const outputs = [
+		(await call(load(), "spar_logs", { run: "aaaa1111" }, ctx(f.dir))).text,
+		(await call(load(), "spar_brief", { run: "aaaa1111" }, ctx(f.dir))).text,
+		(await call(load(), "spar_skill", {}, ctx(f.dir))).text,
+		(await call(load(), "spar_status", { run: "zzzz" }, ctx(f.dir))).text,
+	];
+	for (const out of outputs) assert.doesNotMatch(out, /[\x1b\r\x07]/, JSON.stringify(out));
+	assert.match(outputs[0]!, /\nred\nprogress 10%progress 99%\ndone$/);
+	assert.match(outputs[1]!, /bad hidden|badhidden/);
+	assert.match(outputs[3]!, /exited 1: error: no run/);
 });

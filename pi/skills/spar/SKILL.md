@@ -23,9 +23,11 @@ whole unit of work.
 
 ## Gates belong to the operator
 
-Approve, reject, ship, confirm, reconcile, round extensions, rulings, reassign, amend
-and cleanup are not tools. When a run waits at a gate (exit 2), tell the operator what
-is waiting and give them `next_command` from `spar_brief`. Exit codes: 0 ok, 1 failed or
+Approve, reject, ship, confirm, reconcile, round extensions, rulings, reassign, amend,
+stop, resume and cleanup are not tools, and running them through bash asks the operator.
+When a run waits at a gate (exit 2), tell the operator what is waiting and give them
+`next_command` from `spar_brief`; they clear it from `/spar`. Launch through the tools,
+not bash: the tools validate and show the operator the fleet and the gates. Exit codes: 0 ok, 1 failed or
 stopped, 2 human gate, 3 stuck, 4 no usable providers.
 
 ## Everything else

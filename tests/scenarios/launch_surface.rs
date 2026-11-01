@@ -158,6 +158,109 @@ fn validate_only_reports_and_creates_nothing() {
     );
 }
 
+fn seats(v: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = v["fleet"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no fleet: {v}"))
+        .iter()
+        .map(|s| {
+            format!(
+                "{} {} {} {} {}",
+                s["role"], s["seat"], s["provider"], s["model"], s["projected"]
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// O147: the pre-check names the seats the launch then fills, and which gates the
+/// config would pass by itself, so a front end can show both before anyone confirms.
+#[test]
+fn validate_only_reports_the_fleet_and_gates_the_launch_gets() {
+    let sb = Sandbox::new();
+    std::fs::write(
+        sb.project.join("spar.toml"),
+        "autonomy = \"semi\"\n[gates]\nship = false\n[roles]\nplanner = \"cli:claude@opus\"\nimplementer = \"cli:codex\"\nreviewer = [\"cli:codex\", \"cli:claude@opus\"]\n",
+    )
+    .unwrap();
+    for args in [
+        vec!["plan", "-t", "task"],
+        vec![
+            "plan",
+            "-t",
+            "task",
+            "--providers",
+            "cli:codex,cli:claude",
+            "--fleet",
+            "small",
+        ],
+        vec!["implement", "-t", "task"],
+        vec!["implement", "-t", "task", "--role", "reviewer=cli:grok"],
+        vec!["run", "--workflow", "review", "-t", "task"],
+        vec![
+            "run",
+            "--workflow",
+            "review",
+            "-t",
+            "task",
+            "--providers",
+            "cli:grok,cli:codex",
+        ],
+    ] {
+        let mut check = args.clone();
+        check.extend(["--dry-run", "--json", "--validate-only"]);
+        let out = sb.spar().args(&check).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{check:?}: {out:?}");
+        let v = json(&out);
+        assert_eq!(v["gates"]["autonomy"], "semi", "{v}");
+        assert_eq!(v["gates"]["auto_plan"], true, "{v}");
+        assert_eq!(v["gates"]["auto_winner"], false, "{v}");
+        assert_eq!(v["gates"]["auto_ship"], true, "{v}");
+        let mut launch = args.clone();
+        launch.extend(["--dry-run", "--json"]);
+        let out = sb.spar().args(&launch).output().unwrap();
+        assert_eq!(seats(&v), seats(&json(&out)), "{args:?}");
+    }
+}
+
+/// O147: `implement --run` on a run that cannot continue is refused by the pre-check,
+/// as data, not only by the launch after it.
+#[test]
+fn validate_only_refuses_a_run_that_cannot_continue() {
+    let sb = Sandbox::new();
+    let out = sb
+        .spar()
+        .args([
+            "plan",
+            "-t",
+            "task",
+            "--providers",
+            "cli:claude",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let id = json(&out)["id"].as_str().unwrap().to_string();
+    let out = sb
+        .spar()
+        .args(["implement", "--run", &id, "--json", "--validate-only"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let v = json(&out);
+    assert_eq!(v["ok"], false, "{v}");
+    assert_eq!(v["run_id"], id.as_str(), "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not resumable"),
+        "{v}"
+    );
+}
+
 /// #187: every refusal before a run exists is exit 1 with one parseable shape, and
 /// leaves nothing under `.spar/runs`.
 #[test]

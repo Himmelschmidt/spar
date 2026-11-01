@@ -235,16 +235,21 @@ fn run() -> Result<ExitCode> {
                         anyhow::bail!("replan directive is empty");
                     }
                     let (paths, _) = project_ctx()?;
-                    state::RunState::load(&paths, &id)?;
+                    let st = state::RunState::load(&paths, &id)?;
                     let cfg = Config::for_run(&paths, &id)?;
-                    Ok((paths, cfg, directive))
+                    Ok((paths, cfg, directive, st))
                 })();
-                let (paths, cfg, directive) = match checked {
+                let (paths, cfg, directive, st) = match checked {
                     Ok(v) => v,
                     Err(e) => return launch_refused(e, json, Some(&id)),
                 };
                 if validate_only {
-                    return launch_validated(json, Some(&id));
+                    return launch_validated(
+                        json,
+                        Some(&id),
+                        &cfg,
+                        Some(executor::run_fleet_seats(&st)),
+                    );
                 }
                 cfg.reapply_captured_env();
                 return workflow::plan::replan(&paths, &cfg, &id, directive, json);
@@ -342,7 +347,15 @@ fn run() -> Result<ExitCode> {
                 Err(e) => return launch_refused(e, json, None),
             };
             if validate_only {
-                return launch_validated(json, None);
+                let fleet = match workflow::roles_resolve::launch_fleet(
+                    crate::cli::WorkflowKind::Plan,
+                    &opts,
+                    &cfg,
+                ) {
+                    Ok(f) => f,
+                    Err(e) => return launch_refused(e, json, None),
+                };
+                return launch_validated(json, None, &cfg, fleet);
             }
             workflow::plan::run(task_text, brief_path, opts, &paths, &cfg)
         }
@@ -463,9 +476,41 @@ fn run() -> Result<ExitCode> {
                     reassign,
                 };
                 workflow::implement::parse_reassignments(&opts.reassign, &paths)?;
+                let mut fleet = None;
                 match &run_id {
                     Some(id) => {
                         let st = state::RunState::load(&paths, id)?;
+                        // The real launch only finds these under the run lock, after the
+                        // pre-check has said yes; a front end asking first must hear them too.
+                        if validate_only {
+                            if !state::is_resumable(&st) {
+                                anyhow::bail!(
+                                    "run {id} is not resumable (workflow={:?}, phase={:?})",
+                                    st.workflow,
+                                    st.phase
+                                );
+                            }
+                            let extension_only = max_rounds.is_some()
+                                && task.is_none()
+                                && opts.providers.is_empty()
+                                && opts.select.is_empty()
+                                && opts.base.is_none()
+                                && !reload_config
+                                && !accept_contract
+                                && opts.reassign.is_empty();
+                            if let Some(owner) =
+                                runlock::RunLock::owner(&paths, id).filter(|o| o.alive())
+                            {
+                                if !extension_only {
+                                    return Err(runlock::OrchestratorBusy {
+                                        run_id: id.clone(),
+                                        owner_pid: owner.pid,
+                                    }
+                                    .into());
+                                }
+                            }
+                            fleet = Some(executor::run_fleet_seats(&st));
+                        }
                         if let Some(mr) = max_rounds {
                             workflow::implement::check_round_extension(
                                 &st,
@@ -479,12 +524,21 @@ fn run() -> Result<ExitCode> {
                     }
                     // A `--plan` without `--new` continues the run that wrote it, which
                     // `run_from_cli` resolves; only a new run has a pool to pre-check.
-                    None if plan.is_none() || new => workflow::preflight(&opts, &paths, &cfg)?,
+                    None if plan.is_none() || new => {
+                        workflow::preflight(&opts, &paths, &cfg)?;
+                        if validate_only && plan.is_none() {
+                            fleet = workflow::roles_resolve::launch_fleet(
+                                crate::cli::WorkflowKind::Loop,
+                                &opts,
+                                &cfg,
+                            )?;
+                        }
+                    }
                     None => {}
                 }
-                Ok((paths, cfg, opts, task))
+                Ok((paths, cfg, opts, task, fleet))
             })();
-            let (paths, cfg, opts, task) = match prepared {
+            let (paths, cfg, opts, task, fleet) = match prepared {
                 Ok(v) => v,
                 Err(e) => return launch_refused(e, json, run_id.as_deref()),
             };
@@ -496,7 +550,7 @@ fn run() -> Result<ExitCode> {
                 }
             }
             if validate_only {
-                return launch_validated(json, run_id.as_deref());
+                return launch_validated(json, run_id.as_deref(), &cfg, fleet);
             }
             let target = run_id.clone();
             // A round extension refused or found busy after the pre-check is still a
@@ -596,9 +650,14 @@ fn run() -> Result<ExitCode> {
                     reassign: Vec::new(),
                 };
                 workflow::preflight(&opts, &paths, &cfg)?;
-                Ok((paths, cfg, opts))
+                let fleet = if validate_only {
+                    workflow::roles_resolve::launch_fleet(workflow, &opts, &cfg)?
+                } else {
+                    None
+                };
+                Ok((paths, cfg, opts, fleet))
             })();
-            let (paths, cfg, opts) = match prepared {
+            let (paths, cfg, opts, fleet) = match prepared {
                 Ok(v) => v,
                 Err(e) => return launch_refused(e, json, None),
             };
@@ -608,7 +667,7 @@ fn run() -> Result<ExitCode> {
                 return Ok(code);
             }
             if validate_only {
-                return launch_validated(json, None);
+                return launch_validated(json, None, &cfg, fleet);
             }
             workflow::run_named(workflow, opts, &paths, &cfg)
         }
@@ -870,7 +929,15 @@ fn launch_refused(err: anyhow::Error, json: bool, run_id: Option<&str>) -> Resul
     Ok(ExitCode::Failure)
 }
 
-fn launch_validated(json: bool, run_id: Option<&str>) -> Result<ExitCode> {
+/// `fleet` is the seats the launch would fill (`None` where it cannot be known before
+/// launch: `--select`, positional workflows); `gates` says which human gates the run's
+/// config would pass on its own, so a front end can warn before anyone confirms (O147).
+fn launch_validated(
+    json: bool,
+    run_id: Option<&str>,
+    cfg: &Config,
+    fleet: Option<Vec<state::FleetSeat>>,
+) -> Result<ExitCode> {
     if json {
         println!(
             "{}",
@@ -878,6 +945,13 @@ fn launch_validated(json: bool, run_id: Option<&str>) -> Result<ExitCode> {
                 "ok": true,
                 "run_id": run_id,
                 "kind": "validation",
+                "fleet": fleet,
+                "gates": {
+                    "autonomy": cfg.autonomy,
+                    "auto_plan": cfg.auto_plan(),
+                    "auto_winner": cfg.auto_winner(),
+                    "auto_ship": cfg.auto_ship(),
+                },
             }))?
         );
     } else {

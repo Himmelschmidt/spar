@@ -1,9 +1,11 @@
 import type { AgentToolResult, ExtensionAPI, ExtensionContext, Theme, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { type Static, type TSchema, Type } from "typebox";
-import { firstLine, jsonLines, parseJson, runSpar, type SparRun } from "./exec.ts";
+import { clean, firstLine, hasControls, jsonLines, parseJson, runSpar, type SparRun } from "./exec.ts";
 import { sortRuns } from "./format.ts";
+import { judgeBash } from "./guard.ts";
 import { type BriefDetail, type FleetSeat, modelText, type Outcome, renderDetails, type RunDetail, type StatsDetail, type ToolDetails } from "./renderers.ts";
 import { type BusMessage, isRunId, type Provider, type RunRow, type SparEvent } from "./spar.ts";
 
@@ -124,45 +126,89 @@ export function reviewArgs(p: Static<typeof ReviewParams>): string[] {
 	return ["run", "--workflow=review", `--task=${p.task}`, ...fleetArgs(p), "--detach", "--json"];
 }
 
+function visible(text: string): string {
+	return text.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, (c) => `\\x${c.charCodeAt(0).toString(16).padStart(2, "0")}`);
+}
+
 function quote(value: string): string {
-	return /^[\w@:.,=/+-]+$/.test(value) ? value : `'${value.replace(/'/g, "'\\''")}'`;
+	return /^[\w@:.,=/+-]+$/.test(value) ? value : `'${visible(value).replace(/'/g, "'\\''")}'`;
 }
 
 export function display(args: string[]): string {
-	const shown = args
+	return `spar ${args
 		.map((a) => {
 			const flag = /^(--[\w-]+=)([\s\S]*)$/.exec(a);
 			return flag ? `${flag[1]}${quote(flag[2]!)}` : quote(a);
 		})
-		.join(" ");
-	return `spar ${shown.length > 300 ? `${shown.slice(0, 297)}...` : shown}`;
+		.join(" ")}`;
 }
 
-function confirmBody(p: FleetInput, run: RunDetail | undefined, args: string[]): string {
-	const lines: string[] = [];
+export interface Gates {
+	autonomy?: string;
+	auto_plan?: boolean;
+	auto_winner?: boolean;
+	auto_ship?: boolean;
+}
+
+interface Validation {
+	ok?: boolean;
+	error?: string;
+	fleet?: FleetSeat[] | null;
+	gates?: Gates;
+}
+
+type LaunchKind = "plan" | "implement" | "review";
+
+// Which gates the run would pass on its own, among the ones this kind of launch reaches.
+export function gatesOff(kind: LaunchKind, gates: Gates | undefined): string[] {
+	if (!gates) return [];
+	const off: string[] = [];
+	if (kind === "plan" && gates.auto_plan) off.push("plan approval");
+	if (kind !== "review" && gates.auto_ship) off.push("ship (pushes a branch and opens a draft PR)");
+	return off;
+}
+
+function gateLine(kind: LaunchKind, gates: Gates | undefined): string {
+	const off = gatesOff(kind, gates);
+	if (off.length) {
+		return `WARNING: this project's config passes these gates WITHOUT you: ${off.join("; ")} (autonomy ${gates?.autonomy ?? "?"}). Once launched, the run continues past them on its own.`;
+	}
+	if (kind === "review") return "Gates: a review ends when the reviewers finish.";
+	return `Gates: ${kind === "plan" ? "plan approval and ship wait" : "ship waits"} for you (autonomy ${gates?.autonomy ?? "unknown"}).`;
+}
+
+const TASK_PREVIEW = 6;
+
+function confirmBody(kind: LaunchKind, p: FleetInput, run: RunDetail | undefined, v: Validation, args: string[]): string {
+	const lines: string[] = [gateLine(kind, v.gates), ""];
 	lines.push(p.dry_run ? "Dry run: no agents spawn and nothing is billed." : "This dispatches paid agents and spends money.");
 	if ("run" in p && p.run) lines.push(`continues run ${p.run}${run ? ` (${run.workflow}, phase ${run.phase}, round ${run.round})` : ""}`);
 	if (p.task?.trim()) {
-		const task = p.task.trim().split("\n");
-		lines.push(`task: ${task.slice(0, 4).join("\n      ")}${task.length > 4 ? ` (+${task.length - 4} lines)` : ""}`);
+		const task = visible(p.task.trim()).split("\n");
+		lines.push(`task: ${task.slice(0, TASK_PREVIEW).join("\n      ")}${task.length > TASK_PREVIEW ? `\n      (+${task.length - TASK_PREVIEW} more lines: choose View full task)` : ""}`);
 	}
-	const providers = nonEmpty(p.providers);
-	lines.push(`providers: ${providers.length ? providers.join(", ") : "(none given)"}`);
-	if (nonEmpty(p.roles).length) lines.push(`roles: ${nonEmpty(p.roles).join(", ")}`);
-	if (nonEmpty(p.backups).length) lines.push(`backups: ${nonEmpty(p.backups).join(", ")}`);
-	if (nonEmpty(p.effort).length) lines.push(`effort: ${nonEmpty(p.effort).join(", ")}`);
-	if (p.fleet) lines.push(`fleet preset: ${p.fleet}`);
-	if (p.without?.length) lines.push(`without: ${p.without.join(", ")}`);
-	if (p.base) lines.push(`base: ${p.base}`);
-	const fleet = run?.fleet ?? [];
+	const fleet = v.fleet ?? [];
 	if (fleet.length) {
-		lines.push("seats on this run:");
-		for (const s of fleet) lines.push(`  ${s.role} ${s.seat} ${s.model && !s.provider.includes("@") ? `${s.provider}@${s.model}` : s.provider}${s.projected ? " (projected)" : ""}`);
+		lines.push("seats:");
+		for (const s of fleet) {
+			lines.push(`  ${s.role} ${s.model && !s.provider.includes("@") ? `${s.provider}@${s.model}` : s.provider}${s.projected ? " (later phase)" : ""}  [${s.seat}, ${s.source ?? "?"}]`);
+		}
+		lines.push("  (before availability and quota checks; a paused provider may be swapped for its backup)");
 	} else {
-		lines.push("Seats not pinned above come from the project's spar.toml [roles], then [providers].order.");
+		lines.push("seats: spar cannot name them before launch (--select ranks at launch)");
 	}
-	lines.push("", display(args));
+	lines.push("", "command:", display(args));
 	return lines.join("\n");
+}
+
+async function confirmLaunch(ctx: ExtensionContext, title: string, body: string, task: string | undefined, signal: AbortSignal | undefined): Promise<boolean> {
+	const options = ["Cancel", "Launch", ...(task?.trim() ? ["View full task"] : [])];
+	for (;;) {
+		const choice = await ctx.ui.select(`${title}\n\n${body}`, options, { signal });
+		if (choice === "Launch") return true;
+		if (choice !== "View full task") return false;
+		await ctx.ui.select(`Full task\n\n${visible(task!)}`, ["Back"], { signal });
+	}
 }
 
 interface RunJson {
@@ -176,13 +222,13 @@ interface RunJson {
 	ok?: boolean;
 }
 
-async function nextCommand(id: string, ctx: ExtensionContext): Promise<string | undefined> {
-	const brief = await runSpar(["brief", id, "--json"], ctx.cwd, { timeoutMs: OBSERVE_TIMEOUT_MS });
+async function nextCommand(id: string, ctx: ExtensionContext, signal: AbortSignal | undefined): Promise<string | undefined> {
+	const brief = await runSpar(["brief", id, "--json"], ctx.cwd, { signal, timeoutMs: OBSERVE_TIMEOUT_MS });
 	if (brief.code !== 0) return undefined;
 	return parseJson<BriefDetail>(brief.stdout)?.next_command;
 }
 
-async function outcomeOf(run: SparRun, json: RunJson, ctx: ExtensionContext): Promise<Outcome> {
+async function outcomeOf(run: SparRun, json: RunJson, ctx: ExtensionContext, signal: AbortSignal | undefined): Promise<Outcome> {
 	const id = json.id ?? json.run_id ?? null;
 	const phase = json.phase ?? null;
 	return {
@@ -193,7 +239,7 @@ async function outcomeOf(run: SparRun, json: RunJson, ctx: ExtensionContext): Pr
 		error: json.error,
 		dry_run: json.dry_run,
 		fleet: json.fleet ?? undefined,
-		next_command: id ? await nextCommand(id, ctx) : undefined,
+		next_command: id ? await nextCommand(id, ctx, signal) : undefined,
 	};
 }
 
@@ -201,20 +247,53 @@ export function unattendedAllowed(pi: ExtensionAPI): boolean {
 	return pi.getFlag(UNATTENDED_FLAG) === true || process.env[UNATTENDED_ENV] === "1";
 }
 
+export function launchKey(toolCallId: string): string {
+	return `pi-${toolCallId.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 80)}`;
+}
+
+const OPERATOR_PATH = "The operator clears gates from /spar (the gate dialogs) or with the command spar_brief names.";
+
+// A run waiting on the operator, stopped or abandoned is theirs to move: `implement --run`
+// on it would re-dispatch past their decision.
+function blockedRun(run: RunDetail): string | undefined {
+	if (run.phase.startsWith("awaiting_")) return `run ${run.id} is waiting on the operator at ${run.phase}. ${OPERATOR_PATH}`;
+	if (run.phase === "stopped") return `run ${run.id} was stopped; resuming it is the operator's call. ${OPERATOR_PATH}`;
+	if (run.abandoned) return `run ${run.id} is abandoned (no orchestrator); resuming it is the operator's call. ${OPERATOR_PATH}`;
+	if (run.holds_seat) return `run ${run.id} is already running; use spar_wait or spar_status`;
+	return undefined;
+}
+
+const MAY_HAVE_LAUNCHED = "it may have launched. Check spar_status before trying again";
+
 async function launch(
 	pi: ExtensionAPI,
+	kind: LaunchKind,
 	label: string,
-	args: string[],
+	launchArgs: string[],
 	p: FleetInput,
 	ctx: ExtensionContext,
 	signal: AbortSignal | undefined,
+	toolCallId: string,
 ): Promise<Result> {
+	const existing = "run" in p && p.run ? p.run : undefined;
+	const args = existing ? launchArgs : [...launchArgs.slice(0, -2), `--key=${launchKey(toolCallId)}`, "--key-scope=local", ...launchArgs.slice(-2)];
 	const command = display(args);
+	if (args.some(hasControls)) {
+		return result({ kind: "launch", command, refused: "the task or a flag contains control characters (escape sequences, carriage returns); remove them" }, true);
+	}
+	let run: RunDetail | undefined;
+	if (existing) {
+		const status = await observeJson<RunDetail>(["status", existing, "--json"], ctx, signal);
+		if (isResult(status)) return status;
+		const blocked = blockedRun(status);
+		if (blocked) return result({ kind: "launch", command, refused: blocked }, true);
+		run = status;
+	}
 	const check = await runSpar([...args, "--validate-only"], ctx.cwd, { signal, timeoutMs: OBSERVE_TIMEOUT_MS });
 	if (check.aborted) throw new Error("cancelled");
-	if (check.code !== 0) {
-		const refusal = parseJson<{ error?: string }>(check.stdout)?.error;
-		return result({ kind: "launch", command, refused: refusal ?? failure(check, args[0]!) }, true);
+	const validation = parseJson<Validation>(check.stdout);
+	if (check.code !== 0 || !validation?.ok) {
+		return result({ kind: "launch", command, refused: validation?.error ?? failure(check, args[0]!) }, true);
 	}
 	if (!unattendedAllowed(pi)) {
 		if (!ctx.hasUI) {
@@ -227,17 +306,20 @@ async function launch(
 				true,
 			);
 		}
-		const existing = "run" in p && p.run ? await observeJson<RunDetail>(["status", p.run, "--json"], ctx, signal) : undefined;
-		const ok = await ctx.ui.confirm(`Launch ${label}?`, confirmBody(p, isResult(existing) ? undefined : existing, args), { signal });
+		const ok = await confirmLaunch(ctx, `Launch ${label}?`, confirmBody(kind, p, run, validation, args), p.task, signal);
+		if (signal?.aborted) throw new Error("cancelled");
 		if (!ok) return result({ kind: "launch", command, declined: "the operator declined the launch. Ask them what to change before trying again" }, true);
 	}
-	const run = await runSpar(args, ctx.cwd, { signal, timeoutMs: LAUNCH_TIMEOUT_MS });
-	if (run.aborted) throw new Error("cancelled");
-	const json = parseJson<RunJson>(run.stdout);
+	const launched = await runSpar(args, ctx.cwd, { signal, timeoutMs: LAUNCH_TIMEOUT_MS });
+	if (launched.aborted) throw new Error(`cancelled after the launch started: ${MAY_HAVE_LAUNCHED}`);
+	if (launched.timedOut) return error(`spar ${args[0]} did not return within ${LAUNCH_TIMEOUT_MS / 60_000}m: ${MAY_HAVE_LAUNCHED}`);
+	const json = parseJson<RunJson>(launched.stdout);
 	if (!json || json.ok === false) {
-		return result({ kind: "launch", command, refused: (json as { error?: string } | undefined)?.error ?? failure(run, args[0]!) }, true);
+		return result({ kind: "launch", command, refused: (json as { error?: string } | undefined)?.error ?? failure(launched, args[0]!) }, true);
 	}
-	return result({ kind: "launch", command, outcome: await outcomeOf(run, json, ctx) });
+	const outcome = await outcomeOf(launched, json, ctx, signal);
+	outcome.gates_off = gatesOff(kind, validation.gates);
+	return result({ kind: "launch", command, outcome });
 }
 
 function tailLines(text: string, n: number): { lines: string[]; total: number } {
@@ -366,7 +448,7 @@ export function sparTools(pi: ExtensionAPI): Def<TSchema>[] {
 				const run = await runSpar(["logs", p.run, ...(p.slot ? [p.slot] : [])], ctx.cwd, { signal, timeoutMs: OBSERVE_TIMEOUT_MS, maxBytes: 4 * 1024 * 1024 });
 				if (run.aborted) throw new Error("cancelled");
 				if (run.code !== 0) return error(failure(run, "logs"), run.code);
-				const { lines, total } = tailLines(run.stdout, Math.min(400, Math.max(1, p.lines ?? 80)));
+				const { lines, total } = tailLines(clean(run.stdout), Math.min(400, Math.max(1, p.lines ?? 80)));
 				return result({ kind: "logs", run: p.run, slot: p.slot, lines, total: run.truncated ? Math.max(total, lines.length) : total });
 			},
 		}),
@@ -403,7 +485,7 @@ export function sparTools(pi: ExtensionAPI): Def<TSchema>[] {
 		tool({
 			name: "spar_plan",
 			description:
-				"Launch a spar plan run (planner, critic, test contract), detached. It ends at the plan gate, which only the operator approves. Spends money: the operator confirms every launch.",
+				"Launch a spar plan run (planner, critic, test contract), detached. It stops at the plan gate for the operator unless the project's config (autonomy, [gates]) approves plans itself; the result and the confirm dialog say which. Spends money: the operator confirms every launch.",
 			promptSnippet: "Launch a spar plan run (operator confirms; spends money)",
 			promptGuidelines: [
 				"spar_plan, spar_implement and spar_review spend money. Name the fleet (providers or roles) you intend, and expect the operator to confirm or decline. A declined launch is final for that request: ask, do not retry.",
@@ -411,23 +493,23 @@ export function sparTools(pi: ExtensionAPI): Def<TSchema>[] {
 			parameters: PlanParams,
 			executionMode: "sequential",
 			call: (a) => `plan ${JSON.stringify(firstLine(a.task).slice(0, 60))}`,
-			async execute(_id, p, signal, _u, ctx) {
+			async execute(id, p, signal, _u, ctx) {
 				if (!p.task.trim()) return error("task is empty");
-				return launch(pi, "spar plan", planArgs(p), p, ctx, signal);
+				return launch(pi, "plan", "spar plan", planArgs(p), p, ctx, signal, id);
 			},
 		}),
 		tool({
 			name: "spar_implement",
 			description:
-				"Launch spar's build and review loop, detached: either a fresh task (no planner) or continue a run, e.g. an approved plan, with run. Ends at the ship gate, which only the operator clears. Spends money: the operator confirms every launch.",
+				"Launch spar's build and review loop, detached: either a fresh task (no planner) or continue a run, e.g. an approved plan, with run. It stops at the ship gate for the operator unless the project's config ships on its own; the result says which. A run waiting at a gate, stopped or abandoned is refused: that is the operator's call. Spends money: the operator confirms every launch.",
 			promptSnippet: "Launch spar's implement loop for a task or an approved plan (operator confirms; spends money)",
 			parameters: ImplementParams,
 			executionMode: "sequential",
 			call: (a) => (a.run ? `implement --run ${a.run}` : `implement ${JSON.stringify(firstLine(a.task ?? "").slice(0, 60))}`),
-			async execute(_id, p, signal, _u, ctx) {
+			async execute(id, p, signal, _u, ctx) {
 				if (p.run && !isRunId(p.run)) return badId("run id", p.run);
 				if (!p.run && !p.task?.trim()) return error("pass task for a new run, or run to continue one");
-				return launch(pi, p.run ? `spar implement --run ${p.run}` : "spar implement", implementArgs(p), p, ctx, signal);
+				return launch(pi, "implement", p.run ? `spar implement --run ${p.run}` : "spar implement", implementArgs(p), p, ctx, signal, id);
 			},
 		}),
 		tool({
@@ -438,9 +520,9 @@ export function sparTools(pi: ExtensionAPI): Def<TSchema>[] {
 			parameters: ReviewParams,
 			executionMode: "sequential",
 			call: (a) => `review ${JSON.stringify(firstLine(a.task).slice(0, 60))}`,
-			async execute(_id, p, signal, _u, ctx) {
+			async execute(id, p, signal, _u, ctx) {
 				if (!p.task.trim()) return error("task is empty");
-				return launch(pi, "spar review", reviewArgs(p), p, ctx, signal);
+				return launch(pi, "review", "spar review", reviewArgs(p), p, ctx, signal, id);
 			},
 		}),
 		tool({
@@ -463,8 +545,9 @@ export function sparTools(pi: ExtensionAPI): Def<TSchema>[] {
 					timeoutMs: minutes * 60_000 + 30_000,
 				});
 				if (run.aborted) throw new Error("spar wait cancelled");
+				if (run.timedOut) return error(`spar wait did not return ${minutes}m after its own timeout should have fired: spar may be hung. Check spar_status`);
 				const json = parseJson<RunJson>(run.stdout);
-				if (run.timedOut || (run.code === 3 && json?.error === "wait timed out")) {
+				if (run.code === 3 && json?.error === "wait timed out") {
 					const outcome: Outcome = {
 						run_id: p.run,
 						phase: json?.phase ?? null,
@@ -474,7 +557,7 @@ export function sparTools(pi: ExtensionAPI): Def<TSchema>[] {
 					return result({ kind: "wait", outcome, waitedTimeout: true });
 				}
 				if (!json) return error(failure(run, "wait"), run.code);
-				return result({ kind: "wait", outcome: await outcomeOf(run, json, ctx), waitedTimeout: false });
+				return result({ kind: "wait", outcome: await outcomeOf(run, json, ctx, signal), waitedTimeout: false });
 			},
 		}),
 		tool({
@@ -493,7 +576,7 @@ export function sparTools(pi: ExtensionAPI): Def<TSchema>[] {
 				if (!p.message.trim()) return error("message is empty");
 				if (p.run && !isRunId(p.run)) return badId("run id", p.run);
 				const to = p.to?.trim() || "broadcast";
-				const args = ["bus", "send", `--message=${p.message}`, `--to=${to}`, "--json"];
+				const args = ["bus", "send", `--message=${p.message}`, "--from=pi", `--to=${to}`, "--json"];
 				if (p.run) args.push(`--run=${p.run}`);
 				if (p.requires_ack) args.push("--requires-ack");
 				const sent = await observeJson<{ id?: string }>(args, ctx, signal);
@@ -530,7 +613,7 @@ export function sparTools(pi: ExtensionAPI): Def<TSchema>[] {
 				const run = await runSpar(["skills", "get", "core"], ctx.cwd, { signal, timeoutMs: OBSERVE_TIMEOUT_MS });
 				if (run.aborted) throw new Error("cancelled");
 				if (run.code !== 0) return error(failure(run, "skills"), run.code);
-				return result({ kind: "skill", section: p.section, text: section(run.stdout, p.section) });
+				return result({ kind: "skill", section: p.section, text: section(clean(run.stdout), p.section) });
 			},
 		}),
 	];
@@ -544,4 +627,31 @@ export function registerTools(pi: ExtensionAPI): void {
 		description: "Let the model launch spar runs (plan, implement, review) without the operator confirming each one",
 	});
 	for (const def of sparTools(pi)) pi.registerTool(def);
+	pi.on("tool_call", async (event, ctx) => {
+		if (!isToolCallEventType("bash", event)) return undefined;
+		return guardBash(pi, event.input.command, ctx);
+	});
+}
+
+// The spar_* tools are not the only way to reach spar: pi's bash runs it too. Best effort,
+// see guard.ts: a command that hides spar behind a variable, alias or script gets through.
+export async function guardBash(pi: ExtensionAPI, command: string, ctx: ExtensionContext): Promise<{ block: true; reason: string } | undefined> {
+	const verdict = judgeBash(command);
+	if (verdict.kind === "none") return undefined;
+	if (verdict.kind === "launch" && unattendedAllowed(pi)) return undefined;
+	const what =
+		verdict.kind === "operator"
+			? "an operator action (a gate, ship, stop, resume, cleanup, ruling or similar)"
+			: "a launch that spends money (prefer spar_plan, spar_implement or spar_review, which validate and show the fleet)";
+	if (!ctx.hasUI) {
+		return { block: true, reason: `blocked: this bash command runs spar ${what}, and there is no operator UI to confirm it. ${OPERATOR_PATH}` };
+	}
+	const shown = verdict.commands.map((c) => display(c)).join("\n");
+	const choice = await ctx.ui.select(
+		`The model wants to run spar through bash: ${what}.\n\nspar commands found:\n${shown}\n\nfull bash command:\n${visible(command)}`,
+		["Cancel", "Run it"],
+		{ signal: ctx.signal },
+	);
+	if (choice === "Run it") return undefined;
+	return { block: true, reason: `the operator declined this spar command. ${verdict.kind === "operator" ? OPERATOR_PATH : "Ask them before launching."}` };
 }

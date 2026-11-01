@@ -887,7 +887,7 @@ fn seed_spec_bus(
 /// `[roles].test_author`, then the plan's own resolved pool as a last resort. Before this
 /// fix `[roles].test_author` was checked unconditionally first, so it beat an explicit
 /// pool it should have lost to (Bug B for this one staged seat).
-fn resolve_spec_provider(
+pub(crate) fn resolve_spec_provider(
     cfg: &Config,
     dry: bool,
     fleet: &[String],
