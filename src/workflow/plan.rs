@@ -376,19 +376,11 @@ pub fn execute_plan(
                                     state.rename_slot(paths, &old_id, &new_id);
                                     if let Some(s) = state.slot_mut(&new_id) {
                                         new_slot_id = s.id.clone();
-                                        s.provider = pin.provider.clone();
-                                        s.model = pin.model.clone();
+                                        s.point_at(&pin.display());
                                         s.source = Some(SeatSource::Backup);
-                                        s.status = crate::state::SlotStatus::Pending;
-                                        s.error = None;
-                                        s.quota_hit = false;
                                     } else if let Some(s) = state.slot_mut(&job.slot_id) {
-                                        s.provider = pin.provider.clone();
-                                        s.model = pin.model.clone();
+                                        s.point_at(&pin.display());
                                         s.source = Some(SeatSource::Backup);
-                                        s.status = crate::state::SlotStatus::Pending;
-                                        s.error = None;
-                                        s.quota_hit = false;
                                     }
                                     state.save(paths)?;
                                     let retry_job = SlotJob {
@@ -736,12 +728,8 @@ fn run_test_author(
                         if cur_key != backup_key {
                             if let Ok(pin) = crate::provider_ref::Pin::parse(&raw) {
                                 if let Some(s) = state.slot_mut(&id) {
-                                    s.provider = pin.provider.clone();
-                                    s.model = pin.model.clone();
+                                    s.point_at(&pin.display());
                                     s.source = Some(crate::state::SeatSource::Backup);
-                                    s.status = crate::state::SlotStatus::Pending;
-                                    s.error = None;
-                                    s.quota_hit = false;
                                 }
                                 state.save(paths)?;
                                 let retry_job = SlotJob {
@@ -1286,8 +1274,7 @@ fn amend_author_seat(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> R
     }
     state.rename_slot(paths, &seat.id, &new_id);
     if let Some(s) = state.slot_mut(&new_id) {
-        s.provider = pin.provider.clone();
-        s.model = pin.model.clone();
+        s.point_at(&pin.display());
         s.effort = None;
         s.source = Some(SeatSource::Backup);
     }

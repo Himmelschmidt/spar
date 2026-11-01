@@ -865,3 +865,108 @@ fn arena_workflow_all_implementers_rate_limited_parks_on_quota_and_exits_4() {
     .unwrap();
     assert_eq!(state["phase"], "quota");
 }
+
+/// A `PATH` holding only `bin_dir` plus links to the tools spar and the fake CLIs need,
+/// so a provider installed on the host (codex lives in `/usr/bin`) cannot be found.
+fn sealed_path(bin_dir: &std::path::Path) -> String {
+    for tool in ["git", "sh", "cat"] {
+        let real = which::which(tool).unwrap_or_else(|_| panic!("{tool} on PATH"));
+        let link = bin_dir.join(tool);
+        if !link.exists() {
+            std::os::unix::fs::symlink(real, link).unwrap();
+        }
+    }
+    bin_dir.display().to_string()
+}
+
+/// O149, the rotation sequence from biddesk run 52588b2c: a claude dispatch hits its
+/// weekly limit, the seat moves to codex, and the codex dispatch dies before writing a
+/// line (here: not on PATH). The slot log is keyed by slot id, so it still held claude's
+/// transcript, and the early-error scrape read it as codex's own: `cli:codex` was
+/// paused on claude's limit and the run parked on quota.
+#[test]
+fn a_reseated_dispatch_that_dies_early_never_inherits_the_previous_providers_quota() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    let proj = dir.join("proj");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&proj).unwrap();
+    init_repo(&proj);
+    fake_binary(&bin, "claude", WEEKLY_LIMIT_LOG);
+    let path_env = sealed_path(&bin);
+    assert!(
+        which::which_in("codex", Some(&path_env), &proj).is_err(),
+        "codex must not be reachable"
+    );
+
+    spar_cmd()
+        .current_dir(&proj)
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--providers",
+            "cli:claude",
+        ])
+        .env("PATH", &path_env)
+        .assert()
+        .code(4);
+    let run_id = only_run_id(&proj);
+    let run_dir = proj.join(".spar/runs").join(&run_id);
+    let impl_log = run_dir.join("logs/impl.log");
+    assert!(
+        std::fs::read_to_string(&impl_log)
+            .unwrap()
+            .contains("weekly limit"),
+        "round 1 left claude's transcript in the slot log"
+    );
+
+    spar_cmd()
+        .current_dir(&proj)
+        .args(["provider", "resume", "cli:claude"])
+        .env("PATH", &path_env)
+        .assert()
+        .success();
+    spar_cmd()
+        .current_dir(&proj)
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--reassign",
+            "implementer=cli:codex",
+        ])
+        .env("PATH", &path_env)
+        .assert()
+        .stdout(predicate::str::contains(
+            "reassigned seat impl (cli:claude) to cli:codex",
+        ));
+
+    let quota: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(proj.join(".spar/quota.json")).unwrap())
+            .unwrap();
+    let codex = &quota["providers"]["cli:codex"];
+    assert!(
+        codex.is_null() || codex["status"] == "available",
+        "codex never ran, so it must not be paused: {codex}"
+    );
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(run_dir.join("state.json")).unwrap())
+            .unwrap();
+    let imp = state["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == "impl")
+        .unwrap();
+    assert_eq!(imp["provider"], "cli:codex");
+    assert_eq!(imp["status"], "failed");
+    assert_eq!(imp["quota_hit"], false, "{imp}");
+    assert_ne!(state["phase"], "quota");
+    assert!(
+        !std::fs::read_to_string(&impl_log)
+            .unwrap_or_default()
+            .contains("weekly limit"),
+        "the codex dispatch's log must not carry claude's transcript"
+    );
+}
