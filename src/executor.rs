@@ -2092,9 +2092,10 @@ fn apply_parallel_outcome(
             // `quota_hit` back off the slot to route the run to `Phase::Quota`. Read
             // through `&result` here, before anything below moves its fields out: see
             // `quota_hit_for_outcome`.
-            let strong_before = strong_pause_before(paths, &state.id, &prep.job.provider);
+            let witness = PauseWitness::before(paths, &state.id, &prep.job.provider);
             let quota_hit =
                 quota_hit_for_outcome(paths, &prep.job.provider, &prep.log_path, &result);
+            let witness = witness.map(|w| w.after_scrape(paths, &prep.job.provider));
             let err = result.error.clone().unwrap_or_else(|| "failed".into());
             let auth = auth_fault_for(
                 &prep.log_path,
@@ -2112,7 +2113,7 @@ fn apply_parallel_outcome(
                 &err,
                 quota_hit,
                 auth,
-                strong_before,
+                witness,
             );
             if let Some(s) = state.slot_mut(slot_id) {
                 s.quota_hit = quota_hit;
@@ -2693,8 +2694,9 @@ pub fn run_slot(
     } else {
         // Read through `&result` before anything below moves its fields out — see
         // `quota_hit_for_outcome`.
-        let strong_before = strong_pause_before(paths, &state.id, &job.provider);
+        let witness = PauseWitness::before(paths, &state.id, &job.provider);
         let quota_hit = quota_hit_for_outcome(paths, &job.provider, &log_path, &result);
+        let witness = witness.map(|w| w.after_scrape(paths, &job.provider));
         let err = result.error.as_deref().unwrap_or("failed");
         auth_rejection = auth_fault_for(&log_path, err, quota_hit, result.exit_code, result.signal);
         let (quota_hit, auth, classified) = classifier_verdict(
@@ -2706,7 +2708,7 @@ pub fn run_slot(
             err,
             quota_hit,
             auth_rejection,
-            strong_before,
+            witness,
         );
         auth_rejection = auth;
         salvage_expected_artifact(
@@ -3151,8 +3153,8 @@ fn classifier_dispatch_advice(
 /// veto a quota or auth verdict read from text, which becomes a weak pause. Never asked
 /// about what spar settled from its own state: a kill, a halt, the hard ceiling, a
 /// usage error, a refused session id, a typed quota event, or a transient match whose
-/// retries ran out. `strong_before` is [`strong_pause_before`] for this provider: a
-/// veto only weakens a pause this dispatch's own text made strong.
+/// retries ran out. `witness` is the provider's pause around this dispatch's own
+/// scrape ([`PauseWitness`]): a veto only weakens a pause that scrape made.
 #[allow(clippy::too_many_arguments)]
 fn classifier_verdict(
     paths: &SparPaths,
@@ -3163,7 +3165,7 @@ fn classifier_verdict(
     err: &str,
     quota_hit: bool,
     auth: Option<String>,
-    strong_before: bool,
+    witness: Option<PauseWitness>,
 ) -> (bool, Option<String>, Option<crate::classifier::Record>) {
     use crate::classifier::{Action, RegexVerdict};
     let unchanged = (quota_hit, auth.clone(), None);
@@ -3243,7 +3245,7 @@ fn classifier_verdict(
                 rec.model
             )),
         ),
-        Action::WeakPause if quota_hit && !strong_before => {
+        Action::WeakPause if quota_hit && witness.as_ref().is_some_and(|w| w.ours(paths, &key)) => {
             let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
             if store.is_usable(&key) {
                 store.pause_quota(
@@ -3264,14 +3266,49 @@ fn classifier_verdict(
     (quota_hit, auth, Some(rec))
 }
 
-/// Whether `provider` already sat under a pause a live run acts on (O106), before this
-/// dispatch's own scrape: a strong pause from a typed signal, another dispatch or
-/// another box (O141) that a veto must leave alone. `false` without reading the store
-/// when the run's classifier is off.
-fn strong_pause_before(paths: &SparPaths, run_id: &str, provider: &str) -> bool {
-    let on = crate::config::Config::for_run(paths, run_id).is_ok_and(|c| c.classifier.enabled);
-    on && crate::quota::QuotaStore::load(paths)
-        .is_ok_and(|s| s.blocks_live_dispatch(&crate::quota::normalize_key(provider)))
+/// The provider's pause around one dispatch's quota scrape, so a classifier veto only
+/// weakens what that scrape wrote: never a pause a live run already acted on before it
+/// (a typed signal, another run, another box through the merged fleet record, O141),
+/// and never one rewritten while the classifier was being asked.
+struct PauseWitness {
+    strong_before: bool,
+    /// `(version, updated_at)` of the record right after the scrape.
+    after: Option<(u64, Option<chrono::DateTime<chrono::Utc>>)>,
+}
+
+impl PauseWitness {
+    /// `None` without reading the store when the run's classifier is off.
+    fn before(paths: &SparPaths, run_id: &str, provider: &str) -> Option<Self> {
+        crate::config::Config::for_run(paths, run_id)
+            .ok()
+            .filter(|c| c.classifier.enabled)?;
+        let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+        Some(Self {
+            strong_before: store.blocks_live_dispatch(&crate::quota::normalize_key(provider)),
+            after: None,
+        })
+    }
+
+    fn identity(paths: &SparPaths, key: &str) -> (u64, Option<chrono::DateTime<chrono::Utc>>) {
+        let q = crate::quota::QuotaStore::load(paths)
+            .unwrap_or_default()
+            .get(key);
+        (q.version, q.updated_at)
+    }
+
+    fn after_scrape(self, paths: &SparPaths, provider: &str) -> Self {
+        Self {
+            after: Some(Self::identity(
+                paths,
+                &crate::quota::normalize_key(provider),
+            )),
+            ..self
+        }
+    }
+
+    fn ours(&self, paths: &SparPaths, key: &str) -> bool {
+        !self.strong_before && self.after == Some(Self::identity(paths, key))
+    }
 }
 
 struct SlotOutcome {
@@ -8409,7 +8446,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let job = impl_job("impl");
         let outcome = failed_with(Some(1), None, "exit 1");
         let (quota, auth, rec) = classifier_verdict(
-            &paths, "run1", &job, &log_path, &outcome, "exit 1", false, None, false,
+            &paths, "run1", &job, &log_path, &outcome, "exit 1", false, None, None,
         );
         assert!(quota && auth.is_none());
         assert_eq!(rec.unwrap().action, crate::classifier::Action::PauseQuota);
@@ -8426,7 +8463,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         )
         .unwrap();
         let (quota, auth, rec) = classifier_verdict(
-            &paths, "run1", &job, &log_path, &outcome, "exit 1", false, None, false,
+            &paths, "run1", &job, &log_path, &outcome, "exit 1", false, None, None,
         );
         assert!(!quota && auth.is_none(), "below threshold: today's verdict");
         assert!(!rec.unwrap().acted);
@@ -8445,14 +8482,24 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         std::fs::write(&log_path, WEEKLY_LIMIT_LOG).unwrap();
         let job = impl_job("impl");
         let outcome = failed_with(Some(1), None, "exit 1");
+        let witness = PauseWitness::before(&paths, "run1", "cli:muse").unwrap();
         assert!(quota_hit_for_outcome(
             &paths, "cli:muse", &log_path, &outcome
         ));
+        let witness = witness.after_scrape(&paths, "cli:muse");
         assert!(crate::quota::QuotaStore::load(&paths)
             .unwrap()
             .blocks_live_dispatch("cli:muse"));
         let (quota, auth, rec) = classifier_verdict(
-            &paths, "run1", &job, &log_path, &outcome, "exit 1", true, None, false,
+            &paths,
+            "run1",
+            &job,
+            &log_path,
+            &outcome,
+            "exit 1",
+            true,
+            None,
+            Some(witness),
         );
         assert!(!quota && auth.is_none());
         let rec = rec.unwrap();
@@ -8471,7 +8518,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             "exit 1",
             false,
             Some("not logged in".into()),
-            false,
+            None,
         );
         assert!(
             !quota && auth.is_none(),
@@ -8490,13 +8537,22 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         store.pause_quota("cli:muse", "typed five_hour rejection");
         store.mark_strong("cli:muse");
         store.save(&paths).unwrap();
-        assert!(strong_pause_before(&paths, "run1", "cli:muse"));
+        let witness = PauseWitness::before(&paths, "run1", "cli:muse").unwrap();
+        assert!(witness.strong_before);
         let log_path = tmp.path().join("impl.log");
         std::fs::write(&log_path, WEEKLY_LIMIT_LOG).unwrap();
         let job = impl_job("impl");
         let outcome = failed_with(Some(1), None, "exit 1");
         let (quota, _, rec) = classifier_verdict(
-            &paths, "run1", &job, &log_path, &outcome, "exit 1", true, None, true,
+            &paths,
+            "run1",
+            &job,
+            &log_path,
+            &outcome,
+            "exit 1",
+            true,
+            None,
+            Some(witness.after_scrape(&paths, "cli:muse")),
         );
         assert!(!quota);
         assert_eq!(rec.unwrap().action, crate::classifier::Action::WeakPause);
@@ -8505,6 +8561,42 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
                 .unwrap()
                 .blocks_live_dispatch("cli:muse"),
             "a strong pause this dispatch did not make stays strong"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (paths, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.97));
+        let log_path = tmp.path().join("impl.log");
+        std::fs::write(&log_path, WEEKLY_LIMIT_LOG).unwrap();
+        let witness = PauseWitness::before(&paths, "run1", "cli:muse").unwrap();
+        assert!(quota_hit_for_outcome(
+            &paths, "cli:muse", &log_path, &outcome
+        ));
+        let witness = witness.after_scrape(&paths, "cli:muse");
+        let mut store = crate::quota::QuotaStore::load(&paths).unwrap();
+        store.pause_quota_until(
+            "cli:muse",
+            Some(chrono::Utc::now() + chrono::Duration::hours(2)),
+            "typed rejection from another run",
+        );
+        store.mark_strong("cli:muse");
+        store.save(&paths).unwrap();
+        let (quota, _, _) = classifier_verdict(
+            &paths,
+            "run1",
+            &job,
+            &log_path,
+            &outcome,
+            "exit 1",
+            true,
+            None,
+            Some(witness),
+        );
+        assert!(!quota);
+        assert!(
+            crate::quota::QuotaStore::load(&paths)
+                .unwrap()
+                .blocks_live_dispatch("cli:muse"),
+            "a pause rewritten while the classifier was asked is left alone"
         );
 
         let tmp = tempfile::tempdir().unwrap();
@@ -8520,7 +8612,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             "exit 1",
             false,
             Some("not logged in".into()),
-            false,
+            None,
         );
         assert!(!quota && auth.is_none());
         assert!(
@@ -8576,14 +8668,14 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         ];
         for (outcome, err, quota_hit) in cases {
             let (quota, auth, rec) = classifier_verdict(
-                &paths, "run1", &job, &log_path, &outcome, &err, quota_hit, None, false,
+                &paths, "run1", &job, &log_path, &outcome, &err, quota_hit, None, None,
             );
             assert_eq!((quota, auth, rec), (quota_hit, None, None), "{err}");
         }
         std::fs::write(&log_path, "! model `m` does not exist or you lack access\n").unwrap();
         let outcome = failed_with(Some(1), None, "exit 1");
         let (_, _, rec) = classifier_verdict(
-            &paths, "run1", &job, &log_path, &outcome, "exit 1", false, None, false,
+            &paths, "run1", &job, &log_path, &outcome, "exit 1", false, None, None,
         );
         assert!(
             rec.is_none(),

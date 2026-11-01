@@ -13,6 +13,9 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 const LOG_TAIL_BYTES: usize = 4096;
+/// How much of the log is read before tool output is dropped and the tail is cut: tool
+/// lines are most of a log, so the 4 KB budget is filled from well before the end.
+const READ_WINDOW: usize = 64 * 1024;
 const MAX_RETRIES: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,7 +83,7 @@ impl FailureState {
             signal,
             tool_calls,
             spar_error: spar_error.map(|e| no_panic(|| redact(e))),
-            log_tail: no_panic(|| log_tail(&crate::process::tail_log(log_path, LOG_TAIL_BYTES))),
+            log_tail: no_panic(|| log_tail(&read_window(log_path))),
         }
     }
 }
@@ -268,38 +271,94 @@ struct WireUsage {
     cost: Option<f64>,
 }
 
+/// A failure, kept apart from an answer so only answers and deterministic refusals
+/// are remembered: a timeout, a 429 or a 5xx may not repeat.
+struct CallError {
+    message: String,
+    /// The same request would fail the same way (a 4xx other than 408/409/429, an
+    /// unparseable answer).
+    deterministic: bool,
+    /// The endpoint looks down: a transport failure, or 408/409/429/5xx after the
+    /// retries ran out.
+    trips: bool,
+}
+
+impl CallError {
+    fn fixed(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            deterministic: true,
+            trips: false,
+        }
+    }
+}
+
+impl<E: std::fmt::Display> From<E> for CallError {
+    fn from(e: E) -> Self {
+        Self {
+            message: e.to_string(),
+            deterministic: false,
+            trips: false,
+        }
+    }
+}
+
 type Memo = std::sync::Mutex<std::collections::HashMap<u64, std::result::Result<Answer, String>>>;
 
-/// Answers (and failures) by request, so the dispatch and verdict sites asking about
-/// the same log pay for one call. Keyed on what the answer depends on: the model, the
-/// endpoint, the vendor's criteria, the exit, the signal and the log tail.
+/// Answers (and deterministic refusals) by request, so the dispatch and verdict sites
+/// asking about the same failure pay for one call.
 fn memo() -> &'static Memo {
     static MEMO: std::sync::OnceLock<Memo> = std::sync::OnceLock::new();
     MEMO.get_or_init(Default::default)
 }
 
-/// While open, no call is made to that endpoint: an outage costs one failed consult
-/// per `BREAKER_OPEN`, not one per failed dispatch.
 const BREAKER_OPEN: Duration = Duration::from_secs(300);
 
-type Breaker = std::sync::Mutex<std::collections::HashMap<String, Instant>>;
-
-fn breaker() -> &'static Breaker {
-    static BREAKER: std::sync::OnceLock<Breaker> = std::sync::OnceLock::new();
-    BREAKER.get_or_init(Default::default)
+#[derive(Debug, Clone, Copy)]
+enum Breaker {
+    /// No calls until then.
+    Open(Instant),
+    /// The window lapsed and one consult is probing the endpoint; the rest skip.
+    Probing(Instant),
 }
 
-fn breaker_open(base_url: &str) -> bool {
-    breaker()
-        .lock()
-        .ok()
-        .and_then(|m| m.get(base_url).copied())
-        .is_some_and(|until| Instant::now() < until)
+type Breakers = std::sync::Mutex<std::collections::HashMap<String, Breaker>>;
+
+fn breakers() -> &'static Breakers {
+    static B: std::sync::OnceLock<Breakers> = std::sync::OnceLock::new();
+    B.get_or_init(Default::default)
 }
 
-fn trip_breaker(base_url: &str) {
-    if let Ok(mut m) = breaker().lock() {
-        m.insert(base_url.to_string(), Instant::now() + BREAKER_OPEN);
+/// Whether this consult may call `base_url`. Checked and updated under one lock, so
+/// during an outage at most one consult at a time is waiting on the endpoint. A probe
+/// that never reported back (a panic) stops blocking after one more window.
+fn breaker_admits(base_url: &str, budget: Duration) -> bool {
+    let Ok(mut m) = breakers().lock() else {
+        return true;
+    };
+    let now = Instant::now();
+    match m.get(base_url).copied() {
+        None => true,
+        Some(Breaker::Open(until)) if now < until => false,
+        Some(Breaker::Probing(since)) if now < since + budget + BREAKER_OPEN => false,
+        Some(_) => {
+            m.insert(base_url.to_string(), Breaker::Probing(now));
+            true
+        }
+    }
+}
+
+fn breaker_report(base_url: &str, tripped: bool) {
+    let Ok(mut m) = breakers().lock() else {
+        return;
+    };
+    if tripped {
+        m.insert(
+            base_url.to_string(),
+            Breaker::Open(Instant::now() + BREAKER_OPEN),
+        );
+    } else {
+        m.remove(base_url);
     }
 }
 
@@ -310,21 +369,23 @@ fn memo_key(cfg: &ClassifierConfig, adapter: &str, state: &FailureState) -> u64 
         &cfg.model,
         &cfg.base_url,
         adapter,
-        state.exit_code,
-        state.signal,
-        &state.log_tail,
+        serde_json::to_string(state).unwrap_or_default(),
     )
         .hash(&mut h);
     h.finish()
 }
 
+fn budget(cfg: &ClassifierConfig) -> Duration {
+    Duration::from_secs(cfg.timeout_secs) + Duration::from_secs(1)
+}
+
 /// One System One call (`POST <base_url>/systemone`, pi-ai's `typesafe-system-one`
 /// shape). Retries a transport error, 408, 409, 429 or 5xx while the total budget
-/// (`timeout_secs` + 1) lasts, at most `MAX_RETRIES` times. A transport failure opens
-/// the breaker for this endpoint.
+/// (`timeout_secs` + 1) lasts, at most `MAX_RETRIES` times; when they run out the
+/// endpoint's breaker opens for `BREAKER_OPEN`.
 pub fn classify(cfg: &ClassifierConfig, adapter: &str, state: &FailureState) -> Result<Answer> {
-    let key = memo_key(cfg, adapter, state);
-    if let Some(hit) = memo().lock().ok().and_then(|m| m.get(&key).cloned()) {
+    let key = (!state.log_tail.is_empty()).then(|| memo_key(cfg, adapter, state));
+    if let Some(hit) = key.and_then(|k| memo().lock().ok().and_then(|m| m.get(&k).cloned())) {
         return match hit {
             Ok(a) => Ok(Answer {
                 cached: true,
@@ -335,32 +396,41 @@ pub fn classify(cfg: &ClassifierConfig, adapter: &str, state: &FailureState) -> 
             Err(e) => bail!("{e} (cached)"),
         };
     }
-    if breaker_open(&cfg.base_url) {
-        bail!("classifier skipped: endpoint failed within the last 5 minutes");
+    if !breaker_admits(&cfg.base_url, budget(cfg)) {
+        bail!("classifier skipped: endpoint failing, retried after 5 minutes");
     }
     let result = call(cfg, adapter, state);
-    if let Ok(mut m) = memo().lock() {
-        m.insert(
-            key,
-            result
-                .as_ref()
-                .map(Clone::clone)
-                .map_err(|e| format!("{e:#}")),
-        );
+    let remember = match &result {
+        Ok(a) => Some(Ok(a.clone())),
+        Err(e) if e.deterministic => Some(Err(e.message.clone())),
+        Err(_) => None,
+    };
+    breaker_report(
+        &cfg.base_url,
+        result.as_ref().err().is_some_and(|e| e.trips),
+    );
+    if let (Some(k), Some(r)) = (key, remember) {
+        if let Ok(mut m) = memo().lock() {
+            m.insert(k, r);
+        }
     }
-    result
+    result.map_err(|e| anyhow::anyhow!(e.message))
 }
 
-fn call(cfg: &ClassifierConfig, adapter: &str, state: &FailureState) -> Result<Answer> {
+fn call(
+    cfg: &ClassifierConfig,
+    adapter: &str,
+    state: &FailureState,
+) -> std::result::Result<Answer, CallError> {
     let body = serde_json::to_string(&Request {
         model: &cfg.model,
         state,
         questions: failure_question::questions(adapter),
     })?;
-    let api_key = read_key(cfg)?;
+    let api_key = read_key(cfg).map_err(|e| CallError::from(format!("{e:#}")))?;
     let url = format!("{}/systemone", cfg.base_url.trim_end_matches('/'));
     let per_attempt = Duration::from_secs(cfg.timeout_secs);
-    let budget = per_attempt + Duration::from_secs(1);
+    let budget = budget(cfg);
     let started = Instant::now();
     let mut attempt = 0;
     let text = loop {
@@ -376,7 +446,7 @@ fn call(cfg: &ClassifierConfig, adapter: &str, state: &FailureState) -> Result<A
             .header("Content-Type", "application/json")
             .header("X-OpenRouter-Title", "spar")
             .send(&body);
-        let (reason, transport) = match sent {
+        let reason = match sent {
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 let text = resp.into_body().read_to_string().unwrap_or_default();
@@ -384,41 +454,50 @@ fn call(cfg: &ClassifierConfig, adapter: &str, state: &FailureState) -> Result<A
                     break text;
                 }
                 if !matches!(status, 408 | 409 | 429 | 500..=599) {
-                    bail!(
+                    return Err(CallError::fixed(format!(
                         "classifier returned HTTP {status}: {}",
                         truncate(&text, 200)
-                    );
+                    )));
                 }
-                (format!("HTTP {status}"), false)
+                format!("HTTP {status}")
             }
-            Err(e) => (e.to_string(), true),
+            Err(e) => e.to_string(),
         };
         let backoff = Duration::from_millis(250 << attempt);
         let out_of_time = started.elapsed() + backoff + Duration::from_millis(250) >= budget;
         if attempt >= MAX_RETRIES || out_of_time {
-            if transport {
-                trip_breaker(&cfg.base_url);
-            }
-            bail!(
-                "classifier unreachable after {} attempts: {reason}",
-                attempt + 1
-            );
+            return Err(CallError {
+                message: format!(
+                    "classifier unreachable after {} attempts: {reason}",
+                    attempt + 1
+                ),
+                deterministic: false,
+                trips: true,
+            });
         }
         std::thread::sleep(backoff);
         attempt += 1;
     };
     let latency_ms = started.elapsed().as_millis() as u64;
-    let parsed: Response = serde_json::from_str(&text).context("parse classifier response")?;
+    let parsed: Response = serde_json::from_str(&text)
+        .map_err(|e| CallError::fixed(format!("parse classifier response: {e}")))?;
     let wire = parsed
         .answers
         .get(QUESTION_ID)
-        .context("classifier returned no failure_class answer")?;
+        .ok_or_else(|| CallError::fixed("classifier returned no failure_class answer"))?;
     if wire.kind != "choice" {
-        bail!("classifier returned a {} answer, not a choice", wire.kind);
+        return Err(CallError::fixed(format!(
+            "classifier returned a {} answer, not a choice",
+            wire.kind
+        )));
     }
     let choice: FailureClass =
-        serde_json::from_value(serde_json::Value::String(wire.choice.clone()))
-            .with_context(|| format!("classifier returned unknown label {:?}", wire.choice))?;
+        serde_json::from_value(serde_json::Value::String(wire.choice.clone())).map_err(|_| {
+            CallError::fixed(format!(
+                "classifier returned unknown label {:?}",
+                wire.choice
+            ))
+        })?;
     let probability = wire.probabilities.get(&wire.choice).copied().unwrap_or(0.0);
     Ok(Answer {
         choice,
@@ -434,13 +513,57 @@ fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-/// The last `LOG_TAIL_BYTES` of `text`, redacted. The cut comes first and drops the
-/// partial line (or word) it lands in, so no secret is redacted whole and then cut, or
-/// cut so its recognizable start is lost; redaction can only lengthen a line slightly,
-/// so the result is trimmed again from the front on line boundaries.
+/// The end of the slot log, starting on a line boundary.
+fn read_window(log_path: &Path) -> String {
+    let text = crate::process::tail_log(log_path, READ_WINDOW);
+    let whole = std::fs::metadata(log_path).is_ok_and(|m| m.len() as usize <= READ_WINDOW);
+    if whole {
+        text
+    } else {
+        drop_partial_head(&text).to_string()
+    }
+}
+
+/// Only what the provider and spar said, never what the tools returned. The slot log is
+/// the stream coalescer's rendering for every adapter (`process::StreamCoalescer`):
+/// `← ` lines are tool results (env dumps, `.env` files, API responses) and are
+/// dropped; `→ name  args` keeps the tool name and drops its arguments; spar's own spawn
+/// header is dropped. Provider errors (`! `), status (`· `), assistant text and plain
+/// output stay: that is the wording the evaluation scored.
+pub fn provider_lines(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut header = text.starts_with("# spawn ");
+    for line in text.split_inclusive('\n') {
+        if header {
+            if line.trim_end() == "---" {
+                header = false;
+            }
+            continue;
+        }
+        if line.starts_with("← ") {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("→ ") {
+            let name = rest.split("  ").next().unwrap_or("").trim_end();
+            out.push_str("→ ");
+            out.push_str(name);
+            out.push('\n');
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+/// The last `LOG_TAIL_BYTES` of the provider's own lines, redacted. `text` starts on a
+/// line boundary. The cut comes before redaction and drops the line it lands in whole,
+/// so no secret is cut away from the key that marks it; redaction can lengthen a line,
+/// so the result is trimmed again from the front.
 pub fn log_tail(text: &str) -> String {
-    let cut = tail_bytes(text, LOG_TAIL_BYTES);
-    let cut = if cut.len() < text.len() {
+    let lines = provider_lines(text);
+    let cut = tail_bytes(&lines, LOG_TAIL_BYTES);
+    let mid_line = cut.len() < lines.len() && !lines[..lines.len() - cut.len()].ends_with('\n');
+    let cut = if mid_line {
         drop_partial_head(cut)
     } else {
         cut
@@ -450,7 +573,7 @@ pub fn log_tail(text: &str) -> String {
         match red.find('\n') {
             Some(i) => red = red[i + 1..].to_string(),
             None => {
-                red = tail_bytes(&red, LOG_TAIL_BYTES).to_string();
+                red = drop_partial_head(tail_bytes(&red, LOG_TAIL_BYTES)).to_string();
                 break;
             }
         }
@@ -466,11 +589,13 @@ fn tail_bytes(text: &str, n: usize) -> &str {
     &text[start..]
 }
 
+/// Drops the partial first line, however long; with no newline at all, the first
+/// whitespace-delimited word.
 fn drop_partial_head(cut: &str) -> &str {
-    let at = match cut.find('\n') {
-        Some(i) if i < 1024 => i,
-        _ => cut.find(char::is_whitespace).unwrap_or(cut.len()),
-    };
+    let at = cut
+        .find('\n')
+        .or_else(|| cut.find(char::is_whitespace))
+        .unwrap_or(cut.len());
     let rest = &cut[at..];
     &rest[rest.chars().next().map_or(0, char::len_utf8)..]
 }
@@ -500,21 +625,44 @@ const TOKEN_PREFIXES: &[&str] = &[
     "npm_",
 ];
 
-/// Strips what looks like a secret: the value of any key or flag whose name says
-/// secret (`*password*`, `*passwd`, `*pwd`, `*token`, `*secret*`, `*_key`, `*-key`,
-/// `*apikey`, `authorization`), bearer tokens, URL passwords (database
-/// URLs), JWTs, vendor-prefixed keys and long base64 or hex runs. Errs toward removing
-/// too much. Works on chars, never byte offsets, so no input can make it panic.
+/// Strips what looks like a secret: PEM blocks, the value of any key or flag whose name
+/// says secret (see `secret_name`), bearer and other scheme tokens, cookies, `-u
+/// user:pass`, URL credentials, JWTs, vendor-prefixed keys and long base64 or hex runs.
+/// Errs toward removing too much. Works on chars, never byte offsets, so no input can
+/// make it panic.
 pub fn redact(text: &str) -> String {
-    text.split('\n')
+    redact_pem(text)
+        .split('\n')
         .map(redact_line)
         .collect::<Vec<_>>()
         .join("\n")
 }
 
+fn redact_pem(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(b) = rest.find("-----BEGIN ") {
+        out.push_str(&rest[..b]);
+        out.push_str(REDACTED);
+        let after = &rest[b + "-----BEGIN ".len()..];
+        rest = match after.find("-----END ") {
+            Some(e) => {
+                let tail = &after[e + "-----END ".len()..];
+                match tail.find("-----") {
+                    Some(close) => &tail[close + 5..],
+                    None => "",
+                }
+            }
+            None => "",
+        };
+    }
+    out.push_str(rest);
+    out
+}
+
 fn redact_line(line: &str) -> String {
     let chars: Vec<char> = line.chars().collect();
-    let chars = redact_url_passwords(&chars);
+    let chars = redact_url_credentials(&chars);
     let chars = redact_keyed_values(&chars);
     redact_tokens(&chars)
 }
@@ -528,11 +676,14 @@ fn is_quote(c: char) -> bool {
 }
 
 fn ends_value(c: char) -> bool {
-    c.is_whitespace() || is_quote(c) || matches!(c, ',' | ';' | '&' | '}' | ')' | ']' | '<' | '>')
+    c.is_whitespace()
+        || is_quote(c)
+        || matches!(c, ',' | ';' | '&' | '}' | ')' | ']' | '<' | '>' | '\\')
 }
 
-/// `scheme://user:pass@host` keeps the user and host.
-fn redact_url_passwords(chars: &[char]) -> Vec<char> {
+/// `scheme://user:pass@host` keeps the user and host; `scheme://token@host` keeps the
+/// host.
+fn redact_url_credentials(chars: &[char]) -> Vec<char> {
     let mut out = Vec::with_capacity(chars.len());
     let mut i = 0;
     while i < chars.len() {
@@ -546,7 +697,9 @@ fn redact_url_passwords(chars: &[char]) -> Vec<char> {
         i += 3;
         let start = i;
         while i < chars.len()
-            && !(chars[i].is_whitespace() || chars[i] == '/' || is_quote(chars[i]))
+            && !(chars[i].is_whitespace()
+                || matches!(chars[i], '/' | '?' | '#')
+                || is_quote(chars[i]))
         {
             i += 1;
         }
@@ -559,38 +712,82 @@ fn redact_url_passwords(chars: &[char]) -> Vec<char> {
                 out.extend(REDACTED.chars());
                 out.extend_from_slice(&authority[at..]);
             }
+            (Some(at), _) => {
+                out.extend(REDACTED.chars());
+                out.extend_from_slice(&authority[at..]);
+            }
             _ => out.extend_from_slice(authority),
         }
     }
     out
 }
 
-fn secret_name(ident: &str) -> bool {
+/// How a name marks its value.
+#[derive(PartialEq)]
+enum Secret {
+    No,
+    /// Always a secret.
+    Strong,
+    /// A secret only as a quoted JSON key or a `name=value` pair (`key`, `sig`, `auth`):
+    /// as prose (`auth: not logged in`) it is the provider's own wording.
+    Weak,
+    /// The rest of the line (`Cookie:`, `Set-Cookie:`).
+    Line,
+    /// `-u` / `--user`: a flag whose value is `user:password`.
+    UserFlag,
+}
+
+fn secret_name(ident: &str) -> Secret {
+    let flag = ident.starts_with('-');
     let k = ident.trim_start_matches('-').to_ascii_lowercase();
     let k = k.trim_end_matches(['.', '-', '_']);
     if k.is_empty() {
-        return false;
+        return Secret::No;
     }
-    k.contains("password")
+    if flag && (k == "u" || k == "user") {
+        return Secret::UserFlag;
+    }
+    if k == "cookie" || k == "set-cookie" {
+        return Secret::Line;
+    }
+    let strong = k.contains("password")
         || k.contains("passwd")
+        || k.contains("passphrase")
+        || k.ends_with("pass")
         || k.contains("secret")
         || k.contains("apikey")
         || k.contains("api_key")
         || k.contains("api-key")
         || k.contains("private_key")
+        || k.contains("authorization")
         || k == "pwd"
         || k.ends_with("_pwd")
-        || k == "token"
         || k.ends_with("token")
         || k.ends_with("_key")
         || k.ends_with("-key")
-        || k == "authorization"
-        || k == "bearer"
+        || k == "bearer";
+    if strong {
+        return Secret::Strong;
+    }
+    if matches!(
+        k,
+        "key" | "sig" | "signature" | "auth" | "credentials" | "credential" | "access_key"
+    ) {
+        return Secret::Weak;
+    }
+    Secret::No
 }
 
-/// `NAME=value`, `NAME: value`, `"name": "value"`, `--name value`, `--name=value` and
-/// `Bearer value`, for a secret-sounding name. A quoted value is taken to its closing
-/// quote.
+fn skip_while(chars: &[char], mut j: usize, f: impl Fn(char) -> bool) -> usize {
+    while j < chars.len() && f(chars[j]) {
+        j += 1;
+    }
+    j
+}
+
+/// `NAME=value`, `NAME: value`, `NAME := value`, `"name": "value"` (also JSON-escaped,
+/// `\"name\": \"value\"`), `--name value`, `--name=value`, `Authorization: <scheme>
+/// value`, `Bearer value`, `<value>`. A quoted value is taken to its closing quote.
 fn redact_keyed_values(chars: &[char]) -> Vec<char> {
     let mut out = Vec::with_capacity(chars.len());
     let mut i = 0;
@@ -601,57 +798,76 @@ fn redact_keyed_values(chars: &[char]) -> Vec<char> {
             continue;
         }
         let start = i;
-        while i < chars.len() && is_ident(chars[i]) {
-            i += 1;
-        }
+        i = skip_while(chars, i, is_ident);
         let ident: String = chars[start..i].iter().collect();
         out.extend_from_slice(&chars[start..i]);
-        if !secret_name(&ident) {
+        let kind = secret_name(&ident);
+        if kind == Secret::No {
             continue;
         }
-        let flag = ident.starts_with("--");
+        let flag = ident.starts_with("--") || kind == Secret::UserFlag;
         let bearer = ident.eq_ignore_ascii_case("bearer");
-        let mut j = i;
-        while j < chars.len() && is_quote(chars[j]) {
-            j += 1;
-        }
-        while j < chars.len() && matches!(chars[j], ' ' | '\t') {
-            j += 1;
-        }
+        let quoted_key = i < chars.len() && (is_quote(chars[i]) || chars[i] == '\\');
+        let mut j = skip_while(chars, i, |c| is_quote(c) || c == '\\');
+        j = skip_while(chars, j, |c| c == ' ' || c == '\t');
         let sep = j < chars.len() && matches!(chars[j], '=' | ':');
+        let tight_eq = j == i && sep && chars[j] == '=';
         if sep {
             j += 1;
+            if j < chars.len() && chars[j] == '=' {
+                j += 1;
+            }
         } else if !(flag || bearer) || j == i {
             continue;
         }
-        while j < chars.len() && matches!(chars[j], ' ' | '\t') {
-            j += 1;
+        if kind == Secret::Weak && !(quoted_key || tight_eq) {
+            continue;
         }
-        let quote = (j < chars.len() && is_quote(chars[j])).then(|| chars[j]);
-        if quote.is_some() {
-            j += 1;
+        j = skip_while(chars, j, |c| c == ' ' || c == '\t');
+        if kind == Secret::Line {
+            if j < chars.len() {
+                out.extend_from_slice(&chars[i..j]);
+                out.extend(REDACTED.chars());
+                i = chars.len();
+            }
+            continue;
         }
-        let scheme: String = chars[j..chars.len().min(j + 7)].iter().collect();
-        let scheme = scheme.to_ascii_lowercase();
-        if !bearer && (scheme.starts_with("bearer ") || scheme.starts_with("basic ")) {
-            j += scheme.find(' ').unwrap_or(0) + 1;
-            while j < chars.len() && chars[j] == ' ' {
-                j += 1;
+        let open = j;
+        j = skip_while(chars, j, |c| c == '\\');
+        let close = match chars.get(j) {
+            Some(&q) if is_quote(q) => Some(q),
+            Some('<') => Some('>'),
+            _ => None,
+        };
+        if close.is_some() {
+            j += 1;
+        } else {
+            j = open;
+        }
+        if !bearer && kind == Secret::Strong && ident.to_ascii_lowercase().contains("authorization")
+        {
+            let word_end = skip_while(chars, j, |c| c.is_ascii_alphabetic());
+            let gap = skip_while(chars, word_end, |c| c == ' ');
+            let more = gap < chars.len() && !ends_value(chars[gap]);
+            if word_end > j && gap > word_end && more {
+                j = gap;
+            }
+        } else if !bearer {
+            let word_end = skip_while(chars, j, |c| c.is_ascii_alphabetic());
+            let word: String = chars[j..word_end].iter().collect();
+            let word = word.to_ascii_lowercase();
+            if matches!(word.as_str(), "bearer" | "basic" | "token" | "digest")
+                && word_end < chars.len()
+                && chars[word_end] == ' '
+            {
+                j = skip_while(chars, word_end, |c| c == ' ');
             }
         }
         let vstart = j;
-        match quote {
-            Some(q) => {
-                while j < chars.len() && chars[j] != q {
-                    j += 1;
-                }
-            }
-            None => {
-                while j < chars.len() && !ends_value(chars[j]) {
-                    j += 1;
-                }
-            }
-        }
+        j = match close {
+            Some(q) => skip_while(chars, j, |c| c != q && c != '\\'),
+            None => skip_while(chars, j, |c| !ends_value(c)),
+        };
         if j == vstart {
             continue;
         }
@@ -1233,5 +1449,263 @@ pub mod tests {
         let tail = log_tail(&many);
         assert!(tail.len() <= LOG_TAIL_BYTES);
         assert!(!tail.contains("password=a\n"));
+    }
+
+    fn consult_once(cfg: &ClassifierConfig, paths: &SparPaths, tail: &str) -> Record {
+        consult(
+            cfg,
+            paths,
+            "r1",
+            "s1",
+            "claude",
+            &state(tail),
+            Site::Verdict,
+            RegexVerdict::Work,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn breaker_trips_on_exhausted_5xx_but_not_on_4xx_and_errors_are_not_memoized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        std::fs::create_dir_all(paths.run_dir("r1")).unwrap();
+
+        let down = fake_system_one(503, "{}".into(), Duration::ZERO);
+        let cfg = enabled_cfg(&down.base_url, &tmp.path().join("key"));
+        assert!(consult_once(&cfg, &paths, "first").error.is_some());
+        let sent = down.bodies.lock().unwrap().len();
+        assert_eq!(sent, 1 + MAX_RETRIES);
+        let rec = consult_once(&cfg, &paths, "second");
+        assert!(
+            rec.error.unwrap().contains("skipped"),
+            "5xx exhausted trips"
+        );
+        breaker_report(&cfg.base_url, false);
+        consult_once(&cfg, &paths, "first");
+        assert_eq!(
+            down.bodies.lock().unwrap().len(),
+            2 * sent,
+            "a 5xx is never served from memory"
+        );
+
+        let refused = fake_system_one(400, "{}".into(), Duration::ZERO);
+        let cfg = enabled_cfg(&refused.base_url, &tmp.path().join("key"));
+        consult_once(&cfg, &paths, "a");
+        consult_once(&cfg, &paths, "b");
+        assert_eq!(refused.bodies.lock().unwrap().len(), 2, "4xx does not trip");
+        let rec = consult_once(&cfg, &paths, "a");
+        assert!(
+            rec.error.unwrap().contains("cached"),
+            "a 4xx is deterministic"
+        );
+        assert_eq!(refused.bodies.lock().unwrap().len(), 2);
+
+        let ok = fake_system_one(200, answer_body("auth", 0.9), Duration::ZERO);
+        let cfg = enabled_cfg(&ok.base_url, &tmp.path().join("key"));
+        consult_once(&cfg, &paths, "");
+        consult_once(&cfg, &paths, "");
+        assert_eq!(
+            ok.bodies.lock().unwrap().len(),
+            2,
+            "an empty tail is not memoized"
+        );
+        let mut other = state("same tail");
+        consult_once(&cfg, &paths, "same tail");
+        other.spar_error = Some("missing expected artifact".into());
+        classify(&cfg, "claude", &other).unwrap();
+        assert_eq!(
+            ok.bodies.lock().unwrap().len(),
+            4,
+            "spar_error is part of the key"
+        );
+    }
+
+    #[test]
+    fn a_lapsed_breaker_lets_exactly_one_probe_through() {
+        let url = "http://breaker.test/one-probe";
+        let budget = Duration::from_secs(6);
+        breakers().lock().unwrap().insert(
+            url.into(),
+            Breaker::Open(Instant::now() - Duration::from_secs(1)),
+        );
+        let admitted: Vec<bool> = std::thread::scope(|sc| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| sc.spawn(|| breaker_admits(url, budget)))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(admitted.iter().filter(|a| **a).count(), 1);
+        breaker_report(url, false);
+        assert!(breaker_admits(url, budget));
+    }
+
+    #[test]
+    fn tool_output_and_tool_arguments_never_reach_the_tail() {
+        let log = "# spawn claude -p\ncwd=/w\n---\n\
+            → Bash  {\"command\":\"cat .env\"}\n\
+            ← ✓  t1  OPENAI_API_KEY=sk-live-abcdefghijklmnop STRIPE=rk_live_zzz\n\
+            ← ✗  t2  {\"error\":\"quota exceeded\",\"token\":\"abc\"}\n\
+            Let me check the config.\n\
+            ! API Error: 429 You've hit your usage limit\n\
+            · done  ·  2 tools\n";
+        let tail = log_tail(log);
+        assert_eq!(
+            tail,
+            "→ Bash\nLet me check the config.\n! API Error: 429 You've hit your usage limit\n· done  ·  2 tools\n"
+        );
+    }
+
+    #[test]
+    fn a_secret_line_cut_anywhere_never_leaks_through_failure_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("slot.log");
+        let secret = "s3cr3tvalue";
+        for pad in 0..64 {
+            let filler: String = (0..LOG_TAIL_BYTES / 20)
+                .map(|i| format!("line {i:05} ok here\n"))
+                .collect();
+            let text = format!(
+                "start\nexport DATABASE_PASSWORD={secret} more words here\n{filler}{}",
+                "y".repeat(pad)
+            );
+            std::fs::write(&log, &text).unwrap();
+            let st =
+                FailureState::new("cli:claude", "implementer", Some(1), None, None, None, &log);
+            assert!(
+                !st.log_tail.contains(secret),
+                "pad {pad}: {}",
+                &st.log_tail[..80]
+            );
+            assert!(
+                !st.log_tail.contains("words here") || st.log_tail.contains("DATABASE_PASSWORD")
+            );
+        }
+
+        let value = format!("hunter2 {}", "f ".repeat((LOG_TAIL_BYTES - 12) / 2));
+        let value_first = format!("head password={value}\nend");
+        let cut_at = value_first.len() - LOG_TAIL_BYTES;
+        assert!(
+            value_first[..cut_at].ends_with("password="),
+            "the cut drops the key"
+        );
+        let tail = log_tail(&value_first);
+        assert!(
+            !tail.contains("hunter2"),
+            "a long cut line is dropped whole"
+        );
+        assert_eq!(tail, "end");
+    }
+
+    #[test]
+    fn redaction_covers_escaped_json_schemes_cookies_pem_and_query_params() {
+        let cases: &[(&str, &str)] = &[
+            (r#"{\"password\": \"hunter2\"}"#, "hunter2"),
+            (
+                r#"{"type":"result","result":"API_KEY=\"k3yv4lue\" set"}"#,
+                "k3yv4lue",
+            ),
+            (r#"{\"api_key\":\"abcde\",\"user\":\"bob\"}"#, "abcde"),
+            ("Authorization: token ghx123", "ghx123"),
+            ("Authorization: Digest qopauth9", "qopauth9"),
+            ("Proxy-Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+            ("Cookie: session=abc123; csrftoken=zz9", "abc123"),
+            ("Set-Cookie: sid=q1w2e3; Path=/; HttpOnly", "q1w2e3"),
+            ("curl -u admin:pa55w0rd https://x", "pa55w0rd"),
+            ("curl --user admin:pa55w0rd https://x", "pa55w0rd"),
+            ("git clone https://ghtok3n@github.com/o/r", "ghtok3n"),
+            ("SMTP_PASS=mailpw", "mailpw"),
+            ("gpg_passphrase: horse battery", "horse"),
+            ("DB_PASSWORD := pg-secret", "pg-secret"),
+            ("GET /x?key=k1k2&sig=s1s2&token=t1t2&page=2", "k1k2"),
+            ("GET /x?key=k1k2&sig=s1s2&token=t1t2&page=2", "s1s2"),
+            ("GET /x?key=k1k2&sig=s1s2&token=t1t2&page=2", "t1t2"),
+            ("https://h/p?secret=zzz&password=yyy", "zzz"),
+            ("https://h/p?secret=zzz&password=yyy", "yyy"),
+            (
+                r#"{"key": "kval", "auth": "aval", "credentials": "cval"}"#,
+                "kval",
+            ),
+            (
+                r#"{"key": "kval", "auth": "aval", "credentials": "cval"}"#,
+                "aval",
+            ),
+            (
+                r#"{"key": "kval", "auth": "aval", "credentials": "cval"}"#,
+                "cval",
+            ),
+            ("password=<hunter 2>", "hunter 2"),
+        ];
+        for (line, leak) in cases {
+            let out = redact(line);
+            assert!(!out.contains(leak), "leaked {leak}: {out}");
+        }
+        assert!(redact("Cookie: a=b").starts_with("Cookie: "));
+        assert!(redact("GET /x?key=k1k2&page=2").contains("page=2"));
+        assert!(redact(r#"{\"api_key\":\"abcde\",\"user\":\"bob\"}"#).contains("bob"));
+        let pem = "before\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk\nAAAA\n-----END OPENSSH PRIVATE KEY-----\nafter";
+        assert_eq!(redact(pem), "before\n<redacted>\nafter");
+        let cut = "x\n-----BEGIN RSA PRIVATE KEY-----\nMIIEow";
+        assert_eq!(redact(cut), "x\n<redacted>");
+        for kept in [
+            "auth: not logged in",
+            "[auth]: credentials rejected",
+            "the key: a missing semicolon",
+        ] {
+            assert_eq!(redact(kept), kept);
+        }
+    }
+
+    /// Offline check against the evaluation corpus (no model calls): does the new tail
+    /// keep the provider's own error wording the eval sent? Run with
+    /// `SPAR_CLASSIFIER_EVAL_CORPUS=<corpus.jsonl> cargo test eval_corpus_tails -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn eval_corpus_tails() {
+        let path = std::env::var("SPAR_CLASSIFIER_EVAL_CORPUS").expect("corpus path");
+        let text = std::fs::read_to_string(path).unwrap();
+        let (mut items, mut lines_total, mut lines_kept, mut whole) = (0, 0, 0, 0);
+        let mut misses = Vec::new();
+        for l in text.lines() {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            let Some(raw) = v["tail8k"].as_str() else {
+                continue;
+            };
+            items += 1;
+            let eval_tail = tail_bytes(raw, LOG_TAIL_BYTES);
+            let new_tail = log_tail(raw);
+            let provider = provider_lines(eval_tail);
+            let wanted: Vec<String> = provider
+                .lines()
+                .filter(|l| !l.trim().is_empty() && !l.starts_with("→ "))
+                .rev()
+                .take(5)
+                .map(|l| redact(l).trim().to_string())
+                .collect();
+            let kept = wanted
+                .iter()
+                .filter(|w| new_tail.contains(w.as_str()))
+                .count();
+            lines_total += wanted.len();
+            lines_kept += kept;
+            if kept == wanted.len() {
+                whole += 1;
+            } else {
+                misses.push((
+                    v["id"].as_str().unwrap_or("?").to_string(),
+                    wanted
+                        .iter()
+                        .filter(|w| !new_tail.contains(w.as_str()))
+                        .map(|w| w.chars().take(100).collect::<String>())
+                        .collect::<Vec<_>>(),
+                ));
+            }
+        }
+        println!(
+            "{items} items; last-5 provider lines kept in full for {whole}; {lines_kept}/{lines_total} lines kept"
+        );
+        for (id, lost) in &misses {
+            println!("  {id}: lost {lost:?}");
+        }
     }
 }

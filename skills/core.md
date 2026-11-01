@@ -136,9 +136,10 @@ classifier says the work failed at >= `veto_threshold` (0.9), the run is not par
 vetoed quota verdict keeps its pause but weak (a strong pause that predates this dispatch
 is left alone), a vetoed auth verdict writes no pause. Below threshold, on timeout (6s
 budget per consult) or error, or with a missing key, spar's own verdict stands; after a
-network failure the classifier is skipped for 5 minutes. The request carries the provider, role, exit
-code, signal, tool count, spar's error and the last 4 KB of the log with secrets
-redacted. Every call appends a `classifier` event to `events.jsonl` (`model`, `choice`,
+network failure the classifier is skipped for 5 minutes. The request carries the provider,
+role, exit code, signal, tool count, spar's error and the last 4 KB of the provider's own
+log lines: tool results and tool arguments are never sent, and what remains is redacted
+for secrets. Every call appends a `classifier` event to `events.jsonl` (`model`, `choice`,
 `probability`, `probabilities`, `acted`, `action`, `regex_verdict`, `latency_ms`,
 `cost_usd`, `cached`, `error`), and the slot's last one is `slots[].classifier` in
 `status --json`. `spar doctor` shows whether it is on and the key is readable.
