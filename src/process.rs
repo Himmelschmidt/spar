@@ -2434,8 +2434,13 @@ impl LogWriter {
     }
 }
 
-/// Read only the last `max_bytes` of a log (seek from end). Avoids loading multi-MB logs.
-/// Empty when the log cannot be read.
+/// Read only the last `max_bytes` of a log's provider output (seek from end). Avoids
+/// loading multi-MB logs. Empty when the log cannot be read.
+///
+/// The `# spawn` header spar writes ahead of the output is never part of the tail: its
+/// session id, run id and paths are not the provider talking, and the quota scrape's
+/// bare `429` / `billing` needles matched them, pausing a provider that never said a
+/// word about limits.
 pub fn tail_log(path: &Path, max_bytes: usize) -> String {
     let Ok(mut f) = File::open(path) else {
         return String::new();
@@ -2443,21 +2448,42 @@ pub fn tail_log(path: &Path, max_bytes: usize) -> String {
     let Ok(len) = f.seek(SeekFrom::End(0)) else {
         return String::new();
     };
-    let truncated = len > max_bytes as u64;
-    let seeked = if truncated {
-        f.seek(SeekFrom::End(-(max_bytes as i64))).is_ok()
-    } else {
-        f.seek(SeekFrom::Start(0)).is_ok()
-    };
+    let start = len
+        .saturating_sub(max_bytes as u64)
+        .max(spawn_header_len(&f));
     let mut buf = Vec::new();
-    if !seeked || f.read_to_end(&mut buf).is_err() {
+    if f.seek(SeekFrom::Start(start)).is_err() || f.read_to_end(&mut buf).is_err() {
         return String::new();
     }
-    if truncated {
+    if start > 0 {
         let skip = next_char_boundary(&buf, 0);
         buf.drain(..skip);
     }
     String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Byte length of the header `run_captured_with_adapter` writes (`# spawn` line through
+/// the `---` line), 0 when the log does not open with a complete one.
+fn spawn_header_len(f: &File) -> u64 {
+    let mut reader = BufReader::new(f);
+    if reader.seek(SeekFrom::Start(0)).is_err() {
+        return 0;
+    }
+    if !reader.fill_buf().is_ok_and(|b| b.starts_with(b"# spawn ")) {
+        return 0;
+    }
+    let mut line = Vec::new();
+    let mut read = 0u64;
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => return 0,
+            Ok(n) => read += n as u64,
+        }
+        if line == b"---\n" {
+            return read;
+        }
+    }
 }
 
 fn next_char_boundary(buf: &[u8], mut i: usize) -> usize {
@@ -3908,6 +3934,20 @@ mod tests {
         // Must be valid UTF-8 view (lossless for our content after boundary).
         assert!(t.contains("END"));
         assert!(!t.chars().any(|c| c == '\u{FFFD}'));
+    }
+
+    #[test]
+    fn tail_log_leaves_out_the_spawn_header() {
+        let tmp = tempdir().unwrap();
+        let log = tmp.path().join("impl.log");
+        std::fs::write(
+            &log,
+            "# spawn /bin/claude -p --session-id 0429abcd-0000\ncwd=/src/billing-api-spar-e4291f00-impl\n---\nboom\n",
+        )
+        .unwrap();
+
+        assert_eq!(tail_log(&log, 10_000), "boom\n");
+        assert_eq!(tail_log(&log, 3), "om\n");
     }
 
     #[test]
