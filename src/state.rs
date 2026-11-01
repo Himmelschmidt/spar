@@ -982,11 +982,13 @@ impl RunState {
 
     pub fn save(&self, paths: &SparPaths) -> Result<()> {
         paths.ensure_run_dirs(&self.id)?;
-        let prev_phase = if paths.state_file(&self.id).is_file() {
-            RunState::load(paths, &self.id).ok().map(|s| s.phase)
+        let prev = if paths.state_file(&self.id).is_file() {
+            RunState::load(paths, &self.id).ok()
         } else {
             None
         };
+        let prev_phase = prev.as_ref().map(|s| s.phase);
+        let prev_archived = prev.is_some_and(|s| s.archived_at.is_some());
         let file = paths.state_file(&self.id);
         let text = serde_json::to_string_pretty(self)?;
         // Written through a temp file in the same directory, then renamed: `state.json`
@@ -999,6 +1001,17 @@ impl RunState {
         std::fs::rename(&tmp, &file).with_context(|| format!("replace {}", file.display()))?;
         crate::runlock::note_state_written(paths, &self.id);
 
+        // Archiving moves no phase, so without these a feed client would keep showing an
+        // archived run forever (O146).
+        match (prev_archived, self.archived_at) {
+            (false, Some(at)) => {
+                let _ = crate::events::append(paths, &self.id, &crate::events::Event::archived(at));
+            }
+            (true, None) => {
+                let _ = crate::events::append(paths, &self.id, &crate::events::Event::unarchived());
+            }
+            _ => {}
+        }
         if prev_phase != Some(self.phase) {
             let mut ev = crate::events::Event::phase(self.phase, prev_phase);
             ev.round = Some(self.round);
