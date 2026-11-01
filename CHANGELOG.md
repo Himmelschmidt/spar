@@ -4,6 +4,25 @@ All notable changes to spar are recorded here.
 
 ## [Unreleased]
 
+## [0.0.7] - 2026-11-01
+
+### Added
+
+- **herdr can now be your spar monitor.** An optional herdr plugin gives every project
+  with active runs its own workspace and every run its own pane, and the sidebar shows
+  which runs are working and which need you, across all your projects at once. From a
+  run's pane you can open a popup to act on its gate (only the actions that apply right
+  now, each run only after you type yes) or open live logs for its agents. It works on
+  a phone-sized screen as well as a desktop, and the pi front end keeps working
+  alongside it or without it.
+- **spar can ask a small, cheap classifier about failures its own rules don't
+  recognise.** When an agent fails with an error spar would otherwise treat as a plain
+  work failure, it can check whether it was really a usage limit, a login problem or a
+  passing outage, and pause, re-route or retry accordingly. It is off unless you turn
+  it on with your own API key, only ever sees the provider's error lines (never your
+  code or tool output, with secrets removed), gives up after a few seconds and
+  backs off if the service is down.
+
 ## [0.0.6] - 2026-11-01
 
 ### Added
