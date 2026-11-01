@@ -30,5 +30,5 @@ Decisions: `DECISIONS.md` **O145**, **O146**.
 
 ## Prerequisites
 
-- pi installed on rhodium (also needed to exercise the pi adapter from O99 for real).
+- pi 1.4.0 installed on the dev box (`~/.local/bin/pi`).
 - A survey of existing pi packages before building any widget by hand.
