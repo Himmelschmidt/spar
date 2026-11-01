@@ -26,6 +26,7 @@ export function installFake(responses: Record<string, unknown>): Fake {
 	writeFileSync(join(dir, "responses.json"), JSON.stringify(responses));
 	writeFileSync(join(dir, "calls.log"), "");
 	process.env.FAKE_SPAR_DIR = dir;
+	delete process.env.SPAR_PI_BIN;
 	process.env.PATH = `${dir}:${ORIGINAL_PATH}`;
 	return {
 		dir,
@@ -38,6 +39,7 @@ export function installFake(responses: Record<string, unknown>): Fake {
 }
 
 export function installNoSpar(): void {
+	delete process.env.SPAR_PI_BIN;
 	process.env.PATH = scratch("spar-pi-empty-");
 }
 
@@ -82,6 +84,7 @@ export function row(id: string, over: Partial<RunRow> = {}): RunRow {
 		dry_run: false,
 		updated_at: new Date(Date.now() - HOUR).toISOString(),
 		task: `task for ${id}\nmore`,
+		cost_usd: null,
 		...over,
 	};
 }

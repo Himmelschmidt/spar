@@ -1,8 +1,9 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import { SPAR_BIN, type SparEvent } from "./spar.ts";
+import { type SparEvent, sparBin } from "./spar.ts";
 
-// The O146 contract: one JSON object per line, `{run_id, cursor, ...event}`. Everything that
+// The O146 contract: one JSON object per line, `{run_id, cursor, ...event}`, where `cursor` is
+// an opaque string (`1,<run>:<offset>,...`) passed back verbatim as `--since`. Everything that
 // depends on that shape lives in this file.
 export interface FeedEvent extends SparEvent {
 	run_id: string;
@@ -20,9 +21,8 @@ export function parseFeedLine(line: string): FeedEvent | undefined {
 	}
 	if (typeof value !== "object" || value === null) return undefined;
 	const raw = value as Record<string, unknown>;
-	if (typeof raw.run_id !== "string" || raw.cursor === undefined || raw.cursor === null) return undefined;
-	const cursor = typeof raw.cursor === "string" ? raw.cursor : JSON.stringify(raw.cursor);
-	return { ...(raw as unknown as SparEvent), run_id: raw.run_id, cursor };
+	if (typeof raw.run_id !== "string" || typeof raw.cursor !== "string") return undefined;
+	return { ...(raw as unknown as SparEvent), run_id: raw.run_id, cursor: raw.cursor };
 }
 
 export function feedArgs(cursor: string | undefined): string[] {
@@ -58,11 +58,14 @@ export class EventFeed {
 
 	start(): void {
 		if (this.stopped || this.child) return;
-		const child = spawn(SPAR_BIN, feedArgs(this.cursor), {
+		// stdin stays open so a spar that exits on EOF dies with us even when pi is SIGKILLed.
+		const child = spawn(sparBin(), feedArgs(this.cursor), {
 			cwd: this.options.cwd,
-			stdio: ["ignore", "pipe", "ignore"],
+			stdio: ["pipe", "pipe", "ignore"],
 			windowsHide: true,
 		});
+		const killOnExit = () => child.kill("SIGTERM");
+		process.once("exit", killOnExit);
 		this.child = child;
 		this.options.onConnect?.();
 
@@ -79,6 +82,7 @@ export class EventFeed {
 			if (error.code === "ENOENT") missing = true;
 		});
 		child.on("close", () => {
+			process.removeListener("exit", killOnExit);
 			if (this.child === child) this.child = undefined;
 			if (missing) this.stopped = true;
 			this.scheduleRestart();

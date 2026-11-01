@@ -4,6 +4,9 @@
   "private": true,
   "description": "spar's human front end for the pi coding agent: run footer, run list and run detail",
   "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
   "keywords": [
     "pi-package"
   ],

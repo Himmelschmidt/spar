@@ -28,7 +28,14 @@ if (key === undefined) {
 	process.stderr.write(`error: no fake response for "${line}"\n`);
 	process.exit(2);
 }
-const value = responses[key];
+let value = responses[key];
+if (value && typeof value === "object" && Array.isArray(value.__seq)) {
+	const n = fs
+		.readFileSync(path.join(dir, "calls.log"), "utf8")
+		.split("\n")
+		.filter((l) => l === line).length - 1;
+	value = value.__seq[Math.min(n, value.__seq.length - 1)];
+}
 if (value && typeof value === "object" && "__exit" in value) {
 	process.stderr.write(`${value.__stderr ?? "error"}\n`);
 	process.exit(value.__exit);

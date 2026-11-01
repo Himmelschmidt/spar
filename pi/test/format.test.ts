@@ -5,26 +5,36 @@ import type { Brief } from "../extensions/spar/spar.ts";
 import { minutesSinceLocalMidnight, statsCost } from "../extensions/spar/spar.ts";
 import { row, status } from "./helpers.ts";
 
-test("runs needing the operator sort first, then running, then most recent", () => {
+const DAY = 86_400_000;
+
+test("fresh runs needing the operator sort first, then running, then stale ones, then most recent", () => {
 	const now = Date.now();
 	const runs = [
 		row("old", { updated_at: new Date(now - 5000).toISOString() }),
 		row("live", { holds_seat: true }),
 		row("new", { updated_at: new Date(now).toISOString() }),
 		row("gate", { needs_human: true }),
+		row("stale", { needs_human: true, updated_at: new Date(now - 8 * DAY).toISOString() }),
 	];
 	assert.deepEqual(
-		sortRuns(runs).map((r) => r.id),
-		["gate", "live", "new", "old"],
+		sortRuns(runs, new Date(now)).map((r) => r.id),
+		["gate", "live", "stale", "new", "old"],
 	);
 });
 
-test("footer counts running and waiting runs, paused providers and cost", () => {
+test("footer counts running runs, runs waiting in the last 7 days, paused providers and cost", () => {
+	const now = new Date();
 	const text = footerText(
 		{
-			runs: [row("a", { holds_seat: true }), row("b", { needs_human: true }), row("c", { needs_human: true })],
+			runs: [
+				row("a", { holds_seat: true }),
+				row("b", { needs_human: true }),
+				row("c", { needs_human: true }),
+				row("d", { needs_human: true, updated_at: new Date(now.getTime() - 8 * DAY).toISOString() }),
+			],
 			paused: [{ name: "codex", quota_status: "paused" }],
 			costToday: 3.5,
+			now,
 		},
 		plain,
 	);
@@ -32,18 +42,26 @@ test("footer counts running and waiting runs, paused providers and cost", () => 
 });
 
 test("footer omits empty parts", () => {
-	assert.equal(footerText({ runs: [], paused: [], costToday: undefined }, plain), "spar | 0 running");
+	assert.equal(footerText({ runs: [], paused: [], costToday: undefined, now: new Date() }, plain), "spar | 0 running");
 });
 
-test("list rows carry id, phase, workflow, round, age, flag and cost", () => {
-	const runs = [row("aaaa1111", { round: 3 }), row("bbbb2222", { needs_human: true, phase: "awaiting_ship_confirm" })];
-	const costs = new Map([["aaaa1111", status("aaaa1111").cost!.total]]);
-	const rows = listRows(runs, costs, new Date());
-	assert.equal(rows[0]!.id, "bbbb2222");
+test("list rows carry id, phase, round, age, flag, cost and workflow", () => {
+	const now = new Date();
+	const runs = [
+		row("aaaa1111", { round: 3, cost_usd: 12.5 }),
+		row("bbbb2222", { needs_human: true, phase: "awaiting_ship_confirm" }),
+		row("cccc3333", { needs_human: true, updated_at: new Date(now.getTime() - 9 * DAY).toISOString() }),
+	];
+	const rows = listRows(runs, now);
+	assert.deepEqual(
+		rows.map((r) => r.id),
+		["bbbb2222", "cccc3333", "aaaa1111"],
+	);
 	assert.match(rows[0]!.label, /^bbbb2222\s+awaiting_ship_confirm\s+r1\s+1h\s+NEEDS YOU\s+-\s+loop\s*$/);
-	assert.match(rows[1]!.label, /^aaaa1111\s+review\s+r3\s+1h\s+\$12\.50\+\s+loop\s*$/);
-	assert.equal(rows[1]!.description, "task for aaaa1111");
-	assert.equal(listText([], new Map(), new Date()), "spar: no runs in this project");
+	assert.match(rows[1]!.label, /^cccc3333\s+review\s+r1\s+9d\s+stale\s+-\s+loop\s*$/);
+	assert.match(rows[2]!.label, /^aaaa1111\s+review\s+r3\s+1h\s+\$12\.50\s+loop\s*$/);
+	assert.equal(rows[2]!.description, "task for aaaa1111");
+	assert.equal(listText([], now), "spar: no runs in this project");
 });
 
 test("detail groups findings by severity and ends with the next command", () => {

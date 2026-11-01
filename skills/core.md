@@ -1243,6 +1243,7 @@ event/presence mirror live under `.spar/runs/<id>/bus/`.
 
 ```bash
 spar status [run_id] [--json] [--all]   # --all = every registered project; a run with a live orchestrator shows `pid=<n>`
+spar status --here [--json]   # {"project_root", "spar_initialized"}: the project this dir resolves to and whether it has a .spar/; reads no runs
 spar status --hosts h1,h2 | --all-hosts [--json]   # runs on other boxes over ssh (O140)
 spar stats [--since 7d] [--by model|role|provider|project] [--all-projects] [--json]
 spar wait <run_id> [--timeout 8h] [--follow] [--json]
@@ -1425,6 +1426,17 @@ spar grows, and a hard-coded "live" list goes stale. Read the booleans.
 | `holds_seat` | the run occupies, or is about to occupy, provider capacity: orchestrator alive, or queued in the daemon's admission queue waiting on a provider bucket. Count these as live; never re-brief one |
 | `needs_human` | nothing moves until a person acts: a human gate, the `plan_approved` handoff, or a broken run (`failed`, `stuck`, `escalated`, `quota`, abandoned). The TUI's `⚑ need you` flags read the same rule |
 | `resumable` | `implement --run` / `spar resume` would pick it up now. Never true while `holds_seat` |
+
+List rows also carry `cost_usd`: the run's total reported spend, `null` when no dispatch
+reported one (the same number as `cost.total.cost_usd` in `status <id> --json`, where
+`cost_reported` says whether it is partial). Read commands (`status`, `stats
+--all-projects`) register a project in the global registry only once it has a `.spar/`;
+any git checkout resolves as a project root, so `status --here` is how a front end tells
+an initialized project from a bare repo.
+
+`brief <id> --json` `next_command` is the one command that moves the run on; a `done` run
+gets `spar cleanup <id> --if-merged` and a `plan_rejected` one `spar cleanup <id>`, never
+`spar resume`.
 
 **Reviews.** When the implement gate (or `--workflow review`) reads a reviewer's
 `review-<slot>.md`, it records the parse on that slot as `slots[].review` (`null` until

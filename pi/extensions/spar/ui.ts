@@ -1,23 +1,34 @@
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder, getSelectListTheme } from "@earendil-works/pi-coding-agent";
-import { Container, SelectList, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { Container, Key, matchesKey, SelectList, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import type { ListRow, Paint } from "./format.ts";
 
 export function themePaint(theme: Theme): Paint {
 	return (tone, text) => theme.fg(tone, text);
 }
 
+const HEIGHT = 0.85;
 const OVERLAY = { overlay: true, overlayOptions: { width: "90%", maxHeight: "85%", anchor: "center" } } as const;
 
-export function pickRun(ctx: ExtensionContext, rows: ListRow[], waiting: number): Promise<string | undefined> {
+function overlayRows(terminalRows: number): number {
+	return Math.floor(terminalRows * HEIGHT);
+}
+
+export function pickRun(
+	ctx: ExtensionContext,
+	rows: ListRow[],
+	waiting: number,
+	stale: number,
+): Promise<string | undefined> {
 	return ctx.ui.custom<string | undefined>((tui, theme, _keybindings, done) => {
 		const container = new Container();
 		const border = new DynamicBorder((s) => theme.fg("accent", s));
-		const title = `spar runs: ${rows.length}${waiting ? `, ${waiting} need you` : ""}`;
+		const title = `spar runs: ${rows.length}${waiting ? `, ${waiting} need you` : ""}${stale ? `, ${stale} stale` : ""}`;
 		const labelWidth = Math.max(...rows.map((r) => r.label.length)) + 2;
 		const list = new SelectList(
 			rows.map((r) => ({ value: r.id, label: r.label, description: r.description })),
-			Math.max(5, Math.min(rows.length, tui.terminal.rows - 10)),
+			// Borders, title, hint and the list's own scroll line.
+			Math.max(3, Math.min(rows.length, overlayRows(tui.terminal.rows) - 5)),
 			getSelectListTheme(),
 			{ minPrimaryColumnWidth: labelWidth, maxPrimaryColumnWidth: labelWidth },
 		);
@@ -45,7 +56,7 @@ export function showDetail(ctx: ExtensionContext, build: (paint: Paint) => strin
 	return ctx.ui.custom<DetailResult>((tui, theme, keybindings, done) => {
 		const lines = build(themePaint(theme));
 		let top = 0;
-		const viewport = () => Math.max(5, Math.floor(tui.terminal.rows * 0.85) - 4);
+		const viewport = () => Math.max(3, overlayRows(tui.terminal.rows) - 3);
 		const maxTop = () => Math.max(0, lines.length - viewport());
 		return {
 			render(width: number): string[] {
@@ -63,8 +74,10 @@ export function showDetail(ctx: ExtensionContext, build: (paint: Paint) => strin
 			invalidate() {},
 			handleInput(data: string): void {
 				const page = viewport();
-				if (keybindings.matches(data, "tui.select.cancel")) return done("close");
-				if (data === "b" || data === "q") return done(data === "b" ? "back" : "close");
+				if (keybindings.matches(data, "tui.select.cancel") || matchesKey(data, Key.escape) || matchesKey(data, "q")) {
+					return done("close");
+				}
+				if (matchesKey(data, "b")) return done("back");
 				if (keybindings.matches(data, "tui.select.up")) top = Math.max(0, top - 1);
 				else if (keybindings.matches(data, "tui.select.down")) top = Math.min(maxTop(), top + 1);
 				else if (keybindings.matches(data, "tui.select.pageUp")) top = Math.max(0, top - page);

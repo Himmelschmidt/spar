@@ -1,4 +1,4 @@
-import type { Brief, BusMessage, CostLine, Finding, Provider, RunRow, RunStatus, SparEvent } from "./spar.ts";
+import { type Brief, type BusMessage, type CostLine, type Finding, isStale, type Provider, type RunRow, type RunStatus, type SparEvent } from "./spar.ts";
 
 export type Tone = "accent" | "warning" | "error" | "success" | "muted" | "dim";
 export type Paint = (tone: Tone, text: string) => string;
@@ -12,11 +12,12 @@ export interface FooterState {
 	runs: RunRow[];
 	paused: Provider[];
 	costToday: number | undefined;
+	now: Date;
 }
 
 export function footerText(state: FooterState, paint: Paint): string {
 	const running = state.runs.filter((r) => r.holds_seat).length;
-	const waiting = state.runs.filter((r) => r.needs_human).length;
+	const waiting = state.runs.filter((r) => r.needs_human && !isStale(r, state.now)).length;
 	const parts = [paint("accent", "spar"), `${running} running`];
 	if (waiting > 0) parts.push(paint("warning", `${waiting} need you`));
 	if (state.paused.length > 0) parts.push(paint("error", `paused ${state.paused.map((p) => p.name).join(",")}`));
@@ -24,8 +25,8 @@ export function footerText(state: FooterState, paint: Paint): string {
 	return parts.join(paint("dim", " | "));
 }
 
-export function sortRuns<T extends RunRow>(runs: T[]): T[] {
-	const rank = (r: RunRow) => (r.needs_human ? 0 : r.holds_seat ? 1 : 2);
+export function sortRuns<T extends RunRow>(runs: T[], now: Date): T[] {
+	const rank = (r: RunRow) => (r.needs_human && !isStale(r, now) ? 0 : r.holds_seat ? 1 : r.needs_human ? 2 : 3);
 	return [...runs].sort((a, b) => rank(a) - rank(b) || Date.parse(b.updated_at) - Date.parse(a.updated_at));
 }
 
@@ -36,6 +37,11 @@ export function money(usd: number): string {
 export function costLabel(cost: CostLine | undefined): string {
 	if (!cost || cost.cost_usd === null || cost.dispatches === 0) return "-";
 	return cost.cost_reported === "all" ? money(cost.cost_usd) : `${money(cost.cost_usd)}+`;
+}
+
+export function runFlag(run: RunRow, now: Date): string {
+	if (run.needs_human) return isStale(run, now) ? "stale" : "NEEDS YOU";
+	return run.holds_seat ? "running" : "";
 }
 
 export function age(iso: string, now: Date): string {
@@ -62,28 +68,28 @@ export interface ListRow {
 	description: string;
 }
 
-export function listRows(runs: RunRow[], costs: Map<string, CostLine | undefined>, now: Date): ListRow[] {
-	const sorted = sortRuns(runs);
+export function listRows(runs: RunRow[], now: Date): ListRow[] {
+	const sorted = sortRuns(runs, now);
 	const phaseWidth = Math.max(5, ...sorted.map((r) => r.phase.length));
 	const workflowWidth = Math.max(8, ...sorted.map((r) => r.workflow.length));
 	return sorted.map((r) => {
-		const flag = r.needs_human ? "NEEDS YOU" : r.holds_seat ? "running" : "";
+		const flag = runFlag(r, now);
 		const label = [
 			r.id,
 			r.phase.padEnd(phaseWidth),
 			`r${r.round}`.padEnd(4),
 			age(r.updated_at, now).padStart(4),
 			flag.padEnd(9),
-			costLabel(costs.get(r.id)).padStart(9),
+			(r.cost_usd === null || r.cost_usd === undefined ? "-" : money(r.cost_usd)).padStart(9),
 			r.workflow.padEnd(workflowWidth),
 		].join("  ");
 		return { id: r.id, label, description: firstLine(r.task) };
 	});
 }
 
-export function listText(runs: RunRow[], costs: Map<string, CostLine | undefined>, now: Date): string {
+export function listText(runs: RunRow[], now: Date): string {
 	if (runs.length === 0) return "spar: no runs in this project";
-	return listRows(runs, costs, now)
+	return listRows(runs, now)
 		.map((r) => r.label.trimEnd())
 		.join("\n");
 }
@@ -127,7 +133,8 @@ export function detailLines({ status, brief, bus, now }: DetailInput, paint: Pai
 		lines.push(paint("accent", t));
 	};
 	const maxRounds = status.max_rounds ?? brief?.max_rounds;
-	const flag = status.needs_human ? paint("warning", "  NEEDS YOU") : status.holds_seat ? paint("success", "  running") : "";
+	const statusFlag = runFlag(status, now);
+	const flag = statusFlag ? `  ${paint(statusFlag === "NEEDS YOU" ? "warning" : statusFlag === "running" ? "success" : "dim", statusFlag)}` : "";
 	lines.push(
 		`${paint("accent", `run ${status.id}`)}  ${status.workflow}  phase ${status.phase}  round ${status.round}${maxRounds ? `/${maxRounds}` : ""}${flag}`,
 	);

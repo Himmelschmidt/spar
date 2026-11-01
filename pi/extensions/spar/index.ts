@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { Footer } from "./footer.ts";
 import { detailLines, listRows, listText, plain, sortRuns } from "./format.ts";
-import { type Brief, type BusMessage, type CostLine, type RunRow, type RunStatus, sparJson } from "./spar.ts";
+import { type Brief, type BusMessage, isRunId, isStale, type RunRow, type RunStatus, sparJson } from "./spar.ts";
 import { pickRun, showDetail, themePaint } from "./ui.ts";
 
 const STATUS_KEY = "spar";
@@ -34,13 +34,23 @@ export default function (pi: ExtensionAPI) {
 		description: "spar runs: /spar lists them, /spar <id> shows one",
 		getArgumentCompletions: async (prefix) => {
 			const runs = footer?.runs ?? (await listRuns(cwd)) ?? [];
-			const items: AutocompleteItem[] = sortRuns(runs)
+			const now = new Date();
+			const items: AutocompleteItem[] = sortRuns(runs, now)
 				.filter((r) => r.id.startsWith(prefix.trim()))
-				.map((r) => ({ value: r.id, label: r.id, description: `${r.phase}${r.needs_human ? ", needs you" : ""}` }));
+				.map((r) => {
+					const flag = r.needs_human ? (isStale(r, now) ? ", needs you (stale)" : ", needs you") : "";
+					return { value: r.id, label: r.id, description: `${r.phase}${flag}` };
+				});
 			return items.length ? items : null;
 		},
 		handler: async (args, ctx) => {
 			const id = args.trim().split(/\s+/)[0] ?? "";
+			if (id && !isRunId(id)) {
+				const message = `spar: "${id}" is not a run id. Usage: /spar [run-id]`;
+				if (ctx.mode === "tui") ctx.ui.notify(message, "error");
+				else emit(ctx, message);
+				return;
+			}
 			if (ctx.mode !== "tui") {
 				emit(ctx, id ? await detailText(ctx.cwd, id) : await runListText(ctx.cwd));
 				return;
@@ -65,19 +75,6 @@ async function listRuns(cwd: string): Promise<RunRow[] | undefined> {
 	return runs.ok ? runs.value : undefined;
 }
 
-async function runCosts(cwd: string, runs: RunRow[]): Promise<Map<string, CostLine | undefined>> {
-	const costs = new Map<string, CostLine | undefined>();
-	const queue = [...runs];
-	const worker = async () => {
-		for (let run = queue.shift(); run; run = queue.shift()) {
-			const status = await sparJson<RunStatus>(["status", run.id, "--json"], cwd);
-			costs.set(run.id, status.ok ? status.value.cost?.total : undefined);
-		}
-	};
-	await Promise.all(Array.from({ length: 8 }, worker));
-	return costs;
-}
-
 async function chooseRun(ctx: ExtensionContext): Promise<string | undefined> {
 	const runs = await sparJson<RunRow[]>(["status", "--json"], ctx.cwd);
 	if (!runs.ok) {
@@ -88,15 +85,16 @@ async function chooseRun(ctx: ExtensionContext): Promise<string | undefined> {
 		ctx.ui.notify("spar: no runs in this project", "info");
 		return undefined;
 	}
-	const costs = await runCosts(ctx.cwd, runs.value);
-	const waiting = runs.value.filter((r) => r.needs_human).length;
-	return pickRun(ctx, listRows(runs.value, costs, new Date()), waiting);
+	const now = new Date();
+	const waiting = runs.value.filter((r) => r.needs_human && !isStale(r, now)).length;
+	const stale = runs.value.filter((r) => r.needs_human && isStale(r, now)).length;
+	return pickRun(ctx, listRows(runs.value, now), waiting, stale);
 }
 
 async function runListText(cwd: string): Promise<string> {
 	const runs = await sparJson<RunRow[]>(["status", "--json"], cwd);
 	if (!runs.ok) return failure(runs.missing, runs.message);
-	return listText(runs.value, await runCosts(cwd, runs.value), new Date());
+	return listText(runs.value, new Date());
 }
 
 interface Detail {

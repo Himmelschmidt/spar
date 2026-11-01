@@ -386,6 +386,11 @@ pub enum Command {
         /// This host's runs plus every `[registry] remotes` host's.
         #[arg(long)]
         all_hosts: bool,
+        /// Only report the project this directory resolves to and whether spar has
+        /// initialized it (`{"project_root", "spar_initialized"}`). Reads no runs and
+        /// registers nothing: the cheap probe a front end uses before it starts polling.
+        #[arg(long, conflicts_with_all = ["run_id", "all", "archived", "hosts", "all_hosts"])]
+        here: bool,
     },
 
     /// Aggregate run history: rounds, outcomes, review findings, cost, wall time and

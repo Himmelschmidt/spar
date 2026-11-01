@@ -46,8 +46,7 @@ const brief: Brief = {
 
 function fake() {
 	return installFake({
-		"status --json": [row("aaaa1111"), row("bbbb2222", { needs_human: true })],
-		"status aaaa1111 --json": status("aaaa1111"),
+		"status --json": [row("aaaa1111", { cost_usd: 12.5 }), row("bbbb2222", { needs_human: true })],
 		"status bbbb2222 --json": status("bbbb2222", { needs_human: true }),
 		"brief bbbb2222 --json": brief,
 		"bus log --run bbbb2222 --json": [],
@@ -61,7 +60,15 @@ test("/spar in print mode lists runs with the waiting one first", async () => {
 	const out = await printed(() => load().handler("", printCtx(f.dir)));
 	const lines = out.trim().split("\n");
 	assert.match(lines[0]!, /^bbbb2222 .*NEEDS YOU/);
-	assert.match(lines[1]!, /^aaaa1111 .*\$12\.50\+ +loop$/);
+	assert.match(lines[1]!, /^aaaa1111 .*\$12\.50 +loop$/);
+	assert.deepEqual(f.calls(), ["status --json"], "costs come from the list rows");
+});
+
+test("/spar rejects an argument that is not a run id instead of passing it to spar", async () => {
+	const f = fake();
+	const out = await printed(() => load().handler("--all", printCtx(f.dir)));
+	assert.equal(out, 'spar: "--all" is not a run id. Usage: /spar [run-id]\n');
+	assert.deepEqual(f.calls(), []);
 });
 
 test("/spar <id> in print mode prints the run detail", async () => {

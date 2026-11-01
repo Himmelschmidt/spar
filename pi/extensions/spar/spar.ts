@@ -1,6 +1,20 @@
 import { execFile } from "node:child_process";
 
-export const SPAR_BIN = process.env.SPAR_PI_BIN || "spar";
+export function sparBin(): string {
+	return process.env.SPAR_PI_BIN || "spar";
+}
+
+const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+
+export function isRunId(value: string): boolean {
+	return RUN_ID.test(value);
+}
+
+export const STALE_MS = 7 * 86_400_000;
+
+export function isStale(run: { updated_at: string }, now: Date): boolean {
+	return now.getTime() - Date.parse(run.updated_at) > STALE_MS;
+}
 
 export type SparResult<T> =
 	| { ok: true; value: T }
@@ -9,7 +23,7 @@ export type SparResult<T> =
 export function sparJson<T>(args: string[], cwd: string, timeoutMs = 15_000): Promise<SparResult<T>> {
 	return new Promise((resolve) => {
 		execFile(
-			SPAR_BIN,
+			sparBin(),
 			args,
 			{ cwd, timeout: timeoutMs, maxBuffer: 256 * 1024 * 1024, windowsHide: true },
 			(error, stdout, stderr) => {
@@ -42,6 +56,12 @@ export interface RunRow {
 	updated_at: string;
 	task?: string | null;
 	project_name?: string | null;
+	cost_usd?: number | null;
+}
+
+export interface Here {
+	project_root: string | null;
+	spar_initialized: boolean;
 }
 
 export interface CostLine {
