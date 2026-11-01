@@ -23,7 +23,7 @@ export interface Fake {
 export function installFake(responses: Record<string, unknown>): Fake {
 	const dir = scratch("spar-pi-test-");
 	symlinkSync(FAKE, join(dir, "spar"));
-	writeFileSync(join(dir, "responses.json"), JSON.stringify(responses));
+	writeFileSync(join(dir, "responses.json"), JSON.stringify({ "events --tail-cursor --json": { cursor: "1" }, ...responses }));
 	writeFileSync(join(dir, "calls.log"), "");
 	process.env.FAKE_SPAR_DIR = dir;
 	delete process.env.SPAR_PI_BIN;

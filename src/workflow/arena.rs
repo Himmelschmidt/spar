@@ -319,6 +319,11 @@ pub fn confirm_winner(
     slot: Option<String>,
     json: bool,
 ) -> Result<ExitCode> {
+    // Loaded first so a mistyped id fails without the lock minting a run dir. Then
+    // serialized with every other writer: a confirm racing a running `spar reconcile`
+    // would rewrite the state that reconcile is driving.
+    RunState::load(paths, run_id)?;
+    let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
     let mut state = RunState::load(paths, run_id)?;
     if state.phase != Phase::AwaitingWinnerConfirm && state.phase != Phase::AwaitingReconcile {
         anyhow::bail!(

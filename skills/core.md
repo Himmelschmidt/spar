@@ -416,13 +416,15 @@ spar run --workflow review -t "Review PR #12 for auth bugs" --providers cli:clau
 spar plan -t "..." --providers cli:claude --base origin/main
 spar run --workflow review -t "..." --providers cli:grok,cli:claude --base feat/checkout
 
-spar confirm <run_id> [--winner <slot>]   # arena winner
+spar confirm <run_id> [--winner <slot>]   # arena winner; exit 1 while a reconcile holds the run
 spar reconcile <run_id>                  # arena merge-good-parts + review
 spar ship <run_id> --confirm [--base <branch>]   # draft PR (never merges); adopts an open one
 spar ship <run_id> --override-gate --reason "…"  # ship over open findings (stuck/failed/quota/ceiling)
 spar ship <run_id> --adopt-remote               # fast-forward onto a hand-pushed branch, then ship
 spar sync-prs --run <id> | --all [--json] [--dry-run]   # merged PR -> done, closed -> stopped
 spar stop <run_id> [--json]              # halt dispatch, KEEP branch+worktree (resumable)
+                                         # at a gate: no-op, unless a live process holds it
+                                         # (a running reconcile): reaped, run left at the gate
 spar stop --abandoned [--json]           # reap every run nobody is driving any more
 spar cleanup <run_id> [--purge]          # remove worktrees (--purge: run record, KEEPS artifacts/)
 spar cleanup <run_id> --purge-artifacts  # …and artifacts/ too
@@ -1247,7 +1249,7 @@ spar status --here [--json]   # {"project_root", "spar_initialized"}: the projec
 spar status --hosts h1,h2 | --all-hosts [--json]   # runs on other boxes over ssh (O140)
 spar stats [--since 7d] [--by model|role|provider|project] [--all-projects] [--json]
 spar wait <run_id> [--timeout 8h] [--follow] [--json]
-spar events [--run <id>] [--follow] [--since <cursor>|now] [--json]   # every run's events, one feed (O146)
+spar events [--run <id>] [--follow] [--since <cursor>|now] [--tail-cursor] [--exit-on-stdin-eof] [--json]   # every run's events, one feed (O146)
 spar logs <run_id> [slot] [-f|--follow]
 
 # Global home: open `spar` from anywhere. Runs stay under each project’s
@@ -1423,6 +1425,7 @@ spar events --follow --json              # from now; keeps going until killed
 spar events --json                       # backlog of every run, ordered by time, then exits
 spar events --follow --json --since "$CURSOR"   # resume after a disconnect
 spar events --run <id> --json            # one run (shown even if archived)
+spar events --tail-cursor --json         # {"cursor": "..."} for the current end, then exits
 ```
 
 Each `--json` line is one object: `run_id`, `cursor`, then the event's own fields
@@ -1442,6 +1445,15 @@ renamed; ignore a `type` you don't know.
   that; an archived run keeps its entry.
 - `--since now` (the default with `--follow`) starts at the tail. Without `--follow`
   and without `--since`, it starts at the beginning of every run.
+- **Start with no gap:** `--since now` has no cursor until the first event, so a
+  follower that drops before then cannot resume exactly. Take
+  `spar events --tail-cursor --json` first (one line, `{"cursor": "..."}`, no events;
+  plain text without `--json`) and start `--follow --since <that cursor>`; every later
+  restart passes the last cursor seen, or that one if none came. Not with `--follow` or
+  `--since`.
+- `--exit-on-stdin-eof` (with `--follow` only): exit `0` when stdin reaches end of
+  file. Spawn the follower with a stdin pipe and it dies with its parent, even a
+  SIGKILLed one, instead of tailing forever as an orphan.
 - Order is by `ts` within a batch, but one run's events always keep their file order,
   and an event written late can carry an earlier `ts` than one already printed. Don't
   sort on `ts` and drop "older" ones.

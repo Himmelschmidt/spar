@@ -196,6 +196,11 @@ renamed, so ignore a `type` you don't know.
   earlier `ts` than one already printed.
 - `--run <id>` limits the feed to one run (shown even if archived). An unknown id or a
   malformed cursor exits `1`.
+- `--tail-cursor` prints `{"cursor": "..."}` (with `--json`) for the current end of every
+  log and exits, printing no events. Start `--follow --since <that cursor>` with it so a
+  follower that drops before its first event still resumes with no gap.
+- `--exit-on-stdin-eof` makes `--follow` exit `0` when stdin closes, so a follower
+  spawned with a stdin pipe dies with its parent.
 
 ## Status JSON
 
