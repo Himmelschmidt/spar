@@ -132,9 +132,11 @@ typed quota events are never sent. At probability >= `threshold` (0.7) a `quota`
 pauses the provider (strong) and takes the backup path, `auth` takes the O104 path
 (short-wait retry, then backup or park), and `transient` takes the retry loop (still only
 after at least one tool call). When the rules read quota or auth from log text and the
-classifier says the work failed at >= `veto_threshold` (0.9), the verdict becomes a weak
-pause: the run is not parked. Below threshold, on timeout (5s, two retries), an error or a
-missing key, spar's own verdict stands. The request carries the provider, role, exit
+classifier says the work failed at >= `veto_threshold` (0.9), the run is not parked: a
+vetoed quota verdict keeps its pause but weak (a strong pause that predates this dispatch
+is left alone), a vetoed auth verdict writes no pause. Below threshold, on timeout (6s
+budget per consult) or error, or with a missing key, spar's own verdict stands; after a
+network failure the classifier is skipped for 5 minutes. The request carries the provider, role, exit
 code, signal, tool count, spar's error and the last 4 KB of the log with secrets
 redacted. Every call appends a `classifier` event to `events.jsonl` (`model`, `choice`,
 `probability`, `probabilities`, `acted`, `action`, `regex_verdict`, `latency_ms`,

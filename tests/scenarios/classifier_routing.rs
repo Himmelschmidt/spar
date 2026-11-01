@@ -178,7 +178,11 @@ fn a_novel_quota_wording_parks_on_quota_through_the_classifier() {
     assert!(!events.contains("sk-or-v1-scenario-fake"));
 
     let sent = bodies.lock().unwrap();
-    assert!(!sent.is_empty());
+    assert_eq!(
+        sent.len(),
+        1,
+        "the dispatch and verdict sites share one call for the same log"
+    );
     let req: serde_json::Value = serde_json::from_str(&sent[0]).unwrap();
     assert_eq!(req["state"]["provider"], "cli:claude");
     assert!(req["state"]["log_tail"]

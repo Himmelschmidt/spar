@@ -259,7 +259,12 @@ test("a launch cancelled after spar started says it may have launched", async ()
 	const f = installFake({ [line([...PLAN_ARGS, "--validate-only"])]: validated(), [line(PLAN_ARGS)]: { __hold: true } });
 	const controller = new AbortController();
 	const c = ctx(f.dir, { answers: ["Launch"] });
-	setTimeout(() => controller.abort(), 400);
+	const started = setInterval(() => {
+		if (f.calls().length >= 2) {
+			clearInterval(started);
+			controller.abort();
+		}
+	}, 20);
 	await assert.rejects(call(load(), "spar_plan", PLAN, c, controller.signal), /may have launched. Check spar_status/);
 });
 

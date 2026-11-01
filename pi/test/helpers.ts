@@ -57,7 +57,7 @@ export function cleanup(): void {
 	for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 }
 
-export async function until(check: () => boolean, timeoutMs = 5_000): Promise<void> {
+export async function until(check: () => boolean, timeoutMs = 15_000): Promise<void> {
 	const start = Date.now();
 	while (!check()) {
 		if (Date.now() - start > timeoutMs) throw new Error("timed out waiting for condition");

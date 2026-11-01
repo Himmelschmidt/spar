@@ -296,19 +296,11 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
         state.rename_slot(paths, &old_id, &new_id);
         if let Some(s) = state.slot_mut(&new_id) {
             new_slot_id = s.id.clone();
-            s.provider = pin.provider.clone();
-            s.model = pin.model.clone();
+            s.point_at(&pin.display());
             s.source = Some(crate::state::SeatSource::Backup);
-            s.status = SlotStatus::Pending;
-            s.error = None;
-            s.quota_hit = false;
         } else if let Some(s) = state.slot_mut(&job.slot_id) {
-            s.provider = pin.provider.clone();
-            s.model = pin.model.clone();
+            s.point_at(&pin.display());
             s.source = Some(crate::state::SeatSource::Backup);
-            s.status = SlotStatus::Pending;
-            s.error = None;
-            s.quota_hit = false;
         }
         state.save(paths)?;
         let retry_job = SlotJob {

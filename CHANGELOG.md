@@ -4,6 +4,48 @@ All notable changes to spar are recorded here.
 
 ## [Unreleased]
 
+## [0.0.6] - 2026-11-01
+
+### Added
+
+- **spar now has a front end inside the pi coding agent.** A footer shows what is
+  running, which runs need you, which providers are paused and what you have spent
+  today. A command lists your runs and opens any one of them: its phase, its agents,
+  its review findings by severity, its cost, recent activity and the next step.
+- **You can act on a run from there.** Approving or rejecting a plan, shipping
+  (including overriding a blocked review with a stated reason), confirming an arena
+  winner, reconciling, adding rounds, resuming, stopping, recording a ruling, moving
+  a seat to another agent and cleaning up a merged run each open a confirmation that
+  shows exactly what will run. You get a notification when a run starts needing you.
+- **A pi session can drive spar for you.** It can check status, read briefs, logs and
+  history, watch runs and send messages to the agents. Launching a run always asks you
+  first and shows the agents, the gates and the full command; approving and shipping
+  are never left to the model, including when it tries to run them through the shell.
+- **A live feed of every run's progress.** A new command streams what every run in a
+  project is doing as it happens, and a client that disconnects can pick up exactly
+  where it left off.
+- **Checking a launch now shows which agents it would use and which gates it would
+  stop at**, and refuses a run that can't be continued before anything starts.
+
+### Changed
+
+- **The built-in terminal dashboard is gone.** Running spar with no command now prints
+  help; the pi front end replaces the dashboard.
+- **Opening a repository that doesn't use spar no longer registers it as a spar
+  project.**
+
+### Fixed
+
+- **A provider is no longer paused for hitting a limit it never hit.** spar could mistake
+  its own bookkeeping, or a project whose folder name contains words like "billing" or
+  "quota", for a rate-limit message after any failed attempt.
+- **After a seat moved to a different agent, a limit hit by the old agent is no longer
+  blamed on the new one.**
+- **Confirming an arena winner can no longer collide with a reconcile that is still
+  running**, and stopping a run at a decision point now ends whatever was still working
+  on it while leaving the decision waiting for you.
+- **The suggested next step for a finished run is now cleanup, not resume.**
+
 ## [0.0.5] - 2026-10-31
 
 ### Added

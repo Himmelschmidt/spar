@@ -23,6 +23,11 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// Holds words the quota scrape treats as a limit signal (`429`, `billing`). spar puts
+/// this path in every slot log's `# spawn` header, so a scrape that read its own header
+/// would pause the provider after any failed dispatch and the next run would refuse it.
+const PROJECT_DIR: &str = "proj-429-billing";
+
 struct Fixture {
     _tmp: tempfile::TempDir,
     proj: PathBuf,
@@ -34,7 +39,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let tmp = tempdir().unwrap();
-        let proj = tmp.path().join("proj");
+        let proj = tmp.path().join(PROJECT_DIR);
         let bin = tmp.path().join("bin");
         let home = tmp.path().join("home");
         let spar_home = tmp.path().join("spar-home");
@@ -636,7 +641,7 @@ fn reviewers_judge_from_detached_checkouts_and_never_move_the_implementer_branch
         .proj
         .parent()
         .unwrap()
-        .join(format!("proj-spar-{id}-reviewers"));
+        .join(format!("{PROJECT_DIR}-spar-{id}-reviewers"));
     let seat = st["slots"]
         .as_array()
         .unwrap()

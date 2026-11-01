@@ -122,6 +122,22 @@ export interface SparEvent {
 	status?: string;
 	message?: string;
 	round?: number;
+	classifier?: ClassifierRecord;
+}
+
+/** O148: one failure-classifier consultation, carried by a `classifier` event. */
+export interface ClassifierRecord {
+	model: string;
+	choice?: string;
+	probability?: number;
+	probabilities?: Record<string, number>;
+	acted: boolean;
+	action: string;
+	regex_verdict: string;
+	latency_ms: number;
+	cost_usd?: number;
+	cached?: boolean;
+	error?: string;
 }
 
 export interface Brief {
