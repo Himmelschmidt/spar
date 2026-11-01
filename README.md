@@ -176,6 +176,16 @@ spar                 # product TUI in current repo
 spar --task "…"      # open TUI with a seeded task
 ```
 
+### Human (pi)
+
+The TUI is frozen (O145). Its replacement is `spar-pi`, a [pi](https://pi.dev) package
+under [`pi/`](pi/README.md): a footer with runs in flight, runs waiting on you, paused
+providers and today's cost, plus `/spar` (run list) and `/spar <id>` (run detail).
+
+```bash
+pi -e /path/to/spar/pi
+```
+
 ### Path A — plan, then implement (one run id)
 
 ```bash

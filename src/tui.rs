@@ -13039,6 +13039,7 @@ mod labels {
             unit_id: None,
             base_ref: None,
             base_commit: None,
+            cost_usd: None,
             project_root: None,
             project_name: None,
         };
@@ -13791,6 +13792,7 @@ mod labels {
             unit_id: None,
             base_ref: None,
             base_commit: None,
+            cost_usd: None,
             project_root: None,
             project_name: None,
         }
@@ -15873,6 +15875,7 @@ mod render_stability {
                 unit_id: None,
                 base_ref: None,
                 base_commit: None,
+                cost_usd: None,
                 project_root: None,
                 project_name: None,
             })
@@ -17686,6 +17689,7 @@ mod render_stability {
             unit_id: None,
             base_ref: None,
             base_commit: None,
+            cost_usd: None,
             project_root: Some(PathBuf::from("/nonexistent").join(project)),
             project_name: Some(project.to_string()),
         }
@@ -19345,6 +19349,7 @@ mod folding {
             unit_id: None,
             base_ref: None,
             base_commit: None,
+            cost_usd: None,
             project_root: None,
             project_name: None,
         }
@@ -19880,6 +19885,7 @@ mod home_ia {
             unit_id: None,
             base_ref: None,
             base_commit: None,
+            cost_usd: None,
             project_root: Some(root.to_path_buf()),
             project_name: root.file_name().map(|s| s.to_string_lossy().into_owned()),
         }
@@ -21951,6 +21957,7 @@ mod home_ia {
                 unit_id: None,
                 base_ref: None,
                 base_commit: None,
+                cost_usd: None,
                 project_root: None,
                 project_name: None,
             }
@@ -22426,6 +22433,7 @@ mod chat_acceptance {
             unit_id: None,
             base_ref: None,
             base_commit: None,
+            cost_usd: None,
             project_root: Some(project.clone()),
             project_name: Some("proj".into()),
         };

@@ -775,6 +775,10 @@ pub struct RunSummary {
     /// currently loudest and can change between snapshots (AC-28).
     #[serde(skip)]
     pub unit_id: Option<String>,
+    /// The run's total reported spend (`stats::run_cost(..).total.cost_usd`), so a run
+    /// list needs no per-run `status <id>` call. `null` when no dispatch reported a cost.
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
     /// Filled when listing across projects (global home).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_root: Option<PathBuf>,
@@ -1487,7 +1491,9 @@ pub fn list_runs(paths: &SparPaths) -> Result<Vec<RunSummary>> {
             continue;
         };
         let live = state.liveness(paths);
+        let cost_usd = crate::stats::run_cost(&state).total.cost_usd;
         out.push(RunSummary {
+            cost_usd,
             // `RunState::abandoned` without asking the lock and the queue twice: a
             // run holding no seat is neither alive nor queued.
             abandoned: !live.holds_seat && is_abandoned(state.phase, false),

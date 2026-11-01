@@ -126,6 +126,9 @@ pub(crate) fn next_command(state: &crate::state::RunState) -> String {
         crate::state::Phase::AwaitingRoundExtension => {
             format!("spar implement --run {id} --max-rounds <N>")
         }
+        // Finished runs cannot resume; what is left is reclaiming their worktrees.
+        crate::state::Phase::Done => format!("spar cleanup {id} --if-merged"),
+        crate::state::Phase::PlanRejected => format!("spar cleanup {id}"),
         _ => format!("spar resume {id}"),
     }
 }
@@ -348,6 +351,19 @@ mod tests {
         ] {
             assert_eq!(classify(phase), Some("gate"), "{phase:?}");
         }
+    }
+
+    #[test]
+    fn finished_runs_are_not_told_to_resume() {
+        assert_eq!(
+            next_command(&state_at(Phase::Done)),
+            "spar cleanup r1 --if-merged"
+        );
+        assert_eq!(
+            next_command(&state_at(Phase::PlanRejected)),
+            "spar cleanup r1"
+        );
+        assert_eq!(next_command(&state_at(Phase::Failed)), "spar resume r1");
     }
 
     #[test]

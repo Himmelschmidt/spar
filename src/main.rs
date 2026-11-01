@@ -619,7 +619,11 @@ fn run() -> Result<ExitCode> {
             archived,
             hosts,
             all_hosts,
+            here,
         } => {
+            if here {
+                return status_here_cmd(json);
+            }
             if !hosts.is_empty() || all_hosts {
                 if run_id.is_some() {
                     anyhow::bail!("--hosts / --all-hosts list runs; drop the run id");
@@ -1547,6 +1551,26 @@ fn stats_cmd(
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         stats::print_human(&report);
+    }
+    Ok(ExitCode::Success)
+}
+
+/// `spar status --here`: which project this directory is, and whether spar has
+/// initialized it. Any git checkout resolves as a project root, but only one holding a
+/// `.spar/` has ever run spar.
+fn status_here_cmd(json: bool) -> Result<ExitCode> {
+    let root = paths::find_project_root().ok();
+    let initialized = root
+        .as_ref()
+        .is_some_and(|r| paths::SparPaths::new(r).root.is_dir());
+    if json {
+        let v = serde_json::json!({"project_root": root, "spar_initialized": initialized});
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        match &root {
+            Some(r) => println!("project: {} (spar_initialized: {initialized})", r.display()),
+            None => println!("not inside a project"),
+        }
     }
     Ok(ExitCode::Success)
 }
