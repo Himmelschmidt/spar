@@ -1,0 +1,59 @@
+id = "spar.monitor"
+name = "spar monitor"
+version = "0.1.0"
+min_herdr_version = "0.9.5"
+description = "One herdr agent pane per spar run, a gate popup and seat logs, all through the spar CLI"
+platforms = ["linux", "macos"]
+
+[[startup]]
+command = ["node", "src/main.ts", "startup"]
+
+[[actions]]
+id = "sync"
+title = "spar: sync runs"
+contexts = ["global", "workspace", "tab", "pane"]
+command = ["node", "src/main.ts", "sync"]
+
+[[actions]]
+id = "board"
+title = "spar: open board"
+contexts = ["global", "workspace", "tab", "pane"]
+command = ["node", "src/main.ts", "board-open"]
+
+[[actions]]
+id = "act"
+title = "spar: act on run"
+contexts = ["pane"]
+command = ["node", "src/main.ts", "act-open"]
+
+[[actions]]
+id = "logs"
+title = "spar: seat logs"
+contexts = ["pane"]
+command = ["node", "src/main.ts", "logs-open"]
+
+[[panes]]
+id = "run"
+title = "spar run"
+placement = "split"
+command = ["sh", "-c", "exec node \"$HERDR_PLUGIN_ROOT/src/main.ts\" run"]
+
+[[panes]]
+id = "board"
+title = "spar board"
+placement = "tab"
+command = ["sh", "-c", "exec node \"$HERDR_PLUGIN_ROOT/src/main.ts\" board"]
+
+[[panes]]
+id = "act"
+title = "spar: act on run"
+placement = "popup"
+width = "90%"
+height = "90%"
+command = ["sh", "-c", "exec node \"$HERDR_PLUGIN_ROOT/src/main.ts\" act"]
+
+[[panes]]
+id = "logs"
+title = "spar seat log"
+placement = "split"
+command = ["sh", "-c", "exec node \"$HERDR_PLUGIN_ROOT/src/main.ts\" logs"]
