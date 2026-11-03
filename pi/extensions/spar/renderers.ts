@@ -1,7 +1,7 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { age, costLabel, describeEvent, listRows, money, type Paint, plain, runFlag, type Tone } from "./format.ts";
-import type { Brief, BusMessage, Finding, Provider, RunRow, RunStatus, SparEvent } from "./spar.ts";
+import { type Brief, type BusMessage, type Finding, type Provider, type RunRow, type RunStatus, type SparEvent, withModels } from "./spar.ts";
 
 export interface FleetSeat {
 	seat: string;
@@ -217,15 +217,17 @@ export function detailLines(details: ToolDetails, paint: Paint, now = new Date()
 			const head = paint("dim", `${details.run}${details.slot ? ` ${details.slot}` : ""}: last ${details.lines.length} of ${details.total} lines`);
 			return [head, ...details.lines];
 		}
-		case "providers":
+		case "providers": {
+			const rows = withModels(details.providers);
 			return table(
-				details.providers.map((p) => [
+				rows.map((p) => [
 					p.name,
 					p.quota_status,
 					p.paused_until ? `until ${stamp(p.paused_until)}` : "",
 					p.quota_hint ?? "",
 				]),
-			).map((l, i) => (details.providers[i]!.quota_status === "available" ? l : paint("error", l)));
+			).map((l, i) => (rows[i]!.quota_status === "available" ? l : paint("error", l)));
+		}
 		case "stats":
 			return statsLines(details.stats, paint);
 		case "launch":

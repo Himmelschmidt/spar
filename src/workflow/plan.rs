@@ -110,19 +110,16 @@ pub fn run(
     let _ = bus::join(paths, Some(&state.id), "orchestrator", None, None);
     state.save(paths)?;
 
-    let art = crate::model_select::load_select_artifact(paths, &state.id)
-        .ok()
-        .flatten();
     let mut jobs = Vec::new();
-    for (idx, (id, role, template, prov, source)) in
-        plan_slot_specs(&state, cfg).into_iter().enumerate()
+    for PlanSeat {
+        id,
+        role,
+        template,
+        provider: prov,
+        model,
+        source,
+    } in plan_slot_specs(&state, cfg)
     {
-        let model = art.as_ref().and_then(|a| {
-            a.choices
-                .iter()
-                .find(|c| c.role.as_deref() == Some(role.as_config_key()) || c.slot == idx)
-                .and_then(|c| c.model.clone())
-        });
         let mut slot = executor::init_slot_model(&id, &prov, role, model.clone());
         slot.source = Some(source);
         state.slots.push(slot);
@@ -224,20 +221,30 @@ pub fn run(
     Ok(state.exit_code())
 }
 
-/// The planner + critic slot specs `(id, role, template, provider, source)`, drawn from
-/// the resolved pool via `resolve_seat` so both the first-pass and re-plan paths key the
-/// slots identically. `plan_critic` is omitted entirely when `[critic].enabled` is false
+struct PlanSeat {
+    id: String,
+    role: SlotRole,
+    template: &'static str,
+    provider: String,
+    model: Option<String>,
+    source: SeatSource,
+}
+
+/// The planner + critic seats, drawn
+/// from the resolved pool via `resolve_seat` so both the first-pass and re-plan paths key
+/// the slots identically. The model is the `--select` choice for the primary, so the
+/// backup check reads the same quota key the dispatch gate does; a backup carries its own. `plan_critic` is omitted entirely when `[critic].enabled` is false
 /// (`--without critic`) — not resolved-then-discarded, so it never touches the bus.
-fn plan_slot_specs(
-    state: &RunState,
-    cfg: &Config,
-) -> Vec<(String, SlotRole, &'static str, String, SeatSource)> {
+fn plan_slot_specs(state: &RunState, cfg: &Config) -> Vec<PlanSeat> {
     let mut specs = vec![(SlotRole::Planner, "planner", "planner")];
     if cfg.critic.enabled {
         specs.push((SlotRole::PlanCritic, "critic", "plan_critic"));
     }
-    let store = crate::quota::QuotaStore::load(&crate::paths::SparPaths::new(&state.project_root))
-        .unwrap_or_default();
+    let paths = crate::paths::SparPaths::new(&state.project_root);
+    let store = crate::quota::QuotaStore::load(&paths).unwrap_or_default();
+    let art = crate::model_select::load_select_artifact(&paths, &state.id)
+        .ok()
+        .flatten();
     let has_backup = cfg.backups.planner.is_some()
         || cfg.backups.plan_critic.is_some()
         || cfg.backups.test_author.is_some();
@@ -257,6 +264,12 @@ fn plan_slot_specs(
     };
     let mut out = Vec::with_capacity(specs.len());
     for (idx, (role, prefix, template)) in specs.into_iter().enumerate() {
+        let selected = art.as_ref().and_then(|a| {
+            a.choices
+                .iter()
+                .find(|c| c.role.as_deref() == Some(role.as_config_key()) || c.slot == idx)
+                .and_then(|c| c.model.clone())
+        });
         let Some((prov, source)) = crate::backup::resolve_with_backup(
             role,
             idx,
@@ -264,9 +277,10 @@ fn plan_slot_specs(
             &state.providers,
             state.pool_origin,
             cfg,
+            selected.as_deref(),
             &store,
             available.as_ref(),
-            &crate::paths::SparPaths::new(&state.project_root),
+            &paths,
             state.dry_run,
         )
         .or_else(|| {
@@ -281,8 +295,16 @@ fn plan_slot_specs(
         }) else {
             continue;
         };
+        let model = (source != SeatSource::Backup).then_some(selected).flatten();
         let id = format!("{prefix}-{}", sanitize_slot(&prov));
-        out.push((id, role, template, prov, source));
+        out.push(PlanSeat {
+            id,
+            role,
+            template,
+            provider: prov,
+            model,
+            source,
+        });
     }
     out
 }
@@ -337,12 +359,8 @@ pub fn execute_plan(
             };
             let mut handled_via_backup = false;
             if let Some(slot_state) = slot_state {
-                let cause = crate::backup::dispatch_stop_cause(
-                    &slot_state,
-                    &job.provider,
-                    &store,
-                    available.as_ref(),
-                );
+                let cause =
+                    crate::backup::dispatch_stop_cause(&slot_state, &store, available.as_ref());
                 if cause.engages_backup() && slot_state.source != Some(SeatSource::Backup) {
                     if let Some(raw) = crate::backup::backup_for_role(job.role, 0, cfg) {
                         if crate::backup::backup_eligible(
@@ -706,12 +724,7 @@ fn run_test_author(
         };
         let mut handled = false;
         if let Some(slot_state) = slot_state {
-            let cause = crate::backup::dispatch_stop_cause(
-                &slot_state,
-                &job.provider,
-                &store,
-                available.as_ref(),
-            );
+            let cause = crate::backup::dispatch_stop_cause(&slot_state, &store, available.as_ref());
             if cause.engages_backup() && slot_state.source != Some(crate::state::SeatSource::Backup)
             {
                 if let Some(raw) = crate::backup::backup_for_role(SlotRole::TestAuthor, 0, cfg) {
@@ -1549,9 +1562,17 @@ fn continue_locked(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exit
         });
     }
     if jobs.is_empty() {
-        for (id, role, template, prov, source) in plan_slot_specs(&state, cfg) {
+        for PlanSeat {
+            id,
+            role,
+            template,
+            provider: prov,
+            model,
+            source,
+        } in plan_slot_specs(&state, cfg)
+        {
             if state.slots.iter().all(|s| s.id != id) {
-                let mut slot = executor::init_slot(&id, &prov, role);
+                let mut slot = executor::init_slot_model(&id, &prov, role, model);
                 slot.source = Some(source);
                 state.slots.push(slot);
             }

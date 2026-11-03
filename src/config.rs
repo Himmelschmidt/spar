@@ -2274,7 +2274,37 @@ pub struct UserConfig {
     /// Account label per provider (`"cli:claude" = "acct-a"`): boxes logged into the
     /// same account share a fleet pause and a fleet slot count, different accounts don't.
     #[serde(default)]
-    pub accounts: std::collections::HashMap<String, String>,
+    pub accounts: std::collections::HashMap<String, AccountLabel>,
+}
+
+/// An `[accounts]` label. The fleet key is `<cli>#<label>[@<model>]`, so a label holding
+/// `#` or `@` could read as another account's label plus a model.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AccountLabel(String);
+
+impl AccountLabel {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for AccountLabel {
+    type Error = String;
+
+    fn try_from(label: String) -> std::result::Result<Self, Self::Error> {
+        if label.contains(['#', '@']) {
+            return Err(format!(
+                "account label '{label}' may not contain '#' or '@'"
+            ));
+        }
+        Ok(Self(label))
+    }
+}
+
+impl<'de> Deserialize<'de> for AccountLabel {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        Self::try_from(String::deserialize(d)?).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

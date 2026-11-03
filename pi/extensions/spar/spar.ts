@@ -163,6 +163,11 @@ export interface Provider {
 	quota_status: string;
 	quota_hint?: string | null;
 	paused_until?: string | null;
+	models?: Provider[];
+}
+
+export function withModels(providers: Provider[]): Provider[] {
+	return providers.flatMap((p) => [p, ...(p.models ?? [])]);
 }
 
 export interface Stats {

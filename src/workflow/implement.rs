@@ -2309,12 +2309,8 @@ pub fn execute_loop(
                         .find(|s| s.id == impl_job.slot_id)
                         .cloned()
                         .unwrap();
-                    let cause = crate::backup::dispatch_stop_cause(
-                        &slot_state,
-                        &impl_slot.provider,
-                        &store,
-                        available.as_ref(),
-                    );
+                    let cause =
+                        crate::backup::dispatch_stop_cause(&slot_state, &store, available.as_ref());
                     if cause.engages_backup() && slot_state.source != Some(SeatSource::Backup) {
                         let backup_key = crate::provider_ref::ProviderRef::parse(&backup_raw)
                             .map(|r| r.storage_key())
@@ -2399,12 +2395,8 @@ pub fn execute_loop(
                     .find(|s| s.id == impl_job.slot_id)
                     .cloned()
                     .unwrap();
-                let cause = crate::backup::dispatch_stop_cause(
-                    &slot_state,
-                    &impl_slot.provider,
-                    &store,
-                    available.as_ref(),
-                );
+                let cause =
+                    crate::backup::dispatch_stop_cause(&slot_state, &store, available.as_ref());
                 if cause.engages_backup() {
                     if let Some(backup_raw) =
                         crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
@@ -3439,8 +3431,7 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
                     Some(detected)
                 }
             };
-        let cause =
-            crate::backup::dispatch_stop_cause(&slot_state, &cur, &store, available_opt.as_ref());
+        let cause = crate::backup::dispatch_stop_cause(&slot_state, &store, available_opt.as_ref());
         if has_backup {
             if cause.engages_backup() {
                 if let Some(backup_raw) =

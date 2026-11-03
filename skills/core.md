@@ -1344,7 +1344,9 @@ shared_path = "/mnt/fleet/spar"     # a directory; "" (default) = per-project .s
 - Records are keyed by **account**: the provider bucket (`cli:claude`, model-free) plus
   the `[accounts]` label, written `cli:claude#acct-a`. Boxes with the same label share
   a pause; a box on `acct-b` is not paused by `acct-a`'s limit. No label = the bare
-  bucket, shared by every box without one.
+  bucket, shared by every box without one. A model-scoped key (agy) carries its model
+  after the label, `cli:agy#acct-a@<model>`, so a label may not contain `#` or `@`: the
+  user config fails to load if one does.
 - Every quota read (`provider list`, seat choice, per-dispatch re-checks) merges the
   project's `.spar/quota.json` with the shared `quota.json`. Every write still goes to
   the project file, and the changed keys are merged into the shared file under

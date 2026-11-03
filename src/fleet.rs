@@ -35,7 +35,7 @@ const SHARED_RETRY: Duration = Duration::from_secs(60);
 #[derive(Clone)]
 pub struct Shared {
     pub dir: PathBuf,
-    accounts: HashMap<String, String>,
+    accounts: HashMap<String, crate::config::AccountLabel>,
 }
 
 static WARNED: AtomicBool = AtomicBool::new(false);
@@ -128,7 +128,10 @@ impl Shared {
             dir: dir.to_path_buf(),
             accounts: accounts
                 .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .map(|(k, v)| {
+                    let label = crate::config::AccountLabel::try_from(v.to_string()).unwrap();
+                    (k.to_string(), label)
+                })
                 .collect(),
         }
     }
@@ -163,7 +166,9 @@ impl Shared {
             Err(_) => (quota_key.to_string(), String::new()),
         };
         match self.accounts.get(&sub) {
-            Some(label) if !label.is_empty() => format!("{sub}#{label}{model}"),
+            Some(label) if !label.as_str().is_empty() => {
+                format!("{sub}#{}{model}", label.as_str())
+            }
             _ => format!("{sub}{model}"),
         }
     }
@@ -486,13 +491,11 @@ mod tests {
             Some("cli:agy"),
             "a legacy model-less record still maps to the CLI level"
         );
-        let odd = Shared::at(tmp.path(), &[("cli:claude", "a@b")]);
-        assert_eq!(odd.account_key("cli:claude@m"), "cli:claude#a@b@m");
-        assert_eq!(
-            odd.quota_key_for("cli:claude#a@b@m").as_deref(),
-            Some("cli:claude@m")
-        );
-        assert_eq!(odd.quota_key_for("cli:claude#a@c@m"), None);
+        for bad in ["a@b", "a#b"] {
+            let toml = format!("[accounts]\n\"cli:claude\" = \"{bad}\"\n");
+            let err = toml::from_str::<crate::config::UserConfig>(&toml).unwrap_err();
+            assert!(err.to_string().contains("may not contain"), "{err}");
+        }
     }
 
     #[test]
