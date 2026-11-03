@@ -499,6 +499,21 @@ mod tests {
     }
 
     #[test]
+    fn account_keys_carry_a_claude_family_bucket() {
+        let tmp = tempdir().unwrap();
+        let a = Shared::at(tmp.path(), &[("cli:claude", "acct-a")]);
+        assert_eq!(a.account_key("cli:claude@opus"), "cli:claude#acct-a@opus");
+        assert_eq!(
+            a.quota_key_for("cli:claude#acct-a@opus").as_deref(),
+            Some("cli:claude@opus")
+        );
+        assert_eq!(
+            a.quota_key_for("cli:claude#acct-a").as_deref(),
+            Some("cli:claude")
+        );
+    }
+
+    #[test]
     fn remote_slots_count_other_boxes_and_projects_and_expire_only_provably_dead_leases() {
         let tmp = tempdir().unwrap();
         let shared = Shared::at(tmp.path(), &[("cli:claude", "acct-a")]);

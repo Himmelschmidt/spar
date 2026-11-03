@@ -97,18 +97,42 @@ impl ProviderRef {
         }
     }
 
-    /// Where this seat's quota pause lives. A model on a `Model`-scoped adapter
-    /// keys per model (`cli:agy@flash`); everything else keys per login, exactly
-    /// `storage_key()`. The scope is declared on the adapter type.
+    /// Where this seat's quota pause lives. A model whose adapter declares a bucket
+    /// keys there (`cli:agy@flash`, `cli:claude@opus` for `claude-opus-5-5` too);
+    /// everything else keys per login, exactly `storage_key()`. The scope is declared
+    /// on the adapter type. Idempotent on its own output.
     pub fn quota_key(&self) -> String {
-        let model_scoped = self.backend == ExecBackend::NativeCli
-            && self.model.is_some()
-            && crate::providers::adapter_named(&self.storage_key())
-                .is_some_and(|a| a.quota_scope() == crate::providers::QuotaScope::Model);
-        if model_scoped {
-            self.display()
-        } else {
-            self.storage_key()
+        if self.backend != ExecBackend::NativeCli {
+            return self.storage_key();
+        }
+        let Some(model) = self.model.as_deref() else {
+            return self.storage_key();
+        };
+        match crate::providers::adapter_named(&self.storage_key())
+            .and_then(|a| a.quota_bucket(model))
+        {
+            Some(bucket) => format!("{}@{bucket}", self.storage_key()),
+            None => self.storage_key(),
+        }
+    }
+
+    /// Where a rejection's pause lives, from the signal, not just the seat: a
+    /// login-wide window lands on the login even when the seat has a bucket, a named
+    /// bucket lands there whichever seat reported it, and the seat's own bucket
+    /// resolves through [`quota_key`](Self::quota_key). No adapter means the login.
+    pub fn rejection_key(&self, signal: crate::providers::QuotaSignal<'_>) -> String {
+        if self.backend != ExecBackend::NativeCli {
+            return self.quota_key();
+        }
+        let Some(adapter) = crate::providers::adapter_named(&self.storage_key()) else {
+            return self.quota_key();
+        };
+        match adapter.rejection_scope(signal) {
+            crate::providers::QuotaScope::Login => self.storage_key(),
+            crate::providers::QuotaScope::Seat => self.quota_key(),
+            crate::providers::QuotaScope::Bucket(bucket) => {
+                format!("{}@{bucket}", self.storage_key())
+            }
         }
     }
 
@@ -235,17 +259,69 @@ mod tests {
     }
 
     #[test]
-    fn quota_key_is_per_model_only_for_model_scoped_adapters() {
+    fn quota_key_is_the_adapters_bucket() {
         let agy = ProviderRef::parse("cli:agy@gemini-3-flash").unwrap();
         assert_eq!(agy.quota_key(), "cli:agy@gemini-3-flash");
         let bare = ProviderRef::parse("cli:agy").unwrap();
         assert_eq!(bare.quota_key(), "cli:agy");
-        let claude = ProviderRef::parse("cli:claude@opus").unwrap();
-        assert_eq!(claude.quota_key(), "cli:claude");
+        let opus = ProviderRef::parse("cli:claude@opus").unwrap();
+        assert_eq!(opus.quota_key(), "cli:claude@opus");
+        let full = ProviderRef::parse("cli:claude@claude-opus-5-5").unwrap();
+        assert_eq!(full.quota_key(), "cli:claude@opus");
+        let haiku = ProviderRef::parse("cli:claude@haiku").unwrap();
+        assert_eq!(haiku.quota_key(), "cli:claude");
+        let full_haiku = ProviderRef::parse("cli:claude@claude-haiku-5-5").unwrap();
+        assert_eq!(full_haiku.quota_key(), "cli:claude");
         let api = ProviderRef::parse("api:openai@gpt-5").unwrap();
         assert_eq!(api.quota_key(), "api:openai");
         let unknown = ProviderRef::parse("cli:nothing@x").unwrap();
         assert_eq!(unknown.quota_key(), "cli:nothing");
+        assert_eq!(
+            ProviderRef::parse(&opus.quota_key()).unwrap().quota_key(),
+            "cli:claude@opus"
+        );
+    }
+
+    #[test]
+    fn rejection_key_follows_the_signal_for_claude() {
+        use crate::providers::{QuotaSignal, RateLimitWindow as W};
+        let opus = ProviderRef::parse("cli:claude@opus").unwrap();
+        let window = |w: &W| opus.rejection_key(QuotaSignal::Window(w));
+        assert_eq!(window(&W::SevenDayOpus), "cli:claude@opus");
+        assert_eq!(window(&W::SevenDaySonnet), "cli:claude@sonnet");
+        assert_eq!(window(&W::FiveHour), "cli:claude");
+        assert_eq!(window(&W::SevenDay), "cli:claude");
+        assert_eq!(window(&W::SevenDayOverageIncluded), "cli:claude@opus");
+        let haiku = ProviderRef::parse("cli:claude@haiku").unwrap();
+        assert_eq!(
+            haiku.rejection_key(QuotaSignal::Window(&W::SevenDayOverageIncluded)),
+            "cli:claude"
+        );
+        let sonnet = ProviderRef::parse("cli:claude@sonnet").unwrap();
+        assert_eq!(
+            sonnet.rejection_key(QuotaSignal::Window(&W::SevenDayOpus)),
+            "cli:claude@opus",
+            "a named bucket lands there whichever seat reported it"
+        );
+        assert_eq!(
+            opus.rejection_key(QuotaSignal::Text("You've reached your Fable limit")),
+            "cli:claude@fable"
+        );
+        assert_eq!(
+            opus.rejection_key(QuotaSignal::Text("You've hit your weekly limit")),
+            "cli:claude"
+        );
+        let agy = ProviderRef::parse("cli:agy@flash").unwrap();
+        assert_eq!(
+            agy.rejection_key(QuotaSignal::Window(&W::FiveHour)),
+            "cli:agy@flash",
+            "agy always writes the seat"
+        );
+        let codex = ProviderRef::parse("cli:codex@gpt-5").unwrap();
+        assert_eq!(
+            codex.rejection_key(QuotaSignal::Window(&W::SevenDayOpus)),
+            "cli:codex"
+        );
     }
 
     #[test]

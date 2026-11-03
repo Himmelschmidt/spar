@@ -1,4 +1,5 @@
 use crate::paths::SparPaths;
+use crate::providers::ClaudeFamily;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -644,6 +645,10 @@ impl QuotaStore {
                 // "5-hour limit" in its usage-limit messages (changelog). The full
                 // sentence is inferred from the weekly one; no live capture yet.
                 || contains_phrase(&lower, "hit your 5-hour limit")
+                // A generic limit line names no window ("You've hit your limit") and a
+                // per-model one names its family ("You've reached your Fable limit").
+                || contains_phrase(&lower, "hit your limit")
+                || ClaudeFamily::limit_line(&lower).is_some()
                 || is_agy_quota_rejection(&lower)
                 // muse's dispatch-time 429 reads "Subscription quota exhausted" (#153).
                 || lower.contains("quota exhausted")
@@ -864,14 +869,19 @@ pub(crate) fn scrape_claude_stated_reset(log: &str) -> Option<(Option<DateTime<U
     if !lower.contains("resets ") {
         return None;
     }
+    // A per-model family line is a weekly-window rejection (`seven_day_*`), and a
+    // generic limit line is a rejection all the same; both count as limit phrases.
+    let family = ClaudeFamily::limit_line(&lower);
     if !(lower.contains("rate limit")
         || lower.contains("weekly limit")
         || lower.contains("usage limit")
-        || lower.contains("5-hour limit"))
+        || lower.contains("5-hour limit")
+        || lower.contains("hit your limit")
+        || family.is_some())
     {
         return None;
     }
-    let period = if lower.contains("seven_day") || lower.contains("weekly") {
+    let period = if lower.contains("seven_day") || lower.contains("weekly") || family.is_some() {
         "weekly"
     } else {
         "rate"
@@ -1127,6 +1137,24 @@ mod tests {
         assert!(
             until.is_some(),
             "a five-hour window's next occurrence is a sound inference and must be kept"
+        );
+
+        let fable = "You've reached your Fable limit \u{b7} resets 12am (America/New_York)\n";
+        let (until, hint) = scrape_claude_stated_reset(fable).expect("family line must be a hit");
+        assert!(
+            until.is_none(),
+            "a per-model weekly window states no inferable day"
+        );
+        assert!(
+            hint.contains("weekly"),
+            "hint should name the window: {hint}"
+        );
+
+        let generic = "You've hit your limit \u{b7} resets 3pm (UTC)\n";
+        let (until, _) = scrape_claude_stated_reset(generic).expect("generic line must be a hit");
+        assert!(
+            until.is_some(),
+            "a generic login-wide limit infers like a rate window"
         );
     }
     use super::*;
@@ -1582,7 +1610,9 @@ mod tests {
     #[test]
     fn quota_key_splits_model_scoped_providers_only() {
         assert_eq!(quota_key("claude"), "cli:claude");
-        assert_eq!(quota_key("cli:claude@opus"), "cli:claude");
+        assert_eq!(quota_key("cli:claude@opus"), "cli:claude@opus");
+        assert_eq!(quota_key("cli:claude@claude-opus-5-5"), "cli:claude@opus");
+        assert_eq!(quota_key("cli:claude@haiku"), "cli:claude");
         assert_eq!(quota_key("cli:codex@opus"), "cli:codex");
         assert_eq!(quota_key("cli:agy@flash"), "cli:agy@flash");
         assert_eq!(quota_key("cli:agy"), "cli:agy");
@@ -1685,6 +1715,11 @@ mod tests {
         );
         assert!(QuotaStore::scrape_strong_quota_signal("usage limit reached, try later").is_some());
         assert!(QuotaStore::scrape_strong_quota_signal("account is out of credits").is_some());
+        assert!(QuotaStore::scrape_strong_quota_signal("You've hit your limit").is_some());
+        assert!(
+            QuotaStore::scrape_strong_quota_signal("You've reached your Fable limit").is_some()
+        );
+        assert!(QuotaStore::scrape_strong_quota_signal("You've reached your Opus limit").is_some());
     }
 
     /// Claude's stated-reset sentence is a separate line from "! rate limit ...
