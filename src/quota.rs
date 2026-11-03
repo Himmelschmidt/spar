@@ -200,6 +200,30 @@ pub fn merge(a: ProviderQuota, b: ProviderQuota, now: DateTime<Utc>) -> Provider
     out
 }
 
+/// The CLI-level parent of a model quota key (`cli:agy@m` → `cli:agy`), `None`
+/// for anything else. The `@model` on the key decides, never the adapter: by
+/// the time a key is stored its scope was already resolved at creation.
+pub(crate) fn cli_level(key: &str) -> Option<String> {
+    let pref = crate::provider_ref::ProviderRef::parse(key).ok()?;
+    pref.model
+        .as_ref()
+        .filter(|m| !m.is_empty())
+        .map(|_| pref.storage_key())
+}
+
+/// Combine a model record with its CLI-level parent: most restrictive holds.
+/// Deliberately not `merge`'s resume logic — `version` decides between two
+/// writes to one key, not between two different keys, and a model resume must
+/// never silently undo a CLI-level manual pause.
+fn strictest(model: ProviderQuota, parent: ProviderQuota, now: DateTime<Utc>) -> ProviderQuota {
+    match (model.holds(now), parent.holds(now)) {
+        (false, false) => model,
+        (true, false) => model,
+        (false, true) => parent,
+        (true, true) => merge(model, parent, now),
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QuotaStore {
     #[serde(default)]
@@ -304,8 +328,9 @@ impl QuotaStore {
     /// Logs a pause only when it starts one: a provider already held by a live pause of
     /// the same kind is the same pause re-stated, not a new event.
     fn note_pause(&mut self, name: &str, manual: bool, until: Option<DateTime<Utc>>, hint: &str) {
-        let held = !self.is_usable(name);
-        let was_manual = self.get(name).status == ProviderStatus::PausedManual;
+        let own = self.record(name);
+        let held = own.holds(Utc::now());
+        let was_manual = own.status == ProviderStatus::PausedManual;
         if held && was_manual == manual {
             return;
         }
@@ -340,7 +365,9 @@ impl QuotaStore {
             .collect()
     }
 
-    pub fn get(&self, name: &str) -> ProviderQuota {
+    /// This key's own record only: local merged with the fleet record for the
+    /// same key, never combined with any other key.
+    pub fn record(&self, name: &str) -> ProviderQuota {
         let local = self.providers.get(name).cloned();
         let fleet = self.fleet.get(name).cloned();
         match (local, fleet) {
@@ -350,15 +377,43 @@ impl QuotaStore {
         }
     }
 
+    /// What a seat on `name` sees: a model key combined with its CLI-level
+    /// parent, most restrictive holds, so a legacy `cli:agy` record still holds
+    /// every agy model and an account-wide pause holds all of them.
+    pub fn get(&self, name: &str) -> ProviderQuota {
+        match cli_level(name) {
+            Some(parent) => {
+                let mut out = strictest(self.record(name), self.record(&parent), Utc::now());
+                out.name = name.to_string();
+                out
+            }
+            None => self.record(name),
+        }
+    }
+
     pub fn is_usable(&self, name: &str) -> bool {
         !self.get(name).holds(Utc::now())
     }
 
-    /// Whether the provider is held by an operator's pause that has not lapsed. Quota
-    /// writers consult this so a rate-limit event never replaces the operator's
-    /// decision, and probes consult it so they never clear one.
-    pub fn is_manually_paused(&self, name: &str) -> bool {
-        self.get(name).status == ProviderStatus::PausedManual && !self.is_usable(name)
+    /// Whether this key itself carries a live manual pause that has not lapsed,
+    /// ignoring any parent a model key combines with. Quota writers consult the own
+    /// record so a rate-limit event never replaces the operator's decision, and a
+    /// probe's manual guard uses it so a CLI-level manual pause never suppresses
+    /// recording the model's own quota signal.
+    pub fn record_manually_paused(&self, name: &str) -> bool {
+        let own = self.record(name);
+        own.status == ProviderStatus::PausedManual && own.holds(Utc::now())
+    }
+
+    /// The own-record half of [`is_quota_paused`](Self::is_quota_paused). A healthy
+    /// probe clears the seat's own stale quota pause even when a parent manual
+    /// pause still holds the seat; the parent is the operator's business.
+    pub fn record_quota_paused(&self, name: &str) -> bool {
+        let own = self.record(name);
+        matches!(
+            own.status,
+            ProviderStatus::PausedQuota | ProviderStatus::Cooldown
+        ) && own.holds(Utc::now())
     }
 
     /// Whether the provider is held by a quota pause that has not lapsed: the only kind
@@ -396,10 +451,15 @@ impl QuotaStore {
     }
 
     pub fn pause_quota(&mut self, name: &str, hint: impl Into<String>) {
-        if self.is_manually_paused(name) {
+        let own = self.record(name);
+        if own.status == ProviderStatus::PausedManual && own.holds(Utc::now()) {
             return;
         }
-        let strong = self.is_quota_paused(name) && self.get(name).strong;
+        let strong = matches!(
+            own.status,
+            ProviderStatus::PausedQuota | ProviderStatus::Cooldown
+        ) && own.holds(Utc::now())
+            && own.strong;
         let hint = hint.into();
         self.note_pause(name, false, None, &hint);
         self.insert(ProviderQuota {
@@ -420,10 +480,15 @@ impl QuotaStore {
         until: Option<DateTime<Utc>>,
         hint: impl Into<String>,
     ) {
-        if self.is_manually_paused(name) {
+        let own = self.record(name);
+        if own.status == ProviderStatus::PausedManual && own.holds(Utc::now()) {
             return;
         }
-        let strong = self.is_quota_paused(name) && self.get(name).strong;
+        let strong = matches!(
+            own.status,
+            ProviderStatus::PausedQuota | ProviderStatus::Cooldown
+        ) && own.holds(Utc::now())
+            && own.strong;
         let hint = hint.into();
         self.note_pause(name, false, until, &hint);
         self.insert(ProviderQuota {
@@ -445,10 +510,15 @@ impl QuotaStore {
     /// Upgrade a live quota pause to strong: the rejection behind it was typed or a
     /// line-scoped strong signal, not a broad needle.
     pub fn mark_strong(&mut self, name: &str) {
-        if !self.is_quota_paused(name) {
+        let own = self.record(name);
+        if !matches!(
+            own.status,
+            ProviderStatus::PausedQuota | ProviderStatus::Cooldown
+        ) || !own.holds(Utc::now())
+        {
             return;
         }
-        let mut q = self.get(name);
+        let mut q = own;
         q.strong = true;
         self.insert(q);
     }
@@ -456,10 +526,15 @@ impl QuotaStore {
     /// Downgrade a live quota pause to weak: the classifier vetoed the text that made
     /// it strong (O148). The pause itself stays.
     pub fn mark_weak(&mut self, name: &str) {
-        if !self.is_quota_paused(name) {
+        let own = self.record(name);
+        if !matches!(
+            own.status,
+            ProviderStatus::PausedQuota | ProviderStatus::Cooldown
+        ) || !own.holds(Utc::now())
+        {
             return;
         }
-        let mut q = self.get(name);
+        let mut q = own;
         q.strong = false;
         self.insert(q);
     }
@@ -474,7 +549,10 @@ impl QuotaStore {
         q.status == ProviderStatus::PausedManual || q.strong
     }
 
-    pub fn resume(&mut self, name: &str) {
+    /// Write `available` on exactly one key, with no CLI-level fan-out. The probe's
+    /// parent clear uses this: clearing the parent through [`resume`](Self::resume)
+    /// would also clear every model key, including an independently paused sibling.
+    pub fn resume_exact(&mut self, name: &str) {
         self.insert(ProviderQuota {
             name: name.into(),
             status: ProviderStatus::Available,
@@ -485,6 +563,25 @@ impl QuotaStore {
             strong: false,
             version: 0,
         });
+    }
+
+    /// A CLI-level resume clears the login and every model key under it, so one
+    /// resume undoes an account-wide pause fleet-wide. A model resume clears only
+    /// that model; a CLI-level pause still holding it is reported by the caller.
+    pub fn resume(&mut self, name: &str) {
+        let mut keys = vec![name.to_string()];
+        if cli_level(name).is_none() {
+            keys.extend(
+                self.names()
+                    .into_iter()
+                    .filter(|n| cli_level(n).as_deref() == Some(name)),
+            );
+        }
+        keys.sort();
+        keys.dedup();
+        for key in keys {
+            self.resume_exact(&key);
+        }
     }
 
     /// Best-effort scan of log text for quota / rate-limit language. Deliberately
@@ -631,7 +728,7 @@ fn read_fleet(shared: &crate::fleet::Shared) -> HashMap<String, ProviderQuota> {
         .providers
         .into_iter()
         .filter_map(|(account, mut q)| {
-            let storage = shared.storage_key_for(&account)?;
+            let storage = shared.quota_key_for(&account)?;
             q.name = storage.clone();
             Some((storage, q))
         })
@@ -650,14 +747,15 @@ fn is_agy_quota_rejection(lower: &str) -> bool {
 
 /// agy states its reset as a relative Go duration on the rejection line ("Resets in
 /// 125h56m29s."), so unlike claude's wall-clock form it needs no timezone or calendar
-/// inference. Gated on `cli:agy` for the same reason as [`scrape_claude_rate_limits`].
+/// inference. Gated on the agy login for the same reason as [`scrape_claude_rate_limits`].
 /// A rejection whose duration does not parse still reports the hit with no instant,
-/// leaving the generic cooldown.
+/// leaving the generic cooldown. Returns the reset and hint only: the caller writes
+/// the dispatched seat's own quota key.
 pub fn scrape_agy_stated_reset(
     provider: &str,
     log: &str,
-) -> Option<(String, Option<DateTime<Utc>>, String)> {
-    if normalize_key(provider) != "cli:agy" {
+) -> Option<(Option<DateTime<Utc>>, String)> {
+    if sub_key(provider) != "cli:agy" {
         return None;
     }
     let lower = log
@@ -668,13 +766,11 @@ pub fn scrape_agy_stated_reset(
     let Some(until) = parse_go_duration(after).and_then(|d| Utc::now().checked_add_signed(d))
     else {
         return Some((
-            "cli:agy".into(),
             None,
             "agy individual quota reached (stated reset unparseable, default cooldown)".into(),
         ));
     };
     Some((
-        "cli:agy".into(),
         Some(until),
         format!(
             "agy individual quota reached, resets {}",
@@ -714,7 +810,8 @@ fn parse_go_duration(s: &str) -> Option<chrono::Duration> {
 /// Parse Claude-style `rate_limits.five_hour` JSON fragments from logs/statusline, or
 /// (failing that) the CLI's plain-text weekly/five-hour rejection line, e.g. `! rate
 /// limit  seven_day  rejected` followed by "You've hit your weekly limit · resets 12am
-/// (America/New_York)". Returns (provider_name, cooldown_until, hint).
+/// (America/New_York)". Returns (cooldown_until, hint); the caller writes the
+/// dispatched seat's own quota key.
 ///
 /// Gated on `provider` actually being a claude adapter: both shapes are specific to
 /// the Claude CLI's own output, and a codex/grok/pi log that happens to contain
@@ -723,8 +820,8 @@ fn parse_go_duration(s: &str) -> Option<chrono::Duration> {
 pub fn scrape_claude_rate_limits(
     provider: &str,
     log: &str,
-) -> Option<(String, Option<DateTime<Utc>>, String)> {
-    if normalize_key(provider) != "cli:claude" {
+) -> Option<(Option<DateTime<Utc>>, String)> {
+    if sub_key(provider) != "cli:claude" {
         return None;
     }
     // Look for embedded JSON objects containing rate_limits
@@ -762,9 +859,7 @@ pub fn scrape_claude_rate_limits(
 /// stated reset can be found but not parsed (unknown tz, unexpected format), still
 /// reports the hit so the caller pauses the provider — the fallback is the generic
 /// default-cooldown pause, made visible on stderr rather than silently guessed.
-pub(crate) fn scrape_claude_stated_reset(
-    log: &str,
-) -> Option<(String, Option<DateTime<Utc>>, String)> {
+pub(crate) fn scrape_claude_stated_reset(log: &str) -> Option<(Option<DateTime<Utc>>, String)> {
     let lower = log.to_ascii_lowercase();
     if !lower.contains("resets ") {
         return None;
@@ -789,14 +884,12 @@ pub(crate) fn scrape_claude_stated_reset(
     // preferred over anything derived here — see `detect_and_pause_quota`.
     if period == "weekly" {
         return Some((
-            "cli:claude".into(),
             None,
             format!("claude {period} limit (no stated reset instant, default cooldown)"),
         ));
     }
     match parse_stated_reset(log, Utc::now()) {
         Some(until) => Some((
-            "cli:claude".into(),
             Some(until),
             format!("claude {period} limit, resets {}", until.to_rfc3339()),
         )),
@@ -806,7 +899,6 @@ pub(crate) fn scrape_claude_stated_reset(
                  falling back to the default cooldown window"
             );
             Some((
-                "cli:claude".into(),
                 None,
                 format!("claude {period} limit (stated reset unparseable, default cooldown)"),
             ))
@@ -883,9 +975,7 @@ fn parse_reset_clause_in_line(line: &str, now: DateTime<Utc>) -> Option<DateTime
     Some(candidate.with_timezone(&Utc))
 }
 
-fn parse_rate_limits_value(
-    v: &serde_json::Value,
-) -> Option<(String, Option<DateTime<Utc>>, String)> {
+fn parse_rate_limits_value(v: &serde_json::Value) -> Option<(Option<DateTime<Utc>>, String)> {
     let rl = v
         .get("rate_limits")
         .or_else(|| v.get("status").and_then(|s| s.get("rate_limits")))?;
@@ -902,19 +992,12 @@ fn parse_rate_limits_value(
         .and_then(|x| x.as_str())
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|d| d.with_timezone(&Utc));
-    Some((
-        "cli:claude".into(),
-        until,
-        format!("claude five_hour used_percentage={used}"),
-    ))
+    Some((until, format!("claude five_hour used_percentage={used}")))
 }
 
-/// Canonical quota bucket key. Model-free (`cli:claude@sonnet` and `cli:claude@haiku`
-/// share one bucket — rate limits are per account) and prefix-normalized, so a bare
-/// `claude` from the CLI or `provider list` maps to the same `cli:claude` bucket that
-/// slot providers and the auto-pause path write. Callers on both sides must go through
-/// this or the store keys silently disagree.
-pub fn normalize_key(raw: &str) -> String {
+/// Which subscription a seat bills to. Always model-free: `cli:agy@flash` and
+/// `cli:agy@pro` are one login, one backup-exclusion domain, one fleet label.
+pub fn sub_key(raw: &str) -> String {
     let candidate = if raw.contains(':') {
         raw.to_string()
     } else {
@@ -925,10 +1008,23 @@ pub fn normalize_key(raw: &str) -> String {
         .unwrap_or_else(|_| raw.to_string())
 }
 
+/// Where a seat's pause lives. A model on a `Model`-scoped adapter keys per model
+/// (`cli:agy@flash`); everything else is `sub_key`. Idempotent on its own output.
+pub fn quota_key(raw: &str) -> String {
+    let candidate = if raw.contains(':') {
+        raw.to_string()
+    } else {
+        format!("cli:{raw}")
+    };
+    crate::provider_ref::ProviderRef::parse(&candidate)
+        .map(|p| p.quota_key())
+        .unwrap_or_else(|_| raw.to_string())
+}
+
 pub fn filter_usable(names: &[String], store: &QuotaStore) -> Vec<String> {
     names
         .iter()
-        .filter(|n| store.is_usable(&normalize_key(n)))
+        .filter(|n| store.is_usable(&quota_key(n)))
         .cloned()
         .collect()
 }
@@ -959,7 +1055,7 @@ pub fn ensure_usable(paths: &SparPaths, names: &[String]) -> Result<()> {
     let store = QuotaStore::load(paths).unwrap_or_default();
     let mut paused: Vec<String> = Vec::new();
     for n in names {
-        let key = normalize_key(n);
+        let key = quota_key(n);
         if !store.is_usable(&key) && !paused.contains(&key) {
             paused.push(key);
         }
@@ -1015,7 +1111,7 @@ mod tests {
     fn a_weekly_limit_yields_no_inferred_cooldown_and_a_five_hour_one_does() {
         let weekly = "! rate limit  seven_day  rejected\n\
                       You've hit your weekly limit \u{b7} resets 12am (America/New_York)\n";
-        let (_, until, hint) = scrape_claude_stated_reset(weekly).expect("weekly must be a hit");
+        let (until, hint) = scrape_claude_stated_reset(weekly).expect("weekly must be a hit");
         assert!(
             until.is_none(),
             "a weekly window must not invent a reset day, got {until:?}"
@@ -1027,7 +1123,7 @@ mod tests {
 
         let five_hour = "! rate limit  five_hour  rejected\n\
                          You've hit your session limit \u{b7} resets 12:40pm (America/New_York)\n";
-        let (_, until, _) = scrape_claude_stated_reset(five_hour).expect("five-hour must be a hit");
+        let (until, _) = scrape_claude_stated_reset(five_hour).expect("five-hour must be a hit");
         assert!(
             until.is_some(),
             "a five-hour window's next occurrence is a sound inference and must be kept"
@@ -1349,7 +1445,7 @@ mod tests {
         .unwrap();
         assert!(!legacy.get("cli:claude").sticky);
         assert!(legacy.is_usable("cli:claude"));
-        assert!(!legacy.is_manually_paused("cli:claude"));
+        assert!(!legacy.record_manually_paused("cli:claude"));
         assert_eq!(
             legacy.effective_status("cli:claude"),
             ProviderStatus::Available
@@ -1387,13 +1483,13 @@ mod tests {
         store.pause_manual("cli:grok", Some(until));
         assert_eq!(store.get("cli:grok").status, ProviderStatus::PausedManual);
         assert_eq!(store.get("cli:grok").cooldown_until, Some(until));
-        assert!(store.is_manually_paused("cli:grok"));
+        assert!(store.record_manually_paused("cli:grok"));
         assert!(!store.is_quota_paused("cli:grok"));
 
         store.providers.get_mut("cli:grok").unwrap().cooldown_until =
             Some(Utc::now() - chrono::Duration::seconds(1));
         assert!(store.is_usable("cli:grok"));
-        assert!(!store.is_manually_paused("cli:grok"));
+        assert!(!store.record_manually_paused("cli:grok"));
     }
 
     /// The 2026-10-22 shape: grok paused by hand until 2027, then a live run's slot hit
@@ -1473,13 +1569,25 @@ mod tests {
     }
 
     #[test]
-    fn normalize_key_bare_and_prefixed_match() {
+    fn sub_key_bare_and_prefixed_match() {
         // `provider list` (bare "claude"), the CLI arg, and slot providers must all
-        // resolve to the same bucket the auto-pause path writes.
-        assert_eq!(normalize_key("claude"), "cli:claude");
-        assert_eq!(normalize_key("cli:claude"), "cli:claude");
-        assert_eq!(normalize_key("cli:claude@opus"), "cli:claude");
-        assert_eq!(normalize_key("api:openai"), "api:openai");
+        // resolve to the same subscription the backup rule and fleet labels use.
+        assert_eq!(sub_key("claude"), "cli:claude");
+        assert_eq!(sub_key("cli:claude"), "cli:claude");
+        assert_eq!(sub_key("cli:claude@opus"), "cli:claude");
+        assert_eq!(sub_key("cli:agy@flash"), "cli:agy");
+        assert_eq!(sub_key("api:openai"), "api:openai");
+    }
+
+    #[test]
+    fn quota_key_splits_model_scoped_providers_only() {
+        assert_eq!(quota_key("claude"), "cli:claude");
+        assert_eq!(quota_key("cli:claude@opus"), "cli:claude");
+        assert_eq!(quota_key("cli:codex@opus"), "cli:codex");
+        assert_eq!(quota_key("cli:agy@flash"), "cli:agy@flash");
+        assert_eq!(quota_key("cli:agy"), "cli:agy");
+        assert_eq!(quota_key("api:openai@gpt-5"), "api:openai");
+        assert_eq!(quota_key("cli:agy@flash"), quota_key("cli:agy@flash"));
     }
 
     /// The real captured log text from the dogfooding incident (roadmap/BACKLOG.md).
@@ -1494,9 +1602,7 @@ mod tests {
     /// cheaply and asserts nothing, so no inferred cooldown beats a wrong one.
     #[test]
     fn scrape_claude_rate_limits_refuses_to_invent_a_weekly_reset_day() {
-        let (name, until, hint) =
-            scrape_claude_rate_limits("cli:claude", WEEKLY_LIMIT_LOG).unwrap();
-        assert_eq!(name, "cli:claude");
+        let (until, hint) = scrape_claude_rate_limits("cli:claude", WEEKLY_LIMIT_LOG).unwrap();
         assert!(
             until.is_none(),
             "a weekly window states a time but not a day; inferring one is a guess: {until:?}"
@@ -1511,8 +1617,7 @@ mod tests {
     fn scrape_claude_rate_limits_falls_back_when_reset_unparseable() {
         let log = "! rate limit  five_hour  rejected\n\
             You've hit your session limit \u{b7} resets whenever (Nowhere/Fake)\n";
-        let (name, until, hint) = scrape_claude_rate_limits("cli:claude", log).unwrap();
-        assert_eq!(name, "cli:claude");
+        let (until, hint) = scrape_claude_rate_limits("cli:claude", log).unwrap();
         assert!(
             until.is_none(),
             "unparseable reset must fall back to the generic default cooldown, not guess"
@@ -1615,7 +1720,7 @@ mod tests {
     fn strong_quota_signal_matches_claudes_5_hour_wording() {
         let line = "You've hit your 5-hour limit \u{b7} resets 12:40pm (America/New_York)";
         assert!(QuotaStore::scrape_strong_quota_signal(line).is_some());
-        let (_, until, _) =
+        let (until, _) =
             scrape_claude_stated_reset(line).expect("the renamed window still states a reset");
         assert!(until.is_some(), "a five-hour reset is a sound inference");
         for prose in [
@@ -1706,18 +1811,74 @@ mod tests {
     }
 
     #[test]
+    fn legacy_cli_level_file_holds_every_model() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_swarm_root().unwrap();
+        std::fs::write(
+            paths.quota_file(),
+            format!(
+                "{{\"providers\":{{\"cli:agy\":{{\"name\":\"cli:agy\",\"status\":\"paused_quota\",\"hint\":\"legacy\",\"updated_at\":\"{}\"}}}}}}",
+                Utc::now().to_rfc3339()
+            ),
+        )
+        .unwrap();
+        let store = super::QuotaStore::load(&paths).unwrap();
+        assert!(!store.names().iter().any(|n| n.contains('@')));
+        assert!(!store.is_usable("cli:agy@flash"));
+        assert!(!store.is_usable("cli:agy@anything"));
+        assert!(
+            !store.blocks_live_dispatch("cli:agy@flash"),
+            "a legacy record reads weak: it benches the seat without parking a live run"
+        );
+        assert!(store.is_usable("cli:codex"));
+    }
+
+    #[test]
+    fn cli_resume_clears_every_model_key_while_model_resume_clears_one() {
+        let mut store = super::QuotaStore::default();
+        store.pause_manual("cli:agy", None);
+        store.pause_quota("cli:agy@a", "a limit");
+        store.pause_quota("cli:agy@b", "b limit");
+        store.resume("cli:agy");
+        assert!(store.is_usable("cli:agy"));
+        assert!(store.is_usable("cli:agy@a"));
+        assert!(store.is_usable("cli:agy@b"));
+
+        let mut store = super::QuotaStore::default();
+        store.pause_quota("cli:agy@a", "a limit");
+        store.pause_quota("cli:agy@b", "b limit");
+        store.resume("cli:agy@a");
+        assert!(store.is_usable("cli:agy@a"));
+        assert!(!store.is_usable("cli:agy@b"));
+    }
+
+    #[test]
+    fn model_resume_never_lifts_a_cli_level_pause() {
+        let mut store = super::QuotaStore::default();
+        store.pause_manual("cli:agy", None);
+        store.pause_quota("cli:agy@flash", "flash limit");
+        store.resume("cli:agy@flash");
+        assert!(!store.is_usable("cli:agy@flash"));
+        assert!(!store.is_usable("cli:agy@pro"));
+        assert_eq!(
+            super::cli_level("cli:agy@flash").as_deref(),
+            Some("cli:agy")
+        );
+    }
+
+    #[test]
     fn agy_stated_reset_pauses_for_the_stated_duration() {
         let before = Utc::now();
-        let (name, until, hint) =
+        let (until, hint) =
             scrape_agy_stated_reset("cli:agy@gemini-3.5-flash", AGY_QUOTA_STDERR).unwrap();
-        assert_eq!(name, "cli:agy");
         let until = until.expect("125h56m29s parses");
         let stated = chrono::Duration::seconds(125 * 3600 + 56 * 60 + 29);
         assert!(until >= before + stated && until <= Utc::now() + stated);
         assert!(hint.contains("resets"), "{hint}");
         assert!(scrape_agy_stated_reset("cli:claude", AGY_QUOTA_STDERR).is_none());
         assert!(scrape_agy_stated_reset("cli:agy", "Resets in 5m0s.").is_none());
-        let (_, until, _) =
+        let (until, _) =
             scrape_agy_stated_reset("cli:agy", "Individual quota reached. Resets in 1m29.5s.")
                 .expect("still a hit");
         assert!(
@@ -1725,7 +1886,7 @@ mod tests {
             "a fractional duration falls back, not rounds"
         );
         for absurd in ["Resets in 9999999999999h.", "Resets in 99999999999h."] {
-            let (_, until, _) =
+            let (until, _) =
                 scrape_agy_stated_reset("cli:agy", &format!("Individual quota reached. {absurd}"))
                     .expect("still a hit");
             assert!(until.is_none(), "{absurd} must fall back, not panic");

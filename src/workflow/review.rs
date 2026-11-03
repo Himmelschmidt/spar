@@ -247,12 +247,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
         if slot_state.status != SlotStatus::Failed {
             continue;
         }
-        let cause = crate::backup::dispatch_stop_cause(
-            &slot_state,
-            &job.provider,
-            &store,
-            available.as_ref(),
-        );
+        let cause = crate::backup::dispatch_stop_cause(&slot_state, &store, available.as_ref());
         if !cause.engages_backup() || slot_state.source == Some(crate::state::SeatSource::Backup) {
             continue;
         }

@@ -346,7 +346,7 @@ pub fn parse_reassignments(raw: &[String], paths: &SparPaths) -> Result<Vec<Reas
                 bail!("--reassign {r:?}: no adapter named {cli}");
             }
         }
-        let key = crate::quota::normalize_key(&pin.provider);
+        let key = crate::quota::quota_key(&pin.display());
         if store.blocks_live_dispatch(&key) {
             bail!(
                 "--reassign {r:?}: {key} is paused; resume it with `spar provider resume {key}` \
@@ -849,9 +849,12 @@ fn run_from_approved(
             if matches!(
                 slot.role,
                 SlotRole::Implementer | SlotRole::Reviewer | SlotRole::Tester
-            ) && !crate::backup::is_provider_eligible(&slot.provider, &store, available.as_ref())
-            {
-                let key = crate::quota::normalize_key(&slot.provider);
+            ) && !crate::backup::is_provider_eligible(
+                &slot.provider_ref().display(),
+                &store,
+                available.as_ref(),
+            ) {
+                let key = slot.provider_ref().quota_key();
                 if !still_paused.contains(&key) {
                     still_paused.push(key);
                 }
@@ -986,7 +989,9 @@ fn prepare_implement_slots(
         let mut source = seat.source;
         let mut model = seat.model.clone();
         let mut seat_id = seat.seat.clone();
-        if !crate::backup::is_provider_eligible(&provider, &store, available.as_ref()) {
+        let seat_ref =
+            crate::provider_ref::ProviderRef::for_seat(&provider, model.as_deref()).display();
+        if !crate::backup::is_provider_eligible(&seat_ref, &store, available.as_ref()) {
             let ordinal = if seat.role == SlotRole::Reviewer {
                 reviewer_ordinal(&seat.seat).unwrap_or(0)
             } else {
@@ -1909,8 +1914,12 @@ fn run_with_task(
         };
         let mut still_paused: Vec<String> = Vec::new();
         for slot in &state.slots {
-            if !crate::backup::is_provider_eligible(&slot.provider, &store, available.as_ref()) {
-                let key = crate::quota::normalize_key(&slot.provider);
+            if !crate::backup::is_provider_eligible(
+                &slot.provider_ref().display(),
+                &store,
+                available.as_ref(),
+            ) {
+                let key = slot.provider_ref().quota_key();
                 if !still_paused.contains(&key) {
                     still_paused.push(key);
                 }
@@ -2300,12 +2309,8 @@ pub fn execute_loop(
                         .find(|s| s.id == impl_job.slot_id)
                         .cloned()
                         .unwrap();
-                    let cause = crate::backup::dispatch_stop_cause(
-                        &slot_state,
-                        &impl_slot.provider,
-                        &store,
-                        available.as_ref(),
-                    );
+                    let cause =
+                        crate::backup::dispatch_stop_cause(&slot_state, &store, available.as_ref());
                     if cause.engages_backup() && slot_state.source != Some(SeatSource::Backup) {
                         let backup_key = crate::provider_ref::ProviderRef::parse(&backup_raw)
                             .map(|r| r.storage_key())
@@ -2390,12 +2395,8 @@ pub fn execute_loop(
                     .find(|s| s.id == impl_job.slot_id)
                     .cloned()
                     .unwrap();
-                let cause = crate::backup::dispatch_stop_cause(
-                    &slot_state,
-                    &impl_slot.provider,
-                    &store,
-                    available.as_ref(),
-                );
+                let cause =
+                    crate::backup::dispatch_stop_cause(&slot_state, &store, available.as_ref());
                 if cause.engages_backup() {
                     if let Some(backup_raw) =
                         crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
@@ -3362,7 +3363,9 @@ fn recheck_seat(
         return Ok(SeatCheck::Ready(slot_id.to_string()));
     }
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-    let key = crate::quota::normalize_key(&slot.provider);
+    let seat = slot.provider_ref();
+    let key = seat.quota_key();
+    let sub = seat.storage_key();
     // Only a pause a live run can trust stops it here: a weak heuristic pause ("429"
     // in "429 passed") written by this very run must not park it or reseat it (O106).
     if !store.blocks_live_dispatch(&key) {
@@ -3374,7 +3377,7 @@ fn recheck_seat(
     };
     let backup = ordinal
         .and_then(|o| crate::backup::backup_for_role(slot.role, o, cfg))
-        .filter(|b| crate::quota::normalize_key(b) != key)
+        .filter(|b| crate::quota::sub_key(b) != sub)
         .filter(|b| crate::backup::backup_eligible(b, &store, None, paths, state.dry_run));
     let Some(backup_raw) = backup else {
         return Ok(SeatCheck::Park(format!(
@@ -3428,8 +3431,7 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
                     Some(detected)
                 }
             };
-        let cause =
-            crate::backup::dispatch_stop_cause(&slot_state, &cur, &store, available_opt.as_ref());
+        let cause = crate::backup::dispatch_stop_cause(&slot_state, &store, available_opt.as_ref());
         if has_backup {
             if cause.engages_backup() {
                 if let Some(backup_raw) =
@@ -3660,7 +3662,7 @@ fn try_rotate_reviewer_provider(
     if infra && slot.source != Some(SeatSource::Backup) {
         let backup = reviewer_ordinal(rev_id)
             .and_then(|o| crate::backup::backup_for_role(SlotRole::Reviewer, o, cfg))
-            .filter(|b| crate::quota::normalize_key(b) != crate::quota::normalize_key(&cur))
+            .filter(|b| crate::quota::sub_key(b) != crate::quota::sub_key(&cur))
             .filter(|b| crate::backup::backup_eligible(b, &store, None, paths, state.dry_run));
         if let Some(raw) = backup {
             let id = move_seat_to_backup(state, paths, rev_id, &raw)?;

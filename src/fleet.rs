@@ -35,7 +35,7 @@ const SHARED_RETRY: Duration = Duration::from_secs(60);
 #[derive(Clone)]
 pub struct Shared {
     pub dir: PathBuf,
-    accounts: HashMap<String, String>,
+    accounts: HashMap<String, crate::config::AccountLabel>,
 }
 
 static WARNED: AtomicBool = AtomicBool::new(false);
@@ -117,7 +117,7 @@ impl Shared {
         let accounts = user
             .accounts
             .into_iter()
-            .map(|(k, v)| (crate::quota::normalize_key(&k), v))
+            .map(|(k, v)| (crate::quota::sub_key(&k), v))
             .collect();
         Some(Self { dir, accounts })
     }
@@ -128,7 +128,10 @@ impl Shared {
             dir: dir.to_path_buf(),
             accounts: accounts
                 .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .map(|(k, v)| {
+                    let label = crate::config::AccountLabel::try_from(v.to_string()).unwrap();
+                    (k.to_string(), label)
+                })
                 .collect(),
         }
     }
@@ -145,20 +148,43 @@ impl Shared {
         self.dir.join("slots")
     }
 
-    /// The fleet key for a storage key: the provider bucket plus the operator's account
-    /// label, so two boxes logged into one account share a pause and two accounts on one
-    /// provider do not.
-    pub fn account_key(&self, storage_key: &str) -> String {
-        match self.accounts.get(storage_key) {
-            Some(label) if !label.is_empty() => format!("{storage_key}#{label}"),
-            _ => storage_key.to_string(),
+    /// The fleet key for a quota key: the login's account label plus the model when
+    /// the key carries one (`cli:agy#acct-a@gemini-3-flash`), so two boxes logged
+    /// into one account share a pause and two accounts on one provider do not.
+    /// Legacy model-less records (`cli:agy#acct-a`) map to the CLI level, which
+    /// holds every model.
+    pub fn account_key(&self, quota_key: &str) -> String {
+        let (sub, model) = match crate::provider_ref::ProviderRef::parse(quota_key) {
+            Ok(pref) => {
+                let suffix = pref
+                    .model
+                    .as_ref()
+                    .map(|m| format!("@{m}"))
+                    .unwrap_or_default();
+                (pref.storage_key(), suffix)
+            }
+            Err(_) => (quota_key.to_string(), String::new()),
+        };
+        match self.accounts.get(&sub) {
+            Some(label) if !label.as_str().is_empty() => {
+                format!("{sub}#{}{model}", label.as_str())
+            }
+            _ => format!("{sub}{model}"),
         }
     }
 
-    /// The local storage key an account key maps to, when this box uses that account.
-    pub fn storage_key_for(&self, account_key: &str) -> Option<String> {
-        let storage = account_key.split('#').next()?;
-        (self.account_key(storage) == account_key).then(|| storage.to_string())
+    /// The local quota key an account key maps to, when this box uses that
+    /// account. The model suffix (after this box's own label) round-trips;
+    /// anything else maps back only for the same account.
+    pub fn quota_key_for(&self, account_key: &str) -> Option<String> {
+        let cut = account_key.find(['#', '@']).unwrap_or(account_key.len());
+        let base = &account_key[..cut];
+        let rest = account_key.strip_prefix(&self.account_key(base))?;
+        if rest.is_empty() {
+            return Some(base.to_string());
+        }
+        let model = rest.strip_prefix('@')?;
+        Some(format!("{base}@{model}"))
     }
 }
 
@@ -385,8 +411,9 @@ fn count_remote_slots(
         if rec.machine.same(me) && rec.project_root == project_root {
             continue;
         }
-        if let Some(storage) = shared.storage_key_for(&rec.account) {
-            *out.entry(storage).or_insert(0) += 1;
+        if let Some(storage) = shared.quota_key_for(&rec.account) {
+            let sub = storage.split('@').next().unwrap_or(&storage).to_string();
+            *out.entry(sub).or_insert(0) += 1;
         }
     }
     out
@@ -434,12 +461,41 @@ mod tests {
         assert_eq!(a.account_key("cli:claude"), "cli:claude#acct-a");
         assert_eq!(a.account_key("cli:codex"), "cli:codex");
         assert_eq!(
-            a.storage_key_for("cli:claude#acct-a").as_deref(),
+            a.quota_key_for("cli:claude#acct-a").as_deref(),
             Some("cli:claude")
         );
-        assert_eq!(a.storage_key_for("cli:claude#acct-b"), None);
-        assert_eq!(a.storage_key_for("cli:claude"), None);
-        assert_eq!(a.storage_key_for("cli:codex").as_deref(), Some("cli:codex"));
+        assert_eq!(a.quota_key_for("cli:claude#acct-b"), None);
+        assert_eq!(a.quota_key_for("cli:claude"), None);
+        assert_eq!(a.quota_key_for("cli:codex").as_deref(), Some("cli:codex"));
+    }
+
+    #[test]
+    fn account_keys_carry_the_model_and_legacy_records_stay_cli_level() {
+        let tmp = tempdir().unwrap();
+        let a = Shared::at(tmp.path(), &[("cli:agy", "acct-a")]);
+        assert_eq!(
+            a.account_key("cli:agy@gemini-3-flash"),
+            "cli:agy#acct-a@gemini-3-flash"
+        );
+        assert_eq!(
+            a.quota_key_for("cli:agy#acct-a@gemini-3-flash").as_deref(),
+            Some("cli:agy@gemini-3-flash")
+        );
+        assert_eq!(
+            a.quota_key_for("cli:agy#acct-b@gemini-3-flash"),
+            None,
+            "another account's model key never maps back"
+        );
+        assert_eq!(
+            a.quota_key_for("cli:agy#acct-a").as_deref(),
+            Some("cli:agy"),
+            "a legacy model-less record still maps to the CLI level"
+        );
+        for bad in ["a@b", "a#b"] {
+            let toml = format!("[accounts]\n\"cli:claude\" = \"{bad}\"\n");
+            let err = toml::from_str::<crate::config::UserConfig>(&toml).unwrap_err();
+            assert!(err.to_string().contains("may not contain"), "{err}");
+        }
     }
 
     #[test]

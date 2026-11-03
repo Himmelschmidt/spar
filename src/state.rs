@@ -578,6 +578,13 @@ impl SlotState {
     /// Every outcome field of the last dispatch is dropped with the old provider (O149):
     /// a seat that names one provider while carrying another's `quota_hit`, `auth_fault`
     /// or usage reports that failure against a provider that never ran.
+    /// The ref this seat dispatches as: its stored provider plus its recorded
+    /// model. Quota gates resolve through this so a seat whose model came from
+    /// config or model-select keys identically to the writer's backfilled job.
+    pub fn provider_ref(&self) -> crate::provider_ref::ProviderRef {
+        crate::provider_ref::ProviderRef::for_seat(&self.provider, self.model.as_deref())
+    }
+
     pub fn point_at(&mut self, provider: &str) {
         match crate::provider_ref::ProviderRef::parse(provider) {
             Ok(pref) => {

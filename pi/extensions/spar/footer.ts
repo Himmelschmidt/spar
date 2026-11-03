@@ -8,6 +8,7 @@ import {
 	type Stats,
 	sparJson,
 	statsCost,
+	withModels,
 } from "./spar.ts";
 
 // Applied at once so the footer moves before the debounced re-read confirms it: an
@@ -165,7 +166,7 @@ export class Footer {
 	private async pollProviders(): Promise<void> {
 		const providers = await sparJson<Provider[]>(["provider", "list", "--json"], this.options.cwd, 30_000);
 		if (this.stopped || !providers.ok) return;
-		this.paused = providers.value.filter(isPaused);
+		this.paused = withModels(providers.value).filter(isPaused);
 		this.render();
 	}
 

@@ -94,7 +94,7 @@ pub fn is_provider_eligible(
     store: &QuotaStore,
     available: Option<&std::collections::HashSet<String>>,
 ) -> bool {
-    let key = crate::quota::normalize_key(provider);
+    let key = crate::quota::quota_key(provider);
     if !store.is_usable(&key) {
         return false;
     }
@@ -107,7 +107,7 @@ pub fn is_provider_eligible(
         }
     }
     if let Some(set) = available {
-        if !set.contains(&key) {
+        if !set.contains(&crate::quota::sub_key(provider)) {
             return false;
         }
     }
@@ -129,7 +129,7 @@ pub fn backup_eligible(
     if is_provider_eligible(backup, store, available) {
         return true;
     }
-    let key = crate::quota::normalize_key(backup);
+    let key = crate::quota::quota_key(backup);
     if dry || !store.is_quota_paused(&key) {
         return false;
     }
@@ -187,6 +187,7 @@ pub fn resolve_with_backup(
     pool: &[String],
     pool_origin: crate::state::PoolOrigin,
     cfg: &crate::config::Config,
+    primary_model: Option<&str>,
     store: &QuotaStore,
     available: Option<&std::collections::HashSet<String>>,
     paths: &crate::paths::SparPaths,
@@ -201,7 +202,8 @@ pub fn resolve_with_backup(
         cfg,
     );
     let (prov, src) = primary?;
-    if is_provider_eligible(&prov, store, available) {
+    let seat = crate::provider_ref::ProviderRef::for_seat(&prov, primary_model).display();
+    if is_provider_eligible(&seat, store, available) {
         return Some((prov, src));
     }
     let backup_raw = backup_for_role(role, role_index, cfg)?;
@@ -214,7 +216,6 @@ pub fn resolve_with_backup(
 
 pub fn dispatch_stop_cause(
     slot: &SlotState,
-    provider: &str,
     store: &QuotaStore,
     available: Option<&std::collections::HashSet<String>>,
 ) -> StopCause {
@@ -252,10 +253,12 @@ pub fn dispatch_stop_cause(
             || lower.contains("capacity")
             || lower.contains("billing"))
             && {
-                let key = crate::quota::normalize_key(provider);
+                let seat = slot.provider_ref();
+                let key = seat.quota_key();
+                let sub = seat.storage_key();
                 store.effective_status(&key) != crate::quota::ProviderStatus::Available
                     || !store.is_usable(&key)
-                    || available.is_some_and(|s| !s.contains(&key))
+                    || available.is_some_and(|s| !s.contains(&sub))
             }
         {
             return StopCause::Environmental;
@@ -266,18 +269,15 @@ pub fn dispatch_stop_cause(
             || lower.contains("os error")
             || lower.contains("executable not found"))
             && {
-                let key = crate::quota::normalize_key(provider);
+                let seat = slot.provider_ref();
+                let key = seat.quota_key();
+                let sub = seat.storage_key();
                 store.effective_status(&key) != crate::quota::ProviderStatus::Available
                     || !store.is_usable(&key)
-                    || available.is_some_and(|s| !s.contains(&key))
+                    || available.is_some_and(|s| !s.contains(&sub))
             }
         {
             return StopCause::Environmental;
-        }
-    }
-    if let Ok(pref) = crate::provider_ref::ProviderRef::parse(provider) {
-        if pref.backend == crate::provider_ref::ExecBackend::ApiSdk {
-            return StopCause::Work;
         }
     }
     StopCause::Work
@@ -287,6 +287,12 @@ pub fn dispatch_stop_cause(
 mod tests {
     use super::*;
     use crate::state::{SlotRole, SlotState, SlotStatus};
+
+    fn api_slot() -> SlotState {
+        let mut s = slot_with_quota(false);
+        s.point_at("api:openai@gpt-5");
+        s
+    }
 
     fn slot_with_quota(hit: bool) -> SlotState {
         let mut s = crate::executor::init_slot("test", "cli:claude", SlotRole::Implementer);
@@ -300,7 +306,7 @@ mod tests {
         let mut slot = slot_with_quota(true);
         slot.status = SlotStatus::Failed;
         assert_eq!(
-            dispatch_stop_cause(&slot, "cli:claude", &store, None),
+            dispatch_stop_cause(&slot, &store, None),
             StopCause::Environmental
         );
     }
@@ -313,7 +319,7 @@ mod tests {
         slot.status = SlotStatus::Failed;
         slot.error = Some("rate limit exceeded".into());
         assert_eq!(
-            dispatch_stop_cause(&slot, "cli:claude", &store, None),
+            dispatch_stop_cause(&slot, &store, None),
             StopCause::Environmental
         );
     }
@@ -327,7 +333,7 @@ mod tests {
         let mut set = std::collections::HashSet::new();
         set.insert("cli:grok".to_string());
         assert_eq!(
-            dispatch_stop_cause(&slot, "cli:claude", &store, Some(&set)),
+            dispatch_stop_cause(&slot, &store, Some(&set)),
             StopCause::Environmental
         );
     }
@@ -338,10 +344,7 @@ mod tests {
         store.pause_quota("cli:claude", "test");
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Done;
-        assert_eq!(
-            dispatch_stop_cause(&slot, "cli:claude", &store, None),
-            StopCause::Work
-        );
+        assert_eq!(dispatch_stop_cause(&slot, &store, None), StopCause::Work);
     }
 
     #[test]
@@ -352,7 +355,7 @@ mod tests {
         let mut set = std::collections::HashSet::new();
         set.insert("cli:grok".to_string());
         assert_eq!(
-            dispatch_stop_cause(&slot, "cli:claude", &store, Some(&set)),
+            dispatch_stop_cause(&slot, &store, Some(&set)),
             StopCause::Work
         );
     }
@@ -365,7 +368,7 @@ mod tests {
         let mut set = std::collections::HashSet::new();
         set.insert("cli:claude".to_string());
         assert_eq!(
-            dispatch_stop_cause(&slot, "cli:claude", &store, Some(&set)),
+            dispatch_stop_cause(&slot, &store, Some(&set)),
             StopCause::Work
         );
     }
@@ -375,10 +378,7 @@ mod tests {
         let store = QuotaStore::default();
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Failed;
-        assert_eq!(
-            dispatch_stop_cause(&slot, "cli:claude", &store, None),
-            StopCause::Work
-        );
+        assert_eq!(dispatch_stop_cause(&slot, &store, None), StopCause::Work);
     }
 
     #[test]
@@ -405,12 +405,7 @@ mod tests {
         set.insert("cli:claude".to_string());
         assert!(is_provider_eligible("api:openai@gpt-5", &store, Some(&set)));
         assert_eq!(
-            dispatch_stop_cause(
-                &slot_with_quota(false),
-                "api:openai@gpt-5",
-                &store,
-                Some(&set)
-            ),
+            dispatch_stop_cause(&api_slot(), &store, Some(&set)),
             StopCause::Work
         );
     }
@@ -426,11 +421,11 @@ mod tests {
             &store,
             Some(&set)
         ));
-        let mut slot = slot_with_quota(false);
+        let mut slot = api_slot();
         slot.status = SlotStatus::Failed;
         slot.error = Some("rate limit exceeded".into());
         assert_eq!(
-            dispatch_stop_cause(&slot, "api:openai@gpt-5", &store, Some(&set)),
+            dispatch_stop_cause(&slot, &store, Some(&set)),
             StopCause::Environmental
         );
     }
@@ -444,7 +439,7 @@ mod tests {
         let mut set = std::collections::HashSet::new();
         set.insert("cli:claude".to_string());
         assert_eq!(
-            dispatch_stop_cause(&slot, "cli:claude", &store, Some(&set)),
+            dispatch_stop_cause(&slot, &store, Some(&set)),
             StopCause::Work
         );
     }
@@ -458,7 +453,7 @@ mod tests {
         let mut set = std::collections::HashSet::new();
         set.insert("cli:claude".to_string());
         assert_eq!(
-            dispatch_stop_cause(&slot, "cli:claude", &store, Some(&set)),
+            dispatch_stop_cause(&slot, &store, Some(&set)),
             StopCause::Work
         );
     }
@@ -472,7 +467,7 @@ mod tests {
         let mut set = std::collections::HashSet::new();
         set.insert("cli:claude".to_string());
         assert_eq!(
-            dispatch_stop_cause(&slot, "cli:claude", &store, Some(&set)),
+            dispatch_stop_cause(&slot, &store, Some(&set)),
             StopCause::Work
         );
     }
@@ -486,14 +481,14 @@ mod tests {
         set.insert("cli:claude".to_string());
         // If Work branch were neutralized to Environmental, this would be Environmental
         assert_eq!(
-            dispatch_stop_cause(&slot, "cli:claude", &store, Some(&set)),
+            dispatch_stop_cause(&slot, &store, Some(&set)),
             StopCause::Work
         );
         // Verify environmental still distinct
         let mut env_slot = slot_with_quota(true);
         env_slot.status = SlotStatus::Failed;
         assert_eq!(
-            dispatch_stop_cause(&env_slot, "cli:claude", &store, Some(&set)),
+            dispatch_stop_cause(&env_slot, &store, Some(&set)),
             StopCause::Environmental
         );
     }
@@ -505,10 +500,7 @@ mod tests {
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Failed;
         slot.error = Some("hard ceiling: slot timed out after 10s".into());
-        assert_eq!(
-            dispatch_stop_cause(&slot, "cli:claude", &store, None),
-            StopCause::Work
-        );
+        assert_eq!(dispatch_stop_cause(&slot, &store, None), StopCause::Work);
     }
 
     #[test]
@@ -518,10 +510,7 @@ mod tests {
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Failed;
         slot.error = Some("missing expected artifact: summary-impl.md".into());
-        assert_eq!(
-            dispatch_stop_cause(&slot, "cli:claude", &store, None),
-            StopCause::Work
-        );
+        assert_eq!(dispatch_stop_cause(&slot, &store, None), StopCause::Work);
     }
 
     #[test]
@@ -531,10 +520,7 @@ mod tests {
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Failed;
         slot.error = Some("review verdict: request_changes".into());
-        assert_eq!(
-            dispatch_stop_cause(&slot, "cli:claude", &store, None),
-            StopCause::Work
-        );
+        assert_eq!(dispatch_stop_cause(&slot, &store, None), StopCause::Work);
     }
 
     #[test]
@@ -544,10 +530,7 @@ mod tests {
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Failed;
         slot.error = Some("some other failure".into());
-        assert_eq!(
-            dispatch_stop_cause(&slot, "cli:claude", &store, None),
-            StopCause::Work
-        );
+        assert_eq!(dispatch_stop_cause(&slot, &store, None), StopCause::Work);
     }
 
     #[test]
@@ -557,15 +540,12 @@ mod tests {
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Failed;
         slot.error = Some("exit code 1".into());
-        assert_eq!(
-            dispatch_stop_cause(&slot, "cli:claude", &store, None),
-            StopCause::Work
-        );
+        assert_eq!(dispatch_stop_cause(&slot, &store, None), StopCause::Work);
         // Neutralisation: if paused check were leak, this would be Environmental
         let mut env_slot = slot_with_quota(true);
         env_slot.status = SlotStatus::Failed;
         assert_eq!(
-            dispatch_stop_cause(&env_slot, "cli:claude", &store, None),
+            dispatch_stop_cause(&env_slot, &store, None),
             StopCause::Environmental
         );
     }
@@ -625,7 +605,7 @@ mod tests {
         slot.status = SlotStatus::Failed;
         slot.auth_fault = true;
         slot.error = Some("exit 1".into());
-        let cause = dispatch_stop_cause(&slot, "cli:claude", &store, None);
+        let cause = dispatch_stop_cause(&slot, &store, None);
         assert_eq!(cause, StopCause::Auth);
         assert!(cause.engages_backup());
         assert!(StopCause::Environmental.engages_backup());
@@ -672,8 +652,141 @@ mod tests {
         slot.status = SlotStatus::Failed;
         slot.error = Some("rate limit seven_day rejected".into());
         assert_eq!(
-            dispatch_stop_cause(&slot, "cli:claude", &store, None),
+            dispatch_stop_cause(&slot, &store, None),
             StopCause::Environmental
         );
+    }
+
+    #[test]
+    fn agy_model_pause_holds_only_that_model() {
+        let mut store = QuotaStore::default();
+        store.pause_quota_until(
+            "cli:agy@flash",
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            "agy individual quota reached",
+        );
+        store.mark_strong("cli:agy@flash");
+        assert!(!is_provider_eligible("cli:agy@flash", &store, None));
+        assert!(store.blocks_live_dispatch("cli:agy@flash"));
+        assert!(is_provider_eligible("cli:agy@pro", &store, None));
+        assert!(!store.blocks_live_dispatch("cli:agy@pro"));
+
+        let mut store = QuotaStore::default();
+        store.pause_quota("cli:agy@pro", "pro limit");
+        store.mark_strong("cli:agy@pro");
+        assert!(!is_provider_eligible("cli:agy@pro", &store, None));
+        assert!(is_provider_eligible("cli:agy@flash", &store, None));
+    }
+
+    #[test]
+    fn agy_cli_level_pause_holds_every_model() {
+        let mut store = QuotaStore::default();
+        store.pause_manual("cli:agy", None);
+        assert!(!is_provider_eligible("cli:agy@flash", &store, None));
+        assert!(!is_provider_eligible("cli:agy@pro", &store, None));
+        assert!(!is_provider_eligible("cli:agy", &store, None));
+
+        let mut legacy = QuotaStore::default();
+        legacy.pause_quota_until(
+            "cli:agy",
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            "legacy record",
+        );
+        legacy.mark_strong("cli:agy");
+        assert!(!is_provider_eligible("cli:agy@flash", &legacy, None));
+        assert!(!is_provider_eligible("cli:agy@pro", &legacy, None));
+        assert!(legacy.blocks_live_dispatch("cli:agy@flash"));
+        assert!(legacy.blocks_live_dispatch("cli:agy@pro"));
+    }
+
+    #[test]
+    fn a_selected_model_decides_whether_the_backup_takes_the_seat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::SparPaths::new(tmp.path());
+        let mut cfg = crate::config::Config::default();
+        cfg.backups.planner = Some("cli:codex".into());
+        let mut store = QuotaStore::default();
+        store.pause_manual("cli:agy@flash", None);
+        let pool = vec!["cli:agy".to_string()];
+        let seat = |model| {
+            resolve_with_backup(
+                SlotRole::Planner,
+                0,
+                0,
+                &pool,
+                crate::state::PoolOrigin::Selected,
+                &cfg,
+                model,
+                &store,
+                None,
+                &paths,
+                true,
+            )
+            .unwrap()
+            .0
+        };
+        assert_eq!(seat(Some("pro")), "cli:agy");
+        assert_eq!(seat(Some("flash")), "cli:codex");
+    }
+
+    #[test]
+    fn a_stop_cause_reads_the_seats_model_key() {
+        let mut slot = slot_with_quota(false);
+        slot.point_at("cli:agy@flash");
+        slot.status = SlotStatus::Failed;
+        slot.error = Some("no capacity".into());
+        let mut store = QuotaStore::default();
+        store.pause_quota("cli:agy@pro", "limit");
+        assert_eq!(dispatch_stop_cause(&slot, &store, None), StopCause::Work);
+        store.pause_quota("cli:agy@flash", "limit");
+        assert_eq!(
+            dispatch_stop_cause(&slot, &store, None),
+            StopCause::Environmental
+        );
+    }
+
+    #[test]
+    fn agy_models_are_one_sub_for_the_backup_rule() {
+        assert_eq!(
+            crate::quota::sub_key("cli:agy@pro"),
+            crate::quota::sub_key("cli:agy@flash")
+        );
+        assert_ne!(
+            crate::quota::quota_key("cli:agy@pro"),
+            crate::quota::quota_key("cli:agy@flash")
+        );
+    }
+
+    #[test]
+    fn account_scoped_models_share_one_bucket() {
+        for (seat, other) in [
+            ("cli:claude@opus", "cli:claude@haiku"),
+            ("cli:codex@gpt-5", "cli:codex@mini"),
+            ("cli:muse@pro", "cli:muse@flash"),
+            ("cli:grok@heavy", "cli:grok@fast"),
+            ("cli:pi@model-a", "cli:pi@model-b"),
+        ] {
+            let mut store = QuotaStore::default();
+            store.pause_quota(&crate::quota::quota_key(seat), "limit");
+            assert!(
+                !is_provider_eligible(other, &store, None),
+                "{seat} must hold {other}"
+            );
+            assert_eq!(
+                crate::quota::quota_key(seat),
+                crate::quota::quota_key(other),
+            );
+        }
+    }
+
+    #[test]
+    fn agy_model_seat_survives_the_detected_cli_set() {
+        let mut store = QuotaStore::default();
+        store.pause_quota("cli:agy@flash", "flash limit");
+        let mut set = std::collections::HashSet::new();
+        set.insert("cli:agy".to_string());
+        assert!(!is_provider_eligible("cli:agy@flash", &store, Some(&set)));
+        assert!(is_provider_eligible("cli:agy@pro", &store, Some(&set)));
+        assert!(!is_provider_eligible("cli:codex", &store, Some(&set)));
     }
 }

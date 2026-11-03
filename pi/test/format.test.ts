@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { actionLines, describeEvent, detailLines, footerText, listRows, listText, plain, sortRuns } from "../extensions/spar/format.ts";
 import type { Brief } from "../extensions/spar/spar.ts";
-import { minutesSinceLocalMidnight, statsCost } from "../extensions/spar/spar.ts";
+import { minutesSinceLocalMidnight, statsCost, withModels } from "../extensions/spar/spar.ts";
 import { row, status } from "./helpers.ts";
 
 const DAY = 86_400_000;
@@ -160,5 +160,16 @@ test("a classifier event names the slot, the answer, its probability and whether
 	assert.equal(
 		describeEvent({ ...base, classifier: { ...record, acted: false, action: "none", error: "classifier unreachable\nmore" } }),
 		"classifier impl: error classifier unreachable",
+	);
+});
+
+test("provider rows include per-model rows so a model pause shows as paused", () => {
+	const rows = withModels([
+		{ name: "cli:agy", quota_status: "available", models: [{ name: "cli:agy@flash", quota_status: "paused_quota" }] },
+		{ name: "cli:claude", quota_status: "available" },
+	]);
+	assert.deepEqual(
+		rows.map((p) => p.name),
+		["cli:agy", "cli:agy@flash", "cli:claude"],
 	);
 });
