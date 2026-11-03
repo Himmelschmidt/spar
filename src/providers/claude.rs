@@ -106,7 +106,10 @@ fn line_scope(line: &str) -> Option<QuotaScope> {
     None
 }
 
-fn text_scope(log: &str) -> QuotaScope {
+/// The rejection votes across text lines: the named family bucket when every line
+/// agrees on one, whether any vote is seat-scoped, and whether any vote is
+/// login-wide (or two votes disagree, which also widens to the login).
+fn scope_votes(log: &str) -> (Option<&'static str>, bool, bool) {
     let mut bucket: Option<&'static str> = None;
     let mut seat = false;
     let mut login = false;
@@ -122,6 +125,10 @@ fn text_scope(log: &str) -> QuotaScope {
             },
         }
     }
+    (bucket, seat, login)
+}
+
+fn reduce_votes(bucket: Option<&'static str>, seat: bool, login: bool) -> QuotaScope {
     if login || (bucket.is_some() && seat) || (bucket.is_none() && !seat) {
         return QuotaScope::Login;
     }
@@ -129,6 +136,28 @@ fn text_scope(log: &str) -> QuotaScope {
         Some(b) => QuotaScope::Bucket(b),
         None => QuotaScope::Seat,
     }
+}
+
+fn text_scope(log: &str) -> QuotaScope {
+    let (bucket, seat, login) = scope_votes(log);
+    reduce_votes(bucket, seat, login)
+}
+
+/// A typed window voting alongside text lines: the window's scope joins the same
+/// ballot, broadest wins, and text with no rejection lines contributes nothing, so
+/// a lone typed event keeps its bucket.
+fn combined_scope(window: &RateLimitWindow, log: &str) -> QuotaScope {
+    let (mut bucket, mut seat, mut login) = scope_votes(log);
+    match window_scope(window) {
+        QuotaScope::Login => login = true,
+        QuotaScope::Seat => seat = true,
+        QuotaScope::Bucket(b) => match bucket {
+            None => bucket = Some(b),
+            Some(cur) if cur == b => {}
+            Some(_) => login = true,
+        },
+    }
+    reduce_votes(bucket, seat, login)
 }
 
 impl ProviderAdapter for ClaudeAdapter {
@@ -146,6 +175,7 @@ impl ProviderAdapter for ClaudeAdapter {
         match signal {
             QuotaSignal::Window(window) => window_scope(window),
             QuotaSignal::Text(log) => text_scope(log),
+            QuotaSignal::WindowAndText(window, log) => combined_scope(window, log),
         }
     }
 
@@ -553,6 +583,34 @@ mod tests {
             "mixed families widen to the login"
         );
         assert_eq!(text("all quiet here"), S::Login);
+    }
+
+    #[test]
+    fn rejection_scope_combines_a_window_with_prose() {
+        use QuotaScope as S;
+        use RateLimitWindow as W;
+        let both = |w: &W, l: &str| ClaudeAdapter.rejection_scope(QuotaSignal::WindowAndText(w, l));
+        assert_eq!(
+            both(&W::SevenDayOpus, "{\"type\":\"rate_limit_event\"}"),
+            S::Bucket("opus"),
+            "prose-free output leaves the typed bucket standing"
+        );
+        assert_eq!(
+            both(&W::SevenDayOpus, "You've hit your limit"),
+            S::Login,
+            "a generic line next to a family window widens to the login"
+        );
+        assert_eq!(
+            both(&W::SevenDayOpus, "You've reached your Opus limit"),
+            S::Bucket("opus")
+        );
+        assert_eq!(
+            both(&W::SevenDayOpus, "You've reached your Fable limit"),
+            S::Login,
+            "conflicting families widen to the login"
+        );
+        assert_eq!(both(&W::SevenDayOverageIncluded, "all quiet here"), S::Seat);
+        assert_eq!(both(&W::FiveHour, "all quiet here"), S::Login);
     }
 
     #[test]

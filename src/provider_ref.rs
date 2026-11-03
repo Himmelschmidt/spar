@@ -311,6 +311,19 @@ mod tests {
             opus.rejection_key(QuotaSignal::Text("You've hit your weekly limit")),
             "cli:claude"
         );
+        assert_eq!(
+            opus.rejection_key(QuotaSignal::WindowAndText(
+                &W::SevenDayOpus,
+                "You've hit your limit"
+            )),
+            "cli:claude",
+            "a generic line next to a family window widens to the login"
+        );
+        assert_eq!(
+            opus.rejection_key(QuotaSignal::WindowAndText(&W::SevenDayOpus, "")),
+            "cli:claude@opus",
+            "prose-free output leaves the typed bucket standing"
+        );
         let agy = ProviderRef::parse("cli:agy@flash").unwrap();
         assert_eq!(
             agy.rejection_key(QuotaSignal::Window(&W::FiveHour)),

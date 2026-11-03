@@ -658,6 +658,37 @@ fn probe_parses_a_raw_stream_json_rejection() {
     );
 }
 
+/// A raw `seven_day_opus` event next to a generic limit line pauses the login:
+/// the window votes alongside the prose, broadest wins.
+#[test]
+fn probe_widens_a_typed_event_with_generic_prose_to_the_login() {
+    let reset_at = chrono::Utc::now() + chrono::Duration::hours(2);
+    let fx = Fixture::new();
+    fx.cli(
+        "claude",
+        &format!(
+            "echo '{{\"type\":\"rate_limit_event\",\"rate_limit_info\":{{\"status\":\"rejected\",\"rateLimitType\":\"seven_day_opus\",\"resetsAt\":{}}}}}'; echo \"You've hit your limit\"; exit 1",
+            reset_at.timestamp()
+        ),
+    );
+    let out = fx
+        .spar()
+        .args(["provider", "probe", "cli:claude@opus", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let r: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(r[0]["verdict"], "quota", "{r}");
+    assert_eq!(r[0]["provider"], "cli:claude", "{r}");
+    let quota = fx.quota();
+    assert!(
+        quota["providers"]["cli:claude"].is_object(),
+        "the login is paused: {quota}"
+    );
+}
+
 /// Recovery: a stream that reports `seven_day_opus` rejected and then recovers
 /// with `allowed` writes no pause on any claude key when the dispatch fails for
 /// an unrelated reason.

@@ -46,13 +46,14 @@ pub fn probe(paths: &SparPaths, provider: &str, dry: bool) -> ProbeReport {
     let key = ProviderRef::parse(provider)
         .map(|pref| {
             if out.verdict == Verdict::Quota {
+                let text = out.output.as_deref().unwrap_or("");
                 match out.window {
-                    Some(window) => {
-                        pref.rejection_key(crate::providers::QuotaSignal::Window(&window))
-                    }
-                    None => pref.rejection_key(crate::providers::QuotaSignal::Text(
-                        out.output.as_deref().unwrap_or(""),
-                    )),
+                    // Finished output carries no stream state: the window votes
+                    // alongside the prose, broadest wins, and prose-free output
+                    // leaves the typed bucket standing.
+                    Some(window) => pref
+                        .rejection_key(crate::providers::QuotaSignal::WindowAndText(&window, text)),
+                    None => pref.rejection_key(crate::providers::QuotaSignal::Text(text)),
                 }
             } else {
                 pref.quota_key()

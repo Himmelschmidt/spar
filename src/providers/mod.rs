@@ -199,6 +199,12 @@ pub enum QuotaScope {
 pub enum QuotaSignal<'a> {
     Window(&'a RateLimitWindow),
     Text(&'a str),
+    /// A typed window together with the full text: the window votes alongside the
+    /// text's rejection lines, broadest wins, while text with no rejection lines
+    /// abstains (unlike `Text` alone, which defaults to login-wide). The probe
+    /// uses this: finished output carries no stream state, so a generic prose line
+    /// next to a family window widens the pause to the login.
+    WindowAndText(&'a RateLimitWindow, &'a str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
