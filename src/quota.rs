@@ -865,7 +865,7 @@ pub fn scrape_claude_rate_limits(
 /// fires when one line both names a rate/usage limit and states a reset, so a limit
 /// phrase on one line and an unrelated "resets the counter" three pages later never
 /// combine into a pause. When the stated reset can be found but not parsed (unknown
-/// tz, unexpected format), still reports the hit so the caller pauses the provider —
+/// tz, unexpected format), still reports the hit so the caller pauses the provider:
 /// the fallback is the generic default-cooldown pause, made visible on stderr
 /// rather than silently guessed.
 pub(crate) fn scrape_claude_stated_reset(log: &str) -> Option<(Option<DateTime<Utc>>, String)> {

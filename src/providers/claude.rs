@@ -36,9 +36,9 @@ impl ClaudeFamily {
     /// first (`claude-<family>-…` with version-like segments after it,
     /// `claude-<family><digit>`) or a numeric version first
     /// (`claude-<version>-<family>-…`), case-insensitive, with any `[...]`
-    /// suffix ignored (`opus[1m]`, `claude-opus-5-5[1m]`). Anything else —
-    /// `opusplan`, `default`, `opus-degraded`, `magnum-opus`,
-    /// `claude-magnum-opus`, `claude-opus-degraded` — is not a family seat.
+    /// suffix ignored (`opus[1m]`, `claude-opus-5-5[1m]`). Anything else
+    /// (`opusplan`, `default`, `opus-degraded`, `magnum-opus`,
+    /// `claude-magnum-opus`, `claude-opus-degraded`) is not a family seat.
     pub fn of(model: &str) -> Option<Self> {
         let lower = model.to_ascii_lowercase();
         let base = lower.split('[').next().unwrap_or("").trim();
@@ -68,7 +68,7 @@ impl ClaudeFamily {
     }
 
     fn version_seg(s: &str) -> bool {
-        !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        s == "latest" || !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || b == b'.')
     }
 
     /// The per-model weekly bucket, `None` for a family with no per-model window.
@@ -99,7 +99,7 @@ impl ClaudeFamily {
 
 /// The family a typed window votes for: `None` is a login-wide vote. An
 /// overage-included window names no family on the wire, so it votes the seat it
-/// was dispatched on — which is `None` (login-wide) when the seat names no family.
+/// was dispatched on, which is `None` (login-wide) when the seat names no family.
 fn window_vote(
     window: &RateLimitWindow,
     seat_family: Option<ClaudeFamily>,
@@ -150,8 +150,8 @@ impl ProviderAdapter for ClaudeAdapter {
     }
 
     /// The bucket this rejection covers, `None` for the whole login. The typed
-    /// window (when present) and every rejection line each vote a family — `None`
-    /// for a login-wide vote — resolved against the dispatched seat's own family:
+    /// window (when present) and every rejection line each vote a family (`None`
+    /// for a login-wide vote), resolved against the dispatched seat's own family:
     /// a vote for another family widens to the login, so a family bucket only ever
     /// holds the seat it belongs to. No votes, any login-wide vote, or disagreeing
     /// votes all widen to the login.
@@ -531,7 +531,6 @@ mod tests {
             "claude-magnum-opus",
             "claude-opus-degraded",
             "claude-foo-sonnet",
-            "claude-3-5-sonnet-latest",
             "claude-4-1",
             "claude-",
             "claude",
@@ -539,6 +538,8 @@ mod tests {
             assert_eq!(F::of(m), None, "{m}");
         }
         assert_eq!(F::of("Claude-Opus-5-5"), Some(F::Opus));
+        assert_eq!(F::of("claude-3-5-sonnet-latest"), Some(F::Sonnet));
+        assert_eq!(F::of("claude-opus-4-latest"), Some(F::Opus));
     }
 
     #[test]

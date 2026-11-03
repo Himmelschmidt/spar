@@ -198,7 +198,7 @@ is the fallback when muse is not installed.
 `cli:codex@openai/gpt-4o-mini`, `api:openai@gpt-5`. The split happens before the
 provider-name check, so the model may contain `:` and `/` (OpenRouter slugs like
 `tencent/hy3:free`) while the adapter name may not. `@model` variants usually share one quota
-bucket with their bare provider — rate limits are per account, not per model. The
+bucket with their bare provider: rate limits are per account, not per model. The
 exceptions are agy, whose Gemini models are metered separately (`cli:agy@flash` and
 `cli:agy@pro` pause independently, while a login-wide pause, `cli:agy` with no
 model, still holds every model), and claude, whose weekly windows are metered per

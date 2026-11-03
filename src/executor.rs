@@ -3026,7 +3026,7 @@ fn outcome_log_text(log_path: &Path, outcome: &SlotOutcome) -> String {
 }
 
 /// Where a failed dispatch's pause lives: the typed window (when the adapter
-/// emitted one) voting alongside the log tail, broadest wins, like the probe — one
+/// emitted one) voting alongside the log tail, broadest wins, like the probe: one
 /// code path for both. One pure function of the same outcome the scrape will see,
 /// computed before the witness is taken so the witness, the scrape, the classifier
 /// verdict and every pause write share the key.
@@ -7171,7 +7171,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     }
 
     /// A prose-only family rejection names no reset and trips no broad needle, so
-    /// only the strong branch can pause it — and it must land on the family bucket,
+    /// only the strong branch can pause it, and it must land on the family bucket,
     /// trusted (strong), leaving the login and every other family alone.
     #[test]
     fn fable_prose_alone_pauses_only_the_fable_bucket() {
