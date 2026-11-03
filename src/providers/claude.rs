@@ -145,19 +145,29 @@ fn text_scope(log: &str) -> QuotaScope {
 
 /// A typed window voting alongside text lines: the window's scope joins the same
 /// ballot, broadest wins, and text with no rejection lines contributes nothing, so
-/// a lone typed event keeps its bucket.
-fn combined_scope(window: &RateLimitWindow, log: &str) -> QuotaScope {
-    let (mut bucket, mut seat, mut login) = scope_votes(log);
+/// a lone typed event keeps its bucket. A seat-scoped window vote is resolved
+/// against the dispatched seat's bucket: when the text names that same bucket,
+/// both votes agree and the bucket stands, otherwise the vote stays seat-scoped
+/// and widens exactly as an unknown seat would.
+fn combined_scope(seat: Option<&str>, window: &RateLimitWindow, log: &str) -> QuotaScope {
+    let (mut bucket, mut seat_vote, mut login) = scope_votes(log);
+    let seat_bucket = seat
+        .and_then(ClaudeFamily::of)
+        .and_then(ClaudeFamily::bucket);
     match window_scope(window) {
         QuotaScope::Login => login = true,
-        QuotaScope::Seat => seat = true,
+        QuotaScope::Seat => match (seat_bucket, bucket) {
+            (Some(own), Some(named)) if own != named => login = true,
+            (Some(_), Some(_)) => {}
+            _ => seat_vote = true,
+        },
         QuotaScope::Bucket(b) => match bucket {
             None => bucket = Some(b),
             Some(cur) if cur == b => {}
             Some(_) => login = true,
         },
     }
-    reduce_votes(bucket, seat, login)
+    reduce_votes(bucket, seat_vote, login)
 }
 
 impl ProviderAdapter for ClaudeAdapter {
@@ -171,11 +181,11 @@ impl ProviderAdapter for ClaudeAdapter {
             .map(std::borrow::Cow::Borrowed)
     }
 
-    fn rejection_scope(&self, signal: QuotaSignal<'_>) -> QuotaScope {
+    fn rejection_scope(&self, seat: Option<&str>, signal: QuotaSignal<'_>) -> QuotaScope {
         match signal {
             QuotaSignal::Window(window) => window_scope(window),
             QuotaSignal::Text(log) => text_scope(log),
-            QuotaSignal::WindowAndText(window, log) => combined_scope(window, log),
+            QuotaSignal::WindowAndText(window, log) => combined_scope(seat, window, log),
         }
     }
 
@@ -543,21 +553,21 @@ mod tests {
             W::Unknown,
         ] {
             assert_eq!(
-                ClaudeAdapter.rejection_scope(QuotaSignal::Window(&w)),
+                ClaudeAdapter.rejection_scope(None, QuotaSignal::Window(&w)),
                 S::Login,
                 "{w}"
             );
         }
         assert_eq!(
-            ClaudeAdapter.rejection_scope(QuotaSignal::Window(&W::SevenDayOpus)),
+            ClaudeAdapter.rejection_scope(None, QuotaSignal::Window(&W::SevenDayOpus)),
             S::Bucket("opus")
         );
         assert_eq!(
-            ClaudeAdapter.rejection_scope(QuotaSignal::Window(&W::SevenDaySonnet)),
+            ClaudeAdapter.rejection_scope(None, QuotaSignal::Window(&W::SevenDaySonnet)),
             S::Bucket("sonnet")
         );
         assert_eq!(
-            ClaudeAdapter.rejection_scope(QuotaSignal::Window(&W::SevenDayOverageIncluded)),
+            ClaudeAdapter.rejection_scope(None, QuotaSignal::Window(&W::SevenDayOverageIncluded)),
             S::Seat
         );
     }
@@ -565,7 +575,7 @@ mod tests {
     #[test]
     fn rejection_scope_reads_prose_lines() {
         use QuotaScope as S;
-        let text = |l: &str| ClaudeAdapter.rejection_scope(QuotaSignal::Text(l));
+        let text = |l: &str| ClaudeAdapter.rejection_scope(None, QuotaSignal::Text(l));
         assert_eq!(text("You've reached your Fable limit"), S::Bucket("fable"));
         assert_eq!(
             text("! rate limit  seven_day_opus  rejected"),
@@ -589,28 +599,56 @@ mod tests {
     fn rejection_scope_combines_a_window_with_prose() {
         use QuotaScope as S;
         use RateLimitWindow as W;
-        let both = |w: &W, l: &str| ClaudeAdapter.rejection_scope(QuotaSignal::WindowAndText(w, l));
+        let both = |s: Option<&str>, w: &W, l: &str| {
+            ClaudeAdapter.rejection_scope(s, QuotaSignal::WindowAndText(w, l))
+        };
         assert_eq!(
-            both(&W::SevenDayOpus, "{\"type\":\"rate_limit_event\"}"),
+            both(None, &W::SevenDayOpus, "{\"type\":\"rate_limit_event\"}"),
             S::Bucket("opus"),
             "prose-free output leaves the typed bucket standing"
         );
         assert_eq!(
-            both(&W::SevenDayOpus, "You've hit your limit"),
+            both(None, &W::SevenDayOpus, "You've hit your limit"),
             S::Login,
             "a generic line next to a family window widens to the login"
         );
         assert_eq!(
-            both(&W::SevenDayOpus, "You've reached your Opus limit"),
+            both(None, &W::SevenDayOpus, "You've reached your Opus limit"),
             S::Bucket("opus")
         );
         assert_eq!(
-            both(&W::SevenDayOpus, "You've reached your Fable limit"),
+            both(None, &W::SevenDayOpus, "You've reached your Fable limit"),
             S::Login,
             "conflicting families widen to the login"
         );
-        assert_eq!(both(&W::SevenDayOverageIncluded, "all quiet here"), S::Seat);
-        assert_eq!(both(&W::FiveHour, "all quiet here"), S::Login);
+        assert_eq!(
+            both(None, &W::SevenDayOverageIncluded, "all quiet here"),
+            S::Seat
+        );
+        assert_eq!(both(None, &W::FiveHour, "all quiet here"), S::Login);
+        assert_eq!(
+            both(
+                Some("fable"),
+                &W::SevenDayOverageIncluded,
+                "You've reached your Fable limit"
+            ),
+            S::Bucket("fable"),
+            "both signals name the dispatched family"
+        );
+        assert_eq!(
+            both(
+                Some("opus"),
+                &W::SevenDayOverageIncluded,
+                "You've reached your Fable limit"
+            ),
+            S::Login,
+            "the text names another family's bucket"
+        );
+        assert_eq!(
+            both(Some("opus"), &W::SevenDayOverageIncluded, "all quiet here"),
+            S::Seat,
+            "prose-free output stays seat-scoped for the key to resolve"
+        );
     }
 
     #[test]

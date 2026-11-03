@@ -261,8 +261,10 @@ pub trait ProviderAdapter: Send + Sync {
         None
     }
     /// What a rejection covers: the typed window when the adapter emitted one, else
-    /// the text it was read from. Defaults to the whole login.
-    fn rejection_scope(&self, _signal: QuotaSignal<'_>) -> QuotaScope {
+    /// the text it was read from. `seat` is the dispatched seat's model, when the
+    /// seat names one: a `Seat`-scoped vote can only be compared against text votes
+    /// once it is resolved to that seat's bucket. Defaults to the whole login.
+    fn rejection_scope(&self, _seat: Option<&str>, _signal: QuotaSignal<'_>) -> QuotaScope {
         QuotaScope::Login
     }
     fn binary_names(&self) -> &[&'static str];

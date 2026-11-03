@@ -16,7 +16,7 @@ impl ProviderAdapter for AgyAdapter {
         Some(std::borrow::Cow::Borrowed(model))
     }
 
-    fn rejection_scope(&self, _signal: QuotaSignal<'_>) -> QuotaScope {
+    fn rejection_scope(&self, _seat: Option<&str>, _signal: QuotaSignal<'_>) -> QuotaScope {
         QuotaScope::Seat
     }
 

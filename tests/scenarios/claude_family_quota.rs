@@ -689,6 +689,41 @@ fn probe_widens_a_typed_event_with_generic_prose_to_the_login() {
     );
 }
 
+/// An overage-included event with matching family prose pauses that family: both
+/// signals name the dispatched seat's bucket, so nothing widens to the login.
+#[test]
+fn probe_parses_an_overage_event_with_matching_family_prose() {
+    let reset_at = chrono::Utc::now() + chrono::Duration::hours(2);
+    let fx = Fixture::new();
+    fx.cli(
+        "claude",
+        &format!(
+            "echo '{{\"type\":\"rate_limit_event\",\"rate_limit_info\":{{\"status\":\"rejected\",\"rateLimitType\":\"seven_day_overage_included\",\"resetsAt\":{}}}}}'; echo \"You've reached your Fable limit\"; exit 1",
+            reset_at.timestamp()
+        ),
+    );
+    let out = fx
+        .spar()
+        .args(["provider", "probe", "cli:claude@fable", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let r: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(r[0]["verdict"], "quota", "{r}");
+    assert_eq!(r[0]["provider"], "cli:claude@fable", "{r}");
+    let quota = fx.quota();
+    assert!(
+        quota["providers"]["cli:claude@fable"].is_object(),
+        "the fable bucket is paused: {quota}"
+    );
+    assert!(
+        quota["providers"].get("cli:claude").is_none(),
+        "no login-wide pause: {quota}"
+    );
+}
+
 /// Recovery: a stream that reports `seven_day_opus` rejected and then recovers
 /// with `allowed` writes no pause on any claude key when the dispatch fails for
 /// an unrelated reason.

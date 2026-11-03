@@ -127,7 +127,7 @@ impl ProviderRef {
         let Some(adapter) = crate::providers::adapter_named(&self.storage_key()) else {
             return self.quota_key();
         };
-        match adapter.rejection_scope(signal) {
+        match adapter.rejection_scope(self.model.as_deref(), signal) {
             crate::providers::QuotaScope::Login => self.storage_key(),
             crate::providers::QuotaScope::Seat => self.quota_key(),
             crate::providers::QuotaScope::Bucket(bucket) => {
@@ -323,6 +323,23 @@ mod tests {
             opus.rejection_key(QuotaSignal::WindowAndText(&W::SevenDayOpus, "")),
             "cli:claude@opus",
             "prose-free output leaves the typed bucket standing"
+        );
+        let fable = ProviderRef::parse("cli:claude@fable").unwrap();
+        assert_eq!(
+            fable.rejection_key(QuotaSignal::WindowAndText(
+                &W::SevenDayOverageIncluded,
+                "You've reached your Fable limit"
+            )),
+            "cli:claude@fable",
+            "an overage window with matching family prose pauses that family"
+        );
+        assert_eq!(
+            opus.rejection_key(QuotaSignal::WindowAndText(
+                &W::SevenDayOverageIncluded,
+                "You've reached your Fable limit"
+            )),
+            "cli:claude",
+            "an overage window with another family's prose widens to the login"
         );
         let agy = ProviderRef::parse("cli:agy@flash").unwrap();
         assert_eq!(
