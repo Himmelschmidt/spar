@@ -1,6 +1,6 @@
 [package]
 name = "spar"
-version = "0.0.8"
+version = "0.0.9"
 edition = "2021"
 description = "Multi-agent coding orchestrator: dual backends, plan/review/arena/ship"
 license = "MIT"

@@ -4,6 +4,21 @@ All notable changes to spar are recorded here.
 
 ## [Unreleased]
 
+## [0.0.9] - 2026-11-03
+
+### Changed
+
+- **Gemini models on agy now pause separately.** When one Gemini model hits its limit,
+  seats on your other Gemini models keep working instead of all pausing together.
+- **Claude's Opus, Sonnet and Fable weekly limits now pause only that model family.**
+  Hitting your Opus weekly limit no longer stops your Sonnet or Haiku seats. The 5-hour
+  and overall weekly limits still pause every Claude seat.
+- **Provider status shows a row per model** where pauses are per model, in
+  `spar provider list`, `spar stats` and the pi footer.
+- **`spar provider resume` works per model.** Resuming a provider clears every model
+  under it; resuming one model clears only that model.
+- **Account labels in your user config can no longer contain `#` or `@`.**
+
 ## [0.0.8] - 2026-11-01
 
 ### Fixed
