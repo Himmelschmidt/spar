@@ -1102,6 +1102,83 @@ fn stream_to_log(
     }
 }
 
+/// The typed quota verdict folded from claude `rate_limit_event` payloads: the last
+/// rejected window wins, a later `allowed`/`allowed_warning` clears it, anything
+/// else leaves it alone. Both the live coalescer and the probe's text scan fold
+/// through this one function, so the two can never disagree on what the wire said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TypedQuotaVerdict {
+    pub window: Option<RateLimitWindow>,
+    pub resets_at: Option<i64>,
+    pub recovered: bool,
+}
+
+impl TypedQuotaVerdict {
+    /// Fold one `rate_limit_event` payload in; returns its `status` for the caller's
+    /// render decision.
+    pub fn fold_event<'v>(&mut self, v: &'v serde_json::Value) -> &'v str {
+        let status = v
+            .pointer("/rate_limit_info/status")
+            .and_then(|x| x.as_str())
+            .unwrap_or("?");
+        let kind = v
+            .pointer("/rate_limit_info/rateLimitType")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        match status {
+            "rejected" => {
+                // Typed, not recovered from a rendered line: `status` is the
+                // provider's own verdict, so routing on it cannot false-positive
+                // on prose that merely mentions limits.
+                self.window = Some(RateLimitWindow::parse(kind));
+                // The same object states when the window reopens, as an absolute
+                // instant in epoch seconds. Prefer the window-specific entry when
+                // the payload carries `unifiedWindows`, else the top-level one.
+                self.resets_at = v
+                    .pointer(&format!("/rate_limit_info/unifiedWindows/{kind}/resetsAt"))
+                    .and_then(|x| x.as_i64())
+                    .or_else(|| {
+                        v.pointer("/rate_limit_info/resetsAt")
+                            .and_then(|x| x.as_i64())
+                    });
+            }
+            "allowed" | "allowed_warning" => {
+                // A rejection does not latch: a later allowed event means the
+                // dispatch is not (or is no longer) blocked. Only a clear of an
+                // actual rejection counts as a recovery; routine allowed traffic
+                // must not disable the prose fallback.
+                if self.window.is_some() {
+                    self.recovered = true;
+                }
+                self.window = None;
+                self.resets_at = None;
+            }
+            // Anything outside the known statuses means the event could not be
+            // read, not that the window reopened.
+            _ => {}
+        }
+        status
+    }
+}
+
+/// Fold every `rate_limit_event` line in finished text, in order. Lines that are
+/// not JSON event objects are skipped, so prose-heavy output scans cheaply.
+pub fn scan_rate_limit_events(text: &str) -> TypedQuotaVerdict {
+    let mut out = TypedQuotaVerdict::default();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.contains("rate_limit_event") {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if v.get("type").and_then(|t| t.as_str()) == Some("rate_limit_event") {
+                out.fold_event(&v);
+            }
+        }
+    }
+    out
+}
+
 struct StreamCoalescer {
     is_err: bool,
     /// Set from the provider's `rate_limit_event` when its status is `rejected`.
@@ -1364,65 +1441,22 @@ impl StreamCoalescer {
                     return None;
                 }
                 "rate_limit_event" => {
-                    let status = v
-                        .pointer("/rate_limit_info/status")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("?");
-                    let kind = v
-                        .pointer("/rate_limit_info/rateLimitType")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("");
-                    match status {
-                        "rejected" => {
-                            // Captured here, typed, rather than recovered downstream from
-                            // the rendered line: `status` is the provider's own verdict on
-                            // this request, so routing on it cannot false-positive on prose
-                            // that merely mentions limits.
-                            self.quota_rejected = Some(RateLimitWindow::parse(kind));
-                            // The same object states when the window reopens, as an absolute
-                            // instant in epoch seconds — day included, no timezone, nothing
-                            // inferred. Prefer the window-specific entry when the payload
-                            // carries `unifiedWindows`, else the top-level one. Reading the
-                            // rendered sentence's wall-clock time instead is what made the
-                            // weekly reset look unknowable when it never was.
-                            self.quota_resets_at = v
-                                .pointer(&format!(
-                                    "/rate_limit_info/unifiedWindows/{kind}/resetsAt"
-                                ))
-                                .and_then(|x| x.as_i64())
-                                .or_else(|| {
-                                    v.pointer("/rate_limit_info/resetsAt")
-                                        .and_then(|x| x.as_i64())
-                                });
-                        }
-                        "allowed" | "allowed_warning" => {
-                            // A `rejected` status does not latch: a stream can be rejected,
-                            // fall back to another window, and keep going. A later
-                            // allowed/allowed_warning event means this dispatch is not
-                            // (or is no longer) blocked, so it must clear the verdict rather
-                            // than let an earlier rejection outlive its own recovery and
-                            // misroute an unrelated later failure onto `Phase::Quota`.
-                            //
-                            // Only counts as a *recovery* — and only a recovery disables the
-                            // prose fallback below — when it actually clears a rejection.
-                            // Routine `allowed` traffic with no prior rejection (which Claude
-                            // emits constantly; the coalescer suppresses rendering it for
-                            // exactly that reason) must not set this, or the fallback would be
-                            // dead for essentially every dispatch from the provider this
-                            // feature was built for.
-                            if self.quota_rejected.is_some() {
-                                self.quota_recovered = true;
-                            }
-                            self.quota_rejected = None;
-                            self.quota_resets_at = None;
-                        }
-                        // Anything outside the three known values (missing/non-string
-                        // `status`, or a future enum member) means this event could not be
-                        // read, not that the window reopened — leaving a genuine, already
-                        // recorded rejection alone is safer than clearing it on a guess.
-                        _ => {}
-                    }
+                    // Folded through the shared verdict so the live stream and a later
+                    // text scan (the probe) read the wire the same way.
+                    let mut verdict = TypedQuotaVerdict {
+                        window: self.quota_rejected,
+                        resets_at: self.quota_resets_at,
+                        recovered: self.quota_recovered,
+                    };
+                    let status = verdict.fold_event(&v);
+                    self.quota_rejected = verdict.window;
+                    self.quota_resets_at = verdict.resets_at;
+                    self.quota_recovered = verdict.recovered;
                     if status != "allowed" {
+                        let kind = v
+                            .pointer("/rate_limit_info/rateLimitType")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("");
                         return Some(format!("! rate limit  {kind}  {status}\n"));
                     }
                     return None;
@@ -2629,6 +2663,26 @@ mod tests {
     /// the `unifiedWindows` lookup still keys off the raw (empty) `kind`, which can never
     /// match a real window entry — this must fall back to the top-level `resetsAt`
     /// rather than come back empty.
+    #[test]
+    fn scan_reads_rejection_recovery_and_noise() {
+        let v = scan_rate_limit_events(
+            "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"rejected\",\"rateLimitType\":\"seven_day_opus\",\"resetsAt\":1788000000}}\nnot json at all\n",
+        );
+        assert_eq!(v.window, Some(RateLimitWindow::SevenDayOpus));
+        assert_eq!(v.resets_at, Some(1788000000));
+        assert!(!v.recovered);
+
+        let v = scan_rate_limit_events(
+            "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"rejected\",\"rateLimitType\":\"five_hour\"}}\n\
+             {\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"allowed_warning\",\"rateLimitType\":\"five_hour\"}}",
+        );
+        assert_eq!(v.window, None);
+        assert!(v.recovered);
+
+        let v = scan_rate_limit_events("{\"type\":\"rate_limit_event\"}\nplain prose\n");
+        assert_eq!(v, TypedQuotaVerdict::default());
+    }
+
     #[test]
     fn old_sidecar_window_strings_still_deserialize() {
         for (raw, want) in [

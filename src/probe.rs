@@ -42,28 +42,62 @@ pub struct ProbeReport {
 /// output names: a login-wide claude rejection pauses `cli:claude`, an Opus-limit
 /// one pauses `cli:claude@opus`. Any other verdict uses the seat's own key.
 pub fn probe(paths: &SparPaths, provider: &str, dry: bool) -> ProbeReport {
-    let (verdict, detail, until, output) = call(paths, provider, dry);
+    let out = call(paths, provider, dry);
     let key = ProviderRef::parse(provider)
         .map(|pref| {
-            if verdict == Verdict::Quota {
-                pref.rejection_key(crate::providers::QuotaSignal::Text(
-                    output.as_deref().unwrap_or(""),
-                ))
+            if out.verdict == Verdict::Quota {
+                match out.window {
+                    Some(window) => {
+                        pref.rejection_key(crate::providers::QuotaSignal::Window(&window))
+                    }
+                    None => pref.rejection_key(crate::providers::QuotaSignal::Text(
+                        out.output.as_deref().unwrap_or(""),
+                    )),
+                }
             } else {
                 pref.quota_key()
             }
         })
         .unwrap_or_else(|_| quota::quota_key(provider));
     let mut store = QuotaStore::load(paths).unwrap_or_default();
-    let change = apply(&mut store, &key, verdict, until, detail.as_deref());
+    let change = apply(
+        &mut store,
+        &key,
+        out.verdict,
+        out.until,
+        out.detail.as_deref(),
+    );
     if change.written {
         let _ = store.save(paths);
     }
     ProbeReport {
         provider: key,
-        verdict,
-        detail,
+        verdict: out.verdict,
+        detail: out.detail,
         store: change.what,
+    }
+}
+
+/// What one probe call found: the verdict, its detail, the stated reopening instant,
+/// the raw output the verdict was read from, and the typed rejection window when the
+/// output carried a `rate_limit_event` whose final status was rejected.
+struct CallOutcome {
+    verdict: Verdict,
+    detail: Option<String>,
+    until: Option<chrono::DateTime<chrono::Utc>>,
+    output: Option<String>,
+    window: Option<crate::providers::RateLimitWindow>,
+}
+
+impl CallOutcome {
+    fn without_output(verdict: Verdict, detail: Option<String>) -> Self {
+        Self {
+            verdict,
+            detail,
+            until: None,
+            output: None,
+            window: None,
+        }
     }
 }
 
@@ -122,31 +156,21 @@ fn apply(
     }
 }
 
-fn call(
-    paths: &SparPaths,
-    provider: &str,
-    dry: bool,
-) -> (
-    Verdict,
-    Option<String>,
-    Option<chrono::DateTime<chrono::Utc>>,
-    Option<String>,
-) {
-    let no_output = |v: Verdict, d: Option<String>| (v, d, None, None);
+fn call(paths: &SparPaths, provider: &str, dry: bool) -> CallOutcome {
     let Ok(pref) = ProviderRef::parse(provider) else {
-        return no_output(
+        return CallOutcome::without_output(
             Verdict::Skipped,
             Some(format!("bad provider ref `{provider}`")),
         );
     };
     let Some(adapter) = providers::adapter_named(provider) else {
-        return no_output(
+        return CallOutcome::without_output(
             Verdict::Skipped,
             Some("only cli providers are probed".into()),
         );
     };
     let Some(bin) = adapter.resolve_binary() else {
-        return no_output(Verdict::Skipped, Some("not on PATH".into()));
+        return CallOutcome::without_output(Verdict::Skipped, Some("not on PATH".into()));
     };
     let opts = SpawnOpts {
         prompt: PROBE_PROMPT.into(),
@@ -163,7 +187,7 @@ fn call(
     let mut cmd = adapter.build_headless(&bin, &opts);
     if dry {
         let (program, args) = providers::command_to_parts(&cmd);
-        return no_output(
+        return CallOutcome::without_output(
             Verdict::Skipped,
             Some(format!(
                 "dry-run: would run {} {}",
@@ -177,7 +201,7 @@ fn call(
         cmd.env(k, v);
     }
     let Some(out) = providers::run_with_timeout(&mut cmd, PROBE_TIMEOUT) else {
-        return no_output(
+        return CallOutcome::without_output(
             Verdict::Failed,
             Some(format!(
                 "no answer within {}s (or could not spawn)",
@@ -190,12 +214,76 @@ fn call(
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    let (verdict, detail) = classify(out.status.success(), &text);
+    let mut decided = decide(out.status.success(), provider, &text);
+    decided.output = Some(text);
+    decided
+}
+
+/// The verdict for finished probe output: the text-only `classify`, upgraded by a
+/// typed `rate_limit_event` whose final status is rejected (a raw stream-json line
+/// carries no prose for `classify` to read), and downgraded when the stream
+/// recovered (a rejected event later cleared by `allowed`, mirroring the dispatch
+/// rule that a recovered rejection routes no pause). The typed `resetsAt` wins over
+/// the text-scraped instant when both exist.
+fn decide(exit_ok: bool, provider: &str, text: &str) -> CallOutcome {
+    let typed = crate::process::scan_rate_limit_events(text);
+    if let Some(window) = typed.window {
+        let (verdict, detail) = classify(exit_ok, text);
+        let until = typed
+            .resets_at
+            .and_then(chrono::DateTime::from_timestamp_secs)
+            .or_else(|| {
+                (verdict == Verdict::Quota)
+                    .then(|| quota::scrape_claude_rate_limits(provider, text))
+                    .flatten()
+                    .and_then(|(until, _)| until)
+            });
+        return CallOutcome {
+            verdict: Verdict::Quota,
+            detail: match detail {
+                Some(d) if verdict == Verdict::Quota => Some(d),
+                _ => Some(format!("rate_limit_event {window} rejected")),
+            },
+            until,
+            output: None,
+            window: Some(window),
+        };
+    }
+    let (verdict, detail) = classify(exit_ok, text);
+    if typed.recovered && verdict == Verdict::Quota {
+        let detail = (!exit_ok).then(|| last_line(text)).flatten();
+        return CallOutcome {
+            verdict: if exit_ok {
+                Verdict::Healthy
+            } else {
+                Verdict::Failed
+            },
+            detail,
+            until: None,
+            output: None,
+            window: None,
+        };
+    }
     let until = (verdict == Verdict::Quota)
-        .then(|| quota::scrape_claude_rate_limits(provider, &text))
+        .then(|| quota::scrape_claude_rate_limits(provider, text))
         .flatten()
         .and_then(|(until, _)| until);
-    (verdict, detail, until, Some(text))
+    CallOutcome {
+        verdict,
+        detail,
+        until,
+        output: None,
+        window: None,
+    }
+}
+
+fn last_line(output: &str) -> Option<String> {
+    output
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(|l| l.chars().take(300).collect())
 }
 
 /// Quota first (the more specific refusal), then auth, then the exit status.
@@ -209,13 +297,7 @@ fn classify(exit_ok: bool, output: &str) -> (Verdict, Option<String>) {
     if exit_ok {
         return (Verdict::Healthy, None);
     }
-    let last = output
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .map(|l| l.chars().take(300).collect());
-    (Verdict::Failed, last)
+    (Verdict::Failed, last_line(output))
 }
 
 #[cfg(test)]
@@ -382,6 +464,60 @@ mod tests {
             assert!(!c.written, "{v:?}");
             assert_eq!(store.get("cli:codex").updated_at, before);
         }
+    }
+
+    #[test]
+    fn decide_upgrades_a_raw_stream_json_rejection() {
+        let reset = 1_788_000_000i64;
+        let text = format!(
+            "{{\"type\":\"rate_limit_event\",\"rate_limit_info\":{{\"status\":\"rejected\",\"rateLimitType\":\"seven_day_opus\",\"resetsAt\":{reset}}}}}"
+        );
+        let out = decide(false, "cli:claude@opus", &text);
+        assert_eq!(out.verdict, Verdict::Quota);
+        assert_eq!(
+            out.window,
+            Some(crate::providers::RateLimitWindow::SevenDayOpus)
+        );
+        assert_eq!(
+            out.until,
+            chrono::DateTime::from_timestamp_secs(reset),
+            "the typed resetsAt sets the instant prose could never state"
+        );
+    }
+
+    #[test]
+    fn decide_keeps_prose_detail_when_both_fire() {
+        let text = "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"rejected\",\"rateLimitType\":\"five_hour\",\"resetsAt\":1788000000}}\n\
+            You've hit your weekly limit";
+        let out = decide(false, "cli:claude@opus", text);
+        assert_eq!(out.verdict, Verdict::Quota);
+        assert_eq!(
+            out.window,
+            Some(crate::providers::RateLimitWindow::FiveHour)
+        );
+        assert!(
+            out.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("weekly limit")),
+            "the prose line stays the detail: {:?}",
+            out.detail
+        );
+    }
+
+    #[test]
+    fn decide_downgrades_a_recovered_stream() {
+        let text = "{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"rejected\",\"rateLimitType\":\"seven_day_opus\"}}\n\
+            {\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"allowed\",\"rateLimitType\":\"seven_day_opus\"}}\n\
+            You've hit your weekly limit";
+        let out = decide(false, "cli:claude@opus", text);
+        assert_eq!(
+            out.verdict,
+            Verdict::Failed,
+            "a recovered rejection routes no pause even with prose in the tail"
+        );
+        assert_eq!(out.window, None);
+        let out = decide(true, "cli:claude@opus", text);
+        assert_eq!(out.verdict, Verdict::Healthy);
     }
 
     #[test]

@@ -624,6 +624,40 @@ fn same_sub_claude_buckets_are_rejected_at_launch() {
     );
 }
 
+/// A probe whose output is only a raw stream-json `rate_limit_event` still
+/// pauses the right bucket: the probe parses the typed event, not just prose.
+#[test]
+fn probe_parses_a_raw_stream_json_rejection() {
+    let reset_at = chrono::Utc::now() + chrono::Duration::hours(2);
+    let fx = Fixture::new();
+    fx.cli(
+        "claude",
+        &format!(
+            "echo '{{\"type\":\"rate_limit_event\",\"rate_limit_info\":{{\"status\":\"rejected\",\"rateLimitType\":\"seven_day_opus\",\"resetsAt\":{}}}}}'; exit 1",
+            reset_at.timestamp()
+        ),
+    );
+    let out = fx
+        .spar()
+        .args(["provider", "probe", "cli:claude@opus", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let r: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(r[0]["verdict"], "quota", "{r}");
+    assert_eq!(r[0]["provider"], "cli:claude@opus", "{r}");
+    let quota = fx.quota();
+    let opus = &quota["providers"]["cli:claude@opus"];
+    assert!(opus.is_object(), "the opus bucket is paused: {quota}");
+    assert_eq!(opus["status"], "cooldown");
+    assert!(
+        quota["providers"].get("cli:claude").is_none(),
+        "no login-wide pause: {quota}"
+    );
+}
+
 /// Recovery: a stream that reports `seven_day_opus` rejected and then recovers
 /// with `allowed` writes no pause on any claude key when the dispatch fails for
 /// an unrelated reason.
